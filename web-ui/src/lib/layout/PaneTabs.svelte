@@ -16,13 +16,8 @@
   import { isPreviewTab, tabKey, MAX_PANES, type PaneNode, type Tab } from "./layout";
   import { TAB_FADE_PX, revealTabScrollLeft, tabFadeWidths, tabInView, type TabBounds } from "./tabScroll";
   import type { Session } from "../workspace/sessions";
-  import {
-    dotState,
-    dotTitle,
-    renameSession,
-    sessionLabel as labelSession,
-    switchingViews,
-  } from "../workspace/sessions";
+  import { renameSession, sessionLabel as labelSession, switchingViews } from "../workspace/sessions";
+  import { glyphState, glyphTitle } from "../workspace/comms.svelte";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import type { DropSpot, LayoutCtrl } from "./dnd";
   import { agentHue, type LinkCtrl } from "../workspace/agentLinks";
@@ -788,9 +783,9 @@
             <SessionGlyph
               kind={s?.kind ?? "shell"}
               agentKind={s?.agent_kind}
-              state={s ? dotState(s) : ""}
+              state={s ? glyphState(s) : ""}
               size={10}
-              title={s ? dotTitle(s) : "terminal"}
+              title={s ? glyphTitle(s) : "terminal"}
             />
           {:else if tab.surface === "settings"}
             <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">

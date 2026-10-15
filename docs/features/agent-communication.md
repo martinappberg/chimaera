@@ -125,24 +125,33 @@ is not moved to the background: its result may be what the next step needs.
 ## Wakes and wake requests
 
 - **What & when.** A message to an idle chat agent may start a turn — billed — only as
-  Settings → Agents → **Agents may wake each other** says: **Never** (it waits for the agent's
-  next turn or the user's hand-over), **Ask me** (default: a wake request in the dashboard's
-  Needs you), **Within limits** (it wakes, inside the caps).
-- **How it's used.** A wake request card — "analyst wants to wake reviewer: '…'" — offers
-  **Wake** (delivers every unread message as one send) and **Leave in inbox**
-  (`POST /comms/wakes/{wid} {wake}`). A reply to a question the reader asked
-  (`expect_reply`, then `reply_to` it) wakes the asker without asking — the question-and-answer
-  that works without a blocking call. A chat that ends its turn with messages still unread
-  meets the same policy then. The user can also hand an agent its inbox
-  (`POST /comms/deliver`, the Mastermind panel's inbox chip) or one Timeline message
-  (`POST /timeline/{seq}/deliver`).
-- **Key behaviors.** Caps: a fresh message wakes at most once per sender per 3 minutes, 10
-  wakes per workspace per hour, 4 per conversation (a reply chain; a reply isn't held to the
-  3 minutes — a quick second question's answer would otherwise sit unread) — past the conversation's limit the user is asked "X and Y have
-  been going back and forth — let them continue?" (Continue resets it). A wake starts with a
-  line saying why ("[chimaera delivered this while you were idle: it answers a question you
-  asked]"). Terminal agents are never woken, whatever the policy. Wake requests are one per
-  reader, at most 16 per workspace, and vanish once the reader has nothing unread.
+  Settings → Agents → **Agents may wake each other** says: **Automatically** (default: it
+  wakes, inside the caps), **Ask me** (a wake request, every time), **Never** (it waits for the
+  agent's next turn or the user's hand-over).
+- **How it's used.** A wake request shows where the user looks: a bar above the idle agent's
+  own composer — the sender, the message on one line, **Leave** · **Wake** (`WakeRequestBar`)
+  — an attention-colored glyph on its rail row, tab and focus-strip chip ("analyst sent a
+  message — wake it?"), a "Message waiting" notification (`notifications.needsYou`; a click
+  opens the agent), and a card in the dashboard's Needs you ("analyst wants to wake reviewer:
+  '…'", **Wake** / **Leave in inbox**). **Wake** delivers every unread message as one send
+  (`POST /comms/wakes/{wid} {wake}`). A reply to a question the reader asked (`expect_reply`,
+  then `reply_to` it) wakes the asker without asking — the question-and-answer that works
+  without a blocking call. A chat that ends its turn with messages still unread meets the same
+  policy then. The user can also hand an agent its inbox (`POST /comms/deliver`, the
+  Mastermind panel's inbox chip) or one Timeline message (`POST /timeline/{seq}/deliver`); a
+  prompt the user types carries waiting messages too (claude's UserPromptSubmit hook).
+- **Key behaviors.** Caps: a fresh message wakes the same reader at most once per sender per 3
+  minutes (per pair, so a coordinator handing work to three idle agents wakes all three), 10
+  wakes per workspace per hour, 4 per conversation (a reply chain; a reply isn't held to the 3
+  minutes — a quick second question's answer would otherwise sit unread). Past a cap nothing
+  is left unseen: a message inside the 3 minutes wakes its reader once they have passed (the
+  sender is told "chimaera wakes it again in 2 min"); past the hour's wakes the user is asked
+  (the request says "hour's wakes used"); past the conversation's limit the user is asked "X
+  and Y have been going back and forth — let them continue?" (Continue resets it). A wake
+  starts with a line saying why ("[chimaera delivered this while you were idle: it answers a
+  question you asked]"). Terminal agents are never woken, whatever the policy. Wake requests
+  are one per reader (a notification only for a new one), at most 16 per workspace, and vanish
+  once the reader has nothing unread.
 
 ## The Mastermind inside it
 
@@ -161,7 +170,7 @@ is not moved to the background: its result may be what the next step needs.
 
 - **What & when.** Settings → Agents → **Agents can see and message each other**
   (`agents.communication.enabled`, default on), **Agents may wake each other**
-  (`agents.communication.wakes`: `never` · `ask` · `auto`, default `ask`) and **Messages may
+  (`agents.communication.wakes`: `never` · `ask` · `auto`, default `auto`) and **Messages may
   move a waiting subagent to the background** (`agents.communication.freeSubagents`, default
   off; Claude chats — see Delivery).
 - **Key behaviors.** Off: new sessions get none of the four tools, no paragraph and no
@@ -184,7 +193,7 @@ woke it; the switch off in Settings refused a running agent's `message_agent` at
 emptied its tool list to the base six, and the Mastermind panel showed its off banner.
 Later the same day: asked in plain words, a sonnet chat and an opus chat each put a question
 to the codex chat through `workspace_agents` / `read_agent` / `message_agent` and were woken
-by its answers; two haiku chats in a counting relay under **Within limits**
+by its answers; two haiku chats in a counting relay under **Within limits** (now **Automatically**)
 woke each other four times (a reply within the 3 minutes included), the fifth asked the user,
 **Continue** gave four more; a codex **terminal** read its inbox with `read_messages` when
 prompted and answered with `message_agent`, pre-approved, which woke the asker; a codex chat,
@@ -219,8 +228,12 @@ _Captured 2026-09-29/30 from the maintainer, in the design conversation that pro
   running — "extend it to be better and have agents be able to talk to each other".
 - **Deliberate calls (settled by the maintainer):** built in, not a plugin — the Agent notes
   plugin is deleted; **enabled by default**, and "it is important one can turn it off"; the
-  **Mastermind is part of it**; waking an idle agent is a policy defaulting to **Ask me**;
-  peers reading each other's work (`read_agent`) — "yes most definitely".
+  **Mastermind is part of it**; waking an idle agent is a policy; peers reading each other's
+  work (`read_agent`) — "yes most definitely".
+- **Wakes default to Automatically (2026-10-15).** The default was **Ask me** until a peer's
+  message sat unread in an idle chat while its wake request waited in the dashboard, out of
+  sight: "IT should be auto by default I feel", and a request that does need the user "should
+  come up there" — in the agent's own chat.
 - **How settled it is (intended vs provisional):** the calls above are the maintainer's.
   The mechanics — the carriers, the caps, the tool names, the header format — are how it
   works now.

@@ -59,7 +59,8 @@ workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
   (the door, not an inline form). TUI sessions say honestly what is known ("needs
   permission — answer in the terminal") and offer the door.
 - **Wake requests** ([agent-communication.md](agent-communication.md#wakes-and-wake-requests)).
-  While the wake policy is **Ask me**, a message to an idle chat agent adds a card — "analyst
+  When a message to an idle chat agent needs the user's OK (the **Ask me** wake policy, or the
+  hour's wakes used under **Automatically**), Needs you adds a card — "analyst
   wants to wake reviewer" with the message — offering **Wake** / **Leave in inbox**; a
   conversation past its wake limit asks "… have been going back and forth — let them
   continue?" (**Continue**). From the comms store (`workspace/comms.svelte.ts`, over

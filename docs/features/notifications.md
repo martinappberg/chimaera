@@ -21,7 +21,10 @@ and in `App.svelte` the view reporting + `focusFromNotification`.
 
 - **What & when.** Discrete "a person may want to know this now" events, one per real state
   edge of an agent session: `done` (running → finished), `input` (the turn ended waiting on
-  you), `permission`, `question`, `error`, `rate_limited`, and `agent` (the `notify` tool).
+  you), `permission`, `question`, `error`, `rate_limited`, `agent` (the `notify` tool), and
+  `wake` — another agent's message waiting for the user's OK to wake an idle agent ("Message
+  waiting", subtitle "Message from ⟨sender⟩"; one per new wake request, pushed by
+  `comms.rs`, never by the state watcher — [agent-communication.md](agent-communication.md#wakes-and-wake-requests)).
   Each carries the session's display name, its workspace, a state phrase, and a body quoting
   what it was about — how the final reply starts, the permission line ("Bash: rm -rf build"),
   the question, the error.
@@ -30,7 +33,7 @@ and in `App.svelte` the view reporting + `focusFromNotification`.
   `/ws/events`. Which kinds exist at all is the daemon's `notifications.*` settings (so every
   consumer agrees).
 - **Where it lives.** `notices.rs` (`Notices` store, `run` watcher, `get_notices`,
-  `frame_since`, `push_agent_notice`); the record fields `AgentRecord.notice_note` /
+  `frame_since`, `push_agent_notice`, `push_wake_notice`); the record fields `AgentRecord.notice_note` /
   `reply_draft` (`agent_state.rs`).
 - **Key behaviors.**
   - **One detector, every surface.** Agent state is written by claude hooks, chat protocol
@@ -160,7 +163,7 @@ and in `App.svelte` the view reporting + `focusFromNotification`.
 ## Settings
 
 Category **Notifications** (daemon-scoped, `settings/schema.ts`): `notifications.turnFinished`,
-`notifications.needsYou` (permission / question / waiting / error / limit),
+`notifications.needsYou` (permission / question / waiting / error / limit / a message waiting to wake an agent),
 `notifications.agentMessages`, `notifications.sound`, `notifications.whileFocused`,
 `notifications.dockBadge` (badge + bounce). All default on. Per daemon, like every setting: a
 remote host's alerts follow that host's settings.

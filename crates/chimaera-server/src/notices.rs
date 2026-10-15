@@ -81,6 +81,9 @@ pub(crate) enum NoticeKind {
     RateLimited,
     /// The agent called the `notify` tool.
     Agent,
+    /// Another agent's message waits for the user's OK to wake this idle
+    /// agent (agent communication's wake request).
+    Wake,
 }
 
 impl NoticeKind {
@@ -93,7 +96,8 @@ impl NoticeKind {
             | NoticeKind::Permission
             | NoticeKind::Question
             | NoticeKind::Error
-            | NoticeKind::RateLimited => "notifications.needsYou",
+            | NoticeKind::RateLimited
+            | NoticeKind::Wake => "notifications.needsYou",
         }
     }
 
@@ -107,6 +111,7 @@ impl NoticeKind {
             NoticeKind::Error => "Stopped on an error",
             NoticeKind::RateLimited => "Hit a usage limit",
             NoticeKind::Agent => "Message",
+            NoticeKind::Wake => "Message waiting",
         }
     }
 
@@ -402,6 +407,46 @@ pub(crate) fn push_agent_notice(
     Ok("Notification sent.".to_string())
 }
 
+/// A wake request reached the user (agent communication): one notice about
+/// the idle reader — a click opens it, where the request waits with its
+/// Wake button — naming the sender, with the message as its body.
+pub(crate) fn push_wake_notice(state: &AppState, req: &crate::comms::WakeRequest) {
+    if !kind_enabled(state, NoticeKind::Wake) {
+        return;
+    }
+    let Some(subject) = describe(state, &req.to_sid) else {
+        return;
+    };
+    if subject.mastermind {
+        return;
+    }
+    let from = crate::session_view::display_name_now(state, &req.from_sid)
+        .unwrap_or_else(|| req.from_name.clone());
+    let lead = if req.reason == "hop_limit" {
+        format!("Back and forth with {from}")
+    } else {
+        format!("Message from {from}")
+    };
+    let subtitle = match &subject.workspace {
+        Some(ws) => format!("{lead} · {ws}"),
+        None => lead,
+    };
+    state.notices.push(Notice {
+        id: 0,
+        kind: NoticeKind::Wake,
+        session_id: req.to_sid.clone(),
+        workspace_id: subject.workspace_id,
+        workspace: subject.workspace,
+        agent: subject.agent,
+        title: subject.name.clone(),
+        name: subject.name,
+        subtitle,
+        body: crate::agent_state::notice_line(&req.text),
+        at_ms: crate::session_view::now_ms(),
+        created: Instant::now(),
+    });
+}
+
 /// What an observed state change means for the feed.
 #[derive(Debug, PartialEq, Eq)]
 enum Edge {
@@ -446,7 +491,7 @@ fn still_true(kind: NoticeKind, state: AgentState) -> bool {
         NoticeKind::Permission | NoticeKind::Question => state == AgentState::NeedsPermission,
         NoticeKind::Error => state == AgentState::Errored,
         NoticeKind::RateLimited => state == AgentState::RateLimited,
-        NoticeKind::Agent => false,
+        NoticeKind::Agent | NoticeKind::Wake => false,
     }
 }
 

@@ -75,14 +75,21 @@ pub(crate) const SEND_TOOL: &str = "message_agent";
 /// Posts per session per minute — a looping agent can't flood the Timeline
 /// (shared with plugins' Timeline appends).
 const POSTS_PER_MINUTE: usize = 10;
-/// A fresh message (no `reply_to`) wakes someone at most this often per
-/// sender, a workspace sees at most `WAKES_PER_HOUR` wakes, and one
+/// A fresh message (no `reply_to`) wakes the same reader at most this often
+/// per sender, a workspace sees at most `WAKES_PER_HOUR` wakes, and one
 /// conversation (a reply chain) at most `THREAD_WAKES_MAX` — two agents
 /// messaging each other can't become a billed loop. A reply is bounded by
 /// its conversation, not the gap: a second question within the gap would
-/// otherwise leave its answer unread beside an asker waiting for it. A
-/// message past a cap still lands in the inbox.
-const WAKE_GAP: Duration = Duration::from_secs(180);
+/// otherwise leave its answer unread beside an asker waiting for it. Past a
+/// cap nothing is silently stranded: a message inside the gap wakes its
+/// reader once the gap has passed, and past the hour's or the
+/// conversation's wakes the user is asked. Short under test, so the
+/// deferred wake can be watched.
+const WAKE_GAP: Duration = if cfg!(test) {
+    Duration::from_secs(2)
+} else {
+    Duration::from_secs(180)
+};
 const WAKES_PER_HOUR: usize = 10;
 const THREAD_WAKES_MAX: usize = 4;
 /// Conversations whose wake counts are kept (oldest forgotten first).
@@ -139,6 +146,8 @@ pub(crate) fn enabled(state: &AppState) -> bool {
         .unwrap_or(true)
 }
 
+/// Default `auto` (the maintainer's call, 2026-10-15): a message an agent
+/// sends to an idle peer should arrive; the caps bound the cost.
 pub(crate) fn wake_policy(state: &AppState) -> WakePolicy {
     match crate::lock(&state.settings)
         .map_cached()
@@ -146,8 +155,8 @@ pub(crate) fn wake_policy(state: &AppState) -> WakePolicy {
         .and_then(Value::as_str)
     {
         Some("never") => WakePolicy::Never,
-        Some("auto") => WakePolicy::Auto,
-        _ => WakePolicy::Ask,
+        Some("ask") => WakePolicy::Ask,
+        _ => WakePolicy::Auto,
     }
 }
 
@@ -201,11 +210,15 @@ pub(crate) struct WakeRequest {
     pub(crate) to_name: String,
     pub(crate) from_sid: String,
     pub(crate) from_name: String,
+    /// The sender's agent ("claude", "codex", …), so the ask can show
+    /// which agent is talking.
+    pub(crate) from_agent: String,
     /// The newest message it covers.
     pub(crate) message: u64,
     pub(crate) text: String,
     /// "ask" (the wake policy asks first) | "hop_limit" (a conversation
-    /// used its wakes; continuing is the user's call).
+    /// used its wakes; continuing is the user's call) | "hourly" (the
+    /// workspace used the hour's wakes).
     pub(crate) reason: &'static str,
     pub(crate) created_ms: u64,
     #[serde(skip)]
@@ -215,8 +228,13 @@ pub(crate) struct WakeRequest {
 #[derive(Default)]
 struct CommsState {
     posts: HashMap<String, VecDeque<Instant>>,
-    /// Per sender: when it last woke someone.
-    woke_at: HashMap<String, Instant>,
+    /// Per (sender, reader): when the sender last woke that reader with a
+    /// fresh message. Per pair, so a coordinator handing out work to three
+    /// idle agents wakes all three.
+    woke_at: HashMap<(String, String), Instant>,
+    /// Per (workspace, reader): a wake held back by the gap is scheduled
+    /// (one timer per reader, however many messages wait behind it).
+    deferred: HashSet<(String, String)>,
     /// Per workspace: the wakes in the last hour.
     wakes: HashMap<String, VecDeque<Instant>>,
     /// Per (workspace, thread root): wakes so far, with insertion order for
@@ -276,7 +294,8 @@ impl Comms {
     pub(crate) fn forget_session(&self, sid: &str) {
         let mut st = crate::lock(&self.inner);
         st.posts.remove(sid);
-        st.woke_at.remove(sid);
+        st.woke_at.retain(|(from, to), _| from != sid && to != sid);
+        st.deferred.retain(|(_, reader)| reader != sid);
         st.in_flight.retain(|_, f| f.reader != sid);
         st.awaiting.retain(|(_, reader), _| reader != sid);
         let mut touched = Vec::new();
@@ -301,6 +320,7 @@ impl Comms {
         st.epochs.remove(ws);
         st.dirty.remove(ws);
         st.awaiting.retain(|(w, _), _| w != ws);
+        st.deferred.retain(|(w, _)| w != ws);
         st.last_message.remove(ws);
         st.in_flight.retain(|_, f| f.ws != ws);
         st.thread_wakes.retain(|(w, _), _| w != ws);
@@ -404,27 +424,38 @@ pub(crate) fn take_post_slot(state: &AppState, sid: &str) -> Result<(), String> 
     Ok(())
 }
 
+/// Which cap held a wake back.
+#[derive(Debug, PartialEq)]
+enum Capped {
+    /// The conversation used its wakes: continuing is the user's call.
+    Conversation,
+    /// The workspace's wakes for the hour are used: the user is asked.
+    Hourly,
+    /// This sender woke this reader moments ago: the wake waits this long.
+    Gap(Duration),
+}
+
 impl CommsState {
-    /// Record a wake by `sender` in `ws` (conversation `thread`) if every
-    /// cap allows one now. `Err(true)` = the conversation used its wakes.
+    /// Record a wake of `reader` by `sender` in `ws` (conversation `thread`)
+    /// if every cap allows one now.
     fn claim_wake(
         &mut self,
         sender: &str,
+        reader: &str,
         ws: &str,
         thread: Option<(String, u64)>,
-    ) -> Result<(), bool> {
+    ) -> Result<(), Capped> {
         if let Some(key) = &thread {
             if self.thread_wakes.get(key).copied().unwrap_or(0) >= THREAD_WAKES_MAX {
-                return Err(true);
+                return Err(Capped::Conversation);
             }
         }
-        if thread.is_none()
-            && self
-                .woke_at
-                .get(sender)
-                .is_some_and(|t| t.elapsed() < WAKE_GAP)
-        {
-            return Err(false);
+        self.woke_at.retain(|_, t| t.elapsed() < WAKE_GAP);
+        let pair = (sender.to_string(), reader.to_string());
+        if thread.is_none() {
+            if let Some(t) = self.woke_at.get(&pair) {
+                return Err(Capped::Gap(WAKE_GAP.saturating_sub(t.elapsed())));
+            }
         }
         let window = self.wakes.entry(ws.to_string()).or_default();
         while window
@@ -434,14 +465,14 @@ impl CommsState {
             window.pop_front();
         }
         if window.len() >= WAKES_PER_HOUR {
-            return Err(false);
+            return Err(Capped::Hourly);
         }
         window.push_back(Instant::now());
         // The gap is a fresh message's: a reply neither checks nor sets it.
         match thread {
             Some(key) => self.count_thread_wake(key),
             None => {
-                self.woke_at.insert(sender.to_string(), Instant::now());
+                self.woke_at.insert(pair, Instant::now());
             }
         }
         Ok(())
@@ -461,7 +492,13 @@ impl CommsState {
     }
 
     /// Undo the wake `claim_wake` just recorded (the send failed).
-    fn release_wake(&mut self, sender: &str, ws: &str, thread: Option<&(String, u64)>) {
+    fn release_wake(
+        &mut self,
+        sender: &str,
+        reader: &str,
+        ws: &str,
+        thread: Option<&(String, u64)>,
+    ) {
         if let Some(window) = self.wakes.get_mut(ws) {
             window.pop_back();
         }
@@ -472,7 +509,8 @@ impl CommsState {
                 }
             }
             None => {
-                self.woke_at.remove(sender);
+                self.woke_at
+                    .remove(&(sender.to_string(), reader.to_string()));
             }
         }
     }
@@ -570,22 +608,26 @@ impl CommsState {
     }
 
     /// Ask the user about a wake: one request per reader (a newer message
-    /// updates it; a hop-limit reason sticks).
-    fn request(&mut self, ws: &str, mut req: WakeRequest) {
+    /// updates it; a hop-limit reason sticks). True for a new request — the
+    /// one that is announced.
+    fn request(&mut self, ws: &str, mut req: WakeRequest) -> bool {
         let list = self.requests.entry(ws.to_string()).or_default();
-        if let Some(old) = list.iter_mut().find(|r| r.to_sid == req.to_sid) {
+        let fresh = if let Some(old) = list.iter_mut().find(|r| r.to_sid == req.to_sid) {
             if old.reason == "hop_limit" {
                 req.reason = "hop_limit";
             }
             req.id = old.id.clone();
             *old = req;
+            false
         } else {
             list.push(req);
             while list.len() > REQUESTS_PER_WORKSPACE {
                 list.remove(0);
             }
-        }
+            true
+        };
         bump(self, ws);
+        fresh
     }
 }
 
@@ -1090,6 +1132,8 @@ enum Plan {
     Steer,
     /// Start a turn now (policy + caps allowed it); the words say why.
     Wake(&'static str),
+    /// Start a turn once this sender's gap for the reader has passed.
+    Later(Duration),
     /// The Mastermind's direction as an ordinary send (queued if busy).
     Direct,
     /// Ask the user (Needs you).
@@ -1118,20 +1162,25 @@ fn decide_idle(
             return Plan::Inbox("the Mastermind reads it when the user hands it over");
         }
         // A reply is bounded by its conversation here too, not the gap.
-        return match st.claim_wake(sender, ws, thread) {
+        // Past a limit its panel's inbox shows what waits.
+        return match st.claim_wake(sender, &reader.sid, ws, thread) {
             Ok(()) => Plan::Wake("the user lets the Mastermind act on its own"),
-            Err(true) => Plan::Inbox("this conversation woke the Mastermind enough for now"),
-            Err(false) => Plan::Inbox("the Mastermind was woken recently"),
+            Err(Capped::Gap(after)) => Plan::Later(after),
+            Err(Capped::Conversation) => {
+                Plan::Inbox("this conversation woke the Mastermind enough for now")
+            }
+            Err(Capped::Hourly) => Plan::Inbox("the Mastermind was woken enough this hour"),
         };
     }
     if policy == WakePolicy::Ask && !reply_wake {
         return Plan::Request("ask");
     }
-    match st.claim_wake(sender, ws, thread) {
+    match st.claim_wake(sender, &reader.sid, ws, thread) {
         Ok(()) if reply_wake => Plan::Wake("it answers a question you asked"),
         Ok(()) => Plan::Wake("the user lets agents in this workspace wake each other"),
-        Err(true) => Plan::Request("hop_limit"),
-        Err(false) => Plan::Inbox("it was woken recently"),
+        Err(Capped::Gap(after)) => Plan::Later(after),
+        Err(Capped::Conversation) => Plan::Request("hop_limit"),
+        Err(Capped::Hourly) => Plan::Request("hourly"),
     }
 }
 
@@ -1308,7 +1357,7 @@ pub(crate) async fn message_agent(state: &Arc<AppState>, from_sid: &str, args: &
             Plan::Direct if targets[0].busy => "next_step",
             Plan::Wake(_) | Plan::Direct => "woke",
             Plan::Request(_) => "asked",
-            Plan::Carrier | Plan::Inbox(_) => "inbox",
+            Plan::Carrier | Plan::Inbox(_) | Plan::Later(_) => "inbox",
         }
     };
     let to_field = if broadcast {
@@ -1345,7 +1394,9 @@ pub(crate) async fn message_agent(state: &Arc<AppState>, from_sid: &str, args: &
         *last = (*last).max(posted.seq);
         if !broadcast {
             for (target, plan) in targets.iter().zip(&plans) {
-                let next_step = matches!(plan, Plan::Steer | Plan::Free(_))
+                // A held-back wake meets the policy again when its timer
+                // fires, as a missed turn's message does at the turn end.
+                let next_step = matches!(plan, Plan::Steer | Plan::Free(_) | Plan::Later(_))
                     || matches!(plan, Plan::Carrier | Plan::Inbox(_) if target.busy && target.chat && target.alive);
                 if next_step {
                     st.await_turn_end(&target.ws, &target.sid, posted.seq);
@@ -1547,12 +1598,20 @@ async fn execute(
                     tracing::warn!(%err, to = %target.sid, "agent message wake not delivered");
                     crate::lock(&state.comms.inner).release_wake(
                         &from.sid,
+                        &target.sid,
                         &target.ws,
                         thread.as_ref(),
                     );
                     "it waits in its inbox (it couldn't take the message right now)".into()
                 }
             }
+        }
+        Plan::Later(after) => {
+            defer_wake(state, &target.ws, &target.sid, after);
+            format!(
+                "you woke it moments ago, so chimaera wakes it again {} to read this",
+                soon(after)
+            )
         }
         Plan::Direct => {
             match deliver_all(
@@ -1596,6 +1655,7 @@ async fn execute(
                 to_name: target.name.clone(),
                 from_sid: from.sid.clone(),
                 from_name: from.name.clone(),
+                from_agent: from.agent.clone(),
                 message: posted.seq,
                 text: posted
                     .note
@@ -1606,13 +1666,23 @@ async fn execute(
                 created_ms: crate::timeline::now_ms(),
                 thread,
             };
-            crate::lock(&state.comms.inner).request(&target.ws, req);
-            if reason == "hop_limit" {
-                "you two have gone back and forth enough for now; the user was asked whether to let the conversation continue — until then it waits in its inbox".into()
-            } else {
-                "it's idle; the user was asked whether to wake it — until then it waits in its inbox".into()
+            ask_user(state, &target.ws, req);
+            match reason {
+                "hop_limit" => "you two have gone back and forth enough for now; the user was asked whether to let the conversation continue — until then it waits in its inbox".into(),
+                "hourly" => "agents here have used this hour's wakes; the user was asked whether to wake it — until then it waits in its inbox".into(),
+                _ => "it's idle; the user was asked whether to wake it — until then it waits in its inbox".into(),
             }
         }
+    }
+}
+
+/// "in 40 s", "in 3 min": when a held-back wake comes.
+fn soon(after: Duration) -> String {
+    let secs = after.as_secs().max(1);
+    if secs < 60 {
+        format!("in {secs} s")
+    } else {
+        format!("in {} min", secs.div_ceil(60))
     }
 }
 
@@ -1818,13 +1888,44 @@ fn spawn_idle_check(state: &Arc<AppState>, sid: String) {
     }
     let state = state.clone();
     tokio::spawn(async move {
-        idle_check(&state, &sid).await;
+        idle_check(&state, &sid, "when your turn ended").await;
     });
 }
 
-/// A chat reader just went idle with messages it never read: wake it, ask
-/// the user, or leave them, exactly as a fresh message would.
-async fn idle_check(state: &Arc<AppState>, sid: &str) {
+/// Run `idle_check` for a reader once `after` has passed: a wake the gap
+/// held back. One timer per reader; messages that come meanwhile wait
+/// behind it. Bounded by the gap itself.
+fn defer_wake(state: &Arc<AppState>, ws: &str, sid: &str, after: Duration) {
+    let key = (ws.to_string(), sid.to_string());
+    if !crate::lock(&state.comms.inner).deferred.insert(key.clone()) {
+        return;
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        // A beat past the gap, so the claim made then succeeds.
+        tokio::time::sleep(after + Duration::from_millis(250)).await;
+        crate::lock(&state.comms.inner).deferred.remove(&key);
+        if enabled(&state) {
+            idle_check(&state, &key.1, "while you were idle").await;
+        }
+    });
+}
+
+/// Put a wake request in front of the user — Needs you, the reader's own
+/// chat, and (once per request) a notification.
+fn ask_user(state: &Arc<AppState>, ws: &str, req: WakeRequest) {
+    let announce = req.clone();
+    let fresh = crate::lock(&state.comms.inner).request(ws, req);
+    if fresh {
+        crate::notices::push_wake_notice(state, &announce);
+    }
+    state.changes.notify_waiters();
+}
+
+/// A chat reader went idle with messages it never read (its turn ended, or
+/// a held-back wake came due): wake it, ask the user, or leave them,
+/// exactly as a fresh message would. `when` words the wake's why-line.
+async fn idle_check(state: &Arc<AppState>, sid: &str, when: &str) {
     let Some(reader) = reader(state, sid) else {
         return;
     };
@@ -1914,7 +2015,7 @@ async fn idle_check(state: &Arc<AppState>, sid: &str) {
     };
     match plan {
         Plan::Wake(reason) => {
-            let why = format!("[chimaera delivered these when your turn ended: {reason}]");
+            let why = format!("[chimaera delivered these {when}: {reason}]");
             match deliver_all(
                 state,
                 &reader,
@@ -1936,11 +2037,22 @@ async fn idle_check(state: &Arc<AppState>, sid: &str) {
                     tracing::warn!(%err, session = %reader.sid, "idle wake not delivered");
                     crate::lock(&state.comms.inner).release_wake(
                         &from.sid,
+                        &reader.sid,
                         &reader.ws,
                         thread.as_ref(),
                     );
                 }
             }
+        }
+        Plan::Later(after) => {
+            // Still undecided: they meet the policy again when it fires.
+            {
+                let mut st = crate::lock(&state.comms.inner);
+                for e in &unread {
+                    st.await_turn_end(&reader.ws, &reader.sid, e.seq);
+                }
+            }
+            defer_wake(state, &reader.ws, &reader.sid, after);
         }
         Plan::Request(reason) => {
             let req = WakeRequest {
@@ -1949,14 +2061,14 @@ async fn idle_check(state: &Arc<AppState>, sid: &str) {
                 to_name: reader.name.clone(),
                 from_sid: from.sid.clone(),
                 from_name: from.name.clone(),
+                from_agent: from.agent.clone(),
                 message: trigger.seq,
                 text: timeline::cap(&trigger_note.text, 300),
                 reason,
                 created_ms: crate::timeline::now_ms(),
                 thread,
             };
-            crate::lock(&state.comms.inner).request(&reader.ws, req);
-            state.changes.notify_waiters();
+            ask_user(state, &reader.ws, req);
         }
         _ => {}
     }
@@ -2744,24 +2856,29 @@ mod tests {
     }
 
     #[test]
-    fn wakes_are_capped_per_sender_workspace_and_conversation() {
+    fn wakes_are_capped_per_pair_workspace_and_conversation() {
+        let gap = |r: Result<(), Capped>| matches!(r, Err(Capped::Gap(d)) if d <= WAKE_GAP);
         let mut st = CommsState::default();
-        assert_eq!(st.claim_wake("a", "w", None), Ok(()));
-        assert_eq!(
-            st.claim_wake("a", "w", None),
-            Err(false),
-            "one sender, one wake per gap"
+        assert_eq!(st.claim_wake("a", "r", "w", None), Ok(()));
+        assert!(
+            gap(st.claim_wake("a", "r", "w", None)),
+            "one sender, one wake of a reader per gap"
         );
-        for i in 0..WAKES_PER_HOUR - 1 {
-            assert_eq!(st.claim_wake(&format!("s{i}"), "w", None), Ok(()));
+        assert_eq!(
+            st.claim_wake("a", "r2", "w", None),
+            Ok(()),
+            "a coordinator wakes each idle agent it hands work to"
+        );
+        for i in 0..WAKES_PER_HOUR - 2 {
+            assert_eq!(st.claim_wake(&format!("s{i}"), "r", "w", None), Ok(()));
         }
         assert_eq!(
-            st.claim_wake("late", "w", None),
-            Err(false),
+            st.claim_wake("late", "r", "w", None),
+            Err(Capped::Hourly),
             "the hourly cap"
         );
         assert_eq!(
-            st.claim_wake("late", "other", None),
+            st.claim_wake("late", "r", "other", None),
             Ok(()),
             "per workspace"
         );
@@ -2771,33 +2888,66 @@ mod tests {
         // One pair going back and forth: the gap doesn't stop a reply,
         // the conversation's limit does.
         for i in 0..THREAD_WAKES_MAX {
-            let sender = if i % 2 == 0 { "t-a" } else { "t-b" };
+            let (sender, reader) = if i % 2 == 0 {
+                ("t-a", "t-b")
+            } else {
+                ("t-b", "t-a")
+            };
             assert_eq!(
-                st.claim_wake(sender, "w", thread.clone()),
+                st.claim_wake(sender, reader, "w", thread.clone()),
                 Ok(()),
                 "wake {i}"
             );
         }
         assert_eq!(
-            st.claim_wake("t-next", "w", thread.clone()),
-            Err(true),
+            st.claim_wake("t-next", "t-a", "w", thread.clone()),
+            Err(Capped::Conversation),
             "the conversation used its wakes"
         );
-        st.release_wake("t-a", "w", thread.as_ref());
-        assert_eq!(st.claim_wake("t-next", "w", thread), Ok(()));
+        st.release_wake("t-a", "t-b", "w", thread.as_ref());
+        assert_eq!(st.claim_wake("t-next", "t-a", "w", thread), Ok(()));
 
         // A reply's wake leaves a sender's fresh-message gap alone, claimed
         // or released.
         let mut st = CommsState::default();
         let thread = Some(("w".to_string(), 3u64));
-        assert_eq!(st.claim_wake("r", "w", None), Ok(()));
-        assert_eq!(st.claim_wake("r", "w", thread.clone()), Ok(()));
-        st.release_wake("r", "w", thread.as_ref());
-        assert_eq!(
-            st.claim_wake("r", "w", None),
-            Err(false),
+        assert_eq!(st.claim_wake("r", "x", "w", None), Ok(()));
+        assert_eq!(st.claim_wake("r", "x", "w", thread.clone()), Ok(()));
+        st.release_wake("r", "x", "w", thread.as_ref());
+        assert!(
+            gap(st.claim_wake("r", "x", "w", None)),
             "the fresh gap outlives a released reply"
         );
+        // A failed fresh wake gives its gap back.
+        st.release_wake("r", "x", "w", None);
+        assert_eq!(st.claim_wake("r", "x", "w", None), Ok(()));
+    }
+
+    #[test]
+    fn past_a_cap_an_idle_reader_is_woken_later_or_the_user_is_asked() {
+        let from = reader("s-a");
+        let to = reader("s-b");
+        let plan = |st: &mut CommsState, policy| {
+            plan_for(st, policy, &from, &to, false, false, false, None)
+        };
+        let mut st = CommsState::default();
+        assert!(matches!(plan(&mut st, WakePolicy::Auto), Plan::Wake(_)));
+        assert!(
+            matches!(plan(&mut st, WakePolicy::Auto), Plan::Later(d) if d <= WAKE_GAP),
+            "inside the gap: woken once it passes, never left unseen"
+        );
+        let mut st = CommsState::default();
+        for i in 0..WAKES_PER_HOUR {
+            st.claim_wake(&format!("s{i}"), "elsewhere", "w", None)
+                .unwrap();
+        }
+        assert_eq!(
+            plan(&mut st, WakePolicy::Auto),
+            Plan::Request("hourly"),
+            "the hour's wakes used: the user decides"
+        );
+        assert_eq!(soon(Duration::from_secs(40)), "in 40 s");
+        assert_eq!(soon(Duration::from_secs(170)), "in 3 min");
     }
 
     #[test]

@@ -201,7 +201,9 @@ with a new `agent` origin so its transcript shows who sent it (the `worker`
 origin's chip, generalized). It bills the user, so it's policy-gated:
 
 - **Wake policy**, the second row of the setting (§7); the default is
-  **Ask me**:
+  **Ask me** (*as built since 2026-10-15:* **Automatically**, the old
+  *Within limits* — a request asked out of sight left a peer's message
+  unread; a request now also shows in the idle agent's own chat):
   - *Never* — mail only. The user wakes an agent with **Deliver** on the
     message (the existing route, generalized).
   - *Ask me* — a wake request lands in the dashboard's Needs-you queue:
@@ -394,7 +396,7 @@ Settled by the maintainer, 2026-09-30:
   and `tell_mastermind`.
 
 - **Wakes**: mail by default, phone by policy, and the policy defaults to
-  **Ask me** (§5).
+  **Ask me** (§5) — changed 2026-10-15 to **Automatically** by the maintainer.
 - **No per-workspace override** in v1; the switch is global (§7).
 - **Peers read each other** with `read_agent`, within the workspace.
 - **No cross-workspace** visibility in v1 (P3 at the earliest).

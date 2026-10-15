@@ -10,6 +10,7 @@ import {
   parseComms,
   unreadFor,
   wake,
+  wakeRequestFor,
 } from "./comms.svelte";
 
 const REQ = {
@@ -18,6 +19,7 @@ const REQ = {
   to_name: "fix CI",
   from_sid: "s-1",
   from_name: "loader refactor",
+  from_agent: "claude",
   message: 12,
   text: "main is red",
   reason: "ask",
@@ -42,9 +44,10 @@ describe("parseComms", () => {
     ]);
   });
 
-  it("defaults to on, Ask me, and nothing waiting", () => {
-    expect(parseComms(null)).toEqual({ enabled: true, wakes: "ask", unread: {}, wake_requests: [] });
-    expect(parseComms({ enabled: false, wakes: "sometimes" })).toMatchObject({ enabled: false, wakes: "ask" });
+  it("defaults to on, Automatically, and nothing waiting", () => {
+    expect(parseComms(null)).toEqual({ enabled: true, wakes: "auto", unread: {}, wake_requests: [] });
+    expect(parseComms({ enabled: false, wakes: "sometimes" })).toMatchObject({ enabled: false, wakes: "auto" });
+    expect(parseComms({ wakes: "ask" }).wakes).toBe("ask");
   });
 });
 
@@ -78,6 +81,10 @@ describe("the comms store", () => {
     expect(unreadFor("s-2")).toBe(3);
     expect(unreadFor("s-9")).toBe(0);
     expect(commsStore.wakeRequests.map((r) => r.id)).toEqual(["w-1"]);
+    // The idle agent's own chat and rail row find its request.
+    expect(wakeRequestFor("s-2")?.id).toBe("w-1");
+    expect(wakeRequestFor("s-1")).toBeNull();
+    expect(wakeRequestFor(null)).toBeNull();
 
     onCommsNudge({ "ws-a": 4, "ws-b": 1 });
     await flush();

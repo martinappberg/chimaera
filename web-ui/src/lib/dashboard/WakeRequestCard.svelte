@@ -49,7 +49,7 @@
 </script>
 
 {#snippet who(sid: string, name: string)}
-  {@const agent = agentOf(sid)}
+  {@const agent = agentOf(sid) ?? (sid === request.from_sid ? request.from_agent : null)}
   <button class="who" title="open {name}" onclick={() => onOpenSession(sid)}>
     {#if agent !== null}<SessionGlyph kind="agent" agentKind={agent} size={11} />{/if}
     <span class="name">{name}</span>
@@ -67,6 +67,9 @@
       {@render who(request.from_sid, from)}
       <span class="words">wants to wake</span>
       {@render who(request.to_sid, to)}
+      {#if request.reason === "hourly"}
+        <span class="words" title="agents in this workspace used this hour's wakes, so chimaera asks before the next">· hour's wakes used</span>
+      {/if}
     {/if}
   </div>
   {#if oneLine !== ""}

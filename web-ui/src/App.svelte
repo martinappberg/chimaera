@@ -42,7 +42,6 @@
     displayName,
     sessionLabel,
     dotState,
-    dotTitle,
     isBusy,
     listSessions,
     listWorkspaces,
@@ -256,7 +255,13 @@
   import { computeStatus, initCompute, queuedJobCount } from "./lib/workspace/compute";
   import { surfacesOf } from "./lib/layout/surfaces";
   import { activateTimelineWorkspace, onTimelineNudge } from "./lib/workspace/timeline.svelte";
-  import { activateCommsWorkspace, onCommsNudge, onCommsReconnect } from "./lib/workspace/comms.svelte";
+  import {
+    activateCommsWorkspace,
+    glyphState,
+    glyphTitle,
+    onCommsNudge,
+    onCommsReconnect,
+  } from "./lib/workspace/comms.svelte";
   import {
     activateKnowledgeWorkspace,
     focusKnowledgeEntry,
@@ -5749,9 +5754,9 @@
               <SessionGlyph
                 kind={s.kind}
                 agentKind={s.agent_kind}
-                state={dotState(s)}
+                state={glyphState(s)}
                 size={11}
-                title={dotTitle(s)}
+                title={glyphTitle(s)}
                 pulse
                 backgrounded={backgrounded(s)}
               />
@@ -6560,9 +6565,9 @@
               <SessionGlyph
                 kind={s.kind}
                 agentKind={s.agent_kind}
-                state={dotState(s)}
+                state={glyphState(s)}
                 size={10}
-                title={dotTitle(s)}
+                title={glyphTitle(s)}
                 pulse
                 backgrounded={backgrounded(s)}
               />
