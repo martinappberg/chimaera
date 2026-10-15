@@ -2814,7 +2814,7 @@ Adopted: `SpawnSpec.developer_note` (the cluster context, codex chats only) ride
 
 Gate: live `driver_codex_developer_note_reaches_fresh_and_resumed_threads` through the real driver (fresh FIRSTOTTER; resumed in a new process with a new note, SECONDHERON); hermetic `developer_note_is_one_developer_message_for_inject_items`; full `just chat-smoke` 27/27.
 
-## ACP v1 — Grok Build and Google Antigravity (2026-10-01)
+## ACP v1 — Grok Build, Google Antigravity and Cursor CLI (2026-10-01; Cursor 2026-10-14)
 
 Verified Grok Build **1.0.46 (2765805b9442)** with `grok agent --no-leader stdio`,
 and Google's **agy-acp-server 1.2.1** (`agy_acp_server.par` beside `localharness_external`).
@@ -3197,9 +3197,9 @@ The chat's subagent surface named the work but never the model doing it, and a s
 - `includeTurns: true` is preceded by `deprecationNotice {summary: "Full-history hydration is deprecated for paginated threads; omit `includeTurns` or set it to `false`, then page with `thread/turns/list` and `thread/items/list`."}` — suppressed while a read is pending. A thread history over the 8 MiB ndjson line cap cannot be read whole this way; paging is the follow-up.
 - An invalid id answers `-32600 "invalid thread id: …"`.
 
-### ACP (Antigravity, Grok): no subagent surface
+### ACP (Antigravity, Grok, Cursor): no subagent surface
 
-Neither ACP adapter reports subagents on its wire today, so there is nothing to name a model for or open; the chip and the view are claude- and codex-only by wire reality.
+No ACP agent reports subagents on its wire today (the shared `acp.rs` adapter maps none), so there is nothing to name a model for or open; the chip and the view are claude- and codex-only by wire reality.
 
 ## Pass 43 (2026-10-14 — live probes claude 2.1.300 + codex 0.162.1): request records in transcripts, a stint that could never close, thinking that reads as thinking. ADOPTED.
 
@@ -3243,7 +3243,7 @@ Thought rows, their fold and the ThoughtRow's "Thinking"/"Thought" label were al
 
 ### Gemini CLI 0.64.0
 
-Gemini is out of the catalog: with 0.64.0 installed, the daemon's agent list is claude, codex, agy and grok, and Gemini session records stay readable only. Nothing to change.
+Gemini is out of the catalog: with 0.64.0 installed, the daemon's agent list was claude, codex, agy and grok (cursor joined it on a parallel branch the same day), and Gemini session records stay readable only. Nothing to change.
 
 ### Gate (Pass 43)
 
@@ -3283,7 +3283,7 @@ Issue #277: a message from another agent reached a working agent "at its next st
 - Spawning shows as `subAgentActivity` items (no collab item for the spawn itself); only `wait` is a `collabAgentToolCall` row (as in 0.156.1).
 - One of three runs stalled after the steer: the child emitted one reasoning item and nothing more for 250 s (no command completion). Not reproduced in two later runs; recorded, not understood.
 
-#### ACP (Antigravity, Grok)
+#### ACP (Antigravity, Grok, Cursor)
 
 No mid-turn input on ACP v1 (`session/prompt` is one at a time) and no subagent surface (Pass 42): unchanged — a message to a busy ACP chat waits for the turn to end and then meets the wake policy.
 
@@ -3298,5 +3298,5 @@ No mid-turn input on ACP v1 (`session/prompt` is one at a time) and no subagent 
 
 - Hermetic: `lib.rs` `main_thread_names_what_the_running_turn_waits_on`; claude `background_for_a_message_says_why_and_stays_quiet_when_raced`; server `comms::tests::a_subagent_wait_is_passed_where_the_runtime_allows_it`, `tests::comms::a_terminal_waiting_on_a_subagent_is_named_and_reads_when_it_returns`; live `claude_background_tasks_frees_a_parent_waiting_on_a_subagent`, `codex_steer_ends_a_parent_wait_on_a_subagent`.
 - Live, isolated daemon: see docs/features/agent-communication.md "Verified live (2026-10-14)".
-- `just chat-smoke` on claude 2.1.300 + codex 0.162.1: 31/31. The `TESTED_*_VERSION` pins (2.1.289, 0.160.0) are left for a drift pass of their own.
+- `just chat-smoke` on claude 2.1.300 + codex 0.162.1: 31/31. The `TESTED_*_VERSION` pins are already 2.1.300 and 0.162.1 (set by Pass 43).
 

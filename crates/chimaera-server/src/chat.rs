@@ -3951,7 +3951,8 @@ mod tests {
     }
 
     /// Codex elicits every MCP call; the driver answers the prompt-free
-    /// tools (notify and the read-only document tools) for every session.
+    /// tools (`mcp::ALWAYS_ALLOWED_TOOLS`: notify, the read-only document
+    /// tools, open_browser, update_plan) for every session.
     #[test]
     fn codex_pre_approves_the_prompt_free_tools_for_every_session() {
         use crate::workspaces::MastermindMode;
@@ -3964,6 +3965,7 @@ mod tests {
                 "document_guide".to_string(),
                 "check_document".to_string(),
                 "open_browser".to_string(),
+                "update_plan".to_string(),
             ])
         );
         let ask = codex_mcp_auto_approve(Some(MastermindMode::Ask), Vec::new())

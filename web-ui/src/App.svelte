@@ -77,12 +77,12 @@
     getAgentDefault,
     listAgents,
     listRecents,
-    quickStarts,
+    primaryStart,
     relativeAge,
     setAgentDefault,
     type AgentInfo,
     type LaunchPick,
-    type QuickStart,
+    type PrimaryStart,
     type RecentConvo,
   } from "./lib/workspace/launcher";
   import { agentProductName } from "./lib/shared/agentNames";
@@ -102,7 +102,7 @@
     createReconnectListenerGate,
     selectRemoteReconnectSurface,
   } from "./lib/net/remoteReconnect";
-  import { attachImageToComposer, insertIntoComposer } from "./lib/chat/composerBus";
+  import { insertIntoComposer } from "./lib/chat/composerBus";
   import { volatileChatDrafts } from "./lib/chat/drafts";
   import { imageToAttachment, type ImageAttachment } from "./lib/chat/images";
   import {
@@ -779,12 +779,12 @@
    *  the launcher popover reports its fresher probe back via onAgents. */
   let agents = $state<AgentInfo[] | null>(null);
   $effect(() => { if ($agentCatalog.length) agents = $agentCatalog; });
-  /** The rail's one-click starts: the saved default (the primary — it
-   *  carries the chevron and the new-agent shortcut), then Claude Code and
-   *  Codex. Each knows what its click does: start, or the setup step that
-   *  unblocks a missing agent (launcher.ts `quickStarts`). */
-  const railQuick = $derived(
-    quickStarts(agents, agentDefault.agent, getSetting("agents.defaultView"), agentProductName),
+  /** The rail's one new-agent row: the saved default, which the main click
+   *  and the new-agent shortcut start; its chevron opens the launcher menu.
+   *  It knows what its click does: start, or the setup step that unblocks a
+   *  missing agent (launcher.ts `primaryStart`). */
+  const railStart = $derived(
+    primaryStart(agents, agentDefault.agent, getSetting("agents.defaultView"), agentProductName),
   );
   let launcherOpen = $state(false);
   /** The split button's rect at open time; the popover hangs below it. */
@@ -2144,7 +2144,7 @@
    * shell-escaped paths. Registered with the uploads module, which owns the
    * upload half (terminal paste routes through it too).
    */
-  function insertUploadedPath(sessionId: string, absPath: string): void {
+  function insertUploadedPath(sessionId: string, absPath: string, image?: ImageAttachment): void {
     const s = sessionsById.get(sessionId);
     if (s === undefined || !s.alive) return;
     const root = workspace?.root;
@@ -2152,7 +2152,7 @@
       s.kind === "agent"
         ? composeAgentPathReference(root !== undefined ? workspaceRelative(absPath, root) : absPath)
         : composeShellPathReference(absPath, s.cwd_current ?? s.cwd);
-    typeIntoSession(sessionId, text);
+    typeIntoSession(sessionId, text, image);
   }
 
   /** The live session shown by `paneId`, if any — the OS-drop target gate
@@ -2299,14 +2299,13 @@
       accepted += 1;
       // An image dropped on a CHAT pane also attaches its pixels, so the
       // model sees it immediately; the uploaded path stays the durable,
-      // host-side artifact the agent can re-read later.
+      // host-side artifact the agent can re-read later. Both land in one
+      // delivery, so the picture and its mention can never split.
       const s = sessionsById.get(sessionId);
-      if (s?.ui === "chat" && file.type.startsWith("image/")) {
-        const attachment = await imageToAttachment(file);
-        if (attachment !== null) attachImageToComposer(sessionId, attachment);
-      }
+      const image =
+        s?.ui === "chat" && file.type.startsWith("image/") ? ((await imageToAttachment(file)) ?? undefined) : undefined;
       // Sequential: keeps multi-file reference order stable in the input.
-      await uploadAndInsert(sessionId, file, file.name);
+      await uploadAndInsert(sessionId, file, file.name, image);
     }
   }
 
@@ -4043,7 +4042,7 @@
    *  setup (managed runtimes) or Settings → Agents. A quick start does NOT
    *  change the saved default: the rows never reorder under the pointer;
    *  choosing in the launcher menu is what moves the primary. */
-  function quickStart(q: QuickStart, term = false): void {
+  function quickStart(q: PrimaryStart, term = false): void {
     launcherOpen = false;
     if (term && q.info?.installed !== false) {
       void spawnSession("agent", { agent: q.id, ui: "term" });
@@ -4060,11 +4059,10 @@
     void spawnSession("agent", { agent: q.id });
   }
 
-  /** The primary quick start / Cmd+Shift+E: the saved default, instantly
-   *  (or its setup step when it isn't runnable here). */
+  /** The rail's row / Cmd+Shift+E: the saved default, instantly (or its
+   *  setup step when it isn't runnable here). */
   function newAgentPrimary(): void {
-    const primary = railQuick[0];
-    if (primary !== undefined) quickStart(primary);
+    quickStart(railStart);
   }
 
   /** Settings → Agents: where every agent is installed, updated and pointed
@@ -5892,18 +5890,17 @@
         {#each agentSessions as s (s.id)}
           {@render sessionRow(s)}
         {/each}
-        <!-- Quick starts: one click starts Claude Code / Codex (and the
-             saved default, which leads and is the shortcut's target). The
-             primary row is a split button: its CHEVRON — hover ~150ms or a
-             click — opens the launcher menu with every other agent and the
-             way into Settings → Agents. ⌘/ctrl-click starts in the terminal.
-             A missing agent's row says what its click will set up. -->
+        <!-- One split button: the main surface starts the saved default
+             agent instantly (the shortcut's target too); its CHEVRON — hover
+             ~150ms or a click — opens the launcher menu: the installed
+             agents up front, the rest folded behind one row, and the way
+             into Settings → Agents. ⌘/ctrl-click starts in the terminal.
+             A missing default says what its click will set up. -->
         <div class="new-split" role="group" aria-label="new agent" bind:this={newSplitEl}>
-          {#each railQuick as q (q.id)}
-            <div class="quick">
+          {#if railStart}
+            {@const q = railStart}
               <button
                 class="row new quick-start"
-                class:primary={q.primary}
                 class:want-setup={q.action !== "start"}
                 data-agent={q.id}
                 title={q.action === "install"
@@ -5912,11 +5909,12 @@
                     ? `set up chat for ${q.name}`
                     : q.action === "setup"
                       ? `set up ${q.name} in Settings → Agents`
-                      : `start ${q.name}${newInWorktree ? " in a new worktree" : ""}${q.primary ? ` (${keyHint("newAgent")})` : ""} · ${isMac ? "⌘" : "ctrl"}-click for the terminal`}
+                      : `start ${q.name}${newInWorktree ? " in a new worktree" : ""} (${keyHint("newAgent")}) · ${isMac ? "⌘" : "ctrl"}-click for the terminal`}
                 onclick={(e) => quickStart(q, e.metaKey || e.ctrlKey)}
               >
                 <span class="new-plus" aria-hidden="true">+</span>
-                <span class="new-name">{q.name}</span>
+                <span class="new-name">new agent</span>
+                <span class="new-default">{q.name}</span>
                 {#if newInWorktree && q.action === "start"}
                   <svg class="new-wt" viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
                     <path
@@ -5937,7 +5935,6 @@
                   >
                 {/if}
               </button>
-              {#if q.primary}
                 <button
                   class="new-chev"
                   aria-haspopup="menu"
@@ -5968,9 +5965,7 @@
                     />
                   </svg>
                 </button>
-              {/if}
-            </div>
-          {/each}
+          {/if}
         </div>
         {#if createError}
           <div class="create-error">{createError}</div>
@@ -7492,24 +7487,13 @@
     color: var(--fg);
   }
 
-  .row.new.primary {
-    color: var(--fg);
-    font-weight: 500;
-  }
-
-  /* --- the rail's quick starts (the launcher's split button) --- */
+  /* --- the rail's new-agent row (the launcher's split button) --- */
 
   .new-split {
     display: flex;
-    flex-direction: column;
-    gap: 1px;
-    margin-top: 0.15rem;
-  }
-
-  .quick {
-    display: flex;
     align-items: stretch;
     gap: 1px;
+    margin-top: 0.15rem;
   }
 
   .new-split .row.new.quick-start {
@@ -7517,17 +7501,6 @@
     min-width: 0;
     margin-top: 0;
     gap: 6px;
-    color: var(--muted);
-    font-weight: 400;
-  }
-
-  .new-split .row.new.quick-start:hover {
-    color: var(--fg);
-  }
-
-  /* The primary (the saved default, the shortcut's target) reads a step
-     stronger than its siblings — the only emphasis the group carries. */
-  .new-split .row.new.quick-start.primary {
     color: var(--fg);
     font-weight: 500;
   }
@@ -7544,6 +7517,17 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  /* What the main surface will spawn — quiet transparency, not chrome. */
+  .new-default {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    color: var(--muted);
   }
 
   /* A missing agent: the click sets it up rather than spawning a doomed

@@ -56,8 +56,8 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
   an agent's reply and the document it wrote read alike,
   but has its own font-size and line-height settings rather than borrowing `terminal.fontSize`.
   CodeMirror views reconfigure while mounted.
-- **Reading Width is the column width.** `chat.contentWidth` (Appearance › Reading Width, 672 px by
-  default: 48em of the 14 px chat text) sets the transcript column, its composer and trays, and the
+- **Reading Width is the column width.** `chat.contentWidth` (Appearance › Reading Width, 680 px by
+  default, the Claude desktop app's column) sets the transcript column, its composer and trays, and the
   rendered Markdown column (plus its padding) on every chat surface; a narrower pane still fits its
   space. It used to cap a 48em column, so any value above 48em did nothing.
 - **Newer surfaces are represented.** `dashboard.landing` controls the workspace landing and
@@ -89,8 +89,8 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
   installs Google's companion. Advanced holds custom executable paths, Reinstall and Uninstall.
   Installation progress follows a retained daemon result from the terminal's actual exit status, with bounded polling only while
   Settings is visible. Re-checking and saving another row preserve unfinished path edits.
-  The agent menu's **agent settings →** opens this panel; it is where agents beyond the rail's
-  two defaults are set up. Cursor's custom executable is `agents.cursor.path`; a dated Cursor
+  The agent menu's **agent settings →** opens this panel; it is where every agent is set up and
+  managed. Cursor's custom executable is `agents.cursor.path`; a dated Cursor
   build reads as its date and is "Up to date" only when the installed build is the latest one.
   See [agents.md](agents.md).
 - **Theme palettes** (`themes.ts`) — each theme carries its own hand-tuned 16-color terminal ANSI

@@ -63,7 +63,7 @@ and in `App.svelte` the view reporting + `focusFromNotification`.
 
 ## Agent-sent notifications (`notify` tool)
 
-- **What & when.** Every session that has the chimaera MCP server (all four chat providers, Claude
+- **What & when.** Every session that has the chimaera MCP server (all five chat providers, Claude
   terminals and eligible Codex terminals) can call `notify(message, title?)` — "ping me when the job finishes" now works. The
   tool description and the MCP instructions steer agents to use it only for news the user
   asked for or would want while away: turn ends and permission asks are already automatic.
@@ -72,7 +72,7 @@ and in `App.svelte` the view reporting + `focusFromNotification`.
 - **Key behaviors.** Pre-approved for native Claude/Codex sessions — Claude via `permissions.allow: ["mcp__chimaera__notify", …]` in the generated
   settings, codex via `SpawnSpec.mcp_auto_approve` (the driver answers those tools'
   elicitations). ACP sessions retain their provider's native approval behavior.
-  `ALWAYS_ALLOWED_TOOLS` also holds the read-only document tools. Rate-limited per session (one per 5s, 20 per hour; the refusal text tells the
+  `ALWAYS_ALLOWED_TOOLS` also holds the read-only document tools, `open_browser` and `update_plan`. Rate-limited per session (one per 5s, 20 per hour; the refusal text tells the
   agent why). An agent message supersedes the automatic `done`/`input` notice for the same
   session for 2 minutes, so "notify me when done" pings once, in the agent's words. With
   "Messages from Agents" off, the tool answers that the user turned it off.
@@ -167,9 +167,9 @@ remote host's alerts follow that host's settings.
 
 - Linux and Windows notifications are build-checked only; the click route and the Dock/launcher
   badge there have not been driven on real desktops.
-- Hook-less agent TUIs (Codex, Antigravity and Grok; legacy Gemini records) have no
+- Hook-less agent TUIs (Codex, Antigravity, Grok and Cursor; legacy Gemini records) have no
   authoritative attention edges, so they produce no automatic turn/approval notices. Their
-  rail dots use output activity. All four chat providers use protocol state; an eligible
+  rail dots use output activity. All five chat providers use protocol state; an eligible
   Codex terminal can still call `notify` explicitly.
 
 ---

@@ -156,7 +156,7 @@ repos,branches,log,show,compare}`, `GET/POST/DELETE /api/v1/git/worktrees`,
 
 ## New agents in their own worktree
 
-- **What & when.** Start a new agent (chat or terminal; Claude, Codex, Antigravity, Grok) on a fresh
+- **What & when.** Start a new agent (chat or terminal; any agent — Claude, Codex, Antigravity, Grok, Cursor) on a fresh
   branch in a worktree of its own, so parallel agents never edit the same checkout. A remembered
   per-workspace choice, not a dialog.
 - **How it's used.** In a git workspace the launcher popover ends with one switch, **In a new
@@ -170,7 +170,7 @@ repos,branches,log,show,compare}`, `GET/POST/DELETE /api/v1/git/worktrees`,
   **`<branch>` kept · Remove · Keep**. Remove goes through the fenced `DELETE /git/worktrees` (never
   `force`): uncommitted changes, commits that are neither pushed nor merged, a live session inside,
   or another tool's lock keep it, and the rail says why.
-- **Where it lives.** UI `Launcher.svelte` (the `wtrow` switch), `App.svelte` (`spawnSession` →
+- **Where it lives.** UI `Launcher.svelte` (the footer's **In a new worktree** switch, `.wt`), `App.svelte` (`spawnSession` →
   `wantsWorktree`, `toggleNewInWorktree`, `offerWorktreeRemoval`/`removeKeptWorktree`,
   `openWorktreeWindow`), `sessions.ts` (`wantsWorktree`, `worktreeInUse`, `setNewInWorktree`),
   `launcher.ts` (`parseRecents`). Daemon `git/worktree.rs` (`create_session_worktree`,

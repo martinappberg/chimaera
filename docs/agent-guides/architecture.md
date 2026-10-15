@@ -10,8 +10,8 @@
 
 The daemon serves one workspace UI containing structured agent chats, persistent
 PTYs, files and artifacts, git review/history, workspace context, and extensions.
-Claude Code and Codex use their native structured protocols; Antigravity and Grok
-Build use the shared ACP v1 adapter. All four support chat and conversation-copy
+Claude Code and Codex use their native structured protocols; Antigravity, Grok
+Build and Cursor CLI use the shared ACP v1 adapter. All five support chat and conversation-copy
 forks. Native terminal/chat switching and the Mastermind role are currently
 limited to Claude/Codex. See [the agent map](../../crates/chimaera-agent/AGENTS.md)
 and [the server map](../../crates/chimaera-server/AGENTS.md).
@@ -160,7 +160,7 @@ on the alternate screen cannot restore the primary screen's scrollback
 
 All adapters normalize into one internal **ACP-shaped event model** (message/thought chunks,
 tool calls with kinds + diffs, plan entries, permission requests with options, turn lifecycle).
-The chat UI renders that model across the four structured agents. PTY sessions
+The chat UI renders that model across the five structured agents. PTY sessions
 render each agent’s own interactive TUI.
 
 **Tier A — PTY + injected hooks (the founding primary mode, 2026-07-06;
@@ -194,7 +194,7 @@ without the user choosing it. Tier A remains fully supported — one
 settings default (`agents.defaultView`) flips the world back if the paused billing split
 ever lands.
 
-**Tier C — ACP client (implemented for Antigravity and Grok Build).** The shared
+**Tier C — ACP client (implemented for Antigravity, Grok Build and Cursor CLI).** The shared
 `acp.rs` driver negotiates protocol v1, runtime catalogs and capabilities, approval
 replies, queued turns, cancellation and conversation-copy forks. Antigravity's
 chat executable is resolved separately from its terminal executable. Gemini
@@ -483,6 +483,7 @@ codex launch did not work in the field.
 - **Resume section** — recent resumable Claude sessions *for this workspace* (cwd-scoped, from
   the same `~/.claude/projects` JSONL store the naming pipeline reads): title, age; selecting
   spawns `claude --resume <id>` in a PTY. Searchable past ~8 entries.
+- **Today (October 2026).** The rail row reads **+ new agent · <saved default>**; its chevron opens the menu, which lists the installed agents first (the default leading, no built-in bias) and folds the uninstalled ones under *other agents* (every agent shows when none is installed). Rows show name and version, with a terminal glyph on hover; the footer holds the **In a new worktree** switch and the Settings link. Installs run through the setup dialog, not a pre-typed terminal; resuming lives in the rail's RECENT section. Current behavior: [agents.md](../features/agents.md#the-launcher--the-new-agent-row--the-agent-menu).
 
 - **Rail Recents (author, 2026-07-06; restructure same evening):** the rail groups
   **terminals first** (there are few), **agents below** (there are many) — each section

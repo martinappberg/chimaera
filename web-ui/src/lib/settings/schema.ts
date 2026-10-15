@@ -428,11 +428,11 @@ const DEFS = {
     description:
       "Width of the reading column in chat transcripts (composer included) and rendered Markdown. Narrower panes fit their space.",
     type: "integer",
-    // 48em of the 14px chat text: about a hundred characters per line.
-    default: 672,
+    // The Claude desktop app's reading column; ~97 characters of 14px text.
+    default: 680,
     min: 480,
     max: 1400,
-    step: 16,
+    step: 8,
     unit: "px",
     scope: "client",
   },

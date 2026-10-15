@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { groupAgents, normalizeAgentCatalog, quickAction, quickAgentIds, quickStarts } from "./launcher";
+import { groupAgents, normalizeAgentCatalog, primaryAgentId, primaryStart, quickAction } from "./launcher";
 import { agentProductName } from "../shared/agentNames";
 
 const ready = { installed: true, chat_capable: true };
@@ -11,28 +11,26 @@ const catalog = normalizeAgentCatalog([
   { id: "cursor", name: "Cursor CLI", installed: false, managed_install: true },
 ]);
 
-describe("quick starts", () => {
-  it("offers Claude Code and Codex, the default first", () => {
-    expect(quickAgentIds("claude", catalog)).toEqual(["claude", "codex"]);
-    expect(quickAgentIds("codex", catalog)).toEqual(["codex", "claude"]);
+describe("the rail's one start", () => {
+  it("is the saved default, whichever agent that is", () => {
+    expect(primaryAgentId("claude", catalog)).toBe("claude");
+    expect(primaryAgentId("grok", catalog)).toBe("grok");
+    expect(primaryAgentId("cursor", catalog)).toBe("cursor");
   });
-  it("keeps another default as the primary one-click start", () => {
-    expect(quickAgentIds("grok", catalog)).toEqual(["grok", "claude", "codex"]);
-    expect(quickAgentIds("cursor", catalog)).toEqual(["cursor", "claude", "codex"]);
+  it("lets a retired default yield to the first installed agent once the catalog is known", () => {
+    expect(primaryAgentId("gemini", catalog)).toBe("claude");
+    const codexOnly = catalog.map((a) => ({ ...a, installed: a.id === "codex" }));
+    expect(primaryAgentId("gemini", codexOnly)).toBe("codex");
+    const none = catalog.map((a) => ({ ...a, installed: false }));
+    expect(primaryAgentId("gemini", none)).toBe("claude");
+    expect(primaryAgentId("gemini", null)).toBe("gemini");
+    expect(primaryAgentId("gemini", [])).toBe("gemini");
   });
-  it("lets a retired default yield to Claude Code once the catalog is known", () => {
-    expect(quickAgentIds("gemini", catalog)).toEqual(["claude", "codex"]);
-    expect(quickAgentIds("gemini", null)).toEqual(["gemini", "claude", "codex"]);
-    expect(quickAgentIds("gemini", [])).toEqual(["gemini", "claude", "codex"]);
-  });
-  it("drops a quick agent this host's catalog doesn't list", () => {
-    const noCodex = catalog.filter((a) => a.id !== "codex");
-    expect(quickAgentIds("claude", noCodex)).toEqual(["claude"]);
-  });
-  it("names rows from the catalog, else the product name", () => {
-    expect(quickStarts(null, "cursor", "chat", agentProductName).map((q) => q.name)).toEqual(["Cursor CLI", "Claude Code", "Codex"]);
-    const rows = quickStarts(catalog, "codex", "chat");
-    expect(rows.map((q) => [q.id, q.primary])).toEqual([["codex", true], ["claude", false]]);
+  it("names the row from the catalog, else the product name", () => {
+    expect(primaryStart(null, "cursor", "chat", agentProductName).name).toBe("Cursor CLI");
+    const row = primaryStart(catalog, "codex", "chat");
+    expect([row.id, row.name, row.action]).toEqual(["codex", "Codex", "start"]);
+    expect(primaryStart(catalog, "agy", "chat").action).toBe("install");
   });
 });
 
@@ -58,14 +56,19 @@ describe("quick action", () => {
 });
 
 describe("launcher groups", () => {
-  it("puts the quick agents first, then the others ready-first", () => {
-    const { quick, others } = groupAgents(catalog, "claude");
-    expect(quick.map((a) => a.id)).toEqual(["claude", "codex"]);
-    expect(others.map((a) => a.id)).toEqual(["grok", "agy", "cursor"]);
+  it("puts the installed agents first, the default leading, the rest folded", () => {
+    const { installed, others } = groupAgents(catalog, "claude");
+    expect(installed.map((a) => a.id)).toEqual(["claude", "codex", "grok"]);
+    expect(others.map((a) => a.id)).toEqual(["agy", "cursor"]);
   });
-  it("moves a non-built-in default into the quick group", () => {
-    const { quick, others } = groupAgents(catalog, "cursor");
-    expect(quick.map((a) => a.id)).toEqual(["cursor", "claude", "codex"]);
-    expect(others.map((a) => a.id)).toEqual(["grok", "agy"]);
+  it("leads with whichever installed agent is the default", () => {
+    const { installed } = groupAgents(catalog, "grok");
+    expect(installed.map((a) => a.id)).toEqual(["grok", "claude", "codex"]);
+  });
+  it("shows every agent up front when none is installed", () => {
+    const none = catalog.map((a) => ({ ...a, installed: false }));
+    const { installed, others } = groupAgents(none, "codex");
+    expect(installed.map((a) => a.id)).toEqual(["codex", "claude", "agy", "grok", "cursor"]);
+    expect(others).toEqual([]);
   });
 });
