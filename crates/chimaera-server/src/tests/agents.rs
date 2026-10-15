@@ -109,6 +109,90 @@ async fn handshake_failure_for_every_provider(submit: bool) {
 /// session: it stays registered (dead) with the record Errored — the same
 /// keep-visible contract as ProtocolError — so the rail shows the failure
 /// and the journaled diagnostic is reachable.
+/// Cursor's ACP `authenticate` starts a browser login on a signed-out host;
+/// the daemon's chat spawn must switch that off for Cursor alone. Each
+/// provider's real spawn path runs a fake that records its environment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_cursor_chat_spawns_disable_the_browser_login() {
+    use std::os::unix::fs::PermissionsExt;
+    let inherited = std::env::var_os("NO_OPEN_BROWSER").is_some();
+    for kind in [
+        agents::AgentKind::Cursor,
+        agents::AgentKind::Grok,
+        agents::AgentKind::Antigravity,
+    ] {
+        let state = test_state();
+        let dir = test_dir(&format!("browser-login-{}", kind.as_str()));
+        let env_file = dir.join("env.txt");
+        let fake = dir.join("fake-acp");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nenv > '{}.tmp'\nmv '{0}.tmp' '{0}'\nexec cat >/dev/null\n",
+                env_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if kind == agents::AgentKind::Antigravity {
+            // Google's chat runtime is a separate executable.
+            let (status, body) = request(
+                &state,
+                Method::PUT,
+                "/api/v1/settings",
+                Some(serde_json::json!({"agents.agy.chatPath": fake.to_string_lossy()})),
+            )
+            .await;
+            assert!(status.is_success(), "{status} {body}");
+        }
+        let id = format!("s-browser-{}", kind.as_str());
+        crate::lock(&state.agents).insert(id.clone(), agents::AgentRecord::new("key".into(), kind));
+        crate::lock(&state.session_workspaces).insert(id.clone(), "w-test".into());
+        let recipe = chat::ChatRecipe {
+            workspace_root: dir.clone(),
+            workspace_id: "w-test".into(),
+            kind,
+            bin: fake.clone(),
+            version: None,
+            settings: None,
+            mcp_config: None,
+            model: None,
+            resume: None,
+            fork_at: None,
+            rollback_turns: None,
+            revert_before_turn: None,
+            remote_control: chat::RemoteControlAtStart::No,
+            carry_ultracode: false,
+            theme: "dark".into(),
+            prelude: None,
+            mastermind: None,
+            portable_context: None,
+            created_at_ms: None,
+        };
+        chat::spawn_chat_session(&state, id.clone(), recipe, None)
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        let env = loop {
+            if let Ok(env) = std::fs::read_to_string(&env_file) {
+                break env;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{kind:?} chat never started its executable"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        state.chat.kill(&id);
+        let disabled = env.lines().any(|l| l == "NO_OPEN_BROWSER=1");
+        if kind == agents::AgentKind::Cursor {
+            assert!(disabled, "Cursor chat may open a browser login");
+        } else if !inherited {
+            assert!(!disabled, "{kind:?} chat got Cursor's browser switch");
+        }
+    }
+}
+
 #[tokio::test]
 async fn chat_handshake_failure_without_recipe_stays_visible_errored() {
     let state = test_state();
