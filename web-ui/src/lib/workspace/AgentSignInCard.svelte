@@ -169,6 +169,8 @@
         {agent.name} signs in from its own terminal. Chimaera opens one and notices when the login lands.
       {:else if agent.signedIn === true}
         {agent.name} is signed in on this host. Sign in again to switch accounts or refresh the login.
+      {:else if agent.signedIn === null}
+        {agent.name}'s sign-in couldn't be checked. Sign in here, or carry on if you already have.
       {:else}
         {agent.name} isn't signed in on this host.
       {/if}
