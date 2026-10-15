@@ -155,6 +155,11 @@ pub(crate) struct AppState {
     /// cached per agent for the daemon's lifetime;
     /// `GET /api/v1/agents?refresh=true` bypasses and refills it.
     pub(crate) agent_bins: Mutex<HashMap<agents::AgentKind, launcher::AgentDetection>>,
+    /// Recent detection MISSES (the reason + when): served for a short
+    /// window so a catalog read doesn't re-run a login shell per uninstalled
+    /// agent (`launcher::MISS_TTL`). Cleared by a refresh, a changed
+    /// `agents.<id>.path`, and the next hit.
+    pub(crate) agent_misses: Mutex<HashMap<agents::AgentKind, (String, Instant)>>,
     /// Root of Claude Code's per-project transcript store, normally
     /// `~/.claude/projects`; tests point it at a fixture dir.
     pub(crate) claude_projects_dir: PathBuf,
@@ -341,6 +346,7 @@ impl AppState {
             notices: crate::notices::Notices::new(),
             browser_opens: crate::browser_open::BrowserOpens::default(),
             agent_bins: Mutex::new(HashMap::new()),
+            agent_misses: Mutex::new(HashMap::new()),
             claude_projects_dir: home.join(".claude").join("projects"),
             managed_root: data_dir.join("agents"),
             legacy_managed_root: None,

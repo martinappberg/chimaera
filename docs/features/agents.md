@@ -251,7 +251,11 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   `is_outdated`, `claude_resumables`); upstream latest-release probes in `agent_updates.rs`.
   Routes `GET /api/v1/agents`, `GET /api/v1/agents/claude/sessions`.
 - **Key behaviors.** Detection runs the registered agents' login shells + version probes concurrently (serial would
-  visibly stall the popover), with a 6s timeout backstopped by well-known paths. `is_outdated` flags
+  visibly stall the popover), with a 6s timeout backstopped by well-known paths. A hit is cached for
+  the daemon's lifetime (stat-validated, so an in-place update is noticed); a miss is cached for 90 s
+  only, so a catalog read with uninstalled agents doesn't re-run a login shell per agent per call,
+  while a refresh (the launcher's own open, Settings), a changed `agents.<id>.path`, an explicit path
+  that now runs, or a managed install landing all see past it at once. `is_outdated` flags
   npm-era codex (0.1.x). The Antigravity IDE's `agy` symlink (which just opens the GUI) is detected
   and refused. Resumables are scanned off the reactor, exclude transcripts already open in a live
   session, and are titled by the same custom > ai > first-prompt chain as live naming. Latest
