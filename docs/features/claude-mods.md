@@ -1,7 +1,8 @@
 # Claude Mods in structured chat
 
 **Status: implemented and live-verified.** Claude Code 2.1.289 passes the native
-control/module/reattach suite and model-driven transcript/tool rendering checks.
+control/module/reattach suite and model-driven transcript/tool rendering checks;
+2.1.300 passes the native control/module/reattach suite again (2026-10-14).
 The complete Claude/Codex compatibility smoke suite also passes.
 
 ## What and how

@@ -796,6 +796,29 @@ mod tests {
         assert!(entry.ended_at_ms.is_some());
     }
 
+    /// Claude Code 2.1.295+ speaks the Program Status Protocol (OSC 7501):
+    /// a `?` probe, then `state=…:app=claude-code…` reports only when the
+    /// terminal answers. Neither may read as OSC 7 (cwd) or disturb capture.
+    #[test]
+    fn program_status_osc_7501_is_not_a_mark() {
+        for payload in [
+            "7501;?",
+            "7501;state=working:app=claude-code:title=Reading",
+            "7501;state=blocked:app=claude-code:kind=permission",
+            "7501;state=clear",
+        ] {
+            assert_eq!(parse_osc(payload.as_bytes()), None, "{payload}");
+        }
+        let marks = Marks::new();
+        feed_str(&marks, "\x1b]133;C\x07");
+        feed_str(
+            &marks,
+            "a\x1b]7501;state=working:app=claude-code\x1b\\b\r\n",
+        );
+        feed_str(&marks, "\x1b]133;D;0\x07");
+        assert_eq!(marks.journal(10)[0].output, "ab");
+    }
+
     #[test]
     fn split_across_chunks_and_st_terminator() {
         let marks = Marks::new();

@@ -2176,11 +2176,12 @@
     if (a === null || a.detail === "" || a.detail === "starting") return undefined;
     return a.kind === "thinking" ? `thinking · ${a.detail}` : a.detail;
   });
-  /** Output tokens generated this turn ("12.3k tokens"); hidden until the
-   *  agent reports any. */
+  /** Output tokens generated this turn ("12.3k tokens", "2.3M tokens" —
+   *  the drivers' `fmt_tokens` spelling); hidden until the agent reports any. */
   const turnTokensLabel = $derived.by(() => {
     const n = store.turnTokens;
     if (n <= 0) return null;
+    if (n >= 999_950) return `${(n / 1_000_000).toFixed(1)}M tokens`;
     return n >= 1000 ? `${(n / 1000).toFixed(1)}k tokens` : `${n} tokens`;
   });
   /** Work running beside the turn: live subagents plus the background set

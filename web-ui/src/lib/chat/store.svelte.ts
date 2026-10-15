@@ -1338,10 +1338,12 @@ export class ChatStore {
       case "thinking_tokens": {
         // Fires even when no thought text streams (summarized display) —
         // the status row shows a live token estimate instead of "starting".
+        // 0 is "thinking, no estimate" (codex at a reasoning item's start).
         const tokens = (ev.tokens as number) ?? 0;
         this.activity = {
           kind: "thinking",
-          detail: tokens >= 1000 ? `~${(tokens / 1000).toFixed(1)}k tokens` : `~${tokens} tokens`,
+          detail:
+            tokens <= 0 ? "" : tokens >= 1000 ? `~${(tokens / 1000).toFixed(1)}k tokens` : `~${tokens} tokens`,
         };
         break;
       }
