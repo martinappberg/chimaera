@@ -1,4 +1,4 @@
-import { versionNumber, type AgentInfo } from "../workspace/launcher";
+import { releaseCore, versionNumber, versionToken, type AgentInfo } from "../workspace/launcher";
 
 /** Unknown versions and failed checks must never become an up-to-date claim. */
 export function agentUpdateStatus(a: AgentInfo): { text: string | null; current: boolean } {
@@ -7,7 +7,11 @@ export function agentUpdateStatus(a: AgentInfo): { text: string | null; current:
   if (!a.version || !/^\d+\.\d+\.\d+$/.test(versionNumber(a.version))) {
     return { text: "Version unknown", current: false };
   }
-  if (!a.latestVersion || !/^\d+\.\d+\.\d+$/.test(a.latestVersion)) {
+  if (!a.latestVersion || !/^\d+\.\d+\.\d+$/.test(releaseCore(a.latestVersion))) {
+    return { text: null, current: false };
+  }
+  // Two builds of one date are not ordered: only the same build is current.
+  if (a.latestVersion !== releaseCore(a.latestVersion) && versionToken(a.version) !== a.latestVersion) {
     return { text: null, current: false };
   }
   return { text: "Up to date", current: true };

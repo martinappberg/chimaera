@@ -4,9 +4,10 @@
   /**
    * The one-line disclosure every collapsible activity line shares (a tool
    * group, a folded run): a muted sentence with a trailing chevron, a
-   * breathing dot while work under it runs, a badge when it failed. A quiet
-   * line, not a card — the Claude/Codex apps render activity this way, so
-   * prose stays the page's voice.
+   * small working glyph while work under it runs, its elapsed (the
+   * duration once settled), a badge when it failed. A quiet line, not a
+   * card — the Claude/Codex apps render activity this way, so prose stays
+   * the page's voice.
    */
   interface Props {
     label: string;
@@ -14,6 +15,9 @@
     tooltip: string;
     running?: boolean;
     health?: "failed" | "recovered" | null;
+    /** "1m 22s": how long the work under the line has run (live) or took
+     *  (settled); null hides it (old journals, sub-second work). */
+    elapsed?: string | null;
     /** False while a retained chat tab is hidden; pauses the live dot. */
     visible?: boolean;
     onToggle: () => void;
@@ -25,6 +29,7 @@
     tooltip,
     running = false,
     health = null,
+    elapsed = null,
     visible = true,
     onToggle,
   }: Props = $props();
@@ -39,9 +44,18 @@
   title={tooltip}
 >
   {#if running}
-    <span class="live-dot" aria-hidden="true"></span>
+    <!-- ⁘ — four dots taking turns: work in flight, not an alarm. -->
+    <svg class="working" viewBox="0 0 10 10" width="10" height="10" aria-hidden="true">
+      <circle cx="5" cy="1.6" r="1.25" />
+      <circle cx="8.4" cy="5" r="1.25" />
+      <circle cx="5" cy="8.4" r="1.25" />
+      <circle cx="1.6" cy="5" r="1.25" />
+    </svg>
   {/if}
   <span class="label">{label}</span>
+  {#if elapsed !== null}
+    <span class="elapsed">{elapsed}</span>
+  {/if}
   {#if health === "failed"}
     <span class="badge bad">failed</span>
   {:else if health === "recovered"}
@@ -94,33 +108,49 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  /* Running: a small breathing dot instead of a badge (the label already
-     says what is running, in the present tense). */
-  .live-dot {
+  /* Running: the four-dot glyph, each dot brightening in turn (the label
+     already says what is running). */
+  .working {
     flex: none;
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--accent);
-    animation: live-breathe 1.6s ease-in-out infinite;
+    fill: var(--accent);
   }
-  @keyframes live-breathe {
+  .working circle {
+    opacity: 0.3;
+    animation: working-turn 1.2s ease-in-out infinite;
+  }
+  .working circle:nth-child(2) {
+    animation-delay: 0.3s;
+  }
+  .working circle:nth-child(3) {
+    animation-delay: 0.6s;
+  }
+  .working circle:nth-child(4) {
+    animation-delay: 0.9s;
+  }
+  @keyframes working-turn {
     0%,
+    60%,
     100% {
-      opacity: 0.35;
+      opacity: 0.3;
     }
-    50% {
+    25% {
       opacity: 1;
     }
   }
-  :global(html.app-hidden) .live-dot,
-  .summary.paused .live-dot {
+  :global(html.app-hidden) .working circle,
+  .summary.paused .working circle {
     animation-play-state: paused;
   }
   @media (prefers-reduced-motion: reduce) {
-    .live-dot {
+    .working circle {
       animation: none;
+      opacity: 0.8;
     }
+  }
+  .elapsed {
+    flex: none;
+    color: color-mix(in srgb, var(--muted) 80%, transparent);
+    font-variant-numeric: tabular-nums;
   }
   .badge {
     flex: none;

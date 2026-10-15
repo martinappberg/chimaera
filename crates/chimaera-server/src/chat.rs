@@ -2359,7 +2359,7 @@ fn recover_portable_context(entries: &[Arc<SeqEvent>], target: AgentKind) -> Opt
     // ACP attaches the handoff to the first real user prompt. Once accepted,
     // it lives in the provider's persisted session and must not be reattached
     // on every daemon restart. A fork closed before its first send still needs it.
-    if matches!(target, AgentKind::Antigravity | AgentKind::Grok)
+    if target.is_acp()
         && entries[marker_index + 1..]
             .iter()
             .any(|entry| matches!(entry.ev, AgentEvent::ForkContextConsumed))
@@ -3337,7 +3337,7 @@ pub(crate) async fn spawn_chat_session(
                 recipe.resume.clone(),
             )
         }
-        AgentKind::Grok | AgentKind::Antigravity => (
+        AgentKind::Grok | AgentKind::Antigravity | AgentKind::Cursor => (
             crate::launcher::build_acp_chat_command(recipe.kind, chat_bin),
             recipe.resume.clone(),
         ),
@@ -3361,7 +3361,7 @@ pub(crate) async fn spawn_chat_session(
     // the chat agent it spawns.
     spec.env_remove = crate::api::spawn_env_remove(&spec.env);
     spec.pinned_native_id = pinned;
-    if matches!(recipe.kind, AgentKind::Grok | AgentKind::Antigravity) {
+    if recipe.kind.is_acp() {
         if let Some(key) = crate::lock(&state.agents).get(&id).map(|r| r.key.clone()) {
             spec.mcp_servers
                 .push(json!({"type":"http","name":"chimaera",
@@ -3371,6 +3371,13 @@ pub(crate) async fn spawn_chat_session(
         spec.initial_model = model.clone();
         spec.initial_mode = initial_mode.clone();
         spec.initial_effort = initial_effort.clone();
+    }
+    // Cursor's ACP `authenticate` starts a browser login when the host is
+    // signed out (PROTOCOL.md, ACP › Cursor). A daemon must never open one:
+    // the chat fails with the sign-in hint instead.
+    if recipe.kind == AgentKind::Cursor {
+        spec.env
+            .push(("NO_OPEN_BROWSER".to_string(), "1".to_string()));
     }
     // The codex MCP key rides the env, never argv (see mcp_url_bare): the
     // record is re-read here rather than threaded — the spawn paths insert
@@ -3505,7 +3512,7 @@ pub(crate) async fn spawn_chat_session(
         let _ = tokio::task::block_in_place(|| seed_resumed_journal(state, &id, &recipe));
     }
 
-    if matches!(recipe.kind, AgentKind::Grok | AgentKind::Antigravity) {
+    if recipe.kind.is_acp() {
         // Also covers a copied chat closed before its first real send: Recents
         // has a new Chimaera id, but seed_resumed_journal copied its marker.
         spec.portable_context = recover_portable_context_from_disk(state, &id, recipe.kind).await;
@@ -4046,7 +4053,7 @@ mod tests {
         assert!(recover_portable_context(&durable, AgentKind::Codex)
             .as_deref()
             .is_some_and(|context| context.contains(r#"{"role":"assistant","content":"answer"}"#)));
-        for target in [AgentKind::Antigravity, AgentKind::Grok] {
+        for target in [AgentKind::Antigravity, AgentKind::Grok, AgentKind::Cursor] {
             let mut resumed = durable.clone();
             assert!(recover_portable_context(&resumed, target).is_some());
             // Sending is not acceptance: the provider may reject a request.
@@ -5431,6 +5438,15 @@ mod tests {
         assert!(!AgentKind::Gemini.chat_capable());
         assert!(AgentKind::Antigravity.chat_capable());
         assert!(AgentKind::Grok.chat_capable());
+        assert!(AgentKind::Cursor.chat_capable());
+        assert!(AgentKind::Cursor.is_acp() && !AgentKind::Cursor.native_chat_controls());
+        assert_eq!(
+            crate::launcher::build_acp_chat_command(
+                AgentKind::Cursor,
+                std::path::Path::new("/x/cursor-agent")
+            ),
+            ["/x/cursor-agent", "acp"]
+        );
     }
 
     #[test]

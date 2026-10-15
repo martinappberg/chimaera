@@ -25,7 +25,7 @@ agents, files, and tools side by side. Read a document while an agent works on i
 Inspect a table, review a diff, or run a web app beside the conversation. Work on
 your own machine or connect to a remote host.
 
-It runs your own **Claude Code, Codex, Antigravity, or Grok Build**, with the
+It runs your own **Claude Code, Codex, Antigravity, Grok Build, or Cursor CLI**, with the
 accounts, skills, and connections configured on that host. Your agents do the
 work. Chimaera gives you a place to direct it, see the results, and keep the
 project in view.

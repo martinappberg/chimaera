@@ -2936,6 +2936,49 @@ parameter without rewriting global settings. Do not infer terminal parity from
 these passing Chat tests.
 
 
+### Cursor CLI over ACP (2026-10-14, signed-out probe)
+
+Cursor CLI **2026.10.14-941492e** (`cursor-agent`, also linked as `agent` by the official
+installer) has a hidden `acp` subcommand — absent from the top-level `--help`, described by
+`cursor-agent acp --help` as "Start the Cursor Agent as an ACP (Agent Client Protocol)
+server". Chimaera uses it through the shared adapter rather than the `-p --output-format
+stream-json` print mode: print mode runs one prompt per process with no permission round-trip
+(`-f`/`--yolo` or an allow-list decide), no mid-turn cancellation and no session controls,
+while ACP gives the same approval, cancel, queue and resume surface as Grok and Antigravity.
+
+Probed on this machine while signed out (no account was created and no login performed):
+
+- `initialize` → `protocolVersion: 1`; `agentCapabilities` = `loadSession: true`,
+  `mcpCapabilities {http, sse}`, `promptCapabilities {image: true, audio: false,
+  embeddedContext: false}`, `sessionCapabilities {list: {}}` — no `resume`, so a reopened chat
+  uses `session/load`, whose history replay arrives during the handshake and is discarded
+  there (Chimaera's journal owns the transcript). One auth method: `cursor_login` ("Authenticate
+  using existing Cursor login credentials. Run 'agent login' first if not logged in.").
+- `authenticate {methodId: "cursor_login"}` while signed out does NOT fail fast: it starts
+  Cursor's browser login. With `NO_OPEN_BROWSER=1` it answers `-32602 Invalid params` with
+  `data.message` "Failed to open browser for login. Please visit: https://cursor.com/
+  loginDeepControl?challenge=…" — a one-time challenge owned by that process. The daemon sets
+  `NO_OPEN_BROWSER=1` on every Cursor chat spawn, and the adapter's `sign_in` hint replaces the
+  error: "Cursor CLI is not signed in on this host. Run `cursor-agent login` in a terminal,
+  then start the chat again."
+- `session/new` without authentication → `-32000 Authentication required`.
+
+From Cursor's documentation (https://cursor.com/docs/cli/acp), pending a signed-in run:
+modes are `agent`, `plan` and `ask`; permission options are `allow-once`, `allow-always`,
+`reject-once`; MCP servers come from `.cursor/mcp.json` (team dashboard servers are not
+loaded over ACP). Cursor also sends extension methods. `cursor/update_todos`,
+`cursor/task` and `cursor/generate_image` are notifications and are ignored.
+`cursor/ask_question` and `cursor/create_plan` are BLOCKING requests; the adapter refuses
+them with `-32601` like any unsupported client method and journals a Notice pointing at the
+terminal view, because their reply shapes are documented but unverified. The modes/models a
+session offers come only from its own `session/new` result and `configOptions`; nothing is
+manufactured (`cursor_offers_only_what_its_session_advertises`).
+
+Live verification is opt-in and pending a maintainer `cursor-agent login`:
+`CHIMAERA_TEST_CURSOR=$(command -v cursor-agent) cargo test -p chimaera-agent --test acp_live
+cursor -- --ignored --nocapture` (bills tiny turns). Until then `TESTED_CURSOR_VERSION` pins
+the build whose handshake was probed, not a verified turn wire.
+
 ### Startup lifecycle verification (2026-10-01)
 
 Claude 2.1.287 emits `system/hook_started` and `system/hook_response` before

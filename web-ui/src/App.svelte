@@ -72,12 +72,15 @@
     getAgentDefault,
     listAgents,
     listRecents,
+    quickStarts,
     relativeAge,
     setAgentDefault,
     type AgentInfo,
     type LaunchPick,
+    type QuickStart,
     type RecentConvo,
   } from "./lib/workspace/launcher";
+  import { agentProductName } from "./lib/shared/agentNames";
   import { EventsSocket } from "./lib/net/events";
   import {
     agentHue,
@@ -770,15 +773,13 @@
    *  the launcher popover reports its fresher probe back via onAgents. */
   let agents = $state<AgentInfo[] | null>(null);
   $effect(() => { if ($agentCatalog.length) agents = $agentCatalog; });
-  /** The catalog row for the default agent, once the catalog is loaded. */
-  const defaultAgentInfo = $derived(
-    agents?.find((a) => a.id === agentDefault.agent) ?? null,
+  /** The rail's one-click starts: the saved default (the primary — it
+   *  carries the chevron and the new-agent shortcut), then Claude Code and
+   *  Codex. Each knows what its click does: start, or the setup step that
+   *  unblocks a missing agent (launcher.ts `quickStarts`). */
+  const railQuick = $derived(
+    quickStarts(agents, agentDefault.agent, getSetting("agents.defaultView"), agentProductName),
   );
-  /** Known-missing: the catalog is loaded and says the default isn't here.
-   *  (Null catalog / unknown agent falls back to spawn — the common path.) */
-  const defaultMissing = $derived(agents !== null && (defaultAgentInfo === null || !defaultAgentInfo.installed || (defaultAgentInfo.chatSetupRequired && getSetting("agents.defaultView") === "chat")));
-  /** Missing but chimaera can install it in place (managed runtime). */
-  const defaultInstallable = $derived(defaultMissing && (defaultAgentInfo?.managedInstall ?? false));
   let launcherOpen = $state(false);
   /** The split button's rect at open time; the popover hangs below it. */
   let launcherAnchor = $state<DOMRect | null>(null);
@@ -4018,24 +4019,42 @@
     void spawnSession("shell");
   }
 
-  /** The split button's main surface / Cmd+Shift+E: the persisted default
-   *  agent, instantly — no popover in the way. */
-  function spawnDefaultAgent(): void {
-    void spawnSession("agent", { agent: agentDefault.agent });
-  }
-
-  /** What the main surface / new-agent shortcut does: normally spawn the
-   *  default instantly, but when it isn't installed, don't launch a doomed
-   *  pane — install it in place (managed) or, if there's no managed install,
-   *  open the launcher to pick an agent that has one. */
-  function newAgentPrimary(): void {
+  /** One rail quick start: spawn that agent instantly in the default view
+   *  (`term` = the ⌘/ctrl-click terminal path) — or, when it could only open
+   *  a doomed pane, the step that unblocks it: the curated install / chat
+   *  setup (managed runtimes) or Settings → Agents. A quick start does NOT
+   *  change the saved default: the rows never reorder under the pointer;
+   *  choosing in the launcher menu is what moves the primary. */
+  function quickStart(q: QuickStart, term = false): void {
     launcherOpen = false;
-    if (defaultMissing) {
-      if (defaultInstallable && defaultAgentInfo !== null) launcherInstall(defaultAgentInfo);
-      else openLauncher();
+    if (term && q.info?.installed !== false) {
+      void spawnSession("agent", { agent: q.id, ui: "term" });
       return;
     }
-    spawnDefaultAgent();
+    if ((q.action === "install" || q.action === "setup-chat") && q.info !== null) {
+      launcherInstall(q.info);
+      return;
+    }
+    if (q.action === "setup") {
+      openAgentSettings();
+      return;
+    }
+    void spawnSession("agent", { agent: q.id });
+  }
+
+  /** The primary quick start / Cmd+Shift+E: the saved default, instantly
+   *  (or its setup step when it isn't runnable here). */
+  function newAgentPrimary(): void {
+    const primary = railQuick[0];
+    if (primary !== undefined) quickStart(primary);
+  }
+
+  /** Settings → Agents: where every agent is installed, updated and pointed
+   *  at a binary (the launcher's footer, a set-up chip). */
+  function openAgentSettings(): void {
+    launcherOpen = false;
+    openSettingsSurface();
+    requestSettingsSection("Agents");
   }
 
   /** Re-probe the host's agent catalog. `force` bypasses the daemon's
@@ -4062,8 +4081,14 @@
     launcherOpen = true;
   }
 
-  function closeLauncher(): void {
+  /** Escape hands focus back to the chevron (menu-button pattern); an
+   *  outside press returns it to the focused terminal. */
+  function closeLauncher(how?: "escape"): void {
     launcherOpen = false;
+    if (how === "escape") {
+      newSplitEl?.querySelector<HTMLElement>(".new-chev")?.focus();
+      return;
+    }
     const sid = focusedSessionOf(layout);
     if (sid !== null) pool.focusTerminal(sid);
   }
@@ -5736,53 +5761,71 @@
         {#each agentSessions as s (s.id)}
           {@render sessionRow(s)}
         {/each}
-        <!-- Split button: the main surface spawns the persisted default
-             agent instantly — always. Only the CHEVRON opens the launcher
-             popover (hover ~150ms or click). -->
+        <!-- Quick starts: one click starts Claude Code / Codex (and the
+             saved default, which leads and is the shortcut's target). The
+             primary row is a split button: its CHEVRON — hover ~150ms or a
+             click — opens the launcher menu with every other agent and the
+             way into Settings → Agents. ⌘/ctrl-click starts in the terminal.
+             A missing agent's row says what its click will set up. -->
         <div class="new-split" role="group" aria-label="new agent" bind:this={newSplitEl}>
-          <button
-            class="row new primary main"
-            class:want-install={defaultMissing}
-            title={defaultMissing
-              ? defaultAgentInfo?.chatSetupRequired
-                ? `set up chat for ${defaultAgentInfo.name}`
-                : `choose an agent to set up`
-              : `start ${defaultAgentInfo?.name ?? agentDefault.agent} (${keyHint("newAgent")})`}
-            onclick={newAgentPrimary}
-          >
-            <!-- When the default isn't installed the surface installs it
-                 (managed) rather than spawning a pane that would just print
-                 the shim's error — so the label becomes the action and the
-                 agent name takes the accent. -->
-            <span class="new-label"
-              >{defaultMissing ? (defaultAgentInfo?.chatSetupRequired ? "set up chat" : defaultInstallable ? "install" : "set up") : "+ new agent"}</span
-            >
-            <span class="new-default" class:accent={defaultMissing}>{defaultAgentInfo?.name ?? agentDefault.agent}</span>
-          </button>
-          <button
-            class="new-chev"
-            aria-haspopup="menu"
-            aria-expanded={launcherOpen}
-            aria-label="choose an agent"
-            title="choose an agent"
-            onpointerenter={armLauncherHover}
-            onpointerleave={disarmLauncherHover}
-            onclick={() => {
-              if (launcherOpen && Date.now() - launcherOpenedAt > 400) closeLauncher();
-              else openLauncher();
-            }}
-          >
-            <svg viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
-              <path
-                d="M4 6l4 4 4-4"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.5"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-              />
-            </svg>
-          </button>
+          {#each railQuick as q (q.id)}
+            <div class="quick">
+              <button
+                class="row new quick-start"
+                class:primary={q.primary}
+                class:want-setup={q.action !== "start"}
+                data-agent={q.id}
+                title={q.action === "install"
+                  ? `install ${q.name}`
+                  : q.action === "setup-chat"
+                    ? `set up chat for ${q.name}`
+                    : q.action === "setup"
+                      ? `set up ${q.name} in Settings → Agents`
+                      : `start ${q.name}${q.primary ? ` (${keyHint("newAgent")})` : ""} · ${isMac ? "⌘" : "ctrl"}-click for the terminal`}
+                onclick={(e) => quickStart(q, e.metaKey || e.ctrlKey)}
+              >
+                <span class="new-plus" aria-hidden="true">+</span>
+                <span class="new-name">{q.name}</span>
+                {#if q.action !== "start"}
+                  <span class="new-need"
+                    >{q.action === "install" ? "install" : q.action === "setup-chat" ? "set up chat" : "set up"}</span
+                  >
+                {/if}
+              </button>
+              {#if q.primary}
+                <button
+                  class="new-chev"
+                  aria-haspopup="menu"
+                  aria-expanded={launcherOpen}
+                  aria-label="more agents"
+                  title="more agents"
+                  onpointerenter={armLauncherHover}
+                  onpointerleave={disarmLauncherHover}
+                  onkeydown={(e) => {
+                    if (e.key === "ArrowDown" && !launcherOpen) {
+                      e.preventDefault();
+                      openLauncher();
+                    }
+                  }}
+                  onclick={() => {
+                    if (launcherOpen && Date.now() - launcherOpenedAt > 400) closeLauncher();
+                    else openLauncher();
+                  }}
+                >
+                  <svg viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
+                    <path
+                      d="M4 6l4 4 4-4"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.5"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                    />
+                  </svg>
+                </button>
+              {/if}
+            </div>
+          {/each}
         </div>
         {#if createError}
           <div class="create-error">{createError}</div>
@@ -6421,6 +6464,7 @@
     onInstall={launcherInstall}
     onUpdate={launcherUpdate}
     onClose={closeLauncher}
+    onSettings={openAgentSettings}
     onAgents={(a) => (agents = a)}
   />
 {/if}
@@ -7290,42 +7334,66 @@
     font-weight: 500;
   }
 
-  /* --- the agent launcher's split button --- */
+  /* --- the rail's quick starts (the launcher's split button) --- */
 
   .new-split {
     display: flex;
-    align-items: stretch;
+    flex-direction: column;
     gap: 1px;
     margin-top: 0.15rem;
   }
 
-  .new-split .row.new.main {
+  .quick {
+    display: flex;
+    align-items: stretch;
+    gap: 1px;
+  }
+
+  .new-split .row.new.quick-start {
     flex: 1;
     min-width: 0;
     margin-top: 0;
     gap: 6px;
+    color: var(--muted);
+    font-weight: 400;
   }
 
-  .new-label {
+  .new-split .row.new.quick-start:hover {
+    color: var(--fg);
+  }
+
+  /* The primary (the saved default, the shortcut's target) reads a step
+     stronger than its siblings — the only emphasis the group carries. */
+  .new-split .row.new.quick-start.primary {
+    color: var(--fg);
+    font-weight: 500;
+  }
+
+  .new-plus {
     flex: none;
+    width: 0.7em;
+    text-align: center;
+    opacity: 0.75;
   }
 
-  /* What the main surface will spawn — quiet transparency, not chrome. */
-  .new-default {
+  .new-name {
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-family: var(--mono);
-    font-size: var(--text-xs);
-    color: var(--muted);
   }
 
-  /* Default agent isn't installed: the surface installs instead of spawning,
-     so the agent name takes the accent — the label ("install"/"set up") and
-     tooltip say what will happen. */
-  .new-default.accent {
+  /* A missing agent: the click sets it up rather than spawning a doomed
+     pane, so the row says which step — quiet, in the accent. */
+  .new-need {
+    margin-left: auto;
+    flex: none;
+    font-size: var(--text-xs);
     color: var(--accent);
+  }
+
+  .new-split .row.new.quick-start.want-setup .new-name {
+    opacity: 0.8;
   }
 
   .new-chev {
@@ -7353,6 +7421,11 @@
 
   .new-chev:active {
     background: var(--row-active);
+  }
+
+  .new-chev:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: -2px;
   }
 
   .create-error {

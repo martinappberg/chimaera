@@ -2,7 +2,7 @@
 
 The rich chat surface: instead of running an agent as a raw TUI, Chimaera drives the same
 CLI over its **structured JSON protocol** (Claude Code over bidirectional `stream-json`,
-Codex over `codex app-server` JSON-RPC, Grok Build and Google Antigravity over ACP v1) and renders a first-class chat UI — streamed prose
+Codex over `codex app-server` JSON-RPC, Grok Build, Google Antigravity and Cursor CLI over ACP v1) and renders a first-class chat UI — streamed prose
 and thinking, tool cards, permission and question prompts, inline artifacts, model/effort
 controls, and lossless reconnect. Claude/Codex can toggle the same session identity between chat
 and the TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
@@ -68,7 +68,7 @@ Implementation: `claude.rs`, `journal.rs`, `chat.rs::resolve_start_settings`, an
 
 ## Agents and available controls
 
-Claude Code, Codex, Antigravity (Gemini models), and Grok Build share the transcript,
+Claude Code, Codex, Antigravity (Gemini models), Grok Build and Cursor CLI share the transcript,
 composer, permissions, queue and replay core. Session `capabilities` and `catalog` events
 control the available header/composer actions. ACP model choices come from the authenticated
 provider; unsupported actions are not guessed from the agent's brand. Forking works across all
@@ -83,7 +83,8 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   same turn, several waiting messages together — the way Claude Code and the Codex app behave
   (claude: the CLI's own queue, `priority:"next"`; codex: `turn/steer`). **⌥↩ / Alt+Enter** sends one
   for **after this turn** instead (claude `priority:"later"`; codex's next-run queue). The running
-  placeholder names the chord. ACP providers queue both send forms for the next turn; they
+  placeholder names the chord ("add to this turn… · ⌥↩ after it ends"; Esc to stop lives on the
+  visible stop button's tooltip). ACP providers queue both send forms for the next turn; they
   do not support mid-turn steering. `socket.send` returns `false` when the socket isn't OPEN, so the
   draft is only cleared on an accepted send — a message during a reconnect window is preserved, not
   lost; reconnect replays the daemon-owned state.
@@ -129,7 +130,9 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   content-fit). A manual size remains the baseline rather than locking the input: once new text uses
   the available room, the composer keeps growing to the cap. A successful send resets the next draft
   to its natural height.
-- **Autocomplete.** `/` → slash-command popover (native chimaera pickers first, then the CLI's
+- **Autocomplete.** The selected suggestion row leads with a `❯` pointer as well as the highlight,
+  so the choice reads without colour (the pointer's slot is always reserved; rows never shift).
+  `/` → slash-command popover (native chimaera pickers first, then the CLI's
   own commands and Codex's enabled skills); `@name` → fuzzy file/dir quick-open; `@term:` → workspace-terminal grants (see
   [linked-terminals.md](linked-terminals.md)). `/rename <name>` pins a session name. `/compact`
   is native for codex (`thread/compact/start`; the compaction runs as its own turn) — claude's
@@ -305,7 +308,7 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
 
 ## The transcript
 
-- **Content.** User bubbles (right), agent prose (left, markdown), plan/todo panel, permission/
+- **Content.** User bubbles (right), agent prose (left, markdown), the plan card, permission/
   question cards, inline artifacts — and, between the prose, one family of quiet 12px **activity
   lines** that cluster tight so messages stay the page's voice:
   - **Thought** — a collapsed reasoning block: "Thought" + a faded first line read as plain text
@@ -313,10 +316,22 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
     newest title, the way Codex's own status line reads, and stays put when the row settles); click
     for the text, rendered as sanitized markdown (paths, hover previews and embeds as in a reply)
     and mounted only while open.
-  - **Tool groups** — a run of tool calls as one line, titled by the agent's own past-tense batch
-    label when it offers one (Claude `tool_use_summary`: "Listed files in the workspace"; on by
-    default, `chat.toolSummaries`), else readable counts ("Ran 2 commands, read a file"); calls
-    still running read in the present tense with a breathing dot ("Running agent “…”").
+  - **Tool groups** — a run of tool calls as one line. While a call runs the line leads with what
+    the call says it is doing in the agent's own words when the wire gives a description (Claude's
+    Bash `description`: "⁘ Locating the "also edited by" code… 1m 22s ›"), with a small four-dot
+    working glyph (paused when the window is hidden) and the elapsed time; settled, it is titled by
+    the agent's own past-tense batch label when it offers one (Claude `tool_use_summary`: "Listed
+    files in the workspace"; on by default, `chat.toolSummaries`), else a lone described call's
+    description, else readable counts ("Ran 2 commands, read a file") — Codex commands and ACP
+    rows carry no description, so they read this way — followed by the run's duration (nothing
+    under a second; descriptions are read from execute rows only — other tools' `description`
+    arguments, like an Artifact's caption, say something else). Calls still running without a
+    description read in the present tense
+    ("Running agent “…”"). Times are journal-backed (the call's first frame to its terminal
+    update), so replay shows the same durations; a live elapsed corrects for a remote daemon's
+    clock offset, sampled only from frames delivered live (never replay). One shared 1 Hz clock
+    ticks while any live line is shown. Expanded, a described row shows the description first and the command after it
+    in mono. Settled activity folds read the same way, with the run's tool time.
   - **Finished work** — "Agent “…” finished · 2 tools · 12.3k tokens · 4s" (click for its report),
     a background command's own close sentence ('Background command "…" completed (exit code 0)'),
     a monitor's end; each links its output file.
@@ -362,7 +377,12 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   renderer stamped open anything: agent HTML that forges the classes opens nothing.
 - **Live status line.** While a turn runs: elapsed · output tokens this turn · running tasks
   (subagents + background work) · what it is doing — the agent's own phrase when it offers one
-  (Claude `task_summary`, "Measuring file sizes…"), else Thinking / Writing / Running tools.
+  (Claude `task_summary`, "Measuring file sizes…"), else Starting / Working / Thinking / Writing /
+  Running tools / Compacting. The word is dropped only while a row in view already says it: a
+  running call's line in the open trailing run (not folded, not scrolled away), or streaming
+  prose or a live thought row as the newest block at the reader's bottom (screen readers still hear
+  it); a reasoning item that drew no thought row (Codex, empty summary) says Thinking. Waiting on
+  a permission, a question or the next step always shows its word.
   Codex's synchronous SessionStart and UserPromptSubmit hooks show their actual phase
   and a hook row linking to the hook configuration. These can block a turn after the
   runtime has initialized but before it receives the opening message.
@@ -389,12 +409,15 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   exception is a tool group whose first row is trimmed away, whose render key shifts). User bubbles remain verbatim plain text—not Markdown—but
   recognized LaTeX spans use the same sanitized MathML renderer, so typed equations do not show raw
   delimiters.
-- **Assistant message metadata + actions.** Hover an assistant message (or focus one of its actions)
-  to reveal a slim rail directly below the prose: the journal-backed send time, copy-full-message,
-  and conversation-fork actions. The rail flows inline right after the message's last word and
-  takes a line of its own only when that line is full (or the message ends in a list, table or
-  code block) — no row is reserved under every message; while a message streams it takes no
-  space at all. The timestamp starts at `now`, advances through minute labels and
+- **Assistant message metadata + actions.** Hover an assistant message (or Tab to one of its
+  actions — they stay in the tab order, and focus reveals them) to show a quiet cluster at the
+  message's top right, floating over the gap above it on the page background: the journal-backed
+  send time, then small icons — plan usage (the `/usage` panel; its tooltip carries the turn's
+  output tokens and duration), copy-full-message, rewind-to-here (the RewindDialog flow, anchored
+  on the next message you sent, so the reply itself stays; offered once such a message exists),
+  and fork-from-here. Hidden, it catches no pointer, so selecting prose under its corner still
+  works; a read-only subagent view offers copy alone; while a message streams it is absent.
+  Touch devices show it inline after the message's last word instead. The timestamp starts at `now`, advances through minute labels and
   `1h ago`, then switches to the user's local hour cycle and calendar (`today`, `yesterday`, nearby
   weekday, dated time, and a year-bearing date for older calendar years). One view-level timer wakes
   only at the next label boundary rather than leaving an interval on every transcript row. Touch
@@ -566,8 +589,7 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   codex collab stint — lands one "Agent “…” finished" row with its report (`subagent_finished`); a
   finished/abandoned run drops from the tray (reconciled shut at turn end; a deliberate Stop settles
   neutrally, a genuine error fails).
-  The plan/todo panel likewise surfaces the current step in its
-  summary ("plan · 1/3 · ◐ …"). Both are pure derivations over `blocks`/`plan` — no new events
+  The plan card likewise names the current step (its active form) when folded. Both are pure derivations over `blocks`/`plan` — no new events
   (`AgentsTray.svelte`).
 - **Which model each subagent runs on, and open a subagent as its own chat.** Every subagent row —
   the agents tray, the background tray's `agent` lanes, the "Agent:" tool card and the "Agent “…”
@@ -591,18 +613,24 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   incremental `TaskCreate`/`TaskUpdate`/`TaskList` family; both feed the same pinned panel and
   neither leaves bookkeeping rows in the transcript. Because the new family carries more than a
   checklist, a row can show **who owns it** (`@name`) and **what blocks it** ("blocked by #1", with
-  its own ⊘ mark since a blocked task is still `todo`), plus a muted detail line when the task's
+  a dashed circle and "after #1", since a blocked task is still `todo`), plus a muted detail line when the task's
   description says more than its subject. Blockers are filtered to ones still open, so finishing a
   dependency visibly unblocks its dependents. The in-progress summary prefers the agent's own
   present-continuous `activeForm` ("Running tests"). Older CLIs and codex, whose plans carry none of
   this, render exactly as before — the extra fields are simply absent.
-- **Three pinned strips, one shell, all minimizable.** Plan, subagents, and background work are three
+- **The plan card, and two pinned strips.** Plan, subagents, and background work are three
   orthogonal readings of a session — what the agent *means* to do, *who* is working, what is
-  *detached* — so they share the `WorkTray` chrome and stack above the composer, collapsed by
-  default, each a one-line glance. Only non-empty strips render, and the plan's glyph stays still
-  unless a step is actually in flight. Inside the plan, finished tasks fold into a "N done" line so a
-  long list shows what's next rather than a wall of ✓ (they unfold on click; a fully-finished plan
-  shows its rows, since nothing else remains). The workspace dashboard card follows the same rule —
+  *detached* — stacked above the composer; only non-empty ones render. Subagents and background
+  work share the `WorkTray` chrome, collapsed by default to a one-line glance. The plan is a rounded
+  card (`PlanCard.svelte`, derivations in `planCard.ts`) with one row per step whose circle says its
+  state without colour: a filled check for done (quiet text), a plain circle for the step in flight
+  (foreground, its active form), a dashed circle for waiting. It is the same card for every runtime —
+  Claude's Task family or TodoWrite, Codex `update_plan`, an ACP plan all arrive as the one `plan`
+  level-set. Rows update in place (keyed by the agent's id, else position) and never reorder; a
+  long plan scrolls inside the card, which keeps the step in flight in view by moving only its own
+  scroll. Once the turn ends with every step done it folds to one line ("4 tasks done"), and the
+  corner count + chevron (`2/4 ⌄`) folds or unfolds it at any time (the automatic state wins again
+  when it next changes). The workspace dashboard card follows the same rule —
   live tasks first, finished ones as a count — so it never fills with ✓ while hiding the work in
   flight. **A subagent's task list is its own**: its `Task*` calls never reach the parent stream, so
   they cannot appear in the parent's plan (verified live) — the subagent surfaces as its Agent row

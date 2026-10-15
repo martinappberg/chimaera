@@ -21,7 +21,7 @@ work — locally, over SSH, or inside a Slurm allocation. One Rust binary
 (`chimaera`, statically linked on Linux) runs the daemon and serves the Svelte UI;
 a native Tauri app wraps the same UI in real windows.
 
-Chimaera launches the user’s own Claude Code, Codex, Antigravity and Grok Build
+Chimaera launches the user’s own Claude Code, Codex, Antigravity, Grok Build and Cursor CLI
 runtimes with the account, skills, and connections on the workspace host. Structured
 chat adapters drive their native protocols; interactive agent TUIs run in daemon-owned PTYs. Windows are views onto
 the daemon: closing a view or losing its connection leaves remote work running
