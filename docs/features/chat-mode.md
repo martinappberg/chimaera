@@ -412,10 +412,10 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   recognized LaTeX spans use the same sanitized MathML renderer, so typed equations do not show raw
   delimiters.
 - **Assistant message metadata + actions.** Hover an assistant message (or Tab to one of its
-  actions — they stay in the tab order, and focus reveals them) to show a quiet cluster at the
-  message's top right, floating over the gap above it on the page background: the journal-backed
-  send time, then small icons — plan usage (the `/usage` panel; its tooltip carries the turn's
-  output tokens and duration), copy-full-message, rewind-to-here (the RewindDialog flow, anchored
+  actions — they stay in the tab order, and focus reveals them) to show bare glyphs at the
+  message's bottom right, floating over the gap below it, where a long reply leaves the reader:
+  the journal-backed send time (its tooltip carries the turn's duration and output tokens), then
+  small icons — copy-full-message, rewind-to-here (the RewindDialog flow, anchored
   on the next message you sent, so the reply itself stays; offered once such a message exists),
   and fork-from-here. Hidden, it catches no pointer, so selecting prose under its corner still
   works; a read-only subagent view offers copy alone; while a message streams it is absent.
