@@ -1,8 +1,9 @@
 <script lang="ts">
   /**
    * "qc.py also edited by 'fix normalization' · 3 min ago" — this live
-   * session and another live one in the workspace wrote the same file
-   * (`sameFile.svelte.ts`). Small and warn-toned, the only color it carries;
+   * session and another live one in the workspace wrote the same file, the
+   * other one recently or in its running turn (`sameFile.svelte.ts`; the
+   * note ages out on its own). Small and warn-toned, the only color it carries;
    * a click opens the other session. Renders nothing without an overlap, so
    * a host can mount it unconditionally. Nothing locks.
    */

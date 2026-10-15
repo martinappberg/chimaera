@@ -422,3 +422,55 @@ export function sameFileOverlaps(
   }
   return out;
 }
+
+/** How long another session's write of a shared file stays news (the
+ *  daemon's `SAME_FILE_FRESH_MS`): the notice means "wrote it recently, or
+ *  is writing it in the turn running now", never "wrote it once and is
+ *  still open". */
+export const SAME_FILE_FRESH_MS = 15 * 60_000;
+
+/** Another session's write of a file this session also wrote, as the daemon
+ *  reports it (`GET /workspaces/{id}/same-file`): when it last wrote it, and
+ *  whether that was in its running turn. */
+export interface SameFileWrite extends SameFile {
+  at: number;
+  active: boolean;
+}
+
+/** Whether a write is still news at `now`: made in the writer's running
+ *  turn, or younger than {@link SAME_FILE_FRESH_MS}. */
+export function sameFileCurrent(w: Pick<SameFileWrite, "at" | "active">, now: number): boolean {
+  return w.active || now - w.at < SAME_FILE_FRESH_MS;
+}
+
+/** A session's notes from its writes: the current ones only, the newest per
+ *  other session, newest first, at most `cap`. */
+export function currentSameFileNotes(
+  writes: readonly SameFileWrite[],
+  now: number,
+  cap = 4,
+): SameFileWrite[] {
+  const byOther = new Map<string, SameFileWrite>();
+  for (const w of writes) {
+    if (!sameFileCurrent(w, now)) continue;
+    const seen = byOther.get(w.other);
+    if (seen === undefined || w.at > seen.at) byOther.set(w.other, w);
+  }
+  return [...byOther.values()].sort((a, b) => b.at - a.at).slice(0, cap);
+}
+
+/** When the next shown write ages out (ms since the epoch), or null when none
+ *  will on its own (none shown, or only running turns' writes — a turn's end
+ *  changes the roster, which refetches). */
+export function nextSameFileExpiry(
+  writes: Iterable<Pick<SameFileWrite, "at" | "active">>,
+  now: number,
+): number | null {
+  let next: number | null = null;
+  for (const w of writes) {
+    if (w.active) continue;
+    const end = w.at + SAME_FILE_FRESH_MS;
+    if (end > now && (next === null || end < next)) next = end;
+  }
+  return next;
+}
