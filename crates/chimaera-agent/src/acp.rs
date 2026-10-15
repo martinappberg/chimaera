@@ -312,6 +312,12 @@ pub struct AcpMapper {
     /// Calls of the agent's own plan tool: the plan card is their whole
     /// surface, so they draw no row (as claude's TodoWrite).
     hidden_calls: HashSet<String>,
+    /// What each open row shows — (title, kind, locations) — so a
+    /// `tool_call_update` that renames the call can re-emit its `ToolCall`
+    /// (Cursor opens every MCP call as "MCP: tool", Grok as "use_tool", and
+    /// names it only on the update; PROTOCOL.md Pass 45). Dropped when the
+    /// call ends or the turn does.
+    open_rows: HashMap<String, (String, ToolKind, Vec<String>)>,
     /// Cursor's to-do list — `cursor/update_todos {merge: true}` upserts by
     /// id into it: (id, content, status) in the order first seen.
     todos: Vec<(String, String, String)>,
@@ -414,6 +420,7 @@ impl AcpMapper {
             mcp_auto_approve: None,
             mcp_calls: HashMap::new(),
             hidden_calls: HashSet::new(),
+            open_rows: HashMap::new(),
             todos: Vec::new(),
         };
         if !mapper.models.is_empty() {
@@ -1061,6 +1068,7 @@ impl Mapper for AcpMapper {
                     self.turn = None;
                     self.mcp_calls.clear();
                     self.hidden_calls.clear();
+                    self.open_rows.clear();
                     for (request_id, _) in self.asks.drain() {
                         step.events.push(AgentEvent::PermissionResolved {
                             request_id,
@@ -1290,21 +1298,74 @@ impl Mapper for AcpMapper {
                     }
                     return step;
                 }
+                let locations = || -> Vec<String> {
+                    rows(&update["locations"])
+                        .take(16)
+                        .filter_map(|v| path(&v["path"]))
+                        .collect()
+                };
                 if update["sessionUpdate"] == "tool_call" {
                     let kind =
                         serde_json::from_value(update["kind"].clone()).unwrap_or(ToolKind::Other);
+                    let (title, locations) = (small(&update["title"]), locations());
+                    if !ended
+                        && (self.open_rows.len() < MAX_PENDING || self.open_rows.contains_key(&id))
+                    {
+                        self.open_rows
+                            .insert(id.clone(), (title.clone(), kind, locations.clone()));
+                    }
                     step.events.push(AgentEvent::ToolCall {
                         id: id.clone(),
                         kind,
-                        title: small(&update["title"]),
-                        locations: rows(&update["locations"])
-                            .take(16)
-                            .filter_map(|v| path(&v["path"]))
-                            .collect(),
+                        title,
+                        locations,
                         status,
                         cross_turn: false,
                         command: None,
                     });
+                } else if let Some((title, kind, locations_now)) = self.open_rows.get_mut(&id) {
+                    // ACP's update replaces whichever of these it carries;
+                    // the row is re-emitted (clients upsert by id, as for
+                    // codex's file-change rows) only when what it shows moved.
+                    let mut moved = false;
+                    if update["title"]
+                        .as_str()
+                        .is_some_and(|t| !t.trim().is_empty())
+                    {
+                        let renamed = small(&update["title"]);
+                        moved |= renamed != *title;
+                        *title = renamed;
+                    }
+                    if let Ok(renamed) = serde_json::from_value::<ToolKind>(update["kind"].clone())
+                    {
+                        moved |= renamed != *kind;
+                        *kind = renamed;
+                    }
+                    if update["locations"].is_array() {
+                        let renamed = locations();
+                        moved |= renamed != *locations_now;
+                        *locations_now = renamed;
+                    }
+                    if moved {
+                        step.events.push(AgentEvent::ToolCall {
+                            id: id.clone(),
+                            kind: *kind,
+                            title: title.clone(),
+                            locations: locations_now.clone(),
+                            // A re-emit never finishes the row: the update
+                            // below carries the terminal status.
+                            status: if ended {
+                                ToolStatus::InProgress
+                            } else {
+                                status
+                            },
+                            cross_turn: false,
+                            command: None,
+                        });
+                    }
+                }
+                if ended {
+                    self.open_rows.remove(&id);
                 }
                 let content = rows(&update["content"])
                     .take(4)
@@ -2102,6 +2163,99 @@ mod tests {
             "call-v",
             "chimaera-notify: notify"
         ))));
+    }
+
+    /// Cursor and Grok name an MCP call only on the `tool_call_update`
+    /// after the row opens (PROTOCOL.md Pass 45): the row is re-emitted
+    /// under the new title, once per change, and never finished by it.
+    #[test]
+    fn a_renaming_update_retitles_the_row() {
+        let rows = |step: &DriverStep| -> Vec<(String, ToolKind, ToolStatus)> {
+            step.events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::ToolCall {
+                        title,
+                        kind,
+                        status,
+                        ..
+                    } => Some((title.clone(), *kind, *status)),
+                    _ => None,
+                })
+                .collect()
+        };
+        // cursor-agent 2026.10.14-941492e, captured 2026-10-15.
+        let mut m = mapper();
+        m.kind = CURSOR.kind;
+        let id = "call-dff99f2e-b536-4ea5-82b2-409a16e88c4c-1\nfc_77bc5181-0275-9386-833a-574b551b67aa_0";
+        let opened = m.on_frame(&update(json!({"sessionUpdate":"tool_call","toolCallId":id,"title":"MCP: tool","kind":"other","status":"pending","rawInput":{}})));
+        assert_eq!(
+            rows(&opened),
+            [("MCP: tool".into(), ToolKind::Other, ToolStatus::Pending)]
+        );
+        let named = m.on_frame(&update(json!({"sessionUpdate":"tool_call_update","toolCallId":id,"title":"chimaera: notify",
+            "rawInput":{"providerIdentifier":"chimaera","toolName":"notify","args":{"text":"hello from probe"}}})));
+        assert_eq!(
+            rows(&named),
+            [(
+                "chimaera: notify".into(),
+                ToolKind::Other,
+                ToolStatus::InProgress
+            )]
+        );
+        assert!(
+            matches!(named.events.last(), Some(AgentEvent::ToolCallUpdate { id: i, .. }) if i == id)
+        );
+        // The same title again, or a status-only update: no re-emit.
+        let again = m.on_frame(&update(
+            json!({"sessionUpdate":"tool_call_update","toolCallId":id,"title":"chimaera: notify"}),
+        ));
+        assert!(rows(&again).is_empty());
+        let done = m.on_frame(&update(json!({"sessionUpdate":"tool_call_update","toolCallId":id,"status":"completed","rawOutput":{"success":true}})));
+        assert!(rows(&done).is_empty() && m.open_rows.is_empty());
+
+        // grok 1.0.46: opens as its `use_tool` tool, renamed (kind and
+        // all) by the update; a rename landing with the completion re-emits
+        // in progress and the update finishes it. Titles stay capped.
+        let mut m = mapper();
+        m.kind = GROK.kind;
+        let id = "call-a49db86c-3bb4-445f-887b-27c3370ef139-1";
+        m.on_frame(&update(json!({"sessionUpdate":"tool_call","toolCallId":id,"title":"use_tool","kind":"other","status":"pending",
+            "rawInput":{"tool_name":"chimaera__notify","tool_input":{"text":"hello from probe"}},
+            "_meta":{"x.ai/tool":{"version":1,"name":"use_tool","kind":"use_tool","namespace":"grok_build","label":"Use Tool","read_only":false}}})));
+        let named = m.on_frame(&update(json!({"sessionUpdate":"tool_call_update","toolCallId":id,"title":"chimaera__notify","kind":"other","status":"in_progress"})));
+        assert_eq!(
+            rows(&named),
+            [(
+                "chimaera__notify".into(),
+                ToolKind::Other,
+                ToolStatus::InProgress
+            )]
+        );
+        let long = "x".repeat(400);
+        let done = m.on_frame(&update(json!({"sessionUpdate":"tool_call_update","toolCallId":id,"title":long,"kind":"fetch","status":"completed"})));
+        let renamed = rows(&done);
+        assert_eq!(renamed.len(), 1);
+        assert!(renamed[0].0.len() < 200 && renamed[0].1 == ToolKind::Fetch);
+        assert_eq!(renamed[0].2, ToolStatus::InProgress);
+        assert!(matches!(
+            done.events.last(),
+            Some(AgentEvent::ToolCallUpdate {
+                status: ToolStatus::Completed,
+                ..
+            })
+        ));
+        // An unknown call, or one whose row ended, is never conjured.
+        let stray = m.on_frame(&update(
+            json!({"sessionUpdate":"tool_call_update","toolCallId":id,"title":"late"}),
+        ));
+        assert!(rows(&stray).is_empty());
+        // A turn's end forgets the open rows.
+        m.on_frame(&update(json!({"sessionUpdate":"tool_call","toolCallId":"open","title":"search_tool","kind":"other","status":"pending"})));
+        assert_eq!(m.open_rows.len(), 1);
+        let prompt = send(&mut m, "go");
+        m.on_frame(&json!({"id":prompt.outbound[0]["id"],"result":{"stopReason":"end_turn"}}));
+        assert!(m.open_rows.is_empty());
     }
 
     /// Cursor's to-do list is the plan card (PROTOCOL.md Pass 45): the

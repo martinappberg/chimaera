@@ -411,7 +411,13 @@ impl MainThread {
                 cross_turn: false,
                 ..
             } => {
-                if self.turn_since_ms.is_none() || self.calls.iter().any(|c| &c.id == id) {
+                if self.turn_since_ms.is_none() {
+                    return;
+                }
+                // A re-emit renames the call (an ACP update naming its MCP
+                // tool); the wait keeps its start.
+                if let Some(call) = self.calls.iter_mut().find(|c| &c.id == id) {
+                    call.title = title.chars().take(160).collect();
                     return;
                 }
                 let kind = match kind {

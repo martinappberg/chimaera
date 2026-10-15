@@ -1350,11 +1350,13 @@ export class ChatStore {
       }
       case "tool_call": {
         // Drivers may re-emit a call to enrich it (e.g. an image's saved
-        // path arrives at completion) — upsert by id, never duplicate.
+        // path arrives at completion, an ACP update names the MCP tool a
+        // row opened without) — upsert by id, never duplicate.
         const existing = this.toolIndex.get(ev.id as string);
         const row = existing !== undefined ? this.blocks[existing] : undefined;
         if (row !== undefined && row.kind === "tool") {
           row.title = ev.title as string;
+          if (typeof ev.kind === "string") row.tool = ev.kind;
           row.locations = (ev.locations as string[]) ?? [];
           if (typeof ev.command === "string") row.command = ev.command;
           // A late enriching re-emit must never walk a finished tool back to

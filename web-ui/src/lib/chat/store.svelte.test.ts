@@ -426,6 +426,21 @@ describe("ChatStore pending-send ordering", () => {
     expect(delivered.blocks[0]).toMatchObject({ kind: "user", id: "q2", text: "made it" });
   });
 
+  it("a re-emitted call renames its row in place (an ACP update naming the MCP tool)", () => {
+    // Cursor opens every MCP call as "MCP: tool" and names it on the update;
+    // the driver re-emits the call, still in progress, then finishes it.
+    const store = fold([
+      { type: "tool_call", id: "m1", kind: "other", title: "MCP: tool", status: "pending" },
+      { type: "tool_call", id: "m1", kind: "fetch", title: "chimaera: notify", status: "in_progress" },
+      { type: "tool_call_update", id: "m1", status: "completed" },
+      // A late re-emit never walks the finished row back.
+      { type: "tool_call", id: "m1", kind: "fetch", title: "chimaera: notify", status: "in_progress" },
+    ]);
+    const tools = store.blocks.filter((b) => b.kind === "tool");
+    expect(tools).toHaveLength(1);
+    expect(tools[0]).toMatchObject({ tool: "fetch", title: "chimaera: notify", status: "completed" });
+  });
+
   it("a codex-style allow (option 'accept') marks the tool allowed, never denied", () => {
     // The bug: codex allow ids are `accept*`, not `allow_*`, so the old
     // id-prefix check marked every ALLOWED codex command denied → "1 command
