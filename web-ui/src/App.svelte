@@ -5892,14 +5892,14 @@
         {#each agentSessions as s (s.id)}
           {@render sessionRow(s)}
         {/each}
-        <!-- Quick starts: one click starts Claude Code / Codex (and the
-             saved default, which leads and is the shortcut's target). The
-             primary row is a split button: its CHEVRON — hover ~150ms or a
-             click — opens the launcher menu with every other agent and the
+        <!-- One split button: the main surface starts the saved default
+             agent instantly (the shortcut's target too); its CHEVRON — hover
+             ~150ms or a click — opens the launcher menu: Claude Code and
+             Codex up front, the other agents folded behind one row, and the
              way into Settings → Agents. ⌘/ctrl-click starts in the terminal.
-             A missing agent's row says what its click will set up. -->
+             A missing default says what its click will set up. -->
         <div class="new-split" role="group" aria-label="new agent" bind:this={newSplitEl}>
-          {#each railQuick as q (q.id)}
+          {#each railQuick.slice(0, 1) as q (q.id)}
             <div class="quick">
               <button
                 class="row new quick-start"
@@ -5916,7 +5916,8 @@
                 onclick={(e) => quickStart(q, e.metaKey || e.ctrlKey)}
               >
                 <span class="new-plus" aria-hidden="true">+</span>
-                <span class="new-name">{q.name}</span>
+                <span class="new-name">new agent</span>
+                <span class="new-default">{q.name}</span>
                 {#if newInWorktree && q.action === "start"}
                   <svg class="new-wt" viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
                     <path
@@ -7544,6 +7545,17 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  /* What the main surface will spawn — quiet transparency, not chrome. */
+  .new-default {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    color: var(--muted);
   }
 
   /* A missing agent: the click sets it up rather than spawning a doomed

@@ -106,16 +106,21 @@ export function quickAgentIds(defaultId: string, catalog: readonly AgentInfo[] |
   return loaded ? ids.filter((id, i) => i === 0 || catalog.some((a) => a.id === id)) : ids;
 }
 
-/** The launcher menu's two groups: the quick agents in rail order, then the
- *  others — ready chats first, catalog order within (see `orderAgents`). */
+/** The launcher menu's two groups, with no built-in bias: the agents this
+ *  host has installed (the saved default first, then catalog order), and —
+ *  folded behind one row — the ones it has not. With nothing installed there
+ *  is nothing to prefer, so every agent shows up front. */
 export function groupAgents(
   agents: readonly AgentInfo[],
   defaultId: string,
 ): { quick: AgentInfo[]; others: AgentInfo[] } {
-  const ids = quickAgentIds(defaultId, agents);
-  const quick = ids.flatMap((id) => agents.filter((a) => a.id === id));
-  const others = orderAgents(agents.filter((a) => !ids.includes(a.id)));
-  return { quick, others };
+  const lead = (list: readonly AgentInfo[]) => [
+    ...list.filter((a) => a.id === defaultId),
+    ...list.filter((a) => a.id !== defaultId),
+  ];
+  const installed = agents.filter((a) => a.installed);
+  if (installed.length === 0) return { quick: lead(agents), others: [] };
+  return { quick: lead(installed), others: agents.filter((a) => !a.installed) };
 }
 
 /** What one quick start does when clicked: start the agent, or — when it

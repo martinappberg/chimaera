@@ -46,6 +46,7 @@
   import { isMac } from "../shared/keys";
   import { openInSystemBrowser } from "../shared/urlOpen";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
+  import Chevron from "../shared/Chevron.svelte";
 
   interface Props {
     /** The rail's quick-start group rect; the popover hangs below it (fixed). */
@@ -97,12 +98,53 @@
   let showLoading = $state(false);
 
   const groups = $derived(catalog === null ? null : groupAgents(catalog, defaultId));
-  /** The roving order: quick agents, others, the worktree switch (git
-   *  workspaces only), then the settings link. */
-  const rows = $derived(groups === null ? [] : [...groups.quick, ...groups.others]);
   const quickCount = $derived(groups?.quick.length ?? 0);
-  const wtIndex = $derived(inWorktree !== null ? rows.length : -1);
-  const settingsIndex = $derived(rows.length + (inWorktree !== null ? 1 : 0));
+  const hasOthers = $derived((groups?.others.length ?? 0) > 0);
+  /** The other agents stay folded behind one row until asked for — the
+   *  menu is "which of the two" most days, not a catalog. Remembered. */
+  const OTHERS_KEY = "chimaera.launcherOthersOpen";
+  let othersOpen = $state(readOthersOpen());
+  function readOthersOpen(): boolean {
+    try {
+      return localStorage.getItem(OTHERS_KEY) === "1";
+    } catch {
+      return false;
+    }
+  }
+  function setOthersOpen(open: boolean): void {
+    othersOpen = open;
+    try {
+      localStorage.setItem(OTHERS_KEY, open ? "1" : "0");
+    } catch {
+      // Per-viewer convenience only.
+    }
+  }
+  const shownOthers = $derived(hasOthers && othersOpen ? (groups?.others ?? []) : []);
+  /** The roving order: quick agents, the "other agents" row, the others
+   *  while unfolded, the worktree switch (git workspaces only), then the
+   *  settings link. */
+  const othersIndex = $derived(hasOthers ? quickCount : -1);
+  const agentRowCount = $derived(quickCount + (hasOthers ? 1 : 0) + shownOthers.length);
+  const wtIndex = $derived(inWorktree !== null ? agentRowCount : -1);
+  const settingsIndex = $derived(agentRowCount + (inWorktree !== null ? 1 : 0));
+  /** The agent at roving index `i`, null for the non-agent rows. */
+  function rowAt(i: number): AgentInfo | null {
+    if (groups === null) return null;
+    if (i < quickCount) return groups.quick[i] ?? null;
+    if (!hasOthers || i === othersIndex) return null;
+    return shownOthers[i - quickCount - 1] ?? null;
+  }
+  function indexOfAgent(id: string | undefined): number {
+    if (groups === null || id === undefined) return -1;
+    const q = groups.quick.findIndex((a) => a.id === id);
+    if (q !== -1) return q;
+    const o = shownOthers.findIndex((a) => a.id === id);
+    return o === -1 ? -1 : quickCount + 1 + o;
+  }
+  function toggleOthers(): void {
+    setOthersOpen(!othersOpen);
+    if (hl > othersIndex && hl < agentRowCount) hl = othersIndex;
+  }
 
   let hl = $state(0);
   let rootEl = $state<HTMLElement | null>(null);
@@ -129,11 +171,15 @@
   /** Swap in a fresh catalog, keeping the highlight on the same agent (or on
    *  the same footer control) rather than the same index. */
   function adopt(next: AgentInfo[]): void {
-    const footer = catalog !== null && hl >= rows.length ? hl - rows.length : null;
-    const selected = rows[hl]?.id;
+    const onSettingsRow = catalog !== null && hl === settingsIndex;
+    const onWtRow = catalog !== null && wtIndex !== -1 && hl === wtIndex;
+    const onOthersRow = catalog !== null && hl === othersIndex;
+    const selected = rowAt(hl)?.id;
     catalog = next;
-    if (footer !== null) hl = rows.length + footer;
-    else hl = Math.max(0, rows.findIndex((a) => a.id === selected));
+    if (onSettingsRow) hl = settingsIndex;
+    else if (onWtRow) hl = wtIndex;
+    else if (onOthersRow) hl = othersIndex;
+    else hl = Math.max(0, indexOfAgent(selected));
   }
 
   onMount(() => {
@@ -211,8 +257,12 @@
       onToggleWorktree?.(!inWorktree);
       return;
     }
-    const a = rows[i];
-    if (a === undefined) return;
+    if (i === othersIndex) {
+      toggleOthers();
+      return;
+    }
+    const a = rowAt(i);
+    if (a === null) return;
     if (!a.installed || (a.chatSetupRequired && ui !== "term")) {
       // No curated install: Settings → Agents is where it gets set up.
       if (a.managedInstall) onInstall(a);
@@ -420,10 +470,32 @@
       {#each groups.quick as a, i (a.id)}
         {@render agentRow(a, i)}
       {/each}
-      {#if groups.others.length > 0}
-        <div class="group-label" role="presentation">other agents</div>
-        {#each groups.others as a, j (a.id)}
-          {@render agentRow(a, quickCount + j)}
+      {#if hasOthers}
+        <!-- The rest of the catalog, one row until asked: the menu is
+             "which of the two" most days. -->
+        <div
+          class="arow others"
+          class:hl={hl === othersIndex}
+          role="menuitem"
+          tabindex="-1"
+          id={itemId(othersIndex)}
+          aria-expanded={othersOpen}
+          onpointerenter={() => (hl = othersIndex)}
+          onclick={toggleOthers}
+          onkeydown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              e.stopPropagation();
+              toggleOthers();
+            }
+          }}
+        >
+          <span class="gslot others-chev"><Chevron open={othersOpen} /></span>
+          <span class="aname others-label">other agents</span>
+          <span class="asub"><span class="aver">{groups.others.length}</span></span>
+        </div>
+        {#each shownOthers as a, j (a.id)}
+          {@render agentRow(a, quickCount + 1 + j)}
         {/each}
       {/if}
     </div>
@@ -485,13 +557,27 @@
 <style>
   /* The quiet seam between the quick agents and the rest: a hairline and a
      lowercase word, no chrome. */
-  .group-label {
-    margin: 4px 9px 0;
-    padding: 7px 0 3px;
+  /* The fold row: the quiet seam between the two quick agents and the rest
+     of the catalog — a hairline above, the agents' own row language. */
+  .arow.others {
+    margin-top: 4px;
     border-top: 1px solid var(--edge);
+    border-radius: 0 0 6px 6px;
     color: var(--muted);
-    font-size: var(--text-xs);
     user-select: none;
+  }
+  .arow.others .others-label {
+    font-weight: 400;
+    color: var(--muted);
+  }
+  .arow.others.hl .others-label,
+  .arow.others:hover .others-label {
+    color: var(--fg);
+  }
+  .others-chev {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
   }
   .launcher {
     position: fixed;

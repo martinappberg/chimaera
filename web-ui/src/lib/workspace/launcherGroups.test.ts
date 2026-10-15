@@ -58,14 +58,19 @@ describe("quick action", () => {
 });
 
 describe("launcher groups", () => {
-  it("puts the quick agents first, then the others ready-first", () => {
+  it("puts the installed agents first, the default leading, the rest folded", () => {
     const { quick, others } = groupAgents(catalog, "claude");
-    expect(quick.map((a) => a.id)).toEqual(["claude", "codex"]);
-    expect(others.map((a) => a.id)).toEqual(["grok", "agy", "cursor"]);
+    expect(quick.map((a) => a.id)).toEqual(["claude", "codex", "grok"]);
+    expect(others.map((a) => a.id)).toEqual(["agy", "cursor"]);
   });
-  it("moves a non-built-in default into the quick group", () => {
-    const { quick, others } = groupAgents(catalog, "cursor");
-    expect(quick.map((a) => a.id)).toEqual(["cursor", "claude", "codex"]);
-    expect(others.map((a) => a.id)).toEqual(["grok", "agy"]);
+  it("leads with whichever installed agent is the default", () => {
+    const { quick } = groupAgents(catalog, "grok");
+    expect(quick.map((a) => a.id)).toEqual(["grok", "claude", "codex"]);
+  });
+  it("shows every agent up front when none is installed", () => {
+    const none = catalog.map((a) => ({ ...a, installed: false }));
+    const { quick, others } = groupAgents(none, "codex");
+    expect(quick.map((a) => a.id)).toEqual(["codex", "claude", "agy", "grok", "cursor"]);
+    expect(others).toEqual([]);
   });
 });
