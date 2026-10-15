@@ -12,8 +12,10 @@ wakes, read state, routes), `mcp.rs` (tool lists, instructions, the Mastermind t
 `agents.rs` (the hook carrier), `chat.rs` (turn ends and steer fates reach
 `comms::on_chat_event`), `timeline.rs` (the `note` fields), `ws.rs` (the `comms` frame). Engine
 `crates/chimaera-agent/src/model.rs` (`AgentEvent::AgentMessage`, `AgentCommand::SendIfRunning`,
-the `agent` / `mastermind` origins, `comms_title_suffix`), `lib.rs` (`ChatManager::annotate`),
-`codex.rs` (`agent_steers`). UI `web-ui/src/lib/workspace/comms.svelte.ts` (the store),
+the `agent` / `mastermind` origins, `comms_title_suffix`, `BackgroundTool.for_message`),
+`lib.rs` (`ChatManager::annotate`, `main_wait`), `codex.rs` (`agent_steers`), `claude.rs`
+(the background-for-a-message notice); `agent_state.rs` (`note_main_call`, a claude
+terminal's open calls). UI `web-ui/src/lib/workspace/comms.svelte.ts` (the store),
 `web-ui/src/lib/chat/agentMessages.ts` + `AgentMessageCards.svelte` (message cards),
 `web-ui/src/lib/dashboard/WakeRequestCard.svelte`, `AgentCard.svelte`, `MastermindDock.svelte`,
 `web-ui/src/lib/settings/schema.ts`, the Timeline rows. Wire (bearer-authed):
@@ -58,9 +60,23 @@ on the per-session MCP endpoint ([linked-terminals.md](linked-terminals.md#the-m
     (UserPromptSubmit), or at start. A hook fired inside one of its subagents never carries it
     (it would be read there and never by the agent it was sent to). A chat session also journals an `agent_message` event so
     its transcript shows the message where the agent read it.
+  - **Claude chat waiting on a subagent:** a turn blocked on a foreground subagent has no
+    next step until it returns, so by default the message is read then, and the sender is
+    told so ("waiting on a subagent for 4 min (…); it reads this when that subagent
+    returns"). With **Messages may move a waiting subagent to the background** on
+    (`agents.communication.freeSubagents`, default off), chimaera first moves that subagent to
+    the background (the CLI's Ctrl-B, `background_tasks`): the Agent call returns at once, the
+    agent's own PostToolUse carries the message, and the subagent keeps working. The chat
+    shows "subagent moved to the background to read a message from another agent; it keeps
+    working". It is off by default because it changes the flow of the user's turn, and the
+    subagent's result then arrives in a separate turn (Claude Code's own task notification) —
+    billed, and after the turn the user started has ended. Broadcasts never move anyone's
+    subagent.
   - **Codex chat, mid-turn:** `send_if_running` — steered into the running turn (a queued
-    user message with `origin: "agent"`), read (`sent`) at its next step. One that misses its
-    turn settles `dropped` and goes back to the inbox; it never opens a turn.
+    user message with `origin: "agent"`), read (`sent`) at its next step. While the agent
+    waits on its spawned agents (`wait`), the steer ends that wait at once: it reads and
+    answers, then waits again. One that misses its turn settles `dropped` and goes back to
+    the inbox; it never opens a turn.
   - **Antigravity and Grok chats, mid-turn:** messages stay in the inbox. Unread direct
     messages meet the wake policy after the current turn; these agents do not support
     Codex steering.
@@ -80,6 +96,30 @@ on the per-session MCP endpoint ([linked-terminals.md](linked-terminals.md#the-m
   answer; the rest wait. Read state persists per workspace (`<data>/workspace/<ws>/comms.json`,
   atomic rewrite) — a restart neither re-delivers nor loses one. Broadcasts reach every other
   agent's carrier and never wake anyone.
+- **What the sender is told.** `message_agent` names what a working reader waits on and for
+  how long, and when it will read the message; a message that reaches a waiting agent at once
+  waits up to 8 s for the read and says whether it happened (a Codex reader in its `wait`, or
+  a Claude reader with `freeSubagents` on: "Sent (#12) to builder — it was waiting on a
+  subagent for 4 min (audit the loader); chimaera moved that subagent to the background (it
+  keeps working); it has read it"). `workspace_agents` shows the same per agent
+  ("working: running a command for 12 min (cargo test) · reads messages when its command
+  ends"). The Timeline's delivery chip reads "reached it mid-wait" for those.
+
+**While the reader's turn waits on something** (live, claude 2.1.300 and codex 0.162.1,
+[PROTOCOL.md Pass 44](../../crates/chimaera-agent/PROTOCOL.md)):
+
+| Reader | Waiting on a subagent | Running a long command | The sender is told |
+|---|---|---|---|
+| Claude chat | read when the subagent returns; with `freeSubagents` on, read now: the subagent moves to the background and keeps working | read when the command ends | what it waits on, for how long, and when (or, freed, whether) it read it |
+| Codex chat | read now: the steer ends the `wait`, the subagent keeps working | read when the command ends | the same |
+| Claude terminal | read when the subagent returns: nothing can move a terminal's subagent | read when the command ends | "waiting on a subagent for N min (…); a terminal can't be interrupted, so it reads this when that subagent returns" |
+| Antigravity / Grok chat | no subagent surface; nothing reaches a running ACP turn | read after the turn, by the wake policy | "it waits in its inbox (its current turn is still running; it is …) and reads it when that turn ends" |
+| Codex terminal | inbox only (`read_messages`) | inbox only | "sees messages when it calls read_messages" |
+
+Claude Code's own queued input (stdin messages, its cross-session peer messages, its task
+notifications) is read only between main-thread steps, and its Send now (`priority: "now"`,
+`interrupt {send_now}`) stops the subagent the turn waits on, so neither is used. A command
+is not moved to the background: its result may be what the next step needs.
 
 ## Wakes and wake requests
 
@@ -110,7 +150,8 @@ on the per-session MCP endpoint ([linked-terminals.md](linked-terminals.md#the-m
   `read_timeline`, `spawn_agent`, `spawn_terminal`, `interrupt_agent`.
 - **Key behaviors.** Its `message_agent` carries direction (`origin: "mastermind"`, the
   Mastermind header): to a chat worker an ordinary send — Claude/Codex read it at their next
-  step while working, ACP workers queue it for the next turn, and an idle worker starts a turn —
+  step while working (with `freeSubagents` on, a Claude chat waiting on a foreground
+  subagent has it moved to the background first, as for a peer's message), ACP workers queue it for the next turn, and an idle worker starts a turn —
   gated by the Mastermind's own ask-first/auto mode, not the wake policy; to a claude
   terminal the hook carrier. Messages to it (`to: "mastermind"`) wake an auto-mode Mastermind
   within the caps and wait in the panel's inbox in ask-first mode.
@@ -118,8 +159,10 @@ on the per-session MCP endpoint ([linked-terminals.md](linked-terminals.md#the-m
 ## The switch
 
 - **What & when.** Settings → Agents → **Agents can see and message each other**
-  (`agents.communication.enabled`, default on) and **Agents may wake each other**
-  (`agents.communication.wakes`: `never` · `ask` · `auto`, default `ask`).
+  (`agents.communication.enabled`, default on), **Agents may wake each other**
+  (`agents.communication.wakes`: `never` · `ask` · `auto`, default `ask`) and **Messages may
+  move a waiting subagent to the background** (`agents.communication.freeSubagents`, default
+  off; Claude chats — see Delivery).
 - **Key behaviors.** Off: new sessions get none of the four tools, no paragraph and no
   Mastermind tier, and a codex terminal no MCP injection unless a plugin needs one — the
   worker view is byte-for-byte the one from before the feature
@@ -146,6 +189,17 @@ woke each other four times (a reply within the 3 minutes included), the fifth as
 prompted and answered with `message_agent`, pre-approved, which woke the asker; a codex chat,
 asked in plain words, started a conversation itself (`workspace_agents` → `read_agent` →
 `message_agent`) and read the haiku's answer, steered into its still-running turn.
+
+**Verified live (2026-10-14, claude 2.1.300 + codex 0.162.1, billed, isolated daemon over
+its HTTP/WS API):** a haiku chat asked a chat that was waiting on a 150 s foreground subagent
+a yes/no question with `expect_reply`, 24 s into the subagent's run. Claude reader (moving
+the subagent, as `freeSubagents` on does now — the runs predate the setting): read
+0.2 s after the send (the subagent moved to the background), answered with `message_agent`
+4.1 s later, which woke the asker; the subagent finished at 165 s with its own result
+("PONG") and Claude Code relayed it in a turn of its own. Codex reader (gpt-5.6-sol, collab
+`wait`): read 0.4 s after the send, answered 10.4 s later (codex auto-reviewed the
+pre-approved call), waited again, and its subagent finished on schedule.
+`message_agent` answered "… — it has read it" in both.
 
 ---
 

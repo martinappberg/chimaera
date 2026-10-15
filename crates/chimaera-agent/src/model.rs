@@ -956,6 +956,12 @@ pub enum AgentCommand {
     /// the TUI's Ctrl-B).
     BackgroundTool {
         tool_call_id: String,
+        /// The daemon freed the main thread so it reads a message from
+        /// another agent now (agent communication): its notice says so, and
+        /// a call that finished first (a benign race) says nothing.
+        /// Additive: absent from the UI's own Ctrl-B.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        for_message: bool,
     },
     /// Stop a running task — a subagent row id or a background task's
     /// native key (claude stop_task, generic over its task registry).
@@ -1210,7 +1216,7 @@ impl AgentCommand {
             } => {
                 check_command_len("user_message_id", user_message_id.len(), COMMAND_ID_MAX)?;
             }
-            Self::BackgroundTool { tool_call_id } => {
+            Self::BackgroundTool { tool_call_id, .. } => {
                 check_command_len("tool_call_id", tool_call_id.len(), COMMAND_ID_MAX)?;
             }
             Self::StopTask { task_id } => {
