@@ -2,7 +2,7 @@
 
 The rich chat surface: instead of running an agent as a raw TUI, Chimaera drives the same
 CLI over its **structured JSON protocol** (Claude Code over bidirectional `stream-json`,
-Codex over `codex app-server` JSON-RPC, Grok Build and Google Antigravity over ACP v1) and renders a first-class chat UI — streamed prose
+Codex over `codex app-server` JSON-RPC, Grok Build, Google Antigravity and Cursor CLI over ACP v1) and renders a first-class chat UI — streamed prose
 and thinking, tool cards, permission and question prompts, inline artifacts, model/effort
 controls, and lossless reconnect. Claude/Codex can toggle the same session identity between chat
 and the TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
@@ -68,7 +68,7 @@ Implementation: `claude.rs`, `journal.rs`, `chat.rs::resolve_start_settings`, an
 
 ## Agents and available controls
 
-Claude Code, Codex, Antigravity (Gemini models), and Grok Build share the transcript,
+Claude Code, Codex, Antigravity (Gemini models), Grok Build and Cursor CLI share the transcript,
 composer, permissions, queue and replay core. Session `capabilities` and `catalog` events
 control the available header/composer actions. ACP model choices come from the authenticated
 provider; unsupported actions are not guessed from the agent's brand. Forking works across all

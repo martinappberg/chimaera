@@ -37,11 +37,12 @@ import { derived, get, writable, type Readable } from "svelte/store";
 import { api, ApiError } from "../net/api";
 import { refreshKnowledge } from "../workspace/knowledge";
 import { normalizePlatform, type PlatformTables } from "./platform";
+import { agentProductName } from "../shared/agentNames";
 
 /** Stable provider identity; extension surfaces never default unknown IDs to Codex. */
 export type AgentId = string;
 export function agentName(id: AgentId): string {
-  return ({claude: "Claude Code", codex: "Codex", agy: "Antigravity", grok: "Grok Build"} as Record<string,string>)[id] ?? id;
+  return agentProductName(id);
 }
 
 export interface PluginRequirement {
