@@ -114,7 +114,8 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   the account is signed in or structured chat works. Afterward, Sign in opens the
   provider's interactive agent in a terminal; Open chat starts a chat using the existing account.
   The dialog tells users who aren't signed in to sign in first. Open chat does not perform login;
-  authentication failures appear in the normal chat startup or turn UI. Settings says “Installed · Supports chat and
+  a chat started while signed out shows the agent's [sign-in card](#sign-in) in place of the
+  startup error. Settings says “Installed · Supports chat and
   terminal” rather than claiming readiness. Running conversations and account data are kept.
 - **Where it lives.** `agent_setup.rs`, `workspace/agentSetup.ts`, and
   `workspace/AgentSetupDialog.svelte`: authenticated `GET/POST /api/v1/agents/{id}/setup` and
@@ -161,14 +162,65 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   install method for a bare binary behind our symlink, and claude's would install a second copy
   elsewhere, leaving the managed link stale); your own binary's `update` passes through untouched.
 
+## Sign in
+
+- **What & when.** Every built-in agent signs in from the app: no terminal, no "run `x login`
+  and start the chat again". The daemon knows per agent whether its CLI is signed in on the
+  workspace host, and one small flow signs it in — from the agent's card in Settings → Agents,
+  from the launcher row (a signed-out agent reads *not signed in* with a **sign in** chip), and
+  in a chat that could not start because the agent is signed out, where the card replaces the
+  raw error and the chat starts itself once the login lands.
+- **How it's used.** Click **Sign in**. The card shows the page to open (**Open ↗** goes
+  through the native shell's browser opener, so it works for a daemon on another host;
+  **Copy link** for a browser elsewhere), a device code to enter on that page when the CLI's
+  flow uses one, and a field to paste a code back when the page shows one. Finish in the
+  browser; the card says *Signed in* when the CLI itself reports the login, and a waiting chat
+  starts again in place. **Cancel** stops the CLI's login; a failure says what the CLI said and
+  offers **Try again**. Antigravity signs in only from its own terminal UI: its button opens a
+  managed terminal running `agy` and the daemon notices when the login lands.
+- **Per runtime.** Detection is each CLI's own status command, never a credential file;
+  chimaera never reads, copies or refreshes a credential.
+
+  | Agent | Signed in? | Sign in | In the card |
+  |---|---|---|---|
+  | Claude Code | `claude auth status --json` → `loggedIn` | `claude auth login` under the daemon (`BROWSER=true`, so only the app opens the page) | page + paste back the code the page shows |
+  | Codex | `codex login status` (exit 0 "Logged in" / exit 1 "Not logged in") | `codex login --device-auth` | page + a device code to enter |
+  | Grok Build | `grok models` ("You are logged in" / "You are not authenticated") | `grok login --device-auth` | page + a device code to enter |
+  | Cursor CLI | `cursor-agent status --format json` → `isAuthenticated` | `NO_OPEN_BROWSER=1 cursor-agent login` | page |
+  | Antigravity | `agy models` (lists the account's models; an auth-shaped failure is signed out, any other failure unknown) | its TUI, in a managed terminal | the terminal, watched |
+
+  A status command that does not answer in 10 s is *unknown* (nothing is offered), never a
+  verdict. A device code is single-use and leaves the wire with the operation's end.
+- **Where it lives.** `agent_auth.rs` (daemon), `workspace/agentSignIn.ts` +
+  `workspace/AgentSignInCard.svelte` (the one card; Settings, the chat view). Wire, all
+  additive: `GET /api/v1/agents` rows carry `signed_in: true|false|null` and
+  `sign_in: {how: browser|terminal, command, accepts_code, operation}`;
+  `GET /api/v1/agents/{id}/sign-in[?check=true]` (the status, re-asked with `check`),
+  `POST /api/v1/agents/{id}/sign-in {workspace_id, request_id, theme?}` (start or join — a
+  repeated click, a second window — the one operation per agent),
+  `DELETE …/sign-in/{operation}` (cancel, generation-scoped), `POST …/sign-in/{operation}/code
+  {code}` (the pasted code, for a login that reads one). A relaunch after a failed startup is
+  `POST /sessions/{id}/view {ui: "chat"}` on the dead chat, for every agent (a surface switch
+  stays Claude/Codex-only).
+- **Key behaviors.** The verdict is cached on the catalog for 10 minutes and re-asked on a
+  sign-in's end, on `?check=true`/`?refresh=true`, on a changed executable, and after any chat
+  startup failure (so the row and card say *not signed in* when that is why). The login runs
+  as its own process group with a 10-minute deadline, output private to the daemon (64 KiB;
+  only the URL, the code and a short failure tail reach the wire), no session or PTY entry;
+  cancel is SIGTERM then SIGKILL to the group. A clean exit is never success by itself — the
+  status command is asked again. Concurrent status probes for one agent share a run. The
+  terminal flow re-probes every 15 s while its terminal lives, and ends when the terminal
+  closes. The chat view shows one line per failure: a startup error that a fatal banner shows
+  is not repeated as a transcript line, and a fatal banner is not followed by *agent exited*.
+
 ## Cursor CLI
 
 - **What & when.** Cursor's terminal agent (`cursor-agent`, linked as `agent` too) as a fifth
   built-in runtime: its own TUI in a PTY, or structured chat over ACP.
 - **How it's used.** Start it from the agent menu's *other agents*, or make it the default.
-  The CLI keeps its own sign-in: run `cursor-agent login` once on the workspace host (the
-  terminal view shows Cursor's "Press any key to log in…" until then). Chat started while
-  signed out fails fast with that instruction instead of opening a browser from the daemon.
+  The CLI keeps its own sign-in, done from the app ([Sign in](#sign-in)): a chat started while
+  signed out fails fast — never a browser opened from the daemon — and shows the sign-in card.
+  The terminal view shows Cursor's "Press any key to log in…" until then.
 - **Where it lives.** `agent_state.rs` (`AgentKind::Cursor`, id `cursor`, `path_bin()` =
   `cursor-agent`), `launcher.rs` (detection, `build_acp_chat_command` → `cursor-agent acp`),
   `chat.rs` (ACP spawn, `NO_OPEN_BROWSER=1`), `runtimes.rs` (managed install, `cursor-agent`

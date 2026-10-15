@@ -742,8 +742,15 @@ async fn handle_chat_exit(state: &Arc<AppState>, id: &str, exit: DriverExit) {
             if let Some(recipe) = recipe {
                 crate::lock(&state.chat_recipes).insert(id.to_string(), recipe);
             }
-            if let Some(record) = crate::lock(&state.agents).get_mut(id) {
+            let kind = crate::lock(&state.agents).get_mut(id).map(|record| {
                 record.state = AgentState::Errored;
+                record.kind
+            });
+            // A signed-out CLI is the common startup failure: re-ask its
+            // status now so the chat's card, the launcher row and Settings
+            // say so instead of showing the raw error.
+            if let Some(kind) = kind {
+                crate::agent_auth::recheck(state.clone(), kind);
             }
         }
 
@@ -1388,6 +1395,9 @@ pub(crate) async fn switch_view(
     if target_chat == currently_chat && (currently_chat || pty_alive) {
         return StatusCode::NO_CONTENT.into_response();
     }
+    // A dead chat asked for chat again is a relaunch in place (the sign-in
+    // card's "start again"), not a surface switch: every agent gets it.
+    let relaunch = target_chat && !currently_chat && !pty_alive;
 
     let Some(record) = crate::lock(&state.agents).get(&id).cloned() else {
         return err(
@@ -1395,7 +1405,7 @@ pub(crate) async fn switch_view(
             "only agent sessions can switch views".to_string(),
         );
     };
-    if !record.kind.native_chat_controls() {
+    if !record.kind.native_chat_controls() && !relaunch {
         return err(
             StatusCode::BAD_REQUEST,
             format!(
@@ -1455,7 +1465,7 @@ pub(crate) async fn switch_view(
     // claude with no `--resume` (an empty conversation). Fall back to the
     // handle this chat was itself resumed from (still the conversation tip
     // while no turn has run), so the terminal reattaches to the same history.
-    let resume = if currently_chat {
+    let resume = if currently_chat || relaunch {
         chat_info
             .as_ref()
             .and_then(|c| c.native_session_id.clone())
@@ -1548,6 +1558,11 @@ async fn perform_switch(
         .get(id)
         .map(|r| r.theme.clone())
         .unwrap_or_else(|| "dark".to_string());
+    // A relaunch after a failed startup keeps the model the user picked; a
+    // surface switch never had one on the recipe.
+    let model = crate::lock(&state.chat_recipes)
+        .get(id)
+        .and_then(|r| r.model.clone());
     // A user-pinned name lives in different stores per surface: chat sessions
     // pin it on the AgentRecord (customTitle), PTY sessions on SessionInfo.name
     // (renamed). Capture it from whichever holds it NOW so the toggle carries
@@ -1596,7 +1611,7 @@ async fn perform_switch(
         version,
         settings,
         mcp_config,
-        model: None,
+        model,
         resume,
         fork_at: None,
         rollback_turns: None,

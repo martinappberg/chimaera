@@ -526,7 +526,15 @@ pub(crate) async fn list_agents(
                 Ok(bin) if kind.chat_capable() => chat_executable(&state, kind, bin).await.is_ok(),
                 _ => false,
             };
-            (kind, detection, chat_ready)
+            // Whether the CLI says it is signed in here (its own status
+            // command, cached; a re-check re-asks). Unknown until installed.
+            let signed_in = match &detection.path {
+                Ok(bin) => {
+                    crate::agent_auth::status(&state, kind, bin, query.check || query.refresh).await
+                }
+                Err(_) => None,
+            };
+            (kind, detection, chat_ready, signed_in)
         }
     }));
     let detections = if query.check {
@@ -539,11 +547,18 @@ pub(crate) async fn list_agents(
 
     let rows = detections
         .into_iter()
-        .map(|(kind, detection, chat_ready)| {
+        .map(|(kind, detection, chat_ready, signed_in)| {
             let mut row = serde_json::Map::new();
             row.insert("id".into(), json!(kind.as_str()));
             row.insert("name".into(), json!(kind.product_name()));
             row.insert("installed".into(), json!(detection.path.is_ok()));
+            // Additive: `signed_in` is the CLI's own verdict (null = unknown
+            // or not installed); `sign_in` says how this agent signs in from
+            // the app and names any sign-in in progress.
+            row.insert("signed_in".into(), json!(signed_in));
+            if let Some(sign_in) = crate::agent_auth::descriptor(&state, kind) {
+                row.insert("sign_in".into(), sign_in);
+            }
             if let Some(status) = crate::runtimes::installation_status(&state, kind) {
                 row.insert("installation".into(), status);
             }

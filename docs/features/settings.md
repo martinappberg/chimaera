@@ -85,7 +85,10 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
 - **Agents panel** (`AgentsSettings.svelte`) — one card per built-in agent (Claude Code, Codex,
   Antigravity, Grok Build, Cursor CLI) shows version, chat/terminal readiness,
   and whether Chimaera manages the installation. Install, Set up chat, or Update is offered when
-  applicable; personal installations link to official update instructions. Antigravity's chat setup
+  applicable; personal installations link to official update instructions. An installed agent whose
+  CLI reports no login reads "Installed · Not signed in" with a **Sign in** that opens the sign-in
+  card under the row (the same card a chat shows; [agents.md › Sign in](agents.md#sign-in)) — the
+  card follows the login and the row refreshes when the CLI confirms it. Antigravity's chat setup
   installs Google's companion. Advanced holds custom executable paths, Reinstall and Uninstall.
   Installation progress follows a retained daemon result from the terminal's actual exit status, with bounded polling only while
   Settings is visible. Re-checking and saving another row preserve unfinished path edits.

@@ -8,6 +8,8 @@
     versionNumber, type AgentInfo,
   } from "../workspace/launcher";
   import { openAgentSetup, type SetupAction } from "../workspace/agentSetup";
+  import { needsSignIn } from "../workspace/agentSignIn";
+  import AgentSignInCard from "../workspace/AgentSignInCard.svelte";
   import ConfirmDialog from "../shared/ConfirmDialog.svelte";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import { flushSettings, getSetting, setSetting } from "./store.svelte";
@@ -31,6 +33,9 @@
   let rowError = $state<Record<string, string | null>>({});
   let messages = $state<Record<string, string | null>>({});
   let uninstallAsk = $state<AgentInfo | null>(null);
+  /** Agents whose sign-in card is open under their row (a click, or a
+   *  sign-in already running on the daemon). */
+  let signingIn = $state<Record<string, boolean>>({});
   let uninstallError = $state<string | null>(null);
   let removing = $state(false);
 
@@ -87,7 +92,7 @@
   }
 
   $effect(() => {
-    if (!visible || !$pageVisible || !$agentCatalog.some(a => a.setup?.running || a.installation?.running)) return;
+    if (!visible || !$pageVisible || !$agentCatalog.some(a => a.setup?.running || a.installation?.running || a.signIn?.operation?.running)) return;
     let pending = false;
     const timer = setInterval(async () => {
       if (pending) return;
@@ -129,7 +134,7 @@
           <span class="glyph"><SessionGlyph kind="agent" agentKind={a.id} size={20} title={a.name} /></span>
           <div class="text">
             <div class="head"><h3>{a.name}</h3>{#if a.version}<span class="version" title={a.version}>{versionNumber(a.version)}</span>{/if}</div>
-            <p class="state">{!a.installed ? "Not installed" : a.outdated ? "Needs an update" : a.chatSetupRequired ? "Installed · Chat companion missing" : a.chatCapable ? "Installed · Supports chat and terminal" : "Installed · Terminal only"}</p>
+            <p class="state">{!a.installed ? "Not installed" : a.outdated ? "Needs an update" : a.chatSetupRequired ? "Installed · Chat companion missing" : needsSignIn(a) ? "Installed · Not signed in" : a.chatCapable ? "Installed · Supports chat and terminal" : "Installed · Terminal only"}</p>
             {#if a.installed}<p class="detail" title={a.latestError ?? undefined}>{a.managed ? "Managed by Chimaera" : "Your installation"}{#if status.text} · {status.text}{/if}</p>{/if}
           </div>
           <div class="actions">
@@ -141,9 +146,17 @@
               <button class="btn primary" disabled={wsId === null} onclick={() => void install(a, "update")}>Update</button>
             {:else if (!a.installed || a.updateAvailable || a.outdated) && a.installUrl}
               <button class="link" onclick={() => openInSystemBrowser(a.installUrl!)}>{a.installed ? "Update instructions ↗" : "Install instructions ↗"}</button>
+            {:else if needsSignIn(a) && !signingIn[a.id] && !a.signIn?.operation?.running}
+              <button class="btn primary" disabled={wsId === null} onclick={() => { signingIn[a.id] = true; }}>Sign in</button>
             {/if}
           </div>
         </div>
+        {#if a.installed && (signingIn[a.id] || a.signIn?.operation?.running)}
+          <!-- The same card a chat shows; here under the row that names the agent. -->
+          <div class="signin-slot">
+            <AgentSignInCard agent={a} workspaceId={wsId} autostart={signingIn[a.id] === true && !a.signIn?.operation?.running} onSignedIn={() => { void load(); setTimeout(() => { signingIn[a.id] = false; }, 2500); }} onDismiss={() => { signingIn[a.id] = false; }} />
+          </div>
+        {/if}
         {#if a.installation?.running && !a.setup?.running}<p class="notice">Follow this installation in its terminal in the sidebar.</p>{/if}
         {#if a.setup && !busy}<button class="link setup-result" onclick={() => install(a, "install", true)}>{a.setup.phase === "failed" ? "Setup needs attention — view result" : a.setup.phase === "cancelled" ? "Installation cancelled — view result" : "View installation result"}</button>{/if}
         {#if messages[a.id]}<p class="notice" role="status">{messages[a.id]}</p>{/if}
@@ -186,6 +199,7 @@
 
 <style>
   .setup-result { margin:4px 14px 12px; }
+  .signin-slot { margin:12px 0 2px 32px; }
   .cat-row { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:30px 14px 6px; }
   h2 { margin:0; font-size:var(--text-lg); font-weight:600; color:var(--fg); }
   .intro { margin:0 14px 14px; font-size:var(--text-sm); color:var(--muted); line-height:1.5; }
