@@ -123,4 +123,27 @@ describe("the plan card's reading of every runtime's plan", () => {
     expect(stepDetail({ ...write, description: "Write the report" })).toBeNull();
     expect(planFolds([], false)).toBe(false);
   });
+
+  it("a finished plan belongs to the turn that touched it", () => {
+    const finished = {
+      type: "plan",
+      entries: [
+        { content: "a", status: "done" },
+        { content: "b", status: "done" },
+      ],
+    };
+    const firstTurn = [
+      { type: "turn_started", turn_id: "t1" },
+      { type: "plan", entries: [{ content: "a", status: "in_progress" }, { content: "b", status: "todo" }] },
+      finished,
+    ];
+    expect(fold(firstTurn).planTouched).toBe(true);
+    // The next turn starts without touching it: the card must not reopen it.
+    const next = [...firstTurn, { type: "turn_completed", turn_id: "t1", usage: {} }, { type: "turn_started", turn_id: "t2" }];
+    expect(fold(next).planTouched).toBe(false);
+    // Re-sending the identical list (a TaskList read) is not new work.
+    expect(fold([...next, finished]).planTouched).toBe(false);
+    // A new plan is.
+    expect(fold([...next, { type: "plan", entries: [{ content: "c", status: "in_progress" }] }]).planTouched).toBe(true);
+  });
 });
