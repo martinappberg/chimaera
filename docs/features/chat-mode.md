@@ -631,8 +631,9 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   Claude's Task family or TodoWrite, Codex `update_plan`, an ACP plan all arrive as the one `plan`
   level-set. Rows update in place (keyed by the agent's id, else position) and never reorder; a
   long plan scrolls inside the card, which keeps the step in flight in view by moving only its own
-  scroll. Once the turn ends with every step done it folds to one line ("4 tasks done"), and the
-  corner count + chevron (`2/4 ⌄`) folds or unfolds it at any time (the automatic state wins again
+  scroll. Once the turn ends with every step done the card leaves (the desktop apps keep a
+  finished list only in the transcript, never pinned); while steps are open, the corner count +
+  chevron (`2/4 ⌄`) folds it to one line or unfolds it at any time (the automatic state wins again
   when it next changes). The workspace dashboard card follows the same rule —
   live tasks first, finished ones as a count — so it never fills with ✓ while hiding the work in
   flight. **A subagent's task list is its own**: its `Task*` calls never reach the parent stream, so

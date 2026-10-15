@@ -93,7 +93,7 @@
   </svg>
 {/snippet}
 
-<section class="plan-card" class:visible aria-label="plan">
+<section class="plan-card" class:visible class:folded aria-label="plan">
   <!-- The toggle is a flex column of its own at the card's right, so no row —
        first, scrolled-to, or "12/15" wide — ever runs under it. -->
   <button
@@ -175,6 +175,11 @@
     font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
     cursor: pointer;
+  }
+  /* Folded, the card is one line: the toggle sits on that line's centre. */
+  .plan-card.folded .toggle {
+    margin-top: 0;
+    align-self: center;
   }
   .toggle:hover,
   .toggle:focus-visible {

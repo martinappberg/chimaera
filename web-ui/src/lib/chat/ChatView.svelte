@@ -2280,6 +2280,10 @@
     pinnedElicitations = store.elicitations;
     pinnedSends = store.pendingSends;
   });
+  /** Every step done: the card has nothing left to follow once the turn ends. */
+  const planAllDone = $derived(
+    pinnedPlan.length > 0 && pinnedPlan.every((p) => p.status === "done"),
+  );
 
   const jumpLabel = $derived(
     followedVersion !== store.transcriptVersion
@@ -3288,7 +3292,11 @@
     />
   {/if}
 
-  {#if pinnedPlan.length > 0}
+  <!-- The card is for the plan in flight: once the turn ends with every
+       step done it has nothing left to follow, so it leaves (the desktop
+       apps keep a finished list only in the transcript, never pinned). A
+       plan with open steps stays through the idle gap for the next turn. -->
+  {#if pinnedPlan.length > 0 && !(planAllDone && !agentBusy)}
     <PlanCard entries={pinnedPlan} running={agentBusy} {visible} />
   {/if}
 
