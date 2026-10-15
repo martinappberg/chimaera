@@ -816,8 +816,11 @@ pub(crate) struct ProbeQuery {
     refresh: bool,
 }
 
-async fn refresh_probes(state: &AppState) {
+pub(crate) async fn refresh_probes(state: &AppState) {
     state.probes.invalidate();
+    // "Check again" means the agents too: a cached detection miss must not
+    // outlive the user's explicit ask.
+    crate::launcher::forget_misses(state);
     // A transient version timeout must not disable inventory until a daemon
     // restart. Explicit retries reuse the resolved binary, preserving the
     // configured installation and avoiding expensive PATH probes for others.
