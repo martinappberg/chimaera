@@ -856,16 +856,17 @@ pub(crate) async fn agent_plugins(
     if query.refresh {
         refresh_probes(&state).await;
     }
-    let (claude, codex, agy, grok) = tokio::join!(
+    let (claude, codex, agy, grok, cursor) = tokio::join!(
         claude_state(&state),
         codex_state(&state, &id, &root),
         extensions::inventory(&state, &id, &root, AgentKind::Antigravity),
         extensions::inventory(&state, &id, &root, AgentKind::Grok),
+        extensions::inventory(&state, &id, &root, AgentKind::Cursor),
     );
     axum::Json(json!({
         "schema": 1,
         "host": state.hostname,
-        "agents": [claude, codex, agy, grok],
+        "agents": [claude, codex, agy, grok, cursor],
     }))
     .into_response()
 }
