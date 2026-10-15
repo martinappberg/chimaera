@@ -75,7 +75,7 @@ describe("settings appearance bootstrap", () => {
     ).__CHIMAERA_APPEARANCE_BOOTSTRAP__ = {
       mode: "light",
       themeId: "chimaera-light",
-      background: "#fbfbfc",
+      background: "#f9f8f5",
       accent: null,
     };
 
@@ -83,7 +83,7 @@ describe("settings appearance bootstrap", () => {
 
     expect(document.documentElement.dataset.theme).toBe("light");
     expect(document.documentElement.style.colorScheme).toBe("light");
-    expect(document.documentElement.style.getPropertyValue("--bg")).toBe("#fbfbfc");
+    expect(document.documentElement.style.getPropertyValue("--bg")).toBe("#f9f8f5");
   });
 
   it("replaces a stale bootstrap on the first authoritative frame after GET failure", async () => {
@@ -101,12 +101,12 @@ describe("settings appearance bootstrap", () => {
 
     expect(document.documentElement.dataset.theme).toBe("light");
     expect(document.documentElement.style.colorScheme).toBe("light");
-    expect(document.documentElement.style.getPropertyValue("--bg")).toBe("#fbfbfc");
+    expect(document.documentElement.style.getPropertyValue("--bg")).toBe("#f9f8f5");
     expect(document.documentElement.style.getPropertyValue("--accent")).toBe("#2e9e6b");
     expect(mocks.cacheAppearanceBootstrap).toHaveBeenLastCalledWith({
       mode: "light",
       themeId: "chimaera-light",
-      background: "#fbfbfc",
+      background: "#f9f8f5",
       accent: null,
     });
   });

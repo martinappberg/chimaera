@@ -374,7 +374,7 @@ const DEFS = {
     description:
       "Base size in pixels for the complete structured-chat surface, including transcript prose, the composer, tool cards, trays, and the embedded Mastermind chat.",
     type: "number",
-    default: 13.5,
+    default: 14,
     min: 11,
     max: 24,
     step: 0.5,
@@ -395,7 +395,7 @@ const DEFS = {
     category: "Chat",
     description: "Line height multiplier for messages and the composer.",
     type: "number",
-    default: 1.55,
+    default: 1.6,
     min: 1.2,
     max: 2.2,
     step: 0.05,

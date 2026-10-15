@@ -210,7 +210,7 @@
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
-    color: color-mix(in srgb, var(--muted) 75%, transparent);
+    color: color-mix(in srgb, var(--muted) 85%, transparent);
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
   }
@@ -224,7 +224,7 @@
     background: none;
     border: none;
     border-radius: 4px;
-    color: color-mix(in srgb, var(--muted) 70%, transparent);
+    color: color-mix(in srgb, var(--muted) 85%, transparent);
     font: inherit;
     font-size: var(--text-xs);
     cursor: pointer;

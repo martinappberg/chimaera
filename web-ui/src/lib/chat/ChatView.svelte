@@ -3464,7 +3464,7 @@
      little air where prose begins and ends so messages stay the page's
      voice. */
   .column {
-    --activity-fg: color-mix(in srgb, var(--muted) 82%, transparent);
+    --activity-fg: var(--muted);
   }
   .column > :global(.activity + .activity) {
     margin-top: -2px;

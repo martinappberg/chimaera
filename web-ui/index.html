@@ -14,11 +14,11 @@
          falls back to the system light/dark preference. -->
     <style>
       :root {
-        --chimaera-bootstrap-bg: #fbfbfc;
+        --chimaera-bootstrap-bg: #f9f8f5;
         background: var(--chimaera-bootstrap-bg);
       }
       :root[data-theme="dark"] {
-        --chimaera-bootstrap-bg: #17171c;
+        --chimaera-bootstrap-bg: #1c1c1a;
       }
       body {
         background: var(--chimaera-bootstrap-bg);
@@ -31,7 +31,7 @@
           typeof matchMedia === "function" && matchMedia("(prefers-color-scheme: dark)").matches
             ? "dark"
             : "light";
-        let background = mode === "dark" ? "#17171c" : "#fbfbfc";
+        let background = mode === "dark" ? "#1c1c1a" : "#f9f8f5";
         let cached = null;
         let carried = null;
         let stored = null;

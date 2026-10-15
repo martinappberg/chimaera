@@ -101,28 +101,28 @@ const chimaeraLight: ThemeDef = {
   label: "Chimaera Light",
   kind: "light",
   tokens: {
-    "--bg": "#fbfbfc",
-    "--fg": "#1d1d20",
-    "--muted": "#65656d", // holds 4.5:1 even on --row-active
+    "--bg": "#f9f8f5",
+    "--fg": "#232320",
+    "--muted": "#625f58", // holds 4.5:1 even on --row-active
     "--accent": "#2e9e6b",
     "--err": "#cc4444",
     "--warn": "#a5730d", // renders as note TEXT, not just a dot — 4.0:1 floor
     "--rate": "#8a68c0",
-    "--rail-bg": "#f3f3f5",
-    "--row-hover": "#ececef",
-    "--row-active": "#e4e4e9",
-    "--term-selection": "#1d1d2026",
-    "--term-bg": "#ffffff",
+    "--rail-bg": "#f2f1ed",
+    "--row-hover": "#ebe9e4",
+    "--row-active": "#e3e1db",
+    "--term-selection": "#23232026",
+    "--term-bg": "#fdfcfa",
     "--scrim": "rgba(0, 0, 0, 0.25)",
     "--overlay-bg": "#ffffff",
-    "--edge": "#e3e3e7",
+    "--edge": "#e4e2dc",
     "--syn-keyword": "#9a4fa8",
     "--syn-string": "#2b8654",
     "--syn-comment": "#80808a",
     "--syn-number": "#a05e2a",
     "--syn-type": "#2f7a9b",
     "--syn-func": "#3e6fc0",
-    "--syn-def": "#1d1d20",
+    "--syn-def": "#232320",
     "--syn-prop": "#705aa8",
     "--ficon-generic": "#7c7c85",
     "--ficon-lang": "#4a76c4",
@@ -159,43 +159,43 @@ const chimaeraLight: ThemeDef = {
 };
 
 // --- Chimaera Dark (original default; values mirror app.css dark block) -----
-// 2026-07-07 softening pass: the neutral stack lifted a step and given a cool
-// undertone (void-black read as harsh next to the softer themes), muted and
-// comments brightened to keep their ratios on the lighter sheets. Identity —
-// neutral surfaces, green accent — unchanged.
+// 2026-07-07 softening pass lifted the neutral stack a step off void-black;
+// 2026-10-15 readability pass turned both chimaera stacks WARM (ivory on
+// charcoal, like a printed page) — same contrast as the cool greys, read as
+// softer. Identity — neutral surfaces, green accent — unchanged.
 
 const chimaeraDark: ThemeDef = {
   id: "chimaera-dark",
   label: "Chimaera Dark",
   kind: "dark",
   tokens: {
-    "--bg": "#17171c",
-    "--fg": "#e7e7ea",
-    "--muted": "#9a9aa6",
+    "--bg": "#1c1c1a",
+    "--fg": "#ecebe6",
+    "--muted": "#a6a49c",
     "--accent": "#3fbf85",
     "--err": "#d96b6b",
     "--warn": "#d0a355",
     "--rate": "#a58fd6",
-    "--rail-bg": "#1c1c23",
-    "--row-hover": "#25252d",
-    "--row-active": "#2d2d36",
-    "--term-selection": "#e7e7ea33",
-    "--term-bg": "#121218",
+    "--rail-bg": "#1f1f1d",
+    "--row-hover": "#2a2a27",
+    "--row-active": "#33332f",
+    "--term-selection": "#ecebe633",
+    "--term-bg": "#161615",
     "--scrim": "rgba(0, 0, 0, 0.5)",
-    "--overlay-bg": "#202028",
-    "--edge": "#31313b",
+    "--overlay-bg": "#242422",
+    "--edge": "#34342f",
     "--syn-keyword": "#c586d6",
     "--syn-string": "#7cc99a",
     "--syn-comment": "#7d7e89",
     "--syn-number": "#d0a355",
     "--syn-type": "#6fb3d2",
     "--syn-func": "#82a7e8",
-    "--syn-def": "#e7e7ea",
+    "--syn-def": "#ecebe6",
     "--syn-prop": "#a58fd6",
     "--ficon-generic": "#8b8b95",
     "--ficon-lang": "#6f9ae4",
     "--ficon-data": "#58c39c",
-    "--ficon-doc": "#9a9aa6",
+    "--ficon-doc": "#a6a49c",
     "--ficon-media": "#d8a45c",
     "--ficon-archive": "#c39a63",
     "--ficon-config": "#9a9ab0",
