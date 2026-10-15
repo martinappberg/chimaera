@@ -173,27 +173,29 @@ fn task_list_instructions(kind: Option<crate::agents::AgentKind>) -> &'static st
     match kind {
         Some(AgentKind::Claude) => {
             "\n\n\
-Task list: for any request that edits files or runs more than one command, \
-keep your task list current with TaskCreate/TaskUpdate — the whole plan up \
-front, one step in_progress at a time, each marked completed as it finishes, \
-the list replaced when the plan changes. The user follows it as a plan card \
-beside the chat; a plan written only as prose shows nothing there."
+Plan card: for any request that edits files or runs more than one command, \
+track your steps with the TaskCreate and TaskUpdate TOOLS (never a file, a \
+markdown checklist, or prose: only those tool calls draw the card): create \
+the whole plan up front, keep exactly one step in_progress, mark each \
+completed as it finishes, and update the list when the plan changes. The \
+user follows that card beside the chat while you work."
         }
         Some(AgentKind::Codex) => {
             "\n\n\
-Task list: for any request that edits files or runs more than one command, \
-keep your plan current with update_plan — the whole plan up front, one step \
-in_progress at a time, each marked completed as it finishes, the list \
-replaced when the plan changes. The user follows it as a plan card beside \
-the chat; a plan written only as prose shows nothing there."
+Plan card: for any request that edits files or runs more than one command, \
+track your steps with the update_plan TOOL (never a file, a markdown \
+checklist, or prose: only that tool call draws the card): the whole plan up \
+front, exactly one step in_progress, each marked completed as it finishes, \
+the list updated when the plan changes. The user follows that card beside \
+the chat while you work."
         }
         _ => {
             "\n\n\
-Task list: for any request that edits files or runs more than one command, \
-keep your plan or to-do list current with your own plan tool — the whole \
-plan up front, one step in progress at a time, each marked done as it \
-finishes. The user follows it as a plan card beside the chat; a plan written \
-only as prose shows nothing there."
+Plan card: for any request that edits files or runs more than one command, \
+track your steps with your own plan or to-do TOOL (never a file, a markdown \
+checklist, or prose: only that tool draws the card): the whole plan up \
+front, one step in progress at a time, each marked done as it finishes. The \
+user follows that card beside the chat while you work."
         }
     }
 }
