@@ -9,6 +9,7 @@
    * from the daemon.
    */
   import ConfirmDialog from "../shared/ConfirmDialog.svelte";
+  import { formatTokenCount } from "../shared/format";
   import { pageVisible } from "../shared/visibility";
   import { knowledge } from "../workspace/knowledge";
   import { installedOutcome, type Outcome } from "./installCopy";
@@ -233,7 +234,7 @@
   }
 
   function fmtTokens(n: number): string {
-    return n >= 1000 ? `~${(n / 1000).toFixed(1).replace(/\.0$/, "")}k` : `~${n}`;
+    return `~${formatTokenCount(n)}`;
   }
 
   /** "4 skills · 2 hooks · ~1.2k tokens in every session". */

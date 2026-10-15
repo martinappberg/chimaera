@@ -12,6 +12,7 @@
  * cost reads "—", never $0 — and have their own vitest suite.
  */
 import { writable } from "svelte/store";
+import { formatTokenCount } from "../shared/format";
 import { api, ApiError } from "../net/api";
 import type { Session } from "./sessions";
 
@@ -289,13 +290,11 @@ export async function fetchArchived(workspaceId: string): Promise<ArchivedConvo[
 
 // ---- the honest-number rules: unknown is "—", never zero ---------------------
 
-/** A token count, compact ("1.2M", "34k"), or "—" when unknown. */
+/** A token count in the table's compact spelling ("1.2M", "34k"), or "—"
+ *  when unknown (`shared/format.ts` holds the one rule). */
 export function formatTokens(v: number | null | undefined): string {
-  if (v === null || v === undefined || !Number.isFinite(v)) return "—";
-  if (v >= 1_000_000)
-    return `${(v / 1_000_000).toFixed(v >= 10_000_000 ? 0 : 1)}M`;
-  if (v >= 1_000) return `${(v / 1_000).toFixed(v >= 10_000 ? 0 : 1)}k`;
-  return String(Math.round(v));
+  if (v === null || v === undefined) return "—";
+  return formatTokenCount(v, true);
 }
 
 /** "4 min", "1h 20m", "2 d" — how long a session ran. */

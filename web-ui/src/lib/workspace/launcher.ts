@@ -94,30 +94,15 @@ export const agentCatalog = { subscribe: catalog.subscribe };
 
 let agentsCache: Promise<AgentInfo[]> | null = null;
 
-/** Ready chats first; setup never looks like a launch action. Stable sorting
- * preserves the curated/provider order within each group. */
-export function orderAgents(agents: readonly AgentInfo[]): AgentInfo[] {
-  const rank = (a: AgentInfo) => a.installed && !a.outdated && a.chatCapable ? 0 : 1;
-  return [...agents].sort((a, b) => rank(a) - rank(b));
-}
+// --- the launcher's shape: one rail row, the menu behind its chevron --------
 
-// --- the launcher's shape: quick starts first, the rest behind "more" -------
-
-/** The agents the rail always offers as one-click starts. Everything else in
- *  the catalog sits behind the launcher's chevron, with its install state. */
-export const QUICK_AGENTS: readonly string[] = ["claude", "codex"];
-
-/** The rail's quick-start ids, the primary (what the main click and the
- *  new-agent shortcut start) first: the saved default, then the built-in
- *  quick agents. A default the loaded catalog no longer lists (a retired
- *  agent) yields to Claude Code rather than pointing at nothing. Before the
- *  catalog loads every id is offered; after, a non-primary id the host's
- *  catalog lacks is dropped. */
-export function quickAgentIds(defaultId: string, catalog: readonly AgentInfo[] | null): string[] {
-  const loaded = catalog !== null && catalog.length > 0;
-  const primary = loaded && !catalog.some((a) => a.id === defaultId) ? QUICK_AGENTS[0] : defaultId;
-  const ids = [primary, ...QUICK_AGENTS.filter((id) => id !== primary)];
-  return loaded ? ids.filter((id, i) => i === 0 || catalog.some((a) => a.id === id)) : ids;
+/** The id the rail's one row starts: the saved default, or — once the loaded
+ *  catalog no longer lists it (a retired agent) — the first installed agent
+ *  in catalog order, else the catalog's first, rather than pointing at
+ *  nothing. Before the catalog loads the default is taken at its word. */
+export function primaryAgentId(defaultId: string, catalog: readonly AgentInfo[] | null): string {
+  if (catalog === null || catalog.length === 0 || catalog.some((a) => a.id === defaultId)) return defaultId;
+  return (catalog.find((a) => a.installed) ?? catalog[0]).id;
 }
 
 /** The launcher menu's two groups, with no built-in bias: the agents this
@@ -127,17 +112,17 @@ export function quickAgentIds(defaultId: string, catalog: readonly AgentInfo[] |
 export function groupAgents(
   agents: readonly AgentInfo[],
   defaultId: string,
-): { quick: AgentInfo[]; others: AgentInfo[] } {
+): { installed: AgentInfo[]; others: AgentInfo[] } {
   const lead = (list: readonly AgentInfo[]) => [
     ...list.filter((a) => a.id === defaultId),
     ...list.filter((a) => a.id !== defaultId),
   ];
   const installed = agents.filter((a) => a.installed);
-  if (installed.length === 0) return { quick: lead(agents), others: [] };
-  return { quick: lead(installed), others: agents.filter((a) => !a.installed) };
+  if (installed.length === 0) return { installed: lead(agents), others: [] };
+  return { installed: lead(installed), others: agents.filter((a) => !a.installed) };
 }
 
-/** What one quick start does when clicked: start the agent, or — when it
+/** What the rail's row does when clicked: start the agent, or — when it
  *  could only open a doomed pane — the setup step that unblocks it
  *  (a curated install / chat setup in the setup dialog, else Settings →
  *  Agents). An unloaded catalog starts: the daemon answers honestly. */
@@ -150,27 +135,25 @@ export function quickAction(a: AgentInfo | null, defaultView: "chat" | "terminal
   return "start";
 }
 
-/** One rail quick-start row. */
-export interface QuickStart {
+/** The rail's one new-agent row: what the main click and the new-agent
+ *  shortcut start (its chevron opens the menu for everything else). */
+export interface PrimaryStart {
   id: string;
   /** Catalog name, else the built-in product name. */
   name: string;
   action: QuickAction;
-  /** The default: carries the chevron and the new-agent shortcut. */
-  primary: boolean;
   info: AgentInfo | null;
 }
 
-export function quickStarts(
+export function primaryStart(
   catalog: readonly AgentInfo[] | null,
   defaultId: string,
   defaultView: "chat" | "terminal",
   fallbackName: (id: string) => string = (id) => id,
-): QuickStart[] {
-  return quickAgentIds(defaultId, catalog).map((id, i) => {
-    const info = catalog?.find((a) => a.id === id) ?? null;
-    return { id, name: info?.name ?? fallbackName(id), action: quickAction(info, defaultView), primary: i === 0, info };
-  });
+): PrimaryStart {
+  const id = primaryAgentId(defaultId, catalog);
+  const info = catalog?.find((a) => a.id === id) ?? null;
+  return { id, name: info?.name ?? fallbackName(id), action: quickAction(info, defaultView), info };
 }
 
 /** GET /api/v1/agents — what this host has, per known agent. `check` also
@@ -453,7 +436,6 @@ export function setAgentDefault(d: AgentDefault): void {
   }
 }
 
-/** Compact relative age for resume rows ("now", "5m", "3h", "2d"). */
 /** The bare version number, wherever the CLI buried it ("codex-cli 0.52.0",
  *  "2.1.202 (Claude Code)"). Shared by the launcher and both settings panels. */
 export function versionNumber(version: string): string {

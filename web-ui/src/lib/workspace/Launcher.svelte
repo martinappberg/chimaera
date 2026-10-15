@@ -1,17 +1,18 @@
 <script lang="ts">
   /**
-   * The agent launcher popover (docs/design/README.md "The agent launcher"), opened by
-   * the rail's chevron ONLY — hover (~150ms) or a click; the rail's quick
-   * starts are pure instant spawns and never open this.
+   * The agent launcher popover (docs/features/agents.md "The agent launcher"), opened by
+   * the rail's chevron ONLY — hover (~150ms) or a click; the rail's one row
+   * is a pure instant spawn of the saved default and never opens this.
    *
-   * The rail already starts Claude Code and Codex (and the saved default) in
-   * one click, so this answers the rest of "which agent, and how":
-   * - the quick agents first, in rail order — here for their terminal start
-   *   (the icon button, or ⌘↵) and update affordance;
-   * - then "other agents" (Antigravity, Grok Build, Cursor CLI, extension
-   *   agents), ready chats first, each showing its install state: the
-   *   version when installed, "not installed" with an install chip (a
-   *   curated managed install) or a set-up chip into Settings → Agents;
+   * The rail already starts the saved default in one click, so this answers
+   * the rest of "which agent, and how", with no built-in bias:
+   * - the agents this host has installed, the default first, then catalog
+   *   order — each for its chat start, its terminal start (the icon button
+   *   on hover, or ⌘↵) and its update affordance;
+   * - then "other agents", folded behind one row: the ones not installed,
+   *   "not installed" with an install chip (a curated managed install) or a
+   *   set-up chip into Settings → Agents. With nothing installed every agent
+   *   shows up front;
    * - a footer link into Settings → Agents, where every agent is managed.
    *
    * Installed rows read as just a version; whose binary it is ("installed by
@@ -98,7 +99,7 @@
   let showLoading = $state(false);
 
   const groups = $derived(catalog === null ? null : groupAgents(catalog, defaultId));
-  const quickCount = $derived(groups?.quick.length ?? 0);
+  const installedCount = $derived(groups?.installed.length ?? 0);
   const hasOthers = $derived((groups?.others.length ?? 0) > 0);
   /** The other agents stay folded behind one row until asked for — the
    *  menu is "which of the two" most days, not a catalog. Remembered. */
@@ -120,26 +121,26 @@
     }
   }
   const shownOthers = $derived(hasOthers && othersOpen ? (groups?.others ?? []) : []);
-  /** The roving order: quick agents, the "other agents" row, the others
+  /** The roving order: installed agents, the "other agents" row, the others
    *  while unfolded, the worktree switch (git workspaces only), then the
    *  settings link. */
-  const othersIndex = $derived(hasOthers ? quickCount : -1);
-  const agentRowCount = $derived(quickCount + (hasOthers ? 1 : 0) + shownOthers.length);
+  const othersIndex = $derived(hasOthers ? installedCount : -1);
+  const agentRowCount = $derived(installedCount + (hasOthers ? 1 : 0) + shownOthers.length);
   const wtIndex = $derived(inWorktree !== null ? agentRowCount : -1);
   const settingsIndex = $derived(agentRowCount + (inWorktree !== null ? 1 : 0));
   /** The agent at roving index `i`, null for the non-agent rows. */
   function rowAt(i: number): AgentInfo | null {
     if (groups === null) return null;
-    if (i < quickCount) return groups.quick[i] ?? null;
+    if (i < installedCount) return groups.installed[i] ?? null;
     if (!hasOthers || i === othersIndex) return null;
-    return shownOthers[i - quickCount - 1] ?? null;
+    return shownOthers[i - installedCount - 1] ?? null;
   }
   function indexOfAgent(id: string | undefined): number {
     if (groups === null || id === undefined) return -1;
-    const q = groups.quick.findIndex((a) => a.id === id);
+    const q = groups.installed.findIndex((a) => a.id === id);
     if (q !== -1) return q;
     const o = shownOthers.findIndex((a) => a.id === id);
-    return o === -1 ? -1 : quickCount + 1 + o;
+    return o === -1 ? -1 : installedCount + 1 + o;
   }
   function toggleOthers(): void {
     setOthersOpen(!othersOpen);
@@ -369,7 +370,7 @@
            chimaera has no curated install for it. -->
       <button
         class="achip"
-        class:solid={i < quickCount}
+        class:solid={i < installedCount}
         tabindex="-1"
         title={a.managedInstall
           ? `downloads the official ${a.name} build into ~/.chimaera/agents — runs with progress and results in agent setup`
@@ -388,7 +389,7 @@
            starts itself once the CLI confirms the login. -->
       <button
         class="achip"
-        class:solid={i < quickCount}
+        class:solid={i < installedCount}
         tabindex="-1"
         title="sign in to {a.name} — the chat opens with the sign-in, then starts"
         onclick={(e) => {
@@ -453,7 +454,7 @@
     {/if}
   {:else}
     <div class="agents">
-      {#each groups.quick as a, i (a.id)}
+      {#each groups.installed as a, i (a.id)}
         {@render agentRow(a, i)}
       {/each}
       {#if hasOthers}
@@ -481,7 +482,7 @@
           <span class="asub"><span class="aver">{groups.others.length}</span></span>
         </div>
         {#each shownOthers as a, j (a.id)}
-          {@render agentRow(a, quickCount + 1 + j)}
+          {@render agentRow(a, installedCount + 1 + j)}
         {/each}
       {/if}
     </div>

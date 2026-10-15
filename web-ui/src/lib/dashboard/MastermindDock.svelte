@@ -82,8 +82,8 @@
   /** Setup-card agent choice — both chat-driver agents enforce the mode
    *  through their own harness (claude: settings pre-allows; codex: the
    *  driver answering its MCP tool-call elicitations from the recorded
-   *  mode). These are the rail's two quick agents; the choice starts on
-   *  whichever of them the user made the launcher default. */
+   *  mode). The choice starts on whichever of the two the user made the
+   *  launcher default. */
   let agent = $state<"claude" | "codex">(getAgentDefault().agent === "codex" ? "codex" : "claude");
   /** A PUT/DELETE is in flight — buttons disable, the chat gap shows busy. */
   let pending = $state(false);

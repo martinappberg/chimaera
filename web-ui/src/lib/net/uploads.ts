@@ -12,6 +12,7 @@
  */
 
 import { writable } from "svelte/store";
+import type { ImageAttachment } from "../chat/images";
 import { getToken, notifyUnauthorized } from "./api";
 
 export interface UploadResult {
@@ -216,7 +217,7 @@ export async function trackFileOp<T>(
   }
 }
 
-type PathInserter = (sessionId: string, absPath: string) => void;
+type PathInserter = (sessionId: string, absPath: string, image?: ImageAttachment) => void;
 let pathInserter: PathInserter | null = null;
 
 /** App-level wiring: the one function that composes + types an uploaded
@@ -227,10 +228,16 @@ export function setUploadPathInserter(fn: PathInserter | null): void {
 
 /**
  * Upload `blob` for `sessionId` under `name`, tracking a job chip, then hand
- * the resulting path to the registered inserter. Errors surface on the chip;
+ * the resulting path — and `image`, the picture's pixels for a chat composer
+ * — to the registered inserter in one delivery. Errors surface on the chip;
  * nothing is ever typed for a failed upload.
  */
-export async function uploadAndInsert(sessionId: string, blob: Blob, name: string): Promise<void> {
+export async function uploadAndInsert(
+  sessionId: string,
+  blob: Blob,
+  name: string,
+  image?: ImageAttachment,
+): Promise<void> {
   const id = ++jobSeq;
   let cancelled = false;
   uploadJobs.update((jobs) => [
@@ -249,7 +256,7 @@ export async function uploadAndInsert(sessionId: string, blob: Blob, name: strin
         }),
     });
     finishJob(id, null);
-    pathInserter?.(sessionId, result.path);
+    pathInserter?.(sessionId, result.path, image);
   } catch (e) {
     if (cancelled) {
       finishJob(id, null);
