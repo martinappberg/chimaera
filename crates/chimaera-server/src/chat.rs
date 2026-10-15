@@ -3427,9 +3427,12 @@ pub(crate) async fn spawn_chat_session(
     // (`notify`, the read-only document tools) every session pre-approves.
     // Active workbench plugins' tools join the pre-approved set too (the user
     // switched the plugin on; its card names the tools) — for workers as well.
-    if recipe.kind == AgentKind::Codex {
+    // An ACP chat (never a Mastermind) gets the same worker consent: ACP has
+    // no pre-allow config either, so its driver answers the permission
+    // request for a listed chimaera tool itself (PROTOCOL.md Pass 45).
+    if recipe.kind == AgentKind::Codex || recipe.kind.is_acp() {
         let plugin_tools = crate::plugins::spawn_allow(state, &recipe.workspace_id).await;
-        spec.mcp_auto_approve = Some(codex_mcp_auto_approve(recipe.mastermind, plugin_tools));
+        spec.mcp_auto_approve = Some(chat_mcp_auto_approve(recipe.mastermind, plugin_tools));
     }
     // Codex selects its create-time model in-protocol at thread open; Claude
     // already received the same recipe value through build_chat_command.
@@ -3762,12 +3765,13 @@ pub(crate) async fn resurrect_chat(
     }
 }
 
-/// The codex driver's standing consent to chimaera MCP tool calls (see the
-/// gating note in `spawn_chat_session`): the prompt-free tools and the
-/// workspace's extras (`plugins::spawn_allow`: active plugin tools, agent
+/// A chat driver's standing consent to chimaera MCP tool calls — codex and
+/// the ACP agents, the runtimes whose pre-allow is answered at the prompt
+/// (see the gating note in `spawn_chat_session`): the prompt-free tools and
+/// the workspace's extras (`plugins::spawn_allow`: active plugin tools, agent
 /// communication's) for every session, plus a Mastermind's tier — whose
 /// ask-first sends keep their prompt.
-fn codex_mcp_auto_approve(
+fn chat_mcp_auto_approve(
     mastermind: Option<crate::workspaces::MastermindMode>,
     plugin_tools: Vec<String>,
 ) -> chimaera_agent::driver::McpAutoApprove {
@@ -3956,7 +3960,7 @@ mod tests {
     #[test]
     fn codex_pre_approves_the_prompt_free_tools_for_every_session() {
         use crate::workspaces::MastermindMode;
-        let worker = codex_mcp_auto_approve(None, Vec::new());
+        let worker = chat_mcp_auto_approve(None, Vec::new());
         assert_eq!(worker.server, "chimaera");
         assert_eq!(
             worker.tools,
@@ -3968,7 +3972,7 @@ mod tests {
                 "update_plan".to_string(),
             ])
         );
-        let ask = codex_mcp_auto_approve(Some(MastermindMode::Ask), Vec::new())
+        let ask = chat_mcp_auto_approve(Some(MastermindMode::Ask), Vec::new())
             .tools
             .unwrap();
         for tool in [
@@ -3983,7 +3987,7 @@ mod tests {
             .iter()
             .any(|t| t == "spawn_agent" || t == "run_in_terminal"));
         assert_eq!(
-            codex_mcp_auto_approve(Some(MastermindMode::Auto), Vec::new()).tools,
+            chat_mcp_auto_approve(Some(MastermindMode::Auto), Vec::new()).tools,
             None
         );
     }

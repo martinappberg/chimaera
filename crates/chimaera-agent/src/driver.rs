@@ -117,10 +117,12 @@ pub struct SpawnSpec {
     pub mcp_servers: Vec<Value>,
     /// MCP tool calls the embedder has already consented to: the driver
     /// answers their approval prompts accept itself instead of surfacing a
-    /// PermissionRequest. Codex-only today — its app-server elicits EVERY
-    /// MCP tool call regardless of approval-mode config (live-probed,
-    /// PROTOCOL.md Pass 19), so a pre-allow must answer at the prompt.
-    /// Claude ignores it (its pre-allows ride the settings file).
+    /// PermissionRequest. Codex — its app-server elicits EVERY MCP tool call
+    /// regardless of approval-mode config (live-probed, PROTOCOL.md Pass
+    /// 19) — and the ACP agents, which have no pre-allow config at all
+    /// (Pass 45): a pre-allow must answer at the prompt, in each agent's
+    /// own pinned frame shape. Claude ignores it (its pre-allows ride the
+    /// settings file).
     pub mcp_auto_approve: Option<McpAutoApprove>,
     /// Turn the agent's Remote Control bridge on right after the handshake,
     /// registered under this display name. The embedder's standing choice (a
