@@ -151,48 +151,48 @@ fn agy_connections(output: &str) -> Result<Vec<Connection>, &'static str> {
     Ok(rows)
 }
 
-/// `cursor-agent mcp list`: one `name: status` line per server from
-/// `.cursor/mcp.json` and `~/.cursor/mcp.json`. The status words are Cursor's
-/// own (`ready`, `connecting`, `disabled`, `failed`, `unavailable`, an auth
-/// wording); only the name and a normalized status leave here.
+/// `cursor-agent mcp list` (2026.10.14): one `<id>: <status>` line per server
+/// from `.cursor/mcp.json` and `~/.cursor/mcp.json`, the status one of
+/// `ready`, `requires_authentication`, `loading`, `disabled`,
+/// `not loaded (needs approval)` or `Error: <message>` (the message may run
+/// on to further lines). The id is whatever precedes the last `: ` before a
+/// known status, so an id with `:` or a space survives; a line that is none
+/// of these (an update notice, an error's continuation) is skipped, never a
+/// failed report. Only ids and normalized statuses leave here.
 fn cursor_connections(output: &str) -> Result<Vec<Connection>, &'static str> {
+    const STATUSES: [(&str, &str); 5] = [
+        ("ready", "connected"),
+        ("requires_authentication", "needs_auth"),
+        ("loading", "configured"),
+        ("disabled", "disabled"),
+        ("not loaded (needs approval)", "needs_approval"),
+    ];
     let text = crate::agent_auth::strip_controls(output);
-    let lines: Vec<&str> = text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
-    if lines
-        .iter()
-        .any(|l| l.to_ascii_lowercase().starts_with("no mcp servers"))
-    {
-        return Ok(vec![]);
-    }
-    let mut rows = Vec::new();
-    for line in lines {
-        let Some((name, status)) = line.split_once(':') else {
-            return Err("Cursor returned an unrecognized connection.");
+    let mut rows: Vec<Connection> = Vec::new();
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if line.to_ascii_lowercase().starts_with("no mcp servers") {
+            return Ok(vec![]);
+        }
+        let parsed = STATUSES
+            .iter()
+            .find_map(|(word, status)| {
+                line.strip_suffix(word)
+                    .and_then(|head| head.strip_suffix(": "))
+                    .map(|name| (name, *status))
+            })
+            .or_else(|| {
+                // `<id>: Error: <message>` — an OAuth or startup failure, not a
+                // sign-in prompt, whatever the message says.
+                line.split_once(": Error:")
+                    .map(|(name, _)| (name, "failed"))
+            });
+        let Some((name, status)) = parsed else {
+            continue;
         };
         let name = name.trim();
-        if !valid_name(name) || name.contains(char::is_whitespace) {
-            return Err("Cursor returned an unrecognized connection.");
+        if !valid_name(name) {
+            continue;
         }
-        let word = status.trim().to_ascii_lowercase();
-        // Cursor's own kinds: ready, connecting, needsAuth, needsApproval,
-        // disabled, failed, unavailable, error.
-        let status = if word.contains("approval") {
-            "needs_approval"
-        } else if word.contains("auth") || word.contains("login") {
-            "needs_auth"
-        } else if word.starts_with("ready") || word.contains("connected") {
-            "connected"
-        } else if word.contains("disabled") {
-            "disabled"
-        } else if word.contains("fail") || word.contains("error") || word.contains("unavailable") {
-            "failed"
-        } else {
-            "configured"
-        };
         let mut row = connection(name, "mcp", status, false);
         row.login_terminal = status == "needs_auth";
         rows.push(row);
@@ -379,17 +379,20 @@ pub(crate) async fn list(
     if query.refresh {
         refresh_probes(&state).await;
     }
+    // Cursor's `mcp list` connects every server it knows, so it takes the
+    // shared gate FIRST, with the whole budget to itself, rather than as a
+    // sixth in the queue whose 60 s would be mostly waiting.
+    let mut cursor = probe(&state, &ws, &root, AgentKind::Cursor).await;
     // Each holds the shared agent-probe gate; the whole request is bounded.
-    let (claude, codex, mut agy, mut grok, mut cursor, effective) = tokio::join!(
+    let (claude, codex, mut agy, mut grok, effective) = tokio::join!(
         probe(&state, &ws, &root, AgentKind::Claude),
         probe(&state, &ws, &root, AgentKind::Codex),
         probe(&state, &ws, &root, AgentKind::Antigravity),
         probe(&state, &ws, &root, AgentKind::Grok),
-        probe(&state, &ws, &root, AgentKind::Cursor),
         super::extensions::inventory(&state, &ws, &root, AgentKind::Grok),
     );
     if cursor["available"] == true {
-        cursor["notice"] = json!("Lists the MCP servers Cursor's CLI knows from .cursor/mcp.json and ~/.cursor/mcp.json. A server that needs a login signs in from a terminal, where Cursor opens its own browser flow.");
+        cursor["notice"] = json!("Lists the MCP servers Cursor's CLI knows from .cursor/mcp.json and ~/.cursor/mcp.json. A server that needs a login signs in from a terminal on this host (cursor-agent mcp login), which waits for the browser's callback on this host: local workspaces only.");
     }
     agy["actions"] = json!(["manage_connections"]);
     agy["notice"] = json!("Lists connections managed by Antigravity's CLI. Project and plugin connections can also load when an agent starts. Manage sign-in in Antigravity.");
@@ -432,36 +435,53 @@ mod tests {
 
     #[test]
     fn cursor_connections_read_name_and_status_lines_and_offer_a_terminal_login() {
+        // Cursor 2026.10.14's own words, an id with a colon and a space, a
+        // multi-line Error, a stray update notice.
         let rows = cursor_connections(
-            "goldfish: ready
-notes: needsAuth
+            "A new version of Cursor Agent is available.
+goldfish: ready
+notes: requires_authentication
 old: disabled
-broken: failed to start
-new: needsApproval
+slow: loading
+new: not loaded (needs approval)
+my: odd server: ready
+broken: Error: OAuth token exchange failed
+  at https://secret.invalid/?token=secret
 ",
         )
         .unwrap();
         let by: std::collections::BTreeMap<_, _> =
             rows.iter().map(|r| (r.name.as_str(), r)).collect();
+        assert_eq!(
+            rows.len(),
+            7,
+            "the notice and the error's continuation are skipped"
+        );
         assert_eq!(by["goldfish"].status, "connected");
         assert_eq!(by["notes"].status, "needs_auth");
         assert!(by["notes"].login_terminal && !by["notes"].login);
         assert!(!by["goldfish"].login_terminal);
         assert_eq!(by["old"].status, "disabled");
-        assert_eq!(by["broken"].status, "failed");
+        assert_eq!(by["slow"].status, "configured");
         assert_eq!(by["new"].status, "needs_approval");
         assert!(
             !by["new"].login_terminal,
             "approval is granted in Cursor, not a login"
         );
-        assert!(cursor_connections(
-            "No MCP servers configured
-"
-        )
-        .unwrap()
-        .is_empty());
-        assert!(cursor_connections("Starting login process...").is_err());
+        assert_eq!(by["my: odd server"].status, "connected");
+        assert_eq!(
+            by["broken"].status, "failed",
+            "an OAuth error is not a sign-in prompt"
+        );
+        assert!(!by["broken"].login_terminal);
+        assert!(cursor_connections("No MCP servers configured\n")
+            .unwrap()
+            .is_empty());
+        assert!(cursor_connections("Starting login process...")
+            .unwrap()
+            .is_empty());
         let wire = serde_json::to_string(&rows).unwrap();
+        assert!(!wire.contains("secret"));
         assert!(wire.contains("\"login_terminal\":true"));
         assert!(
             !wire.contains("\"login_terminal\":false"),
