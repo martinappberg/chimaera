@@ -220,8 +220,7 @@ impl Driver for AcpAdapter {
         if native.is_empty() || native.len() > 512 {
             return Err("Invalid ACP sessionId".into());
         }
-        let mut mapper = AcpMapper::new(native.to_owned(), &init, &session);
-        mapper.kind = self.kind;
+        let mut mapper = AcpMapper::new(native.to_owned(), &init, &session, self.kind);
         mapper.mcp_auto_approve = spec.mcp_auto_approve.clone();
         mapper.offer_grok_modes(self.kind);
         // ACP has no portable system-context field. Hold the bounded handoff
@@ -353,7 +352,7 @@ fn unique_rows<'a>(v: &'a Value, key: &str) -> impl Iterator<Item = &'a Value> {
 }
 
 impl AcpMapper {
-    fn new(native: String, init: &Value, session: &Value) -> Self {
+    fn new(native: String, init: &Value, session: &Value, kind: &'static str) -> Self {
         let models = unique_rows(&session["models"]["availableModels"], "modelId")
             .filter_map(|m| {
                 let id = small(&m["modelId"]);
@@ -416,7 +415,7 @@ impl AcpMapper {
             grok_modes: false,
             always_approve: false,
             deferred_mode: None,
-            kind: "",
+            kind,
             mcp_auto_approve: None,
             mcp_calls: HashMap::new(),
             hidden_calls: HashSet::new(),
@@ -1493,7 +1492,7 @@ impl Mapper for AcpMapper {
 mod tests {
     use super::*;
     fn mapper() -> AcpMapper {
-        AcpMapper::new("session".into(), &json!({}), &json!({}))
+        AcpMapper::new("session".into(), &json!({}), &json!({}), "")
     }
     fn commands(m: &mut AcpMapper, names: &[&str]) -> DriverStep {
         let list: Vec<_> = names.iter().map(|n| json!({"name":n})).collect();
@@ -1854,7 +1853,7 @@ mod tests {
     fn cursor_offers_only_what_its_session_advertises() {
         let init = json!({"protocolVersion":1,"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":true,"audio":false,"embeddedContext":false},"sessionCapabilities":{"list":{}}},"authMethods":[{"id":"cursor_login"}]});
         let session = json!({"sessionId":"session","modes":{"currentModeId":"agent","availableModes":[{"id":"agent","name":"Agent"},{"id":"plan","name":"Plan"},{"id":"ask","name":"Ask"}]}});
-        let mut m = AcpMapper::new("session".into(), &init, &session);
+        let mut m = AcpMapper::new("session".into(), &init, &session, CURSOR.kind);
         m.offer_grok_modes(CURSOR.kind);
         assert!(!m.grok_modes);
         assert!(m.caps.image_input);

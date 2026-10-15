@@ -4070,7 +4070,7 @@ mod tests {
     /// tools (`mcp::ALWAYS_ALLOWED_TOOLS`: notify, the read-only document
     /// tools, open_browser, update_plan) for every session.
     #[test]
-    fn codex_pre_approves_the_prompt_free_tools_for_every_session() {
+    fn chat_consent_pre_approves_the_prompt_free_tools_for_every_session() {
         use crate::workspaces::MastermindMode;
         let worker = chat_mcp_auto_approve(None, Vec::new());
         assert_eq!(worker.server, "chimaera");
