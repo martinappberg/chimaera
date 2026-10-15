@@ -46,9 +46,9 @@ use crate::model::{
 use crate::model::{RemoteControlSnapshot, RemoteControlState};
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 
-/// CLI version these frame shapes were verified against (2026-09-25,
-/// full chat-smoke 23/23; PROTOCOL.md Pass 33).
-pub const TESTED_CLAUDE_VERSION: &str = "2.1.289";
+/// CLI version these frame shapes were verified against (2026-10-14,
+/// full chat-smoke 29/29 + chat-mods-smoke; PROTOCOL.md Pass 43).
+pub const TESTED_CLAUDE_VERSION: &str = "2.1.300";
 
 /// Arguments for a structured chat session, before server-side extras
 /// (`--settings`, `--mcp-config`, `--session-id`) and login-shell wrapping.
@@ -1018,6 +1018,16 @@ impl ClaudeMapper {
             .as_str()
             .filter(|m| !m.is_empty())
             .map(String::from);
+        // 2.1.300 answers `initialize` with its own `claude_code_version`.
+        // The launcher's `--version` line stays the journaled truth; the
+        // wire's word fills in only when that probe failed.
+        let agent_version = agent_version.or_else(|| {
+            commands_catalog["claude_code_version"]
+                .as_str()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(|v| truncate_label(v, 64))
+        });
         Self {
             native_session_id: pinned_native_id,
             agent_version,
@@ -9571,6 +9581,34 @@ pub(crate) mod tests {
             "message": { "id": "m9", "content": [{ "type": "text", "text": "sub" }] },
         }));
         assert!(step.events.is_empty());
+    }
+
+    /// 2.1.300's `initialize` names its own version: it fills in for a
+    /// failed launcher probe and never overrides one that worked.
+    #[test]
+    fn initialize_version_backs_up_a_failed_probe() {
+        let catalog = json!({ "commands": [], "claude_code_version": "2.1.300" });
+        let version = |m: ClaudeMapper| match m.init_event() {
+            AgentEvent::Init { agent_version, .. } => agent_version,
+            other => panic!("expected Init, got {other:?}"),
+        };
+        assert_eq!(
+            version(ClaudeMapper::new(None, None, &catalog)).as_deref(),
+            Some("2.1.300")
+        );
+        assert_eq!(
+            version(ClaudeMapper::new(
+                None,
+                Some("2.1.300 (Claude Code)".into()),
+                &catalog
+            ))
+            .as_deref(),
+            Some("2.1.300 (Claude Code)")
+        );
+        assert_eq!(
+            version(ClaudeMapper::new(None, None, &json!({ "commands": [] }))),
+            None
+        );
     }
 
     // --- 2.1.259 surface: initialize extras, Remote Control, new frames --

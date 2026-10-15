@@ -238,7 +238,8 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   the row's title seeds the soft `ai_title` (`title_hint`), and the journal is seeded from the
   previous life — copied when a chat journal exists, otherwise **imported from the claude
   transcript** (`~/.claude/projects/<enc>/<id>.jsonl` → `AgentEvent`s, bounded newest-tail with an
-  explicit `Truncated` marker). A saved Claude chat whose history cannot be reconstructed reports
+  explicit `Truncated` marker; only user/assistant records count toward that tail, so the per-request
+  `api-request*` records Claude 2.1.300 writes there never crowd out the conversation). A saved Claude chat whose history cannot be reconstructed reports
   a recoverable error with a terminal suggestion, rather than silently changing views. A Codex
   recent resumes on its last surface: `thread/resume` in chat, `codex resume <thread-id>` in the
   TUI. A normally finished Codex chat copies its native `ChatInfo` thread id into Recents before

@@ -9,7 +9,8 @@ Sources:
 - **live**: probed against the real CLIs (claude 2.1.206, codex 0.142.5;
   codex 0.144.2 from Pass 16 on; claude 2.1.259 + codex 0.153.0 from Pass 30
   on; claude 2.1.280/2.1.281 + codex 0.156.1 from Pass 31 on; claude 2.1.283
-  + codex 0.157.1 from Pass 33 on).
+  + codex 0.157.1 from Pass 33 on; claude 2.1.289 + codex 0.160.0 from the
+  October refresh; claude 2.1.300 + codex 0.162.1 from Pass 43 on).
 - **official schema/docs**: Codex's upstream `codex-rs/app-server/README.md`
   and the version-specific output of `codex app-server generate-ts` /
   `generate-json-schema` (the preferred shape inventory for the installed
@@ -266,7 +267,9 @@ server request is refused with a JSON-RPC error, never shown as a card
 Neither wire protocol carries a version handshake we can depend on:
 
 - **claude**: the `initialize` control response is the command + model catalog
-  (see pass 5) — it carries NO version field.
+  (see pass 5). Through 2.1.289 it carried NO version field; 2.1.300 adds
+  `claude_code_version` ("2.1.300"), which the driver journals only when the
+  launcher's probe failed (Pass 43).
 - **codex**: the `initialize` RESULT carries `userAgent` (+ `codexHome`,
   `platform`), but it is the server's own phrasing, not a stable version
   contract, and the driver handshake discards it.
@@ -3155,3 +3158,50 @@ The chat's subagent surface named the work but never the model doing it, and a s
 
 Neither ACP adapter reports subagents on its wire today, so there is nothing to name a model for or open; the chip and the view are claude- and codex-only by wire reality.
 
+## Pass 43 (2026-10-14 — live probes claude 2.1.300 + codex 0.162.1): request records in transcripts, a stint that could never close, thinking that reads as thinking. ADOPTED.
+
+The installed CLIs had moved past both pins (claude 2.1.289 → 2.1.300, codex 0.160.0 → 0.162.1). Sources: `just chat-smoke` (29/29) and `just chat-mods-smoke` (1/1) against the real installs; the SDK schema `.describe()` text and literal sets of both claude binaries (2.1.289 from `npm pack @anthropic-ai/claude-code-darwin-arm64@2.1.289`); free `initialize` probes on both claude binaries; `codex app-server generate-ts --experimental` from 0.160.0 (`npm install --prefix <scratch> @openai/codex@0.160.0`) and 0.162.1; a raw app-server probe and three driver-level turns on 0.162.1 (gpt-5.6-sol and gpt-6-astra) through an isolated daemon; one Haiku one-word turn to get a transcript written by 2.1.300. Neither global install was touched. (The task that asked for this pass called it "Pass 34"; that number is taken, so it continues the series as 43.)
+
+### Claude 2.1.289 → 2.1.300
+
+- **`initialize` response.** Live, both binaries: the same keys (`account`, `agents`, `analytics_disabled`, `available_output_styles`, `capabilities`, `commands`, `current_permission_mode`, `fast_mode_disabled_reason`, `fast_mode_state`, `feedback_mode`, `ide_rc_auto_enable_gate`, `models`, `output_style`, `pid`, `remote_control_auto_connect_default`, `remote_control_auto_enable`, `remote_control_auto_on_by_default`, `remote_control_available`, `session_state`, `user_output_styles_dir`) plus, new in 2.1.300, **`claude_code_version: "2.1.300"`** ("Claude Code version of the process that runs this session's turns (the same value its system/init carries)"). Model entries gain `supportsThinkingOff` (`@internal`); `haiku` now lists `supportedEffortLevels` low…max where 2.1.289 listed none — the catalog drives the effort control, so nothing to change. (`hooks_applied`, listed in Pass 30, is in neither.) ADOPTED: the mapper journals `claude_code_version` on `Init` only when the launcher's `--version` probe failed (`initialize_version_backs_up_a_failed_probe`). Codex has no equivalent field (its `userAgent` is phrasing, see "Version detection"), so its Init is unchanged.
+- **System frames.** Schema subtype set 154 → 157, nothing removed: `permission_check_status {tool_use_id, agent_id?, status: "checking" | "done"}` (`@internal`: a call has waited ~4 s on the auto-mode classifier — "where it would otherwise show a silent pause that looks like a running tool"), `file_attachments_missing` (a remote client's file references that did not arrive), and the Mods control `ui_prompt_autocomplete` (`prompt.autocomplete` hooks answer a surface's composer). The binary also emits `rewind_stand_in`. Not adopted: unknown system subtypes fall through quietly, and the classifier signal is `@internal` (a follow-up could show it as an activity line). Hook event names: the same 33.
+- **Tools.** The same names in both builds: `Agent`, `Task{Create,Update,List,Get,Output,Stop}`, `Monitor`, `Workflow`, `ScheduleWakeup`, `Artifact`, `EnterWorktree`/`ExitWorktree`, `SendMessage`, `ListAgents`, `PushNotification`, `SubagentHandback`. New parameters: `Agent.effort` (low…max or an integer, "Set this ONLY when the user … explicitly ask[s]"), `Read.allow_large` ("over the usual size limits, up to what still fits in your context"), a character offset for `WebFetch`. Agent definitions gain `autoCompactWindow`, `omitClaudeMd` and `effort`. None changes a title, kind or location the driver derives.
+- **Subagent and background frames.** A subagent's messages now carry a top-level `agent_id` (= its `task_id`) beside `subagent_type`/`task_description`; the driver keeps keying on `parent_tool_use_id`. `background_tasks_changed` tasks gain `parent_task_id`, and its documented order is now explicit: a task that starts in the background joins the set before its `task_started`, a finishing task leaves after its `task_updated` and `task_notification` (`claude_background_task_lanes_start_and_settle` passed live). The Bash result's `backgroundEndsWithFinalResponse` now also covers a headless session that takes no further input. `narration_block_indexes`, `tool_use_summary`, Remote Control and `interrupt_send_now_v1` are unchanged.
+- **Mods.** `prompt.change` (12 sites) and `$.ui.view` (7) exist only in 2.1.300. `chat-mods-smoke` (control, module, reattach) passed; neither hook is adopted.
+- **Program Status Protocol (OSC 7501, changelog 2.1.295).** The TUI asks `OSC 7501 ; ?` and reports only when the terminal answers: `OSC 7501 ; state=<working|blocked|…>:app=claude-code[:id=…][:kind=…][:progress=n][:title=…][:msg=…]`, `state=clear` to reset. Chimaera's PTY answers no such probe, so a Claude terminal never sends a report; the marks scanner reads OSC 133/633/7 only, and `7501;` cannot match `7;` (`program_status_osc_7501_is_not_a_mark`). Surfacing working/waiting/done in a terminal tab would mean answering the probe: a follow-up, not adopted.
+
+### Claude: request records in the on-disk transcript
+
+2.1.300 writes each API request's shape beside the conversation. One Haiku turn that said "ok" left a 222 KB transcript; its user/assistant records were about 3 KB. New record kinds, each a `type`-first line: `api-request-shape {shape, shapeHash}` (the system prompt and tools, ~40 KB, written when the hash changes), `api-request-blob {hash, message}` (request messages by hash, 3–31 KB; `role`, never `type`, so the launcher's `"type":"user"` message count is unaffected), `api-request {id, params, requestDigest, shapeHash, cacheControl, …}`, `atis-latch` and `cost-state`. Assistant records gain `requestRef`, `requestedModel`, `perTurnEffort`, `apiBlockIndex` and `advisorModel`.
+
+The importer kept a byte- and record-budgeted tail of every non-blank line and parsed only that tail, so on a long 2.1.300 session the request records (and the already-large `attachment` records) would crowd the conversation out of the 2 MiB window and mark history as clipped. ADOPTED: `transcript::is_conversation_record` deserializes only the top-level `type` and `isSidechain` (no allocation for the rest) and keeps `user`/`assistant` lines; every other kind, any kind a later CLI adds, and a line cut at the 1 MiB cap are dropped before they are parsed or counted. The subagent reader applies the same filter (sidechains kept). Tests: `request_records_never_crowd_out_the_conversation` (4 MiB of request records around a two-message conversation import whole, unmarked), `record_heads_classify_without_a_full_parse`.
+
+### Codex 0.160.0 → 0.162.1: the generated schema
+
+Additive, nothing removed or renamed. New client requests `thread/prediction/request`, `thread/attachmentOwner/list`, `account/bedrock/checkGovCloudRequirements`; new notification `thread/prediction/updated {threadId, sourceTurnId, result: {type: "completed", text} | {type: "failed"}}` (unhandled notifications are ignored). `MessagePhase` gains `"partial_answer"` ("a partial answer"); the only phase the driver reads is a subagent's closing words (`phase != "commentary"`), so a partial answer is a candidate and the latest message still wins. **`subAgentActivity` items gain `model` and `reasoningEffort`** ("Resolved model at sub-agent creation; absent from older records and other activities"; live: `gpt-5.6-sol`/`xhigh` on `started`, null on the others). `Turn.rootTurnId`, `TurnStartParams.parentTurnId`/`rootTurnId`, `ThreadGoal{Set,Clear}Params.origin`, `EnvironmentAddParams.skills`, `MisalignmentErrorDetails.reviewTarget`, `ResponseItem` `additional_tools`; `CodexErrorInfo` widens to also allow a string or an object; skill `path` becomes `LegacyAppPathString` (still a string). `SubAgentActivityKind` (`started|interacted|interrupted|completed`) and `CollabAgentTool` are unchanged. Every method literal in `codex.rs` is in the unions except the three known fallbacks (`turn/failed`, `thread/rollback`, `item/plan`). ADOPTED: the spawn marker's `model` reaches `SubagentInfo` at row open, before the `thread/read` answers.
+
+Live order at a child's finish on 0.162.1: the parent's `subAgentActivity {completed}` `item/started` (t+0 ms), the child's `turn/completed` (+1 ms), the marker's `item/completed` (+5 ms). The driver acts at `item/completed`, so the marker is still the no-op Pass 31 made it. A gpt-5.6-sol reasoning item can carry no summary at all (`summary: []`, `item/started` → `item/completed` in 0.6 s, no deltas), even with `summary: "auto"`.
+
+### Codex: a subagent row that stayed running after everything finished (FIXED)
+
+A maintainer's chat (codex 0.160.0, gpt-6-astra) showed `subagent "…" · follow-up input · 28 tools · 2334950 tokens` with a live dot long after the agent answered — Codex itself said every subagent had finished — until the process exited and the row failed as "subagent stopped with the agent process". The rollouts explain it. The parent used three collab tools on its agents: `spawn_agent`, `followup_task` and `send_message`. All of them surface as `subAgentActivity {kind: "interacted"}`, but only `followup_task` (and a message to an agent that is still working) sets the agent working. **`send_message` to an agent that already answered only queues the message for its next turn: no child turn starts and the child thread sends nothing** (its rollout ends at the previous `task_complete`; reproduced live on 0.162.1: `spawn_agent` → `wait_agent` → `completed` → `send_message` → `interacted`, then silence). The driver opened a new stint on "interacted", and only the child's own turn end closes a stint, so that row could never close.
+
+ADOPTED: "interacted" never opens a stint. A working agent's row gets the "Follow-up input" note; new work opens the next stint at the child's own `turn/started` — the one signal that it is working again, and whose `turn/completed` closes what it opened. Test: `a_message_to_a_finished_agent_opens_no_stint_that_cannot_close` (the real order: spawn with a model, a message while working, both agents answer, `send_message` to the finished one, `followup_task` to the other, parent turn end, teardown with nothing to fail). Live, through the driver on 0.162.1: the `send_message` marker produced no row, and the stint closed `answered` with its finish line.
+
+### Codex: thinking reads as thinking (ADOPTED)
+
+Codex chats said "Working" through every reasoning step and "Thinking" only once a summary title arrived, which is when the step is already over (and never, for a model that sends no summary). Subagent rows read `thinking · 28 tools · 2334950 tokens`, words claude's rows never use. Now:
+
+- A reasoning `item/started` on the parent's current turn journals `ThinkingTokens {tokens: 0}` — "thinking, no estimate" — so the status line says "Thinking" while the model thinks, as it does for claude. The UI shows no token detail for 0. Live (gpt-6-astra): "Thinking" from the reasoning item's start, its title 4.6 s later; "Running tools" while it waited on its agent. (`reasoning_is_thinking_while_it_runs_and_names_its_section`; the vitest `reads a thinking signal with no estimate as plain thinking`.)
+- A subagent row's line uses the status line's words ("Working" at a turn start, "Thinking", "Writing", "Delegating") and, like codex's own status line, the newest section title of a finished reasoning summary ("Preparing recursive file listing"), held through further reasoning until a tool or reply replaces it. Counts use claude's spelling: "1 tool", "20.3k tokens". (`reasoning_section_titles_parse_only_a_leading_bold_line`.)
+
+Thought rows, their fold and the ThoughtRow's "Thinking"/"Thought" label were already shared by both agents and are unchanged.
+
+### Gemini CLI 0.64.0
+
+Gemini is out of the catalog: with 0.64.0 installed, the daemon's agent list is claude, codex, agy and grok, and Gemini session records stay readable only. Nothing to change.
+
+### Gate (Pass 43)
+
+`just chat-smoke` 29/29 on claude 2.1.300 + codex 0.162.1 (the suite prints no total cost), including `driver_codex_instant_steering_reads_during_a_response`, pending since the October refresh; `just chat-mods-smoke` 1/1. Pins: `TESTED_CLAUDE_VERSION = "2.1.300"`, `TESTED_CODEX_VERSION = "0.162.1"`.
