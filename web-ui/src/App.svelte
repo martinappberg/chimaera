@@ -7499,6 +7499,7 @@
   .new-split .row.new.quick-start {
     flex: 1;
     min-width: 0;
+    overflow: hidden;
     margin-top: 0;
     gap: 6px;
     color: var(--fg);
@@ -7512,7 +7513,11 @@
     opacity: 0.75;
   }
 
+  /* The agent's name gives way first when the rail is narrow (one ellipsis
+     before a second); the verb shrinks only once the name is gone, so the
+     narrowest rail still clips inside the button, never under the chevron. */
   .new-name {
+    flex: 0 1 auto;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -7521,6 +7526,7 @@
 
   /* What the main surface will spawn — quiet transparency, not chrome. */
   .new-default {
+    flex: 0 24 auto;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -7580,7 +7586,7 @@
   .wt-kept {
     display: flex;
     align-items: baseline;
-    gap: 0.4rem;
+    gap: 0.3rem;
     min-width: 0;
     padding: 2px 8px 4px;
     font-size: var(--text-xs);
@@ -7606,16 +7612,26 @@
     color: var(--fg);
   }
 
+  /* Two text buttons in the rail's own hover language (a tinted box, no
+     underline); the keyboard ring is the app-wide one. */
   .wt-kept-btn {
     flex: none;
     appearance: none;
     border: none;
     background: none;
-    padding: 0.05rem 0.2rem;
+    padding: 1px 5px;
     font: inherit;
     color: var(--muted);
     cursor: pointer;
-    border-radius: 3px;
+    border-radius: 4px;
+    transition:
+      color 0.12s ease,
+      background-color 0.12s ease;
+  }
+
+  /* The last box overhangs its padding so Keep ends on the rows' text edge. */
+  .wt-kept-btn:last-child {
+    margin-right: -5px;
   }
 
   .wt-kept-btn.strong {
@@ -7624,17 +7640,12 @@
 
   .wt-kept-btn:hover:not(:disabled) {
     color: var(--fg);
-    text-decoration: underline;
-    text-underline-offset: 2px;
+    background: var(--row-hover);
   }
 
   .wt-kept-btn:disabled {
     opacity: 0.5;
     cursor: default;
-  }
-
-  .wt-kept-btn:focus-visible {
-    outline: 1px solid var(--focus-ring);
   }
 
   /* The worktree choice is on: a tiny branch glyph after the agent name,

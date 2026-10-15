@@ -88,7 +88,7 @@
   .thought > summary:hover,
   .thought > summary:focus-visible {
     color: var(--fg);
-    background: color-mix(in srgb, var(--fg) 4%, transparent);
+    background: var(--hover-tint);
   }
   .thought > summary :global(.chev) {
     opacity: 0.55;

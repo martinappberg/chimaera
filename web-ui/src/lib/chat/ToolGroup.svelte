@@ -7,7 +7,7 @@
   import { subagentTitle } from "./subagentView";
   import ToolCallCard from "./ToolCallCard.svelte";
   import { isLive, spanLabel, toolGroupTitle, toolRunHealth, toolSpanMs, type TurnTail } from "./toolLabels";
-  import { liveClock } from "./liveClock.svelte";
+  import { liveClock } from "../shared/liveClock.svelte";
   import ModSite from "./ModSite.svelte";
   import type { ModsController } from "./mods.svelte";
   import { pageVisible } from "../shared/visibility";

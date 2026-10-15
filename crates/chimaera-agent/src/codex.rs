@@ -2208,6 +2208,7 @@ impl CodexMapper {
                     step.events.push(AgentEvent::Error {
                         message: msg.to_string(),
                         fatal: false,
+                        sign_in: false,
                     });
                 }
             }
@@ -2515,6 +2516,7 @@ impl CodexMapper {
                     step.events.push(AgentEvent::Error {
                         message: format!("turn/start failed: {}", err["message"]),
                         fatal: false,
+                        sign_in: false,
                     });
                     // A pending or refused model choice still owns its
                     // queued input; every promotion uses the same gates.
@@ -2604,6 +2606,7 @@ impl CodexMapper {
                     step.events.push(AgentEvent::Error {
                         message: format!("interrupt failed: {msg}"),
                         fatal: false,
+                        sign_in: false,
                     });
                 }
             }
@@ -2639,6 +2642,7 @@ impl CodexMapper {
                     step.events.push(AgentEvent::Error {
                         message: format!("mode change failed: {}", err["message"]),
                         fatal: false,
+                        sign_in: false,
                     });
                 }
             }
@@ -2667,7 +2671,7 @@ impl CodexMapper {
                             } else {
                                 format!("model change failed: {}", error["message"])
                             },
-                            fatal: false,
+                            fatal: false, sign_in: false,
                         });
                     }
                 } else {
@@ -2706,6 +2710,7 @@ impl CodexMapper {
                     step.events.push(AgentEvent::Error {
                         message: format!("effort change failed: {}", err["message"]),
                         fatal: false,
+                        sign_in: false,
                     });
                 }
             }
@@ -2716,6 +2721,7 @@ impl CodexMapper {
                 step.events.push(AgentEvent::Error {
                     message: format!("compact failed: {}", err["message"]),
                     fatal: false,
+                    sign_in: false,
                 });
             }
             (
@@ -4143,6 +4149,7 @@ impl CodexMapper {
         step.events.push(AgentEvent::Error {
             message: format!("steer failed: {msg}"),
             fatal: false,
+            sign_in: false,
         });
         true
     }
@@ -5264,6 +5271,7 @@ impl CodexMapper {
                         message: "Wait for the current model change before selecting another model"
                             .into(),
                         fatal: false,
+                        sign_in: false,
                     });
                     return step;
                 }
@@ -5277,7 +5285,7 @@ impl CodexMapper {
                         self.model_change_failed = true;
                         step.events.push(AgentEvent::Error {
                             message: "This Codex version cannot confirm custom model changes; update Codex or choose a listed model".into(),
-                            fatal: false,
+                            fatal: false, sign_in: false,
                         });
                     }
                 } else {
@@ -5324,6 +5332,7 @@ impl CodexMapper {
                     step.events.push(AgentEvent::Error {
                         message: "Wait for the model change before changing effort".into(),
                         fatal: false,
+                        sign_in: false,
                     });
                     return step;
                 }
@@ -5376,6 +5385,7 @@ impl CodexMapper {
                     step.events.push(AgentEvent::Error {
                         message: "Wait for the model change before changing mode".into(),
                         fatal: false,
+                        sign_in: false,
                     });
                     return step;
                 }
@@ -9994,7 +10004,7 @@ mod tests {
         }));
         assert!(matches!(
             &step.events[0],
-            AgentEvent::Error { fatal: false, message } if message.contains("not now")
+            AgentEvent::Error { fatal: false, message, sign_in: false } if message.contains("not now")
         ));
     }
 

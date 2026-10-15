@@ -38,6 +38,7 @@ async fn exercise(adapter: AcpAdapter, env: &str, args: &[&str]) {
             AgentEvent::Error {
                 message,
                 fatal: true,
+                ..
             } => panic!("startup: {message}"),
             _ => {}
         }
@@ -80,7 +81,7 @@ async fn exercise(adapter: AcpAdapter, env: &str, args: &[&str]) {
                 AgentEvent::TurnAborted { reason, .. }
                 | AgentEvent::Error {
                     message: reason,
-                    fatal: true,
+                    fatal: true, sign_in: false,
                 } => panic!("turn: {reason}"),
                 _ => {}
             }
@@ -127,6 +128,7 @@ async fn exercise(adapter: AcpAdapter, env: &str, args: &[&str]) {
             AgentEvent::Error {
                 message,
                 fatal: true,
+                ..
             } => panic!("resume: {message}"),
             _ => {}
         }
@@ -174,6 +176,7 @@ async fn until(
         if let AgentEvent::Error {
             message,
             fatal: true,
+            ..
         } = &entry.ev
         {
             panic!("{message}");

@@ -148,7 +148,7 @@
   .head {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 2px;
     min-width: 0;
   }
   .line {
@@ -179,7 +179,7 @@
   .line.expandable:hover,
   .line.expandable:focus-visible {
     color: var(--fg);
-    background: color-mix(in srgb, var(--fg) 4%, transparent);
+    background: var(--hover-tint);
   }
   .line:disabled {
     opacity: 1;
@@ -191,7 +191,7 @@
   /* Success is the expected outcome — it stays in the row's quiet voice;
      only a failure earns colour. */
   .ok .icon {
-    color: color-mix(in srgb, var(--accent) 55%, var(--muted));
+    color: var(--done-quiet);
   }
   .bad .icon,
   .bad .title {
@@ -217,23 +217,27 @@
   .stats::before {
     content: "· ";
   }
-  /* A quiet affordance: plain muted text, underlined only on hover. */
+  /* A quiet affordance: plain muted text that hovers like the line beside
+     it (the same box, radius and transition). */
   .output {
     flex: none;
-    padding: 0 4px;
+    padding: 2px 6px;
     background: none;
     border: none;
-    border-radius: 4px;
+    border-radius: 6px;
     color: color-mix(in srgb, var(--muted) 70%, transparent);
     font: inherit;
     font-size: var(--text-xs);
+    line-height: 1.4;
     cursor: pointer;
+    transition:
+      background-color 0.12s ease,
+      color 0.12s ease;
   }
   .output:hover,
   .output:focus-visible {
     color: var(--fg);
-    text-decoration: underline;
-    text-underline-offset: 2px;
+    background: var(--hover-tint);
   }
   .report {
     margin: 2px 0 8px 2px;

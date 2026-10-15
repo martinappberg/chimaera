@@ -52,7 +52,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
 ## Connections
 
 - **What & when.** The second segment lists configured MCP servers and installed hosted
-  connectors for Claude Code, Codex, Antigravity and Grok Build in the current workspace on this host.
+  connectors for Claude Code, Codex, Antigravity, Grok Build and Cursor CLI in the current workspace on this host.
   Plugins remains the default. Agent account login is outside this flow.
 - **How it's used.** Open Extensions → Connections. **Check again** refreshes the agents'
   reports. **Sign in** opens a dialog with a browser authorization link, progress,
@@ -761,11 +761,12 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   a bounded directory scan (200 skills per dir, 8 KiB of each `SKILL.md`) joined with the live
   catalog.
 
-### Antigravity and Grok Build
+### Antigravity, Grok Build and Cursor CLI
 
-Both are core agents in Plugins, Connections and Skills. Agent identity and action lists are
-open-ended on these reports; the UI never assumes an unknown agent is Codex. This does not
-add third-party agent registration to the current Wasm plugin API.
+Antigravity and Grok are core agents in Plugins, Connections and Skills; Cursor CLI in Plugins
+and Connections. Agent identity and action lists are open-ended on these reports; the UI never
+assumes an unknown agent is Codex. This does not add third-party agent registration to the
+current Wasm plugin API.
 
 - **Grok:** discovery uses `grok inspect --json`, including Claude-compatible add-ons that
   `grok plugin list` and `grok mcp list` omit. Project trust remains Grok's decision. Its
@@ -779,6 +780,19 @@ add third-party agent registration to the current Wasm plugin API.
   confirms it. User and project copies remain separate. Install/enable/disable use native
   CLI commands. **Command help** opens CLI help: `/plugins` is *not* a native menu in 1.2.14
   and must never be sent as a management prompt.
+- **Cursor CLI:** `cursor-agent mcp list` (one `<id>: <status>` line per server from
+  `.cursor/mcp.json` and `~/.cursor/mcp.json`; its words `ready`, `requires_authentication`,
+  `loading`, `disabled`, `not loaded (needs approval)` and `Error: …` — an error is "Couldn't
+  connect", never a sign-in prompt; a line that is none of these is skipped) is its Connections
+  report. A server that `requires_authentication` offers **Sign in** in a **local workspace
+  only**: `cursor-agent mcp login <name>` has no no-browser mode and waits for its OAuth callback
+  on a localhost port of the CLI's host, so it runs in a managed terminal (`login_connection`,
+  accepted only for a server the last report listed) and opens the browser itself; on a remote
+  or cluster workspace the row says *sign in on the host*. The CLI has no plugin inventory
+  (`cursor-agent plugin` manages marketplaces only) and no skills command, so the Plugins group
+  says so (without a gate or a prelude, nothing runs) and Skills lists no Cursor column; nothing
+  is derived from `.cursor/` by hand. Cursor's `mcp list` connects every server it knows, so its
+  probe takes the shared gate first with the whole budget rather than queueing last.
 - **Connections:** Antigravity's list covers CLI-managed connections, not every project or
   plugin server; the page says so. Grok combines its native MCP list with effective inspect
   results. Neither adapter fabricates OAuth status or a `mcp login` flow; Grok sign-in uses

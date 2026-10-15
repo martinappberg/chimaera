@@ -417,6 +417,7 @@ async fn report_startup_failure(
         .send(AgentEvent::Error {
             message,
             fatal: true,
+            sign_in: false,
         })
         .await;
     let _ = io.events.send(AgentEvent::Exited { status }).await;
