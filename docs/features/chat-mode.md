@@ -111,7 +111,10 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   independently enforces those image budgets plus 256 KiB of text, a 10 MiB pre-deserialization
   WebSocket envelope, and a per-session 32 MiB / 64-message aggregate across the manager channel
   and driver-held send queue. A refused command raises a visible, nonfatal notice; the socket stays
-  healthy.
+  healthy. No send carries a blank block: the composer never builds one, the daemon strips
+  whitespace-only text and image blocks without data at ingress and refuses a send left with
+  nothing (`AgentCommand::strip_empty_blocks`), and every driver skips one as a backstop (an agent
+  reads a blank block as a message that came through empty).
 - **Your pictures stay in your message.** At WebSocket ingress the daemon saves each sent image
   into the session's upload landing pad (`upload::save_send_images`: same per-session caps as OS
   drops, a client-supplied `path` is always discarded, a failed save never refuses the send) and

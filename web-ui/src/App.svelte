@@ -96,7 +96,7 @@
   } from "./lib/net/remoteReconnect";
   import { attachImageToComposer, insertIntoComposer } from "./lib/chat/composerBus";
   import { volatileChatDrafts } from "./lib/chat/drafts";
-  import { imageToAttachment } from "./lib/chat/images";
+  import { imageToAttachment, type ImageAttachment } from "./lib/chat/images";
   import {
     reportUploadError,
     setUploadPathInserter,
@@ -2010,15 +2010,15 @@
    * a newline, so nothing is ever submitted. If the session is open in a
    * pane, surface it so the typed reference is reviewable at a glance.
    */
-  function typeIntoSession(id: string, text: string): void {
+  function typeIntoSession(id: string, text: string, image?: ImageAttachment): void {
     // Chat sessions: the input is the mounted Composer, not a PTY socket.
     // insertIntoComposer buffers when the composer hasn't mounted yet (a chat
     // pane restored on a slow snapshot) and drains on registration, so the
-    // grant is never lost to a mount race.
+    // grant is never lost to a mount race. `image` (chat only) rides along.
     if (sessionsById.get(id)?.ui === "chat") {
       const loc = paneForTab(layout.root, { surface: "terminal", sessionId: id });
       if (loc !== null) layout = activateTab(layout, loc.paneId, loc.index);
-      insertIntoComposer(id, text);
+      insertIntoComposer(id, text, "inline", undefined, image);
       return;
     }
     if (!pool.sendText(id, text)) typeIntoDetachedSession(id, text);
@@ -2077,15 +2077,20 @@
       ).then((up) => typeIntoSession(targetId, composeSelectionReference(rel, sel, kind, up?.path ?? null)));
       return;
     }
+    const reference = composeSelectionReference(rel, sel, kind);
     if (crop !== undefined && kind === "chat") {
       // Chat sees the pixels as an attachment, through the same downscale
-      // and payload caps as a pasted screenshot.
+      // and payload caps as a pasted screenshot — delivered WITH the locator
+      // in one insert, so both land in the same composer and leave in the
+      // same message (a crop alone would reach the agent with no words).
       const label = sel.label;
       void imageToAttachment(crop).then((image) => {
-        if (image !== null) attachImageToComposer(targetId, label !== undefined ? { ...image, label } : image);
+        const attachment = image === null ? undefined : label !== undefined ? { ...image, label } : image;
+        typeIntoSession(targetId, reference, attachment);
       });
+      return;
     }
-    typeIntoSession(targetId, composeSelectionReference(rel, sel, kind));
+    typeIntoSession(targetId, reference);
   }
 
   /** Names each region image a terminal agent receives (`ref-1.png`, …);

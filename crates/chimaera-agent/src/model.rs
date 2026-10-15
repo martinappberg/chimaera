@@ -1067,6 +1067,17 @@ fn check_command_len(field: &str, actual: usize, max: usize) -> Result<(), Comma
 }
 
 impl AgentCommand {
+    /// Drop a send's blocks that carry nothing for the agent: whitespace-only
+    /// text and images without data. An agent reads an empty block as a
+    /// message that "came through empty", so no client's leftover may reach
+    /// one. Runs before [`Self::validate_ingress`], which then refuses a send
+    /// with nothing left.
+    pub fn strip_empty_blocks(&mut self) {
+        if let Some(blocks) = self.send_blocks_mut() {
+            blocks.retain(ContentBlock::has_content);
+        }
+    }
+
     /// Validate every client-controlled collection and string before this
     /// command enters the driver's bounded channel. WebSocket framing has its
     /// own earlier byte ceiling; this remains authoritative for programmatic
@@ -1080,6 +1091,11 @@ impl AgentCommand {
             | Self::SendAfterTurn { blocks }
             | Self::SendIfRunning { blocks, .. } => {
                 check_command_len("send blocks", blocks.len(), COMMAND_BLOCKS_MAX)?;
+                if !blocks.iter().any(ContentBlock::has_content) {
+                    return Err(CommandValidationError {
+                        message: "a send needs text or an image".into(),
+                    });
+                }
                 let mut images = 0usize;
                 let mut skills = 0usize;
                 let mut text_total = 0usize;
@@ -1310,6 +1326,18 @@ pub enum ContentBlock {
     },
 }
 
+impl ContentBlock {
+    /// Whether the block carries anything for the agent: non-blank text, an
+    /// image with data, or a skill invocation.
+    pub fn has_content(&self) -> bool {
+        match self {
+            Self::Text { text } => !text.trim().is_empty(),
+            Self::Image { data, .. } => !data.is_empty(),
+            Self::Skill { name, .. } => !name.is_empty(),
+        }
+    }
+}
+
 /// The text of a user message: its text blocks joined, non-text blocks dropped —
 /// the prompt string both drivers hand their child. Shared so the two `Send`
 /// handlers can't drift.
@@ -1317,7 +1345,7 @@ pub fn blocks_text(blocks: &[ContentBlock]) -> String {
     blocks
         .iter()
         .filter_map(|b| match b {
-            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -2061,6 +2089,64 @@ mod tests {
         assert!(
             serde_json::from_str::<AgentCommand>(r#"{"type":"prime_fork","blocks":[]}"#).is_err(),
             "removed internal commands must not become callable from the public WS wire"
+        );
+    }
+
+    /// A blank text block or an image without data never reaches an agent:
+    /// ingress strips them, and a send left with nothing is refused.
+    #[test]
+    fn blank_send_blocks_are_stripped_and_an_empty_send_refused() {
+        let image = |data: &str| ContentBlock::Image {
+            media_type: "image/png".into(),
+            data: data.into(),
+            path: None,
+        };
+        let mut cmd = AgentCommand::Send {
+            blocks: vec![
+                image("AAAA"),
+                ContentBlock::Text {
+                    text: " \n ".into(),
+                },
+                image(""),
+                ContentBlock::Text {
+                    text: "this region".into(),
+                },
+                ContentBlock::Text {
+                    text: String::new(),
+                },
+            ],
+        };
+        cmd.strip_empty_blocks();
+        assert_eq!(
+            cmd,
+            AgentCommand::Send {
+                blocks: vec![
+                    image("AAAA"),
+                    ContentBlock::Text {
+                        text: "this region".into()
+                    },
+                ],
+            }
+        );
+        assert!(cmd.validate_ingress().is_ok());
+
+        for blocks in [
+            vec![],
+            vec![ContentBlock::Text { text: "  ".into() }],
+            vec![image("")],
+        ] {
+            let mut cmd = AgentCommand::SendAfterTurn { blocks };
+            assert!(cmd.validate_ingress().is_err(), "unstripped: {cmd:?}");
+            cmd.strip_empty_blocks();
+            assert!(cmd.validate_ingress().is_err(), "stripped: {cmd:?}");
+        }
+        assert_eq!(
+            blocks_text(&[
+                ContentBlock::Text { text: "a".into() },
+                ContentBlock::Text { text: " ".into() },
+                ContentBlock::Text { text: "b".into() },
+            ]),
+            "a\nb"
         );
     }
 

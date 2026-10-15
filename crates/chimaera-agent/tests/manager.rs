@@ -1353,6 +1353,13 @@ async fn interrupt_recovers_a_hung_turn_via_watchdog() {
     );
 }
 
+/// The smallest send ingress accepts (an empty one is refused).
+fn tiny_send() -> AgentCommand {
+    AgentCommand::Send {
+        blocks: vec![ContentBlock::Text { text: "x".into() }],
+    }
+}
+
 #[tokio::test]
 async fn repeated_valid_sends_hit_the_shared_retained_queue_budget() {
     let fx = fixture();
@@ -1369,18 +1376,18 @@ async fn repeated_valid_sends_hit_the_shared_retained_queue_budget() {
     })
     .await;
 
-    // Empty sends are individually valid and consume essentially no payload
+    // One-character sends are individually valid and consume essentially no payload
     // bytes. They exercise the item dimension that prevents an authenticated
     // client growing either driver's pending VecDeque without bound.
     for _ in 0..RETAINED_SENDS_MAX {
         fx.manager
-            .command("s-budget", AgentCommand::Send { blocks: vec![] })
+            .command("s-budget", tiny_send())
             .await
             .expect("send within retained-item budget");
     }
     let err = fx
         .manager
-        .command("s-budget", AgentCommand::Send { blocks: vec![] })
+        .command("s-budget", tiny_send())
         .await
         .expect_err("one more retained send must be refused");
     assert!(

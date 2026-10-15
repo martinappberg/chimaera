@@ -1484,16 +1484,20 @@
       store.notice(`${agentName} does not support images in this chat. Your draft is kept.`, "error");
       return false;
     }
+    // Never a blank block: an agent reads one as a message that came through
+    // empty (the daemon strips them too, and refuses a send with nothing).
     const blocks: Record<string, unknown>[] = [];
-    if (text.length > 0) blocks.push({ type: "text", text });
+    if (text.trim().length > 0) blocks.push({ type: "text", text });
     // Codex exposes skills through `skills/list`; an exact `/skill-name`
     // token keeps the user's original prose AND adds the app-server's native
     // skill input block. Claude catalog entries have no skill_path and keep
     // riding its own slash-command text path.
     blocks.push(...skillBlocksForText(text, composerCommands));
     for (const img of images) {
+      if (img.data.length === 0) continue;
       blocks.push({ type: "image", media_type: img.media_type, data: img.data });
     }
+    if (blocks.length === 0) return false;
     return socket.send({ type: afterTurn ? "send_after_turn" : "send", blocks });
   }
 

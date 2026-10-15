@@ -3746,7 +3746,12 @@ impl ClaudeMapper {
         let content: Vec<Value> = blocks
             .iter()
             .filter_map(|b| match b {
-                ContentBlock::Text { text } => Some(json!({ "type": "text", "text": text })),
+                ContentBlock::Text { text } if !text.trim().is_empty() => {
+                    Some(json!({ "type": "text", "text": text }))
+                }
+                // A blank block reads to the agent as a message that came
+                // through empty (ingress strips them; this is the backstop).
+                ContentBlock::Text { .. } => None,
                 ContentBlock::Image {
                     media_type, data, ..
                 } => Some(json!({
