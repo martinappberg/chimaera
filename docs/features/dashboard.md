@@ -188,8 +188,10 @@ mode). **Recents** show only in the blank state ("pick up where you left off", c
 old "last active" jump is the `↳` mark on the Now line. The last line of the surface is the
 workspace's **activity** for the last seven days (`ActivityLine.svelte`: "This week: 38 sessions ·
 1.2M tokens", opening Settings → Activity) — [session-history.md](session-history.md#activity). A
-card whose session wrote a file another live session also wrote carries a small warn-toned notice
-("qc.py also edited by 'fix normalization' · 3 min ago"), which opens that session.
+card whose session wrote a file another live session also wrote, recently or in its running turn,
+carries a small warn-toned notice ("qc.py also edited by 'fix normalization' · 3 min ago"), which
+opens that session; it ages out with the write, exactly like the chat's
+([session-history.md](session-history.md#two-sessions-one-file)).
 
 ## The Mastermind panel
 

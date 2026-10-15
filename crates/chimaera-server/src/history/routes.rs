@@ -313,8 +313,9 @@ pub(crate) async fn session_edits(
 }
 
 /// GET /workspaces/{id}/same-file — every pair of LIVE agent sessions here
-/// that wrote the same file, with when the other one wrote it (the chat's
-/// notice line and the dashboard card read it; nothing locks).
+/// that wrote the same file while the other one's write is still current
+/// (recent, or in its running turn: `active`), with when it wrote it (the
+/// chat's notice line and the dashboard card read it; nothing locks).
 pub(crate) async fn same_file(
     State(state): State<Arc<AppState>>,
     AxPath(id): AxPath<String>,
@@ -324,8 +325,9 @@ pub(crate) async fn same_file(
     }
     let pairs: Vec<serde_json::Value> = super::same_file_pairs(&state, &id)
         .into_iter()
-        .map(|(session, other, path, at)| {
-            json!({"session": session, "other": other, "path": path, "at": at})
+        .map(|p| {
+            json!({"session": p.session, "other": p.other, "path": p.path, "at": p.at,
+                   "active": p.active})
         })
         .collect();
     Json(json!({"pairs": pairs})).into_response()

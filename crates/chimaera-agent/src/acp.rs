@@ -621,6 +621,9 @@ impl AcpMapper {
         let mut prompt: Vec<Value> = item
             .blocks
             .iter()
+            // A blank block reads to the agent as a message that came through
+            // empty (ingress strips them; this is the backstop).
+            .filter(|b| b.has_content())
             .map(|b| match b {
                 ContentBlock::Text { text } => json!({"type":"text","text":text}),
                 ContentBlock::Image {
