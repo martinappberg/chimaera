@@ -237,7 +237,8 @@ pub enum AgentEvent {
     },
     /// Live thinking-token estimate (claude system/thinking_tokens) — the
     /// "thinking · ~N tokens" status signal; fires even when the thinking
-    /// display is summarized and no thought text streams.
+    /// display is summarized and no thought text streams. `0` is "thinking,
+    /// no estimate" (codex: a reasoning item started).
     ThinkingTokens {
         tokens: u64,
     },
