@@ -32,21 +32,21 @@
   --notice-stack-offset: 140px;
   /* Single focus treatment for every keyboard-focusable control. */
   --focus-ring: color-mix(in srgb, var(--accent) 70%, transparent);
-  --bg: #f9f8f5;
-  --fg: #232320;
-  --muted: #625f58;
+  --bg: #fbfbfc;
+  --fg: #1d1d20;
+  --muted: #65656d;
   --accent: #2e9e6b;
   --err: #cc4444;
   --warn: #a5730d; /* agent needs_permission / idle_prompt dot */
   --rate: #8a68c0; /* agent rate_limited dot */
-  --rail-bg: #f2f1ed;
-  --row-hover: #ebe9e4;
-  --row-active: #e3e1db;
-  --term-selection: #23232026;
-  --term-bg: #fdfcfa;
+  --rail-bg: #f3f3f5;
+  --row-hover: #ececef;
+  --row-active: #e4e4e9;
+  --term-selection: #1d1d2026;
+  --term-bg: #ffffff;
   --scrim: rgba(0, 0, 0, 0.25);
   --overlay-bg: #ffffff;
-  --edge: #e4e2dc;
+  --edge: #e3e3e7;
   /* Syntax accents for the read-only code view (CodeMirror), muted to match
      the terminal's ANSI palette. */
   --syn-keyword: #9a4fa8;
@@ -55,7 +55,7 @@
   --syn-number: #a05e2a;
   --syn-type: #2f7a9b;
   --syn-func: #3e6fc0;
-  --syn-def: #232320;
+  --syn-def: #1d1d20;
   --syn-prop: #705aa8;
   /* File-type glyph tints (icons.ts categories), muted so the set reads as
      one quiet family rather than a rainbow — a hair more saturated in dark. */
@@ -82,33 +82,33 @@
 :root[data-theme="dark"] {
   /* Fallback only — the live palette comes inline from settings/themes.ts. */
   color-scheme: dark;
-  --bg: #1c1c1a;
-  --fg: #ecebe6;
-  --muted: #a6a49c;
+  --bg: #17171c;
+  --fg: #e7e7ea;
+  --muted: #9a9aa6;
   --accent: #3fbf85;
   --err: #d96b6b;
   --warn: #d0a355;
   --rate: #a58fd6;
-  --rail-bg: #1f1f1d;
-  --row-hover: #2a2a27;
-  --row-active: #33332f;
-  --term-selection: #ecebe633;
-  --term-bg: #161615;
+  --rail-bg: #1c1c23;
+  --row-hover: #25252d;
+  --row-active: #2d2d36;
+  --term-selection: #e7e7ea33;
+  --term-bg: #121218;
   --scrim: rgba(0, 0, 0, 0.5);
-  --overlay-bg: #242422;
-  --edge: #34342f;
+  --overlay-bg: #202028;
+  --edge: #31313b;
   --syn-keyword: #c586d6;
   --syn-string: #7cc99a;
   --syn-comment: #7d7e89;
   --syn-number: #d0a355;
   --syn-type: #6fb3d2;
   --syn-func: #82a7e8;
-  --syn-def: #ecebe6;
+  --syn-def: #e7e7ea;
   --syn-prop: #a58fd6;
   --ficon-generic: #8b8b95;
   --ficon-lang: #6f9ae4;
   --ficon-data: #58c39c;
-  --ficon-doc: #a6a49c;
+  --ficon-doc: #9a9aa6;
   --ficon-media: #d8a45c;
   --ficon-archive: #c39a63;
   --ficon-config: #9a9ab0;

@@ -20,8 +20,10 @@
  * variants, >= 3.8:1 for comments, which must stay visibly dimmer than code).
  * Where a canonical tone missed the floor, its OKLab lightness was moved just
  * far enough to pass with the hue and chroma untouched, so each theme still
- * reads unmistakably as itself. Nord is kept exactly canonical — its softness
- * is the point, and the terminal's minimumContrastRatio floor backstops it.
+ * reads unmistakably as itself. themes.contrast.test.ts enforces the floors
+ * (2026-10-15: Nord joined the contract — muted, err, magenta and comment
+ * lifted; its selection surfaces stepped down to nord1/nord2 so secondary
+ * text holds 4:1 on a selected row).
  */
 
 /** Every themable CSS custom property; each theme must define them all. */
@@ -101,28 +103,28 @@ const chimaeraLight: ThemeDef = {
   label: "Chimaera Light",
   kind: "light",
   tokens: {
-    "--bg": "#f9f8f5",
-    "--fg": "#232320",
-    "--muted": "#625f58", // holds 4.5:1 even on --row-active
-    "--accent": "#2e9e6b",
+    "--bg": "#fbfbfc",
+    "--fg": "#1d1d20",
+    "--muted": "#65656d", // holds 4.5:1 even on --row-active
+    "--accent": "#1f8757", // link + "allowed" text: floored from #2e9e6b (3.4:1)
     "--err": "#cc4444",
-    "--warn": "#a5730d", // renders as note TEXT, not just a dot — 4.0:1 floor
-    "--rate": "#8a68c0",
-    "--rail-bg": "#f2f1ed",
-    "--row-hover": "#ebe9e4",
-    "--row-active": "#e3e1db",
-    "--term-selection": "#23232026",
-    "--term-bg": "#fdfcfa",
+    "--warn": "#9d6d0e", // renders as note TEXT, not just a dot
+    "--rate": "#8765bd",
+    "--rail-bg": "#f3f3f5",
+    "--row-hover": "#ececef",
+    "--row-active": "#e4e4e9",
+    "--term-selection": "#1d1d2026",
+    "--term-bg": "#ffffff",
     "--scrim": "rgba(0, 0, 0, 0.25)",
     "--overlay-bg": "#ffffff",
-    "--edge": "#e4e2dc",
+    "--edge": "#e3e3e7",
     "--syn-keyword": "#9a4fa8",
     "--syn-string": "#2b8654",
     "--syn-comment": "#80808a",
     "--syn-number": "#a05e2a",
     "--syn-type": "#2f7a9b",
     "--syn-func": "#3e6fc0",
-    "--syn-def": "#232320",
+    "--syn-def": "#1d1d20",
     "--syn-prop": "#705aa8",
     "--ficon-generic": "#7c7c85",
     "--ficon-lang": "#4a76c4",
@@ -159,43 +161,43 @@ const chimaeraLight: ThemeDef = {
 };
 
 // --- Chimaera Dark (original default; values mirror app.css dark block) -----
-// 2026-07-07 softening pass lifted the neutral stack a step off void-black;
-// 2026-10-15 readability pass turned both chimaera stacks WARM (ivory on
-// charcoal, like a printed page) — same contrast as the cool greys, read as
-// softer. Identity — neutral surfaces, green accent — unchanged.
+// 2026-07-07 softening pass: the neutral stack lifted a step and given a cool
+// undertone (void-black read as harsh next to the softer themes), muted and
+// comments brightened to keep their ratios on the lighter sheets. Identity —
+// neutral surfaces, green accent — unchanged.
 
 const chimaeraDark: ThemeDef = {
   id: "chimaera-dark",
   label: "Chimaera Dark",
   kind: "dark",
   tokens: {
-    "--bg": "#1c1c1a",
-    "--fg": "#ecebe6",
-    "--muted": "#a6a49c",
+    "--bg": "#17171c",
+    "--fg": "#e7e7ea",
+    "--muted": "#9a9aa6",
     "--accent": "#3fbf85",
     "--err": "#d96b6b",
     "--warn": "#d0a355",
     "--rate": "#a58fd6",
-    "--rail-bg": "#1f1f1d",
-    "--row-hover": "#2a2a27",
-    "--row-active": "#33332f",
-    "--term-selection": "#ecebe633",
-    "--term-bg": "#161615",
+    "--rail-bg": "#1c1c23",
+    "--row-hover": "#25252d",
+    "--row-active": "#2d2d36",
+    "--term-selection": "#e7e7ea33",
+    "--term-bg": "#121218",
     "--scrim": "rgba(0, 0, 0, 0.5)",
-    "--overlay-bg": "#242422",
-    "--edge": "#34342f",
+    "--overlay-bg": "#202028",
+    "--edge": "#31313b",
     "--syn-keyword": "#c586d6",
     "--syn-string": "#7cc99a",
     "--syn-comment": "#7d7e89",
     "--syn-number": "#d0a355",
     "--syn-type": "#6fb3d2",
     "--syn-func": "#82a7e8",
-    "--syn-def": "#ecebe6",
+    "--syn-def": "#e7e7ea",
     "--syn-prop": "#a58fd6",
     "--ficon-generic": "#8b8b95",
     "--ficon-lang": "#6f9ae4",
     "--ficon-data": "#58c39c",
-    "--ficon-doc": "#a6a49c",
+    "--ficon-doc": "#9a9aa6",
     "--ficon-media": "#d8a45c",
     "--ficon-archive": "#c39a63",
     "--ficon-config": "#9a9ab0",
@@ -232,14 +234,14 @@ const nord: ThemeDef = {
   tokens: {
     "--bg": "#323947", // between panes (nord0) and rail
     "--fg": "#d8dee9", // nord4
-    "--muted": "#8792a8", // lightened nord3 for legible secondary text
+    "--muted": "#9faac1", // nord3 lifted to hold 4.5 on every sheet, 4:1 on a selected row
     "--accent": "#88c0d0", // nord8, the signature frost cyan
-    "--err": "#bf616a", // nord11
+    "--err": "#e17f87", // nord11 lifted (canonical #bf616a is 3.1:1 as text)
     "--warn": "#ebcb8b", // nord13
-    "--rate": "#b48ead", // nord15
+    "--rate": "#b690af", // nord15
     "--rail-bg": "#373f4f",
-    "--row-hover": "#414b5e",
-    "--row-active": "#4a566c",
+    "--row-hover": "#3b4252", // nord1
+    "--row-active": "#3e4657", // between nord1 and nord2: muted must hold on it
     "--term-selection": "#d8dee930",
     "--term-bg": "#2e3440", // nord0, the canonical editor bg
     "--scrim": "rgba(0, 0, 0, 0.45)",
@@ -247,13 +249,13 @@ const nord: ThemeDef = {
     "--edge": "#434c5e", // nord2
     "--syn-keyword": "#81a1c1", // nord9
     "--syn-string": "#a3be8c", // nord14
-    "--syn-comment": "#616e88", // the community's brightened comment tone
-    "--syn-number": "#b48ead", // nord15
+    "--syn-comment": "#818faa", // the community tone (#616e88) lifted to the 3.8 floor
+    "--syn-number": "#b690af", // nord15
     "--syn-type": "#8fbcbb", // nord7
     "--syn-func": "#88c0d0", // nord8
     "--syn-def": "#d8dee9",
     "--syn-prop": "#81a1c1",
-    "--ficon-generic": "#8792a8",
+    "--ficon-generic": "#9faac1",
     "--ficon-lang": "#81a1c1",
     "--ficon-data": "#8fbcbb",
     "--ficon-doc": "#9aa5ba",
@@ -268,19 +270,19 @@ const nord: ThemeDef = {
   // contrast floor would repaint it anyway).
   ansi: {
     black: "#3b4252",
-    red: "#bf616a",
+    red: "#e17f87",
     green: "#a3be8c",
     yellow: "#ebcb8b",
     blue: "#81a1c1",
-    magenta: "#b48ead",
+    magenta: "#b690af",
     cyan: "#88c0d0",
     white: "#e5e9f0",
-    brightBlack: "#616e88",
-    brightRed: "#bf616a",
+    brightBlack: "#7d889e",
+    brightRed: "#e17f87",
     brightGreen: "#a3be8c",
     brightYellow: "#ebcb8b",
     brightBlue: "#81a1c1",
-    brightMagenta: "#b48ead",
+    brightMagenta: "#b690af",
     brightCyan: "#8fbcbb",
     brightWhite: "#eceff4",
   },
@@ -363,9 +365,9 @@ const solarizedLight: ThemeDef = {
     "--bg": "#f6efdb", // between base3 panes and base2 rail
     "--fg": "#073642", // base02 — base01 hovers at the 4.5 line on the rail
     "--muted": "#495f66", // base01 deepened to hold 4.5 on selected rows
-    "--accent": "#6b7d00", // solarized green, floored
+    "--accent": "#687906", // solarized green, floored
     "--err": "#d02425",
-    "--warn": "#986e00",
+    "--warn": "#926a05",
     "--rate": "#6569bc", // violet
     "--rail-bg": "#eee8d5", // base2
     "--row-hover": "#e5ddc4",
@@ -431,7 +433,7 @@ const rosePineDawn: ThemeDef = {
     "--muted": "#5f5a78", // subtle deepened to hold 4.5 on selected rows
     "--accent": "#286983", // pine
     "--err": "#a7586f", // love
-    "--warn": "#b06700", // gold
+    "--warn": "#a86304", // gold
     "--rate": "#806b99", // iris
     "--rail-bg": "#f2e9e1", // overlay
     "--row-hover": "#eadfd5",
@@ -494,9 +496,9 @@ const catppuccinLatte: ThemeDef = {
     "--bg": "#e6e9ef", // mantle
     "--fg": "#4c4f69", // text
     "--muted": "#555870", // subtext1, floored for selections
-    "--accent": "#1e66f5", // blue
+    "--accent": "#1b63f1", // blue
     "--err": "#cf0837", // red, floored
-    "--warn": "#ab5d00", // yellow, floored
+    "--warn": "#a55b07", // yellow, floored
     "--rate": "#8839ef", // mauve
     "--rail-bg": "#dce0e8", // crust
     "--row-hover": "#d3d8e2",
@@ -511,7 +513,7 @@ const catppuccinLatte: ThemeDef = {
     "--syn-comment": "#76798c", // overlay2
     "--syn-number": "#ce3400", // peach
     "--syn-type": "#a75a00", // yellow
-    "--syn-func": "#1e66f5", // blue
+    "--syn-func": "#1b63f1", // blue
     "--syn-def": "#4c4f69",
     "--syn-prop": "#5363d6", // lavender
     "--ficon-generic": "#76798c",
