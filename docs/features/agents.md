@@ -169,7 +169,16 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   workspace host, and one small flow signs it in — from the agent's card in Settings → Agents,
   from the launcher row (a signed-out agent reads *not signed in* with a **sign in** chip), and
   in a chat that could not start because the agent is signed out, where the card replaces the
-  raw error and the chat starts itself once the login lands.
+  raw error and the chat starts itself once the login lands, and at the tail of a live chat whose
+  CLI turns out to be signed out — Codex's app-server starts without a login and fails only at the
+  first turn (`401 Unauthorized`), so an auth-shaped turn error re-asks the status command and,
+  when it says signed out, the card appears there, and its composer stays closed ("sign in to
+  Codex first") so no turn runs into a 401. A sign-in that lands — from any card, Settings or
+  another window — relaunches every chat of that agent that waited on it: the ones that died at
+  startup for want of a login and the live ones started while the CLI said signed out (their
+  process never reloads credentials). Same session id, a second life in the same journal; a
+  conversation that had a prompt resumes by its native id, one that had none starts fresh (Cursor
+  refuses to load an empty session). A chat mid-task is left alone.
 - **How it's used.** Click **Sign in**. The card shows the page to open (**Open ↗** goes
   through the native shell's browser opener, so it works for a daemon on another host;
   **Copy link** for a browser elsewhere), a device code to enter on that page when the CLI's
@@ -201,10 +210,13 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   `DELETE …/sign-in/{operation}` (cancel, generation-scoped), `POST …/sign-in/{operation}/code
   {code}` (the pasted code, for a login that reads one). A relaunch after a failed startup is
   `POST /sessions/{id}/view {ui: "chat"}` on the dead chat, for every agent (a surface switch
-  stays Claude/Codex-only).
+  stays Claude/Codex-only); `{ui: "chat", relaunch: true}` does the same for a live chat.
 - **Key behaviors.** The verdict is cached on the catalog for 10 minutes and re-asked on a
   sign-in's end, on `?check=true`/`?refresh=true`, on a changed executable, and after any chat
-  startup failure (so the row and card say *not signed in* when that is why). The login runs
+  startup failure (so the row and card say *not signed in* when that is why). A startup failure
+  whose words are a missing login, or a chat started while the status said signed out, marks the
+  session as waiting on a sign-in (`AgentRecord.signed_out_at_start`); a landed sign-in relaunches
+  those (`chat::relaunch_after_sign_in`, at most 8) and clears the mark. The login runs
   as its own process group with a 10-minute deadline, output private to the daemon (64 KiB;
   only the URL, the code and a short failure tail reach the wire), no session or PTY entry;
   cancel is SIGTERM then SIGKILL to the group. A clean exit is never success by itself — the

@@ -232,6 +232,10 @@ pub(crate) struct AgentRecord {
     /// view switch, which respawns the process but keeps the record and the
     /// conversation — must not repeat it. Never true off-cluster.
     pub(crate) compute_ctx_delivered: bool,
+    /// The process was started while its CLI reported no login, or died at
+    /// startup for want of one: a sign-in landing later relaunches it in
+    /// place (`chat::relaunch_after_sign_in`). Cleared by that relaunch.
+    pub(crate) signed_out_at_start: bool,
     /// Live subagents (SubagentStart/Stop hooks), capped at
     /// [`SUBAGENTS_CAP`]; cleared when the turn ends (Stop) or the session
     /// exits (the record dies with it).
@@ -329,6 +333,7 @@ impl AgentRecord {
             resumed_from: None,
             files_touched: Vec::new(),
             compute_ctx_delivered: false,
+            signed_out_at_start: false,
             subagents: Vec::new(),
             now_line: None,
             usage: None,

@@ -16,6 +16,7 @@
   } from "./paths";
   import { agentCatalog, listAgents } from "../workspace/launcher";
   import { getSignIn, needsSignIn } from "../workspace/agentSignIn";
+  import { looksLikeAuthFailure } from "./authFailure";
   import AgentSignInCard from "../workspace/AgentSignInCard.svelte";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import BranchChip from "../shared/BranchChip.svelte";
@@ -255,16 +256,32 @@
   // stale "signed out" re-asks too, so the launcher row comes right.
   const catalogAgent = $derived($agentCatalog.find((a) => a.id === agentKind) ?? null);
   const signInNeeded = $derived(!readOnly && needsSignIn(catalogAgent));
+  // The newest error the agent reported that reads like a missing login: a
+  // process that started signed out (codex's app-server does) fails only at
+  // its first turn, so the status is re-asked on it.
+  const authShapedError = $derived.by(() => {
+    for (let i = store.blocks.length - 1; i >= 0 && i >= store.blocks.length - 12; i--) {
+      const b = store.blocks[i];
+      if (b.kind === "notice" && b.tone === "error" && looksLikeAuthFailure(b.text)) return `${b.uid}`;
+    }
+    return null;
+  });
   let signInAsked: string | null = null;
   $effect(() => {
     const failure = store.fatalError;
     if (readOnly || catalogAgent === null || !catalogAgent.installed) return;
-    const stale = (failure !== null && catalogAgent.signedIn !== false) || (store.initialized && catalogAgent.signedIn === false);
-    const key = failure ?? (store.initialized ? "init" : null);
+    const stale = (failure !== null && catalogAgent.signedIn !== false)
+      || (authShapedError !== null && !store.running && catalogAgent.signedIn !== false)
+      || (store.initialized && authShapedError === null && catalogAgent.signedIn === false);
+    const key = failure ?? authShapedError ?? (store.initialized ? "init" : null);
     if (!stale || key === null || signInAsked === key) return;
     signInAsked = key;
     void getSignIn(agentKind, true).catch(() => {});
   });
+  /** A live, idle chat whose CLI says it is signed out: the card sits at the
+   *  transcript's tail; signing in relaunches the chat in place, resuming
+   *  the conversation. */
+  const liveSignIn = $derived(signInNeeded && store.initialized && store.exited === null && store.fatalError === null && !store.running && !store.degraded);
   void listAgents().then((agents) => {
     const info = agents.find((a) => a.id === agentKind);
     models = info?.models ?? [];
@@ -2590,7 +2607,7 @@
   /** Nothing to type into (and so nothing to quote into): a read-only
    *  subagent view, or a session that ended, degraded or failed. */
   const composerDisabled = $derived(
-    readOnly || store.exited !== null || store.degraded || store.fatalError !== null,
+    readOnly || store.exited !== null || store.degraded || store.fatalError !== null || liveSignIn,
   );
   const incompatibleRuntime = $derived(/GLIBC_[\d.]+[^\n]*not found/.test(store.fatalError ?? ""));
 
@@ -2786,7 +2803,7 @@
     {:else if store.exited === null && !store.fatalError && (!store.initialized || store.blocks.length === 0)}
       <div class="empty" role="status">
         <SessionGlyph kind="agent" {agentKind} size={18} />
-        <span>{!store.connected ? `connecting to ${agentName}…` : store.initialized ? `${agentName} is ready` : `starting ${agentName}…`}</span>
+        <span>{!store.connected ? `connecting to ${agentName}…` : store.initialized ? (liveSignIn ? `${agentName} is waiting for a sign-in` : `${agentName} is ready`) : `starting ${agentName}…`}</span>
         {#if store.connected && !store.initialized && store.startupDetail}
           <span class="startup-detail">{store.startupDetail}</span>
         {/if}
@@ -3055,8 +3072,9 @@
         {@const hook = item.block.tone === "info" ? hookNotice(item.block.text) : null}
         {#if hook}
           <HookRow said={hook} sourceIndex={item.index} sourceUid={item.block.uid} />
-        {:else if item.block.text !== store.fatalError}
-        <!-- The failure a fatal banner is showing is not repeated as a line. -->
+        {:else if item.block.text !== store.fatalError && !(signInNeeded && item.block.tone === "error" && looksLikeAuthFailure(item.block.text))}
+        <!-- The failure a fatal banner is showing is not repeated as a line,
+             and a login's refusal is the sign-in card, not raw 401 text. -->
         <div
           class="notice"
           class:error={item.block.tone === "error"}
@@ -3163,6 +3181,11 @@
       </div>
     {/if}
 
+    {#if liveSignIn && catalogAgent !== null}
+      <div class="live-signin">
+        <AgentSignInCard agent={catalogAgent} workspaceId={session.workspace_id ?? null} framed onSignedIn={onRelaunch} />
+      </div>
+    {/if}
     {#if store.fatalError !== null && signInNeeded}
       <!-- The startup failed because the CLI is signed out: the card is the
            whole story, the raw error stays in the journal. -->
@@ -3416,6 +3439,7 @@
     view={quoteOwner}
     running={agentBusy}
     disabled={composerDisabled}
+    disabledHint={liveSignIn ? `sign in to ${agentName} first` : null}
     slashCommands={composerCommands}
     workspaceId={session.workspace_id ?? null}
     {terminals}
@@ -3754,6 +3778,9 @@
     font-size: var(--text-sm);
     text-align: center;
     padding: 6px 0;
+  }
+  .live-signin {
+    padding: 12px 0 4px;
   }
   .notice.error {
     color: var(--err);

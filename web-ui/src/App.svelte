@@ -4601,8 +4601,8 @@
     adjustFont(paneId, delta) {
       adjustFont(paneId, delta);
     },
-    switchView(sessionId, target) {
-      void switchView(sessionId, target);
+    switchView(sessionId, target, relaunch) {
+      void switchView(sessionId, target, relaunch === true);
     },
     detachTabToWindow(paneId, index) {
       const p = findPane(layout.root, paneId);
@@ -4707,12 +4707,12 @@
    * reads as pending via the `switchingViews` store meanwhile. The server's own
    * concurrent-switch 409 (without `busy`) is the backstop, dropped silently.
    */
-  async function switchView(sessionId: string, target: "chat" | "term"): Promise<void> {
+  async function switchView(sessionId: string, target: "chat" | "term", relaunch = false): Promise<void> {
     if (get(switchingViews).has(sessionId)) return;
     switchingViews.update((s) => new Set(s).add(sessionId));
     try {
       try {
-        await switchSessionView(sessionId, target, false);
+        await switchSessionView(sessionId, target, false, relaunch);
       } catch (e) {
         // A concurrent switch already owns this id (409 without busy): the
         // duplicate is a no-op, no toast, no confirm.
@@ -4723,7 +4723,7 @@
         }
         if (!(await askForcedSwitch(sessionId, target))) return;
         try {
-          await switchSessionView(sessionId, target, true);
+          await switchSessionView(sessionId, target, true, relaunch);
         } catch (err) {
           console.error("forced view switch failed", err);
           return;

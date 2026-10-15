@@ -742,8 +742,13 @@ async fn handle_chat_exit(state: &Arc<AppState>, id: &str, exit: DriverExit) {
             if let Some(recipe) = recipe {
                 crate::lock(&state.chat_recipes).insert(id.to_string(), recipe);
             }
+            let auth = crate::agent_auth::auth_shaped(&reason)
+                || crate::agent_auth::auth_shaped(&stderr_tail);
             let kind = crate::lock(&state.agents).get_mut(id).map(|record| {
                 record.state = AgentState::Errored;
+                if auth {
+                    record.signed_out_at_start = true;
+                }
                 record.kind
             });
             // A signed-out CLI is the common startup failure: re-ask its
@@ -1368,6 +1373,11 @@ pub(crate) struct SwitchView {
     ui: String,
     #[serde(default)]
     force: bool,
+    /// Respawn the chat in place even though it is already a live chat —
+    /// after a sign-in landed for a process that started signed out. The
+    /// conversation resumes by its native id.
+    #[serde(default)]
+    relaunch: bool,
 }
 
 /// POST /api/v1/sessions/{id}/view — switch a session between the chat and
@@ -1392,12 +1402,14 @@ pub(crate) async fn switch_view(
         return err(StatusCode::NOT_FOUND, format!("unknown session {id}"));
     }
     let target_chat = body.ui == "chat";
-    if target_chat == currently_chat && (currently_chat || pty_alive) {
+    // A dead chat asked for chat again, or a live one asked to relaunch, is a
+    // respawn in place (the sign-in card's "start again"), not a surface
+    // switch: every agent gets it.
+    let relaunch =
+        target_chat && ((!currently_chat && !pty_alive) || (currently_chat && body.relaunch));
+    if target_chat == currently_chat && (currently_chat || pty_alive) && !relaunch {
         return StatusCode::NO_CONTENT.into_response();
     }
-    // A dead chat asked for chat again is a relaunch in place (the sign-in
-    // card's "start again"), not a surface switch: every agent gets it.
-    let relaunch = target_chat && !currently_chat && !pty_alive;
 
     let Some(record) = crate::lock(&state.agents).get(&id).cloned() else {
         return err(
@@ -1474,6 +1486,11 @@ pub(crate) async fn switch_view(
                     .get(&id)
                     .and_then(|r| r.resume.clone())
             })
+            // A relaunch of a conversation that never had a prompt starts
+            // fresh under the same id: Cursor's `session/load` of an empty
+            // session answers "Invalid params" (seen live), and there is
+            // nothing to resume anyway.
+            .filter(|_| !relaunch || record.first_prompt.is_some())
     } else {
         terminal_resume_handle(&record)
     };
@@ -1527,6 +1544,48 @@ pub(crate) async fn switch_view(
         }
         Err(msg) => err(StatusCode::INTERNAL_SERVER_ERROR, msg),
     }
+}
+
+/// A sign-in landed for `kind`: start every chat of it that waited on a
+/// login again, in place — the ones that died at startup for want of one and
+/// the live ones started while the CLI said signed out (their process never
+/// reloads credentials). The same respawn as the view route's `relaunch`;
+/// a chat mid-task (409) is left alone. Bounded: at most 8 per sign-in.
+pub(crate) async fn relaunch_after_sign_in(state: Arc<AppState>, kind: AgentKind) -> usize {
+    let waiting: Vec<String> = crate::lock(&state.agents)
+        .iter()
+        .filter(|(_, r)| r.kind == kind && r.signed_out_at_start)
+        .map(|(id, _)| id.clone())
+        .take(8)
+        .collect();
+    let mut relaunched = 0;
+    for id in waiting {
+        // Only a chat the registry still knows (dead or alive); a retired one
+        // has nothing to start.
+        if state.chat.get(&id).is_none() {
+            continue;
+        }
+        let response = switch_view(
+            State(state.clone()),
+            Path(id.clone()),
+            Json(SwitchView {
+                ui: "chat".into(),
+                force: false,
+                relaunch: true,
+            }),
+        )
+        .await;
+        if response.status().is_success() {
+            if let Some(record) = crate::lock(&state.agents).get_mut(&id) {
+                record.signed_out_at_start = false;
+            }
+            tracing::info!(%id, kind = kind.as_str(), "chat relaunched after sign-in");
+            relaunched += 1;
+        } else {
+            tracing::info!(%id, status = %response.status(), "chat not relaunched after sign-in");
+        }
+    }
+    relaunched
 }
 
 /// Resume identity for a TUI→chat switch. A live hook-derived transcript is
@@ -3091,6 +3150,9 @@ pub(crate) async fn spawn_fresh_chat_at(
     };
 
     let mut record = crate::agents::AgentRecord::new(key, spec.kind);
+    // Started while the CLI says signed out (codex's app-server starts anyway
+    // and 401s at the first turn): the sign-in that lands later relaunches it.
+    record.signed_out_at_start = crate::agent_auth::cached_verdict(state, spec.kind) == Some(false);
     if is_fork {
         // A branch now opens quietly: the driver is alive but no turn has
         // started, so "finished" is the honest idle state (not "starting").

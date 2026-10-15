@@ -288,6 +288,39 @@ pub(crate) async fn status(
     signed_in
 }
 
+/// The cached verdict, never a probe (a spawn must not wait on one).
+pub(crate) fn cached_verdict(state: &AppState, kind: AgentKind) -> Option<bool> {
+    lock(&state.agent_auth.status)
+        .get(&kind)
+        .filter(|s| s.checked_at.elapsed() < STATUS_TTL)
+        .and_then(|s| s.signed_in)
+}
+
+/// Whether an error the agent reported reads like a missing or rejected
+/// login (the UI's `chat/authFailure.ts` keeps the same cues): a hint to
+/// treat the failure as a sign-in one, never a verdict by itself.
+pub(crate) fn auth_shaped(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "unauthorized",
+        "missing bearer",
+        "not logged in",
+        "not signed in",
+        "run /login",
+        "authentication required",
+        "invalid api key",
+        "login required",
+        "login expired",
+        "expired token",
+        "expired credential",
+    ]
+    .iter()
+    .any(|cue| lower.contains(cue))
+        || lower
+            .split(|c: char| !c.is_ascii_digit())
+            .any(|w| w == "401")
+}
+
 /// A chat failed to start: re-ask this agent's status so the launcher row
 /// and Settings card say "not signed in" when that is why. Bounded by the
 /// probe timeout; the catalog refreshes on the change bus.
@@ -576,6 +609,10 @@ async fn start_operation(
         finish(&operation, phase, &message);
         // The verdict the flow ended on is the one the catalog serves.
         state.changes.notify_waiters();
+        // The chats that waited on this login start again, in place.
+        if phase == Phase::Succeeded {
+            crate::chat::relaunch_after_sign_in(state.clone(), kind).await;
+        }
     });
     Json(progress).into_response()
 }
@@ -1190,6 +1227,26 @@ mod tests {
         assert_eq!(recipe(AgentKind::Antigravity).unwrap().how, How::Terminal);
         assert!(recipe(AgentKind::Claude).unwrap().accepts_code);
         assert!(!recipe(AgentKind::Codex).unwrap().accepts_code);
+    }
+
+    #[test]
+    fn auth_shaped_errors_are_the_sign_in_cues_and_nothing_else() {
+        for text in [
+            "unexpected status 401 Unauthorized: Missing bearer or basic authentication in header",
+            "Not logged in · Please run /login",
+            "Cursor CLI is not signed in on this host.",
+            "Authentication required. Please run 'agent login' first",
+        ] {
+            assert!(auth_shaped(text), "{text}");
+        }
+        for text in [
+            "turn failed",
+            "GLIBC_2.28 not found",
+            "rate limit (status 429)",
+            "port 4011 in use",
+        ] {
+            assert!(!auth_shaped(text), "{text}");
+        }
     }
 
     #[test]
