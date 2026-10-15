@@ -111,12 +111,12 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   system-library failures explain what to fix. Results last until the daemon restarts; a lost
   connection is unknown status, never success.
 - **Installation is one step.** A zero installer exit code says files were installed, not that
-  the account is signed in or structured chat works. Afterward, Sign in opens the
-  provider's interactive agent in a terminal; Open chat starts a chat using the existing account.
-  The dialog tells users who aren't signed in to sign in first. Open chat does not perform login;
-  a chat started while signed out shows the agent's [sign-in card](#sign-in) in place of the
-  startup error. Settings says “Installed · Supports chat and
-  terminal” rather than claiming readiness. Running conversations and account data are kept.
+  the account is signed in or structured chat works. Afterward the dialog shows the agent's
+  [sign-in card](#sign-in) unless the CLI already reports a login (then "Signed in. Open chat
+  when you're ready."); Open chat starts a chat using the account on the host, and a chat started
+  while signed out shows the same card in place of the startup error. The terminal is never the
+  way in. Settings says “Installed · Supports chat and terminal” rather than claiming readiness.
+  Running conversations and account data are kept.
 - **Where it lives.** `agent_setup.rs`, `workspace/agentSetup.ts`, and
   `workspace/AgentSetupDialog.svelte`: authenticated `GET/POST /api/v1/agents/{id}/setup` and
   `DELETE /api/v1/agents/{id}/setup/{operation}`. POST carries `workspace_id`, an
