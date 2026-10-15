@@ -138,10 +138,6 @@
      *  path links open through the workbench opener (`shared/openPath.ts`)
      *  whenever App has registered one. */
     onOpenPath?: (path: string, kind: "file" | "dir") => void;
-    /** Flip this session to its real TUI (the pane-bar view toggle). Used for
-     *  interactive CLI flows the `-p` stream-json mode can't run — `/login`
-     *  above all — so the native auth flow runs where it belongs. */
-    onSwitchToTerminal?: () => void;
     /** Focus the newly-created session while the source remains alive. */
     onForked?: (session: Session) => void;
     /** Show one of this session's SUBAGENTS instead of the session itself:
@@ -170,7 +166,6 @@
     terminals = [],
     onOpenFile,
     onOpenPath,
-    onSwitchToTerminal,
     onForked,
     subagent,
     onOpenSubagent,
@@ -282,6 +277,9 @@
    *  transcript's tail; signing in relaunches the chat in place, resuming
    *  the conversation. */
   const liveSignIn = $derived(signInNeeded && store.initialized && store.exited === null && store.fatalError === null && !store.running && !store.degraded);
+  /** `/login` typed here: the card runs whether or not the catalog thinks
+   *  the agent is signed in (a switch of account, a stale login). */
+  let signInRequested = $state(false);
   void listAgents().then((agents) => {
     const info = agents.find((a) => a.id === agentKind);
     models = info?.models ?? [];
@@ -1762,15 +1760,14 @@
           return toggleUltracode();
         }
       case "login":
-        // /login is an interactive OAuth / setup-token / SSO flow the `-p`
-        // stream-json CLI can't run ("/login isn't available in this
-        // environment") — so an expired session dead-ends in chat with no way
-        // back. Flip to the real TUI, where claude's own /login handles every
-        // auth method safely (chimaera never sees the credentials); sign in
-        // there, then toggle back to chat with the pane-bar button. Claude
-        // only for now — codex's auth flow (`codex login`) is a follow-up.
-        if (agentKind !== "claude" || onSwitchToTerminal === undefined) return false;
-        onSwitchToTerminal();
+        // /login in any chat is the in-app sign-in: the card at the
+        // transcript's tail runs the CLI's own login under the daemon (the
+        // `-p` / app-server processes can't run it themselves, and sent to
+        // the model it is a billed prompt) and the chat relaunches in place
+        // once the login lands. Claude's native /login still lives in its
+        // terminal view (the pane-bar toggle) for anyone who prefers it.
+        if (readOnly || catalogAgent?.signIn === undefined) return false;
+        signInRequested = true;
         return true;
       default:
         return false;
@@ -1982,8 +1979,8 @@
       });
     }
     if (supports("get_mcp")) native.push({ name: "mcp", description: "MCP servers — chimaera panel" });
-    if (agentKind === "claude") {
-      native.push({ name: "login", description: "sign in — opens the terminal for Claude's native auth" });
+    if (catalogAgent?.signIn !== undefined) {
+      native.push({ name: "login", description: `sign in to ${agentName} — in the app` });
     }
     if (supports("compact")) {
       native.push({ name: "compact", description: "compact conversation context" });
@@ -3181,9 +3178,9 @@
       </div>
     {/if}
 
-    {#if liveSignIn && catalogAgent !== null}
+    {#if (liveSignIn || (signInRequested && store.fatalError === null && store.exited === null)) && catalogAgent !== null}
       <div class="live-signin">
-        <AgentSignInCard agent={catalogAgent} workspaceId={session.workspace_id ?? null} framed onSignedIn={onRelaunch} />
+        <AgentSignInCard agent={catalogAgent} workspaceId={session.workspace_id ?? null} framed autostart={signInRequested} onSignedIn={() => { signInRequested = false; onRelaunch?.(); }} onDismiss={signInRequested ? () => { signInRequested = false; } : undefined} />
       </div>
     {/if}
     {#if store.fatalError !== null && signInNeeded}
