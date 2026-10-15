@@ -176,10 +176,27 @@ Drag/copy guidance also appears in entry tooltips. Outside-workspace locations r
 return link in the footer.
 
 Arrow keys select entries and traverse columns; Home/End jump to the first/last entry.
-Selection scrolls into view and is exposed through the tree's active descendant. Enter opens,
+Selection scrolls into view and is exposed through the tree's active descendant. A single click
+or keyboard selection previews a file inside the Finder. Double-click, Enter, the context menu's
+Open, or the preview's **Open** button opens a pinned file tab (and pins an existing preview tab).
+Cmd/Ctrl-click opens beside the Finder, reusing an already-open file as usual.
 F2 renames and Delete opens the existing delete confirmation. Inline name inputs retain their
 normal text-editing shortcuts. Broken links remain manageable but never open. A failed or
 superseded folder navigation cannot start a create operation in a different directory.
+
+The preview column shows the filename, size and modification time above a read-only excerpt.
+Images, the first PDF page, Markdown, code/logs, table/spreadsheet rows, HTML reports, media and
+notebook cells reuse `shared/embed/EmbedCard.svelte` and its bounded loaders; other formats show
+file information with Open for the full viewer. Media waits for Play. The column's divider can be
+dragged or adjusted with arrow keys (Home/End for the limits, double-click to reset); below 580px
+of Finder width the preview sits beneath the columns. Its space stays reserved while browsing
+folders so the file rows do not move between the two clicks of a double-click.
+
+`previews/FinderPreview.svelte` debounces selections by 150ms, cancels superseded target
+resolution, and mounts only the current file's card, keyed by path. Parked/hidden views release
+their preview, including media and HTML frames. The preview sits outside the file tree's keyboard
+scope, so interacting with its content never invokes file rename/delete or navigation shortcuts.
+These are existing preview endpoints; no new daemon routes or persisted layout fields are needed.
 
 ## Raw reads & lightweight editing
 
@@ -1157,6 +1174,16 @@ superseded folder navigation cannot start a create operation in a different dire
 > skill when a `feat:` ships in this area. **Never** inferred from code. Everything above
 > this line is derived and may be regenerated; everything below is deliberate and must not
 > be "helpfully" changed without asking.
+
+### Previewing files while browsing — why it exists
+_Captured 2026-10-15 (the maintainer; issue #274 and the implementation conversation)._
+
+- **Problem it solves:** the maintainer requested previews of the last file clicked in the
+  separate file browser, "in the rightmost view, like normal file browser", with double-click
+  opening the file in a pane. The single-click preview / explicit-open proposal was accepted.
+- **How settled it is:** an addition, open to improvement. Asked whether the preview gestures and
+  layout should remain open or be preserved, the maintainer answered: "Keep the details open to
+  improvement." No particular gesture, dimension or layout is frozen.
 
 ### Why previews (and lightweight editing) are shaped this way
 _Captured 2026-07-09 — drafted from docs/design/README.md + code, confirmed live with the maintainer._

@@ -2440,6 +2440,7 @@
     const existing = paneForTab(layout.root, { surface: "file", path });
     if (existing !== null) {
       layout = activateTab(layout, existing.paneId, existing.index);
+      if (pinned) layout = pinTab(layout, existing.paneId, existing.index);
     } else if (newSplit) {
       layout = splitPane(layout, paneId, "row");
       layout = openFile(layout, path, !pinned);
@@ -4565,8 +4566,8 @@
     closeView(paneId) {
       closeView(paneId);
     },
-    openFileFrom(paneId, path, newSplit) {
-      openFileFromPane(paneId, path, newSplit);
+    openFileFrom(paneId, path, newSplit, pinned = false) {
+      openFileFromPane(paneId, path, newSplit, pinned);
     },
     openPathFrom(paneId, path, kind, newSplit) {
       openPath(path, kind, { fromPane: paneId, split: newSplit });

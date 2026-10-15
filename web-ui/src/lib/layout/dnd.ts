@@ -127,8 +127,9 @@ export interface LayoutCtrl {
    * wherever it lives, else lands in the ACTIVE (focused) pane — the same
    * "opens where you are" rule the FILES tree and quick-open follow. `newSplit`
    * (Cmd/Ctrl) forces a fresh split to the right instead, to place it beside.
+   * `pinned` keeps an explicit open as a normal tab, including an existing preview.
    */
-  openFileFrom(paneId: string, path: string, newSplit: boolean): void;
+  openFileFrom(paneId: string, path: string, newSplit: boolean, pinned?: boolean): void;
   /**
    * Open a VALIDATED path from `paneId` by kind: files land in the active pane
    * (openFileFrom), directories open in the Finder and reveal in the file tree

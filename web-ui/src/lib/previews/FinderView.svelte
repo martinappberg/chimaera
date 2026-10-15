@@ -11,7 +11,8 @@
    * navigation reports up via `onNavigate` (persisted), and an external change
    * to `path` (a terminal dir-link redirecting this Finder) is reconciled by
    * the effect below. Opening a file hands off to the workbench via
-   * `onOpenFile` — every file viewer is reused unchanged.
+   * `onOpenFile`. Selection shows a bounded, read-only preview beside the
+   * columns; explicit opens hand off to the full workbench viewer.
    */
   import { tick, untrack } from "svelte";
   import { basename, dirname, fsDownload, fsList, type FsEntry, humanSize } from "./files";
@@ -44,6 +45,7 @@
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
   import Spinner from "./Spinner.svelte";
+  import FinderPreview from "./FinderPreview.svelte";
   import { isMac } from "../shared/keys";
 
   /** Local-daemon windows hide Download (the file already lives here). */
@@ -104,6 +106,39 @@
   const activeColumn = $derived(columns[activeCol]);
   const selectedIndex = $derived(activeColumn === undefined ? -1 : colSelectedIndex(activeColumn));
   const selectedEntry = $derived(activeColumn?.entries[selectedIndex]);
+  const previewEntry = $derived(selectedEntry?.kind === "file" ? selectedEntry : null);
+
+  let bodyWidth = $state(0);
+  let previewWidth = $state(380);
+  let shownWidth = $state(380);
+  const previewMax = $derived(Math.max(240, Math.min(640, bodyWidth * 0.6)));
+  let resize = $state<{ id: number; x: number; width: number; before: number } | null>(null);
+
+  function resizePreview(e: PointerEvent): void {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const handle = e.currentTarget as HTMLElement;
+    handle.focus({ preventScroll: true });
+    handle.setPointerCapture(e.pointerId);
+    resize = { id: e.pointerId, x: e.clientX, width: shownWidth, before: previewWidth };
+  }
+
+  function setPreviewWidth(width: number): void {
+    previewWidth = Math.max(240, Math.min(previewMax, width));
+  }
+
+  function resizeKey(e: KeyboardEvent): void {
+    if (e.key === "Escape" && resize !== null) {
+      previewWidth = resize.before;
+      resize = null;
+    } else if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+      setPreviewWidth(shownWidth + (e.key === "ArrowLeft" ? 20 : -20));
+    } else if (e.key === "Home") setPreviewWidth(240);
+    else if (e.key === "End") setPreviewWidth(previewMax);
+    else return;
+    e.preventDefault();
+    e.stopPropagation();
+  }
 
   $effect(() => {
     const dir = dropDir;
@@ -271,20 +306,14 @@
   /** Select + open a file shown in column `colIndex`. */
   function openFile(colIndex: number, entry: FsEntry, newSplit: boolean): void {
     if (entry.broken) return;
-    columns = columns.map((c, i) =>
-      i > colIndex ? c : i === colIndex ? { ...c, selected: entry.path } : c,
-    );
-    columns = columns.slice(0, colIndex + 1);
-    activeCol = colIndex;
-    location = columns[colIndex].dir;
-    onNavigate(location);
+    selectInColumn(colIndex, columns[colIndex].entries.findIndex((e) => e.path === entry.path));
     onOpenFile(entry.path, newSplit);
   }
 
   function onRowClick(colIndex: number, entry: FsEntry, e: MouseEvent): void {
-    if (entry.broken) return; // a dangling symlink opens nothing
-    if (entry.kind === "dir") void openDir(colIndex, entry);
-    else openFile(colIndex, entry, e.metaKey || e.ctrlKey);
+    if (entry.kind === "dir" && !entry.broken) void openDir(colIndex, entry);
+    else if ((e.metaKey || e.ctrlKey) && !entry.broken) openFile(colIndex, entry, true);
+    else selectInColumn(colIndex, columns[colIndex].entries.findIndex((row) => row.path === entry.path));
   }
 
   function onRowDown(e: PointerEvent, colIndex: number, entry: FsEntry): void {
@@ -784,7 +813,9 @@
     </div>
   </div>
 
-  <!-- Miller columns. Focusable as a whole; arrows move selection / columns. -->
+  <div class="finder-body" bind:clientWidth={bodyWidth}>
+  <!-- The preview is outside the tree: its text/player controls must never
+       trigger the tree's arrows, Enter, copy, rename or delete handlers. -->
   <div
     class="cols"
     bind:this={colsEl}
@@ -902,6 +933,9 @@
               title={`${entry.symlink ? `${entry.path} → ${entry.target ?? ""}${entry.broken ? " (missing)" : ""}` : entry.path}\nDrag to move · ${isMac ? "Option" : "Alt"} to copy`}
               onpointerdown={(e) => onRowDown(e, ci, entry)}
               onclick={(e) => { if (e.detail === 0) onRowClick(ci, entry, e); }}
+              ondblclick={(e) => {
+                if (entry.kind === "file" && !entry.broken) openFile(ci, entry, e.metaKey || e.ctrlKey);
+              }}
               oncontextmenu={(e) => contextMenu.openAt(e, menuFor(ci, entry))}
             >
               <span class="glyph">
@@ -952,6 +986,36 @@
     {/if}
   </div>
 
+  <!-- This is a focusable window splitter: separator + value and arrow keys. -->
+  <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
+  <div class="preview-divider" class:resizing={resize !== null}
+    role="separator" tabindex="0" aria-label="Preview width" aria-orientation="vertical"
+    aria-valuemin={240} aria-valuemax={Math.round(previewMax)} aria-valuenow={Math.round(shownWidth)}
+    title="Drag to resize preview · double-click to reset"
+    onpointerdown={resizePreview}
+    onpointermove={(e) => {
+      if (resize?.id === e.pointerId) setPreviewWidth(resize.width + resize.x - e.clientX);
+    }}
+    onpointerup={(e) => {
+      if (resize?.id !== e.pointerId) return;
+      resize = null;
+      (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
+    }}
+    onpointercancel={() => {
+      if (resize !== null) previewWidth = resize.before;
+      resize = null;
+    }}
+    onlostpointercapture={() => { resize = null; }}
+    onkeydown={resizeKey}
+    ondblclick={() => { previewWidth = 380; }}
+  ></div>
+  <div class="preview-column" style:--preview-width="{previewWidth}px" bind:clientWidth={shownWidth}>
+    <FinderPreview entry={previewEntry} onOpen={(split) => {
+      if (previewEntry !== null) openFile(activeCol, previewEntry, split);
+    }} />
+  </div>
+  </div>
+
   <div class="status" role="status">
     {#if dropDir !== null}
       <span class="transfer-status" title={dropDir}>{dropAction} into {basename(dropDir) || "/"}</span>
@@ -974,6 +1038,7 @@
 
 <style>
   .finder {
+    container-type: inline-size;
     display: flex;
     flex-direction: column;
     height: 100%;
@@ -1107,6 +1172,7 @@
     position: relative;
     flex: 1;
     min-height: 0;
+    min-width: 0;
     display: flex;
     align-items: stretch;
     overflow-x: auto;
@@ -1114,6 +1180,44 @@
     outline: none;
     scrollbar-width: thin;
     scrollbar-color: color-mix(in srgb, var(--fg) 22%, transparent) transparent;
+  }
+
+  .finder-body {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    overflow: hidden;
+  }
+  .preview-column {
+    flex: 0 0 clamp(240px, var(--preview-width), 60%);
+    min-width: 0;
+    overflow: hidden;
+  }
+  .preview-divider {
+    flex: 0 0 7px;
+    cursor: col-resize;
+    touch-action: none;
+    border-inline: 1px solid var(--edge);
+    background: var(--pane-bg, var(--bg));
+  }
+  .preview-divider:hover, .preview-divider.resizing {
+    background: color-mix(in srgb, var(--accent) 22%, var(--bg));
+  }
+  .preview-divider:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+  @container (max-width: 580px) {
+    .finder-body {
+      flex-direction: column;
+    }
+    .preview-column {
+      flex: 0 0 46%;
+      border-top: 1px solid var(--edge);
+    }
+    .preview-divider {
+      display: none;
+    }
   }
 
   .col {
@@ -1125,6 +1229,8 @@
     scrollbar-width: thin;
     scrollbar-color: color-mix(in srgb, var(--fg) 18%, transparent) transparent;
   }
+
+  .col:last-child { flex-grow: 1; }
 
 
   /* The incoming-column placeholder while a descend lists: same width, its own

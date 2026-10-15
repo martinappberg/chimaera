@@ -56,6 +56,8 @@
     width?: number | null;
     /** A glance (the hover preview): a fixed, shorter body. */
     compact?: boolean;
+    /** The host supplies its own filename/actions (Finder's preview column). */
+    chrome?: boolean;
     /** How to resolve when no `info` came with the card (chat prose embeds
      *  resolve against the session's directories). Default: `path` as an
      *  absolute path. Null answer = unknown (the daemon did not answer). */
@@ -71,6 +73,7 @@
     alt = "",
     width = null,
     compact = false,
+    chrome = true,
     resolve,
     onOpen,
   }: Props = $props();
@@ -255,11 +258,13 @@
 <div
   class="embed-card"
   class:compact
+  class:bare={!chrome}
   class:fit={kind === "image" && !compact}
   class:missing={current !== null && isMissing(current)}
   bind:this={card}
   data-embed-kind={kind ?? "pending"}
 >
+  {#if chrome}
   <div class="head">
     <button class="name" title={hit !== null ? `open ${hit.path} in a pane` : path} disabled={hit === null} onclick={open}>
       {#if kind === "dir"}
@@ -286,6 +291,7 @@
       </button>
     {/if}
   </div>
+  {/if}
 
   {#if current === null}
     <div class="state" class:tile={compact}>
@@ -345,6 +351,7 @@
         <FileIcon path={hit.path} size={28} />
       {/if}
       <span class="facts">{facts}</span>
+      {#if !chrome && kind === "file"}<span class="quiet">No inline preview for this file type.</span>{/if}
     </div>
   {/if}
   {#if alt !== "" && kind !== null && kind !== "image" && !compact}
@@ -381,6 +388,14 @@
   }
   .embed-card.missing {
     border-style: dashed;
+    background: transparent;
+  }
+  .embed-card.bare {
+    width: 100%;
+    min-width: 0;
+    margin: 0;
+    border: none;
+    border-radius: 0;
     background: transparent;
   }
   .head {
