@@ -38,6 +38,7 @@ pub(crate) use service::{
 };
 pub(crate) use session::{session_git, session_turn_end, track_sessions};
 pub(crate) use worktree::{
-    allowed_session_cwd, create_session_worktree, create_worktree, ensure_branch_worktree,
-    managed_worktree_of, remove_worktree,
+    allowed_session_cwd, create_session_worktree, create_worktree, discard_session_worktree,
+    ensure_branch_worktree, forget_missing_managed_workspaces, managed_worktree_of,
+    remove_worktree, Created,
 };

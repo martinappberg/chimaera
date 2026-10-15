@@ -235,12 +235,13 @@ impl RecentsStore {
     }
 
     /// Where conversation `id` last ran in this workspace, when that was not
-    /// the root (see [`RecentEntry::cwd`]).
+    /// the root (see [`RecentEntry::cwd`]). Follows the lineage like
+    /// [`Self::recorded_transcripts`]: an absorbed older id finds its row.
     pub(crate) fn cwd_of(&self, workspace_id: &str, id: &str) -> Option<PathBuf> {
         self.items
             .get(workspace_id)?
             .iter()
-            .find(|e| e.resume.as_deref() == Some(id))
+            .find(|e| e.resume.as_deref() == Some(id) || e.supersedes.iter().any(|s| s == id))
             .and_then(|e| e.cwd.clone())
     }
 
@@ -399,18 +400,16 @@ fn retire_inner(
                 .cloned()
                 .collect();
             let recorded: Vec<PathBuf> = record.transcript_path.iter().cloned().collect();
-            [resume_hint, record.resume_id(), record.resumed_from.clone()]
-                .into_iter()
-                .flatten()
-                .find(|id| {
-                    crate::claude_store::find_blocking(
-                        &state.claude_projects_dir,
-                        id,
-                        &recorded,
-                        &cwds,
-                    )
-                    .is_some()
-                })
+            let candidates: Vec<String> =
+                [resume_hint, record.resume_id(), record.resumed_from.clone()]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+            let ids: Vec<&str> = candidates.iter().map(String::as_str).collect();
+            // One lookup for all of the conversation's handles: the store is
+            // listed at most once however many of them miss.
+            crate::claude_store::find_first(&state.claude_projects_dir, &ids, &recorded, &cwds)
+                .map(|(id, _)| id.to_string())
         };
         let entry = RecentEntry {
             kind: record.kind,
@@ -439,6 +438,15 @@ fn retire_inner(
 #[derive(Deserialize)]
 pub(crate) struct RecentsQuery {
     workspace_id: String,
+}
+
+/// The linked worktree holding `dir` (the nearest folder with a `.git`
+/// file), searched only inside `managed`. Blocking.
+fn worktree_top(dir: &std::path::Path, managed: &std::path::Path) -> Option<PathBuf> {
+    dir.ancestors()
+        .take_while(|d| d.starts_with(managed) && *d != managed)
+        .find(|d| d.join(".git").is_file())
+        .map(std::path::Path::to_path_buf)
 }
 
 /// GET /api/v1/recents?workspace_id= — the workspace's ended agent
@@ -484,8 +492,8 @@ pub(crate) async fn list_recents(
     let store = state.claude_projects_dir.clone();
     let root = workspace.root.clone();
     let managed = state.worktrees_root_real.clone();
-    // A row's worktree, for the UI's "remove it" offer: the managed folder it
-    // ran in, while that folder still exists.
+    // A row's worktree, for the UI's "remove it" offer: the top of the
+    // managed worktree it ran in (also from a subfolder), while it exists.
     let cwds: Vec<Option<PathBuf>> = store_entries
         .iter()
         .map(|e| e.cwd.clone().filter(|c| c.starts_with(&managed)))
@@ -497,8 +505,10 @@ pub(crate) async fn list_recents(
     let (scanned, worktrees) = tokio::task::spawn_blocking(move || {
         let mut dirs = vec![store.join(crate::launcher::encode_cwd(&root))];
         dirs.extend(crate::claude_store::claude_worktree_dirs(&store, &[root]));
-        let worktrees: Vec<Option<PathBuf>> =
-            cwds.into_iter().map(|c| c.filter(|c| c.is_dir())).collect();
+        let worktrees: Vec<Option<PathBuf>> = cwds
+            .into_iter()
+            .map(|c| c.and_then(|c| worktree_top(&c, &managed)))
+            .collect();
         (crate::launcher::scan_resumables(&dirs, &exclude), worktrees)
     })
     .await
@@ -548,4 +558,55 @@ pub(crate) async fn list_recents(
     });
     merged.truncate(CAP_PER_WORKSPACE);
     Json(serde_json::Value::Array(merged)).into_response()
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(resume: &str, cwd: Option<&str>) -> RecentEntry {
+        RecentEntry {
+            kind: AgentKind::Claude,
+            title: "t".into(),
+            resume: Some(resume.into()),
+            supersedes: Vec::new(),
+            last_active: 1,
+            ui: Some(SessionUi::Chat),
+            transcript: None,
+            cwd: cwd.map(PathBuf::from),
+        }
+    }
+
+    /// Reopening by an id the conversation absorbed (an older claude forked
+    /// one per resume) still finds where it ran, like its transcripts do.
+    #[test]
+    fn cwd_of_follows_the_resume_lineage() {
+        let dir = std::env::temp_dir().join(format!("chimaera-recents-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = RecentsStore::load(dir.join("recents.json"));
+        store.push("w", entry("old", Some("/wt/a")), None);
+        store.push("w", entry("new", Some("/wt/a")), Some("old"));
+        assert_eq!(store.cwd_of("w", "new"), Some(PathBuf::from("/wt/a")));
+        assert_eq!(store.cwd_of("w", "old"), Some(PathBuf::from("/wt/a")));
+        assert_eq!(store.cwd_of("w", "other"), None);
+        assert_eq!(store.cwd_of("x", "new"), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn worktree_top_walks_up_only_inside_the_managed_root() {
+        let dir = std::env::temp_dir().join(format!("chimaera-recents-top-{}", std::process::id()));
+        let managed = dir.join("worktrees");
+        let top = managed
+            .join("repo-1")
+            .join("chimaera")
+            .join("claude-abc123");
+        let sub = top.join("src").join("deep");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(top.join(".git"), "gitdir: elsewhere\n").unwrap();
+        assert_eq!(worktree_top(&sub, &managed), Some(top.clone()));
+        assert_eq!(worktree_top(&top, &managed), Some(top.clone()));
+        std::fs::remove_file(top.join(".git")).unwrap();
+        assert_eq!(worktree_top(&sub, &managed), None, "gone: no worktree");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

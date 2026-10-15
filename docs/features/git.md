@@ -188,12 +188,17 @@ repos,branches,log,show,compare}`, `GET/POST/DELETE /api/v1/git/worktrees`,
   as in use; unlocked, it is judged like any worktree (a clean one whose HEAD is already in the main
   branch is removable). `worktree: true` is agents only and never combined with `resume` or `cwd`;
   a workspace that is not a repository answers 400, and a missing agent answers 409 before anything
-  is created. A session row's `managed_worktree` is its spawn folder when that is under the managed
-  root (no filesystem access per snapshot). The Mastermind's `spawn_agent` without `branch` follows
-  the workspace's choice unless it passes `worktree`; a remembered choice in a folder that is no
-  longer a repository falls back to the root. Nothing is ever removed automatically. Reopening a
-  Recents row resumes the conversation inside its worktree while that still exists (the row keeps
-  the folder), else at the root. Intent: [pending](#new-agents-in-their-own-worktree--_intent-pending_).
+  is created; any later failure of that spawn discards the new worktree and its branch again
+  (`discard_session_worktree`: a plain `worktree remove` and `branch -d`, never forced). A session
+  row's `managed_worktree` is the top of the managed worktree its spawn folder lies in, also from a
+  subfolder, read from what the session tracker already resolved (no filesystem access per
+  snapshot; null until it has). The Mastermind's `spawn_agent` without `branch` follows the
+  workspace's choice unless it passes `worktree`; a remembered choice in a folder that is no longer
+  a repository falls back to the root. Nothing is ever removed automatically. A managed worktree
+  opened in its own window is unregistered when it is removed, and `GET /workspaces` drops such a
+  registration once its folder is gone (removed outside chimaera). Reopening a Recents row (by its
+  id or one its lineage absorbed) resumes the conversation inside its worktree while that still
+  exists (the row keeps the folder), else at the root. Intent: [pending](#new-agents-in-their-own-worktree--_intent-pending_).
 
 ## Branches (the agent↔branch map)
 

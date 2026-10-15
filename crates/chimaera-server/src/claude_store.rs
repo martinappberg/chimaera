@@ -111,17 +111,36 @@ pub(crate) fn find_blocking(
     recorded: &[PathBuf],
     cwds: &[PathBuf],
 ) -> Option<PathBuf> {
-    if let Some(path) = find_known(store, id, recorded, cwds) {
-        return Some(path);
+    find_first(store, &[id], recorded, cwds).map(|(_, path)| path)
+}
+
+/// The first of `ids` (in order) whose transcript exists, and where. The
+/// cheap checks run for every id before the store is listed, and it is
+/// listed at most once for all of them (a retiring session tries up to
+/// three handles of one conversation). Blocking.
+pub(crate) fn find_first<'a>(
+    store: &Path,
+    ids: &[&'a str],
+    recorded: &[PathBuf],
+    cwds: &[PathBuf],
+) -> Option<(&'a str, PathBuf)> {
+    let ids: Vec<&'a str> = ids.iter().copied().filter(|id| valid_id(id)).collect();
+    for id in &ids {
+        if let Some(path) = find_known(store, id, recorded, cwds) {
+            return Some((id, path));
+        }
     }
-    if !valid_id(id) {
+    if ids.is_empty() {
         return None;
     }
-    let file = format!("{id}.jsonl");
-    claude_worktree_dirs(store, cwds)
-        .into_iter()
-        .map(|dir| dir.join(&file))
-        .find(|p| p.is_file())
+    let dirs = claude_worktree_dirs(store, cwds);
+    ids.into_iter().find_map(|id| {
+        let file = format!("{id}.jsonl");
+        dirs.iter()
+            .map(|dir| dir.join(&file))
+            .find(|p| p.is_file())
+            .map(|p| (id, p))
+    })
 }
 
 /// [`find_blocking`] without the worktree-directory scan: a stat or a few,
@@ -294,6 +313,26 @@ mod tests {
         );
         assert_eq!(
             find_blocking(&store, "c2", &[], std::slice::from_ref(&root)),
+            None
+        );
+        // Several handles of one conversation: the first that resolves wins,
+        // the cheap checks for all of them before the one store listing.
+        let at_root = put(&store.join(encode_cwd(&root)), "c3");
+        assert_eq!(
+            find_first(
+                &store,
+                &["gone", "c1", "c3"],
+                &[],
+                std::slice::from_ref(&root)
+            ),
+            Some(("c3", at_root))
+        );
+        assert_eq!(
+            find_first(&store, &["gone", "c1"], &[], std::slice::from_ref(&root)).map(|(id, _)| id),
+            Some("c1")
+        );
+        assert_eq!(
+            find_first(&store, &["..", "gone"], &[], std::slice::from_ref(&root)),
             None
         );
         let index = worktree_index(&store, &[root]);
