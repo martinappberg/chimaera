@@ -620,6 +620,7 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   dependency visibly unblocks its dependents. The in-progress summary prefers the agent's own
   present-continuous `activeForm` ("Running tests"). Older CLIs and codex, whose plans carry none of
   this, render exactly as before — the extra fields are simply absent.
+- **Every chat is asked to keep a task list.** The chimaera MCP server's `initialize` instructions ask each runtime, in its own tool's words (Claude `TaskCreate`/`TaskUpdate`, Codex `update_plan`, an ACP agent's plan tool), to keep the whole plan current for any request that edits files or runs more than one command — the plan card draws from that list, and a plan written as prose draws nothing (`mcp.rs` `task_list_instructions`).
 - **The plan card, and two pinned strips.** Plan, subagents, and background work are three
   orthogonal readings of a session — what the agent *means* to do, *who* is working, what is
   *detached* — stacked above the composer; only non-empty ones render. Subagents and background
