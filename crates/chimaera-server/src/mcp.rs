@@ -112,7 +112,9 @@ pub(crate) const MASTERMIND_READ_TOOLS: [&str; 8] = [
 /// so a prompt per pane would be noise. The limits that stand in for the
 /// prompt are that allowlist and the per-session rate limit.
 /// `update_plan` only draws the chat's plan card (a journaled level-set, no
-/// workspace effect); a prompt before every plan update would defeat it.
+/// workspace effect); a prompt before every plan update would defeat it. It
+/// is offered to Claude chats alone (`plan_tool_for`); the pre-allow is
+/// harmless where it isn't listed.
 pub(crate) const ALWAYS_ALLOWED_TOOLS: [&str; 5] = [
     "notify",
     "document_guide",
@@ -160,8 +162,8 @@ work with your own tools first and use it to present the result.";
 
 /// The documents paragraph every session gets (all tiers): the portable
 /// dialect in brief, the two document tools, and how to cite files so the
-/// workbench can open them. Every Claude and Codex session loads this —
-/// keep it short; `document_guide` carries the rest.
+/// workbench can open them. Every session with the chimaera MCP server loads
+/// this (Claude, Codex, ACP) — keep it short; `document_guide` carries the rest.
 const DOCUMENTS_INSTRUCTIONS: &str = "\n\n\
 Documents: write portable markdown (GFM tables, task lists, footnotes; \
 `> [!NOTE]` alerts; `$…$` math; mermaid fences; YAML frontmatter), embed files \
@@ -170,13 +172,20 @@ absolute local ones. Call document_guide for the full rules; run \
 check_document on a document before handing it over. In replies, cite files \
 workspace-relative as `path:line`, `path#L10-L20` or a relative markdown link.";
 
-/// The plan paragraph: the workbench draws one plan card from the agent's
-/// own task list (claude `TaskCreate`/`TaskUpdate`, codex `update_plan`, an
-/// ACP agent's plan), and the desktop apps get that card on every
-/// multi-step request only because they ask for it. A plan written as prose
-/// draws nothing, so each runtime is asked in its own tool's words.
-fn task_list_instructions(kind: Option<crate::agents::AgentKind>) -> &'static str {
+/// The plan paragraph: the workbench draws one plan card beside a CHAT from
+/// the agent's plan level-set — a Claude chat through chimaera's own
+/// `update_plan` (Claude Code offers no TaskCreate/TaskUpdate under `-p`;
+/// probed on 2.1.300), Codex through its built-in `update_plan`, an ACP
+/// agent through the plan its protocol reports — and the desktop apps get
+/// that card on every multi-step request only because they ask for it. A
+/// plan written as prose draws nothing, so each runtime is asked in its own
+/// tool's words. A terminal (TUI) session gets no paragraph: its own task
+/// list renders in its terminal, and there is no card to draw.
+fn task_list_instructions(kind: Option<crate::agents::AgentKind>, chat: bool) -> &'static str {
     use crate::agents::AgentKind;
+    if !chat {
+        return "";
+    }
     match kind {
         Some(AgentKind::Claude) => {
             "\n\n\
@@ -190,20 +199,19 @@ follows that card beside the chat while you work."
         Some(AgentKind::Codex) => {
             "\n\n\
 Plan card: for any request that edits files or runs more than one command, \
-track your steps with the update_plan TOOL (never a file, a markdown \
-checklist, or prose: only that tool call draws the card): the whole plan up \
-front, exactly one step in_progress, each marked completed as it finishes, \
-the list updated when the plan changes. The user follows that card beside \
-the chat while you work."
+track your steps with your built-in update_plan TOOL (never a file, a \
+markdown checklist, or prose: only that tool call draws the card): the whole \
+plan up front, exactly one step in_progress, each marked completed as it \
+finishes, the list updated when the plan changes. The user follows that card \
+beside the chat while you work."
         }
         _ => {
             "\n\n\
-Plan card: for any request that edits files or runs more than one command, \
-track your steps with your own plan or to-do TOOL, or chimaera's update_plan \
-(never a file, a markdown checklist, or prose: only a tool call draws the \
-card): the whole plan up front, one step in progress at a time, each marked \
-done as it finishes. The user follows that card beside the chat while you \
-work."
+Plan card: when you have a plan or to-do tool of your own, keep it current \
+for any request that edits files or runs more than one command — the whole \
+plan up front, one step in progress at a time, each marked done as it \
+finishes. The user follows it as a card beside the chat while you work; a \
+plan written as a file or prose draws nothing there."
         }
     }
 }
@@ -215,7 +223,8 @@ appointed to coordinate this workspace. Extra tools: workspace_status (the \
 roster + git digest — start here), read_timeline (what happened: finished \
 turns, failed commands, ended jobs, knowledge changes, messages — read it for \
 any \"what happened / brief me\" question), list_changed_files (who touched \
-what), spawn_agent / spawn_terminal (new workers at the workspace root), \
+what), spawn_agent / spawn_terminal (new workers: at the workspace root, or in \
+a worktree of their own per the user's choice for new agents), \
 interrupt_agent (chat sessions only). read_agent reads any session's screen \
 or transcript tail. Your message_agent carries direction: the user's \
 appointment sanctions it, so a worker treats it as the user's direction — \
@@ -278,6 +287,10 @@ pub(crate) async fn mcp(
     // workspace's Mastermind, changes what the very next call sees.
     let comms_on = crate::comms::enabled(&state);
     let mastermind = comms_on && mastermind_of(&state, &agent_id);
+    // The runtime and surface decide the plan paragraph and tool: only a chat
+    // has a card to draw, and only Claude lacks a plan tool of its own.
+    let kind = crate::lock(&state.agents).get(&agent_id).map(|r| r.kind);
+    let chat = state.chat.contains(&agent_id);
     // Active workbench plugins decide extra tools + instructions. Computed
     // (awaiting a fresh footprint detect when stale) only for the methods
     // that decide what the agent sees — never on the ping flood.
@@ -308,14 +321,17 @@ pub(crate) async fn mcp(
         "initialize" => Ok(initialize_result(
             &params,
             &agent_id,
-            crate::lock(&state.agents).get(&agent_id).map(|r| r.kind),
+            kind,
+            chat,
             comms_on,
             mastermind,
             mastermind_here,
             &plugin_paragraphs,
         )),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": tool_defs(comms_on, mastermind, plugin_tools) })),
+        "tools/list" => Ok(json!({
+            "tools": tool_defs(plan_tool_for(kind, chat), comms_on, mastermind, plugin_tools)
+        })),
         "tools/call" => {
             tools_call(&state, &agent_id, comms_on, mastermind, &plugins, &params).await
         }
@@ -351,10 +367,12 @@ pub(crate) fn mastermind_of(state: &AppState, agent_id: &str) -> bool {
         .is_some_and(|m| m.session_id == agent_id)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn initialize_result(
     params: &Value,
     agent_id: &str,
     kind: Option<crate::agents::AgentKind>,
+    chat: bool,
     comms_on: bool,
     mastermind: bool,
     mastermind_here: bool,
@@ -367,7 +385,7 @@ fn initialize_result(
         .and_then(|v| v.as_str())
         .unwrap_or(PROTOCOL_FALLBACK);
     let mut instructions = format!("{INSTRUCTIONS}{DOCUMENTS_INSTRUCTIONS}");
-    instructions.push_str(task_list_instructions(kind));
+    instructions.push_str(task_list_instructions(kind, chat));
     if comms_on {
         instructions.push_str(&crate::comms::instructions(
             agent_id,
@@ -438,8 +456,10 @@ fn mastermind_tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "spawn_agent",
-            "description": "Spawn a new worker agent chat session at the workspace root \
-                            (or, with `branch`, in that branch's own worktree). \
+            "description": "Spawn a new worker agent chat session: at the workspace root \
+                            or in a new worktree of its own (the user's choice for new \
+                            agents, or `worktree`), or with `branch` in that branch's \
+                            own worktree. \
                             State WHY you are spawning it, then send it work with \
                             message_agent. Workers bill as the user's own account.",
             "inputSchema": {
@@ -448,8 +468,9 @@ fn mastermind_tool_defs() -> Vec<Value> {
                 "properties": {
                     "agent": {
                         "type": "string",
-                        "enum": ["claude", "codex"],
-                        "description": "Which agent CLI runs the worker",
+                        "enum": ["claude", "codex", "agy", "grok", "cursor"],
+                        "description": "Which agent CLI runs the worker (any chat-capable \
+                                        agent installed on this host)",
                     },
                     "model": {
                         "type": "string",
@@ -514,11 +535,21 @@ fn mastermind_tool_defs() -> Vec<Value> {
     ]
 }
 
-fn tool_defs(comms_on: bool, mastermind: bool, plugin_tools: Vec<Value>) -> Value {
+/// Whether this session is offered chimaera's `update_plan`: a Claude chat
+/// (no task tool under `-p`). Codex has its built-in `update_plan` — a second
+/// tool of the same name would compete with it — an ACP agent reports its
+/// plan over its own protocol, and a terminal has no card to draw.
+fn plan_tool_for(kind: Option<crate::agents::AgentKind>, chat: bool) -> bool {
+    chat && kind == Some(crate::agents::AgentKind::Claude)
+}
+
+fn tool_defs(plan_tool: bool, comms_on: bool, mastermind: bool, plugin_tools: Vec<Value>) -> Value {
     let mut tools = base_tool_defs();
     tools.push(notify_tool_def());
     tools.push(open_browser_tool_def());
-    tools.push(update_plan_tool_def());
+    if plan_tool {
+        tools.push(update_plan_tool_def());
+    }
     if comms_on {
         tools.extend(crate::comms::tool_defs());
     }
@@ -533,7 +564,7 @@ fn tool_defs(comms_on: bool, mastermind: bool, plugin_tools: Vec<Value>) -> Valu
 pub(crate) fn is_core_tool(name: &str) -> bool {
     static NAMES: std::sync::LazyLock<std::collections::HashSet<String>> =
         std::sync::LazyLock::new(|| {
-            tool_defs(true, true, Vec::new())
+            tool_defs(true, true, true, Vec::new())
                 .as_array()
                 .expect("tool definitions are an array")
                 .iter()
@@ -704,7 +735,7 @@ fn notify(state: &AppState, agent_id: &str, args: &Value) -> Value {
     }
 }
 
-/// The `update_plan` tool def (base tier — every session has it): the plan
+/// The `update_plan` tool def (Claude chats — `plan_tool_for`): the plan
 /// card beside the chat. Claude Code offers no task-list tool under `-p`
 /// (TaskCreate/TaskUpdate are interactive-only; probed on 2.1.300), so this
 /// is the one way a Claude chat draws the card; Codex has its own
@@ -1674,13 +1705,11 @@ async fn spawn_agent(
     let agent = args.get("agent").and_then(|a| a.as_str()).unwrap_or("");
     let Some(kind) = crate::agents::AgentKind::parse(agent) else {
         return tool_error(format!(
-            "unknown agent {agent:?} (expected claude or codex)"
+            "unknown agent {agent:?} (expected claude, codex, agy, grok or cursor)"
         ));
     };
     if !kind.chat_capable() {
-        return tool_error(format!(
-            "no chat driver for {agent} (expected claude or codex)"
-        ));
+        return tool_error(format!("no chat driver for {agent}"));
     }
     let model = args
         .get("model")
@@ -1722,12 +1751,22 @@ async fn spawn_agent(
         Ok(slot) => slot,
         Err(at) => return spawn_ceiling_error(at),
     };
+    // Refuse before any worktree exists: a missing agent must not leave an
+    // empty worktree and branch behind (the same order as POST /sessions).
+    if let Err(msg) = crate::launcher::detect(state, kind, false).await.path {
+        return tool_error(msg);
+    }
     // The worker stays in THIS workspace (so message_agent reaches it) and
-    // runs in the branch's worktree.
+    // runs in the branch's worktree. A worktree made fresh for this worker
+    // (`made`) must not outlive a spawn that never happened.
+    let mut made: Option<crate::git::Created> = None;
     let place = match branch {
         None if own_worktree => {
             match crate::git::create_session_worktree(state, &workspace, kind.as_str()).await {
-                Ok(created) => Some(created),
+                Ok(created) => {
+                    made = Some(created.clone());
+                    Some(created)
+                }
                 // Asked for: say why not. Only the remembered default (which
                 // may outlive the folder being a repository): the root.
                 Err((_, msg)) if args.get("worktree").is_some() => {
@@ -1756,6 +1795,7 @@ async fn spawn_agent(
         None => "at the workspace root".to_string(),
     };
     let workspace_id = workspace.id.clone();
+    let workspace_for_discard = workspace.clone();
     match crate::chat::spawn_fresh_chat_at(
         state,
         workspace,
@@ -1792,9 +1832,16 @@ async fn spawn_agent(
                 row["id"].as_str().unwrap_or("?"),
             ))
         }
-        Err(crate::chat::ChatSpawnFailure::AgentUnavailable(msg)) => tool_error(msg),
-        Err(crate::chat::ChatSpawnFailure::Internal(err)) => {
-            tool_error(format!("spawn failed: {err}"))
+        Err(failure) => {
+            if let Some(created) = made {
+                crate::git::discard_session_worktree(state, &workspace_for_discard, &created).await;
+            }
+            match failure {
+                crate::chat::ChatSpawnFailure::AgentUnavailable(msg) => tool_error(msg),
+                crate::chat::ChatSpawnFailure::Internal(err) => {
+                    tool_error(format!("spawn failed: {err}"))
+                }
+            }
         }
     }
 }
@@ -2276,6 +2323,45 @@ fn mention_tokens(prompt: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The plan paragraph and tool follow the runtime and the surface: a
+    /// Claude chat gets chimaera's `update_plan`, a Codex chat is pointed at
+    /// its built-in one (no second tool of that name), an ACP chat is asked
+    /// to keep its own plan current, and a terminal gets neither.
+    #[test]
+    fn plan_paragraph_and_tool_follow_runtime_and_surface() {
+        use crate::agents::AgentKind;
+        let claude = task_list_instructions(Some(AgentKind::Claude), true);
+        assert!(claude.contains("update_plan TOOL from the chimaera MCP server"));
+        let codex = task_list_instructions(Some(AgentKind::Codex), true);
+        assert!(codex.contains("your built-in update_plan TOOL"));
+        assert!(!codex.contains("chimaera"));
+        for kind in [AgentKind::Antigravity, AgentKind::Grok, AgentKind::Cursor] {
+            let acp = task_list_instructions(Some(kind), true);
+            assert!(acp.contains("plan or to-do tool of your own"), "{acp}");
+            assert!(!acp.contains("update_plan"), "{acp}");
+            assert!(!plan_tool_for(Some(kind), true));
+        }
+        for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::Grok] {
+            assert_eq!(task_list_instructions(Some(kind), false), "");
+            assert!(!plan_tool_for(Some(kind), false));
+        }
+        assert_eq!(
+            task_list_instructions(None, true),
+            task_list_instructions(Some(AgentKind::Grok), true)
+        );
+        assert!(plan_tool_for(Some(AgentKind::Claude), true));
+        assert!(!plan_tool_for(Some(AgentKind::Codex), true));
+        let listed = |plan: bool| {
+            tool_defs(plan, false, false, Vec::new())
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["name"] == "update_plan")
+        };
+        assert!(listed(true));
+        assert!(!listed(false));
+    }
     use super::*;
 
     #[test]

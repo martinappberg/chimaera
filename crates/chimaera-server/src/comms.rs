@@ -1453,7 +1453,8 @@ async fn execute(
             "it's idle in a terminal; it sees this with the user's next prompt there".into()
         }
         Plan::Inbox(why) if target.busy && target.chat => format!(
-            "it waits in its inbox ({why}; it is {}) and reads it when that turn ends",
+            "it waits in its inbox ({why}; it is {}) until that turn ends, when the user's wake \
+             setting decides whether it reads it then",
             target.doing(crate::session_view::now_ms())
         ),
         Plan::Inbox(why) => format!("it waits in its inbox ({why})"),
@@ -1987,7 +1988,8 @@ pub(crate) fn tool_defs() -> Vec<Value> {
         json!({
             "name": "workspace_agents",
             "description": "Who is working in this chimaera workspace: every agent session \
-                            (claude, codex; chat or terminal) with its id, what it is doing \
+                            (Claude, Codex, Antigravity, Grok or Cursor; chat or terminal) \
+                            with its id, what it is doing \
                             right now, its branch and recent files, whether it is the \
                             Mastermind, and how a message reaches it. Not your harness's own \
                             peers or subagents. Check it before starting work that could \
@@ -2079,8 +2081,9 @@ pub(crate) fn tool_defs() -> Vec<Value> {
 /// The paragraph every agent's MCP instructions carry while enabled.
 pub(crate) fn instructions(sid: &str, mastermind_here: bool, is_mastermind: bool) -> String {
     let mut out = format!(
-        "\n\nAgent communication: other agents may be working in this workspace — claude and \
-         codex sessions the user started{}. You are session {sid}. workspace_agents shows who is \
+        "\n\nAgent communication: other agents may be working in this workspace — the agent \
+         sessions the user started (Claude, Codex, Antigravity, Grok, Cursor; chat or \
+         terminal){}. You are session {sid}. workspace_agents shows who is \
          here and what each is doing; read_agent reads one's recent work (it costs them \
          nothing, so try it before asking). message_agent sends one of them (by id, \
          \"mastermind\", or \"everyone\") a short message: a finding it needs, a blocker, a \

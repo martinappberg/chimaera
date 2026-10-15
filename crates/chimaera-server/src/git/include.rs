@@ -20,7 +20,7 @@ const MAX_INCLUDE_FILE: u64 = 64 * 1024;
 const MAX_WALK_DIRS: usize = 500;
 
 /// What a copy did, reported on the create answer.
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub(crate) struct IncludeReport {
     pub(crate) copied: usize,
     pub(crate) bytes: u64,
