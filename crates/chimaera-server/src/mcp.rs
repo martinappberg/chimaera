@@ -97,8 +97,9 @@ pub(crate) const MASTERMIND_READ_TOOLS: [&str; 8] = [
 ];
 
 /// Tools every session may call without a prompt: the harness pre-allows
-/// them for workers and Masterminds alike (claude `permissions.allow`, codex
-/// `mcp_auto_approve`). Only side-effect-free-for-the-workspace tools belong
+/// them for workers and Masterminds alike (claude `permissions.allow`; codex
+/// and the ACP chats `mcp_auto_approve`, answered by their drivers at the
+/// prompt). Only side-effect-free-for-the-workspace tools belong
 /// here — `notify` shows the user a notification and nothing else, and a
 /// permission prompt for "may I notify you?" would itself be a notification.
 /// The document tools are read-only (`document_guide` is fixed text;
@@ -175,12 +176,19 @@ workspace-relative as `path:line`, `path#L10-L20` or a relative markdown link.";
 /// The plan paragraph: the workbench draws one plan card beside a CHAT from
 /// the agent's plan level-set — a Claude chat through chimaera's own
 /// `update_plan` (Claude Code offers no TaskCreate/TaskUpdate under `-p`;
-/// probed on 2.1.300), Codex through its built-in `update_plan`, an ACP
-/// agent through the plan its protocol reports — and the desktop apps get
-/// that card on every multi-step request only because they ask for it. A
-/// plan written as prose draws nothing, so each runtime is asked in its own
-/// tool's words. A terminal (TUI) session gets no paragraph: its own task
-/// list renders in its terminal, and there is no card to draw.
+/// probed on 2.1.300), Codex through its built-in `update_plan`, Cursor
+/// through its built-in TodoWrite (`cursor/update_todos` to the client),
+/// Grok through its `todo_write` (the ACP `plan` update) — and the desktop
+/// apps get that card on every multi-step request only because they ask
+/// for it. Antigravity has no plan tool at all (asked, 2026-10-15: "I do not
+/// have a built-in plan, task, or todo tool"), so it is told there is no
+/// card and asked to keep the plan in its reply; a runtime this daemon has
+/// not probed (no record for the session, a legacy kind) gets the neutral
+/// words, since nothing is known about its tools. A plan written as prose
+/// draws nothing, so each runtime is asked in its own tool's words. A
+/// terminal (TUI) session gets no paragraph: its own task list renders in
+/// its terminal, and there is no card to draw. Live-captured shapes:
+/// PROTOCOL.md Pass 45.
 fn task_list_instructions(kind: Option<crate::agents::AgentKind>, chat: bool) -> &'static str {
     use crate::agents::AgentKind;
     if !chat {
@@ -204,6 +212,31 @@ markdown checklist, or prose: only that tool call draws the card): the whole \
 plan up front, exactly one step in_progress, each marked completed as it \
 finishes, the list updated when the plan changes. The user follows that card \
 beside the chat while you work."
+        }
+        Some(AgentKind::Cursor) => {
+            "\n\n\
+Plan card: for any request that edits files or runs more than one command, \
+track your steps with your built-in TodoWrite TOOL (never a file, a markdown \
+checklist, or prose: only that tool draws the card): the whole list up \
+front, exactly one item in_progress, each marked completed as it finishes, \
+the list updated when the plan changes. The user follows that card beside \
+the chat while you work."
+        }
+        Some(AgentKind::Grok) => {
+            "\n\n\
+Plan card: for any request that edits files or runs more than one command, \
+track your steps with your built-in todo_write TOOL (never a file, a \
+markdown checklist, or prose: only that tool draws the card): the whole list \
+up front, exactly one item in_progress, each marked completed as it \
+finishes, the list updated when the plan changes. The user follows that card \
+beside the chat while you work."
+        }
+        Some(AgentKind::Antigravity) => {
+            "\n\n\
+Plan: this runtime has no plan or to-do tool that reaches the chat's plan \
+card, so for any request that edits files or runs more than one command, \
+open your reply with the steps as a short numbered list and say when each \
+is done."
         }
         _ => {
             "\n\n\
@@ -2336,20 +2369,36 @@ mod tests {
         let codex = task_list_instructions(Some(AgentKind::Codex), true);
         assert!(codex.contains("your built-in update_plan TOOL"));
         assert!(!codex.contains("chimaera"));
-        for kind in [AgentKind::Antigravity, AgentKind::Grok, AgentKind::Cursor] {
-            let acp = task_list_instructions(Some(kind), true);
-            assert!(acp.contains("plan or to-do tool of your own"), "{acp}");
+        // Each ACP agent is told what it really has (live-probed, PROTOCOL.md
+        // Pass 45): Cursor its TodoWrite, Grok its todo_write, Antigravity
+        // nothing that reaches the card.
+        let cursor = task_list_instructions(Some(AgentKind::Cursor), true);
+        assert!(cursor.contains("your built-in TodoWrite TOOL"), "{cursor}");
+        let grok = task_list_instructions(Some(AgentKind::Grok), true);
+        assert!(grok.contains("your built-in todo_write TOOL"), "{grok}");
+        let agy = task_list_instructions(Some(AgentKind::Antigravity), true);
+        assert!(agy.contains("no plan or to-do tool"), "{agy}");
+        for acp in [cursor, grok, agy] {
             assert!(!acp.contains("update_plan"), "{acp}");
+            assert!(!acp.contains("chimaera"), "{acp}");
+        }
+        for kind in [AgentKind::Antigravity, AgentKind::Grok, AgentKind::Cursor] {
             assert!(!plan_tool_for(Some(kind), true));
         }
         for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::Grok] {
             assert_eq!(task_list_instructions(Some(kind), false), "");
             assert!(!plan_tool_for(Some(kind), false));
         }
-        assert_eq!(
-            task_list_instructions(None, true),
-            task_list_instructions(Some(AgentKind::Grok), true)
-        );
+        // An unprobed runtime (no record, a legacy kind) gets the neutral words,
+        // never a claim about tools nobody checked.
+        for unknown in [None, Some(AgentKind::Gemini)] {
+            let text = task_list_instructions(unknown, true);
+            assert!(text.contains("plan or to-do tool of your own"), "{text}");
+            assert!(
+                !text.contains("update_plan") && !text.contains("no plan"),
+                "{text}"
+            );
+        }
         assert!(plan_tool_for(Some(AgentKind::Claude), true));
         assert!(!plan_tool_for(Some(AgentKind::Codex), true));
         let listed = |plan: bool| {
