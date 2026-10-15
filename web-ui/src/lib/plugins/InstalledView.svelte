@@ -410,8 +410,9 @@
             <p class="gline err">{a.error}</p>
           {:else if !a.available}
             <p class="gline">{agentName(a.agent)} isn't installed on this host</p>
-          {:else if a.plugins.length === 0 && !a.notice}
-            <!-- A notice already said why the list is empty. -->
+          {:else if a.plugins.length === 0 && (a.actions?.length ?? 1) > 0}
+            <!-- An agent with no plugin actions at all (Cursor) said why in
+                 its notice; every other agent's empty list is news. -->
             <p class="gline">No plugins reported for {agentName(a.agent)}</p>
           {:else}
             <ul class="plist">

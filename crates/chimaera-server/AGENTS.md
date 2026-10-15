@@ -236,8 +236,11 @@ the lifecycle, keep them consistent:
 ## Invariants / gotchas
 
 - **Five native extension adapters, open report identities.** `agent_probe/extensions.rs`
-  owns Antigravity's zero-turn skills/imports and Grok's effective inspect inventory;
-  Cursor's CLI lists no plugins or skills, so its report is a notice with no actions.
+  owns Antigravity's zero-turn skills/imports and Grok's effective inspect inventory; Cursor's
+  inventory is a notice only (its CLI lists no plugins or skills — nothing runs, no gate, no
+  prelude), its Connections come from `cursor-agent mcp list` (`connections::cursor_connections`:
+  the real status words, an `Error:` line is a failure never a sign-in prompt, unparseable lines
+  skipped).
   Never turn an unknown slash command into a discovery prompt; version-gate Antigravity's
   native print command. Reports whitelist fields and separate skill source files/scopes.
   `agent_probe/actions.rs` uses `launcher::extension_action` fixed argv in a visible PTY;
@@ -253,7 +256,11 @@ the lifecycle, keep them consistent:
   cleanup, output/row caps and a 60-second budget including queue time. Reports
   whitelist names/statuses only; no endpoints, environment values or raw errors.
   Connector sign-in (`connections/auth.rs`) is a bounded in-memory job, never a
-  workbench terminal session. Claude requires an internal PTY for input and output even with
+  workbench terminal session — with one deliberate exception: Cursor's `login_connection`
+  (`actions.rs`, argv `cursor-agent mcp login <name>`) runs in a managed terminal, because the
+  CLI has no no-browser mode and waits for its OAuth callback on a localhost port of its host, so
+  the UI offers it for local workspaces only and the daemon accepts only a server the last report
+  listed with `login_terminal`. Claude requires an internal PTY for input and output even with
   `--no-browser` (`connections/auth_pty.rs`); nonblocking I/O is cancellable, raw
   input avoids canonical line truncation, and output is private and capped. Codex
   accepts pipes. Neither transport creates a terminal pane or persists output.

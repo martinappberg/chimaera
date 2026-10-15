@@ -80,8 +80,12 @@ pub(crate) fn extension_action(
     target: Option<&str>,
 ) -> Result<Vec<String>, &'static str> {
     use AgentKind::*;
-    // Cursor's MCP sign-in has no no-browser mode, so it runs in a managed
-    // terminal where the CLI opens the browser itself (never the daemon).
+    // Cursor's MCP sign-in has no no-browser mode and waits for the OAuth
+    // callback on a localhost port of ITS host, so it runs in a managed
+    // terminal where the CLI opens the browser itself (never the daemon) —
+    // and only completes where that browser is on the daemon's host: the UI
+    // offers it for local workspaces alone, and `actions.rs` requires the
+    // target to be a server the last report said needs a login.
     if action == "login_connection" {
         if kind != Cursor {
             return Err("Use this agent's connection sign-in instead.");
