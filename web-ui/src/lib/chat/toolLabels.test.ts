@@ -314,6 +314,15 @@ describe("described tool lines", () => {
     expect(toolDescription({ tool: "execute", nativeInput: { description: "  " } })).toBeNull();
     // Agent spawns are named as agents by the count phrase.
     expect(toolDescription({ tool: "agent", nativeInput: { description: "Audit" } })).toBeNull();
+    // Other tools' `description` arguments are not what the call is doing.
+    const artifact = tool("other", {
+      title: "Artifact: report.html",
+      status: "in_progress",
+      nativeInput: { file_path: "report.html", description: "Quarterly figures for the team" },
+    });
+    expect(toolDescription(artifact)).toBeNull();
+    expect(toolGroupTitle([artifact])).toBe("Using a tool");
+    expect(toolGroupTitle([{ ...artifact, status: "completed" }])).toBe("Used a tool");
     expect(toolDescription({ tool: "execute", nativeInput: { description: "two\nlines" } })).toBe("two lines");
     expect(toolGroupTitle([tool("execute", { status: "in_progress" })])).toBe("Running a command");
   });

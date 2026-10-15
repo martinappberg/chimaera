@@ -423,13 +423,14 @@ export function toolRunHealth(tools: HealthTool[], tail?: TurnTail): "failed" | 
 /** Where a description stops reading as a label. */
 const DESCRIPTION_MAX = 160;
 
-/** What a call says it is doing, in the agent's own plain words — claude's
- *  Bash `description` ("Sum the BAM sizes"), any tool whose arguments carry
- *  one — on one line; null when the wire gave none (codex commands, ACP
- *  rows, whose titles already are the readable label). Agent spawns are
- *  left to the count phrase, which names them as agents. */
+/** What a command says it is doing, in the agent's own plain words —
+ *  claude's Bash `description` ("Sum the BAM sizes") — on one line; null when
+ *  the wire gave none (codex commands, ACP rows, whose titles already are
+ *  the readable label). Execute rows only: other tools' `description`
+ *  arguments say something else (an Artifact's gallery caption, a
+ *  CronCreate's or an MCP tool's own field), not what the call is doing. */
 export function toolDescription(t: { tool: string; nativeInput?: unknown }): string | null {
-  if (t.tool === "agent") return null;
+  if (t.tool !== "execute") return null;
   const input = t.nativeInput;
   if (typeof input !== "object" || input === null) return null;
   const raw = (input as { description?: unknown }).description;

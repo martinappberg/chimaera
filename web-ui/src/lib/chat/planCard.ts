@@ -65,8 +65,17 @@ export function planSummary(entries: readonly PlanEntry[]): string {
   return next !== undefined ? next.content : "";
 }
 
-/** Keyed-render identity: the agent's id when it gave one, else position
- *  (TodoWrite, codex and ACP plans re-send the whole list in order). */
-export function stepKey(entry: PlanEntry, index: number): string {
-  return entry.id !== null ? `id:${entry.id}` : `ix:${index}`;
+/** Keyed-render identities for a whole plan: the agent's id when it gave
+ *  one, else position (TodoWrite, codex and ACP plans re-send the whole list
+ *  in order). Unique by construction — a repeated id (a re-sent TaskCreate,
+ *  a journal from another build) gets the row's index appended, so a keyed
+ *  `{#each}` can never throw on a duplicate. */
+export function stepKeys(entries: readonly PlanEntry[]): string[] {
+  const seen = new Set<string>();
+  return entries.map((entry, index) => {
+    let key = entry.id !== null ? `id:${entry.id}` : `ix:${index}`;
+    while (seen.has(key)) key += `#${index}`;
+    seen.add(key);
+    return key;
+  });
 }

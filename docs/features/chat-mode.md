@@ -321,10 +321,13 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
     files in the workspace"; on by default, `chat.toolSummaries`), else a lone described call's
     description, else readable counts ("Ran 2 commands, read a file") — Codex commands and ACP
     rows carry no description, so they read this way — followed by the run's duration (nothing
-    under a second). Calls still running without a description read in the present tense
+    under a second; descriptions are read from execute rows only — other tools' `description`
+    arguments, like an Artifact's caption, say something else). Calls still running without a
+    description read in the present tense
     ("Running agent “…”"). Times are journal-backed (the call's first frame to its terminal
     update), so replay shows the same durations; a live elapsed corrects for a remote daemon's
-    clock offset. Expanded, a described row shows the description first and the command after it
+    clock offset, sampled only from frames delivered live (never replay). One shared 1 Hz clock
+    ticks while any live line is shown. Expanded, a described row shows the description first and the command after it
     in mono. Settled activity folds read the same way, with the run's tool time.
   - **Finished work** — "Agent “…” finished · 2 tools · 12.3k tokens · 4s" (click for its report),
     a background command's own close sentence ('Background command "…" completed (exit code 0)'),
@@ -368,10 +371,12 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   batch that lands after the stream settled re-stamps the settled message. Only elements the
   renderer stamped open anything: agent HTML that forges the classes opens nothing.
 - **Live status line.** While a turn runs: elapsed · output tokens this turn · running tasks
-  (subagents + background work) · what it is doing, only where nothing else on the page says it —
-  the agent's own phrase when it offers one (Claude `task_summary`, "Measuring file sizes…"),
-  Starting, Compacting, or Thinking when only a token estimate streams. Writing, Running tools
-  and Working are left to the live rows and the glyph (screen readers still hear them).
+  (subagents + background work) · what it is doing — the agent's own phrase when it offers one
+  (Claude `task_summary`, "Measuring file sizes…"), else Starting / Working / Thinking / Writing /
+  Running tools / Compacting. The word is dropped only while a row in view already says it: a
+  running call's line in the open trailing run (not folded, not scrolled away), or streaming
+  prose or a live thought row at the reader's bottom (screen readers still hear it). Waiting on
+  a permission, a question or the next step always shows its word.
   Codex's synchronous SessionStart and UserPromptSubmit hooks show their actual phase
   and a hook row linking to the hook configuration. These can block a turn after the
   runtime has initialized but before it receives the opening message.
