@@ -609,7 +609,6 @@
           >
             {#if creating}
               <div class="row creating">
-                <!-- svelte-ignore a11y_autofocus -->
                 <input
                   class="create-input"
                   type="text"

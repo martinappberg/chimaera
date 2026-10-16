@@ -310,7 +310,7 @@
 </script>
 
 <div class="backdrop" role="presentation" onclick={onClose} onkeydown={onKey}>
-  <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
   <div
     class="sheet"
     role="dialog"
