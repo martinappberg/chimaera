@@ -712,14 +712,15 @@ async fn ledger_crash_mid_restore_leaves_the_old_file() {
     let state = test_state_with_data_dir(0, data.clone());
     let (workspace_id, _) = mid_restore_ledger(&state, &data, "ledger-crash-mid").await;
     let before = std::fs::read(data.join("sessions.json")).unwrap();
-    let stall = Stall::new();
-    lock(&state.ledger).set_restore_step_for_tests(stall.hook());
+    // The crash is the task dying right after the first entry's outcome. A
+    // panic ends it there; an abort would only land at its next await, after
+    // the next entry may already have started.
+    lock(&state.ledger).set_restore_step_for_tests(Arc::new(|| {
+        std::panic::resume_unwind(Box::new("simulated crash mid-restore"))
+    }));
     state.restored.send_replace(false);
     let task = tokio::spawn(ledger::run(state.clone()));
-    stall.wait_entered().await;
-    task.abort();
-    stall.release();
-    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(task.await.unwrap_err().is_panic());
     assert!(!state.chat.contains("s-chat-b"), "the crash came first");
     assert_eq!(std::fs::read(data.join("sessions.json")).unwrap(), before);
     // A crashed daemon sees none of its chats die, so none retires.
