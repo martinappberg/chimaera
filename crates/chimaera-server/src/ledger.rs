@@ -27,6 +27,14 @@
 //! resume. If it is still held at a graceful stop, the fallback is to retire
 //! this daemon's live agent sessions into Recents, so nothing vanishes even
 //! though the ledger can't carry them to the successor.
+//!
+//! A stop that lands during restore never costs an entry. The boot entries
+//! restore has not settled yet (resurrected, retired or dropped) stay
+//! pending: restore stops at the next entry, the stop's write waits for it
+//! (`FLUSH_RESTORE_WAIT`, 5 s), then writes the live sessions plus every pending entry
+//! verbatim, deduped by id and by native resume handle (`merge_pending`).
+//! A crash meanwhile leaves the old file, since nothing writes before
+//! restore ends.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -93,7 +101,7 @@ pub(crate) struct LedgerAgent {
 }
 
 /// What the previous daemon left behind.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct BootLedger {
     pub(crate) sessions: Vec<LedgerEntry>,
     /// terminal session id -> agent session id (linked terminals).
@@ -200,6 +208,11 @@ pub(crate) struct LedgerStore {
     /// The boot read has landed (whatever it found): from here on a held
     /// ledger is this store's to retry, not the boot path's.
     booted: bool,
+    /// The boot entries restore has not settled yet, and the boot links.
+    /// Every write while it is set carries them (see `merge_pending`).
+    pending: Option<BootLedger>,
+    /// Runs after each boot entry's restore outcome (tests).
+    restore_step: Option<crate::persist::Hook>,
 }
 
 impl LedgerStore {
@@ -209,6 +222,8 @@ impl LedgerStore {
             last_written: None,
             hold: crate::persist::Hold::new(true),
             booted: false,
+            pending: None,
+            restore_step: None,
         }
     }
 
@@ -217,9 +232,40 @@ impl LedgerStore {
     /// an unreadable one an empty ledger that keeps the writes held.
     #[cfg(test)]
     pub(crate) fn load_boot(&mut self) -> BootLedger {
-        let read = read_boot(&self.path);
-        self.booted(read.as_ref().err().map(|err| err as &dyn std::fmt::Display));
-        read.unwrap_or_default()
+        match read_boot(&self.path) {
+            Ok(boot) => {
+                self.landed(&boot);
+                boot
+            }
+            Err(err) => {
+                self.booted(Some(&err));
+                BootLedger::default()
+            }
+        }
+    }
+
+    /// Run `hook` after each boot entry's restore outcome.
+    #[cfg(test)]
+    pub(crate) fn set_restore_step_for_tests(&mut self, hook: crate::persist::Hook) {
+        self.restore_step = Some(hook);
+    }
+
+    /// The boot read landed and read `boot`: writes resume, and until
+    /// restore settles them its entries are pending. One call, so no write
+    /// can slip between the release and the pending set.
+    fn landed(&mut self, boot: &BootLedger) {
+        self.booted(None);
+        self.pending = (!boot.sessions.is_empty()).then(|| boot.clone());
+    }
+
+    /// Restore is done with `id`: it is live, in Recents, or dropped.
+    fn settle(&mut self, id: &str) {
+        if let Some(pending) = &mut self.pending {
+            pending.sessions.retain(|entry| entry.id != id);
+            if pending.sessions.is_empty() {
+                self.pending = None;
+            }
+        }
     }
 
     /// Whether writes are held (tests).
@@ -330,6 +376,13 @@ const RECONCILE_TICK: Duration = Duration::from_secs(5);
 /// Minimum gap between writes: cwd polls and title updates churn, and the
 /// ledger lives on a (possibly NFS) home directory.
 const WRITE_DEBOUNCE: Duration = Duration::from_secs(2);
+/// How long a stop's last write waits for the restore entry in flight. It
+/// must stay well inside every caller's stop budget (the app's local stop
+/// and the remote stop script each give up after ~10 s, and the rest of the
+/// stop follows this): a stop that outlasts it reports a failure while the
+/// daemon exits moments later, leaving the app on a dead port. Not the
+/// snapshot gate's `RESTORE_WAIT_CAP`. Past it the entry stays pending.
+pub(crate) const FLUSH_RESTORE_WAIT: Duration = Duration::from_secs(5);
 
 /// Own the ledger for the daemon's lifetime: consume what the previous
 /// daemon left (resurrect / retire), then keep `sessions.json` reconciled
@@ -344,7 +397,7 @@ pub(crate) async fn run(state: Arc<AppState>) {
     let read = tokio::task::spawn_blocking(move || read_boot(&path)).await;
     let boot = match read {
         Ok(Ok(boot)) => {
-            crate::lock(&state.ledger).booted(None);
+            crate::lock(&state.ledger).landed(&boot);
             boot
         }
         Ok(Err(err)) => {
@@ -364,7 +417,7 @@ pub(crate) async fn run(state: Arc<AppState>) {
             _ = tokio::time::sleep(RECONCILE_TICK) => {}
         }
         let writable = retry_held(&state).await;
-        let (entries, links) = snapshot(&state);
+        let (entries, links) = snapshot_with_pending(&state);
         // Once the daemon is stopping, the graceful stop owns the last write
         // (lifecycle's final flush) and then ends the chat drivers politely.
         // A snapshot taken from here on could see those deliberately ended
@@ -442,9 +495,18 @@ async fn retry_held(state: &Arc<AppState>) -> bool {
 /// left as it is, and this daemon's live agent sessions retire into Recents
 /// instead — the fallback that keeps them findable when the ledger can't
 /// carry them to the successor (see the module doc).
+///
+/// A restore under way stops at its next entry (it checks `stopping`); the
+/// wait lets the entry in flight land first, so the live chats the stop
+/// ends next include it and nothing respawns after them. Past
+/// `FLUSH_RESTORE_WAIT` it is still pending, and written verbatim.
 pub(crate) async fn final_flush(state: &Arc<AppState>) {
+    if crate::lock(&state.ledger).booted {
+        let mut restored = state.restored.subscribe();
+        let _ = tokio::time::timeout(FLUSH_RESTORE_WAIT, restored.wait_for(|done| *done)).await;
+    }
     let writable = retry_held(state).await;
-    let (entries, links) = snapshot(state);
+    let (entries, links) = snapshot_with_pending(state);
     if writable {
         crate::lock(&state.ledger).write_if_changed(&entries, &links);
         return;
@@ -606,6 +668,69 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
     (entries, links)
 }
 
+/// `snapshot`, plus the boot entries restore has not settled. Pending is
+/// read first: an entry is live before it settles, so it can be in both
+/// (deduped by id) but never in neither.
+fn snapshot_with_pending(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, String>) {
+    let pending = crate::lock(&state.ledger).pending.clone();
+    let (entries, links) = snapshot(state);
+    merge_pending(entries, links, pending.as_ref())
+}
+
+/// The live sessions plus the pending boot entries. A live row wins by id;
+/// a pending row is also skipped when a live row resumes the same native
+/// conversation (the user reopened it from Recents under a new id). A boot
+/// link survives when both its endpoints are in the result.
+///
+/// A row in both landed while the stop was under way, and its process ran
+/// nothing yet (the pick-up is skipped once stopping): until its first
+/// event its carryover is the default, so the pending one is what it still
+/// owes the successor (the bridge, the cut-off work).
+fn merge_pending(
+    mut entries: Vec<LedgerEntry>,
+    mut links: HashMap<String, String>,
+    pending: Option<&BootLedger>,
+) -> (Vec<LedgerEntry>, HashMap<String, String>) {
+    let Some(pending) = pending else {
+        return (entries, links);
+    };
+    let live = entries.len();
+    for old in &pending.sessions {
+        if let Some(row) = entries[..live].iter_mut().find(|e| e.id == old.id) {
+            if let (Some(agent), Some(was)) = (row.agent.as_mut(), old.agent.as_ref()) {
+                let fresh = agent
+                    .carryover
+                    .as_ref()
+                    .is_none_or(|c| *c == chimaera_agent::Carryover::default());
+                if fresh && was.carryover.is_some() {
+                    agent.carryover = was.carryover.clone();
+                }
+            }
+            continue;
+        }
+        let reopened = old.agent.as_ref().is_some_and(|was| {
+            was.resume.is_some()
+                && entries[..live].iter().any(|e| {
+                    e.agent
+                        .as_ref()
+                        .is_some_and(|a| a.kind == was.kind && a.resume == was.resume)
+                })
+        });
+        if !reopened {
+            entries.push(old.clone());
+        }
+    }
+    let ids: std::collections::HashSet<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+    for (terminal, agent) in &pending.links {
+        if ids.contains(terminal.as_str()) && ids.contains(agent.as_str()) {
+            links
+                .entry(terminal.clone())
+                .or_insert_with(|| agent.clone());
+        }
+    }
+    (entries, links)
+}
+
 /// Restore the boot ledger, then release what waited on it: the held-back
 /// sessions snapshots, and the chat-journal budget, which cannot run earlier —
 /// until a ledgered chat respawns it is live nowhere, yet its journal is what
@@ -613,9 +738,32 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
 pub(crate) async fn consume_boot(state: &Arc<AppState>, boot: BootLedger) {
     restore(state, boot).await;
     // Serving started concurrently; sessions snapshots held back by
-    // `wait_restored` may flow now that the roster is whole.
+    // `wait_restored` may flow now that the roster is whole. A stop waits
+    // on it too (`final_flush`).
     state.restored.send_replace(true);
+    // A stop left entries pending: chats live nowhere whose journals the
+    // next boot resumes from, so the budget waits for that boot.
+    if crate::lock(&state.ledger).pending.is_some() {
+        return;
+    }
     crate::chat::prune_journals(state, None).await;
+}
+
+/// The error `respawn` returns when the daemon began stopping before the
+/// spawn: the entry stays pending (nothing retires, nothing spawns).
+#[derive(Debug)]
+pub(crate) struct RestoreStopped;
+
+impl std::fmt::Display for RestoreStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the daemon is stopping")
+    }
+}
+
+impl std::error::Error for RestoreStopped {}
+
+fn stopping(state: &AppState) -> bool {
+    state.stopping.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Act on what the previous daemon left: resurrect what can come back
@@ -630,29 +778,54 @@ pub(crate) async fn restore(state: &Arc<AppState>, boot: BootLedger) {
     let restore = crate::lock(&state.settings).restore_sessions();
     let mut respawned = 0usize;
     let mut retired = 0usize;
-    for entry in &boot.sessions {
+    for (done, entry) in boot.sessions.iter().enumerate() {
+        // The rest stay pending: the stop's write carries them to the next
+        // boot verbatim, and nothing spawns after the stop ends the chats.
+        if stopping(state) {
+            tracing::info!(
+                left = boot.sessions.len() - done,
+                "daemon stopping mid-restore; the rest wait for the next boot"
+            );
+            break;
+        }
         let workspace = crate::lock(&state.workspaces).get(&entry.workspace_id);
         let plan = plan_restore(entry, restore, workspace.is_some());
-        match plan {
+        let settled = match plan {
             RestorePlan::Respawn => {
                 let workspace = workspace.expect("plan requires a workspace");
                 match respawn(state, entry, workspace).await {
-                    Ok(()) => respawned += 1,
+                    // Landed as the stop began: kept pending as well, so the
+                    // stop's write keeps what its process owes (`merge_pending`).
+                    Ok(()) => {
+                        respawned += 1;
+                        !stopping(state)
+                    }
+                    Err(err) if err.is::<RestoreStopped>() => false,
                     Err(err) => {
                         tracing::warn!(session = %entry.id, %err, "resurrection failed");
-                        if retire_to_recents(state, entry, boot.written_at) {
+                        if retire_off_reactor(state, entry, boot.written_at).await {
                             retired += 1;
                         }
+                        true
                     }
                 }
             }
             RestorePlan::Retire => {
-                if retire_to_recents(state, entry, boot.written_at) {
+                if retire_off_reactor(state, entry, boot.written_at).await {
                     retired += 1;
                 }
+                true
             }
-            RestorePlan::Drop => {}
-        }
+            RestorePlan::Drop => true,
+        };
+        let step = {
+            let mut ledger = crate::lock(&state.ledger);
+            if settled {
+                ledger.settle(&entry.id);
+            }
+            ledger.restore_step.clone()
+        };
+        crate::persist::run_hook(step.as_ref());
     }
     // Linked-terminal edges survive only when both endpoints did.
     {
@@ -810,6 +983,9 @@ async fn respawn(
         kind,
         started_by: crate::history::StartedBy::Restart,
     };
+    if stopping(state) {
+        return Err(RestoreStopped.into());
+    }
     match crate::spawn::spawn_session(state, spec).await {
         Ok(_) => Ok(()),
         Err(crate::spawn::SpawnFailure::AgentUnavailable(msg)) => anyhow::bail!("{msg}"),
@@ -817,9 +993,19 @@ async fn respawn(
     }
 }
 
+/// `retire_to_recents` on the blocking pool: the Recents write and the
+/// transcript lookup are file I/O on a possibly-NFS home.
+async fn retire_off_reactor(state: &Arc<AppState>, entry: &LedgerEntry, last_active: u64) -> bool {
+    let (state, entry) = (state.clone(), entry.clone());
+    tokio::task::spawn_blocking(move || retire_to_recents(&state, &entry, last_active))
+        .await
+        .unwrap_or(false)
+}
+
 /// Remember a non-resurrectable agent conversation in its workspace's
 /// Recents, honoring `retire()`'s rules (untitled claude boots carry
 /// nothing recognizable and are skipped). Returns whether a row landed.
+/// Blocking.
 fn retire_to_recents(state: &Arc<AppState>, entry: &LedgerEntry, last_active: u64) -> bool {
     let Some(agent) = &entry.agent else {
         return false; // shells have no conversation to remember
@@ -1019,6 +1205,73 @@ mod tests {
             plan_restore(&agent_entry(AgentKind::Claude, Some("abc")), true, false),
             RestorePlan::Retire
         );
+    }
+
+    /// A stop's write: live rows win by id, a pending row the user reopened
+    /// under a new id (same agent, same native resume) is not written twice,
+    /// the rest carry over verbatim, and a boot link needs both endpoints.
+    #[test]
+    fn pending_merge_dedupes_by_id_and_native_resume() {
+        let with_id = |mut e: LedgerEntry, id: &str| {
+            e.id = id.into();
+            e
+        };
+        let carry = chimaera_agent::Carryover {
+            remote_control: true,
+            turn_in_flight: true,
+            ..Default::default()
+        };
+        let mut live_a = with_id(chat_entry(AgentKind::Claude, Some("conv-a")), "a");
+        live_a.cwd = PathBuf::from("/live");
+        let mut old_a = with_id(chat_entry(AgentKind::Claude, Some("conv-a")), "a");
+        old_a.agent.as_mut().unwrap().carryover = Some(carry.clone());
+        let live_c = with_id(chat_entry(AgentKind::Codex, Some("t-1")), "c");
+        let old_b = with_id(chat_entry(AgentKind::Codex, Some("t-1")), "b");
+        // Same resume handle, other agent: a different conversation.
+        let old_d = with_id(chat_entry(AgentKind::Claude, Some("t-1")), "d");
+        let old_s = with_id(shell_entry(), "s");
+        let live_links: HashMap<String, String> = [("c".into(), "a".into())].into();
+        let pending = BootLedger {
+            sessions: vec![old_a, old_b, old_d.clone(), old_s.clone()],
+            links: [
+                ("s".to_string(), "d".to_string()),
+                ("x".to_string(), "a".to_string()),
+                ("s2".to_string(), "b".to_string()),
+            ]
+            .into(),
+            written_at: 7,
+        };
+
+        let (entries, links) = merge_pending(
+            vec![live_a.clone(), live_c.clone()],
+            live_links.clone(),
+            Some(&pending),
+        );
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["a", "c", "d", "s"]);
+        // The live row, with the carryover its fresh process still owes.
+        let mut expect_a = live_a.clone();
+        expect_a.agent.as_mut().unwrap().carryover = Some(carry.clone());
+        assert_eq!(entries[0], expect_a);
+        assert_eq!(entries[1], live_c);
+        assert_eq!((&entries[2], &entries[3]), (&old_d, &old_s));
+        let expect_links: HashMap<String, String> =
+            [("c".into(), "a".into()), ("s".into(), "d".into())].into();
+        assert_eq!(links, expect_links);
+
+        // A live row whose process has reported state keeps its own.
+        let mut busy_a = live_a.clone();
+        let own = chimaera_agent::Carryover {
+            ultracode: true,
+            ..Default::default()
+        };
+        busy_a.agent.as_mut().unwrap().carryover = Some(own.clone());
+        let (entries, _) = merge_pending(vec![busy_a], HashMap::new(), Some(&pending));
+        assert_eq!(entries[0].agent.as_ref().unwrap().carryover, Some(own));
+
+        // Nothing pending: the live snapshot as it is.
+        let (entries, links) = merge_pending(vec![live_a.clone()], live_links.clone(), None);
+        assert_eq!((entries, links), (vec![live_a], live_links));
     }
 
     #[test]

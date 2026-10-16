@@ -69,6 +69,16 @@ PTY snapshot-on-attach ([terminals.md](terminals.md)) and the chat seq-journal g
   live nowhere, yet its journal is what it replays and resumes from. After that the budget evicts
   history oldest-first but never a live session's journal — an idle resurrected chat is routinely the
   oldest file in the dir.
+- **A stop during restore loses nothing.** Restore is sequential, and the boot entries it has not
+  settled (respawned, retired or dropped) stay *pending*. A stop that lands meanwhile ends restore at
+  the next entry (`resurrect_chat` and the PTY respawn also check `stopping` before they spawn, and no
+  restart pick-up is sent once stopping); the final flush waits for it for at most 5 s — well inside
+  the app's and the remote stop's ~10 s budget, past it the entry in flight stays pending — and writes
+  the live sessions plus every pending entry verbatim — a live row wins by id, a pending
+  row is skipped when a live row of the same agent resumes the same native conversation, and a chat
+  that landed during the stop keeps its old carryover until its process reports its own. Nothing
+  retires to Recents, the journal budget waits for the next boot, and the successor restores each
+  entry once. A crash meanwhile leaves the old file: nothing writes the ledger before restore ends.
 
 ## Reopening keeps the conversation's view
 
