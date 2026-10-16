@@ -1,3 +1,4 @@
+import { goalLines, parseGoal, parseSchedule, type GoalInfo, type ScheduledJob, type ScheduledWakeup } from "./ahead";
 import { usageRows, type UsageRow } from "../shared/usage";
 import { SvelteMap } from "svelte/reactivity";
 import type { PendingElicitation } from "./elicitation";
@@ -132,6 +133,9 @@ const TRANSCRIPT_EVENTS = new Set([
   "notice",
   "turn_completed",
   "turn_aborted",
+  "turn_cause",
+  // "goal" is deliberately absent: a Codex goal reports its token count
+  // every few seconds; only the lines it adds touch the transcript.
   "truncated",
   "mode_switch",
   "forked",
@@ -391,9 +395,23 @@ export type ChatBlock = BlockIdentity &
        *  trigger's text (the CLI injects it inside its own queue), so this
        *  names only what is knowable: which live watch could have fired. */
       kind: "wake";
-      cause: "monitor" | "background" | "self";
-      /** The one live monitor's description, when exactly one is watching. */
+      /** `wakeup` / `job` / `goal`: the driver named what fired (the
+       *  `turn_cause` that follows the turn's start). */
+      cause: "monitor" | "background" | "self" | "wakeup" | "job" | "goal";
+      /** The one live monitor's description, when exactly one is watching;
+       *  a wakeup's reason; the prompt a job sent. */
       label: string | null;
+      /** A job's schedule in the agent's words ("Every 10 minutes"). */
+      schedule?: string | null;
+    }
+  | {
+      /** A goal moving: set, a failed check, paused, achieved, cleared —
+       *  one quiet line in the agent's own words (see `ahead.ts`). */
+      kind: "goal";
+      label: string;
+      detail: string | null;
+      title: string | null;
+      tone: "plain" | "done" | "warn";
     }
   | {
       /** Work that ran beside the conversation just ended — a subagent
@@ -692,6 +710,18 @@ export class ChatStore {
    *  dies with the driver process (cleared on init/exited: the tasks are the
    *  CLI's children). */
   backgroundTasks = $state<BackgroundTask[]>([]);
+  /** What the agent scheduled to resume itself (the `schedule` level-set):
+   *  claude's pending wakeup and its session jobs. Process-owned like the
+   *  background set — the daemon journals the new process's truth at spawn,
+   *  and nothing fires in a dead process (cleared on `exited`). */
+  wakeup = $state<ScheduledWakeup | null>(null);
+  jobs = $state<ScheduledJob[]>([]);
+  /** The session's goal (latest-wins `goal`); a finished Codex goal stays
+   *  as `complete` until cleared or replaced. */
+  goal = $state<GoalInfo | null>(null);
+  /** The last goal this transcript named, so a restart re-reporting it is
+   *  not a new "Goal set" line. */
+  private lastGoalObjective: string | null = null;
 
   /** Live subagent rows (`tool === "agent"`, pending/in_progress) — the
    *  AgentsTray's source, maintained INCREMENTALLY by the reducer (the
@@ -947,6 +977,10 @@ export class ChatStore {
     this.plan = [];
     this.planTouched = false;
     this.backgroundTasks = [];
+    this.wakeup = null;
+    this.jobs = [];
+    this.goal = null;
+    this.lastGoalObjective = null;
     this.running = false;
     this.compacting = false;
     this.activity = null;
@@ -1093,6 +1127,41 @@ export class ChatStore {
         // (connected-with-link, a refusal) are journaled by the driver as
         // Notice events, so live and replayed transcripts agree.
         this.remoteControl = foldRemoteControl(ev);
+        break;
+      }
+      case "schedule": {
+        const { wakeup, jobs } = parseSchedule(ev);
+        this.wakeup = wakeup;
+        this.jobs = jobs;
+        break;
+      }
+      case "goal": {
+        const next = parseGoal(ev.goal);
+        const ended = ev.ended && typeof ev.ended === "object" ? (ev.ended as Record<string, unknown>) : null;
+        const lines = goalLines(this.goal, next, ended, this.lastGoalObjective);
+        for (const line of lines) {
+          this.blocks.push(this.stamp({ kind: "goal", ...line }));
+        }
+        if (lines.length > 0) this.touchTranscript();
+        if (next !== null) this.lastGoalObjective = next.objective;
+        this.goal = next;
+        break;
+      }
+      case "turn_cause": {
+        // Right behind its turn_started, which placed a wake line when no
+        // message opened the turn: name what fired instead of guessing.
+        const kind = ev.kind === "wakeup" || ev.kind === "job" || ev.kind === "goal" ? ev.kind : null;
+        if (kind === null) break;
+        const label = typeof ev.detail === "string" && ev.detail !== "" ? ev.detail.slice(0, 500) : null;
+        const schedule = typeof ev.schedule === "string" && ev.schedule !== "" ? ev.schedule.slice(0, 500) : null;
+        const last = this.blocks.at(-1);
+        if (last?.kind === "wake") {
+          last.cause = kind;
+          last.label = label;
+          last.schedule = schedule;
+        } else {
+          this.blocks.push(this.stamp({ kind: "wake", cause: kind, label, schedule }));
+        }
         break;
       }
       case "background_tasks": {
@@ -1902,6 +1971,9 @@ export class ChatStore {
         // bridge (the driver journals the Off first; this covers old journals).
         this.backgroundTasks = [];
         this.remoteControl = null;
+        // Nothing resumes a dead process on its own.
+        this.wakeup = null;
+        this.jobs = [];
         // The reply route for any pending ask died with the process. The
         // driver drains resolutions before Exited, so this is usually a
         // no-op — it covers old journals recorded before that fix.

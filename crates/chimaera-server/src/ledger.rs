@@ -902,6 +902,26 @@ mod tests {
                 monitor: true,
             }],
             pickup_at_ms: 1_790_000_000_000,
+            wakeup: Some(chimaera_agent::model::ScheduledWakeup {
+                at_ms: 1_790_000_060_000,
+                scheduled_at_ms: 1_790_000_000_000,
+                reason: "Check the deploy".into(),
+                prompt: "/loop check the deploy".into(),
+            }),
+            jobs: vec![chimaera_agent::model::ScheduledJob {
+                id: "f2143f41".into(),
+                cron: "*/10 * * * *".into(),
+                schedule: "Every 10 minutes".into(),
+                prompt: "post the error rate".into(),
+                recurring: true,
+                next_at_ms: Some(1_790_000_600_000),
+                created_at_ms: 1_790_000_000_000,
+            }],
+            goal: Some(chimaera_agent::CarriedGoal {
+                objective: "all api tests pass".into(),
+                status: "active".into(),
+                set_at_ms: 1_790_000_000_000,
+            }),
         });
         let entries = vec![
             shell_entry(),

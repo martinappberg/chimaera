@@ -141,6 +141,18 @@ pub struct SpawnSpec {
     /// instead of resetting to "now". `None` on a fresh spawn (stamped at
     /// creation).
     pub created_at_ms: Option<u64>,
+    /// The agent resumes an existing conversation (claude `--resume`), so
+    /// what that conversation scheduled and its goal come back with it. A
+    /// fresh conversation starts with neither, whatever the journal says.
+    pub resumes: bool,
+    /// Session jobs the previous process held (claude `CronCreate`): its
+    /// `--resume` restores them, so the driver starts out knowing them and
+    /// the manager journals them at spawn. Empty on a fresh spawn.
+    pub carried_jobs: Vec<crate::model::ScheduledJob>,
+    /// The goal the previous process held, when the agent's own resume
+    /// keeps it (claude). The manager journals it at spawn (`None` resets a
+    /// stale one: Codex re-reads its thread's goal itself).
+    pub carried_goal: Option<crate::model::GoalState>,
     pub handshake_timeout: Duration,
     /// Holds the child's spawn until the embedder says its working folder
     /// is ready: a new chat opens at once while its worktree is still being
@@ -193,6 +205,9 @@ impl SpawnSpec {
             remote_control: None,
             revert_before_turn: None,
             created_at_ms: None,
+            resumes: false,
+            carried_jobs: Vec::new(),
+            carried_goal: None,
             handshake_timeout: HANDSHAKE_TIMEOUT,
             start_gate: None,
         }

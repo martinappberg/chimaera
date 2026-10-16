@@ -1,3 +1,18 @@
+<script module lang="ts">
+  import type { ChatBlock as Block } from "./store.svelte";
+  import { subagentTitle as title } from "./subagentView";
+
+  /** One agent: name it and its latest step, so the collapsed tray alone
+   *  says what is being worked on; several: the count (expand for each).
+   *  Shared with the folded work strip's tooltip. */
+  export function agentsLabel(agents: readonly Extract<Block, { kind: "tool" }>[]): string {
+    if (agents.length !== 1) return `${agents.length} subagents working`;
+    const out = agents[0].content;
+    const step = (out?.kind === "output" ? (out.text ?? "").trim() : "").split("\n", 1)[0];
+    return `subagent “${title(agents[0].title)}”${step !== "" ? ` · ${step}` : " working"}`;
+  }
+</script>
+
 <script lang="ts">
   import WorkTray from "../shared/WorkTray.svelte";
   import WorkTrayRow from "../shared/WorkTrayRow.svelte";
@@ -33,23 +48,19 @@
     onStop?: (id: string) => void;
     /** False while the owning retained chat tab is hidden. */
     visible?: boolean;
+    /** Rows only, inside the folded work strip (which draws the chrome). */
+    embedded?: boolean;
   }
-  let { agents, subagents, modelName, onOpen, onStop, visible = true }: Props = $props();
+  let { agents, subagents, modelName, onOpen, onStop, visible = true, embedded = false }: Props = $props();
 
   const name = subagentTitle;
   function progress(b: Extract<ChatBlock, { kind: "tool" }>): string {
     return b.content?.kind === "output" ? (b.content.text ?? "").trim() : "";
   }
-  /** One agent: name it and its latest step, so the collapsed tray alone
-   *  says what is being worked on; several: the count (expand for each). */
-  const label = $derived.by(() => {
-    if (agents.length !== 1) return `${agents.length} subagents working`;
-    const step = progress(agents[0]).split("\n", 1)[0];
-    return `subagent “${name(agents[0].title)}”${step !== "" ? ` · ${step}` : " working"}`;
-  });
+  const label = $derived(agentsLabel(agents));
 </script>
 
-<WorkTray glyph="✳" {visible} {label}>
+{#snippet rows()}
   {#each agents as agent (agent.id)}
     <WorkTrayRow
       onStop={onStop !== undefined ? () => onStop?.(agent.id) : undefined}
@@ -71,7 +82,15 @@
       {/if}
     </WorkTrayRow>
   {/each}
-</WorkTray>
+{/snippet}
+
+{#if embedded}
+  {@render rows()}
+{:else}
+  <WorkTray glyph="✳" {visible} {label}>
+    {@render rows()}
+  </WorkTray>
+{/if}
 
 <style>
   .name {

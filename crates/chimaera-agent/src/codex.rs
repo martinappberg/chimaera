@@ -228,11 +228,11 @@ use crate::driver::{
 };
 use crate::model::{
     cap_output, clip_command, fmt_elapsed_secs, fmt_tokens, truncate_label, AgentCommand,
-    AgentEvent, ChunkKind, Coalescer, CompactionPhase, ContentBlock, PermissionOption,
-    PermissionOptionKind, RemoteControlSnapshot, RemoteControlState, SlashCommand, ToolContent,
-    ToolKind, ToolStatus, Usage, UserMessageState, BG_LABEL_MAX, SKILL_PATH_MAX,
-    SLASH_COMMANDS_CAP, SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX, SUBAGENT_RESULT_MAX,
-    UNHANDLED_REQUESTS_CAP, UNHANDLED_REQUEST_NAME_MAX,
+    AgentEvent, ChunkKind, Coalescer, CompactionPhase, ContentBlock, GoalEnd, GoalState,
+    PermissionOption, PermissionOptionKind, RemoteControlSnapshot, RemoteControlState,
+    SlashCommand, ToolContent, ToolKind, ToolStatus, Usage, UserMessageState, BG_LABEL_MAX,
+    GOAL_TEXT_MAX, SKILL_PATH_MAX, SLASH_COMMANDS_CAP, SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX,
+    SUBAGENT_RESULT_MAX, UNHANDLED_REQUESTS_CAP, UNHANDLED_REQUEST_NAME_MAX,
 };
 use crate::ndjson::{JsonlSink, JsonlStream};
 use crate::subagent::{
@@ -353,6 +353,8 @@ impl Driver for CodexDriver {
             }
         }
         mapper.bootstrapping = false;
+        // A resumed or forked thread may already have a goal.
+        initial.push(mapper.goal_read());
         Ok(Handshake { mapper, initial })
     }
 }
@@ -984,6 +986,89 @@ enum PendingRpc {
         live: bool,
         reply: tokio::sync::oneshot::Sender<std::result::Result<SubagentTranscript, String>>,
     },
+    /// `thread/goal/get` once the thread is open: a resumed thread may
+    /// already have a goal. An error is an app-server without goals, and
+    /// stays silent.
+    GoalGet,
+    /// `thread/goal/set`; its answer is the goal as it now stands.
+    GoalSet {
+        action: GoalAction,
+    },
+    /// `thread/goal/clear`. `then` is the objective (and token budget) of a
+    /// `SetGoal` replacing the cleared goal, set once the clear succeeds.
+    GoalClear {
+        then: Option<(String, Option<u64>)>,
+    },
+}
+
+/// What a `thread/goal/set` was for — its refusal says which.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GoalAction {
+    Set,
+    Pause,
+    Resume,
+}
+
+impl GoalAction {
+    /// The set makes the goal `active`, which starts a turn at once (live
+    /// 0.162.1) — a turn that may open before the answer lands.
+    fn activates(self) -> bool {
+        matches!(self, GoalAction::Set | GoalAction::Resume)
+    }
+
+    fn refusal(self) -> &'static str {
+        match self {
+            GoalAction::Set => "Goal not set",
+            GoalAction::Pause => "Goal not paused",
+            GoalAction::Resume => "Goal not resumed",
+        }
+    }
+}
+
+/// A goal's `tokensUsed` / `timeUsedSeconds` move after every tool call
+/// (live 0.162.1); a usage-only change journals at most once per window.
+/// Objective, status and budget changes journal at once.
+const GOAL_USAGE_THROTTLE_MS: u64 = 10_000;
+
+/// Cap for a goal's status word, relayed verbatim.
+const GOAL_STATUS_MAX: usize = 40;
+
+/// A `thread/goal/*` goal object as normalized state; `None` for `null`
+/// (no goal) or anything that is not an object.
+fn goal_from_wire(goal: &Value) -> Option<GoalState> {
+    let goal = goal.as_object()?;
+    let text = |key: &str| goal.get(key).and_then(Value::as_str).unwrap_or_default();
+    let count = |key: &str| {
+        goal.get(key).and_then(|v| {
+            v.as_u64().or_else(|| {
+                v.as_f64()
+                    .filter(|f| f.is_finite() && *f >= 0.0)
+                    .map(|f| f as u64)
+            })
+        })
+    };
+    Some(GoalState {
+        objective: truncate_label(text("objective"), GOAL_TEXT_MAX),
+        status: truncate_label(text("status"), GOAL_STATUS_MAX),
+        // `createdAt` is epoch SECONDS.
+        set_at_ms: count("createdAt").map_or(0, |s| s.saturating_mul(1000)),
+        turns: None,
+        last_check: None,
+        tokens_used: count("tokensUsed"),
+        token_budget: count("tokenBudget"),
+        time_used_secs: count("timeUsedSeconds"),
+    })
+}
+
+fn goal_end(outcome: &str, goal: &GoalState) -> GoalEnd {
+    GoalEnd {
+        outcome: outcome.into(),
+        objective: goal.objective.clone(),
+        reason: None,
+        turns: None,
+        tokens: goal.tokens_used,
+        duration_secs: goal.time_used_secs,
+    }
 }
 
 /// A Codex follow-up Chimaera holds: queued for a later turn (FIFO: it opens
@@ -1582,6 +1667,19 @@ struct CodexMapper {
     /// matching tool-call elicitations are answered accept without a
     /// PermissionRequest.
     mcp_auto_approve: Option<crate::driver::McpAutoApprove>,
+    /// The thread's goal as the wire last stated it (`thread/goal/*`).
+    goal: Option<GoalState>,
+    /// The goal as last journaled, and when (ms since the epoch): `goal`
+    /// differs from it only while the usage throttle holds a snapshot back
+    /// ([`GOAL_USAGE_THROTTLE_MS`]).
+    goal_emitted: Option<GoalState>,
+    goal_emitted_ms: u64,
+    /// This process has seen a goal. A goal first seen already `complete`
+    /// was achieved before it (a resumed thread) unless one was seen here.
+    goal_seen: bool,
+    /// A `thread/compact/start` was sent: the server-started turn it opens
+    /// is a compaction, not a goal continuation.
+    compact_requested: bool,
     next_id: u64,
 }
 
@@ -1674,6 +1772,11 @@ impl CodexMapper {
             last_usage: Usage::default(),
             last_checkpoint: None,
             mcp_auto_approve,
+            goal: None,
+            goal_emitted: None,
+            goal_emitted_ms: 0,
+            goal_seen: false,
+            compact_requested: false,
             // The handshake minted 0..next_id (init, config read, thread
             // open, optional rollback, model/list, skills/list) and hands
             // over the next id.
@@ -1818,6 +1921,131 @@ impl CodexMapper {
         id
     }
 
+    /// `thread/goal/get` for the open thread (see [`PendingRpc::GoalGet`]).
+    fn goal_read(&mut self) -> DriverStep {
+        let mut step = DriverStep::default();
+        let id = self.rpc_id();
+        self.pending_rpcs.insert(id, PendingRpc::GoalGet);
+        step.outbound.push(json!({
+            "id": id, "method": "thread/goal/get",
+            "params": { "threadId": self.thread_id },
+        }));
+        step
+    }
+
+    /// `thread/goal/set` with `fields` (objective / status / tokenBudget).
+    fn goal_set(&mut self, action: GoalAction, fields: Value, step: &mut DriverStep) {
+        let id = self.rpc_id();
+        let mut params = json!({ "threadId": self.thread_id, "origin": "user" });
+        if let Some(fields) = fields.as_object() {
+            for (key, value) in fields {
+                params[key] = value.clone();
+            }
+        }
+        self.pending_rpcs.insert(id, PendingRpc::GoalSet { action });
+        step.outbound.push(json!({
+            "id": id, "method": "thread/goal/set", "params": params,
+        }));
+    }
+
+    /// A fresh goal: `active` from the start, so the server opens a turn
+    /// toward it at once.
+    fn goal_set_new(&mut self, objective: String, budget: Option<u64>, step: &mut DriverStep) {
+        let mut fields = json!({ "objective": objective, "status": "active" });
+        if let Some(budget) = budget {
+            fields["tokenBudget"] = json!(budget);
+        }
+        self.goal_set(GoalAction::Set, fields, step);
+    }
+
+    fn goal_clear(&mut self, then: Option<(String, Option<u64>)>, step: &mut DriverStep) {
+        let id = self.rpc_id();
+        self.pending_rpcs.insert(id, PendingRpc::GoalClear { then });
+        step.outbound.push(json!({
+            "id": id, "method": "thread/goal/clear",
+            "params": { "threadId": self.thread_id },
+        }));
+    }
+
+    fn goal_active(&self) -> bool {
+        self.goal
+            .as_ref()
+            .is_some_and(|goal| goal.status == "active")
+    }
+
+    /// The goal runs, or a set that makes it run is in flight: the server
+    /// starts the set's turn without waiting for us to read its answer.
+    fn goal_drives_turns(&self) -> bool {
+        self.goal_active()
+            || self
+                .pending_rpcs
+                .values()
+                .any(|p| matches!(p, PendingRpc::GoalSet { action } if action.activates()))
+    }
+
+    /// Fold the goal as the wire now states it (`None` = no goal) into the
+    /// journal. Objective, status and budget changes journal at once, with
+    /// the goal's end when this is one; a usage-only change waits out
+    /// [`GOAL_USAGE_THROTTLE_MS`] (turn end and `tick` flush it).
+    fn observe_goal(&mut self, next: Option<GoalState>, now_ms: u64, step: &mut DriverStep) {
+        let prev = std::mem::replace(&mut self.goal, next);
+        let ended = match (prev.as_ref(), self.goal.as_ref()) {
+            (Some(prev), Some(next)) if next.status == "complete" && prev.status != "complete" => {
+                Some(goal_end("achieved", next))
+            }
+            (None, Some(next)) if next.status == "complete" && self.goal_seen => {
+                Some(goal_end("achieved", next))
+            }
+            // A complete goal's end was already told (or came before this
+            // process): clearing it is not another end.
+            (Some(prev), None) if prev.status != "complete" => Some(goal_end("cleared", prev)),
+            _ => None,
+        };
+        self.goal_seen |= self.goal.is_some();
+        let material = match (self.goal_emitted.as_ref(), self.goal.as_ref()) {
+            (None, None) => false,
+            (Some(was), Some(now)) => {
+                was.objective != now.objective
+                    || was.status != now.status
+                    || was.token_budget != now.token_budget
+                    || was.set_at_ms != now.set_at_ms
+            }
+            _ => true,
+        };
+        let usage_due = self.goal != self.goal_emitted
+            && now_ms.saturating_sub(self.goal_emitted_ms) >= GOAL_USAGE_THROTTLE_MS;
+        if ended.is_some() || material || usage_due {
+            self.emit_goal(ended, now_ms, step);
+        }
+    }
+
+    fn emit_goal(&mut self, ended: Option<GoalEnd>, now_ms: u64, step: &mut DriverStep) {
+        self.goal_emitted = self.goal.clone();
+        self.goal_emitted_ms = now_ms;
+        step.events.push(AgentEvent::Goal {
+            goal: self.goal.clone(),
+            ended,
+        });
+    }
+
+    /// Journal the snapshot the usage throttle held back, if any — at turn
+    /// end, so the turn closes on the goal's true totals.
+    fn flush_goal(&mut self, now_ms: u64, step: &mut DriverStep) {
+        if self.goal != self.goal_emitted {
+            self.emit_goal(None, now_ms, step);
+        }
+    }
+
+    /// The held-back snapshot once its window has passed, for a goal whose
+    /// updates stopped mid-turn (one long tool call).
+    fn goal_tick(&mut self, now_ms: u64) -> DriverStep {
+        let mut step = DriverStep::default();
+        if now_ms.saturating_sub(self.goal_emitted_ms) >= GOAL_USAGE_THROTTLE_MS {
+            self.flush_goal(now_ms, &mut step);
+        }
+        step
+    }
+
     fn on_frame(&mut self, frame: &Value) -> DriverStep {
         let mut step = DriverStep::default();
         let method = frame["method"].as_str().unwrap_or_default();
@@ -1932,6 +2160,9 @@ impl CodexMapper {
                 }
             }
             "turn/started" => {
+                // Our `turn/start` is in flight or opened this turn; anything
+                // else the server started on its own.
+                let ours = self.turn_pending || self.opening_turn_owned;
                 self.turn_id = frame["params"]["turn"]["id"]
                     .as_str()
                     .unwrap_or_default()
@@ -1950,6 +2181,19 @@ impl CodexMapper {
                 step.events.push(AgentEvent::TurnStarted {
                     turn_id: self.turn_id.clone(),
                 });
+                // A server-started turn while the goal runs is the server
+                // continuing toward it (live 0.162.1: back to back, no
+                // userMessage item) — or the turn a set/resume opens. The
+                // turn a requested compaction opens is neither.
+                if !ours && !std::mem::take(&mut self.compact_requested) && self.goal_drives_turns()
+                {
+                    step.events.push(AgentEvent::TurnCause {
+                        turn_id: self.turn_id.clone(),
+                        kind: "goal".into(),
+                        detail: None,
+                        schedule: None,
+                    });
+                }
                 // Ordinary follow-ups remain queued for later turns. Only an
                 // explicit Steer click captured during the unidentified start
                 // window is promoted now that the turn id is known.
@@ -2308,6 +2552,22 @@ impl CodexMapper {
                     }
                 }
             }
+            // The thread's goal (0.162.1): after every tool call and at turn
+            // end with growing usage, on each status change, and for a goal
+            // the model created (`create_goal`) as for one we set. The
+            // thread gate above already routed a subagent's goal away; an
+            // unscoped frame is refused too.
+            "thread/goal/updated" | "thread/goal/cleared" => {
+                if frame["params"]["threadId"].as_str() != Some(self.thread_id.as_str()) {
+                    return step;
+                }
+                let goal = if method == "thread/goal/updated" {
+                    goal_from_wire(&frame["params"]["goal"])
+                } else {
+                    None
+                };
+                self.observe_goal(goal, crate::now_ms(), &mut step);
+            }
             "thread/name/updated" => {
                 if let Some(name) = frame["params"]["threadName"].as_str() {
                     if !name.is_empty() {
@@ -2367,6 +2627,7 @@ impl CodexMapper {
                 if let Some(flushed) = self.coalescer.flush() {
                     step.events.push(flushed);
                 }
+                self.flush_goal(crate::now_ms(), &mut step);
                 // A turn-end frame arriving AFTER the interrupt watchdog already
                 // closed this turn must NOT emit a second end (symmetry with
                 // claude on_result's `was_active` guard).
@@ -2431,6 +2692,7 @@ impl CodexMapper {
                 if let Some(flushed) = self.coalescer.flush() {
                     step.events.push(flushed);
                 }
+                self.flush_goal(crate::now_ms(), &mut step);
                 // Same `was_active` guard as turn/completed: a turn already
                 // closed by the watchdog must not fail a second time.
                 let was_active = self.turn_active;
@@ -2871,6 +3133,7 @@ impl CodexMapper {
                 });
             }
             (PendingRpc::Compact, Some(err)) => {
+                self.compact_requested = false;
                 step.events.push(AgentEvent::Error {
                     message: format!("compact failed: {}", err["message"]),
                     fatal: false,
@@ -2981,6 +3244,38 @@ impl CodexMapper {
                     "codex could not read the subagent: {}",
                     truncate_label(msg, 200)
                 )));
+            }
+            (PendingRpc::GoalGet | PendingRpc::GoalSet { .. }, None) => {
+                let goal = goal_from_wire(&frame["result"]["goal"]);
+                self.observe_goal(goal, crate::now_ms(), step);
+            }
+            // An app-server without goals (or a thread it cannot read one
+            // for): nothing to show, and nothing the user asked for.
+            (PendingRpc::GoalGet, Some(_)) => {}
+            (PendingRpc::GoalSet { action }, Some(err)) => {
+                step.events.push(AgentEvent::Notice {
+                    text: goal_refusal(action.refusal(), err, "thread/goal/set"),
+                });
+            }
+            (PendingRpc::GoalClear { then }, None) => {
+                // `thread/goal/cleared` follows (or precedes) this answer;
+                // whichever lands first ends the goal, the other is a no-op.
+                self.observe_goal(None, crate::now_ms(), step);
+                if let Some((objective, budget)) = then {
+                    self.goal_set_new(objective, budget, step);
+                }
+            }
+            (PendingRpc::GoalClear { then }, Some(err)) => {
+                // The replacing goal is not set over a goal that would not
+                // clear: a new objective on a `complete` goal stays complete.
+                let refusal = if then.is_some() {
+                    "Goal not set"
+                } else {
+                    "Goal not cleared"
+                };
+                step.events.push(AgentEvent::Notice {
+                    text: goal_refusal(refusal, err, "thread/goal/clear"),
+                });
             }
         }
     }
@@ -3629,9 +3924,38 @@ impl CodexMapper {
                     });
                 }
             }
-            // enteredReviewMode / exitedReviewMode / sleep / imageGeneration
-            // / functionCallOutput / plan etc. are tolerated silently (the
-            // official client renders nothing for them either).
+            // The model's sleep tool (`clock.sleep`, 0.162.1: `{type:
+            // "sleep", id, durationMs}`) — a row, so a waiting agent does
+            // not look stalled.
+            Some("sleep") => {
+                if completed {
+                    step.events.push(AgentEvent::ToolCallUpdate {
+                        id,
+                        status: ToolStatus::Completed,
+                        content: None,
+                    });
+                } else {
+                    if let Some(flushed) = self.coalescer.flush() {
+                        step.events.push(flushed);
+                    }
+                    let title = match item["durationMs"].as_u64() {
+                        Some(ms) => format!("sleep: {}", fmt_elapsed_secs(ms.div_ceil(1000))),
+                        None => "sleep".into(),
+                    };
+                    step.events.push(AgentEvent::ToolCall {
+                        id,
+                        kind: ToolKind::Other,
+                        title,
+                        locations: Vec::new(),
+                        status: ToolStatus::InProgress,
+                        cross_turn: false,
+                        command: None,
+                    });
+                }
+            }
+            // enteredReviewMode / exitedReviewMode / functionCallOutput /
+            // plan etc. are tolerated silently (the official client renders
+            // nothing for them either).
             _ => {}
         }
     }
@@ -4449,6 +4773,11 @@ impl CodexMapper {
     /// harness's drain call in `run_driver`).
     fn drain_pending(&mut self) -> Vec<AgentEvent> {
         let mut events: Vec<AgentEvent> = Vec::new();
+        // The goal outlives this process (it is thread state): journal the
+        // usage the throttle held back, or it is lost with the process.
+        let mut goal = DriverStep::default();
+        self.flush_goal(crate::now_ms(), &mut goal);
+        events.extend(goal.events);
         // The daemon's bridge status is connection-scoped: this process is
         // going, so a live status must not outlive it in the journal (the
         // claude driver journals the same Off at teardown).
@@ -5417,7 +5746,19 @@ impl CodexMapper {
                     }
                 }
             }
-            AgentCommand::Interrupt => self.interrupt(&mut step),
+            AgentCommand::Interrupt => {
+                // Stop must stop: `turn/interrupt` leaves an active goal
+                // active, and the server opens the next continuation turn at
+                // once (live 0.162.1) — the Codex TUI pauses the goal on an
+                // interrupt for that reason. Here, not in `interrupt()`:
+                // Send now interrupts to hand the turn to waiting messages
+                // and leaves the goal running. The pause goes first so it
+                // is in force before the interrupted turn ends.
+                if self.goal_active() {
+                    self.goal_set(GoalAction::Pause, json!({ "status": "paused" }), &mut step);
+                }
+                self.interrupt(&mut step);
+            }
             AgentCommand::SetModel { model_id } => {
                 let effort = self.model_effort(&model_id);
                 if self.pending_model_update.is_some() {
@@ -5616,6 +5957,7 @@ impl CodexMapper {
                 // notification on the pinned version).
                 let id = self.rpc_id();
                 self.pending_rpcs.insert(id, PendingRpc::Compact);
+                self.compact_requested = true;
                 step.outbound.push(json!({
                     "id": id, "method": "thread/compact/start",
                     "params": { "threadId": self.thread_id },
@@ -5752,6 +6094,40 @@ impl CodexMapper {
                         .into(),
                 });
             }
+            // Codex's own wording; the mapper of a live driver always has
+            // its thread (the handshake opens it).
+            AgentCommand::SetGoal { .. } if self.thread_id.is_empty() => {
+                step.events.push(AgentEvent::Notice {
+                    text: "The session must start before you can set a goal.".into(),
+                });
+            }
+            AgentCommand::SetGoal {
+                objective,
+                token_budget,
+            } => {
+                let objective = objective.trim().to_string();
+                if self.goal.is_some() {
+                    // A new objective on a `complete` goal keeps `complete`,
+                    // its tokens and its createdAt (live 0.162.1): a fresh
+                    // goal clears the old one first, and is set once the
+                    // clear answers.
+                    self.goal_clear(Some((objective, token_budget)), &mut step);
+                } else {
+                    self.goal_set_new(objective, token_budget, &mut step);
+                }
+            }
+            // No goal: nothing to pause, resume or clear.
+            AgentCommand::PauseGoal | AgentCommand::ResumeGoal | AgentCommand::ClearGoal
+                if self.goal.is_none() => {}
+            AgentCommand::PauseGoal => {
+                self.goal_set(GoalAction::Pause, json!({ "status": "paused" }), &mut step);
+            }
+            // `active` starts a turn at once (live 0.162.1).
+            AgentCommand::ResumeGoal => {
+                self.goal_set(GoalAction::Resume, json!({ "status": "active" }), &mut step);
+            }
+            // A running turn finishes; no new one starts.
+            AgentCommand::ClearGoal => self.goal_clear(None, &mut step),
         }
         step
     }
@@ -5866,6 +6242,7 @@ impl CodexMapper {
             return step;
         }
         self.turn_active = false;
+        self.flush_goal(crate::now_ms(), &mut step);
         // This only proves the PARENT turn stopped answering. Child threads
         // are process-scoped and may continue streaming independently; their
         // own terminal frames (or driver teardown) close them.
@@ -5942,6 +6319,7 @@ impl Mapper for CodexMapper {
         let flush = self.idle_flush();
         step.events.extend(flush.events);
         step.outbound.extend(flush.outbound);
+        step.events.extend(self.goal_tick(crate::now_ms()).events);
         step
     }
 }
@@ -6340,6 +6718,20 @@ fn parse_expected_turn_id(msg: &str) -> Option<String> {
 
 /// The extension's feature-detect predicate for optional RPCs: JSON-RPC
 /// -32601, or a message naming the method as unknown.
+/// One goal refusal Notice: "Goal not set: <the server's message>", or a
+/// plain word for an app-server that has no goals at all.
+fn goal_refusal(refusal: &str, err: &Value, method: &str) -> String {
+    if is_method_not_found(err, method) {
+        return format!("{refusal}: this Codex version has no goals");
+    }
+    let msg = err["message"]
+        .as_str()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .unwrap_or("request failed");
+    format!("{refusal}: {}", truncate_label(msg, 300))
+}
+
 fn is_method_not_found(err: &Value, method: &str) -> bool {
     if err["code"].as_i64() == Some(-32601) {
         return true;
@@ -12576,5 +12968,592 @@ mod tests {
                 text: "hook: remember the style guide".into()
             }
         );
+    }
+
+    /// A `thread/goal/*` goal object in the 0.162.1 shape.
+    fn wire_goal(objective: &str, status: &str, tokens: u64, secs: u64) -> Value {
+        json!({
+            "threadId": "thr-1", "objective": objective, "status": status,
+            "tokenBudget": null, "tokensUsed": tokens, "timeUsedSeconds": secs,
+            "createdAt": 1_760_000_000u64, "updatedAt": 1_760_000_100u64,
+        })
+    }
+
+    fn goal_updated(thread: &str, goal: Value) -> Value {
+        json!({
+            "method": "thread/goal/updated",
+            "params": { "threadId": thread, "turnId": null, "goal": goal },
+        })
+    }
+
+    fn goal_cleared() -> Value {
+        json!({ "method": "thread/goal/cleared", "params": { "threadId": "thr-1" } })
+    }
+
+    fn goal_events(step: &DriverStep) -> Vec<(Option<GoalState>, Option<GoalEnd>)> {
+        step.events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Goal { goal, ended } => Some((goal.clone(), ended.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A mapper whose thread has a journaled "ship it" goal in `status`.
+    fn mapper_with_goal(status: &str) -> CodexMapper {
+        let mut m = mapper();
+        let step = m.on_frame(&goal_updated("thr-1", wire_goal("ship it", status, 100, 5)));
+        assert_eq!(goal_events(&step).len(), 1);
+        m
+    }
+
+    fn turn_completed(turn: &str) -> Value {
+        json!({
+            "method": "turn/completed",
+            "params": { "threadId": "thr-1", "turn": { "id": turn, "status": "completed" } },
+        })
+    }
+
+    /// A turn the server started on its own (no `turn/start` of ours).
+    fn server_turn(m: &mut CodexMapper, turn: &str) -> DriverStep {
+        m.on_frame(&json!({
+            "method": "turn/started",
+            "params": { "threadId": "thr-1", "turn": { "id": turn } },
+        }))
+    }
+
+    fn has_goal_cause(step: &DriverStep, turn: &str) -> bool {
+        step.events.iter().any(|e| {
+            matches!(e, AgentEvent::TurnCause { turn_id, kind, detail: None, schedule: None }
+                if turn_id == turn && kind == "goal")
+        })
+    }
+
+    fn methods(step: &DriverStep) -> Vec<&str> {
+        step.outbound
+            .iter()
+            .filter_map(|o| o["method"].as_str())
+            .collect()
+    }
+
+    #[test]
+    fn goal_updates_map_the_status_verbatim_and_ignore_other_threads() {
+        let mut m = mapper();
+        let long = "x".repeat(GOAL_TEXT_MAX + 50);
+        let mut goal = wire_goal(&long, "usageLimited", 1234, 61);
+        goal["tokenBudget"] = json!(50_000);
+        let step = m.on_frame(&goal_updated("thr-1", goal));
+        let events = goal_events(&step);
+        assert_eq!(events.len(), 1);
+        let (Some(state), None) = &events[0] else {
+            panic!("expected a goal state, got {events:?}");
+        };
+        assert_eq!(state.status, "usageLimited");
+        assert!(state.objective.ends_with('…'));
+        assert!(state.objective.len() <= GOAL_TEXT_MAX + '…'.len_utf8());
+        assert_eq!(state.set_at_ms, 1_760_000_000_000);
+        assert_eq!(state.tokens_used, Some(1234));
+        assert_eq!(state.token_budget, Some(50_000));
+        assert_eq!(state.time_used_secs, Some(61));
+        assert_eq!((state.turns, &state.last_check), (None, &None));
+
+        // A subagent's goal is its own; an unscoped frame is refused.
+        let step = m.on_frame(&goal_updated("child", wire_goal("theirs", "active", 1, 1)));
+        assert!(step.events.is_empty());
+        let step = m.on_frame(&json!({
+            "method": "thread/goal/updated",
+            "params": { "goal": wire_goal("unscoped", "active", 1, 1) },
+        }));
+        assert!(step.events.is_empty());
+        let step = m.on_frame(&json!({
+            "method": "thread/goal/cleared", "params": { "threadId": "child" },
+        }));
+        assert!(step.events.is_empty());
+        assert_eq!(m.goal.as_ref().unwrap().status, "usageLimited");
+    }
+
+    #[test]
+    fn goal_completion_ends_achieved_once() {
+        let mut m = mapper_with_goal("active");
+        let step = m.on_frame(&goal_updated(
+            "thr-1",
+            wire_goal("ship it", "complete", 900, 42),
+        ));
+        let events = goal_events(&step);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0.as_ref().unwrap().status, "complete");
+        assert_eq!(
+            events[0].1,
+            Some(GoalEnd {
+                outcome: "achieved".into(),
+                objective: "ship it".into(),
+                reason: None,
+                turns: None,
+                tokens: Some(900),
+                duration_secs: Some(42),
+            })
+        );
+        // The turn-end update on the complete goal is not another end.
+        let step = m.on_frame(&goal_updated(
+            "thr-1",
+            wire_goal("ship it", "complete", 950, 43),
+        ));
+        assert!(goal_events(&step).iter().all(|(_, ended)| ended.is_none()));
+
+        // A resumed thread's goal was achieved before this process.
+        let mut m = mapper();
+        let id = m.goal_read().outbound[0]["id"].as_u64().unwrap();
+        let step = m.on_frame(&json!({
+            "id": id, "result": { "goal": wire_goal("old", "complete", 10, 1) },
+        }));
+        let events = goal_events(&step);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].0.is_some() && events[0].1.is_none());
+        // Once this process saw a goal, one first seen complete was
+        // achieved here.
+        m.on_frame(&goal_cleared());
+        let step = m.on_frame(&goal_updated("thr-1", wire_goal("quick", "complete", 5, 1)));
+        let ended = goal_events(&step)[0].1.clone().expect("achieved");
+        assert_eq!(
+            (ended.outcome.as_str(), ended.objective.as_str()),
+            ("achieved", "quick")
+        );
+    }
+
+    #[test]
+    fn goal_clear_ends_a_live_goal_only() {
+        let mut m = mapper();
+        assert!(m.on_frame(&goal_cleared()).events.is_empty(), "no goal");
+
+        let mut m = mapper_with_goal("paused");
+        let step = m.on_frame(&goal_cleared());
+        assert_eq!(
+            goal_events(&step),
+            vec![(
+                None,
+                Some(GoalEnd {
+                    outcome: "cleared".into(),
+                    objective: "ship it".into(),
+                    reason: None,
+                    turns: None,
+                    tokens: Some(100),
+                    duration_secs: Some(5),
+                })
+            )]
+        );
+        assert!(m.on_frame(&goal_cleared()).events.is_empty());
+
+        // An achieved goal already ended: clearing it only drops the state.
+        let mut m = mapper_with_goal("active");
+        m.on_frame(&goal_updated(
+            "thr-1",
+            wire_goal("ship it", "complete", 200, 9),
+        ));
+        assert_eq!(
+            goal_events(&m.on_frame(&goal_cleared())),
+            vec![(None, None)]
+        );
+
+        // A read that finds no goal when there was none says nothing.
+        let mut m = mapper();
+        let id = m.goal_read().outbound[0]["id"].as_u64().unwrap();
+        let step = m.on_frame(&json!({ "id": id, "result": { "goal": null } }));
+        assert!(step.events.is_empty());
+    }
+
+    #[test]
+    fn goal_usage_is_throttled_and_flushed_at_turn_end() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let update = |status: &str, tokens: u64| {
+            goal_updated("thr-1", wire_goal("ship it", status, tokens, tokens / 100))
+        };
+        assert_eq!(goal_events(&m.on_frame(&update("active", 100))).len(), 1);
+        // Usage-only moves wait out the window.
+        for tokens in [200, 300] {
+            assert!(m.on_frame(&update("active", tokens)).events.is_empty());
+        }
+        let due = m.goal_emitted_ms + GOAL_USAGE_THROTTLE_MS;
+        assert!(m.goal_tick(due - 1).events.is_empty());
+        // A status change journals at once, with the latest usage.
+        let events = goal_events(&m.on_frame(&update("budgetLimited", 400)));
+        let state = events[0].0.clone().unwrap();
+        assert_eq!(
+            (state.status.as_str(), state.tokens_used),
+            ("budgetLimited", Some(400))
+        );
+        // The held-back snapshot lands before the turn's end.
+        m.on_frame(&update("budgetLimited", 500));
+        let step = m.on_frame(&turn_completed("turn-A"));
+        let goal_at = step
+            .events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::Goal { .. }))
+            .expect("flushed at turn end");
+        let end_at = step
+            .events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::TurnCompleted { .. }))
+            .unwrap();
+        assert!(goal_at < end_at);
+        assert_eq!(
+            goal_events(&step)[0].0.as_ref().unwrap().tokens_used,
+            Some(500)
+        );
+        // Nothing held back: the next turn end journals no goal.
+        active_turn(&mut m);
+        assert!(goal_events(&m.on_frame(&turn_completed("turn-A"))).is_empty());
+        // turn/failed flushes too.
+        active_turn(&mut m);
+        m.on_frame(&update("budgetLimited", 600));
+        let step = m.on_frame(&json!({
+            "method": "turn/failed", "params": { "error": { "message": "boom" } },
+        }));
+        assert_eq!(
+            goal_events(&step)[0].0.as_ref().unwrap().tokens_used,
+            Some(600)
+        );
+        // With updates stopped mid-turn (one long tool), the window passing
+        // flushes the snapshot.
+        m.on_frame(&update("budgetLimited", 700));
+        let due = m.goal_emitted_ms + GOAL_USAGE_THROTTLE_MS;
+        let step = m.goal_tick(due);
+        assert_eq!(
+            goal_events(&step)[0].0.as_ref().unwrap().tokens_used,
+            Some(700)
+        );
+        assert!(m.goal_tick(due + GOAL_USAGE_THROTTLE_MS).events.is_empty());
+        // Teardown journals what the throttle held back.
+        m.on_frame(&update("budgetLimited", 750));
+        let drained = m.drain_pending();
+        assert!(drained.iter().any(|e| matches!(e,
+            AgentEvent::Goal { goal: Some(goal), ended: None } if goal.tokens_used == Some(750))));
+        // An update after the window journals at once.
+        m.goal_emitted_ms = crate::now_ms() - GOAL_USAGE_THROTTLE_MS;
+        assert_eq!(
+            goal_events(&m.on_frame(&update("budgetLimited", 800))).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn goal_is_read_once_the_thread_opens() {
+        let mut m = mapper();
+        let step = m.goal_read();
+        assert_eq!(methods(&step), ["thread/goal/get"]);
+        assert_eq!(step.outbound[0]["params"], json!({ "threadId": "thr-1" }));
+        let id = step.outbound[0]["id"].as_u64().unwrap();
+        let step = m.on_frame(&json!({
+            "id": id, "result": { "goal": wire_goal("resume me", "paused", 10, 2) },
+        }));
+        let events = goal_events(&step);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0.as_ref().unwrap().status, "paused");
+        assert_eq!(events[0].1, None);
+
+        // An app-server without goals: silent.
+        let mut m = mapper();
+        let id = m.goal_read().outbound[0]["id"].as_u64().unwrap();
+        let step = m.on_frame(&json!({
+            "id": id, "error": { "code": -32601, "message": "method not found" },
+        }));
+        assert!(step.events.is_empty() && step.outbound.is_empty());
+    }
+
+    #[test]
+    fn server_started_turns_carry_a_goal_cause_only_while_it_runs() {
+        let mut m = mapper_with_goal("active");
+        let step = server_turn(&mut m, "turn-G1");
+        assert_eq!(
+            step.events,
+            vec![
+                AgentEvent::TurnStarted {
+                    turn_id: "turn-G1".into()
+                },
+                AgentEvent::TurnCause {
+                    turn_id: "turn-G1".into(),
+                    kind: "goal".into(),
+                    detail: None,
+                    schedule: None,
+                },
+            ]
+        );
+        m.on_frame(&turn_completed("turn-G1"));
+
+        // The user's own turn has a cause: their message.
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "hi".into() }],
+        });
+        let step = server_turn(&mut m, "turn-U");
+        assert!(step
+            .events
+            .iter()
+            .all(|e| !matches!(e, AgentEvent::TurnCause { .. })));
+        m.on_frame(&turn_completed("turn-U"));
+
+        // A paused goal starts nothing.
+        m.on_frame(&goal_updated(
+            "thr-1",
+            wire_goal("ship it", "paused", 100, 5),
+        ));
+        assert!(!has_goal_cause(&server_turn(&mut m, "turn-X"), "turn-X"));
+        m.on_frame(&turn_completed("turn-X"));
+
+        // A resume opens its turn before its answer lands.
+        m.on_command(AgentCommand::ResumeGoal);
+        assert!(has_goal_cause(&server_turn(&mut m, "turn-R"), "turn-R"));
+        m.on_frame(&turn_completed("turn-R"));
+
+        // A requested compaction's turn is not the goal's; the next one is.
+        m.on_frame(&goal_updated(
+            "thr-1",
+            wire_goal("ship it", "active", 100, 5),
+        ));
+        m.on_command(AgentCommand::Compact);
+        assert!(!has_goal_cause(&server_turn(&mut m, "turn-C"), "turn-C"));
+        m.on_frame(&turn_completed("turn-C"));
+        assert!(has_goal_cause(&server_turn(&mut m, "turn-G2"), "turn-G2"));
+    }
+
+    #[test]
+    fn goal_commands_send_their_rpcs() {
+        // No goal: one set, active, carrying the budget.
+        let mut m = mapper();
+        let step = m.on_command(AgentCommand::SetGoal {
+            objective: "  ship it \n".into(),
+            token_budget: Some(50_000),
+        });
+        assert_eq!(methods(&step), ["thread/goal/set"]);
+        assert_eq!(
+            step.outbound[0]["params"],
+            json!({
+                "threadId": "thr-1", "origin": "user", "objective": "ship it",
+                "status": "active", "tokenBudget": 50_000,
+            })
+        );
+        // Its answer is the goal as it stands.
+        let id = step.outbound[0]["id"].as_u64().unwrap();
+        let step = m.on_frame(&json!({
+            "id": id, "result": { "goal": wire_goal("ship it", "active", 0, 0) },
+        }));
+        assert_eq!(goal_events(&step)[0].0.as_ref().unwrap().status, "active");
+
+        let mut m = mapper();
+        let step = m.on_command(AgentCommand::SetGoal {
+            objective: "no budget".into(),
+            token_budget: None,
+        });
+        assert!(step.outbound[0]["params"].get("tokenBudget").is_none());
+
+        // A goal exists (here an achieved one, whose objective a set would
+        // not replace): clear first, set once the clear answers.
+        let mut m = mapper_with_goal("complete");
+        let step = m.on_command(AgentCommand::SetGoal {
+            objective: "next".into(),
+            token_budget: None,
+        });
+        assert_eq!(methods(&step), ["thread/goal/clear"]);
+        assert_eq!(step.outbound[0]["params"], json!({ "threadId": "thr-1" }));
+        let id = step.outbound[0]["id"].as_u64().unwrap();
+        let step = m.on_frame(&json!({ "id": id, "result": { "cleared": true } }));
+        assert_eq!(methods(&step), ["thread/goal/set"]);
+        assert_eq!(step.outbound[0]["params"]["objective"], "next");
+        assert_eq!(step.outbound[0]["params"]["status"], "active");
+        assert_eq!(goal_events(&step), vec![(None, None)]);
+        // The notification after the answer is a no-op.
+        assert!(m.on_frame(&goal_cleared()).events.is_empty());
+
+        // A clear that fails sets nothing over the old goal.
+        let mut m = mapper_with_goal("active");
+        let step = m.on_command(AgentCommand::SetGoal {
+            objective: "next".into(),
+            token_budget: None,
+        });
+        let id = step.outbound[0]["id"].as_u64().unwrap();
+        let step = m.on_frame(&json!({
+            "id": id, "error": { "code": -32000, "message": "thread not loaded" },
+        }));
+        assert!(step.outbound.is_empty());
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::Notice {
+                text: "Goal not set: thread not loaded".into()
+            }]
+        );
+
+        // Pause, resume, clear.
+        let mut m = mapper_with_goal("active");
+        for (cmd, method, params) in [
+            (
+                AgentCommand::PauseGoal,
+                "thread/goal/set",
+                json!({ "threadId": "thr-1", "origin": "user", "status": "paused" }),
+            ),
+            (
+                AgentCommand::ResumeGoal,
+                "thread/goal/set",
+                json!({ "threadId": "thr-1", "origin": "user", "status": "active" }),
+            ),
+            (
+                AgentCommand::ClearGoal,
+                "thread/goal/clear",
+                json!({ "threadId": "thr-1" }),
+            ),
+        ] {
+            let step = m.on_command(cmd);
+            assert_eq!(methods(&step), [method]);
+            assert_eq!(step.outbound[0]["params"], params, "{method}");
+        }
+        // With no goal they do nothing.
+        let mut m = mapper();
+        for cmd in [
+            AgentCommand::PauseGoal,
+            AgentCommand::ResumeGoal,
+            AgentCommand::ClearGoal,
+        ] {
+            let step = m.on_command(cmd);
+            assert!(step.outbound.is_empty() && step.events.is_empty());
+        }
+
+        // A refusal is one Notice in the server's words; an app-server
+        // without goals is named as such.
+        for (err, text) in [
+            (
+                json!({ "code": -32600, "message": "objective too long" }),
+                "Goal not set: objective too long",
+            ),
+            (
+                json!({ "code": -32601, "message": "method not found" }),
+                "Goal not set: this Codex version has no goals",
+            ),
+        ] {
+            let step = m.on_command(AgentCommand::SetGoal {
+                objective: "x".into(),
+                token_budget: None,
+            });
+            let id = step.outbound[0]["id"].as_u64().unwrap();
+            let step = m.on_frame(&json!({ "id": id, "error": err }));
+            assert_eq!(step.events, vec![AgentEvent::Notice { text: text.into() }]);
+        }
+        let mut m = mapper_with_goal("active");
+        let id = m.on_command(AgentCommand::PauseGoal).outbound[0]["id"]
+            .as_u64()
+            .unwrap();
+        let step = m.on_frame(&json!({ "id": id, "error": { "message": "busy" } }));
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::Notice {
+                text: "Goal not paused: busy".into()
+            }]
+        );
+
+        // Before the thread exists.
+        let mut m = mapper();
+        m.thread_id.clear();
+        let step = m.on_command(AgentCommand::SetGoal {
+            objective: "x".into(),
+            token_budget: None,
+        });
+        assert!(step.outbound.is_empty());
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::Notice {
+                text: "The session must start before you can set a goal.".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn stop_pauses_a_running_goal_but_send_now_does_not() {
+        let mut m = mapper_with_goal("active");
+        active_turn(&mut m);
+        let step = m.on_command(AgentCommand::Interrupt);
+        assert_eq!(methods(&step), ["thread/goal/set", "turn/interrupt"]);
+        assert_eq!(
+            step.outbound[0]["params"],
+            json!({ "threadId": "thr-1", "origin": "user", "status": "paused" })
+        );
+
+        // Send now interrupts to hand the turn to a waiting message.
+        let mut m = mapper_with_goal("active");
+        active_turn(&mut m);
+        let step = m.on_command(AgentCommand::SendAfterTurn {
+            blocks: vec![ContentBlock::Text {
+                text: "later".into(),
+            }],
+        });
+        let AgentEvent::UserMessage { id: Some(id), .. } = &step.events[0] else {
+            panic!("expected UserMessage");
+        };
+        let step = m.on_command(AgentCommand::SendNow { id: id.clone() });
+        assert_eq!(methods(&step), ["turn/interrupt"]);
+
+        // No running goal: a plain interrupt.
+        for status in [None, Some("paused"), Some("complete")] {
+            let mut m = match status {
+                Some(status) => mapper_with_goal(status),
+                None => mapper(),
+            };
+            active_turn(&mut m);
+            let step = m.on_command(AgentCommand::Interrupt);
+            assert_eq!(methods(&step), ["turn/interrupt"], "{status:?}");
+        }
+    }
+
+    #[test]
+    fn codex_advertises_goal_controls() {
+        // The driver reports the legacy codex set (no negotiated one).
+        assert!(Mapper::capabilities(&mapper()).is_none());
+        let caps = crate::capabilities::ChatCapabilities::legacy("codex");
+        for command in ["set_goal", "pause_goal", "resume_goal", "clear_goal"] {
+            assert!(caps.commands.iter().any(|c| c == command), "{command}");
+        }
+    }
+
+    #[test]
+    fn sleep_items_render_a_waiting_row() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let sleep = |phase: &str, item: Value| {
+            json!({
+                "method": phase,
+                "params": { "threadId": "thr-1", "turnId": "turn-A", "item": item },
+            })
+        };
+        let item = json!({ "type": "sleep", "id": "sl-1", "durationMs": 300_000 });
+        let step = m.on_frame(&sleep("item/started", item.clone()));
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::ToolCall {
+                id: "sl-1".into(),
+                kind: ToolKind::Other,
+                title: "sleep: 5m 00s".into(),
+                locations: Vec::new(),
+                status: ToolStatus::InProgress,
+                cross_turn: false,
+                command: None,
+            }]
+        );
+        let step = m.on_frame(&sleep("item/completed", item));
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::ToolCallUpdate {
+                id: "sl-1".into(),
+                status: ToolStatus::Completed,
+                content: None,
+            }]
+        );
+        for (item, title) in [
+            (
+                json!({ "type": "sleep", "id": "sl-2", "durationMs": 1500 }),
+                "sleep: 2s",
+            ),
+            (json!({ "type": "sleep", "id": "sl-3" }), "sleep"),
+        ] {
+            let step = m.on_frame(&sleep("item/started", item));
+            assert!(matches!(&step.events[0],
+                AgentEvent::ToolCall { title: t, .. } if t == title));
+        }
     }
 }

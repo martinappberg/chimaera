@@ -5,6 +5,8 @@
 // paragraphs, lists, fenced code, and tables. A prompt containing "slow"
 // streams its reply in small chunks over ~15 s (the live-follow case).
 //
+// A prompt containing "loop" also sets a goal, schedules a wakeup and an
+// interval job, so the pinned Ahead card ticks while the harness scrolls.
 // `--embeds` makes it write the transcripts people actually scroll: it
 // generates a fixture in its working directory (figures of mixed sizes and
 // aspects, multi-page PDFs, markdown documents, tables) and every reply
@@ -243,6 +245,19 @@ rl.on("line", async (line) => {
       const result = name === "Bash" ? `saved ${written}` : `File created successfully at: ${input.file_path}`;
       emit({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: tuid, content: result, is_error: false }] } });
     }
+  }
+  if (text.includes("loop")) {
+    // The pinned Ahead card while scrolling: a goal (Claude's `/goal` reply),
+    // a wakeup 20 minutes out and an interval job (2.1.300 frames,
+    // PROTOCOL.md Pass 47). Nothing here ever fires.
+    emit({ type: "assistant", message: { id: `syn-${turn}`, model: "<synthetic>", content: [{ type: "text", text: "Goal set: every test in tests/api passes" }] },
+      local_command_run: { command: "goal", args: "every test in tests/api passes" } });
+    const id = `m${++msgN}`;
+    stream({ type: "message_start", message: { id } });
+    emit({ type: "assistant", message: { id, content: [{ type: "tool_use", id: `tu-w-${turn}`, name: "ScheduleWakeup", input: { delaySeconds: 1200, reason: "Checking whether the staging deploy finished", prompt: "/loop check the deploy" } }] } });
+    emit({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: `tu-w-${turn}`, content: "Next wakeup scheduled.", is_error: false }] }, tool_use_result: { scheduledFor: Date.now() + 1_200_000, clampedDelaySeconds: 1200, wasClamped: false } });
+    emit({ type: "assistant", message: { id, content: [{ type: "tool_use", id: `tu-c-${turn}`, name: "CronCreate", input: { cron: "*/10 * * * *", prompt: "post the error-rate graph", recurring: true } }] } });
+    emit({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: `tu-c-${turn}`, content: "Scheduled.", is_error: false }] }, tool_use_result: { id: `job${turn}`, humanSchedule: "Every 10 minutes", recurring: true, durable: false, nextFireAt: Date.now() + 420_000 } });
   }
   const id = `m${++msgN}`;
   const reply = EMBEDS ? embedsMarkdown : markdown;

@@ -17,9 +17,11 @@
 //! numbers, journals every event, and fans out to attached clients.
 
 pub mod acp;
+pub mod autonomy;
 pub mod capabilities;
 pub mod claude;
 pub mod codex;
+pub mod cron;
 pub mod driver;
 pub mod elicitation;
 pub mod journal;
@@ -282,6 +284,72 @@ pub struct ChatInfo {
     /// where the full level-set already lives. Cross-turn by nature — it
     /// survives turn ends and dies with the process.
     pub background_running: usize,
+    /// When the agent next resumes itself (claude: a wakeup or a session
+    /// job), and what it said it will do — the rail's "not finished" cue and
+    /// the hold on the turn-end notice. A glance, not the set: the rows live
+    /// on the chat socket's `Schedule` level-set. `None` when nothing is
+    /// scheduled or the process is gone. Additive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_wake: Option<NextWake>,
+    /// The goal as it stands (objective + the agent's own status word), for
+    /// rows and cards with no warm store. `None` without one. Additive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal: Option<GoalBrief>,
+}
+
+/// [`ChatInfo::next_wake`].
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct NextWake {
+    /// Epoch ms of the earliest known run; `None` when the only items are
+    /// jobs whose next run is unknown.
+    pub at_ms: Option<u64>,
+    /// When the wait for `at_ms` began (a wakeup's scheduling time) — a
+    /// countdown's full span; `None` for a job.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_ms: Option<u64>,
+    /// The agent's words for it: a wakeup's reason, a job's prompt.
+    pub label: String,
+    /// Scheduled items in all (one wakeup plus the jobs).
+    pub count: usize,
+}
+
+/// [`ChatInfo::goal`].
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct GoalBrief {
+    pub objective: String,
+    pub status: String,
+}
+
+impl NextWake {
+    fn of(wakeup: Option<&model::ScheduledWakeup>, jobs: &[model::ScheduledJob]) -> Option<Self> {
+        let count = usize::from(wakeup.is_some()) + jobs.len();
+        if count == 0 {
+            return None;
+        }
+        let mut next: Option<(u64, Option<u64>, String)> =
+            wakeup.map(|w| (w.at_ms, Some(w.scheduled_at_ms), w.reason.clone()));
+        for job in jobs {
+            if let Some(at) = job.next_at_ms {
+                if next.as_ref().is_none_or(|(n, _, _)| at < *n) {
+                    next = Some((at, None, job.prompt.clone()));
+                }
+            }
+        }
+        let (at_ms, from_ms, label) = match next {
+            Some((at, from, label)) => (Some(at), from, label),
+            None => (
+                None,
+                None,
+                jobs.first().map(|j| j.prompt.clone()).unwrap_or_default(),
+            ),
+        };
+        Some(NextWake {
+            at_ms,
+            from_ms,
+            label: model::truncate_label(&label, 200),
+            count,
+        })
+    }
 }
 
 /// Private detail behind [`ChatInfo::background_running`]. The session-list
@@ -491,6 +559,30 @@ pub struct Carryover {
     /// LOOP from a series of updates, since each pick-up starts a billed turn.
     #[serde(default, skip_serializing_if = "is_zero_ms")]
     pub pickup_at_ms: u64,
+    /// A pending self-paced wakeup (claude `/loop`). It dies with the
+    /// process — `--resume` does not re-arm it (live 2.1.300) — so the
+    /// pick-up message tells the agent to schedule it again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wakeup: Option<model::ScheduledWakeup>,
+    /// Session jobs (claude `CronCreate`). `--resume` restores them, so the
+    /// successor driver is seeded with them rather than told about them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jobs: Vec<model::ScheduledJob>,
+    /// The goal, without its running counters (the ledger rewrites on any
+    /// change, and Codex reports tokens after every tool call). Claude's
+    /// `--resume` keeps its goal (live 2.1.300) and Codex keeps it on the
+    /// thread, so the successor is seeded with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<CarriedGoal>,
+}
+
+/// The part of a goal a successor process needs (see `Carryover.goal`).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CarriedGoal {
+    pub objective: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "is_zero_ms")]
+    pub set_at_ms: u64,
 }
 
 fn is_zero_ms(ms: &u64) -> bool {
@@ -549,6 +641,22 @@ impl Carryover {
                     })
                     .collect();
             }
+            AgentEvent::Schedule { wakeup, jobs } => {
+                self.wakeup = wakeup.clone();
+                self.jobs = jobs.clone();
+            }
+            AgentEvent::Goal { goal, .. } => {
+                // A finished Codex goal stays on its thread as `complete`;
+                // nothing is left to carry.
+                self.goal = goal
+                    .as_ref()
+                    .filter(|g| g.status != "complete")
+                    .map(|g| CarriedGoal {
+                        objective: g.objective.clone(),
+                        status: g.status.clone(),
+                        set_at_ms: g.set_at_ms,
+                    });
+            }
             AgentEvent::Exited { .. } => *self = Carryover::default(),
             _ => {}
         }
@@ -556,7 +664,7 @@ impl Carryover {
 
     /// Work the restart cut off: something the agent itself has to pick up.
     pub fn interrupted_work(&self) -> bool {
-        self.turn_in_flight || !self.background.is_empty()
+        self.turn_in_flight || !self.background.is_empty() || self.wakeup.is_some()
     }
 }
 
@@ -604,10 +712,21 @@ fn fold_session_metadata(info: &mut ChatInfo, ev: &AgentEvent) {
         } => {
             info.current_mode = Some(mode_id.clone());
         }
+        AgentEvent::Schedule { wakeup, jobs } => {
+            info.next_wake = NextWake::of(wakeup.as_ref(), jobs);
+        }
+        AgentEvent::Goal { goal, .. } => {
+            info.goal = goal.as_ref().map(|g| GoalBrief {
+                objective: model::truncate_label(&g.objective, 200),
+                status: g.status.clone(),
+            });
+        }
         // The bridge is process-owned: a dead process has no live link, even
-        // if the driver never got to journal its Off (a hard kill).
+        // if the driver never got to journal its Off (a hard kill). Nothing
+        // resumes a dead process on its own either.
         AgentEvent::Exited { .. } => {
             info.remote_control_url = None;
+            info.next_wake = None;
         }
         _ => {}
     }
@@ -731,7 +850,7 @@ impl ChatManager {
     pub fn spawn(
         self: &Arc<Self>,
         adapter: &dyn AgentAdapter,
-        spec: SpawnSpec,
+        mut spec: SpawnSpec,
     ) -> Result<ChatInfo> {
         let id = spec.session_id.clone();
         {
@@ -743,6 +862,22 @@ impl ChatManager {
         }
 
         let journal = Arc::new(Journal::open(&self.journal_dir, &id)?);
+        // Claude's `--resume` keeps the conversation's jobs and goal, so a
+        // respawn the restart ledger did not seed (a view switch, a relaunch,
+        // a reopen) starts from what this journal last said about them —
+        // never from a wakeup, which dies with its process.
+        if !spec.resumes {
+            spec.carried_jobs.clear();
+            spec.carried_goal = None;
+        } else if adapter.kind() == "claude" {
+            let reopened = journal.reopened();
+            if spec.carried_goal.is_none() {
+                spec.carried_goal = reopened.goal.clone().filter(|g| g.status == "active");
+            }
+            if spec.carried_jobs.is_empty() {
+                spec.carried_jobs = reopened.jobs.clone();
+            }
+        }
         let (cmd_tx, cmd_rx) = mpsc::channel(CMD_QUEUE);
         let (ev_tx, mut ev_rx) = mpsc::channel::<AgentEvent>(EVENT_QUEUE);
         let (events_tx, _) = broadcast::channel(BROADCAST_QUEUE);
@@ -765,6 +900,21 @@ impl ChatManager {
                 closed: Vec::new(),
             })
             .expect("fresh driver event queue has room for lifecycle reset");
+        // The same boundary for what resumes the agent on its own: a pending
+        // wakeup died with the old process; the jobs and the goal its resume
+        // restores are what the new process starts with.
+        ev_tx
+            .try_send(AgentEvent::Schedule {
+                wakeup: None,
+                jobs: spec.carried_jobs.clone(),
+            })
+            .expect("fresh driver event queue has room for lifecycle reset");
+        ev_tx
+            .try_send(AgentEvent::Goal {
+                goal: spec.carried_goal.clone(),
+                ended: None,
+            })
+            .expect("fresh driver event queue has room for lifecycle reset");
 
         let info = ChatInfo {
             id: id.clone(),
@@ -784,6 +934,8 @@ impl ChatManager {
             status_needs_action: false,
             remote_control_url: None,
             background_running: 0,
+            next_wake: None,
+            goal: None,
         };
         let session = Arc::new(ChatSession {
             unused_startup: AtomicBool::new(journal.last_seq() == 0),
@@ -1426,6 +1578,8 @@ mod tests {
             status_needs_action: false,
             remote_control_url: None,
             background_running: 0,
+            next_wake: None,
+            goal: None,
         }
     }
 

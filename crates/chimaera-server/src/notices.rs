@@ -645,6 +645,17 @@ fn fire_due(state: &AppState, pending: &mut HashMap<String, Pending>) -> bool {
         if !kind_enabled(state, kind) {
             continue;
         }
+        // Nor while the agent has scheduled itself to resume (a `/loop`
+        // between ticks): the turn ended, the work did not. The loop's last
+        // tick ends with nothing scheduled, and that one is the notice.
+        if kind == NoticeKind::Done
+            && state
+                .chat
+                .get(&id)
+                .is_some_and(|info| info.alive && info.next_wake.is_some())
+        {
+            continue;
+        }
         if matches!(kind, NoticeKind::Done | NoticeKind::Input)
             && state
                 .notices

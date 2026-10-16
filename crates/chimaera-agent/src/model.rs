@@ -116,6 +116,18 @@ pub const SLASH_COMMANDS_CAP: usize = 64;
 pub const SLASH_NAME_MAX: usize = 128;
 pub const SLASH_DESCRIPTION_MAX: usize = 320;
 pub const SKILL_PATH_MAX: usize = 1024;
+/// Claude's own ceiling on session jobs (`CronCreate` refuses past 50); every
+/// `Schedule` event carries the whole set, so the set size is the event size.
+pub const SCHEDULE_JOBS_CAP: usize = 50;
+/// One-line cap for a wakeup's reason, a job's schedule text, and the
+/// prompt preview either one will send.
+pub const SCHEDULE_TEXT_MAX: usize = 500;
+/// Cap for a goal's objective: Claude refuses a `/goal` condition past 4000
+/// characters, and Codex's objective is the same kind of sentence.
+pub const GOAL_TEXT_MAX: usize = 4000;
+/// Cap for a goal check's reason and a goal end's reason (the evaluator's
+/// one or two sentences).
+pub const GOAL_REASON_MAX: usize = 1000;
 
 // AgentCommand ingress budgets. These are enforced again by ChatManager
 // immediately before enqueue, so non-WebSocket callers cannot bypass them.
@@ -725,6 +737,51 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reply_to: Option<u64>,
     },
+    /// What the agent has scheduled to resume itself: claude's pending
+    /// `ScheduleWakeup` (a self-paced `/loop`) and its session jobs
+    /// (`CronCreate`, what `/loop <interval>` makes). Claude has no control
+    /// that lists either, so the driver derives the set from the tools'
+    /// calls and results. LEVEL-SET: every event carries the whole schedule
+    /// (empty = nothing pending), consumers replace rather than patch, and
+    /// replay's final state is the last event seen. Jobs survive a
+    /// `--resume`; a wakeup does not (PROTOCOL.md Pass 47). APPENDED last:
+    /// strictly additive.
+    Schedule {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wakeup: Option<ScheduledWakeup>,
+        /// Capped at [`SCHEDULE_JOBS_CAP`].
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        jobs: Vec<ScheduledJob>,
+    },
+    /// The session's goal (claude `/goal`, a session Stop hook the agent's
+    /// small model checks each time the agent stops; codex `thread/goal/*`).
+    /// LATEST-WINS: `goal` is the goal as it stands (`None` = no goal).
+    /// `ended` is one-shot transcript material on the event that ended a
+    /// goal — achieved, failed or cleared — never state. APPENDED last:
+    /// strictly additive.
+    Goal {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        goal: Option<GoalState>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ended: Option<GoalEnd>,
+    },
+    /// Why the turn that just started began with no message from anyone:
+    /// a wakeup or a job fired (claude), or the agent continued toward its
+    /// goal (codex). Emitted right after that turn's `TurnStarted`. A turn
+    /// the agent started for another reason (a monitor event, finished
+    /// background work) carries none. APPENDED last: strictly additive.
+    TurnCause {
+        turn_id: String,
+        /// `wakeup` | `job` | `goal`.
+        kind: String,
+        /// The wakeup's reason, or the prompt the job sent — the agent's
+        /// own words, capped at [`SCHEDULE_TEXT_MAX`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        /// A job's schedule in the agent's words ("Every 10 minutes").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        schedule: Option<String>,
+    },
 }
 
 impl AgentEvent {
@@ -867,6 +924,92 @@ pub struct BackgroundTaskClose {
     /// ending, not a job finishing. Additive.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub monitor: bool,
+}
+
+/// A pending self-paced wakeup (claude `ScheduleWakeup`). Claude keeps at
+/// most one: a new call replaces it, `{stop: true}` cancels it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScheduledWakeup {
+    /// When it fires (the result's `scheduledFor`: Claude rounds the delay
+    /// up to the next minute, so this, not `delaySeconds`, is the truth).
+    pub at_ms: u64,
+    /// When it was scheduled — the countdown's full span.
+    pub scheduled_at_ms: u64,
+    /// The agent's own reason, capped at [`SCHEDULE_TEXT_MAX`].
+    pub reason: String,
+    /// What the wakeup will send, capped at [`SCHEDULE_TEXT_MAX`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prompt: String,
+}
+
+/// One session job (claude `CronCreate`).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScheduledJob {
+    /// The agent's own id — what `CronDelete` takes.
+    pub id: String,
+    /// The cron expression, verbatim (local time on the agent's host).
+    pub cron: String,
+    /// The agent's own words for the schedule (`humanSchedule`, "Every 10
+    /// minutes"); empty when it gave none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub schedule: String,
+    /// What each run sends, capped at [`SCHEDULE_TEXT_MAX`].
+    pub prompt: String,
+    pub recurring: bool,
+    /// The next run, when known (the agent's `nextFireAt`, then advanced by
+    /// the driver after each run, keeping the agent's jitter).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_at_ms: Option<u64>,
+    /// When the driver first saw it — a recurring job expires 7 days on.
+    pub created_at_ms: u64,
+}
+
+/// A goal as it stands (`AgentEvent::Goal.goal`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GoalState {
+    /// The condition or objective, capped at [`GOAL_TEXT_MAX`].
+    pub objective: String,
+    /// The agent's own status word, verbatim — codex `active` | `paused` |
+    /// `blocked` | `usageLimited` | `budgetLimited` | `complete`; claude
+    /// `active` (its goal has no other live state).
+    pub status: String,
+    /// Epoch ms the goal was set.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub set_at_ms: u64,
+    /// Claude: checks so far — what Claude itself calls "N turns".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turns: Option<u32>,
+    /// Claude: the last check's reason it is not met yet, capped at
+    /// [`GOAL_REASON_MAX`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check: Option<String>,
+    /// Codex: tokens spent on the goal so far.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_used: Option<u64>,
+    /// Codex: the budget the goal stops at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<u64>,
+    /// Codex: time spent on the goal so far.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_used_secs: Option<u64>,
+}
+
+/// How a goal ended (`AgentEvent::Goal.ended`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GoalEnd {
+    /// `achieved` | `failed` | `cleared`.
+    pub outcome: String,
+    /// The goal that ended, capped at [`GOAL_TEXT_MAX`].
+    pub objective: String,
+    /// The final check's reason (claude), capped at [`GOAL_REASON_MAX`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turns: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<u64>,
 }
 
 /// Final delivery state of a queued user message.
@@ -1051,6 +1194,22 @@ pub enum AgentCommand {
         id: String,
         blocks: Vec<ContentBlock>,
     },
+    /// Set the session's goal, replacing any goal there is (codex
+    /// `thread/goal/clear` then `thread/goal/set`). `token_budget` stops the
+    /// goal at that many tokens. Claude sets goals by its own `/goal`
+    /// command, sent as a message. APPENDED last: additive.
+    SetGoal {
+        objective: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token_budget: Option<u64>,
+    },
+    /// Pause the goal: no new turn starts toward it (codex `status: paused`).
+    PauseGoal,
+    /// Resume a paused or stopped goal (codex `status: active`, which starts
+    /// a turn at once).
+    ResumeGoal,
+    /// Drop the goal (codex `thread/goal/clear`); a running turn finishes.
+    ClearGoal,
 }
 
 /// A client command exceeded one of the daemon's bounded-ingress budgets.
@@ -1245,12 +1404,23 @@ impl AgentCommand {
                     check_command_len("remote control name", name.len(), COMMAND_SELECTOR_MAX)?;
                 }
             }
+            Self::SetGoal { objective, .. } => {
+                if objective.trim().is_empty() {
+                    return Err(CommandValidationError {
+                        message: "a goal needs an objective".into(),
+                    });
+                }
+                check_command_len("goal objective", objective.len(), GOAL_TEXT_MAX)?;
+            }
             Self::Interrupt
             | Self::SetThinking { .. }
             | Self::SetUltracode { .. }
             | Self::GetUsage
             | Self::Compact
-            | Self::GetMcp => {}
+            | Self::GetMcp
+            | Self::PauseGoal
+            | Self::ResumeGoal
+            | Self::ClearGoal => {}
         }
         Ok(())
     }

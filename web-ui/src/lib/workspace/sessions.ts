@@ -1,3 +1,4 @@
+import { untilLabel } from "../chat/ahead";
 import { writable } from "svelte/store";
 
 import { api, ApiError } from "../net/api";
@@ -159,6 +160,15 @@ export interface Session {
    * rows themselves reads its own ChatStore, which has the full set.
    */
   background_running?: number | null;
+  /**
+   * When the agent next resumes itself (a chat's pending `/loop` wakeup or
+   * interval job) and what it said it will do; absent/null when nothing is
+   * scheduled. Wire truth like `background_running`, so the rail never
+   * calls a looping chat finished.
+   */
+  next_wake?: { at_ms: number | null; from_ms?: number | null; label: string; count: number } | null;
+  /** The chat's goal (objective + the agent's own status word). */
+  goal?: { objective: string; status: string } | null;
   /** Whether this agent can run as a chat session (drives the toggle). */
   chat_capable?: boolean;
   view_switchable?: boolean;
@@ -294,6 +304,7 @@ export function isBusy(s: Session): boolean {
     s.agent_state === "running" ||
     s.exec_stage === "executing" ||
     backgrounded(s) ||
+    scheduledWake(s) !== null ||
     (unintegrated(s) && s.output_active === true)
   );
 }
@@ -323,7 +334,8 @@ export function dotState(s: Session): string {
     case "idle_prompt":
       return "attn";
     case "finished":
-      return "done";
+      // A loop between ticks is waiting, not done.
+      return scheduledWake(s) !== null ? "idle" : "done";
     case "errored":
       return "err";
     case "rate_limited":
@@ -360,6 +372,19 @@ export function backgrounded(s: Session): boolean {
 }
 
 /**
+ * Between turns, but scheduled to resume on its own (a `/loop` wakeup or
+ * interval job): not finished. Every surface that would otherwise say
+ * "done" reads this — the rail glyph and its ring, the dashboard, the kill
+ * confirm (killing the chat ends its loop).
+ */
+export function scheduledWake(s: Session): NonNullable<Session["next_wake"]> | null {
+  if (!s.alive || s.agent_state === "running" || s.next_wake == null) return null;
+  return s.next_wake;
+}
+
+
+
+/**
  * Hover tooltip naming the state behind a session dot.
  *
  * Off-turn work is appended rather than folded into the state words: the
@@ -368,7 +393,11 @@ export function backgrounded(s: Session): boolean {
  * facts are independent ("finished · 2 running in the background").
  */
 export function dotTitle(s: Session): string {
-  const base = turnDotTitle(s);
+  const wake = scheduledWake(s);
+  const base =
+    wake !== null
+      ? `next ${wake.at_ms !== null ? untilLabel(wake.at_ms, Date.now()) : "run scheduled"}${wake.label !== "" ? ` · ${wake.label}` : ""}`
+      : turnDotTitle(s);
   const running = s.background_running ?? 0;
   if (!s.alive || running === 0) return base;
   return `${base} · ${running} running in the background`;

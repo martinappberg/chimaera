@@ -351,8 +351,11 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   - **Finished work** — "Agent “…” finished · 2 tools · 12.3k tokens · 4s" (click for its report),
     a background command's own close sentence ('Background command "…" completed (exit code 0)'),
     a monitor's end; each links its output file.
-  - **Wake markers** — a turn nobody typed (a monitor event, a scheduled wake-up) is marked "Woke
-    on a monitor event · “…”" / "Resumed on its own", unless a finished row already shows why.
+  - **Wake markers** — a turn nobody typed is marked by what started it: "Woke on a monitor
+    event · “…”", "Woke up · <a loop wakeup's reason>", "Woke on schedule · “<a job's prompt>”",
+    "Continuing toward the goal", or "Resumed on its own" when nothing names it — unless a
+    finished row already shows why. Loops and goals (their pinned Ahead card, the goal's own
+    lines, the folded work strip) are their own page: [loops-and-goals.md](loops-and-goals.md).
   - **Folded runs** — once anything follows them (a reply, a finished-work line, a permission decision, a message sent mid-turn), two or more thought and
     tool lines in a row fold into one line — "Thought, ran 6 commands, read 2 files ›" — that
     expands to the original rows. The trailing run stays open while the agent works, so live
