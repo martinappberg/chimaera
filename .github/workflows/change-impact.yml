@@ -1,0 +1,60 @@
+name: change-impact
+
+# The change-impact rule (robustness plan §6, "Prevent drift"): code under a
+# registered feature or area must move with its page or map, or the PR body
+# says why behavior did not change (`Docs unaffected: <ids> — <reason>`). The
+# local doc-drift hook only warns, and not every agent runs it; this is the
+# enforcement. Its own workflow, not a ci.yml job, because the excuse lives in
+# the PR description: `edited` re-runs this check alone when the author adds
+# the line, without rebuilding the world. PR-only, since a main push has no
+# base to compare against. The report is posted before the job fails so the
+# author sees what to update; the job status is the verdict.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+# A body edit right after a push supersedes that push's run.
+concurrency:
+  group: change-impact-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  change-impact:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: write # update the one change-impact comment
+    steps:
+      # The token is not persisted: the report step runs PR code and needs none.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+      # The body and base sha reach the shell only as env vars, never interpolated.
+      # The event's base sha, not `origin/<base>`: a base branch force-pushed after
+      # the PR opened would otherwise drag unrelated commits into the range.
+      - name: Report change impact
+        id: impact
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set +e
+          node scripts/change-impact.mjs --range "${BASE_SHA}...HEAD" --body-env PR_BODY --format markdown > change-impact.md
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+          cat change-impact.md
+      # Best-effort: a fork's read-only token logs and skips; the verdict is below.
+      - name: Post change-impact comment
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node .github/scripts/change-impact-comment.mjs change-impact.md
+      - name: Require docs updated or excused
+        env:
+          IMPACT_STATUS: ${{ steps.impact.outputs.status }}
+        run: test "$IMPACT_STATUS" = 0

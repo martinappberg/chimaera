@@ -713,6 +713,28 @@ Left for later phases, with the evidence that scopes them:
 - The comms wake test above needs a cause and an owner before any quarantine.
 - The server and chat UI map splits (§6) and the structural refactors (§4) were not started.
 
+### Execution record: wave 2 (Phase 7), 2026-10-16
+
+One coordinator ran four lanes at once in a single worktree, each owning a disjoint set of files; the coordinator owned `ci.yml` integration, the root `AGENTS.md` lines and this record. No Rust was compiled in this wave (another session held the host's build budget), so the dependency check reads manifests statically and cross-checks `cargo metadata --no-deps` only on request.
+
+| Lane | Model | Owned files | Result |
+|---|---|---|---|
+| Feature registry | Opus | `docs/features/registry.json`, `scripts/check-feature-registry.mjs`, the generated block in `docs/features/README.md` | 24 features, 22 areas; paths seeded from the old hook's 54 lines, then widened from each page's "Where it lives"; the README routing table is generated and drift-checked |
+| Change impact | Opus | `scripts/change-impact.mjs`, `.github/scripts/change-impact-comment.mjs`, `.github/workflows/change-impact.yml`, `ci.yml` steps | PR-only `change-impact` workflow: report posted as one in-place comment, then the job fails unless every touched page/map changed or the PR body excuses it by id |
+| Dependency direction | Opus | `scripts/check-dependency-direction.mjs`, `scripts/dependency-direction-exceptions.json` | 8 crates, 117 UI edges out of `shared/` and `net/`, 33 dated exceptions with a reason and the obvious fix each; the list can only shrink |
+| Hook, tests, docs | Sonnet | `.claude/hooks/doc-drift.sh` + its test, three `scripts/*.test.mjs`, the document-feature and ship-pr skills | Hook reads the registry (same warning shape; 62-row oracle corpus, 0 differences); 68 node tests across the three script suites and the comment glue; skills route authors to the registry and the excuse line |
+
+What each check enforces, and the seeded violation that proved it fails:
+
+- `check-feature-registry.mjs` — every `docs/features` page has an entry; every owning glob matches a real file; every map and rule exists; ids equal page stems; names equal the page H1; the README routing block equals what the registry renders. Seeded: a renamed page, a bogus glob, a removed entry, a hand-edited block, an unknown key, invalid JSON — each exits 1 naming the cause.
+- `change-impact.mjs` — for the diff range, every touched feature's page and every touched area's map is in the same diff, or the PR body carries `Docs unaffected: <ids> — <reason>` naming that id with a non-empty reason; `*` is refused; a stale excuse is a warning. Seeded in a local clone: a chat file edit alone exits 1 naming `chat-mode` and `chat-ui` with the exact line to paste; the excuse line, or a commit touching the page and map, exits 0; excusing an untouched id warns.
+- `check-dependency-direction.mjs` — `chimaera-core` and `chimaera-plugin-api` depend on nothing internal; `pty`, `agent`, `remote` never on `server` or `app`; `server` never on `app` or the binary crate; `chimaera-app` stays its own workspace; `shared/` imports from no feature area; `net/` imports no `.svelte` component (inside `net/` too) and nothing from a feature area, except the listed edges. Seeded: core→server in a manifest copy, a new `shared/`→`chat/` import, a removed exception (unlisted edge), a kept exception whose edge is gone (stale) — each exits 1 with the edge named.
+- `doc-drift.sh` — unchanged contract (Stop hook, warn only, exit 0), now driven by the registry so a new entry point is added once. Its test shims `git status` and asserts the 54 old cases plus glob semantics (140 assertions).
+
+CI wiring: ci.yml's `scripts` job runs the two checks, the hook test and `node --test scripts/*.test.mjs`. The change-impact gate is its own workflow, `change-impact.yml`, because the excuse lives in the PR description: it runs on `opened`, `synchronize`, `reopened` and `edited`, so adding the line re-runs this check alone (job-level `pull-requests: write`, `contents: read` at the top; the PR body and the event's base sha reach the shell only as environment variables; a fork's read-only token logs and skips the comment, and the job's own status stays the verdict; the comment carries the head sha and is replaced by a "could not run" body on an error, so it never keeps a stale verdict). An independent review (Opus) of the workflow found the pins and permissions correct and raised the body-edit re-run, the unescaped author text in the bot comment and the stale-comment path; all three were fixed before the PR opened, and excuses inside code fences or HTML comments no longer count. `check-workflow-security.mjs` passes on the result. Branch protection was not inspected in this wave; making `change-impact` a required check, and CODEOWNERS on the check scripts and the registry (a PR can otherwise edit the gate it is judged by), are repository-settings decisions.
+
+Accepted limits: `cargo metadata` is not run in CI (the scripts job has no toolchain), so a dependency declared in a way the static parser does not read would pass there; `--cargo` catches it locally. The change-impact rule is path-based, so a behavior change made in a file outside every registered glob is not flagged; the registry is where that is fixed. The exceptions list records 33 edges that should move out of `shared/` and `net/`; this wave did not move any code.
+
 ## 10. Keep the repository healthy as it grows
 
 ### Standard change workflow

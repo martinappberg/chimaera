@@ -28,8 +28,9 @@ of shipping. This skill is how you do that.
 Map the feature to an existing page using the current
 [index](../../../docs/features/README.md) table. Add a new page only
 for a genuinely new capability area (a whole new subsystem) — then add its row to the index
-table **and** a `check` line to the [doc-drift hook](../../hooks/doc-drift.sh) mapping its code
-entry points to the new page.
+table **and** a feature entry in `docs/features/registry.json` (paths, maps, rules, checks) — the
+[doc-drift hook](../../hooks/doc-drift.sh) and CI's change-impact job read it. For an existing
+page, add or extend its entry there. Then run `node scripts/check-feature-registry.mjs --write`.
 
 ## The page structure (derived vs intent — the split is load-bearing)
 

@@ -32,6 +32,9 @@ full rules.
    skill — and capture the human's *why* via the **capture-feature-intent** skill. Only
    `feat:` triggers the intent questionnaire (never `fix:`/`refactor:`/`chore:`/`docs:`);
    "feature" is defined once, in [`scripts/version-bump.sh`](../../../scripts/version-bump.sh).
+5. **Docs the diff touches move with it.** CI's change-impact job lists the feature pages and
+   area maps a PR's diff touches; update them in the same PR, or put a line
+   `Docs unaffected: <ids> — <reason>` in the PR body naming the ids it prints.
 
 ## Choose the title deliberately — it becomes the squash commit
 
