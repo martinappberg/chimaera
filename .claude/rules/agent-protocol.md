@@ -7,14 +7,15 @@ paths: ["crates/chimaera-agent/**", "crates/chimaera-server/src/chat.rs"]
 
 The claude `stream-json` and codex `app-server` wire formats are **unversioned**;
 Antigravity and Grok Build use the negotiated ACP v1 adapter.
-Depth: [chimaera-agent/AGENTS.md](../../crates/chimaera-agent/AGENTS.md) and
-[PROTOCOL.md](../../crates/chimaera-agent/PROTOCOL.md).
+Depth: [chimaera-agent/AGENTS.md](../../crates/chimaera-agent/AGENTS.md) and the
+[PROTOCOL.md](../../crates/chimaera-agent/PROTOCOL.md) index with its topic files
+(`protocol/claude-code.md`, `codex.md`, `acp.md`, `cross-agent.md`).
 
 - **Pinned, not trusted.** Each driver is verified against a pinned CLI version
   (`TESTED_*_VERSION`). Touching a driver — or bumping an agent CLI — **requires
   `just chat-smoke` for Claude/Codex or `just chat-smoke-acp` for ACP**
   (live, billed). Hermetic tests cannot catch upstream
-  drift. Record new wire facts in `PROTOCOL.md` the moment you learn them.
+  drift. Record each new wire fact in its `protocol/` topic file the moment you learn it, then add a dated entry to `protocol/passes.md`.
 - **The seq number is the contract.** Assigned once in `Journal::append`; monotonic,
   gap-free per session. Don't reset/skip/reorder it. Keep `seq` the first serialized
   key of `SeqEvent` (the write-path scan depends on it).

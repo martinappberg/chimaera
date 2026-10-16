@@ -34,6 +34,12 @@ check 'web-ui/src/lib/settings/'      'web-ui/src/lib/settings/AGENTS.md'  'sett
 check 'web-ui/src/lib/knowledge/'     'web-ui/src/lib/knowledge/AGENTS.md' 'knowledge UI'
 check 'web-ui/src/lib/plugins/'       'web-ui/src/lib/plugins/AGENTS.md'   'plugins UI'
 
+# A driver change usually learns a wire fact; its protocol topic file is that fact's home.
+check 'crates/chimaera-agent/src/claude.rs'    'crates/chimaera-agent/protocol/claude-code.md' 'claude wire facts'
+check 'crates/chimaera-agent/src/codex.rs'     'crates/chimaera-agent/protocol/codex.md'       'codex wire facts'
+check 'crates/chimaera-agent/src/acp.rs'       'crates/chimaera-agent/protocol/acp.md'         'ACP wire facts'
+check 'crates/chimaera-agent/src/native_ui.rs' 'crates/chimaera-agent/protocol/mods.md'        'Claude Mods wire facts'
+
 # Feature pages — docs/features/<page> describes what a capability DOES. Prefixes are
 # a feature's entry points; a change there usually wants its page updated too. Warn-only.
 check 'web-ui/src/lib/layout/'        'docs/features/workbench.md'                 'feature: workbench'

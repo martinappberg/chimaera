@@ -3,8 +3,8 @@
 Orientation for coding agents. This crate is the **chat surface's back half**:
 it drives coding-agent CLIs through their *structured* protocols (not a PTY) and
 turns them into one normalized, seq-numbered, replayable event stream. Read this
-before touching the crate; read [`PROTOCOL.md`](PROTOCOL.md) before touching a
-driver. The parent map is the repo-root [AGENTS.md](../../AGENTS.md); deep
+before touching the crate; read the [`PROTOCOL.md`](PROTOCOL.md) index and the
+driver's topic file under [`protocol/`](protocol/) before touching a driver. The parent map is the repo-root [AGENTS.md](../../AGENTS.md); deep
 rationale is in the [architecture guide](../../docs/agent-guides/architecture.md)
 (`### Agent integration`).
 
@@ -103,7 +103,8 @@ including at startup. An unlisted model keeps its native controls.
    or CLI change requires **`just chat-smoke`**; ACP changes also require
    **`just chat-smoke-acp`** against the affected real agents. Live runs bill
    turns; hermetic tests cannot catch upstream drift. Record new wire facts in
-   [`PROTOCOL.md`](PROTOCOL.md) the moment you learn them.
+   their [`protocol/`](protocol/) topic file the moment you learn them, then add a
+   dated entry to [`protocol/passes.md`](protocol/passes.md).
 5. **Drivers share the same normalized contract.** They implement the same
    trait and model. For caps, turn-end resets and unhandled-frame cases, audit
    the other adapters too. Provider capabilities may differ; never manufacture
@@ -118,11 +119,10 @@ including at startup. An unlisted model keeps its native controls.
    there (stable serde tags) so every surface gets it for free.
 3. Implement `tested_version()` + `kind()` (no default impl) and pin the tested
    CLI version; the harness journals the launcher-probed version on `Init` and
-   warns (never blocks) on drift from your pin — see PROTOCOL.md "Version
-   detection". Override `tick`/`drain_pending` if your driver has time-driven
+   warns (never blocks) on drift from your pin — see [version detection](protocol/cross-agent.md#version-detection). Override `tick`/`drain_pending` if your driver has time-driven
    work or asks/queued sends whose reply route dies with the process (otherwise
-   they no-op). Add a `tests/live.rs` case behind the same env gate; extend
-   `PROTOCOL.md`.
+   they no-op). Add a `tests/live.rs` case behind the same env gate; record the wire
+   facts in the topic file, then a dated entry in `protocol/passes.md`.
 4. The server (`chimaera-server`) decides *which* adapter to spawn — this crate
    just runs the one it is handed.
 
