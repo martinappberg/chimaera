@@ -197,18 +197,33 @@ jobs:
     permissions:
       contents: write
     env:
-      # This job runs `tauri build` twice (the plugin smoke's, then
-      # tauri-action's), and the second must be a cargo no-op that only
-      # re-bundles, not a second whole fat-LTO link. Two things recompile it:
-      # a different --config, which reaches the app crate as TAURI_CONFIG, so
-      # both builds get this one; and beforeBuildCommand, which rewrites the
-      # web-ui/dist chimaera-server embeds, so this config skips it and the
-      # web-ui is downloaded from the shared build.
+      # The shared UI build already produced the assets Rust embeds.
       APP_BUILD_CONFIG: '{"build":{"beforeBuildCommand":""}}'
+      APPLE_SIGNING_IDENTITY: 'Developer ID Application: Lieberose Consulting AB (8PPK8S7967)'
+      APPLE_TEAM_ID: '8PPK8S7967'
+      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.version.outputs.sha }}
+      - name: Prepare Apple release credentials
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        run: |
+          : "${APPLE_CERTIFICATE:?Missing APPLE_CERTIFICATE secret (base64 .p12)}"
+          : "${APPLE_CERTIFICATE_PASSWORD:?Missing APPLE_CERTIFICATE_PASSWORD secret}"
+          : "${APPLE_API_ISSUER:?Missing APPLE_API_ISSUER secret}"
+          : "${APPLE_API_KEY:?Missing APPLE_API_KEY secret}"
+          : "${APPLE_API_PRIVATE_KEY:?Missing APPLE_API_PRIVATE_KEY secret (.p8 contents)}"
+          APPLE_API_KEY_PATH="$RUNNER_TEMP/chimaera-notary.p8"
+          umask 077
+          printf '%s\n' "$APPLE_API_PRIVATE_KEY" > "$APPLE_API_KEY_PATH"
+          printf 'APPLE_API_KEY_PATH=%s\n' "$APPLE_API_KEY_PATH" >> "$GITHUB_ENV"
+          xcrun notarytool history --key "$APPLE_API_KEY_PATH" \
+            --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" >/dev/null
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .nvmrc
@@ -237,34 +252,29 @@ jobs:
           sed -i "" "s/\"version\": \"0.0.1\"/\"version\": \"${{ needs.version.outputs.version }}\"/" crates/chimaera-app/tauri.conf.json
           sed -i "" "s/^version = \"0.0.1\"/version = \"${{ needs.version.outputs.version }}\"/" crates/chimaera-app/Cargo.toml
           sed -i "" "s/^version = \"0.0.1\"/version = \"${{ needs.version.outputs.version }}\"/" Cargo.toml
-      # Test plugin execution under the actual macOS signing policy BEFORE
-      # tauri-action publishes anything. Its build reuses this compiled binary
-      # and adds the DMG/updater artifacts with the same entitlement config.
-      # The signing key is here because the updater artifacts stay on: turning
-      # them off would change the config, and so recompile the app (above).
-      - name: Build signed macOS app for plugin smoke
-        run: npx tauri build --bundles app --config "$APP_BUILD_CONFIG"
-        working-directory: crates/chimaera-app
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-      - name: Exercise plugins before publishing
-        run: |
-          bash scripts/build-plugins.sh
-          node scripts/smoke-macos-plugins.mjs
+      - name: Prepare plugin smoke assets
+        run: bash scripts/build-plugins.sh
+      # The custom build command verifies Developer ID, the stapled ticket,
+      # Gatekeeper acceptance, and plugin execution before the action uploads.
       - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: crates/chimaera-app
+          tauriScript: bash ../../scripts/build-macos-release.sh
           args: --config '${{ env.APP_BUILD_CONFIG }}'
           tagName: v${{ needs.version.outputs.version }}
           releaseCommitish: ${{ needs.version.outputs.sha }}
           releaseName: "chimaera v${{ needs.version.outputs.version }}"
           releaseDraft: false
           uploadUpdaterJson: true
+      - name: Remove notarization key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/chimaera-notary.p8"
 
   # Linux + Windows app bundles join the SAME release, as ONE matrix so the
   # recipe cannot drift per-OS. Deliberately serialized (app -> linux ->

@@ -190,7 +190,11 @@ app-build` (never the root `cargo`).
   offered update. Only a local window may start the update. The restart handoff and session ledger restore windows/tabs and eligible session
   identities; conversations resume and shells respawn in new processes, with the limits in
   [lifecycle-and-persistence.md](lifecycle-and-persistence.md). Version stamping matches the literal `0.0.1` sentinel via `sed`; a pre-bumped value silently
-  no-ops and ships the wrong version. Signing is release-only.
+  no-ops and ships the wrong version. Updater signing is release-only. macOS release
+  bundles also require Developer ID signing and notarization: the release build
+  checks the certificate/team, stapled ticket, Gatekeeper acceptance, and live plugin
+  execution before publication. PR bundles keep their ad hoc signature. See
+  [signing setup](../agent-guides/releases.md#macos-signing-and-notarization).
 - **Every check's outcome is kept** (`update::status`: this version, `checked_at`, `available`, the
   failure's `error`, `dev`): `app_update_status(refresh)` answers from it instantly, so a window opened
   after the 6-hourly `app-update` broadcast still learns of the update, and `refresh` is the explicit

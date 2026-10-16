@@ -72,6 +72,12 @@ app-check:
 app-build:
     cd crates/chimaera-app && npm install && npx tauri build
 
+# Developer ID + notarization, using this Mac's external signing config.
+# Updater artifacts stay release-CI-only; verify the notarized app and plugins.
+app-build-signed: plugins
+    npm --prefix crates/chimaera-app ci
+    bash scripts/build-macos-release.sh build --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
 # Static musl builds (requires cargo-zigbuild + zig)
 release-linux: ui plugins
     cargo zigbuild --release --target x86_64-unknown-linux-musl -p chimaera
