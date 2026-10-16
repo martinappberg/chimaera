@@ -1,7 +1,7 @@
 //! Claude's self-resuming work, derived from its frames: the pending
 //! `ScheduleWakeup` and the session jobs (`CronCreate`) that `/loop` makes,
 //! and the `/goal` the CLI checks each time the agent stops. Claude has no
-//! control request that lists or reports any of it (PROTOCOL.md Pass 46), so
+//! control request that lists or reports any of it (PROTOCOL.md Pass 47), so
 //! the driver keeps this state from the tools' calls and structured results,
 //! the `/goal` command's own replies, and the goal check's feedback frames.
 //! Pure state: the driver feeds frames in and journals what comes out.

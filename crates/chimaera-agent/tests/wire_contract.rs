@@ -765,7 +765,7 @@ fn transcript_surface_wire_shapes_are_additive() {
     assert_eq!(flagged["ambient"], json!(true));
 }
 
-/// Loops and goals (PROTOCOL.md Pass 46) ride three additive event shapes —
+/// Loops and goals (PROTOCOL.md Pass 47) ride three additive event shapes —
 /// the `schedule` level-set, the latest-wins `goal` with its one-shot
 /// `ended`, and `turn_cause` — and four goal commands. Empty parts are
 /// omitted, so an empty schedule is just its tag.

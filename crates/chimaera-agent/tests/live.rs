@@ -2837,7 +2837,7 @@ async fn send(manager: &ChatManager, id: &str, text: &str) {
         .expect("send");
 }
 
-/// `/loop`'s self-paced wakeup on the live wire (PROTOCOL.md Pass 46):
+/// `/loop`'s self-paced wakeup on the live wire (PROTOCOL.md Pass 47):
 /// `ScheduleWakeup`'s result is the pending wakeup on the `Schedule`
 /// level-set; when it fires, the CLI opens a turn no message started and the
 /// driver names it (`TurnCause` wakeup, the agent's reason) and spends it.

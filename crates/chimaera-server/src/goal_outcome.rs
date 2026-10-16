@@ -1,7 +1,7 @@
 //! How a Claude `/goal` ended. Its check runs at each stop, but the verdict
 //! that lets the agent stop — achieved, or could not be achieved — never
 //! reaches stdout: only the native transcript records it, as a
-//! `goal_status` attachment (live 2.1.300, PROTOCOL.md Pass 46). After a turn
+//! `goal_status` attachment (live 2.1.300, PROTOCOL.md Pass 47). After a turn
 //! ends with a goal still active, this reads the transcript's tail for the
 //! goal's latest record and journals the end (`ChatManager::annotate`). A
 //! record that still says "not met" (the stop was let through by the block

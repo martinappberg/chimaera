@@ -738,7 +738,7 @@ pub enum AgentEvent {
     /// calls and results. LEVEL-SET: every event carries the whole schedule
     /// (empty = nothing pending), consumers replace rather than patch, and
     /// replay's final state is the last event seen. Jobs survive a
-    /// `--resume`; a wakeup does not (PROTOCOL.md Pass 46). APPENDED last:
+    /// `--resume`; a wakeup does not (PROTOCOL.md Pass 47). APPENDED last:
     /// strictly additive.
     Schedule {
         #[serde(default, skip_serializing_if = "Option::is_none")]

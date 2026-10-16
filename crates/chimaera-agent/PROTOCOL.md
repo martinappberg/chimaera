@@ -719,7 +719,7 @@ file list is therefore honest about exactly what will revert.
 - Items: `mcpToolCall {server, tool, arguments, status, result (MCP
   CallToolResult), error, durationMs}`; `webSearch {query, action:{type,
   url}}`; `contextCompaction`; `enteredReviewMode`/`exitedReviewMode` render nothing
-  (`sleep` draws a "sleep: 5m 00s" row since Pass 46). Plans: `turn/plan/updated {plan:[{step, status:
+  (`sleep` draws a "sleep: 5m 00s" row since Pass 47). Plans: `turn/plan/updated {plan:[{step, status:
   pending|inProgress|completed}], explanation}` is the todo list;
   `item/plan/delta` streams the PROPOSED plan markdown (plan mode).
 - `thread/name/updated {threadId, threadName}` (codex names threads
@@ -1073,7 +1073,7 @@ the park deadline.
 ### Codex: misc notifications seen live (tolerated silently)
 
 `thread/started` (first turn/start), `thread/goal/cleared` (after
-rollback; mapped since Pass 46), `mcpServer/startupStatus/updated`, `remoteControl/status/changed`.
+rollback; mapped since Pass 47), `mcpServer/startupStatus/updated`, `remoteControl/status/changed`.
 `userMessage` items carry `clientId` (null unless the client sent
 `clientUserMessageId`). `account/rateLimits/updated` params here were
 `{rateLimits:{limitId, primary:{usedPercent, windowDurationMins,
@@ -2327,7 +2327,7 @@ CronList, DesignSync.
   webSearch`. ADOPTED: `imageView {id, path}` → a Read row whose location
   opens the image; `dynamicToolCall {namespace?, tool, status, success}` → a
   generic row; `hookPrompt {fragments[{text, hookRunId}]}` → a "hook: …"
-  Notice. `functionCallOutput`, `plan` stay silent (`sleep`: a row, Pass 46).
+  Notice. `functionCallOutput`, `plan` stay silent (`sleep`: a row, Pass 47).
 - New notifications: `warning {threadId?, message}`, `configWarning
   {summary, details?, path?, range?}`, `deprecationNotice {summary,
   details?}` (ADOPTED as bounded Notices; a deprecation is said once per
@@ -2335,7 +2335,7 @@ CronList, DesignSync.
   HookRunSummary}`, `thread/queue/changed {threadId}` (a server-side queue
   exists now — `codex queue` — chimaera keeps its client FIFO), `thread/
   reverted` + `thread/revert {threadId, beforeTurnId}` (alongside
-  `thread/rollback`), `thread/goal/*` (mapped since Pass 46), `thread/environment/*`,
+  `thread/rollback`), `thread/goal/*` (mapped since Pass 47), `thread/environment/*`,
   `thread/realtime/*` (voice), `process/*`, `command/exec/*`, `fs/changed`,
   `skills/changed`, `app/list/updated`, `autoApprovalReview/
   strictReviewRequired`, `model/verification`, `windows*` — all tolerated by
@@ -3384,7 +3384,7 @@ The Codex limit chip and `/usage` panel had been empty: the driver read limits f
 - Hermetic (`codex.rs`): `thread_name_and_usage_limits_map` (now the read's shape), `rate_limits_follow_rolling_updates_with_no_read_at_turn_end`, `rate_limits_say_when_usage_is_refused`, `rate_limit_windows_never_repeat_a_label`, `usage_answers_even_without_plan_limits`. A live probe also showed 0.162.1 ignores an unknown param on this read, so `excludeResetCreditDetails` cannot break a build that predates it.
 - Live: `codex_steer_settings_and_account_surface` now pins `account/rateLimits/read`'s snapshot and window shape. Through the isolated daemon, a Codex chat's `/usage` (no turn) went from an empty report on main to `weekly limit · 6%` plus the matching chip. The codex half of `just chat-smoke` was run.
 
-## Pass 46 (2026-10-15 — live probes claude 2.1.300, codex 0.162.1): loops and goals — work that resumes the agent on its own. ADOPTED.
+## Pass 47 (2026-10-15 — live probes claude 2.1.300, codex 0.162.1): loops and goals — work that resumes the agent on its own. ADOPTED.
 
 Claude's `/loop` (a self-paced `ScheduleWakeup`, or `CronCreate` jobs for an interval), Claude's `/goal` and Codex's thread goals all ran in chat, but nothing showed a pending wakeup or job, a woken turn read only "Resumed on its own", an idle chat between ticks looked finished, a restart silently ended a loop, and Codex `thread/goal/*` fell through. The facts below are what the surface is built on.
 
@@ -3427,7 +3427,7 @@ Claude's `/loop` (a self-paced `ScheduleWakeup`, or `CronCreate` jobs for an int
 - **Session row and notices**: `ChatInfo.next_wake {at_ms, from_ms, label, count}` and `goal {objective, status}` ride the chat row; the turn-end "done" notice is held while anything is scheduled, so a loop's notice is its last tick's.
 - **Restart**: `Carryover` keeps the wakeup, the jobs and the goal (without counters). A lost wakeup counts as interrupted work: the pick-up message names it ("…due in 6 minutes" / "which came due 2 minutes ago") and asks the agent to reschedule it with ScheduleWakeup; claude's jobs and goal seed the new driver (`SpawnSpec.carried_jobs`, `carried_goal`) — only when the spawn resumes the conversation (`SpawnSpec.resumes`; a resurrection whose transcript is gone starts fresh and carries nothing), and, for a Claude respawn the ledger did not seed (a view switch, a relaunch, a reopen), from the journal's last `Goal` and `Schedule` (`Journal::reopened`). The manager journals `Schedule {jobs}` and `Goal` at every spawn ahead of the driver's events (a dead wakeup never survives into the new process's view; Codex re-reads its thread's goal).
 
-### Gate (Pass 46)
+### Gate (Pass 47)
 
 - Hermetic: `autonomy.rs` (7 tests: wakeups, stop, jitter and next run, delete/list level-set, one-shot and expiry, goal set/check/clear, status resync and adoption), `cron.rs` (10), `claude.rs` `a_fired_wakeup_opens_a_turn_named_by_its_reason`, `only_an_unsent_command_with_something_due_is_a_wake`, `goal_set_check_and_clear_map_from_the_cli_frames`, the codex goal tests (`goal_updates_map_the_status_verbatim_and_ignore_other_threads` … `sleep_items_render_a_waiting_row`), `tests/manager.rs` `a_loop_wakeup_fires_as_a_named_turn_and_the_row_knows_whats_next` (fake-claude `loop`) and `a_resumed_respawn_keeps_its_jobs_and_a_fresh_one_does_not`, `journal.rs` `reopening_remembers_the_last_goal_and_jobs`, `claude.rs` `a_stale_cli_command_never_names_a_later_turn`, `tests/wire_contract.rs` `loop_and_goal_wire_shapes_are_additive`, `chimaera-server` `goal_outcome` (3) and `restart_message_asks_to_reschedule_a_lost_wakeup`.
 - Live: `just chat-smoke` adds `claude_wakeup_fires_as_a_named_turn`, `claude_goal_sets_and_clears`, `codex_goal_sets_pauses_and_clears`.

@@ -249,7 +249,7 @@ rl.on("line", async (line) => {
   if (text.includes("loop")) {
     // The pinned Ahead card while scrolling: a goal (Claude's `/goal` reply),
     // a wakeup 20 minutes out and an interval job (2.1.300 frames,
-    // PROTOCOL.md Pass 46). Nothing here ever fires.
+    // PROTOCOL.md Pass 47). Nothing here ever fires.
     emit({ type: "assistant", message: { id: `syn-${turn}`, model: "<synthetic>", content: [{ type: "text", text: "Goal set: every test in tests/api passes" }] },
       local_command_run: { command: "goal", args: "every test in tests/api passes" } });
     const id = `m${++msgN}`;
