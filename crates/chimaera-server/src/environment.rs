@@ -20,7 +20,12 @@
 //! variable nothing is read at all.
 //!
 //! Persisted at `~/.config/chimaera/env-profiles.json`; hand-edits are
-//! first-class (reads re-stat the file, like `settings`). Entries are
+//! first-class and read stale-while-revalidate, like `settings`: hand-edits
+//! reach the cache within `settings::SETTINGS_POLL` (the shared off-reactor
+//! poll, [`refresh`]); routes refresh on read; PUT/PATCH install at once.
+//! Spawn paths ([`materialize_prelude`], [`materialize_probe_prelude`]) and
+//! [`EnvPreludeStore::data_cached`] readers compose from the cache — no stat
+//! or read under the store mutex. Entries are
 //! objects, not bare strings, so named profiles can land later without a
 //! shape break. No /ws/events frame in v1 — the Environment panel fetches on
 //! mount and saves explicitly. PATCH changes only the scopes it names, so two
@@ -139,13 +144,12 @@ impl EnvPreludes {
     }
 }
 
-/// In-memory prelude store backed by `env-profiles.json`, mtime-checked on
-/// read so external edits (vim over SSH) surface without a daemon restart.
+/// In-memory prelude store backed by `env-profiles.json`; external edits
+/// (vim over SSH) surface without a daemon restart through [`refresh`].
 ///
-/// The routes do their disk work on the blocking pool, one job at a time
+/// All disk work after boot runs on the blocking pool, one job at a time
 /// (`gate`), with this struct's mutex held only to snapshot and to install —
-/// never across a stat, read or write. The synchronous [`Self::current`]
-/// that spawn paths call still stats (and on a change reads) under the mutex.
+/// never across a stat, read or write. Readers get the cache.
 pub(crate) struct EnvPreludeStore {
     path: PathBuf,
     data: EnvPreludes,
@@ -209,23 +213,30 @@ impl EnvPreludeStore {
         store
     }
 
-    fn install(&mut self, disk: Disk) {
-        if let Disk::Loaded(data, mtime) = disk {
-            self.data = data;
-            self.mtime = mtime;
+    /// Fold one look in; true when the preludes changed.
+    fn install(&mut self, disk: Disk) -> bool {
+        let Disk::Loaded(data, mtime) = disk else {
+            return false;
+        };
+        self.mtime = mtime;
+        if data == self.data {
+            return false;
         }
+        self.data = data;
+        true
     }
 
-    /// Blocking, under the caller's lock: only for the synchronous callers.
+    /// Blocking: only [`Self::load`], before the store is shared.
     fn refresh(&mut self) {
         let disk = look(&self.path, self.mtime, None);
         self.install(disk);
     }
 
-    /// The current preludes (mtime-checked against on-disk edits).
-    /// Blocking: async code uses [`snapshot`].
-    pub(crate) fn current(&mut self) -> &EnvPreludes {
-        self.refresh();
+    /// The cached preludes, never a disk re-stat — safe on the reactor and
+    /// under any lock. Hand-edits arrive through [`refresh`] (the shared
+    /// poll); a caller that must see one made in the last poll period awaits
+    /// [`snapshot`] instead.
+    pub(crate) fn data_cached(&self) -> &EnvPreludes {
         &self.data
     }
 
@@ -243,30 +254,30 @@ impl EnvPreludeStore {
     }
 }
 
-/// Did a refresh leave the cache trustworthy?
+/// What one refresh found.
 enum Refreshed {
-    Fresh,
+    /// The cache is current; `changed` when this refresh moved it.
+    Fresh { changed: bool },
+    /// The file couldn't be read: the cache is kept but may be stale.
     Unreadable,
 }
 
 /// One off-lock refresh. Blocking; runs inside the store's [`DiskGate`]. The
 /// mutex is taken twice, briefly: to snapshot the path and recorded mtime,
-/// and to install. A synchronous caller that refreshed in between already
-/// installed a read at least as new, so the install is skipped then.
+/// and to install. Every install runs inside the same gate, so the mtime
+/// re-check before installing is a guard, not a race anyone expects to lose.
 fn refresh_job(state: &AppState) -> Refreshed {
     let (path, recorded, hook) = {
         let store = crate::lock(&state.env_preludes);
         (store.path.clone(), store.mtime, store.before_read.clone())
     };
     match look(&path, recorded, hook.as_ref()) {
-        Disk::Same => Refreshed::Fresh,
+        Disk::Same => Refreshed::Fresh { changed: false },
         Disk::Unreadable => Refreshed::Unreadable,
         disk => {
             let mut store = crate::lock(&state.env_preludes);
-            if store.mtime == recorded {
-                store.install(disk);
-            }
-            Refreshed::Fresh
+            let changed = store.mtime == recorded && store.install(disk);
+            Refreshed::Fresh { changed }
         }
     }
 }
@@ -291,11 +302,23 @@ async fn run_job<T: Send + 'static>(
     gate.run(move || job(&job_state)).await
 }
 
+/// Fold an on-disk edit into the store, off the reactor; true when the
+/// preludes changed. Clones nothing: the shared poll runs it every
+/// `settings::SETTINGS_POLL`.
+pub(crate) async fn refresh(state: &Arc<AppState>) -> bool {
+    match run_job(state, refresh_job).await {
+        Ok(Refreshed::Fresh { changed }) => changed,
+        Ok(Refreshed::Unreadable) => false,
+        Err(err) => {
+            tracing::warn!(%err, "environment refresh failed");
+            false
+        }
+    }
+}
+
 /// The current preludes, refreshed from disk off the reactor.
 pub(crate) async fn snapshot(state: &Arc<AppState>) -> EnvPreludes {
-    if let Err(err) = run_job(state, refresh_job).await {
-        tracing::warn!(%err, "environment refresh failed");
-    }
+    refresh(state).await;
     crate::lock(&state.env_preludes).data.clone()
 }
 
@@ -353,10 +376,11 @@ fn read_startup(path: &std::path::Path) -> Option<String> {
 /// Compose and write the per-session prelude file; returns its path, or
 /// None when no prelude applies (then no env var is set — zero behavior
 /// delta for users without preludes). `startup` is [`job_startup`]'s text,
-/// read by the async caller. Best-effort: a failed write degrades to "no
-/// prelude" with a warning, never a failed spawn. Lives under the runtime
-/// dir — hot state, reconstructible, night-scrub is fine because the file is
-/// only read once at spawn.
+/// read by the async caller. The stored scopes come from the cache (the
+/// module header says how stale it can be). Best-effort: a failed write
+/// degrades to "no prelude" with a warning, never a failed spawn. Lives under
+/// the runtime dir — hot state, reconstructible, night-scrub is fine because
+/// the file is only read once at spawn.
 pub(crate) fn materialize_prelude(
     state: &AppState,
     session_id: &str,
@@ -365,7 +389,7 @@ pub(crate) fn materialize_prelude(
     startup: Option<&str>,
 ) -> Option<PathBuf> {
     let text = crate::lock(&state.env_preludes)
-        .current()
+        .data
         .effective(startup, workspace_id, launch);
     write_prelude(&format!("{session_id}.sh"), &text)
 }
@@ -383,7 +407,7 @@ pub(crate) fn materialize_probe_prelude(
     let startup = job_startup_blocking();
     let text =
         crate::lock(&state.env_preludes)
-            .current()
+            .data
             .compose(startup.as_deref(), workspace_id, None);
     let name = format!("probe-{}.sh", chimaera_core::generate_token());
     write_prelude(&name, &text)

@@ -28,8 +28,10 @@ route + per-session materialization) and `crates/chimaera-core/src/shellint.rs`
   scope rides `POST /api/v1/sessions` `{"prelude": "..."}` (wire only in slice 1 — no
   launcher UI yet).
 - **Where it lives.** Storage: `~/.config/chimaera/env-profiles.json` (`EnvPreludeStore` —
-  atomic writes, mtime re-stat so vim-over-ssh hand-edits surface without a restart, same
-  never-brick-on-corrupt rule as settings). Injection: `environment::materialize_prelude`
+  atomic writes, same never-brick-on-corrupt rule as settings). Vim-over-ssh hand-edits surface
+  without a restart: they reach the cache within two seconds (the settings poll), `GET
+  /environment` re-reads the file, PUT/PATCH install at once, and a spawn composes its prelude
+  from the cache without touching the disk. Injection: `environment::materialize_prelude`
   writes the effective text to `runtime_dir()/preludes/<session-id>.sh` and the spawn env
   carries `CHIMAERA_PRELUDE`; the shell-integration rc (bash `--init-file`, zsh ZDOTDIR
   shim) sources it after the user's rc, and the agent login-wrapper

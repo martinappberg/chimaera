@@ -1805,7 +1805,7 @@ pub(crate) async fn chat_executable(
         return Ok(terminal.to_path_buf());
     }
     let explicit = crate::lock(&state.settings)
-        .current()
+        .map_cached()
         .get("agents.agy.chatPath")
         .and_then(|v| v.as_str())
         .filter(|p| !p.trim().is_empty())

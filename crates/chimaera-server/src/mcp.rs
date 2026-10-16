@@ -1156,18 +1156,13 @@ async fn workspace_status(
     // The environment prelude: WHAT is loaded (module/conda/source lines),
     // never exported values — preludes can carry secrets.
     let environment = {
-        let state = state.clone();
-        let ws = workspace.id.clone();
-        tokio::task::spawn_blocking(move || {
-            let startup = crate::environment::job_startup_blocking();
-            let text =
-                crate::lock(&state.env_preludes)
-                    .current()
-                    .effective(startup.as_deref(), &ws, None);
-            prelude_summary(&text)
-        })
-        .await
-        .unwrap_or(Value::Null)
+        let startup = crate::environment::job_startup().await;
+        let text = crate::lock(&state.env_preludes).data_cached().effective(
+            startup.as_deref(),
+            &workspace.id,
+            None,
+        );
+        prelude_summary(&text)
     };
     let surfaces: Vec<Value> = crate::lock(&state.view_state)
         .surfaces_for(&workspace.id)
@@ -1733,9 +1728,8 @@ impl Drop for SpawnReservation {
 /// `appearance.theme` when it names a concrete scheme (an MCP caller has no
 /// client theme to ride); "system"/unset falls back to dark.
 fn spawn_theme(state: &Arc<AppState>) -> String {
-    let mut settings = crate::lock(&state.settings);
-    settings
-        .current()
+    crate::lock(&state.settings)
+        .map_cached()
         .get("appearance.theme")
         .and_then(|v| v.as_str())
         .filter(|t| *t == "light" || *t == "dark")
