@@ -1,378 +1,86 @@
 # web-ui/src/lib/chat — the structured chat surface
 
-Claude Mods use `nativeUi.ts` (bounded socket RPC and tree validation),
-`mods.svelte.ts` (attached views, panes and invalidation), `ModSite.svelte`
-(render instances), `ModNode.svelte`/`ModControl.svelte` (native controls),
-`ModClient.svelte`/`modClient.ts` (isolated surface modules), and
-`ModsWorkbench.svelte` (responsive dock/inline panes, tabs and status). Code
-elements share `../shared/ExtensionCode.svelte` with workbench plugins. Never journal a render tree or
-replay a press; reconnect creates fresh render handles. See
-[Claude Mods](../../../../docs/features/claude-mods.md).
-
-Orientation for coding agents. This directory is the **front half of chat mode**:
-the rich UI that renders Claude, Codex, Antigravity, Grok and Cursor agent streams,
-the sibling of the xterm.js terminal surface. Parent map: repo-root
-[AGENTS.md](../../../../AGENTS.md). The back half it talks to is
-[`crates/chimaera-agent`](../../../../crates/chimaera-agent/AGENTS.md).
-
-Svelte 5 (runes: `$state`/`$derived`/`$effect`/`$props`). Build/check needs
-Node 26 (`.nvmrc`; `nvm use`).
-
-Model controls consume adapter capabilities and live catalog metadata. `custom_model`
-is an explicit opt-in independent of `set_model`; unknown adapters and older capability
-snapshots default to false. `modelCatalogReceived` distinguishes a not-yet-reported
-catalog from a deliberately empty one. Never infer a provider or effort ladder from
-the agent's brand, or shorten an unlisted model ID by guessing its naming scheme.
+Orientation for coding agents. This area is the front half of chat mode: the UI for Claude, Codex, Antigravity, Grok and Cursor. Back half: [chimaera-agent](../../../../crates/chimaera-agent/AGENTS.md). Svelte 5 runes; Node 26. Parent map: [AGENTS.md](../../../../AGENTS.md). Rules: [web-ui.md](../../../../.claude/rules/web-ui.md). All detail, by topic: [REFERENCE.md](REFERENCE.md).
 
 ## The one flow to hold in your head
 
 ```
-  daemon  ──WS /ws/chat/{id}──▶  chatWs.ts (ChatSocket)
-                                     │  auth(last_seq) → ready(head) → batch replay → live ev
-                                     ▼
-                                store.svelte.ts (ChatStore.apply)   ← the reducer
-                                     │  seq-dedupe, folds events into `blocks`
-                                     ▼
-                                ChatView.svelte  ← renders blocks + composer + overlays
-                                     │  user types ─▶ socket.send(AgentCommand)
-                                     └──────────────────────────────────────────▶ daemon
+daemon  ──WS /ws/chat/{id}──▶  chatWs.ts (ChatSocket)
+                                   │  auth(last_seq) → ready(head) → batch replay → live ev
+                                   ▼
+                              store.svelte.ts (ChatStore.apply)   ← the reducer
+                                   │  seq-dedupe, folds events into `blocks`
+                                   ▼
+                              ChatView.svelte  ← renders blocks + composer + overlays
+                                   │  user types ─▶ socket.send(AgentCommand)
+                                   └──────────────────────────────────────────▶ daemon
 ```
-
-**`ChatStore.apply(entry)` is the heart.** Its vocabulary is pinned by `net/fixtures/wire/chat-events.json` (every `AgentEvent` variant, written by chimaera-agent's wire test) and `net/wireFixtures.test.ts`, which folds each one and expects `store.unhandledEventTypes` to stay empty — so a type the reducer ignores on purpose is an explicit `case`, never the `default:`. It is a reducer: one `SeqEvent` in,
-store mutation out. Events below or at `lastSeq` are dropped (dedupe). A throwing
-event is caught in `chatWs` so it can't strand the batch. On `ready`, if the
-journal `head` is below our `lastSeq` the journal was reset — the store
-hard-resets and rebuilds.
 
 ## File map
 
-| File | What it owns |
+| Files ([in full](REFERENCE.md#file-map-in-full)) | What they own |
 |---|---|
-| `ModelPicker.svelte` / `modelPicker.ts` | Shared model menu and optional custom-ID form; catalog identity matching, exact-ID validation, and full unlisted current IDs. Custom entry requires the adapter's explicit capability. |
-| `store.svelte.ts` | `ChatStore` — the reducer + all reactive view state (`blocks`, `pending`, `pendingSends`, `questions`, model/mode, `pendingModel` (a sent selection until provider read-back or failure), activity, exited/degraded/connected/fatalError — the last cleared by a fresh `init`, a `forked` marker, or a journal reset; a SOCKET-origin fatal (a handshake failure via `onFatalError`) also clears on the next successful `ready`, while a journal `error{fatal}` outlives reconnects until the driver is genuinely relaunched), including initial replay hydration through the ready-frame `head`. **The single source of truth for the view.** Every block carries a monotonic per-store `uid` (the transcript's keyed-render key — never an array index). `blocks` is capped at ~2000 with hysteresis: it runs one 64-block slack past the cap, then one batch splice trims back to the cap behind a single "earlier history trimmed" notice (so the O(n) index rebuild runs once per batch, not per event at cap); `trimmedCount` counts the NET front shift (dropped − the replacing notice), making a block's virtual index (`trimmedCount + i`) invariant and `virtualTotal` (`blocks.length + trimmedCount`) monotonic at cap. `structuralVersion` counts insertions/removals (net lengths are a false proxy — a retracted-then-reappended tail cancels out) and `epoch` stamps the transcript generation (a journal reset restarts the trim numbering). `subagents` (a `SvelteMap` by tool row id) folds `subagent_info` — a subagent's agent handle, served model and kind, latest-wins per field, capped — which the trays, agent tool cards and finished rows read for the model chip and the open affordance; `activeAgents` is the reducer-maintained live-subagents set (same proxies as `blocks`, so tray rows update in place — no per-event full-blocks filter), and `tool_output_delta` accumulation is capped client-side (12 KiB head + rolling 4 KiB tail behind the server's own "[N bytes omitted]" marker; the authoritative result replaces it). Its reducer has a vitest test (`store.svelte.test.ts`) — one of the UI’s targeted Vitest suites. |
-| `chatWs.ts` / `cooperativeQueue.ts` | `ChatSocket` — connect/auth/reconnect(backoff)/gap-replay, then dispatch replay/live/control frames through one order-preserving cooperative queue so a cold history cannot starve browser input. Per-command refusals (`command_failed` / `invalid_command`) are visible but nonfatal. Shares reconnect accounting with `../terminal/ws.ts`. |
-| `nativeUi.ts` / `mods.svelte.ts` / `Mod*.svelte` / `modClient.ts` | Claude Mods' transient UI bridge. Native requests are bounded and fail on disconnect; trees and closure handles never enter the journal. One controller attaches per visible socket, renders at most four sites concurrently, refreshes mounted sites on invalidation, and routes panes, controls, focus, status, and composer callbacks. `ModNode` validates native elements and uses sanitized Markdown/SVG; `ModClient` resolves literal JavaScript imports with `es-module-lexer/minimal` (no interpolated imports), then loads supplied module graphs in a terminable worker inside an opaque CSP iframe (no workbench origin or network), caches four bundles, and caps active workers at sixteen. Hidden views unmount Clients. Circular module imports currently report an explicit fault. `nativeComposer.ts` holds bounded, grapheme-aware decoration ranges; `Composer` keeps native edits revision-fenced so a delayed hook cannot overwrite a newer draft. |
-| `chatPool.ts` / `chatPoolRegistry.ts` | Session-keyed warm reducer/transport + scroll/render-window/followed-revision cursor. The agent keeps folding while a tab's bounded DOM snapshot is hidden or its view is evicted; client-pool eviction never stops the daemon-owned process. The registry (the entries map + `disposeChat`/`syncChatSessions`/`disposeAllChats`) is what `App` imports — it rides the always-loaded entry bundle; acquiring (which constructs the store and sockets) lives in the chat chunk. A `sub:<parent>:<agent>` key (`subagentView.ts`) pools a subagent view, fed by the `SubagentSocket` the chat chunk registers (`provideSubagentTransport`) and disposed with its parent. |
-| `subagentView.ts` / `subagentSocket.svelte.ts` / `SubagentBanner.svelte` / `SubagentChip.svelte` | **Open a subagent as its own chat.** `subagentView.ts`: the pool key, `subagentRunning`/`subagentModel` over the parent store, and `advanceCursor` (incremental reads: `epoch`/`after`/`stamp`, own vitest). `SubagentSocket`: the read-only transport behind a `ChatView` in subagent mode — polls `GET /sessions/{id}/subagents/{agent}/transcript` every 2.5 s only while watched + visible and while the parent says the subagent is working (one closing read after; a resumed subagent restarts the window), feeds the store a synthetic `init` then the events, refuses every command. `SubagentBanner` replaces the chat header ("Subagent of ‹chat› · title · kind · model · working/finished · read-only"); `SubagentChip` is the clickable "agent" lane label both trays share; `ModelChip.svelte` is the one model chip (catalog label else the id verbatim; `pill` on the card and banner) the trays, the agent tool card and the banner all render. |
-| `ChatView.svelte` | The host: renders a bottom-anchored transcript window (64 blocks initially, 192 maximum) that pages automatically in both directions — scroll-driven prefetch mounts the next page about two viewports ahead in the reader's direction of travel (one page per frame), sentinels cover windows that end inside the viewport, and fallback buttons appear only without IntersectionObserver — plus a direct jump to newest. A **history spacer** ahead of the column stands in for the unmounted earlier history (sized by `heightModel.ts`, calibrated by what the pages mounted above the reader really measured) and absorbs every above-viewport height change for a scrolled-up reader (see the scroll invariant below); its twin, the **later spacer** after the column, stands in for the unmounted later rows of a history page and takes every scroll-height change a range write makes below the reader, so the scrollbar thumb moves only when the reader scrolls (zero at the live edge, forced; never below the model of the rows still unmounted, or an undershooting estimate ends the scroll range early and the last page moves the end away). A scrollbar drag deep into either mounts the page the model puts there (`pageAround`; a drag to the very end lands on the live edge). A page write never discards rows within one viewport past the prefetch reach (`keepInReach`): the cap counts blocks, and a folded tool run is one short line. Once the window holds the first row, the history spacer's leftover (blank above the first message) shrinks as fast as the reader scrolls into it (`holdTopEdge`). It hangs the header/composer/overlays/panels off itself. Non-tool rows are keyed `b-${block.uid}` and tool groups `g-${firstTool.id}` — **stable identities, never array indices**, so an at-cap trim's front-splice cannot remount the whole window (one caveat: a group whose FIRST tool is trimmed away changes key and remounts). "New rows vs in-place chunk" detection keys on the store's `structuralVersion` (never net lengths), a reducer trim shifts the view's absolute range AND its rendered slice by the trim delta (`trimShift`) so range, rows, and index labels keep agreeing — falling back to the tail when the whole window was trimmed — and cursors/ranges are discarded, never shifted, across a store `epoch` change. Re-activating a hidden tab whose window+content are unchanged since its freeze skips the range rebuild entirely (the frozen rows rebind to live proxies on the next event or bottom-reach). Visible tail rows are reducer proxies; hidden/history rows are one inert snapshot. A fresh replay stays gated until `head`, so it never paints oldest-to-newest. Still the big one — keep new chrome in child components, not inline. With the `subagent` prop it is the read-only view of one of `session`'s subagents: pooled under `subagentChatId`, fed by `SubagentSocket`, header swapped for `SubagentBanner`, composer/Mods/fork/rewind/stop gone (`.chat.read-only`), `sendCommand` silent; `onOpenSubagent` is how its trays/cards/finished rows open one. |
-| `ChatFind.svelte` / `chatFind.ts` | Pane-scoped Find in retained conversation messages (user/assistant/agent messages; not tools/thoughts). Bounded to 500 matching messages, navigated by stable uid through ChatView’s existing transcript window; no full-history DOM mount. Shared controls and non-mutating range highlights live in `../shared/`. |
-| `transcriptWindow.ts` | Pure range math for the 64-block/192-block sliding transcript DOM window — array coordinates throughout; saved cursors alone persist in trim-stable virtual coordinates, converted back at the boundary by `restoreVirtualWindow` (the one stale-cursor policy, with a one-page floor) while `trimShift` keeps a mounted range aligned across a trim. Also the scroll policy: `prefetchPage` (direction-gated, so a short window cannot ping-pong), `keepInReach` (a page write keeps the rows near the reader — the 192-block cap alone unmounted the row being read on tool-heavy history, or pulled the discarded edge within reach so its sentinel paged it straight back, every frame), `pageAround` (a far jump's page), and the spacer's `spacerTarget` / `spacerNeedsRebalance` with the WebKit rationale. Tests cover both paging directions, stale cursor repair, both trim conversions, prefetch, and the spacer policy. |
-| `readingAnchor.ts` | The reading anchor: the top-level row at the viewport's top edge AND the element inside it at that edge (a figure resolving above the paragraph being read, within the same multi-thousand-px reply, moves the text while the row's top stays put) — never a card straddling the edge, which resizes after mounting, but the first element after it that starts in view (else the next row) — with transform-free (`offsetTop`) positions in the column; `measureShift` measures the edge element while the row still holds it, else re-finds the row by node, uid, then source-index range. `rowsInReach` is the source range of the rows near the viewport (`keepInReach`). DOM-only, no state. |
-| `heightModel.ts` | Content-based height model for unmounted blocks (kind + rendered text length — link targets and markup never show — a settled run of thoughts and tool calls on the one line its fold renders and a settled run of three or more finished lines likewise (`weightAt`), the mounted window's unfolded trailing run a line each (`unfoldedFrom`, the mirror of what `foldSpans` leaves open), and inline embeds as the cards they render), in relative units the view calibrates against the pages it has measured; `HistoryWeights` keeps incremental prefix sums (rebuilt per epoch/trim/measure) and maps a spacer position back to a block. Own vitest suite. |
-| `modelPicker.ts` | Shared model identity matching (picker aliases, resolved ids, context suffixes) and placeholder rejection; tested in `modelPicker.test.ts`. |
-| `ChatHeader.svelte` | The responsive header: model / mode / effort selectors, session/status row below 480px, and Chat options for thinking / ultracode / Remote Control + its popover (state dot, open-on-claude.ai / copy link / on-off; reads `store.remoteControl` + `remoteControlAvailable`, sends `set_remote_control` through the host), session identity (always names the agent); controls follow the driver’s advertised capabilities. |
-| `EffortPopover.svelte` / `effortScale.ts` | The reasoning-effort scale (uses the agent-native vocabulary verbatim — never relabel `xhigh`). `effortScale` (pure, own vitest suite) orders the levels faster → smarter when every one is in the shared vocabulary, since agents list them in their own order (Grok: `xhigh` first); an unknown level keeps the agent's order. Connected dots retain full-size labeled click targets; `../shared/toolbarPopover.ts` supplies top-layer placement, arrow-key navigation and focus return. |
-| (the line above the input) | `ChatView` renders one quiet `.branch-line` just above the composer only when there is something to say: on the left the session's branch (`../shared/BranchChip.svelte`, only in a repository; opens "Changes on this branch"), on the right the same-file notice (`../workspace/SameFileNotice.svelte` — another live session wrote a file this one wrote, in the last 15 minutes or in its running turn; it ages out on its own; click opens it). It shares the composer and pinned trays' centered column and side insets; long labels truncate within the pane. The rail shows a branch only for an agent working in a separate worktree (`App.svelte`, `.wt-mark`); agents in the main checkout show nothing there (maintainer, 2026-09-29). |
-| `Composer.svelte` / `composer.ts` | Input chrome plus the pure slash-context, argument-completion, and Codex skill-block helpers (covered by `composer.test.ts`). Autofocus yields to keyboard navigation in the pane tabs (`../shared/tabNavigation.ts`). The textarea carries `data-pane-arrows`, which lets App's `⌘+Arrow` pane-focus chord through when a pane lies that way (otherwise the caret keeps it) — keep the attribute on whatever element holds the draft. Slash discovery is whitespace-boundary aware; path fragments must stay ordinary text. Enter sends (mid-turn: read at the agent's next step); the after-turn chord calls `onSubmit(…, afterTurn=true)` — see the queued-send invariant below. |
-| `uploadTokens.ts` / `uploadChips.ts` / `ComposerMentions.svelte` | A dropped file's mention reads as its name in the draft, where it was referenced (`@/…/uploads/s-…/plot.png` → `@plot.png`): every text entering the composer (inserts, the loaded draft, a paste) is collapsed, every text leaving it (the send, a copy or cut, the saved draft) expanded, so the agent gets exactly the text a drop always typed; typed and picked mentions are never rewritten. `uploadTokens.ts` is pure (own vitest suite): recognition by text (so undo/redo/paste bring one back), `snapRange`, `keepsTokens` (would an edit glue text onto one?), `settleEdit` (the after-the-fact fix). `uploadChips.ts` is the textarea attachment that makes a short form one unit — caret snapping, arrow/Backspace/Delete over it, a space before text typed or pasted against its end, the gluing space-delete refused — every change through `execCommand` so native undo stays whole (never `execCommand("undo")`: WebKit merges typing runs into one undo group). `ComposerMentions` paints every `@` mention as a pill UNDER the textarea (a mirror that copies the field's computed padding/type and follows its scroll — the textarea keeps glyphs, caret, IME, undo) and shows an upload pill's landed path on hover (hidden while a completion popover is open). |
-| `Markdown.svelte` / `MathText.svelte` / `math.ts` | Render agent prose and plain user-message LaTeX (`$`/`$$` and Codex's `\(`/`\[` forms) as KaTeX MathML under one bounded policy — the policy itself (`mathOptions`/`renderMath`/`safeMathHtml`: KaTeX trust off → DOMPurify, memoized) lives in `../shared/math.ts` (a leaf the markdown file previews load on demand; `math.ts` re-exports it), while the CHAT delimiter dialect (`$` at word boundaries, Codex's `\(`/`\[`) stays here and is deliberately distinct from the previews' comrak-mirroring `previews/mdMath.ts`. **Sanitize untrusted/replayed content** (marked/KaTeX → DOMPurify, KaTeX trust off, `<style>` forbidden, external links `noopener`); Markdown also stamps validated file paths as clickable. **Local images are embeds**: inside this component's sanitize calls only (a flag around `DOMPurify.sanitize`; the hook is global), a schemeless `<img>` src moves to `data-md-embed` before the HTML reaches the DOM (never a request against the app's origin); `upgradeEmbeds` then mounts an EmbedCard (`mountEmbed`) — or, for a document (`artifacts.ts` `embedsAsChip`: markdown unless `#slide=`, docx, pptx), a `ProseChip` in an inline slot — in a slot it builds BESIDE the hidden placeholder — never replacing it, since a top-level node of the settled `{@html}` is what its teardown walks — on the settled render and on each closed segment after its word wrap (the open tail keeps a quiet placeholder box, so a card never churns per chunk). A slot is retired (card destroyed, slot removed) once its placeholder leaves the DOM; stamping, anchors and reveal spans skip `.md-embed`. **Streaming renders incrementally** (see the pipeline section below): closed segments parse once, only the open tail re-renders per chunk, and settle swaps in one canonical full parse. Post-render it also marks overflowing `.md-table` hosts and fence code boxes keyboard-reachable (`shared/scrollRegion.ts` — attribute writes only, never overwriting or stripping what the sanitized content brought; at the idle stamp pass, reveal completion and settle, never the open tail). |
-| `tables.ts` / `markedExtensions.ts` | `tables.ts` hosts every GFM table in a `.md-table` scroll container at render time (why in the HTML string rather than a post-render DOM wrap is in the file); the CSS side is the "Markdown tables" recipe in `web-ui/src/app.css` (shared with the file preview's reading view and the live editor's table widget: scroller, rhythm, borders, alignment, numerals, and hosted cells keeping whole tokens — chat overrides three `--md-table-*` spacing tokens on its root), and chat's one delta — headers stay one line; a raw-HTML `<table>` has no host, so it keeps the root's squeeze-to-fit wrapping — lives in `Markdown.svelte`. The host emits no `tabindex`: whether it overflows is only known after layout, so `Markdown.svelte` marks it post-render. `markedExtensions.ts` is the ONE list of chat marked extensions, consumed by the component and by the parity pins in `streamSegments.test.ts`. Own pin: `tables.test.ts`. |
-| `streamSegments.ts` | Pure INCREMENTAL segmentation of streaming markdown source at SAFE top-level blank-line boundaries — and the owner of the streaming security invariant (never more permissive than settle): fences and block math never split (mirrored against math.ts exactly), an HTML-block-opening line bails the message, lists (incl. lazy continuations) and indentation refuse, reference definitions make boundaries sticky until a ~16 KiB tail cap. Lossless partition (segments concatenate back to the source, byte for byte) with prefix-cache invalidation when a rewrite doesn't extend the prior text. Own vitest suite (`streamSegments.test.ts`) incl. hostile-HTML and marked-equivalence pins. |
-| `revealLedger.ts` | Pure reveal-cursor arithmetic for the streaming pipeline (close-segment carry, tail rebuilds that never re-hide, prefix-first ticker takes) — the DOM queues in `Markdown.svelte` mirror it entry-for-entry. Own vitest suite (`revealLedger.test.ts`), incl. the duplicate-tail order contract. |
-| `ToolCallCard` / `ToolGroup` / `toolLabels.ts` | Tool-call rendering (title, status, diff/output, grouping). A collapsed group is one quiet activity line titled by `toolLabels.ts` (pure, own vitest suite): while a call runs, the newest live call's own description (`toolDescription`: an execute row's `nativeInput.description`, i.e. Claude's Bash description — other tools' `description` arguments mean something else; Codex/ACP rows carry none and fall through); settled, the agent's batch labels (`tool_summary`, set on each row as `summary`), else a lone call's description, else readable past/present-tense counts, a lone agent named. The line shows the run's elapsed (live) or duration (`toolSpanMs`/`spanLabel` over the rows' journal-backed `startedAtMs`/`endedAtMs`, stamped by the reducer from `entry.ts`; live elapsed subtracts `store.clockSkewMs`, sampled only from frames the socket delivered live past the replay head — `ChatSocket` passes `live` for `ev`, never for `batch`), ticking through `../shared/liveClock.svelte.ts` (one module-level 1 Hz interval while any reader is live, its view visible and the document shown — the trays, the turn timer and the dashboard card read the same clock). `ActivitySummary` draws the four-dot working glyph (paused under `html.app-hidden`). An expanded described row shows the description, then the command in mono. The chimaera MCP server's agent-communication calls read in words on the card and in the count — "Message to fix CI", "Checked messages", "Listed agents", "Read fix CI's work" (`commsCall` recognizes claude's `message_agent (chimaera)`, codex's `chimaera.message_agent` / `chimaera · message_agent`, the raw `mcp__chimaera__…`; a target shows once the title carries one, `→ fix CI`), the driver's title on hover. `open_browser` reads the same way, with its address — "Showed localhost:8000 in a browser pane", "Didn't open … in a browser pane" for a refusal or no window (`browserCall`: Claude's input, else the daemon's result sentence; the query left off). Terminal rows may accept late output text but must never revive their streaming cursor. |
-| `ActivityFold.svelte` / `activityFold.ts` / `ActivitySummary.svelte` / `ActivityRows.svelte` | Settled activity folds: `foldSpans` (pure, own vitest suite) marks each run of ≥2 thought/tool-group rows that any other row directly follows (a reply, a finished-work line, a permission decision, a message sent mid-turn); ChatView renders it as one `ActivityFold` line titled by `foldTitle` ("Thought, ran 6 commands, read 2 files"), keyed by the row that settled it, whose rows mount only while open and render through the same `activityRow` snippet as the live column. Finished lines never join that fold (results, and a woken turn's only stated cause); a settled run of three or more of them (`FINISHED_FOLD_MIN`) folds on its own into one `FinishedFold` line titled by `finishedTitle` ("2 background tasks finished, 5 stopped"; a failure shows the failed badge), each `FinishedRow` — report and output link included — one click away. The trailing run stays open, and so does a run whose last tool group still has a running call when a mid-turn row follows it (a permission decision lands as its command starts; a message read mid-turn or a peer's note can land inside a long call) — ChatView filters that span out until the calls end. A reply or a finished line settles the run regardless; what outlives those is background work, shown by the fold's live dot. `ActivitySummary` is the one-line disclosure (label, live dot, failed/recovered badge, chevron) and `ActivityRows` the expanded body that the fold and `ToolGroup` share; `toolRunHealth` / `isLive` (`toolLabels.ts`) compute the badge and the dot — a failure's recovery looks past its own group into the rest of the turn (`TurnTail`: ChatView hands each group and fold one shared per-turn call array plus its offset, so a retry after a thought row — or after a message the agent read mid-turn (`midTurn`) — still counts; the tail ends at the mounted window's edge). |
-| `AgentMessageCards.svelte` / `agentMessages.ts` | Messages from other agents in the workspace (agent communication, [plan §12](../../../../docs/design/agent-communication-plan.md)): the `agent_message` block — a card per message with the sender's name beside its vendor mark (`SessionGlyph`; a vendor word with no mark — the daemon's "agent" — shows none rather than a wrong one), `#id`, "to you"/"to everyone", "re #N", a quiet accent edge for the Mastermind's direction, the body through `Markdown` (the plain card, when no header parsed, through `UserText`), and a send's leading why-line as a caption. Never a fork/rewind point. The pending tail reuses it for a Codex steer that hasn't been read ("next step") or missed its turn ("not delivered — it's in their inbox", ✕ dismisses). `agentMessages.ts` (pure, own vitest suite) parses the daemon's header format: a header is a line that starts `[message #` unquoted, so a peer's `> `-quoted body can't forge a second card; peer bodies lose their `> `, the Mastermind's stay verbatim (the daemon escapes a header-shaped line in it with `\`, which the parser removes). |
-| `WakeRequestBar.svelte` | Another agent's message waiting for the user's OK to wake THIS idle agent (agent communication's wake request: the Ask me policy, a conversation's hop limit, or agents that used their wakes since the user last stepped in), pinned above the composer in the `.pinned-card` recipe: the sender's mark and name, the message on one plain-text line, **Leave** · **Wake** (**Continue** past either limit). Read from `../workspace/comms.svelte.ts` (`wakeRequestFor`, `wakeFailures`), not frozen with the pinned cards while hidden; a refused answer stays as the bar in the daemon's words until dismissed. The same request is a card in the dashboard's Needs you. |
-| `HookRow.svelte` / `hookNotice.ts` | What a claude hook said: its notice arrives with every line prefixed alike (`Stop says: …`). `hookNotice` (pure, own vitest suite) reads the hook's name and lines; `HookRow` shows one quiet line (`<name> hook` + the first line, faded) that expands to the lines as written — the thought row's voice, never a block that outweighs the reply. A one-line notice counts only when the name has no space. All other notices render unchanged. |
-| `ThoughtRow.svelte` / `thoughtText.ts` | A reasoning line: "Thought"/"Thinking" + `thoughtPreview` (pure, own vitest suite) — the newest Codex `**section title**` (live or settled, so the row never jumps), else the first line, as plain text with code spans intact; the body renders through `Markdown.svelte` with the chat's prose wiring and mounts only while the row is open. |
-| `FinishedRow.svelte` | The `finished` block: a subagent's end (`subagent_finished`, report on click), a background command's or monitor's close (the CLI's own sentence + output link). |
-| `AgentsTray.svelte` / `BackgroundTray.svelte` / `backgroundKinds.ts` | Two of the three pinned cards above the composer (one recipe with the plan card, `app.css` `.pinned-card`): live subagents (derived from in-flight Agent tool rows; a lone agent is named with its step) and live background tasks (the `background_tasks` level-set; the header names a Monitor watch and counts the rest per kind via `backgroundKinds.ts`, so it doubles as the between-turns "still waiting" signal), each with a stop affordance, a model chip (`BackgroundTask.model` / `store.subagents`, labelled through the model catalog, else the agent's own id) and — on the "agent" lane label (`SubagentChip`) — the opener for the subagent's own conversation. Chrome lives in the shared `../shared/WorkTray.svelte` + `WorkTrayRow.svelte` shell; elapsed/duration text uses `../shared/time.ts`. The plan is the third reading (what the agent *means* to do, beside *who* is working and what is *detached*), drawn by `PlanCard.svelte`. |
-| `statusWord.ts` | Whether the live status row says its phase word (pure, own vitest suite): dropped only while a row in view says it — a live call's line in the open trailing run, or the newest block streaming as a thought/message at the reader's bottom; waiting, token-only thinking, and a reasoning item that drew no thought row (Codex, empty summary) always say it. |
-| `AheadCard.svelte` / `ahead.ts` | What resumes the agent on its own (PROTOCOL.md Pass 47): the goal (Claude `/goal`, Codex thread goals), the pending `/loop` wakeup and the interval jobs — one pinned card (`.pinned-card` recipe), one line per thing in the agent's own words with a still `../shared/CountdownRing.svelte` (drains toward the run, accent in its last minute, the live dot once a due run is the turn in progress) or `../shared/GoalGlyph.svelte`, and a calm time (`untilLabel`: minutes, seconds only in the last minute, a clock time past the hour). **A row never changes size**: the time and the hover/focus actions share one grid cell and swap visibility; a click opens the row's detail with the same actions as text (the touch path; `@media (hover: none)` hides the hover set). Three or more scheduled things fold to one line. Claude's loops stop by asking the agent ("Stop the loop.", "Cancel scheduled job <id>.") and its goal clears by `/goal clear` — both visible user messages, the native route; Codex goals pause/resume/clear by command. A row asked to stop reads "stopping…" until the agent's schedule drops it (3 min cap). `ahead.ts` (pure, own vitest suite) parses the wire, writes the goal transcript lines (`goalLines`: Claude's "Goal achieved / could not be achieved / not yet met" and "turns", Codex's status words; a restart re-reporting the same goal is not a new "Goal set"), and formats times, rings and counts. |
-| `WorkStrip.svelte` | The pinned work cards folded into one line when three or more kinds of work run at once (subagents, background, goal, schedule; ChatView unfolds only when one kind is left, so the stack never flips as subagents come and go): the goal leads (else the busiest kind), every other kind a glyph and a number, each a button that opens that kind's own rows — the trays and the Ahead card drawn `embedded` — under the line, one at a time. The plan card stays its own card. |
-| `PlanCard.svelte` / `planCard.ts` | The plan card above the composer, the same for every runtime (a Claude chat's Task*/TodoWrite or the chimaera MCP server's `update_plan` — the tool a Claude chat is offered and asked to use, its call row hidden by the driver — Codex's built-in `update_plan`, ACP plans: all arrive as the `plan` level-set): one row per step, a circle per state (filled check done, plain circle in flight, dashed waiting/blocked), the current step in the foreground, done steps quiet. Rows are keyed by `stepKeys` (the agent's id, else position; a repeated id gets its index appended, so a keyed each never throws) and never reorder; a long plan scrolls inside the card, which keeps the step in flight visible by moving only its own scroll. A finished plan folds to "n tasks done" when its turn ends and stays there to be glanced at until the agent moves on: the next turn that starts without changing it retires it (`store.planTouched`, reset at each `turn_started`; an identical re-sent list does not count), and ChatView unmounts it — the card folds away (`leave`), a fold or unfold animates the card's height, and a step finishing in view grows its filled circle and draws its tick (all skipped while hidden or under reduced motion; local transitions, so a card mounting with finished steps stays still); while the plan has open steps, the corner `n/m ⌄` folds it to one line and a user toggle holds until the automatic state next changes. `planCard.ts` (pure, own vitest suite incl. the three runtime shapes through the reducer) owns marks, text, progress, the fold rule and keys. |
-| `authFailure.ts` / the chat's sign-in card | Signing in from inside a chat. `looksLikeAuthFailure` (pure) reads an agent error as a missing or rejected login (`401`, "missing bearer", "run /login", …) — a cue to re-ask the CLI's status command (`getSignIn(agent, true)`), never a verdict. `ChatView` shows `../workspace/AgentSignInCard.svelte` in three places: a startup that failed signed out (the card replaces the raw error), a chat still starting while the catalog says signed out, and `liveSignIn` — a live, idle chat whose CLI says signed out — at the transcript's tail, with the composer closed (`disabledHint` "sign in to <agent> first") and the status line saying the agent waits for a sign-in. `/login` typed in any chat is intercepted on send (never sent to the model) and runs the same card (`signInRequested`). A landed sign-in relaunches the chat in place (`onRelaunch` → `POST /sessions/{id}/view {ui:"chat", relaunch:true}`), resuming the conversation. |
-| `PermissionCard` / `QuestionCard` | The permission prompt and structured-question cards (their answers ride `socket.send`; `PermissionCard` also carries the deny-with-feedback field; `QuestionCard` presents Codex auto-resolution deadlines without owning the authoritative timeout). |
-| `ElicitationCard.svelte` / `ElicitationFields.svelte` / `elicitation.ts` | MCP typed forms, nested object groups, URL requests and explicit submit/decline/cancel decisions; native browser opener, bounded driver schema, no optimistic dismissal. `McpPanel` routes Claude needs-auth rows to the existing connection dialog and reconnects after confirmed sign-in. |
-| `PlanApprovalCard.svelte` | Claude `ExitPlanMode` plan-approval card — renders the sanitized plan markdown + the three official options (auto-accept / manual / keep-planning) with an optional comment that rides the permission reply. |
-| `RewindDialog.svelte` | The destructive in-place rewind/fork-point confirmation overlay (claude rewind + codex `thread/rollback`). |
-| `ForkDialog.svelte` | The non-destructive conversation-branch picker: target agent plus native-vs-portable boundary disclosure. |
-| `AgentMessageMeta.svelte` | The hover/focus actions at an assistant message's bottom right (absolute, bare glyphs over the gap below — no card; `pointer-events: none` while hidden so prose selection under it works; inline after the last word on touch): localized journal-backed timestamp (tooltip = the turn's duration + tokens; none when the message has no send time, e.g. a subagent's replay), then icons — copy always, then rewind-to-here (`ChatView.rewindPoints`: the next user message's checkpoint in the mounted window, so the reply stays; `RewindDialog` words it via `fromReply`) and fork only when the host passes them. The buttons stay in the tab order — focus reveals them. Read-only views pass neither, so they show copy alone. Its pure time ladder lives in `../shared/time.ts`. |
-| `McpPanel.svelte` / `UsagePanel.svelte` | The `/mcp` linked-server panel and the `/usage` panel (the plan windows as `../shared/UsageBars.svelte` rows, reset times included). |
-| `UsageMeter.svelte` | The header's usage meter: a faint gauge (needle at the fullest reading) until a reading reaches 80% (`../shared/usage.ts` `usageHeadline`: its short name and number in warn, a spent limit in err); a click opens the context window (tokens, Compact while idle — `ChatView.compactNow`, the `/compact` path) and every plan window (`store.rateLimit.windows`, else the single chip window, else — for an agent whose stream reports none, `ACCOUNT_USAGE_IN_CHAT` (Antigravity) — the account's live read, `ChatView.accountUsage` from `../settings/agentUsage.ts`, asked while the chat shows and idles), plus All limits → Settings → Agents (`settings/jump.ts` `openSettingsAt`, which App watches). Renders nothing for an agent that reports neither. |
-| `ArtifactGallery` / `artifacts.ts` / `embeds.ts` | Prose embeds in the transcript are `../shared/embed/EmbedCard` cards (one design with the documents; loads near the viewport, box reserved up front, fresh on overwrite, missing/error states). **The "written this turn" gallery** (a `turn_end` block, also pushed on an aborted turn that wrote something) shows the files the turn's edit tools wrote (`artifacts`, the tools' absolute locations, artifact kinds only — figures, reports, documents, tables, notebooks, slides, media; never source code) plus shell-written ones, **minus what the prose already showed** (`proseEmbedTargets` / `proseCovered`: an embed or a prose name covers any shape — a name's path link previews on a rest as a chip would — the shallowest match only; `covered` lists them: the heading becomes "Also written" and `chipLabels` widens names against them too), as **one chip line** after the header: every file — figures, HTML, PDF, media and documents alike — is a `FileChip` in written order (never tiles: a turn that saved twenty plots must still cost a line or two); click opens, a rest previews that one file (`hoverTargets.ts`; there is no preview fold — unfolding every tile at once was the clutter); past seven, six show, one of each view kind before a second of any (`artifacts.ts` `foldedChips`), behind a "+n more"/"fewer" toggle; `chipLabels` widens colliding names with their folders; `fileStateAfter` + the disk monitor mark a chip gone or changed-since while on screen, the latter shown in its preview. Replay and live agree because all of it runs in the reducer. Shell-written ones: the reducer lists the artifact-shaped paths the turn's commands (the execute row's additive `command` — the whole text, since the title truncates at ~120 chars — falling back to the title) and outputs mention (`mentioned`, `artifacts.ts` `artifactMentions`, head+tail scanned, capped), and the gallery keeps those `fs/resolve_targets` confirms exist AND were modified between the turn's journal-stamped `startedAtMs`/`endedAtMs` (`writtenDuring`, 3 s slack — daemon clock on both sides). `EmbedResolver` (one per ChatView) resolves chat targets against the same base ladder as path links, but strictly (an embed names one file), batched and briefly cached; a card or gallery remounted by transcript paging takes a cached answer synchronously (`peek`, and `shared/embed/embed.ts` `peekFile` for absolute paths), so its box is final before its first paint instead of growing a tunnel round trip later — and a card mounted from `peekFile` re-asks once near (`resolveFile(…, {fresh: true})`, which never joins a request sent before it), since the file may have been rewritten since. Own vitest suite (`artifacts.test.ts`; the reducer side in `store.svelte.test.ts`). |
-| `FileChip.svelte` / `ProseChip.svelte` | The file chip (icon + name, gone/not-found states), shared by the turn-end line (every written file) and prose document embeds; it registers its preview in the chat's `HoverTargets` while its file is known. `ProseChip` is a prose embed's chip: resolves through the `EmbedResolver`, asks again on a pointer arrival or click while not found. |
-| `hoverTargets.ts` | What a chat element previews on hover (`HoverTargets`, one per ChatView, a `WeakMap` — sanitized agent HTML can forge classes and `data-*`, so only elements the chat built or stamped preview), answered to the shared hover controller (`../previews/doc/hoverController.svelte.ts`) as its `targetOf`. `ChatView` hosts that controller over the transcript (`root` = the scroller, `layer` = the chat, `anchors: false`, `standalone: true`); `Markdown.svelte` registers resolved FILE path links (never dirs or ambiguous names), `ArtifactGallery` its chips. Its `refs` (`ReferenceChips`, `../shared/references.ts`) hold the **id chips** `Markdown.svelte` makes on settled content (`linkReferences` after `stampPaths`; again when a reference source arrives): an id a source answers for (a knowledge entry's `F-228`) previews its lines and opens on click/Enter through the target's `open`. Own vitest suite. |
-| `terminalMentions.ts` | Terminal-reference parsing, unique legacy-name resolution, readable labels and ID-preserving composer short forms; shares the atomic token editing/copy machinery with uploads. `Composer` lists cwd/activity/link ownership, offers Terminal + and linked-terminal open/unlink controls. Picker and drag selections always send session IDs. Own Vitest suite. |
-| `UserText.svelte` | User-message bubble: plain text (never Markdown); `@term:` references render terminal-icon chips (open a uniquely resolved live terminal; unavailable/ambiguous stay inert; copy retains the original reference); every `@` file mention reads as a chip in place (icon + name — `paths.ts::mentionChipLabel`, an upload by its landed name, other names widened by `artifacts.ts::chipLabels` only where two collide — clickable once resolved, muted on a confirmed miss, the whole mention in its tooltip and in a copy via `data-full`); a path written without `@` stays as written (a dotted link once validated); recognized LaTeX spans delegated to `MathText`; `>`-led quoted lines muted with their markers kept (`shared/reference.ts::quoteRuns`). |
-| `AttachmentStrip.svelte` / `ImagePreview.svelte` | A message's images as picture tiles (one row height, width from the picture's aspect via `images.ts::tileBox`, no hover effects): `drafts` in the composer (in-memory pixels, ✕ to remove, click → `ImagePreview`, a fixed overlay like the plan card's) and `paths` on sent/queued bubbles (the daemon's saved copies from `user_message.attachment_paths`, resolved near the viewport through `resolveFile`, click → open in a pane, a gone copy a dashed tile). A picture-only message puts the strip where the bubble would be. |
-| `paths.ts` | The chat half of path links: which candidates a code span / link target offers (parsing is `../shared/fileRef.ts`, shared with the terminal), and `PathResolver` — one per ChatView, batching every renderer's candidates into `fsValidate` calls grouped by base ladder (live cwd, spawn cwd, workspace root from App's `setChatLinkContext`), caching hits/ambiguous/misses keyed by candidate + base ladder + workspace (`resolveScope`; misses expire after 15 s and at every turn end, hits after 60 s; failures are never cached). A click re-checks before opening (`resolveNow` / `reopenResolution`), so a stale hit never opens a moved or deleted file. Opening goes through `../shared/openPath.ts` (reveal at the line, Cmd/Ctrl split); ambiguous names open a context-menu pick list. Own vitest suite (`paths.test.ts`). |
-| `voice.svelte.ts` / `voiceCapture.ts` / `VoiceMeter.svelte` / `voiceLanguages.ts` | Voice dictation — the composer's mic button (on by default; `/voice on` or `off`; the same in Claude and Codex chats). `Dictation` (one per composer) is a chain of `Phrase`s — one `/ws/voice` socket each, opened with the mic (audio captured before a socket is up is queued, never dropped). `PauseDetector` (pure, tested) ends a phrase at a pause: the service revises nothing until a stream is finalized, so the recording finalizes each phrase there and speaks on into a fresh one — opened only when speech resumes, with ~300 ms of pre-roll, so a recording that ends in silence opens none — and each phrase's corrected text arrives a moment later. The host check (`hostCanDictate`) re-asks on the window's next focus/visibility whenever the answer was no. `finals` is the leading run of finished phrases, `interim` everything after (a finishing phrase keeps its guess until its correction lands); keeps the last five levels for `VoiceMeter`'s waveform (beside the stop button), and owns `error` (the composer only reads it) — including the silence message naming the device when the loudest chunk stayed near zero; a generation counter fences late events from an ended recording. `hostCanDictate` / `recheckHost` cache the daemon's `GET /api/v1/voice` per window (re-asked after a login error), gating the mic; `voiceProblem` is `/voice on`'s check (that, then one mic permission request). `voiceCapture.ts`: `listMicrophones` (names are withheld until the page has the mic once), `startCapture(onChunk, microphone)` resolving a remembered NAME to this origin's device id, and an AudioWorklet (inlined as a Blob URL) box-filtering the device rate to 16 kHz mono PCM16 in 100 ms chunks with an RMS level; the mic is released after each recording. Keys stay the composer's: the Dictate chord (`keys.dictate`, matched only while the composer has focus — App's handler has no case for it, so it falls through), and while recording Esc restores the draft and Enter stops and sends; Space is never taken over. The words stream INTO the draft (`dictationParts` / `joinParts`: the text around the caret, settled words, forming words, spaced like typing), so the box grows like typing; the textarea goes read-only with transparent text and the composer's `.ghost` mirror (exact box, font, wrapping, scroll and scrollbar-width padding) draws it with the spoken part dimmed — keep their box and font properties identical. Pure helpers (`dictationParts`, `insertDictation`, `joinSpoken`) have a vitest suite (`voice.test.ts`). |
-| `composerBus.ts` | Cross-component channel to insert text/attachments into the active composer (e.g. `@term:` grants, references, dropped-file paths, a quoted transcript passage). An insert is `inline` (joins the draft after a space) or `block` (its own paragraph, so a quote's `>` starts a line); `composer.ts::draftWithInsert` is the pure join. An insert may name the mounting view's token (`view`): one chat can be mounted twice (the Mastermind dock and a pane), and a quote belongs in the composer under its selection. Own vitest suite (`composerBus.test.ts`). |
-| `composerHeight.ts` | Pure height policy for content-fit growth plus manual resize baselines; covered by `composerHeight.test.ts`. |
-| `drafts.ts` | Per-session composer draft persistence (survives the per-session ChatView remount + a page reload) — text layers into sessionStorage, images stay in-memory; both bounded. It also publishes which drafts remain memory-only so an interface-build transition cannot silently reload over them. |
-| `images.ts` | Pasted/dropped image → downscale + base64 encode into an `ImageAttachment` (the canonical home of that type, with its encoded size); size-bounded. Also the tile geometry (`tileBox`) and draft `<img>` source (`attachmentSrc`); own vitest suite. |
+| `store.svelte.ts` | `ChatStore`: the reducer and all view state. |
+| `chatWs.ts`, `cooperativeQueue.ts` | `ChatSocket`: auth, reconnect, gap replay, ordered dispatch. |
+| `chatPool.ts`, `chatPoolRegistry.ts` | Warm store and socket per session; the registry App imports. |
+| `ChatView.svelte` | The host: transcript window, composer, overlays. |
+| `transcriptWindow.ts`, `readingAnchor.ts`, `heightModel.ts` | Window math, reading anchor, row heights. |
+| `Markdown`, `streamSegments.ts`, `revealLedger.ts`, `tables.ts`, `markedExtensions.ts`, `MathText`, `math.ts` | Sanitized prose and math, streamed. |
+| `ChatHeader`, `ModelPicker`, `EffortPopover`, `capabilities.ts` | Header controls from capabilities. |
+| `Composer`, `composer.ts`, `composerHeight.ts`, `composerBus.ts`, `drafts.ts` | Input, slash completion, inserts, drafts. |
+| `uploadTokens.ts`, `uploadChips.ts`, `ComposerMentions`, `terminalMentions.ts` | Atomic mention tokens in the draft. |
+| `voice*.ts`, `VoiceMeter` | Voice dictation. |
+| `images.ts`, `AttachmentStrip`, `ImagePreview` | Image attachments and tiles. |
+| `ToolCallCard`, `ToolGroup`, `toolLabels.ts` | Tool calls and their one-line labels. |
+| `Activity*`, `activityFold.ts`, `FinishedFold`, `FinishedRow` | Folds of settled activity. |
+| `ThoughtRow`, `thoughtText.ts`, `HookRow`, `hookNotice.ts`, `statusWord.ts` | Thought and hook lines; status word. |
+| `AgentsTray`, `BackgroundTray`, `PlanCard`, `AheadCard`, `WorkStrip` | Pinned work cards. |
+| `subagent*.ts`, `SubagentBanner`, `SubagentChip`, `ModelChip` | A subagent as a read-only chat. |
+| `AgentMessageCards`, `agentMessages.ts`, `WakeRequestBar` | Other agents' messages and wake requests. |
+| `PermissionCard`, `QuestionCard`, `PlanApprovalCard`, `Elicitation*` | Answers to the agent. |
+| `RewindDialog`, `ForkDialog`, `AgentMessageMeta` | Rewind, fork, message actions. |
+| `McpPanel`, `UsagePanel`, `UsageMeter` | `/mcp`, `/usage` and the usage meter. |
+| `ArtifactGallery`, `artifacts.ts`, `embeds.ts`, `FileChip`, `ProseChip`, `hoverTargets.ts` | Embeds, written files, hover previews. |
+| `paths.ts`, `UserText` | Path links; the user-message bubble. |
+| `ChatFind`, `chatFind.ts`, `quoteSelection.ts` | Find in chat; quote a selection. |
+| `nativeUi.ts`, `mods.svelte.ts`, `Mod*.svelte`, `modClient.ts`, `nativeComposer.ts` | [Claude Mods](REFERENCE.md#claude-mods): never journaled or replayed. |
 
-The transcript's copy affordances — fenced code blocks, blockquotes, and whole
-assistant messages — reuse `../shared/clipboard.ts` (the native-first clipboard
-writer lifted out of the terminal pool) — see the shared/ area. Selection-copy
-depends on settled prose being plain text nodes: the settle swap to the
-canonical parse (below) renders span-free, because span-fragmented text copies
-with a hard newline at every visual wrap point.
+## State owners
 
-A selection in the transcript joins the workbench's context bridge
-(`../shared/reference.ts`): `ChatView` publishes it as a `chat` selection and
-floats the shared `ReferenceChip` ("quote in reply") on the chat root
-(`quoteSelection.ts` holds the DOM helpers); App resolves its target to this
-same chat only and inserts `composeChatQuote`'s blockquote as a `block` into
-the publishing view's composer. A chat whose composer is disabled offers none. Keep that chip (and any other floating chrome) OFF the
-`.column`: `readingAnchor.ts` binary-searches the column's children as a
-vertical stack of rows, which an absolutely positioned child would break.
-
-## The streaming render pipeline (Markdown.svelte + streamSegments.ts)
-
-Re-parsing + re-sanitizing + re-word-wrapping the WHOLE accumulated message on
-every coalesced wire chunk (2 KiB / 100 ms) is O(n²) — a multi-thousand-word
-reply burned tens of ms per chunk near its end. The live pipeline instead makes
-per-chunk work proportional to the TRAILING OPEN SEGMENT, not the message:
-
-- **The security invariant** (owned by `streamSegments.ts`): the streaming
-  render must NEVER be more permissive than the settled render. Splitting
-  inside a construct whose interior is inert when parsed whole (fenced code,
-  block math, raw HTML) would hand that interior to marked as ordinary
-  markdown — turning inert text into live DOM (`<img>` beacons, clickable
-  links) that DOMPurify allows. So fences and block math are tracked and never
-  split, and any line that can OPEN a CommonMark HTML block bails segmentation
-  for the whole message. Nothing ever force-closes a fence/math/HTML tail.
-- **Segmentation** (`streamSegments.ts`, pure, incremental): the source splits
-  at safe top-level blank-line boundaries; the scanner persists its cursor +
-  construct state, so each advance walks only the new lines. "Safe" is
-  conservative — open fences and `$$`/`\[` block math never split (open/close
-  lines mirror math.ts EXACTLY, pinned by tests, and `\r\n` is normalized the
-  way marked's lexer does); a list refuses to close until a flush non-list
-  block starts (loose continuations AND lazy-continuation lines); indented
-  tails refuse; a reference-link definition makes boundaries sticky for the
-  message (document-global targets), relaxed only past a ~16 KiB tail cap and
-  even then only at the ordinary safe boundaries. The partition is lossless —
-  closed segments + the open tail concatenate back to the source
-  byte-for-byte, so the reducer's materialized `\n\n` block separators
-  (PR #122) can't be eaten or doubled. Residual worst case, accepted: one
-  giant never-closing fence (or an HTML bail) keeps the whole tail open, so
-  its parse cost stays O(open) per chunk by construction.
-- **Per chunk**: closed segments were parsed + DOMPurify-sanitized + copy-
-  decorated + local-anchor-classified + word-wrapped ONCE (each in its own
-  `display: contents` wrapper, so layout matches the wrapper-free settled
-  render); their DOM is never touched again. Only the open tail's wrapper
-  re-renders. A parser throw falls back to inert plain text (never a dropped
-  segment); a text update that does NOT extend the previous source (a
-  retraction/reroute rewrite) invalidates the whole cached prefix and rebuilds
-  from the fresh split.
-- **Reveal** (`revealLedger.ts` owns the cursor arithmetic, pure + tested):
-  word spans exist only for not-yet-revealed words. The 75 ms ticker drains a
-  prefix-then-tail queue in document order; the cursor carries across tail
-  rebuilds and into closing segments so shown words never re-hide or re-fade —
-  and every advance that closed segments MUST rebuild the tail, even when its
-  source is string-equal (the duplicate-paragraph trap; the tail memo is
-  invalidated on closes). A drained closed segment dissolves its spans shortly
-  after the fade (span-fragmented text copies with hard newlines at wrap
-  points, and closed-segment DOM now survives long enough to be selected).
-  Blocks whose first word is unrevealed hide whole (probe spans). Reduced
-  motion skips spans and the ticker entirely — content lands instantly, still
-  incrementally.
-- **Hidden ≠ settled.** `streaming` is TURN state (this row is the streaming
-  tail, compared by block uid), `visible` rides separately: hiding a tab
-  mid-stream FREEZES the live segment DOM in place — no canonical-parse swap
-  at tab-switch-away, no ticker — and thaw resumes with the reveal cursor
-  intact (catch-up segments append; the already-read prefix never
-  re-animates). The swap to the canonical parse happens only when the row
-  genuinely stops streaming.
-- **Deferred decorations**: `stampPaths` (TreeWalker + `shared/fileRef.ts`)
-  runs at idle on closed segments — never on the per-chunk hot path — and its
-  async resolve callback re-stamps only the affected root, again at idle (or
-  the settled root, when the stream settled while the batch was in flight —
-  the canonical swap disconnected the segment it walked). What a stamped
-  element opens lives in a component `WeakMap`, never in DOM attributes
-  (sanitized agent HTML can forge classes and `data-*`). On
-  WKWebView (the native app) `requestIdleCallback` is absent and the fallback
-  is a short fixed delay. The open tail is stamped when its segment closes or
-  at settle — but its schemeless anchors get the `md-local` class
-  SYNCHRONOUSLY at every render (a streamed relative link must be swallowed by
-  the click handler from first paint, or it navigates the workbench away).
-- **Settle = ONE canonical full re-parse.** When `streaming` flips false the
-  template swaps to the memoized `{@html html}` whole-message parse (computed
-  lazily — a live block never pays it per chunk) and full decorations run. The
-  settled transcript is therefore identical to a never-streamed render BY
-  CONSTRUCTION — any conservative-segmentation artifact is transient — and the
-  settled DOM is span-free, which keeps selection-copy clean. (Tradeoff, also
-  by construction: the settle swap replaces the subtree, so a selection held
-  ACROSS the settle moment is dropped — strictly better than the old
-  per-chunk whole-subtree rebuild, which dropped selections every 100 ms
-  mid-stream.)
-- **Safety rail**: EVERY fragment that reaches `innerHTML`/`{@html}` — each
-  closed segment, each tail render, the plain-text fallback, the canonical
-  parse — passes through the same DOMPurify config first. Unsanitized
-  fragments are never concatenated. The non-streaming path (history rows,
-  reading mode) is the same single memoized parse as before.
+| State | Owner | Who mutates |
+|---|---|---|
+| `blocks`, `pendingSends`, plan, subagents, flags | `ChatStore` | `apply` and store methods only. |
+| Socket, resume `lastSeq` | `ChatSocket` | The socket; it feeds the store. |
+| Warm entries, scroll cursor | `chatPool.ts` | Acquire; App disposes. |
+| Drafts, dictation | `drafts.ts`, `Dictation` | `Composer`; `Dictation`. |
 
 ## Invariants / gotchas
 
-- **Agent output is untrusted.** Anything the model emits (prose, tool output,
-  file contents it echoes) is attacker-influenced. Render it through
-  `Markdown.svelte`'s sanitizer; never `{@html}` raw agent text elsewhere; never
-  build a live external link without `rel="noopener"`.
-- **Math stays inside the same trust boundary.** KaTeX emits MathML with
-  `trust:false`; DOMPurify still sanitizes the combined result. Exclude `.katex`
-  descendants from path stamping and streaming word spans — mutating generated
-  math markup corrupts equations.
-- **Never lose a user action to a closed socket.** `socket.send` returns `false`
-  when not OPEN — respect it (the composer keeps the draft; `store.connected`
-  tracks liveness). Reconnect replays the gap; don't invent a client-side queue.
-- **A queued send is NOT a transcript block until the agent reads it.**
-  A mid-turn send (plain Enter) is read at the agent's NEXT STEP — between tool
-  calls, both agents; until then it lives in `store.pendingSends` (a faded
-  bubble at the scrollable transcript tail), never in `blocks`, so it can't
-  splice output already rendered or crowd the fixed composer. The reducer
-  appends it to `blocks` at the current end only when `user_message_update`
-  resolves it `sent` — possibly mid-turn, which is where the agent read it
-  (several waiting messages are read together; such a block is `midTurn`, and
-  the turn-end artifact scan looks past it to the turn's real opener); `cancelled` removes it;
-  `dropped` marks it "not delivered" until dismissed. `send_after_turn` (the
-  composer's ⌥↩ / Alt+Enter, yielding to any app action the user binds to the
-  same keys — ⇧⌘↩ is Zoom Pane) holds a message until the turn ends: its echo carries `after_turn`, kept as `afterTurn` (caption "after
-  this turn" vs "next step"). Every waiting bubble offers **Send now**
-  (`{type:"send_now", id}`: the daemon interrupts the turn and every waiting
-  message is read at once; for Claude this is the CLI's send-now, which leaves
-  background agents running, unlike Stop) and ✕ (`{type:"cancel_queued", id}`: pulls back a
-  waiting send, dismisses a dropped one — the driver's tombstone `Cancelled`
-  survives replay — and no-ops, or answers a Notice, once read). A **Stop
-  never drops the queue** — the driver aborts only the turn and the waiting
-  messages resolve `sent` right after, so `dropped` means genuinely
-  undeliverable (agent died). `steer_queued` is wire-only for old clients;
-  the UI never sends it. All pure reducer, so replay rebuilds the identical
-  order — see `store.svelte.test.ts`.
-- **Other agents' messages are cards, never the user's words.** They reach a
-  chat two ways, and both fold into one `agent_message` block: a Claude chat's
-  hook delivery is the daemon-journaled `agent_message` event (context at the
-  next step — no user message exists), and a real send (a wake, the user's
-  hand-over, a Codex steer) is a `user_message` with `origin: "agent"` /
-  `"mastermind"` whose text the reducer parses into messages. A queued one
-  keeps its origin in `pendingSends` and promotes to the card, not a user
-  bubble. A turn-opening send is a turn boundary (the artifact scan, the wake
-  marker) like a user message; its checkpoint is swallowed, never passed to an
-  earlier user message. The legacy `origin: "worker"` stays a tagged user
-  bubble.
-- **The seq contract is the daemon's.** Trust `lastSeq`/`head` from the wire; do
-  not renumber. A gap is healed by reconnect replay, not by client bookkeeping.
-- **Inactive UI is not an inactive agent.** A hidden retained chat freezes its
-  bounded transcript plus auxiliary plan/subagent/background/ask/send snapshots,
-  while `chatPool` keeps its reducer and socket warm and the daemon-owned process
-  continues working. Invisible timers/animations stop, but keyed cards stay
-  mounted so expansion, comments, and question choices survive. A hidden
-  permission/plan card must never call `focus()`; it may focus when its view
-  becomes visible. Live-set or client-pool eviction may unmount a view or close
-  a parked *client socket*, never the agent; the next acquire gap-replays the
-  journal.
-- **Scroll restoration is window-aware and has one writer.** Save the
-  scroll offset **relative to the rendered rows** (spacer excluded — it is
-  re-derived on remount), the bounded block range **in virtual coordinates**
-  (array index + the store's `trimmedCount`, so a cap trim while parked can't
-  strand the cursor), whether it still tracks the tail, and the transcript
-  revision the reader followed. Stream/Markdown/content and transcript-viewport
-  resize follow requests coalesce into one frame. Pinned-tray/composer height
-  changes are inputs to that same writer, never independent scroll owners. A
-  live tail continues rendering while the reader scrolls or types, and
-  following is the reader's position alone: a reader at the bottom stays there
-  while typing (a draft never unpins them — maintainer, 2026-10-15), one who
-  scrolled up stays where they are; a pinned reader's viewport keeps its
-  bottom edge in the same frame as the composer grows, and the composer
-  measures its content on an off-flow clone (collapsing the live
-  textarea clamped the pinned transcript's scrollTop every keystroke). Hidden tabs snapshot once and must not
-  retain reactive block proxies. Replay never remounts the entire transcript.
-  A visible top sentinel while a short live tail fills the viewport is layout,
-  not reader intent: it may prepend only while retaining the tail, and stops at
-  the DOM cap instead of silently paging the reader away from live activity.
-- **A pinned follower leaves the live edge only by its own hand.** In WebKit a
-  scroll event lands a frame late (rows appended in between make a reader who
-  never moved look scrolled up), and scrollTop is clamped wherever a re-render
-  momentarily shrinks the content (an up-move nobody made). So `onScroll`
-  keeps `atBottom` for a non-move, and — while a turn runs — for an up-move
-  with no wheel/pointer/touch/key input behind it (WebKit dispatches those
-  ahead of the scroll they cause; the wheel listener must stay passive). The
-  live-tail chrome gates on `atLiveEdge`, which counts a tail window whose
-  appended row is one flush from rendering as live: tearing the status row out
-  and back in per append was one of those shrinks. A parked view's scroll
-  events are ignored outright: a turn ending while hidden drops the status
-  row, the clamp's event met a frozen range with rows waiting, and the chat
-  reopened short of its newest row with following off. Repro: the real-WebKit
-  harness in `scripts/perf/transcript-scroll/` with a page script that sends
-  and samples the gap.
-- **Never write `scrollTop` while a gesture may be in flight.** WebKit (the
-  native app) has no scroll anchoring, and its scrolling thread owns the
-  position during a fling: a mid-gesture `scrollTop` write — any correction for
-  rows mounted above the reader — snaps back for a frame or two (measured with
-  real momentum wheel events; see field notes 2026-09-25). A scrolled-up
-  reader's anchor row is held by resizing the **history spacer** instead: page
-  writes, trims, fold regrouping, and previews decoding above them (the column
-  ResizeObserver runs before paint) all shift the spacer by exactly the
-  anchor's movement. The spacer may go negative when the model underestimates
-  (rows pulled past the scroll origin, like the old rendered edge). Scroll
-  writes are reserved for the bottom-follow writer, a restore, and the idle
-  rebalance, which re-sizes the spacers to the model with one compensating
-  write read from the offset BEFORE the spacer changes (shrinking it first
-  clamps the offset). Idle means no scroll event for 160 ms AND no wheel
-  input (a decelerating fling keeps sending momentum wheel events after its
-  move rounds to nothing, while WebKit still owns the position), then one
-  frame (a long task can run the timer ahead of queued scroll events): a
-  write inside a fling is snapped back and leaves WebKit's scrolling thread
-  and the page disagreeing about the offset. A range write that drops rows
-  above the reader holds the column's height until the anchor hold has run
-  (WebKit clamps the offset at the layout in between). The transcript sets
-  `overflow-anchor: none` so Chromium doesn't correct the same shift twice.
-  Verify changes here with the real-wheel harness in
-  `scripts/perf/transcript-scroll/` — Chromium, jsdom and the Browser pane
-  hide the WebKit behavior.
-- **Fork boundaries are event-backed.** A rendered block's `forkSeq` is the
-  latest sequence that makes that message true on replay (a queued user message
-  advances on its `sent` update; a final Codex assistant message advances on
-  `turn_completed`). An assistant action includes that block and opens with an
-  empty composer; a user action passes its own id/seq so the daemon can derive
-  the exact cut before delivery, then restores the selected text through
-  `composerBus` as an unsent destination draft. Only pass `nativeAt` for the
-  exact vendor boundary the reducer proved; the server independently validates
-  it against the journal.
-  `forked {native:false}` clears copied source-native ids and stale live work:
-  those rows are display history in the fresh destination, not actionable
-  rewind points or running prompts/tasks.
-- **Runes discipline.** Mutate `$state` only inside the store's methods; give
-  every timer/listener an `$effect` teardown (a stray debounce firing after
-  unmount is a bug); an `$effect` that both reads and writes the same `$state`
-  loops.
-- **Prose leads; activity lines follow.** Thought, tool-group, finished and wake rows share one
-  quieter voice (12px, the column's `--activity-fg`, an `activity` class that ChatView clusters
-  tight) so agent messages stay the page's voice. A settled message's hover rail flows inline after
-  its last word (the `.md` shell is `display: contents`, a closing `<p>` goes inline — nothing
-  measures `.md`, keep it that way). New transcript chrome joins that family rather than adding a new visual
-  weight. A run of thought/tool lines that any other row has followed folds into one
-  line (`activityFold.ts`); the trailing run stays unfolded, so live work is always visible. Three or more finished lines in a row that something has since followed fold the same way, on their own (maintainer, 2026-10-04). Wake markers are reducer-derived (`markWake`, pure over `blocks` + the live background
-  set), so replay rebuilds them; the live status line reads `turnTokens` / `activityLine`.
-  A `thought_retracted` event (Claude narration that streamed as thought before its signature)
-  cuts exactly its UTF-16 length off the turn's trailing thought row, dropping a row left empty at
-  the tail; the same text follows as message chunks, so it renders as prose live and on replay.
-- **UI quality is an acceptance criterion.** Use the theme tokens (`--fg`,
-  `--accent`, `--edge`, `--overlay-bg`, …) — no hard-coded colors — so light and
-  dark both hold. Shared chrome (buttons, popovers, card headers, entrance
-  animations) should be shared, not re-pasted per card.
+- **Render agent output only through `Markdown.svelte`'s sanitizer** ([render](REFERENCE.md#render-and-sanitizer-invariants)).
+- **Streaming is never more permissive than settle** ([pipeline](REFERENCE.md#the-streaming-render-pipeline)).
+- **Trust the daemon's seq: a gap heals by replay, and fork points are event-backed** ([reducer](REFERENCE.md#reducer-invariants)).
+- **A queued send becomes a block only once read, and agents' messages are cards** ([reducer](REFERENCE.md#reducer-invariants)).
+- **The reducer's vocabulary is pinned by daemon-written fixtures.** `net/fixtures/wire/chat-events.json` (every `AgentEvent` variant, written by chimaera-agent's wire test) goes through `ChatStore.apply` in `net/wireFixtures.test.ts`, which expects `store.unhandledEventTypes` to stay empty — a type the reducer ignores on purpose is an explicit `case`, never the `default:`.
+- **Never lose a user action to a closed socket; hiding a chat never stops its agent** ([transport](REFERENCE.md#transport-invariants)).
+- **Rows key by stable uid, never array index** ([file map](REFERENCE.md#file-map-in-full)).
+- **Scroll has one writer; never write `scrollTop` mid-gesture** ([scroll](REFERENCE.md#scroll-invariants)).
+- **Keep floating chrome off `.column`** ([quote](REFERENCE.md#copy-and-quote-selection)).
+- **Never infer controls from the agent's brand** ([capabilities](REFERENCE.md#session-capabilities)).
+- **Mutate `$state` only in store methods, tear down every `$effect` timer, use theme tokens, share chrome instead of re-pasting it per card** ([conventions](REFERENCE.md#runes-and-ui-conventions)).
 
 ## Adding to the chat UI
 
-- New event kind from a driver? Add its case to `ChatStore.apply` and render it
-  from `blocks`; keep the wire type in sync with `chimaera-agent/model.rs`.
-- New agent command (a button that tells the agent something)? `socket.send({
-  type: "…", … })` and add the matching `AgentCommand` variant server-side.
-- Keep `ChatView.svelte` from growing without bound. The overlays/panels (header,
-  rewind dialog, `/mcp`, usage, effort) are already their own components — add new
-  chrome the same way rather than inlining it into the host.
+Event: a `ChatStore.apply` case. Command: `socket.send` + `AgentCommand`. Chrome: a new component ([recipe](REFERENCE.md#adding-to-the-chat-ui)).
 
-## Session capabilities
+## Checks
 
-`capabilities.ts` consumes the driver’s additive `capabilities` event; unknown agents have no
-implicit controls. `catalog` refreshes model/mode/command choices without replaying Init or
-resetting a turn. Header/composer controls follow those facts. `ForkDialog` includes every
-ready chat adapter; native history and a conversation copy have different transfer semantics.
-See [integration design](../../../../docs/agent-guides/agent-integrations.md).
+```sh
+npm --prefix web-ui run check
+npm --prefix web-ui run test -- src/lib/chat
+```
 
+Verify live (**verify-app** skill); a fake claude (**chat-mode** skill) gives a hermetic UI check.
 
-Startup status is separate from transcript activity: `startup_progress` stores
-one latest phase until Init, fatal Error or Exited. A reconnect replays that same
-phase; a fresh progress event marks a respawn uninitialized even when history is
-already present. The composer can accept a queued message while startup runs.
+## Neighbours
+
+[net](../net/AGENTS.md) · [layout](../layout/AGENTS.md) · [shared](../shared/AGENTS.md) · [settings](../settings/AGENTS.md) · [terminal](../terminal/AGENTS.md). Feature pages: [chat-mode](../../../../docs/features/chat-mode.md), [claude-mods](../../../../docs/features/claude-mods.md), [loops-and-goals](../../../../docs/features/loops-and-goals.md), [agent-communication](../../../../docs/features/agent-communication.md).

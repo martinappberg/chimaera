@@ -107,7 +107,7 @@ on the per-session MCP endpoint ([linked-terminals.md](linked-terminals.md#the-m
   ends"). The Timeline's delivery chip reads "reached it mid-wait" for those.
 
 **While the reader's turn waits on something** (live, claude 2.1.300 and codex 0.162.1,
-[PROTOCOL.md Pass 44](../../crates/chimaera-agent/PROTOCOL.md)):
+[PROTOCOL.md Pass 44](../../crates/chimaera-agent/protocol/passes.md#pass-44-2026-10-14--live-probes-claude-21300--codex-01621-reaching-an-agents-main-thread-while-it-waits-on-a-subagent-adopted)):
 
 | Reader | Waiting on a subagent | Running a long command | The sender is told |
 |---|---|---|---|
