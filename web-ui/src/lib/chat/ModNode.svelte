@@ -30,7 +30,6 @@
     {#if client}{@render client(current)}{/if}
   {:else if current.type === "Markdown"}
     <!-- The listener only intercepts an allowlisted anchor inside sanitized Markdown. -->
-    <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div class="mod-markdown" style={uiStyle(current.props, current.type)} onclickcapture={(event) => markdownPress(event, current)}><Markdown text={String(current.props.text ?? "")} /></div>
   {:else if current.type === "Code"}
     <ExtensionCode source={String(current.props.source ?? "")} language={typeof current.props.language === "string" ? current.props.language : undefined} path={typeof current.props.path === "string" ? current.props.path : undefined} startLine={typeof current.props.startLine === "number" ? current.props.startLine : undefined} format={current.props.format === "diff" ? "diff" : "source"} wrap={current.props.wrap === "truncate-end" ? "truncate-end" : "wrap"} />

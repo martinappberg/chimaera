@@ -8,40 +8,33 @@ description: Run Chimaera locally and iterate on it — the daemon + Vite web-UI
 Chimaera is a Rust daemon (`crates/`) that embeds and serves a Svelte web UI
 (`web-ui/`), plus a standalone Tauri app (`crates/chimaera-app`). See
 [AGENTS.md](../../../AGENTS.md) for the repo map; this skill is the run loop.
+Read the preflight, then the launch path. The later sections are details for one
+surface each: daemon, Vite, native app, remote, cloud.
 
-## The dev loop (do this to develop the UI + daemon)
+## Preflight: what can this session do?
 
-Run the daemon and the Vite dev server side by side, then work against
-`http://localhost:5173`. The launch configs are in
-[`.claude/launch.json`](../../launch.json):
+Check these first. Report each gap; do not claim a check you cannot run.
 
-- **chimaerad** → `cargo run -p chimaera -- serve --port 9700`
-- **web-ui** → Vite on 5173, proxying `/api`, `/ws`, `/raw` to the daemon on 9700
-
-Prefer the preview tooling to start them (`preview_start` with the `chimaerad`
-then `web-ui` config), or `just`:
-
-```sh
-just dev-ui        # Vite dev server (assumes a daemon is already running)
-# in another shell:
-cargo run -p chimaera -- serve --port 9700
-```
-
-**Auth depends on which daemon Vite targets.** Its dev-only `/dev/manifest`
-middleware reads `~/.chimaera/manifest.json`; an unstamped debug daemon instead
-uses `~/.chimaera-dev` by default. Open Vite with the debug daemon's printed
-`#token=…` fragment to authenticate. `CHIMAERA_DEV_TARGET=http://127.0.0.1:<port>`
-changes the proxy target (see `web-ui-sandbox`), but does not change that manifest
-path. The isolated served-UI loop below avoids this mismatch.
+- **`preview_start` + `preview_logs`?** Yes: use the preview launch. No: use the
+  manual launcher.
+- **A browser tool?** None: drive the daemon headless (`scripts/smoke-daemon.mjs`).
+- **Cargo allowed, and no other `cargo`/`rustc` running?** Build only then (see
+  [worktree-lifecycle](../worktree-lifecycle/SKILL.md)). Otherwise reuse
+  `target/debug/chimaera` only if its `build` matches HEAD (see below).
+- **Node 26?** If `node --version` differs from `.nvmrc`, run `nvm use`.
+- **UI build?** If `npm --prefix web-ui run build` fails, stop. Do not verify a
+  UI change against an older bundle.
+- **`just`?** Absent: use the `cargo`/`npm` commands shown beside each recipe.
+- **Disk?** `df -h ~`. Under ~50 GiB free, run `scripts/worktree-gc` first.
 
 ## Isolated per-worktree run (coding agents — use this in a worktree)
 
 The default `chimaerad` / `web-ui` configs hardcode ports 9700 / 5173. Unstamped
 Rust builds also share the default `~/.chimaera-dev` state dir. A second worktree
 can collide on ports or state. `serve` writes its manifest at startup and removes
-its owned record at shutdown; separate worktrees should use separate state dirs. When another
-daemon may be up, run **`chimaerad-isolated`** instead — a self-contained
-daemon just for this worktree:
+its owned record at shutdown; separate worktrees need separate state dirs. Run
+**`chimaerad-isolated`**, a self-contained daemon for this worktree. It is the one
+launch path for coding agents:
 
 ```
 preview_start  →  config "chimaerad-isolated"
@@ -74,7 +67,7 @@ build). From a shell, point the CLI at this worktree's isolated daemon with
 it builds the fixture and downloads the locked releases into
 `plugins/dist-test` (see [plugins/AGENTS.md](../../../plugins/AGENTS.md)).
 
-Then `preview_start chimaerad-isolated`, read the printed
+Then run `preview_start chimaerad-isolated`, read the printed
 `http://127.0.0.1:<port>/#token=…` from `preview_logs`, and navigate the preview
 there (serve mode has no `/dev/manifest` auto-auth — the token rides the URL
 fragment). A **debug** daemon reads `web-ui/dist` from disk per request, so after
@@ -96,7 +89,7 @@ in your session.
 To reset this worktree's isolated daemon state, stop its daemon first, then delete
 `.chimaera-dev/`.
 
-## Running the built daemon (production-like)
+## Daemon: the built, production-like run
 
 The daemon **embeds `web-ui/dist` at compile time** (rust-embed). So a non-dev
 run needs the UI built first — otherwise you serve a stale or empty bundle.
@@ -113,6 +106,31 @@ npm --prefix web-ui run build && cargo run -p chimaera -- serve
 `serve` prints the UI URL and a bearer token. `chimaera status` / `chimaera kill`
 inspect and stop a running local daemon.
 
+## Vite dev loop (UI + daemon, on the default ports)
+
+Use this loop only when no other daemon is up. Run the daemon and Vite side by side, then work against
+`http://localhost:5173`. The launch configs are in
+[`.claude/launch.json`](../../launch.json):
+
+- **chimaerad** → `cargo run -p chimaera -- serve --port 9700`
+- **web-ui** → Vite on 5173, proxying `/api`, `/ws`, `/raw` to the daemon on 9700
+
+Prefer the preview tooling to start them (`preview_start` with the `chimaerad`
+then `web-ui` config), or `just`:
+
+```sh
+just dev-ui        # Vite dev server (assumes a daemon is already running)
+# in another shell:
+cargo run -p chimaera -- serve --port 9700
+```
+
+**Auth depends on which daemon Vite targets.** Its dev-only `/dev/manifest`
+middleware reads `~/.chimaera/manifest.json`; an unstamped debug daemon instead
+uses `~/.chimaera-dev` by default. Open Vite with the debug daemon's printed
+`#token=…` fragment to authenticate. `CHIMAERA_DEV_TARGET=http://127.0.0.1:<port>`
+changes the proxy target (see `web-ui-sandbox`), but does not change that manifest
+path. The isolated served-UI loop above avoids this mismatch.
+
 ## Native app
 
 Its own cargo workspace — never built by the root `cargo` commands.
@@ -125,23 +143,21 @@ just app-build          # bundle the .app/.dmg
 
 **Isolated app — the app counterpart of `chimaerad-isolated`.** Unstamped
 `app-dev` builds use `~/.chimaera-dev`, separate from the released app's
-`~/.chimaera`, but two dev worktrees still share state and app identity. `app-dev-isolated` runs
-[`run-app-isolated.sh`](run-app-isolated.sh), which sets `CHIMAERA_HOME=
-~/.chimaera-dev-app/<worktree-key>` before launching the built binary. The key
-includes a stable checksum of the absolute worktree path because linked
-worktrees commonly all end in `chimaera`. Because the
-app, the `--daemon` it spawns (a free port, THIS worktree's build), and the
-shells that daemon spawns all inherit `CHIMAERA_HOME`, the whole stack is isolated
-— nothing lands in the shared `~/.chimaera` — yet still per-worktree.
+`~/.chimaera`, but two dev worktrees still share state and app identity.
+`app-dev-isolated` runs [`run-app-isolated.sh`](run-app-isolated.sh), which sets
+`CHIMAERA_HOME=~/.chimaera-dev-app/<worktree-key>` before launching the built
+binary. The key includes a stable checksum of the absolute worktree path because
+linked worktrees commonly all end in `chimaera`. The app, the `--daemon` it
+spawns (a free port, THIS worktree's build), and the shells that daemon spawns all
+inherit `CHIMAERA_HOME`. Nothing lands in the shared `~/.chimaera`.
 
-The launcher also runs a generated `chimaera-dev` identity rather than
-`chimaera` (on macOS, a small `target/debug/chimaera-dev.app` wrapper with its
-own bundle id; elsewhere, a `target/debug/chimaera-dev` hard link). It also
-builds with a per-worktree Tauri identifier: the single-instance plugin keys
-its socket/service from compiled configuration, not wrapper metadata. This keeps
-the isolated GUI process distinct in Activity Monitor and Computer Use while
-the released app is open; for live automation, target **`chimaera-dev`**, never
-the user's `chimaera`.
+The launcher runs a generated `chimaera-dev` identity rather than `chimaera` (on
+macOS, a small `target/debug/chimaera-dev.app` wrapper with its own bundle id;
+elsewhere, a `target/debug/chimaera-dev` hard link). It builds with a per-worktree
+Tauri identifier: the single-instance plugin keys its socket/service from compiled
+configuration, not wrapper metadata. The isolated GUI process stays distinct in
+Activity Monitor and Computer Use while the released app is open. For live
+automation, target **`chimaera-dev`**, never the user's `chimaera`.
 
 **Why `~/…` and not `<worktree>/.chimaera-dev-app`:** the state dir holds unix
 sockets (the askpass relay, the ssh ControlMaster) whose *full path* must fit the
@@ -158,61 +174,7 @@ after a UI change rebuild the UI and reload the window; no app restart.
 (For a REMOTE flow, pair it with a **dev host** — the next section — so the
 host side is isolated too.)
 
-## Remote (HPC / dev server)
-
-```sh
-just dist                       # one-time: static musl binaries into ~/.chimaera/dist
-cargo run -p chimaera -- connect <host>   # install-if-missing, start-or-attach, tunnel, open UI
-```
-
-`connect` shells out to system `ssh`, inheriting `~/.ssh/config`.
-
-## Remote isolated dev daemon (dev is dev — no toggle)
-
-Dev-ness is the BUILD's property: a dev build (never release-stamped —
-`chimaera_core::is_dev_build()`, the `0.0.1` sentinel) targets
-`~/.chimaera-dev` on BOTH ends, always. Locally, a dev build with no
-`CHIMAERA_HOME` defaults its own state to `~/.chimaera-dev` (the isolated-rig
-script still overrides with its per-worktree home); remotely, every `connect`
-from a dev build runs against the host's `~/.chimaera-dev`. A release always
-targets `~/.chimaera`. There is no flag, no per-host toggle — neither world
-can reach the other's daemon:
-
-```sh
-just dist                                  # musl-build THIS worktree into ~/.chimaera/dist
-cargo run -p chimaera -- connect <host>    # dev build ⇒ deploy + start under ~/.chimaera-dev
-cargo run -p chimaera -- status <host>     # dev build ⇒ the dev daemon's manifest/port/pid/build
-```
-
-The whole remote side effect is scoped to `~/.chimaera-dev` on the host: the
-binary (`~/.chimaera-dev/bin/chimaera`), the daemon (started under
-`CHIMAERA_HOME=~/.chimaera-dev`, so its manifest and state live in
-`~/.chimaera-dev/data/`), and the probe/reuse/replace decision. The real daemon
-is never probed, stopped, or replaced — the two run side by side. A dev connect
-never downloads a release: no local build (`just dist` stash or `--binary`) is
-a hard error, so a release binary can't silently impersonate your build. The
-same principle runs the other way: a dev app never OFFERS a release update
-(`check_app_update` reports none) — an "update" would swap the build under
-test.
-
-In the native app every host row wears the amber `dev` pill (the build is dev,
-so every connection is). The isolated app (`just app-dev-isolated`) + any host
-is the full end-to-end rig — your app build tunneling to your daemon build on
-a real cluster — which is how you exercise remote-only paths like OSC 52
-clipboard from a remote TUI or the reauth overlay on a tunnel drop.
-
-Gotchas:
-
-- **Same-commit rebuilds look identical**: build ids compare the git hash, so
-  a rebuilt (even dirty) tree won't auto-replace a running dev daemon. Force it
-  with `--update-daemon` / the row's "update" action.
-- **A dev build cannot attach to the real `~/.chimaera` daemon at all** (and a
-  release can't attach to a dev one). To exercise the real daemon, use a
-  release build.
-- **Old hosts.json entries with a `"dev"` key** (from the toggle era) still
-  parse; the key is ignored.
-
-## Handing the human a live app to test (the flow to prompt them with)
+### Handing the human a live app to test (the flow to prompt them with)
 
 When you finish a change and want **the human** to test it in the real app
 (not your headless preview), give them a running isolated app — and if they want
@@ -265,6 +227,67 @@ The app deploys your build to the host's `~/.chimaera-dev`, starts the remote
 daemon, tunnels, and opens the remote workspace; an ssh password/Duo prompt
 surfaces in the app's askpass overlay. Now they can exercise remote-only paths
 (uploads streaming to the host, remote terminal links, reconnect/reauth).
+
+## Remote (HPC / dev server)
+
+```sh
+just dist                       # one-time: static musl binaries into ~/.chimaera/dist
+cargo run -p chimaera -- connect <host>   # install-if-missing, start-or-attach, tunnel, open UI
+```
+
+`connect` shells out to system `ssh`, inheriting `~/.ssh/config`.
+
+### Remote isolated dev daemon (dev is dev — no toggle)
+
+Dev-ness is the BUILD's property: a dev build (never release-stamped —
+`chimaera_core::is_dev_build()`, the `0.0.1` sentinel) targets
+`~/.chimaera-dev` on BOTH ends, always. Locally, a dev build with no
+`CHIMAERA_HOME` defaults its own state to `~/.chimaera-dev` (the isolated-rig
+script still overrides with its per-worktree home); remotely, every `connect`
+from a dev build runs against the host's `~/.chimaera-dev`. A release always
+targets `~/.chimaera`. There is no flag, no per-host toggle — neither world
+can reach the other's daemon:
+
+```sh
+just dist                                  # musl-build THIS worktree into ~/.chimaera/dist
+cargo run -p chimaera -- connect <host>    # dev build ⇒ deploy + start under ~/.chimaera-dev
+cargo run -p chimaera -- status <host>     # dev build ⇒ the dev daemon's manifest/port/pid/build
+```
+
+The whole remote side effect is scoped to `~/.chimaera-dev` on the host: the
+binary (`~/.chimaera-dev/bin/chimaera`), the daemon (started under
+`CHIMAERA_HOME=~/.chimaera-dev`, so its manifest and state live in
+`~/.chimaera-dev/data/`), and the probe/reuse/replace decision. The real daemon
+is never probed, stopped, or replaced — the two run side by side. A dev connect
+never downloads a release: no local build (`just dist` stash or `--binary`) is
+a hard error, so a release binary can't silently impersonate your build. The
+same principle runs the other way: a dev app never OFFERS a release update
+(`check_app_update` reports none) — an "update" would swap the build under
+test.
+
+In the native app every host row wears the amber `dev` pill (the build is dev,
+so every connection is). The isolated app (`just app-dev-isolated`) + any host
+is the full end-to-end rig — your app build tunneling to your daemon build on
+a real cluster — which is how you exercise remote-only paths like OSC 52
+clipboard from a remote TUI or the reauth overlay on a tunnel drop.
+
+Gotchas:
+
+- **Same-commit rebuilds look identical**: build ids compare the git hash, so
+  a rebuilt (even dirty) tree won't auto-replace a running dev daemon. Force it
+  with `--update-daemon` / the row's "update" action.
+- **A dev build cannot attach to the real `~/.chimaera` daemon at all** (and a
+  release can't attach to a dev one). To exercise the real daemon, use a
+  release build.
+- **Old hosts.json entries with a `"dev"` key** (from the toggle era) still
+  parse; the key is ignored.
+
+## Cloud sessions
+
+Cloud sessions (`CLAUDE_CODE_REMOTE=true`) have no browser pane and no HPC access; a
+SessionStart hook builds `web-ui/dist`. Drive the daemon with
+`node scripts/smoke-daemon.mjs`. See the
+[cloud sessions guide](../../../docs/agent-guides/cloud-sessions.md).
 
 ## Which build is actually running? (debug workflow)
 

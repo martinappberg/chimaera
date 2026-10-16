@@ -10,37 +10,68 @@ launch) reproduce **against the real daemon + UI**, not in unit tests. This skil
 is how you observe one. Bring the app up with the **develop** skill
 (`chimaerad-isolated` preview), then read it with the available inspection tools.
 
+## Use safe fixtures and bounded diagnostics
+
+- Never use the maintainer's real chats, research data, or cluster files as a
+  repro. Do not copy them into tests, fixtures, docs, or logs you keep.
+- Use the fixtures the repo has: the fake Claude agent
+  ([`crates/chimaera-agent/src/bin/fake-claude.rs`](../../../crates/chimaera-agent/src/bin/fake-claude.rs)),
+  the agent test fixtures in `crates/chimaera-agent/tests/fixtures`, the headless
+  daemon smoke (`scripts/smoke-daemon.mjs`), and the web-UI `*.fixture.*` files.
+  Use a throwaway workspace directory for file and terminal repros.
+- Bound every diagnostic you collect. Read logs with a line limit (for example
+  `preview_logs` with `lines`, or `tail -n 200`) and a time window. Do not dump a
+  whole log or a whole response body into your context. Cap saved evidence at a
+  few hundred lines or a few hundred KB. Redact tokens before you keep any URL.
+
 ## Read the three surfaces
 
 | Want to see… | Tool | Notes |
 |---|---|---|
 | What the **daemon** did | `preview_logs` (`level: error` to filter) | Rust `tracing` goes to the daemon's stderr; this is your server log. |
-| A **client** error | `preview_console_logs` (`level: error`) | JS exceptions, failed sockets, Svelte warnings. |
-| **API / WS** traffic | `preview_network` (`filter: failed`) | Every `/api/v1/*` call with status; pass a `requestId` to read a response body. |
-| The **rendered** state | `preview_snapshot` (structure) / `preview_screenshot` (visual) | Snapshot is text — better for asserting content/roles than a screenshot. |
-| A **CSS** value | `preview_inspect` (specific properties) | More reliable than eyeballing a screenshot. |
+| A **client** error | `read_console_messages` (`onlyErrors: true`) | JS exceptions, failed sockets, Svelte warnings. |
+| **API / WS** traffic | `read_network_requests` (`urlPattern`) | Every `/api/v1/*` call with status; pass a `requestId` to read a response body. |
+| The **rendered** state | `read_page` (structure) / `computer` `screenshot` (visual) | The page tree is text — better for asserting content/roles than a screenshot. |
+| A **CSS** value | `javascript_tool` (`getComputedStyle`) | More reliable than eyeballing a screenshot. |
 
 The table describes preview tooling when it is exposed in your session. Otherwise,
 use the develop skill's manual isolated launcher and its terminal output or log
 file, plus the available browser/native-app tools. Do not assume unavailable
 `preview_*` APIs exist; name any surface you could not inspect.
 
-Use `preview_eval` for one-off inspection/repro (`window.location.reload()`, read a
+Use `javascript_tool` for one-off inspection/repro (`window.location.reload()`, read a
 store value) — never to *implement* a change; edit source and reload.
 
 ## Reproduce a failure
 
-1. Bring up `chimaerad-isolated`; navigate the preview to the token URL from
+1. Write the smallest reproduction first: the fewest steps, on a fresh isolated
+   daemon, with a fixture from above. If you cannot reproduce it, stop. Report
+   that, with the bounded evidence you have.
+2. Bring up `chimaerad-isolated`; navigate the preview to the token URL from
    `preview_logs` (serve mode has no `/dev/manifest` auto-auth — the token rides
    the `#token=` fragment).
-2. Drive the exact path that breaks (open a folder, spawn a terminal, kill the
+3. Drive the exact path that breaks (open a folder, spawn a terminal, kill the
    socket + reattach, resize, open a preview, launch an agent).
-3. Watch all three surfaces above as you go. A daemon-side panic shows in
-   `preview_logs`; a client crash in `preview_console_logs`; a contract mismatch in
-   `preview_network` (a 4xx/5xx or an unexpected body).
-4. Read source to diagnose → edit source → reload. A **debug** daemon reads
+4. Watch all three surfaces above as you go. A daemon-side panic shows in
+   `preview_logs`; a client crash in `read_console_messages`; a contract mismatch in
+   `read_network_requests` (a 4xx/5xx or an unexpected body).
+5. Read source to diagnose → edit source → reload. A **debug** daemon reads
    `web-ui/dist` from disk per request, so after a UI change just rebuild the UI
    (`npm --prefix web-ui run build`) and reload — no daemon restart.
+
+## Record hypothesis, test, result
+
+Keep one entry per hypothesis, in the order you test them:
+
+```
+Hypothesis: <one cause, stated so a test can disprove it>
+Test:       <the one change or observation that separates it from the others>
+Result:     confirmed | refuted | inconclusive (<what you saw>)
+```
+
+Test one hypothesis at a time. Change one thing between observations. Put the
+final record in the PR or the report, so the next person does not repeat a refuted
+path.
 
 ## Common failure modes (recognize these fast)
 
@@ -64,5 +95,5 @@ store value) — never to *implement* a change; edit source and reload.
 ## Then verify
 
 Once it's fixed, don't just eyeball it — drive the flow end-to-end and capture proof
-(`preview_screenshot` / `preview_network` / `preview_logs`). The **verify-app** skill
+(a screenshot / `read_network_requests` / `preview_logs`). The **verify-app** skill
 is the acceptance bar; state what you ran and observed.
