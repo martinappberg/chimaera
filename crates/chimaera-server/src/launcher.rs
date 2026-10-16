@@ -23,6 +23,7 @@
 //! `.zshrc` — a login-only `-lc` (or a GUI launch with no usable `$SHELL`)
 //! misses both, so a plain `which` from the daemon's environment is not enough.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -306,7 +307,7 @@ async fn detect_inner(
         refresh,
         serve_miss,
         |managed, explicit| async move {
-            resolve_bin(kind, &managed, explicit, shell_budget).await
+            resolve_bin(&state.shell_probes, kind, &managed, explicit, shell_budget).await
         },
     )
     .await
@@ -536,7 +537,7 @@ const SHELL_PROBE_OUTPUT_CAP: u64 = 64 * 1024;
 
 /// A login shell that couldn't answer `command -v`: `reason` for the logs,
 /// `plain` for the person deciding whether to retry.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ShellProbeError {
     reason: String,
     plain: String,
@@ -580,17 +581,28 @@ async fn resolve_via_login_shell(
     probe_login_shell(shell, bin, SHELL_PROBE_TIMEOUT).await
 }
 
-/// `command -v` in the interactive login shell. Nonce markers separate the
-/// answer from startup/logout banners and prove startup reached our command.
-/// A completed empty answer is the ONLY shell result that permits fallback.
 async fn probe_login_shell(
     shell: &str,
     bin: &str,
     timeout: Duration,
 ) -> Result<Option<PathBuf>, ShellProbeError> {
+    let mut answers = probe_login_shell_all(shell, &[bin], timeout).await?;
+    answers.pop().expect("one answer per bin")
+}
+
+/// One shell's answers: per bin, the path, nothing, or an answer that isn't
+/// a path (that bin's error alone); the whole shell failing is the outer one.
+type ShellAnswers = Result<Vec<Result<Option<PathBuf>, ShellProbeError>>, ShellProbeError>;
+
+/// `command -v` for each of `bins` in ONE interactive login shell. Nonce
+/// markers separate the answers from each other and from startup/logout
+/// banners, and prove startup reached our command. A completed empty answer
+/// is the ONLY shell result that permits fallback.
+async fn probe_login_shell_all(shell: &str, bins: &[&str], timeout: Duration) -> ShellAnswers {
     use tokio::io::AsyncReadExt;
     let nonce = chimaera_core::generate_token();
     let start = format!("chimaera-{nonce}-start");
+    let next = format!("chimaera-{nonce}-next");
     let end = format!("chimaera-{nonce}-end");
     let incomplete = || {
         ShellProbeError::new(
@@ -598,9 +610,15 @@ async fn probe_login_shell(
             format!("Your login shell ({shell}) stopped before it finished starting."),
         )
     };
-    // `bin` is a fixed registration name, never user-supplied shell text.
+    // Each bin is a fixed registration name, never user-supplied shell text.
     // Semicolons + printf work in both POSIX shells and fish.
-    let script = format!("printf '\\n{start}\\n'; command -v {bin} || true; printf '\\n{end}\\n'");
+    let mut script = format!("printf '\\n{start}\\n';");
+    for (i, bin) in bins.iter().enumerate() {
+        let after = if i + 1 == bins.len() { &end } else { &next };
+        script.push_str(&format!(
+            " command -v {bin} || true; printf '\\n{after}\\n';"
+        ));
+    }
     let mut child = tokio::process::Command::new(shell)
         .arg("-ilc")
         .arg(script)
@@ -657,20 +675,33 @@ async fn probe_login_shell(
         if lines.next().is_none() {
             return Err(incomplete());
         }
-        let mut answer = None;
+        let mut answers = Vec::with_capacity(bins.len());
+        let mut answer = Ok(None);
         for line in lines {
-            if line == end {
-                return Ok(answer);
-            }
-            if !line.is_empty() {
-                if answer.is_some() || !Path::new(line).is_absolute() {
-                    return Err(ShellProbeError::new(
-                        format!("login shell `{shell}` returned an unsupported executable for {bin}"),
-                        format!("Your login shell ({shell}) answered `{bin}` with something other than a file path, such as an alias."),
-                    ));
+            if line == next || line == end {
+                answers.push(std::mem::replace(&mut answer, Ok(None)));
+                if line == end {
+                    return if answers.len() == bins.len() {
+                        Ok(answers)
+                    } else {
+                        Err(incomplete())
+                    };
                 }
-                answer = Some(PathBuf::from(line));
+                continue;
             }
+            let Some(bin) = bins.get(answers.len()) else {
+                return Err(incomplete());
+            };
+            if line.is_empty() || answer.is_err() {
+                continue;
+            }
+            answer = match answer {
+                Ok(None) if Path::new(line).is_absolute() => Ok(Some(PathBuf::from(line))),
+                _ => Err(ShellProbeError::new(
+                    format!("login shell `{shell}` returned an unsupported executable for {bin}"),
+                    format!("Your login shell ({shell}) answered `{bin}` with something other than a file path, such as an alias."),
+                )),
+            };
         }
         Err(incomplete())
     };
@@ -689,6 +720,72 @@ async fn probe_login_shell(
         // deadline waiting for a process stuck in uninterruptible filesystem IO.
     }
     result
+}
+
+/// The login shell answers `command -v` for every catalog agent at once, and
+/// each detection that needs an answer while that shell runs shares it: a
+/// cold catalog read starts one interactive shell instead of one per agent
+/// (five rc files at once is part of what makes each one slow on a loaded
+/// host). A flight is keyed by shell and budget, so a spawn never waits out
+/// a patient check's 30 s; it runs as its own task, so a caller that goes
+/// away can't strand it; and it ends with its shell — answers are never kept
+/// past it (`agent_bins` / `agent_misses` are the cache).
+#[derive(Default)]
+pub(crate) struct ShellProbes {
+    flights: std::sync::Mutex<HashMap<(String, Duration), (Instant, Flight)>>,
+}
+
+type Flight = futures::future::Shared<futures::future::BoxFuture<'static, Arc<ShellAnswers>>>;
+
+impl ShellProbes {
+    async fn answer(
+        &self,
+        shell: &str,
+        kind: AgentKind,
+        budget: Duration,
+    ) -> Result<Option<PathBuf>, ShellProbeError> {
+        use futures::FutureExt;
+        let Some(index) = AgentKind::ALL.iter().position(|k| *k == kind) else {
+            // Retired from the catalog (gemini): asked on its own.
+            return probe_login_shell(shell, kind.path_bin(), budget).await;
+        };
+        let flight = {
+            let mut flights = crate::lock(&self.flights);
+            let key = (shell.to_string(), budget);
+            match flights.get(&key) {
+                // Still running: a flight can't outlive its budget, and one
+                // nobody polled to the end may have finished unobserved.
+                Some((started, flight))
+                    if flight.peek().is_none() && started.elapsed() < budget =>
+                {
+                    flight.clone()
+                }
+                _ => {
+                    let shell = shell.to_string();
+                    let probe = tokio::spawn(async move {
+                        let bins = AgentKind::ALL.map(AgentKind::path_bin);
+                        probe_login_shell_all(&shell, &bins, budget).await
+                    });
+                    let flight = async move {
+                        Arc::new(probe.await.unwrap_or_else(|e| {
+                            Err(ShellProbeError::new(
+                                format!("login shell probe failed: {e}"),
+                                "Chimaera couldn't ask your login shell.".into(),
+                            ))
+                        }))
+                    }
+                    .boxed()
+                    .shared();
+                    flights.insert(key, (Instant::now(), flight.clone()));
+                    flight
+                }
+            }
+        };
+        match flight.await.as_ref() {
+            Ok(answers) => answers[index].clone(),
+            Err(e) => Err(e.clone()),
+        }
+    }
 }
 
 struct BinarySearch {
@@ -712,13 +809,14 @@ impl BinarySearch {
 /// prefixes → managed install. Never rank by version: an older CLI can be the
 /// user's deliberate choice. A failed shell cannot authorize another install.
 async fn resolve_bin(
+    probes: &ShellProbes,
     kind: AgentKind,
     managed_bin: &Path,
     explicit: Option<String>,
     shell_budget: Duration,
 ) -> Result<PathBuf, Unresolved> {
     let search = BinarySearch::current(kind);
-    let probe = probe_login_shell(&search.shell, kind.path_bin(), shell_budget);
+    let probe = probes.answer(&search.shell, kind, shell_budget);
     resolve_with_search(kind, managed_bin, explicit, &search, probe).await
 }
 

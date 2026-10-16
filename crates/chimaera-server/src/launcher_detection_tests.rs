@@ -217,6 +217,91 @@ async fn shell_probe_distinguishes_miss_banners_and_startup_failure() {
 }
 
 #[tokio::test]
+async fn one_shell_answers_every_agent_and_keeps_each_answer_its_own() {
+    let f = Fixture::new();
+    let codex = f.executable("bin/codex", "echo codex");
+    let cursor = f.executable("bin/cursor-agent", "echo cursor");
+    // `grok` is a shell function here: an answer that isn't a path is that
+    // agent's error alone, never a shift of the answers after it.
+    let shell = f.executable(
+        "shell",
+        &format!(
+            "test \"$1\" = -ilc || exit 2\nprintf '/startup/banner\\n'\nPATH='{}' /bin/sh -ec \"grok() {{ :; }}; $2\"",
+            codex.parent().unwrap().display()
+        ),
+    );
+    let bins = AgentKind::ALL.map(AgentKind::path_bin);
+    assert_eq!(bins, ["claude", "codex", "agy", "grok", "cursor-agent"]);
+    let answers = probe_login_shell_all(shell.to_str().unwrap(), &bins, PROBE_BUDGET)
+        .await
+        .unwrap();
+    assert!(matches!(answers[0], Ok(None)));
+    assert_eq!(
+        answers[1].as_ref().unwrap().as_deref(),
+        Some(codex.as_path())
+    );
+    assert!(matches!(answers[2], Ok(None)));
+    let grok = answers[3].as_ref().unwrap_err();
+    assert!(grok.reason.contains("unsupported executable for grok"));
+    assert!(grok.plain.contains("`grok`"));
+    assert_eq!(
+        answers[4].as_ref().unwrap().as_deref(),
+        Some(cursor.as_path())
+    );
+}
+
+#[tokio::test]
+async fn concurrent_detections_share_one_login_shell() {
+    let f = Fixture::new();
+    let runs_file = f.0.join("runs");
+    let codex = f.executable("bin/codex", "echo codex");
+    let shell = f.executable(
+        "counting-shell",
+        &format!(
+            "echo run >> '{}'\nsleep 0.3\nPATH='{}' /bin/sh -ec \"$2\"",
+            runs_file.display(),
+            codex.parent().unwrap().display()
+        ),
+    );
+    let shell = shell.to_str().unwrap();
+    let runs = || std::fs::read_to_string(&runs_file).unwrap().lines().count();
+    let probes = ShellProbes::default();
+
+    // Every agent's detection at once (a cold catalog read): one shell.
+    let answers = futures::future::join_all(
+        AgentKind::ALL.map(|kind| probes.answer(shell, kind, PROBE_BUDGET)),
+    )
+    .await;
+    assert_eq!(runs(), 1);
+    assert_eq!(
+        answers[1].as_ref().unwrap().as_deref(),
+        Some(codex.as_path())
+    );
+    for (i, answer) in answers.iter().enumerate() {
+        assert!(i == 1 || matches!(answer, Ok(None)), "{i}: {answer:?}");
+    }
+
+    // A finished flight is never reused: the next look asks again.
+    probes
+        .answer(shell, AgentKind::Codex, PROBE_BUDGET)
+        .await
+        .unwrap();
+    assert_eq!(runs(), 2);
+
+    // A spawn never waits out a patient check: each budget is its own flight.
+    let (quick, patient) = tokio::join!(
+        probes.answer(
+            shell,
+            AgentKind::Codex,
+            PROBE_BUDGET - Duration::from_secs(1)
+        ),
+        probes.answer(shell, AgentKind::Codex, PROBE_BUDGET),
+    );
+    assert_eq!(quick.unwrap(), patient.unwrap());
+    assert_eq!(runs(), 4);
+}
+
+#[tokio::test]
 async fn shell_probe_timeout_kills_startup_children_and_does_not_become_a_miss() {
     let f = Fixture::new();
     let leaked = f.0.join("leaked-child");

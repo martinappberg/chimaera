@@ -54,6 +54,8 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   than 6 seconds to start.") and every surface reads it as *couldn't check* with a Retry, never as
   not installed with an Install. Retry is `POST /api/v1/agents/{id}/detect`: the same resolution
   with a 30 s shell budget (`launcher::verify`; spawns keep 6 s), answering what the row will say.
+  One login shell answers for every agent at once, and detections running together share it
+  (`launcher::ShellProbes`), so a catalog read starts one shell rather than one per agent.
   A runnable explicit path wins without probing the shell; a
   hit is cached for the daemon's life, a miss for 90 s (`launcher::MISS_TTL`, so a catalog read
   with uninstalled agents doesn't pay the login-shell probe each time) — the launcher's own
