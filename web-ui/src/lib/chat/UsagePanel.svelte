@@ -1,6 +1,6 @@
 <script lang="ts">
   /**
-   * Plan-usage windows (claude usage_report / codex account/read) — a small
+   * Plan-usage windows (claude usage_report / codex account/rateLimits/read) — a small
    * bar per limit window. Rendered inline in the transcript from a `usage`
    * block. Subscription plans show utilization, never dollars.
    */

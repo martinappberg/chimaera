@@ -3358,3 +3358,28 @@ Cursor's built-in `TodoWrite` reaches the client as **`cursor/update_todos`, a J
 
 - Hermetic (`acp.rs`): `antigravity_pre_approval_reads_the_mcp_meta_and_the_title`, `grok_pre_approval_reads_the_use_tool_input_and_the_title`, `cursor_pre_approval_needs_the_preceding_update_and_the_title_to_agree`, `cursor_update_todos_draws_the_plan_card_and_is_accepted`, `grok_plan_tool_rows_are_hidden_and_the_plan_update_draws`, `a_renaming_update_retitles_the_row`; `mcp.rs` `plan_paragraph_and_tool_follow_runtime_and_surface`.
 - Live: `just chat-smoke-acp` with `CHIMAERA_TEST_GROK`, `CHIMAERA_TEST_AGY_ACP` (the resolved `.par`) and `CHIMAERA_TEST_CURSOR`; and the isolated daemon — see docs/features/chat-mode.md ("Verified live", Pass 45).
+
+## Pass 46 (2026-10-15 — live probes codex 0.162.1): usage limits moved to `account/rateLimits/read`. ADOPTED.
+
+The Codex limit chip and `/usage` panel had been empty: the driver read limits from `account/read`'s `result.rate_limit.{primary_window,secondary_window}` (Pass 4's shape), and on 0.162.1 `account/read` returns only `{account: {type, email, planType}, requiresOpenaiAuth, workspaceRouting}`. Both a live probe and the generated schema agree.
+
+### The read and the rolling update
+
+- **`account/rateLimits/read {supportsLunaReserve?, excludeResetCreditDetails?}`** → `{ordinaryUsageAllowed: bool | null, rateLimits: RateLimitSnapshot, rateLimitsByLimitId: {[limitId]: RateLimitSnapshot} | null, rateLimitResetCredits: {availableCount, credits: [...] | null} | null, accountId, rateLimitUpsell}`. `rateLimits` is the "backward-compatible single-bucket view; mirrors the historical payload". `ordinaryUsageAllowed` is the backend's verdict ("clients must not infer recovery from percentages or reset times"). `excludeResetCreditDetails: true` skips the reset-credit detail lookup "for background usage polls".
+- **`RateLimitSnapshot`** = `{limitId, limitName, normalModelSlug, primary: RateLimitWindow | null, secondary: RateLimitWindow | null, credits: {hasCredits, unlimited, balance} | null, individualLimit, spendControlReached, planType, rateLimitReachedType: "rate_limit_reached" | "workspace_owner_credits_depleted" | … | null}`. **`RateLimitWindow`** = `{usedPercent (0-100), windowDurationMins | null, resetsAt (epoch s) | null}`.
+- Live, a Pro account: `limitId: "codex"`, one window `{usedPercent, windowDurationMins: 10080, resetsAt}` as `primary`, `secondary: null` (no 5-hour window), `rateLimitsByLimitId` holding the same `codex` bucket.
+- **`account/rateLimits/updated {rateLimits: RateLimitSnapshot}`** is a "sparse rolling rate-limit update": clients merge available values into the last read, and a null field "does not clear a previously observed value". It is account-scoped (no `threadId`), so the thread gate passes it.
+
+### ADOPTED
+
+- The per-turn poll and `GetUsage` send `account/rateLimits/read {excludeResetCreditDetails: true}`; `account/read` is no longer asked.
+- `RateLimits` holds the `rateLimits` bucket. A read replaces it; a rolling update merges non-null windows and a set `rateLimitReachedType`, and an update for another `limitId` is ignored.
+- The chip (`RateLimit`) is the fullest window, journaled only when it changed. `limit_reached` comes from `rateLimitReachedType`, from `ordinaryUsageAllowed: false`, or from a window at 100%.
+- Labels use Claude's words: ≤ 6 h → "session limit", 7 d → "weekly limit", else "Nh" / "Nd limit", and "usage limit" without a duration.
+- A refused read (an API-key login) leaves the chip empty and answers `/usage` with an empty report instead of never answering.
+- Multi-bucket limits (`rateLimitsByLimitId`) and reset credits are not shown.
+
+### Gate (Pass 46)
+
+- Hermetic (`codex.rs`): `thread_name_and_usage_limits_map` (now the read's shape), `rate_limits_poll_each_turn_end_and_merge_rolling_updates`, `rate_limits_say_when_usage_is_refused`, `usage_answers_even_without_plan_limits`.
+- Live: `codex_steer_settings_and_account_surface` now pins `account/rateLimits/read`'s snapshot and window shape. Through the isolated daemon, a Codex chat's `/usage` (no turn) went from an empty report on main to `weekly limit · 6%` plus the matching chip. The codex half of `just chat-smoke` was run.
