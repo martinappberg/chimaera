@@ -1641,16 +1641,25 @@ async fn codex_steer_settings_and_account_surface() {
         );
     }
 
-    // account/read: the rate-limit source (tolerated when absent).
-    let account = chat
-        .request_raw("account/read", json!({ "refreshToken": false }), HANDSHAKE)
+    // account/rateLimits/read: the usage-limit source since account/read
+    // stopped carrying limits (Pass 46). An API-key login may refuse it.
+    let limits = chat
+        .request_raw(
+            "account/rateLimits/read",
+            json!({ "excludeResetCreditDetails": true }),
+            HANDSHAKE,
+        )
         .await
-        .expect("account/read answered");
-    if account.get("error").is_none() {
-        assert!(
-            account["result"].is_object(),
-            "account/read returns an object: {account}"
-        );
+        .expect("account/rateLimits/read answered");
+    if limits.get("error").is_none() {
+        let snapshot = &limits["result"]["rateLimits"];
+        assert!(snapshot.is_object(), "a rateLimits snapshot: {limits}");
+        for window in [&snapshot["primary"], &snapshot["secondary"]] {
+            assert!(
+                window.is_null() || window["usedPercent"].is_number(),
+                "a window carries usedPercent: {limits}"
+            );
+        }
     }
 
     // model/list feeds the picker with per-model efforts.

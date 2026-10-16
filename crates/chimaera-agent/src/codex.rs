@@ -966,10 +966,8 @@ enum PendingRpc {
         /// thread's effort).
         chosen: bool,
     },
-    /// account/read — rate-limit telemetry; `report` also renders /usage.
-    AccountRead {
-        report: bool,
-    },
+    /// account/rateLimits/read — the account's usage limits, for /usage.
+    RateLimitsRead,
     /// thread/compact/start ack; the compaction itself runs as its own turn
     /// whose contextCompaction item lands the "context compacted" notice.
     Compact,
@@ -1248,6 +1246,115 @@ fn learn_subagent_facts(agent: &mut CollabAgent, thread: &Value) -> bool {
     changed
 }
 
+/// One window of the account's Codex usage limit (`RateLimitWindow`, live
+/// 0.162.1: `{usedPercent 0-100, windowDurationMins, resetsAt epoch-s}`).
+#[derive(Clone, Debug, PartialEq)]
+struct RateWindow {
+    used_percent: f64,
+    window_mins: Option<u64>,
+    resets_at: Option<u64>,
+}
+
+impl RateWindow {
+    fn parse(window: &Value) -> Option<Self> {
+        Some(Self {
+            used_percent: window["usedPercent"].as_f64()?,
+            window_mins: window["windowDurationMins"].as_u64(),
+            resets_at: window["resetsAt"].as_u64(),
+        })
+    }
+
+    /// Claude's words where the window means the same thing.
+    fn label(&self) -> String {
+        const DAY: u64 = 24 * 60;
+        match self.window_mins {
+            Some(mins) if mins <= 6 * 60 => "session limit".to_string(),
+            Some(mins) if mins == 7 * DAY => "weekly limit".to_string(),
+            Some(mins) if mins < DAY => format!("{}h limit", mins / 60),
+            Some(mins) => format!("{}d limit", mins / DAY),
+            None => "usage limit".to_string(),
+        }
+    }
+}
+
+/// A limit bucket's id is only compared, never shown.
+const LIMIT_ID_MAX: usize = 64;
+
+/// The account's usage limits: the single-bucket `rateLimits` view of
+/// `account/rateLimits/read` (it "mirrors the historical payload"), held so
+/// the sparse `account/rateLimits/updated` can merge into it. 0.162.1's
+/// `account/read` no longer carries limits at all.
+#[derive(Default)]
+struct RateLimits {
+    /// The bucket (`limitId`, e.g. `codex`): a rolling update for another
+    /// bucket must not overwrite this one's windows.
+    limit_id: Option<String>,
+    primary: Option<RateWindow>,
+    secondary: Option<RateWindow>,
+    /// `rateLimitReachedType` was set: requests are being refused.
+    reached: bool,
+    /// The read's `ordinaryUsageAllowed: false` (rolling updates never carry
+    /// it; null is unknown, not allowed).
+    blocked: bool,
+}
+
+impl RateLimits {
+    fn read(result: &Value) -> Self {
+        let snapshot = &result["rateLimits"];
+        Self {
+            limit_id: snapshot["limitId"]
+                .as_str()
+                .map(|id| truncate_label(id, LIMIT_ID_MAX)),
+            primary: RateWindow::parse(&snapshot["primary"]),
+            secondary: RateWindow::parse(&snapshot["secondary"]),
+            reached: !snapshot["rateLimitReachedType"].is_null(),
+            blocked: result["ordinaryUsageAllowed"] == false,
+        }
+    }
+
+    /// A rolling update is sparse: a null field is unknown, not cleared. The
+    /// next read (`/usage`) or a later update settles anything a merge left
+    /// stale.
+    fn merge(&mut self, snapshot: &Value) {
+        let theirs = snapshot["limitId"].as_str();
+        if let (Some(ours), Some(theirs)) = (self.limit_id.as_deref(), theirs) {
+            if ours != theirs {
+                return;
+            }
+        }
+        if self.limit_id.is_none() {
+            self.limit_id = theirs.map(|id| truncate_label(id, LIMIT_ID_MAX));
+        }
+        if let Some(window) = RateWindow::parse(&snapshot["primary"]) {
+            self.primary = Some(window);
+        }
+        if let Some(window) = RateWindow::parse(&snapshot["secondary"]) {
+            self.secondary = Some(window);
+        }
+        if !snapshot["rateLimitReachedType"].is_null() {
+            self.reached = true;
+        }
+    }
+
+    /// `(utilization, resets_at, label)` per known window. The /usage panel
+    /// keys its rows by label, so a repeated one is told apart.
+    fn windows(&self) -> Vec<(f64, Option<String>, String)> {
+        let mut windows: Vec<(f64, Option<String>, String)> = Vec::new();
+        for window in [&self.primary, &self.secondary].into_iter().flatten() {
+            let mut label = window.label();
+            if windows.iter().any(|(_, _, seen)| *seen == label) {
+                label.push_str(" (2)");
+            }
+            windows.push((
+                window.used_percent,
+                window.resets_at.map(|at| at.to_string()),
+                label,
+            ));
+        }
+        windows
+    }
+}
+
 /// Protocol → normalized-model translator for the app-server stream. Pure
 /// state machine (no I/O), mirroring claude's `Mapper`.
 struct CodexMapper {
@@ -1395,6 +1502,10 @@ struct CodexMapper {
     turn_output_base: Option<u64>,
     turn_output: u64,
     turn_output_emitted: u64,
+    /// The account's usage limits as last read and merged (`RateLimits`).
+    rate_limits: RateLimits,
+    /// The chip last journaled, so an unchanged rolling update adds nothing.
+    rate_limit_sent: Option<AgentEvent>,
     /// The deprecated thread/compacted notification may overlap the
     /// contextCompaction item pair. Fold both sources to exactly one start
     /// and one completion event per turn.
@@ -1516,6 +1627,8 @@ impl CodexMapper {
             turn_output_base: None,
             turn_output: 0,
             turn_output_emitted: 0,
+            rate_limits: RateLimits::default(),
+            rate_limit_sent: None,
             compaction_active: false,
             compaction_completed: false,
             decline_notified: false,
@@ -2034,6 +2147,12 @@ impl CodexMapper {
             "item/autoApprovalReview/completed" => {
                 self.on_auto_review(&frame["params"], true, &mut step)
             }
+            // Rolling usage-limit updates (sparse; merged into the last read).
+            // Account-scoped: no threadId, so the thread gate lets them by.
+            "account/rateLimits/updated" => {
+                self.rate_limits.merge(&frame["params"]["rateLimits"]);
+                self.emit_rate_limits(false, &mut step);
+            }
             // Codex's Remote Control lives on its app-server DAEMON, not on
             // this per-session app-server: the status is relayed (live
             // 0.153.0: `disabled` right after initialize), and there is no
@@ -2259,15 +2378,13 @@ impl CodexMapper {
                             .events
                             .push(AgentEvent::TurnCompleted { turn_id, usage }),
                     }
-                    // Refresh rate-limit telemetry once per turn (account/read
-                    // is the extension's source; tolerated if absent).
-                    let id = self.rpc_id();
-                    self.pending_rpcs
-                        .insert(id, PendingRpc::AccountRead { report: false });
-                    step.outbound.push(json!({
-                        "id": id, "method": "account/read",
-                        "params": { "refreshToken": false },
-                    }));
+                    // No usage read here: codex sends the rolling
+                    // account/rateLimits/updated during every turn (live
+                    // 0.162.1, before turn/completed), and a read still in
+                    // flight at turn end held the app-server open long
+                    // enough that an immediate resume of the thread
+                    // (rewind, relaunch) was refused: "thread … already has
+                    // an active writer".
                 }
                 self.reset_turn_state();
                 if was_active {
@@ -2714,8 +2831,12 @@ impl CodexMapper {
                     });
                 }
             }
-            (PendingRpc::AccountRead { .. }, Some(_)) => {
-                // Absent on older binaries; the chip just stays empty.
+            (PendingRpc::RateLimitsRead, Some(_)) => {
+                // No plan limits to read (an API-key login): the chip stays
+                // empty, and /usage says so instead of never answering.
+                step.events.push(AgentEvent::UsageReport {
+                    windows: Vec::new(),
+                });
             }
             (PendingRpc::Compact, Some(err)) => {
                 step.events.push(AgentEvent::Error {
@@ -2756,8 +2877,9 @@ impl CodexMapper {
                     self.emit_effort_state_marked(Some(effort_id), chosen, step);
                 }
             }
-            (PendingRpc::AccountRead { report }, None) => {
-                self.on_account(&frame["result"], report, step);
+            (PendingRpc::RateLimitsRead, None) => {
+                self.rate_limits = RateLimits::read(&frame["result"]);
+                self.emit_rate_limits(true, step);
             }
             (
                 PendingRpc::Steer {
@@ -2831,35 +2953,36 @@ impl CodexMapper {
         }
     }
 
-    /// account/read result → RateLimit chip (+ /usage windows on request).
-    /// Wire shape: rate_limit.{primary_window,secondary_window} each
-    /// {used_percent 0-100, limit_window_seconds, reset_at epoch-s}.
-    fn on_account(&mut self, result: &Value, report: bool, step: &mut DriverStep) {
-        let rl = &result["rate_limit"];
-        let window = |w: &Value| -> Option<(f64, Option<String>, String)> {
-            let pct = w["used_percent"].as_f64()?;
-            let resets = w["reset_at"].as_u64().map(|s| s.to_string());
-            let label = match w["limit_window_seconds"].as_u64() {
-                Some(secs) if secs <= 6 * 3600 => "session limit".to_string(),
-                Some(secs) => format!("{}d limit", secs / 86_400),
-                None => "usage limit".to_string(),
-            };
-            Some((pct, resets, label))
-        };
-        let windows: Vec<_> = [&rl["primary_window"], &rl["secondary_window"]]
-            .into_iter()
-            .filter_map(window)
-            .collect();
+    /// account/rateLimits/read. Reset-credit details cost the backend a
+    /// second lookup, and nothing here shows them.
+    fn read_rate_limits(&mut self, step: &mut DriverStep) {
+        let id = self.rpc_id();
+        self.pending_rpcs.insert(id, PendingRpc::RateLimitsRead);
+        step.outbound.push(json!({
+            "id": id, "method": "account/rateLimits/read",
+            "params": { "excludeResetCreditDetails": true },
+        }));
+    }
+
+    /// The usage limits → the header chip (journaled only when it changed)
+    /// and, on request, the /usage windows.
+    fn emit_rate_limits(&mut self, report: bool, step: &mut DriverStep) {
+        let windows = self.rate_limits.windows();
         if let Some((pct, resets, label)) =
             windows.iter().max_by(|a, b| a.0.total_cmp(&b.0)).cloned()
         {
-            step.events.push(AgentEvent::RateLimit {
+            let chip = AgentEvent::RateLimit {
                 utilization: pct,
                 resets_at: resets,
                 label: Some(label),
-                limit_reached: rl["limit_reached"] == true
+                limit_reached: self.rate_limits.reached
+                    || self.rate_limits.blocked
                     || windows.iter().any(|(p, ..)| *p >= 100.0),
-            });
+            };
+            if self.rate_limit_sent.as_ref() != Some(&chip) {
+                self.rate_limit_sent = Some(chip.clone());
+                step.events.push(chip);
+            }
         }
         if report {
             step.events.push(AgentEvent::UsageReport {
@@ -5423,15 +5546,7 @@ impl CodexMapper {
                     }));
                 }
             }
-            AgentCommand::GetUsage => {
-                let id = self.rpc_id();
-                self.pending_rpcs
-                    .insert(id, PendingRpc::AccountRead { report: true });
-                step.outbound.push(json!({
-                    "id": id, "method": "account/read",
-                    "params": { "refreshToken": false },
-                }));
-            }
+            AgentCommand::GetUsage => self.read_rate_limits(&mut step),
             AgentCommand::Answer {
                 request_id,
                 answers,
@@ -10171,7 +10286,7 @@ mod tests {
     }
 
     #[test]
-    fn thread_name_and_account_read_map() {
+    fn thread_name_and_usage_limits_map() {
         let mut m = mapper();
         let step = m.on_frame(&json!({
             "method": "thread/name/updated",
@@ -10185,32 +10300,230 @@ mod tests {
         );
 
         let step = m.on_command(AgentCommand::GetUsage);
-        let id = step.outbound[0]["id"].as_u64().unwrap();
-        assert_eq!(step.outbound[0]["method"], "account/read");
-        let step = m.on_frame(&json!({
-            "id": id,
-            "result": { "rate_limit": {
-                "primary_window": { "used_percent": 42.0, "limit_window_seconds": 18000,
-                                    "reset_at": 1800000000u64 },
-                "secondary_window": { "used_percent": 12.0, "limit_window_seconds": 604800 },
-            }},
-        }));
+        assert_eq!(step.outbound[0]["method"], "account/rateLimits/read");
+        assert_eq!(
+            step.outbound[0]["params"]["excludeResetCreditDetails"],
+            true
+        );
+        let step = answer_rate_limits(
+            &mut m,
+            step,
+            json!({
+                "ordinaryUsageAllowed": true,
+                "rateLimits": rate_snapshot(
+                    json!({ "usedPercent": 42, "windowDurationMins": 300, "resetsAt": 1800000000u64 }),
+                    json!({ "usedPercent": 12, "windowDurationMins": 10080, "resetsAt": null }),
+                ),
+                "rateLimitsByLimitId": null,
+                "rateLimitResetCredits": { "availableCount": 1, "credits": null },
+            }),
+        );
         match &step.events[0] {
             AgentEvent::RateLimit {
-                utilization, label, ..
+                utilization,
+                label,
+                resets_at,
+                limit_reached,
             } => {
                 assert!((utilization - 42.0).abs() < 0.01);
                 assert_eq!(label.as_deref(), Some("session limit"));
+                assert_eq!(resets_at.as_deref(), Some("1800000000"));
+                assert!(!limit_reached);
             }
             other => panic!("expected RateLimit, got {other:?}"),
         }
         match &step.events[1] {
             AgentEvent::UsageReport { windows } => {
                 assert_eq!(windows.len(), 2);
-                assert_eq!(windows[1].label, "7d limit");
+                assert_eq!(windows[1].label, "weekly limit");
+                assert_eq!(windows[1].resets_at, None);
             }
             other => panic!("expected UsageReport, got {other:?}"),
         }
+    }
+
+    /// A `RateLimitSnapshot` as codex 0.162.1 sends it (live probe shape).
+    fn rate_snapshot(primary: Value, secondary: Value) -> Value {
+        json!({
+            "limitId": "codex", "limitName": null, "normalModelSlug": null,
+            "primary": primary, "secondary": secondary,
+            "credits": { "hasCredits": false, "unlimited": false, "balance": "0" },
+            "individualLimit": null, "spendControlReached": false,
+            "planType": "pro", "rateLimitReachedType": null,
+        })
+    }
+
+    /// Answer the `account/rateLimits/read` that `step` sent.
+    fn answer_rate_limits(m: &mut CodexMapper, step: DriverStep, result: Value) -> DriverStep {
+        let sent = step
+            .outbound
+            .iter()
+            .find(|f| f["method"] == "account/rateLimits/read")
+            .expect("a rate-limit read");
+        m.on_frame(&json!({ "id": sent["id"], "result": result }))
+    }
+
+    #[test]
+    fn rate_limits_follow_rolling_updates_with_no_read_at_turn_end() {
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "method": "turn/started",
+            "params": { "threadId": "thr-1", "turn": { "id": "turn-A" } },
+        }));
+        // Codex sends the rolling update mid-turn (live 0.162.1, Pro: one
+        // weekly window, no session window)…
+        let step = m.on_frame(&json!({
+            "method": "account/rateLimits/updated",
+            "params": { "rateLimits": rate_snapshot(
+                json!({ "usedPercent": 0, "windowDurationMins": 10080, "resetsAt": 1792652719u64 }),
+                Value::Null,
+            ) },
+        }));
+        assert!(matches!(
+            &step.events[..],
+            [AgentEvent::RateLimit { utilization, label: Some(label), .. }]
+                if *utilization == 0.0 && label == "weekly limit"
+        ));
+        // …so the turn's end asks nothing: a read still in flight there held
+        // the app-server open past an immediate resume.
+        let end = m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "threadId": "thr-1", "turn": { "id": "turn-A", "status": "completed" } },
+        }));
+        assert!(
+            end.outbound
+                .iter()
+                .all(|f| f["method"] != "account/rateLimits/read"),
+            "{:?}",
+            end.outbound
+        );
+
+        // A rolling update is sparse: the session window it adds joins the
+        // weekly one it leaves out.
+        let update = |primary: Value, secondary: Value| {
+            json!({
+                "method": "account/rateLimits/updated",
+                "params": { "rateLimits": {
+                    "limitId": "codex", "primary": primary, "secondary": secondary,
+                    "rateLimitReachedType": null,
+                } },
+            })
+        };
+        let step = m.on_frame(&update(
+            Value::Null,
+            json!({ "usedPercent": 63.5, "windowDurationMins": 300, "resetsAt": 1792000000u64 }),
+        ));
+        assert!(matches!(
+            &step.events[..],
+            [AgentEvent::RateLimit { utilization, label: Some(label), .. }]
+                if *utilization == 63.5 && label == "session limit"
+        ));
+        // The same numbers again journal nothing.
+        let step = m.on_frame(&update(
+            Value::Null,
+            json!({ "usedPercent": 63.5, "windowDurationMins": 300, "resetsAt": 1792000000u64 }),
+        ));
+        assert!(step.events.is_empty(), "{:?}", step.events);
+        // Another bucket's update leaves this one alone.
+        let step = m.on_frame(&json!({
+            "method": "account/rateLimits/updated",
+            "params": { "rateLimits": {
+                "limitId": "codex_other",
+                "primary": { "usedPercent": 99, "windowDurationMins": 300, "resetsAt": null },
+            } },
+        }));
+        assert!(step.events.is_empty(), "{:?}", step.events);
+        // /usage lists both windows the merge holds.
+        let usage = m.on_command(AgentCommand::GetUsage);
+        let step = answer_rate_limits(
+            &mut m,
+            usage,
+            json!({
+                "ordinaryUsageAllowed": true,
+                "rateLimits": rate_snapshot(
+                    json!({ "usedPercent": 1, "windowDurationMins": 10080, "resetsAt": null }),
+                    json!({ "usedPercent": 64, "windowDurationMins": 300, "resetsAt": null }),
+                ),
+            }),
+        );
+        let windows = step
+            .events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::UsageReport { windows } => Some(windows),
+                _ => None,
+            })
+            .expect("a usage report");
+        let labels: Vec<_> = windows.iter().map(|w| w.label.as_str()).collect();
+        assert_eq!(labels, ["weekly limit", "session limit"]);
+    }
+
+    #[test]
+    fn rate_limits_say_when_usage_is_refused() {
+        // The backend's verdict, not the percentages.
+        let mut m = mapper();
+        let usage = m.on_command(AgentCommand::GetUsage);
+        let step = answer_rate_limits(
+            &mut m,
+            usage,
+            json!({
+                "ordinaryUsageAllowed": false,
+                "rateLimits": rate_snapshot(
+                    json!({ "usedPercent": 40, "windowDurationMins": 300, "resetsAt": null }),
+                    Value::Null,
+                ),
+            }),
+        );
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::RateLimit {
+                limit_reached: true,
+                ..
+            }
+        ));
+        // A rolling update that names a reached limit says so too.
+        let mut m = mapper();
+        let step = m.on_frame(&json!({
+            "method": "account/rateLimits/updated",
+            "params": { "rateLimits": {
+                "limitId": "codex",
+                "primary": { "usedPercent": 40, "windowDurationMins": null, "resetsAt": null },
+                "rateLimitReachedType": "workspace_member_usage_limit_reached",
+            } },
+        }));
+        assert!(matches!(
+            &step.events[..],
+            [AgentEvent::RateLimit { limit_reached: true, label: Some(label), .. }]
+                if label == "usage limit"
+        ));
+    }
+
+    #[test]
+    fn rate_limit_windows_never_repeat_a_label() {
+        // The /usage panel keys rows by label: two windows of one duration
+        // (or both without one) must still read apart.
+        let limits = RateLimits::read(&json!({ "rateLimits": rate_snapshot(
+            json!({ "usedPercent": 5, "windowDurationMins": null, "resetsAt": null }),
+            json!({ "usedPercent": 9, "windowDurationMins": null, "resetsAt": null }),
+        ) }));
+        let labels: Vec<_> = limits.windows().into_iter().map(|(.., l)| l).collect();
+        assert_eq!(labels, ["usage limit", "usage limit (2)"]);
+    }
+
+    #[test]
+    fn usage_answers_even_without_plan_limits() {
+        // An API-key login has no plan limits: /usage still gets its
+        // (empty) answer.
+        let mut m = mapper();
+        let usage = m.on_command(AgentCommand::GetUsage);
+        let id = usage.outbound[0]["id"].clone();
+        let step = m.on_frame(&json!({
+            "id": id, "error": { "code": -32600, "message": "requires ChatGPT auth" },
+        }));
+        assert!(matches!(
+            &step.events[..],
+            [AgentEvent::UsageReport { windows }] if windows.is_empty()
+        ));
     }
 
     /// Live 0.144.2 shape: the spawn marker on the PARENT thread
