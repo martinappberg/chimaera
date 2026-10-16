@@ -42,6 +42,8 @@ const PROBLEMS_SHOWN: usize = 20;
 const RENDERS_PER_SECOND: u32 = 4;
 /// A query's answer.
 const QUERY_MAX: usize = 1 << 20;
+/// A file action's answer (a message and where to open).
+const FILE_ANSWER_MAX: usize = 64 << 10;
 /// A view counts as open this long after its last render.
 pub(crate) const OPEN_FOR: Duration = Duration::from_secs(10 * 60);
 
@@ -615,7 +617,14 @@ pub(crate) async fn file_action_route(
         Ok(text) => text,
         Err(err) => return super::bad_request(err),
     };
-    let answer: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    // `{"message", "open"}`: small, and measured before it is parsed.
+    let answer = match super::hostfns::bounded_json(&text, FILE_ANSWER_MAX) {
+        Ok(answer) => answer,
+        Err(err) if text.len() > FILE_ANSWER_MAX => {
+            return super::bad_request(format!("{}'s answer is {err}", m.name))
+        }
+        Err(_) => Value::Null,
+    };
     let message = answer
         .get("message")
         .and_then(Value::as_str)

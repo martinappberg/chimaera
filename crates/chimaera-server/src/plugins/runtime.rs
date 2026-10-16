@@ -89,6 +89,9 @@ const HOST_GRACE: Duration = Duration::from_secs(2);
 const TICK: Duration = Duration::from_millis(100);
 /// Linear memory per instance.
 const MEMORY_CAP: usize = 64 << 20;
+/// Linear memory of every instance together, daemon-wide: `MAX_INSTANCES`
+/// at their own cap would be 4 GiB on a host the daemon shares.
+const GUEST_MEMORY_CAP: usize = 512 << 20;
 const TABLE_ELEMENTS_CAP: usize = 65_536;
 const MAX_INSTANCES: usize = 64;
 const IDLE: Duration = Duration::from_secs(10 * 60);
@@ -108,6 +111,8 @@ const INSTRUCTIONS_MAX: usize = 8 * 1024;
 /// every session's `tools/list`, beside the core tools.
 const TOOL_DESCRIPTION_MAX: usize = 2 * 1024;
 const TOOL_SCHEMA_MAX: usize = 16 * 1024;
+/// Every tool schema of one plugin together.
+const TOOL_SCHEMAS_TOTAL_MAX: usize = 256 * 1024;
 const HOOK_LINE_MAX: usize = 1024;
 /// A Knowledge snapshot's JSON (the view's whole data, cached per
 /// workspace) and its stamp: a real `.living/` of ~300 findings, ~160
@@ -143,9 +148,53 @@ type Builds = VecDeque<(Arc<str>, Pre)>;
 struct Shared {
     engine: Engine,
     linker: Linker<HostState>,
+    /// Held only to look up or record a build, never across a compile: one
+    /// slow compile must not stall every other plugin's calls.
+    compiled: Mutex<Compiled>,
+}
+
+/// One compile's outcome, shared by every call that asked for that build
+/// while it ran.
+type Compiling = Arc<tokio::sync::OnceCell<Result<Pre, String>>>;
+
+#[derive(Default)]
+struct Compiled {
     /// plugin id → its pre-instantiated builds by SHA-256, most recently
     /// used first, at most `COMPILED_PER_ID`.
-    compiled: tokio::sync::Mutex<VecDeque<(String, Builds)>>,
+    builds: VecDeque<(String, Builds)>,
+    /// Builds compiling now: a second caller waits on the first's compile.
+    inflight: HashMap<BuildKey, Compiling>,
+}
+
+impl Compiled {
+    /// `id`'s build `sha`, made most recently used, if it is compiled.
+    fn hit(&mut self, id: &str, sha: &str) -> Option<Pre> {
+        let at = self.builds.iter().position(|(i, _)| i == id)?;
+        let (id, mut builds) = self.builds.remove(at).expect("found above");
+        let found = builds.iter().position(|(s, _)| &**s == sha).map(|at| {
+            let build = builds.remove(at).expect("found above");
+            let pre = build.1.clone();
+            builds.push_front(build);
+            pre
+        });
+        self.builds.push_front((id, builds));
+        found
+    }
+
+    fn keep(&mut self, id: &str, sha: Arc<str>, pre: Pre) {
+        let mut builds = self
+            .builds
+            .iter()
+            .position(|(i, _)| i == id)
+            .and_then(|at| self.builds.remove(at))
+            .map(|(_, builds)| builds)
+            .unwrap_or_default();
+        builds.retain(|(s, _)| *s != sha);
+        builds.push_front((sha, pre));
+        builds.truncate(COMPILED_PER_ID);
+        self.builds.push_front((id.to_string(), builds));
+        self.builds.truncate(COMPILED_IDS);
+    }
 }
 
 static SHARED: OnceLock<Result<Shared, String>> = OnceLock::new();
@@ -188,30 +237,56 @@ fn build_shared() -> wasmtime::Result<Shared> {
     Ok(Shared {
         engine,
         linker,
-        compiled: tokio::sync::Mutex::new(VecDeque::new()),
+        compiled: Mutex::new(Compiled::default()),
     })
 }
 
 /// The component for `m`'s build, compiled on first use (Cranelift: tens
 /// of ms of CPU, so on the blocking pool) and kept while it is one of the
-/// plugin's last `COMPILED_PER_ID` builds. A failure isn't kept here: the
-/// caller remembers it (`PluginRuntime::refused`), where a retry clears it.
+/// plugin's last `COMPILED_PER_ID` builds. Calls for a build that is
+/// compiling wait on that one compile; calls for any other build don't wait
+/// at all. A failure isn't kept here: the caller remembers it
+/// (`PluginRuntime::refused`), where a retry clears it.
 async fn component(m: &Manifest) -> Result<Pre, String> {
     let shared = shared()?;
-    let mut compiled = shared.compiled.lock().await;
-    let mut builds = compiled
-        .iter()
-        .position(|(id, _)| id == &m.id)
-        .and_then(|at| compiled.remove(at))
-        .map(|(_, builds)| builds)
-        .unwrap_or_default();
-    if let Some(at) = builds.iter().position(|(sha, _)| *sha == m.wasm.sha256) {
-        let build = builds.remove(at).expect("found above");
-        let done = build.1.clone();
-        builds.push_front(build);
-        compiled.push_front((m.id.clone(), builds));
-        return Ok(done);
+    let key: BuildKey = (m.id.clone(), m.wasm.sha256.clone());
+    let cell = {
+        let mut compiled = crate::lock(&shared.compiled);
+        if let Some(pre) = compiled.hit(&m.id, &m.wasm.sha256) {
+            return Ok(pre);
+        }
+        compiled.inflight.entry(key.clone()).or_default().clone()
+    };
+    let result = cell.get_or_init(|| compile(shared, m)).await.clone();
+    // Recorded and released in one step: a caller that misses the cache
+    // after this finds the build there, never a second compile.
+    let mut compiled = crate::lock(&shared.compiled);
+    if let Ok(pre) = &result {
+        if compiled.hit(&m.id, &m.wasm.sha256).is_none() {
+            compiled.keep(&m.id, m.wasm.sha256.clone(), pre.clone());
+        }
     }
+    if compiled
+        .inflight
+        .get(&key)
+        .is_some_and(|c| Arc::ptr_eq(c, &cell))
+    {
+        compiled.inflight.remove(&key);
+    }
+    result
+}
+
+/// Tests only: a compile of this plugin id first sleeps this long (a large
+/// component on a slow login node).
+#[cfg(test)]
+static COMPILE_DELAY: Mutex<Option<(String, Duration)>> = Mutex::new(None);
+
+async fn compile(shared: &Shared, m: &Manifest) -> Result<Pre, String> {
+    #[cfg(test)]
+    let delay = crate::lock(&COMPILE_DELAY)
+        .as_ref()
+        .filter(|(id, _)| *id == m.id)
+        .map(|(_, d)| *d);
     let bytes = m.wasm.bytes.clone();
     let engine = shared.engine.clone();
     let linker = shared.linker.clone();
@@ -219,6 +294,10 @@ async fn component(m: &Manifest) -> Result<Pre, String> {
     let api = m.api.clone();
     let started = Instant::now();
     let result = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some(delay) = delay {
+            std::thread::sleep(delay);
+        }
         let component = Component::new(&engine, &**bytes)?;
         let pre = linker.instantiate_pre(&component)?;
         // The gate already refused an `api` this host doesn't serve.
@@ -240,14 +319,6 @@ async fn component(m: &Manifest) -> Result<Pre, String> {
         ),
         Err(err) => tracing::error!(plugin = %m.id, %err, "plugin refused"),
     }
-    if let Ok(pre) = &result {
-        builds.push_front((m.wasm.sha256.clone(), pre.clone()));
-        builds.truncate(COMPILED_PER_ID);
-    }
-    if !builds.is_empty() {
-        compiled.push_front((m.id.clone(), builds));
-        compiled.truncate(COMPILED_IDS);
-    }
     result
 }
 
@@ -256,16 +327,17 @@ async fn component(m: &Manifest) -> Result<Pre, String> {
 /// first tool call never waits on Cranelift: seconds for a large component
 /// on a slow login node. One at a time, after a short delay at boot; a build
 /// already compiled is a cache hit. Faulted and held plugins are skipped
-/// (they never run here).
+/// (they never run here). A plugin that runs programs also gets the login
+/// environment of each workspace it is on captured, so its first job start
+/// (inside a 5 s guest call) doesn't wait on a slow login shell.
 pub(crate) fn warm(state: &Arc<AppState>, only: Option<String>, delay: Duration) {
     let state = state.clone();
     tokio::spawn(async move {
         tokio::time::sleep(delay).await;
-        let on: std::collections::HashSet<String> = crate::lock(&state.workspaces)
-            .list()
-            .into_iter()
-            .flat_map(|w| w.plugins_on)
-            .collect();
+        let workspaces = crate::lock(&state.workspaces).list();
+        let on: std::collections::HashSet<&String> =
+            workspaces.iter().flat_map(|w| &w.plugins_on).collect();
+        let mut envs: std::collections::BTreeSet<&str> = Default::default();
         for m in super::catalog(&state).iter() {
             if only.as_ref().is_some_and(|id| id != &m.id)
                 || !on.contains(&m.id)
@@ -275,6 +347,17 @@ pub(crate) fn warm(state: &Arc<AppState>, only: Option<String>, delay: Duration)
                 continue;
             }
             let _ = component(m).await;
+            if !m.programs.is_empty() {
+                envs.extend(
+                    workspaces
+                        .iter()
+                        .filter(|w| w.plugins_on.contains(&m.id))
+                        .map(|w| w.id.as_str()),
+                );
+            }
+        }
+        for ws in envs {
+            super::jobs::warm_env(&state, ws).await;
         }
     });
 }
@@ -304,10 +387,53 @@ impl AllocationBudget {
     }
 }
 
-#[derive(Default)]
+/// Bytes of linear memory reserved across stores, against `cap`.
+struct SharedMemory {
+    used: std::sync::atomic::AtomicUsize,
+    cap: usize,
+}
+
+static GUEST_MEMORY: SharedMemory = SharedMemory {
+    used: std::sync::atomic::AtomicUsize::new(0),
+    cap: GUEST_MEMORY_CAP,
+};
+
+impl SharedMemory {
+    fn reserve(&self, n: usize) -> bool {
+        self.used
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(n).filter(|total| *total <= self.cap)
+            })
+            .is_ok()
+    }
+
+    fn release(&self, n: usize) {
+        self.used.fetch_sub(n, Ordering::AcqRel);
+    }
+}
+
 struct InstanceLimits {
     memory: AllocationBudget,
     table: AllocationBudget,
+    /// The daemon-wide budget this store's memory also counts against;
+    /// what it holds goes back when the store drops.
+    shared: &'static SharedMemory,
+}
+
+impl Default for InstanceLimits {
+    fn default() -> Self {
+        InstanceLimits {
+            memory: AllocationBudget::default(),
+            table: AllocationBudget::default(),
+            shared: &GUEST_MEMORY,
+        }
+    }
+}
+
+impl Drop for InstanceLimits {
+    fn drop(&mut self) {
+        self.shared.release(self.memory.used);
+    }
 }
 
 impl ResourceLimiter for InstanceLimits {
@@ -317,10 +443,18 @@ impl ResourceLimiter for InstanceLimits {
         desired: usize,
         maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
-        Ok(self.memory.grow(current, desired, maximum, MEMORY_CAP))
+        if !self.memory.grow(current, desired, maximum, MEMORY_CAP) {
+            return Ok(false);
+        }
+        if !self.shared.reserve(self.memory.pending) {
+            self.memory.failed();
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     fn memory_grow_failed(&mut self, _error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.shared.release(self.memory.pending);
         self.memory.failed();
         Ok(())
     }
@@ -935,6 +1069,10 @@ impl PluginRuntime {
                 m.name
             ));
         }
+        // A caller holding `m` across an await (a long tool's resume, a
+        // route that looked it up before an update or a remove) never runs
+        // that build again: its `[access]` and code are no longer what runs.
+        super::still_current(state, m, None)?;
         let key: Key = (m.id.clone(), ws.to_string());
         if let Some(fault) = self.faulted(&key) {
             return Err(format!(
@@ -1328,6 +1466,14 @@ fn check_offer(
             declared.join(", ")
         ));
     }
+    let total: usize = defs.iter().map(|d| d.input_schema.len()).sum();
+    if total > TOOL_SCHEMAS_TOTAL_MAX {
+        return Err(format!(
+            "{} is refused: its tools' input schemas are over {} KiB together",
+            m.name,
+            TOOL_SCHEMAS_TOTAL_MAX / 1024
+        ));
+    }
     let mut tools = Vec::with_capacity(defs.len());
     for def in defs {
         if def.input_schema.len() > TOOL_SCHEMA_MAX {
@@ -1504,6 +1650,81 @@ mod tests {
             "x".repeat(TOOL_SCHEMA_MAX)
         );
         assert!(check_offer(&m, defs(&huge, "x"), None).is_err());
+    }
+
+    /// The daemon-wide guest memory budget spans stores, and a dropped
+    /// store gives its share back.
+    #[test]
+    fn guest_memory_is_capped_across_instances_and_freed_when_one_goes() {
+        let budget: &'static SharedMemory = Box::leak(Box::new(SharedMemory {
+            used: std::sync::atomic::AtomicUsize::new(0),
+            cap: 60 << 20,
+        }));
+        let store = || {
+            let mut host = HostState::new("test", "ws", crate::plugins::capabilities::Access::NONE);
+            host.limits.shared = budget;
+            let mut store = Store::new(&shared().unwrap().engine, host);
+            store.limiter(|s| &mut s.limits);
+            store
+        };
+        let forty_mb = wasmtime::MemoryType::new(640, None);
+        let mut first = store();
+        let mut second = store();
+        assert!(wasmtime::Memory::new(&mut first, forty_mb.clone()).is_ok());
+        assert!(
+            wasmtime::Memory::new(&mut second, forty_mb.clone()).is_err(),
+            "two instances must not pass the daemon-wide budget together"
+        );
+        drop(first);
+        assert_eq!(budget.used.load(Ordering::Relaxed), 0);
+        assert!(wasmtime::Memory::new(&mut second, forty_mb).is_ok());
+    }
+
+    /// Many tools under the per-tool cap still can't flood `tools/list`.
+    #[test]
+    fn a_plugins_tool_schemas_are_capped_together() {
+        let mut m = (*crate::plugins::test_catalog::fixture()).clone();
+        m.provides.mcp_tools = (0..20).map(|i| format!("t{i}")).collect();
+        let schema = format!(
+            r#"{{"type":"object","description":"{}"}}"#,
+            "x".repeat(TOOL_SCHEMA_MAX - 64)
+        );
+        let defs: Vec<wit::ToolDef> = m
+            .provides
+            .mcp_tools
+            .iter()
+            .map(|name| wit::ToolDef {
+                name: name.clone(),
+                description: "d".into(),
+                input_schema: schema.clone(),
+            })
+            .collect();
+        let err = check_offer(&m, defs.clone(), None).err().unwrap();
+        assert!(err.contains("together"), "{err}");
+        m.provides.mcp_tools.truncate(8);
+        assert!(check_offer(&m, defs[..8].to_vec(), None).is_ok());
+    }
+
+    /// One build compiling (seconds on a slow login node) never holds up a
+    /// call to a build that is already compiled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_compile_never_blocks_a_compiled_build() {
+        let fast = crate::plugins::test_catalog::fixture();
+        component(&fast).await.unwrap();
+        let mut slow = (*fast).clone();
+        slow.id = "slow-compile-test".into();
+        *crate::lock(&COMPILE_DELAY) = Some((slow.id.clone(), Duration::from_secs(3)));
+        let compiling = tokio::spawn(async move { component(&slow).await.map(|_| ()) });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let started = Instant::now();
+        component(&fast).await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a compiled build waited {:?} on another's compile",
+            started.elapsed()
+        );
+        assert!(!compiling.is_finished());
+        compiling.await.unwrap().unwrap();
     }
 
     #[test]

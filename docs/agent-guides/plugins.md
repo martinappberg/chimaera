@@ -832,10 +832,10 @@ has what 0.2 adds:
 
 | Call | What |
 |---|---|
-| `output_read(cx, path, offset, cap)` · `output_list` · `output_write` · `output_remove` | the plugin's output folder for this workspace (`output:<path>`), outside the repository; reads ≤ 8 MiB a call from an offset, its own writes ≤ 8 MiB a file, 1 GiB per plugin (the oldest top-level entries go past it); never through a link |
+| `output_read(cx, path, offset, cap)` · `output_list` · `output_write` · `output_remove` | the plugin's output folder for this workspace (`output:<path>`), outside the repository; reads ≤ 8 MiB a call from an offset, its own writes ≤ 8 MiB a file, 1 GiB per plugin (each write charged before it lands; the oldest top-level entries go to make room, else the write is refused); never through a link |
 | `publish(cx, surface, key, &data)` · `unpublish` | a data surface (below); checked, kept, announced to this workspace's windows |
 | `invalidate(cx, view)` | windows showing the view render it again (≤ 4 a second; a burst is one) |
-| `watch(cx, &paths)` | up to 256 workspace paths heard as `file-changed`; swept every 5 s only while one of its views was rendered in the last 10 minutes |
+| `watch(cx, &paths)` | up to 256 workspace paths heard as `file-changed`; swept every 5 s only while one of its views was rendered in the last 10 minutes; needs `[access] files = "read"` |
 | `setting(cx, key)` | a declared setting: the user's value, else its default |
 | `state_keep(cx, key, &value)` | durable state, read back with `host::state_get`; within the same 64 KiB. `state_put` stays memory-only (and makes a kept key memory-only again) |
 | `roots(cx)` | the absolute workspace root and output folder (for arguments a program will need, and for mapping printed paths back) |

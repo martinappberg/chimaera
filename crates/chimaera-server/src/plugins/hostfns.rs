@@ -23,6 +23,9 @@
 //! - `[access]` (`capabilities::Access`): files, the Timeline and sessions
 //!   are refused to a build whose manifest doesn't allow them.
 //! - `log`: ≤ 64 lines per call, each ≤ 2 KiB.
+//! - Guest JSON is measured before it is parsed (`bounded_json`): a parsed
+//!   `Value` costs many times its text, and a guest's string can be most of
+//!   its 64 MiB memory.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
@@ -48,6 +51,23 @@ const LOG_LINE_MAX: usize = 2 * 1024;
 const SESSIONS_MAX: usize = 256;
 /// Kinds one `timeline-recent` may name.
 const KINDS_MAX: usize = 16;
+/// A Timeline entry's JSON: a note's text at its cap, every byte of it
+/// `\u`-escaped at the worst, plus its `kind` and `to`.
+const ENTRY_MAX: usize = 6 * timeline::TEXT_MAX + 1024;
+
+/// `text` parsed as JSON only when it is at most `max` bytes: the length
+/// decides before any allocation does (`{"a":[0,0,…]}` near a guest's
+/// 64 MiB would parse to over a GiB of `Value`s).
+pub(super) fn bounded_json(text: &str, max: usize) -> Result<Value, String> {
+    if text.len() > max {
+        return Err(format!(
+            "over the {} KiB cap ({} bytes)",
+            max.div_ceil(1024),
+            text.len()
+        ));
+    }
+    serde_json::from_str(text).map_err(|e| format!("not JSON ({e})"))
+}
 
 /// Small per-(plugin, workspace) state plugins keep in the daemon (read
 /// cursors, caches). In memory; the keys a plugin kept with `state-keep`
@@ -187,6 +207,35 @@ impl HostState {
     }
 }
 
+/// Whether a guest call's build may still act: `manifest` still the build
+/// that runs as its id, not held or faulted, and with `ws` still switched
+/// on there. A call that began before an update, a removal or a block keeps
+/// its instance for a few seconds; its side effects stop here. `None` (a
+/// unit test's instance) has nothing to check.
+pub(crate) fn build_current(
+    app: &crate::AppState,
+    manifest: Option<&Arc<super::Manifest>>,
+    ws: Option<&str>,
+) -> Result<(), String> {
+    match manifest {
+        Some(m) => super::still_current(app, m, ws),
+        None => Ok(()),
+    }
+}
+
+impl HostState {
+    /// `build_current` for this instance; `in_workspace` adds the switch
+    /// check. Writes a plugin makes while it hears `switched-off` (the
+    /// switch is already off) pass `false`.
+    fn current(&self, app: &crate::AppState, in_workspace: bool) -> Result<(), String> {
+        build_current(
+            app,
+            self.manifest.as_ref(),
+            in_workspace.then_some(self.workspace.as_str()),
+        )
+    }
+}
+
 /// Read back what `plugin` kept durably in `ws`, once per daemon.
 async fn load_kept(app: &Arc<crate::AppState>, plugin: &str, ws: &str) {
     if crate::lock(&app.plugin_state).is_loaded(plugin, ws) {
@@ -204,9 +253,20 @@ impl HostState {
         if key.is_empty() || key.len() > 256 {
             return Err("a state key is 1–256 bytes".into());
         }
-        let parsed: Value =
-            serde_json::from_str(&value).map_err(|e| format!("state {key}: not JSON ({e})"))?;
+        if key.len() + value.len() > STATE_CAP {
+            return Err(format!(
+                "state is capped at {} KiB per plugin per workspace ({} bytes asked)",
+                STATE_CAP >> 10,
+                key.len() + value.len()
+            ));
+        }
+        let parsed = bounded_json(&value, STATE_CAP).map_err(|e| format!("state {key}: {e}"))?;
         let value = (!parsed.is_null()).then_some(value);
+        if kept {
+            // Durable: a replaced or removed build must not leave state a
+            // later install of the id would read back.
+            self.current(&app, false)?;
+        }
         let durable_changed =
             crate::lock(&app.plugin_state).put(&self.plugin, &self.workspace, &key, value, kept)?;
         if durable_changed {
@@ -466,8 +526,7 @@ impl host::Host for HostState {
         let Some(sid) = scope.cx.session.clone() else {
             return Err("only a session's call may write the Timeline".into());
         };
-        let entry: Value =
-            serde_json::from_str(&entry).map_err(|e| format!("the entry is not JSON ({e})"))?;
+        let entry = bounded_json(&entry, ENTRY_MAX).map_err(|e| format!("the entry is {e}"))?;
         let Some(fields) = entry.as_object() else {
             return Err("an entry is a JSON object".into());
         };
@@ -516,6 +575,7 @@ impl host::Host for HostState {
             },
             Some(_) => return Err("`to` is a session id, \"mastermind\", or null".into()),
         };
+        self.current(&app, true)?;
         crate::comms::take_post_slot(&app, &sid)?;
         let posted = crate::comms::append_plugin_note(&app, &self.workspace, &sid, to, text).await;
         Ok(posted.seq)
@@ -551,8 +611,8 @@ impl host::Host for HostState {
             return;
         };
         let app = scope.app.clone();
-        let fields = match serde_json::from_str::<Value>(&event) {
-            Ok(Value::Object(fields)) if event.len() <= EVENT_MAX => fields,
+        let fields = match bounded_json(&event, EVENT_MAX) {
+            Ok(Value::Object(fields)) => fields,
             _ => {
                 tracing::warn!(
                     plugin = %self.plugin,
@@ -755,10 +815,11 @@ impl platform::Host for HostState {
     ) -> Result<(), String> {
         let (dir, rel) = self.output(&path)?;
         let app = self.scope()?.app.clone();
-        blocking(move || super::output::write(&dir, &rel, &bytes)).await?;
-        // The quota, measured at most once a minute.
-        super::output::usage(&app, &self.plugin, false).await;
-        Ok(())
+        super::output::fits(&rel, bytes.len())?;
+        self.current(&app, false)?;
+        // Charged before it lands: the measure runs at most once a minute.
+        super::output::charge(&app, &self.plugin, bytes.len() as u64).await?;
+        blocking(move || super::output::write(&dir, &rel, &bytes)).await
     }
 
     async fn output_remove(&mut self, _cx: wit::Context, path: String) -> Result<(), String> {
@@ -774,6 +835,7 @@ impl platform::Host for HostState {
         data: String,
     ) -> Result<(), String> {
         let app = self.scope()?.app.clone();
+        self.current(&app, true)?;
         super::surfaces::publish(&app, &self.plugin, &self.workspace, &surface, &key, &data).await
     }
 
@@ -788,6 +850,13 @@ impl platform::Host for HostState {
     }
 
     async fn watch(&mut self, _cx: wit::Context, paths: Vec<String>) -> Result<(), String> {
+        // Whether and when a path changes is what reading it would tell.
+        // Clearing the set asks nothing.
+        if !paths.is_empty() && self.access.files != FilesAccess::Read {
+            return Err(
+                "this plugin's manifest doesn't allow watching files ([access] files)".into(),
+            );
+        }
         let app = self.scope()?.app.clone();
         super::files::set_watch(&app, &self.plugin, &self.workspace, paths)
     }
@@ -886,6 +955,23 @@ mod tests {
         assert!(relative("../x").unwrap_err().contains("`..` is refused"));
         assert!(relative("a/../../x").is_err());
         assert!(relative("/etc/passwd").unwrap_err().contains("absolute"));
+    }
+
+    #[test]
+    fn guest_json_is_measured_before_it_is_parsed() {
+        // Over the cap and not JSON at all: the cap answers, so no parse ran.
+        let flood = format!("{{\"a\":[{}", "0,".repeat(20_000));
+        let err = bounded_json(&flood, EVENT_MAX).unwrap_err();
+        assert!(err.starts_with("over the 16 KiB cap"), "{err}");
+        assert!(bounded_json("{\"a\":1", EVENT_MAX)
+            .unwrap_err()
+            .starts_with("not JSON"));
+        assert_eq!(bounded_json("{\"a\":1}", 7).unwrap(), json!({"a": 1}));
+        assert!(bounded_json("{\"a\":1}", 6).is_err());
+        // A note at its cap, fully escaped, still fits.
+        let escaped = "\\u0041".repeat(timeline::TEXT_MAX);
+        let note = format!("{{\"kind\":\"note\",\"to\":null,\"text\":\"{escaped}\"}}");
+        assert!(bounded_json(&note, ENTRY_MAX).is_ok());
     }
 
     #[test]

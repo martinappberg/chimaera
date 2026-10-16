@@ -161,6 +161,14 @@ fn expand_dir(raw: &str, var: impl Fn(&str) -> Option<String>) -> Result<PathBuf
     Ok(dir)
 }
 
+/// What an unpack may write: `UNPACKED_MAX`, and never into the last
+/// `FREE_AFTER_MIN` of the filesystem (`free` unknown: the cap alone).
+fn unpack_limit(free: Option<u64>) -> u64 {
+    free.map_or(UNPACKED_MAX, |f| {
+        f.saturating_sub(FREE_AFTER_MIN).min(UNPACKED_MAX)
+    })
+}
+
 /// Bytes free to this user on the filesystem holding `dir` (blocking).
 fn free_bytes(dir: &Path) -> Option<u64> {
     let st = rustix::fs::statvfs(dir).ok()?;
@@ -517,6 +525,11 @@ fn unpack_tar(reader: impl Read, root: &File, budget: &mut Budget) -> Result<(),
 fn unpack_zip(file: File, root: &File, budget: &mut Budget) -> Result<(), String> {
     let mut zip =
         zip::ZipArchive::new(BufReader::new(file)).map_err(|e| format!("not a zip: {e}"))?;
+    // The central directory says how many there are: refused before any is
+    // written.
+    if zip.len() > budget.max_entries {
+        return Err(format!("more than {} entries", budget.max_entries));
+    }
     for i in 0..zip.len() {
         let mut entry = zip
             .by_index(i)
@@ -708,7 +721,7 @@ impl<W: Write> Write for CappedWriter<W> {
 async fn download(
     a: &ArtifactDecl,
     dest: &Path,
-    on_bytes: &(dyn Fn(u64) + Send + Sync),
+    on_bytes: &(dyn Fn(u64) -> Result<(), String> + Send + Sync),
 ) -> Result<u64, String> {
     use sha2::{Digest, Sha256};
     use tokio::io::AsyncWriteExt;
@@ -745,7 +758,8 @@ async fn download(
             break;
         }
         total += n as u64;
-        on_bytes(total);
+        // An Err stops the download (curl is killed on drop).
+        on_bytes(total)?;
         if total > cap {
             return Err(format!(
                 "the download is larger than the {} bytes its plugin declared",
@@ -907,7 +921,12 @@ async fn install_inner(
     let key = (m.id.clone(), tool.id.clone());
     let installs = &state.plugin_platform.installs;
     installs.set(&key, "downloading", 0, artifact.size);
-    let on_bytes = |done: u64| installs.set(&key, "downloading", done, artifact.size);
+    // A removal, an update or a block mid-download stops it at the next
+    // chunk, not an hour later.
+    let on_bytes = |done: u64| {
+        installs.set(&key, "downloading", done, artifact.size);
+        super::still_current(state, m, None)
+    };
     let bytes = match download(artifact, &archive, &on_bytes).await {
         Ok(b) => b,
         Err(err) => {
@@ -915,14 +934,22 @@ async fn install_inner(
             return Err(err);
         }
     };
+    if let Err(err) = super::still_current(state, m, None) {
+        cleanup(vec![archive]).await;
+        return Err(err);
+    }
     // `unpack = "none"`: the file is the program, so it takes the program's
     // name (a release names it `jq-linux-amd64`; jobs ask for `jq`).
     let name = tool.programs.first().unwrap_or(&tool.id).clone();
     installs.set(&key, "unpacking", 0, 0);
     let unpacked = {
         let (archive, staging, kind) = (archive.clone(), staging.clone(), artifact.unpack.clone());
+        let dir = dir.clone();
         tokio::task::spawn_blocking(move || {
-            unpack(&archive, &kind, &staging, &name, UNPACKED_MAX, ENTRIES_MAX)
+            // Measured now, with the download on disk: an archive that
+            // unpacks to many times its size stops while the margin holds.
+            let max = unpack_limit(free_bytes(&dir));
+            unpack(&archive, &kind, &staging, &name, max, ENTRIES_MAX)
         })
         .await
         .map_err(|e| e.to_string())
@@ -991,6 +1018,10 @@ async fn install_inner(
                 tool.name
             ));
         }
+    }
+    if let Err(err) = super::still_current(state, m, None) {
+        restore(&version_dir, &aside).await;
+        return Err(err);
     }
     cleanup(vec![aside]).await;
     {
@@ -1448,6 +1479,113 @@ mod tests {
         )
         .unwrap_err()
         .contains("unpacked"));
+    }
+
+    /// A zip of `(name, body, unix mode)`; a mode with `S_IFLNK` makes a
+    /// link whose target is the body. Names are written as given (the
+    /// writer keeps only permission bits, so no device or FIFO here).
+    fn zip_of(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
+        use zip::write::SimpleFileOptions;
+        let mut out = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, body, mode) in entries {
+            let options = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored)
+                .unix_permissions(*mode & 0o7777);
+            if mode & 0o170000 == 0o120000 {
+                out.add_symlink(*name, String::from_utf8_lossy(body), options)
+                    .unwrap();
+            } else {
+                out.start_file(*name, options).unwrap();
+                out.write_all(body).unwrap();
+            }
+        }
+        out.finish().unwrap().into_inner()
+    }
+
+    fn unpack_zip_bytes(bytes: &[u8], label: &str, max_entries: usize) -> Result<PathBuf, String> {
+        let dir = temp(label);
+        let archive = dir.join("a.zip");
+        std::fs::write(&archive, bytes).unwrap();
+        let dest = dir.join("out");
+        unpack(&archive, "zip", &dest, "x", 1 << 20, max_entries).map(|_| dest)
+    }
+
+    #[test]
+    fn the_hostile_zip_corpus_is_refused() {
+        let good = zip_of(&[
+            ("bin/tool", b"#!/bin/sh\n", 0o100755),
+            ("bin/alias", b"tool", 0o120777),
+        ]);
+        let out = unpack_zip_bytes(&good, "zip-good", 100).unwrap();
+        assert!(out.join("bin/tool").is_file());
+        assert!(out.join("bin/alias").is_symlink());
+        let big = vec![0u8; (1 << 20) + 1];
+        let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+            ("zip-dotdot", zip_of(&[("../evil", b"x", 0o100644)]), "`..`"),
+            (
+                "zip-absolute",
+                zip_of(&[("/tmp/evil", b"x", 0o100644)]),
+                "absolute",
+            ),
+            (
+                "zip-link-out",
+                zip_of(&[("a", b"../../etc", 0o120777)]),
+                "leaves the folder",
+            ),
+            (
+                "zip-link-abs",
+                zip_of(&[("a", b"/etc", 0o120777)]),
+                "leaves the folder",
+            ),
+            ("zip-big", zip_of(&[("big", &big, 0o100644)]), "unpacked"),
+        ];
+        for (label, bytes, why) in cases {
+            let err = unpack_zip_bytes(&bytes, label, 100).unwrap_err();
+            assert!(err.contains(why), "{label}: {err}");
+        }
+        // Too many, refused by the count before the first is written.
+        let names: Vec<String> = (0..11).map(|i| format!("f{i}")).collect();
+        let many: Vec<(&str, &[u8], u32)> = names
+            .iter()
+            .map(|n| (n.as_str(), &b"x"[..], 0o100644))
+            .collect();
+        let dir = temp("zip-many");
+        let archive = dir.join("a.zip");
+        std::fs::write(&archive, zip_of(&many)).unwrap();
+        let dest = dir.join("out");
+        let err = unpack(&archive, "zip", &dest, "x", 1 << 20, 10).unwrap_err();
+        assert!(err.contains("entries"), "{err}");
+        assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_second_entry_of_the_same_name_is_refused() {
+        // Never over a file already unpacked (`O_EXCL`), whatever the case
+        // of its name on a case-insensitive filesystem.
+        let twice = tar_of(&[
+            ("bin/x", tar::EntryType::Regular, b"one", ""),
+            ("bin/x", tar::EntryType::Regular, b"two", ""),
+        ]);
+        let err = unpack_bytes(&twice, "dup").unwrap_err();
+        assert!(err.contains("exists"), "{err}");
+        let dir = temp("case-probe");
+        std::fs::write(dir.join("Probe"), b"").unwrap();
+        if dir.join("probe").exists() {
+            let cased = tar_of(&[
+                ("Bin/x", tar::EntryType::Regular, b"one", ""),
+                ("bin/x", tar::EntryType::Regular, b"two", ""),
+            ]);
+            let err = unpack_bytes(&cased, "case").unwrap_err();
+            assert!(err.contains("exists"), "{err}");
+        }
+    }
+
+    #[test]
+    fn an_unpack_never_takes_the_last_free_gigabyte() {
+        assert_eq!(unpack_limit(None), UNPACKED_MAX);
+        assert_eq!(unpack_limit(Some(100 << 30)), UNPACKED_MAX);
+        assert_eq!(unpack_limit(Some(FREE_AFTER_MIN + (300 << 20))), 300 << 20);
+        assert_eq!(unpack_limit(Some(FREE_AFTER_MIN / 2)), 0);
     }
 
     #[test]

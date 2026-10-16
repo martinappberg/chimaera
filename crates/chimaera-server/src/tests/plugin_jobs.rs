@@ -486,3 +486,182 @@ async fn a_tools_folder_setting_moves_where_tools_install() {
         .is_file());
     let _ = std::fs::remove_dir_all(&elsewhere);
 }
+
+/// A guest call in flight on a build an update replaced, or in a workspace
+/// the plugin was just switched off in, can't start a job (D5).
+#[tokio::test]
+async fn a_job_starts_only_for_the_current_build_where_it_is_on() {
+    let (state, ws) = jobs_workspace("jobs-current").await;
+    let m = crate::plugins::test_catalog::privileged();
+    let spec = r#"{"program": "echo", "args": ["hi"]}"#;
+    let mut stale = (*m).clone();
+    stale.wasm.sha256 = std::sync::Arc::from("0".repeat(64));
+    let err = crate::plugins::jobs::start(&state, &std::sync::Arc::new(stale), &ws, spec)
+        .await
+        .unwrap_err();
+    assert!(err.contains("was updated"), "{err}");
+    switch(&state, &ws, false).await;
+    let err = crate::plugins::jobs::start(&state, &m, &ws, spec)
+        .await
+        .unwrap_err();
+    assert!(err.contains("not switched on"), "{err}");
+}
+
+/// An update whose build no longer declares a program stops that program's
+/// running job; a job of a program it still declares keeps going (D6).
+#[tokio::test]
+async fn an_update_that_drops_a_program_stops_its_jobs() {
+    let state = test_state();
+    let src = test_dir("jobs-update-src");
+    let toml = crate::plugins::test_catalog::dist_test_text("test-privileged/plugin.toml");
+    std::fs::write(src.join("plugin.toml"), &toml).unwrap();
+    std::fs::write(
+        src.join("plugin.wasm"),
+        crate::plugins::test_catalog::dist_test_bytes("test-privileged/plugin.wasm"),
+    )
+    .unwrap();
+    let install = || {
+        request_trusting(
+            &state,
+            Method::POST,
+            "/api/v1/plugins/install",
+            Some(json!({"path": src})),
+        )
+    };
+    let (status, body) = install().await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ws = make_workspace(&state, "jobs-update").await;
+    switch(&state, &ws, true).await;
+    let dropped = act(&state, &ws, "slow", Value::Null).await.unwrap();
+    let kept = act(
+        &state,
+        &ws,
+        "spec",
+        json!({"program": "sh", "args": ["-c", "sleep 30"], "wall_s": 30}),
+    )
+    .await
+    .unwrap();
+    let job = state.plugin_platform.jobs.get(&dropped).unwrap();
+    let started = Instant::now();
+    while job.json()["state"] != "running" {
+        assert!(started.elapsed() < Duration::from_secs(10));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let next = toml
+        .replacen("version = \"0.1.0\"", "version = \"0.1.1\"", 1)
+        .replace("[[programs]]\nname = \"sleep\"\n\n", "");
+    assert!(!next.contains("\"sleep\""), "{next}");
+    std::fs::write(src.join("plugin.toml"), &next).unwrap();
+    let (status, body) = install().await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let updated = Instant::now();
+    while !job.is_done() {
+        assert!(
+            updated.elapsed() < Duration::from_secs(10),
+            "the dropped program's job kept running"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(job.json()["cancelled"], true);
+    let kept = state.plugin_platform.jobs.get(&kept).unwrap();
+    assert!(!kept.is_done(), "{}", kept.json());
+    switch(&state, &ws, false).await;
+}
+
+/// A tool's setup step is reachable like a job: a block, an untrust or a
+/// remove (`cancel_where`) stops its process group, and a build that is no
+/// longer current never starts one (D7).
+#[tokio::test]
+async fn a_tool_setup_step_stops_with_its_plugin() {
+    let (state, _ws) = jobs_workspace("jobs-setup-stop").await;
+    let m = crate::plugins::test_catalog::privileged();
+    let dir = test_dir("jobs-setup-stop-tool");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let script = bin.join("slow-setup");
+    std::fs::write(&script, "#!/bin/sh\necho $$ > \"$1\"\nexec sleep 30\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let pid_file = dir.join("setup.pid");
+    let args = vec![pid_file.to_string_lossy().into_owned()];
+    let step = {
+        let (state, m, bin, dir, args) = (
+            state.clone(),
+            m.clone(),
+            bin.clone(),
+            dir.clone(),
+            args.clone(),
+        );
+        tokio::spawn(async move {
+            crate::plugins::jobs::run_setup(&state, &m, &bin, &dir, "slow-setup", &args).await
+        })
+    };
+    let started = Instant::now();
+    let pid: i32 = loop {
+        if let Some(pid) = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|t| t.trim().parse().ok())
+        {
+            break pid;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the setup step never ran"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    crate::plugins::jobs::cancel_where(&state, PID, None);
+    let ended = tokio::time::timeout(Duration::from_secs(8), step)
+        .await
+        .expect("the setup step outlived its plugin's cancel")
+        .unwrap();
+    let err = ended.unwrap_err();
+    assert!(err.contains("stopped"), "{err}");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while running(pid) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!running(pid), "the setup step's process {pid} outlived it");
+    let mut stale = (*m).clone();
+    stale.wasm.sha256 = std::sync::Arc::from("0".repeat(64));
+    let err = crate::plugins::jobs::run_setup(&state, &stale, &bin, &dir, "slow-setup", &args)
+        .await
+        .unwrap_err();
+    assert!(err.contains("was updated"), "{err}");
+}
+
+/// A slow login shell: the job start inside a guest call is abandoned at
+/// the call's budget, yet the capture finishes and is cached, so a later
+/// start finds it (D8).
+#[tokio::test]
+async fn a_login_environment_capture_outlives_a_caller_that_gave_up() {
+    let state = test_state();
+    state
+        .plugin_platform
+        .jobs
+        .set_capture_delay_for_tests(Duration::from_millis(1500));
+    let gave_up = tokio::time::timeout(
+        Duration::from_millis(200),
+        crate::plugins::jobs::login_env(&state, None),
+    )
+    .await;
+    assert!(gave_up.is_err());
+    // Every later try gives up sooner than one capture takes: only a
+    // capture that outlived its caller can answer one.
+    let started = Instant::now();
+    let env = loop {
+        let attempt = tokio::time::timeout(
+            Duration::from_millis(300),
+            crate::plugins::jobs::login_env(&state, None),
+        )
+        .await;
+        if let Ok(env) = attempt {
+            break env.unwrap();
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(25),
+            "the abandoned capture was never cached"
+        );
+    };
+    assert!(env.iter().any(|(k, _)| k == "PATH"));
+}
