@@ -7,7 +7,7 @@ The rules every driver shares, and the normalized events whose meaning is the sa
 - One normalized event model (`model.rs`, ACP-shaped); drivers translate.
 - Caps apply at event construction, not at sinks (login-node budgets).
 - A handshake watchdog is mandatory per driver. A failed launch never switches to a PTY automatically (2026-10-01; see [Startup lifecycle](#startup-lifecycle)).
-- An agent→client request that no handler knows is never shown as a permission card, and the user hears about it once per kind: a Notice and a daemon `warn`. Both drivers share `UNHANDLED_REQUESTS_CAP` (64 names remembered) and `UNHANDLED_REQUEST_NAME_MAX` (80 chars in a notice or reply), in `model.rs`. Claude's control requests are parked, because the CLI's deadline or another attached client settles them and an error reply could break flows that rely on that. Codex's JSON-RPC requests get a `-32601` error, because nothing else would answer them. ACP refuses an unsupported client method with `-32601` too (Pass 34; 2026-10-14).
+- An agent→client request that no handler knows is never shown as a permission card, and the user hears about it once per kind: a Notice and a daemon `warn`. The Claude and Codex drivers share `UNHANDLED_REQUESTS_CAP` (64 names remembered) and `UNHANDLED_REQUEST_NAME_MAX` (80 chars in a notice or reply), in `model.rs`. Claude's control requests are parked, because the CLI's deadline or another attached client settles them and an error reply could break flows that rely on that. Codex's JSON-RPC requests get a `-32601` error, because nothing else would answer them. ACP refuses an unsupported client method with `-32601` too (Pass 34; 2026-10-14).
 - Model switches emit only `ModelSwitched`, never a second process `Init`. `Init` is a complete driver-process snapshot that expires stale asks; the UI reducer treats every real `Init` as authoritative, and absent optional fields clear the prior process snapshot (Pass 26).
 - Every daemon↔UI addition is additive and pinned in `tests/wire_contract.rs`; defaults serialize to nothing, so old journals replay byte-identically (Pass 8 and later).
 
@@ -74,7 +74,7 @@ Recorded 2026-07-10. That blockage usually happened below chimaera's event layer
 
 ## Interrupt watchdog
 
-Recorded 2026-07-11 (Pass 11).
+Recorded 2026-07-11 (Pass 11, claude 2.1.206 / codex 0.142.5; the `was_active` guard re-verified at every later pin).
 
 - Interrupt-when-idle is a no-op on both native wires: claude's `interrupt` acks nothing about the turn, and codex answers "no active turn to interrupt". A turn wedged with no end had no escape.
 - `AgentCommand::Interrupt` arms a grace deadline counted down on the harness `tick` (`INTERRUPT_GRACE_TICKS`, 1.5 s of `COALESCE_INTERVAL_MS` = 100 ms ticks, `driver.rs`). If it expires with a turn still open, the mapper synthesizes `TurnAborted {reason:"interrupted", interrupted:true}` and clears turn state. It is idle-guarded.

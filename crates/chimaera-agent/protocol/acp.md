@@ -1,6 +1,6 @@
 # ACP v1: Grok Build, Google Antigravity and Cursor CLI
 
-The current contract of the shared ACP adapter (`src/acp.rs`). The pins are `TESTED_GROK_VERSION`, `TESTED_AGY_VERSION` and `TESTED_CURSOR_VERSION`; the live gate is `just chat-smoke-acp`. Each fact names the pass or date and the agent version where it was recorded, for example "(Pass 45, grok 1.0.46)". The dated record is [passes.md](passes.md); the shared rules are in [cross-agent.md](cross-agent.md).
+The current contract of the shared ACP adapter (`src/acp.rs`). The pins are `TESTED_GROK_VERSION`, `TESTED_AGY_VERSION` and `TESTED_CURSOR_VERSION`; the live gate is `just chat-smoke-acp`. Each fact names the pass or date and the agent version where it was recorded, for example "(Pass 45, grok 1.0.46)". A fact tagged "(2026-10-01)" alone was recorded at Grok Build 1.0.46 and agy-acp 1.2.1, the 2026-10-01 live probe. The dated record is [passes.md](passes.md); the shared rules are in [cross-agent.md](cross-agent.md).
 
 ## Runtimes and launch
 

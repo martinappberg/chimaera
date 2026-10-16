@@ -26,4 +26,4 @@ Depth: [chimaera-agent/AGENTS.md](../../crates/chimaera-agent/AGENTS.md) and the
   asymmetries have been real bugs.
 - **Bounded allocations at event construction** (`model.rs` caps) so a giant tool
   input never reaches the journal, ring, or a client.
-- **argv lives in `launcher.rs`, not in drivers or `chat.rs`.**
+- **argv is assembled in `launcher.rs`, never in `chat.rs`.** A driver contributes only its protocol flags (`claude::chat_args`); the binary, model, resume, settings and MCP arguments are the launcher's.

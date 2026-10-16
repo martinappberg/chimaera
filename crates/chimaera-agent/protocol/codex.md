@@ -103,7 +103,7 @@ Recorded at codex 0.159.3 (2026-10-03).
 - UI wording: "Yes" / "Yes, and don't ask again this session" / "Yes, and don't ask again for commands that start with {cmd}" (Pass 2, vsix).
 - `item/permissions/requestApproval {threadId, turnId, itemId, environmentId, startedAtMs, cwd, reason?, permissions: {network:{enabled}|null, fileSystem:{read[]|null, write[]|null}|null}}` → `{permissions: GrantedPermissionProfile, scope: "turn"|"session", strictAutoReview?}`, not the `{decision}` union. Allow for turn / for session echo the requested profile; Deny grants `{}` for the turn and is recognized by option id, so deny-with-feedback steers the reason (Pass 30, schema 0.153.0). Live emission is not yet observed.
 - Decline has no message field, so a decline with feedback answers `{"decision":"decline"}` and then delivers the reason into the running turn through `turn/steer` (`dispatch_input`). Its ack is final: it is never parked as unread or re-driven, so a Stop right after a deny-with-feedback starts no new turn; a refusal while the turn runs is an Error notice (Pass 9; Pass 38).
-- Mode table (UI → wire). `permissions` (a profile id) and `sandboxPolicy` are mutually exclusive on the wire; chimaera sends profiles (Pass 4; Pass 18; Pass 20; Pass 26):
+- Mode table (UI → wire). `permissions` (a profile id) and `sandboxPolicy` are mutually exclusive on the wire; chimaera sends profiles (Pass 4; Pass 18, codex 0.144.2; Pass 20; Pass 26):
 
 | Mode | `permissions` | `approvalPolicy` | `approvalsReviewer` | collaboration mode |
 |---|---|---|---|---|
