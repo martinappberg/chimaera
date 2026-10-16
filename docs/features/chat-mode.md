@@ -489,10 +489,10 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   keeps that historical page stable until the reader returns to newest; merely scrolling within the
   live tail does not freeze it. Visible tail rows point directly at the reducer's reactive blocks, so a
   streamed delta updates its own row instead of cloning/repainting the whole window. The tail keeps
-  rendering while the reader scrolls or types. A non-empty composer draft or attachment pauses only
-  auto-follow; incoming events extend the bounded tail behind a source-row anchor and surface as “new
-  activity” rather than moving the text box or reading position while the user types. Submitting is an
-  explicit return to the live edge, so the sent/queued bubble and its reply stay visible.
+  rendering while the reader scrolls or types. Following depends only on where the reader is: at the
+  bottom, the chat keeps following new output while a draft is being typed; scrolled up (to look at an
+  earlier reply while answering it), it stays put and new output surfaces as “new activity”.
+  Submitting is an explicit return to the live edge, so the sent/queued bubble and its reply stay visible.
 - **Tab lifecycle.** Recently viewed chat tabs retain only that bounded rendered page in the pane's
   live set. A visible page uses live reducer references; hiding it takes one plain-data transcript
   snapshot plus snapshots of plan/subagent/background/permission/question/queued-send chrome, and
@@ -630,8 +630,9 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   Claude's Task family, TodoWrite or chimaera's `update_plan`, Codex's `update_plan`, an ACP plan all
   arrive as the one `plan` level-set. Rows update in place (keyed by the agent's id, else position) and never reorder; a
   long plan scrolls inside the card, which keeps the step in flight in view by moving only its own
-  scroll. Once the turn ends with every step done the card leaves — ChatView unmounts it (the desktop apps keep a
-  finished list only in the transcript, never pinned); while steps are open, the corner count +
+  scroll. A step that finishes draws its tick. Once the turn ends with every step done the card folds to one line
+  ("4 tasks done") so the finished plan can still be glanced at, and folds away when the agent moves on — the next
+  turn that starts without changing the plan, or a new plan, which takes its place; while steps are open, the corner count +
   chevron (`2/4 ⌄`) folds it to one line or unfolds it at any time (the automatic state wins again
   when it next changes). The workspace dashboard card follows the same rule —
   live tasks first, finished ones as a count — so it never fills with ✓ while hiding the work in

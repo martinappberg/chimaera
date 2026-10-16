@@ -67,6 +67,7 @@
   import type { PendingElicitation } from "./elicitation";
   import PlanApprovalCard from "./PlanApprovalCard.svelte";
   import PlanCard from "./PlanCard.svelte";
+  import { planShows } from "./planCard";
   import WakeRequestBar from "./WakeRequestBar.svelte";
   import { commsStore, wakeRequestFor } from "../workspace/comms.svelte";
   import QuestionCard from "./QuestionCard.svelte";
@@ -348,7 +349,9 @@
   let anchorSettled = true;
   // svelte-ignore state_referenced_locally
   let followedVersion = $state(chatFollowedVersion(chatId) ?? -1);
-  /** A non-empty draft pauses bottom-following, never transcript rendering. */
+  /** A non-empty draft: a Mod never takes focus from it. Following is the
+   *  reader's position alone — typing at the bottom keeps the live edge in
+   *  view (maintainer, 2026-10-15); only scrolling up leaves it. */
   let composerEngaged = $state(false);
   /** An explicit history page is stable. Ordinary scrolling inside a tail page
    *  keeps streaming until retaining the reader would exceed the DOM cap.
@@ -874,7 +877,6 @@
     const version = store.transcriptVersion;
     const trimmed = store.trimmedCount;
     const following = atBottom;
-    const drafting = composerEngaged;
     untrack(() => {
       const structural = store.structuralVersion;
       if (renderReady && store.epoch !== renderedEpoch) {
@@ -954,11 +956,11 @@
           // settle the unread stamp: an in-place chunk landing in the same
           // flush as the hide is IN the snapshot but was never marked
           // followed, and nothing after this would heal the phantom chip.
-          if (following && !drafting) markFollowed(version);
+          if (following) markFollowed(version);
           return;
         }
         const next = advanceTailWindow({ start: renderStart, end: renderEnd }, total);
-        if (following && !drafting) {
+        if (following) {
           setRange(next.start, next.end, { live: true, tail: true });
           markFollowed(version);
         } else if (canDiscardBefore(next.start)) {
@@ -975,7 +977,6 @@
         tracksTail &&
         (version !== renderedVersion || structural !== renderedStructural)
       ) {
-        if (drafting && version !== renderedVersion && atBottom) atBottom = false;
         const next = advanceTailWindow({ start: renderStart, end: renderEnd }, total);
         if (structural === renderedStructural) {
           // In-place chunk growth: the row set is unchanged. The live proxy
@@ -986,8 +987,8 @@
           } else {
             renderedVersion = version;
           }
-          if (following && !drafting) markFollowed(version);
-        } else if (following && !drafting) {
+          if (following) markFollowed(version);
+        } else if (following) {
           setRange(next.start, next.end, { live: true, tail: true });
           markFollowed(version);
         } else if (canDiscardBefore(next.start)) {
@@ -1136,11 +1137,11 @@
       followAfterTick = false;
       const forced = forceFollow;
       forceFollow = false;
-      if (!visible || (!forced && (!atBottom || composerEngaged))) return;
+      if (!visible || (!forced && !atBottom)) return;
       followFrame = requestAnimationFrame(() => {
         followFrame = null;
         const el = transcriptEl;
-        if (el === null || (!forced && (!atBottom || composerEngaged))) return;
+        if (el === null || (!forced && !atBottom)) return;
         // This writer owns the position anyway, so it keeps the spacer sized
         // for the reader's first scroll up into history.
         rebalanceSpacer(true);
@@ -1451,14 +1452,14 @@
   }
 
   // Stick to the bottom while new content streams, unless the reader scrolled
-  // up or is composing. `lastSeq` catches in-place chunk/tool updates; every
-  // request is coalesced by queueBottomScroll above.
+  // up. `lastSeq` catches in-place chunk/tool updates; every request is
+  // coalesced by queueBottomScroll above.
   $effect(() => {
     void store.blocks.length;
     void store.pending.length;
     void store.elicitations.length;
     void store.lastSeq;
-    if (!visible || store.hydrating || !renderReady || !atBottom || composerEngaged) return;
+    if (!visible || store.hydrating || !renderReady || !atBottom) return;
     queueBottomScroll();
   });
 
@@ -1487,18 +1488,14 @@
       const shrunk = viewportHeight - height;
       viewportHeight = height;
       if (atBottom) {
-        if (!composerEngaged) queueBottomScroll();
-        else if (
-          shrunk > 0 ||
-          (shrunk < 0 && transcript.scrollHeight - transcript.scrollTop - height >= 1)
-        ) {
-          // A draft pauses following new rows, not the viewport's bottom
-          // edge: a composer growing a line keeps the lines above it in view.
-          // A growing viewport flush with the end was already clamped by
-          // layout; shifting it again would open a gap under the newest line.
+        if (shrunk > 0) {
+          // The composer grew a line (or a tray opened): keep the bottom edge
+          // in this frame, before paint, so the newest line never dips behind
+          // the composer for the frame the follow writer below waits out.
           transcript.scrollTop += shrunk;
           lastScrollTop = transcript.scrollTop;
         }
+        queueBottomScroll();
       } else if (readingAnchor === null) {
         pinReadingAnchor();
       } else {
@@ -2288,6 +2285,7 @@
   let pinnedAgents = $state.raw<ActiveAgent[]>([]);
   let pinnedBackgroundTasks = $state.raw<BackgroundTask[]>([]);
   let pinnedPlan = $state.raw<PlanEntry[]>([]);
+  let pinnedPlanTouched = $state(false);
   let pinnedPermissions = $state.raw<PendingPermission[]>([]);
   let pinnedQuestions = $state.raw<PendingQuestion[]>([]);
   let pinnedElicitations = $state.raw<PendingElicitation[]>([]);
@@ -2298,6 +2296,7 @@
         pinnedAgents = $state.snapshot(liveActiveAgents);
         pinnedBackgroundTasks = $state.snapshot(store.backgroundTasks);
         pinnedPlan = $state.snapshot(store.plan);
+        pinnedPlanTouched = store.planTouched;
         pinnedPermissions = $state.snapshot(store.pending);
         pinnedQuestions = $state.snapshot(store.questions);
         pinnedElicitations = $state.snapshot(store.elicitations);
@@ -2308,15 +2307,12 @@
     pinnedAgents = liveActiveAgents;
     pinnedBackgroundTasks = store.backgroundTasks;
     pinnedPlan = store.plan;
+    pinnedPlanTouched = store.planTouched;
     pinnedPermissions = store.pending;
     pinnedQuestions = store.questions;
     pinnedElicitations = store.elicitations;
     pinnedSends = store.pendingSends;
   });
-  /** Every step done: the card has nothing left to follow once the turn ends. */
-  const planAllDone = $derived(
-    pinnedPlan.length > 0 && pinnedPlan.every((p) => p.status === "done"),
-  );
   /** Another agent's message waiting on the user to wake this one (rare,
    *  and read from the workspace's comms store, so it is not frozen with
    *  the pinned cards while hidden). */
@@ -2324,6 +2320,11 @@
   const wakeFailure = $derived(
     readOnly ? null : (commsStore.wakeFailures.find((f) => f.request.to_sid === session.id) ?? null),
   );
+  /** Live while visible: it has to flip in the same render as `agentBusy`
+   *  (both change at `turn_started`), or a retiring card unfolds for a frame
+   *  and its outro freezes it that way. The snapshot while hidden. */
+  const planTouched = $derived(visible ? store.planTouched : pinnedPlanTouched);
+  const showPlan = $derived(planShows(pinnedPlan, planTouched));
 
   const jumpLabel = $derived(
     followedVersion !== store.transcriptVersion
@@ -3015,7 +3016,7 @@
             embeds={proseEmbeds}
             {hoverTargets}
             onReveal={() => {
-              if (visible && atBottom && !composerEngaged) queueBottomScroll();
+              if (visible && atBottom) queueBottomScroll();
             }}
           />
           {/snippet}
@@ -3357,12 +3358,14 @@
     />
   {/if}
 
-  <!-- The card is for the plan in flight: once the turn ends with every
-       step done it has nothing left to follow, so it leaves (the desktop
-       apps keep a finished list only in the transcript, never pinned). A
-       plan with open steps stays through the idle gap for the next turn. -->
-  {#if pinnedPlan.length > 0 && !(planAllDone && !agentBusy)}
-    <PlanCard entries={pinnedPlan} running={agentBusy} {visible} />
+  <!-- The card is for the plan in flight and the one just finished: a
+       finished plan folds to "n tasks done" and folds away when the agent
+       moves on; a plan with open steps stays through the idle gap for the
+       next turn. -->
+  {#if showPlan}
+    <!-- Running means running for THIS plan: a turn that hasn't touched a
+         finished one must not unfold it while it folds away. -->
+    <PlanCard entries={pinnedPlan} running={agentBusy && planTouched} {visible} />
   {/if}
 
   {#if wakeRequest !== null || wakeFailure !== null}

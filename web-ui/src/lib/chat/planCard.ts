@@ -56,6 +56,14 @@ export function planFolds(entries: readonly PlanEntry[], running: boolean): bool
   return !running && planProgress(entries).allDone;
 }
 
+/** Whether the pinned card shows the plan: one with open steps always (it
+ *  stays through the idle gap for the next turn); a finished one only while
+ *  the latest turn touched it — to be glanced at, folded, until the agent
+ *  moves on (maintainer, 2026-10-15). */
+export function planShows(entries: readonly PlanEntry[], touched: boolean): boolean {
+  return entries.length > 0 && (touched || !planProgress(entries).allDone);
+}
+
 /** The folded line: the step in flight, else what is next, else the tally. */
 export function planSummary(entries: readonly PlanEntry[]): string {
   const p = planProgress(entries);

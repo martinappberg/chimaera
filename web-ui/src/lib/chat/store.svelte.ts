@@ -588,6 +588,12 @@ function catalogRows(value: unknown, key: string): Record<string, unknown>[] {
   });
 }
 
+/** A plan's steps and their states — what the agent changing its plan
+ *  means, without the detail fields a resync may fill in or drop. */
+function planSteps(plan: readonly PlanEntry[]): string {
+  return JSON.stringify(plan.map((e) => [e.id, e.content, e.status]));
+}
+
 export class ChatStore {
   blocks = $state<ChatBlock[]>([]);
   pending = $state<PendingPermission[]>([]);
@@ -596,6 +602,10 @@ export class ChatStore {
   questions = $state<PendingQuestion[]>([]);
   elicitations = $state<PendingElicitation[]>([]);
   plan = $state<PlanEntry[]>([]);
+  /** The plan changed since the latest turn started. A finished plan stays
+   *  pinned (folded) while this holds; the next turn that starts without
+   *  touching it means the agent moved on, and the card lets it go. */
+  planTouched = $state(false);
   initialized = $state(false);
   startupDetail = $state<string | null>(null);
   model = $state<string | null>(null);
@@ -930,6 +940,7 @@ export class ChatStore {
     // (or a stuck "running") must not outlive the reset; the replay rebuilds
     // whatever is genuinely current.
     this.plan = [];
+    this.planTouched = false;
     this.backgroundTasks = [];
     this.running = false;
     this.compacting = false;
@@ -1262,6 +1273,7 @@ export class ChatStore {
       case "turn_started":
         this.turnStartedAt = entry.ts;
         this.running = true;
+        this.planTouched = false;
         this.activity = { kind: "waiting", detail: "starting" };
         this.turnTokens = 0;
         this.activityLine = null;
@@ -1454,12 +1466,12 @@ export class ChatStore {
         block.streaming = !terminal;
         break;
       }
-      case "plan":
+      case "plan": {
         // LEVEL-SET, like background_tasks: every Plan carries the whole list,
         // so replace. Mapped field-by-field (not cast) because the rich fields
         // are omitted entirely by older journals, TodoWrite, and codex — the
         // panel reads `blockedBy.length`, which must never be undefined.
-        this.plan = ((ev.entries as Record<string, unknown>[]) ?? [])
+        const next: PlanEntry[] = ((ev.entries as Record<string, unknown>[]) ?? [])
           .map((e) => ({
             content: (e.content as string) ?? "",
             status: (e.status as PlanEntry["status"]) ?? "todo",
@@ -1474,7 +1486,13 @@ export class ChatStore {
           // reworded TaskList line parsed twice, a journal from another build)
           // would throw and take the whole view down.
           .filter((e, i, arr) => e.id === null || arr.findIndex((o) => o.id === e.id) === i);
+        // Touched means the steps or their states changed: a re-sent list
+        // (a TaskList read, a repeated update_plan, a detail line filled in)
+        // is not this turn's work.
+        if (planSteps(next) !== planSteps(this.plan)) this.planTouched = true;
+        this.plan = next;
         break;
+      }
       case "permission_request": {
         const requestId = (ev.request_id as string) ?? "";
         if (requestId === "") break;
@@ -1833,6 +1851,7 @@ export class ChatStore {
           this.promptSuggestion = null;
           this.clearFatal();
           this.plan = [];
+          this.planTouched = false;
           this.exited = null;
           this.degraded = false;
         }

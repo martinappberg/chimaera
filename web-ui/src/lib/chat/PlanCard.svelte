@@ -1,5 +1,7 @@
 <script lang="ts">
   import { tick } from "svelte";
+  import { cubicOut } from "svelte/easing";
+  import { slide } from "svelte/transition";
   import Chevron from "../shared/Chevron.svelte";
   import type { PlanEntry } from "./store.svelte";
   import {
@@ -21,7 +23,8 @@
    * same level-set (`store.plan`), so this card is the same for all of them.
    * Rows update in place (keyed by the agent's id, else position) and the
    * card never reorders; a finished plan folds to one line once its turn
-   * ends, one click from its steps.
+   * ends, one click from its steps, and leaves (folding away) when the agent
+   * moves on — the host unmounts it.
    */
   interface Props {
     entries: PlanEntry[];
@@ -74,6 +77,69 @@
     });
   });
 
+  /** Motion only where someone can see it: a hidden tab or reduced motion
+   *  gets the end state at once. */
+  const animates = () =>
+    visible && !(typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches);
+
+  /** The agent moved on: the card folds away instead of vanishing. */
+  function leave(node: HTMLElement) {
+    if (!animates()) return { duration: 0 };
+    const fold = slide(node, { duration: 260, easing: cubicOut });
+    return { ...fold, css: (t: number, u: number) => `${fold.css?.(t, u) ?? ""};opacity: ${t * t}` };
+  }
+
+  /** A step just finished: the filled circle grows in and the tick draws.
+   *  Local, so a card mounting with finished steps (a reopened chat) stays
+   *  still — only a step finishing in view moves. */
+  function fillIn(_node: Element) {
+    if (!animates()) return { duration: 0 };
+    return {
+      duration: 220,
+      easing: cubicOut,
+      css: (t: number) => `transform: scale(${0.55 + 0.45 * t}); opacity: ${t}`,
+    };
+  }
+  function drawTick(_node: Element) {
+    if (!animates()) return { duration: 0 };
+    return { delay: 90, duration: 240, easing: cubicOut, css: (_t: number, u: number) => `stroke-dashoffset: ${(9.2 * u).toFixed(2)}` };
+  }
+
+  /** Fold and unfold resize the card: animate its height from what it was
+   *  to what it became (measured before and after the DOM update), so the
+   *  steps fold into the summary line instead of snapping. */
+  let card = $state<HTMLElement | undefined>();
+  let heightBefore = 0;
+  let heightMotion: Animation | null = null;
+  $effect.pre(() => {
+    void folded;
+    heightBefore = card?.offsetHeight ?? 0;
+  });
+  $effect(() => {
+    void folded;
+    const el = card;
+    const from = heightBefore;
+    heightBefore = 0;
+    if (el === undefined || from === 0 || !animates()) return;
+    const to = el.offsetHeight;
+    if (Math.abs(to - from) < 2) return;
+    // One at a time, from wherever the last one had got to (the measure
+    // above read its animated height); only the latest unclips the card.
+    heightMotion?.cancel();
+    // Clipped only while it moves: at rest the card's focus rings show.
+    el.style.overflow = "hidden";
+    const motion = el.animate([{ height: `${from}px` }, { height: `${to}px` }], {
+      duration: 240,
+      easing: "cubic-bezier(0.2, 0, 0, 1)",
+    });
+    heightMotion = motion;
+    motion.onfinish = motion.oncancel = () => {
+      if (heightMotion !== motion) return;
+      heightMotion = null;
+      el.style.removeProperty("overflow");
+    };
+  });
+
   const MARK_WORD: Record<StepMark, string> = {
     done: "done",
     current: "in progress",
@@ -85,15 +151,22 @@
 {#snippet circle(mark: StepMark)}
   <svg class="mark {mark}" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
     {#if mark === "done"}
-      <circle cx="8" cy="8" r="7" class="fill" />
-      <path d="M4.9 8.3l2.1 2.1 4.1-4.5" class="tick" />
+      <circle cx="8" cy="8" r="7" class="fill" in:fillIn />
+      <path d="M4.9 8.3l2.1 2.1 4.1-4.5" class="tick" in:drawTick />
     {:else}
       <circle cx="8" cy="8" r="6.25" class="ring" />
     {/if}
   </svg>
 {/snippet}
 
-<section class="plan-card pinned-card" class:visible class:folded aria-label="plan">
+<section
+  class="plan-card pinned-card"
+  class:visible
+  class:folded
+  aria-label="plan"
+  bind:this={card}
+  out:leave
+>
   <!-- The toggle is a flex column of its own at the card's right, so no row —
        first, scrolled-to, or "12/15" wide — ever runs under it. -->
   <button
@@ -251,6 +324,8 @@
   }
   .mark.done .fill {
     fill: var(--accent);
+    transform-box: fill-box;
+    transform-origin: center;
   }
   .mark.done .tick {
     fill: none;
@@ -258,6 +333,8 @@
     stroke-width: 1.7;
     stroke-linecap: round;
     stroke-linejoin: round;
+    /* The path's length, so the finishing tick can draw itself. */
+    stroke-dasharray: 9.2;
   }
   .body {
     display: flex;

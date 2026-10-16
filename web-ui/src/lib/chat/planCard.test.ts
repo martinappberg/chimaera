@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { SeqEvent } from "./chatWs";
 import {
   planFolds,
+  planShows,
   planProgress,
   planSummary,
   stepDetail,
@@ -122,5 +123,40 @@ describe("the plan card's reading of every runtime's plan", () => {
     expect(stepDetail(write)).toBe("Summarize failures");
     expect(stepDetail({ ...write, description: "Write the report" })).toBeNull();
     expect(planFolds([], false)).toBe(false);
+  });
+
+  it("a finished plan belongs to the turn that touched it", () => {
+    const finished = {
+      type: "plan",
+      entries: [
+        { content: "a", status: "done" },
+        { content: "b", status: "done" },
+      ],
+    };
+    const firstTurn = [
+      { type: "turn_started", turn_id: "t1" },
+      { type: "plan", entries: [{ content: "a", status: "in_progress" }, { content: "b", status: "todo" }] },
+      finished,
+    ];
+    expect(fold(firstTurn).planTouched).toBe(true);
+    // The next turn starts without touching it: the card must not reopen it.
+    const next = [...firstTurn, { type: "turn_completed", turn_id: "t1", usage: {} }, { type: "turn_started", turn_id: "t2" }];
+    expect(fold(next).planTouched).toBe(false);
+    // Re-sending the same steps (a TaskList read, a detail filled in) is not
+    // new work.
+    expect(fold([...next, finished]).planTouched).toBe(false);
+    const detailed = { ...finished, entries: finished.entries.map((e) => ({ ...e, description: "more" })) };
+    expect(fold([...next, detailed]).planTouched).toBe(false);
+    // A new plan is.
+    expect(fold([...next, { type: "plan", entries: [{ content: "c", status: "in_progress" }] }]).planTouched).toBe(true);
+  });
+
+  it("the card shows an open plan always and a finished one only while touched", () => {
+    const open: PlanEntry[] = fold([{ type: "plan", entries: [{ content: "a", status: "done" }, { content: "b", status: "todo" }] }]).plan;
+    const done: PlanEntry[] = fold([{ type: "plan", entries: [{ content: "a", status: "done" }] }]).plan;
+    expect(planShows(open, false)).toBe(true);
+    expect(planShows(done, true)).toBe(true);
+    expect(planShows(done, false)).toBe(false);
+    expect(planShows([], true)).toBe(false);
   });
 });
