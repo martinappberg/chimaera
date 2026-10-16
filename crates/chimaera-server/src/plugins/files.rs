@@ -54,6 +54,8 @@ enum Seen {
     At(u64, u64),
 }
 
+type FileKey = (String, String, String);
+
 #[derive(Default)]
 pub(crate) struct Files {
     /// Changes waiting for the worker: (workspace, relative path, saved).
@@ -62,7 +64,7 @@ pub(crate) struct Files {
     saved: HashMap<String, Instant>,
     /// (plugin, workspace, file) → when to deliver, and whether a save is
     /// among the changes.
-    pending: HashMap<(String, String, String), (Instant, bool)>,
+    pending: HashMap<FileKey, (Instant, bool)>,
     /// (plugin, workspace) → its watch set and what the sweep last saw.
     watches: HashMap<(String, String), HashMap<String, Seen>>,
     /// Viewed files the sweep saw (plugin, workspace) → path → stat.
@@ -72,6 +74,19 @@ pub(crate) struct Files {
 }
 
 impl Files {
+    fn take_due(&mut self, now: Instant) -> Vec<(FileKey, bool)> {
+        let due: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|(_, (at, _))| *at <= now)
+            .map(|(k, (_, saved))| (k.clone(), *saved))
+            .collect();
+        for (k, _) in &due {
+            self.pending.remove(k);
+        }
+        due
+    }
+
     pub(crate) fn forget_plugin(&mut self, plugin: &str) {
         self.pending.retain(|(p, _, _), _| p != plugin);
         self.watches.retain(|(p, _), _| p != plugin);
@@ -217,19 +232,9 @@ async fn step(state: &Arc<AppState>) -> Option<Instant> {
     for (ws, rel, saved) in queued {
         route(state, &ws, &rel, saved).await;
     }
-    let due: Vec<((String, String, String), bool)> = {
+    let due = {
         let mut files = crate::lock(&state.plugin_platform.files);
-        let now = Instant::now();
-        let due: Vec<_> = files
-            .pending
-            .iter()
-            .filter(|(_, (at, _))| *at <= now)
-            .map(|(k, (_, saved))| (k.clone(), *saved))
-            .collect();
-        for (k, _) in &due {
-            files.pending.remove(k);
-        }
-        due
+        files.take_due(Instant::now())
     };
     for ((plugin, ws, rel), saved) in due {
         let Some(m) = super::manifest(state, &plugin) else {
@@ -311,27 +316,29 @@ async fn route(state: &Arc<AppState>, ws: &str, rel: &str, saved: bool) {
         }
         queue_delivery(
             &mut files,
-            &m,
+            &m.id,
             ws,
             rel,
             saved,
             kind.and_then(|k| k.debounce_ms),
+            Instant::now(),
         );
     }
 }
 
 fn queue_delivery(
     files: &mut Files,
-    m: &Manifest,
+    plugin: &str,
     ws: &str,
     rel: &str,
     saved: bool,
     debounce_ms: Option<u64>,
+    now: Instant,
 ) {
     let debounce =
         Duration::from_millis(debounce_ms.unwrap_or(super::platform::DEBOUNCE_DEFAULT_MS));
-    let key = (m.id.clone(), ws.to_string(), rel.to_string());
-    let at = Instant::now() + debounce;
+    let key = (plugin.to_string(), ws.to_string(), rel.to_string());
+    let at = now + debounce;
     let room = files.pending.len() < PENDING_MAX;
     match files.pending.get_mut(&key) {
         Some(entry) => {
@@ -341,7 +348,7 @@ fn queue_delivery(
         None if room => {
             files.pending.insert(key, (at, saved));
         }
-        None => tracing::warn!(plugin = %m.id, "plugin file event dropped: too many pending"),
+        None => tracing::warn!(plugin, "plugin file event dropped: too many pending"),
     }
 }
 
@@ -479,4 +486,80 @@ pub(crate) fn settings_changed(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(plugin: &str, ws: &str, path: &str) -> FileKey {
+        (plugin.into(), ws.into(), path.into())
+    }
+
+    #[test]
+    fn burst_waits_for_last_change_and_preserves_saved() {
+        let mut files = Files::default();
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        for (ms, saved) in [(0, false), (80, true), (160, false)] {
+            queue_delivery(&mut files, "p", "w", "notes", saved, Some(100), at(ms));
+            assert!(files.take_due(at(ms + 79)).is_empty());
+        }
+        // Neither the first nor the second deadline may end this burst.
+        assert!(files.take_due(at(259)).is_empty());
+        assert_eq!(
+            files.take_due(at(260)),
+            vec![(key("p", "w", "notes"), true)]
+        );
+        assert!(files.take_due(at(1_000)).is_empty());
+    }
+
+    #[test]
+    fn saves_separated_by_a_debounce_window_are_distinct_bursts() {
+        let mut files = Files::default();
+        let start = Instant::now();
+        // Slow HTTP/file writes may legitimately fall in separate bursts.
+        for ms in [0, 150, 300] {
+            let now = start + Duration::from_millis(ms);
+            queue_delivery(&mut files, "p", "w", "notes", true, Some(100), now);
+            assert_eq!(
+                files.take_due(now + Duration::from_millis(100)),
+                vec![(key("p", "w", "notes"), true)]
+            );
+        }
+        // A later non-save must not inherit an earlier burst's saved flag.
+        let now = start + Duration::from_millis(450);
+        queue_delivery(&mut files, "p", "w", "notes", false, Some(100), now);
+        assert_eq!(
+            files.take_due(now + Duration::from_millis(100)),
+            vec![(key("p", "w", "notes"), false)]
+        );
+        assert!(files.pending.is_empty());
+    }
+
+    #[test]
+    fn debounce_is_scoped_to_plugin_workspace_and_file() {
+        let mut files = Files::default();
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        queue_delivery(&mut files, "p", "w", "a", false, None, at(0));
+        queue_delivery(&mut files, "other", "w", "a", true, Some(100), at(0));
+        queue_delivery(&mut files, "p", "other", "a", false, Some(100), at(0));
+        queue_delivery(&mut files, "p", "w", "b", false, Some(100), at(0));
+        queue_delivery(&mut files, "p", "w", "a", true, None, at(50));
+        assert!(files.take_due(at(99)).is_empty());
+        let mut due = files.take_due(at(100));
+        due.sort();
+        assert_eq!(
+            due,
+            vec![
+                (key("other", "w", "a"), true),
+                (key("p", "other", "a"), false),
+                (key("p", "w", "b"), false),
+            ]
+        );
+        assert!(files.take_due(at(349)).is_empty());
+        assert_eq!(files.take_due(at(350)), vec![(key("p", "w", "a"), true)]);
+        assert!(files.pending.is_empty());
+    }
 }
