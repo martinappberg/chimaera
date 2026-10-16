@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use chimaera_agent::model::UsageWindow;
 use serde_json::{json, Value};
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 
 use super::{
     base_command, bin_of, read_rpc_line, wrapped, CodexRpc, GroupKill, ProbePrelude, GATE,
@@ -38,8 +38,11 @@ use super::{
 use crate::agents::AgentKind;
 use crate::AppState;
 
-/// Startup plus one account read; live it takes under two seconds.
-const CLAUDE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Startup plus one account read (live: claude under 2 s, grok 0.5 s, agy
+/// 4 s); the whole process group dies with the read either way.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Antigravity's `/usage` answer is one short JSON line.
+const AGY_OUTPUT_CAP: u64 = 1024 * 1024;
 
 /// GET /agents/{id}/usage[?refresh=true] for `claude` / `codex` / `grok` /
 /// `agy` — `{agent, windows: [{label, utilization 0-100, resets_at?}],
@@ -74,6 +77,12 @@ async fn read(state: &Arc<AppState>, kind: AgentKind, agent: &str, refresh: bool
             "checked_at_ms": crate::timeline::now_ms(), "error": error,
         })
     };
+    // A signed-out CLI can only fail, and Antigravity's would start its
+    // browser sign-in (it ignores BROWSER): never spawn one the sign-in
+    // check already says is signed out.
+    if crate::agent_auth::cached_verdict(state, kind) == Some(false) {
+        return failed("not signed in".to_string());
+    }
     let (bin, _version, _retained) = match bin_of(state, kind).await {
         Ok(found) => found,
         Err(error) => return failed(error),
@@ -158,7 +167,7 @@ async fn claude_usage(
         }
         Ok::<Value, String>(answer)
     };
-    let answer = tokio::time::timeout(CLAUDE_TIMEOUT, exchange)
+    let answer = tokio::time::timeout(PROBE_TIMEOUT, exchange)
         .await
         .map_err(|_| "claude get_usage timed out".to_string());
     drop(group);
@@ -255,7 +264,7 @@ async fn grok_usage(
         }
         Ok::<Value, String>(answer)
     };
-    let answer = tokio::time::timeout(CLAUDE_TIMEOUT, exchange)
+    let answer = tokio::time::timeout(PROBE_TIMEOUT, exchange)
         .await
         .map_err(|_| "grok billing timed out".to_string());
     drop(group);
@@ -302,7 +311,30 @@ async fn agy_usage(
     prelude: Option<&Path>,
 ) -> Result<(Vec<UsageWindow>, bool), String> {
     let argv = wrapped(bin, &["-p", "/usage", "--output-format", "json"]);
-    let out = super::run_bounded(&argv, Some(home), prelude).await?;
+    let mut cmd = base_command(&argv, Some(home), prelude);
+    cmd.stderr(Stdio::null()).process_group(0);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("could not start agy: {e}"))?;
+    // The whole group, not just the login shell, dies with a stalled read.
+    let group = GroupKill(child.id().map(|pid| nix::unistd::Pid::from_raw(pid as i32)));
+    let mut stdout = child.stdout.take().ok_or("no stdout")?;
+    let read = async {
+        let mut out = Vec::new();
+        (&mut stdout)
+            .take(AGY_OUTPUT_CAP)
+            .read_to_end(&mut out)
+            .await
+            .map_err(|e| format!("agy read failed: {e}"))?;
+        Ok::<Vec<u8>, String>(out)
+    };
+    let out = tokio::time::timeout(PROBE_TIMEOUT, read)
+        .await
+        .map_err(|_| "agy /usage timed out".to_string());
+    drop(group);
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    let out = String::from_utf8_lossy(&out??).into_owned();
     // The JSON is the last line (a login profile may print before it).
     let answer = out
         .lines()

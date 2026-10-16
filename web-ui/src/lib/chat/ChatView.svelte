@@ -69,7 +69,7 @@
   import PlanCard from "./PlanCard.svelte";
   import { planShows } from "./planCard";
   import { openSettingsAt } from "../settings/jump";
-  import { USAGE_AGENTS, getAgentUsage, type AgentUsage } from "../settings/agentUsage";
+  import { ACCOUNT_USAGE_IN_CHAT, getAgentUsage, type AgentUsage } from "../settings/agentUsage";
   import WakeRequestBar from "./WakeRequestBar.svelte";
   import { commsStore, wakeRequestFor } from "../workspace/comms.svelte";
   import QuestionCard from "./QuestionCard.svelte";
@@ -2213,15 +2213,15 @@
     openSettingsAt("Agents");
   }
 
-  /** The account's limits from Agent settings' live read, for a chat whose
-   *  own stream has reported none (a fresh chat, Codex before its first turn
-   *  ends, Antigravity always). Asked while the chat shows and idles — again
-   *  after each turn — and the daemon answers from its minute cache. */
+  /** The account's limits from Agent settings' live read, for an agent whose
+   *  chat stream reports none (Antigravity). Asked while the chat shows and
+   *  idles — again after each turn — and the daemon answers from its minute
+   *  cache. */
   let accountUsage = $state<AgentUsage | null>(null);
   let accountUsageReading = false;
   $effect(() => {
     if (!visible || !$pageVisible || readOnly || agentBusy) return;
-    if (store.rateLimit !== null || !USAGE_AGENTS.has(agentKind)) return;
+    if (store.rateLimit !== null || !ACCOUNT_USAGE_IN_CHAT.has(agentKind)) return;
     untrack(() => {
       if (accountUsageReading) return;
       accountUsageReading = true;

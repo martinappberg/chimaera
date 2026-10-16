@@ -310,9 +310,9 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   **Compact** while the agent is idle — the same path as typing `/compact`), then every plan window
   this chat knows, each with when it resets ("in 1h 40m", "Thu 09:00"), and **All limits** →
   Settings → Agents. Claude reports both plan windows on every request (`unifiedWindows`), Codex its
-  primary/secondary windows, Grok its weekly credit window after each turn; a chat whose own stream
-  has reported none yet (a fresh chat, Codex before its first turn ends, Antigravity always) shows
-  the account's live read from Agent settings instead ([agents.md](agents.md#plan-usage)). Nothing
+  primary/secondary windows during each turn, Grok its weekly credit window after each turn; an
+  Antigravity chat, whose stream reports none, shows the account's live read from Agent settings
+  instead ([agents.md](agents.md#plan-usage)). Nothing
   shows for an agent that reports neither (Cursor). Subscription usage (`/usage`, `/cost`, the
   meter) shows **percentages, never dollars**.
 - **Where.** `ChatHeader.svelte`, `UsageMeter.svelte`, `EffortPopover.svelte`, `UsagePanel.svelte`,

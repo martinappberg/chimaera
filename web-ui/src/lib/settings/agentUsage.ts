@@ -13,6 +13,11 @@ import { usageRows, type UsageRow } from "../shared/usage";
  *  reports none (the daemon answers 404), so nothing shows for it. */
 export const USAGE_AGENTS: ReadonlySet<string> = new Set(["claude", "codex", "grok", "agy"]);
 
+/** Agents whose chat stream never reports plan limits, so a chat's meter
+ *  shows the account's read instead. The others report them with their own
+ *  requests; asking ahead would spawn a CLI for numbers already on the way. */
+export const ACCOUNT_USAGE_IN_CHAT: ReadonlySet<string> = new Set(["agy"]);
+
 export interface AgentUsage {
   rows: UsageRow[];
   limitReached: boolean;

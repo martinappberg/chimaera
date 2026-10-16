@@ -1105,8 +1105,14 @@ impl Mapper for AcpMapper {
                             turn_id,
                             usage: Usage::default(),
                         });
-                        if self.kind == GROK.kind {
-                            // Free reads (no model call), live 1.0.46.
+                        // Free reads (no model call), live 1.0.46. Never
+                        // stacked: a Grok that leaves them unanswered must
+                        // not fill `pending` until prompts are refused.
+                        let asking = self
+                            .pending
+                            .values()
+                            .any(|p| matches!(p, Pending::GrokSessionInfo | Pending::GrokBilling));
+                        if self.kind == GROK.kind && !asking {
                             let session = json!({"sessionId": self.native});
                             self.request(
                                 "_x.ai/session/info",
@@ -1814,6 +1820,22 @@ mod tests {
         let refused = m
             .on_frame(&json!({"id":done.outbound[0]["id"],"error":{"code":-32601,"message":"no"}}));
         assert!(refused.events.is_empty(), "{:?}", refused.events);
+        // A read Grok never answers is not asked again until it is.
+        let turn = send(&mut m, "third");
+        let done =
+            m.on_frame(&json!({"id":turn.outbound[0]["id"],"result":{"stopReason":"end_turn"}}));
+        assert_eq!(done.outbound.len(), 2);
+        let turn = send(&mut m, "fourth");
+        let again =
+            m.on_frame(&json!({"id":turn.outbound[0]["id"],"result":{"stopReason":"end_turn"}}));
+        assert!(
+            again
+                .outbound
+                .iter()
+                .all(|f| !f["method"].as_str().unwrap_or("").starts_with("_x.ai/")),
+            "{:?}",
+            again.outbound
+        );
     }
     #[test]
     fn other_acp_agents_ask_nothing_after_a_turn() {

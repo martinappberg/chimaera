@@ -73,7 +73,7 @@
       class:full={headline?.level === "full"}
       aria-haspopup="dialog"
       aria-expanded={open}
-      aria-label={headline === null ? `Usage: ${summary}` : undefined}
+      aria-label={`Usage: ${summary}${limitReached ? " · limit reached" : ""}`}
       title={summary}
       onclick={onToggle}
     >

@@ -251,7 +251,7 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   in Settings → Agents: a **Plan usage** section, collapsed by default (maintainer, 2026-10-15),
   that opens to every window with a bar, its percentage and when it resets, and **Refresh**. Read
   when the section is first opened (the daemon answers from a minute's cache) and on Refresh;
-  the chat header's usage meter shows the same read while a chat's own stream has reported none
+  an Antigravity chat's usage meter shows the same read, since its chat stream reports none
   ([chat-mode.md](chat-mode.md#header-controls)).
 - **Per agent.** Each read is the agent's own, with no model call and no quota spent:
   - **Claude** — a short-lived `claude -p` stream-json process answers the `initialize` and
