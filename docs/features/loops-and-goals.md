@@ -49,4 +49,10 @@ Claude has no control that lists or reports loops and goals, so the driver keeps
 > this line is derived and may be regenerated; everything below is deliberate and must not
 > be "helpfully" changed without asking.
 
-_Pending — to be captured with the maintainer when this ships._
+### Loops and goals — why they exist
+_Captured 2026-10-16 (from the maintainer: the design pass on 2026-10-15 and the intent questionnaire)._
+
+- **Problem it solves:** agents that resume by themselves (`/loop`, `/goal`, Codex goals) must be visible: what will happen next, when, and why, and a chat that will act again must never look finished. Before this, all three worked in chat but nothing showed them.
+- **How settled it is (intended vs provisional):** the *why* and the quietness are settled. The surface should be "insanely good" — something the user loves, "not too much", "super easy to understand and follow while not being in their face" — in the agent's own words, and never "done" too early. The card, the fold rule and the wording are how it works today and can change if improved (an addition to the core, not a core bet).
+- **Deliberate calls from the design pass (2026-10-15):** option A (one quiet pinned card, one line per thing) over a composer chip or folding into the background tray; when many things run at once, fold into one line ("could we figure out how to fold it into other things when you just have too many things up at once?"), for any three kinds of work, not only with a loop or goal; stopping a Claude loop sends Claude a visible message (Claude has no control for it); the "done" notification waits for the real end. Hovering a row must not change the card's height — a flicker in the mock was the first thing noticed.
+- **Do not change (or: open to change):** open to change — improve freely, keeping the why above.
