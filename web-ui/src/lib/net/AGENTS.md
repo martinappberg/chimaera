@@ -13,6 +13,8 @@ Orientation for coding agents. This area owns the client side of every daemon co
 | `rtt.ts` | Rolling minimum of `/health` fetch timings = the link RTT estimate. `LINK_RTT_BADGE_MS` sets when the host chip shows it. |
 | `native.ts` | Bridge to the Tauri shell (`window.__TAURI__`). `isNativeShell()` gates shell-only features; every helper has a browser fallback. |
 | `remoteReconnect.ts` | Native SSH reconnect view state, and `createReconnectListenerGate`: the reconnect waits until the `host-status` listener is attached. |
+| `connection.svelte.ts` | `Connection`, App's daemon-connection coordinator: `health` / `healthUp` / `eventsUp` / `appBuild`, the native remote window's SSH reconnect (overlay state, `host-status` handling, the 401 latch and its 30 s re-arm damp), the window-scope report to the shell, the health poll + kick, build skew, the sessions fallback poll while `/ws/events` is down, and the `onMount` listeners (`listenAppUpdate`, `listenLocalDaemonUpdated`, `listenHostStatus`). App constructs it and calls each `track*` / `poll*` method where those effects sat, so effect order is App's. Everything it needs from a feature area (the update store, the asset-transition bridge, the sessions and links pollers, the appearance bootstrap, `windowKey`) comes in through `ConnectionDeps`, so net/ imports none of them (`scripts/check-dependency-direction.mjs`). |
+| `rehome.ts` | `rehomeUrl`: the `http://127.0.0.1:{port}/#token=…&win=…` URL a window navigates to when its daemon's port or token moved. A remote heal passes `host` + job context; the local daemon's self-update passes neither (header). |
 | `uploads.ts` | `POST /sessions/{id}/upload` and upload-to-directory, the `uploadJobs` chip store, `trackFileOp`, and the path-inserter hook that App registers (`setUploadPathInserter`). |
 
 Tests: `*.test.ts` beside each module; `uploadNames.fixture.json` feeds `uploadNames.test.ts`.
@@ -27,6 +29,7 @@ Tests: `*.test.ts` beside each module; `uploadNames.fixture.json` feeds `uploadN
 | `reconnectingSockets` (writable) | `reconnect.ts` | The `Reconnector` class. Each down socket adds at most one. |
 | `uploadJobs` (writable) | `uploads.ts` | This module's functions; `reportUploadError` for an external failure. |
 | `askpassActive` (writable) | `native.ts` | `native.ts`. |
+| Connection state (`Connection` `$state`: health, `eventsUp`, reconnect overlay, `jobEnded`) | `connection.svelte.ts` | Its own methods; App's events socket reports through `noteEventsStatus`. App's markup reads it off the instance. |
 | RTT estimate (readable) | `rtt.ts` | `recordLinkRtt`, called by the `/health` poll. |
 
 ## Invariants / gotchas

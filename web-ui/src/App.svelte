@@ -1,8 +1,12 @@
 <script lang="ts">
   import { RecentSessions } from "./lib/workspace/recentSessions";
   import AgentSetupDialog from "./lib/workspace/AgentSetupDialog.svelte";
-  import { agentSetup, openAgentSetup } from "./lib/workspace/agentSetup";
+  import { agentSetup } from "./lib/workspace/agentSetup";
   import { agentCatalog } from "./lib/workspace/launcher";
+  import { LauncherState } from "./lib/workspace/launcherState.svelte";
+  import { RecentsRail } from "./lib/workspace/recents.svelte";
+  import { KeptWorktreeNotice } from "./lib/workspace/worktreeNotice.svelte";
+  import { needsAppend, SessionRoster } from "./lib/workspace/sessionRoster";
   import { nextInGroup } from "./lib/workspace/sessionCycle";
   import { onMount, tick, untrack } from "svelte";
   import { paneTabHasKeyboardFocus } from "./lib/shared/tabNavigation";
@@ -13,30 +17,18 @@
     ApiError,
     getActiveWorkspaceId,
     getHostLabel,
-    getJobContext,
-    getToken,
     isDetachedWindow,
-    isHomeHub,
     leaveHomeHub,
-    setDetachedWindow,
     takeOpenRequest,
-    clearUnauthorized,
     notifyUnauthorized,
-    pollHealth,
-    reclaimHomeHub,
     setActiveWorkspaceId,
-    unauthorized,
-    type Health,
   } from "./lib/net/api";
-  import { linkRtt, linkRttNow, resetLinkRtt, LINK_RTT_BADGE_MS } from "./lib/net/rtt";
+  import { linkRtt, linkRttNow, LINK_RTT_BADGE_MS } from "./lib/net/rtt";
   import { LOCAL_ECHO_MIN_RTT_MS } from "./lib/terminal/localEcho";
-  import { healthPollDelayMs, type PollHandle } from "./lib/net/poll";
   import { pageVisible } from "./lib/shared/visibility";
   import {
     backgrounded,
-    baseName,
     createSession,
-    createWorkspace,
     deleteSession,
     deleteWorkspace,
     displayName,
@@ -74,20 +66,9 @@
   } from "./lib/dashboard/mastermindPanelState.svelte";
   import { foldUnread, isUnread, markSeen } from "./lib/workspace/unread.svelte";
   import {
-    getAgentDefault,
-    listAgents,
-    listRecents,
-    primaryStart,
     agentRechecks,
-    recheckAgent,
     relativeAge,
-    setAgentDefault,
-    type AgentInfo,
-    type LaunchPick,
-    type PrimaryStart,
-    type RecentConvo,
   } from "./lib/workspace/launcher";
-  import { agentProductName } from "./lib/shared/agentNames";
   import { EventsSocket } from "./lib/net/events";
   import {
     agentHue,
@@ -100,10 +81,6 @@
   } from "./lib/workspace/agentLinks";
   import { typeIntoDetachedSession } from "./lib/terminal/ws";
   import { reconnectingSockets } from "./lib/net/reconnect";
-  import {
-    createReconnectListenerGate,
-    selectRemoteReconnectSurface,
-  } from "./lib/net/remoteReconnect";
   import { insertIntoComposer } from "./lib/chat/composerBus";
   import { volatileChatDrafts } from "./lib/chat/drafts";
   import { imageToAttachment, type ImageAttachment } from "./lib/chat/images";
@@ -146,25 +123,19 @@
     closePane,
     cycleTab,
     defaultLayout,
-    deserializeLayout,
     detachTab,
     dropTab,
-    dropTabAtRootEdge,
     findPane,
     topRightPane,
     focusPane,
     focusedFile as focusedFileOf,
     focusedSession as focusedSessionOf,
     moveFocus,
-    moveTabToIndex,
     moveTabToPane,
     navigateFileHistory,
     openFileLink,
     newPaneSplitDirection,
     MAX_PANES,
-    movePane,
-    movePaneToIndex,
-    movePaneToRootEdge,
     openChanges,
     openSubagent,
     openFile,
@@ -192,25 +163,19 @@
     paneForTab,
     panes as panesOf,
     pruneDeletedPath,
-    pruneFiles,
     pruneSessions,
     pruneTabs,
     rewriteTabPaths,
-    adoptTabs,
     allSessionIds,
-    allTabs,
-    serializeLayout,
     sessionPaneId,
     setPaneFont,
     setRatio,
-    soloLayout,
     splitPane,
     moveTabDirection,
     tabCount,
     tabKey,
     toggleZoom,
     visibleSessionIds,
-    type AdoptSpot,
     type FocusDir,
     type Layout,
     type SplitDir,
@@ -229,7 +194,6 @@
     CLOSE_SAVE_DEADLINE_MS,
     dirtyFiles,
     discardDirtyFile,
-    noteDaemonLink,
     saveDirtyFiles,
     unsavedCloseError,
     unsavedDeleteNote,
@@ -247,7 +211,6 @@
     openFileHistory,
     openRepoHistory,
     repoForPath,
-    removeWorktree,
     revealRepo,
     setGitFocus,
     setGitOpener,
@@ -256,7 +219,6 @@
     type GitStatus,
   } from "./lib/workspace/git";
   import { computeStatus, initCompute, queuedJobCount } from "./lib/workspace/compute";
-  import { surfacesOf } from "./lib/layout/surfaces";
   import { activateTimelineWorkspace, onTimelineNudge } from "./lib/workspace/timeline.svelte";
   import {
     activateCommsWorkspace,
@@ -277,6 +239,7 @@
   import "./lib/knowledge/references";
   import "./lib/plugins/references";
   import { registerAskAgent } from "./lib/shared/askAgent";
+  import { flash, showFlash } from "./lib/shared/flash.svelte";
   import {
     activatePluginsWorkspace,
     attachRequest,
@@ -287,12 +250,10 @@
   } from "./lib/plugins/store";
   import { platformFrame, pluginViewTitle, setViewOpener } from "./lib/plugins/platform";
   import ExtensionsGlyph from "./lib/plugins/ExtensionsGlyph.svelte";
-  import { transferBlock, transferInto, type FileSource } from "./lib/workspace/fileTransfer";
   import ComputeStrip from "./lib/workspace/ComputeStrip.svelte";
   import type JobWindowNotices from "./lib/workspace/JobWindowNotices.svelte";
   import type JobClusterHome from "./lib/workspace/JobClusterHome.svelte";
   import {
-    dropSpotAt,
     folderTargetAt,
     paneContentEl,
     paneIdAt,
@@ -301,23 +262,13 @@
     registerStage,
     sameSpot,
     sideWord,
-    startDrag,
     unregisterLinkRow,
     unregisterStage,
     type DropSpot,
     type LayoutCtrl,
   } from "./lib/layout/dnd";
-  import {
-    ACK_LATE_MS,
-    ACK_TIMEOUT_MS,
-    broadcastTransport,
-    mintTransfer,
-    nativeTransport,
-    TransferLedger,
-    type AdoptDrop,
-    type XwinTransport,
-    type XwinWindowInfo,
-  } from "./lib/layout/crossWindow";
+  import { createCrossWindow } from "./lib/layout/crossWindowController";
+  import { createDragStart } from "./lib/layout/dragStart";
   import {
     chordDigit,
     fontChord,
@@ -334,29 +285,19 @@
     modifierSetting,
   } from "./lib/shared/keybindings";
   import {
-    appUpdateStatus,
     askpassActive,
     closeThisWindow,
-    clusterOpen,
-    connectHost,
     isNativeShell,
-    onAppUpdate,
-    onHostStatus,
-    onLocalDaemonUpdated,
     onFocusSession,
     onMenu,
     onUnsavedPrompt,
     openWindow,
-    openDetachedPopup,
-    openDetachedWindow,
     replyUnsaved,
     reportUnsaved,
     reportWindowScope,
     reportWindowView,
     setNativeWindowTitle,
-    shellBuild,
     takePendingFocus,
-    type HostStatusEvent,
   } from "./lib/net/native";
   import { clearBrowserNotices, deliverBrowserNotices } from "./lib/workspace/notices";
   import {
@@ -379,26 +320,16 @@
     flushSettings,
     getSetting,
     loadSettings,
-    setSetting,
     settingsLoaded,
   } from "./lib/settings/store.svelte";
   import type { DashCtx } from "./lib/dashboard/dash";
+  import { flushViewState, windowKey } from "./lib/layout/viewState";
+  import { loadRailChrome, saveRailChrome } from "./lib/layout/railState";
+  import { createRailResize } from "./lib/layout/railResize";
   import {
-    flushViewState,
-    loadViewState,
-    putViewState,
-    saveViewState,
-    windowKey,
-  } from "./lib/layout/viewState";
-  import {
-    FILES_FRAC_MAX,
-    FILES_FRAC_MIN,
-    RAIL_DEFAULT,
-    RAIL_MAX,
-    RAIL_MIN,
-    loadRailChrome,
-    saveRailChrome,
-  } from "./lib/layout/railState";
+    createViewPersistence,
+    pruneDeadFiles as pruneDeadFileTabs,
+  } from "./lib/layout/windowPersistence";
   import { hintsActive, initChordHints } from "./lib/shared/chordHints.svelte";
   import FolderPicker from "./lib/workspace/FolderPicker.svelte";
   import HomeNavigation from "./lib/workspace/HomeNavigation.svelte";
@@ -421,27 +352,25 @@
   import ReauthOverlay from "./lib/workspace/ReauthOverlay.svelte";
   import AssetTransitionNotice from "./lib/layout/AssetTransitionNotice.svelte";
   import {
-    assetRearmDelayMs,
-    assetTransition,
     BUILD_META_NAME,
+    assetTransition,
     buildSource,
     clearChunkFailure,
     documentBuildSource,
-    noteChunkFailure,
-    planAssetNavigation,
-    rearmAssetNavigation,
     requestAssetReload,
     requestWindowReload,
-    cancelWindowReload,
     requireAssetNavigation,
+    cancelWindowReload,
   } from "./lib/layout/assetTransition";
-  import { claimWindowReload } from "./lib/layout/windowReload";
+  import { installAssetGate } from "./lib/layout/assetGate.svelte";
+  import { Connection } from "./lib/net/connection.svelte";
   import { focusOnMount } from "./lib/shared/focusOnMount";
+  import { InlineRename } from "./lib/shared/inlineRename.svelte";
   import Launcher from "./lib/workspace/Launcher.svelte";
   import SessionGlyph from "./lib/shared/SessionGlyph.svelte";
   import BranchChip from "./lib/shared/BranchChip.svelte";
   import WakeRing from "./lib/shared/WakeRing.svelte";
-  import { archiveRecents, nudgeHistory, unarchiveRecents } from "./lib/workspace/history";
+  import { nudgeHistory } from "./lib/workspace/history";
   import { sameFile, setSameFileOpener } from "./lib/workspace/sameFile.svelte";
   import { requestSettingsSection, settingsOpen } from "./lib/settings/jump";
   import { setAgentNames } from "./lib/chat/toolLabels";
@@ -450,21 +379,6 @@
   import SplitTree from "./lib/layout/SplitNode.svelte";
   import Pane from "./lib/layout/Pane.svelte";
 
-  let health = $state<Health | null>(null);
-  /** Last authenticated HTTP health result. The event stream can reconnect
-   *  independently while the daemon and SSH tunnel remain reachable. */
-  let healthUp = $state(false);
-  /** Source identity of the daemon that supplied this document. A different
-   *  source means its immutable lazy-chunk namespace changed underneath us. */
-  let servedBuild = documentBuildSource(
-    document.querySelector<HTMLMetaElement>(`meta[name="${BUILD_META_NAME}"]`)?.content,
-  );
-  function daemonBuildChanged(next: string | null | undefined): boolean {
-    const nextSource = buildSource(next);
-    return servedBuild !== null && nextSource !== null && nextSource !== servedBuild;
-  }
-  /** This app binary's build id (native only); vs health.build = skew. */
-  let appBuild = $state<string | null>(null);
   /** macOS workbench windows put the native controls over the webview instead
    *  of spending a separate row on the repeated window title. */
   const nativeTitlebarOverlay = isNativeShell() && isMac;
@@ -500,45 +414,35 @@
   let quickOpenOpen = $state(false);
   /** Element focused when the quick-open palette opened; restored on close. */
   let quickOpenRestoreEl: HTMLElement | null = null;
-  let eventsUp = $state(false);
   let createError = $state<string | null>(null);
 
-  // --- remote window: auto-reconnect a dropped tunnel ------------------------
-  /** This window's host alias ("local" for the local daemon). */
-  const hostAlias = getHostLabel();
-  const isRemoteWindow = hostAlias !== "local";
-  /** Set when this window sits on a compute-node daemon (Mode 2 job). */
-  const jobCtx = getJobContext();
-  /** The key this window's tunnel reports `host-status` under. A job window
-   *  listens ONLY on its composite key — matching the bare login alias made
-   *  every login-tunnel blip re-home job windows onto the login daemon
-   *  (found live: "opening the session just opens the login host"). */
-  const statusAlias =
-    jobCtx !== null
-      ? `${hostAlias}#job${jobCtx.jobId}${jobCtx.cws !== null ? `~${jobCtx.cws}` : ""}`
-      : hostAlias;
-  /** Only the native shell can re-run ssh; a browser tunnel is the CLI's job. */
-  const canReconnect = isRemoteWindow && isNativeShell();
-  /** Native events are not replayed. A stale-token page must not invoke
-   *  reconnect until its connected endpoint/token listener is attached. */
-  const reconnectListener = createReconnectListenerGate();
-  /** This window's scope key for the shell registry (null alias = local). */
-  const scopeAlias = isRemoteWindow ? (jobCtx !== null ? statusAlias : hostAlias) : null;
-  /** Carry hub identity across daemon origins. `sessionStorage` remembers the
-   *  original launcher, while the current local-empty scope covers a promoted
-   *  workbench that the shell is reclaiming as Home right now. */
-  function shouldCarryHomeHub(): boolean {
-    return isHomeHub() || (isNativeShell() && scopeAlias === null && activeWsId === null);
-  }
-  /** The reconnect status or failure dialog is showing. */
-  let showReconnect = $state(false);
-  /** A connectHost call is in flight. */
-  let reconnecting = $state(false);
-  /** Last reconnect failure, surfaced with a Retry. */
-  let reconnectError = $state<string | null>(null);
-  /** A job window's job left the queue (the shell's `ended` on its key);
-   *  `reason` is Slurm's state, or "stopped" for a stop from the app. */
-  let jobEnded = $state<{ reason: string | null } | null>(null);
+  // --- the daemon connection: health, events, remote reconnect --------------
+  /** Reachability, the remote window's SSH reconnect, the 401 latch and the
+   *  shell's window-scope report (net/connection.svelte.ts). Constructed here:
+   *  its 401 and window-scope effects keep this place in App's effect order. */
+  const conn: Connection = new Connection({
+    activeWsId: () => activeWsId,
+    detachedWindow: () => detachedWindow,
+    windowLabel: (): string => windowLabel,
+    eventsSocket: () => eventsSocket,
+    onEventsRecovered: onCommsReconnect,
+    onAppStatus: applyAppStatus,
+    onAppVersion: (version) => {
+      updateState.appVersion = version;
+    },
+    appearanceForNavigation: appearanceBootstrapForNavigation,
+    windowKey,
+    assets: {
+      servedBuild: () =>
+        documentBuildSource(
+          document.querySelector<HTMLMetaElement>(`meta[name="${BUILD_META_NAME}"]`)?.content,
+        ),
+      buildSource,
+      requireNavigation: requireAssetNavigation,
+    },
+  });
+  const { hostAlias, isRemoteWindow, jobCtx, scopeAlias } = conn;
+  const eventsUp = $derived(conn.eventsUp);
   /** The job window's notices — their own chunk, loaded only in job windows. */
   let JobNoticesView = $state<typeof JobWindowNotices | null>(null);
   if (jobCtx !== null) {
@@ -570,311 +474,48 @@
     );
   }
 
-  /** Context from the shell's liveness monitor for the current drop. */
-  let reconnectReason = $state<string | null>(null);
-  /** Dismissing a failed reconnect downgrades it to an ambient Retry instead
-   *  of removing the only recovery path. Unauthorized native windows never
-   *  fall through to the browser-only manual auth overlay. */
-  const reconnectSurface = $derived(
-    selectRemoteReconnectSurface({
-      open: showReconnect,
-      error: reconnectError,
-      authBlocked: canReconnect && $unauthorized,
-    }),
-  );
-
-  /** Re-establish this remote window's ssh tunnel. Idempotent: the shell
-   *  reuses a live tunnel, and reuses the old loopback port so a heal needs no
-   *  navigation. Surfaces the SSH auth modal (mounted app-wide) only if ssh
-   *  actually re-prompts. A job window heals through its cluster workspace —
-   *  `cluster_open` reuses or rebuilds the job's forward, keeps this window,
-   *  and pings the composite status key with the (possibly new) port. */
-  async function attemptReconnect(): Promise<void> {
-    if (!canReconnect || reconnecting || jobEnded !== null) return;
-    reconnecting = true;
-    reconnectError = null;
-    try {
-      await reconnectListener.ready;
-      if (jobCtx !== null) {
-        if (jobCtx.cws === null) {
-          // A window from before job windows named their workspace: nothing
-          // here can find its job again.
-          throw new Error(`Open this workspace again from ${hostAlias}'s page in Home.`);
-        }
-        await clusterOpen(hostAlias, jobCtx.cws);
-      } else {
-        await connectHost(hostAlias);
-      }
-      // Every successful shell connect republishes `host-status: connected`,
-      // which clears the overlay and re-homes this window when needed.
-    } catch (e) {
-      reconnectError = e instanceof Error ? e.message : String(e);
-    } finally {
-      reconnecting = false;
-    }
-  }
-
-  function beginReconnect(reason: string): void {
-    // A job that ended has nothing to reconnect to: its overlay says so.
-    if (!canReconnect || jobEnded !== null) return;
-    reconnectReason = reason;
-    showReconnect = true;
-    void attemptReconnect();
-  }
-
-  function retryReconnect(): void {
-    showReconnect = true;
-    void attemptReconnect();
-  }
-
-  function dismissReconnect(): void {
-    showReconnect = false;
-  }
-
-  function finishReconnect(): void {
-    showReconnect = false;
-    reconnectError = null;
-    reconnectReason = null;
-  }
-
-  function handleHostStatus(e: HostStatusEvent): void {
-    if (!canReconnect || e.alias !== statusAlias) return;
-    if (e.status === "ended") {
-      // Only a job window's composite key ends; a "down" without it is still
-      // just a connection blip (the reconnect below).
-      if (jobCtx === null) return;
-      jobEnded = { reason: e.reason ?? null };
-      finishReconnect();
-      return;
-    }
-    if (jobEnded !== null) return;
-    if (e.status === "down") {
-      beginReconnect(e.reason ?? "The remote connection stopped responding.");
-      return;
-    }
-    if (e.status === "error") return;
-    finishReconnect();
-    const port = e.local_port;
-    // Compute-status events carry no token (compute tokens stay in the
-    // shell's Rust side); a rebuilt job tunnel lands on the SAME daemon,
-    // so this window's own token still holds — carry it across the origin
-    // move ourselves.
-    const token = e.token ?? (jobCtx !== null ? getToken() : null);
-    const portMoved = port !== null && String(port) !== location.port;
-    const tokenMoved = token !== null && token !== getToken();
-    const buildMoved = daemonBuildChanged(e.build);
-    if (portMoved || tokenMoved) {
-      const params = new URLSearchParams();
-      if (token !== null) params.set("token", token);
-      params.set("win", windowKey());
-      if (activeWsId !== null) params.set("ws", activeWsId);
-      if (shouldCarryHomeHub()) params.set("hub", "1");
-      params.set("host", hostAlias);
-      params.set("appearance", JSON.stringify(appearanceBootstrapForNavigation()));
-      if (jobCtx !== null) {
-        params.set("job", jobCtx.jobId);
-        if (jobCtx.node !== null) params.set("node", jobCtx.node);
-        if (jobCtx.cws !== null) params.set("cws", jobCtx.cws);
-      }
-      requireAssetNavigation(
-        buildMoved ? "build" : "connection",
-        `http://127.0.0.1:${port ?? location.port}/#${params.toString()}`,
-      );
-    } else {
-      // Neither port nor token moved: the heal was IN PLACE and nothing
-      // navigates, so this is the one path that must release a latched 401
-      // itself. A moved token stays dead until the reload lands — blocked on
-      // unsaved work or not — so releasing there would only burn a slot on a
-      // doomed reconnect.
-      closeUnauthorizedReconnect();
-      if (buildMoved) requireAssetNavigation("build", null);
-    }
-  }
-
-  // A 401 in a native remote window usually means the daemon restarted and
-  // minted a fresh tunnel token. Let the shell reconnect this exact host and
-  // re-home the window; the generic "paste a URL" auth page is only correct
-  // for browser tunnels, which cannot re-run ssh themselves.
-  let handledRemoteUnauthorized = false;
-  $effect(() => {
-    if (!canReconnect || !$unauthorized || handledRemoteUnauthorized) return;
-    handledRemoteUnauthorized = true;
-    untrack(() =>
-      beginReconnect("The remote daemon changed credentials; reconnecting will refresh this window."),
-    );
-  });
-  /** Minimum spacing between releases of the 401 latch. A daemon that keeps
-   *  rejecting this token while the shell keeps reporting `connected` would
-   *  otherwise loop 401 → reconnect → release → 401; with the damp an
-   *  episode gets at most two automatic rounds, then the latch parks with
-   *  the ambient Retry until a manual retry. */
-  const UNAUTHORIZED_REARM_MS = 30_000;
-  let lastUnauthorizedReconnectAt: number | null = null;
-  /** The shell reported `connected` on the SAME port + token while a 401
-   *  was latched: an in-place heal, which never navigates, so the latch
-   *  must be released here — or the "needs fresh credentials" chip outlives
-   *  a working window — and the one-shot above re-armed, or the next daemon
-   *  restart's 401 gets no automatic recovery. Only `handleHostStatus`'s
-   *  no-move branch calls this; a moved token is dead until its reload. */
-  function closeUnauthorizedReconnect(): void {
-    if (!$unauthorized) return;
-    const now = Date.now();
-    if (
-      lastUnauthorizedReconnectAt !== null &&
-      now - lastUnauthorizedReconnectAt < UNAUTHORIZED_REARM_MS
-    ) {
-      return;
-    }
-    lastUnauthorizedReconnectAt = now;
-    clearUnauthorized();
-    handledRemoteUnauthorized = false;
-  }
-
-  // `/ws/events` owns its own backoff and is not SSH liveness: it can restart
-  // while authenticated HTTP remains healthy. Only the shell's consecutive
-  // authenticated health failures (or a 401 above) start SSH recovery, and
-  // only its `connected` event finishes that recovery.
-
-  // Keep the shell's window registry current so "open this workspace" raises
-  // this window instead of duplicating it (the SPA swaps `ws` client-side, so
-  // the shell can't see the change otherwise). The report is SPLIT by
-  // urgency: the scope IDENTITY (alias/ws/detached) drives raise-dedup,
-  // cross-window drag routing, and the persisted record, so it reports
-  // immediately — a debounce there leaves the shell routing on a stale
-  // workspace and loses the report entirely on a quick ⌘Q. Only the LABEL
-  // (which for a detached window tracks its tab, i.e. an agent's mutating
-  // title) is debounced, because each report costs a shell-side tray rebuild.
-  $effect(() => {
-    if (!isNativeShell()) return;
-    const alias = scopeAlias;
-    const reportedWsId = activeWsId;
-    const detached = detachedWindow;
-    const label = untrack(() => windowLabel) || null;
-    void reportWindowScope(alias, reportedWsId, label, detached).then(
-      () => {
-        // A promoted local workbench becomes the singleton Home again when
-        // its workspace disappears. Restore the browser half of that identity
-        // only while the reported empty scope is still current: an older IPC
-        // completion must not undo a newer workspace promotion.
-        if (alias === null && reportedWsId === null && activeWsId === null) {
-          reclaimHomeHub();
-        }
-      },
-      () => {
-        // Navigation can transiently reject reconciliation; only a confirmed
-        // report is allowed to reclaim the browser's Home identity.
-      },
-    );
-  });
-  $effect(() => {
-    if (!isNativeShell()) return;
-    const label = windowLabel || null;
-    const timer = setTimeout(() => {
-      void reportWindowScope(
-        untrack(() => scopeAlias),
-        untrack(() => activeWsId),
-        label,
-        untrack(() => detachedWindow),
-      ).catch(() => {
-        // label-only refresh; the identity effect above is the authority
-      });
-    }, 250);
-    return () => clearTimeout(timer);
-  });
   // --- the agent launcher (split button + popover) ---
-  /** The persisted default agent the split button's main surface spawns. */
-  let agentDefault = $state(getAgentDefault());
-  /** The host's agent catalog (install status per CLI), so the split button
-   *  can reflect whether its default is installed. Null until first fetched;
-   *  the launcher popover reports its fresher probe back via onAgents. */
-  let agents = $state<AgentInfo[] | null>(null);
-  $effect(() => { if ($agentCatalog.length) agents = $agentCatalog; });
-  /** The rail's one new-agent row: the saved default, which the main click
-   *  and the new-agent shortcut start; its chevron opens the launcher menu.
-   *  It knows what its click does: start, or the setup step that unblocks a
-   *  missing agent (launcher.ts `primaryStart`). */
-  const railStart = $derived(
-    primaryStart(agents, agentDefault.agent, getSetting("agents.defaultView"), agentProductName),
-  );
-  let launcherOpen = $state(false);
-  /** The split button's rect at open time; the popover hangs below it. */
-  let launcherAnchor = $state<DOMRect | null>(null);
-  let newSplitEl = $state<HTMLElement | null>(null);
-  /** Hover-intent timer (~150ms, chevron only) that opens the launcher. */
-  let launcherHoverTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The new-agent split button, its popover and the agent catalog
+   *  (workspace/launcherState.svelte.ts); every start comes back through
+   *  `startAgent` → `spawnSession`, which writes the roster and layout here. */
+  const launcher = new LauncherState({
+    activeWsId: () => activeWsId,
+    startAgent: (spawn) => startAgent(spawn),
+    openPicker: () => openPicker(),
+    openSettingsSurface: () => openSettingsSurface(),
+    refocusTerminal: () => {
+      const sid = focusedSessionOf(layout);
+      if (sid !== null) pool.focusTerminal(sid);
+    },
+  });
+  $effect(() => { launcher.adoptCatalog($agentCatalog); });
   // --- the rail's Recents section (ended agent conversations) ---
-  let recents = $state<RecentConvo[]>([]);
-  let recentsExpanded = $state(false);
-  /** The collapsed section's floor, mirrored by `.recents-list`'s min-height
-   *  (3 rows): below it the sessions column scrolls rather than hiding history. */
-  const RECENTS_MIN_ROWS = 3;
-  /** Recents rows the collapsed section can show without clipping. The
-   *  section fills the height the sessions column has left (`.recents` is
-   *  the column's flex: 1), so a short roster on a tall window shows a long
-   *  history and a full roster falls back to the CSS floor (3 rows) and the
-   *  column scrolls. Measured, never guessed: a ResizeObserver on the list
-   *  reports its box; the first two rows give the row pitch. Only the count
-   *  is state, so a resize that doesn't change it costs nothing. */
-  let recentsFit = $state(RECENTS_MIN_ROWS);
-  let recentsListEl = $state<HTMLElement | null>(null);
-  function measureRecents(): void {
-    const el = recentsListEl;
-    // The expanded list is taller by design (it scrolls); measuring it would
-    // inflate the fit and hide the "show less" toggle.
-    if (el === null || recentsExpanded) return;
-    const first = el.firstElementChild;
-    if (!(first instanceof HTMLElement)) return;
-    const second = first.nextElementSibling;
-    const pitch =
-      second instanceof HTMLElement ? second.offsetTop - first.offsetTop : first.offsetHeight + 1;
-    if (pitch <= 0) return;
-    // The last row needs no trailing gap: a box exactly N rows tall fits N.
-    const gap = pitch - first.offsetHeight;
-    const fit = Math.max(RECENTS_MIN_ROWS, Math.floor((el.clientHeight + gap) / pitch));
-    if (fit !== recentsFit) recentsFit = fit;
-  }
-  $effect(() => {
-    const el = recentsListEl;
-    if (el === null) return;
-    const ro = new ResizeObserver(measureRecents);
-    ro.observe(el);
-    return () => ro.disconnect();
+  /** Recents rows, their fit, expand, archive and reopen
+   *  (workspace/recents.svelte.ts). Its fit observer is declared here; the
+   *  workspace-switch refetch further down, after the kept-worktree notice. */
+  const recentsRail = new RecentsRail({
+    activeWsId: () => activeWsId,
+    sessions: () => sessions,
+    startAgent: (spawn) => startAgent(spawn),
+    offerWorktreeRemoval: (ws, path, branch) => keptWorktree.offer(ws, path, branch),
   });
-
-  /** Expanded, the section wants more height than the column may have left
-   *  (the live roster comes first), so the column scrolls it into view —
-   *  else "show all" can change nothing visible. Collapse scrolls back. */
-  function toggleRecents(): void {
-    recentsExpanded = !recentsExpanded;
-    const section = recentsListEl?.parentElement;
-    const column = section?.parentElement;
-    if (section == null || column == null) return;
-    void tick().then(() => {
-      // Scroll the sessions column itself — never scrollIntoView, which
-      // would also shift the overflow-hidden rail around it.
-      const top = section.getBoundingClientRect().top - column.getBoundingClientRect().top;
-      column.scrollTo({ top: recentsExpanded ? column.scrollTop + top : 0 });
-      // Collapsing back to a box the same size as before fires no resize;
-      // the column may have changed meanwhile, so re-fit explicitly.
-      if (!recentsExpanded) measureRecents();
-    });
-  }
-  /** Recents to SHOW: drop any whose conversation is currently LIVE (a live
-   *  agent with the same title). A running conversation belongs under AGENTS,
-   *  not RECENT — and the server's live-exclusion can briefly miss a fresh
-   *  session whose transcript id isn't recorded yet, so a row would otherwise
-   *  appear in both sections at once. */
-  const visibleRecents = $derived.by(() => {
-    const liveTitles = new Set(
-      sessions.filter((s) => s.kind === "agent" && s.alive).map((s) => displayName(s)),
-    );
-    return recents.filter((r) => r.title === "" || !liveTitles.has(r.title));
-  });
+  recentsRail.trackFit();
   /** Rail row currently showing the inline kill confirmation. */
   let confirmKillId = $state<string | null>(null);
-  /** Rail row currently in inline rename (double-click or F2). */
-  let renamingId = $state<string | null>(null);
-  let renameDraft = $state("");
+  /** Inline rename of a rail row (double-click / F2), keyed by session id:
+   *  chimaera owns the pin, so it works for every session kind, not just
+   *  claude's /rename. No unchanged check: re-submitting the shown name pins
+   *  it. The PATCH is fire-and-forget; the next sessions snapshot restores
+   *  the truth on failure. Focus is left where the unmounted input leaves it. */
+  const railRename = new InlineRename<string>({
+    submit(id, name, close) {
+      close();
+      renameSession(id, name).catch(() => {
+        // next sessions snapshot restores the truth
+      });
+    },
+    errorText: () => "",
+  });
   /** Inline-create request for the file tree (rail-header buttons). */
   let treeCreate = $state<{ kind: "file" | "dir"; nonce: number } | null>(null);
   let treeCreateNonce = 0;
@@ -923,157 +564,62 @@
    *  open script-side): show the "this window is empty" state instead. */
   let detachedEmpty = $state(false);
 
-  /** Transient feedback chip (bottom center, auto-fades): the outcome of an
-   *  action that would otherwise fail silently (a refused detach, a blocked
-   *  popup, a cross-window move that didn't complete). */
-  let flash = $state<string | null>(null);
-  let flashTimer: ReturnType<typeof setTimeout> | null = null;
-  function showFlash(message: string): void {
-    flash = message;
-    if (flashTimer !== null) clearTimeout(flashTimer);
-    flashTimer = setTimeout(() => (flash = null), 3200);
-  }
-
   // --- cross-window moves (crossWindow.ts is the protocol) -------------------
 
-  /** The active transport: shell-routed in the native app, a per-workspace
-   *  BroadcastChannel in the browser. Null on the home screen (browser). */
-  let xwin: XwinTransport | null = null;
-  /** Cached sibling-window roster for the "Move to ⟨window⟩" menu rows —
-   *  menus build synchronously, so they read the last refresh. */
-  let xwinRoster = $state<XwinWindowInfo[]>([]);
-  /** Tabs sent to another window, awaiting its ack (remove-only-on-ok). */
-  /** Tabs sent away, plus the workspace they left — an ack must only ever
-   *  remove tabs from the workspace the move started in (tabKey singletons
-   *  like the dashboard exist in EVERY workspace). */
-  const pendingMoves = new TransferLedger<{ tabs: Tab[]; ws: string | null }>();
-  /** Monotonic per-window drag id: the shell fences a drag's late rAF track
-   *  calls once its drop/cancel has landed (see done_drags). */
-  let dragSeq = 0;
-
-  function refreshXwinRoster(): void {
-    void xwin?.roster().then((r) => (xwinRoster = r));
-  }
-
-  /** The adopt payload: enough for the receiver to validate the workspace
-   *  and rebuild the tabs (`layout` is a serialized solo blob). */
-  function adoptPayload(tabs: Tab[], active: number, fontSize?: number): unknown {
-    return { ws: activeWsId, layout: serializeLayout(soloLayout(tabs, active, fontSize)) };
-  }
-
-  /** Sent tabs enter the ledger BEFORE the routing call goes out (the
-   *  transfer id is sender-minted), so the target's ack can never beat the
-   *  entry it resolves. Soft/hard deadlines per crossWindow.ts. */
-  function armTransfer(transfer: number, tabs: Tab[]): void {
-    pendingMoves.add(transfer, { tabs, ws: activeWsId }, Date.now());
-    setTimeout(() => {
-      for (const _ of pendingMoves.timeouts(Date.now())) {
-        showFlash("the move didn't complete — the tab stays here");
-      }
-    }, ACK_TIMEOUT_MS + 50);
-    setTimeout(() => pendingMoves.expire(Date.now()), ACK_LATE_MS + 100);
-  }
-
-  /** A routed move that never left after all (refused, errored): forget the
-   *  pre-armed entry without touching the layout. */
-  function disarmTransfer(transfer: number): void {
-    pendingMoves.ack(transfer, false, Date.now());
-  }
-
-  function resolveTransfer(transfer: number, ok: boolean): void {
-    const known = pendingMoves.has(transfer);
-    const entry = pendingMoves.ack(transfer, ok, Date.now());
-    if (entry === null) {
-      if (known && !ok) showFlash("the other window declined the move");
-      return;
-    }
-    if (entry.ws !== activeWsId) {
-      // The move started in another workspace: its copies live in that
-      // workspace's blob, not this layout. Removing "matching" tabs here
-      // would delete this workspace's own dashboard/git/file tabs.
-      return;
-    }
-    let next = layout;
-    for (const t of entry.tabs) {
-      const loc = paneForTab(next.root, t);
-      if (loc !== null) next = detachTab(next, loc.paneId, loc.index);
-    }
-    layout = next;
-  }
-
-  /** The receiving half: validate the payload (workspace + serialized solo
-   *  blob), adopt at the drop spot, and ack. Anything that cannot be adopted
-   *  FAITHFULLY — a malformed blob, the wrong workspace (the shell's routing
-   *  scope can be momentarily stale), or this window still restoring its own
-   *  layout (bootViewState would overwrite the adoption) — acks false, and
-   *  the sender keeps its tabs. */
-  function acceptAdopt(drop: AdoptDrop): void {
-    dropSpot = null;
-    const body = drop.payload as { ws?: unknown; layout?: unknown } | null;
-    const decoded =
-      body !== null && typeof body === "object" ? deserializeLayout(body.layout) : null;
-    const incoming = decoded !== null ? allTabs(decoded) : [];
-    if (
-      decoded === null ||
-      incoming.length === 0 ||
-      !layoutReady ||
-      body === null ||
-      body.ws !== activeWsId
-    ) {
-      xwin?.ack(drop.transfer, false);
-      return;
-    }
-    const pane0 = panesOf(decoded.root)[0];
-    const activeTab = pane0?.tabs[Math.min(pane0.active, pane0.tabs.length - 1)];
-    const raw = drop.at !== undefined ? dropSpotAt(drop.at.x, drop.at.y) : null;
-    const spot: AdoptSpot | null =
-      raw !== null && (raw.kind === "zone" || raw.kind === "tab" || raw.kind === "edge")
-        ? raw
-        : null;
-    layout = adoptTabs(layout, incoming, spot, activeTab !== undefined ? tabKey(activeTab) : undefined);
-    xwin?.ack(drop.transfer, true);
-    const sid = focusedSessionOf(layout);
-    if (sid !== null) pool.focusTerminal(sid);
-  }
+  /** Sender ledger, transport, adopt, detach-out, re-attach and the move
+   *  menu; it never holds the layout (App's getters and setters below). */
+  const xw = createCrossWindow({
+    winKey: () => winKey,
+    getLayout: () => layout,
+    setLayout: (next) => (layout = next),
+    getWs: () => activeWsId,
+    getWsRoot: () => workspace?.root ?? null,
+    isReady: () => layoutReady,
+    isJobWindow: () => jobCtx !== null,
+    getOrigin: () => detachOrigin,
+    windowLabel: () => windowLabel,
+    isDetached: () => detachedWindow,
+    getDropSpot: () => dropSpot,
+    setDropSpot: (spot) => (dropSpot = spot),
+    dirtyFiles: () => get(dirtyFiles),
+    volatileDrafts: () => get(volatileChatDrafts),
+    flash: showFlash,
+    onAdopted: () => {
+      const sid = focusedSessionOf(layout);
+      if (sid !== null) pool.focusTerminal(sid);
+    },
+  });
 
   // One transport per (window, workspace scope); incoming adoption and acks
   // ride it. The effect keys on the workspace only — handlers read live
-  // state at event time, not at subscription time.
-  $effect(() => {
-    const wsId = activeWsId;
-    const t = isNativeShell()
-      ? nativeTransport()
-      : wsId !== null
-        ? broadcastTransport(wsId, {
-            winId: () => winKey,
-            label: () => windowLabel,
-            detached: () => detachedWindow,
-          })
-        : null;
-    xwin = t;
-    if (t === null) return;
-    const unIncoming = t.incoming({
-      onOver: (at) => {
-        // The shell streams `over` per animation frame; only a LOGICAL spot
-        // change may touch $state — an unconditional write would force a
-        // layout pass and re-render in this (background) window every frame.
-        const next = dropSpotAt(at.x, at.y);
-        if (!sameSpot(next, dropSpot)) dropSpot = next;
-      },
-      onLeave: () => (dropSpot = null),
-      onDrop: (drop) => acceptAdopt(drop),
-    });
-    const unAcks = t.acks((transfer, ok) => resolveTransfer(transfer, ok));
-    refreshXwinRoster();
-    return () => {
-      unIncoming();
-      unAcks();
-      t.close();
-      // A leave that raced the teardown (workspace switch mid-hover) would
-      // otherwise strand this window's drop overlay.
-      dropSpot = null;
-      if (xwin === t) xwin = null;
-    };
+  // state at event time, not at subscription time. The teardown nulls
+  // dropSpot (a leave that raced a workspace switch).
+  $effect(() => xw.subscribe(activeWsId));
+
+  /** Drag starts (tabs, rail rows, tree entries, pane grips); owns the
+   *  per-window drag id the cross-window track/cancel calls are fenced by. */
+  const { beginDrag, beginPaneDrag } = createDragStart({
+    getLayout: () => layout,
+    setLayout: (next) => (layout = next),
+    setDropSpot: (spot) => (dropSpot = spot),
+    setBandPanes: (next) => (bandPanes = next),
+    xw,
+    isNative: isNativeShell,
+    tabLabel: (tab) => tabLabel(tab),
+    sessionAlive: (id) => sessionsById.get(id)?.alive ?? false,
+    paneSessionId: (paneId) => osDropSession(paneId)?.id ?? null,
+    linkTargetsFor: (tab) => linkTargetsFor(tab),
+    linkSessionsFor: (tab) => linkSessionsFor(tab),
+    referenceFileDrop: (paneId, path, kind) => referenceFileDrop(paneId, path, kind),
+    referenceCommitDrop: (paneId, tab) => referenceCommitDrop(paneId, tab),
+    linkByDrop: (terminalId, agentPaneId) => linkByDrop(terminalId, agentPaneId),
+    linkBySession: (terminalId, agentId) => linkBySession(terminalId, agentId),
+    focusTerminal: (sid) => pool.focusTerminal(sid),
+    focusFocusedSession: () => {
+      const sid = focusedSessionOf(layout);
+      if (sid !== null) pool.focusTerminal(sid);
+    },
+    focusPane: (paneId) => ctrl.focusPane(paneId),
   });
 
   // Rail chrome (width + FILES section) is a window preference, persisted
@@ -1093,28 +639,63 @@
   /** The stage element; its edges are the root-split drop targets. */
   let stageEl = $state<HTMLElement | null>(null);
 
+  const { onFilesDividerDown, onRailResizeDown, resetRailWidth } = createRailResize({
+    getRailEl: () => railEl,
+    getDaemonEl: () => daemonEl,
+    getFilesFrac: () => filesFrac,
+    setFilesFrac: (frac) => (filesFrac = frac),
+    setFilesDividerActive: (active) => (filesDividerActive = active),
+    getRailWidth: () => railWidth,
+    setRailWidth: (width) => (railWidth = width),
+    setRailDividerActive: (active) => (railDividerActive = active),
+    setDragging: pool.setDragging,
+  });
+
   const winKey = windowKey();
 
   /**
-   * View-state key: (window id, workspace id) composed client-side, so
-   * switching workspaces away and back restores that workspace's layout.
-   * Server key charset is [A-Za-z0-9_-]{1,64}; uuid + "_" + "w-xxxxxxxx" fits.
+   * The window's view-state persistence (lib/layout/windowPersistence.ts):
+   * keyed by (window, workspace) with a workspace-only mirror. It reads App's
+   * state through getters and writes `layout` only through the setter below,
+   * so App stays the sole owner of the live layout.
    */
-  function stateKey(wsId: string | null): string {
-    return wsId === null ? winKey : `${winKey}_${wsId}`;
-  }
-
-  /**
-   * Workspace-only view-state key (no window id). The layout is mirrored here so
-   * a window that reopens a workspace with a FRESH id — after a deliberate close
-   * (the native shell discards the window's identity by macOS convention), or a
-   * plain browser reopen — still restores that workspace's last-active layout
-   * instead of falling back to the empty default. Consulted only when the
-   * window-keyed blob is absent; last-active window on a workspace wins.
-   */
-  function wsKey(wsId: string): string {
-    return `ws_${wsId}`;
-  }
+  const viewPersistence = createViewPersistence({
+    winKey,
+    getWs: () => activeWsId,
+    getWsRoot: () => workspace?.root ?? null,
+    getLayout: () => layout,
+    setLayout: (next) => {
+      layout = next;
+    },
+    isReady: () => layoutReady,
+    setReady: (ready) => {
+      layoutReady = ready;
+    },
+    isDetached: () => detachedWindow,
+    getOrigin: () => detachOrigin,
+    setDetached: (detached, origin) => {
+      detachedWindow = detached;
+      detachOrigin = origin;
+    },
+    onBooted: () => {
+      pruneAndAutoOpen();
+      pruneDeadFiles();
+      if (__CHIMAERA_PERF__) {
+        const spec = stallDriveSpec();
+        if (spec !== null) {
+          void runStallDrive(
+            {
+              get: () => layout,
+              set: (next) => {
+                layout = next;
+              },
+            },
+            spec,
+          );
+        }
+      }
+    },
+  });
 
   const workspace = $derived(workspaces.find((w) => w.id === activeWsId) ?? null);
   /** The workspace root sits in a git repository — the only place a new
@@ -1424,13 +1005,13 @@
   const dashCtx = $derived<DashCtx>({
     wsName: workspace?.name ?? "",
     ready: gotSessions,
-    recents: visibleRecents,
+    recents: recentsRail.visible,
     mru: agentMru,
     mastermind: workspace?.mastermind ?? null,
     refreshWorkspaces,
-    onOpenRecent: openRecent,
+    onOpenRecent: recentsRail.open,
     onNewTerminal: newShell,
-    onNewAgent: newAgentPrimary,
+    onNewAgent: launcher.newAgentPrimary,
     onOpenGit: openGitPanel,
     onOpenSession: openSess,
     onOpenTimeline: openTimelineSurface,
@@ -1512,54 +1093,9 @@
     return names;
   });
 
-  // Health polling keeps the hostname fresh, trips the 401 overlay, and
-  // independently tracks authenticated daemon reachability. The events
-  // socket can restart while HTTP remains healthy, so the Home badge accepts
-  // either successful channel instead of calling that transient "offline".
-  // Cadence (net/poll.ts): the events socket is the real liveness signal, so
-  // while it's up this is a 60s safety net; while it's down the 5s recovery
-  // probe runs only in a visible window (hidden takes the slow tier, with a
-  // catch-up fetch on visibility return). The delay getter reads `eventsUp`
-  // live at each arm — the poller itself is armed once (no teardown churn).
-  let healthPoll: PollHandle | null = null;
-  $effect(() => {
-    const handle = pollHealth(
-      (h) => {
-        healthUp = true;
-        // Cross-nudge: HTTP just proved the daemon reachable — if the events
-        // socket is sitting out a backoff (or gave up as fatal), retry it
-        // now instead of letting two independent slow clocks ignore each
-        // other. It in turn nudges the per-session sockets on recovery.
-        if (!eventsUp) eventsSocket?.retryNow();
-        if (daemonBuildChanged(h.build)) {
-          // The origin can stay stable across a daemon handoff, but the
-          // hashed JS namespace cannot. Reload before the user opens a lazy
-          // surface whose old URL now correctly 404s.
-          requireAssetNavigation("build", null);
-          return;
-        }
-        servedBuild ??= buildSource(h.build);
-        health = h;
-      },
-      () => {
-        healthUp = false;
-      },
-      (hidden) => healthPollDelayMs(eventsUp, hidden),
-    );
-    healthPoll = handle;
-    return () => {
-      healthPoll = null;
-      handle.stop();
-    };
-  });
-
-  // An events up/down transition warrants a prompt reachability probe —
-  // kick() is deferred and damped (KICK_DAMP_MS), so a crash-looping daemon
-  // flapping the socket once a second cannot become a fetch per transition.
-  $effect(() => {
-    void eventsUp;
-    healthPoll?.kick();
-  });
+  // The health poll, then its kick on every events up/down transition (the
+  // kick reads the handle the poll effect assigns; net/connection.svelte.ts).
+  conn.trackHealth();
 
   // While this document is hidden nobody sees the presence animations: a
   // root class lets each component pause its own infinite keyframes with an
@@ -1570,95 +1106,19 @@
     return () => document.documentElement.classList.remove("app-hidden");
   });
 
-  // Vite reports every failed production dynamic import here, including the
-  // nested PDF/editor/spreadsheet chunks that never pass through Pane's
-  // top-level loader. Keep the rejection flowing to its local error boundary
-  // while one shared notice offers build-safe recovery.
-  $effect(() => {
-    const onPreloadError = (event: VitePreloadErrorEvent) => {
-      console.error("interface chunk failed to load", event.payload);
-      noteChunkFailure();
-    };
-    window.addEventListener("vite:preloadError", onPreloadError);
-    return () => window.removeEventListener("vite:preloadError", onPreloadError);
-  });
-
-  // Build/connection transitions navigate automatically only when all local
-  // state survives navigation. A blocked transition stays visible instead of
-  // looping beforeunload prompts or silently dropping a memory-only draft.
-  let handledAssetRevision = 0;
-  let assetRearmTimer: ReturnType<typeof setTimeout> | null = null;
-  /** A retry that came due while nobody could see the window; the return to
-   *  visible is its catch-up. */
-  let deferredAssetRearm: { revision: number; keepForce: boolean } | null = null;
-  $effect(() => {
-    const transition = $assetTransition;
-    if (transition === null || !transition.requested) return;
-    const blocked = $dirtyFiles.size > 0 || $volatileChatDrafts.size > 0;
-    if (blocked && !transition.forced) return;
-    if (transition.revision === handledAssetRevision) return;
-    handledAssetRevision = transition.revision;
-    // Only a forced attempt with dirty files meets the beforeunload prompt
-    // (the guard below exists only then); it hands straight back to the gate.
-    const prompted = transition.forced && $dirtyFiles.size > 0;
-    untrack(() => {
-      const navigation = planAssetNavigation(location.href, transition.target);
-      if (navigation.kind === "reload") {
-        location.reload();
-      } else if (navigation.kind === "replace") {
-        location.replace(navigation.target);
-      } else {
-        history.replaceState(history.state, "", navigation.target);
-        location.reload();
-      }
-      // Issue once, then wait: the document outliving the call proves nothing
-      // (navigation is asynchronous) and a re-issue cancels the load in flight
-      // (see assetRearmDelayMs). A retry that comes due while hidden holds
-      // until the window is looked at — a window nobody can see must not push
-      // a document load through the tunnel every half minute.
-      if (assetRearmTimer !== null) clearTimeout(assetRearmTimer);
-      assetRearmTimer = setTimeout(() => {
-        assetRearmTimer = null;
-        // Unprompted: no beforeunload could have consumed the force, so it
-        // carries into the retry; a prompted hand-back never waits on visibility.
-        const unprompted = !prompted;
-        if (unprompted && document.visibilityState === "hidden") {
-          deferredAssetRearm = { revision: transition.revision, keepForce: true };
-          return;
-        }
-        rearmAssetNavigation(transition.revision, unprompted);
-      }, assetRearmDelayMs(prompted, transition.attempts));
-    });
-  });
-  $effect(() => {
-    if (!$pageVisible || deferredAssetRearm === null) return;
-    const { revision, keepForce } = deferredAssetRearm;
-    deferredAssetRearm = null;
-    rearmAssetNavigation(revision, keepForce);
-  });
-  // Deliberately not the navigation effect's own cleanup: that effect re-runs
-  // on every dirty-state change and would drop the pending retry with it.
-  $effect(() => () => {
-    if (assetRearmTimer !== null) clearTimeout(assetRearmTimer);
-  });
-  // The native Reload Window (layout/windowReload.ts) reloads through the
-  // gate above while it is mounted, not plainly.
-  $effect(() => claimWindowReload());
+  // The asset navigation gate (layout/assetGate.svelte.ts): failed-chunk
+  // reports, then build/connection navigation, its hidden-window catch-up,
+  // its timer cleanup and the native Reload Window claim. Declared before
+  // the beforeunload guard below, which re-reads the live dirty set.
+  installAssetGate();
 
   // Slurm strip: one probe at boot; the store keeps its own 60s poll gated on
   // "scheduler is slurm" + a visible window (see workspace/compute.ts).
   $effect(() => initCompute());
 
-  // Daemon/app build skew (native): the daemon serving this window is a
-  // different build than the app — the update toast offers the restart.
-  // Health rides a poll, so this stays current without extra traffic. The
-  // build-timestamp suffix is ignored, like core's builds_match: the same
-  // commit built at different moments must not read as skew.
-  $effect(() => {
-    updateState.buildSkew =
-      appBuild !== null &&
-      typeof health?.build === "string" &&
-      health.build.split(".")[0] !== appBuild.split(".")[0];
+  // Daemon/app build skew (native) for the update toast.
+  conn.trackBuildSkew((skew) => {
+    updateState.buildSkew = skew;
   });
 
   /** The one update worth offering in this window right now — or, after an
@@ -1666,50 +1126,20 @@
   const updateNotice = $derived(currentNotice(scopeAlias));
   updateState.scope = scopeAlias;
 
-  // /ws/events pushes full session snapshots; the 5s poll only runs as a
-  // fallback while the socket is down (including before the first frame).
-  // Links normally ride the socket frames; the fallback refreshes them too.
-  $effect(() => {
-    if (eventsUp) return;
-    return pollSessions(
-      (list) => {
-        applySessions(list);
-        listLinks().then(
-          (l) => (links = l),
-          () => {
-            // stale links until the daemon is reachable again
-          },
-        );
-      },
-      () => {
-        // transient poll failure; the daemon dot already reflects reachability
-      },
-    );
+  // The 5s sessions + links poll, only while /ws/events is down.
+  conn.pollWhileEventsDown({
+    sessions: pollSessions,
+    listLinks,
+    applySessions,
+    setLinks: (l: Link[]) => (links = l),
   });
 
   // Persist the layout (debounced in viewState) whenever it changes, keyed
   // by (window, workspace) so each workspace keeps its own tree.
+  // The blob is built before the layoutReady gate, so the effect tracks the
+  // layout, workspace and detachedness even while not ready.
   $effect(() => {
-    // `surfaces` is the additive, normalized "what this window shows" list
-    // (design §8): the daemon reads only that key and treats `layout` as
-    // opaque, so the layout blob itself stays exactly as before.
-    const blob: Record<string, unknown> = {
-      v: 1,
-      ws: activeWsId,
-      layout: serializeLayout(layout),
-      surfaces: surfacesOf(layout, workspace?.root ?? null),
-    };
-    if (detachedWindow) {
-      blob.dt = 1;
-      if (detachOrigin !== null) blob.origin = detachOrigin;
-    }
-    if (!layoutReady) return;
-    saveViewState(stateKey(activeWsId), blob);
-    // Mirror under the workspace-only key so a reopened window (fresh id)
-    // restores this workspace instead of the empty default (see wsKey).
-    // A detached window's deliberately partial layout never writes the
-    // mirror — it would poison the real workspace window's restore fallback.
-    if (activeWsId !== null && !detachedWindow) saveViewState(wsKey(activeWsId), blob);
+    viewPersistence.persist();
   });
 
   // Persist rail chrome (width + FILES section) locally on any change. Drags
@@ -1808,7 +1238,7 @@
         // refetch this window's workspace list iff the epoch moved.
         if (lastRecentsEpoch !== epoch) {
           lastRecentsEpoch = epoch;
-          refreshRecents();
+          recentsRail.refresh();
           // A session ended: the history surfaces refetch while visible.
           nudgeHistory();
         }
@@ -1826,19 +1256,9 @@
         });
       },
       onBrowserOpen: onAgentBrowserOpen,
-      onStatus: (up) => {
-        // A recovered events socket often means a re-established tunnel — a
-        // different link. Drop the RTT window so the rolling minimum can't
-        // latch the old link's floor (the badge goes blank until the next
-        // health sample, which the recovery kick fetches promptly).
-        if (up && !eventsUp) resetLinkRtt();
-        // No comms frame is sent on connect: refetch what changed while the
-        // socket was down (or a restarted daemon renumbered).
-        if (up && !eventsUp) onCommsReconnect();
-        eventsUp = up;
-        // A save that died with the link retries once it is back.
-        noteDaemonLink(up);
-      },
+      // RTT reset + comms refetch on recovery, then eventsUp, then the
+      // dead-link save retry (net/connection.svelte.ts).
+      onStatus: (up) => conn.noteEventsStatus(up),
       onFatal: (message) => {
         if (message === "unauthorized") notifyUnauthorized();
       },
@@ -1854,7 +1274,7 @@
     // snapshot may have arrived first, and pruneAndAutoOpen gates on
     // settingsLoaded() so an explicit landing choice is never raced.
     void loadSettings().then(pruneAndAutoOpen);
-    void refreshAgents();
+    void launcher.refreshAgents();
 
     // Native menu items the shell forwards to the focused window. Cmd+W
     // closes the focused VIEW (a home window just closes), reclaiming the
@@ -1878,25 +1298,7 @@
         () => {},
       );
       // Build-skew + app-update signals for the update toast.
-      void shellBuild().then((b) => (appBuild = b));
-      // The broadcast carries only the version; the shell's cache holds the
-      // whole outcome (when it checked), which Settings → Updates shows. A
-      // window opened after a broadcast reads the same cache at mount.
-      const readAppStatus = (): void => {
-        void appUpdateStatus(false).then(
-          (status) => {
-            if (status !== null) applyAppStatus(status);
-          },
-          () => {},
-        );
-      };
-      unlistenAppUpdate = asyncDisposer(
-        onAppUpdate((version) => {
-          updateState.appVersion = version;
-          readAppStatus();
-        }),
-      );
-      readAppStatus();
+      unlistenAppUpdate = conn.listenAppUpdate();
       unlistenMenu = asyncDisposer(
         onMenu((action) => {
           // Workbench commands wait while a modal asks something.
@@ -1911,7 +1313,7 @@
               newShell();
               break;
             case "new-agent":
-              newAgentPrimary();
+              launcher.newAgentPrimary();
               break;
             case "settings":
               openSettingsSurface();
@@ -1922,38 +1324,10 @@
           }
         }),
       );
-      // The local daemon was replaced (self-update). Re-home (carrying the
-      // window id, so the layout follows) when its origin moved; when the
-      // handoff retained port+token, a changed build still requires a reload
-      // because the immutable hashed asset namespace changed.
-      unlistenDaemonMoved = asyncDisposer(
-        onLocalDaemonUpdated(({ port, token, build }) => {
-          if (getHostLabel() !== "local") return;
-          if (String(port) === location.port && token === getToken()) {
-            if (daemonBuildChanged(build)) requireAssetNavigation("build", null);
-            return;
-          }
-          const params = new URLSearchParams();
-          params.set("token", token);
-          params.set("win", windowKey());
-          if (activeWsId !== null) params.set("ws", activeWsId);
-          if (shouldCarryHomeHub()) params.set("hub", "1");
-          params.set("appearance", JSON.stringify(appearanceBootstrapForNavigation()));
-          requireAssetNavigation(
-            "build",
-            `http://127.0.0.1:${port}/#${params.toString()}`,
-          );
-        }),
-      );
-      // This remote window's tunnel dropped or came back. "down" → reconnect
-      // now (the shell confirmed the forward is dead); "connected" → re-home
-      // if the origin moved, or reload if only the daemon build moved. A pure
-      // same-build heal stays in place and its WebSocket just reconnects.
-      // Matching is on statusAlias: a job window heeds ONLY its composite
-      // key's events — the login alias's port/token are another daemon.
-      const listening = onHostStatus(handleHostStatus);
-      void listening.then(reconnectListener.attached, reconnectListener.failed);
-      unlistenHostStatus = asyncDisposer(listening);
+      // The local daemon was replaced (self-update): re-home or reload.
+      unlistenDaemonMoved = conn.listenLocalDaemonUpdated();
+      // This remote window's tunnel dropped or came back.
+      unlistenHostStatus = conn.listenHostStatus();
     }
 
     const onPagehide = () => {
@@ -1987,7 +1361,7 @@
       setPathOpener(null);
       setViewOpener(null);
       setSameFileOpener(null);
-      if (archivedUndoTimer !== null) clearTimeout(archivedUndoTimer);
+      recentsRail.dispose();
       setChatLinkContext(null);
       events.close();
       pool.disposePool();
@@ -2721,88 +2095,24 @@
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
 
-  /** Guards overlapping boots (initial load racing a workspace switch). */
-  let bootSeq = 0;
-
   /** Restore this (window, workspace)'s layout from the daemon; anything
    *  missing/invalid (including a not-yet-upgraded daemon) falls back to the
    *  default. Blobs written before per-workspace keys are read from the bare
-   *  window key when they match the active workspace. */
-  async function bootViewState(): Promise<void> {
-    const seq = ++bootSeq;
-    const wsAtBoot = activeWsId;
-    const matches = (raw: unknown): boolean =>
-      typeof raw === "object" &&
-      raw !== null &&
-      (raw as { v?: unknown }).v === 1 &&
-      (raw as { ws?: unknown }).ws === wsAtBoot;
-    // A slow/hung daemon must never leave the stage blank forever: after 3s
-    // the default layout renders and a late restore is simply dropped.
-    const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000));
-    let raw = await Promise.race([loadViewState(stateKey(wsAtBoot)), timeout]);
-    // A detached window never takes the fallbacks: the legacy and mirror
-    // blobs describe the FULL workspace, and restoring one would silently
-    // turn a torn-off pane into a clone of the main window (while the shell
-    // still routes around it as detached). Its own blob or nothing.
-    if (!isDetachedWindow()) {
-      if (!matches(raw) && wsAtBoot !== null) {
-        // pre-composite-key blob migration
-        raw = await Promise.race([loadViewState(winKey), timeout]);
-      }
-      if (!matches(raw) && wsAtBoot !== null) {
-        // No layout for THIS window yet (a reopened/fresh window): fall back
-        // to this workspace's last-active layout so a reopen restores, not
-        // resets.
-        raw = await Promise.race([loadViewState(wsKey(wsAtBoot)), timeout]);
-      }
-    }
-    if (seq !== bootSeq) return; // a later switch superseded this boot
-    if (matches(raw)) {
-      const restored = deserializeLayout((raw as { layout?: unknown }).layout);
-      if (restored !== null) layout = restored;
-      // Detachedness: the hash hint is authoritative (only ITS OWN blob was
-      // consulted above when set); the blob's dt:1 covers pre-hint blobs. A
-      // blob-only signal also refreshes the hint so a plain reload agrees.
-      const r = raw as { dt?: unknown; origin?: unknown };
-      detachedWindow = isDetachedWindow() || r.dt === 1;
-      if (detachedWindow && !isDetachedWindow()) setDetachedWindow(true);
-      detachOrigin =
-        detachedWindow && typeof r.origin === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(r.origin)
-          ? r.origin
-          : null;
-      // A solo window IS focus mode — no rail, ever (the reveal affordances
-      // and the chord are gated). Heal a blob persisted before that rule so
-      // an old dt window can't come up stranded rail-open, stripless.
-      if (detachedWindow && !layout.focusMode) layout = { ...layout, focusMode: true };
-    }
-    layoutReady = true;
-    pruneAndAutoOpen();
-    pruneDeadFiles();
-    if (__CHIMAERA_PERF__) {
-      const spec = stallDriveSpec();
-      if (spec !== null) {
-        void runStallDrive(
-          {
-            get: () => layout,
-            set: (next) => {
-              layout = next;
-            },
-          },
-          spec,
-        );
-      }
-    }
+   *  window key when they match the active workspace (windowPersistence.ts). */
+  function bootViewState(): Promise<void> {
+    return viewPersistence.boot();
   }
 
   /** Drop restored file tabs whose files are definitively gone (400/404);
    *  an unreachable or not-yet-upgraded daemon never wipes tabs. */
   function pruneDeadFiles(): void {
-    const paths = allFilePaths(layout);
-    if (paths.length === 0) return;
-    void Promise.all(paths.map(async (p) => [p, await fsProbe(p)] as const)).then((results) => {
-      const dead = new Set(results.filter(([, r]) => r === "dead").map(([p]) => p));
-      if (dead.size > 0) layout = pruneFiles(layout, dead);
-    });
+    void pruneDeadFileTabs(
+      () => layout,
+      (next) => {
+        layout = next;
+      },
+      fsProbe,
+    );
   }
 
   /**
@@ -2994,7 +2304,7 @@
         // Does what the split button's main surface does — spawn the
         // persisted default agent, or install it when it's missing.
         intercept();
-        newAgentPrimary();
+        launcher.newAgentPrimary();
         return;
       case "newBrowser":
         intercept();
@@ -3291,28 +2601,16 @@
     // Clearing dt here (client, hint, and shell/record via the identity
     // report) is what stops the switch from either self-closing the window
     // (dt over an empty restore) or restoring the workspace mirror as a
-    // silent clone while the shell still routes around it as detached.
-    if (detachedWindow) {
-      detachedWindow = false;
-      detachOrigin = null;
-      setDetachedWindow(false);
-      // Strip dt from the outgoing blob too, or switching BACK to this
-      // workspace later would resurrect solo mode from stale state.
-      saveViewState(stateKey(activeWsId), {
-        v: 1,
-        ws: activeWsId,
-        layout: serializeLayout(layout),
-        // This window is leaving the workspace: it shows none of it now.
-        surfaces: [],
-      });
-    }
-    // Flush the outgoing workspace's pending layout write under its own key,
-    // then restore (or default) the incoming workspace's tree.
-    void flushViewState();
+    // silent clone while the shell still routes around it as detached; the
+    // outgoing blob is rewritten without dt (or switching BACK would
+    // resurrect solo mode). Then the outgoing workspace's pending layout
+    // write is flushed under its own key — all before activeWsId changes.
+    viewPersistence.leaveWorkspace();
     activeWsId = w.id;
     setActiveWorkspaceId(w.id);
-    layoutReady = false;
-    layout = defaultLayout();
+    // layoutReady drops BEFORE the default layout lands, or the persist
+    // effect would write the default under the incoming workspace's key.
+    viewPersistence.resetForBoot();
     autoOpened = false;
     void bootViewState();
   }
@@ -3330,18 +2628,9 @@
       .finally(refreshWorkspaces);
   }
 
-  /** Agent ids in the previous snapshot. A vanished agent just retired into
-   *  the workspace's recents; an appeared one may be a resumed conversation
-   *  leaving them — either way the rail section refetches. */
-  let prevAgentIds = new Set<string>();
-
-  /**
-   * First-known non-zero created_at per session id. The daemon's mid-switch
-   * placeholder row carries created_at:0 (a sentinel); sorting by it verbatim
-   * would teleport a switching session to the rail top. Keeping its original
-   * created_at through placeholders AND respawns keeps the row in place. Pruned to live ids each snapshot.
-   */
-  const lastCreatedAt = new Map<string, number>();
+  /** Tombstones, first-known created_at and the previous agent set
+   *  (workspace/sessionRoster.ts); `applySessions` keeps the writes. */
+  const roster = new SessionRoster();
 
   /**
    * Swap in a sessions list. `snapshot` marks a list that came FROM THE
@@ -3350,28 +2639,10 @@
    * tombstoned session is gone — a locally filtered list lacks the id by
    * construction and must not lift its own tombstone.
    */
-  function applySessions(list: Session[], snapshot = true): void {
-    // A session being optimistically killed is tombstoned: never re-add it
-    // from an intervening snapshot (the daemon hasn't reaped it yet), so the
-    // row can't flicker back before it's really gone. A snapshot that no
-    // longer lists the id is the daemon confirming the retire — the tombstone
-    // has done its job and lifts, so a later resume under the same id can't
-    // be filtered away.
-    if (killing.size > 0) {
-      if (snapshot) {
-        const present = new Set(list.map((s) => s.id));
-        for (const id of killing) if (!present.has(id)) killing.delete(id);
-      }
-      if (killing.size > 0) list = list.filter((s) => !killing.has(s.id));
-    }
-    for (const s of list) {
-      if (s.created_at !== 0 && !lastCreatedAt.has(s.id)) lastCreatedAt.set(s.id, s.created_at);
-    }
-    const ids = new Set(list.map((s) => s.id));
-    for (const id of lastCreatedAt.keys()) if (!ids.has(id)) lastCreatedAt.delete(id);
-    const sortKey = (s: Session): number =>
-      lastCreatedAt.get(s.id) ?? s.created_at;
-    list.sort((a, b) => sortKey(a) - sortKey(b) || a.id.localeCompare(b.id));
+  function applySessions(incoming: Session[], snapshot = true): void {
+    // Tombstoned (optimistically killed) rows stay out until a daemon
+    // snapshot confirms the retire; rail order is first-known created_at.
+    const { list, agentsChanged } = roster.reconcile(incoming, snapshot);
     // Unread marks fold BEFORE the swap: the transitions ("was running, now
     // finished") need the previous rows. The focused session is exempt —
     // output that ended under the user's eyes was seen.
@@ -3393,11 +2664,9 @@
         layout = pruneTabs(layout, (t) => t.surface !== "subagent" || t.sessionId !== s.id);
       }
     }
-    const agentIds = new Set(list.filter((s) => s.kind === "agent").map((s) => s.id));
-    const changed =
-      agentIds.size !== prevAgentIds.size || [...prevAgentIds].some((id) => !agentIds.has(id));
-    prevAgentIds = agentIds;
-    if (changed) refreshRecents();
+    // A vanished agent just retired into the workspace's recents; an appeared
+    // one may be a resumed conversation leaving them.
+    if (agentsChanged) recentsRail.refresh();
     pruneAndAutoOpen();
   }
 
@@ -3418,17 +2687,15 @@
    *  visible flicker over a remote link, where the round trip and the exit
    *  both take longer. `KILL_TOMBSTONE_MS` after the request settles a
    *  lingering tombstone is dropped and the roster refetched, so a kill that
-   *  genuinely failed shows the truth instead of hiding the row forever. */
-  const killing = new Set<string>();
+   *  genuinely failed shows the truth instead of hiding the row forever.
+   *  The tombstone set is `roster.killing`. */
   const KILL_TOMBSTONE_MS = 20_000;
 
   /** Tombstone `ids` and drop them from the local roster in ONE re-apply
    *  (a workspace stop kills many at once). */
   function tombstone(ids: readonly string[]): void {
-    for (const id of ids) {
-      killing.add(id);
-      recentlyCreated.delete(id);
-    }
+    roster.bury(ids);
+    for (const id of ids) recentlyCreated.delete(id);
     applySessions(
       sessions.filter((s) => !ids.includes(s.id)),
       false,
@@ -3440,9 +2707,7 @@
    *  (see `killing`). */
   function armTombstoneExpiry(ids: readonly string[]): void {
     window.setTimeout(() => {
-      let lingering = false;
-      for (const id of ids) if (killing.delete(id)) lingering = true;
-      if (!lingering) return;
+      if (!roster.expire(ids)) return;
       listSessions().then(applySessions, () => {
         // unreachable daemon: the next snapshot/poll reconciles
       });
@@ -4032,7 +3297,7 @@
       // detour); an unknown/unloaded catalog trusts the default view.
       const chatCapable =
         kind === "agent"
-          ? agents?.find((a) => a.id === (spawn.agent ?? "claude"))?.chatCapable
+          ? launcher.agents?.find((a) => a.id === (spawn.agent ?? "claude"))?.chatCapable
           : undefined;
       // A new agent follows the workspace's worktree choice; reopens,
       // resumes and explicit folders never do.
@@ -4042,7 +3307,7 @@
       const s = await createSession(activeWsId, kind, null, spawnSize(), req, chatCapable);
       recentlyCreated.add(s.id);
       // A racing events snapshot may already have delivered the session.
-      if (!sessions.some((x) => x.id === s.id)) sessions.push(s);
+      if (needsAppend(sessions, s)) sessions.push(s);
       // The new session opens as the active tab in the focused pane,
       // focused, immediately — never an invisible rail-only row.
       openSess(s.id);
@@ -4060,118 +3325,9 @@
     void spawnSession("shell");
   }
 
-  /** One rail quick start: spawn that agent instantly in the default view
-   *  (`term` = the ⌘/ctrl-click terminal path) — or, when it could only open
-   *  a doomed pane, the step that unblocks it: a retry of a check the login
-   *  shell couldn't finish, the curated install / chat setup (managed
-   *  runtimes) or Settings → Agents. A quick start does NOT change the saved
-   *  default: the rows never reorder under the pointer; choosing in the
-   *  launcher menu is what moves the primary. */
-  function quickStart(q: PrimaryStart, term = false): void {
-    launcherOpen = false;
-    if (q.action === "check") {
-      // Look again only: a start that lands half a minute later would
-      // surprise. The row reads ready once the check finds it.
-      void recheckAgent(q.id).catch(() => {});
-      return;
-    }
-    if (term && q.info?.installed !== false) {
-      void spawnSession("agent", { agent: q.id, ui: "term" });
-      return;
-    }
-    if ((q.action === "install" || q.action === "setup-chat") && q.info !== null) {
-      launcherInstall(q.info);
-      return;
-    }
-    if (q.action === "setup") {
-      openAgentSettings();
-      return;
-    }
-    void spawnSession("agent", { agent: q.id });
-  }
-
-  /** The rail's row / Cmd+Shift+E: the saved default, instantly (or its
-   *  setup step when it isn't runnable here). */
-  function newAgentPrimary(): void {
-    quickStart(railStart);
-  }
-
-  /** Settings → Agents: where every agent is installed, updated and pointed
-   *  at a binary (the launcher's footer, a set-up chip). */
-  function openAgentSettings(): void {
-    launcherOpen = false;
-    openSettingsSurface();
-    requestSettingsSection("Agents");
-  }
-
-  /** Re-probe the host's agent catalog. `force` bypasses the daemon's
-   *  detection cache (after an install, or when the launcher opens). Failures
-   *  keep the last-known catalog rather than blanking the button. */
-  async function refreshAgents(force = false): Promise<void> {
-    try {
-      agents = await listAgents(force);
-    } catch {
-      // keep the last catalog; the next trigger retries
-    }
-  }
-
-  // --- the agent launcher popover ---
-
-  /** When the popover opened, so a chevron click landing right after a
-   *  hover-open confirms it instead of flash-closing it. */
-  let launcherOpenedAt = 0;
-
-  function openLauncher(): void {
-    if (launcherOpen || activeWsId === null || newSplitEl === null) return;
-    launcherAnchor = newSplitEl.getBoundingClientRect();
-    launcherOpenedAt = Date.now();
-    launcherOpen = true;
-  }
-
-  /** Escape hands focus back to the chevron (menu-button pattern); an
-   *  outside press returns it to the focused terminal. */
-  function closeLauncher(how?: "escape"): void {
-    launcherOpen = false;
-    if (how === "escape") {
-      newSplitEl?.querySelector<HTMLElement>(".new-chev")?.focus();
-      return;
-    }
-    const sid = focusedSessionOf(layout);
-    if (sid !== null) pool.focusTerminal(sid);
-  }
-
-  /** Hover intent (~150ms) on the CHEVRON opens the launcher — the main
-   *  surface never does; it is a pure instant spawn (field feedback: a
-   *  popover chasing every hover of the button read as intrusive). */
-  function armLauncherHover(): void {
-    if (launcherOpen || activeWsId === null) return;
-    disarmLauncherHover();
-    launcherHoverTimer = setTimeout(() => {
-      launcherHoverTimer = null;
-      openLauncher();
-    }, 150);
-  }
-
-  function disarmLauncherHover(): void {
-    if (launcherHoverTimer !== null) {
-      clearTimeout(launcherHoverTimer);
-      launcherHoverTimer = null;
-    }
-  }
-
-  /** Every launcher selection becomes the new default agent and spawns. An
-   *  EXPLICIT surface pick (the "open"/terminal buttons, ⌘↵) also becomes the
-   *  sticky default view, so the split button and the next plain row press
-   *  follow it until the user picks the other surface again. */
-  function launcherPick(pick: LaunchPick): void {
-    launcherOpen = false;
-    agentDefault = { agent: pick.agent };
-    setAgentDefault(agentDefault);
-    if (pick.explicit === true && pick.ui !== undefined) {
-      // The setting's vocabulary is "terminal"; the wire/pick term is "term".
-      setSetting("agents.defaultView", pick.ui === "term" ? "terminal" : "chat");
-    }
-    void spawnSession("agent", pick);
+  /** Every agent start from the launcher, a quick start or a Recents row. */
+  function startAgent(spawn: AgentSpawn): void {
+    void spawnSession("agent", spawn);
   }
 
   /** Flip the workspace's "new agents start in a new worktree" choice:
@@ -4195,218 +3351,19 @@
 
   // --- a managed worktree left behind (session ended / conversation archived) ---
 
-  /** The one "kept" notice under the agents: a managed worktree whose last
-   *  session just ended. Never auto-removed — Remove or Keep, the user's
-   *  call; a newer notice replaces it. */
-  let wtNotice = $state<{
-    ws: string;
-    path: string;
-    label: string;
-    busy: boolean;
-    error: string | null;
-  } | null>(null);
-  let wtNoticeTimer: ReturnType<typeof setTimeout> | null = null;
-
-  function clearWtNoticeTimer(): void {
-    if (wtNoticeTimer !== null) {
-      clearTimeout(wtNoticeTimer);
-      wtNoticeTimer = null;
-    }
-  }
-
-  function dismissWtNotice(): void {
-    clearWtNoticeTimer();
-    wtNotice = null;
-  }
-
-  function offerWorktreeRemoval(ws: string, path: string, branch: string | null): void {
-    clearWtNoticeTimer();
-    // The branch's last segment: the rail is narrow, and "chimaera/" says
-    // nothing the notice needs (the full path is the tooltip).
-    wtNotice = { ws, path, label: baseName(branch ?? path), busy: false, error: null };
-  }
-
-  async function removeKeptWorktree(): Promise<void> {
-    const n = wtNotice;
-    if (n === null || n.busy) return;
-    wtNotice = { ...n, busy: true };
-    try {
-      await removeWorktree(n.ws, n.path);
-      if (wtNotice?.path === n.path) wtNotice = null;
-      if (activeWsId === n.ws) refreshRecents();
-    } catch (e) {
-      if (wtNotice?.path !== n.path) return;
-      // The daemon's refusal (uncommitted changes, unmerged commits, a live
-      // session, a lock) is the honest answer: say it, keep the worktree.
-      wtNotice = {
-        ...n,
-        busy: false,
-        error: e instanceof ApiError ? e.message : "could not remove the worktree",
-      };
-      clearWtNoticeTimer();
-      wtNoticeTimer = setTimeout(() => {
-        wtNoticeTimer = null;
-        if (wtNotice?.path === n.path) wtNotice = null;
-      }, 6000);
-    }
-  }
-
-  // A notice belongs to its workspace; a switch drops it.
-  $effect(() => {
-    const ws = activeWsId;
-    untrack(() => {
-      if (wtNotice !== null && wtNotice.ws !== ws) dismissWtNotice();
-    });
+  /** The "kept" notice under the agents (workspace/worktreeNotice.svelte.ts).
+   *  Its effects — a workspace switch drops another workspace's notice, and
+   *  the timer teardown — are declared here, before the Recents refetch. */
+  const keptWorktree = new KeptWorktreeNotice({
+    activeWsId: () => activeWsId,
+    refreshRecents: () => recentsRail.refresh(),
+    onError: (message) => (createError = message),
   });
-  $effect(() => {
-    return () => clearWtNoticeTimer();
-  });
-
-  /** Open a managed worktree as its own window — the folder picker's "new
-   *  window" path; this window stays where it is. */
-  async function openWorktreeWindow(path: string): Promise<void> {
-    try {
-      const w = await createWorkspace(path);
-      const alias = getHostLabel() === "local" ? null : getHostLabel();
-      await openWindow(alias, w.id, true);
-    } catch (e) {
-      createError = e instanceof ApiError ? e.message : "could not open the worktree";
-    }
-  }
-
-  function launcherInstall(a: AgentInfo): void {
-    launcherOpen = false;
-    if (activeWsId === null) { openPicker(); return; }
-    openAgentSetup(a, activeWsId, "install");
-  }
-
-  function launcherUpdate(a: AgentInfo): void {
-    launcherOpen = false;
-    if (activeWsId === null) { openPicker(); return; }
-    openAgentSetup(a, activeWsId, "update");
-  }
+  keptWorktree.track();
 
   // --- the rail's Recents section ---
-
-  /** Monotone fetch counter: a slow early /recents response must not
-   *  clobber a newer one. */
-  let recentsSeq = 0;
-
-  /** Reload the workspace's ended agent conversations. Retire timing needs
-   *  no guessing: the daemon pushes a `recents` epoch frame the moment a
-   *  conversation lands in the store, and this refetches on it. This path
-   *  also runs on agent-set changes — a conversation resumed into a live
-   *  session must drop off the list even though the store didn't change. */
-  function refreshRecents(): void {
-    const ws = activeWsId;
-    if (ws === null) {
-      recents = [];
-      return;
-    }
-    const seq = ++recentsSeq;
-    listRecents(ws)
-      .then((r) => {
-        if (activeWsId === ws && seq === recentsSeq) recents = r;
-      })
-      .catch(() => {
-        // rail stays on its last list; the next snapshot retries
-      });
-  }
-
-  $effect(() => {
-    void activeWsId;
-    recentsExpanded = false;
-    refreshRecents();
-  });
-
-  /** Recents rows glide up when one is archived (the dashboard roster's
-   *  flip idiom); zero under reduced motion. */
-  const recentsFlipMs =
-    typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches
-      ? 0
-      : 220;
-
-  /** "Archived 12 · Undo" after Archive all, for ~6 s. */
-  let archivedUndo = $state<{ ws: string; keys: string[] } | null>(null);
-  let archivedUndoTimer: ReturnType<typeof setTimeout> | null = null;
-
-  function archiveEntry(r: RecentConvo) {
-    return { key: r.key, kind: r.kind, title: r.title, resume: r.resume, ui: r.ui };
-  }
-
-  /** Archive hides a conversation from Recents — never deletes it; it stays
-   *  in All sessions under "Archived". Optimistic: the row animates out now,
-   *  and a failure refetches the truth. No confirm, no toast. */
-  async function archiveRecent(r: RecentConvo): Promise<void> {
-    const ws = activeWsId;
-    if (ws === null) return;
-    recents = recents.filter((x) => x.key !== r.key);
-    if (r.worktree !== null && !worktreeInUse(sessions, r.worktree)) {
-      offerWorktreeRemoval(ws, r.worktree, null);
-    }
-    try {
-      await archiveRecents(ws, [archiveEntry(r)]);
-    } catch {
-      refreshRecents();
-    }
-  }
-
-  async function archiveAllRecents(): Promise<void> {
-    const ws = activeWsId;
-    const rows = visibleRecents;
-    if (ws === null || rows.length === 0) return;
-    const gone = new Set(rows.map((r) => r.key));
-    recents = recents.filter((x) => !gone.has(x.key));
-    try {
-      const keys = await archiveRecents(ws, rows.map(archiveEntry));
-      if (archivedUndoTimer !== null) clearTimeout(archivedUndoTimer);
-      archivedUndo = { ws, keys };
-      archivedUndoTimer = setTimeout(() => {
-        archivedUndo = null;
-        archivedUndoTimer = null;
-      }, 6000);
-    } catch {
-      refreshRecents();
-    }
-  }
-
-  /** Undo restores exactly the set Archive all hid. */
-  async function undoArchiveAll(): Promise<void> {
-    const undo = archivedUndo;
-    if (undo === null) return;
-    archivedUndo = null;
-    if (archivedUndoTimer !== null) clearTimeout(archivedUndoTimer);
-    archivedUndoTimer = null;
-    try {
-      await unarchiveRecents(undo.ws, undo.keys);
-    } finally {
-      refreshRecents();
-    }
-  }
-
-  /** A Recents row: resume when the daemon captured a native conversation
-   *  handle, else an honest fresh start (the tooltip says why). The row's
-   *  title rides along so the restored conversation keeps its name instead of
-   *  showing a bare "claude" until a new turn regenerates one. */
-  function openRecent(r: RecentConvo): void {
-    const titleHint = r.title !== "" ? r.title : undefined;
-    // Reopening is independent of the preference for NEW conversations.
-    // Legacy/scanned CLI histories predate an explicit chat choice.
-    // Preserve their terminal surface instead of migrating them on an update.
-    const ui = r.ui ?? "term";
-    void spawnSession(
-      "agent",
-      r.resume !== null
-        ? { agent: r.kind, resume: r.resume, titleHint, ui }
-        : { agent: r.kind, titleHint, ui },
-    );
-  }
-
-  function recentTooltip(r: RecentConvo): string {
-    return r.resume !== null
-      ? `resume “${r.title}”`
-      : `no saved conversation handle was recorded — starts a fresh ${r.kind} session`;
-  }
+  // A workspace switch collapses the section and refetches it.
+  recentsRail.trackWorkspace();
 
   /** Kill the session's process on the daemon and drop it locally — OPTIMISTIC:
    *  the row/tab vanishes at once and the ChatView tears down immediately,
@@ -4420,7 +3377,7 @@
     const dying = sessions.find((x) => x.id === id);
     const kept = dying?.kind === "agent" ? (dying.managed_worktree ?? null) : null;
     if (dying !== undefined && kept !== null && !worktreeInUse(sessions, kept, id)) {
-      offerWorktreeRemoval(dying.workspace_id, kept, dying.git?.branch ?? null);
+      keptWorktree.offer(dying.workspace_id, kept, dying.git?.branch ?? null);
     }
     chatPool.disposeChat(id); // stop its socket reconnecting right away
     tombstone([id]);
@@ -4447,23 +3404,9 @@
     armTombstoneExpiry(ids);
   }
 
-  /** Inline rename (double-click / F2 on a rail row): chimaera owns the
-   *  pin — it works for every session kind, not just claude's /rename. */
   function startRename(s: Session): void {
     confirmKillId = null;
-    renamingId = s.id;
-    renameDraft = displayNames.get(s.id) ?? displayName(s);
-  }
-
-  function commitRename(): void {
-    const id = renamingId;
-    if (id === null) return;
-    renamingId = null;
-    const name = renameDraft.trim();
-    if (name === "") return; // empty = cancel, never un-pin by accident
-    renameSession(id, name).catch(() => {
-      // next sessions snapshot restores the truth
-    });
+    railRename.begin(s.id, displayNames.get(s.id) ?? displayName(s));
   }
 
   /** Rail-header "new file"/"new folder": an inline-create row in the tree,
@@ -4634,58 +3577,16 @@
       void switchView(sessionId, target);
     },
     detachTabToWindow(paneId, index) {
-      const p = findPane(layout.root, paneId);
-      const tab = p?.tabs[index];
-      if (p === null || tab === undefined) return;
-      // No drop point on the menu path: open near the pane, offset a touch
-      // so the new window reads as "came out of here". Client coords sit in
-      // the VIEWPORT while window.screenX/Y is the OUTER frame — the browser
-      // chrome (tab strip + toolbar) between them must be added, or the
-      // popup opens a chrome-height too high. (Native ignores screen coords;
-      // the shell lifts client coords itself.)
-      const rect = paneRootEl(paneId)?.getBoundingClientRect();
-      const cx = (rect?.left ?? 80) + 48;
-      const cy = (rect?.top ?? 80) + 48;
-      const chromeX = Math.max((window.outerWidth - window.innerWidth) / 2, 0);
-      const chromeY = Math.max(window.outerHeight - window.innerHeight, 0);
-      void detachOut(
-        [tab],
-        {
-          clientX: cx,
-          clientY: cy,
-          screenX: window.screenX + chromeX + cx,
-          screenY: window.screenY + chromeY + cy,
-        },
-        0,
-        p.fontSize,
-      );
+      xw.detachTabToWindow(paneId, index);
     },
     moveTargets() {
-      return xwinRoster;
+      return xw.moveTargets();
     },
     refreshMoveTargets() {
-      refreshXwinRoster();
+      xw.refreshMoveTargets();
     },
     moveTabToWindow(paneId, index, winId) {
-      const p = findPane(layout.root, paneId);
-      const tab = p?.tabs[index];
-      if (p === null || tab === undefined || xwin === null) return;
-      if (guardDirtyMove([tab])) return;
-      void (async () => {
-        if (!(await browserTargetAlive(winId))) {
-          showFlash("that window isn't open anymore");
-          refreshXwinRoster();
-          return;
-        }
-        const transfer = mintTransfer();
-        armTransfer(transfer, [tab]);
-        try {
-          await xwin?.adoptInto(winId, adoptPayload([tab], 0, p.fontSize), transfer);
-        } catch {
-          disarmTransfer(transfer);
-          showFlash("that window isn't open anymore");
-        }
-      })();
+      xw.moveTabToWindow(paneId, index, winId);
     },
   };
 
@@ -4814,407 +3715,6 @@
       if (s.kind === "agent" && s.alive && s.workspace_id === term.workspace_id) out.add(s.id);
     }
     return out.size > 0 ? out : undefined;
-  }
-
-  /** Whether drags in this window may tear out into a new window. */
-  function canDetachOut(): boolean {
-    // A compute (job) window's daemon has its own URL vocabulary; the shell
-    // refuses the detach anyway — refusing HERE keeps the ghost honest and
-    // stops each attempt from pre-seeding an orphaned view-state blob.
-    return activeWsId !== null && jobCtx === null;
-  }
-
-  /** Realm-local unsaved state must not leave this window: a dirty file's
-   *  CodeMirror buffer, and a chat composer's volatile draft (memory-only
-   *  image attachments / oversized text), both evaporate for the moving tab.
-   *  Same rule as the rename guard. True = blocked, reason flashed. */
-  function guardDirtyMove(tabs: Tab[]): boolean {
-    const dirty = get(dirtyFiles);
-    if (tabs.some((t) => t.surface === "file" && dirty.has(t.path))) {
-      showFlash("save the file before moving it to another window");
-      return true;
-    }
-    const volatile = get(volatileChatDrafts);
-    if (tabs.some((t) => t.surface === "terminal" && volatile.has(t.sessionId))) {
-      showFlash("send or clear the chat draft before moving it to another window");
-      return true;
-    }
-    return false;
-  }
-
-  /** Whether a browser-transport target is still alive. BroadcastChannel
-   *  posts to a closed window are indistinguishable from delivered ones, so
-   *  the menu paths probe the live roster first — the native shell errors
-   *  from adopt_tab itself and needs no probe. */
-  async function browserTargetAlive(winId: string): Promise<boolean> {
-    if (isNativeShell() || xwin === null) return true;
-    const roster = await xwin.roster();
-    return roster.some((w) => w.winId === winId);
-  }
-
-  /**
-   * An out-of-window RELEASE: over a sibling chimaera window it becomes a
-   * cross-window move (shell-routed, remove-on-ack); over the desktop it
-   * detaches into a new window. The browser has no sibling geometry, so
-   * there it always detaches. A routing failure falls through to detach —
-   * a completed gesture must never dissolve into silence.
-   */
-  async function outDrop(
-    tabs: Tab[],
-    at: { clientX: number; clientY: number; screenX: number; screenY: number },
-    dragId: number,
-    active = 0,
-    fontSize?: number,
-  ): Promise<void> {
-    if (guardDirtyMove(tabs)) return;
-    if (isNativeShell() && xwin !== null) {
-      const transfer = mintTransfer();
-      // Armed BEFORE the routing call: the shell emits the drop to the
-      // target inside drag_drop, so a fast ack could otherwise beat the
-      // invoke's own response back to an empty ledger.
-      armTransfer(transfer, tabs);
-      try {
-        const r = await xwin.drop(
-          at.clientX,
-          at.clientY,
-          dragId,
-          transfer,
-          adoptPayload(tabs, active, fontSize),
-        );
-        if (r.routed) return; // the ack (or its timeout) owns the outcome now
-        disarmTransfer(transfer);
-      } catch {
-        disarmTransfer(transfer);
-      }
-    }
-    await detachOut(tabs, at, active, fontSize);
-  }
-
-  /**
-   * The solo strip's one-click undo: send everything in this detached window
-   * back to the window it came from. On the ok-ack the ledger removes the
-   * tabs, the layout empties, and the empty-close effect closes this window
-   * — the whole flow is the ordinary move machinery.
-   */
-  async function reattachToOrigin(): Promise<void> {
-    if (xwin === null || detachOrigin === null) return;
-    const tabs = allTabs(layout);
-    if (tabs.length === 0 || guardDirtyMove(tabs)) return;
-    if (!(await browserTargetAlive(detachOrigin))) {
-      showFlash("the original window isn't open anymore — use a tab's Move menu instead");
-      return;
-    }
-    const p = findPane(layout.root, layout.focusedPaneId);
-    const activeTab = p?.tabs[p.active];
-    const activeIndex =
-      activeTab !== undefined
-        ? tabs.findIndex((t) => tabKey(t) === tabKey(activeTab))
-        : 0;
-    const transfer = mintTransfer();
-    armTransfer(transfer, tabs);
-    try {
-      await xwin.adoptInto(
-        detachOrigin,
-        adoptPayload(tabs, Math.max(activeIndex, 0), p?.fontSize),
-        transfer,
-      );
-    } catch {
-      disarmTransfer(transfer);
-      showFlash("the original window isn't open anymore — use a tab's Move menu instead");
-    }
-  }
-
-  /**
-   * Detach tabs into their own window: pre-seed the new window's view-state
-   * blob (`dt:1` + this window as origin), open a window on that id, then —
-   * only once the open genuinely happened — remove the tabs here. The tabs
-   * are views onto daemon-owned state, so the new window reattaches its own
-   * sockets; nothing is ever moved but layout.
-   */
-  async function detachOut(
-    tabs: Tab[],
-    at: { clientX: number; clientY: number; screenX: number; screenY: number },
-    active = 0,
-    fontSize?: number,
-  ): Promise<void> {
-    const wsId = activeWsId;
-    if (wsId === null || tabs.length === 0 || guardDirtyMove(tabs)) return;
-    const solo = soloLayout(tabs, active, fontSize);
-    const winId = `w-${crypto.randomUUID()}`;
-    const blob: Record<string, unknown> = {
-      v: 1,
-      ws: wsId,
-      layout: serializeLayout(solo),
-      surfaces: surfacesOf(solo, workspace?.root ?? null),
-      dt: 1,
-      origin: winKey,
-    };
-    if (!(await putViewState(`${winId}_${wsId}`, blob))) {
-      showFlash("couldn't reach the daemon — the tab stays here");
-      return;
-    }
-    // Size the new window on the source pane when the payload lives in one
-    // (a rail-row drag doesn't), clamped to a sane floor.
-    const srcPane = paneForTab(layout.root, tabs[0])?.paneId;
-    const rect = srcPane !== undefined ? paneRootEl(srcPane)?.getBoundingClientRect() : undefined;
-    const w = Math.max(rect?.width ?? 900, 680);
-    const h = Math.max(rect?.height ?? 600, 440);
-    if (isNativeShell()) {
-      try {
-        // Client coords: the shell lifts them into screen space itself.
-        await openDetachedWindow(wsId, winId, { x: at.clientX, y: at.clientY, w, h });
-      } catch (e) {
-        showFlash(`couldn't open the window — ${String(e)}`);
-        return;
-      }
-    } else if (!openDetachedPopup(winId, wsId, { x: at.screenX, y: at.screenY, w, h })) {
-      showFlash("the browser blocked the popup — allow popups to detach tabs");
-      return;
-    }
-    let next = layout;
-    for (const t of tabs) {
-      const loc = paneForTab(next.root, t);
-      if (loc !== null) next = detachTab(next, loc.paneId, loc.index);
-    }
-    layout = next;
-  }
-
-  /**
-   * Words for the drag ghost's hint on the spots dnd.ts can't name itself:
-   * WHICH session a reference band or link target is ("@ reference in
-   * claude-1", "link to codex-2") — the same names the tabs and rail show.
-   * Null for the geometric spots (dnd's generic reading covers them).
-   */
-  function describeSpot(spot: DropSpot): string | null {
-    if (spot.kind === "fileOp") {
-      const folder = spot.dir === "/" ? "/" : `${basename(spot.dir)}/`;
-      const modifier = spot.operation === "move" ? ` · ${isMac ? "Option" : "Alt"} to copy` : "";
-      return spot.blocked ?? `${spot.operation} into ${folder}${modifier}`;
-    }
-    if (spot.kind === "ref" || spot.kind === "link") {
-      const s = osDropSession(spot.paneId);
-      if (s === null) return null;
-      const name = tabLabel({ surface: "terminal", sessionId: s.id });
-      return spot.kind === "ref" ? `@ reference in ${name}` : `link to ${name}`;
-    }
-    if (spot.kind === "linkpane" || spot.kind === "linktab" || spot.kind === "linkrow") {
-      return `link to ${tabLabel({ surface: "terminal", sessionId: spot.sessionId })}`;
-    }
-    return null;
-  }
-
-  /**
-   * Shared drag start for rail rows and pane tabs (any surface). `linkIntent`
-   * (set when the drag starts from a pane's link icon) restricts a shell
-   * terminal to link-only drops — anywhere but an agent is a no-op, never a
-   * tab move.
-   */
-  function beginDrag(
-    e: PointerEvent,
-    tab: Tab,
-    onClick: () => void,
-    linkIntent = false,
-    source: FileSource | null = tab.surface === "file" ? { path: tab.path, kind: "file" } : null,
-  ): void {
-    const label = tabLabel(tab);
-    const dragId = ++dragSeq;
-    // Arm the bottom bands for this drag: reference targets for path drags
-    // (file previews and Finder/dir payloads), link targets for shell-
-    // terminal drags. Drives the partitioned zone previews (the band region
-    // is reserved, never flashed over).
-    const refPath =
-      tab.surface === "file" || tab.surface === "finder"
-        ? tab.path
-        : tab.surface === "gitx" && tab.view === "commit"
-          ? tab.sha
-          : undefined;
-    const armed = new Set<string>();
-    const linkTargets = linkTargetsFor(tab);
-    const linkSessions = linkSessionsFor(tab);
-    if (linkTargets !== undefined) for (const id of linkTargets.keys()) armed.add(id);
-    if (refPath !== undefined) {
-      for (const p of panesOf(layout.root)) {
-        const a = p.tabs[p.active];
-        if (
-          a !== undefined &&
-          a.surface === "terminal" &&
-          (sessionsById.get(a.sessionId)?.alive ?? false)
-        ) {
-          armed.add(p.id);
-        }
-      }
-    }
-    bandPanes = armed;
-    startDrag(
-      e,
-      { tab, label, refPath },
-      {
-        onSpot: (s) => (dropSpot = s),
-        onDrop: (spot) => {
-          if (spot.kind === "fileOp") {
-            if (source !== null && spot.blocked === null) void transferInto(source, spot.dir, spot.operation);
-            return;
-          }
-          if (spot.kind === "ref") {
-            // Drag-to-reference: type into the session, never open a tab.
-            if (tab.surface === "file") referenceFileDrop(spot.paneId, tab.path, "file");
-            else if (tab.surface === "finder") referenceFileDrop(spot.paneId, tab.path, "dir");
-            else if (tab.surface === "gitx") referenceCommitDrop(spot.paneId, tab);
-            return;
-          }
-          if (spot.kind === "link") {
-            // Plain tab drag onto an agent pane's band.
-            if (tab.surface === "terminal") linkByDrop(tab.sessionId, spot.paneId);
-            return;
-          }
-          if (spot.kind === "linkpane" || spot.kind === "linktab" || spot.kind === "linkrow") {
-            // Link-intent drop on an agent (its view, tab, or rail row): link,
-            // then surface the agent.
-            if (tab.surface === "terminal") linkBySession(tab.sessionId, spot.sessionId);
-            return;
-          }
-          // A link-intent drag (from the link icon) only ever links — a drop
-          // anywhere but an agent is a no-op, never a surprise tab move.
-          if (linkIntent) return;
-          if (spot.kind === "out") {
-            // Released outside the window: move into the sibling window
-            // under the pointer, or detach into a new one.
-            const src = paneForTab(layout.root, tab);
-            const fs = src !== undefined && src !== null ? findPane(layout.root, src.paneId)?.fontSize : undefined;
-            void outDrop([tab], spot, dragId, 0, fs);
-            return;
-          }
-          // `upload` never reaches this pointer-drag callback (it is only ever
-          // set on dropSpot by App's OS-drop handlers), so the zone arm is
-          // explicit and the impossible case is a no-op.
-          layout =
-            spot.kind === "tab"
-              ? moveTabToIndex(layout, tab, spot.paneId, spot.index)
-              : spot.kind === "edge"
-                ? dropTabAtRootEdge(layout, tab, spot.edge)
-                : spot.kind === "zone"
-                  ? dropTab(layout, tab, spot.paneId, spot.zone)
-                  : layout;
-          if (tab.surface === "terminal") {
-            pool.focusTerminal(tab.sessionId);
-          } else if (document.activeElement instanceof HTMLElement) {
-            // A file surface landed: pull DOM focus off any terminal so
-            // plain keys stop reaching a PTY that is no longer visible.
-            document.activeElement.blur();
-          }
-        },
-        onClick,
-        onEnd: () => {
-          dropSpot = null;
-          bandPanes = new Set();
-          // Clear any sibling-window highlight the drag lit up. After a
-          // routed drop the shell already forgot the drag — a no-op then.
-          // The id also fences this drag's still-in-flight track calls.
-          xwin?.cancel(dragId);
-        },
-        // The "@ reference" band exists over panes showing a LIVE session
-        // (dnd only consults this for file drags).
-        acceptsRef: (paneId) => {
-          const p = findPane(layout.root, paneId);
-          if (p === null) return false;
-          const a = p.tabs[p.active];
-          return (
-            a !== undefined &&
-            a.surface === "terminal" &&
-            (sessionsById.get(a.sessionId)?.alive ?? false)
-          );
-        },
-      },
-      {
-        linkTargets,
-        linkSessions,
-        linkIntent,
-        fileTargetAt: source === null || linkIntent ? undefined : (x, y, copy) => {
-          const folder = folderTargetAt(x, y);
-          if (folder === null) return null;
-          const operation = copy ? "copy" : "move";
-          return { ...folder, kind: "fileOp", operation, blocked: transferBlock(source, folder.dir, operation) };
-        },
-        describe: describeSpot,
-        // Realm-local unsaved state never arms the out spot: the ghost must
-        // not advertise "open as new window" for a move the drop refuses.
-        allowOut: !linkIntent && canDetachOut() && !guardBlocksTab(tab),
-        trackOut: isNativeShell()
-          ? (x, y) => xwin?.track(x, y, dragId) ?? Promise.resolve(false)
-          : undefined,
-        trackEnd: isNativeShell() ? () => xwin?.cancel(dragId) : undefined,
-      },
-    );
-  }
-
-  /** Whether guardDirtyMove would refuse this tab (silently — for arming
-   *  decisions; the guard itself flashes the reason at act time). */
-  function guardBlocksTab(tab: Tab): boolean {
-    return (
-      (tab.surface === "file" && get(dirtyFiles).has(tab.path)) ||
-      (tab.surface === "terminal" && get(volatileChatDrafts).has(tab.sessionId))
-    );
-  }
-
-  /** The pane grip's whole-pane drag: move the ENTIRE pane (all tabs) to
-   *  another split position, reusing the tab-drag drop zones. A plain click
-   *  focuses the pane. No refPath/link arming — only tab/edge/zone spots fire,
-   *  and any spot targeting the dragged pane itself is suppressed. */
-  function beginPaneDrag(e: PointerEvent, paneId: string): void {
-    const pane = findPane(layout.root, paneId);
-    // The old "last pane never moves" gate predates tear-out: a single-pane
-    // window's grip now has somewhere to go — OUT. In-window spots on the
-    // dragged pane itself are self-drops and no-op below.
-    if (pane === null || (panesOf(layout.root).length < 2 && !canDetachOut())) return;
-    const dragId = ++dragSeq;
-    const active = pane.tabs[pane.active];
-    const base = active !== undefined ? tabLabel(active) : "pane";
-    const extra = pane.tabs.length > 1 ? ` +${pane.tabs.length - 1}` : "";
-    startDrag(
-      e,
-      { label: `${base}${extra}` },
-      {
-        onSpot: (s) => {
-          // Never advertise a drop onto the pane being dragged (self-move).
-          dropSpot = s !== null && "paneId" in s && s.paneId === paneId ? null : s;
-        },
-        onDrop: (spot) => {
-          if ("paneId" in spot && spot.paneId === paneId) return;
-          if (spot.kind === "out") {
-            // The whole pane (all its tabs, active index, font) tears out.
-            const p = findPane(layout.root, paneId);
-            if (p !== null) void outDrop(p.tabs, spot, dragId, p.active, p.fontSize);
-            return;
-          }
-          layout =
-            spot.kind === "tab"
-              ? movePaneToIndex(layout, paneId, spot.paneId, spot.index)
-              : spot.kind === "edge"
-                ? movePaneToRootEdge(layout, paneId, spot.edge)
-                : spot.kind === "zone"
-                  ? movePane(layout, paneId, spot.paneId, spot.zone)
-                  : layout;
-          const sid = focusedSessionOf(layout);
-          if (sid !== null) pool.focusTerminal(sid);
-        },
-        onClick: () => ctrl.focusPane(paneId),
-        onEnd: () => {
-          dropSpot = null;
-          bandPanes = new Set();
-          xwin?.cancel(dragId);
-        },
-      },
-      {
-        // The pane's own zones are refused on drop (onSpot hides their
-        // preview too), so the ghost must not promise "split right" there.
-        describe: (s) => ("paneId" in s && s.paneId === paneId ? "" : describeSpot(s)),
-        allowOut: canDetachOut() && !pane.tabs.some(guardBlocksTab),
-        trackOut: isNativeShell()
-          ? (x, y) => xwin?.track(x, y, dragId) ?? Promise.resolve(false)
-          : undefined,
-        trackEnd: isNativeShell() ? () => xwin?.cancel(dragId) : undefined,
-      },
-    );
   }
 
   /** A tab's display label (drags, the detached-window title). */
@@ -5373,158 +3873,11 @@
       },
     };
   }
-
-  /**
-   * FILES section resize: a quiet divider above the section header; drag
-   * moves the boundary (fraction of the rail, clamped), Escape restores.
-   */
-  function onFilesDividerDown(e: PointerEvent): void {
-    if (e.button !== 0 || railEl === null || daemonEl === null) return;
-    e.preventDefault();
-    const divider = e.currentTarget as HTMLElement;
-    const rail = railEl;
-    const daemon = daemonEl;
-    const pointerId = e.pointerId;
-    const startFrac = filesFrac;
-    let raf = 0;
-    let lastY = e.clientY;
-    let done = false;
-
-    try {
-      divider.setPointerCapture(pointerId);
-    } catch {
-      // capture unavailable; window-level listeners still track the drag
-    }
-    filesDividerActive = true;
-
-    const apply = () => {
-      raf = 0;
-      const railH = rail.getBoundingClientRect().height;
-      const daemonTop = daemon.getBoundingClientRect().top;
-      if (railH <= 0) return;
-      const h = daemonTop - lastY;
-      filesFrac = Math.min(Math.max(h / railH, FILES_FRAC_MIN), FILES_FRAC_MAX);
-    };
-
-    const onMove = (ev: PointerEvent) => {
-      if (ev.pointerId !== pointerId) return;
-      lastY = ev.clientY;
-      if (raf === 0) raf = requestAnimationFrame(apply);
-    };
-
-    const finish = (cancel: boolean) => {
-      if (done) return;
-      done = true;
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
-      window.removeEventListener("pointercancel", onCancel);
-      window.removeEventListener("keydown", onKey, true);
-      if (raf !== 0) cancelAnimationFrame(raf);
-      if (cancel) filesFrac = startFrac;
-      filesDividerActive = false;
-    };
-
-    const onUp = (ev: PointerEvent) => {
-      if (ev.pointerId === pointerId) finish(false);
-    };
-    const onCancel = (ev: PointerEvent) => {
-      if (ev.pointerId === pointerId) finish(true);
-    };
-    const onKey = (ev: KeyboardEvent) => {
-      if (ev.key === "Escape") {
-        ev.preventDefault();
-        ev.stopPropagation();
-        finish(true);
-      }
-    };
-
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
-    window.addEventListener("pointercancel", onCancel);
-    window.addEventListener("keydown", onKey, true);
-  }
-
-  /**
-   * Sidebar width resize: a quiet vertical handle on the rail's right edge.
-   * Drag moves the boundary (clamped to [RAIL_MIN, RAIL_MAX]); Escape restores.
-   * The stage grows/shrinks with the rail, so terminals are told to hold their
-   * fits until the drag ends (setDragging) to avoid per-frame reflow jank.
-   */
-  function onRailResizeDown(e: PointerEvent): void {
-    if (e.button !== 0 || railEl === null) return;
-    e.preventDefault();
-    const handle = e.currentTarget as HTMLElement;
-    const rail = railEl;
-    const pointerId = e.pointerId;
-    const startX = e.clientX;
-    const startWidth = rail.getBoundingClientRect().width;
-    const startRail = railWidth;
-    let raf = 0;
-    let lastX = e.clientX;
-    let done = false;
-
-    try {
-      handle.setPointerCapture(pointerId);
-    } catch {
-      // capture unavailable; window-level listeners still track the drag
-    }
-    railDividerActive = true;
-    pool.setDragging(true);
-
-    const apply = () => {
-      raf = 0;
-      railWidth = Math.min(Math.max(startWidth + (lastX - startX), RAIL_MIN), RAIL_MAX);
-    };
-
-    const onMove = (ev: PointerEvent) => {
-      if (ev.pointerId !== pointerId) return;
-      lastX = ev.clientX;
-      if (raf === 0) raf = requestAnimationFrame(apply);
-    };
-
-    const finish = (cancel: boolean) => {
-      if (done) return;
-      done = true;
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
-      window.removeEventListener("pointercancel", onCancel);
-      window.removeEventListener("keydown", onKey, true);
-      if (raf !== 0) cancelAnimationFrame(raf);
-      if (cancel) railWidth = startRail;
-      railDividerActive = false;
-      // Flush the fits deferred during the drag now that the width is settled.
-      pool.setDragging(false);
-    };
-
-    const onUp = (ev: PointerEvent) => {
-      if (ev.pointerId === pointerId) finish(false);
-    };
-    const onCancel = (ev: PointerEvent) => {
-      if (ev.pointerId === pointerId) finish(true);
-    };
-    const onKey = (ev: KeyboardEvent) => {
-      if (ev.key === "Escape") {
-        ev.preventDefault();
-        ev.stopPropagation();
-        finish(true);
-      }
-    };
-
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
-    window.addEventListener("pointercancel", onCancel);
-    window.addEventListener("keydown", onKey, true);
-  }
-
-  /** Double-click the width handle to snap back to the default sidebar width. */
-  function resetRailWidth(): void {
-    railWidth = RAIL_DEFAULT;
-  }
 </script>
 
 {#if $agentSetup}
   {#key $agentSetup}
-    <AgentSetupDialog request={$agentSetup} onclose={() => agentSetup.set(null)} onlaunch={launcherPick} />
+    <AgentSetupDialog request={$agentSetup} onclose={() => agentSetup.set(null)} onlaunch={launcher.pick} />
   {/key}
 {/if}
 
@@ -5562,8 +3915,8 @@
               {workspaces}
               sessions={sessions.filter((s) => !isMastermind(s))}
               hostLabel={getHostLabel()}
-              {health}
-              daemonReachable={eventsUp || healthUp}
+              health={conn.health}
+              daemonReachable={eventsUp || conn.healthUp}
               onOpen={activateWorkspace}
               onRemove={removeWorkspace}
               onStop={stopWorkspace}
@@ -5736,7 +4089,7 @@
               class="row"
               class:agent-row={s.kind === "agent"}
               class:active={s.id === focusedSessionId}
-              class:unread={renamingId !== s.id && isUnread(s.id)}
+              class:unread={railRename.target !== s.id && isUnread(s.id)}
               class:link-target={dropSpot?.kind === "linkrow" && dropSpot.sessionId === s.id}
               style:--hue={s.kind === "agent" ? agentHue(s.id) : null}
               use:linkRow={s}
@@ -5753,7 +4106,7 @@
                 onRailRowDown(e, s.id);
               }}
               onkeydown={(e) => {
-                if (renamingId === s.id) return; // the input owns keys
+                if (railRename.target === s.id) return; // the input owns keys
                 if (e.key === "Enter" || e.key === " ") {
                   e.preventDefault();
                   openSess(s.id);
@@ -5767,7 +4120,7 @@
                 contextMenu.openAt(e, [
                   { label: "Rename…", onSelect: () => startRename(s) },
                   ...(wt !== null
-                    ? [{ label: "Open worktree in new window", onSelect: () => void openWorktreeWindow(wt) }]
+                    ? [{ label: "Open worktree in new window", onSelect: () => void keptWorktree.openWindow(wt) }]
                     : []),
                 ]);
               }}
@@ -5786,24 +4139,15 @@
                 pulse
                 backgrounded={backgrounded(s)}
               />
-              {#if renamingId === s.id}
+              {#if railRename.target === s.id}
                 <!-- svelte-ignore a11y_autofocus -->
                 <input
                   class="rename-input"
                   type="text"
                   autofocus
-                  bind:value={renameDraft}
-                  onkeydown={(e) => {
-                    e.stopPropagation();
-                    if (e.key === "Enter") {
-                      e.preventDefault();
-                      commitRename();
-                    } else if (e.key === "Escape") {
-                      e.preventDefault();
-                      renamingId = null;
-                    }
-                  }}
-                  onblur={commitRename}
+                  bind:value={railRename.draft}
+                  onkeydown={(e) => railRename.keydown(e)}
+                  onblur={() => railRename.blur()}
                 />
               {:else}
                 <!-- svelte-ignore a11y_no_static_element_interactions --
@@ -5833,7 +4177,7 @@
                   {/if}
                 </span>
               {/if}
-              {#if renamingId !== s.id && isUnread(s.id)}
+              {#if railRename.target !== s.id && isUnread(s.id)}
                 <!-- Unread: the scannable half of the cue (the bold name is
                      the readable half). Yields to the close button on hover. -->
                 <span class="unread-dot" aria-hidden="true"></span>
@@ -5932,9 +4276,9 @@
              agents up front, the rest folded behind one row, and the way
              into Settings → Agents. ⌘/ctrl-click starts in the terminal.
              A missing default says what its click will set up. -->
-        <div class="new-split" role="group" aria-label="new agent" bind:this={newSplitEl}>
-          {#if railStart}
-            {@const q = railStart}
+        <div class="new-split" role="group" aria-label="new agent" bind:this={launcher.splitEl}>
+          {#if launcher.railStart}
+            {@const q = launcher.railStart}
               <button
                 class="row new quick-start"
                 class:want-setup={q.action !== "start"}
@@ -5948,7 +4292,7 @@
                     : q.action === "setup"
                       ? `set up ${q.name} in Settings → Agents`
                       : `start ${q.name}${newInWorktree ? " in a new worktree" : ""} (${keyHint("newAgent")}) · ${isMac ? "⌘" : "ctrl"}-click for the terminal`}
-                onclick={(e) => quickStart(q, e.metaKey || e.ctrlKey)}
+                onclick={(e) => launcher.quickStart(q, e.metaKey || e.ctrlKey)}
               >
                 <span class="new-plus" aria-hidden="true">+</span>
                 <span class="new-name">new agent</span>
@@ -5984,20 +4328,20 @@
                 <button
                   class="new-chev"
                   aria-haspopup="menu"
-                  aria-expanded={launcherOpen}
+                  aria-expanded={launcher.open}
                   aria-label="more agents"
                   title="more agents"
-                  onpointerenter={armLauncherHover}
-                  onpointerleave={disarmLauncherHover}
+                  onpointerenter={launcher.armHover}
+                  onpointerleave={launcher.disarmHover}
                   onkeydown={(e) => {
-                    if (e.key === "ArrowDown" && !launcherOpen) {
+                    if (e.key === "ArrowDown" && !launcher.open) {
                       e.preventDefault();
-                      openLauncher();
+                      launcher.openMenu();
                     }
                   }}
                   onclick={() => {
-                    if (launcherOpen && Date.now() - launcherOpenedAt > 400) closeLauncher();
-                    else openLauncher();
+                    if (launcher.open && Date.now() - launcher.openedAt > 400) launcher.closeMenu();
+                    else launcher.openMenu();
                   }}
                 >
                   <svg viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
@@ -6016,7 +4360,8 @@
         {#if createError}
           <div class="create-error">{createError}</div>
         {/if}
-        {#if wtNotice !== null && wtNotice.ws === activeWsId}
+        {#if keptWorktree.notice !== null && keptWorktree.notice.ws === activeWsId}
+          {@const wtNotice = keptWorktree.notice}
           <div class="wt-kept" role="status" title={wtNotice.path}>
             {#if wtNotice.error !== null}
               <span class="wt-kept-msg err">Kept: {wtNotice.error}</span>
@@ -6026,9 +4371,9 @@
                 class="wt-kept-btn strong"
                 title="delete this worktree's folder — the branch stays"
                 disabled={wtNotice.busy}
-                onclick={() => void removeKeptWorktree()}>Remove</button
+                onclick={() => void keptWorktree.remove()}>Remove</button
               >
-              <button class="wt-kept-btn" disabled={wtNotice.busy} onclick={dismissWtNotice}>Keep</button>
+              <button class="wt-kept-btn" disabled={wtNotice.busy} onclick={keptWorktree.dismiss}>Keep</button>
             {/if}
           </div>
         {/if}
@@ -6039,33 +4384,33 @@
         {#if workspace !== null}
           <!-- The section fills whatever the sessions column has left and
                shows as many rows as FIT that space (measured, see
-               recentsFit) — never a fixed three. -->
-          <div class="recents" class:expanded={recentsExpanded}>
+               recentsRail.fit) — never a fixed three. -->
+          <div class="recents" class:expanded={recentsRail.expanded}>
             <!-- svelte-ignore a11y_no_static_element_interactions -- the
                  context menu is a shortcut; nothing here needs a keyboard
                  path beyond the rows' own. -->
             <div
               class="recents-head"
               oncontextmenu={(e) => {
-                if (visibleRecents.length > 0) {
-                  contextMenu.openAt(e, [{ label: "Archive all", onSelect: () => void archiveAllRecents() }]);
+                if (recentsRail.visible.length > 0) {
+                  contextMenu.openAt(e, [{ label: "Archive all", onSelect: () => void recentsRail.archiveAll() }]);
                 }
               }}
             >
               <span>recent</span>
               <span class="recents-actions">
-              {#if recentsExpanded || visibleRecents.length > recentsFit}
+              {#if recentsRail.expanded || recentsRail.visible.length > recentsRail.fit}
                 <!-- In the header, not below the rows: on a short column the
                      rows may sit under the fold, the header never does. -->
                 <button
                   class="recents-more"
-                  aria-expanded={recentsExpanded}
-                  title={recentsExpanded
+                  aria-expanded={recentsRail.expanded}
+                  title={recentsRail.expanded
                     ? "show only what fits"
-                    : `show all ${visibleRecents.length} recent conversations`}
-                  onclick={toggleRecents}
+                    : `show all ${recentsRail.visible.length} recent conversations`}
+                  onclick={recentsRail.toggle}
                 >
-                  {recentsExpanded ? "less" : "more"}
+                  {recentsRail.expanded ? "less" : "more"}
                 </button>
               {/if}
               <!-- Every past session, beyond these: in ⌘P too. Both header
@@ -6105,28 +4450,28 @@
               </button>
               </span>
             </div>
-            <div class="recents-list sidebar-scrollbar" class:expanded={recentsExpanded} bind:this={recentsListEl}>
-              {#each recentsExpanded ? visibleRecents : visibleRecents.slice(0, recentsFit) as r (r.key)}
+            <div class="recents-list sidebar-scrollbar" class:expanded={recentsRail.expanded} bind:this={recentsRail.listEl}>
+              {#each recentsRail.expanded ? recentsRail.visible : recentsRail.visible.slice(0, recentsRail.fit) as r (r.key)}
                 <button
                   class="recent-row"
-                  title={recentTooltip(r)}
-                  onclick={() => openRecent(r)}
+                  title={recentsRail.tooltip(r)}
+                  onclick={() => recentsRail.open(r)}
                   oncontextmenu={(e) =>
-                    contextMenu.openAt(e, [{ label: "Archive", onSelect: () => void archiveRecent(r) }])}
-                  animate:flip={{ duration: recentsFlipMs }}
-                  out:fade={{ duration: recentsFlipMs === 0 ? 0 : 120 }}
+                    contextMenu.openAt(e, [{ label: "Archive", onSelect: () => void recentsRail.archive(r) }])}
+                  animate:flip={{ duration: recentsRail.flipMs }}
+                  out:fade={{ duration: recentsRail.flipMs === 0 ? 0 : 120 }}
                 >
                   <SessionGlyph kind="agent" agentKind={r.kind} size={11} />
                   <span class="recent-title">{r.title}</span>
                   <span class="recent-age">{relativeAge(r.lastActive)}</span>
                 </button>
               {/each}
-              {#if archivedUndo !== null && archivedUndo.ws === activeWsId}
+              {#if recentsRail.archivedUndo !== null && recentsRail.archivedUndo.ws === activeWsId}
                 <div class="recents-note">
-                  Archived {archivedUndo.keys.length} ·
-                  <button class="recents-undo" onclick={() => void undoArchiveAll()}>Undo</button>
+                  Archived {recentsRail.archivedUndo.keys.length} ·
+                  <button class="recents-undo" onclick={() => void recentsRail.undoArchiveAll()}>Undo</button>
                 </div>
-              {:else if visibleRecents.length === 0}
+              {:else if recentsRail.visible.length === 0}
                 <div class="recents-note">No recent conversations</div>
               {/if}
             </div>
@@ -6249,7 +4594,7 @@
         <!-- Inside an allocation the label carries the node ("cluster ›
              n042") so a compute-node window never poses as its login
              node — derived from the daemon's self block, hash-independent. -->
-        <span class="daemon-host" class:remote={isRemoteWindow} title={health?.hostname}
+        <span class="daemon-host" class:remote={isRemoteWindow} title={conn.health?.hostname}
           >{$computeStatus?.self
             ? `${getHostLabel()} › ${$computeStatus.self.node}`
             : getHostLabel()}</span
@@ -6637,11 +4982,11 @@
       {#if detachedWindow && detachOrigin !== null}
         <!-- Send everything in this solo window back where it came from; the
              ok-ack empties the layout and the window closes itself. -->
-        <button class="strip-reattach" title="move this window's tabs back to their original window" onclick={() => void reattachToOrigin()}>
+        <button class="strip-reattach" title="move this window's tabs back to their original window" onclick={() => void xw.reattachToOrigin()}>
           re-attach
         </button>
       {/if}
-      <span class="strip-host" class:remote={isRemoteWindow} title={health?.hostname}
+      <span class="strip-host" class:remote={isRemoteWindow} title={conn.health?.hostname}
         >{getHostLabel()}</span
       >
       {#if isRemoteWindow && $linkRtt !== null && $linkRtt >= LINK_RTT_BADGE_MS}
@@ -6658,16 +5003,16 @@
   {/if}
 </div>
 
-{#if launcherOpen && activeWsId !== null && launcherAnchor !== null}
+{#if launcher.open && activeWsId !== null && launcher.anchor !== null}
   <Launcher
-    anchor={launcherAnchor}
-    initial={agents}
-    onPick={launcherPick}
-    onInstall={launcherInstall}
-    onUpdate={launcherUpdate}
-    onClose={closeLauncher}
-    onSettings={openAgentSettings}
-    onAgents={(a) => (agents = a)}
+    anchor={launcher.anchor}
+    initial={launcher.agents}
+    onPick={launcher.pick}
+    onInstall={launcher.install}
+    onUpdate={launcher.update}
+    onClose={launcher.closeMenu}
+    onSettings={launcher.openAgentSettings}
+    onAgents={launcher.setAgents}
     inWorktree={workspaceIsRepo ? (workspace?.new_in_worktree === true) : null}
     onToggleWorktree={(on) => void toggleNewInWorktree(on)}
   />
@@ -6736,7 +5081,7 @@
 
 <!-- Blocking re-auth overlay: the daemon rejected this window's token
      (restart or expiry). Self-gating on the `unauthorized` store. -->
-<ReauthOverlay enabled={!canReconnect} />
+<ReauthOverlay enabled={!conn.canReconnect} />
 
 <!-- SSH auth prompt (password / 2FA), app-wide so a mid-session reconnect on
      the workbench can prompt just like the home screen. Self-gating. -->
@@ -6820,8 +5165,8 @@
 
 <!-- Transient outcome chip: an action that would otherwise fail in silence
      (a refused detach, a blocked popup, a cross-window move that timed out). -->
-{#if flash !== null}
-  <div class="flash-chip" role="status" aria-live="polite">{flash}</div>
+{#if flash.text !== null}
+  <div class="flash-chip" role="status" aria-live="polite">{flash.text}</div>
 {/if}
 
 <!-- OS-drop / paste uploads in flight (and, briefly, why one failed) —
@@ -6870,12 +5215,12 @@
     cws={jobCtx.cws}
     self={$computeStatus?.self ?? null}
     receivedAt={$computeStatus?.received_at_ms ?? 0}
-    ended={jobEnded}
-    stacked={reconnectSurface !== "hidden" && !$askpassActive}
+    ended={conn.jobEnded}
+    stacked={conn.reconnectSurface !== "hidden" && !$askpassActive}
   />
 {/if}
 
-{#if reconnectSurface !== "hidden" && !$askpassActive}
+{#if conn.reconnectSurface !== "hidden" && !$askpassActive}
   <!-- An automatic reconnect is status, not a blocking decision: keep the
        rendered workbench readable while the tunnel heals. Only a failed
        attempt becomes a modal with Retry. A scoped askpass prompt temporarily
@@ -6884,21 +5229,21 @@
        an unrecoverable blank state. An asset-transition notice must not hide
        it either: a build/connection transition blocked on unsaved work has no
        dismiss and can sit there indefinitely, so the strip stacks below it. -->
-  {#if reconnectSurface === "status"}
+  {#if conn.reconnectSurface === "status"}
     <div
       class="reconnect-status"
       class:stacked={$assetTransition !== null}
       role="status"
       aria-live="polite"
     >
-      <span class="reconnect-spinner" class:spin={reconnecting} aria-hidden="true"></span>
+      <span class="reconnect-spinner" class:spin={conn.reconnecting} aria-hidden="true"></span>
       <span class="reconnect-status-copy">
-        <strong>{reconnecting ? `reconnecting to ${hostAlias}…` : `waiting for ${hostAlias}…`}</strong>
-        <span>{reconnectReason ?? "the workbench will resume in place"}</span>
+        <strong>{conn.reconnecting ? `reconnecting to ${hostAlias}…` : `waiting for ${hostAlias}…`}</strong>
+        <span>{conn.reconnectReason ?? "the workbench will resume in place"}</span>
       </span>
-      <button class="reconnect-status-dismiss" aria-label="dismiss reconnect status" onclick={dismissReconnect}>×</button>
+      <button class="reconnect-status-dismiss" aria-label="dismiss reconnect status" onclick={() => conn.dismissReconnect()}>×</button>
     </div>
-  {:else if reconnectSurface === "failure"}
+  {:else if conn.reconnectSurface === "failure"}
     <div class="reconnect-overlay">
       <div
         class="reconnect-panel"
@@ -6912,16 +5257,16 @@
           <span class="reconnect-spinner" aria-hidden="true"></span>
           <span class="reconnect-title">can’t reach {hostAlias}</span>
         </div>
-        <p class="reconnect-body">{reconnectError}</p>
+        <p class="reconnect-body">{conn.reconnectError}</p>
         <div class="reconnect-actions">
-          <button class="reconnect-dismiss" onclick={dismissReconnect}>dismiss</button>
+          <button class="reconnect-dismiss" onclick={() => conn.dismissReconnect()}>dismiss</button>
           <button
             class="reconnect-retry"
             use:focusOnMount
-            disabled={reconnecting}
-            onclick={retryReconnect}
+            disabled={conn.reconnecting}
+            onclick={() => conn.retryReconnect()}
           >
-            {reconnecting ? "reconnecting…" : "retry"}
+            {conn.reconnecting ? "reconnecting…" : "retry"}
           </button>
         </div>
       </div>
@@ -6937,15 +5282,15 @@
       <span class="reconnect-status-copy">
         <strong>reconnect to {hostAlias}</strong>
         <span>
-          {reconnectError ?? "this window still needs fresh remote credentials"}
+          {conn.reconnectError ?? "this window still needs fresh remote credentials"}
         </span>
       </span>
       <button
         class="reconnect-status-retry"
-        disabled={reconnecting}
-        onclick={retryReconnect}
+        disabled={conn.reconnecting}
+        onclick={() => conn.retryReconnect()}
       >
-        {reconnecting ? "reconnecting…" : "retry"}
+        {conn.reconnecting ? "reconnecting…" : "retry"}
       </button>
     </div>
   {/if}

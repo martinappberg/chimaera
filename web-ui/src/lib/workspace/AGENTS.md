@@ -8,10 +8,10 @@ Orientation for coding agents. This area owns the workbench's domain data and th
 
 | Family | Files |
 |---|---|
-| Sessions | `sessions.ts`, `sessionCycle.ts` (next agent/terminal chord), `recentSessions.ts` (grace for a new tab before its create lands), `unread.svelte.ts`, `agentLinks.ts` (linked terminals), `sameFile.svelte.ts` + `SameFileNotice.svelte`, `SessionsView.svelte` (all past sessions), `SessionChangesView.svelte` + `SessionEdits.svelte` |
+| Sessions | `sessions.ts`, `sessionRoster.ts` (pure half of App's `applySessions`: kill tombstones, first-known `created_at` rail order, agent-set change), `sessionCycle.ts` (next agent/terminal chord), `recentSessions.ts` (grace for a new tab before its create lands), `recents.svelte.ts` (rail Recents: fetch, fit, expand, archive + Undo, reopen), `worktreeNotice.svelte.ts` (the rail's kept-worktree notice + open a worktree in a new window), `unread.svelte.ts`, `agentLinks.ts` (linked terminals), `sameFile.svelte.ts` + `SameFileNotice.svelte`, `SessionsView.svelte` (all past sessions), `SessionChangesView.svelte` + `SessionEdits.svelte` |
 | Files | `FileTree.svelte` (rail FILES, lazy), `fsEvents.ts` (in-app fs-mutation bus: `fsEpoch`, `lastFsMutation`), `diskWatch.ts` (daemon disk-change monitor), `fileClipboard.svelte.ts`, `fileTransfer.ts`, `QuickOpen.svelte` |
 | Git | `git.ts` (status/diff client + stores), `gitDeco.ts` (one status decoration everywhere), `gitFormat.ts`, `GitView.svelte` (Source Control panel), `GitRepoSection.svelte`, `GitDetailView.svelte` (`gitx` tab), `GitHistoryList.svelte`, `CommitRow.svelte` |
-| Agents | `launcher.ts` (catalog, resumables, saved default) + `Launcher.svelte`, `agentSetup.ts` + `AgentSetupDialog.svelte` (managed install/update), `agentSignIn.ts` + `AgentSignInCard.svelte`, `operations.ts` (shared operation phases and request helper) |
+| Agents | `launcher.ts` (catalog, resumables, saved default) + `Launcher.svelte`, `launcherState.svelte.ts` (the rail's new-agent split button + popover state; starts go back through App's spawn), `agentSetup.ts` + `AgentSetupDialog.svelte` (managed install/update), `agentSignIn.ts` + `AgentSignInCard.svelte`, `operations.ts` (shared operation phases and request helper) |
 | Home and hosts | `HomeScreen.svelte`, `HomeNavigation.svelte`, `HomeActions.svelte` (row menu), `FolderPicker.svelte`, `RemoteSettingsDialog.svelte`, `ReauthOverlay.svelte` (blocking re-auth), `AskpassModal.svelte` + `askpassScope.ts` (in-app SSH prompts) |
 | Clusters and compute | `cluster.ts` (pure words and launch spec), `clusterRow.ts` (the home row's subset), `clusterStore.svelte.ts`, `ClusterPage.svelte`, `ClusterStartSheet.svelte`, `ClusterFolderPicker.svelte`, `ClusterSettingDialog.svelte`, `JobClusterHome.svelte`, `JobWindowNotices.svelte`, `compute.ts` (`/api/v1/compute` store), `ComputeBanner.svelte`, `ComputeStrip.svelte` |
 | Timeline, Knowledge, history | `timeline.svelte.ts` + `timelineModel.ts` (pure), `TimelineView.svelte`, `TimelineRow.svelte` (shared row anatomy), `knowledge.ts`, `history.ts` (history, edits, activity, CSV) |
@@ -32,6 +32,8 @@ Tests: `*.test.ts` beside the modules.
 | `updateState` (`$state`) | `update.svelte.ts` | The module's functions. |
 | `fsEpoch`, `lastFsMutation`, `pendingDelete` | `fsEvents.ts` | Any surface that creates, renames, or deletes; App reads `lastFsMutation` to fix open tabs. |
 | Unread marks, `sameFile`, `clusterOverviews`, file clipboard | Their `*.svelte.ts` modules | Their exported functions. |
+| Rail Recents, kept-worktree notice, launcher popover + catalog copy (`RecentsRail`, `KeptWorktreeNotice`, `LauncherState`) | `recents.svelte.ts`, `worktreeNotice.svelte.ts`, `launcherState.svelte.ts` | Their class methods. App constructs one each and calls their `track*` methods at the original effect positions; the session roster and `layout` stay App's (spawns go through App's `spawnSession`). |
+| Tombstones, first-known `created_at`, previous agent set (`SessionRoster`) | `sessionRoster.ts` | `applySessions`, `tombstone` and the tombstone expiry in App. |
 
 ## Invariants / gotchas
 
