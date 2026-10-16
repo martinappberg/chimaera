@@ -1034,7 +1034,7 @@ pub(crate) fn codex_user_theme_set(config_path: &Path) -> bool {
 
 /// The explicit `agents.<kind>.path` overrides from settings, as a map.
 pub(crate) fn explicit_agent_paths(state: &AppState) -> HashMap<AgentKind, String> {
-    let mut settings = crate::lock(&state.settings);
+    let settings = crate::lock(&state.settings);
     let mut map = HashMap::new();
     for kind in AgentKind::ALL {
         if let Some(path) = settings.agent_path(kind) {

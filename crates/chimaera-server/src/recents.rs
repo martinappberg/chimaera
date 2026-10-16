@@ -10,7 +10,6 @@
 //! they come back when that session ends.
 
 use std::collections::HashMap;
-use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -139,18 +138,25 @@ impl RecentEntry {
     }
 }
 
-/// workspace id -> ended conversations, newest first; backed by a single
-/// JSON file (save-on-change), load-tolerant like the other stores.
-pub(crate) struct RecentsStore {
-    path: PathBuf,
-    items: HashMap<String, Vec<RecentEntry>>,
-}
+/// Read cap for `recents.json`. The format bounds each workspace to
+/// `CAP_PER_WORKSPACE` (20) rows of a title, two PATH_MAX paths and at most
+/// `SUPERSEDES_CAP` ancestor ids — a few KiB per row at worst, ~100 KiB per
+/// workspace — so 8 MiB holds far more workspaces than anyone keeps. A file
+/// past it is corruption: it loads empty and the next push replaces it.
+pub(crate) const MAX_RECENTS_BYTES: usize = 8 * 1024 * 1024;
 
-impl RecentsStore {
-    pub(crate) fn load(path: PathBuf) -> Self {
-        let items = match std::fs::read_to_string(&path) {
-            Ok(contents) => match serde_json::from_str::<serde_json::Value>(&contents) {
-                Ok(serde_json::Value::Object(map)) => map
+type RecentsMap = HashMap<String, Vec<RecentEntry>>;
+
+/// The store's file name, for its log lines.
+const RECENTS_FILE: &str = "recents.json";
+
+/// What one bounded read of `recents.json` found: `Err` when it couldn't be
+/// read; missing, oversized and corrupt are all an empty map (logged).
+fn read_recents(path: &std::path::Path) -> Result<RecentsMap, std::io::Error> {
+    match crate::persist::read_bounded(path, MAX_RECENTS_BYTES) {
+        crate::persist::Bounded::Ok(contents) => {
+            match serde_json::from_slice::<serde_json::Value>(&contents) {
+                Ok(serde_json::Value::Object(map)) => Ok(map
                     .into_iter()
                     .map(|(ws, list)| {
                         let entries = list
@@ -159,19 +165,81 @@ impl RecentsStore {
                             .unwrap_or_default();
                         (ws, entries)
                     })
-                    .collect(),
+                    .collect()),
                 Ok(_) | Err(_) => {
                     tracing::warn!(path = %path.display(), "corrupt recents.json; starting with empty recents");
-                    HashMap::new()
+                    Ok(HashMap::new())
                 }
-            },
-            Err(err) if err.kind() == ErrorKind::NotFound => HashMap::new(),
+            }
+        }
+        crate::persist::Bounded::Missing => Ok(HashMap::new()),
+        crate::persist::Bounded::TooLarge => {
+            tracing::warn!(path = %path.display(), "recents.json exceeds {MAX_RECENTS_BYTES} bytes; starting with empty recents");
+            Ok(HashMap::new())
+        }
+        crate::persist::Bounded::Io(err) => Err(err),
+    }
+}
+
+/// workspace id -> ended conversations, newest first; backed by a single
+/// JSON file (save-on-change), load-tolerant like the other stores.
+pub(crate) struct RecentsStore {
+    path: PathBuf,
+    items: RecentsMap,
+    /// The file is there but couldn't be read (permissions, a directory at
+    /// the path, an I/O error): nothing is written over it. Each save
+    /// retries the read; once it reads, what it holds is merged in and the
+    /// hold lifts.
+    hold: crate::persist::Hold,
+}
+
+impl RecentsStore {
+    /// Load the store (blocking; boot). Missing, oversized or corrupt is an
+    /// empty history (logged); unreadable is an empty history held from
+    /// being saved over.
+    pub(crate) fn load(path: PathBuf) -> Self {
+        let mut hold = crate::persist::Hold::default();
+        let items = read_recents(&path).unwrap_or_else(|err| {
+            hold.note(&path, RECENTS_FILE, err);
+            HashMap::new()
+        });
+        RecentsStore { path, items, hold }
+    }
+
+    /// A held store's retry (blocking, where the save runs): when the file
+    /// reads now, merge it in — this daemon's rows first (they are newer),
+    /// then the file's rows this daemon doesn't already carry, by key and by
+    /// lineage — and lift the hold. Returns whether a save may go ahead.
+    fn retry_held(&mut self) -> bool {
+        if !self.hold.is_held() {
+            return true;
+        }
+        let disk = match read_recents(&self.path) {
+            Ok(disk) => disk,
             Err(err) => {
-                tracing::warn!(path = %path.display(), %err, "failed to read recents.json; starting with empty recents");
-                HashMap::new()
+                self.hold.note(&self.path, RECENTS_FILE, err);
+                return false;
             }
         };
-        RecentsStore { path, items }
+        for (ws, rows) in disk {
+            let list = self.items.entry(ws).or_default();
+            for row in rows {
+                let key = row.archive_key();
+                let known = list.iter().any(|e| {
+                    e.archive_key() == key
+                        || row
+                            .resume
+                            .as_ref()
+                            .is_some_and(|id| e.supersedes.contains(id))
+                });
+                if !known {
+                    list.push(row);
+                }
+            }
+            list.truncate(CAP_PER_WORKSPACE);
+        }
+        self.hold.release(&self.path, RECENTS_FILE);
+        true
     }
 
     /// Record an ended conversation at the front of its workspace's list.
@@ -256,8 +324,12 @@ impl RecentsStore {
             .collect()
     }
 
-    /// Atomically persist the map (tmp file + rename).
-    fn save(&self) -> anyhow::Result<()> {
+    /// Atomically persist the map (tmp file + rename) — never over a file
+    /// that can't be read (the change stays in memory; the hold logs once).
+    fn save(&mut self) -> anyhow::Result<()> {
+        if !self.retry_held() {
+            return Ok(());
+        }
         let map: serde_json::Map<String, serde_json::Value> = self
             .items
             .iter()

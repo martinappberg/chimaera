@@ -161,3 +161,107 @@ async fn view_state_without_token_is_401() {
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{method}");
     }
 }
+
+#[tokio::test]
+async fn view_state_store_missing_file_is_empty_and_round_trips() {
+    let path = test_dir("vs-missing").join("view-state.json");
+    let mut store = view_state::ViewStateStore::load(path.clone());
+    assert!(store.get("w").is_none());
+    store
+        .put("w".into(), serde_json::json!({"a": 1}))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut reloaded = view_state::ViewStateStore::load(path);
+    assert_eq!(*reloaded.get("w").unwrap(), serde_json::json!({"a": 1}));
+}
+
+/// Over the cap: empty view state (windows fall back to their defaults),
+/// and the next put replaces the runaway file.
+#[tokio::test]
+async fn view_state_store_oversized_file_loads_empty_and_is_replaced() {
+    let path = test_dir("vs-big").join("view-state.json");
+    std::fs::write(
+        &path,
+        super::recents::oversized(r#"{"old":1}"#, view_state::MAX_STATE_FILE_BYTES),
+    )
+    .unwrap();
+    let mut store = view_state::ViewStateStore::load(path.clone());
+    assert!(store.get("old").is_none());
+    store
+        .put("w".into(), serde_json::json!(1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(std::fs::metadata(&path).unwrap().len() < 4096);
+}
+
+/// Unreadable: puts still answer success and serve this daemon's windows
+/// from memory, but nothing is written over the file — until it reads
+/// again: then the next put merges (the file's keys this daemon lacks are
+/// kept) and lands.
+#[tokio::test]
+async fn view_state_store_unreadable_file_is_held_until_it_reads_then_merged() {
+    let dir = test_dir("vs-dir").join("view-state.json");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut store = view_state::ViewStateStore::load(dir.clone());
+    store
+        .put("w".into(), serde_json::json!(1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(*store.get("w").unwrap(), serde_json::json!(1));
+    assert!(dir.is_dir());
+
+    let path = test_dir("vs-perm").join("view-state.json");
+    let body = br#"{"kept":{"layout":1},"w":"stale"}"#;
+    if !super::recents::unreadable_file(&path, body) {
+        return; // root reads anything
+    }
+    let mut store = view_state::ViewStateStore::load(path.clone());
+    store
+        .put("w".into(), serde_json::json!(1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(super::recents::readable_again(&path), body.to_vec(), "held");
+
+    store
+        .put("w".into(), serde_json::json!(2))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        *store.get("kept").unwrap(),
+        serde_json::json!({"layout": 1})
+    );
+    let mut reloaded = view_state::ViewStateStore::load(path);
+    assert_eq!(
+        *reloaded.get("w").unwrap(),
+        serde_json::json!(2),
+        "memory wins"
+    );
+    assert_eq!(
+        *reloaded.get("kept").unwrap(),
+        serde_json::json!({"layout": 1})
+    );
+}
+
+/// Over the wire, a held store still answers 204: refusing would fail every
+/// window's layout save (and detach) for the daemon's life.
+#[tokio::test]
+async fn view_state_put_answers_success_while_held() {
+    let data = test_dir("vs-held-route");
+    std::fs::create_dir_all(data.join("view-state.json")).unwrap();
+    let state = test_state_with_data_dir(0, data);
+    let (status, _) = request(
+        &state,
+        Method::PUT,
+        "/api/v1/view-state/win-held",
+        Some(serde_json::json!({"v": 1})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, body) = request(&state, Method::GET, "/api/v1/view-state/win-held", None).await;
+    assert_eq!(body, serde_json::json!({"state": {"v": 1}}));
+}

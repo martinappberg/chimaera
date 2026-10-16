@@ -4,12 +4,14 @@
 //! in the web-ui schema (web-ui/src/lib/settings/schema.ts). Values are
 //! opaque to the server except for the few daemon-consumed keys below.
 //!
-//! Hand-edits are first-class: REST reads re-stat the file and pick up
-//! external changes, a slow off-reactor poll ([`watch_external_edits`])
-//! catches edits no read observes, and /ws/events broadcasts a fresh
+//! Hand-edits are first-class, read stale-while-revalidate: hand-edits reach
+//! the cache within [`SETTINGS_POLL`] (the off-reactor poll,
+//! [`watch_external_edits`]); routes refresh on read; PUT installs at once.
+//! Every daemon-side getter (`scrollback_lines`, `git_path`, …) reads only
+//! the cache — no stat or read under the store mutex, so a hung disk never
+//! reaches a spawn or the reactor. /ws/events broadcasts a fresh
 //! `{"type":"settings"}` frame whenever the content generation moves (PUT or
-//! on-disk edit). The events path itself never stats — see
-//! [`SettingsStore::generation_cached`].
+//! on-disk edit); a new window's first frame refreshes first.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -30,14 +32,13 @@ const MAX_SETTINGS_BYTES: usize = 256 * 1024;
 
 type Map = serde_json::Map<String, serde_json::Value>;
 
-/// In-memory settings map backed by `settings.json`, mtime-checked on read
-/// so external edits (vim over SSH) surface without a daemon restart.
+/// In-memory settings map backed by `settings.json`; external edits (vim
+/// over SSH) surface without a daemon restart through [`refresh`].
 ///
-/// The routes and the watcher do their disk work through [`refresh`] and
-/// [`put_settings`]: on the blocking pool, one job at a time (`gate`), with
-/// this struct's mutex held only to snapshot and to install — never across a
-/// stat, read or write. The synchronous [`Self::current`] getters other
-/// modules call still stat (and on a change read) under the mutex.
+/// All disk work after boot goes through [`refresh`] and [`put_settings`]: on
+/// the blocking pool, one job at a time (`gate`), with this struct's mutex
+/// held only to snapshot and to install — never across a stat, read or
+/// write. The getters read the cached map only.
 pub(crate) struct SettingsStore {
     path: PathBuf,
     map: Map,
@@ -110,30 +111,22 @@ impl SettingsStore {
         true
     }
 
-    /// Re-read when the file changed on disk since the cached read. Blocking,
-    /// under the caller's lock: only for the synchronous getters.
+    /// Re-read when the file changed on disk since the cached read. Blocking:
+    /// only [`Self::load`], before the store is shared.
     fn refresh(&mut self) {
         let disk = look(&self.path, self.mtime, None);
         self.install(disk);
     }
 
-    /// The current settings map (mtime-checked against on-disk edits).
-    /// Blocking: async code awaits [`refresh`] and reads [`Self::map_cached`].
-    pub(crate) fn current(&mut self) -> &Map {
-        self.refresh();
-        &self.map
-    }
-
-    /// The cached map WITHOUT the disk re-stat — for the `/ws/events` hot
-    /// path, which runs per client on every wake and must never do blocking
-    /// fs on the reactor. External edits are folded in by
-    /// [`watch_external_edits`] (off-reactor), not by this read.
+    /// The cached map, never a disk re-stat — safe on the reactor and under
+    /// any lock. External edits are folded in by [`watch_external_edits`]
+    /// (off-reactor); a caller that must see a hand-edit made in the last
+    /// [`SETTINGS_POLL`] awaits [`refresh`] first.
     pub(crate) fn map_cached(&self) -> &Map {
         &self.map
     }
 
-    /// The cached content generation WITHOUT the disk re-stat (same contract
-    /// as [`Self::map_cached`]).
+    /// The cached content generation (same contract as [`Self::map_cached`]).
     pub(crate) fn generation_cached(&self) -> u64 {
         self.generation
     }
@@ -153,8 +146,8 @@ impl SettingsStore {
     }
 
     /// Daemon-consumed key: scrollback lines for newly spawned sessions.
-    pub(crate) fn scrollback_lines(&mut self) -> Option<usize> {
-        let v = self.current().get("daemon.scrollbackLines")?.as_u64()?;
+    pub(crate) fn scrollback_lines(&self) -> Option<usize> {
+        let v = self.map.get("daemon.scrollbackLines")?.as_u64()?;
         // Keep hand-edited / agent-edited settings on the same resource
         // boundary the settings UI advertises. The previous 1,000,000-line
         // server ceiling silently accepted 5x the UI maximum per session.
@@ -163,8 +156,8 @@ impl SettingsStore {
 
     /// Daemon-consumed key: resurrect sessions from the ledger when the
     /// daemon restarts (see `ledger`).
-    pub(crate) fn restore_sessions(&mut self) -> bool {
-        self.current()
+    pub(crate) fn restore_sessions(&self) -> bool {
+        self.map
             .get("daemon.restoreSessions")
             .and_then(|v| v.as_bool())
             .unwrap_or(true)
@@ -174,8 +167,8 @@ impl SettingsStore {
     /// structured chat session right after its handshake (see
     /// `chat::spawn_chat_session`). Default off: enabling registers the
     /// session with claude.ai, which is the user's call, not the daemon's.
-    pub(crate) fn remote_control_at_start(&mut self) -> bool {
-        self.current()
+    pub(crate) fn remote_control_at_start(&self) -> bool {
+        self.map
             .get("chat.remoteControlAtStart")
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
@@ -184,8 +177,8 @@ impl SettingsStore {
     /// Native defaults opt out only of cross-conversation model and effort
     /// preferences. Explicit picks, resumed settings and permission modes
     /// keep their separate precedence in `chat::resolve_start_settings`.
-    pub(crate) fn remember_chat_model(&mut self) -> bool {
-        self.current()
+    pub(crate) fn remember_chat_model(&self) -> bool {
+        self.map
             .get("chat.newSessionModel")
             .and_then(|v| v.as_str())
             != Some("agent")
@@ -193,12 +186,8 @@ impl SettingsStore {
 
     /// A launch-only override; absent/unknown preserves the native Codex
     /// configuration, including a user who already opted into instant input.
-    pub(crate) fn codex_instant_interrupt(&mut self) -> Option<bool> {
-        match self
-            .current()
-            .get("chat.codexSteering")
-            .and_then(|v| v.as_str())
-        {
+    pub(crate) fn codex_instant_interrupt(&self) -> Option<bool> {
+        match self.map.get("chat.codexSteering").and_then(|v| v.as_str()) {
             Some("immediate") => Some(true),
             Some("next_step") => Some(false),
             _ => None,
@@ -210,8 +199,8 @@ impl SettingsStore {
     /// agent one message saying what stopped (see `chat::resurrect_chat`).
     /// Default on: it only fires when there is work to pick up, and that is
     /// the point of the restart surviving at all; each one starts a turn.
-    pub(crate) fn resume_after_restart(&mut self) -> bool {
-        self.current()
+    pub(crate) fn resume_after_restart(&self) -> bool {
+        self.map
             .get("chat.resumeAfterRestart")
             .and_then(|v| v.as_bool())
             .unwrap_or(true)
@@ -220,8 +209,8 @@ impl SettingsStore {
     /// Daemon-consumed key: ask Claude for its per-batch tool labels (the
     /// transcript's tool-group titles). Default on: the labels are what the
     /// official clients show; each costs one small-model call.
-    pub(crate) fn tool_summaries(&mut self) -> bool {
-        self.current()
+    pub(crate) fn tool_summaries(&self) -> bool {
+        self.map
             .get("chat.toolSummaries")
             .and_then(|v| v.as_bool())
             .unwrap_or(true)
@@ -229,8 +218,8 @@ impl SettingsStore {
 
     /// Daemon-consumed key: periodically check GitHub for newer releases
     /// (see `update`).
-    pub(crate) fn update_auto_check(&mut self) -> bool {
-        self.current()
+    pub(crate) fn update_auto_check(&self) -> bool {
+        self.map
             .get("update.autoCheck")
             .and_then(|v| v.as_bool())
             .unwrap_or(true)
@@ -239,8 +228,8 @@ impl SettingsStore {
     /// Daemon-consumed key: an explicit path to the `git` binary. `None` (unset
     /// or blank) means "resolve git from the login shell, then PATH". Set on HPC
     /// login nodes whose stock `/usr/bin/git` is too old for the git service.
-    pub(crate) fn git_path(&mut self) -> Option<String> {
-        let s = self.current().get("git.path")?.as_str()?.trim();
+    pub(crate) fn git_path(&self) -> Option<String> {
+        let s = self.map.get("git.path")?.as_str()?.trim();
         (!s.is_empty()).then(|| s.to_string())
     }
 
@@ -249,16 +238,16 @@ impl SettingsStore {
     /// login shell, then a chimaera-managed install". The same escape hatch as
     /// [`git_path`], per agent — for hosts where the agent lives somewhere the
     /// login shell doesn't surface.
-    pub(crate) fn agent_path(&mut self, kind: crate::agents::AgentKind) -> Option<String> {
+    pub(crate) fn agent_path(&self, kind: crate::agents::AgentKind) -> Option<String> {
         let key = format!("agents.{}.path", kind.as_str());
-        let s = self.current().get(&key)?.as_str()?.trim();
+        let s = self.map.get(&key)?.as_str()?.trim();
         (!s.is_empty()).then(|| s.to_string())
     }
 
     /// Daemon-consumed key: directory names quick-open skips while walking.
     /// None = the built-in default list.
-    pub(crate) fn quickopen_ignore_dirs(&mut self) -> Option<Vec<String>> {
-        let list = self.current().get("quickOpen.ignoreDirs")?.as_array()?;
+    pub(crate) fn quickopen_ignore_dirs(&self) -> Option<Vec<String>> {
+        let list = self.map.get("quickOpen.ignoreDirs")?.as_array()?;
         Some(
             list.iter()
                 .filter_map(|v| v.as_str())
@@ -310,9 +299,9 @@ fn encode(map: &Map) -> Result<Vec<u8>, WriteError> {
 
 /// One off-lock refresh, side effects included. Blocking; runs inside the
 /// store's [`DiskGate`]. The mutex is taken twice, briefly: to snapshot the
-/// path and recorded mtime, and to install. A synchronous getter that
-/// refreshed in between already installed a read at least as new, so the
-/// install is skipped then. True when the content changed.
+/// path and recorded mtime, and to install. Every install runs inside the
+/// same gate, so the mtime re-check before installing is a guard, not a
+/// race anyone expects to lose. True when the content changed.
 ///
 /// The quick-open clear and the `/ws/events` wake happen HERE, not in the
 /// awaiting handler: a handler dropped mid-job (a closed window) must not
@@ -362,18 +351,24 @@ pub(crate) async fn refresh(state: &Arc<AppState>) -> bool {
         })
 }
 
-/// Cadence of the external-edit poll. Hand-edits are rare and were already
-/// only broadcast on the next events wake, so a couple of seconds' surfacing
-/// latency changes nothing a user can see — while each pass costs exactly one
-/// stat, off the reactor, instead of one per client per wake.
-const SETTINGS_POLL: Duration = Duration::from_secs(2);
+/// Cadence of the external-edit poll — the staleness bound of every cached
+/// read of settings.json and env-profiles.json. Hand-edits are rare and a
+/// couple of seconds' surfacing latency changes nothing a user can see, while
+/// each pass costs one stat per file, off the reactor, instead of one per
+/// reader.
+pub(crate) const SETTINGS_POLL: Duration = Duration::from_secs(2);
 
-/// Surface hand-edits of settings.json to `/ws/events` without any reactor
-/// stat. The events hot path (`ws::send_settings_snapshot`) reads only the
-/// cached generation/map — the old stat-on-every-wake ran per client under
-/// the settings mutex ON the reactor, where one NFS hiccup stalls everything
-/// — so this task owns the steady-state external-edit detection instead.
-/// The loop has no exit path; a failed pass is logged inside [`refresh`].
+/// Fold hand-edits of settings.json AND env-profiles.json into their caches
+/// without any reactor stat: one task, one sleep, each store's look through
+/// its own [`DiskGate`]. The two looks of a pass run side by side, but the
+/// loop awaits both: while one file's read hangs, no later pass runs for
+/// either, and the other store's hand-edits wait for its route (GET refreshes
+/// on read) or the hang to clear. Accepted: both files sit in the same config
+/// directory, so a hang on one rarely spares the other. The getters and spawn
+/// paths read only the caches — the old stat-under-the-mutex ran ON the
+/// reactor, where one NFS hiccup stalled everything — so this task owns
+/// steady-state external-edit detection. The loop has no exit path; a failed
+/// pass is logged inside each refresh.
 pub(crate) async fn watch_external_edits(state: Arc<AppState>) {
     loop {
         tokio::time::sleep(SETTINGS_POLL).await;
@@ -381,11 +376,13 @@ pub(crate) async fn watch_external_edits(state: Arc<AppState>) {
     }
 }
 
-/// One poll pass: true when the on-disk file changed the settings content
-/// (already broadcast by [`refresh`]). A failed stat — an NFS hiccup, not the file
-/// being absent, which is a legitimate state — is no change.
+/// One poll pass over both stores: true when either on-disk file changed its
+/// store's content (a settings change is already broadcast by [`refresh`]).
+/// A failed stat — an NFS hiccup, not the file being absent, which is a
+/// legitimate state — is no change.
 pub(crate) async fn poll_external_edit(state: &Arc<AppState>) -> bool {
-    refresh(state).await
+    let (settings, environment) = tokio::join!(refresh(state), crate::environment::refresh(state));
+    settings || environment
 }
 
 /// GET /api/v1/settings
@@ -401,9 +398,8 @@ pub(crate) async fn get_settings(State(state): State<Arc<AppState>>) -> Response
 /// handler awaiting it is dropped (a superseded save aborted on page hide):
 /// the shim rebuild, the quick-open clear and the wake can't be lost once
 /// the file is written. A hand-edit is folded in first so the diff is
-/// against what was really on disk, and `before` is taken BEFORE the write
-/// — a synchronous getter that re-reads the new file between the rename
-/// and the install would otherwise make the diff empty.
+/// against what was really on disk, and `before` is taken BEFORE the write,
+/// from the cache only this gate installs into.
 fn put_job(state: &AppState, map: Map) -> Result<(), WriteError> {
     refresh_job(state);
     let body = encode(&map)?;

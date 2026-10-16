@@ -33,6 +33,17 @@ pub(crate) const CAP_PER_WORKSPACE: usize = 2000;
 const KEY_MAX: usize = 256;
 const TITLE_MAX: usize = 300;
 const BATCH_MAX: usize = 500;
+/// Read cap for `recents-archive.json`. A full workspace is `CAP_PER_WORKSPACE`
+/// entries of a ≤`KEY_MAX` key, a ≤`TITLE_MAX`-char title and a few ancestor
+/// ids: ~0.5 MiB as real titles encode, ~12 MiB if every title were
+/// escape-heavy. 16 MiB covers dozens of realistic full workspaces (archives
+/// exist only for registered ones) and one worst-case one. A file past it
+/// is HELD like an unreadable one, never replaced: replacing the archive
+/// would un-hide every conversation in it.
+pub(crate) const MAX_ARCHIVE_BYTES: usize = 16 * 1024 * 1024;
+
+/// The store's file name, for its log lines.
+const ARCHIVE_FILE: &str = "recents-archive.json";
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub(crate) struct Archived {
@@ -61,20 +72,92 @@ pub(crate) fn key_of(resume: Option<&str>, kind: &str, title: &str) -> String {
     }
 }
 
+type ArchiveMap = HashMap<String, Vec<Archived>>;
+
+/// One bounded read of `recents-archive.json`: `Err` (the reason) when it
+/// can't be read or is past the cap; missing and corrupt are empty.
+fn read_archive(path: &std::path::Path) -> Result<ArchiveMap, String> {
+    match crate::persist::read_bounded(path, MAX_ARCHIVE_BYTES) {
+        crate::persist::Bounded::Ok(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or_else(|err| {
+            tracing::warn!(path = %path.display(), %err, "corrupt recents-archive.json; starting with nothing archived");
+            HashMap::new()
+        })),
+        crate::persist::Bounded::Missing => Ok(HashMap::new()),
+        crate::persist::Bounded::TooLarge => Err(format!("over its {MAX_ARCHIVE_BYTES}-byte cap")),
+        crate::persist::Bounded::Io(err) => Err(err.to_string()),
+    }
+}
+
 pub(crate) struct ArchiveStore {
     path: PathBuf,
     /// workspace id -> archived, oldest first.
-    items: HashMap<String, Vec<Archived>>,
+    items: ArchiveMap,
+    /// The file is there but can't be read (or is past the cap): archiving
+    /// works in memory, but nothing writes over the file — that would bring
+    /// every conversation it hid back into Recents. Each persist retries the
+    /// read; once it reads, the two merge and the hold lifts.
+    hold: crate::persist::Hold,
+    /// What was unarchived (workspace, key) or forgotten (workspace) while
+    /// held, so the merge doesn't hide it again.
+    dropped: HashSet<(String, String)>,
+    forgotten: HashSet<String>,
 }
 
 impl ArchiveStore {
-    /// Load-tolerant like every store: missing or corrupt is empty.
+    /// Load-tolerant like every store (blocking; boot): missing or corrupt
+    /// is empty; unreadable or oversized is empty and held.
     pub(crate) fn load(path: PathBuf) -> Self {
-        let items = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<HashMap<String, Vec<Archived>>>(&s).ok())
-            .unwrap_or_default();
-        ArchiveStore { path, items }
+        let mut hold = crate::persist::Hold::default();
+        let items = read_archive(&path).unwrap_or_else(|reason| {
+            hold.note(&path, ARCHIVE_FILE, reason);
+            HashMap::new()
+        });
+        ArchiveStore {
+            path,
+            items,
+            hold,
+            dropped: HashSet::new(),
+            forgotten: HashSet::new(),
+        }
+    }
+
+    /// The path to read again, while held.
+    fn held_path(&self) -> Option<PathBuf> {
+        self.hold.is_held().then(|| self.path.clone())
+    }
+
+    fn note_held(&mut self, reason: &str) {
+        self.hold.note(&self.path, ARCHIVE_FILE, reason);
+    }
+
+    /// The file read again: union by key, the file's (older) entries first
+    /// and this daemon's after, minus what was unarchived or forgotten
+    /// meanwhile; the oldest go past the cap. The hold lifts.
+    fn merge(&mut self, disk: ArchiveMap) {
+        for (ws, old) in disk {
+            if self.forgotten.contains(&ws) {
+                continue;
+            }
+            let mine = self.items.remove(&ws).unwrap_or_default();
+            let mut list: Vec<Archived> = old
+                .into_iter()
+                .filter(|a| {
+                    !mine.iter().any(|m| m.key == a.key)
+                        && !self.dropped.contains(&(ws.clone(), a.key.clone()))
+                })
+                .collect();
+            list.extend(mine);
+            if list.len() > CAP_PER_WORKSPACE {
+                let drop = list.len() - CAP_PER_WORKSPACE;
+                list.drain(..drop);
+            }
+            if !list.is_empty() {
+                self.items.insert(ws, list);
+            }
+        }
+        self.hold.release(&self.path, ARCHIVE_FILE);
+        self.dropped.clear();
+        self.forgotten.clear();
     }
 
     /// Every id a workspace's archive hides: the keys and their ancestors.
@@ -113,6 +196,10 @@ impl ArchiveStore {
 
     /// Unarchive by key; returns how many came back.
     pub(crate) fn remove(&mut self, ws: &str, keys: &HashSet<String>) -> usize {
+        if self.hold.is_held() {
+            self.dropped
+                .extend(keys.iter().map(|k| (ws.to_string(), k.clone())));
+        }
         let Some(list) = self.items.get_mut(ws) else {
             return 0;
         };
@@ -143,14 +230,20 @@ impl ArchiveStore {
     }
 
     pub(crate) fn forget_workspace(&mut self, ws: &str) -> bool {
+        if self.hold.is_held() {
+            self.forgotten.insert(ws.to_string());
+        }
         self.items.remove(ws).is_some()
     }
 
-    fn snapshot(&self) -> (PathBuf, Vec<u8>) {
-        (
-            self.path.clone(),
-            serde_json::to_vec(&self.items).unwrap_or_else(|_| b"{}".to_vec()),
-        )
+    /// What to write, or `None` while held.
+    fn snapshot(&self) -> Option<(PathBuf, Vec<u8>)> {
+        (!self.hold.is_held()).then(|| {
+            (
+                self.path.clone(),
+                serde_json::to_vec(&self.items).unwrap_or_else(|_| b"{}".to_vec()),
+            )
+        })
     }
 }
 
@@ -159,7 +252,25 @@ impl ArchiveStore {
 /// last change is the one on disk.
 pub(crate) async fn persist(state: &Arc<AppState>) {
     let _write = state.recents_archive_write.lock().await;
-    let (path, body) = crate::lock(&state.recents_archive).snapshot();
+    // Held: read the file again first (off the reactor); only a read that
+    // lands lets this write go, merged.
+    let held = crate::lock(&state.recents_archive).held_path();
+    if let Some(path) = held {
+        let read = tokio::task::spawn_blocking(move || read_archive(&path))
+            .await
+            .unwrap_or_else(|err| Err(err.to_string()));
+        let mut store = crate::lock(&state.recents_archive);
+        match read {
+            Ok(disk) => store.merge(disk),
+            Err(reason) => {
+                store.note_held(&reason);
+                return;
+            }
+        }
+    }
+    let Some((path, body)) = crate::lock(&state.recents_archive).snapshot() else {
+        return;
+    };
     let written =
         tokio::task::spawn_blocking(move || crate::persist::atomic_write_json(&path, body)).await;
     match written {
@@ -321,6 +432,9 @@ mod tests {
         let mut store = ArchiveStore {
             path: PathBuf::from("/nonexistent"),
             items: HashMap::new(),
+            hold: crate::persist::Hold::default(),
+            dropped: HashSet::new(),
+            forgotten: HashSet::new(),
         };
         let mut forked = entry("new-id");
         forked.supersedes = vec!["old-id".into()];

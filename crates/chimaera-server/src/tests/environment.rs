@@ -447,3 +447,100 @@ async fn environment_workspace_delete_never_resurrects_under_a_concurrent_patch(
         })
     );
 }
+
+/// One shared poll pass folds a hand-edit of settings.json AND of
+/// env-profiles.json into the caches with no route called; until then the
+/// readers answer the cache, and a spawn's prelude carries the edit after.
+#[tokio::test]
+async fn hand_edits_of_both_stores_land_after_one_poll() {
+    let data_dir = test_dir("env-poll");
+    let env = env_path(&data_dir);
+    let settings = data_dir.join("config").join("settings.json");
+    let state = test_state_with_data_dir(0, data_dir.clone());
+    let session = format!("env-poll-{}", std::process::id());
+
+    std::fs::write(&settings, r#"{"git.path": "/opt/git/bin/git"}"#).unwrap();
+    std::fs::write(
+        &env,
+        r#"{"workspaces": {"w-1": {"text": "ml hand-edited"}}}"#,
+    )
+    .unwrap();
+    lock(&state.settings).force_stale_for_tests();
+    lock(&state.env_preludes).force_stale_for_tests();
+
+    // Before the poll: the caches, untouched by the edit.
+    assert_eq!(lock(&state.settings).git_path(), None);
+    assert!(
+        crate::environment::materialize_prelude(&state, &session, "w-1", None, None).is_none(),
+        "a spawn read env-profiles.json instead of the cache"
+    );
+
+    assert!(crate::settings::poll_external_edit(&state).await);
+    assert_eq!(
+        lock(&state.settings).git_path().as_deref(),
+        Some("/opt/git/bin/git")
+    );
+    assert_eq!(
+        lock(&state.env_preludes).data_cached().workspaces["w-1"].text,
+        "ml hand-edited"
+    );
+    let prelude = crate::environment::materialize_prelude(&state, &session, "w-1", None, None)
+        .expect("the polled workspace prelude");
+    let text = std::fs::read_to_string(&prelude).unwrap();
+    crate::environment::remove_prelude_file(&session);
+    assert!(text.contains("ml hand-edited"), "{text}");
+
+    // Settled: the next pass sees both recorded mtimes and does nothing.
+    assert!(!crate::settings::poll_external_edit(&state).await);
+
+    // An environment-only edit is reported by the same pass.
+    std::fs::write(&env, r#"{"host": {"text": "ml host"}}"#).unwrap();
+    lock(&state.env_preludes).force_stale_for_tests();
+    assert!(crate::environment::refresh(&state).await);
+    assert!(lock(&state.env_preludes)
+        .data_cached()
+        .workspaces
+        .is_empty());
+}
+
+/// With env-profiles.json's read parked on a hung disk, a spawn's prelude
+/// composes from the cache at once and the settings getters answer.
+#[tokio::test(flavor = "current_thread")]
+async fn environment_prelude_answers_from_the_cache_while_the_read_is_stalled() {
+    let data_dir = test_dir("env-prelude-stalled");
+    let path = env_path(&data_dir);
+    std::fs::write(&path, r#"{"host": {"text": "ml cached"}}"#).unwrap();
+    let state = test_state_with_data_dir(0, data_dir.clone());
+
+    let stall = Stall::new();
+    lock(&state.env_preludes).set_before_read_for_tests(stall.hook());
+    std::fs::write(&path, r#"{"host": {"text": "ml fresh"}}"#).unwrap();
+    lock(&state.env_preludes).force_stale_for_tests();
+    let polling = tokio::spawn({
+        let state = state.clone();
+        async move { crate::settings::poll_external_edit(&state).await }
+    });
+    stall.wait_entered().await;
+
+    let session = format!("env-prelude-stalled-{}", std::process::id());
+    let prelude = crate::environment::materialize_prelude(&state, &session, "w-1", None, None)
+        .expect("the cached host prelude");
+    let text = std::fs::read_to_string(&prelude).unwrap();
+    crate::environment::remove_prelude_file(&session);
+    assert!(text.contains("ml cached"), "{text}");
+    assert_eq!(lock(&state.settings).scrollback_lines(), None);
+    let (status, _) = request(&state, Method::GET, "/api/v1/health", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!polling.is_finished(), "the stalled read let go early");
+
+    stall.release();
+    assert!(polling.await.unwrap());
+    assert_eq!(
+        lock(&state.env_preludes)
+            .data_cached()
+            .host
+            .as_ref()
+            .map(|e| e.text.as_str()),
+        Some("ml fresh")
+    );
+}
