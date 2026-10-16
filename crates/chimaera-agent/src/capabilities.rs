@@ -30,7 +30,14 @@ impl ChatCapabilities {
                 "reconnect_mcp",
                 "set_remote_control",
             ],
-            "codex" => &["compact", "steer_queued"],
+            "codex" => &[
+                "compact",
+                "steer_queued",
+                "set_goal",
+                "pause_goal",
+                "resume_goal",
+                "clear_goal",
+            ],
             _ => return Self::default(),
         };
         Self {

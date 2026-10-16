@@ -525,6 +525,7 @@ async fn spawn_chat_ui(
         revert_before_turn: None,
         remote_control: crate::chat::RemoteControlAtStart::Setting,
         carry_ultracode: false,
+        carried: Default::default(),
         theme: theme.to_string(),
         prelude: body.prelude.clone().filter(|p| !p.trim().is_empty()),
         // A resumed recent is never the Mastermind: retiring one clears the

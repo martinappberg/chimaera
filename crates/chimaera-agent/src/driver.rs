@@ -141,6 +141,14 @@ pub struct SpawnSpec {
     /// instead of resetting to "now". `None` on a fresh spawn (stamped at
     /// creation).
     pub created_at_ms: Option<u64>,
+    /// Session jobs the previous process held (claude `CronCreate`): its
+    /// `--resume` restores them, so the driver starts out knowing them and
+    /// the manager journals them at spawn. Empty on a fresh spawn.
+    pub carried_jobs: Vec<crate::model::ScheduledJob>,
+    /// The goal the previous process held, when the agent's own resume
+    /// keeps it (claude). The manager journals it at spawn (`None` resets a
+    /// stale one: Codex re-reads its thread's goal itself).
+    pub carried_goal: Option<crate::model::GoalState>,
     pub handshake_timeout: Duration,
 }
 
@@ -178,6 +186,8 @@ impl SpawnSpec {
             remote_control: None,
             revert_before_turn: None,
             created_at_ms: None,
+            carried_jobs: Vec::new(),
+            carried_goal: None,
             handshake_timeout: HANDSHAKE_TIMEOUT,
         }
     }

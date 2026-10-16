@@ -22,6 +22,7 @@ mod exec;
 mod fs;
 mod fs_watch;
 mod git;
+mod goal_outcome;
 mod history;
 mod job_host;
 mod knowledge;

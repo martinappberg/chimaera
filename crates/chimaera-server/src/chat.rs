@@ -35,6 +35,13 @@ pub(crate) enum ChatSignal {
     Exit(String, DriverExit),
 }
 
+/// See [`ChatRecipe::carried`].
+#[derive(Clone, Default)]
+pub(crate) struct CarriedResume {
+    pub(crate) jobs: Vec<chimaera_agent::model::ScheduledJob>,
+    pub(crate) goal: Option<chimaera_agent::model::GoalState>,
+}
+
 /// Everything needed to respawn a chat session as a PTY TUI (the
 /// view toggle and lifecycle recovery).
 #[derive(Clone)]
@@ -73,6 +80,11 @@ pub(crate) struct ChatRecipe {
     pub(crate) remote_control: RemoteControlAtStart,
     /// Resurrection only: claude's session-scoped ultracode was on.
     pub(crate) carry_ultracode: bool,
+    /// Resurrection only: what claude's `--resume` restores by itself — its
+    /// session jobs and its goal — so the new driver starts out knowing them.
+    /// Consumed by the spawn (the stored recipe keeps none: a later respawn
+    /// must not revive a job that has since been cancelled).
+    pub(crate) carried: CarriedResume,
     pub(crate) theme: String,
     /// Launch-scope prelude text (see `environment`). Carried on the recipe
     /// so a view-switch/rewind respawn keeps the launch scope; not
@@ -238,10 +250,13 @@ pub(crate) fn spawn_signal_task(state: Arc<AppState>) {
         // Per-session turn folds for the Timeline (protocol tier). Owned by
         // this single task, like `pending_edits`.
         let mut episodes = crate::episodes::ChatEpisodes::default();
+        // Claude goals whose end only the transcript records (see the module).
+        let mut goals = crate::goal_outcome::GoalWatch::default();
         while let Some(signal) = rx.recv().await {
             match signal {
                 ChatSignal::Event(id, entry) => {
                     apply_chat_event(&state, &id, &entry.ev);
+                    goals.observe(&state, &id, &entry.ev);
                     // AFTER the fold: a turn end reads the record idle.
                     crate::comms::on_chat_event(&state, &id, &entry.ev);
                     crate::history::observe_chat(&state, &id, &entry.ev);
@@ -1017,6 +1032,11 @@ pub(crate) fn chat_session_json(
         "now_line": null,
         "usage": null,
         "background_running": info.background_running,
+        // The same exception, for work that resumes the agent by itself: a
+        // pending wakeup or session job (`next_wake`) and the goal. A chat
+        // idle between loop ticks must not read as finished on the rail.
+        "next_wake": info.next_wake,
+        "goal": info.goal,
         "display_name": display_name,
         "ui": "chat",
         "chat_capable": true,
@@ -1711,6 +1731,7 @@ async fn perform_switch(
         revert_before_turn: None,
         remote_control: RemoteControlAtStart::No,
         carry_ultracode: false,
+        carried: Default::default(),
         theme,
         prelude: launch_prelude,
         mastermind,
@@ -1867,6 +1888,8 @@ fn control_only_switch_journal(path: &std::path::Path) -> bool {
             | AgentEvent::PromptSuggestion { .. }
             | AgentEvent::SessionStatus { .. }
             | AgentEvent::RemoteControl { .. }
+            | AgentEvent::Schedule { .. }
+            | AgentEvent::Goal { ended: None, .. }
             | AgentEvent::Exited { .. } => {}
             _ => return false,
         }
@@ -2102,6 +2125,7 @@ pub(crate) async fn rewind_session(
             // A rewind respawns a live session: keep the user's bridge choice.
             remote_control: RemoteControlAtStart::No,
             carry_ultracode: false,
+            carried: Default::default(),
             theme,
             prelude: launch_prelude,
             portable_context,
@@ -3232,6 +3256,7 @@ pub(crate) async fn spawn_fresh_chat_at(
         revert_before_turn: None,
         remote_control: RemoteControlAtStart::Setting,
         carry_ultracode: false,
+        carried: Default::default(),
         theme: spec.theme,
         prelude: spec.prelude.filter(|p| !p.trim().is_empty()),
         mastermind,
@@ -3651,7 +3676,17 @@ pub(crate) async fn spawn_chat_session(
         // has a new Chimaera id, but seed_resumed_journal copied its marker.
         spec.portable_context = recover_portable_context_from_disk(state, &id, recipe.kind).await;
     }
-    crate::lock(&state.chat_recipes).insert(id.clone(), recipe.clone());
+    if recipe.kind == AgentKind::Claude {
+        spec.carried_jobs = recipe.carried.jobs.clone();
+        spec.carried_goal = recipe.carried.goal.clone();
+    }
+    crate::lock(&state.chat_recipes).insert(
+        id.clone(),
+        ChatRecipe {
+            carried: CarriedResume::default(),
+            ..recipe.clone()
+        },
+    );
     let adapter = recipe
         .kind
         .chat_adapter()
@@ -3813,6 +3848,18 @@ pub(crate) async fn resurrect_chat(
             None => RemoteControlAtStart::Setting,
         },
         carry_ultracode: carry.as_ref().is_some_and(|c| c.ultracode),
+        carried: carry
+            .as_ref()
+            .map(|c| CarriedResume {
+                jobs: c.jobs.clone(),
+                goal: c.goal.as_ref().map(|g| chimaera_agent::model::GoalState {
+                    objective: g.objective.clone(),
+                    status: g.status.clone(),
+                    set_at_ms: g.set_at_ms,
+                    ..Default::default()
+                }),
+            })
+            .unwrap_or_default(),
         theme: entry.theme.clone(),
         // The ledger doesn't persist launch text: a resurrected session
         // re-runs the durable scopes (host ⊕ workspace) only.
@@ -3982,14 +4029,30 @@ fn pickup_message(
             "restarted again within minutes of the last pick-up message; not sending another");
         return None;
     }
-    restart_message(carry)
+    restart_message(carry, now_ms)
+}
+
+/// When a lost wakeup was due, relative to the restart: the agent's next
+/// `ScheduleWakeup` takes a delay, not a clock time.
+fn due_phrase(at_ms: u64, now_ms: u64) -> String {
+    let minutes = |ms: u64| ms.div_ceil(60_000).max(1);
+    if at_ms > now_ms {
+        let m = minutes(at_ms - now_ms);
+        format!("due in {m} minute{}", if m == 1 { "" } else { "s" })
+    } else {
+        let m = minutes(now_ms - at_ms);
+        format!(
+            "which came due {m} minute{} ago",
+            if m == 1 { "" } else { "s" }
+        )
+    }
 }
 
 /// The one message a resurrected chat gets when the restart cut its work
 /// off: what stopped, named the way the agent's own tool results named it
 /// (its labels, its task ids), and what to do about it. `None` when nothing
 /// was cut off — an idle chat just comes back idle.
-fn restart_message(carry: &chimaera_agent::Carryover) -> Option<String> {
+fn restart_message(carry: &chimaera_agent::Carryover, now_ms: u64) -> Option<String> {
     if !carry.interrupted_work() {
         return None;
     }
@@ -3997,6 +4060,34 @@ fn restart_message(carry: &chimaera_agent::Carryover) -> Option<String> {
         "The Chimaera daemon hosting this session restarted, so this conversation \
          was resumed in a new agent process.",
     );
+    // A pending loop wakeup never survives `--resume` (live 2.1.300); the
+    // session's jobs do, so only the wakeup is the agent's to re-arm.
+    if let Some(wakeup) = &carry.wakeup {
+        let reason = wakeup
+            .reason
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        text.push_str(&format!(
+            " Your pending loop wakeup was lost with the old process: \"{reason}\", {}.",
+            due_phrase(wakeup.at_ms, now_ms)
+        ));
+        if carry.background.is_empty() {
+            if carry.turn_in_flight {
+                text.push_str(" Your last turn was also cut off before it finished.");
+            }
+            text.push_str(
+                "\n\nSchedule the wakeup again with ScheduleWakeup unless the loop is clearly \
+                 done",
+            );
+            text.push_str(if carry.turn_in_flight {
+                ", then continue where you left off."
+            } else {
+                "."
+            });
+            return Some(text);
+        }
+    }
     if carry.background.is_empty() {
         text.push_str(
             " Your last turn was cut off before it finished. Continue where you left off.",
@@ -4025,6 +4116,9 @@ fn restart_message(carry: &chimaera_agent::Carryover) -> Option<String> {
         };
         let label = label.split_whitespace().collect::<Vec<_>>().join(" ");
         text.push_str(&format!("\n- {kind} \"{label}\" (id {})", task.id));
+    }
+    if carry.wakeup.is_some() {
+        text.push_str("\n\nSchedule the lost wakeup again with ScheduleWakeup unless the loop is clearly done.");
     }
     // Restoring is the default: offered a free choice ("whichever you still
     // need"), a live Haiku just acknowledged and restarted nothing.
@@ -4129,6 +4223,8 @@ mod tests {
             status_needs_action: false,
             remote_control_url: None,
             background_running,
+            next_wake: None,
+            goal: None,
         }
     }
 
@@ -5410,6 +5506,7 @@ mod tests {
             revert_before_turn: None,
             remote_control: RemoteControlAtStart::No,
             carry_ultracode: false,
+            carried: Default::default(),
             theme: "dark".into(),
             prelude: None,
             mastermind: None,
@@ -5478,6 +5575,61 @@ mod tests {
     /// The restart pick-up message: nothing to say for an idle chat (even
     /// one whose bridge was on — that comes back by itself), and otherwise
     /// the work named the way the agent's own tool results named it.
+    /// A pending loop wakeup dies with the process (`--resume` does not
+    /// re-arm it), so the pick-up asks the agent to schedule it again — by a
+    /// delay, since that is what its tool takes.
+    #[test]
+    fn restart_message_asks_to_reschedule_a_lost_wakeup() {
+        let wakeup = |at_ms| chimaera_agent::model::ScheduledWakeup {
+            at_ms,
+            scheduled_at_ms: 0,
+            reason: "Check the\n deploy".into(),
+            prompt: String::new(),
+        };
+        let idle = chimaera_agent::Carryover {
+            wakeup: Some(wakeup(10 * 60_000)),
+            ..Default::default()
+        };
+        let text = restart_message(&idle, 4 * 60_000).expect("a lost wakeup");
+        assert!(
+            text.contains("\"Check the deploy\", due in 6 minutes."),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("ScheduleWakeup unless the loop is clearly done."),
+            "{text}"
+        );
+        assert!(!text.contains("cut off"), "{text}");
+
+        let overdue_mid_turn = chimaera_agent::Carryover {
+            wakeup: Some(wakeup(60_000)),
+            turn_in_flight: true,
+            ..Default::default()
+        };
+        let text = restart_message(&overdue_mid_turn, 3 * 60_000).expect("both");
+        assert!(text.contains("which came due 2 minutes ago."), "{text}");
+        assert!(text.contains("Your last turn was also cut off"), "{text}");
+        assert!(
+            text.ends_with("then continue where you left off."),
+            "{text}"
+        );
+
+        // Session jobs come back with `--resume`: nothing to say about them.
+        let jobs_only = chimaera_agent::Carryover {
+            jobs: vec![chimaera_agent::model::ScheduledJob {
+                id: "j".into(),
+                cron: "*/10 * * * *".into(),
+                schedule: String::new(),
+                prompt: "p".into(),
+                recurring: true,
+                next_at_ms: None,
+                created_at_ms: 0,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(restart_message(&jobs_only, 0), None);
+    }
+
     #[test]
     fn restart_message_names_what_stopped() {
         use chimaera_agent::{CarriedTask, Carryover};
@@ -5487,13 +5639,13 @@ mod tests {
             ultracode: true,
             ..Carryover::default()
         };
-        assert_eq!(restart_message(&idle), None);
+        assert_eq!(restart_message(&idle, 0), None);
 
         let turn_only = Carryover {
             turn_in_flight: true,
             ..Carryover::default()
         };
-        let text = restart_message(&turn_only).expect("a cut-off turn");
+        let text = restart_message(&turn_only, 0).expect("a cut-off turn");
         assert!(text.contains("Your last turn was cut off"), "{text}");
         assert!(text.contains("Continue where you left off"), "{text}");
         assert!(!text.contains("Restart whichever"), "{text}");
@@ -5518,7 +5670,7 @@ mod tests {
             ],
             ..Carryover::default()
         };
-        let text = restart_message(&background).expect("background work");
+        let text = restart_message(&background, 0).expect("background work");
         for line in [
             "- Background command \"npm run dev\" (id b-1)",
             "- Monitor \"Watch CI for PR 158\" (id bm-1)",
@@ -5535,7 +5687,7 @@ mod tests {
             turn_in_flight: true,
             ..background
         };
-        let text = restart_message(&both).expect("both");
+        let text = restart_message(&both, 0).expect("both");
         assert!(text.contains("Your last turn was also cut off"), "{text}");
         assert!(text.contains("then continue where you left off"), "{text}");
     }

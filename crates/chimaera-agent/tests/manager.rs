@@ -552,6 +552,85 @@ async fn background_tasks_outlive_their_turn_and_accumulate() {
     assert!(!info.alive);
 }
 
+/// A self-paced `/loop` end to end (fake-claude `loop`, live 2.1.300
+/// frames): the first turn leaves a pending wakeup and an interval job on
+/// the session row, the wakeup fires as a turn no message opened and that
+/// turn is named by its reason, and the last tick stops the loop.
+#[tokio::test]
+async fn a_loop_wakeup_fires_as_a_named_turn_and_the_row_knows_whats_next() {
+    let fx = fixture();
+    let mut loop_spec = spec("s-loop", &fx.cwd, "loop");
+    loop_spec.env = vec![
+        ("FAKE_LOOP_DELAY_MS".into(), "400".into()),
+        ("FAKE_LOOP_TICKS".into(), "2".into()),
+    ];
+    fx.manager.spawn(&ClaudeAdapter, loop_spec).expect("spawn");
+    let att = fx.manager.attach("s-loop", 0).expect("attach");
+    let mut seen: Vec<Arc<SeqEvent>> = att.replay.clone();
+    let mut rx = att.live;
+
+    send_text(&fx, "s-loop", "/loop check the staging deploy").await;
+    wait_for(
+        &mut rx,
+        &mut seen,
+        "the job",
+        |ev| matches!(ev, AgentEvent::Schedule { wakeup: Some(_), jobs } if jobs.len() == 1),
+    )
+    .await;
+    wait_for(&mut rx, &mut seen, "first turn end", |ev| {
+        matches!(ev, AgentEvent::TurnCompleted { .. })
+    })
+    .await;
+    let next = fx
+        .manager
+        .get("s-loop")
+        .expect("info")
+        .next_wake
+        .expect("next wake");
+    assert_eq!(next.count, 2, "the wakeup and the job");
+    assert_eq!(next.label, "Checking whether the staging deploy finished");
+
+    let cause = wait_for(&mut rx, &mut seen, "a woken turn", |ev| {
+        matches!(ev, AgentEvent::TurnCause { .. })
+    })
+    .await;
+    let AgentEvent::TurnCause { kind, detail, .. } = &cause.ev else {
+        unreachable!()
+    };
+    assert_eq!(kind, "wakeup");
+    assert_eq!(
+        detail.as_deref(),
+        Some("Checking whether the staging deploy finished")
+    );
+    // Right behind its TurnStarted, with no user message between.
+    let order: Vec<_> = dedup_by_seq(&seen).into_iter().map(|e| &e.ev).collect();
+    let at = order
+        .iter()
+        .position(|ev| matches!(ev, AgentEvent::TurnCause { .. }))
+        .unwrap();
+    assert!(matches!(order[at - 1], AgentEvent::TurnStarted { .. }));
+
+    // The second (last) tick stops the wakeup; the job stays.
+    wait_for(&mut rx, &mut seen, "the second woken turn", |ev| {
+        matches!(ev, AgentEvent::TurnCause { .. })
+    })
+    .await;
+    wait_for(&mut rx, &mut seen, "its end", |ev| {
+        matches!(ev, AgentEvent::TurnCompleted { .. })
+    })
+    .await;
+    let next = fx
+        .manager
+        .get("s-loop")
+        .expect("info")
+        .next_wake
+        .expect("the job");
+    assert_eq!(
+        (next.count, next.label.as_str()),
+        (1, "post the error-rate graph")
+    );
+}
+
 /// The 2.1.281 transcript surfaces end to end (fake-claude `showcase`):
 /// narration journals as PROSE, tool batches get their labels, a subagent
 /// closes with exactly one finished line (report + footprint) and a clean

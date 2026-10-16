@@ -36,7 +36,11 @@
 //! that really write files under the cwd — documents by Write, a figure, a
 //! table and a report "by a shell command", one figure embedded in the prose —
 //! so the made-this-turn gallery can be driven without billing; odd turns
-//! touch documents only).
+//! touch documents only), `loop` (live 2.1.300 `/loop` and `/goal` frames: a
+//! first message schedules a `ScheduleWakeup` that fires after
+//! `FAKE_LOOP_DELAY_MS` as a turn opened by an unsent command, `FAKE_LOOP_TICKS`
+//! times, plus an every-10-minutes `CronCreate` job; `/goal <cond>` sets a goal
+//! and fails one check; `/goal clear` clears it; "Stop the loop." stops both).
 
 use std::io::{BufRead, Write};
 
@@ -74,6 +78,8 @@ fn main() {
     // Session-scoped flag state, so an apply_flag_settings shows up in the
     // next get_settings read-back like the real CLI's.
     let mut ultracode = false;
+    // Loop mode: set by "Stop the loop." so a pending wake never fires.
+    let loop_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let stdin = std::io::stdin().lock();
     for line in stdin.lines() {
@@ -188,6 +194,13 @@ fn main() {
                         run_artifacts_turn(turn_count);
                         turn_active = false;
                         turn_count += 1;
+                    }
+                    // `/loop` and `/goal` as 2.1.300 frames them: a wakeup
+                    // that really fires, an interval job, a goal with a
+                    // failed check. Every turn ends itself.
+                    "loop" => {
+                        run_loop_turn(&frame, &loop_stop);
+                        turn_active = false;
                     }
                     _ => run_canned_turn(),
                 }
@@ -1173,4 +1186,214 @@ fn finish_turn(allowed: bool) {
             "usage": { "input_tokens": 10, "output_tokens": 5 },
         }));
     }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+fn env_ms(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// A tool result carrying the structured `tool_use_result` (what the driver
+/// reads a schedule from).
+fn tool_result_with(id: &str, content: &str, result: Value) {
+    emit(
+        json!({ "type": "user", "parent_tool_use_id": null, "message": { "content": [
+        { "type": "tool_result", "tool_use_id": id, "content": content, "is_error": false },
+    ]}, "tool_use_result": result }),
+    );
+}
+
+fn loop_result() {
+    emit(
+        json!({ "type": "result", "subtype": "success", "is_error": false,
+        "stop_reason": "end_turn", "usage": { "output_tokens": 20 }, "duration_ms": 900 }),
+    );
+}
+
+fn schedule_wakeup(msg: &str, id: &str, reason: &str, delay_ms: u64) {
+    tool_use(
+        msg,
+        id,
+        "ScheduleWakeup",
+        json!({
+            "delaySeconds": delay_ms / 1000, "reason": reason,
+            "prompt": "/loop check whether the staging deploy finished",
+        }),
+    );
+    tool_result_with(
+        id,
+        "Next wakeup scheduled.",
+        json!({
+            "scheduledFor": now_ms() + delay_ms, "clampedDelaySeconds": delay_ms / 1000,
+            "wasClamped": false,
+        }),
+    );
+}
+
+/// One `loop`-mode turn, chosen by the message: a goal command, the stop
+/// request, or anything else starting the loop.
+fn run_loop_turn(frame: &Value, stop: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::Ordering;
+    let text = frame["message"]["content"]
+        .as_array()
+        .and_then(|blocks| blocks.iter().find_map(|b| b["text"].as_str()))
+        .or_else(|| frame["message"]["content"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    emit(
+        json!({ "type": "system", "subtype": "init", "session_id": "fake-native-1",
+        "model": "fake-model", "permissionMode": "default", "slash_commands": ["compact"] }),
+    );
+    let synthetic = |text: String, args: &str| {
+        emit(json!({ "type": "assistant", "parent_tool_use_id": null,
+            "message": { "id": format!("syn-{}", now_ms()), "model": "<synthetic>",
+                "role": "assistant", "content": [{ "type": "text", "text": text }] },
+            "local_command_run": { "command": "goal", "args": args } }));
+    };
+    if let Some(cond) = text.strip_prefix("/goal ").map(str::trim) {
+        if cond == "clear" {
+            synthetic("Goal cleared: all tests in tests/api pass".into(), "clear");
+            loop_result();
+            return;
+        }
+        synthetic(format!("Goal set: {cond}"), cond);
+        stream(json!({ "type": "message_start", "message": { "id": "mg-1" } }));
+        stream_text("mg-1", "Goal acknowledged. Running the tests first.");
+        tool_use(
+            "mg-1",
+            "tu-g1",
+            "Bash",
+            json!({ "command": "pytest tests/api", "description": "Run the API tests" }),
+        );
+        tool_result("tu-g1", "46 passed, 2 failed");
+        stream(json!({ "type": "message_start", "message": { "id": "mg-2" } }));
+        stream_text(
+            "mg-2",
+            "Two tests still fail; fixing the token refresh next.",
+        );
+        emit(
+            json!({ "type": "user", "isSynthetic": true, "parent_tool_use_id": null,
+            "message": { "role": "user", "content": [{ "type": "text", "text": format!(
+                "Stop hook feedback:\n[{cond}]: The last pytest run shows 2 failures in \
+                 test_auth.py (token refresh), so the condition is not met.") }] } }),
+        );
+        stream(json!({ "type": "message_start", "message": { "id": "mg-3" } }));
+        stream_text("mg-3", "Still working on the token refresh.");
+        loop_result();
+        return;
+    }
+    if text.trim() == "Stop the loop." || text.starts_with("Cancel scheduled job") {
+        stop.store(true, Ordering::SeqCst);
+        stream(json!({ "type": "message_start", "message": { "id": "mx-1" } }));
+        tool_use("mx-1", "tu-stop", "ScheduleWakeup", json!({ "stop": true }));
+        tool_result_with(
+            "tu-stop",
+            "Loop stopped.",
+            json!({ "scheduledFor": 0,
+            "clampedDelaySeconds": 0, "wasClamped": false, "stopped": true, "cancelledWakeups": 1 }),
+        );
+        tool_use("mx-1", "tu-del", "CronDelete", json!({ "id": "f2143f41" }));
+        tool_result_with(
+            "tu-del",
+            "Cancelled job f2143f41.",
+            json!({ "id": "f2143f41" }),
+        );
+        stream_text("mx-1", "Stopped the loop and cancelled the job.");
+        loop_result();
+        return;
+    }
+    stop.store(false, Ordering::SeqCst);
+    let delay = env_ms("FAKE_LOOP_DELAY_MS", 45_000);
+    let ticks = env_ms("FAKE_LOOP_TICKS", 3);
+    stream(json!({ "type": "message_start", "message": { "id": "ml-1" } }));
+    stream_text(
+        "ml-1",
+        "Staging is still rolling out (3 of 5 pods). I'll check again shortly.",
+    );
+    schedule_wakeup(
+        "ml-1",
+        "tu-w0",
+        "Checking whether the staging deploy finished",
+        delay,
+    );
+    let next = (now_ms() / 600_000 + 1) * 600_000 + 13_370;
+    tool_use(
+        "ml-1",
+        "tu-c0",
+        "CronCreate",
+        json!({ "cron": "*/10 * * * *",
+        "prompt": "post the error-rate graph", "recurring": true }),
+    );
+    tool_result_with(
+        "tu-c0",
+        "Scheduled recurring job f2143f41 (Every 10 minutes).",
+        json!({
+        "id": "f2143f41", "humanSchedule": "Every 10 minutes", "recurring": true,
+        "durable": false, "nextFireAt": next as f64 }),
+    );
+    loop_result();
+    let stop = std::sync::Arc::clone(stop);
+    std::thread::spawn(move || {
+        for tick in 1..=ticks {
+            std::thread::sleep(std::time::Duration::from_millis(delay));
+            if stop.load(Ordering::SeqCst) {
+                return;
+            }
+            let uuid = format!("fake-wake-{tick}");
+            emit(json!({ "type": "command_lifecycle", "command_uuid": uuid, "state": "started" }));
+            emit(
+                json!({ "type": "system", "subtype": "init", "session_id": "fake-native-1",
+                "model": "fake-model", "permissionMode": "default", "slash_commands": ["compact"] }),
+            );
+            let msg = format!("mt-{tick}");
+            stream(json!({ "type": "message_start", "message": { "id": msg } }));
+            tool_use(
+                &msg,
+                &format!("tu-k{tick}"),
+                "Bash",
+                json!({
+                "command": "kubectl rollout status deploy/api", "description": "Check the rollout" }),
+            );
+            tool_result(
+                &format!("tu-k{tick}"),
+                "Waiting for rollout: 4 of 5 updated",
+            );
+            if tick < ticks {
+                stream_text(
+                    &msg,
+                    &format!("Tick {tick}: 4 of 5 pods updated. Checking again shortly."),
+                );
+                schedule_wakeup(
+                    &msg,
+                    &format!("tu-w{tick}"),
+                    "Checking whether the staging deploy finished",
+                    delay,
+                );
+            } else {
+                stream_text(
+                    &msg,
+                    "All 5 pods serve build 1483. The deploy is live, so the loop is done.",
+                );
+                tool_use(&msg, "tu-wstop", "ScheduleWakeup", json!({ "stop": true }));
+                tool_result_with(
+                    "tu-wstop",
+                    "Loop stopped.",
+                    json!({ "scheduledFor": 0,
+                    "clampedDelaySeconds": 0, "wasClamped": false, "stopped": true, "cancelledWakeups": 0 }),
+                );
+            }
+            loop_result();
+            emit(
+                json!({ "type": "command_lifecycle", "command_uuid": uuid, "state": "completed" }),
+            );
+        }
+    });
 }

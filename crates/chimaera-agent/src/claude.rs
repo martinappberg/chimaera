@@ -505,6 +505,11 @@ impl Driver for ClaudeDriver {
         // first turn, and the header chip must not claim the catalog default
         // until then when a remembered `--model` was passed.
         mapper.model = spec.initial_model.clone();
+        // What `--resume` restored (the manager journaled the same at spawn).
+        mapper
+            .schedule
+            .seed(spec.carried_jobs.clone(), crate::now_ms());
+        mapper.goal.seed(spec.carried_goal.clone());
         let mut initial: Vec<DriverStep> = Vec::new();
         // Seed the effort/ultracode chips with the CLI's applied settings.
         let mut step = DriverStep::default();
@@ -997,6 +1002,15 @@ struct ClaudeMapper {
     /// `user` frame carrying a uuid not in here (and not a replay) was
     /// injected around us — a Remote Control client's message.
     minted_uuids: VecDeque<String>,
+    /// The pending wakeup and the session jobs (`/loop`), from their tools'
+    /// results — Claude has no control that lists them.
+    schedule: crate::autonomy::ScheduleTracker,
+    /// The `/goal` the CLI checks each time the agent stops.
+    goal: crate::autonomy::GoalTracker,
+    /// A `command_lifecycle` started a command nobody here sent: the CLI is
+    /// opening a turn by itself (a wakeup, a job, a monitor event). Consumed
+    /// when that turn opens.
+    cli_turn: bool,
     next_ctl: u64,
 }
 
@@ -1146,6 +1160,9 @@ impl ClaudeMapper {
             remote_control_auto_enable,
             remote_control: None,
             minted_uuids: VecDeque::new(),
+            schedule: Default::default(),
+            goal: Default::default(),
+            cli_turn: false,
             next_ctl: 0,
         }
     }
@@ -1338,6 +1355,17 @@ impl ClaudeMapper {
             step.events.push(AgentEvent::TurnStarted {
                 turn_id: self.turn_id(),
             });
+            if std::mem::take(&mut self.cli_turn) {
+                if let Some((fired, schedule)) = self.schedule.on_cli_turn(crate::now_ms()) {
+                    step.events.push(AgentEvent::TurnCause {
+                        turn_id: self.turn_id(),
+                        kind: fired.kind.into(),
+                        detail: Some(fired.detail).filter(|d| !d.is_empty()),
+                        schedule: fired.schedule,
+                    });
+                    step.events.push(schedule);
+                }
+            }
         }
     }
 
@@ -1541,6 +1569,19 @@ impl ClaudeMapper {
             // Output of a local slash command (`/context`, `/usage`, …) —
             // the CLI wraps it in <local-command-stdout>/<…-stderr> tags and
             // renders it as assistant-style text; here it is a notice.
+            // The CLI's own notices. `stop-hook-block-cap` (2.1.300): a Stop
+            // hook — `/goal`'s check — blocked the agent's stop too many times
+            // in a row, so the turn ended anyway; the goal stays set.
+            Some("notification") => {
+                if frame["key"] == "stop-hook-block-cap" {
+                    if let Some(text) = frame["text"].as_str().filter(|t| !t.trim().is_empty()) {
+                        self.flush_prose(step);
+                        step.events.push(AgentEvent::Notice {
+                            text: truncate_label(text.trim(), STATUS_DETAIL_MAX),
+                        });
+                    }
+                }
+            }
             Some("local_command_output") => {
                 if let Some(text) = frame["content"].as_str() {
                     let text = local_command_text(text);
@@ -2394,6 +2435,20 @@ impl ClaudeMapper {
                 );
             }
         }
+        if frame["isSynthetic"] == json!(true) {
+            // The CLI's own words to the model — a Stop hook's "not yet"
+            // (live 2.1.300: `/goal`'s failed check), never a message.
+            if let Some(text) = frame["message"]["content"]
+                .as_array()
+                .and_then(|blocks| blocks.iter().find_map(|b| b["text"].as_str()))
+            {
+                if let Some(goal) = self.goal.on_stop_feedback(text) {
+                    self.flush_prose(step);
+                    step.events.push(goal);
+                }
+            }
+            return;
+        }
         self.on_remote_user_text(frame, step);
     }
 
@@ -2724,6 +2779,28 @@ impl ClaudeMapper {
                 });
             }
         }
+        // `/goal`'s reply: a synthetic frame naming the local command it
+        // answers (live 2.1.300). Set and cleared become the goal's own
+        // transcript lines, so their prose is not repeated.
+        if frame["local_command_run"]["command"] == "goal" {
+            let args = frame["local_command_run"]["args"]
+                .as_str()
+                .unwrap_or_default();
+            let text: String = message["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|b| b["text"].as_str())
+                .collect();
+            let (event, said) = self.goal.on_command_reply(args, &text, crate::now_ms());
+            if let Some(event) = event {
+                self.flush_prose(step);
+                step.events.push(event);
+            }
+            if said {
+                return;
+            }
+        }
         let msg_id = message["id"].as_str().unwrap_or_default();
         let streamed = self.streamed.contains(msg_id);
         let Some(blocks) = message["content"].as_array() else {
@@ -2886,6 +2963,9 @@ impl ClaudeMapper {
             return;
         }
 
+        if crate::autonomy::ScheduleTracker::is_schedule_tool(name) {
+            self.schedule.on_tool_use(&id, name, input);
+        }
         let kind = tool_kind(name);
         self.tool_kinds.insert(id.clone(), kind);
         if name == "Monitor" && self.monitor_tools.len() < TASK_LABELS_CAP {
@@ -2955,6 +3035,18 @@ impl ClaudeMapper {
                         .on_tool_result(&id, failed, &tool_result_text(block))
                 {
                     step.events.push(AgentEvent::Plan { entries });
+                }
+            }
+            if self.schedule.tracks(&id) {
+                // The structured result rides the frame only when it carried
+                // this one result.
+                let single = blocks.iter().filter(|v| v["type"] == "tool_result").count() == 1;
+                let result = native_output.filter(|_| single);
+                if let Some(schedule) =
+                    self.schedule
+                        .on_tool_result(&id, failed, result, crate::now_ms())
+                {
+                    step.events.push(schedule);
                 }
             }
             // Edit-family cards already carry their diff; the "File updated"
@@ -3815,6 +3907,16 @@ impl ClaudeMapper {
             return;
         };
         let Some(pos) = self.awaiting_read.iter().position(|q| q == id) else {
+            // A command nobody here sent, starting while idle: the CLI is
+            // opening a turn by itself (live 2.1.300: a fired wakeup or job
+            // starts this way, with no `user` frame). The turn opens on its
+            // first frame; `ensure_turn` names what fired.
+            if frame["state"] == "started"
+                && !self.turn_active
+                && !self.minted_uuids.iter().any(|u| u == id)
+            {
+                self.cli_turn = true;
+            }
             return;
         };
         let state = match frame["state"].as_str() {
@@ -4434,6 +4536,12 @@ impl ClaudeMapper {
             // held FIFO has no native way to inject one entry into the open
             // turn, and the chat UI never offers this command for Claude.
             AgentCommand::SteerQueued { .. } => {}
+            // Claude's goal is its own `/goal` command, sent as a message
+            // (the UI does); it has no pause, and no goal control request.
+            AgentCommand::SetGoal { .. }
+            | AgentCommand::PauseGoal
+            | AgentCommand::ResumeGoal
+            | AgentCommand::ClearGoal => {}
             // Remote Control: the `remote_control` control request (the
             // official SDK hosts' exact shape — live 2.1.259). Enable answers
             // `{session_url, connect_url, environment_id, bridge_epoch,
@@ -10723,6 +10831,135 @@ pub(crate) mod tests {
         );
         // Older shapes pass through untouched.
         assert_eq!(agent_report_text("plain report"), "plain report");
+    }
+
+    fn tool_use_frame(id: &str, name: &str, input: Value) -> Value {
+        json!({"type": "assistant", "uuid": format!("a-{id}"), "parent_tool_use_id": null,
+            "message": {"id": format!("msg-{id}"), "model": "claude-sonnet-5-5", "role": "assistant",
+                "content": [{"type": "tool_use", "id": id, "name": name, "input": input}]}})
+    }
+
+    fn tool_result_frame(id: &str, result: Value) -> Value {
+        json!({"type": "user", "uuid": format!("u-{id}"), "parent_tool_use_id": null,
+            "message": {"role": "user", "content": [
+                {"tool_use_id": id, "type": "tool_result", "content": "ok", "is_error": false}]},
+            "tool_use_result": result})
+    }
+
+    fn text_frame(id: &str, model: &str, text: &str) -> Value {
+        json!({"type": "assistant", "uuid": format!("a-{id}"), "parent_tool_use_id": null,
+            "message": {"id": id, "model": model, "role": "assistant",
+                "content": [{"type": "text", "text": text}]}})
+    }
+
+    /// Live 2.1.300 `/loop`: ScheduleWakeup's result is the pending wakeup.
+    /// When it fires, the CLI opens a turn with a command nobody here sent
+    /// (`command_lifecycle started`, no `user` frame), and that turn is named
+    /// by what fired; the wakeup is spent.
+    #[test]
+    fn a_fired_wakeup_opens_a_turn_named_by_its_reason() {
+        let mut m = mapper();
+        send_text(&mut m, "/loop check the deploy", false);
+        m.on_frame(&tool_use_frame(
+            "tu-w",
+            "ScheduleWakeup",
+            json!({"delaySeconds": 60, "reason": "Checking the deploy", "prompt": "/loop check"}),
+        ));
+        let at = crate::now_ms() + 60_000;
+        let step = m.on_frame(&tool_result_frame(
+            "tu-w",
+            json!({"scheduledFor": at, "clampedDelaySeconds": 60, "wasClamped": false}),
+        ));
+        let scheduled = step.events.iter().find_map(|e| match e {
+            AgentEvent::Schedule {
+                wakeup: Some(w), ..
+            } => Some(w.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            scheduled.map(|w| (w.at_ms, w.reason)),
+            Some((at, "Checking the deploy".into()))
+        );
+        m.on_frame(&result_frame());
+        assert!(!m.turn_active);
+
+        assert!(m
+            .on_frame(&lifecycle("cli-wake-1", "started"))
+            .events
+            .is_empty());
+        let step = m.on_frame(&text_frame("msg-tick", "claude-sonnet-5-5", "tick"));
+        let kinds: Vec<_> = step
+            .events
+            .iter()
+            .map(|e| match e {
+                AgentEvent::TurnStarted { .. } => "started",
+                AgentEvent::TurnCause { .. } => "cause",
+                AgentEvent::Schedule { .. } => "schedule",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(&kinds[..3], ["started", "cause", "schedule"]);
+        assert!(
+            matches!(&step.events[1], AgentEvent::TurnCause { kind, detail: Some(d), .. }
+            if kind == "wakeup" && d == "Checking the deploy")
+        );
+        assert!(
+            matches!(&step.events[2], AgentEvent::Schedule { wakeup: None, jobs } if jobs.is_empty())
+        );
+    }
+
+    /// A turn the CLI opens with nothing due (a monitor event, the hidden
+    /// keepalive) gets no cause; one our own send opens is never a wake.
+    #[test]
+    fn only_an_unsent_command_with_something_due_is_a_wake() {
+        let mut m = mapper();
+        let (ours, _) = send_text(&mut m, "hi", false);
+        assert!(m.on_frame(&lifecycle(&ours, "started")).events.is_empty());
+        assert!(!m.cli_turn, "our own send");
+        m.on_frame(&result_frame());
+        m.on_frame(&lifecycle("cli-x", "started"));
+        let step = m.on_frame(&text_frame("msg-x", "claude-sonnet-5-5", "woke"));
+        assert!(matches!(step.events[0], AgentEvent::TurnStarted { .. }));
+        assert!(!step
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnCause { .. })));
+    }
+
+    /// Live 2.1.300 `/goal`: the reply is a synthetic frame naming the local
+    /// command; a failed check is a synthetic user frame; `/goal clear`
+    /// answers locally. Set and cleared become goal events, not prose, and a
+    /// check never reads as a (remote) user message.
+    #[test]
+    fn goal_set_check_and_clear_map_from_the_cli_frames() {
+        let mut m = mapper();
+        let cond = "the file n.txt contains the number 3";
+        send_text(&mut m, &format!("/goal {cond}"), false);
+        let mut set = text_frame("g-1", "<synthetic>", &format!("Goal set: {cond}"));
+        set["local_command_run"] = json!({"command": "goal", "args": cond});
+        let step = m.on_frame(&set);
+        assert!(
+            matches!(&step.events[..], [AgentEvent::Goal { goal: Some(g), ended: None }]
+            if g.objective == cond && g.status == "active")
+        );
+        let check = json!({"type": "user", "isSynthetic": true, "parent_tool_use_id": null,
+            "uuid": "u-check", "message": {"role": "user", "content": [{"type": "text",
+            "text": format!("Stop hook feedback:\n[{cond}]: n.txt holds 1, not 3.")}]}});
+        let step = m.on_frame(&check);
+        assert!(
+            matches!(&step.events[..], [AgentEvent::Goal { goal: Some(g), .. }]
+            if g.turns == Some(1) && g.last_check.as_deref() == Some("n.txt holds 1, not 3."))
+        );
+        m.on_frame(&result_frame());
+
+        send_text(&mut m, "/goal clear", false);
+        let mut clear = text_frame("g-2", "<synthetic>", &format!("Goal cleared: {cond}"));
+        clear["local_command_run"] = json!({"command": "goal", "args": "clear"});
+        let step = m.on_frame(&clear);
+        assert!(
+            matches!(&step.events[..], [AgentEvent::Goal { goal: None, ended: Some(e) }]
+            if e.outcome == "cleared" && e.objective == cond)
+        );
     }
 }
 
