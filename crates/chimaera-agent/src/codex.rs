@@ -1336,6 +1336,30 @@ impl RateLimits {
         }
     }
 
+    /// Requests are refused (the backend's verdict, a reached type, or a
+    /// window at 100%).
+    fn refused(&self) -> bool {
+        self.reached
+            || self.blocked
+            || [&self.primary, &self.secondary]
+                .into_iter()
+                .flatten()
+                .any(|w| w.used_percent >= 100.0)
+    }
+
+    fn usage_windows(&self) -> Vec<crate::model::UsageWindow> {
+        self.windows()
+            .into_iter()
+            .map(
+                |(utilization, resets_at, label)| crate::model::UsageWindow {
+                    label,
+                    utilization,
+                    resets_at,
+                },
+            )
+            .collect()
+    }
+
     /// `(utilization, resets_at, label)` per known window. The /usage panel
     /// keys its rows by label, so a repeated one is told apart.
     fn windows(&self) -> Vec<(f64, Option<String>, String)> {
@@ -1353,6 +1377,14 @@ impl RateLimits {
         }
         windows
     }
+}
+
+/// Usage windows (and whether requests are refused) from an
+/// `account/rateLimits/read` result, labelled like the chat's. Public for
+/// the daemon's Agent-settings read.
+pub fn rate_limit_usage(result: &Value) -> (Vec<crate::model::UsageWindow>, bool) {
+    let limits = RateLimits::read(result);
+    (limits.usage_windows(), limits.refused())
 }
 
 /// Protocol → normalized-model translator for the app-server stream. Pure
@@ -2975,9 +3007,8 @@ impl CodexMapper {
                 utilization: pct,
                 resets_at: resets,
                 label: Some(label),
-                limit_reached: self.rate_limits.reached
-                    || self.rate_limits.blocked
-                    || windows.iter().any(|(p, ..)| *p >= 100.0),
+                limit_reached: self.rate_limits.refused(),
+                windows: self.rate_limits.usage_windows(),
             };
             if self.rate_limit_sent.as_ref() != Some(&chip) {
                 self.rate_limit_sent = Some(chip.clone());
@@ -10324,11 +10355,15 @@ mod tests {
                 label,
                 resets_at,
                 limit_reached,
+                windows,
             } => {
                 assert!((utilization - 42.0).abs() < 0.01);
                 assert_eq!(label.as_deref(), Some("session limit"));
                 assert_eq!(resets_at.as_deref(), Some("1800000000"));
                 assert!(!limit_reached);
+                // The chip carries every window for the header's popover.
+                let labels: Vec<_> = windows.iter().map(|w| w.label.as_str()).collect();
+                assert_eq!(labels, ["session limit", "weekly limit"]);
             }
             other => panic!("expected RateLimit, got {other:?}"),
         }

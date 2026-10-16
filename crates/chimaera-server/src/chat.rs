@@ -4507,6 +4507,7 @@ mod tests {
                     resets_at: None,
                     label: Some("session limit".into()),
                     limit_reached: false,
+                    windows: Vec::new(),
                 },
             ),
             seq_event(

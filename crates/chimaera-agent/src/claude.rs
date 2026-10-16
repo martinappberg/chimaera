@@ -2358,11 +2358,29 @@ impl ClaudeMapper {
             Some("overage") => Some("usage credit limit"),
             other => other,
         };
+        // Every request's frame carries both plan windows (live 2.1.300:
+        // `unifiedWindows {five_hour, seven_day: {utilization 0-1, resetsAt}}`),
+        // whichever one `rateLimitType` names.
+        let windows = [
+            ("five_hour", "session limit"),
+            ("seven_day", "weekly limit"),
+        ]
+        .into_iter()
+        .filter_map(|(key, label)| {
+            let window = &info["unifiedWindows"][key];
+            Some(UsageWindow {
+                label: label.to_string(),
+                utilization: (window["utilization"].as_f64()? * 100.0).clamp(0.0, 100.0),
+                resets_at: window["resetsAt"].as_u64().map(|secs| secs.to_string()),
+            })
+        })
+        .collect();
         step.events.push(AgentEvent::RateLimit {
             utilization: (info["utilization"].as_f64().unwrap_or(0.0) * 100.0).clamp(0.0, 100.0),
             resets_at: info["resetsAt"].as_u64().map(|secs| secs.to_string()),
             label: label.map(String::from),
             limit_reached: status == "rejected",
+            windows,
         });
     }
 
@@ -3459,37 +3477,9 @@ impl ClaudeMapper {
                 }
             }
             PendingControl::GetUsage => {
-                let limits = &payload["rate_limits"];
-                let mut windows = Vec::new();
-                for (key, label) in [
-                    ("five_hour", "session (5h)"),
-                    ("seven_day", "weekly"),
-                    ("seven_day_sonnet", "weekly sonnet"),
-                    ("seven_day_opus", "weekly opus"),
-                    ("extra_usage", "extra usage"),
-                ] {
-                    if let Some(u) = limits[key]["utilization"].as_f64() {
-                        windows.push(UsageWindow {
-                            label: label.to_string(),
-                            utilization: u,
-                            resets_at: limits[key]["resets_at"].as_str().map(String::from),
-                        });
-                    }
-                }
-                if let Some(scoped) = limits["model_scoped"].as_array() {
-                    for m in scoped {
-                        if let (Some(name), Some(u)) =
-                            (m["display_name"].as_str(), m["utilization"].as_f64())
-                        {
-                            windows.push(UsageWindow {
-                                label: format!("weekly {name}"),
-                                utilization: u,
-                                resets_at: m["resets_at"].as_str().map(String::from),
-                            });
-                        }
-                    }
-                }
-                step.events.push(AgentEvent::UsageReport { windows });
+                step.events.push(AgentEvent::UsageReport {
+                    windows: usage_windows(payload),
+                });
             }
             PendingControl::Rewind {
                 user_message_id,
@@ -4746,6 +4736,59 @@ const PENDING_TASK_CAP: usize = 64;
 /// The chimaera MCP server's plan tool as claude names it (`mcp__<server>__<tool>`).
 const CHIMAERA_PLAN_TOOL: &str = "mcp__chimaera__update_plan";
 
+/// Usage windows from a `get_usage` control response (`{rate_limits:
+/// {five_hour, seven_day, seven_day_sonnet, seven_day_opus, extra_usage:
+/// {utilization 0-100, resets_at}, model_scoped: [{display_name,
+/// utilization, resets_at}]}}`), labelled like the streamed chip's windows.
+/// Labels are unique (the usage rows are keyed by them), so a model-scoped
+/// window that repeats a named one is dropped. Public for the daemon's
+/// Agent-settings read.
+pub fn usage_windows(payload: &Value) -> Vec<UsageWindow> {
+    const SCOPED_MAX: usize = 16;
+    let limits = &payload["rate_limits"];
+    let named = [
+        ("five_hour", "session limit".to_string()),
+        ("seven_day", "weekly limit".to_string()),
+        ("seven_day_sonnet", "weekly Sonnet limit".to_string()),
+        ("seven_day_opus", "weekly Opus limit".to_string()),
+        ("extra_usage", "extra usage".to_string()),
+    ]
+    .into_iter()
+    .map(|(key, label)| (&limits[key], label));
+    let scoped = limits["model_scoped"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(SCOPED_MAX)
+        .filter_map(|m| {
+            let name = truncate_label(m["display_name"].as_str()?, 48);
+            Some((m, format!("weekly {name} limit")))
+        });
+    let mut windows: Vec<UsageWindow> = Vec::new();
+    for (window, label) in named.chain(scoped) {
+        let Some(utilization) = window["utilization"].as_f64() else {
+            continue;
+        };
+        // Extra (paid overage) usage reports 0% while switched off (live
+        // 2.1.300: `is_enabled: false`); a window that can't be used isn't one.
+        if window["is_enabled"] == false {
+            continue;
+        }
+        if windows.iter().any(|w| w.label == label) {
+            continue;
+        }
+        windows.push(UsageWindow {
+            label,
+            utilization: utilization.clamp(0.0, 100.0),
+            resets_at: window["resets_at"]
+                .as_str()
+                .map(|at| truncate_label(at, 40))
+                .or_else(|| window["resets_at"].as_u64().map(|secs| secs.to_string())),
+        });
+    }
+    windows
+}
+
 /// `TodoWrite` was a LEVEL-SET — every call carried the whole list, so the
 /// driver was a pure translator. `TaskCreate`/`TaskUpdate` are INCREMENTAL
 /// (create one, patch one by id), so the list has to be held here and
@@ -5676,6 +5719,72 @@ pub(crate) mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn rate_limit_event_carries_both_plan_windows() {
+        // Live 2.1.300 frame: the chip names the weekly window, and every
+        // request carries both windows alongside.
+        let mut m = mapper();
+        let step = m.on_frame(&json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "allowed_warning", "resetsAt": 1792551600u64,
+                "rateLimitType": "seven_day", "utilization": 0.56,
+                "overageStatus": "rejected", "isUsingOverage": false,
+                "unifiedWindows": {
+                    "five_hour": { "utilization": 0.2, "resetsAt": 1792110000u64 },
+                    "seven_day": { "utilization": 0.56, "resetsAt": 1792551600u64 },
+                },
+            },
+        }));
+        match &step.events[..] {
+            [AgentEvent::RateLimit {
+                utilization,
+                label,
+                limit_reached,
+                windows,
+                ..
+            }] => {
+                assert!((utilization - 56.0).abs() < 0.01);
+                assert_eq!(label.as_deref(), Some("weekly limit"));
+                assert!(!limit_reached);
+                assert_eq!(windows.len(), 2);
+                assert_eq!(windows[0].label, "session limit");
+                assert!((windows[0].utilization - 20.0).abs() < 0.01);
+                assert_eq!(windows[0].resets_at.as_deref(), Some("1792110000"));
+                assert_eq!(windows[1].label, "weekly limit");
+            }
+            other => panic!("expected one RateLimit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn usage_windows_label_like_the_chip_and_never_repeat() {
+        let windows = usage_windows(&json!({ "rate_limits": {
+            "five_hour": { "utilization": 42.0, "resets_at": "2026-10-15T20:00:00Z" },
+            "seven_day": { "utilization": 57.0, "resets_at": null },
+            "seven_day_opus": { "utilization": 12.0 },
+            "extra_usage": { "utilization": 0, "is_enabled": false },
+            "model_scoped": [
+                { "display_name": "Opus", "utilization": 12.0 },
+                { "display_name": "Fable 5", "utilization": 3.0 },
+            ],
+        }}));
+        let labels: Vec<_> = windows.iter().map(|w| w.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "session limit",
+                "weekly limit",
+                "weekly Opus limit",
+                "weekly Fable 5 limit"
+            ]
+        );
+        assert_eq!(
+            windows[0].resets_at.as_deref(),
+            Some("2026-10-15T20:00:00Z")
+        );
+    }
 
     fn mapper() -> ClaudeMapper {
         ClaudeMapper::new(

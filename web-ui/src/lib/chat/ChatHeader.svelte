@@ -1,8 +1,8 @@
 <script lang="ts">
   /**
    * The chat header strip: identity chip, the model / permission-mode / effort
-   * pickers, ultracode + thinking toggles, and the live status chips (stop,
-   * rate limit, context). It renders and toggles the shared `menu` state but
+   * pickers, ultracode + thinking toggles, and the live status (stop, and the
+   * usage meter: context and plan limits). It renders and toggles the shared `menu` state but
    * the picks themselves are the host's callbacks (they ride socket.send).
    */
   import { toolbarPopover } from "../shared/toolbarPopover";
@@ -17,6 +17,8 @@
 
   import type { ModelChoice } from "./modelPicker";
   import ModelPicker from "./ModelPicker.svelte";
+  import UsageMeter from "./UsageMeter.svelte";
+  import type { UsageRow } from "../shared/usage";
 
   interface Props {
     store: ChatStore;
@@ -26,7 +28,7 @@
     visible?: boolean;
     /** The one-of-N open overlay; two-way so the host can open /mcp and the
      *  outside-dismiss action can close everything. */
-    menu: "model" | "mode" | "effort" | "mcp" | "remote" | "options" | null;
+    menu: "model" | "mode" | "effort" | "mcp" | "remote" | "options" | "usage" | null;
     canPickModel: boolean;
     allowCustomModel?: boolean;
     canPickMode: boolean;
@@ -49,6 +51,15 @@
     /** Turn the agent's Remote Control bridge on/off (claude: the
      *  `remote_control` control; codex answers with a pointer to its daemon). */
     onSetRemoteControl: (enabled: boolean) => void;
+    /** Free the context window (the usage popover's Compact); offered only
+     *  while the agent is idle. */
+    onCompact?: () => void;
+    /** Agent settings, where the account's limits are read live. */
+    onOpenSettings?: () => void;
+    /** The account's limits from that live read, shown while this chat's
+     *  own stream has reported none. */
+    accountLimits?: UsageRow[];
+    accountLimitReached?: boolean;
   }
 
   let {
@@ -58,6 +69,10 @@
     mods,
     visible = true,
     menu = $bindable(),
+    onCompact,
+    onOpenSettings,
+    accountLimits = [],
+    accountLimitReached = false,
     canPickModel,
     allowCustomModel = false,
     canPickMode,
@@ -86,6 +101,14 @@
   // live state (its bridge is not switchable from here).
   const rc = $derived(store.remoteControl);
   const rcShown = $derived(store.remoteControlAvailable || rc !== null);
+  /** The plan windows this chat knows: every window the agent reported, else
+   *  the single one its limit event names. */
+  const limitRows = $derived.by<UsageRow[]>(() => {
+    const limit = store.rateLimit;
+    if (limit === null) return accountLimits;
+    if (limit.windows.length > 0) return limit.windows;
+    return [{ label: limit.label ?? "usage limit", utilization: limit.utilization, resetsAt: limit.resetsAt }];
+  });
   const rcState = $derived<"off" | "connecting" | "connected" | "error">(rc?.state ?? "off");
   const rcTitle = $derived(
     rcState === "connected"
@@ -250,12 +273,6 @@
             Remote Control <span>{rcState}</span>
           </button>
         {/if}
-        <div class="options-heading">
-          {store.contextPct === null ? "Context usage not yet available" : `${Math.round(store.contextPct)}% of context used`}
-          {#if store.rateLimit !== null && (store.rateLimit.limitReached || store.rateLimit.utilization >= 80)}
-            <br />{store.rateLimit.label ?? "Usage limit"}: {store.rateLimit.limitReached ? "reached" : `${Math.floor(store.rateLimit.utilization)}%`}
-          {/if}
-        </div>
       </div>
     {/if}
       {#if menu === "remote"}
@@ -314,28 +331,17 @@
   {#if store.running || store.compacting}
     <button class="stop" onclick={onInterrupt} aria-label="Stop" title="interrupt the agent (Esc)"><span class="stop-mark" aria-hidden="true"></span><span class="stop-label">Stop</span></button>
   {/if}
-  {#if store.rateLimit !== null && (store.rateLimit.limitReached || store.rateLimit.utilization >= 80)}
-    <span
-      class="ratelimit"
-      class:hit={store.rateLimit.limitReached}
-      title={`${store.rateLimit.label ?? "Usage limit"}: ${store.rateLimit.limitReached ? "reached" : `${Math.floor(store.rateLimit.utilization)}%`}${store.rateLimit.resetsAt !== null ? ` · resets ${new Date(Number(store.rateLimit.resetsAt) * 1000).toLocaleString()}` : ""}`}
-    >
-      <span class="rate-label">{store.rateLimit.label ?? "Usage limit"}</span>
-      <span class="rate-label-short">{(store.rateLimit.label ?? "Usage").replace(/\s+limit$/i, "")}</span>
-      <span>{store.rateLimit.limitReached ? "reached" : `${Math.floor(store.rateLimit.utilization)}%`}</span>
-    </span>
-  {/if}
-  {#if store.contextPct !== null}
-    <span
-      class="ctx"
-      class:full={store.contextPct >= 80}
-      title={store.contextTokens !== null
-        ? `context window: ${store.contextTokens.total.toLocaleString()} / ${store.contextTokens.max.toLocaleString()} tokens`
-        : "context window used"}
-    >
-      {Math.round(store.contextPct)}% ctx
-    </span>
-  {/if}
+  <UsageMeter
+    contextPct={store.contextPct}
+    contextTokens={store.contextTokens}
+    limits={limitRows}
+    limitReached={store.rateLimit?.limitReached ?? accountLimitReached}
+    open={menu === "usage"}
+    onToggle={() => (menu = menu === "usage" ? null : "usage")}
+    onClose={() => (menu = null)}
+    {onCompact}
+    {onOpenSettings}
+  />
   </div>
 </header>
 </div>
@@ -541,7 +547,6 @@
   }
   .spacer { flex: 1; }
   .session-status { display: flex; align-items: center; gap: 6px; min-width: 0; }
-  .rate-label-short { display: none; }
   .primary-picker { flex: 0 1 auto; min-width: 0; }
   .primary-picker .chip { max-width: 100%; }
   .pick-label { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
@@ -552,15 +557,11 @@
   .options-menu .menu-row span { color: var(--muted); }
   .options-heading { padding: 8px 12px; font-size: var(--text-xs); color: var(--muted); white-space: normal; }
   .chip:focus-visible, .stop:focus-visible, .menu-row:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
-  .stop, .ctx, .ratelimit { flex: none; white-space: nowrap; }
+  .stop { flex: none; white-space: nowrap; }
   .stop { height: var(--pane-control-size); }
   @container pane-chrome (max-width: 620px) {
-    .agent-name, .ctx { display: none; }
-    .ctx.full { display: inline; }
+    .agent-name { display: none; }
     .agent-id { border: 0; margin: 0; padding: 0; }
-    .strip .ratelimit { min-width: 0; flex-shrink: 1; padding: 0 6px; }
-    .rate-label { display: none; }
-    .rate-label-short { display: inline; min-width: 0; max-width: 52px; overflow: hidden; text-overflow: ellipsis; }
     .stop { width: var(--pane-control-size); padding: 0; }
     .stop-label { display: none; }
   }
@@ -598,33 +599,5 @@
   .stop-mark { width: 6px; height: 6px; border-radius: 1px; background: currentColor; }
   .stop:hover {
     background: var(--row-hover);
-  }
-  .ctx {
-    font-variant-numeric: tabular-nums;
-    color: var(--muted);
-  }
-  .ctx.full {
-    color: var(--warn);
-  }
-  .ratelimit {
-    gap: 4px;
-    font-variant-numeric: tabular-nums;
-    color: var(--warn);
-    border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--edge));
-    border-radius: 999px;
-    padding: 0 8px;
-    height: calc(var(--text-xs) + 6px);
-    display: inline-flex;
-    align-items: center;
-    animation: rise 0.18s ease; /* @keyframes rise lives in app.css */
-  }
-  .ratelimit.hit {
-    color: var(--err);
-    border-color: color-mix(in srgb, var(--err) 55%, var(--edge));
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .ratelimit {
-      animation: none;
-    }
   }
 </style>
