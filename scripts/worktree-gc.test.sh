@@ -3,11 +3,19 @@
 # output, so its safety rules are pinned here against a throwaway repo (a local
 # bare origin, a fake `gh` that serves canned PR states) and run in CI.
 # Run: bash scripts/worktree-gc.test.sh
+#
+# Two sections:
+#   deterministic  fake `lsof` and `ps` first on PATH answer from fixture
+#                  files, so every classification rule (previews included)
+#                  runs without inspecting a single real process.
+#   integration    real processes, real lsof/ps, real SIGTERM. A preflight
+#                  probes process inspection first; where a sandbox denies it,
+#                  the section is skipped and counted, never failed — the
+#                  script's own answer to that is "everything is ACTIVE".
+# The script itself has no test hook: the shims are ordinary PATH entries, so
+# no leftover environment variable can redirect a real (hook) run.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
-real_node=$(command -v node)
-real_npm=$(command -v npm)
-real_just=$(command -v just || true)
 T=$(mktemp -d "${TMPDIR:-/tmp}/worktree-gc-test.XXXXXX")
 T=$(cd "$T" && pwd -P)
 pids=""
@@ -18,7 +26,7 @@ cleanup() {
   rm -rf "$T"
 }
 trap cleanup EXIT
-pass=0 fail=0
+pass=0 fail=0 skip=0
 ok() { pass=$((pass + 1)); }
 no() { fail=$((fail + 1)); printf 'FAIL  %s\n' "$*"; }
 
@@ -36,6 +44,66 @@ cat "$GH_FAKE_PRS"
 EOF
 chmod +x "$T/bin/gh"
 export PATH="$T/bin:$PATH" GH_FAKE_PRS="$T/prs.tsv"
+
+# ------------------------------------------------- process fixtures (shims) ---
+# The deterministic section's process table: $FX/lsof is `lsof -F` output,
+# $FX/ps holds pid \t ppid \t args. $FX/ps-fail set to "all" denies every ps
+# call (as a sandbox does), "axo" only the parent snapshot. Fixture PIDs start
+# above any kernel's pid_max (Linux caps it at 2^22), so even a stray signal
+# can never reach a real process. A table with no process at all would read
+# as "cannot inspect" (and fall through to /proc on Linux), so one base
+# process always remains.
+FX="$T/fx"
+mkdir -p "$FX"
+fx_reset() {
+  printf 'p5000000\ncinit\nfcwd\nn/\nftxt\nn/sbin/init\n' >"$FX/lsof"
+  printf '5000000\t0\t/sbin/init\n' >"$FX/ps"
+  rm -f "$FX/ps-fail"
+}
+fx_proc() { # pid ppid exe cwd args [open-file...]
+  local pid=$1 ppid=$2 exe=$3 cwd=$4 args=$5 f
+  shift 5
+  {
+    printf 'p%s\nc%s\n' "$pid" "${exe##*/}"
+    # Twice: Linux lsof repeats cwd records for a multithreaded process.
+    printf 'fcwd\nn%s\n' "$cwd" "$cwd"
+    printf 'ftxt\nn%s\n' "$exe"
+    for f in "$@"; do printf 'f3r\nn%s\n' "$f"; done
+  } >>"$FX/lsof"
+  printf '%s\t%s\t%s\n' "$pid" "$ppid" "$args" >>"$FX/ps"
+}
+fx_shims() {
+  printf '#!/bin/sh\ncat "%s/lsof"\n' "$FX" >"$T/bin/lsof"
+  cat >"$T/bin/ps" <<EOF
+#!/bin/sh
+fx="$FX"
+EOF
+  cat >>"$T/bin/ps" <<'EOF'
+mode=$(cat "$fx/ps-fail" 2>/dev/null)
+[ "$mode" != all ] || exit 1
+pid="" fields=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -axo)
+      [ "$mode" != axo ] || exit 1
+      exec awk -F'\t' '{ printf "%8d %8d\n", $1, $2 }' "$fx/ps" ;;
+    -p) pid=$2; shift ;;
+    -o) fields="$fields $2"; shift ;;
+  esac
+  shift
+done
+awk -F'\t' -v p="$pid" -v f="$fields" '
+  $1 == p { found = 1
+    if (f == "") { print "  PID TTY TIME CMD"; print p " ?? 0:00.00 " $3; exit }
+    s = ""; n = split(f, a, " ")
+    for (i = 1; i <= n; i++) s = s (i > 1 ? " " : "") (a[i] == "lstart=" ? "Thu Jan  1 00:00:00 2026" : $3)
+    print s; exit }
+  END { exit !found }' "$fx/ps"
+EOF
+  chmod +x "$T/bin/lsof" "$T/bin/ps"
+}
+fx_reset
+fx_shims
 
 git init -q --bare -b main "$T/origin.git"
 git clone -q "$T/origin.git" "$T/main" 2>/dev/null
@@ -177,11 +245,10 @@ for d in "$W"/*; do
   find "$d" -exec touch -t 202601010000 {} + 2>/dev/null
   find "$M/.git/worktrees/${d##*/}" -exec touch -t 202601010000 {} + 2>/dev/null
 done
-(cd "$W/inuse" && exec sleep 300) &
-pids="$pids $!"
-disown $! 2>/dev/null
-sleep 1
+fx_proc 5000010 5000000 /bin/sleep "$W/inuse" "sleep 300"
 
+# --------------------------------------------------------- deterministic ---
+# Every process below is a fixture row; no real process is inspected.
 judge() { # label row group [reason-substring]
   case "$2" in
     "$3 "*) case "$2" in *"${4:-}"*) ok ;; *) no "$1: expected reason '$4' in: $2" ;; esac ;;
@@ -252,6 +319,191 @@ for n in localbare dirty aftermerge locked inuse recentclosed recentbase reused 
 [ -z "$(git -C "$M" worktree list --porcelain | grep -F "$W/merged")" ] && ok || no "merged still registered"
 grep -q "df free: " "$T/apply" && ok || no "apply did not report df: $(tail -3 "$T/apply")"
 
+# Dev previews from fixture process tables: which holders make a merged
+# checkout PREVIEW (stoppable) and which keep it ACTIVE. Dry runs only — the
+# PIDs are not real; --apply's shutdown path is in the integration section.
+merged_wt() { # name [state]
+  new_wt "$1"
+  commit "$W/$1" "$1"
+  git -C "$W/$1" push -q origin "b/$1"
+  printf '%s\t%s\t%s\t%s\n' "b/$1" "${2:-MERGED}" 30 "$(git -C "$W/$1" rev-parse HEAD)" >>"$T/prs.tsv"
+}
+for name in fxdaemon fxapp fxvite fxnpm fxjust fxjustapp fxcompound fxmixed fxforeign fxrelease fxconnect fxdirty fxunpushed fxlocked fxnested; do merged_wt "$name"; done
+merged_wt fxopen OPEN
+merged_wt fxclosed CLOSED
+echo notes >"$W/fxdirty/notes.txt"
+commit "$W/fxunpushed" unpushed
+git -C "$M" worktree lock "$W/fxlocked"
+git -C "$M" worktree add -q --detach "$W/fxnested/child" main
+fx_node=/usr/local/bin/node fx_just=/usr/local/bin/just
+fx_daemon() { # pid name [open-file...]
+  local pid=$1 w="$W/$2"
+  shift 2
+  fx_proc "$pid" 5000000 "$w/target/debug/chimaera" "$w" "target/debug/chimaera serve --port 0" "$@"
+}
+fx_vite() { # pid ppid name
+  fx_proc "$1" "$2" "$fx_node" "$W/$3/web-ui" "node $W/$3/web-ui/node_modules/.bin/vite --port 0"
+}
+fx_daemon 5000101 fxdaemon
+# A daemon-owned child (a test agent): its daemon shuts it down.
+fx_proc 5000102 5000101 /bin/sleep "$W/fxdaemon" "sleep 300"
+fx_app="$W/fxapp/crates/chimaera-app/target/debug/chimaera-dev.app/Contents/MacOS/chimaera-dev"
+fx_proc 5000111 5000000 "$fx_app" "$W/fxapp" "$fx_app --daemon"
+fx_vite 5000121 5000000 fxvite
+# npm run dev → sh -c vite → node vite
+fx_proc 5000131 5000000 "$fx_node" "$W/fxnpm/web-ui" "npm run dev"
+fx_proc 5000132 5000131 /bin/sh "$W/fxnpm/web-ui" "sh -c vite"
+fx_vite 5000133 5000132 fxnpm
+# just dev-ui → sh -cu 'cd web-ui && npm run dev' → npm exec vite → node vite
+fx_proc 5000141 5000000 "$fx_just" "$W/fxjust" "just dev-ui"
+fx_proc 5000142 5000141 /bin/sh "$W/fxjust/web-ui" "sh -cu cd web-ui && npm run dev"
+fx_proc 5000143 5000142 "$fx_node" "$W/fxjust/web-ui" "npm exec vite"
+fx_vite 5000144 5000143 fxjust
+# just app-dev-isolated → sh -cu 'bash …run-app-isolated.sh' → (exec) chimaera-dev
+fx_dev="$W/fxjustapp/crates/chimaera-app/target/debug/chimaera-dev"
+fx_proc 5000151 5000000 "$fx_just" "$W/fxjustapp" "just app-dev-isolated"
+fx_proc 5000152 5000151 /bin/sh "$W/fxjustapp" "sh -cu bash .claude/skills/develop/run-app-isolated.sh"
+fx_proc 5000153 5000152 "$fx_dev" "$W/fxjustapp" "$fx_dev"
+# A compound script: its shell is not a recognized wrapper.
+fx_proc 5000161 5000000 "$fx_node" "$W/fxcompound/web-ui" "npm run dev"
+fx_proc 5000162 5000161 /bin/sh "$W/fxcompound/web-ui" "sh -c vite & wait"
+fx_vite 5000163 5000162 fxcompound
+fx_daemon 5000171 fxmixed
+fx_proc 5000172 5000000 /bin/sleep "$W/fxmixed" "sleep 300"
+fx_daemon 5000181 fxforeign "$M/file.txt"
+fx_proc 5000191 5000000 "$W/fxrelease/target/release/chimaera" "$W/fxrelease" "target/release/chimaera serve --port 0"
+fx_proc 5000201 5000000 "$W/fxconnect/target/debug/chimaera" "$W/fxconnect" "target/debug/chimaera connect somehost"
+fx_daemon 5000211 fxdirty
+fx_daemon 5000221 fxunpushed
+fx_daemon 5000231 fxlocked
+fx_daemon 5000241 fxopen
+fx_daemon 5000251 fxclosed
+fx_daemon 5000261 fxnested
+bash "$GC" --no-fetch --no-sizes >"$T/out" 2>&1
+for name in fxdaemon fxapp fxvite fxnpm fxjust fxjustapp; do expect "b/$name" PREVIEW "stop dev preview"; done
+for name in fxcompound fxmixed fxforeign fxrelease fxconnect fxdirty fxunpushed fxlocked fxopen fxclosed fxnested; do expect "b/$name" ACTIVE; done
+# ps denied outright (as some sandboxes do), or only its parent snapshot:
+# a preview it cannot verify is just a process using the checkout — ACTIVE.
+for mode in all axo; do
+  echo "$mode" >"$FX/ps-fail"
+  bash "$GC" --no-fetch --no-sizes >"$T/out" 2>&1
+  for name in fxdaemon fxvite fxjust fxjustapp; do expect "b/$name" ACTIVE; done
+done
+rm -f "$FX/ps-fail"
+GH_FAKE_FAIL=1 bash "$GC" --no-fetch --no-sizes >"$T/out" 2>&1
+expect b/fxdaemon ACTIVE
+# Running in the merged checkout itself still protects it.
+(cd "$W/fxdaemon" && bash "$GC" --no-fetch --no-sizes) >"$T/out" 2>&1
+expect b/fxdaemon ACTIVE "this session runs here"
+fx_reset
+
+# --self --sweep: only unreferenced, old objects go; referenced and young stay.
+S="$W/localbare"
+fake_target "$S"
+D="$S/target/debug/deps"
+printf 'junk\0%s/app-1.a.cgu.00.rcgu.o\0junk' "$D" >"$D/app-1"
+chmod +x "$D/app-1"
+for o in app-1.a.cgu.00.rcgu.o app-1.old.cgu.07.rcgu.o app-1.young.cgu.03.rcgu.o app-1.dev.cgu.05.rcgu.o; do echo o >"$D/$o"; done
+# An older build still hard-linked outside deps/ (run-app-isolated.sh's .app).
+mkdir -p "$S/target/debug/dev.app/Contents/MacOS"
+printf 'x\0%s/app-1.dev.cgu.05.rcgu.o\0' "$D" >"$S/target/debug/dev.app/Contents/MacOS/dev"
+chmod +x "$S/target/debug/dev.app/Contents/MacOS/dev"
+touch -t 202601010000 "$D/app-1.a.cgu.00.rcgu.o" "$D/app-1.old.cgu.07.rcgu.o" "$D/app-1.dev.cgu.05.rcgu.o" "$D"
+deps_mtime() { if stat -f %m "$D" >/dev/null 2>&1; then stat -f %m "$D"; else stat -c %Y "$D"; fi; }
+before_mtime=$(deps_mtime)
+(cd "$S" && bash "$GC" --self --sweep) >"$T/self" 2>&1
+grep -q "1 stale debug object" "$T/self" && [ -f "$D/app-1.old.cgu.07.rcgu.o" ] && ok || no "self sweep dry run: $(cat "$T/self")"
+(cd "$S" && bash "$GC" --self --sweep --apply) >"$T/self" 2>&1
+[ ! -e "$D/app-1.old.cgu.07.rcgu.o" ] && ok || no "stale object not swept: $(cat "$T/self")"
+[ -f "$D/app-1.a.cgu.00.rcgu.o" ] && [ -f "$D/app-1.young.cgu.03.rcgu.o" ] && [ -f "$D/libx.rlib" ] && ok || no "sweep deleted a live object"
+[ -f "$D/app-1.dev.cgu.05.rcgu.o" ] && ok || no "sweep deleted an object a binary outside deps/ references"
+[ "$(deps_mtime)" = "$before_mtime" ] && ok || no "sweep moved deps/ mtime (the idle clock)"
+(cd "$S" && bash "$GC" --self --sweep --apply) >"$T/self" 2>&1
+grep -q "no stale debug objects" "$T/self" && ok || no "empty sweep: $(cat "$T/self")"
+
+# --self: the whole target dir, but not while something runs from it.
+(cd "$S" && bash "$GC" --self) >"$T/self" 2>&1
+[ -d "$S/target" ] && grep -q "would delete" "$T/self" && ok || no "self dry run: $(cat "$T/self")"
+# A process holding a file under target/ open, as a daemon running from
+# target/debug does.
+fx_proc 5000301 5000000 /bin/sleep / "sleep 300" "$S/target/debug/deps/libx.rlib"
+(cd "$S" && bash "$GC" --self --apply) >"$T/self" 2>&1
+[ -d "$S/target" ] && grep -q "skipped" "$T/self" && ok || no "self trim ignored an open file: $(cat "$T/self")"
+fx_reset
+(cd "$S" && bash "$GC" --self --apply) >"$T/self" 2>&1
+[ ! -e "$S/target" ] && [ -f "$S/file.txt" ] && ok || no "self trim: $(cat "$T/self")"
+
+# Hooks: the low-disk flag, the off switch, and a detached background run.
+# (A fresh interval stamp keeps these first calls from spawning a run.)
+mkdir -p "$M/.git/worktree-gc" && touch "$M/.git/worktree-gc/last-run"
+out=$(cd "$M" && WORKTREE_GC_LOW_GB=999999999 bash "$GC" --hook session-start </dev/null)
+case "$out" in "Disk is low:"*) ok ;; *) no "no low-disk flag: $out" ;; esac
+out=$(cd "$M" && WORKTREE_GC=off WORKTREE_GC_LOW_GB=999999999 bash "$GC" --hook session-start </dev/null)
+[ -z "$out" ] && ok || no "WORKTREE_GC=off still printed: $out"
+LOG="$M/.git/worktree-gc/log"
+rm -rf "$M/.git/worktree-gc"
+out=$(cd "$M" && bash "$GC" --hook session-start </dev/null)
+[ -z "$out" ] && ok || no "session-start printed with plenty of disk: $out"
+i=0
+while [ $i -lt 60 ] && ! grep -q "nothing to do\|df free: " "$LOG" 2>/dev/null; do sleep 1; i=$((i + 1)); done
+grep -q -- "--- auto run" "$LOG" && ok || no "no background run logged: $(ls -la "$M/.git/worktree-gc" 2>&1; cat "$LOG" 2>&1)"
+# The run's last log line comes before its exit trap drops the lock: wait for
+# the lock, then count runs. A leftover lock proves nothing either way.
+i=0
+while [ $i -lt 30 ] && [ -d "$M/.git/worktree-gc/lock" ]; do sleep 1; i=$((i + 1)); done
+(cd "$M" && bash "$GC" --hook session-start </dev/null)
+sleep 3
+runs=$(grep -c -- "--- auto run" "$LOG")
+[ "$runs" = 1 ] && ok || no "a second run started inside the interval ($runs runs): $(cat "$LOG")"
+# session-end: /clear does nothing; a real end sweeps the session's worktree
+# (named by the hook payload's cwd) in the background.
+fake_target "$S"
+printf 'x\0' >"$D/app-1" && chmod +x "$D/app-1"
+echo o >"$D/app-1.gone.cgu.01.rcgu.o" && touch -t 202601010000 "$D/app-1.gone.cgu.01.rcgu.o"
+printf '{"reason":"clear","cwd":"%s"}' "$S" | (cd "$M" && bash "$GC" --hook session-end) && ok || no "session-end (clear) failed"
+sleep 2
+[ -f "$D/app-1.gone.cgu.01.rcgu.o" ] && ok || no "session-end swept on /clear"
+printf '{"reason":"other","cwd":"%s"}' "$S" | (cd "$M" && bash "$GC" --hook session-end) && ok || no "session-end failed"
+i=0
+while [ $i -lt 30 ] && [ -f "$D/app-1.gone.cgu.01.rcgu.o" ]; do sleep 1; i=$((i + 1)); done
+[ ! -e "$D/app-1.gone.cgu.01.rcgu.o" ] && ok || no "session-end did not sweep $S: $(tail -3 "$LOG")"
+
+# `git config worktree-gc.auto false`: hooks still flag low disk, delete nothing.
+git -C "$M" config worktree-gc.auto false
+echo o >"$D/app-1.kept.cgu.02.rcgu.o" && touch -t 202601010000 "$D/app-1.kept.cgu.02.rcgu.o"
+rm -rf "$M/.git/worktree-gc"
+out=$(cd "$M" && WORKTREE_GC_LOW_GB=999999999 bash "$GC" --hook session-start </dev/null)
+case "$out" in "Disk is low:"*) ok ;; *) no "auto=false lost the low-disk flag: $out" ;; esac
+printf '{"reason":"other","cwd":"%s"}' "$S" | (cd "$M" && bash "$GC" --hook session-end)
+(cd "$M" && bash "$GC" --auto) >/dev/null 2>&1
+sleep 3
+[ ! -e "$M/.git/worktree-gc/last-run" ] && [ ! -e "$M/.git/worktree-gc/log" ] && [ -f "$D/app-1.kept.cgu.02.rcgu.o" ] && ok ||
+  no "auto=false still ran: $(ls "$M/.git/worktree-gc" 2>&1)"
+
+# ----------------------------------------------------------- integration ---
+# Real processes, real lsof/ps, real SIGTERM. Probe first: where a sandbox
+# denies process inspection the script correctly calls everything ACTIVE, so
+# these cases cannot run there. That is a skip, reported with its count, not a
+# failure of the rules the deterministic section already pinned.
+rm -f "$T/bin/lsof" "$T/bin/ps"
+real_node=$(command -v node || true)
+real_npm=$(command -v npm || true)
+real_just=$(command -v just || true)
+# The cases this section asserts (the run checks it, so a skip reports the
+# true number); the two just launcher chains add five each.
+INTEGRATION_CASES=61
+[ -z "$real_just" ] || INTEGRATION_CASES=$((INTEGRATION_CASES + 10))
+probe_processes() {
+  local tool out
+  for tool in cc node npm lsof ps; do
+    command -v "$tool" >/dev/null 2>&1 || { echo "no $tool on PATH"; return 1; }
+  done
+  out=$(ps -p $$ -o args= 2>/dev/null) && [ -n "$out" ] || { echo "\`ps -p PID -o args=\` failed"; return 1; }
+  out=$(ps -axo pid=,ppid= 2>/dev/null) && [ -n "$out" ] || { echo "\`ps -axo pid=,ppid=\` failed"; return 1; }
+  out=$(lsof -nP -w -p $$ -Fn 2>/dev/null)
+  [ -n "$out" ] || { echo "\`lsof -p PID\` listed nothing"; return 1; }
+}
+integration() {
 # Real preview processes: executables, cwd, parentage, and SIGTERM handlers
 # exercise the same OS inspection as a live daemon. Copying system binaries
 # breaks macOS code signing, so compile a tiny local fixture instead.
@@ -299,10 +551,7 @@ int main(void) {
 EOF
 cc "$T/preview.c" -o "$T/preview" || exit 1
 preview_wt() { # name [state]
-  new_wt "$1"
-  commit "$W/$1" "$1"
-  git -C "$W/$1" push -q origin "b/$1"
-  printf '%s\t%s\t%s\t%s\n' "b/$1" "${2:-MERGED}" 30 "$(git -C "$W/$1" rev-parse HEAD)" >>"$T/prs.tsv"
+  merged_wt "$@"
   fake_target "$W/$1"
   cp "$T/preview" "$W/$1/target/debug/chimaera"
 }
@@ -337,6 +586,11 @@ start_preview previewnested
 start_preview previewstubborn IGNORE_TERM=1
 stubborn=$preview_pid
 start_preview previewwrites DIRTY_ON_STOP=1
+# Any other process using a merged checkout keeps it ACTIVE.
+merged_wt realinuse
+(cd "$W/realinuse" && exec sleep 300) &
+pids="$pids $!"
+disown $! 2>/dev/null
 start_preview previewforeign HOLD_FILE="$W/previewmixed/target/debug/deps/libx.rlib"
 mkdir -p "$W/previewrelease/target/release"
 cp "$T/preview" "$W/previewrelease/target/release/chimaera"
@@ -435,31 +689,15 @@ bash "$GC" --no-fetch --no-sizes >"$T/out" 2>&1
 for name in previewdaemon previewapp previewvite previewnpm previewstubborn previewwrites $real_previews; do expect "b/$name" PREVIEW "stop dev preview"; done
 expect b/previewnpmcompound ACTIVE
 for name in previewmixed previewdirty previewunpushed previewlocked previewopen previewclosed previewforeign previewrelease previewnested; do expect "b/$name" ACTIVE; done
+expect b/realinuse ACTIVE "in use by sleep"
 for pid in "$daemon_pid" "$app_pid" "$vite_pid" "$npm_pid"; do kill -0 "$pid" 2>/dev/null && ok || no "dry run stopped preview $pid"; done
 rm "$T/bin/lsof"
-GH_FAKE_FAIL=1 bash "$GC" --no-fetch --no-sizes >"$T/out" 2>&1
-expect b/previewdaemon ACTIVE
-# Running in the merged checkout itself still protects it.
-(cd "$W/previewdaemon" && bash "$GC" --no-fetch --no-sizes) >"$T/out" 2>&1
-expect b/previewdaemon ACTIVE "this session runs here"
-# Failure to inspect parentage must not weaken normal process protection.
-real_ps=$(command -v ps)
-export GC_TEST_PS="$real_ps"
-cat >"$T/bin/ps" <<'EOF'
-#!/bin/sh
-[ "$1" != -axo ] || exit 1
-exec "$GC_TEST_PS" "$@"
-EOF
-chmod +x "$T/bin/ps"
-bash "$GC" --no-fetch --no-sizes >"$T/out" 2>&1
-expect b/previewdaemon ACTIVE
-rm "$T/bin/ps"
 bash "$GC" --apply --no-fetch --no-sizes >"$T/apply-previews" 2>&1
 for name in previewdaemon previewapp previewvite previewnpm $real_previews; do [ ! -e "$W/$name" ] && ok || no "$name not removed: $(cat "$T/apply-previews")"; done
 for pid in "$daemon_pid" "$app_pid" "$vite_pid" "$npm_pid" $real_preview_pids; do kill -0 "$pid" 2>/dev/null && no "preview $pid survived cleanup" || ok; done
 [ ! -e "$T/reap-order-error" ] && ok || no "launcher stopped before its child was reaped"
 [ -d "$W/previewnpmcompound" ] && ok || no "compound npm script was removed"
-for name in previewmixed previewdirty previewunpushed previewlocked previewopen previewclosed previewforeign previewrelease previewstubborn previewwrites previewnested; do [ -d "$W/$name" ] && ok || no "protected $name removed"; done
+for name in previewmixed previewdirty previewunpushed previewlocked previewopen previewclosed previewforeign previewrelease previewstubborn previewwrites previewnested realinuse; do [ -d "$W/$name" ] && ok || no "protected $name removed"; done
 kill -0 "$mixed_pid" 2>/dev/null && ok || no "preview was stopped despite an unrelated holder"
 kill -0 "$stubborn" 2>/dev/null && ok || no "stubborn preview was forcibly killed"
 grep -q 'preview shutdown timed out' "$T/apply-previews" && ok || no "missing shutdown timeout diagnostic"
@@ -490,92 +728,16 @@ bash "$GC" --apply --no-fetch --no-sizes >"$T/race" 2>&1
 kill -0 "$race_pid" 2>/dev/null && ok || no "preview was stopped after the checkout became dirty"
 rm "$T/bin/lsof"
 
-# --self --sweep: only unreferenced, old objects go; referenced and young stay.
-S="$W/localbare"
-fake_target "$S"
-D="$S/target/debug/deps"
-printf 'junk\0%s/app-1.a.cgu.00.rcgu.o\0junk' "$D" >"$D/app-1"
-chmod +x "$D/app-1"
-for o in app-1.a.cgu.00.rcgu.o app-1.old.cgu.07.rcgu.o app-1.young.cgu.03.rcgu.o app-1.dev.cgu.05.rcgu.o; do echo o >"$D/$o"; done
-# An older build still hard-linked outside deps/ (run-app-isolated.sh's .app).
-mkdir -p "$S/target/debug/dev.app/Contents/MacOS"
-printf 'x\0%s/app-1.dev.cgu.05.rcgu.o\0' "$D" >"$S/target/debug/dev.app/Contents/MacOS/dev"
-chmod +x "$S/target/debug/dev.app/Contents/MacOS/dev"
-touch -t 202601010000 "$D/app-1.a.cgu.00.rcgu.o" "$D/app-1.old.cgu.07.rcgu.o" "$D/app-1.dev.cgu.05.rcgu.o" "$D"
-deps_mtime() { if stat -f %m "$D" >/dev/null 2>&1; then stat -f %m "$D"; else stat -c %Y "$D"; fi; }
-before_mtime=$(deps_mtime)
-(cd "$S" && bash "$GC" --self --sweep) >"$T/self" 2>&1
-grep -q "1 stale debug object" "$T/self" && [ -f "$D/app-1.old.cgu.07.rcgu.o" ] && ok || no "self sweep dry run: $(cat "$T/self")"
-(cd "$S" && bash "$GC" --self --sweep --apply) >"$T/self" 2>&1
-[ ! -e "$D/app-1.old.cgu.07.rcgu.o" ] && ok || no "stale object not swept: $(cat "$T/self")"
-[ -f "$D/app-1.a.cgu.00.rcgu.o" ] && [ -f "$D/app-1.young.cgu.03.rcgu.o" ] && [ -f "$D/libx.rlib" ] && ok || no "sweep deleted a live object"
-[ -f "$D/app-1.dev.cgu.05.rcgu.o" ] && ok || no "sweep deleted an object a binary outside deps/ references"
-[ "$(deps_mtime)" = "$before_mtime" ] && ok || no "sweep moved deps/ mtime (the idle clock)"
-(cd "$S" && bash "$GC" --self --sweep --apply) >"$T/self" 2>&1
-grep -q "no stale debug objects" "$T/self" && ok || no "empty sweep: $(cat "$T/self")"
+}
+if why=$(probe_processes); then
+  before=$((pass + fail))
+  integration
+  ran=$((pass + fail - before))
+  [ "$ran" = "$INTEGRATION_CASES" ] || no "integration ran $ran cases but INTEGRATION_CASES says $INTEGRATION_CASES: update it"
+else
+  skip=$INTEGRATION_CASES
+  echo "worktree-gc: skipping $skip integration cases: cannot inspect real processes ($why)"
+fi
 
-# --self: the whole target dir, but not while something runs from it.
-(cd "$S" && bash "$GC" --self) >"$T/self" 2>&1
-[ -d "$S/target" ] && grep -q "would delete" "$T/self" && ok || no "self dry run: $(cat "$T/self")"
-# (A process holding a file under target/ open, as a daemon running from
-# target/debug does. Not a copied system binary: macOS kills those on exec.)
-(cd / && exec sleep 300) <"$S/target/debug/deps/libx.rlib" &
-holder=$!
-disown "$holder" 2>/dev/null
-sleep 1
-(cd "$S" && bash "$GC" --self --apply) >"$T/self" 2>&1
-[ -d "$S/target" ] && grep -q "skipped" "$T/self" && ok || no "self trim ignored an open file: $(cat "$T/self")"
-kill "$holder" 2>/dev/null
-sleep 1
-(cd "$S" && bash "$GC" --self --apply) >"$T/self" 2>&1
-[ ! -e "$S/target" ] && [ -f "$S/file.txt" ] && ok || no "self trim: $(cat "$T/self")"
-
-# Hooks: the low-disk flag, the off switch, and a detached background run.
-# (A fresh interval stamp keeps these first calls from spawning a run.)
-mkdir -p "$M/.git/worktree-gc" && touch "$M/.git/worktree-gc/last-run"
-out=$(cd "$M" && WORKTREE_GC_LOW_GB=999999999 bash "$GC" --hook session-start </dev/null)
-case "$out" in "Disk is low:"*) ok ;; *) no "no low-disk flag: $out" ;; esac
-out=$(cd "$M" && WORKTREE_GC=off WORKTREE_GC_LOW_GB=999999999 bash "$GC" --hook session-start </dev/null)
-[ -z "$out" ] && ok || no "WORKTREE_GC=off still printed: $out"
-LOG="$M/.git/worktree-gc/log"
-rm -rf "$M/.git/worktree-gc"
-out=$(cd "$M" && bash "$GC" --hook session-start </dev/null)
-[ -z "$out" ] && ok || no "session-start printed with plenty of disk: $out"
-i=0
-while [ $i -lt 60 ] && ! grep -q "nothing to do\|df free: " "$LOG" 2>/dev/null; do sleep 1; i=$((i + 1)); done
-grep -q -- "--- auto run" "$LOG" && ok || no "no background run logged: $(ls -la "$M/.git/worktree-gc" 2>&1; cat "$LOG" 2>&1)"
-# The run's last log line comes before its exit trap drops the lock: wait for
-# the lock, then count runs. A leftover lock proves nothing either way.
-i=0
-while [ $i -lt 30 ] && [ -d "$M/.git/worktree-gc/lock" ]; do sleep 1; i=$((i + 1)); done
-(cd "$M" && bash "$GC" --hook session-start </dev/null)
-sleep 3
-runs=$(grep -c -- "--- auto run" "$LOG")
-[ "$runs" = 1 ] && ok || no "a second run started inside the interval ($runs runs): $(cat "$LOG")"
-# session-end: /clear does nothing; a real end sweeps the session's worktree
-# (named by the hook payload's cwd) in the background.
-fake_target "$S"
-printf 'x\0' >"$D/app-1" && chmod +x "$D/app-1"
-echo o >"$D/app-1.gone.cgu.01.rcgu.o" && touch -t 202601010000 "$D/app-1.gone.cgu.01.rcgu.o"
-printf '{"reason":"clear","cwd":"%s"}' "$S" | (cd "$M" && bash "$GC" --hook session-end) && ok || no "session-end (clear) failed"
-sleep 2
-[ -f "$D/app-1.gone.cgu.01.rcgu.o" ] && ok || no "session-end swept on /clear"
-printf '{"reason":"other","cwd":"%s"}' "$S" | (cd "$M" && bash "$GC" --hook session-end) && ok || no "session-end failed"
-i=0
-while [ $i -lt 30 ] && [ -f "$D/app-1.gone.cgu.01.rcgu.o" ]; do sleep 1; i=$((i + 1)); done
-[ ! -e "$D/app-1.gone.cgu.01.rcgu.o" ] && ok || no "session-end did not sweep $S: $(tail -3 "$LOG")"
-
-# `git config worktree-gc.auto false`: hooks still flag low disk, delete nothing.
-git -C "$M" config worktree-gc.auto false
-echo o >"$D/app-1.kept.cgu.02.rcgu.o" && touch -t 202601010000 "$D/app-1.kept.cgu.02.rcgu.o"
-rm -rf "$M/.git/worktree-gc"
-out=$(cd "$M" && WORKTREE_GC_LOW_GB=999999999 bash "$GC" --hook session-start </dev/null)
-case "$out" in "Disk is low:"*) ok ;; *) no "auto=false lost the low-disk flag: $out" ;; esac
-printf '{"reason":"other","cwd":"%s"}' "$S" | (cd "$M" && bash "$GC" --hook session-end)
-(cd "$M" && bash "$GC" --auto) >/dev/null 2>&1
-sleep 3
-[ ! -e "$M/.git/worktree-gc/last-run" ] && [ ! -e "$M/.git/worktree-gc/log" ] && [ -f "$D/app-1.kept.cgu.02.rcgu.o" ] && ok ||
-  no "auto=false still ran: $(ls "$M/.git/worktree-gc" 2>&1)"
-
-echo "worktree-gc: $pass passed, $fail failed"
+echo "worktree-gc: $pass passed, $fail failed, $skip skipped"
 [ "$fail" -eq 0 ]

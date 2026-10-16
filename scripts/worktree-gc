@@ -51,6 +51,9 @@
 # /proc on Linux) for every process's cwd and open files, file mtimes. It
 # fails safe: when it cannot see processes, every worktree counts as ACTIVE;
 # when it cannot reach GitHub, no worktree is removable by PR state.
+# Its tests feed fixture process tables through fake lsof/ps placed first on
+# PATH. There is deliberately no test-only switch in here, so nothing left in
+# a hook's environment can make a real run trust fake process data.
 #
 # Sizes are `du` of the build output. du can overstate what a delete frees
 # (cargo hardlinks objects between deps/ and incremental/, and APFS clones
