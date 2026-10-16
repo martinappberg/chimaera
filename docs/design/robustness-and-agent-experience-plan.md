@@ -2,7 +2,7 @@
 
 Inventory date: 2026-10-15. Code baseline: `d8a99391`.
 
-Status: Phases 0–2 and Phase 4 landed on 2026-10-15, each in one pull request (see the execution records at the end of §9). Phases 3 and 5–8 remain proposed.
+Status: Phases 0–5 and Phase 7 landed between 2026-10-15 and 2026-10-16, each in one pull request (see the execution records at the end of §9). Phase 6 (remote, compute, native and plugin hardening) and Phase 8 (the integrated verification record) remain.
 
 Chimaera needs clearer ownership boundaries, stronger integration checks, and
 smaller agent entry documents. Preserve its daemon ownership model and existing
@@ -836,6 +836,30 @@ CI wiring: ci.yml's `scripts` job runs the two checks, the hook test and `node -
 Accepted limits: `cargo metadata` is not run in CI (the scripts job has no toolchain), so a dependency declared in a way the static parser does not read would pass there; `--cargo` catches it locally. The change-impact rule is path-based, so a behavior change made in a file outside every registered glob is not flagged; the registry is where that is fixed. The exceptions list records 33 edges that should move out of `shared/` and `net/`; this wave did not move any code.
 ||||||| 0e472d3a
 ||||||| 5c5bdf32
+
+### Execution record: wave 6 (Phase 5), 2026-10-16
+
+One coordinator (Fable 5.1) ran six Opus lanes in one worktree in two waves, then two follow-ups (one Sonnet, one Opus), an independent invariant review (Opus) and an `xhigh` review; the coordinator did the inventories' briefs, the dependency-direction fix, the live verification and this record. No Rust changed, so no cargo ran for the lanes; `App.svelte` was the one shared file, split by line regions, every lane editing it by exact-string replacements.
+
+| Lane | Model | Owned files | Result |
+|---|---|---|---|
+| A1 connection/recovery | Opus | `net/connection.svelte.ts`, `net/rehome.ts` + test, `layout/assetGate.svelte.ts`, App's regions | `Connection`: health, events-up, the remote window's SSH reconnect and 401 latch, build skew, the fallback poll and the three shell listeners; the re-home URL builder unified with 86 cases pinning both old copies' parameter order; the asset gate's five effects in declaration order |
+| A2 window persistence | Opus | `layout/windowPersistence.ts` + test, `layout/railResize.ts`, App's regions | `buildViewBlob` byte-identical to the old inline effect and to detach-out (pinned), own-key → bare-key → `ws_` mirror restore precedence, the flush → activeWsId → ready=false → default-layout order of a workspace switch; `layout` assigned only in App |
+| B1 rail/session actions | Opus | `workspace/{recents,worktreeNotice,launcherState}.svelte.ts`, `workspace/sessionRoster.ts` + test, App's regions | Recents fit/expand/archive/Undo, the kept-worktree notice, the launcher popover and catalog as rune classes; the pure half of `applySessions` (tombstones, first-known `created_at` order, agent-set change) with 13 cases; the writes to `sessions` and `layout` stay in App |
+| B2 cross-window | Opus | `layout/crossWindowController.ts` + test, `layout/dragStart.ts`, `shared/flash.svelte.ts`, App's regions | Sender ledger, transport subscription, adopt, detach-out (now `buildViewBlob`), re-attach and the Move menu; 18 cases pin sender-removes-on-ack, the refusal while restoring, the dirty-file and draft guards; one owner for the drag id |
+| C1 preview lifetime | Opus | `previews/viewLifecycle.svelte.ts` + test, Pane/FileView `visible`, Log/FinderPreview/Pptx/Notebook/Docx/Board/Table/Pdf/Media/DocIssues, `layout.ts` `trimLive` | A preview's loads end with the view (one `AbortController` per load generation); a disk change that lands while parked is read off screen and applied in the reveal's own update; PptxView's missing unmount invalidation fixed; the PDF size walk pauses while parked; `trimLive` pure with 4 cases |
+| C2 shared patterns | Opus | `shared/resizeDrag.ts` + test, `shared/inlineRename.svelte.ts` + test, SplitNode/Mastermind/SplitEdit/Finder dividers, FileTree/Finder/PaneTabs renames, ImagePreview/PlanApprovalCard/ForkDialog | One drag loop (capture, rAF, Escape/pointercancel restore) and one rename state machine (blank/unchanged/invalid, Escape-before-blur, one submit per edit), every site keeping its own constants and focus targets; the two full-window overlays get `modalFocus` |
+| Follow-ups | Sonnet, Opus | `layout/railResize.ts` onto the helper + the guide's line refs (Sonnet); App's rail-row rename onto `InlineRename` (Opus) | The last two copies gone; the rail rename keeps its old semantics (no unchanged check, fire-and-forget PATCH, no focus move) |
+
+`App.svelte` went from 8,869 to 7,197 lines; 56 effects before, 40 inline plus 16 declared by the modules after, in the same order. The dependency-direction gate (Phase 7) caught the new `net/` module reaching into `workspace/`, `settings/` and `layout/`; every such need now comes in through `ConnectionDeps`, and the fallback poll is generic over the row types. Checks: svelte-check clean over 1,114 files, 2,852 Vitest cases, the build, doc links, agent assets and dependency direction.
+
+Reviews: the invariant review confirmed effect order, the single owner of `layout` and `sessions`, and every wire and persisted shape, and found one real regression — `modalFocus` on the pane-local ForkDialog made the whole window's chords stand down and stole focus from other panes — which became a restore-only `shared/returnFocus.ts`; it also named two parked-preview changes missing from the declared list (below). The `xhigh` pass added a unit test for the rail drags, a redraw for a board whose disk read raced a page switch, and documented the two `bind:this` fields App's markup writes.
+
+Live, against an isolated daemon serving the rebuilt bundle, in Chromium: boot restored the layout with the own-key → mirror precedence visible in the network log; a notebook, a CSV and a Word document rewritten on disk while parked each showed the new version on reveal with no stale frame and no console error; the log view followed appended lines; the file-tree rename (context menu, Enter) renamed the file and retitled its tab; the FILES divider and the rail width drags persisted across a reload; the launcher popover opened and closed. Not driven live: cross-window moves between native windows, the three dialogs' focus return, PPTX (no fixture), and the Safari tab-switch harness (Phase 8).
+
+Declared behaviour changes, all deliberate: focus returns to the opener when ImagePreview, the full-plan overlay or ForkDialog closes (the first two are window modals: chords stand down while open; ForkDialog is pane-local and does not); ForkDialog gains Escape; a second rename commit while one is saving is ignored; the split edit|preview divider no longer sticks on a cancelled pointer; parked previews (PPTX, Word, notebook, board, table) apply disk changes on reveal instead of while hidden; preview loads abort on unmount; the PDF size walk pauses while parked; DocIssues gates on its own pane layer (a window-level modal no longer delays the check) and aborts an in-flight check when the tab parks; a board whose disk read raced a page switch redraws from the new text.
+
+Left for later: MarkdownView, CodeView and `buffers.svelte.ts` keep their own disk handling (they own "never lose an edit"); DiffView still rebuilds on git epochs while parked; the seven `ResizeObserver` copies and the per-view "copied" timers were not consolidated; CompareView still lacks focus return (ui-contracts Gaps 4); PdfView probably starts one pdf.js worker per document (check Workers in Web Inspector with three PDFs open).
 
 ## 10. Keep the repository healthy as it grows
 

@@ -1083,6 +1083,14 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   `retain`/`release`/`noteWrite`); every `*View.svelte`. The store subscribes to
   `workspace/fsEvents.ts` (`fsEpoch`/`lastFsMutation`) + `workspace/git.ts` (`gitStatus`) +
   `workspace/diskWatch.ts`; the daemon half is `chimaera-server/src/fs_watch.rs` on `/ws/events`.
+- **A parked view does no rendering, and its loads end with it.** `previews/viewLifecycle.svelte.ts`
+  gives every rendered view its lifetime: `Pane` passes `visible` down (through `FileView`), each
+  load carries the signal of its generation and is aborted when a newer one starts or the view
+  unmounts, and a disk change that lands while the view is parked is read and parsed off screen,
+  then applied in the reveal's own update, before it paints (PPTX, Word, notebooks, boards,
+  tables). The PDF page-size walk pauses while parked; the log view's follow and the Finder's
+  side preview stop. MarkdownView and the editor keep their own disk handling (they own "never
+  lose an edit"); a parked Finder still re-lists its columns on fs events so the return is instant.
 - **Large reading documents.** `previews/readingWindow.ts` keeps offscreen prose paragraphs
   in memory behind measured, same-tag placeholders once rendered text exceeds
   100,000 characters. Only blocks within 1,000 px of the reading viewport stay connected, so a
