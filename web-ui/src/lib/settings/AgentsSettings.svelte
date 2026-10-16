@@ -12,7 +12,7 @@
   import AgentSignInCard from "../workspace/AgentSignInCard.svelte";
   import ConfirmDialog from "../shared/ConfirmDialog.svelte";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
-  import { flushSettings, getSetting, setSetting } from "./store.svelte";
+  import { flushSettings, getSetting, setSetting, settingsSaveRejection } from "./store.svelte";
   import { agentUpdateStatus } from "./agentStatus";
   import UsageBars from "../shared/UsageBars.svelte";
   import { USAGE_AGENTS, getAgentUsage, type AgentUsage } from "./agentUsage";
@@ -106,7 +106,9 @@
         setSetting(key, value);
         inputs[key] = baseline[key] = value;
       }
-      await flushSettings();
+      // false = the daemon refused or never got the write; load() would then
+      // show the old path as if it had been saved.
+      if (!(await flushSettings())) throw new Error(settingsSaveRejection() || "Couldn't save");
       await load();
     } catch (e) { rowError[a.id] = e instanceof Error ? e.message : "Couldn't save"; }
     finally { saving[a.id] = false; }

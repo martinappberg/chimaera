@@ -7,14 +7,21 @@
    *
    * Bespoke rather than generic SettingRows because it edits a different store
    * than settings.json: /api/v1/environment (env-profiles.json on the daemon),
-   * multi-line text with an explicit Save. The PUT replaces the WHOLE map, so
-   * save re-fetches and merges — other workspaces' entries must round-trip
-   * untouched — which is also why there is no debounced autosave here.
+   * multi-line text with an explicit Save. Save PATCHes only the scopes whose
+   * editor changed (`planEnvironmentSave`), so a scope another window saved
+   * meanwhile is never restored to this window's stale copy. Editing stays
+   * open during a save: baselines move to the text that was sent, so later
+   * keystrokes remain unsaved instead of being taken for saved.
    */
   import { onMount } from "svelte";
-  import { ApiError, getActiveWorkspaceId } from "../net/api";
+  import { getActiveWorkspaceId } from "../net/api";
   import { listWorkspaces } from "../workspace/sessions";
-  import { getEnvironment, putEnvironment, type EnvironmentMap } from "./environment";
+  import {
+    baselinesAfterSave,
+    getEnvironment,
+    patchEnvironment,
+    planEnvironmentSave,
+  } from "./environment";
 
   // The window's workspace identity is fixed for the pane's lifetime
   // (window = workspace), so a mount-time read is enough.
@@ -59,32 +66,21 @@
   onMount(load);
 
   async function save(): Promise<void> {
-    if (saving || !dirty) return;
+    if (saving) return;
+    const saved = { host: savedHost, workspace: savedWs };
+    const plan = planEnvironmentSave({ host: hostText, workspace: wsText }, saved, wsId);
+    if (plan === null) return;
     saving = true;
     saveError = null;
     try {
-      // Fetch-merge-put: the PUT replaces the whole map, so every other
-      // workspace's entry rides along unchanged. An empty editor REMOVES its
-      // scope's entry — never persist { text: "" }.
-      const fresh = await getEnvironment();
-      const workspaces = { ...(fresh.workspaces ?? {}) };
-      if (wsId !== null) {
-        if (wsText.trim() === "") delete workspaces[wsId];
-        else workspaces[wsId] = { text: wsText };
-      }
-      const next: EnvironmentMap = {};
-      if (hostText.trim() !== "") next.host = { text: hostText };
-      if (Object.keys(workspaces).length > 0) next.workspaces = workspaces;
-      await putEnvironment(next);
-      savedHost = hostText;
-      savedWs = wsText;
+      await patchEnvironment(plan.patch);
+      const next = baselinesAfterSave(saved, plan);
+      savedHost = next.host;
+      savedWs = next.workspace;
     } catch (e) {
-      saveError =
-        e instanceof ApiError && e.status === 413
-          ? "prelude too large — the daemon caps each scope at 32 KB"
-          : e instanceof Error
-            ? e.message
-            : "failed to save";
+      // The daemon's own text: a 413 can be one scope over 32 KB or the
+      // merged file over its cap, and only the daemon knows which.
+      saveError = e instanceof Error ? e.message : "failed to save";
     } finally {
       saving = false;
     }
@@ -121,7 +117,6 @@
         rows="4"
         spellcheck="false"
         autocapitalize="off"
-        disabled={saving}
         aria-label="host prelude"
       ></textarea>
     </div>
@@ -142,7 +137,6 @@
           rows="4"
           spellcheck="false"
           autocapitalize="off"
-          disabled={saving}
           aria-label="workspace prelude"
         ></textarea>
       {:else}
@@ -276,10 +270,6 @@
 
   .prelude::placeholder {
     color: var(--muted);
-    opacity: 0.6;
-  }
-
-  .prelude:disabled {
     opacity: 0.6;
   }
 

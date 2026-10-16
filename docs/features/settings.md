@@ -18,7 +18,12 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
   [native-app.md › Home launcher](native-app.md#home-launcher)) edits keys through typed rows; a raw-JSON
   editor (`SettingsJson.svelte`) is available for anything the schema doesn't surface. `GET
   /api/v1/settings` returns the map; `PUT /api/v1/settings` replaces it whole (≤256 KB, 204). Changes
-  broadcast on `/ws/events` so every window converges.
+  broadcast on `/ws/events` so every window converges. Each window has one writer (`settingsWriter.ts`):
+  edits are debounced into a single PUT of the current map, a failed PUT is retried with bounded backoff
+  (slower while the window is hidden) and immediately when the events socket reconnects, and the header
+  shows **unsaved** until it lands (click to retry now). Until the daemon accepts a local edit, incoming
+  settings frames are ignored so they cannot revert it. A map the daemon refuses (e.g. too large) is not
+  retried; the indicator shows the daemon's reason, and the next settings frame replaces the refused map.
 - **Where it lives.** `settings.rs` (`get_settings`/`put_settings`, `SettingsStore`); UI schema in
   `web-ui/src/lib/settings/schema.ts` (where defaults live).
 - **Key behaviors.** Reads **re-stat the file** so external edits surface without a restart, bumping a
@@ -38,7 +43,8 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
   deletes that key). The UI covers Appearance, Agents, Environment, Dashboard, Chat, Terminal,
   Editor, Files, Quick Open, Git, Extensions, Notifications, Daemon, Updates, and Keyboard.
   Bespoke sections use their own stores: Environment's multiline preludes use
-  `/api/v1/environment` and `env-profiles.json`; Plugins exposes each plugin's declared
+  `/api/v1/environment` and `env-profiles.json` (Save PATCHes only the scopes you changed, so another
+  window's save of the other scope survives); Plugins exposes each plugin's declared
   settings; Activity reads session records. Documents offers opt-in writes of the documents dialect into the workspace's `AGENTS.md` or a
   Claude Code skill over `/api/v1/agent-docs`
   ([agents.md](agents.md#documents-the-portable-dialect-check_document-and-the-issues-chip)).
