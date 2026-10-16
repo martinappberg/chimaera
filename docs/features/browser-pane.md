@@ -59,8 +59,13 @@ plane `ANY /proxy/{id}[/{*path}]`; agent-opened panes add the MCP `open_browser`
   simultaneous absolute-path apps contend only on the cookie half (WS + redirects); the
   last document navigation owns it — reloading a pane re-claims it.
 - **Header fixups** (headers only, bodies are opaque): absolute-path `Location`
-  responses re-prefix under `/proxy/{id}`; `Referrer-Policy: same-origin` is injected
-  when absent so app pages don't leak ticket URLs to external links.
+  responses re-prefix under `/proxy/{id}`. Every proxied answer (redirects, error pages
+  and the rescue included) leaves with one `Referrer-Policy` line, so app pages don't leak
+  ticket URLs to external links: the app's effective policy (the last recognized token)
+  passes when it never sends a path cross-origin (`no-referrer`, `same-origin`, `origin`,
+  `strict-origin`, `origin-when-cross-origin`, `strict-origin-when-cross-origin`);
+  anything else (`unsafe-url`, `no-referrer-when-downgrade`, empty, unknown) becomes
+  `same-origin`.
 - **Honest failure pages.** Expired sessions 404 and unreachable targets 502 with a
   quiet theme-neutral page + an `x-chimaera-proxy` header the client reads — never a raw
   browser error inside a pane.
@@ -223,6 +228,12 @@ plane `ANY /proxy/{id}[/{*path}]`; agent-opened panes add the MCP `open_browser`
     and the rescue loses both its cookie and its `Referer`. It would touch every tunnel
     path (`connect`, cluster job forwards), each forwarding a single port — not worth it for
     the residual risk above unless the threat model changes.
+- **The referrer floor is a header, not a boundary.** The proxy never rewrites bodies.
+  A page's `<meta name="referrer" content="unsafe-url">`, a `referrerpolicy` attribute on
+  a link, image, script or frame, or a script's `fetch(…, {referrerPolicy})` overrides the
+  header. Such a page can still send its `/proxy/{id}` URL to another origin. So can any
+  script that simply reads `location`. Only a separate origin for the data plane (see
+  above) would close this.
 - **http upstream only.** The data plane opens a plain `TcpStream` and speaks clear-text
   HTTP/1.1, so a TLS-enabled app (`https://localhost:8443`) is deliberately **not**
   proxyable: `proxyableUrl` and the address bar refuse it and hand it to the user's real

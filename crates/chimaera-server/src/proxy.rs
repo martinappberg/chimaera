@@ -985,6 +985,63 @@ fn is_doc_navigation(headers: &HeaderMap) -> bool {
         .is_some_and(|a| a.contains("text/html"))
 }
 
+// --- referrer floor ------------------------------------------------------------------
+
+/// Policies that never put a URL's path in a cross-origin `Referer`. The
+/// `/proxy/{id}` path IS the capability (the data plane is unauthenticated),
+/// so a pane's page may choose any of these and nothing weaker.
+const STRONG_REFERRER_POLICIES: [&str; 6] = [
+    "no-referrer",
+    "same-origin",
+    "origin",
+    "strict-origin",
+    "origin-when-cross-origin",
+    "strict-origin-when-cross-origin",
+];
+
+/// Recognized policies that send the full URL (path included) cross-origin.
+const WEAK_REFERRER_POLICIES: [&str; 2] = ["unsafe-url", "no-referrer-when-downgrade"];
+
+/// The policy a browser would apply from these headers: every
+/// `Referrer-Policy` line read as one comma list, the LAST recognized token
+/// wins and unknown tokens are skipped (the Referrer Policy spec's parse).
+/// Matched case-insensitively, as Chromium does. `None` when nothing is
+/// recognized or a value isn't text.
+fn effective_referrer_policy(headers: &HeaderMap) -> Option<&'static str> {
+    let mut effective = None;
+    for value in headers.get_all(header::REFERRER_POLICY) {
+        // A line that isn't visible ASCII is one bad line, not a reason to
+        // forget the tokens before it (a browser skips it the same way).
+        let Ok(text) = value.to_str() else {
+            continue;
+        };
+        for token in text.split(',').map(str::trim) {
+            if let Some(known) = STRONG_REFERRER_POLICIES
+                .iter()
+                .chain(WEAK_REFERRER_POLICIES.iter())
+                .find(|p| p.eq_ignore_ascii_case(token))
+            {
+                effective = Some(*known);
+            }
+        }
+    }
+    effective
+}
+
+/// Leave exactly one `Referrer-Policy` line: the app's effective policy when it
+/// is at least as strict as `same-origin`'s guarantee (no cross-origin path),
+/// else `same-origin`. Writing the single canonical token, never the app's
+/// list, means a browser that matches case-sensitively or doesn't know a newer
+/// token can't fall back to an earlier, weaker one. A page's own
+/// `<meta name="referrer">` or `referrerpolicy=` still overrides this (bodies
+/// are opaque here; see docs/features/browser-pane.md).
+fn floor_referrer_policy(headers: &mut HeaderMap) {
+    let policy = effective_referrer_policy(headers)
+        .filter(|p| STRONG_REFERRER_POLICIES.contains(p))
+        .unwrap_or("same-origin");
+    headers.insert(header::REFERRER_POLICY, HeaderValue::from_static(policy));
+}
+
 // --- error pages ------------------------------------------------------------------
 
 /// A quiet, theme-neutral page for proxy failures — this renders inside the
@@ -1040,6 +1097,7 @@ pub(crate) async fn data_plane(State(state): State<Arc<AppState>>, req: Request)
             return Response::builder()
                 .status(StatusCode::TEMPORARY_REDIRECT)
                 .header(header::LOCATION, format!("/proxy/{id}/{query}"))
+                .header(header::REFERRER_POLICY, "same-origin")
                 .body(Body::empty())
                 .unwrap_or_else(|_| StatusCode::TEMPORARY_REDIRECT.into_response());
         }
@@ -1138,8 +1196,25 @@ pub(crate) async fn fallback(State(state): State<Arc<AppState>>, req: Request) -
 }
 
 /// The forwarder: dial, stream the request up, stream the response back,
-/// relaying a WebSocket upgrade as a raw byte tunnel.
+/// relaying a WebSocket upgrade as a raw byte tunnel. Every answer — the
+/// app's, its redirects and errors, and the proxy's own failure pages — leaves
+/// through the referrer floor; a 101 is relayed verbatim (nothing navigates
+/// from it).
 async fn forward(
+    state: Arc<AppState>,
+    id: String,
+    upstream_pq: String,
+    prefixed: bool,
+    req: Request,
+) -> Response {
+    let mut resp = forward_inner(state, id, upstream_pq, prefixed, req).await;
+    if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
+        floor_referrer_policy(resp.headers_mut());
+    }
+    resp
+}
+
+async fn forward_inner(
     state: Arc<AppState>,
     id: String,
     upstream_pq: String,
@@ -1375,13 +1450,6 @@ async fn forward(
         )) {
             rparts.headers.append(header::SET_COOKIE, v);
         }
-    }
-    // Don't leak /proxy/{id} URLs to third-party sites the app links out to.
-    if !rparts.headers.contains_key(header::REFERRER_POLICY) {
-        rparts.headers.insert(
-            header::REFERRER_POLICY,
-            HeaderValue::from_static("same-origin"),
-        );
     }
     let mut out = Response::new(Body::new(rbody));
     *out.status_mut() = rparts.status;

@@ -495,3 +495,173 @@ async fn websocket_echo_through_the_tunnel() {
         other => panic!("expected echoed text frame, got {other:?}"),
     }
 }
+
+/// A target that answers every request with `extra` (raw header lines, each
+/// ending in CRLF) on its response head: `/redirect…` a 302 to an absolute
+/// path, `/missing…` a 404 page, anything else a 200 document. No body ever
+/// echoes the request, so nothing about the caller leaves the test.
+async fn spawn_policy_target(extra: &'static str) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut tmp).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    }
+                    if buf.len() > 64 * 1024 {
+                        return;
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf).to_string();
+                let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                let (status, more, body) = if path.starts_with("/redirect") {
+                    ("302 Found", "Location: /next\r\n", "")
+                } else if path.starts_with("/missing") {
+                    (
+                        "404 Not Found",
+                        "Content-Type: text/html\r\n",
+                        "<p>gone</p>",
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        "Content-Type: text/html\r\n",
+                        "<a href=\"http://example.invalid/\">out</a>",
+                    )
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\n{more}{extra}Content-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+    addr
+}
+
+/// The one Referrer-Policy value a response carries (exactly one: the floor
+/// replaces every line the app sent, so no browser has a list to reinterpret).
+fn sole_policy(headers: &HeaderMap) -> String {
+    let all: Vec<_> = headers.get_all("referrer-policy").iter().collect();
+    assert_eq!(all.len(), 1, "exactly one Referrer-Policy line: {all:?}");
+    all[0].to_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn upstream_weak_referrer_policy_is_floored() {
+    // (the app's raw header lines, the policy the pane's browser must see).
+    // Anything that could send the full /proxy/{id} URL cross-origin is
+    // replaced by same-origin; anything at least that strict passes through.
+    let cases: [(&'static str, &str); 20] = [
+        ("Referrer-Policy: unsafe-url\r\n", "same-origin"),
+        (
+            "Referrer-Policy: no-referrer-when-downgrade\r\n",
+            "same-origin",
+        ),
+        ("Referrer-Policy: UNSAFE-URL\r\n", "same-origin"),
+        ("Referrer-Policy: \r\n", "same-origin"),
+        ("Referrer-Policy: bogus\r\n", "same-origin"),
+        ("Referrer-Policy: no-referrer\r\n", "no-referrer"),
+        ("Referrer-Policy: same-origin\r\n", "same-origin"),
+        ("Referrer-Policy: origin\r\n", "origin"),
+        ("Referrer-Policy: strict-origin\r\n", "strict-origin"),
+        (
+            "Referrer-Policy: origin-when-cross-origin\r\n",
+            "origin-when-cross-origin",
+        ),
+        (
+            "Referrer-Policy: strict-origin-when-cross-origin\r\n",
+            "strict-origin-when-cross-origin",
+        ),
+        // Browsers take the LAST recognized token of the list.
+        (
+            "Referrer-Policy: strict-origin, unsafe-url\r\n",
+            "same-origin",
+        ),
+        (
+            "Referrer-Policy: unsafe-url, strict-origin-when-cross-origin\r\n",
+            "strict-origin-when-cross-origin",
+        ),
+        ("Referrer-Policy: no-referrer, bogus\r\n", "no-referrer"),
+        ("Referrer-Policy: bogus, unsafe-url,\r\n", "same-origin"),
+        // Several header lines are one list, in order.
+        (
+            "Referrer-Policy: no-referrer\r\nReferrer-Policy: unsafe-url\r\n",
+            "same-origin",
+        ),
+        (
+            "Referrer-Policy: unsafe-url\r\nReferrer-Policy: origin\r\n",
+            "origin",
+        ),
+        // Mixed case resolves the same way, and leaves as the canonical token.
+        ("Referrer-Policy: No-Referrer\r\n", "no-referrer"),
+        (
+            "Referrer-Policy: Strict-Origin, Unsafe-Url\r\n",
+            "same-origin",
+        ),
+        // No policy at all: the proxy's own default.
+        ("", "same-origin"),
+    ];
+    let state = test_state();
+    for (lines, want) in cases {
+        let target = spawn_policy_target(lines).await;
+        let id = mint(&state, "127.0.0.1", target.port()).await;
+        let (status, headers, _) =
+            get_with_headers(&state, &format!("/proxy/{id}/page"), &[]).await;
+        assert_eq!(status, StatusCode::OK, "{lines:?}");
+        assert_eq!(sole_policy(&headers), want, "app sent {lines:?}");
+    }
+}
+
+#[tokio::test]
+async fn referrer_floor_covers_redirects_errors_and_the_rescue() {
+    let state = test_state();
+    let target = spawn_policy_target("Referrer-Policy: unsafe-url\r\n").await;
+    let id = mint(&state, "127.0.0.1", target.port()).await;
+
+    // The app's redirect: Location still re-prefixed, policy floored.
+    let (status, headers, _) =
+        get_with_headers(&state, &format!("/proxy/{id}/redirect"), &[]).await;
+    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(
+        header_str(&headers, "location"),
+        format!("/proxy/{id}/next")
+    );
+    assert_eq!(sole_policy(&headers), "same-origin");
+
+    // The app's own error page.
+    let (status, headers, _) = get_with_headers(&state, &format!("/proxy/{id}/missing"), &[]).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(sole_policy(&headers), "same-origin");
+
+    // The absolute-path rescue (no /proxy prefix on the request, Referer
+    // names the app) answers through the same floor.
+    let (status, headers, _) = get_with_headers(
+        &state,
+        "/static/page.html",
+        &[("referer", &format!("http://127.0.0.1:9700/proxy/{id}/lab"))],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(sole_policy(&headers), "same-origin");
+
+    // The proxy's own answers: the bare-id redirect and the failure pages.
+    let (status, headers, _) = get_with_headers(&state, &format!("/proxy/{id}"), &[]).await;
+    assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(sole_policy(&headers), "same-origin");
+    let (status, headers, _) = get_with_headers(&state, "/proxy/p-nosuchsession/x", &[]).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(sole_policy(&headers), "same-origin");
+}
