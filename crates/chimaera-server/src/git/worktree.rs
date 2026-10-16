@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -14,7 +15,7 @@ use crate::AppState;
 use super::http::{bad_request, conflict, git_too_old};
 use super::include::{copy_included, IncludeReport};
 use super::parse::RepoInfo;
-use super::service::{configured_git, run_git, MAX_STATUS_OUTPUT};
+use super::service::{configured_git, run_git, run_git_within, MAX_STATUS_OUTPUT};
 
 /// A stable directory name for a repo, shared by all of its worktrees:
 /// `<repo-dir-name>-<hash of the common git dir>`. The hash disambiguates two
@@ -96,6 +97,23 @@ fn refuse(status: StatusCode, message: impl Into<String>) -> Refusal {
     (status, message.into())
 }
 
+/// How long a worktree checkout may take. It writes every tracked file, so
+/// it grows with the repository — a few seconds for tens of thousands of
+/// files on a laptop, more on a network filesystem — far past the budget
+/// git reads get, but still bounded.
+const CHECKOUT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Parallel checkout workers (git 2.32+; an older git ignores the key).
+/// Writing the files is most of a worktree's creation, and a few workers
+/// halve it; the cap matches the daemon's ceiling on concurrent git
+/// processes, so a shared node's cores stay shared.
+fn checkout_workers() -> String {
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(4);
+    format!("checkout.workers={workers}")
+}
+
 /// Create a worktree for `branch` under the managed root (off `base`, or
 /// HEAD, when the branch is new) and copy what `.worktreeinclude` names. It
 /// stays a dimension of the workspace `ws_id` names (whose git epoch
@@ -124,10 +142,27 @@ async fn create_in(
             ));
         }
     }
+    let path = prepare_path(state, repo, branch).await?;
+    // An existing branch is checked out as-is; a new one is created off
+    // `base` (or HEAD). git itself refuses if the branch is checked out
+    // elsewhere.
+    let exists = branch_exists(git, procs, &repo.toplevel, branch).await;
+    check_out(state, ws_id, git, repo, branch, base, exists, &path).await
+}
 
-    // Managed location only. `branch` passed check-ref-format, so it carries no
-    // `..` component; assert containment anyway — a path escape here would let a
-    // later `remove` delete outside the managed root.
+/// The managed folder for `branch`: refused when something is already
+/// there, its parent made, and spelled through the parent's real path —
+/// what `canonicalize` gives once git has made the folder, known before it
+/// exists, so a chat can start on it while the checkout runs.
+async fn prepare_path(
+    state: &Arc<AppState>,
+    repo: &RepoInfo,
+    branch: &str,
+) -> Result<PathBuf, Refusal> {
+    // Managed location only. `branch` passed check-ref-format (or was
+    // minted here), so it carries no `..` component; assert containment
+    // anyway — a path escape here would let a later `remove` delete outside
+    // the managed root.
     let path = state.worktrees_root.join(repo_key(repo)).join(branch);
     if !path.starts_with(&state.worktrees_root) {
         return Err(refuse(
@@ -136,39 +171,52 @@ async fn create_in(
         ));
     }
     // Filesystem checks off the reactor (the managed root may be on NFS).
-    let prepared = {
-        let path = path.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), Refusal> {
-            if path.exists()
-                && std::fs::read_dir(&path)
-                    .map(|mut d| d.next().is_some())
-                    .unwrap_or(true)
-            {
-                return Err(refuse(
-                    StatusCode::CONFLICT,
-                    "a worktree for that branch already exists",
-                ));
-            }
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|err| {
-                    refuse(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("failed to create {}: {err}", parent.display()),
-                    )
-                })?;
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|err| refuse(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
-    };
-    prepared?;
+    tokio::task::spawn_blocking(move || -> Result<PathBuf, Refusal> {
+        if path.exists()
+            && std::fs::read_dir(&path)
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(true)
+        {
+            return Err(refuse(
+                StatusCode::CONFLICT,
+                "a worktree for that branch already exists",
+            ));
+        }
+        let (Some(parent), Some(leaf)) = (path.parent(), path.file_name()) else {
+            return Ok(path);
+        };
+        std::fs::create_dir_all(parent).map_err(|err| {
+            refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to create {}: {err}", parent.display()),
+            )
+        })?;
+        let real = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+        Ok(real.join(leaf))
+    })
+    .await
+    .map_err(|err| refuse(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+}
 
+/// `git worktree add` into a prepared folder, then the `.worktreeinclude`
+/// copy and the epoch bump. A failed checkout — or one past its deadline,
+/// for which git is killed — leaves nothing behind: not the half-written
+/// folder, not its registration, not a branch made for it.
+#[allow(clippy::too_many_arguments)]
+async fn check_out(
+    state: &Arc<AppState>,
+    ws_id: &str,
+    git: &Path,
+    repo: &RepoInfo,
+    branch: &str,
+    base: Option<&str>,
+    exists: bool,
+    path: &Path,
+) -> Result<Created, Refusal> {
+    let procs = &state.git.procs;
     let path_str = path.to_string_lossy().into_owned();
-    // An existing branch is checked out as-is; a new one is created off `base`
-    // (or HEAD). git itself refuses if the branch is checked out elsewhere.
-    let exists = branch_exists(git, procs, &repo.toplevel, branch).await;
-    let mut args: Vec<&str> = vec!["worktree", "add"];
+    let workers = checkout_workers();
+    let mut args: Vec<&str> = vec!["-c", &workers, "worktree", "add"];
     if exists {
         args.push(&path_str);
         args.push(branch);
@@ -180,13 +228,35 @@ async fn create_in(
             args.push(base);
         }
     }
-    let out = run_git(git, procs, &repo.toplevel, &args, 64 * 1024)
-        .await
-        .map_err(|err| refuse(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    if !out.success {
+    let added = run_git_within(
+        git,
+        procs,
+        &repo.toplevel,
+        &args,
+        64 * 1024,
+        CHECKOUT_TIMEOUT,
+    )
+    .await;
+    let refusal = match added {
+        Ok(out) if out.success => None,
         // git's own message is the most useful thing we can say here (branch
         // already checked out in another worktree, bad base, …).
-        return Err(refuse(StatusCode::CONFLICT, out.stderr));
+        Ok(out) => Some(refuse(StatusCode::CONFLICT, out.stderr)),
+        Err(err) => Some(refuse(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+    };
+    if let Some(refusal) = refusal {
+        undo_failed_add(
+            git,
+            procs,
+            &repo.toplevel,
+            path,
+            (!exists).then_some(branch),
+        )
+        .await;
+        state.git.bump(ws_id);
+        state.git.invalidate(ws_id);
+        state.changes.notify_waiters();
+        return Err(refusal);
     }
 
     // A worktree is a dimension of the workspace it was made from, never a
@@ -194,15 +264,9 @@ async fn create_in(
     // home screen gains no entry. Opening it as its own window stays possible
     // like any folder (POST /workspaces), and a removal still drops such a
     // registration (see `remove_worktree`).
-    let canonical = {
-        let raw = path.clone();
-        tokio::task::spawn_blocking(move || std::fs::canonicalize(&raw).unwrap_or(raw))
-            .await
-            .unwrap_or_else(|_| path.clone())
-    };
 
     // Ignored files the repo asks to carry over (`.env` and the like).
-    let included = copy_included(git, procs, &repo.toplevel, &canonical).await;
+    let included = copy_included(git, procs, &repo.toplevel, path).await;
 
     // The repo's worktree list changed: every window watching it refetches.
     // Invalidate too — the refetch this bump triggers must recompute, not be
@@ -212,11 +276,56 @@ async fn create_in(
     state.changes.notify_waiters();
 
     Ok(Created {
-        path: canonical,
+        path: path.to_path_buf(),
         branch: branch.to_string(),
         included,
         reused: false,
     })
+}
+
+/// What a failed or killed `worktree add` may leave: a half-written folder
+/// git still has locked as "initializing" (so only a double `--force`
+/// removes its registration), the folder itself when git never registered
+/// it, and the branch `-b` made. The folder is always this call's own: it
+/// was empty or missing before git ran, under the managed root.
+async fn undo_failed_add(
+    git: &Path,
+    procs: &Semaphore,
+    toplevel: &Path,
+    path: &Path,
+    new_branch: Option<&str>,
+) {
+    let path_str = path.to_string_lossy().into_owned();
+    let _ = run_git(
+        git,
+        procs,
+        toplevel,
+        &["worktree", "remove", "--force", "--force", &path_str],
+        4096,
+    )
+    .await;
+    let leftover = path.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || {
+        if leftover.exists() {
+            if let Err(err) = std::fs::remove_dir_all(&leftover) {
+                tracing::warn!(path = %leftover.display(), %err,
+                    "could not remove a failed worktree checkout");
+            }
+        }
+    })
+    .await;
+    if let Some(branch) = new_branch {
+        // `-d`, never `-D`: the branch was made by this call at its base, so
+        // it holds nothing of its own; anything else is not ours to drop.
+        match run_git(git, procs, toplevel, &["branch", "-d", branch], 4096).await {
+            Ok(out) if out.success => {}
+            Ok(out) if out.stderr.contains("not found") => {}
+            Ok(out) => tracing::warn!(%branch, stderr = %out.stderr,
+                "kept the branch of a failed worktree checkout"),
+            Err(err) => tracing::warn!(%branch, %err,
+                "kept the branch of a failed worktree checkout"),
+        }
+    }
 }
 
 /// The worktree that has `branch` checked out in `workspace`'s repository,
@@ -276,6 +385,47 @@ pub(crate) async fn create_session_worktree(
     workspace: &crate::workspaces::Workspace,
     agent: &str,
 ) -> Result<Created, Refusal> {
+    plan_session_worktree(state, workspace, agent)
+        .await?
+        .check_out(state)
+        .await
+}
+
+/// A new agent session's worktree, decided but not yet checked out: the
+/// branch is free and its folder ready, so a chat can open on them while
+/// [`PlannedWorktree::check_out`] writes the files.
+pub(crate) struct PlannedWorktree {
+    ws_id: String,
+    git: PathBuf,
+    repo: RepoInfo,
+    pub(crate) branch: String,
+    pub(crate) path: PathBuf,
+}
+
+impl PlannedWorktree {
+    pub(crate) async fn check_out(self, state: &Arc<AppState>) -> Result<Created, Refusal> {
+        check_out(
+            state,
+            &self.ws_id,
+            &self.git,
+            &self.repo,
+            &self.branch,
+            None,
+            false,
+            &self.path,
+        )
+        .await
+    }
+}
+
+/// The quick half of [`create_session_worktree`]: a free branch name and its
+/// prepared folder (one `rev-parse` per name tried; git's location and the
+/// repository come from caches).
+pub(crate) async fn plan_session_worktree(
+    state: &Arc<AppState>,
+    workspace: &crate::workspaces::Workspace,
+    agent: &str,
+) -> Result<PlannedWorktree, Refusal> {
     let git = state.git.resolve_git(configured_git(state)).await;
     if !git.adequate {
         return Err(refuse(
@@ -306,13 +456,21 @@ pub(crate) async fn create_session_worktree(
         agent
     };
     // A clash (an existing branch of that name) just draws again; never
-    // check out somebody's existing branch for a "new worktree".
+    // check out somebody's existing branch for a "new worktree". The name is
+    // valid by construction, so it skips `check-ref-format`.
     for _ in 0..4 {
         let branch = format!("chimaera/{agent}-{}", six_hex());
         if branch_exists(&git.path, &state.git.procs, &repo.toplevel, &branch).await {
             continue;
         }
-        return create_in(state, &workspace.id, &git.path, &repo, &branch, None).await;
+        let path = prepare_path(state, &repo, &branch).await?;
+        return Ok(PlannedWorktree {
+            ws_id: workspace.id.clone(),
+            git: git.path.clone(),
+            repo,
+            branch,
+            path,
+        });
     }
     Err(refuse(
         StatusCode::CONFLICT,

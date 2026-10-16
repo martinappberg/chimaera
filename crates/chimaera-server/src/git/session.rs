@@ -370,7 +370,11 @@ async fn pass(state: &Arc<AppState>, seen_epochs: &mut HashMap<String, u64>) {
     for session in &live {
         let prior = previous.get(&session.id);
         let mut tracked = match prior {
-            Some(t) if t.cwd == session.cwd => t.clone(),
+            // Kept while its folder stays put — except a folder that was no
+            // repository, asked again once an epoch moves (the probe cache
+            // forgot it too): a chat opens on its worktree before the
+            // checkout has made one.
+            Some(t) if t.cwd == session.cwd && (t.repo.is_some() || !epochs_moved) => t.clone(),
             _ => {
                 let repo = if git.adequate {
                     resolve_cwd(state, &git.path, &session.cwd).await

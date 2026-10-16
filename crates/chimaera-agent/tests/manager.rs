@@ -2904,3 +2904,74 @@ async fn elicitation_replays_without_persisting_the_submitted_values() {
     .contains("private-input-marker"));
     assert!(f.manager.kill("elicit"));
 }
+
+/// A held spawn says why it waits and starts no agent until its gate opens;
+/// a refused gate ends the startup with the embedder's words, and a chat
+/// closed while it waits ends at once.
+#[tokio::test]
+async fn a_start_gate_holds_the_agent_until_its_folder_is_ready() {
+    use chimaera_agent::driver::StartGate;
+    let mut fx = fixture();
+    let gated = |id: &str, fx: &Fixture| {
+        let (open, ready) = tokio::sync::watch::channel(None);
+        let mut held = spec(id, &fx.cwd, "normal");
+        held.start_gate = Some(StartGate {
+            waiting: "Setting up worktree…".to_string(),
+            ready,
+        });
+        fx.manager.spawn(&ClaudeAdapter, held).expect("spawn");
+        open
+    };
+    let waiting = |ev: &AgentEvent| matches!(ev, AgentEvent::StartupProgress { detail } if detail == "Setting up worktree…");
+
+    let open = gated("g-open", &fx);
+    let att = fx.manager.attach("g-open", 0).expect("attach");
+    let (mut live, mut seen) = (att.live, att.replay);
+    if !seen.iter().any(|e| waiting(&e.ev)) {
+        wait_for(&mut live, &mut seen, "the waiting line", waiting).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let held = fx.manager.attach("g-open", 0).expect("attach").replay;
+    assert!(
+        !held.iter().any(|e| matches!(e.ev, AgentEvent::Init { .. })),
+        "no agent before the gate opens: {held:#?}"
+    );
+    open.send(Some(Ok(()))).expect("driver holds the gate");
+    wait_for(&mut live, &mut seen, "Init", |ev| {
+        matches!(ev, AgentEvent::Init { .. })
+    })
+    .await;
+    assert!(fx.manager.kill("g-open"));
+    let exit = tokio::time::timeout(WAIT, fx.exits.recv()).await.unwrap();
+    assert_eq!(exit.as_deref(), Some("g-open:Killed"));
+
+    let refuse = gated("g-refused", &fx);
+    let mut live = fx.manager.attach("g-refused", 0).expect("attach").live;
+    refuse
+        .send(Some(Err(
+            "Couldn't set up this chat's worktree: cut short".into()
+        )))
+        .expect("driver holds the gate");
+    let mut seen = Vec::new();
+    wait_for(&mut live, &mut seen, "the refusal", |ev| {
+        matches!(ev, AgentEvent::Error { message, fatal: true, .. } if message.contains("cut short"))
+    })
+    .await;
+    let exit = tokio::time::timeout(WAIT, fx.exits.recv()).await.unwrap();
+    assert!(
+        exit.as_deref()
+            .is_some_and(|e| e.starts_with("g-refused:HandshakeFailed")),
+        "{exit:?}"
+    );
+
+    let open = gated("g-closed", &fx);
+    assert!(fx.manager.kill("g-closed"));
+    let exit = tokio::time::timeout(Duration::from_secs(5), fx.exits.recv())
+        .await
+        .expect("closing never waits for the gate");
+    assert_eq!(exit.as_deref(), Some("g-closed:Killed"));
+    assert!(
+        open.send(Some(Ok(()))).is_err(),
+        "a closed chat holds no gate, which is how the embedder knows to undo its folder"
+    );
+}

@@ -855,3 +855,186 @@ async fn managed_worktree_is_the_worktree_top_and_dead_registrations_go() {
         "the repository's own workspace stays"
     );
 }
+
+/// A `git` that runs `before` ahead of every `worktree add` and `after`
+/// behind it (the real git's status is dropped when `after` exits), and is
+/// the real git otherwise — set as `git.path`.
+fn git_around_add(state: &Arc<AppState>, label: &str, before: &str, after: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let real = std::process::Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .expect("git must be installed");
+    let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
+    let bin = test_dir(label).join("git");
+    std::fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\ncase \" $* \" in\n*\" worktree add \"*) {before}; '{real}' \"$@\"; {after} ;;\n*) exec '{real}' \"$@\" ;;\nesac\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut map = serde_json::Map::new();
+    map.insert("git.path".into(), bin.to_string_lossy().into());
+    lock(&state.settings).put(map).unwrap();
+}
+
+/// A fake `claude` chat binary that writes the folder it started in to
+/// `marker`, then answers the handshake and stays.
+fn claude_noting_cwd(label: &str, marker: &std::path::Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = test_dir(label).join("claude");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\npwd -P > '{}'\n\
+             printf '%s\\n' '{{\"type\":\"control_response\",\"response\":{{\"subtype\":\"success\",\"request_id\":\"init\",\"response\":{{\"commands\":[]}}}}}}'\n\
+             cat >/dev/null\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// A new chat in its own worktree opens before its checkout (which grows
+/// with the repository), refuses a view switch while it runs, and its agent
+/// starts inside the finished worktree, at the path the chat reported. The
+/// session tracker, which first saw that folder before it was a repository,
+/// still finds the worktree once the checkout lands.
+#[tokio::test]
+async fn a_chat_in_its_own_worktree_opens_before_its_checkout() {
+    let repo = init_temp_repo("sg-wt-early");
+    let state = test_state();
+    tokio::spawn(crate::git::track_sessions(state.clone()));
+    let marker = test_dir("sg-wt-early-marker").join("cwd");
+    preset_agent(
+        &state,
+        crate::agents::AgentKind::Claude,
+        Ok(claude_noting_cwd("sg-wt-early-bin", &marker)),
+        None,
+    );
+    git_around_add(&state, "sg-wt-early-git", "sleep 4", "exit $?");
+    let (ws, _) = add_workspace(&state, &repo).await;
+
+    let (status, session) = request(
+        &state,
+        Method::POST,
+        "/api/v1/sessions",
+        Some(serde_json::json!({
+            "workspace_id": ws, "kind": "agent", "worktree": true, "ui": "chat",
+        })),
+    )
+    .await;
+    assert!(status.is_success(), "spawn failed: {session}");
+    let id = session["id"].as_str().unwrap().to_string();
+    let cwd = PathBuf::from(session["cwd"].as_str().unwrap());
+    assert!(
+        !cwd.join(".git").exists(),
+        "answered before the checkout ran: {cwd:?}"
+    );
+    assert!(lock(&state.worktree_setups).contains_key(&id));
+    let (status, err) = request(
+        &state,
+        Method::POST,
+        &format!("/api/v1/sessions/{id}/view"),
+        Some(serde_json::json!({"ui": "term"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{err}");
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !marker.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the agent never started"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let ran_in = std::fs::read_to_string(&marker).unwrap();
+    assert_eq!(
+        std::path::Path::new(ran_in.trim()),
+        cwd,
+        "the reported path is real"
+    );
+    assert!(!lock(&state.worktree_setups).contains_key(&id));
+    let branch = git_in(&cwd, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    assert!(branch.starts_with("chimaera/claude-"), "{branch}");
+    assert_eq!(
+        managed_worktree_eventually(&state, &id).await,
+        serde_json::json!(cwd)
+    );
+    state.chat.kill(&id);
+}
+
+/// A checkout that fails after its chat opened ends the chat's startup with
+/// git's words and leaves no worktree, folder or branch behind.
+#[tokio::test]
+async fn a_failed_checkout_ends_the_chat_and_leaves_nothing() {
+    let repo = init_temp_repo("sg-wt-cut");
+    let state = test_state();
+    preset_agent(
+        &state,
+        crate::agents::AgentKind::Claude,
+        Ok(write_fake_claude("sg-wt-cut-bin")),
+        None,
+    );
+    // The real checkout completes, then "fails": everything it made must go.
+    git_around_add(
+        &state,
+        "sg-wt-cut-git",
+        ":",
+        "echo 'fatal: cut short' >&2; exit 1",
+    );
+    let (ws, _) = add_workspace(&state, &repo).await;
+
+    let (status, session) = request(
+        &state,
+        Method::POST,
+        "/api/v1/sessions",
+        Some(serde_json::json!({
+            "workspace_id": ws, "kind": "agent", "worktree": true, "ui": "chat",
+        })),
+    )
+    .await;
+    assert!(status.is_success(), "spawn failed: {session}");
+    let id = session["id"].as_str().unwrap().to_string();
+    let cwd = PathBuf::from(session["cwd"].as_str().unwrap());
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let said = loop {
+        let replay = state
+            .chat
+            .attach(&id, 0)
+            .map(|a| a.replay)
+            .unwrap_or_default();
+        let said = replay.iter().find_map(|e| match &e.ev {
+            chimaera_agent::model::AgentEvent::Error { message, .. } => Some(message.clone()),
+            _ => None,
+        });
+        if let Some(said) = said {
+            break said;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no startup error: {replay:#?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert!(
+        said.starts_with("Couldn't set up this chat's worktree") && said.contains("cut short"),
+        "{said}"
+    );
+    let list = git_in(&repo, &["worktree", "list", "--porcelain"]);
+    assert_eq!(
+        list.lines().filter(|l| l.starts_with("worktree ")).count(),
+        1,
+        "only the main checkout remains: {list}"
+    );
+    let branches = git_in(&repo, &["branch", "--list", "chimaera/*"]);
+    assert!(branches.is_empty(), "no branch left: {branches}");
+    assert!(!cwd.exists(), "no folder left: {cwd:?}");
+    assert!(lock(&state.worktree_setups).is_empty());
+}

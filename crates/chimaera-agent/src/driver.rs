@@ -142,6 +142,21 @@ pub struct SpawnSpec {
     /// creation).
     pub created_at_ms: Option<u64>,
     pub handshake_timeout: Duration,
+    /// Holds the child's spawn until the embedder says its working folder
+    /// is ready: a new chat opens at once while its worktree is still being
+    /// checked out. `None` = spawn now.
+    pub start_gate: Option<StartGate>,
+}
+
+/// What a held spawn waits on. The embedder sends `Some(Ok(()))` once
+/// `SpawnSpec::cwd` exists, or `Some(Err(why))`, which ends the startup
+/// with `why` as its visible error; a dropped sender ends it too. The
+/// startup budget (`handshake_timeout`) starts only after the gate opens.
+#[derive(Clone, Debug)]
+pub struct StartGate {
+    /// The startup line shown while it holds ("Setting up worktree…").
+    pub waiting: String,
+    pub ready: watch::Receiver<Option<Result<(), String>>>,
 }
 
 /// A standing consent for MCP tool calls, scoped to one configured server.
@@ -179,6 +194,7 @@ impl SpawnSpec {
             revert_before_turn: None,
             created_at_ms: None,
             handshake_timeout: HANDSHAKE_TIMEOUT,
+            start_gate: None,
         }
     }
 }
@@ -423,6 +439,46 @@ async fn report_startup_failure(
     let _ = io.events.send(AgentEvent::Exited { status }).await;
 }
 
+/// Hold the spawn until the gate opens. `Some` is how the driver ended
+/// instead: closed while waiting, or the folder never came.
+async fn wait_for_gate(mut gate: StartGate, io: &mut DriverIo) -> Option<DriverExit> {
+    let _ = io
+        .events
+        .send(AgentEvent::StartupProgress {
+            detail: gate.waiting.clone(),
+        })
+        .await;
+    let opened = tokio::select! {
+        biased;
+        _ = io.kill.changed() => {
+            let _ = io.events.send(AgentEvent::Exited { status: None }).await;
+            return Some(DriverExit::Killed);
+        }
+        // Cloned inside the future: the watch guard must not live across
+        // the select's await (it isn't Send).
+        ready = async { gate.ready.wait_for(Option::is_some).await.map(|r| r.clone()) } => {
+            match ready {
+                Ok(ready) => ready.unwrap_or(Ok(())),
+                Err(_) => Err("The chat's folder was never set up.".to_string()),
+            }
+        }
+    };
+    let reason = opened.err()?;
+    let _ = io
+        .events
+        .send(AgentEvent::Error {
+            message: reason.clone(),
+            fatal: true,
+            sign_in: false,
+        })
+        .await;
+    let _ = io.events.send(AgentEvent::Exited { status: None }).await;
+    Some(DriverExit::HandshakeFailed {
+        reason,
+        stderr_tail: String::new(),
+    })
+}
+
 /// An agent that handshakes and then exits almost immediately never served a
 /// conversation — that exit is a startup failure (the plausible post-update
 /// crash mode), not an end-of-life, and its stderr is the only diagnostic.
@@ -435,6 +491,11 @@ pub const FAILURE_AT_BIRTH_WINDOW: Duration = Duration::from_secs(10);
 /// until the child, the client, or a kill signal ends the session. Every exit
 /// path closes stdin and reaps the child with a bounded wait.
 pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo) -> DriverExit {
+    if let Some(gate) = spec.start_gate.clone() {
+        if let Some(exit) = wait_for_gate(gate, &mut io).await {
+            return exit;
+        }
+    }
     let mut env = spec.env.clone();
     env.extend(driver.env_extra());
     let child = match JsonlChild::spawn(

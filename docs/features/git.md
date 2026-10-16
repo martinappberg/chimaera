@@ -143,7 +143,10 @@ repos,branches,log,show,compare}`, `GET/POST/DELETE /api/v1/git/worktrees`,
   registration. (Maintainer, 2026-09-29: the whole window jumping to a new branch "feels bad UI UX" —
   "that one agent could be in just that branch".) Create is additive; names go through `check-ref-format`, the base through
   `rev::resolve_commit`; 409 if the branch is already checked out; path containment under the managed
-  root is asserted. `.worktreeinclude` (Claude Code's file, gitignore syntax) copies files that are both
+  root is asserted. The checkout runs with a few parallel workers (`checkout.workers`, at most 4 — the
+  daemon's ceiling on concurrent git processes; an older git ignores it) under its own 120 s deadline,
+  since it grows with the repository; one that fails or is cut off leaves nothing — not the folder,
+  its registration, nor a branch it made. `.worktreeinclude` (Claude Code's file, gitignore syntax) copies files that are both
   git-ignored and matched — ≤200 files / 64 MB, symlinks never followed or copied, nothing overwritten.
   Remove is **fenced five ways**: under the managed root, not the current workspace, no live session
   inside (any surface, including an agent's hook-reported folder), clean, and no commits that are
@@ -174,7 +177,8 @@ repos,branches,log,show,compare}`, `GET/POST/DELETE /api/v1/git/worktrees`,
   `wantsWorktree`, `toggleNewInWorktree`, `offerWorktreeRemoval`/`removeKeptWorktree`,
   `openWorktreeWindow`), `sessions.ts` (`wantsWorktree`, `worktreeInUse`, `setNewInWorktree`),
   `launcher.ts` (`parseRecents`). Daemon `git/worktree.rs` (`create_session_worktree`,
-  `managed_worktree_of`), `api/sessions.rs` (`CreateSession.worktree`), `api/workspaces.rs`
+  `plan_session_worktree`, `managed_worktree_of`), `api/sessions.rs` (`CreateSession.worktree`,
+  `WorktreeSetup`), `api/workspaces.rs`
   (`patch_workspace`), `workspaces.rs` (`new_in_worktree`), `mcp.rs` (`spawn_agent`'s `worktree`).
   Wire (all additive): `PATCH /api/v1/workspaces/{id} {new_in_worktree}`, the workspace row's
   `new_in_worktree`, `POST /api/v1/sessions {worktree: true}`, session rows' `managed_worktree`,
@@ -189,7 +193,16 @@ repos,branches,log,show,compare}`, `GET/POST/DELETE /api/v1/git/worktrees`,
   branch is removable). `worktree: true` is agents only and never combined with `resume` or `cwd`;
   a workspace that is not a repository answers 400, and a missing agent answers 409 before anything
   is created; any later failure of that spawn discards the new worktree and its branch again
-  (`discard_session_worktree`: a plain `worktree remove` and `branch -d`, never forced). A session
+  (`discard_session_worktree`: a plain `worktree remove` and `branch -d`, never forced). **A chat
+  opens before its checkout** (`plan_session_worktree`, then `PlannedWorktree::check_out` in the
+  background): the branch and folder are settled up front (one `rev-parse`), the chat answers in
+  milliseconds with its startup line reading "Setting up worktree…", the composer takes messages at
+  once, and the agent's process starts once the files are there (`AppState::worktree_setups`, the
+  driver's `SpawnSpec::start_gate`). Measured on a 1,165-file repository, the old synchronous create
+  answered in 0.5–3.4 s with nothing on screen. A failed checkout ends the chat's startup with git's
+  words; a chat closed before its checkout finished gets its worktree removed again; view switch,
+  rewind and fork answer 409 until the checkout ends. A terminal agent still waits for its
+  checkout. A session
   row's `managed_worktree` is the top of the managed worktree its spawn folder lies in, also from a
   subfolder, read from what the session tracker already resolved (no filesystem access per
   snapshot; null until it has). The Mastermind's `spawn_agent` without `branch` follows the
