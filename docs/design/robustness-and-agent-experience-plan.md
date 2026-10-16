@@ -2,7 +2,7 @@
 
 Inventory date: 2026-10-15. Code baseline: `d8a99391`.
 
-Status: Phases 0–2 landed on 2026-10-15 in one pull request (see the execution record at the end of §9). Phases 3–8 remain proposed.
+Status: Phases 0–2 and Phase 4 landed on 2026-10-15, each in one pull request (see the execution records at the end of §9). Phases 3 and 5–8 remain proposed.
 
 Chimaera needs clearer ownership boundaries, stronger integration checks, and
 smaller agent entry documents. Preserve its daemon ownership model and existing
@@ -709,11 +709,19 @@ Evidence beyond the lanes' own tests, gathered by the coordinator against an iso
 Left for later phases, with the evidence that scopes them:
 
 - Phase 3: Rust-produced wire fixtures consumed by the TypeScript decoders, and browser/component scenarios.
-- Phase 4: the server lane's audit lists the remaining synchronous `current()` / `put` callers on async paths (`chat.rs`, `spawn.rs`, `launcher.rs`, `runtimes.rs`, `mcp.rs`, `ws.rs`, `plugins/*`, `git/*`, `quickopen.rs`, `notices.rs`, `update.rs`, `agent_updates.rs`, `ledger.rs`, `api/workspaces.rs`, `agent_probe/actions.rs`). The async helpers to move them onto are `environment::snapshot` and `settings::refresh` + `map_cached`. Uncapped loaders not yet on `read_bounded` because they have no cap today: `recents.rs`, `workspaces.rs`, `view_state.rs`, `ledger.rs`, `recents_archive.rs`, `plugins/trust.rs`, `drafts.rs`.
+- Phase 4: done in wave 2 (see below). No settings or environment reader on the audit list stats or reads under its mutex any more; the small stores' own writes (ledger reconcile, recents push, workspace add) still run synchronously under their mutex where they always did.
 - The comms wake test above needs a cause and an owner before any quarantine.
 - The server and chat UI map splits (§6) and the structural refactors (§4) were not started.
 
-### Execution record: wave 2 (Phase 7), 2026-10-16
+### Execution record: wave 2 (Phase 4), 2026-10-15
+
+Two Opus lanes in one worktree, disjoint files, one API contract set up front (every settings and environment getter keeps its name and takes `&self`; `current()` is removed).
+
+- Readers: `SettingsStore` and `EnvPreludeStore` no longer stat or read under their mutex anywhere. Every daemon-consumed getter answers from the cache; the one off-reactor poll (`settings::watch_external_edits`, 2 s) refreshes both stores through their own `DiskGate`s with `tokio::join!`; routes refresh on read; `PUT`/`PATCH` install at once; a new window's first settings frame awaits `settings::refresh`. The staleness contract is stated in both store headers, the server map, and the two feature pages. Call sites migrated: `ws.rs`, `mcp.rs` (two), `launcher.rs`, `runtimes.rs`, `plugins/jobs.rs`; the rest compiled unchanged.
+- Loaders: `recents.rs` (8 MiB), `workspaces.rs` (8 MiB), `view_state.rs` (16 MiB = 2 × keys × per-key cap), `ledger.rs` (16 MiB; boot load now on the blocking pool), `recents_archive.rs` (16 MiB), `plugins/trust.rs` (8 MiB), `drafts.rs` (≈6 MiB from the worst-case escaping of its capped fields; the sidecar too). Each cap is a named const with its reason. An oversized file is corruption for recents, workspaces, view-state and the ledger: it loads empty with one warning and the next write replaces it; the archive holds instead (replacing it would un-hide every conversation) and trust fails closed. An unreadable file (`Bounded::Io`) is never overwritten: the store holds its writes, retries the bounded read on the next write (the ledger on every reconcile tick), merges what is on disk with this daemon's state by that store's own rule once it reads (ledger: the old daemon's agents retire to Recents; workspaces: this daemon's record wins per id and root; recents and the archive: union by key; view-state: disk keys this daemon lacks are kept), then releases. While held: a workspace add rolls back and answers 503, a view-state put keeps memory and answers 204 (hot state), recents and the ledger log once per hold. The ledger starts held until its boot read lands, so a stop during that read writes nothing; if it is still held at a graceful stop, `ledger::final_flush` retires every live agent session to Recents so nothing vanishes. An independent review (Opus) is what turned the first cut's lifetime holds into this rule.
+- Known limits, deliberate: five boot-time loads still run synchronously inside `AppState::new`, before the listener accepts connections, so nothing is waiting on the reactor yet; the ledger's and recents' own writes still run synchronously under their mutex where they always did; `materialize_prelude` still writes its small per-session file where it is called. Moving these is a `lifecycle.rs`/`state.rs` change that was not in scope.
+
+### Execution record: wave 3 (Phase 7), 2026-10-16
 
 One coordinator ran four lanes at once in a single worktree, each owning a disjoint set of files; the coordinator owned `ci.yml` integration, the root `AGENTS.md` lines and this record. No Rust was compiled in this wave (another session held the host's build budget), so the dependency check reads manifests statically and cross-checks `cargo metadata --no-deps` only on request.
 

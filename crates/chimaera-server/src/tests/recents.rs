@@ -624,3 +624,197 @@ async fn archiving_hides_recents_without_deleting_anything() {
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert!(lock(&reloaded.recents_archive).hidden(&ws_id).is_empty());
 }
+
+/// Plant `body` at `path` and make it unreadable (mode 000). False when the
+/// process can read it anyway (root), so a test can skip rather than lie.
+pub(super) fn unreadable_file(path: &std::path::Path, body: &[u8]) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, body).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    std::fs::read(path).is_err()
+}
+
+/// Give a test's unreadable file back its mode, so it can be read and removed.
+pub(super) fn readable_again(path: &std::path::Path) -> Vec<u8> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::read(path).unwrap()
+}
+
+/// Valid JSON (`body`) padded with whitespace to one byte past `cap`: it
+/// would parse, so only the cap can be what turned it away.
+pub(super) fn oversized(body: &str, cap: usize) -> Vec<u8> {
+    let mut bytes = body.as_bytes().to_vec();
+    bytes.resize(cap + 1, b' ');
+    bytes
+}
+
+fn recent(title: &str) -> recents::RecentEntry {
+    recents::RecentEntry {
+        kind: agents::AgentKind::Claude,
+        title: title.to_string(),
+        resume: Some(format!("id-{title}")),
+        supersedes: Vec::new(),
+        last_active: 1,
+        ui: None,
+        transcript: None,
+        cwd: None,
+    }
+}
+
+#[test]
+fn recents_store_missing_file_is_empty_and_round_trips() {
+    let path = test_dir("recents-missing").join("recents.json");
+    let mut store = recents::RecentsStore::load(path.clone());
+    assert!(store.list("w").is_empty());
+    store.push("w", recent("a"), None);
+    let reloaded = recents::RecentsStore::load(path);
+    assert_eq!(reloaded.list("w")[0].title, "a");
+}
+
+/// Over the cap: an empty history (logged), and the next change replaces
+/// the runaway file with a real one.
+#[test]
+fn recents_store_oversized_file_loads_empty_and_is_replaced() {
+    let path = test_dir("recents-big").join("recents.json");
+    let body = serde_json::json!({"w": [{"kind": "claude", "title": "old", "last_active": 1}]});
+    std::fs::write(
+        &path,
+        oversized(&body.to_string(), recents::MAX_RECENTS_BYTES),
+    )
+    .unwrap();
+    let mut store = recents::RecentsStore::load(path.clone());
+    assert!(store.list("w").is_empty());
+    store.push("w", recent("new"), None);
+    assert!(std::fs::metadata(&path).unwrap().len() < 4096);
+    let reloaded = recents::RecentsStore::load(path);
+    assert_eq!(reloaded.list("w").len(), 1);
+    assert_eq!(reloaded.list("w")[0].title, "new");
+}
+
+/// Unreadable (a directory at the path, or a file without read
+/// permission): the daemon still serves recents from memory, but never
+/// writes over what it couldn't read — until it reads again: then the next
+/// push merges the file's rows with this daemon's and lands.
+#[test]
+fn recents_store_unreadable_file_is_held_until_it_reads_then_merged() {
+    let dir = test_dir("recents-dir").join("recents.json");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut store = recents::RecentsStore::load(dir.clone());
+    store.push("w", recent("a"), None);
+    assert_eq!(store.list("w").len(), 1);
+    assert!(dir.is_dir());
+
+    let path = test_dir("recents-perm").join("recents.json");
+    let body = br#"{"w":[{"kind":"claude","title":"kept","resume":"id-kept","last_active":1}]}"#;
+    if !unreadable_file(&path, body) {
+        return; // root reads anything: nothing to prove here
+    }
+    let mut store = recents::RecentsStore::load(path.clone());
+    assert!(store.list("w").is_empty());
+    store.push("w", recent("new"), None);
+    store.push("w", recent("newer"), None);
+    assert_eq!(store.list("w").len(), 2);
+    assert_eq!(
+        readable_again(&path),
+        body.to_vec(),
+        "held: never written over"
+    );
+
+    store.push("w", recent("latest"), None);
+    let titles = |s: &recents::RecentsStore| -> Vec<String> {
+        s.list("w").into_iter().map(|e| e.title).collect()
+    };
+    assert_eq!(titles(&store), ["latest", "newer", "new", "kept"]);
+    let reloaded = recents::RecentsStore::load(path);
+    assert_eq!(titles(&reloaded), ["latest", "newer", "new", "kept"]);
+}
+
+/// The archive: unreadable or oversized is held (replacing it would un-hide
+/// every conversation in it) and served from memory; once the file reads,
+/// the next change merges with it and lands — minus what was unarchived
+/// meanwhile.
+#[tokio::test]
+async fn recents_archive_holds_an_unreadable_or_oversized_file_then_merges() {
+    let entry = |key: &str| {
+        serde_json::json!({"workspace_id": "", "entries": [
+            {"key": key, "kind": "claude", "title": "t"}]})
+    };
+    let archive = |state: Arc<AppState>, ws: String, key: &'static str| {
+        let mut body = entry(key);
+        body["workspace_id"] = ws.into();
+        async move { request(&state, Method::POST, "/api/v1/recents/archive", Some(body)).await }
+    };
+    let archived = |state: Arc<AppState>, ws: String| async move {
+        let (_, listed) = request(
+            &state,
+            Method::GET,
+            &format!("/api/v1/recents/archived?workspace_id={ws}"),
+            None,
+        )
+        .await;
+        let mut keys: Vec<String> = listed["archived"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["key"].as_str().unwrap().to_string())
+            .collect();
+        keys.sort();
+        keys
+    };
+
+    // Oversized: held, never replaced.
+    let data = test_dir("archive-big");
+    let file = data.join("recents-archive.json");
+    let big = oversized(r#"{"w":[]}"#, recents_archive::MAX_ARCHIVE_BYTES);
+    std::fs::write(&file, &big).unwrap();
+    let state = test_state_with_data_dir(0, data.clone());
+    let ws = make_workspace(&state, "archive-big-root").await;
+    assert_eq!(
+        archive(state.clone(), ws.clone(), "k-1").await.0,
+        StatusCode::OK
+    );
+    assert_eq!(archived(state.clone(), ws.clone()).await, ["k-1"]);
+    assert_eq!(std::fs::metadata(&file).unwrap().len(), big.len() as u64);
+
+    // Unreadable: held; then readable, and the next change merges.
+    let data = test_dir("archive-perm");
+    let state = test_state_with_data_dir(0, data.clone());
+    let ws = make_workspace(&state, "archive-perm-root").await;
+    drop(state);
+    let file = data.join("recents-archive.json");
+    let body = serde_json::json!({ws.clone(): [
+        {"key": "old-1", "kind": "claude", "title": "o", "at": 1},
+        {"key": "old-2", "kind": "claude", "title": "o", "at": 1}]})
+    .to_string();
+    if !unreadable_file(&file, body.as_bytes()) {
+        return; // root reads anything
+    }
+    let state = test_state_with_data_dir(0, data.clone());
+    assert_eq!(
+        archive(state.clone(), ws.clone(), "k-1").await.0,
+        StatusCode::OK
+    );
+    assert_eq!(archived(state.clone(), ws.clone()).await, ["k-1"]);
+    // Unarchived while held: the merge must not hide it again.
+    let (status, _) = request(
+        &state,
+        Method::POST,
+        "/api/v1/recents/unarchive",
+        Some(serde_json::json!({"workspace_id": ws, "keys": ["old-2"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(readable_again(&file), body.as_bytes().to_vec(), "held");
+
+    assert_eq!(
+        archive(state.clone(), ws.clone(), "k-2").await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        archived(state.clone(), ws.clone()).await,
+        ["k-1", "k-2", "old-1"]
+    );
+    let reloaded = test_state_with_data_dir(0, data);
+    assert_eq!(archived(reloaded, ws).await, ["k-1", "k-2", "old-1"]);
+}

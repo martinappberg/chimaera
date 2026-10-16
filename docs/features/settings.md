@@ -26,8 +26,10 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
   retried; the indicator shows the daemon's reason, and the next settings frame replaces the refused map.
 - **Where it lives.** `settings.rs` (`get_settings`/`put_settings`, `SettingsStore`); UI schema in
   `web-ui/src/lib/settings/schema.ts` (where defaults live).
-- **Key behaviors.** Reads **re-stat the file** so external edits surface without a restart, bumping a
-  content generation that `/ws/events` diffs against. Daemon-consumed keys include
+- **Key behaviors.** External edits surface without a restart: hand-edits reach the daemon's
+  cache within two seconds (one off-reactor poll), `GET /settings` and a new window's first
+  frame re-read the file, and a PUT installs at once; the daemon's own readers use the cache
+  and never touch the disk. A change bumps a content generation that `/ws/events` diffs against. Daemon-consumed keys include
   `git.path`, `agents.*.path`, `agents.communication.*`, `notifications.*`,
   `daemon.scrollbackLines`, `daemon.restoreSessions`, `chat.remoteControlAtStart`,
   `chat.toolSummaries`, `chat.codexSteering`, `chat.resumeAfterRestart`, `update.autoCheck` and

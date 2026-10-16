@@ -396,10 +396,12 @@ async fn login_env(
     // key, so an edit there re-captures too.
     let startup = crate::environment::job_startup().await;
     let prelude_text = {
-        let mut preludes = crate::lock(&state.env_preludes);
+        let preludes = crate::lock(&state.env_preludes);
         match ws {
-            Some(ws) => preludes.current().effective(startup.as_deref(), ws, None),
-            None => preludes.current().host_only(startup.as_deref()),
+            Some(ws) => preludes
+                .data_cached()
+                .effective(startup.as_deref(), ws, None),
+            None => preludes.data_cached().host_only(startup.as_deref()),
         }
     };
     let key = format!("{}\u{0}{prelude_text}", crate::launcher::login_shell());

@@ -18,9 +18,17 @@
 //! The ledger deliberately stores no argv: resurrection rebuilds commands
 //! through the same spawn path as POST /sessions, so hook URLs, shims, and
 //! themes always match the *new* daemon, never the dead one.
+//!
+//! A ledger this daemon could not read (an I/O error, not an absent file)
+//! is never written over: writes hold from construction until a boot read
+//! lands, and while the file stays unreadable every reconcile tick retries
+//! it. Once it reads, the previous daemon's agents retire into Recents (the
+//! `restoreSessions: false` path — nothing respawns mid-session) and writes
+//! resume. If it is still held at a graceful stop, the fallback is to retire
+//! this daemon's live agent sessions into Recents, so nothing vanishes even
+//! though the ledger can't carry them to the successor.
 
 use std::collections::HashMap;
-use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -167,6 +175,17 @@ impl LedgerEntry {
     }
 }
 
+/// Read cap for `sessions.json`. The ledger has no session-count cap of its
+/// own; an entry is two paths, a title, a model and a carryover (bounded by
+/// the drivers' task caps) — a few KiB, ~20 KiB at the very worst — so
+/// 16 MiB is the open sessions of hundreds of windows at their largest. A
+/// bigger file is corruption, not a ledger: it boots empty and the next
+/// write replaces it.
+pub(crate) const MAX_LEDGER_BYTES: usize = 16 * 1024 * 1024;
+
+/// The store's file name, for its log lines.
+const LEDGER_FILE: &str = "sessions.json";
+
 /// The on-disk ledger. One writer (the reconcile loop); writes are atomic
 /// (tmp + rename) and skipped when nothing changed, so an idle daemon costs
 /// zero I/O.
@@ -174,6 +193,13 @@ pub(crate) struct LedgerStore {
     path: PathBuf,
     /// Serialized body of the last write, for change detection.
     last_written: Option<String>,
+    /// Writes wait: set from construction until the boot read lands, and
+    /// kept while the file can't be read (the previous daemon's sessions
+    /// are still in it). See the module doc.
+    hold: crate::persist::Hold,
+    /// The boot read has landed (whatever it found): from here on a held
+    /// ledger is this store's to retry, not the boot path's.
+    booted: bool,
 }
 
 impl LedgerStore {
@@ -181,45 +207,33 @@ impl LedgerStore {
         LedgerStore {
             path,
             last_written: None,
+            hold: crate::persist::Hold::new(true),
+            booted: false,
         }
     }
 
-    /// Read what the previous daemon left. Load-tolerant like every store:
-    /// a missing or corrupt file is an empty ledger, never an error.
-    pub(crate) fn load_boot(&self) -> BootLedger {
-        let contents = match std::fs::read_to_string(&self.path) {
-            Ok(c) => c,
-            Err(err) if err.kind() == ErrorKind::NotFound => return BootLedger::default(),
-            Err(err) => {
-                tracing::warn!(path = %self.path.display(), %err, "failed to read session ledger");
-                return BootLedger::default();
-            }
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) else {
-            tracing::warn!(path = %self.path.display(), "corrupt session ledger; starting empty");
-            return BootLedger::default();
-        };
-        let sessions = value
-            .get("sessions")
-            .and_then(|s| s.as_array())
-            .map(|a| a.iter().filter_map(LedgerEntry::from_json).collect())
-            .unwrap_or_default();
-        let links = value
-            .get("links")
-            .and_then(|l| l.as_object())
-            .map(|m| {
-                m.iter()
-                    .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default();
-        BootLedger {
-            sessions,
-            links,
-            written_at: value
-                .get("written_at")
-                .and_then(|w| w.as_u64())
-                .unwrap_or(0),
+    /// Read what the previous daemon left, as `run` does at boot
+    /// (blocking): a missing, oversized or corrupt file is an empty ledger;
+    /// an unreadable one an empty ledger that keeps the writes held.
+    #[cfg(test)]
+    pub(crate) fn load_boot(&mut self) -> BootLedger {
+        let read = read_boot(&self.path);
+        self.booted(read.as_ref().err().map(|err| err as &dyn std::fmt::Display));
+        read.unwrap_or_default()
+    }
+
+    /// Whether writes are held (tests).
+    #[cfg(test)]
+    pub(crate) fn is_held(&self) -> bool {
+        self.hold.is_held()
+    }
+
+    /// The boot read landed: writes resume unless it was unreadable (why).
+    fn booted(&mut self, unreadable: Option<&dyn std::fmt::Display>) {
+        self.booted = true;
+        match unreadable {
+            Some(reason) => self.hold.note(&self.path, LEDGER_FILE, reason),
+            None => self.hold.release(&self.path, LEDGER_FILE),
         }
     }
 
@@ -241,6 +255,9 @@ impl LedgerStore {
         if self.last_written.as_deref() == Some(body.as_str()) {
             return;
         }
+        if self.hold.is_held() {
+            return;
+        }
         if let Err(err) = self.save(&body) {
             tracing::error!(%err, "failed to persist session ledger");
             return;
@@ -257,6 +274,48 @@ impl LedgerStore {
         };
         crate::persist::atomic_write_json(&self.path, full)
     }
+}
+
+/// The previous daemon's ledger at `path`, or why the file that is there
+/// can't be read (blocking: the boot runs it on the blocking pool). The
+/// store's hold logs that, once; a retry every tick must not.
+fn read_boot(path: &std::path::Path) -> Result<BootLedger, std::io::Error> {
+    let contents = match crate::persist::read_bounded(path, MAX_LEDGER_BYTES) {
+        crate::persist::Bounded::Ok(c) => c,
+        crate::persist::Bounded::Missing => return Ok(BootLedger::default()),
+        crate::persist::Bounded::TooLarge => {
+            tracing::warn!(path = %path.display(), "session ledger exceeds {MAX_LEDGER_BYTES} bytes; starting empty");
+            return Ok(BootLedger::default());
+        }
+        crate::persist::Bounded::Io(err) => return Err(err),
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&contents) else {
+        tracing::warn!(path = %path.display(), "corrupt session ledger; starting empty");
+        return Ok(BootLedger::default());
+    };
+    let sessions = value
+        .get("sessions")
+        .and_then(|s| s.as_array())
+        .map(|a| a.iter().filter_map(LedgerEntry::from_json).collect())
+        .unwrap_or_default();
+    let links = value
+        .get("links")
+        .and_then(|l| l.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    let boot = BootLedger {
+        sessions,
+        links,
+        written_at: value
+            .get("written_at")
+            .and_then(|w| w.as_u64())
+            .unwrap_or(0),
+    };
+    Ok(boot)
 }
 
 fn unix_now() -> u64 {
@@ -278,13 +337,33 @@ const WRITE_DEBOUNCE: Duration = Duration::from_secs(2);
 pub(crate) async fn run(state: Arc<AppState>) {
     // Boot data must be read (and acted on) before the reconcile loop's
     // first write replaces it with the current — initially empty — truth.
-    let boot = crate::lock(&state.ledger).load_boot();
+    // Off the reactor: `~/.chimaera` may be on NFS. Until this read lands
+    // the store is held, so a graceful stop meanwhile writes nothing over
+    // the file (see `final_flush`).
+    let path = crate::lock(&state.ledger).path.clone();
+    let read = tokio::task::spawn_blocking(move || read_boot(&path)).await;
+    let boot = match read {
+        Ok(Ok(boot)) => {
+            crate::lock(&state.ledger).booted(None);
+            boot
+        }
+        Ok(Err(err)) => {
+            crate::lock(&state.ledger).booted(Some(&err));
+            BootLedger::default()
+        }
+        // A read that never finished says nothing about the file: hold.
+        Err(err) => {
+            crate::lock(&state.ledger).booted(Some(&err));
+            BootLedger::default()
+        }
+    };
     consume_boot(&state, boot).await;
     loop {
         tokio::select! {
             _ = state.changes.notified() => {}
             _ = tokio::time::sleep(RECONCILE_TICK) => {}
         }
+        let writable = retry_held(&state).await;
         let (entries, links) = snapshot(&state);
         // Once the daemon is stopping, the graceful stop owns the last write
         // (lifecycle's final flush) and then ends the chat drivers politely.
@@ -295,9 +374,95 @@ pub(crate) async fn run(state: Arc<AppState>) {
         if state.stopping.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
-        crate::lock(&state.ledger).write_if_changed(&entries, &links);
+        if writable {
+            crate::lock(&state.ledger).write_if_changed(&entries, &links);
+        }
         tokio::time::sleep(WRITE_DEBOUNCE).await;
     }
+}
+
+/// A held ledger, read again (off the reactor) once the boot read has
+/// landed. When it reads now, the previous daemon's agents retire into
+/// Recents — never dropped, never respawned mid-session — and the hold
+/// lifts. Returns whether writes may go ahead.
+async fn retry_held(state: &Arc<AppState>) -> bool {
+    let path = {
+        let ledger = crate::lock(&state.ledger);
+        if !ledger.hold.is_held() {
+            return true;
+        }
+        if !ledger.booted {
+            return false; // the boot path owns that read
+        }
+        ledger.path.clone()
+    };
+    match tokio::task::spawn_blocking(move || read_boot(&path)).await {
+        Ok(Ok(old)) => {
+            let state2 = state.clone();
+            let retired = tokio::task::spawn_blocking(move || {
+                let retired = old
+                    .sessions
+                    .iter()
+                    .filter(|entry| retire_to_recents(&state2, entry, old.written_at))
+                    .count();
+                if retired > 0 {
+                    state2
+                        .recents_epoch
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                retired
+            })
+            .await
+            .unwrap_or(0);
+            let mut ledger = crate::lock(&state.ledger);
+            let path = ledger.path.clone();
+            ledger.hold.release(&path, LEDGER_FILE);
+            if retired > 0 {
+                tracing::info!(retired, "the previous daemon's agents retired to Recents");
+            }
+            true
+        }
+        Ok(Err(err)) => {
+            let mut ledger = crate::lock(&state.ledger);
+            let path = ledger.path.clone();
+            ledger.hold.note(&path, LEDGER_FILE, err);
+            false
+        }
+        Err(err) => {
+            let mut ledger = crate::lock(&state.ledger);
+            let path = ledger.path.clone();
+            ledger.hold.note(&path, LEDGER_FILE, err);
+            false
+        }
+    }
+}
+
+/// The graceful stop's last write. A held ledger is retried first; one that
+/// still can't be written (unreadable, or the boot read never landed) is
+/// left as it is, and this daemon's live agent sessions retire into Recents
+/// instead — the fallback that keeps them findable when the ledger can't
+/// carry them to the successor (see the module doc).
+pub(crate) async fn final_flush(state: &Arc<AppState>) {
+    let writable = retry_held(state).await;
+    let (entries, links) = snapshot(state);
+    if writable {
+        crate::lock(&state.ledger).write_if_changed(&entries, &links);
+        return;
+    }
+    let state2 = state.clone();
+    let now = unix_now();
+    let retired = tokio::task::spawn_blocking(move || {
+        entries
+            .iter()
+            .filter(|entry| retire_to_recents(&state2, entry, now))
+            .count()
+    })
+    .await
+    .unwrap_or(0);
+    tracing::warn!(
+        retired,
+        "session ledger not written at stop (unreadable); live agent sessions retired to Recents"
+    );
 }
 
 /// Derive the ledger from live state. Only chimaera-spawned user sessions
@@ -863,6 +1028,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("sessions.json");
         let mut store = LedgerStore::new(path.clone());
+        store.load_boot(); // the boot read lands: writes may go ahead
         let entries: Vec<_> = AgentKind::ALL
             .into_iter()
             .map(|kind| {
@@ -887,6 +1053,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("sessions.json");
         let mut store = LedgerStore::new(path.clone());
+        store.load_boot(); // the boot read lands: writes may go ahead
 
         let mut chat = chat_entry(AgentKind::Claude, Some("conv-2"));
         chat.id = "s-3".into();
