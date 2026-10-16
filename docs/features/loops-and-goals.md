@@ -36,6 +36,12 @@ Work that resumes an agent on its own, shown in its chat: Claude Code's `/loop` 
 - Claude's `--resume` brings back its jobs and its goal but not a pending wakeup. The daemon carries all three (`Carryover`): the jobs and goal seed the new driver, and a lost wakeup makes the restart pick-up message name it ("Your pending loop wakeup was lost with the old process: "…", due in 6 minutes.") and ask Claude to schedule it again — subject to the usual pick-up rules (`chat.resumeAfterRestart`, never a Mastermind, the restart-loop guard).
 - Codex keeps its goal on the thread; the driver reads it again when the thread opens.
 
+## Not shown (deliberately)
+
+- **Claude's durable jobs** (`CronCreate {durable: true}`, kept in the project's `.claude/scheduled_tasks.json` across sessions) are behind a Claude-side flag that is off for the accounts probed; Claude makes them session-only, and they show like any job. Their file is never read: its shape hasn't been observed ([PROTOCOL.md Pass 47](../../crates/chimaera-agent/PROTOCOL.md)).
+- **`/schedule` routines** are cloud agents on Anthropic's servers; a run is its own cloud session and never wakes this chat.
+- **Codex automations** belong to the Codex app and cloud; the app-server Chimaera drives has no scheduling beyond goals.
+
 ## How it's derived (Claude)
 
 Claude has no control that lists or reports loops and goals, so the driver keeps them from frames (`autonomy.rs`): `ScheduleWakeup` / `CronCreate` / `CronDelete` / `CronList` calls and their structured results, a job's next run after each fire computed from its cron and Claude's stable per-job jitter (`cron.rs`), a turn the CLI opens on its own (a `command_lifecycle` for a command nobody here sent) named by whatever was due, `/goal`'s own replies, and the synthetic "Stop hook feedback" frame of a failed check. How a goal ended never reaches stdout: after the turn, the daemon reads it from Claude's transcript (`goal_outcome.rs`).
