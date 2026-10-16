@@ -32,10 +32,8 @@
   }
 </script>
 
-<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 <div class="preview" role="dialog" aria-modal="true" aria-label="preview {label}" tabindex="-1" onkeydown={onKeydown}>
   <button class="backdrop" type="button" aria-label="close preview" onclick={onClose}></button>
-  <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
   <div class="panel" tabindex="-1" bind:this={panel}>
     <img {src} alt={label} draggable="false" />
     <div class="bar">

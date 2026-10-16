@@ -59,7 +59,8 @@ To build an extension, read the **[plugin authoring guide](docs/agent-guides/plu
 it covers extension boundaries, a compilable starter, local installation, and validation.
 
 Deep docs, read on demand: the **[architecture guide](docs/agent-guides/architecture.md)**
-(the source of truth for how it's built and why), the design spine
+(the source of truth for how it's built and why), the
+[UI contracts](docs/agent-guides/ui-contracts.md) (shared web-UI primitives), the design spine
 [docs/design/README.md](docs/design/README.md), and the dated [field notes](docs/history/field-notes.md).
 Before editing, read each `.claude/rules/*.md` whose frontmatter `paths` match the
 files you will touch. Claude Code loads these automatically; other agents must do

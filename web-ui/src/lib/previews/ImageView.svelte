@@ -505,7 +505,6 @@
   </div>
 
   <!-- Focusable (not tabbable) so Esc reaches it after a press on the image. -->
-  <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div
     class="viewport"

@@ -76,6 +76,17 @@ gh pr create --title "chore: <what>" --body-file /absolute/path/to/pr-body.md
 Write the PR description to that file with actual newlines. When the desktop
 task exposes `attach_artifact`, attach the created PR URL to the task.
 
+The PR body states five things. Write "none" where one does not apply; do not omit it.
+
+- **Affected contracts:** the feature pages, area maps, rules, and wire or IPC
+  shapes the change touches.
+- **Tests run:** each command, and its result.
+- **Runtime evidence:** what you drove live and observed (see **verify-app**), and
+  each check that was blocked.
+- **Compatibility:** any change to the daemon↔UI wire, public behavior, saved state,
+  or CLI. Say "none" only after you checked.
+- **Remaining risk:** what the change does not cover, and the follow-up.
+
 End the PR body with an accurate agent trailer. For Codex:
 
 ```
@@ -93,6 +104,19 @@ breaks `main` holds releases back until a fix lands; fix forward. That run needs
 every `ci.yml` job green, not just the required ones: auto-merge doesn't wait
 for `scripts` or `musl`, and a PR that lands with either red breaks `main` the
 same way, so watch them pass too.
+
+## Check the integrated commit
+
+After the squash-merge, look at the commit that landed on `main`, not at your branch.
+
+1. Read the merge commit's subject:
+   `gh pr view <n> --json mergeCommit --jq .mergeCommit.oid`, then
+   `git fetch origin && git log -1 --format=%s <oid>`. (`origin/main` alone may
+   be someone else's later merge.)
+2. If the prefix or the `[skip release]` marker changed, tell the maintainer:
+   the release request is wrong.
+3. Confirm `main`'s own `ci.yml` run passed on that commit, with every job green
+   (`gh run list --branch main --limit 3`). If it failed, fix forward at once.
 
 ## After merge
 

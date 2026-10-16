@@ -759,6 +759,28 @@ Recommendation: keep the fixtures as the contract and do not add a generator in 
 
 **Browser/component scenarios: not added, costed.** The web UI has no component harness: Vitest runs in the `node` environment with no DOM, no `@testing-library/svelte`, no `@vitest/browser`, and the web-ui rule records that as deliberate ("component/UI behavior has no browser tests"). The three §5 scenarios with the highest risk are permission answers (`PermissionCard` must send `{type:"permission", request_id, option_id}` — the chat-socket fixture now pins what the daemon refuses with, but not the click), the disconnected composer (`Composer` with `connected=false` must neither clear a draft nor send into a closed socket) and modal focus (`shared/modalFocus` + `ConfirmDialog`: entry, containment, Escape, restoration). Building the harness: add `jsdom` (or `@vitest/browser` + Playwright, which also exercises real focus and layout at the price of a browser install in the `ui` job) as a second Vitest project matched on `*.component.test.ts`, `resolve.conditions: ["browser"]` so Svelte's client build is picked, a mount helper around `svelte`'s `mount()`/`unmount()` that provides the stores the components read (chat store, settings store, `pageVisible`), and `@testing-library/svelte` for queries; the `#token=` bootstrap shim in `vitest.setup.ts` already covers module-load side effects. About a day for the harness and the first three scenarios; the WKWebView-only behaviors (scrolling, native dialogs) stay live checks as §5 says. Left for the phase that first changes one of those three components.
 
+### Execution record: wave 3 (workflow and UI contracts), 2026-10-16
+
+One coordinator ran two writing lanes at once in a single worktree, then one read-only review. The lanes owned disjoint files. No Rust was built in this wave (another session held the build); every check here is a Node or documentation check.
+
+| Lane | Model | Owned files | Result |
+|---|---|---|---|
+| UI contracts guide + a11y review (§5) | Opus | `docs/agent-guides/ui-contracts.md`, `.claude/rules/web-ui.md` (one bullet), `web-ui/src/lib/shared/AGENTS.md` (one sentence), `docs/README.md`, root `AGENTS.md`, `web-ui/src/**/*.svelte` (comments only) | Eight contract sections, each with the primitive, the helper, the states and one cited example; a Gaps section with ten proposals and nothing built; all 67 `svelte-ignore a11y_*` suppressions reviewed one by one: 51 kept with a reason, 16 removed as stale (no element or behavior changed), 0 defects fixed; 92 icon-only buttons scanned, all named |
+| Skills (§10 table) | Sonnet | the ten `.claude/skills/*/SKILL.md` | Every required improvement present; no command, path, flag or gotcha dropped (a span-by-span check against `HEAD`); the bridges unchanged because every `name` and `description` stayed |
+| Independent review | Opus | read-only | Sampled 10 guide claims (6 true, 3 imprecise, 1 false) and 10 skill commands (8 OK, 2 imprecise); 12 findings, no blocker; all fixed before the PR opened |
+
+Evidence:
+
+- The stale suppressions were found by disabling all 67 at once and reading `svelte-check`'s 58 warnings; the review re-compiled the 11 edited files with `svelte/compiler` and found 0 a11y warnings, with the kept suppressions warning as expected when disabled.
+- `svelte-check`: 1083 files, 0 errors, 0 warnings, before and after. Vitest: 147 files, 2332 tests pass, 3 skipped. `node scripts/check-doc-links.mjs` (129 files) and `node scripts/check-agent-assets.mjs` pass.
+- The review's false claim (`tabNavigation` had three consumers, not two) and the imprecise ones (the `--muted` on `--row-active` floor is 4.0:1; `--accent-text` keeps 75% accent; the reload gate only defers the asset reload and Reload Window) are corrected in the guide. Six `preview_*` tool names that no session exposes were replaced in three skills with the tools that exist.
+
+Left for later, with the evidence that scopes it:
+
+- The guide's Gaps section: no spacing tokens or breakpoints; `Segmented` and four other radio groups without arrow keys; ten tab lists in eight files not on `tabNavigation`; two `aria-modal` overlays not on `modalFocus`; no shared Escape helper, preview state component, or live-region announcer; the split edit/preview divider is pointer-only. Each needs a live check and is not a documentation change.
+- The §5 component/browser checks (modal focus, permission answers, disconnected composer, unsaved close, pane switching, error boundaries) were not started; the guide names the behaviors they would cover.
+- Native-app whole-window zoom was not checked.
+
 ## 10. Keep the repository healthy as it grows
 
 ### Standard change workflow

@@ -17,6 +17,22 @@ AGENTS.md that governs the part you're touching first, they are the fast map:
 - UI: [`web-ui/src/lib/chat/AGENTS.md`](../../../web-ui/src/lib/chat/AGENTS.md)
   — the store reducer, the socket, the components.
 
+## Route by provider
+
+Find the provider and driver first. Then read only that provider's section of
+[`PROTOCOL.md`](../../../crates/chimaera-agent/PROTOCOL.md). Wire facts live there
+and in the engine `AGENTS.md`; do not restate them in a PR or in this skill.
+
+| Provider | Protocol | Driver | Version pin | Live gate |
+|---|---|---|---|---|
+| Claude Code | bidirectional `stream-json` | `claude.rs` | `TESTED_CLAUDE_VERSION` | `just chat-smoke` |
+| Codex | `codex app-server` JSON-RPC | `codex.rs` | `TESTED_CODEX_VERSION` | `just chat-smoke` |
+| Grok Build, Antigravity, Cursor CLI | ACP | `acp.rs` | `TESTED_GROK_VERSION`, `TESTED_AGY_VERSION`, `TESTED_CURSOR_VERSION` | `just chat-smoke-acp` |
+
+Before you advertise a control (model, effort, mode, resume), check that the
+provider reports the capability (`capabilities.rs`). Keep the native term: `xhigh`
+stays `xhigh`.
+
 ## The end-to-end path (know it before you change it)
 
 ```
@@ -53,6 +69,12 @@ break, reset, or renumber it anywhere.
    executables). Hermetic tests cannot prove real-agent behavior. Record any
    new wire fact in `PROTOCOL.md` the moment you learn it.
 
+   **Live version evidence.** When a driver or a CLI changes, the PR states
+   three things: which `TESTED_*_VERSION` pin you set or kept, which gate you ran
+   (`just chat-smoke` or `just chat-smoke-acp`) with its result, and the installed
+   CLI version it ran against (for example `claude --version`). If you could not
+   run the gate, report it as blocked and name the missing credential or CLI.
+
 ### Codex schema preflight (free, before the live gate)
 
 Current Codex app-server builds can emit a version-matched TypeScript or JSON
@@ -86,4 +108,4 @@ behavior are not proven by a schema.
   green (plugin assets, fmt, clippy, and both Rust workspaces' tests); if
   `web-ui/**` changed, run its `check`, `test`, and `build` scripts too (Node 26).
 - Say in the PR what you ran and observed (hermetic + live; chat-smoke if a
-  driver changed), per the repo's verify-live rule.
+  driver changed, with the version evidence above), per the repo's verify-live rule.

@@ -918,7 +918,6 @@
             </span>
           {/if}
           {#if renamingTab === tabKey(tab)}
-            <!-- svelte-ignore a11y_autofocus -->
             <input
               class="tab-rename-input"
               class:invalid={renameError !== null}
@@ -1095,7 +1094,6 @@
       {#if !zoomed}
         <!-- Pointer-only grip, not a click action or an extra keyboard tab stop.
              Tab context menus provide keyboard moves; Pane actions owns splits. -->
-        <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
         <span
           class="pane-grip"
           role="img"

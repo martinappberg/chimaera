@@ -56,6 +56,22 @@ wait — so do merged PRs in a repo that merges with merge commits, where the PR
 commits land in main. The cost: a merged session you return to after its folder
 went has no worktree.
 
+## Record ownership
+
+When you start a worktree, record who owns it: the session name, the branch, and the
+PR. Record each preview you start with its owner, PID, and port (the isolated daemon,
+Vite, the isolated app). Put that line in your session notes or the PR body. Stop
+only what is on your record. A process or worktree with no owner on your record is
+not yours; leave it alone and report it.
+
+## Bound build concurrency
+
+Run one cargo build at a time on the Mac. Overlapping builds from several sessions
+(or a bisect that rebuilds while another build runs) have exhausted RAM and killed
+the session. Before a build, check that no other `cargo` or `rustc` process is running
+(`pgrep -x cargo; pgrep -x rustc`). If one is running, wait for it. Do not start
+parallel builds from lanes of one swarm; serialize them.
+
 ## The lifecycle
 
 1. **Before a big build**, check `df -h ~`. Under ~50 GiB free (the session-start
@@ -81,7 +97,15 @@ went has no worktree.
    preview does not exit gracefully or another session keeps the worktree
    ACTIVE, report the blocker and leave it intact. The next automatic GC is
    a fallback for leftover previews, not a reason to keep yours running.
-3. **At session end** the SessionEnd hook runs `--self --sweep`: it deletes only the
+3. **Verify the cleanup** after the PR merges and the worktree is gone:
+   - run `scripts/worktree-gc`; your worktree is absent from the table, or
+     reported ACTIVE with a reason;
+   - run `git worktree list`; no stale entry remains (`git worktree prune`
+     removes only entries whose folder is gone);
+   - confirm the previews on your ownership record no longer run;
+   - run `df -h ~` and note the freed space.
+   The branch is kept on purpose.
+4. **At session end** the SessionEnd hook runs `--self --sweep`: it deletes only the
    stale debug objects no binary in `target/` references, so the next build stays warm.
    `--self` without `--sweep` deletes this worktree's whole `target/` (the next build
    starts cold) and refuses while anything runs from it.
@@ -124,6 +148,14 @@ machine opted out), `WORKTREE_GC=off` silences them entirely, and
 in, whatever the cwd. It fails safe: without `lsof`/`/proc`, or when it can't read a
 worktree's files, that worktree is ACTIVE; without `gh` nothing is removable by PR
 state.
+
+**Diagnose a missing host capability.** If a sandbox denies `ps`, `lsof`, or `gh`,
+the script does not guess. It keeps the affected worktrees ACTIVE or KEEP, and it
+removes nothing it cannot verify. A dry run that shows everything ACTIVE or KEEP on
+a host like this is correct, not broken. Check each tool by hand (`command -v ps
+lsof gh`, then `gh auth status`) and report which one is missing. Do not work
+around it with a manual delete. The test script prints the same missing capability
+and counts its integration cases as skipped.
 
 ## Hooks
 

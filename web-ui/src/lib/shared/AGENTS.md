@@ -1,6 +1,6 @@
 # web-ui/src/lib/shared — cross-cutting primitives
 
-Orientation for coding agents. This area owns leaf modules that many areas import: icons and glyphs, small UI controls, dialogs and menus, keys and keybindings, file references and locators, the reference/provenance bridge, link and path policies, the math and Mermaid policies, embed cards, find, clipboard, and visibility. A module here must not depend on a surface area's internals. It does not own any pane surface. Parent map: repo-root [AGENTS.md](../../../../AGENTS.md). Rules: [.claude/rules/web-ui.md](../../../../.claude/rules/web-ui.md).
+Orientation for coding agents. This area owns leaf modules that many areas import: icons and glyphs, small UI controls, dialogs and menus, keys and keybindings, file references and locators, the reference/provenance bridge, link and path policies, the math and Mermaid policies, embed cards, find, clipboard, and visibility. A module here must not depend on a surface area's internals. It does not own any pane surface. Parent map: repo-root [AGENTS.md](../../../../AGENTS.md). Rules: [.claude/rules/web-ui.md](../../../../.claude/rules/web-ui.md). Contracts these primitives implement (focus, dialogs, states, visibility, a11y): [ui-contracts.md](../../../../docs/agent-guides/ui-contracts.md).
 
 ## File map
 

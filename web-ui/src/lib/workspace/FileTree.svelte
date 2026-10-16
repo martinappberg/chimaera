@@ -1114,7 +1114,6 @@
             <FileIcon path={editDraft} size={14} />
           {/if}
         </span>
-        <!-- svelte-ignore a11y_autofocus -->
         <input
           class="edit-input"
           type="text"
@@ -1227,7 +1226,6 @@
         {/if}
       </span>
       {#if edit?.mode === "rename" && edit.path === entry.path}
-        <!-- svelte-ignore a11y_autofocus -->
         <input
           class="edit-input"
           type="text"

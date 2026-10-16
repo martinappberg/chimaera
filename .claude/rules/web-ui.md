@@ -54,6 +54,10 @@ KaTeX math policy). The
   new call.
 - **Theme tokens, not hard-coded colors** (`--fg`, `--accent`, `--edge`, …) so the
   curated light + dark both hold. UI quality is an acceptance criterion.
+- **Build on the shared UI contracts.** Before you add a control, dialog, loading
+  state or background task, read
+  [ui-contracts.md](../../docs/agent-guides/ui-contracts.md): the primitive and
+  helper for each contract, and the reviewed a11y suppressions.
 - **Runes discipline.** Mutate `$state` only in the owning store's methods; give every
   timer/listener an `$effect` teardown; an `$effect` that reads and writes the same
   `$state` loops.
