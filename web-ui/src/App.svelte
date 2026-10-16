@@ -440,7 +440,7 @@
   import BranchChip from "./lib/shared/BranchChip.svelte";
   import { archiveRecents, nudgeHistory, unarchiveRecents } from "./lib/workspace/history";
   import { sameFile, setSameFileOpener } from "./lib/workspace/sameFile.svelte";
-  import { requestSettingsSection } from "./lib/settings/jump";
+  import { requestSettingsSection, settingsOpen } from "./lib/settings/jump";
   import { setAgentNames } from "./lib/chat/toolLabels";
   import QuickOpen from "./lib/workspace/QuickOpen.svelte";
   import FileTree from "./lib/workspace/FileTree.svelte";
@@ -3669,6 +3669,17 @@
     layout = openSettings(layout);
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
+
+  // A surface that can't reach these callbacks (a chat's usage popover)
+  // asks for Settings at a section through the store.
+  $effect(() => {
+    const section = $settingsOpen;
+    if (section === null) return;
+    untrack(() => {
+      settingsOpen.set(null);
+      openSettingsAt(section);
+    });
+  });
 
   /** Open/focus the workspace dashboard (rail row, ⌘0, the landing default). */
   function openDashboardSurface(): void {

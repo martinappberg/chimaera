@@ -14,6 +14,8 @@
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import { flushSettings, getSetting, setSetting } from "./store.svelte";
   import { agentUpdateStatus } from "./agentStatus";
+  import UsageBars from "../shared/UsageBars.svelte";
+  import { USAGE_AGENTS, getAgentUsage, type AgentUsage } from "./agentUsage";
 
   let { visible = true }: { visible?: boolean } = $props();
   type AgentPathKey = "agents.claude.path" | "agents.codex.path" | "agents.agy.path" | "agents.grok.path" | "agents.cursor.path" | "agents.agy.chatPath";
@@ -42,6 +44,26 @@
   let stillUnchecked = $state<Record<string, boolean>>({});
   let uninstallError = $state<string | null>(null);
   let removing = $state(false);
+  /** Each account's plan usage, read live from its CLI when its section is
+   *  first opened (collapsed by default — a look, not a dashboard), and on
+   *  Refresh. */
+  let usage = $state<Record<string, AgentUsage>>({});
+  let usageReading = $state<Record<string, boolean>>({});
+  let usageNow = $state(Date.now());
+  const showsUsage = (a: AgentInfo) => USAGE_AGENTS.has(a.id) && a.installed && !needsSignIn(a);
+
+  async function readUsage(id: string, refresh = false): Promise<void> {
+    if (usageReading[id]) return;
+    usageReading[id] = true;
+    try {
+      usage[id] = await getAgentUsage(id, refresh);
+    } catch (e) {
+      usage[id] = { rows: [], limitReached: false, checkedAtMs: Date.now(), error: e instanceof Error ? e.message : "Couldn't read usage" };
+    } finally {
+      usageReading[id] = false;
+      usageNow = Date.now();
+    }
+  }
 
   function syncInputs(list: AgentInfo[]): void {
     const next = { ...inputs };
@@ -186,6 +208,31 @@
         {#if a.setup && !busy}<button class="link setup-result" onclick={() => install(a, "install", true)}>{a.setup.phase === "failed" ? "Setup needs attention — view result" : a.setup.phase === "cancelled" ? "Installation cancelled — view result" : "View installation result"}</button>{/if}
         {#if messages[a.id]}<p class="notice" role="status">{messages[a.id]}</p>{/if}
         {#if rowError[a.id]}<p class="err" role="alert">{rowError[a.id]}</p>{/if}
+        {#if showsUsage(a)}
+          {@const u = usage[a.id]}
+          <details
+            class="usage"
+            ontoggle={(e) => {
+              if ((e.currentTarget as HTMLDetailsElement).open && usage[a.id] === undefined) void readUsage(a.id);
+            }}
+          >
+            <summary>Plan usage</summary>
+            <div class="usage-body">
+              {#if u === undefined}
+                <p class="detail">Reading…</p>
+              {:else if u.error !== null}
+                <p class="detail" title={u.error}>Couldn't read usage from {a.name}.</p>
+              {:else if u.rows.length === 0}
+                <p class="detail">No plan limits reported for this account.</p>
+              {:else}
+                <UsageBars rows={u.rows} now={usageNow} refused={u.limitReached} />
+              {/if}
+              {#if u !== undefined}
+                <button class="link refresh" disabled={usageReading[a.id]} onclick={() => void readUsage(a.id, true)}>{usageReading[a.id] ? "Checking…" : "Refresh"}</button>
+              {/if}
+            </div>
+          </details>
+        {/if}
         {#if key !== undefined || a.managed}
         <details>
           <summary>Advanced</summary>
@@ -225,6 +272,8 @@
 <style>
   .setup-result { margin:4px 14px 12px; }
   .signin-slot { margin:12px 0 2px 32px; }
+  .usage-body { margin-top:10px; max-width:440px; display:flex; flex-direction:column; gap:8px; }
+  .refresh { align-self:flex-start; }
   .cat-row { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:30px 14px 6px; }
   h2 { margin:0; font-size:var(--text-lg); font-weight:600; color:var(--fg); }
   .intro { margin:0 14px 14px; font-size:var(--text-sm); color:var(--muted); line-height:1.5; }

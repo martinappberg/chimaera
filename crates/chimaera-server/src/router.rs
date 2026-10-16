@@ -275,6 +275,8 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         // Look again for one agent, patiently (a Retry of a check that
         // couldn't conclude).
         .route("/agents/{id}/detect", post(launcher::detect_agent))
+        // The agent account's plan usage, asked of the agent (Agent settings).
+        .route("/agents/{id}/usage", get(agent_probe::usage::usage))
         .route(
             "/agents/{id}/setup",
             get(crate::agent_setup::get).post(crate::agent_setup::start),

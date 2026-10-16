@@ -11,3 +11,12 @@ export const settingsJump = writable<string | null>(null);
 export function requestSettingsSection(section: string): void {
   settingsJump.set(section);
 }
+
+/** Open Settings at a section from a surface that can't reach App's
+ *  callbacks (a chat's usage popover → "Agents"); App opens the surface,
+ *  then requests the section. */
+export const settingsOpen = writable<string | null>(null);
+
+export function openSettingsAt(section: string): void {
+  settingsOpen.set(section);
+}

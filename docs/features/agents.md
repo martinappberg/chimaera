@@ -262,6 +262,36 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   chat view shows one line per failure: a startup error that a fatal banner shows
   is not repeated as a transcript line, and a fatal banner is not followed by *agent exited*.
 
+## Plan usage
+
+- **What & when.** Each agent account's plan limits, read live from the agent itself, under its card
+  in Settings → Agents: a **Plan usage** section, collapsed by default (maintainer, 2026-10-15),
+  that opens to every window with a bar, its percentage and when it resets, and **Refresh**. Read
+  when the section is first opened (the daemon answers from a minute's cache) and on Refresh;
+  an Antigravity chat's usage meter shows the same read, since its chat stream reports none
+  ([chat-mode.md](chat-mode.md#header-controls)).
+- **Per agent.** Each read is the agent's own, with no model call and no quota spent:
+  - **Claude** — a short-lived `claude -p` stream-json process answers the `initialize` and
+    `get_usage` controls (no MCP servers via `--strict-mcp-config`, no hooks via a process-only
+    `disableAllHooks`; under two seconds; nothing written to the user's settings): the session and
+    weekly windows, per-model weekly windows ("weekly Fable limit"), and extra usage only while
+    it is switched on.
+  - **Codex** — a short-lived `codex app-server` answers `account/rateLimits/read`.
+  - **Grok** — a short-lived `grok agent stdio` answers its `_x.ai/billing` extension right after
+    `initialize` (no session): the period's credit usage ("weekly limit") and its end.
+  - **Antigravity** — the CLI's own `agy -p /usage --output-format json` (it "answers without
+    starting an agent turn"): a session and a weekly window per model group ("Gemini session
+    limit"); an untouched window shows no reset time (it reports "now + window").
+  - **Cursor** — nothing a host can read (its usage panel calls Cursor's own servers): no section.
+- **Where it lives.** `agent_probe/usage.rs` (`GET /api/v1/agents/{id}/usage[?refresh=true]` →
+  `{agent, windows, limit_reached, checked_at_ms, error?}`, 404 for agents without a read; under
+  the daemon-wide probe gate and the probe cache, login-shell wrapped with the host prelude,
+  `$HOME` as the working directory, process-group teardown); the parsers live with the drivers
+  (`claude::usage_windows`, `codex::rate_limit_usage`, `acp::grok_billing_usage`). UI:
+  `settings/agentUsage.ts`, `AgentsSettings.svelte`, `shared/UsageBars.svelte`.
+- **Key behaviors.** Only answers are cached, so a sign-in or a network blip is asked again on
+  the next look; a failed read says so in one line (its reason on hover), never a zero.
+
 ## Cursor CLI
 
 - **What & when.** Cursor's terminal agent (`cursor-agent`, linked as `agent` too) as a fifth
