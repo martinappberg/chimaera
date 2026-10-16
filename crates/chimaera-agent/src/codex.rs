@@ -10306,7 +10306,7 @@ mod tests {
             step.outbound[0]["params"]["excludeResetCreditDetails"],
             true
         );
-        let step = read_rate_limits(
+        let step = answer_rate_limits(
             &mut m,
             step,
             json!({
@@ -10355,7 +10355,7 @@ mod tests {
     }
 
     /// Answer the `account/rateLimits/read` that `step` sent.
-    fn read_rate_limits(m: &mut CodexMapper, step: DriverStep, result: Value) -> DriverStep {
+    fn answer_rate_limits(m: &mut CodexMapper, step: DriverStep, result: Value) -> DriverStep {
         let sent = step
             .outbound
             .iter()
@@ -10376,7 +10376,7 @@ mod tests {
             "params": { "threadId": "thr-1", "turn": { "id": "turn-A", "status": "completed" } },
         }));
         // Live 0.162.1 Pro account: one weekly window, no session window.
-        let step = read_rate_limits(
+        let step = answer_rate_limits(
             &mut m,
             end,
             json!({
@@ -10430,7 +10430,7 @@ mod tests {
         assert!(step.events.is_empty(), "{:?}", step.events);
         // /usage lists both windows the merge holds.
         let usage = m.on_command(AgentCommand::GetUsage);
-        let step = read_rate_limits(
+        let step = answer_rate_limits(
             &mut m,
             usage,
             json!({
@@ -10458,7 +10458,7 @@ mod tests {
         // The backend's verdict, not the percentages.
         let mut m = mapper();
         let usage = m.on_command(AgentCommand::GetUsage);
-        let step = read_rate_limits(
+        let step = answer_rate_limits(
             &mut m,
             usage,
             json!({
@@ -10491,6 +10491,18 @@ mod tests {
             [AgentEvent::RateLimit { limit_reached: true, label: Some(label), .. }]
                 if label == "usage limit"
         ));
+    }
+
+    #[test]
+    fn rate_limit_windows_never_repeat_a_label() {
+        // The /usage panel keys rows by label: two windows of one duration
+        // (or both without one) must still read apart.
+        let limits = RateLimits::read(&json!({ "rateLimits": rate_snapshot(
+            json!({ "usedPercent": 5, "windowDurationMins": null, "resetsAt": null }),
+            json!({ "usedPercent": 9, "windowDurationMins": null, "resetsAt": null }),
+        ) }));
+        let labels: Vec<_> = limits.windows().into_iter().map(|(.., l)| l).collect();
+        assert_eq!(labels, ["usage limit", "usage limit (2)"]);
     }
 
     #[test]

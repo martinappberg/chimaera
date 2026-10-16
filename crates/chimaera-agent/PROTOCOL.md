@@ -3381,5 +3381,5 @@ The Codex limit chip and `/usage` panel had been empty: the driver read limits f
 
 ### Gate (Pass 46)
 
-- Hermetic (`codex.rs`): `thread_name_and_usage_limits_map` (now the read's shape), `rate_limits_poll_each_turn_end_and_merge_rolling_updates`, `rate_limits_say_when_usage_is_refused`, `usage_answers_even_without_plan_limits`.
+- Hermetic (`codex.rs`): `thread_name_and_usage_limits_map` (now the read's shape), `rate_limits_poll_each_turn_end_and_merge_rolling_updates`, `rate_limits_say_when_usage_is_refused`, `rate_limit_windows_never_repeat_a_label`, `usage_answers_even_without_plan_limits`. A live probe also showed 0.162.1 ignores an unknown param on this read, so `excludeResetCreditDetails` cannot break a build that predates it.
 - Live: `codex_steer_settings_and_account_surface` now pins `account/rateLimits/read`'s snapshot and window shape. Through the isolated daemon, a Codex chat's `/usage` (no turn) went from an empty report on main to `weekly limit · 6%` plus the matching chip. The codex half of `just chat-smoke` was run.
