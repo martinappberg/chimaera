@@ -402,6 +402,7 @@
   import { loadPaneView, retryPaneView } from "./lib/layout/lazyViews";
   import AskpassModal from "./lib/workspace/AskpassModal.svelte";
   import ContextMenuHost from "./lib/shared/ContextMenuHost.svelte";
+  import SlowLoad from "./lib/shared/SlowLoad.svelte";
   import { contextMenu } from "./lib/shared/contextMenu.svelte";
   import ConfirmDialog from "./lib/shared/ConfirmDialog.svelte";
   import CloseDirtyDialog from "./lib/layout/CloseDirtyDialog.svelte";
@@ -5529,7 +5530,7 @@
          settings panel must not freeze the whole Home window. -->
     {#if homeLoad !== null}
       {#await homeLoad}
-        {#if !homeSettingsOpen}<p role="status">Loading Home…</p>{/if}
+        {#if !homeSettingsOpen}<SlowLoad>Loading Home…</SlowLoad>{/if}
       {:then HomeScreen}
         <div class="home-host" class:parked={homeSettingsOpen} inert={homeSettingsOpen}>
           <svelte:boundary onerror={(e) => console.error("home failed", e)}>
