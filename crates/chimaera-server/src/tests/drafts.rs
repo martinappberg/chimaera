@@ -419,3 +419,49 @@ async fn drafts_never_take_the_shared_filesystem_permits() {
     let (_, body) = request(&state, Method::GET, "/api/v1/fs/drafts", None).await;
     assert_eq!(body["drafts"].as_array().unwrap().len(), 12);
 }
+
+/// A draft file past what any PUT can produce is not ours: it reads as no
+/// draft (logged), never into memory whole.
+#[tokio::test]
+async fn drafts_ignore_a_file_over_the_read_cap() {
+    let state = test_state();
+    let (status, _) = put_draft(&state, "/w/big.md", None, "small").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let body = serde_json::json!({"path": "/w/big.md", "base_hash": null,
+        "updated_ms": 1, "bytes": 1, "text": "x"});
+    std::fs::write(
+        draft_file(&state, "/w/big.md"),
+        super::recents::oversized(&body.to_string(), crate::drafts::MAX_DRAFT_FILE_BYTES),
+    )
+    .unwrap();
+    let (status, _) = request(&state, Method::GET, &draft_uri("/w/big.md"), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A draft file that is there but unreadable is an error to GET (not "no
+/// draft"), and a writer-scoped DELETE that can't tell whose it is leaves it.
+#[tokio::test]
+async fn drafts_keep_an_unreadable_draft_file() {
+    let state = test_state();
+    let (status, _) = put_draft(&state, "/w/odd.md", None, "t").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let file = draft_file(&state, "/w/odd.md");
+    std::fs::remove_file(meta_file(&state, "/w/odd.md")).unwrap();
+    std::fs::remove_file(&file).unwrap();
+    std::fs::create_dir(&file).unwrap();
+
+    let (status, _) = request(&state, Method::GET, &draft_uri("/w/odd.md"), None).await;
+    assert!(
+        !status.is_success() && status != StatusCode::NOT_FOUND,
+        "an unreadable draft is an error, not an absent one: {status}"
+    );
+    let (status, _) = request(
+        &state,
+        Method::DELETE,
+        "/api/v1/fs/draft?path=/w/odd.md&writer=win-a",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(file.is_dir());
+}

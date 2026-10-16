@@ -42,6 +42,7 @@ async fn ledger_resurrects_sessions_across_restart() {
     // PTY: the "daemon" is going down, taking its children with it.
     let (entries, links) = ledger::snapshot(&state);
     assert_eq!(entries.len(), 1, "the live shell is in the ledger");
+    lock(&state.ledger).load_boot(); // as `run`'s boot read would
     lock(&state.ledger).write_if_changed(&entries, &links);
     state.sessions.kill(&sid).ok();
 
@@ -369,4 +370,175 @@ async fn hidden_workspace_is_unlisted_and_its_sessions_stay_out_of_the_ledger() 
     for sid in sids {
         state.sessions.kill(&sid).ok();
     }
+}
+
+fn ledger_shell(id: &str) -> ledger::LedgerEntry {
+    ledger::LedgerEntry {
+        id: id.into(),
+        workspace_id: "w1".into(),
+        cwd: PathBuf::from("/tmp"),
+        pinned_name: None,
+        cols: 80,
+        rows: 24,
+        theme: "dark".into(),
+        created_at: 1,
+        agent: None,
+    }
+}
+
+#[test]
+fn ledger_store_missing_file_boots_empty_and_round_trips() {
+    let path = test_dir("ledger-missing").join("sessions.json");
+    let mut store = ledger::LedgerStore::new(path.clone());
+    assert!(store.is_held(), "held until the boot read lands");
+    assert!(store.load_boot().sessions.is_empty());
+    store.write_if_changed(&[ledger_shell("s-1")], &std::collections::HashMap::new());
+    let boot = ledger::LedgerStore::new(path).load_boot();
+    assert_eq!(boot.sessions, vec![ledger_shell("s-1")]);
+}
+
+/// Over the cap: an empty boot (logged), and the reconcile loop's next
+/// write replaces the runaway file.
+#[test]
+fn ledger_store_oversized_file_boots_empty_and_is_replaced() {
+    let path = test_dir("ledger-big").join("sessions.json");
+    let old = r#"{"sessions":[{"id":"s-old","workspace_id":"w1","cwd":"/tmp","cols":80,"rows":24}],"links":{}}"#;
+    std::fs::write(
+        &path,
+        super::recents::oversized(old, ledger::MAX_LEDGER_BYTES),
+    )
+    .unwrap();
+    let mut store = ledger::LedgerStore::new(path.clone());
+    assert!(store.load_boot().sessions.is_empty());
+    store.write_if_changed(&[ledger_shell("s-1")], &std::collections::HashMap::new());
+    let boot = ledger::LedgerStore::new(path).load_boot();
+    assert_eq!(boot.sessions, vec![ledger_shell("s-1")]);
+}
+
+/// Unreadable at boot: the previous daemon's sessions are still in the
+/// file, unresurrected — no write replaces it for this daemon's lifetime,
+/// so the next boot can try again.
+#[test]
+fn ledger_store_unreadable_file_holds_every_write() {
+    let dir = test_dir("ledger-dir").join("sessions.json");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut store = ledger::LedgerStore::new(dir.clone());
+    assert!(store.load_boot().sessions.is_empty());
+    store.write_if_changed(&[ledger_shell("s-1")], &std::collections::HashMap::new());
+    assert!(dir.is_dir());
+
+    let path = test_dir("ledger-perm").join("sessions.json");
+    let body = br#"{"v":1,"sessions":[],"links":{},"written_at":7}"#;
+    if !super::recents::unreadable_file(&path, body) {
+        return; // root reads anything
+    }
+    let mut store = ledger::LedgerStore::new(path.clone());
+    assert!(store.load_boot().sessions.is_empty());
+    store.write_if_changed(&[ledger_shell("s-1")], &std::collections::HashMap::new());
+    store.write_if_changed(&[ledger_shell("s-2")], &std::collections::HashMap::new());
+    assert_eq!(super::recents::readable_again(&path), body.to_vec());
+}
+
+/// An old ledger with one codex conversation (it can only retire).
+fn old_ledger(ws: &str) -> String {
+    serde_json::json!({"v": 1, "written_at": 7, "links": {}, "sessions": [{
+        "id": "s-old", "workspace_id": ws, "cwd": "/tmp", "cols": 80, "rows": 24,
+        "agent": {"kind": "codex", "title": "old work", "resume": null}}]})
+    .to_string()
+}
+
+async fn until(what: &str, mut done: impl FnMut() -> bool) {
+    for _ in 0..300 {
+        if done() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+/// The production boot path (`run`: the boot read on the blocking pool,
+/// then the hold): an unreadable ledger holds every write; once it reads,
+/// the next tick retires the previous daemon's agents into Recents and the
+/// write lands.
+#[tokio::test]
+async fn ledger_run_holds_an_unreadable_ledger_until_it_reads_then_retires_it() {
+    let data = test_dir("ledger-run-held");
+    let path = data.join("sessions.json");
+    let body = old_ledger("w-old");
+    if !super::recents::unreadable_file(&path, body.as_bytes()) {
+        return; // root reads anything
+    }
+    let state = test_state_with_data_dir(0, data);
+    state.restored.send_replace(false);
+    let task = tokio::spawn(ledger::run(state.clone()));
+    until("the boot read", || *state.restored.borrow()).await;
+    assert!(lock(&state.ledger).is_held());
+    state.changes.notify_waiters();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        super::recents::readable_again(&path),
+        body.as_bytes(),
+        "held"
+    );
+
+    until("the hold to lift", || {
+        state.changes.notify_waiters();
+        !lock(&state.ledger).is_held()
+    })
+    .await;
+    let titles: Vec<String> = lock(&state.recents)
+        .list("w-old")
+        .into_iter()
+        .map(|e| e.title)
+        .collect();
+    assert_eq!(titles, ["old work"], "retired, not dropped");
+    until("the write", || {
+        std::fs::read_to_string(&path).is_ok_and(|now| now != body)
+    })
+    .await;
+    task.abort();
+}
+
+/// Held at a graceful stop: nothing is written over the ledger, and this
+/// daemon's live agent sessions retire into Recents instead of vanishing.
+#[tokio::test]
+async fn ledger_held_at_stop_retires_live_agents_to_recents() {
+    let data = test_dir("ledger-stop-held");
+    let path = data.join("sessions.json");
+    std::fs::create_dir_all(&path).unwrap();
+    let state = test_state_with_data_dir(0, data);
+    lock(&state.ledger).load_boot(); // booted, unreadable
+    let sid = inject_silent_agent(&state, "k-held");
+    plant_agent_record(
+        &state,
+        &sid,
+        "w-live",
+        agents::AgentKind::Claude,
+        Some("live work"),
+        None,
+    );
+    ledger::final_flush(&state).await;
+    let titles: Vec<String> = lock(&state.recents)
+        .list("w-live")
+        .into_iter()
+        .map(|e| e.title)
+        .collect();
+    assert_eq!(titles, ["live work"]);
+    assert!(path.is_dir(), "nothing written over it");
+    state.sessions.kill(&sid).ok();
+}
+
+/// A stop before the boot read lands writes nothing: the file still holds
+/// the previous daemon's sessions for the successor.
+#[tokio::test]
+async fn ledger_stop_during_the_boot_read_never_overwrites_the_file() {
+    let data = test_dir("ledger-stop-boot");
+    let path = data.join("sessions.json");
+    let body = old_ledger("w-old");
+    std::fs::write(&path, &body).unwrap();
+    let state = test_state_with_data_dir(0, data);
+    assert!(lock(&state.ledger).is_held(), "held from construction");
+    ledger::final_flush(&state).await;
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
 }

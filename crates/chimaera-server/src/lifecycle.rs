@@ -6,7 +6,7 @@ use anyhow::Context;
 use tokio::net::TcpListener;
 
 use crate::{agent_updates, git, ledger, proxy, recents, runtimes, settings, update};
-use crate::{app, lock, AppState, ServerConfig};
+use crate::{app, AppState, ServerConfig};
 
 /// Bind on 127.0.0.1, write the manifest, and serve until SIGINT/SIGTERM.
 pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
@@ -214,8 +214,9 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     // them back (resumable ones live, the rest into Recents at boot). We must
     // NOT retire the LIVE chats here: that removes their workspace mapping, so
     // the reconciler's next snapshot would drop them and they'd never resurrect.
-    let (entries, links) = ledger::snapshot(&state);
-    lock(&state.ledger).write_if_changed(&entries, &links);
+    // The one exception is `final_flush`'s own fallback: a ledger it still
+    // can't read is left alone, and then the live agents retire to Recents.
+    ledger::final_flush(&state).await;
 
     // A relay child (`ssh -N -L`) outlives its parent unless killed — never
     // strand one on a login node.

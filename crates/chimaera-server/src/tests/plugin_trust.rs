@@ -694,3 +694,34 @@ async fn a_first_party_plugin_is_verified_and_asks_nothing() {
         "the lock covers it: no record"
     );
 }
+
+/// Only a MISSING trust file grandfathers what is installed. An oversized
+/// or unreadable one fails closed like a corrupt one — nothing it said is
+/// trusted — and boot leaves it as it is.
+#[tokio::test]
+async fn an_oversized_or_unreadable_trust_file_fails_closed_and_is_left_alone() {
+    let data = test_dir("tr-big");
+    std::fs::create_dir_all(data.join("plugins")).unwrap();
+    let file = data.join("plugins/trust.json");
+    let big = super::recents::oversized(r#"{"schema":1,"records":[]}"#, trust::TRUST_MAX);
+    std::fs::write(&file, &big).unwrap();
+    let state = test_state_with_data_dir(0, data);
+    let broken = trust::broken_for_tests(&state).expect("oversized fails closed");
+    assert!(broken.contains("cap"), "{broken}");
+    assert_eq!(std::fs::metadata(&file).unwrap().len(), big.len() as u64);
+
+    let data = test_dir("tr-dir");
+    let dir = data.join("plugins/trust.json");
+    std::fs::create_dir_all(&dir).unwrap();
+    let state = test_state_with_data_dir(0, data);
+    assert!(trust::broken_for_tests(&state).is_some());
+    assert!(dir.is_dir());
+
+    let data = test_dir("tr-missing");
+    let state = test_state_with_data_dir(0, data.clone());
+    assert_eq!(trust::broken_for_tests(&state), None);
+    assert!(
+        data.join("plugins/trust.json").is_file(),
+        "the first file is written"
+    );
+}

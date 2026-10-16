@@ -1,6 +1,5 @@
 //! Persistent workspace registry: `{id, root, name}` records stored as JSON.
 
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -65,10 +64,68 @@ pub(crate) struct Workspace {
     pub(crate) new_in_worktree: bool,
 }
 
+/// Read cap for `workspaces.json`. A record is a PATH_MAX root, a name, a
+/// Mastermind binding and a few plugin ids — under ~10 KiB even pretty-printed
+/// at its worst, a few hundred bytes in practice — so 8 MiB is hundreds of
+/// worst-case workspaces and tens of thousands of real ones. A file past it
+/// is corruption: it loads empty and the next save replaces it.
+pub(crate) const MAX_WORKSPACES_BYTES: usize = 8 * 1024 * 1024;
+
+/// The store's file name, for its log lines.
+const WORKSPACES_FILE: &str = "workspaces.json";
+
+/// A save refused because `workspaces.json` is there but can't be read:
+/// writing this daemon's list over it would lose the user's. Routes answer
+/// it with 503.
+#[derive(Debug)]
+pub(crate) struct Held;
+
+impl std::fmt::Display for Held {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the saved workspace list can't be read right now, so this change wasn't made; try again shortly")
+    }
+}
+
+impl std::error::Error for Held {}
+
+/// One bounded read of `workspaces.json`, retired plugins' switches
+/// dropped: `Err` when it couldn't be read; missing, oversized and corrupt
+/// are an empty list (logged). The flag says whether a switch was dropped.
+fn read_workspaces(path: &Path) -> Result<(Vec<Workspace>, bool), std::io::Error> {
+    let mut items: Vec<Workspace> = match crate::persist::read_bounded(path, MAX_WORKSPACES_BYTES) {
+        crate::persist::Bounded::Ok(contents) => match serde_json::from_slice(&contents) {
+            Ok(items) => items,
+            Err(err) => {
+                tracing::warn!(path = %path.display(), %err, "corrupt workspaces.json; starting with an empty workspace list");
+                Vec::new()
+            }
+        },
+        crate::persist::Bounded::Missing => Vec::new(),
+        crate::persist::Bounded::TooLarge => {
+            tracing::warn!(path = %path.display(), "workspaces.json exceeds {MAX_WORKSPACES_BYTES} bytes; starting with an empty workspace list");
+            Vec::new()
+        }
+        crate::persist::Bounded::Io(err) => return Err(err),
+    };
+    let mut dropped = false;
+    for w in &mut items {
+        let before = w.plugins_on.len();
+        w.plugins_on
+            .retain(|p| crate::plugins::retired::of(p).is_none());
+        dropped |= w.plugins_on.len() != before;
+    }
+    Ok((items, dropped))
+}
+
 /// In-memory workspace list backed by a JSON file (save-on-change).
 pub(crate) struct WorkspaceStore {
     path: PathBuf,
     items: Vec<Workspace>,
+    /// The file is there but couldn't be read: saves refuse ([`Held`]) so
+    /// an I/O hiccup can never replace the user's list with this one. Each
+    /// save retries the read first; once it reads, the lists merge and the
+    /// hold lifts.
+    hold: crate::persist::Hold,
     /// Bumped per snapshot: what `written` compares.
     generation: u64,
     /// The generation last on disk, behind the one lock every write takes.
@@ -117,34 +174,21 @@ pub(crate) struct SwitchUndo {
 }
 
 impl WorkspaceStore {
-    /// Load the store from `path`. A missing or corrupt file yields an empty
-    /// store (with a warning for the corrupt case). A retired plugin's
-    /// switch is dropped everywhere, and the list saved once if any was on.
+    /// Load the store from `path` (blocking; boot). A missing, oversized or
+    /// corrupt file yields an empty store (with a warning for the latter
+    /// two); an unreadable one an empty store whose saves are held. A
+    /// retired plugin's switch is dropped everywhere, and the list saved
+    /// once if any was on.
     pub(crate) fn load(path: PathBuf) -> Self {
-        let mut items: Vec<Workspace> = match std::fs::read_to_string(&path) {
-            Ok(contents) => match serde_json::from_str(&contents) {
-                Ok(items) => items,
-                Err(err) => {
-                    tracing::warn!(path = %path.display(), %err, "corrupt workspaces.json; starting with an empty workspace list");
-                    Vec::new()
-                }
-            },
-            Err(err) if err.kind() == ErrorKind::NotFound => Vec::new(),
-            Err(err) => {
-                tracing::warn!(path = %path.display(), %err, "failed to read workspaces.json; starting with an empty workspace list");
-                Vec::new()
-            }
-        };
-        let mut dropped = false;
-        for w in &mut items {
-            let before = w.plugins_on.len();
-            w.plugins_on
-                .retain(|p| crate::plugins::retired::of(p).is_none());
-            dropped |= w.plugins_on.len() != before;
-        }
+        let mut hold = crate::persist::Hold::default();
+        let (items, dropped) = read_workspaces(&path).unwrap_or_else(|err| {
+            hold.note(&path, WORKSPACES_FILE, err);
+            (Vec::new(), false)
+        });
         let mut store = WorkspaceStore {
             path,
             items,
+            hold,
             generation: 0,
             written: Arc::new(Mutex::new(0)),
         };
@@ -155,6 +199,48 @@ impl WorkspaceStore {
             }
         }
         store
+    }
+
+    /// A held store's retry (blocking, where the save runs): when the file
+    /// reads now, its records merge with this daemon's — memory wins per id
+    /// and per root (this daemon's sessions point at its ids) — and the
+    /// hold lifts. Returns whether a save may go ahead.
+    fn retry_held(&mut self) -> bool {
+        if !self.hold.is_held() {
+            return true;
+        }
+        let disk = match read_workspaces(&self.path) {
+            Ok((disk, _)) => disk,
+            Err(err) => {
+                self.hold.note(&self.path, WORKSPACES_FILE, err);
+                return false;
+            }
+        };
+        let mut merged: Vec<Workspace> = Vec::with_capacity(disk.len() + self.items.len());
+        for record in disk {
+            if let Some(mine) = self.items.iter().find(|w| w.id == record.id) {
+                merged.push(mine.clone());
+            } else if let Some(mine) = self.items.iter().find(|w| w.root == record.root) {
+                // This daemon's sessions map to its own id, so it wins; the
+                // dropped record's data stays on disk under its id.
+                tracing::warn!(
+                    root = %record.root.display(),
+                    dropped_id = %record.id,
+                    kept_id = %mine.id,
+                    "workspaces.json readable again: a record for this folder under another id was dropped; its data stays under workspace/<dropped_id>"
+                );
+            } else {
+                merged.push(record);
+            }
+        }
+        for mine in &self.items {
+            if !merged.iter().any(|w| w.id == mine.id) {
+                merged.push(mine.clone());
+            }
+        }
+        self.items = merged;
+        self.hold.release(&self.path, WORKSPACES_FILE);
+        true
     }
 
     pub(crate) fn list(&self) -> Vec<Workspace> {
@@ -184,7 +270,12 @@ impl WorkspaceStore {
             if let Some(existing) = self.items.iter_mut().find(|w| w.id == workspace.id) {
                 existing.hidden = true;
             }
-            self.save()?;
+            if let Err(err) = self.save() {
+                if let Some(existing) = self.items.iter_mut().find(|w| w.id == workspace.id) {
+                    existing.hidden = false;
+                }
+                return Err(err);
+            }
         }
         Ok(workspace)
     }
@@ -195,11 +286,19 @@ impl WorkspaceStore {
 
     /// Register `root` (must already be canonical). Idempotent per canonical
     /// root; re-registering stamps the existing entry as freshly opened.
+    /// A refused save takes the change back: memory never shows a
+    /// workspace the caller was told wasn't added.
     pub(crate) fn add(&mut self, root: PathBuf) -> anyhow::Result<Workspace> {
-        if let Some(existing) = self.items.iter_mut().find(|w| w.root == root) {
-            existing.last_opened_at = unix_now();
-            let workspace = existing.clone();
-            self.save()?;
+        if let Some(i) = self.items.iter().position(|w| w.root == root) {
+            let was = self.items[i].last_opened_at;
+            self.items[i].last_opened_at = unix_now();
+            let workspace = self.items[i].clone();
+            if let Err(err) = self.save() {
+                if let Some(w) = self.items.iter_mut().find(|w| w.id == workspace.id) {
+                    w.last_opened_at = was;
+                }
+                return Err(err);
+            }
             return Ok(workspace);
         }
         let name = workspace_name(&root);
@@ -215,7 +314,10 @@ impl WorkspaceStore {
             hidden: false,
         };
         self.items.push(workspace.clone());
-        self.save()?;
+        if let Err(err) = self.save() {
+            self.items.retain(|w| w.id != workspace.id);
+            return Err(err);
+        }
         Ok(workspace)
     }
 
@@ -248,7 +350,10 @@ impl WorkspaceStore {
                 hidden: false,
             },
         );
-        self.save()?;
+        if let Err(err) = self.save() {
+            self.items.remove(0);
+            return Err(err);
+        }
         Ok(true)
     }
 
@@ -259,14 +364,17 @@ impl WorkspaceStore {
         entry.last_opened_at = unix_now();
         let workspace = entry.clone();
         if let Err(err) = self.save() {
-            tracing::warn!(%err, "failed to persist workspace touch");
+            // A hold has already said so, once.
+            if !err.is::<Held>() {
+                tracing::warn!(%err, "failed to persist workspace touch");
+            }
         }
         Some(workspace)
     }
 
     /// Remember whether new agents in `id` start in their own worktree.
-    /// `Ok(None)` = unknown workspace. A lost write is cosmetic (the choice
-    /// reverts at the next restart), so the in-memory value stays either way.
+    /// `Ok(None)` = unknown workspace. A refused save takes the change back,
+    /// so memory and the caller's answer agree.
     pub(crate) fn set_new_in_worktree(
         &mut self,
         id: &str,
@@ -278,9 +386,15 @@ impl WorkspaceStore {
         if entry.new_in_worktree == on {
             return Ok(Some(entry.clone()));
         }
+        let was = entry.new_in_worktree;
         entry.new_in_worktree = on;
         let workspace = entry.clone();
-        self.save()?;
+        if let Err(err) = self.save() {
+            if let Some(entry) = self.items.iter_mut().find(|w| w.id == id) {
+                entry.new_in_worktree = was;
+            }
+            return Err(err);
+        }
         Ok(Some(workspace))
     }
 
@@ -436,18 +550,25 @@ impl WorkspaceStore {
 
     /// Unregister `id` (never touches the directory). Returns whether it
     /// existed.
+    /// A refused save puts it back where it was.
     pub(crate) fn remove(&mut self, id: &str) -> anyhow::Result<bool> {
-        let before = self.items.len();
-        self.items.retain(|w| w.id != id);
-        let removed = self.items.len() != before;
-        if removed {
-            self.save()?;
+        let Some(i) = self.items.iter().position(|w| w.id == id) else {
+            return Ok(false);
+        };
+        let gone = self.items.remove(i);
+        if let Err(err) = self.save() {
+            self.items.insert(i, gone);
+            return Err(err);
         }
-        Ok(removed)
+        Ok(true)
     }
 
-    /// The list as it is now, stamped with the next generation.
+    /// The list as it is now, stamped with the next generation. Refused
+    /// ([`Held`]) while the file on disk can't be read.
     fn snapshot(&mut self) -> anyhow::Result<Snapshot> {
+        if !self.retry_held() {
+            return Err(Held.into());
+        }
         let bytes = serde_json::to_vec_pretty(&self.items)?;
         self.generation += 1;
         Ok(Snapshot {
