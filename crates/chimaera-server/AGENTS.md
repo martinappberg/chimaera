@@ -28,7 +28,7 @@ Orientation for coding agents. This crate is the daemon: every HTTP route, every
 | `subagents.rs`, `recents_archive.rs`, `knowledge.rs` | A subagent's transcript; archived Recents; the Knowledge snapshot. |
 | `plugins/` | The plugin host: lock, catalog, trust, runtime, platform, jobs. |
 | `agent_probe.rs` + `agent_probe/` | Ask agents: plugins, skills, connections, extensions, usage. |
-| `comms.rs`, `mcp.rs` | Agent communication; the per-session MCP endpoint and tiers. |
+| `comms.rs`, `mcp.rs` | Agent communication; the per-session MCP endpoint and tiers. Chat instructions require a final task-tool update before replying; no user refresh action or inferred completion. |
 | `workspaces`, `links`, `settings`, `quickopen`, `recents`, `naming`, `view_state` | Roots, linked terminals, settings, palette, Recents, view-state. |
 
 Cross-module topics: [status feed](REFERENCE.md#the-status-feed-v02), [Mastermind](REFERENCE.md#the-mastermind--the-coordinator-inside-agent-communication), [Codex MCP injection](REFERENCE.md#codex-mcp-injection), [chat-mode seam](REFERENCE.md#chatrs--the-chat-mode-seam), [agent integration](REFERENCE.md#agent-integration-and-view-persistence).

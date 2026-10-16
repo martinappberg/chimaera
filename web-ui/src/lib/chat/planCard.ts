@@ -6,8 +6,7 @@
  */
 import type { PlanEntry } from "./store.svelte";
 
-/** How a step's circle draws: filled check, the plain current circle, a
- *  dashed waiting circle, or a dashed circle that is waiting on others. */
+/** Task checkboxes stay visually distinct from scheduled-run clocks. */
 export type StepMark = "done" | "current" | "todo" | "blocked";
 
 /** Blocked is orthogonal to status: a blocked task is still `todo`. The
@@ -20,9 +19,9 @@ export function stepMark(entry: PlanEntry): StepMark {
 
 /** A step's line: the agent's present-continuous phrasing while it is the
  *  one in flight ("Running tests"), else its subject. */
-export function stepText(entry: PlanEntry): string {
+export function stepText(entry: PlanEntry, running = true): string {
   const active = entry.activeForm?.trim();
-  return entry.status === "in_progress" && active ? active : entry.content;
+  return running && entry.status === "in_progress" && active ? active : entry.content;
 }
 
 /** The second line, only when it adds something: agents often restate the
@@ -50,10 +49,10 @@ export function planProgress(entries: readonly PlanEntry[]): PlanProgress {
   };
 }
 
-/** A finished plan folds to one line once its turn is over; while the turn
- *  runs — or any step is left — the steps stay in view. */
+/** Idle plans are a compact record, even when the agent left steps open.
+ *  Only an agent update can mark a step complete. */
 export function planFolds(entries: readonly PlanEntry[], running: boolean): boolean {
-  return !running && planProgress(entries).allDone;
+  return !running && entries.length > 0;
 }
 
 /** Whether the pinned card shows the plan: one with open steps always (it
@@ -65,10 +64,10 @@ export function planShows(entries: readonly PlanEntry[], touched: boolean): bool
 }
 
 /** The folded line: the step in flight, else what is next, else the tally. */
-export function planSummary(entries: readonly PlanEntry[]): string {
+export function planSummary(entries: readonly PlanEntry[], running = true): string {
   const p = planProgress(entries);
   if (p.allDone) return p.total === 1 ? "1 task done" : `${p.total} tasks done`;
-  if (p.current !== null) return stepText(p.current);
+  if (p.current !== null) return stepText(p.current, running);
   const next = entries.find((e) => e.status !== "done");
   return next !== undefined ? next.content : "";
 }

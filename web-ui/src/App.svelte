@@ -28,6 +28,7 @@
   import { pageVisible } from "./lib/shared/visibility";
   import {
     backgrounded,
+    branchLabel,
     createSession,
     deleteSession,
     deleteWorkspace,
@@ -4638,9 +4639,7 @@
             </svg>
             {#if stripGit.label}<span class="dg-repo">{stripGit.label}</span>{/if}
             <span class="dg-branch"
-              >{gs.detached
-                ? `No branch (at ${gs.head ?? "?"})`
-                : (gs.branch ?? "No commits yet")}</span
+              >{branchLabel(gs)}</span
             >
             {#if gs.ahead > 0}<span class="dg-ab" title={aheadBehindWords(gs.ahead, 0, gs.upstream)}>↑{gs.ahead}</span>{/if}
             {#if gs.behind > 0}<span class="dg-ab" title={aheadBehindWords(0, gs.behind, gs.upstream)}>↓{gs.behind}</span>{/if}

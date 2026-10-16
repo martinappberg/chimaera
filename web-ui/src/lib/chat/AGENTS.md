@@ -27,14 +27,14 @@ daemon  ──WS /ws/chat/{id}──▶  chatWs.ts (ChatSocket)
 | `transcriptWindow.ts`, `readingAnchor.ts`, `heightModel.ts` | Window math, reading anchor, row heights. |
 | `Markdown`, `streamSegments.ts`, `revealLedger.ts`, `tables.ts`, `markedExtensions.ts`, `MathText`, `math.ts` | Sanitized prose and math, streamed. |
 | `ChatHeader`, `ModelPicker`, `EffortPopover`, `capabilities.ts` | Header controls from capabilities. |
-| `Composer`, `composer.ts`, `composerHeight.ts`, `composerBus.ts`, `drafts.ts` | Input, slash completion, inserts, drafts. |
+| `Composer`, `composer.ts`, `composerHeight.ts`, `composerBus.ts`, `drafts.ts` | Input, slash completion, inserts, drafts; one context row for branch/worktree, linked terminals and notices, only when populated; terminal completion opens through `@term`, with no permanent launcher. |
 | `uploadTokens.ts`, `uploadChips.ts`, `ComposerMentions`, `terminalMentions.ts` | Atomic mention tokens in the draft. |
 | `voice*.ts`, `VoiceMeter` | Voice dictation. |
 | `images.ts`, `AttachmentStrip`, `ImagePreview` | Image attachments and tiles. |
 | `ToolCallCard`, `ToolGroup`, `toolLabels.ts` | Tool calls and their one-line labels. |
 | `Activity*`, `activityFold.ts`, `FinishedFold`, `FinishedRow` | Folds of settled activity. |
 | `ThoughtRow`, `thoughtText.ts`, `HookRow`, `hookNotice.ts`, `statusWord.ts` | Thought and hook lines; status word. |
-| `AgentsTray`, `BackgroundTray`, `PlanCard`, `AheadCard`, `WorkStrip` | Pinned work cards. |
+| `AgentsTray`, `BackgroundTray`, `PlanCard`, `AheadCard`, `WorkStrip`, `workStrip.ts` | Pinned work cards; one shared inventory folds three kinds (including tasks) into a labelled strip; Running groups background agents and commands behind an activity icon. Idle tasks fold without adding a status label or refresh action; task tools own completion. |
 | `subagent*.ts`, `SubagentBanner`, `SubagentChip`, `ModelChip` | A subagent as a read-only chat. |
 | `AgentMessageCards`, `agentMessages.ts`, `WakeRequestBar` | Other agents' messages and wake requests. |
 | `PermissionCard`, `QuestionCard`, `PlanApprovalCard`, `Elicitation*` | Answers to the agent. |

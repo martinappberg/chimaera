@@ -13,8 +13,8 @@
    * default: the header count is the glance; the rows are a click away.
    */
   interface Props {
-    /** Header glyph (✳ subagents, ⧖ background) — the tray's identity. */
-    glyph: string;
+    /** Header glyph — text or a shared icon. */
+    glyph: string | Snippet;
     /** The one-line collapsed summary ("2 subagents working"). */
     label: string;
     /** Expanded state — bindable so a tray can gate its own work (e.g. a
@@ -45,7 +45,7 @@
   >
     <!-- The breath means "work is happening right now"; a hidden tab's
          glyph goes still (nobody sees it). -->
-    <span class="spark" class:still={!visible} aria-hidden="true">{glyph}</span>
+    <span class="spark" class:still={!visible} aria-hidden="true">{#if typeof glyph === "string"}{glyph}{:else}{@render glyph()}{/if}</span>
     <!-- aria-live on the summary only: the count changing is worth
          announcing, per-row churn is not. -->
     <span class="head-label" role="status" aria-live={visible ? "polite" : "off"}>{label}</span>
@@ -109,11 +109,14 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  /* The glyph is a text character; a fixed slot keeps the label's edge where
-     the plan card's marks put theirs. */
+  /* A fixed centered slot aligns text glyphs and SVGs with the label. */
   .spark {
     flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     width: 14px;
+    height: 14px;
     text-align: center;
     color: var(--accent);
     /* Presence, not alarm — shared keyframe in app.css. */

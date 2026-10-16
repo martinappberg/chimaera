@@ -3,6 +3,7 @@
   import { cubicOut } from "svelte/easing";
   import { slide } from "svelte/transition";
   import Chevron from "../shared/Chevron.svelte";
+  import TaskListGlyph from "../shared/TaskListGlyph.svelte";
   import type { PlanEntry } from "./store.svelte";
   import {
     planFolds,
@@ -17,14 +18,14 @@
 
   /**
    * The agent's plan as a card above the composer — one row per step, a
-   * circle that says its state without colour (filled check: done; plain
-   * circle: the one in flight; dashed: waiting), the current step in the
+   * checkbox that says its state without colour (check: done; dash:
+   * in progress; empty: waiting), the current step in the
    * foreground, finished steps quiet. Every runtime's plan arrives as the
    * same level-set (`store.plan`), so this card is the same for all of them.
    * Rows update in place (keyed by the agent's id, else position) and the
-   * card never reorders; a finished plan folds to one line once its turn
-   * ends, one click from its steps, and leaves (folding away) when the agent
-   * moves on — the host unmounts it.
+   * card never reorders. Idle plans fold to one line; unfinished steps remain
+   * unchanged until the agent updates them, never inferred completion. Finished plans
+   * leave when the agent moves on — the host unmounts them.
    */
   interface Props {
     entries: PlanEntry[];
@@ -33,9 +34,11 @@
     /** False while the retained owner is hidden (no motion, no live
      *  announcements). */
     visible?: boolean;
+    /** The work strip owns the header and disclosure. */
+    embedded?: boolean;
   }
 
-  let { entries, running, visible = true }: Props = $props();
+  let { entries, running, visible = true, embedded = false }: Props = $props();
 
   const progress = $derived(planProgress(entries));
   const autoFolded = $derived(planFolds(entries, running));
@@ -46,10 +49,11 @@
     void autoFolded;
     userOpen = null;
   });
-  const folded = $derived(userOpen === null ? autoFolded : !userOpen);
-  const summary = $derived(planSummary(entries));
+  const folded = $derived(!embedded && (userOpen === null ? autoFolded : !userOpen));
+  const summary = $derived(planSummary(entries, running));
+  const inactive = $derived(!running);
   const count = $derived(`${progress.done}/${progress.total}`);
-  const toggleLabel = $derived(folded ? "show the plan's steps" : "fold the plan to one line");
+  const toggleLabel = $derived(folded ? "show tasks" : "collapse tasks");
 
   /** Keep the step in flight inside the bounded list — moving only the
    *  list's own scroll, never the page, and only when it left the view. */
@@ -89,7 +93,7 @@
     return { ...fold, css: (t: number, u: number) => `${fold.css?.(t, u) ?? ""};opacity: ${t * t}` };
   }
 
-  /** A step just finished: the filled circle grows in and the tick draws.
+  /** A step just finished: the filled checkbox grows in and the tick draws.
    *  Local, so a card mounting with finished steps (a reopened chat) stays
    *  still — only a step finishing in view moves. */
   function fillIn(_node: Element) {
@@ -148,53 +152,53 @@
   };
 </script>
 
-{#snippet circle(mark: StepMark)}
+{#snippet checkbox(mark: StepMark)}
   <svg class="mark {mark}" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
     {#if mark === "done"}
-      <circle cx="8" cy="8" r="7" class="fill" in:fillIn />
+      <rect x="1.5" y="1.5" width="13" height="13" rx="2.5" class="fill" in:fillIn />
       <path d="M4.9 8.3l2.1 2.1 4.1-4.5" class="tick" in:drawTick />
     {:else}
-      <circle cx="8" cy="8" r="6.25" class="ring" />
+      <rect x="1.75" y="1.75" width="12.5" height="12.5" rx="2.5" class="ring" />
+      {#if mark === "current"}<path d="M5 8h6" class="dash" />{/if}
     {/if}
   </svg>
 {/snippet}
 
 <section
-  class="plan-card pinned-card"
+  class="plan-card"
+  class:pinned-card={!embedded}
   class:visible
   class:folded
-  aria-label="plan"
+  class:inactive
+  aria-label="Tasks"
   bind:this={card}
   out:leave
 >
-  <!-- The toggle is a flex column of its own at the card's right, so no row —
-       first, scrolled-to, or "12/15" wide — ever runs under it. -->
+  {#if !embedded}
   <button
-    class="toggle"
+    class="heading"
     aria-expanded={!folded}
     aria-label="{toggleLabel} ({progress.done} of {progress.total} done)"
-    title={toggleLabel}
+    title={folded ? `${toggleLabel} · ${summary}` : toggleLabel}
     onclick={() => (userOpen = folded)}
   >
-    <!-- A folded finished plan already says its tally. -->
-    {#if !(folded && progress.allDone)}<span class="count">{count}</span>{/if}
+    <span class="list-icon"><TaskListGlyph /></span>
+    <span class="kind">Tasks</span>
+    <span class="summary">{folded ? summary : ''}</span>
+    <span class="count">{count}</span>
     <Chevron open={!folded} />
   </button>
-  {#if folded}
-    <button class="folded-line" aria-expanded="false" onclick={() => (userOpen = true)}>
-      {@render circle(progress.allDone ? "done" : progress.current !== null ? "current" : "todo")}
-      <span class="text">{summary}</span>
-    </button>
-  {:else}
+  {/if}
+  {#if !folded}
     <ol class="steps" bind:this={list} bind:clientHeight={listHeight}>
       {#each entries as entry, i (keys[i])}
         {@const mark = stepMark(entry)}
         {@const detail = stepDetail(entry)}
         <li class="step {mark}" data-step={keys[i]}>
-          {@render circle(mark)}
+          {@render checkbox(mark)}
           <span class="body">
             <span class="line">
-              <span class="text">{stepText(entry)}</span>
+              <span class="text">{stepText(entry, running)}</span>
               <span class="sr-only">({MARK_WORD[mark]})</span>
               {#if entry.owner}<span class="owner">@{entry.owner}</span>{/if}
               {#if mark === "blocked"}
@@ -209,9 +213,8 @@
       {/each}
     </ol>
   {/if}
-  <!-- One polite announcement per step change, never per row. -->
   <span class="sr-only" role="status" aria-live={visible ? "polite" : "off"}
-    >{progress.current !== null ? stepText(progress.current) : progress.allDone ? "plan done" : ""}</span
+    >{progress.current !== null ? stepText(progress.current, running) : progress.allDone ? "tasks done" : ""}</span
   >
 </section>
 
@@ -220,45 +223,17 @@
      in app.css; this is the card's own layout. */
   .plan-card {
     display: flex;
-    align-items: flex-start;
+    flex-direction: column;
     font-size: var(--text-sm);
     line-height: 1.45;
   }
-  .toggle {
-    order: 1;
-    flex: none;
-    margin: 4px 6px 0 0;
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    padding: 2px 6px;
-    background: none;
-    border: none;
-    border-radius: 6px;
-    color: var(--muted);
-    font: inherit;
-    font-size: var(--text-xs);
-    font-variant-numeric: tabular-nums;
-    cursor: pointer;
-  }
-  /* Folded, the card is one line: the toggle sits on that line's centre. */
-  .plan-card.folded .toggle {
-    margin-top: 0;
-    align-self: center;
-  }
-  .toggle:hover,
-  .toggle:focus-visible {
-    color: var(--fg);
-    background: var(--hover-tint);
-  }
-  .folded-line {
+  .heading {
     display: flex;
     align-items: center;
-    gap: 9px;
+    gap: 8px;
     width: 100%;
-    flex: 1;
     min-width: 0;
-    padding: 6px 8px 6px 11px;
+    padding: 6px 11px;
     background: none;
     border: none;
     border-radius: var(--radius-card);
@@ -267,12 +242,39 @@
     text-align: left;
     cursor: pointer;
   }
-  .folded-line:hover,
-  .folded-line:focus-visible {
+  .heading:hover,
+  .heading:focus-visible {
     color: var(--fg);
+    background: var(--hover-tint);
+  }
+  .list-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 14px;
+    height: 14px;
+  }
+  .list-icon,
+  .kind,
+  .count {
+    flex: none;
+  }
+  .kind {
+    font-size: var(--text-xs);
+    font-weight: 500;
+  }
+  .summary {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .count {
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
   }
   .steps {
-    flex: 1;
     min-width: 0;
     list-style: none;
     margin: 0;
@@ -290,7 +292,7 @@
     padding: 2px 0;
     color: color-mix(in srgb, var(--fg) 80%, var(--muted));
   }
-  .step.current {
+  .plan-card:not(.inactive) .step.current {
     color: var(--fg);
     font-weight: 500;
   }
@@ -304,20 +306,21 @@
     flex: none;
     margin-top: 2px;
   }
-  .folded-line .mark {
-    margin-top: 0;
-  }
   .mark .ring {
     fill: none;
     stroke: currentColor;
     stroke-width: 1.4;
   }
-  .mark.current .ring {
+  .mark .dash {
+    stroke: currentColor;
+    stroke-width: 1.6;
+    stroke-linecap: round;
+  }
+  .plan-card:not(.inactive) .mark.current .ring {
     stroke: var(--fg);
     stroke-width: 1.6;
   }
   /* Waiting reads as an outline still to be drawn. */
-  .mark.todo .ring,
   .mark.blocked .ring {
     stroke: var(--muted);
     stroke-dasharray: 2.6 2.3;

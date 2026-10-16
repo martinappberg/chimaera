@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { tick, untrack } from "svelte";
+  import { tick, untrack, type Snippet } from "svelte";
   import { paneTabHasKeyboardFocus } from "../shared/tabNavigation";
   import { fsQuickOpen, parentName, type QuickOpenEntry } from "../previews/files";
   import FileIcon from "../shared/FileIcon.svelte";
@@ -65,6 +65,8 @@
     /** Live workspace terminals; sending a mention grants access through
      *  the daemon's protocol-input resolver. */
     terminals: TerminalOption[];
+    context?: Snippet;
+    contextEnd?: Snippet;
     onOpenTerminal?: (id: string) => void;
     onUnlinkTerminal?: (id: string) => void;
     focused: boolean;
@@ -99,6 +101,8 @@
     slashCommands,
     workspaceId,
     terminals,
+    context,
+    contextEnd,
     onOpenTerminal,
     onUnlinkTerminal,
     focused,
@@ -114,6 +118,7 @@
   }: Props = $props();
 
   const uid = $props.id();
+  const linkedTerminals = $derived(terminals.filter((t) => t.linkedAgentId === sessionId));
   const COMPOSER_MIN_HEIGHT = 38;
   const COMPOSER_MAX_HEIGHT = 352;
 
@@ -1046,23 +1051,21 @@
     </div>
   {/if}
 
-  {#if terminals.length > 0}
-    <div class="terminal-links" aria-label="Terminal access">
-      <button class="terminal-add" disabled={disabled || spoken !== null} title="Mention a terminal · access is granted when you send"
-        onmousedown={(e) => e.preventDefault()}
-        onclick={() => {
-          const at = el?.selectionStart ?? draft.length;
-          const prefix = at > 0 && !/\s/.test(draft[at - 1]) ? " " : "";
-          draft = draft.slice(0, at) + prefix + "@term:" + draft.slice(el?.selectionEnd ?? at);
-          focusAt(at + prefix.length + 6);
-        }}><TerminalIcon size={13} /> Terminal <span aria-hidden="true">+</span></button>
-      {#each terminals.filter((t) => t.linkedAgentId === sessionId) as t (t.id)}
-        <span class="terminal-link">
-          <button class="terminal-open" title={[t.cwd, t.status, "Open linked terminal"].filter(Boolean).join(" · ")}
-            onclick={() => onOpenTerminal?.(t.id)}>{terminalLabel(t, terminals)}</button>
-          {#if onUnlinkTerminal}<button class="terminal-unlink" aria-label={`Unlink ${terminalLabel(t, terminals)}`} title="Remove this agent's terminal access" onclick={() => onUnlinkTerminal?.(t.id)}>×</button>{/if}
-        </span>
-      {/each}
+  {#if context || contextEnd || linkedTerminals.length > 0}
+    <div class="context-row">
+      {#if context}<div class="context-start">{@render context()}</div>{/if}
+      {#if linkedTerminals.length > 0}
+        <div class="terminal-links" aria-label="Terminal access">
+          {#each linkedTerminals as t (t.id)}
+            <span class="terminal-link">
+              <button class="terminal-open" title={[t.cwd, t.status, "Open linked terminal"].filter(Boolean).join(" · ")}
+                onclick={() => onOpenTerminal?.(t.id)}>{terminalLabel(t, terminals)}</button>
+              {#if onUnlinkTerminal}<button class="terminal-unlink" aria-label={`Unlink ${terminalLabel(t, terminals)}`} title="Remove this agent's terminal access" onclick={() => onUnlinkTerminal?.(t.id)}>×</button>{/if}
+            </span>
+          {/each}
+        </div>
+      {/if}
+      {#if contextEnd}<div class="context-end">{@render contextEnd()}</div>{/if}
     </div>
   {/if}
   {#if images.length > 0}
@@ -1271,12 +1274,28 @@
     color: var(--muted);
     font-size: var(--text-xs);
   }
+  .context-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    margin-bottom: 6px;
+  }
+  .context-start,
+  .context-end {
+    display: flex;
+    min-width: 0;
+    flex: 0 1 auto;
+  }
+  .context-end {
+    margin-left: auto;
+  }
   .terminal-links {
     display: flex;
-    flex-wrap: wrap;
     align-items: center;
     gap: 5px;
-    margin-bottom: 6px;
+    min-width: 0;
+    overflow-x: auto;
   }
   .terminal-links button {
     font: inherit;
@@ -1289,17 +1308,6 @@
   .terminal-links button:hover {
     color: var(--fg);
     background: var(--hover-tint);
-  }
-  .terminal-add {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    padding: 3px 5px;
-    border-radius: 5px;
-  }
-  .terminal-add:disabled {
-    opacity: .5;
-    cursor: default;
   }
   .terminal-link {
     display: inline-flex;
@@ -1315,6 +1323,7 @@
     padding: 2px 5px;
   }
   .terminal-unlink {
+    flex: none;
     padding: 2px 5px;
     border-left: 1px solid var(--edge) !important;
   }

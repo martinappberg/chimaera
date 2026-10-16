@@ -1,6 +1,6 @@
 <script lang="ts">
   /**
-   * A still countdown: a thin ring whose arc is the share of a wait still to
+   * A still clock: a thin ring whose arc is the share of a wait still to
    * go (loops and scheduled jobs — the Ahead card, the rail, the dashboard).
    * Waiting is quiet, so it never animates on its own; it turns accent in
    * the last minute, and a caller swaps it for a live dot once the wait is
@@ -46,6 +46,7 @@
       transform="rotate(-90 7 7)"
     />
   {/if}
+  <path class="hands" d="M7 3.8V7l2.1 1.3" fill="none" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" />
 </svg>
 
 <style>
@@ -56,10 +57,12 @@
   .track {
     stroke: color-mix(in srgb, var(--muted) 35%, transparent);
   }
-  .arc {
+  .arc,
+  .hands {
     stroke: var(--muted);
   }
-  .soon .arc {
+  .soon .arc,
+  .soon .hands {
     stroke: var(--accent);
   }
 </style>

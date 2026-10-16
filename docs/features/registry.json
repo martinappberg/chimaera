@@ -213,7 +213,7 @@
     },
     {
       "id": "agents",
-      "name": "Agents — launch, lifecycle & runtimes",
+      "name": "Agents \u2014 launch, lifecycle & runtimes",
       "page": "docs/features/agents.md",
       "paths": [
         "crates/chimaera-server/src/launcher.rs",
@@ -272,12 +272,16 @@
       "paths": [
         "crates/chimaera-agent/src/**",
         "web-ui/src/lib/chat/**",
-        "crates/chimaera-server/src/chat.rs"
+        "web-ui/src/lib/shared/TaskListGlyph.svelte",
+        "crates/chimaera-server/src/chat.rs",
+        "web-ui/src/lib/shared/ActivityGlyph.svelte",
+        "web-ui/src/lib/shared/WorkTray.svelte"
       ],
       "maps": [
         "crates/chimaera-server/AGENTS.md",
         "crates/chimaera-agent/AGENTS.md",
-        "web-ui/src/lib/chat/AGENTS.md"
+        "web-ui/src/lib/chat/AGENTS.md",
+        "web-ui/src/lib/shared/AGENTS.md"
       ],
       "rules": [
         ".claude/rules/agent-protocol.md",
@@ -320,7 +324,7 @@
     },
     {
       "id": "cli",
-      "name": "CLI — the `chimaera` binary",
+      "name": "CLI \u2014 the `chimaera` binary",
       "page": "docs/features/cli.md",
       "paths": [
         "crates/chimaera/src/**"
@@ -539,7 +543,8 @@
         "crates/chimaera-agent/src/cron.rs",
         "crates/chimaera-server/src/goal_outcome.rs",
         "web-ui/src/lib/chat/AheadCard*",
-        "web-ui/src/lib/chat/WorkStrip*",
+        "web-ui/src/lib/chat/[Ww]orkStrip*",
+        "web-ui/src/lib/shared/CountdownRing.svelte",
         "web-ui/src/lib/chat/ahead*"
       ],
       "maps": [
@@ -792,7 +797,7 @@
     },
     {
       "id": "workbench",
-      "name": "Workbench — panes, tabs, workspaces & navigation",
+      "name": "Workbench \u2014 panes, tabs, workspaces & navigation",
       "page": "docs/features/workbench.md",
       "paths": [
         "web-ui/src/lib/layout/**",

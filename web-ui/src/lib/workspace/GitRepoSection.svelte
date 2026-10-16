@@ -30,7 +30,7 @@
   import { decoFor } from "./gitDeco";
   import { relTime } from "./gitFormat";
   import { midTruncate } from "../previews/files";
-  import { baseName, createSession, dotState, dotTitle, displayName, type Session } from "./sessions";
+  import { baseName, branchLabel, createSession, dotState, dotTitle, displayName, type Session } from "./sessions";
   import Chevron from "../shared/Chevron.svelte";
   import FileIcon from "../shared/FileIcon.svelte";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
@@ -194,8 +194,7 @@
   const otherBranches = $derived(localBranches.filter((b) => !checkedOut.has(b.name)));
 
   function branchName(wt: GitWorktree): string {
-    if (wt.branch) return wt.branch;
-    return wt.detached ? `No branch (at ${wt.head ?? "?"})` : "No commits yet";
+    return branchLabel(wt);
   }
 
 
@@ -586,7 +585,7 @@
     flex: 1;
   }
   .detached {
-    color: var(--warn);
+    color: var(--muted);
   }
 
   .group {

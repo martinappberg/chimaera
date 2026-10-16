@@ -29,7 +29,7 @@
     type GitStatus,
   } from "./git";
   import { flushSettings, getSetting, setSetting } from "../settings/store.svelte";
-  import { type Session } from "./sessions";
+  import { branchLabel, type Session } from "./sessions";
   import Chevron from "../shared/Chevron.svelte";
   import GitRepoSection from "./GitRepoSection.svelte";
 
@@ -248,8 +248,7 @@
       </svg>
       <span class="branch" title={status.upstream ?? "no upstream"}>
         {#if status.detached}
-          <span class="detached">No branch</span>
-          <span class="sha">(at {status.head ?? "?"})</span>
+          <span class="detached">{branchLabel(status)}</span>
         {:else}
           {status.branch ?? "No commits yet"}
         {/if}
@@ -388,7 +387,7 @@
             {/if}
             <span class="repo-dot" aria-hidden="true">·</span>
             <span class="repo-branch" class:detached={r.detached}
-              >{r.branch ?? (r.detached ? `No branch (at ${r.head ?? "?"})` : "No commits yet")}</span
+              >{branchLabel(r)}</span
             >
             {#if st && (st.ahead > 0 || st.behind > 0)}
               <span class="ab" title={aheadBehindWords(st.ahead, st.behind, st.upstream)}
@@ -491,10 +490,7 @@
     font-family: inherit;
   }
   .detached {
-    color: var(--warn);
-  }
-  .sha {
-    opacity: 0.8;
+    color: var(--muted);
   }
 
   .ab {
@@ -706,7 +702,7 @@
     white-space: nowrap;
   }
   .repo-branch.detached {
-    color: var(--warn);
+    color: var(--muted);
   }
   .repo-count {
     flex: none;

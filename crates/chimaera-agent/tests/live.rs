@@ -2309,6 +2309,9 @@ async fn driver_codex_instant_steering_reads_during_a_response() {
                 assert_eq!(*state, UserMessageState::Sent, "native input was consumed");
                 read = true;
             }
+            AgentEvent::Error { .. } | AgentEvent::Notice { .. } => {
+                eprintln!("instant steering diagnostic: {:?}", entry.ev);
+            }
             AgentEvent::TurnCompleted { .. } => break,
             AgentEvent::TurnAborted { reason, .. } => panic!("turn aborted: {reason}"),
             _ => {}
@@ -2950,6 +2953,64 @@ async fn claude_goal_sets_and_clears() {
     )
     .await;
     manager.kill("s-goal");
+}
+
+/// The native task tool must be exposed by the thread-open config without
+/// an MCP substitute, and its final update must reach the journal before reply.
+#[tokio::test]
+#[ignore = "live: spawns real codex, needs auth, bills a short turn"]
+async fn codex_native_plan_updates_through_completion() {
+    use chimaera_agent::codex::CodexAdapter;
+    use chimaera_agent::model::PlanStatus;
+    let dir = tmpdir();
+    let manager = std::sync::Arc::new(ChatManager::new(
+        dir.path().join("chat"),
+        Box::new(|_, _| {}),
+        Box::new(|_, _| {}),
+    ));
+    let spec = SpawnSpec::new(
+        "s-cplan",
+        vec!["codex".into(), "app-server".into()],
+        dir.path().to_path_buf(),
+    );
+    manager.spawn(&CodexAdapter, spec).expect("spawn driver");
+    let mut rx = manager.attach("s-cplan", 0).expect("attach").live;
+    drive_until(&manager, "s-cplan", &mut rx, HANDSHAKE, "init", |ev| {
+        matches!(ev, AgentEvent::Init { .. })
+    })
+    .await;
+    send(
+        &manager,
+        "s-cplan",
+        "Use your native update_plan tool to track exactly two steps: calculate 12+5, \
+         then calculate 12-5. First mark the first step in_progress and the second pending; \
+         after calculating the sum, mark the first completed and the second in_progress; \
+         after calculating the difference, mark both completed. Then reply with both answers. \
+         Use the native task tool, no MCP tools or files.",
+    )
+    .await;
+    let mut plans = Vec::new();
+    drive_until(
+        &manager,
+        "s-cplan",
+        &mut rx,
+        TURN,
+        "native task updates and turn completion",
+        |ev| {
+            if let AgentEvent::Plan { entries } = ev {
+                plans.push(entries.iter().map(|step| step.status).collect::<Vec<_>>());
+            }
+            matches!(ev, AgentEvent::TurnCompleted { .. })
+        },
+    )
+    .await;
+    manager.kill("s-cplan");
+    assert!(plans.contains(&vec![PlanStatus::InProgress, PlanStatus::Todo]));
+    assert!(plans.contains(&vec![PlanStatus::Done, PlanStatus::InProgress]));
+    assert_eq!(
+        plans.last(),
+        Some(&vec![PlanStatus::Done, PlanStatus::Done])
+    );
 }
 
 /// Codex thread goals on the live wire: set (clear-then-set when one exists),

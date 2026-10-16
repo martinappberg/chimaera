@@ -40,6 +40,7 @@ Tests: `*.test.ts` beside the modules.
 - **Git, Timeline, and Knowledge are pulled, never pushed.** `/ws/events` carries only a small epoch nudge. Each store mirrors only the active workspace (`git.ts`, `timeline.svelte.ts`, `knowledge.ts` headers).
 - **Store modules own their `visibilitychange` listener** when the return needs an immediate refetch (`compute.ts`, `comms.svelte.ts`, `timeline.svelte.ts`, `knowledge.ts`). See the rule bullet on recurring work.
 - **Compute asks at most once a minute.** That is the scheduler-politeness floor (`compute.ts` header).
+- **Use `branchLabel()` from `sessions.ts`** for branch names, detached `Commit <hash>` and unborn `No commits yet` across git surfaces. A missing Git context renders no chip.
 - **Use `isMastermind()` from `sessions.ts`.** Do not re-type the predicate inline ([dashboard map](../dashboard/AGENTS.md)).
 - **Unread is per window and in memory.** A reload forgets it on purpose (`unread.svelte.ts` header).
 - **"Since you left" is per viewer.** The last-seen seq lives in localStorage, and every access is wrapped (`timeline.svelte.ts` header).
