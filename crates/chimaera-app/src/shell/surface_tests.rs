@@ -227,7 +227,12 @@ fn daemon_windows_get_the_exact_core_grants_and_never_the_default_set() {
 fn no_token_or_prompt_bearing_event_goes_through_the_broadcast_event_system() {
     let mut files = Vec::new();
     rust_sources(&manifest_dir().join("src"), &mut files);
-    let this = file!().rsplit('/').next().unwrap().to_string();
+    // `file!()` uses the host's separator (`\` on Windows).
+    let this = Path::new(file!())
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     let secret_events = [
         "\"host-status\"",
         "\"local-daemon-updated\"",

@@ -126,7 +126,9 @@ pub async fn ensure_local_daemon() -> anyhow::Result<LocalDaemon> {
 /// running: the old daemon (the stop failed), or nothing yet.
 #[derive(Debug)]
 pub enum UpdateFailure {
-    /// The old daemon refused to stop and is still serving.
+    /// The old daemon refused to stop and is still serving. (The WSL engine
+    /// cannot tell a failed stop apart, so Windows never builds this one.)
+    #[cfg_attr(windows, allow(dead_code))]
     StopFailed(anyhow::Error),
     /// The old daemon stopped (or was never found) and no new one came up.
     RespawnFailed(anyhow::Error),
