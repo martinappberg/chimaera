@@ -57,7 +57,7 @@ no Node needed at run time.
 **One-time build first** (the script fails fast if any is missing):
 
 ```sh
-nvm use 22 && npm --prefix web-ui ci \
+nvm use && npm --prefix web-ui ci \
   && npm --prefix web-ui run build            # Node version is pinned in .nvmrc
 cargo build -p chimaera                       # rust-embed requires web-ui/dist to exist first
 ```
@@ -224,7 +224,7 @@ their real `~/.chimaera` app). `just app-dev-isolated`, or when `just` is absent
 its two steps — the last one **in the background** (it's a long-running GUI):
 
 ```sh
-nvm use 22 && npm --prefix web-ui run build          # UI is embedded/served from dist
+nvm use && npm --prefix web-ui run build          # UI is embedded/served from dist
 bash .claude/skills/develop/run-app-isolated.sh      # builds + runs in background — opens the window
 ```
 

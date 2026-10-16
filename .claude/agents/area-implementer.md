@@ -28,7 +28,7 @@ be disciplined.
   async reactor, ~150 MB RSS).
 
 ## Verify before you claim done
-- Build `web-ui/dist` first on a fresh checkout. `cargo +1.96.0 fmt` on changed Rust;
+- Build `web-ui/dist` first on a fresh checkout. `cargo +1.99.1 fmt` on changed Rust;
   `just check` (plugin assets, fmt, clippy -D warnings, and tests in both Rust workspaces)
   for daemon changes; run web-ui `check`, `test`, and `build` for UI changes.
 - If the change is observable at runtime (terminal, reconnect, resize, previews,

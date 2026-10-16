@@ -10,5 +10,5 @@ f=$(jq -r '.tool_input.file_path // .tool_response.filePath // empty' 2>/dev/nul
 [ "${f##*.}" = "rs" ] || exit 0
 [ -f "$f" ] || exit 0
 command -v rustfmt >/dev/null 2>&1 || exit 0
-rustfmt +1.96.0 --edition 2021 "$f" 2>/dev/null || true
+rustfmt +1.99.1 --edition 2021 "$f" 2>/dev/null || true
 exit 0

@@ -30,6 +30,13 @@ updates:
     cooldown:
       default-days: 7
 
+  - package-ecosystem: cargo
+    directory: /plugins
+    patterns: ["*"]
+    multi-ecosystem-group: dependencies
+    cooldown:
+      default-days: 7
+
   - package-ecosystem: npm
     directory: /web-ui
     patterns: ["*"]
@@ -37,7 +44,7 @@ updates:
     cooldown:
       default-days: 7
     # TypeScript 7 publishes only a version shim at its stable package entry;
-    # svelte-check still requires the TypeScript 5 compiler API.
+    # svelte-check supports the TypeScript 5/6 compiler API, not 7.
     ignore:
       - dependency-name: typescript
         versions: [">=7 <8"]

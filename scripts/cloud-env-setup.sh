@@ -21,7 +21,7 @@ set -u
 # rustup still auto-installs whatever rust-toolchain.toml names on first use.
 TOOLCHAIN=$(curl -fsSL https://raw.githubusercontent.com/martinappberg/chimaera/main/rust-toolchain.toml 2>/dev/null \
   | sed -n 's/^channel *= *"\([^"]*\)".*/\1/p')
-TOOLCHAIN=${TOOLCHAIN:-1.96.0}
+TOOLCHAIN=${TOOLCHAIN:-1.99.1}
 
 if ! command -v rustup >/dev/null 2>&1; then
   # sh.rustup.rs is not on the default Trusted allowlist; static.rust-lang.org is.

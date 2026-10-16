@@ -1795,7 +1795,9 @@
       onTimeline: onTimelineNudge,
       onComms: onCommsNudge,
       onAgentPlugins: onAgentPluginsChanged,
-      onUpdate: (status) => (updateState.daemon = status),
+      onUpdate: (status) => {
+        updateState.daemon = status;
+      },
       onRecents: (epoch) => {
         // Invalidate-and-pull, like git: a conversation retired somewhere;
         // refetch this window's workspace list iff the epoch moved.

@@ -45,7 +45,7 @@ store value) — never to *implement* a change; edit source and reload.
 ## Common failure modes (recognize these fast)
 
 - **Blank UI on a built/served daemon** → stale or empty `web-ui/dist`. Rebuild the
-  UI (Node 22). In the Vite dev loop this can't happen (HMR); on a served daemon it can.
+  UI (Node 26). In the Vite dev loop this can't happen (HMR); on a served daemon it can.
 - **UI change not showing** → served daemon won't HMR — rebuild `web-ui/dist` and
   reload. In the Vite dev loop it should HMR; if not, check the Vite process.
 - **401 on every `/api/v1/*`** → the page has no token. In serve mode the token must

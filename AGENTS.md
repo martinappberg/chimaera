@@ -66,8 +66,8 @@ this explicitly.
 
 ## Run it
 
-Node 22 (`.nvmrc`). The Rust toolchain is pinned in
-`rust-toolchain.toml` — **format with `cargo +1.96.0 fmt`** (a differing default
+Node 26 (`.nvmrc`). The Rust toolchain is pinned in
+`rust-toolchain.toml` — **format with `cargo +1.99.1 fmt`** (a differing default
 `cargo fmt` can pass locally yet fail CI's pinned check).
 
 ```sh
@@ -122,7 +122,7 @@ pane and no HPC access; a SessionStart hook installs the web-UI deps and builds
   adapters (live, billed). **Terminal state is
   server-side** (never serialize the `alacritty` `Term` grid). **UI quality is an
   acceptance criterion** (curated light/dark, the brand mark, a real workbench feel).
-- **Comments state constraints and *why*, not narration.** `cargo +1.96.0 fmt` and
+- **Comments state constraints and *why*, not narration.** `cargo +1.99.1 fmt` and
   `clippy -D warnings` must pass clean.
 - Area-specific constraints live in `.claude/rules/*.md`; read every rule whose
   frontmatter matches the files being changed. The nested `AGENTS.md` maps carry

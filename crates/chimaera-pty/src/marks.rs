@@ -734,10 +734,7 @@ fn unescape_633(s: &str) -> String {
 /// Extract the percent-decoded path from a `file://host/path` URL.
 fn parse_file_url(url: &str) -> Option<String> {
     let rest = url.strip_prefix("file://")?;
-    let path = match rest.find('/') {
-        Some(idx) => &rest[idx..],
-        None => return None,
-    };
+    let path = &rest[rest.find('/')?..];
     let bytes = path.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

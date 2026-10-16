@@ -404,6 +404,10 @@ pub(crate) fn invalidate(state: &Arc<AppState>, m: &Manifest, ws: &str, view: &s
 }
 
 /// The plugin, active in `ws`, or the response saying why not.
+#[allow(
+    clippy::result_large_err,
+    reason = "Return the HTTP error directly without a second allocation"
+)]
 async fn active_plugin(state: &AppState, ws: &str, pid: &str) -> Result<Arc<Manifest>, Response> {
     if crate::lock(&state.workspaces).get(ws).is_none() {
         return Err(super::not_found(&format!("workspace {ws}")));

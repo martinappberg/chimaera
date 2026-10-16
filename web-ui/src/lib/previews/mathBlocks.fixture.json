@@ -150,11 +150,11 @@
       "reading": ["display:x\n"]
     },
     {
-      "note": "a tab after > is the quote marker's optional space",
+      "note": "a tab after > is the quote marker's optional space; comrak 0.56 counts the fence offset in columns",
       "input": ">\t$$ a\n>\t+ b $$\n",
       "editor": ["Blockquote/MathBlock:$$ a\n>\t+ b $$"],
       "server": ">\t```math\n>\t a\n>\t+ b \n>\t```\n",
-      "reading": ["display:  a\n + b \n"]
+      "reading": ["display: a\n+ b \n"]
     },
     {
       "note": "a block on a list item's continuation lines keeps its indentation, so it stays in the item",

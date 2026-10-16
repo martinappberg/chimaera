@@ -25,7 +25,9 @@ impl AuthPty {
         command.stdin(Stdio::from(pty.slave.try_clone()?));
         command.stdout(Stdio::from(pty.slave.try_clone()?));
         command.stderr(Stdio::from(pty.slave));
-        Ok(Self(AsyncFd::new(pty.master)?))
+        // SAFETY: OwnedFd keeps this nonblocking PTY descriptor valid and
+        // unchanged until AsyncFd deregisters it before dropping the owner.
+        Ok(Self(unsafe { AsyncFd::register(pty.master) }?))
     }
 
     pub(super) async fn read(&self, buf: &mut [u8]) -> io::Result<usize> {

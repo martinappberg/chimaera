@@ -84,6 +84,6 @@ behavior are not proven by a schema.
 
 - Build `web-ui/dist` before Rust checks on a fresh checkout. `just check` must be
   green (plugin assets, fmt, clippy, and both Rust workspaces' tests); if
-  `web-ui/**` changed, run its `check`, `test`, and `build` scripts too (Node 22).
+  `web-ui/**` changed, run its `check`, `test`, and `build` scripts too (Node 26).
 - Say in the PR what you ran and observed (hermetic + live; chat-smoke if a
   driver changed), per the repo's verify-live rule.

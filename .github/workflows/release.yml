@@ -36,12 +36,14 @@ permissions:
 # replace a main run waiting there.
 concurrency: release-${{ github.ref }}
 
+# Match CI's temporary Ubuntu 24 baseline for the jobs previously on latest.
+# Exit criteria: docs/agent-guides/releases.md#linux-runner-migration.
 jobs:
   version:
     # A run dispatched from another branch would use that branch's copy of
     # this file; only main's ships.
     if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       actions: read
@@ -72,7 +74,7 @@ jobs:
             echo "::notice title=release::releasing from ${sha:0:8}, the newest main commit ci.yml passed on, not this run's ${TIP:0:8}"
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.green.outputs.sha }}
           fetch-depth: 0
@@ -107,18 +109,16 @@ jobs:
             echo "version=$result" >> "$GITHUB_OUTPUT"
           fi
 
-  daemon:
+  # Build once at the selected green commit; every Unix binary embeds these assets.
+  ui:
     needs: version
     if: needs.version.outputs.release == 'true'
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.version.outputs.sha }}
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .nvmrc
           cache: npm
@@ -127,42 +127,63 @@ jobs:
         working-directory: web-ui
       - run: npm run build
         working-directory: web-ui
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: web-ui-dist
+          path: web-ui/dist
+
+  daemon:
+    needs: [version, ui]
+    if: needs.version.outputs.release == 'true'
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: web-ui-dist
+          path: web-ui/dist
       - run: rustup show
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - run: cargo install cargo-zigbuild --locked --version 0.23.0
+        with:
+          # Keep aligned with ci.yml so runner validation changes only the OS.
+          version: 0.17.0
+          cache-key: ubuntu-24.04-${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ubuntu-24.04-${{ matrix.target }}-zig-0.17.0
+      - run: cargo install cargo-zigbuild --locked --version 0.23.4
       # Stamp the release version so the daemon reports it (health / manifest).
       - run: sed -i "s/^version = \"0.0.1\"/version = \"${{ needs.version.outputs.version }}\"/" Cargo.toml
       - run: cargo zigbuild --release --target ${{ matrix.target }} -p chimaera
       - run: cp target/${{ matrix.target }}/release/chimaera chimaera-${{ matrix.target }}
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: chimaera-${{ matrix.target }}
           path: chimaera-${{ matrix.target }}
 
   daemon-macos:
-    needs: version
+    needs: [version, ui]
     if: needs.version.outputs.release == 'true'
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.version.outputs.sha }}
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          node-version-file: .nvmrc
-          cache: npm
-          cache-dependency-path: web-ui/package-lock.json
-      - run: npm ci
-        working-directory: web-ui
-      - run: npm run build
-        working-directory: web-ui
+          name: web-ui-dist
+          path: web-ui/dist
       - run: rustup show
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: sed -i "" "s/^version = \"0.0.1\"/version = \"${{ needs.version.outputs.version }}\"/" Cargo.toml
       - run: cargo build --release -p chimaera
       - run: cp target/release/chimaera chimaera-aarch64-apple-darwin
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: chimaera-aarch64-apple-darwin
           path: chimaera-aarch64-apple-darwin
@@ -170,7 +191,7 @@ jobs:
   # Build + sign the app and CREATE + PUBLISH the release (tauri-action owns
   # it, and emits latest.json because the app config sets createUpdaterArtifacts).
   app:
-    needs: version
+    needs: [version, ui]
     if: needs.version.outputs.release == 'true'
     runs-on: macos-latest
     permissions:
@@ -182,25 +203,23 @@ jobs:
       # a different --config, which reaches the app crate as TAURI_CONFIG, so
       # both builds get this one; and beforeBuildCommand, which rewrites the
       # web-ui/dist chimaera-server embeds, so this config skips it and the
-      # web-ui is built once, below.
+      # web-ui is downloaded from the shared build.
       APP_BUILD_CONFIG: '{"build":{"beforeBuildCommand":""}}'
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.version.outputs.sha }}
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .nvmrc
           cache: npm
-          cache-dependency-path: |
-            crates/chimaera-app/package-lock.json
-            web-ui/package-lock.json
-      - run: npm ci
-        working-directory: web-ui
-      - run: npm run build
-        working-directory: web-ui
+          cache-dependency-path: crates/chimaera-app/package-lock.json
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: web-ui-dist
+          path: web-ui/dist
       - run: rustup show
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: crates/chimaera-app
           # A no-op today (rust-cache's default key is the job name, `app`), but
@@ -270,10 +289,10 @@ jobs:
         # GNU sed + one quoting dialect everywhere (Git-for-Windows bash).
         shell: bash
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.version.outputs.sha }}
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .nvmrc
           cache: npm
@@ -283,8 +302,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
             libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: runner.os == 'Linux'
+        with:
+          name: web-ui-dist
+          path: web-ui/dist
       - run: rustup show
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: crates/chimaera-app
           # Writer for the per-OS app caches app.yml's bundle matrix restores
@@ -305,6 +329,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: crates/chimaera-app
+          # Linux embeds the shared UI artifact; Windows has no embedded daemon.
+          args: --config '{"build":{"beforeBuildCommand":""}}'
           tagName: v${{ needs.version.outputs.version }}
           releaseCommitish: ${{ needs.version.outputs.sha }}
           releaseName: "chimaera v${{ needs.version.outputs.version }}"
@@ -315,13 +341,14 @@ jobs:
   attach-daemons:
     needs: [version, app, daemon, daemon-macos]
     if: needs.version.outputs.release == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
+          pattern: chimaera-*
           merge-multiple: true
       - env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -340,13 +367,13 @@ jobs:
   plugin-pins:
     needs: [version, attach-daemons]
     if: needs.version.outputs.release == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.version.outputs.sha }}
           persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .nvmrc
       - env:
