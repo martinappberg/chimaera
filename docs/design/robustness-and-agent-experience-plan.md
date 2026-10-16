@@ -721,7 +721,29 @@ Two Opus lanes in one worktree, disjoint files, one API contract set up front (e
 - Loaders: `recents.rs` (8 MiB), `workspaces.rs` (8 MiB), `view_state.rs` (16 MiB = 2 × keys × per-key cap), `ledger.rs` (16 MiB; boot load now on the blocking pool), `recents_archive.rs` (16 MiB), `plugins/trust.rs` (8 MiB), `drafts.rs` (≈6 MiB from the worst-case escaping of its capped fields; the sidecar too). Each cap is a named const with its reason. An oversized file is corruption for recents, workspaces, view-state and the ledger: it loads empty with one warning and the next write replaces it; the archive holds instead (replacing it would un-hide every conversation) and trust fails closed. An unreadable file (`Bounded::Io`) is never overwritten: the store holds its writes, retries the bounded read on the next write (the ledger on every reconcile tick), merges what is on disk with this daemon's state by that store's own rule once it reads (ledger: the old daemon's agents retire to Recents; workspaces: this daemon's record wins per id and root; recents and the archive: union by key; view-state: disk keys this daemon lacks are kept), then releases. While held: a workspace add rolls back and answers 503, a view-state put keeps memory and answers 204 (hot state), recents and the ledger log once per hold. The ledger starts held until its boot read lands, so a stop during that read writes nothing; if it is still held at a graceful stop, `ledger::final_flush` retires every live agent session to Recents so nothing vanishes. An independent review (Opus) is what turned the first cut's lifetime holds into this rule.
 - Known limits, deliberate: five boot-time loads still run synchronously inside `AppState::new`, before the listener accepts connections, so nothing is waiting on the reactor yet; the ledger's and recents' own writes still run synchronously under their mutex where they always did; `materialize_prelude` still writes its small per-session file where it is called. Moving these is a `lifecycle.rs`/`state.rs` change that was not in scope.
 
-### Execution record: wave 3 (Phase 7), 2026-10-16
+### Execution record: wave 3 (workflow and UI contracts), 2026-10-16
+
+One coordinator ran two writing lanes at once in a single worktree, then one read-only review. The lanes owned disjoint files. No Rust was built in this wave (another session held the build); every check here is a Node or documentation check.
+
+| Lane | Model | Owned files | Result |
+|---|---|---|---|
+| UI contracts guide + a11y review (§5) | Opus | `docs/agent-guides/ui-contracts.md`, `.claude/rules/web-ui.md` (one bullet), `web-ui/src/lib/shared/AGENTS.md` (one sentence), `docs/README.md`, root `AGENTS.md`, `web-ui/src/**/*.svelte` (comments only) | Eight contract sections, each with the primitive, the helper, the states and one cited example; a Gaps section with ten proposals and nothing built; all 67 `svelte-ignore a11y_*` suppressions reviewed one by one: 51 kept with a reason, 16 removed as stale (no element or behavior changed), 0 defects fixed; 92 icon-only buttons scanned, all named |
+| Skills (§10 table) | Sonnet | the ten `.claude/skills/*/SKILL.md` | Every required improvement present; no command, path, flag or gotcha dropped (a span-by-span check against `HEAD`); the bridges unchanged because every `name` and `description` stayed |
+| Independent review | Opus | read-only | Sampled 10 guide claims (6 true, 3 imprecise, 1 false) and 10 skill commands (8 OK, 2 imprecise); 12 findings, no blocker; all fixed before the PR opened |
+
+Evidence:
+
+- The stale suppressions were found by disabling all 67 at once and reading `svelte-check`'s 58 warnings; the review re-compiled the 11 edited files with `svelte/compiler` and found 0 a11y warnings, with the kept suppressions warning as expected when disabled.
+- `svelte-check`: 1083 files, 0 errors, 0 warnings, before and after. Vitest: 147 files, 2332 tests pass, 3 skipped. `node scripts/check-doc-links.mjs` (129 files) and `node scripts/check-agent-assets.mjs` pass.
+- The review's false claim (`tabNavigation` had three consumers, not two) and the imprecise ones (the `--muted` on `--row-active` floor is 4.0:1; `--accent-text` keeps 75% accent; the reload gate only defers the asset reload and Reload Window) are corrected in the guide. Six `preview_*` tool names that no session exposes were replaced in three skills with the tools that exist.
+
+Left for later, with the evidence that scopes it:
+
+- The guide's Gaps section: no spacing tokens or breakpoints; `Segmented` and four other radio groups without arrow keys; ten tab lists in eight files not on `tabNavigation`; two `aria-modal` overlays not on `modalFocus`; no shared Escape helper, preview state component, or live-region announcer; the split edit/preview divider is pointer-only. Each needs a live check and is not a documentation change.
+- The §5 component/browser checks (modal focus, permission answers, disconnected composer, unsaved close, pane switching, error boundaries) were not started; the guide names the behaviors they would cover.
+- Native-app whole-window zoom was not checked.
+
+### Execution record: wave 4 (Phase 7), 2026-10-16
 
 One coordinator ran four lanes at once in a single worktree, each owning a disjoint set of files; the coordinator owned `ci.yml` integration, the root `AGENTS.md` lines and this record. No Rust was compiled in this wave (another session held the host's build budget), so the dependency check reads manifests statically and cross-checks `cargo metadata --no-deps` only on request.
 
@@ -742,6 +764,7 @@ What each check enforces, and the seeded violation that proved it fails:
 CI wiring: ci.yml's `scripts` job runs the two checks, the hook test and `node --test scripts/*.test.mjs`. The change-impact gate is its own workflow, `change-impact.yml`, because the excuse lives in the PR description: it runs on `opened`, `synchronize`, `reopened` and `edited`, so adding the line re-runs this check alone (job-level `pull-requests: write`, `contents: read` at the top; the PR body and the event's base sha reach the shell only as environment variables; a fork's read-only token logs and skips the comment, and the job's own status stays the verdict; the comment carries the head sha and is replaced by a "could not run" body on an error, so it never keeps a stale verdict). An independent review (Opus) of the workflow found the pins and permissions correct and raised the body-edit re-run, the unescaped author text in the bot comment and the stale-comment path; all three were fixed before the PR opened, and excuses inside code fences or HTML comments no longer count. `check-workflow-security.mjs` passes on the result. Branch protection was not inspected in this wave; making `change-impact` a required check, and CODEOWNERS on the check scripts and the registry (a PR can otherwise edit the gate it is judged by), are repository-settings decisions.
 
 Accepted limits: `cargo metadata` is not run in CI (the scripts job has no toolchain), so a dependency declared in a way the static parser does not read would pass there; `--cargo` catches it locally. The change-impact rule is path-based, so a behavior change made in a file outside every registered glob is not flagged; the registry is where that is fixed. The exceptions list records 33 edges that should move out of `shared/` and `net/`; this wave did not move any code.
+||||||| 5c5bdf32
 
 ## 10. Keep the repository healthy as it grows
 

@@ -34,6 +34,8 @@ these — short is the point. Use their words; do not answer on their behalf or 
 Reuse answers or explicit decisions the human already supplied in this session.
 Ask only for missing intent; do not repeat answered questions. Record the source
 and capture date so later agents can distinguish those answers from derived facts.
+Never infer an answer from code, commit messages, or the PR diff. If the human did
+not say it, it is not intent.
 
 1. **Why does this feature exist — what problem does it solve for the user?**
 2. **How settled is it — what's a real promise you intend to keep, versus "this is just how it works
@@ -86,6 +88,12 @@ For a filled-in example, see the first entry in
 
 Leave the "_No intent captured yet — pending…_" placeholder in place until you actually have
 answers; replace it only with real ones.
+
+**Preserve earlier decisions and their dates.** When the human changes a decision later,
+do not overwrite the old entry. Add a new dated entry. Mark the old one
+`_Superseded <YYYY-MM-DD> by the entry below._` and keep its text. Keep each decision
+tied to its capture date and its source, so a later agent can see what was decided
+when, and by whom.
 
 ## If the human isn't available
 

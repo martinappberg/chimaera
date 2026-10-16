@@ -25,12 +25,21 @@ embeds it. For a daemon-only change, an existing bundle satisfies that prerequis
 `crates/chimaera-pty` has real PTY tests (`tests.rs`, `snapshot.rs`) — extend
 them when you change terminal state or snapshotting.
 
-## 2. Drive the real flow
+## 2. Select scenarios from the changed contracts
+
+Do not pick scenarios from memory. Read the diff, then find the contracts it
+touches: the area `AGENTS.md` map for each changed path, the
+[feature page](../../../docs/features/README.md) for the capability, and each
+`.claude/rules/*.md` bullet whose `paths` match. Every contract you find
+selects at least one scenario from section 4. If the diff touches a contract that
+no scenario covers, write one. Name the new scenario in the evidence.
+
+## 3. Drive the real flow
 
 Bring up the dev loop (see the **develop** skill), then exercise the *actual*
-path you changed. When available, use the `preview_*` tooling to observe: `preview_snapshot`
-for structure/content, `preview_console_logs` + `preview_logs` for errors,
-`preview_network` for API/WS traffic, `preview_screenshot` for proof.
+path you changed. When available, use the browser-pane tooling to observe:
+`read_page` for structure/content, `read_console_messages` + `preview_logs` for
+errors, `read_network_requests` for API/WS traffic, a screenshot for proof.
 
 If those tools are absent, use the develop skill's manual isolated launcher,
 daemon terminal output, and the available browser or native-app inspection tools.
@@ -40,6 +49,8 @@ Report any visual or network surface your session could not inspect.
 tooling: run the daemon headless and drive it over HTTP/WS instead, starting from
 `scripts/smoke-daemon.mjs`, and name in the PR what you could not check (see the
 [cloud sessions guide](../../../docs/agent-guides/cloud-sessions.md)).
+
+## 4. Scenarios
 
 Match the exercise to what you touched:
 
@@ -66,15 +77,29 @@ Match the exercise to what you touched:
   (`/ws/events`) sends the current full roster; PTY sockets rebuild the screen
   from an escape-sequence snapshot.
 
-## 3. Resource discipline is part of "works"
+## 5. Resource discipline is part of "works"
 
 The daemon must stay light on shared hosts; cluster workspaces normally run
 inside allocations. While exercising, sanity-check it stays within budget (~150 MB RSS target, <1 core steady-state, no runaway buffers) —
 a preview of a huge Parquet/HTML file must never balloon memory. A change that
 works but leaks or busy-loops is not done.
 
-## 4. Report
+## 6. Report with structured evidence
 
-State what you ran and observed, alongside the tests — e.g. "spawned a claude
-session, killed the ws, reattached from a 2nd tab at 80×24 → identical screen;
-`just check` green." That sentence is the deliverable reviewers look for.
+Record one entry per scenario, in the PR body:
+
+```
+Scenario:  <name, and the contract that selected it>
+Steps:     <the exact actions, in order>
+Observed:  <what happened, including numbers such as RSS or window size>
+Evidence:  <artifact: log excerpt, screenshot path, request id, command output>
+Result:    pass | fail | blocked (<what was missing>)
+```
+
+Use `blocked` when a check could not run: a tool is unavailable, credentials are
+missing, or there is no HPC allocation. Do not report a blocked check as a
+failure. Do not report it as a pass. Name what it would take to unblock it.
+
+Example: "spawned a claude session, killed the ws, reattached from a 2nd tab at
+80×24 → identical screen; `just check` green." That sentence, with its evidence,
+is the deliverable reviewers look for.
