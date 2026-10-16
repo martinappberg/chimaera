@@ -867,7 +867,6 @@
                 <FileIcon path={editDraft} size={14} />
               {/if}
             </span>
-            <!-- svelte-ignore a11y_autofocus -->
             <input
               class="edit-input"
               type="text"
@@ -898,7 +897,6 @@
                   <FileIcon path={entry.path} size={14} />
                 {/if}
               </span>
-              <!-- svelte-ignore a11y_autofocus -->
               <input
                 class="edit-input"
                 type="text"
