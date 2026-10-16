@@ -57,11 +57,75 @@ fn control_path() -> String {
     if let Some(t) = wsl_transport() {
         return wsl_control_path(&t.home);
     }
-    let dir = control_dir(&chimaera_core::data_dir());
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        tracing::warn!("failed to create ssh control dir {}: {e}", dir.display());
+    let data_dir = chimaera_core::data_dir();
+    let dir = control_dir(&data_dir);
+    let shared = (!dir.starts_with(&data_dir)).then_some(data_dir.as_path());
+    if !prepare_control_dir(&dir, shared) {
+        // No multiplexing (every call authenticates) beats riding a socket
+        // directory someone else controls.
+        return "none".to_string();
     }
     dir.join("%C").to_string_lossy().into_owned()
+}
+
+/// Create the socket directory, refusing a shared one we don't own. The
+/// `/tmp` fallback (`shared`: `Some(a path we own)`) is a predictable name any
+/// local user can create first; a directory they own would let them plant a
+/// "master" socket our ssh joins as a mux client. So both levels of the
+/// fallback must be ours and private ([`chimaera_core::ensure_private_dir`]);
+/// `false` = don't use `dir`.
+fn prepare_control_dir(dir: &Path, shared: Option<&Path>) -> bool {
+    let Some(ours) = shared else {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::warn!("failed to create ssh control dir {}: {e}", dir.display());
+        }
+        return true;
+    };
+    let private = |level: &Path| {
+        chimaera_core::ensure_private_dir(level).or_else(|e| {
+            if tighten_own_dir(level, ours) {
+                chimaera_core::ensure_private_dir(level)
+            } else {
+                Err(e)
+            }
+        })
+    };
+    let made = dir
+        .parent()
+        .map_or(Ok(()), private)
+        .and_then(|()| private(dir));
+    if let Err(e) = made {
+        tracing::warn!(
+            "not using ssh control dir {}: {e}; ssh connections won't be shared",
+            dir.display()
+        );
+        return false;
+    }
+    true
+}
+
+/// Make `dir` 0700 when it is a real directory owned by the owner of `ours`
+/// that nobody else could write to — the fallback as earlier builds created
+/// it (0755). One that others could write may hold something they planted,
+/// so it is never adopted.
+fn tighten_own_dir(dir: &Path, ours: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let (Ok(meta), Ok(owner)) = (std::fs::symlink_metadata(dir), std::fs::metadata(ours))
+        else {
+            return false;
+        };
+        meta.is_dir()
+            && meta.uid() == owner.uid()
+            && meta.mode() & 0o022 == 0
+            && std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (dir, ours);
+        false
+    }
 }
 
 /// On Windows every ssh/scp runs INSIDE the WSL2 distro that hosts the local
@@ -107,6 +171,12 @@ pub fn wsl_transport_ready() -> bool {
 /// pinned with `-u` so a later change of the distro's default user (Ubuntu
 /// OOBE) can never silently re-home ssh's config/keys/sockets mid-flight.
 fn transport_command(program: &str) -> Command {
+    #[cfg(test)]
+    if let Some(fake) = FAKE_TRANSPORT.with(|f| f.borrow().clone()) {
+        let mut c = Command::new(fake);
+        c.arg(program);
+        return c;
+    }
     match wsl_transport() {
         Some(t) => {
             let mut c = Command::new("wsl.exe");
@@ -121,6 +191,15 @@ fn transport_command(program: &str) -> Command {
         }
         None => Command::new(program),
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: a script that stands in for every ssh/scp spawned on this
+    /// thread, run as `<script> <program> <argv…>`. Thread-local because
+    /// tests run concurrently and `#[tokio::test]` spawns on the test thread.
+    static FAKE_TRANSPORT: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// A `curl` invocation with the same no-console discipline as every other
@@ -204,7 +283,11 @@ async fn output_bounded(
     what: &str,
 ) -> anyhow::Result<std::process::Output> {
     cmd.kill_on_drop(true);
-    cmd.stdout(std::process::Stdio::piped())
+    // Never the caller's stdin: in the CLI, ssh would forward keystrokes
+    // typed during a connect to the remote command. Callers that feed a
+    // script spawn their own child.
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let child = cmd
         .spawn()
@@ -281,7 +364,10 @@ fn control_dir(data_dir: &std::path::Path) -> std::path::PathBuf {
 /// host … (yes/no)?" prompt, so a freshly installed app connecting to a host
 /// it has never seen would otherwise fail outright. `accept-new` records an
 /// unknown key automatically but still *refuses* a changed one — keeping the
-/// MITM protection that a blanket `=no` would throw away.
+/// MITM protection that a blanket `=no` would throw away. A command-line `-o`
+/// beats `~/.ssh/config`, so it is left out for an alias whose own effective
+/// setting is stricter (`StrictHostKeyChecking yes`, see
+/// [`learn_ssh_config`]): the user's choice wins.
 ///
 /// *Liveness* — `ConnectTimeout` bounds the TCP connect so an unreachable
 /// host fails in seconds instead of the OS default (minutes) — a hung
@@ -290,16 +376,17 @@ fn control_dir(data_dir: &std::path::Path) -> std::path::PathBuf {
 /// (laptop sleep, network change) within ~45s and exit; without them a dead
 /// tunnel keeps its local listener open for hours, so every liveness probe
 /// lies "up" and reconnect becomes a no-op.
-fn ssh_opts() -> [String; 16] {
-    [
+fn ssh_opts(host: &str) -> Vec<String> {
+    let mut opts: Vec<String> = vec![
         "-o".into(),
         "ControlMaster=auto".into(),
         "-o".into(),
         format!("ControlPath={}", control_path()),
         "-o".into(),
         "ControlPersist=10m".into(),
-        "-o".into(),
-        "StrictHostKeyChecking=accept-new".into(),
+    ];
+    opts.extend(host_key_opts(host));
+    opts.extend([
         "-o".into(),
         "ConnectTimeout=15".into(),
         "-o".into(),
@@ -315,7 +402,76 @@ fn ssh_opts() -> [String; 16] {
         // chimaera's own masters — the user's ssh config is untouched.
         "-o".into(),
         "Compression=yes".into(),
-    ]
+    ]);
+    opts
+}
+
+/// The trust-on-first-use pair for `host`, or nothing when the user's own
+/// config is stricter. Unlearned aliases get the pair (the old behavior).
+fn host_key_opts(host: &str) -> Vec<String> {
+    let stricter = HOST_KEY_STRICT
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(host)
+        .copied()
+        .unwrap_or(false);
+    if stricter {
+        Vec::new()
+    } else {
+        vec!["-o".into(), "StrictHostKeyChecking=accept-new".into()]
+    }
+}
+
+/// Per alias: whether the user's effective `StrictHostKeyChecking` (from
+/// `ssh -G`) is stricter than trust-on-first-use. Absent = not learned yet.
+static HOST_KEY_STRICT: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, bool>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Learn `host`'s effective ssh settings this crate defers to — today, whether
+/// its `StrictHostKeyChecking` is `yes` — once per alias per process. `ssh -G`
+/// only resolves the config locally (no connection, no prompt). A failure is
+/// not cached: the next connect asks again, and until then the TOFU default
+/// applies. Every public entry point that dials calls this first.
+pub async fn learn_ssh_config(host: &str) {
+    if HOST_KEY_STRICT
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains_key(host)
+    {
+        return;
+    }
+    let mut cmd = transport_command("ssh");
+    cmd.env(ASKPASS_ALIAS_ENV, host).arg("-G").arg(host);
+    let stricter = match output_bounded(&mut cmd, 15, "ssh -G").await {
+        Ok(out) if out.status.success() => stricter_than_tofu(ssh_g_value(
+            &String::from_utf8_lossy(&out.stdout),
+            "stricthostkeychecking",
+        )),
+        _ => return,
+    };
+    if stricter {
+        tracing::info!("{host}: StrictHostKeyChecking is on in your ssh config; chimaera won't add new host keys for it");
+    }
+    HOST_KEY_STRICT
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(host.to_string(), stricter);
+}
+
+/// One key's value in `ssh -G` output (`key value` lines, keys lowercase).
+fn ssh_g_value<'a>(stdout: &'a str, key: &str) -> Option<&'a str> {
+    stdout.lines().find_map(|l| {
+        let (k, v) = l.trim().split_once(' ')?;
+        (k == key).then(|| v.trim())
+    })
+}
+
+/// Whether an effective `StrictHostKeyChecking` refuses unknown keys. `ask`
+/// (the default — no tty to ask on, so TOFU stands in), `accept-new`, and the
+/// weaker `no`/`off` all keep the TOFU option, which is at least as strict.
+fn stricter_than_tofu(value: Option<&str>) -> bool {
+    matches!(value, Some("yes" | "true"))
 }
 
 /// An `ssh` command pre-loaded with the shared options, no host yet. For
@@ -332,7 +488,7 @@ fn ssh_base_via(host: &str, route: &Route) -> Command {
     let mut c = transport_command("ssh");
     c.env(ASKPASS_ALIAS_ENV, host);
     c.args(route_opts(host, route));
-    c.args(ssh_opts());
+    c.args(ssh_opts(host));
     c
 }
 
@@ -354,7 +510,7 @@ fn ssh_cmd(host: &str) -> Command {
 pub fn interactive_ssh_argv(host: &str) -> Vec<String> {
     let mut argv = vec!["ssh".to_string()];
     argv.extend(route_opts(host, &route_of(host)));
-    argv.extend(ssh_opts());
+    argv.extend(ssh_opts(host));
     argv.push("-t".into());
     argv.push(host.to_string());
     argv
@@ -367,7 +523,7 @@ fn scp_cmd(host: &str) -> Command {
     let mut c = transport_command("scp");
     c.env(ASKPASS_ALIAS_ENV, host);
     c.args(route_opts(host, &route_of(host)));
-    c.args(ssh_opts());
+    c.args(ssh_opts(host));
     c
 }
 
@@ -876,7 +1032,7 @@ fn mux_prologue(host: &str, route: &Route) -> Command {
         .env(ASKPASS_ALIAS_ENV, host)
         .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"])
         .args(route_opts(host, route))
-        .args(ssh_opts());
+        .args(ssh_opts(host));
     command
 }
 
@@ -898,6 +1054,7 @@ async fn bounded_mux_ssh(
         .arg(host)
         .args(remote)
         .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let child = match command.spawn() {
@@ -1150,7 +1307,10 @@ async fn locate(
             Ok(ProbeRun::Ran(Some(p))) => format!("registered on {} now", p.manifest.hostname),
             // Probing afresh would dial the alias and prompt a second time.
             Ok(ProbeRun::Failed(f)) if f.cancelled() => bail!("{ASKPASS_CANCELLED}"),
-            Ok(ProbeRun::Failed(f)) => f.to_string(),
+            Ok(ProbeRun::Failed(f)) => match f.fatal(host) {
+                Some(why) => bail!(why),
+                None => f.to_string(),
+            },
             Err(e) => format!("{e:#}"),
         };
         tracing::info!(
@@ -1168,9 +1328,13 @@ async fn locate(
         // The user said no: stop here. The start path below runs more ssh
         // execs, each of which would ask again.
         ProbeRun::Failed(f) if f.cancelled() => bail!("{ASKPASS_CANCELLED}"),
-        // An unreachable host reads as nothing running, as it always has:
-        // the start path then surfaces ssh's own error.
-        ProbeRun::Failed(_) | ProbeRun::Ran(None) => return Ok(None),
+        // Unreachable is not "nothing running": a fresh start would land
+        // next to a daemon this exec merely failed to see.
+        ProbeRun::Failed(f) => match f.fatal(host) {
+            Some(why) => bail!(why),
+            None => bail!("could not reach {host}: {f}"),
+        },
+        ProbeRun::Ran(None) => return Ok(None),
         ProbeRun::Ran(Some(p)) if p.here() => return Ok(Some((p.manifest, p.alive))),
         ProbeRun::Ran(Some(p)) => p,
     };
@@ -1307,12 +1471,29 @@ async fn resolve_daemon(
     // costs a channel-open RTT plus a fork on a loaded login node. `locate`
     // adds execs only for a manifest another node wrote, and leaves every op
     // below routed to the daemon's node.
-    let first = ops.remote_probe(host, true).await?;
+    let mut first = ops.remote_probe(host, true).await?;
     // Before anything reads the scheduler: that answer is cached from an
     // earlier connect, so a cancelled reconnect to a known cluster would
     // otherwise land as "a cluster" (a success) — or, with `update_daemon`,
     // go on to download and scp, each asking again.
     first.bail_if_cancelled()?;
+    first.bail_if_fatal(host)?;
+    if matches!(first, ProbeRun::Failed(_)) && ops.route(host) != Route::Alias {
+        // A learned node route that gave no verdict: start over along the
+        // alias — detecting again, so the scheduler below is this connect's.
+        tracing::info!("{host}: no answer along the learned route; probing afresh");
+        ops.set_route(host, Route::Alias);
+        first = ops.remote_probe(host, true).await?;
+        first.bail_if_cancelled()?;
+        first.bail_if_fatal(host)?;
+    }
+    // Only a probe that ran may decide anything: the cached scheduler is an
+    // earlier connect's answer (a host that stopped answering would show as
+    // "a cluster, connected"), and "nothing running" from a failed exec
+    // would start a daemon next to a live one, or on a login node.
+    if let ProbeRun::Failed(f) = &first {
+        bail!("could not reach {host}: {f}");
+    }
     let scheduler = ops.scheduler(host);
     if scheduler.is_cluster() && !opts.login_serve && !opts.not_cluster {
         // A cluster: nothing of ours may keep running on its login node, so
@@ -1377,12 +1558,15 @@ async fn resolve_daemon(
                     // Secure the replacement binary BEFORE stopping the
                     // running daemon: a failed download/build must never leave
                     // the host with nothing running (the bug that stranded a
-                    // stopped daemon when a dev build 404'd on download).
+                    // stopped daemon when a dev build 404'd on download). The
+                    // upload goes first too — the running daemon keeps its
+                    // old inode across the rename — so a full quota or a
+                    // dropped link mid-scp leaves it serving.
                     let bin = ops
                         .resolve_local_binary(host, opts.binary.as_deref(), progress)
                         .await?;
-                    ops.stop_remote(host, m.pid).await?;
                     ops.deploy_binary(host, &bin, progress).await?;
+                    ops.stop_remote(host, m.pid).await?;
                     progress(Phase::Starting);
                     let started = ops.start_remote(host).await?;
                     // A stop whose exit went unconfirmed (a link blip during
@@ -1429,7 +1613,18 @@ async fn resolve_daemon(
                     .await?;
             }
             progress(Phase::Starting);
-            ops.start_remote(host).await?
+            let started = ops.start_remote(host).await?;
+            // An installed binary of another release that could not be
+            // replaced (see `ensure_remote_binary`), or an explicit
+            // `--binary`, serves fine — but not as our build.
+            if !chimaera_core::builds_match(local_build, started.build.as_deref()) {
+                tracing::warn!(
+                    "the daemon started on {host} is build {}, not ours ({local_build}); connecting to it as outdated",
+                    started.build.as_deref().unwrap_or("pre-build-id")
+                );
+                outdated = true;
+            }
+            started
         }
     };
     Ok((manifest, outdated, live_sessions))
@@ -1446,6 +1641,7 @@ pub async fn connect(
     // "ssh cluster" typed verbatim reached ssh as one hostname in the field)
     // so every ssh invocation below sees a real destination.
     let host = &hosts::normalize_alias(host)?;
+    learn_ssh_config(host).await;
     // Dev-ness is the build's property (see `RemoteHome::current`): a dev
     // build ALWAYS targets `~/.chimaera-dev`, a release always `~/.chimaera`.
     // There is no per-connect override, so a release client can never touch
@@ -1470,8 +1666,9 @@ pub async fn connect(
         // listener the probe cannot see. A stale mux forward can also accept
         // locally without reaching this daemon. One retry on a fresh
         // OS-assigned port covers both; an EXPLICITLY requested port stays a
-        // hard error.
-        Err(e) if opts.local_port.is_none() => {
+        // hard error, and so is anything but a forward failure (a refused
+        // sign-in would fail the same way on any port).
+        Err(e) if opts.local_port.is_none() && e.downcast_ref::<TunnelPhaseError>().is_some() => {
             tracing::warn!("tunnel on 127.0.0.1:{local_port} failed ({e:#}); retrying fresh");
             local_port = ephemeral_port()?;
             progress(Phase::Tunneling { local_port });
@@ -1513,6 +1710,7 @@ pub async fn locate_daemon(
     host: &str,
     home: RemoteHome,
 ) -> anyhow::Result<Option<(Manifest, bool)>> {
+    learn_ssh_config(host).await;
     locate(
         &SshOps {
             home,
@@ -1643,6 +1841,18 @@ impl ProbeRun {
             _ => Ok(()),
         }
     }
+
+    /// The connect ends here, with a plain message, if ssh failed in a way
+    /// no further dial can fix ([`fatal_ssh_failure`]).
+    fn bail_if_fatal(&self, host: &str) -> anyhow::Result<()> {
+        match self {
+            ProbeRun::Failed(f) => match f.fatal(host) {
+                Some(why) => bail!(why),
+                None => Ok(()),
+            },
+            ProbeRun::Ran(_) => Ok(()),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1675,6 +1885,49 @@ impl ProbeFailure {
     fn cancelled(&self) -> bool {
         self.stderr.lines().any(|l| l.trim() == ASKPASS_CANCELLED)
     }
+
+    fn fatal(&self, host: &str) -> Option<String> {
+        fatal_ssh_failure(host, &self.stderr)
+    }
+}
+
+/// The plain-words verdict on an ssh failure no retry can fix — a host key
+/// ssh refused, a refused sign-in, too many keys offered — or `None` when
+/// another attempt might get through. Each ends a connect at once: every
+/// further exec fails the same way, and a refused password is asked for
+/// again on each. Matched on OpenSSH's own client messages, stable across
+/// releases. Never a reason to touch `known_hosts`: that is the user's call.
+fn fatal_ssh_failure(host: &str, stderr: &str) -> Option<String> {
+    let has = |marker: &str| stderr.contains(marker);
+    if has("Host key verification failed") || has("REMOTE HOST IDENTIFICATION HAS CHANGED") {
+        return Some(format!(
+            "ssh refused {host}'s host key: it changed, or your ssh config accepts only keys \
+             already in known_hosts. chimaera never edits known_hosts — check the key, update \
+             it yourself, and connect again."
+        ));
+    }
+    if has("Too many authentication failures") {
+        return Some(format!(
+            "{host} hung up after too many sign-in attempts: ssh offered more keys than it \
+             accepts. Set IdentitiesOnly and the right IdentityFile for {host} in your ssh config."
+        ));
+    }
+    // OpenSSH's own form only — `Permission denied (publickey,password).`:
+    // a remote tool's "Permission denied (os error 13)" is not a sign-in.
+    let denied = stderr.lines().map(str::trim).find(|l| {
+        l.split_once("Permission denied (")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .is_some_and(|(methods, _)| {
+                !methods.is_empty()
+                    && methods.bytes().all(|b| {
+                        b.is_ascii_lowercase() || b.is_ascii_digit() || b"-,@.".contains(&b)
+                    })
+            })
+    })?;
+    Some(format!(
+        "{host} refused the sign-in ({}). Check the user, key or password ssh uses for it.",
+        denied.trim_end_matches('.')
+    ))
 }
 
 impl std::fmt::Display for ProbeFailure {
@@ -1688,28 +1941,34 @@ impl std::fmt::Display for ProbeFailure {
     }
 }
 
-/// Fetch the manifest under `home`, whether its recorded pid answers
-/// `kill -0`, and which node answered, in ONE remote exec — the decision
-/// phase's whole probe. A manifest + a `kill -0` exec cost two serial round
-/// trips, and every exec through the ControlMaster is a channel-open RTT plus
-/// a remote fork (~300-500 ms on a loaded login node at WAN latency). `None`
-/// = no readable manifest (or ssh itself failed — "nothing running", as the
-/// connect flow has always read an unreachable host).
 /// Which batch scheduler `host`'s login shell reaches — one probe exec (which
 /// also raises the ControlMaster, so it may ask the user to authenticate).
 /// Every later cluster command finds the scheduler on the PATH this learned.
 pub async fn detect_scheduler(host: &str, home: RemoteHome) -> anyhow::Result<SchedulerInfo> {
     let host = &hosts::normalize_alias(host)?;
+    learn_ssh_config(host).await;
     if let ProbeRun::Failed(f) = probe_run(host, home, true).await? {
-        bail!("could not reach {host}: {f}");
+        bail!(f
+            .fatal(host)
+            .unwrap_or_else(|| format!("could not reach {host}: {f}")));
     }
     Ok(scheduler_of(host).unwrap_or_default())
 }
 
+/// Fetch the manifest under `home`, whether its recorded pid answers
+/// `kill -0`, and which node answered, in ONE remote exec — the decision
+/// phase's whole probe. A manifest + a `kill -0` exec cost two serial round
+/// trips, and every exec through the ControlMaster is a channel-open RTT plus
+/// a remote fork (~300-500 ms on a loaded login node at WAN latency). `None`
+/// = no readable manifest; an ssh failure is an error — an unreachable host
+/// is not one with nothing running.
 pub async fn remote_probe(host: &str, home: RemoteHome) -> anyhow::Result<Option<Probe>> {
+    learn_ssh_config(host).await;
     match probe_run(host, home, true).await? {
         ProbeRun::Ran(probe) => Ok(probe),
-        ProbeRun::Failed(_) => Ok(None),
+        ProbeRun::Failed(f) => bail!(f
+            .fatal(host)
+            .unwrap_or_else(|| format!("could not reach {host}: {f}"))),
     }
 }
 
@@ -2157,6 +2416,7 @@ pub fn release_triple(os: &str, arch: &str) -> Option<&'static str> {
 
 /// A daemon asset resolved from the GitHub releases API: the release version
 /// it belongs to, its download URL, and its published sha256 (hex).
+#[derive(Debug)]
 struct ReleaseAsset {
     version: String,
     url: String,
@@ -2219,6 +2479,16 @@ async fn release_asset(
     }
     let meta: serde_json::Value =
         serde_json::from_slice(&out.stdout).context("bad release metadata payload")?;
+    parse_release_meta(&meta, asset_name)
+}
+
+/// One GitHub release's metadata → the asset named `asset_name`. `Ok(None)`
+/// when the release doesn't exist or lacks the asset (the caller falls back);
+/// `Err` for any other refusal or a missing url/checksum. Pure for the tests.
+fn parse_release_meta(
+    meta: &serde_json::Value,
+    asset_name: &str,
+) -> anyhow::Result<Option<ReleaseAsset>> {
     // A missing release is `{"message": "Not Found", ...}` — no `tag_name`.
     // Anything ELSE without a tag (rate limit, auth failure) is a transient
     // API error and must surface as one: falling back would misreport it as
@@ -2459,7 +2729,9 @@ async fn resolve_local_binary(
 
 /// Copy `path` to `<home>/bin/chimaera` on the host, staged + renamed so an
 /// interrupted copy never leaves a half-written executable and the old inode
-/// stays intact for anything still running it.
+/// stays intact for anything still running it. The staged copy must answer
+/// `--version` as chimaera before the rename: a truncated upload or a binary
+/// for another architecture never replaces one that works.
 async fn deploy_binary(
     host: &str,
     path: &Path,
@@ -2487,21 +2759,51 @@ async fn deploy_binary(
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    ssh_run(
-        host,
-        &format!(
-            "chmod +x {bin}.new && mv -f {bin}.new {bin}",
-            bin = home.bin_path()
+    let size = std::fs::metadata(path)
+        .with_context(|| format!("failed to read {}", path.display()))?
+        .len();
+    let install = sh_wrap(&install_staged_script(&home.bin_path(), size));
+    let output = output_bounded(ssh_cmd(host).arg(install), SSH_ONESHOT_SECS, "ssh").await?;
+    match output.status.code() {
+        Some(0) => Ok(()),
+        Some(STAGED_BINARY_BROKEN_EXIT) => bail!(
+            "the chimaera copied to {host} does not run there ({}); the installed one was left in place",
+            ssh_failure_line(&output.stderr, &output.status)
         ),
-    )
-    .await?;
-    Ok(())
+        _ => bail!(
+            "installing chimaera on {host} failed: {}",
+            ssh_failure_line(&output.stderr, &output.status)
+        ),
+    }
 }
 
-/// Ensure the host has a chimaera binary, installing one only if absent (the
-/// fresh-host path — an existing binary is left as-is). Replacing an outdated
-/// one is the caller's job: resolve + deploy around a graceful stop, in that
-/// order, so a failed fetch never kills a working daemon.
+/// Exit code of [`install_staged_script`] when the staged copy does not
+/// answer `--version` as chimaera (distinct from the shell's and ssh's own).
+const STAGED_BINARY_BROKEN_EXIT: i32 = 6;
+
+/// The POSIX-sh script that moves the staged `<bin>.new` over `<bin>` — only
+/// once it has all `size` bytes (checked first: a truncated file is never
+/// run) and answers `--version` as chimaera; otherwise it is removed and the
+/// script exits [`STAGED_BINARY_BROKEN_EXIT`] saying why. Pure so the tests
+/// can run it under real shells.
+fn install_staged_script(bin: &str, size: u64) -> String {
+    format!(
+        "chmod +x {bin}.new || exit 1; n=$(wc -c < {bin}.new | tr -d ' '); \
+         if [ \"$n\" != {size} ]; then rm -f {bin}.new; \
+         printf 'copied %s of {size} bytes\\n' \"$n\" >&2; exit {broken}; fi; \
+         v=$({bin}.new --version 2>&1 | head -n 1); \
+         case \"$v\" in \"chimaera \"*) mv -f {bin}.new {bin};; \
+         *) rm -f {bin}.new; printf '%s\\n' \"${{v:-no output}}\" >&2; exit {broken};; esac",
+        broken = STAGED_BINARY_BROKEN_EXIT,
+    )
+}
+
+/// Ensure the host has a chimaera binary to start (the fresh-start path:
+/// nothing is running, so replacing one disturbs nothing). A missing or dev
+/// binary must be replaced; another release's is upgraded to ours, keeping the
+/// installed one if ours can't be fetched or copied — it still serves, and
+/// the caller reports it as outdated. Replacing a RUNNING daemon's binary is
+/// the caller's job: resolve + deploy around a graceful stop.
 ///
 /// The DEV home always deploys, even over an existing binary: its whole point
 /// is running THIS build, and with no dev daemon alive there is nothing a
@@ -2514,24 +2816,60 @@ async fn ensure_remote_binary(
     progress: &impl Fn(Phase),
 ) -> anyhow::Result<()> {
     if home == RemoteHome::Real {
-        // Reuse the existing binary only if it can actually SERVE this home:
-        // executability is not enough. A dev (0.0.1-sentinel) binary stranded
-        // in the real home — deployed there by a pre-fix release that trusted
-        // the dist stash — starts fine but relocates its state to
-        // `~/.chimaera-dev`, so the manifest this connect polls never
-        // appears. Probe the version and replace anything that is not a
-        // stamped release.
-        match remote_binary_version(host, home).await? {
-            Some(v) if !chimaera_core::version_is_dev(&v) => return Ok(()),
-            Some(v) => tracing::info!(
-                "replacing the dev build ({v}) stranded at {} — it cannot serve the real home",
-                home.bin_path()
-            ),
-            None => {}
+        let installed = remote_binary_version(host, home).await?;
+        match installed_binary_action(installed.as_deref(), chimaera_core::VERSION) {
+            InstalledBinary::Keep => return Ok(()),
+            InstalledBinary::Install => {
+                if let Some(v) = installed {
+                    tracing::info!(
+                        "replacing the dev build ({v}) stranded at {} — it cannot serve the real home",
+                        home.bin_path()
+                    );
+                }
+            }
+            InstalledBinary::Upgrade => {
+                let v = installed.unwrap_or_default();
+                let upgraded = async {
+                    let path = resolve_local_binary(host, binary, home, progress).await?;
+                    deploy_binary(host, &path, home, progress).await
+                };
+                if let Err(e) = upgraded.await {
+                    tracing::warn!(
+                        "could not replace chimaera {v} on {host} with {}: {e:#}; starting the installed one",
+                        chimaera_core::VERSION
+                    );
+                }
+                return Ok(());
+            }
         }
     }
     let path = resolve_local_binary(host, binary, home, progress).await?;
     deploy_binary(host, &path, home, progress).await
+}
+
+/// What a fresh start does with the binary installed in the real home.
+#[derive(Debug, PartialEq, Eq)]
+enum InstalledBinary {
+    /// Our release: start it.
+    Keep,
+    /// None, or one that can't serve the real home — a dev (0.0.1-sentinel)
+    /// build relocates its state to `~/.chimaera-dev`, so the manifest this
+    /// connect polls would never appear. Install ours or fail.
+    Install,
+    /// Another release: install ours, else start it anyway.
+    Upgrade,
+}
+
+/// Pure policy behind [`ensure_remote_binary`]: `installed` is what the
+/// host's binary reports (`None` = missing or unrecognizable), `ours` this
+/// build's version.
+fn installed_binary_action(installed: Option<&str>, ours: &str) -> InstalledBinary {
+    match installed {
+        None => InstalledBinary::Install,
+        Some(v) if chimaera_core::version_is_dev(v) => InstalledBinary::Install,
+        Some(v) if v == ours => InstalledBinary::Keep,
+        Some(_) => InstalledBinary::Upgrade,
+    }
 }
 
 /// The version the binary installed in `home` reports (`chimaera X.Y.Z` →
@@ -2570,52 +2908,7 @@ fn parse_cli_version(text: &str) -> Option<String> {
 /// manifest reports a live pid.
 async fn start_remote(host: &str, home: RemoteHome, not_cluster: bool) -> anyhow::Result<Manifest> {
     tracing::info!("starting chimaera daemon on {host} ({})", home.dir());
-    ssh_run(
-        host,
-        // Detach the daemon so it outlives this one-shot ssh command. Primary
-        // path: `serve --daemonize` forks + `setsid(2)`s IN-PROCESS, so it needs
-        // no util-linux `setsid`/`nohup` (absent on macOS/BSD and minimal Linux
-        // containers) — that is what lets `connect` start a daemon on ANY POSIX
-        // remote. Its parent exits 0 the instant the child owns its new session,
-        // so `&& exit` ends the ssh command promptly and `connect` moves on to
-        // the wait exec below.
-        //
-        // Fallback, reached only when `--daemonize` is rejected (a pre-flag
-        // remote binary — an older release, which by definition sits on a Linux
-        // host already provisioned with one): the proven `setsid nohup … &
-        // disown`. `;` not `&&` after `mkdir`: with `&&` the trailing `&`
-        // backgrounds the whole list and the daemon becomes the foreground child
-        // of a subshell still holding the ssh channel's stdio, so sshd never
-        // closes the session and `connect` hangs. Found the hard way on a real
-        // cluster.
-        //
-        // The `>> {log}` target MUST stay a regular file: the daemonize child
-        // (chimaera/src/daemonize.rs) keeps only regular-file stdio and
-        // re-points everything else at /dev/null, so redirecting to a
-        // fifo/pipe — or dropping the redirect — silently sends the remote
-        // daemon's logs to /dev/null.
-        //
-        // Sent BARE (not through `sh_wrap`): pre-existing, and it still assumes
-        // a POSIX login shell — folding it into the wait exec is the follow-up.
-        &format!(
-            "mkdir -p {log_dir}; \
-             {env}{bin} serve --daemonize >> {log} 2>&1 < /dev/null && exit; \
-             {env}setsid nohup {bin} serve >> {log} 2>&1 < /dev/null & disown",
-            log_dir = home.log_dir(),
-            env = format!(
-                "{}{}",
-                home.serve_env(),
-                if not_cluster {
-                    format!("{}=1 ", chimaera_core::cluster::ENV_NOT_A_CLUSTER)
-                } else {
-                    String::new()
-                }
-            ),
-            bin = home.bin_path(),
-            log = home.log_path(),
-        ),
-    )
-    .await?;
+    ssh_run(host, &sh_wrap(&start_line(home, not_cluster))).await?;
     // Wait for the manifest AND a live pid in ONE remote loop instead of up
     // to 15 × 2 client-side execs (each a channel-open RTT + remote fork):
     // 30 half-second ticks = the same 15 s deadline. The manifest is written
@@ -2653,6 +2946,47 @@ async fn start_remote(host: &str, home: RemoteHome, not_cluster: bool) -> anyhow
             stderr.trim()
         ),
     }
+}
+
+/// The POSIX-sh line that starts the daemon detached, so it outlives the
+/// one-shot ssh command. Run through [`sh_wrap`]: sshd hands it to the login
+/// shell, and under tcsh `>> log 2>&1` is a syntax error.
+///
+/// Primary path: `serve --daemonize` forks + `setsid(2)`s IN-PROCESS, so it
+/// needs no util-linux `setsid`/`nohup` (absent on macOS/BSD and minimal Linux
+/// containers) — that is what lets `connect` start a daemon on ANY POSIX
+/// remote. Its parent exits 0 the instant the child owns its new session, so
+/// `&& exit` ends the ssh command promptly and `connect` moves on to the wait.
+///
+/// Fallback, reached only when `--daemonize` is rejected (a pre-flag remote
+/// binary — an older release, which by definition sits on a Linux host
+/// already provisioned with one): the proven `setsid nohup … & disown`.
+/// `disown` is a bash-ism (dash: "not found", exit 127), hence its silenced
+/// error and the trailing `:`; `setsid` already detaches. `;` not `&&` after
+/// `mkdir`: with `&&` the trailing `&` backgrounds the whole list and the
+/// daemon becomes the foreground child of a subshell still holding the ssh
+/// channel's stdio, so sshd never closes the session and `connect` hangs.
+/// Found the hard way on a real cluster.
+///
+/// The `>> {log}` target MUST stay a regular file: the daemonize child
+/// (chimaera/src/daemonize.rs) keeps only regular-file stdio and re-points
+/// everything else at /dev/null, so redirecting to a fifo/pipe — or dropping
+/// the redirect — silently sends the remote daemon's logs to /dev/null.
+fn start_line(home: RemoteHome, not_cluster: bool) -> String {
+    let not_cluster = if not_cluster {
+        format!("{}=1 ", chimaera_core::cluster::ENV_NOT_A_CLUSTER)
+    } else {
+        String::new()
+    };
+    format!(
+        "mkdir -p {log_dir}; \
+         {env}{bin} serve --daemonize >> {log} 2>&1 < /dev/null && exit; \
+         {env}setsid nohup {bin} serve >> {log} 2>&1 < /dev/null & disown 2>/dev/null; :",
+        log_dir = home.log_dir(),
+        env = format!("{}{not_cluster}", home.serve_env()),
+        bin = home.bin_path(),
+        log = home.log_path(),
+    )
 }
 
 /// How many half-second ticks [`start_remote`] waits for the manifest (15 s).
@@ -2704,20 +3038,93 @@ fn ephemeral_port() -> anyhow::Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
-fn spawn_tunnel(host: &str, local: u16, remote: u16) -> anyhow::Result<Child> {
-    ssh_base(host)
-        // Exit non-zero the instant the local bind fails instead of sitting
-        // idle: a reconnect that reuses a not-quite-released port then fails
-        // in <1s (caught by wait_for_port's early-exit branch) rather than
-        // eating the full 15s timeout before the fresh-port retry.
-        .args(["-o", "ExitOnForwardFailure=yes"])
+/// A long-lived ssh child holding (or registering) a `-L` forward, with the
+/// tail of what it wrote to stderr.
+struct Forward {
+    child: Child,
+    stderr: StderrTail,
+}
+
+/// Spawn a forward child: no stdin (keystrokes in the CLI are not the
+/// tunnel's), no stdout, stderr drained into a bounded tail. Draining, not
+/// just piping: a forward lives for hours and ssh writes a line per failed
+/// channel open, so an unread pipe would eventually block it.
+fn spawn_forward(mut cmd: Command, what: &str) -> anyhow::Result<Forward> {
+    cmd.kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| TunnelPhaseError(format!("failed to spawn {what}: {e}")))?;
+    let stderr = StderrTail::drain(&mut child);
+    Ok(Forward { child, stderr })
+}
+
+/// How much of a forward child's stderr is kept: ssh's own complaint is one
+/// line, and a chatty banner before it is not worth more memory.
+const STDERR_TAIL_BYTES: usize = 4096;
+
+/// The last [`STDERR_TAIL_BYTES`] a child wrote to stderr, read by a task that
+/// lives as long as the pipe (a ControlPersist master forked by the child can
+/// hold it after the child exits).
+struct StderrTail {
+    buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl StderrTail {
+    fn drain(child: &mut Child) -> Self {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let task = child.stderr.take().map(|mut pipe| {
+            let buf = std::sync::Arc::clone(&buf);
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut chunk = [0u8; 1024];
+                while let Ok(n @ 1..) = pipe.read(&mut chunk).await {
+                    let mut buf = buf.lock().unwrap_or_else(|p| p.into_inner());
+                    buf.extend_from_slice(&chunk[..n]);
+                    let over = buf.len().saturating_sub(STDERR_TAIL_BYTES);
+                    buf.drain(..over);
+                }
+            })
+        });
+        StderrTail { buf, task }
+    }
+
+    /// Everything kept so far, after giving an exited child's last write a
+    /// moment to arrive.
+    async fn text(&mut self) -> String {
+        if let Some(mut task) = self.task.take() {
+            if tokio::time::timeout(Duration::from_millis(300), &mut task)
+                .await
+                .is_err()
+            {
+                self.task = Some(task);
+            }
+        }
+        let buf = self.buf.lock().unwrap_or_else(|p| p.into_inner());
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+}
+
+/// The login-host forward to the daemon's port. `BatchMode`: the probe just
+/// raised (or reused) the ControlMaster this rides, so a prompt here means
+/// the master vanished in between — and a prompt the user cancels would only
+/// be retried on a fresh port, asking again. Failing without one sends the
+/// user to Retry, which probes (and prompts) once.
+fn spawn_tunnel(host: &str, route: &Route, local: u16, remote: u16) -> anyhow::Result<Forward> {
+    let mut cmd = ssh_base_via(host, route);
+    // Exit non-zero the instant the local bind fails instead of sitting
+    // idle: a reconnect that reuses a not-quite-released port then fails
+    // in <1s (caught by wait_for_port's early-exit branch) rather than
+    // eating the full 15s timeout before the fresh-port retry.
+    cmd.args(["-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes"])
         .arg("-N")
         .arg("-L")
         .arg(format!("{local}:127.0.0.1:{remote}"))
-        .arg(host)
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| TunnelPhaseError(format!("failed to spawn ssh tunnel: {e}")).into())
+        .arg(host);
+    spawn_forward(cmd, "ssh tunnel")
 }
 
 /// Bring up one login-host forward and prove the intended daemon answers
@@ -2731,50 +3138,81 @@ async fn open_proven_tunnel(
     remote: u16,
     token: &str,
 ) -> anyhow::Result<(Child, bool)> {
-    let mut child = spawn_tunnel(host, local, remote)?;
-    let mux_observed = match wait_for_port(local, &mut child).await {
+    let route = route_of(host);
+    let forward = spawn_tunnel(host, &route, local, remote)?;
+    let spec = format!("{local}:127.0.0.1:{remote}");
+    prove_forward(host, &route, local, &spec, forward, token, 15, 15).await
+}
+
+/// Wait up to `wait_secs` for `forward`'s local listener, then up to
+/// `prove_secs` for an authenticated answer through it. Any failure tears the
+/// attempt down — including the `-O cancel` of a forward its mux client handed
+/// to the master on `route` (by its exact `spec`), which otherwise stays bound
+/// until the master expires. A refused sign-in or host key read off the
+/// child's stderr is a plain error, not a [`TunnelPhaseError`]: another port
+/// cannot fix it.
+#[allow(clippy::too_many_arguments)]
+async fn prove_forward(
+    host: &str,
+    route: &Route,
+    local: u16,
+    spec: &str,
+    mut forward: Forward,
+    token: &str,
+    wait_secs: u64,
+    prove_secs: u64,
+) -> anyhow::Result<(Child, bool)> {
+    let mux_observed = match wait_for_port(local, &mut forward.child, wait_secs).await {
         Ok(mux) => mux,
         Err(error) => {
             // `wait_for_port` may have observed a successful mux exit before
             // timing out on its listener. That proves this attempt registered
             // the forward, so it also owns cancelling it.
-            let cancel_master = forward_delegated(false, &mut child);
-            abandon_tunnel_attempt(host, local, remote, child, cancel_master).await;
-            return Err(error);
+            let cancel_master = forward_delegated(false, &mut forward.child);
+            let stderr = forward.stderr.text().await;
+            abandon_forward(host, route, spec, forward.child, cancel_master).await;
+            return Err(forward_error(host, error, &stderr));
         }
     };
-    let Some(mux_delegated) = tunnel_proven(local, token, 15, mux_observed, &mut child).await
+    let Some(mux_delegated) =
+        tunnel_proven(local, token, prove_secs, mux_observed, &mut forward.child).await
     else {
-        let cancel_master = forward_delegated(mux_observed, &mut child);
-        abandon_tunnel_attempt(host, local, remote, child, cancel_master).await;
+        let cancel_master = forward_delegated(mux_observed, &mut forward.child);
+        abandon_forward(host, route, spec, forward.child, cancel_master).await;
         return Err(TunnelPhaseError(format!(
             "ssh tunnel on 127.0.0.1:{local} opened, but the authenticated remote daemon did not answer"
         ))
         .into());
     };
-    Ok((child, mux_delegated))
+    Ok((forward.child, mux_delegated))
+}
+
+/// A failed forward's error, with ssh's own last line when it left one.
+fn forward_error(host: &str, error: anyhow::Error, stderr: &str) -> anyhow::Error {
+    if let Some(fatal) = fatal_ssh_failure(host, stderr) {
+        return anyhow::anyhow!(fatal);
+    }
+    match stderr.lines().rev().map(str::trim).find(|l| !l.is_empty()) {
+        Some(line) => TunnelPhaseError(format!("{error}: {line}")).into(),
+        None => error,
+    }
 }
 
 /// Tear down the ownership shape of an abandoned attempt. Only issue
 /// `-O cancel` when this child proved it delegated: cancelling speculatively
 /// after a bind collision could tear down a different healthy caller's
 /// identical forward.
-async fn abandon_tunnel_attempt(
+async fn abandon_forward(
     host: &str,
-    local: u16,
-    remote: u16,
+    route: &Route,
+    spec: &str,
     mut child: Child,
     cancel_master: bool,
 ) {
     let _ = child.start_kill();
     let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
     if cancel_master {
-        cancel_master_forward(
-            host,
-            &route_of(host),
-            &format!("{local}:127.0.0.1:{remote}"),
-        )
-        .await;
+        cancel_master_forward(host, route, spec).await;
     }
 }
 
@@ -2787,12 +3225,12 @@ fn forward_delegated(observed: bool, child: &mut Child) -> bool {
             .is_some_and(|status| status.success())
 }
 
-/// Poll the local tunnel port until it accepts connections (15s timeout).
+/// Poll the local tunnel port until it accepts connections (`secs` timeout).
 /// Returns true if the forward was delegated to an ssh ControlMaster: the mux
 /// client registers the forward with the master and exits 0 immediately, so a
 /// zero exit here is success, not failure.
-async fn wait_for_port(port: u16, tunnel: &mut Child) -> anyhow::Result<bool> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+async fn wait_for_port(port: u16, tunnel: &mut Child, secs: u64) -> anyhow::Result<bool> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
     let mut mux_delegated = false;
     loop {
         if !mux_delegated {
@@ -2814,7 +3252,7 @@ async fn wait_for_port(port: u16, tunnel: &mut Child) -> anyhow::Result<bool> {
         }
         if tokio::time::Instant::now() > deadline {
             return Err(TunnelPhaseError(format!(
-                "tunnel did not come up on 127.0.0.1:{port} within 15s"
+                "tunnel did not come up on 127.0.0.1:{port} within {secs}s"
             ))
             .into());
         }
@@ -2942,7 +3380,7 @@ fn master_proxy_command(host: &str, pin: Option<&str>) -> String {
         words.push(format!("-o HostName={node}"));
     }
     words.extend(
-        ssh_opts()
+        ssh_opts(host)
             .iter()
             .map(|opt| format!("\"{}\"", opt.replace('%', "%%"))),
     );
@@ -2973,13 +3411,9 @@ fn node_proxy_command(host: &str, route: &Route) -> String {
 fn node_ssh_base(host: &str, route: &Route) -> Command {
     let mut c = transport_command("ssh");
     c.env(ASKPASS_ALIAS_ENV, host);
+    c.args(["-o", "ControlPath=none", "-o", "BatchMode=yes"]);
+    c.args(host_key_opts(host));
     c.args([
-        "-o",
-        "ControlPath=none",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "StrictHostKeyChecking=accept-new",
         "-o",
         "ConnectTimeout=15",
         "-o",
@@ -3017,16 +3451,14 @@ fn spawn_node_tunnel(
     node_target: &str,
     local: u16,
     remote: u16,
-) -> anyhow::Result<Child> {
-    node_ssh_base(host, route)
-        .args(["-o", "ExitOnForwardFailure=yes"])
+) -> anyhow::Result<Forward> {
+    let mut cmd = node_ssh_base(host, route);
+    cmd.args(["-o", "ExitOnForwardFailure=yes"])
         .arg("-N")
         .arg("-L")
         .arg(format!("{local}:127.0.0.1:{remote}"))
-        .arg(node_target)
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| TunnelPhaseError(format!("failed to spawn node ssh tunnel: {e}")).into())
+        .arg(node_target);
+    spawn_forward(cmd, "node ssh tunnel")
 }
 
 fn spawn_direct_node_tunnel(
@@ -3035,16 +3467,14 @@ fn spawn_direct_node_tunnel(
     node: &str,
     local: u16,
     remote: u16,
-) -> anyhow::Result<Child> {
-    ssh_base_via(host, route)
-        .args(["-o", "ExitOnForwardFailure=yes"])
+) -> anyhow::Result<Forward> {
+    let mut cmd = ssh_base_via(host, route);
+    cmd.args(["-o", "ExitOnForwardFailure=yes"])
         .arg("-N")
         .arg("-L")
         .arg(format!("{local}:{node}:{remote}"))
-        .arg(host)
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| TunnelPhaseError(format!("failed to spawn direct node tunnel: {e}")).into())
+        .arg(host);
+    spawn_forward(cmd, "direct node tunnel")
 }
 
 /// Build the tunnel to a workspace job's daemon: the direct forward, then
@@ -3084,35 +3514,25 @@ pub async fn connect_compute_node(
         child,
     };
 
-    // Direct — the login master forwards to the node's port.
+    learn_ssh_config(host).await;
+
+    // Direct — the login master forwards to the node's port. Always cancelled
+    // on close, delegated or not: the mux client may hand the forward to the
+    // master just after the probe answers, and a cancel the master doesn't
+    // hold is a no-op it answers locally. A failed attempt cancels a forward
+    // it delegated (`prove_forward`), or the master keeps the local listener.
     let local = pick_local_port(None, port)?;
     let spec = format!("{local}:{node}:{port}");
     match spawn_direct_node_tunnel(host, &route, node, local, port) {
-        Ok(mut child) => match wait_for_port(local, &mut child).await {
-            Ok(mux) => {
-                if tunnel_proven(local, token, 15, mux, &mut child)
-                    .await
-                    .is_some()
-                {
+        Ok(forward) => {
+            match prove_forward(host, &route, local, &spec, forward, token, 15, 15).await {
+                Ok((child, _)) => {
                     tracing::info!(%node, %job_id, "workspace job tunnel up (direct)");
-                    // Always cancelled on close, delegated or not: the mux
-                    // client may hand the forward to the master just after
-                    // the probe answers, and a cancel the master doesn't
-                    // hold is a no-op it answers locally.
                     return Ok(mk(local, ComputeRung::Direct, Some(spec.clone()), child));
                 }
-                // A delegated forward outlives the exited mux client — the
-                // probe failing does not tear it down, so cancel or the
-                // master keeps proxying the local port until it expires.
-                let cancel_master = forward_delegated(mux, &mut child);
-                child.kill().await.ok();
-                if cancel_master {
-                    cancel_master_forward(host, &route, &spec).await;
-                }
-                tracing::info!(%node, "direct forward opened but the job's daemon did not answer");
+                Err(err) => tracing::info!(%node, %err, "direct forward unavailable"),
             }
-            Err(err) => tracing::info!(%node, %err, "direct forward unavailable"),
-        },
+        }
         Err(err) => tracing::info!(%node, %err, "direct forward spawn failed"),
     }
 
@@ -3120,16 +3540,16 @@ pub async fn connect_compute_node(
     let target = node_target(host, node).await;
     let local = pick_local_port(None, port)?;
     match spawn_node_tunnel(host, &route, &target, local, port) {
-        Ok(mut child) => match wait_for_port(local, &mut child).await {
+        Ok(mut forward) => match wait_for_port(local, &mut forward.child, 15).await {
             Ok(mux) => {
-                if tunnel_proven(local, token, 10, mux, &mut child)
+                if tunnel_proven(local, token, 10, mux, &mut forward.child)
                     .await
                     .is_some()
                 {
                     tracing::info!(%node, %job_id, "workspace job tunnel up (ssh into the node)");
-                    return Ok(mk(local, ComputeRung::SshAdopt, None, child));
+                    return Ok(mk(local, ComputeRung::SshAdopt, None, forward.child));
                 }
-                child.kill().await.ok();
+                forward.child.kill().await.ok();
                 tracing::info!(%node, "ssh into the node forwarded but the job's daemon did not answer");
             }
             Err(err) => tracing::info!(%node, %err, "ssh into the node unavailable"),
@@ -3835,7 +4255,7 @@ mod tests {
 
     #[test]
     fn ssh_opts_multiplex_and_accept_new_hosts() {
-        let opts = ssh_opts();
+        let opts = ssh_opts("cluster");
         assert_eq!(opts[0], "-o");
         assert_eq!(opts[1], "ControlMaster=auto");
         assert_eq!(opts[2], "-o");
@@ -4247,6 +4667,8 @@ mod tests {
         local: Vec<std::net::IpAddr>,
         /// What the detecting probe reports.
         scheduler: Scheduler,
+        /// `deploy_binary` fails (a full quota, a link drop mid-scp).
+        deploy_fails: bool,
     }
 
     impl FakeOps {
@@ -4262,6 +4684,7 @@ mod tests {
                 probe: None,
                 local: vec![CLUSTER_ADDR],
                 scheduler: Scheduler::None,
+                deploy_fails: false,
             }
         }
         fn record(&self, c: Call) {
@@ -4334,6 +4757,7 @@ mod tests {
             _progress: &impl Fn(Phase),
         ) -> anyhow::Result<()> {
             self.record(Call::DeployBinary);
+            anyhow::ensure!(!self.deploy_fails, "scp failed: disk quota exceeded");
             Ok(())
         }
         async fn start_remote(&self, _host: &str) -> anyhow::Result<Manifest> {
@@ -4559,11 +4983,11 @@ mod tests {
                 Call::RemoteProbe,
                 Call::RemoteSessionsCount,
                 Call::ResolveLocalBinary,
-                Call::StopRemote,
                 Call::DeployBinary,
+                Call::StopRemote,
                 Call::StartRemote,
             ],
-            "resolve-local-binary must precede stop-remote"
+            "resolve and stage the binary before stopping the daemon"
         );
         assert_eq!(phases, vec!["probing", "updating", "starting"]);
     }
@@ -4590,8 +5014,8 @@ mod tests {
                 Call::RemoteProbe,
                 Call::RemoteSessionsCount,
                 Call::ResolveLocalBinary,
-                Call::StopRemote,
                 Call::DeployBinary,
+                Call::StopRemote,
                 Call::StartRemote,
             ]
         );
@@ -4830,8 +5254,8 @@ mod tests {
                 (Call::RemoteProbe, ln01.clone()),
                 (Call::RemoteSessionsCount, ln01.clone()),
                 (Call::ResolveLocalBinary, ln01.clone()),
-                (Call::StopRemote, ln01.clone()),
                 (Call::DeployBinary, ln01.clone()),
+                (Call::StopRemote, ln01.clone()),
                 (Call::StartRemote, ln01),
             ]
         );
@@ -5348,5 +5772,651 @@ mod tests {
             "u@ln01: Permission denied (password).",
             "ssh's own last line, not the banner"
         );
+    }
+
+    // --- failures that end a connect, and the binary paths -----------------
+
+    /// A probe that failed says nothing about the host: the scheduler cached
+    /// from an earlier connect must not answer "a cluster, connected" (the app
+    /// would stamp it connected and drop its saved windows), and "nothing
+    /// running" must not start a daemon. One probe, then the error.
+    #[tokio::test]
+    async fn a_failed_first_probe_never_answers_from_the_cached_scheduler() {
+        for scheduler in [Scheduler::Slurm, Scheduler::None] {
+            let fake = FakeOps {
+                scheduler,
+                probe: Some(Box::new(|_| {
+                    ssh_failed(
+                        "ssh: connect to host login.example.edu port 22: Operation timed out",
+                    )
+                })),
+                ..FakeOps::base()
+            };
+            let (out, _) = try_resolve(&fake, false).await;
+            let err = out.expect_err("an unreachable host is an error");
+            assert!(err.downcast_ref::<ClusterHost>().is_none(), "{err:#}");
+            assert!(
+                format!("{err:#}").starts_with("could not reach host: ssh: connect to host"),
+                "{err:#}"
+            );
+            assert_eq!(fake.calls(), vec![Call::RemoteProbe], "{scheduler:?}");
+        }
+    }
+
+    /// A changed host key, a refused sign-in, or too many keys ends the
+    /// connect at the first probe with a plain message: no version probe, no
+    /// download, no second route — each would dial (and prompt) again.
+    #[tokio::test]
+    async fn a_fatal_probe_failure_stops_the_connect_at_once() {
+        for (stderr, says) in [
+            ("@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@\nHost key verification failed.", "never edits known_hosts"),
+            ("u@login.example.edu: Permission denied (publickey,password).", "refused the sign-in"),
+            ("Received disconnect from 10.0.0.1 port 22:2: Too many authentication failures\nDisconnected from 10.0.0.1 port 22", "too many sign-in attempts"),
+        ] {
+            for learned in [Route::Alias, Route::Node(LN01.into())] {
+                let fake = FakeOps {
+                    route: RefCell::new(learned.clone()),
+                    probe: Some(Box::new(move |_| ssh_failed(stderr))),
+                    ..FakeOps::base()
+                };
+                let (out, _) = try_resolve(&fake, true).await;
+                let err = format!("{:#}", out.expect_err("fatal"));
+                assert!(err.contains(says), "{err}");
+                assert_eq!(
+                    fake.routed(),
+                    vec![(Call::RemoteProbe, learned)],
+                    "nothing else dials: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fatal_ssh_failures_are_named_plainly() {
+        let host_key = fatal_ssh_failure("cluster", "Host key verification failed.").unwrap();
+        assert!(host_key.contains("cluster's host key"), "{host_key}");
+        let denied = fatal_ssh_failure(
+            "cluster",
+            "Welcome!\nu@cluster: Permission denied (publickey).\n",
+        )
+        .unwrap();
+        assert_eq!(
+            denied,
+            "cluster refused the sign-in (u@cluster: Permission denied (publickey)). Check the \
+             user, key or password ssh uses for it."
+        );
+        for not_fatal in [
+            "ssh: connect to host cluster port 22: Connection refused",
+            "kex_exchange_identification: read: Connection reset by peer",
+            ASKPASS_CANCELLED,
+            "Permission denied, please try again.",
+            // A remote tool's error, not ssh's sign-in verdict.
+            "chimaera: reading ~/.chimaera: Permission denied (os error 13)",
+            "",
+        ] {
+            assert_eq!(fatal_ssh_failure("cluster", not_fatal), None, "{not_fatal}");
+        }
+    }
+
+    /// The update uploads the new binary while the old daemon still serves
+    /// (it keeps its inode across the rename): an upload that fails leaves it
+    /// running — the stop never happens.
+    #[tokio::test]
+    async fn a_failed_upload_never_stops_the_running_daemon() {
+        let fake = FakeOps {
+            probe_manifest: Some(fake_manifest(Some("old.1"), 42)),
+            alive: true,
+            sessions: Some(0),
+            resolved_bin: PathBuf::from("/tmp/chimaera"),
+            deploy_fails: true,
+            ..FakeOps::base()
+        };
+        let (out, _) = try_resolve(&fake, false).await;
+        assert!(format!("{:#}", out.unwrap_err()).contains("quota"));
+        assert_eq!(
+            fake.calls(),
+            vec![
+                Call::RemoteProbe,
+                Call::RemoteSessionsCount,
+                Call::ResolveLocalBinary,
+                Call::DeployBinary,
+            ],
+            "no StopRemote after a failed upload"
+        );
+    }
+
+    /// A fresh start that came up as another build (an installed release
+    /// that could not be replaced, an explicit `--binary`) is outdated, not
+    /// current.
+    #[tokio::test]
+    async fn a_fresh_start_of_another_build_is_reported_outdated() {
+        let fake = FakeOps {
+            start_manifest: fake_manifest(Some("old.1"), 999),
+            ..FakeOps::base()
+        };
+        let ((manifest, outdated, live), _) = run_resolve(&fake, false).await;
+        assert_eq!(manifest.pid, 999);
+        assert!(outdated, "a mismatched daemon is never reported as current");
+        assert_eq!(live, None);
+    }
+
+    #[test]
+    fn installed_binary_action_upgrades_another_release() {
+        use InstalledBinary::*;
+        assert_eq!(installed_binary_action(None, "1.2.0"), Install);
+        assert_eq!(installed_binary_action(Some("0.0.1"), "1.2.0"), Install);
+        assert_eq!(installed_binary_action(Some("1.2.0"), "1.2.0"), Keep);
+        assert_eq!(installed_binary_action(Some("1.1.0"), "1.2.0"), Upgrade);
+        assert_eq!(installed_binary_action(Some("1.3.0"), "1.2.0"), Upgrade);
+    }
+
+    #[test]
+    fn release_metadata_parse_tells_missing_from_refused() {
+        let parse =
+            |v: serde_json::Value| parse_release_meta(&v, "chimaera-x86_64-unknown-linux-musl");
+        assert!(parse(serde_json::json!({"message": "Not Found"}))
+            .unwrap()
+            .is_none());
+        let refused = parse(serde_json::json!({"message": "API rate limit exceeded"})).unwrap_err();
+        assert!(refused.to_string().contains("rate limit"), "{refused}");
+        let release =
+            |assets: serde_json::Value| serde_json::json!({"tag_name": "v1.2.3", "assets": assets});
+        assert!(parse(release(serde_json::json!([{"name": "other"}])))
+            .unwrap()
+            .is_none());
+        let ok = parse(release(serde_json::json!([{
+            "name": "chimaera-x86_64-unknown-linux-musl",
+            "browser_download_url": "https://example.invalid/a",
+            "digest": "sha256:abc"
+        }])))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            (ok.version.as_str(), ok.url.as_str(), ok.sha256.as_str()),
+            ("1.2.3", "https://example.invalid/a", "abc")
+        );
+        let no_digest = parse(release(serde_json::json!([{
+            "name": "chimaera-x86_64-unknown-linux-musl",
+            "browser_download_url": "https://example.invalid/a"
+        }])))
+        .unwrap_err();
+        assert!(no_digest.to_string().contains("no checksum"), "{no_digest}");
+    }
+
+    #[tokio::test]
+    async fn sha256_file_streams_the_known_digest() {
+        let path = std::env::temp_dir().join(format!("chimaera-sha-{}", std::process::id()));
+        std::fs::write(&path, b"abc").unwrap();
+        assert_eq!(
+            sha256_file(&path).await.unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_failure_line_is_sshs_own_last_line() {
+        use std::os::unix::process::ExitStatusExt;
+        let status = std::process::ExitStatus::from_raw(255 << 8);
+        assert_eq!(
+            ssh_failure_line(
+                b"Welcome to the cluster\n\nssh: Could not resolve hostname x\n\n",
+                &status
+            ),
+            "ssh: Could not resolve hostname x"
+        );
+        assert_eq!(
+            ssh_failure_line(b"  \n", &status),
+            format!("ssh exited {status}")
+        );
+    }
+
+    #[test]
+    fn interactive_and_node_proxy_commands_ride_the_right_master() {
+        let argv = interactive_ssh_argv("login.example.edu");
+        assert_eq!(argv.first().map(String::as_str), Some("ssh"));
+        assert!(argv.contains(&"ControlMaster=auto".to_string()), "{argv:?}");
+        assert_eq!(&argv[argv.len() - 2..], ["-t", "login.example.edu"]);
+        let pinned = node_proxy_command("login.example.edu", &Route::Node(LN01.into()));
+        assert!(pinned.contains(&format!("-o HostName={LN01}")), "{pinned}");
+        for route in [Route::Alias, Route::NodeViaAlias(LN01.into())] {
+            let proxy = node_proxy_command("login.example.edu", &route);
+            assert!(!proxy.contains("HostName="), "{route:?}: {proxy}");
+            assert!(proxy.ends_with("-W %h:%p 'login.example.edu'"), "{proxy}");
+        }
+    }
+
+    /// A user whose own config says `StrictHostKeyChecking yes` keeps it:
+    /// the TOFU option (a command-line `-o` beats the config file) is left
+    /// out for that alias only, on every path that dials it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stricter_user_host_key_setting_wins() {
+        assert_eq!(
+            ssh_g_value(
+                "user jane\nstricthostkeychecking true\nport 22\n",
+                "stricthostkeychecking"
+            ),
+            Some("true")
+        );
+        assert_eq!(ssh_g_value("user jane\n", "stricthostkeychecking"), None);
+        for (value, stricter) in [
+            (Some("true"), true),
+            (Some("yes"), true),
+            (Some("ask"), false),
+            (Some("accept-new"), false),
+            (Some("false"), false),
+            (None, false),
+        ] {
+            assert_eq!(stricter_than_tofu(value), stricter, "{value:?}");
+        }
+
+        let has_tofu =
+            |args: Vec<String>| args.iter().any(|a| a.starts_with("StrictHostKeyChecking"));
+        let fake = FakeSsh::install(
+            "strict",
+            r#"case "$*" in *strict.example.edu*) printf 'user jane\nstricthostkeychecking true\n';; *) printf 'stricthostkeychecking ask\n';; esac"#,
+        );
+        learn_ssh_config("strict.example.edu").await;
+        learn_ssh_config("tofu.example.edu").await;
+        learn_ssh_config("strict.example.edu").await;
+        assert_eq!(
+            fake.calls().len(),
+            2,
+            "learned once per alias: {:?}",
+            fake.calls()
+        );
+        assert!(!has_tofu(ssh_opts("strict.example.edu")));
+        let node = node_ssh_base("strict.example.edu", &Route::Alias);
+        assert!(!has_tofu(
+            node.as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        ));
+        assert!(has_tofu(ssh_opts("tofu.example.edu")));
+        assert!(
+            has_tofu(ssh_opts("never-learned.example.edu")),
+            "the default stays TOFU"
+        );
+    }
+
+    /// The `/tmp` control-dir fallback is a name any local user can create
+    /// first; a directory open to others is refused (no multiplexing beats a
+    /// socket dir someone else controls), a fresh one is made private.
+    #[cfg(unix)]
+    #[test]
+    fn the_shared_control_dir_must_be_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("chimaera-cm-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let fresh = root.join("chimaera-fresh").join("cm");
+        assert!(prepare_control_dir(&fresh, Some(&root)));
+        for dir in [fresh.parent().unwrap(), fresh.as_path()] {
+            let mode = std::fs::metadata(dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "{}", dir.display());
+        }
+        let planted = root.join("chimaera-planted");
+        std::fs::create_dir(&planted).unwrap();
+        std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(!prepare_control_dir(&planted.join("cm"), Some(&root)));
+        assert!(!planted.join("cm").exists(), "nothing created inside it");
+        // What an earlier build made (ours, 0755: nobody else could write
+        // into it) is tightened and kept, so its master keeps working.
+        let earlier = root.join("chimaera-earlier");
+        std::fs::create_dir_all(earlier.join("cm")).unwrap();
+        for dir in [earlier.as_path(), &earlier.join("cm")] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert!(prepare_control_dir(&earlier.join("cm"), Some(&root)));
+        let mode = std::fs::metadata(&earlier).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The daemon start line reaches `sh` through every login shell — tcsh
+    /// reads a bare `>> log 2>&1` as a syntax error — and its fallback ends
+    /// 0 under dash, where `disown` does not exist.
+    #[cfg(unix)]
+    #[test]
+    fn start_line_runs_under_every_login_shell() {
+        use std::os::unix::fs::PermissionsExt;
+        let exe = |path: &Path, body: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let line = start_line(RemoteHome::Real, true);
+        // As sshd runs it (the login shell, through `sh_wrap`), and as each
+        // POSIX shell that can be the remote's `/bin/sh` reads it.
+        let mut runs: Vec<(String, String)> = login_shells()
+            .into_iter()
+            .map(|shell| (shell.to_string(), sh_wrap(&line)))
+            .collect();
+        runs.extend(
+            ["sh", "dash", "bash"]
+                .into_iter()
+                .filter(|shell| login_shells().contains(shell))
+                .map(|shell| (format!("{shell} (as /bin/sh)"), line.clone())),
+        );
+        for (fallback, daemonize) in [
+            // `serve --daemonize` works: one start, nothing in the background.
+            (false, "echo \"$CHIMAERA_NOT_A_CLUSTER $*\" > \"$HOME/started\"; exit 0"),
+            // A pre-flag binary rejects it: the setsid/nohup fallback runs.
+            (true, "case \"$*\" in *--daemonize*) exit 2;; esac; echo \"$CHIMAERA_NOT_A_CLUSTER $*\" > \"$HOME/started\""),
+        ] {
+            for (i, (label, script)) in runs.iter().enumerate() {
+                let shell = label.split(' ').next().unwrap();
+                let home = std::env::temp_dir().join(format!(
+                    "chimaera-start-{}-{i}-{fallback}",
+                    std::process::id()
+                ));
+                let _ = std::fs::remove_dir_all(&home);
+                exe(&home.join(".chimaera/bin/chimaera"), daemonize);
+                // macOS has no setsid(1); the fallback only needs one that execs.
+                exe(&home.join("tools/setsid"), "exec \"$@\"");
+                let out = std::process::Command::new(shell)
+                    .args(["-c", script])
+                    .env("HOME", &home)
+                    .env("PATH", format!("{}:/usr/bin:/bin", home.join("tools").display()))
+                    .output()
+                    .expect("spawn shell");
+                assert!(
+                    out.status.success(),
+                    "{label} fallback={fallback}: {} {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let started = home.join("started");
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !started.exists() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                let args = std::fs::read_to_string(&started).unwrap_or_default();
+                let want = if fallback { "1 serve\n" } else { "1 serve --daemonize\n" };
+                assert_eq!(args, want, "{label} fallback={fallback}");
+                assert!(home.join(".chimaera/logs").is_dir(), "{label}");
+                std::fs::remove_dir_all(&home).ok();
+            }
+        }
+    }
+
+    /// The staged upload replaces the installed binary only when it is all
+    /// there and answers `--version` as chimaera; anything else is removed
+    /// and the installed one stays, under every login shell.
+    #[cfg(unix)]
+    #[test]
+    fn install_staged_script_replaces_only_a_working_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        let installed = "#!/bin/sh\necho 'chimaera 1.0.0'\n";
+        for shell in login_shells() {
+            let dir = std::env::temp_dir()
+                .join(format!("chimaera-install-{}-{shell}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let bin = dir.join("chimaera");
+            let staged = dir.join("chimaera.new");
+            let run = |body: &str, size_delta: i64| {
+                std::fs::write(&bin, installed).unwrap();
+                std::fs::write(&staged, body).unwrap();
+                std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o644)).unwrap();
+                let size = (body.len() as i64 + size_delta) as u64;
+                run_script(
+                    shell,
+                    &install_staged_script(&bin.display().to_string(), size),
+                )
+            };
+            let good = "#!/bin/sh\necho 'chimaera 2.0.0'\n";
+            let out = run(good, 0);
+            assert!(
+                out.status.success(),
+                "{shell}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(std::fs::read_to_string(&bin).unwrap(), good, "{shell}");
+            assert!(!staged.exists(), "{shell}");
+
+            for (body, delta, why) in [
+                (good, 1, "copied"),
+                ("#!/bin/sh\necho 'sh: 1: Syntax error'\n", 0, "Syntax error"),
+                ("#!/bin/sh\nexit 1\n", 0, "no output"),
+            ] {
+                let out = run(body, delta);
+                assert_eq!(
+                    out.status.code(),
+                    Some(STAGED_BINARY_BROKEN_EXIT),
+                    "{shell} {why}"
+                );
+                assert!(
+                    String::from_utf8_lossy(&out.stderr).contains(why),
+                    "{shell}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&bin).unwrap(),
+                    installed,
+                    "{shell} {why}: untouched"
+                );
+                assert!(!staged.exists(), "{shell} {why}: removed");
+            }
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    // --- the fake transport: ssh/scp argv and exit codes, no network --------
+
+    /// Points this thread's ssh/scp at a script that logs its argv (one line
+    /// per call, the program first) and then runs `body`.
+    #[cfg(unix)]
+    struct FakeSsh {
+        dir: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl FakeSsh {
+        fn install(tag: &str, body: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = std::env::temp_dir()
+                .join(format!("chimaera-fake-ssh-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let script = dir.join("transport");
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n{body}\n",
+                    dir.join("argv.log").display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            FAKE_TRANSPORT.with(|f| *f.borrow_mut() = Some(script));
+            FakeSsh { dir }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.join("argv.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeSsh {
+        fn drop(&mut self) {
+            FAKE_TRANSPORT.with(|f| *f.borrow_mut() = None);
+            std::fs::remove_dir_all(&self.dir).ok();
+        }
+    }
+
+    /// `stop_remote`'s exit code is its wire: gone, still running, and a wait
+    /// whose ssh dropped — decided by one non-interactive `kill -0`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_remote_maps_the_wait_exit_codes() {
+        let host = "stop.example.edu";
+        {
+            let _fake = FakeSsh::install("stop-gone", "exit 0");
+            stop_remote(host, 42).await.expect("gone");
+        }
+        {
+            let _fake = FakeSsh::install("stop-alive", "exit 4");
+            let err = stop_remote(host, 42).await.unwrap_err().to_string();
+            assert!(err.contains("still running"), "{err}");
+        }
+        {
+            let fake = FakeSsh::install(
+                "stop-dropped",
+                r#"case "$*" in *BatchMode=yes*) exit 1;; esac; exit 255"#,
+            );
+            stop_remote(host, 42)
+                .await
+                .expect("the re-check found it gone");
+            let calls = fake.calls();
+            assert_eq!(calls.len(), 2, "{calls:?}");
+            assert!(
+                calls[1].contains("BatchMode=yes"),
+                "the re-check never prompts: {}",
+                calls[1]
+            );
+        }
+        {
+            let _fake = FakeSsh::install(
+                "stop-dropped-alive",
+                r#"case "$*" in *BatchMode=yes*) exit 0;; esac; exit 255"#,
+            );
+            assert!(stop_remote(host, 42).await.is_err());
+        }
+    }
+
+    /// The start line reaches the remote through `sh_wrap` (a tcsh or fish
+    /// login shell can't read it bare), then the one wait exec hands back the
+    /// manifest.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn start_remote_sends_a_wrapped_start_line_then_waits_once() {
+        let manifest = serde_json::to_string(&fake_manifest(Some("b.1"), 999)).unwrap();
+        let fake = FakeSsh::install(
+            "start",
+            &format!(
+                "case \"$*\" in *serve*) exit 0;; esac; \
+                 printf '\\n%s\\n%s\\n%s\\npid=999\\n' '{MANIFEST_BEGIN}' '{manifest}' '{MANIFEST_END}'"
+            ),
+        );
+        let started = start_remote("start.example.edu", RemoteHome::Real, false)
+            .await
+            .unwrap();
+        assert_eq!(started.pid, 999);
+        let calls = fake.calls();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(
+            calls[0].contains("start.example.edu sh -c 'mkdir -p $HOME/.chimaera/logs; "),
+            "{}",
+            calls[0]
+        );
+        assert!(
+            calls[1].contains("start.example.edu sh -c '"),
+            "{}",
+            calls[1]
+        );
+    }
+
+    /// The tunnel never prompts (`BatchMode`) and never reads stdin; a
+    /// refused sign-in read off its stderr is a plain error — not a
+    /// `TunnelPhaseError`, which the library and the app retry on a fresh
+    /// port — while a bind clash still is one, with ssh's line attached.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_tunnel_is_not_retried_but_a_bind_clash_is() {
+        let host = "tunnel.example.edu";
+        let local = ephemeral_port().unwrap();
+        {
+            let fake = FakeSsh::install(
+                "tunnel-denied",
+                "echo 'jane@tunnel.example.edu: Permission denied (publickey).' >&2; exit 255",
+            );
+            let err = open_proven_tunnel(host, local, 4600, "token")
+                .await
+                .unwrap_err();
+            assert!(err.downcast_ref::<TunnelPhaseError>().is_none(), "{err:#}");
+            assert!(
+                format!("{err:#}").contains("refused the sign-in"),
+                "{err:#}"
+            );
+            let calls = fake.calls();
+            assert_eq!(
+                calls.len(),
+                1,
+                "no -O cancel for a forward never registered: {calls:?}"
+            );
+            assert!(calls[0].starts_with("ssh "), "{}", calls[0]);
+            assert!(calls[0].contains("BatchMode=yes"), "{}", calls[0]);
+            assert!(
+                calls[0].contains(&format!("-N -L {local}:127.0.0.1:4600 {host}")),
+                "{}",
+                calls[0]
+            );
+        }
+        {
+            let _fake = FakeSsh::install(
+                "tunnel-bind",
+                "echo 'bind [127.0.0.1]:1: Address already in use' >&2; exit 255",
+            );
+            let err = open_proven_tunnel(host, local, 4600, "token")
+                .await
+                .unwrap_err();
+            let phase = err.downcast_ref::<TunnelPhaseError>().expect("retryable");
+            assert!(phase.0.contains("Address already in use"), "{}", phase.0);
+        }
+    }
+
+    /// A direct node forward whose mux client handed the forward to the
+    /// master but whose listener never came up is cancelled on that master
+    /// (by its exact spec) — dropping the child leaves the master holding
+    /// the local port. A child that failed outright registered nothing, so
+    /// nothing is cancelled.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_delegated_forward_that_never_listened_is_cancelled_on_the_master() {
+        let host = "cancel.example.edu";
+        let local = ephemeral_port().unwrap();
+        let spec = format!("{local}:node01:9999");
+        {
+            let fake = FakeSsh::install("cancel-delegated", "exit 0");
+            let forward =
+                spawn_direct_node_tunnel(host, &Route::Alias, "node01", local, 9999).unwrap();
+            assert!(
+                prove_forward(host, &Route::Alias, local, &spec, forward, "t", 1, 1)
+                    .await
+                    .is_err()
+            );
+            let calls = fake.calls();
+            assert_eq!(calls.len(), 2, "{calls:?}");
+            assert!(
+                calls[0].contains(&format!("-N -L {spec} {host}")),
+                "{}",
+                calls[0]
+            );
+            assert!(
+                calls[1].contains(&format!("-O cancel -L {spec} {host}")),
+                "{}",
+                calls[1]
+            );
+        }
+        {
+            let fake = FakeSsh::install("cancel-failed", "exit 255");
+            let forward =
+                spawn_direct_node_tunnel(host, &Route::Alias, "node01", local, 9999).unwrap();
+            assert!(
+                prove_forward(host, &Route::Alias, local, &spec, forward, "t", 1, 1)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(fake.calls().len(), 1, "{:?}", fake.calls());
+        }
     }
 }

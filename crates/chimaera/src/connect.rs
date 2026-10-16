@@ -1,7 +1,8 @@
 use std::path::Path;
 
 use anyhow::{bail, Context};
-use chimaera_remote::{connect, hosts::HostsStore, ClusterHost, ConnectOpts, Phase};
+use chimaera_remote::hosts::{normalize_alias, HostsStore};
+use chimaera_remote::{connect, ClusterHost, ConnectOpts, Phase};
 
 pub async fn run(
     host: &str,
@@ -11,6 +12,9 @@ pub async fn run(
     update_daemon: bool,
     login_node: bool,
 ) -> anyhow::Result<()> {
+    // The alias `connect` dials, so the saved entry read and stamped here is
+    // the same one the app shows ("ssh cluster" typed here is "cluster").
+    let host = &normalize_alias(host)?;
     // Dev is dev: an unstamped build always targets ~/.chimaera-dev on the
     // host (and defaults its own state there) — say so, since the real
     // daemon next to it stays untouched and unreported.

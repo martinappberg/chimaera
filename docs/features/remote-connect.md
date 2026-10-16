@@ -60,9 +60,12 @@ and cluster-only connections). Replacement resolution precedes any daemon stop.
   only** (a stash build is the `0.0.1` sentinel, which relocates its state to `~/.chimaera-dev` and
   can never serve the real home) — always **before**
   stopping any running daemon (a failed fetch must never strand a host with no daemon). (4) **Deploy**
-  via `scp` (staged `.new` + `mv -f`), **start** (`chimaera serve --daemonize`, which forks +
+  via `scp` (staged `.new` + `mv -f`, renamed only once the copy has every byte and answers
+  `--version` as chimaera; an update uploads while the old daemon still serves, then stops it, so a
+  failed upload leaves it running), **start** (`chimaera serve --daemonize`, which forks +
   `setsid(2)`s in-process so it needs no util-linux `setsid`/`nohup` and works on any POSIX remote —
-  Linux, macOS, BSD; falls back to `setsid nohup … & disown` for a pre-flag remote binary; then ONE
+  Linux, macOS, BSD; falls back to `setsid nohup … & disown` for a pre-flag remote binary; the
+  start line rides `sh -c` like every other script, so a tcsh or fish login shell can run it; then ONE
   more exec runs a remote POSIX-sh loop that waits ≤15 s for the manifest + a live pid and prints
   it framed — not 15 client-side polls; a dropped ssh channel retries the wait once, and a host with
   no usable `sleep` is reported as such instead of the loop spinning to a false verdict).
@@ -83,6 +86,8 @@ and cluster-only connections). Replacement resolution precedes any daemon stop.
 - **The override** "Run Chimaera on the login node" (per host, `hosts.json` `login_serve`;
   the CLI's `--login-node`) turns a cluster back into a regular remote, for clusters whose
   admins allow it. Off unless set; an older build rewriting `hosts.json` turns it off.
+  The CLI and the app change `hosts.json` under one lock (`hosts.json.lock`), each change
+  re-read from disk first, so neither writes back a stale copy over the other's.
 
 ## Key behaviors & gotchas
 
@@ -175,8 +180,17 @@ and cluster-only connections). Replacement resolution precedes any daemon stop.
   manifest on shutdown only while it is still its own record, and `chimaera kill`/`status` on a
   node refuse to judge another node's record.
 - **TOFU host keys.** `StrictHostKeyChecking=accept-new` lets a windowed app with no tty reach a
-  never-seen host (it still refuses a *changed* key). `ServerAliveInterval/CountMax` notice a dead
+  never-seen host (it still refuses a *changed* key). An alias whose own ssh config says
+  `StrictHostKeyChecking yes` (read once per process with `ssh -G`) keeps that: chimaera adds no
+  option, and a host not yet in known_hosts fails. `ServerAliveInterval/CountMax` notice a dead
   link within ~45s.
+- **A failed probe decides nothing.** If the first probe's ssh fails, the connect stops with ssh's
+  own line ("could not reach <host>: …"): an earlier connect's cached scheduler never answers
+  "a cluster, connected", and an exec that failed is never read as "nothing running" (that would
+  start a daemon next to a live one, or on a login node). A refused host key, a refused sign-in or
+  too many keys offered stops it at once with a plain message and no further dial; chimaera never
+  edits known_hosts. The tunnel itself runs in `BatchMode` (the probe just used the master), so it
+  never prompts; a refused sign-in there is not retried on another port.
 - **A wedged ControlMaster is cleared before a reconnect.** After laptop sleep the master *process*
   is often alive on a dead TCP link, and every mux client queues on it until that ~45 s keepalive
   fires — a reconnect would wait most of a minute and then fail into a manual retry. The monitor's
@@ -205,7 +219,9 @@ and cluster-only connections). Replacement resolution precedes any daemon stop.
   `~/.chimaera/bin/chimaera --version` over ssh): a dev (`0.0.1`) binary stranded in the real home —
   e.g. deployed by a pre-fix release that trusted the dist stash — is replaced with the release
   instead of reused, because started it would relocate to `~/.chimaera-dev` and the manifest poll
-  would time out forever.
+  would time out forever. Another release's binary is replaced with ours too (nothing is running
+  yet); if ours can't be fetched or copied the installed one starts, and like any daemon of another
+  build it is reported **outdated**, never as current.
 - **Never force-kill a remote daemon.** `stop_remote` is SIGTERM-only (a daemon that won't die may
   hold sessions that mustn't be torn out — it errors honestly). SIGTERM and the ≤10 s wait for exit
   are one remote POSIX-sh exec whose exit code is the wire (0 = gone, a distinct code = still

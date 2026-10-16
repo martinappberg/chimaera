@@ -10,8 +10,8 @@
 //! hostname" against a config that looks correct in their terminal.
 
 use std::io::ErrorKind;
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -90,6 +90,13 @@ pub struct HostEntry {
 }
 
 /// In-memory host list backed by a JSON file (save-on-change).
+///
+/// Every mutation is a locked read-modify-write: it takes an advisory lock on
+/// `hosts.json.lock`, re-reads the file, applies the change, and saves — so a
+/// store loaded earlier (the CLI's, or another app flight's) never writes its
+/// stale copy back over a change made since (a stale save once brought back a
+/// login-node override the user had turned off). The lock is shared by every
+/// process that uses this type: the CLI and the native app.
 pub struct HostsStore {
     path: PathBuf,
     items: Vec<HostEntry>,
@@ -99,6 +106,11 @@ pub struct HostsStore {
     /// user's whole host list as the single alias that connect added.
     unreadable: bool,
 }
+
+/// How long a mutation waits for another writer's lock. A writer holds it
+/// for one small read + write; past this the holder is wedged, and going on
+/// unlocked (the old behavior) beats a hung connect.
+const LOCK_WAIT: Duration = Duration::from_secs(5);
 
 impl HostsStore {
     /// Load from the default location (`~/.chimaera/hosts.json`).
@@ -112,43 +124,7 @@ impl HostsStore {
     /// load; ones that stay invalid are kept as-is so the user still sees
     /// (and can delete) them — connect explains what's wrong.
     pub fn load(path: PathBuf) -> Self {
-        let mut unreadable = false;
-        let mut items: Vec<HostEntry> = match std::fs::read_to_string(&path) {
-            Ok(contents) => match serde_json::from_str(&contents) {
-                Ok(items) => items,
-                Err(err) => {
-                    tracing::warn!(path = %path.display(), %err, "corrupt hosts.json; serving an empty host list and refusing to overwrite it");
-                    unreadable = true;
-                    Vec::new()
-                }
-            },
-            Err(err) if err.kind() == ErrorKind::NotFound => Vec::new(),
-            Err(err) => {
-                tracing::warn!(path = %path.display(), %err, "failed to read hosts.json; serving an empty host list and refusing to overwrite it");
-                unreadable = true;
-                Vec::new()
-            }
-        };
-        for entry in &mut items {
-            // The former two overrides are one connection choice now. Keep
-            // the user's direct-host choice without suppressing scheduler facts.
-            if entry.not_cluster || entry.login_serve {
-                entry.login_serve = true;
-                entry.not_cluster = false;
-                entry.cluster_setup_complete = true;
-            }
-            if let Ok(normalized) = normalize_alias(&entry.alias) {
-                entry.alias = normalized;
-            }
-        }
-        // Keep the first of each alias. `dedup_by` only collapses *adjacent*
-        // equals, but normalization can map two originally-distinct, non-
-        // adjacent entries onto the same alias (e.g. "ssh cluster" + "cluster"),
-        // which `dedup_by` would leave both of — so the host shows up twice and
-        // a stale twin lingers in hosts.json. Retain-with-a-seen-set removes
-        // duplicates at any position; `list()` re-sorts by recency anyway.
-        let mut seen = std::collections::HashSet::new();
-        items.retain(|entry| seen.insert(entry.alias.clone()));
+        let (items, unreadable) = read_items(&path);
         HostsStore {
             path,
             items,
@@ -175,87 +151,70 @@ impl HostsStore {
     /// connect targets is NOT stored here: dev-ness is the build's property
     /// (see `RemoteHome::current`), never a per-host choice.
     pub fn add(&mut self, alias: &str, binary: Option<PathBuf>) -> anyhow::Result<HostEntry> {
-        let alias = &normalize_alias(alias)?;
-        if let Some(existing) = self.items.iter_mut().find(|h| h.alias == *alias) {
-            if existing.binary.is_none() && binary.is_some() {
-                existing.binary = binary;
-                let entry = existing.clone();
-                self.save()?;
-                return Ok(entry);
+        let alias = normalize_alias(alias)?;
+        self.mutate(|items| {
+            if let Some(existing) = items.iter_mut().find(|h| h.alias == alias) {
+                if existing.binary.is_none() && binary.is_some() {
+                    existing.binary = binary;
+                    return Ok((existing.clone(), true));
+                }
+                return Ok((existing.clone(), false));
             }
-            return Ok(existing.clone());
-        }
-        let entry = HostEntry {
-            alias: alias.to_string(),
-            binary,
-            added_at: unix_now(),
-            last_connected_at: None,
-            login_serve: false,
-            cluster_setup_complete: false,
-            not_cluster: false,
-            scheduler: None,
-        };
-        self.items.push(entry.clone());
-        self.save()?;
-        Ok(entry)
+            let entry = new_entry(&alias, binary, None);
+            items.push(entry.clone());
+            Ok((entry, true))
+        })
     }
 
     /// Forget `alias`. Returns whether it existed.
     pub fn remove(&mut self, alias: &str) -> anyhow::Result<bool> {
-        let before = self.items.len();
-        self.items.retain(|h| h.alias != alias);
-        let removed = self.items.len() != before;
-        if removed {
-            self.save()?;
-        }
-        Ok(removed)
+        self.mutate(|items| {
+            let before = items.len();
+            items.retain(|h| h.alias != alias);
+            let removed = items.len() != before;
+            Ok((removed, removed))
+        })
     }
 
     /// Stamp a successful connection to `alias`, adding it if unknown, and
     /// return the stamped entry (so callers publish it without a reload).
     pub fn record_connected(&mut self, alias: &str) -> anyhow::Result<HostEntry> {
-        let entry = match self.items.iter_mut().find(|h| h.alias == alias) {
-            Some(entry) => {
-                entry.last_connected_at = Some(unix_now());
-                entry.clone()
-            }
-            None => {
-                let entry = HostEntry {
-                    alias: alias.to_string(),
-                    binary: None,
-                    added_at: unix_now(),
-                    last_connected_at: Some(unix_now()),
-                    login_serve: false,
-                    cluster_setup_complete: false,
-                    not_cluster: false,
-                    scheduler: None,
-                };
-                self.items.push(entry.clone());
-                entry
-            }
-        };
-        self.save()?;
-        Ok(entry)
+        // `connect` dials the normalized alias; stamping the raw input would
+        // add a twin entry ("ssh cluster" next to "cluster").
+        let alias = normalize_alias(alias)?;
+        self.mutate(|items| {
+            let entry = match items.iter_mut().find(|h| h.alias == alias) {
+                Some(entry) => {
+                    entry.last_connected_at = Some(unix_now());
+                    entry.clone()
+                }
+                None => {
+                    let entry = new_entry(&alias, None, Some(unix_now()));
+                    items.push(entry.clone());
+                    entry
+                }
+            };
+            Ok((entry, true))
+        })
     }
 
     /// Set the warned login-node override for `alias` (adding the host if
     /// unknown) and return the updated entry.
     pub fn set_login_serve(&mut self, alias: &str, on: bool) -> anyhow::Result<HostEntry> {
-        let alias = &normalize_alias(alias)?;
-        if !self.items.iter().any(|h| h.alias == *alias) {
-            self.add(alias, None)?;
-        }
-        let entry = self
-            .items
-            .iter_mut()
-            .find(|h| h.alias == *alias)
-            .expect("just added");
-        entry.login_serve = on;
-        entry.not_cluster = false;
-        entry.cluster_setup_complete = true;
-        let entry = entry.clone();
-        self.save()?;
-        Ok(entry)
+        let alias = normalize_alias(alias)?;
+        self.mutate(|items| {
+            if !items.iter().any(|h| h.alias == alias) {
+                items.push(new_entry(&alias, None, None));
+            }
+            let entry = items
+                .iter_mut()
+                .find(|h| h.alias == alias)
+                .expect("just added");
+            entry.login_serve = on;
+            entry.not_cluster = false;
+            entry.cluster_setup_complete = true;
+            Ok((entry.clone(), true))
+        })
     }
 
     /// Say `alias` is (`on`) or isn't a cluster after all (adding the host if
@@ -273,24 +232,39 @@ impl HostsStore {
         alias: &str,
         scheduler: chimaera_core::slurm::Scheduler,
     ) -> anyhow::Result<Option<HostEntry>> {
-        let Some(entry) = self.items.iter_mut().find(|h| h.alias == alias) else {
-            return Ok(None);
-        };
-        let seen = scheduler.is_cluster().then_some(scheduler);
-        if entry.scheduler != seen {
+        self.mutate(|items| {
+            let Some(entry) = items.iter_mut().find(|h| h.alias == alias) else {
+                return Ok((None, false));
+            };
+            let seen = scheduler.is_cluster().then_some(scheduler);
+            let changed = entry.scheduler != seen;
             entry.scheduler = seen;
-            let entry = entry.clone();
+            Ok((Some(entry.clone()), changed))
+        })
+    }
+
+    /// One locked read-modify-write. `change` gets the list as it is on disk
+    /// NOW and answers `(result, changed)`; the list is saved only when it
+    /// changed. The lock is released when this returns.
+    fn mutate<T>(
+        &mut self,
+        change: impl FnOnce(&mut Vec<HostEntry>) -> anyhow::Result<(T, bool)>,
+    ) -> anyhow::Result<T> {
+        let _lock = lock_file(&self.path);
+        let (items, unreadable) = read_items(&self.path);
+        self.items = items;
+        self.unreadable = unreadable;
+        let (out, changed) = change(&mut self.items)?;
+        if changed {
             self.save()?;
-            return Ok(Some(entry));
         }
-        Ok(Some(entry.clone()))
+        Ok(out)
     }
 
     /// Atomically persist the list (tmp file + rename). The tmp name is
-    /// unique per writer: the app's concurrent connect flights and a CLI
-    /// `connect` in another process all write this file, and a shared
-    /// `hosts.json.tmp` interleaved between two of them renames a torn file
-    /// into place — which `load` then reads as corrupt: an EMPTY host list.
+    /// unique per writer, so even a writer that went on without the lock
+    /// (see [`LOCK_WAIT`]) never renames a torn file into place — which
+    /// `load` would read as corrupt: an EMPTY host list.
     fn save(&self) -> anyhow::Result<()> {
         if self.unreadable {
             anyhow::bail!(
@@ -319,6 +293,102 @@ impl HostsStore {
                 .with_context(|| format!("failed to rename into {}", self.path.display()));
         }
         Ok(())
+    }
+}
+
+/// A fresh entry for a normalized `alias`.
+fn new_entry(alias: &str, binary: Option<PathBuf>, connected: Option<u64>) -> HostEntry {
+    HostEntry {
+        alias: alias.to_string(),
+        binary,
+        added_at: unix_now(),
+        last_connected_at: connected,
+        login_serve: false,
+        cluster_setup_complete: false,
+        not_cluster: false,
+        scheduler: None,
+    }
+}
+
+/// The host list at `path` (healed and deduplicated), and whether the file
+/// existed but could not be read.
+fn read_items(path: &Path) -> (Vec<HostEntry>, bool) {
+    let mut unreadable = false;
+    let mut items: Vec<HostEntry> = match std::fs::read_to_string(path) {
+        Ok(contents) => match serde_json::from_str(&contents) {
+            Ok(items) => items,
+            Err(err) => {
+                tracing::warn!(path = %path.display(), %err, "corrupt hosts.json; serving an empty host list and refusing to overwrite it");
+                unreadable = true;
+                Vec::new()
+            }
+        },
+        Err(err) if err.kind() == ErrorKind::NotFound => Vec::new(),
+        Err(err) => {
+            tracing::warn!(path = %path.display(), %err, "failed to read hosts.json; serving an empty host list and refusing to overwrite it");
+            unreadable = true;
+            Vec::new()
+        }
+    };
+    for entry in &mut items {
+        // The former two overrides are one connection choice now. Keep
+        // the user's direct-host choice without suppressing scheduler facts.
+        if entry.not_cluster || entry.login_serve {
+            entry.login_serve = true;
+            entry.not_cluster = false;
+            entry.cluster_setup_complete = true;
+        }
+        if let Ok(normalized) = normalize_alias(&entry.alias) {
+            entry.alias = normalized;
+        }
+    }
+    // Keep the first of each alias. `dedup_by` only collapses *adjacent*
+    // equals, but normalization can map two originally-distinct, non-
+    // adjacent entries onto the same alias (e.g. "ssh cluster" + "cluster"),
+    // which `dedup_by` would leave both of — so the host shows up twice and
+    // a stale twin lingers in hosts.json. Retain-with-a-seen-set removes
+    // duplicates at any position; `list()` re-sorts by recency anyway.
+    let mut seen = std::collections::HashSet::new();
+    items.retain(|entry| seen.insert(entry.alias.clone()));
+    (items, unreadable)
+}
+
+/// An exclusive advisory lock on `<path>.lock`, held until the file is
+/// dropped. A lock file beside the list, not the list itself: `save` renames
+/// a new file over `hosts.json`, which would orphan a lock taken on the old
+/// one. `None` (with a warning) when the lock can't be had within
+/// [`LOCK_WAIT`] or the filesystem has no locks — the write goes on unlocked,
+/// as it always did.
+fn lock_file(path: &Path) -> Option<std::fs::File> {
+    let lock_path = path.with_extension("json.lock");
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+    {
+        Ok(file) => file,
+        Err(err) => {
+            tracing::warn!(path = %lock_path.display(), %err, "could not open the hosts.json lock; writing unlocked");
+            return None;
+        }
+    };
+    let deadline = Instant::now() + LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Some(file),
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(err) => {
+                tracing::warn!(path = %lock_path.display(), %err, "could not lock hosts.json; writing unlocked");
+                return None;
+            }
+        }
     }
 }
 
@@ -380,10 +450,80 @@ mod tests {
         let err = store.record_connected("cluster").unwrap_err();
         assert!(err.to_string().contains("refusing to overwrite"), "{err}");
         assert_eq!(std::fs::read(&path).unwrap(), b"{ not json");
-        assert!(
-            std::fs::read_dir(&dir).unwrap().count() == 1,
-            "no tmp file left beside it"
-        );
+        let tmp_files = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")
+            })
+            .count();
+        assert_eq!(tmp_files, 0, "no tmp file left beside it");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A store loaded before another writer's change (the CLI's, or another
+    /// connect flight's) never writes its stale copy back: each mutation
+    /// re-reads under the lock. The old save-what-I-loaded brought back a
+    /// login-node override the user had just turned off.
+    #[test]
+    fn a_stale_store_never_writes_back_over_a_newer_change() {
+        let (mut first, dir) = tmp_store("stale");
+        first.set_login_serve("cluster", true).unwrap();
+        let mut stale = HostsStore::load(dir.join("hosts.json"));
+        assert!(stale.get("cluster").unwrap().login_serve);
+        first.set_login_serve("cluster", false).unwrap();
+        stale.record_connected("cluster").unwrap();
+        let saved = HostsStore::load(dir.join("hosts.json"))
+            .get("cluster")
+            .unwrap();
+        assert!(!saved.login_serve, "the user's later choice stands");
+        assert!(saved.last_connected_at.is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Writers in parallel, each holding a store loaded before any of them
+    /// wrote: every one's change lands.
+    #[test]
+    fn concurrent_writers_keep_every_update() {
+        let (_, dir) = tmp_store("concurrent");
+        let path = dir.join("hosts.json");
+        let stores: Vec<HostsStore> = (0..8).map(|_| HostsStore::load(path.clone())).collect();
+        let threads: Vec<_> = stores
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut store)| {
+                std::thread::spawn(move || {
+                    store.record_connected(&format!("host{i}")).unwrap();
+                    store.set_login_serve(&format!("host{i}"), true).unwrap();
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let saved = HostsStore::load(path);
+        for i in 0..8 {
+            assert!(
+                saved
+                    .get(&format!("host{i}"))
+                    .is_some_and(|h| h.login_serve),
+                "host{i} lost: {:?}",
+                saved.list()
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn record_connected_stamps_the_normalized_alias() {
+        let (mut store, dir) = tmp_store("normalized");
+        store.add("cluster", None).unwrap();
+        let stamped = store.record_connected("ssh cluster").unwrap();
+        assert_eq!(stamped.alias, "cluster");
+        assert_eq!(store.list().len(), 1, "no twin entry");
         std::fs::remove_dir_all(&dir).ok();
     }
 

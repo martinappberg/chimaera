@@ -191,6 +191,54 @@ pub fn runtime_dir() -> PathBuf {
     dir
 }
 
+/// Create `path` as a directory only this user can enter, or prove an existing
+/// one already is. For directories under a shared `/tmp` whose name another
+/// user can predict: a pre-created directory (or a symlink planted at the
+/// name) would let them read what we put there, or swap scripts we run. The
+/// final component is made with mode 0700; parents are created normally.
+/// An existing entry must be a real directory (not a symlink), owned by the
+/// effective uid, with no group/other bits — otherwise `PermissionDenied`.
+/// Never chmods or removes an entry it finds: it may not be ours.
+pub fn ensure_private_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        match std::fs::DirBuilder::new().mode(0o700).create(path) {
+            Ok(()) => {}
+            // Ours or a racing creator's: either way it is checked below.
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        let meta = std::fs::symlink_metadata(path)?;
+        let why = if meta.file_type().is_symlink() {
+            Some("it is a symlink".to_string())
+        } else if !meta.is_dir() {
+            Some("it is not a directory".to_string())
+        } else if meta.uid() != nix::unistd::Uid::effective().as_raw() {
+            Some(format!("it is owned by uid {}", meta.uid()))
+        } else if meta.mode() & 0o077 != 0 {
+            Some(format!("its mode is {:o}", meta.mode() & 0o777))
+        } else {
+            None
+        };
+        match why {
+            None => Ok(()),
+            Some(why) => Err(std::io::Error::new(
+                ErrorKind::PermissionDenied,
+                format!("{} is not a private directory: {why}", path.display()),
+            )),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
+}
+
 #[cfg(unix)]
 fn default_runtime_dir() -> PathBuf {
     match std::env::var_os("XDG_RUNTIME_DIR") {
@@ -526,6 +574,66 @@ mod tests {
         assert!(!version_is_dev("0.15.1"));
         assert!(!version_is_dev("1.0.0"));
         assert!(is_dev_build(), "tests always run on the 0.0.1 sentinel");
+    }
+
+    /// A name in a shared /tmp is predictable: whatever already sits there
+    /// must be proven ours and private, never adopted or "fixed" in place.
+    #[cfg(unix)]
+    #[test]
+    fn private_dir_refuses_a_foreign_mode_or_symlink() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-private-dir-test-{}-{}",
+            std::process::id(),
+            &generate_token()[..8]
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Fresh (parents too): created at 0700.
+        let fresh = root.join("a/b/fresh");
+        ensure_private_dir(&fresh).unwrap();
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        // Existing and private: accepted again.
+        ensure_private_dir(&fresh).unwrap();
+
+        // Pre-created world-writable: refused, and left as found.
+        let open = root.join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = ensure_private_dir(&open).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("is not a private directory"));
+        let mode = std::fs::metadata(&open).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o777, "never chmods what it finds");
+
+        // Group-readable is as bad as world-writable.
+        let group = root.join("group");
+        std::fs::create_dir(&group).unwrap();
+        std::fs::set_permissions(&group, std::fs::Permissions::from_mode(0o750)).unwrap();
+        assert_eq!(
+            ensure_private_dir(&group).unwrap_err().kind(),
+            ErrorKind::PermissionDenied
+        );
+
+        // A symlink to a private directory: refused (the target is theirs to move).
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&fresh, &link).unwrap();
+        assert_eq!(
+            ensure_private_dir(&link).unwrap_err().kind(),
+            ErrorKind::PermissionDenied
+        );
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+
+        // A plain file at the name: refused.
+        let file = root.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(
+            ensure_private_dir(&file).unwrap_err().kind(),
+            ErrorKind::PermissionDenied
+        );
+
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[cfg(unix)]
