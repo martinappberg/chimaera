@@ -63,8 +63,12 @@ pub const MAX_PARTITIONS: usize = 50;
 
 /// `squeue -u <user> --noheader -o SQUEUE_FORMAT`. `%j` goes LAST: job names
 /// are the one user-controlled field and may contain the `|` delimiter, which
-/// `splitn` can only fold into the final field.
-pub const SQUEUE_FORMAT: &str = "%i|%P|%T|%L|%N|%C|%m|%M|%Z|%r|%j";
+/// `splitn` can only fold into the final field. `%S` is the start time — for
+/// a pending job, the scheduler's own estimate — so no separate
+/// `squeue --start` per waiting job is ever needed.
+pub const SQUEUE_FORMAT: &str = "%i|%P|%T|%L|%N|%C|%m|%M|%Z|%r|%S|%j";
+/// Fields in a [`SQUEUE_FORMAT`] row.
+const SQUEUE_FIELDS: usize = 12;
 
 /// `sinfo --noheader -o SINFO_FORMAT`.
 pub const SINFO_FORMAT: &str = "%P|%a|%D|%l|%c|%m|%G";
@@ -91,6 +95,13 @@ pub struct Job {
     /// "" or `None` when there is nothing to say.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reason: String,
+    /// `%S` as squeue printed it (`2026-10-03T14:20:00` in the cluster's
+    /// zone): when a running job started, or when a pending one is expected
+    /// to. "" when Slurm has no estimate (`N/A`, `Unknown`). Not serialized:
+    /// the daemon's `/compute` wire keeps its shape, and a client converts it
+    /// with the cluster's zone.
+    #[serde(default, skip_serializing)]
+    pub start: String,
 }
 
 /// Terminal squeue states — a job seen in one of these has ended.
@@ -124,10 +135,19 @@ pub fn is_live_state(state: &str) -> bool {
 /// fatal (Slurm banners and warnings sometimes precede output). The mid-row
 /// fields are tolerated missing — older rows degrade to "".
 pub fn parse_squeue(out: &str) -> (Vec<Job>, bool) {
+    parse_squeue_capped(out, MAX_JOBS)
+}
+
+/// [`parse_squeue`] with its own row cap. `truncated` means rows were left
+/// out: a job missing from such a read may still be queued.
+pub fn parse_squeue_capped(out: &str, max: usize) -> (Vec<Job>, bool) {
     let mut jobs = Vec::new();
     let mut truncated = false;
     for line in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        let mut f = line.splitn(11, '|').map(str::trim);
+        // A row without the `%S` column (the layout before it) still names
+        // its job in the last field.
+        let fields = line.splitn(SQUEUE_FIELDS, '|').count();
+        let mut f = line.splitn(SQUEUE_FIELDS, '|').map(str::trim);
         let (Some(id), Some(partition), Some(state), Some(time_left)) =
             (f.next(), f.next(), f.next(), f.next())
         else {
@@ -136,7 +156,7 @@ pub fn parse_squeue(out: &str) -> (Vec<Job>, bool) {
         if id.is_empty() || !id.starts_with(|c: char| c.is_ascii_digit()) {
             continue; // not a job row
         }
-        if jobs.len() >= MAX_JOBS {
+        if jobs.len() >= max {
             truncated = true;
             break;
         }
@@ -156,6 +176,14 @@ pub fn parse_squeue(out: &str) -> (Vec<Job>, bool) {
             .filter(|r| !matches!(*r, "None" | "(null)" | "n/a"))
             .unwrap_or("")
             .to_string();
+        let start = if fields == SQUEUE_FIELDS {
+            f.next()
+                .filter(|t| t.starts_with(|c: char| c.is_ascii_digit()))
+                .unwrap_or("")
+                .to_string()
+        } else {
+            String::new()
+        };
         jobs.push(Job {
             id: id.to_string(),
             name: f.next().unwrap_or("").to_string(),
@@ -168,6 +196,7 @@ pub fn parse_squeue(out: &str) -> (Vec<Job>, bool) {
             elapsed,
             workdir,
             reason,
+            start,
         });
     }
     (jobs, truncated)
@@ -254,7 +283,9 @@ pub fn parse_sinfo(out: &str) -> (Vec<Partition>, bool) {
 /// Parse Slurm's duration grammar (`squeue %L`, `sinfo %l`, `--time`):
 /// `days-hours:minutes:seconds` with zero leading components omitted, so
 /// `9:54` is min:sec and `8:00:00` is h:min:sec. `UNLIMITED`, `NOT_SET`,
-/// `INVALID`, and bare numbers (ambiguous) are `None`.
+/// `INVALID`, and bare numbers (ambiguous) are `None`, and so is anything past
+/// [`MAX_DURATION_DAYS`] — scheduler output is untrusted, and every caller
+/// adds the result to a clock.
 pub fn parse_duration(s: &str) -> Option<Duration> {
     let s = s.trim();
     let (days, rest) = match s.split_once('-') {
@@ -274,8 +305,19 @@ pub fn parse_duration(s: &str) -> Option<Duration> {
         (_, [h, m, s]) => (*h, *m, *s),
         _ => return None,
     };
-    Some(Duration::from_secs(((days * 24 + h) * 60 + m) * 60 + sec))
+    let secs = days
+        .checked_mul(24)?
+        .checked_add(h)?
+        .checked_mul(60)?
+        .checked_add(m)?
+        .checked_mul(60)?
+        .checked_add(sec)?;
+    (secs <= MAX_DURATION_DAYS * 86_400).then(|| Duration::from_secs(secs))
 }
+
+/// The longest duration [`parse_duration`] believes: ten years, far past any
+/// real walltime.
+pub const MAX_DURATION_DAYS: u64 = 3650;
 
 /// A duration as Slurm's `--time` wants it: `D-HH:MM:SS`, or `HH:MM:SS`
 /// under a day. Seconds round down to the minute — walltimes are minutes.
@@ -797,9 +839,9 @@ mod tests {
     #[test]
     fn parse_squeue_rows_caps_and_skips_noise() {
         let out =
-            "34022541|batch|RUNNING|9:54|n058|4|16G|1:02:03|/home/u/proj|None|chimaera-test\n\
-                   34022542|batch|PENDING|8:00:00||||0:00|(null)|Priority|align.sh\n\
-                   34022543|batch|RUNNING|1:00|n1|2|4G|5:00|/scratch/x|None|my|weird|name\n\
+            "34022541|batch|RUNNING|9:54|n058|4|16G|1:02:03|/home/u/proj|None|2026-10-03T09:00:00|chimaera-test\n\
+                   34022542|batch|PENDING|8:00:00||||0:00|(null)|Priority|N/A|align.sh\n\
+                   34022543|batch|RUNNING|1:00|n1|2|4G|5:00|/scratch/x|None|2026-10-03T09:00:00|my|weird|name\n\
                    slurm_load_jobs: Warning: something\n";
         let (jobs, truncated) = parse_squeue(out);
         assert!(!truncated);
@@ -822,11 +864,36 @@ mod tests {
         );
 
         let many: String = (0..60)
-            .map(|i| format!("{i}|p|RUNNING|1:00|n{i}|1|1G|0:10|/w|None|j{i}\n"))
+            .map(|i| format!("{i}|p|RUNNING|1:00|n{i}|1|1G|0:10|/w|None|N/A|j{i}\n"))
             .collect();
         let (jobs, truncated) = parse_squeue(&many);
         assert_eq!(jobs.len(), MAX_JOBS);
         assert!(truncated);
+        let (jobs, truncated) = parse_squeue_capped(&many, 100);
+        assert_eq!(jobs.len(), 60);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn parse_squeue_reads_the_start_estimate() {
+        let out =
+            "7|p|PENDING|1:00:00||1|1G|0:00|/w|Resources|2026-10-03T14:20:00|chimaera-x~ab12cd\n\
+                   8|p|PENDING|1:00:00||1|1G|0:00|/w|Priority|N/A|plain\n\
+                   9|p|PENDING|1:00:00||1|1G|0:00|/w|Priority|Unknown|other\n";
+        let (jobs, _) = parse_squeue(out);
+        assert_eq!(jobs[0].start, "2026-10-03T14:20:00");
+        assert_eq!(jobs[0].name, "chimaera-x~ab12cd");
+        assert_eq!(
+            (jobs[1].start.as_str(), jobs[1].name.as_str()),
+            ("", "plain")
+        );
+        assert_eq!(jobs[2].start, "", "no estimate is no time");
+        // The layout before `%S` still names its job last.
+        let (old, _) = parse_squeue("1|p|PENDING|59:00||4|8G|0:00|/w|Priority|myjob\n");
+        assert_eq!((old[0].name.as_str(), old[0].start.as_str()), ("myjob", ""));
+        // The daemon's /compute wire carries no new key.
+        assert!(!serde_json::to_string(&jobs[0]).unwrap().contains("start"));
+        assert!(SQUEUE_FORMAT.ends_with("|%S|%j"));
     }
 
     #[test]
@@ -909,6 +976,19 @@ mod tests {
         for junk in ["UNLIMITED", "NOT_SET", "INVALID", "", "42", "a:b"] {
             assert_eq!(parse_duration(junk), None, "{junk}");
         }
+        // Hostile or absurd values never overflow or pass for a walltime.
+        for huge in [
+            "18446744073709551615-00:00:00",
+            "99999999999999999999:00",
+            "1-18446744073709551615:00:00",
+            "3651-00:00:00",
+        ] {
+            assert_eq!(parse_duration(huge), None, "{huge}");
+        }
+        assert_eq!(
+            parse_duration("3650-00:00:00"),
+            Some(Duration::from_secs(MAX_DURATION_DAYS * 86_400))
+        );
         assert_eq!(format_duration(Duration::from_secs(7_200)), "02:00:00");
         assert_eq!(format_duration(Duration::from_secs(604_800)), "7-00:00:00");
         assert_eq!(format_duration(Duration::from_secs(90_061)), "1-01:01:00");

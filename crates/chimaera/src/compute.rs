@@ -12,7 +12,7 @@ use anyhow::{bail, Context};
 use chimaera_core::cluster::HostedState;
 use chimaera_core::slurm::{LaunchSpec, Scheduler};
 use chimaera_remote::cluster::{
-    self, ClusterOverview, HostOpen, JobStart, StartOutcome, StartRefused,
+    self, ClusterOverview, HostOpen, JobStart, StartOutcome, StartRefused, StartUnclear,
 };
 use chimaera_remote::{ComputeTunnel, RemoteHome};
 
@@ -356,11 +356,29 @@ async fn submit(
         replaces,
         facts: &facts,
     };
-    match cluster::start_job(host, home, &ov.config, &req).await {
-        Ok(StartOutcome::Submitted { job, slurm_job_id }) => {
+    let outcome = match cluster::start_job(host, home, &ov.config, &req).await {
+        Ok(outcome) => outcome,
+        Err(e) => match e.downcast_ref::<StartUnclear>() {
+            // Never submit again on a start whose outcome was lost: its own
+            // folder on the cluster says whether sbatch took it.
+            Some(unclear) => match cluster::recover_start(host, home, &unclear.job).await {
+                Ok(Some(outcome)) => outcome,
+                Ok(None) => bail!("{unclear}; nothing was submitted, so it is safe to try again"),
+                Err(again) => bail!("{unclear}: {again:#}"),
+            },
+            None => return Err(refused_error(host, home, &spec, e).await),
+        },
+    };
+    match outcome {
+        StartOutcome::Submitted { job, slurm_job_id } => {
             cluster::remember_spec(host, home, &spec, args.save_as).await?;
+            let slurm = if slurm_job_id.is_empty() {
+                "its Slurm id unread".to_string()
+            } else {
+                format!("Slurm {slurm_job_id}")
+            };
             println!(
-                "submitted job {job} (Slurm {slurm_job_id}) — `chimaera compute jobs {host}` to watch{}",
+                "submitted job {job} ({slurm}) — `chimaera compute jobs {host}` to watch{}",
                 if replaces.is_some() {
                     "; when it starts it stops the job it replaces and takes its workspaces over"
                 } else {
@@ -369,7 +387,7 @@ async fn submit(
             );
             Ok(())
         }
-        Ok(StartOutcome::Attached { job, job_name }) => {
+        StartOutcome::Attached { job, job_name } => {
             cluster::remember_spec(host, home, &spec, args.save_as).await?;
             let mut child =
                 cluster::spawn_attached(host, home, &job, &spec, &job_name, facts.gpu_flag)?;
@@ -387,28 +405,36 @@ async fn submit(
             }
             Ok(())
         }
-        Err(e) => match e.downcast_ref::<StartRefused>() {
-            Some(refused) => {
-                let partition = spec.partition.as_deref();
-                cluster::learn_refusal(host, home, partition, refused.kind)
-                    .await
-                    .ok();
-                let hint = match refused.kind {
-                    chimaera_core::slurm::Refusal::BatchNotAllowed => {
-                        "\nthat partition takes only interactive jobs — rerun with --attached \
+    }
+}
+
+/// A failed start as the user reads it: a refusal says what the cluster
+/// wants (and is remembered for the next start).
+async fn refused_error(
+    host: &str,
+    home: RemoteHome,
+    spec: &LaunchSpec,
+    e: anyhow::Error,
+) -> anyhow::Error {
+    match e.downcast_ref::<StartRefused>() {
+        Some(refused) => {
+            let partition = spec.partition.as_deref();
+            cluster::learn_refusal(host, home, partition, refused.kind)
+                .await
+                .ok();
+            let hint = match refused.kind {
+                chimaera_core::slurm::Refusal::BatchNotAllowed => {
+                    "\nthat partition takes only interactive jobs — rerun with --attached \
                          (it stops when this terminal's connection ends)"
-                    }
-                    chimaera_core::slurm::Refusal::AccountRequired => "\nrerun with --account",
-                    chimaera_core::slurm::Refusal::QosRequired => "\nrerun with --qos",
-                    chimaera_core::slurm::Refusal::ConstraintRequired => {
-                        "\nrerun with --constraint"
-                    }
-                    chimaera_core::slurm::Refusal::Other => "",
-                };
-                bail!("the cluster refused the job: {}{hint}", refused.message)
-            }
-            None => Err(e),
-        },
+                }
+                chimaera_core::slurm::Refusal::AccountRequired => "\nrerun with --account",
+                chimaera_core::slurm::Refusal::QosRequired => "\nrerun with --qos",
+                chimaera_core::slurm::Refusal::ConstraintRequired => "\nrerun with --constraint",
+                chimaera_core::slurm::Refusal::Other => "",
+            };
+            anyhow::anyhow!("the cluster refused the job: {}{hint}", refused.message)
+        }
+        None => e,
     }
 }
 

@@ -11,11 +11,12 @@
 //!
 //! Resource discipline is the design (shared clusters; schedulers are shared
 //! too): detection runs once per daemon lifetime (`?refresh=true`
-//! re-detects), every child process gets a hard kill-on-timeout and an output
-//! cap, snapshots are cached 60 s (at least a minute between scheduler status
-//! checks), the in-job `squeue -j` is floored at once a minute even across
-//! refreshes, and concurrent requests coalesce on one refresh. Nothing is
-//! persisted.
+//! re-detects, at most once a minute), every child process gets a hard
+//! kill-on-timeout and an output cap that is enforced while reading,
+//! snapshots are cached 60 s (at least a minute between scheduler status
+//! checks — `?refresh=true` included), the in-job `squeue -j` is floored at
+//! once a minute, and concurrent requests coalesce on one refresh. Nothing
+//! is persisted.
 //!
 //! Site-agnostic by rule: nothing here — code or the text agents are told —
 //! names a cluster, a partition, a site command or a site path. What a
@@ -253,6 +254,9 @@ pub(crate) struct ComputeService {
 #[derive(Default)]
 struct Inner {
     detection: Option<Detection>,
+    /// When `detection` was last (re)run: `?refresh=true` re-detects at most
+    /// once per [`SNAPSHOT_TTL`] — each detection is a login shell.
+    detected_at: Option<Instant>,
     cache: Option<(Instant, ComputeSnapshot)>,
     /// When the in-job self block was last asked, and what squeue said
     /// (None = the call failed or the job wasn't listed) — the
@@ -317,6 +321,7 @@ impl ComputeService {
         let mut inner = self.inner.lock().await;
         if inner.detection.is_none() {
             inner.detection = self.detect().await;
+            inner.detected_at = Some(Instant::now());
         }
         inner.detection.clone().unwrap_or(Detection::None)
     }
@@ -324,16 +329,25 @@ impl ComputeService {
     /// The current snapshot: cached, single-flight, never an error (a
     /// cluster hiccup degrades to an empty-but-tagged snapshot, not a 500 —
     /// the strip is orientation, not ground truth).
+    ///
+    /// `refresh` re-detects the tools (a module loaded since boot), at most
+    /// once a minute; it never drops the cached queue. Any bearer can send
+    /// it, and the minute between scheduler status checks is a promise to
+    /// the cluster, not to the caller.
     pub(crate) async fn snapshot(&self, refresh: bool) -> ComputeSnapshot {
         let mut inner = self.inner.lock().await;
-        if refresh {
+        if refresh
+            && inner
+                .detected_at
+                .is_none_or(|at| at.elapsed() >= SNAPSHOT_TTL)
+        {
             inner.detection = None;
-            inner.cache = None;
         }
         if inner.detection.is_none() {
             // None (transient probe failure) stays uncached: this round
             // answers "none" but the next call re-probes — see detection().
             inner.detection = self.detect().await;
+            inner.detected_at = Some(Instant::now());
         }
         let (squeue, sinfo) = match &inner.detection {
             None | Some(Detection::None) => return ComputeSnapshot::none(),
@@ -344,8 +358,8 @@ impl ComputeService {
                 return snap.clone();
             }
         }
-        // The self block has its own floor: a refresh drops the snapshot
-        // cache, never the once-a-minute promise for `squeue -j`.
+        // The self block has its own floor, kept across snapshot expiries:
+        // the once-a-minute promise for `squeue -j`.
         let ask_self = self.self_job.as_deref().filter(|_| {
             inner
                 .self_asked
@@ -554,33 +568,55 @@ pub(crate) async fn detect_tools(bindir: Option<&Path>) -> Option<Detection> {
     }
 }
 
-/// Whether Slurm job `job` is still queued or running: `squeue -h -j <id>
-/// -o %T`, one bounded call. `Some(false)` when the controller no longer
-/// lists it (finished long ago: "Invalid job id"; recently: a terminal
-/// state, or nothing), `None` when the question went unanswered (timeout,
-/// any other failure) — the caller keeps waiting rather than guessing.
+/// Whether Slurm job `job` is one of OUR chimaera jobs and still queued or
+/// running. `Some(false)` when the controller no longer lists it for us
+/// (finished long ago: "Invalid job id"; recently: a terminal state, or
+/// nothing), or lists it under a name that isn't ours — Slurm reuses ids, so
+/// a stale record's id may name another user's job, or our own unrelated
+/// one. `None` when the question went unanswered (timeout, any other
+/// failure) — the caller keeps waiting rather than guessing.
 pub(crate) async fn job_is_live(squeue: &Path, job: &str) -> Option<bool> {
-    let out = run_checked(
-        &squeue.to_string_lossy(),
-        &[
-            "-h".into(),
-            "-j".into(),
-            job.to_string(),
-            "-o".into(),
-            "%T".into(),
-        ],
-    )
-    .await?;
-    if !out.success {
-        return out.stderr.contains("Invalid job id").then_some(false);
-    }
     Some(
-        out.stdout
-            .lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
-            .is_some_and(is_live_state),
+        own_queue_row(squeue, job)
+            .await?
+            .is_some_and(|row| is_live_state(&row.state) && slurm::is_chimaera_job(&row.name)),
     )
+}
+
+/// One job's row as the queue shows it to this user.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct QueueRow {
+    pub(crate) state: String,
+    pub(crate) name: String,
+}
+
+/// `squeue -h -u <euid> -j <id> -o %T|%j`, one bounded call: `Some(None)`
+/// when this user has no such job listed, `None` when unanswered.
+pub(crate) async fn own_queue_row(squeue: &Path, job: &str) -> Option<Option<QueueRow>> {
+    let mut args: Vec<String> = vec!["-h".into()];
+    #[cfg(unix)]
+    {
+        // squeue takes a uid as readily as a name, and needs no passwd lookup.
+        args.push("-u".into());
+        args.push(nix::unistd::Uid::effective().as_raw().to_string());
+    }
+    args.extend(["-j".into(), job.to_string(), "-o".into(), "%T|%j".into()]);
+    let out = run_checked(&squeue.to_string_lossy(), &args).await?;
+    if !out.success {
+        return out.stderr.contains("Invalid job id").then_some(None);
+    }
+    Some(parse_queue_row(&out.stdout))
+}
+
+/// The first `STATE|NAME` row. `%j` is last, so a `|` in a name stays in the
+/// name; a row without the name column proves nothing about whose job it is.
+fn parse_queue_row(stdout: &str) -> Option<QueueRow> {
+    let line = stdout.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let (state, name) = line.split_once('|').unwrap_or((line, ""));
+    Some(QueueRow {
+        state: state.trim().to_string(),
+        name: name.trim().to_string(),
+    })
 }
 
 /// First executable `name` on the colon-separated `path` (the login shell's
@@ -907,7 +943,8 @@ fn job_context_text(
     // "UNLIMITED"/"NOT_SET"/noise parse to None: state the rule without
     // inventing an end time.
     let ends = match slurm::parse_duration(&alloc.time_left)
-        .and_then(|left| slurm::format_utc_minute(now + left))
+        .and_then(|left| now.checked_add(left))
+        .and_then(slurm::format_utc_minute)
     {
         Some(end) => format!("around {end}"),
         None => "at its time limit".to_string(),
@@ -1001,7 +1038,10 @@ pub(crate) async fn run_capped(bin: &str, args: &[String]) -> Option<String> {
 }
 
 /// [`run_capped`]'s status-aware form: a completed child is `Some` even on
-/// non-zero exit.
+/// non-zero exit. Each stream is read through [`MAX_OUTPUT`] + 1 bytes and
+/// no further: a flood past the cap stops the child at once (a full pipe
+/// would otherwise hold it until the deadline) and is reported unsuccessful,
+/// so memory is bounded by the cap, not by what the tool prints in 5 s.
 pub(crate) async fn run_checked(bin: &str, args: &[String]) -> Option<CmdResult> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args(args)
@@ -1010,15 +1050,43 @@ pub(crate) async fn run_checked(bin: &str, args: &[String]) -> Option<CmdResult>
         .stderr(Stdio::piped())
         // Timeout drops the future, dropping the child; this reaps it.
         .kill_on_drop(true);
-    let out = tokio::time::timeout(CMD_TIMEOUT, cmd.output())
-        .await
-        .ok()?
-        .ok()?;
-    Some(CmdResult {
-        success: out.status.success(),
-        stdout: capped_lossy(out.stdout),
-        stderr: capped_lossy(out.stderr),
-    })
+    let mut child = cmd.spawn().ok()?;
+    let (mut stdout, mut stderr) = (child.stdout.take()?, child.stderr.take()?);
+    let run = async move {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let read = tokio::try_join!(
+            read_capped(&mut stdout, &mut out),
+            read_capped(&mut stderr, &mut err)
+        );
+        if read.is_err() {
+            let _ = child.start_kill();
+        }
+        // Closed before the wait: a grandchild still writing gets EPIPE
+        // instead of blocking on a pipe nobody reads.
+        drop((stdout, stderr));
+        let status = child.wait().await.ok()?;
+        Some(CmdResult {
+            success: status.success() && read.is_ok(),
+            stdout: capped_lossy(out),
+            stderr: capped_lossy(err),
+        })
+    };
+    tokio::time::timeout(CMD_TIMEOUT, run).await.ok()?
+}
+
+/// Read `r` to EOF into `buf`, or fail once it holds more than
+/// [`MAX_OUTPUT`] (truncated back to the cap).
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
+    r: &mut R,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncReadExt;
+    r.take(MAX_OUTPUT as u64 + 1).read_to_end(buf).await?;
+    if buf.len() > MAX_OUTPUT {
+        buf.truncate(MAX_OUTPUT);
+        return Err(std::io::Error::other("output past the cap"));
+    }
+    Ok(())
 }
 
 /// Byte-capped lossy decode. The BYTES are truncated first: cutting a
@@ -1130,6 +1198,7 @@ mod tests {
             elapsed: "1:00".into(),
             workdir: "/w".into(),
             reason: String::new(),
+            start: String::new(),
         };
         let mut ended = EndedJobs::default();
         let a = vec![
@@ -1368,9 +1437,10 @@ mod tests {
 
         // Fake tools → slurm, parsed snapshot, cached second read. squeue
         // answers both forms: -u (the queue) and -j (the self allocation),
-        // and counts its -j calls.
+        // and counts each.
         let dir = test_dir("fake");
         let asks = dir.join("self-asks");
+        let queue_asks = dir.join("queue-asks");
         tools(
             &dir,
             &[
@@ -1378,8 +1448,9 @@ mod tests {
                 (
                     "squeue",
                     &format!(
-                        "#!/bin/sh\nif [ \"$1\" = \"-j\" ]; then echo x >> '{}'; echo \"$2|batch|RUNNING|3:59:00|node7\"; else echo '1|batch|PENDING|59:00||4|8G|0:00|/home/u|Priority|myjob'; fi\n",
-                        asks.display()
+                        "#!/bin/sh\nif [ \"$1\" = \"-j\" ]; then echo x >> '{}'; echo \"$2|batch|RUNNING|3:59:00|node7\"; else echo x >> '{}'; echo '1|batch|PENDING|59:00||4|8G|0:00|/home/u|Priority|myjob'; fi\n",
+                        asks.display(),
+                        queue_asks.display()
                     ),
                 ),
                 ("sinfo", "#!/bin/sh\necho 'batch*|up|10|1-00:00:00|8|64000|gpu:2'\n"),
@@ -1416,15 +1487,28 @@ mod tests {
         // Inside an allocation: the self block rides the snapshot.
         let svc = ComputeService::with_bindir_and_job(dir.clone(), "4242");
         let snap = svc.snapshot(false).await;
+        let snap_at = snap.fetched_at_ms;
         assert!(serde_json::to_string(&snap).unwrap().contains("\"self\""));
         let own = snap.self_alloc.expect("self allocation");
         assert_eq!(own.job_id, "4242");
         assert_eq!(own.node, "node7");
         assert_eq!(own.time_left, "3:59:00");
-        // A forced refresh refetches the queue but NOT `squeue -j`: once a
-        // minute, whatever the UI asks.
+        // A forced refresh asks the scheduler nothing new inside the
+        // minute: neither the queue nor `squeue -j`, whoever sends it.
+        let queue_asked = || {
+            std::fs::read_to_string(&queue_asks)
+                .unwrap()
+                .lines()
+                .count()
+        };
+        let before = queue_asked();
         let refreshed = svc.snapshot(true).await;
         assert!(refreshed.self_alloc.is_some(), "the last answer is served");
+        assert_eq!(refreshed.fetched_at_ms, snap_at, "the cached snapshot");
+        for _ in 0..5 {
+            svc.snapshot(true).await;
+        }
+        assert_eq!(queue_asked(), before, "refresh keeps the queue floor");
         assert_eq!(
             std::fs::read_to_string(&asks).unwrap().lines().count(),
             1,
@@ -1518,22 +1602,48 @@ mod tests {
         // script rewritten and run at once can fail with "Text file busy"
         // on Linux when another test forks meanwhile (the child briefly
         // holds the write descriptor) — which reads as "unanswered".
+        let args = dir.join("args");
         tools(
             &dir,
-            &[("squeue", "#!/bin/sh\n. \"$(dirname \"$0\")/case.sh\"\n")],
+            &[(
+                "squeue",
+                &format!(
+                    "#!/bin/sh\necho \"$@\" > '{}'\n. \"$(dirname \"$0\")/case.sh\"\n",
+                    args.display()
+                ),
+            )],
         );
         let case = |body: &str| std::fs::write(dir.join("case.sh"), body).unwrap();
         case("exit 0\n");
         runnable(&squeue);
-        case("echo RUNNING\n");
+        case("echo 'RUNNING|chimaera-notes~a1b2c3'\n");
         assert_eq!(job_is_live(&squeue, "1").await, Some(true));
-        case("echo COMPLETING\n");
+        // Asked about this user's jobs only, with the name to prove it ours.
+        let asked = std::fs::read_to_string(&args).unwrap();
+        #[cfg(unix)]
+        assert_eq!(
+            asked.trim(),
+            format!(
+                "-h -u {} -j 1 -o %T|%j",
+                nix::unistd::Uid::effective().as_raw()
+            )
+        );
+        case("echo 'COMPLETING|chimaera-notes~a1b2c3'\n");
         assert_eq!(
             job_is_live(&squeue, "1").await,
             Some(true),
             "still draining"
         );
-        case("echo 'CANCELLED by 1000'\n");
+        // A reused id: live, but not a chimaera job — never a holder.
+        case("echo 'RUNNING|someone-elses-job'\n");
+        assert_eq!(job_is_live(&squeue, "1").await, Some(false));
+        case("echo RUNNING\n");
+        assert_eq!(
+            job_is_live(&squeue, "1").await,
+            Some(false),
+            "no name, no proof"
+        );
+        case("echo 'CANCELLED by 1000|chimaera-notes~a1b2c3'\n");
         assert_eq!(job_is_live(&squeue, "1").await, Some(false));
         case("exit 0\n");
         assert_eq!(job_is_live(&squeue, "1").await, Some(false), "not listed");
@@ -1542,6 +1652,72 @@ mod tests {
         case("echo 'Socket timed out' >&2\nexit 1\n");
         assert_eq!(job_is_live(&squeue, "1").await, None, "unanswered");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn queue_rows_split_state_from_a_name_that_may_hold_bars() {
+        assert_eq!(
+            parse_queue_row("\n  RUNNING|chimaera-a|b~x  \nPENDING|other\n"),
+            Some(QueueRow {
+                state: "RUNNING".into(),
+                name: "chimaera-a|b~x".into()
+            })
+        );
+        assert_eq!(parse_queue_row("  \n"), None);
+        assert_eq!(
+            parse_queue_row("RUNNING"),
+            Some(QueueRow {
+                state: "RUNNING".into(),
+                name: String::new()
+            })
+        );
+    }
+
+    /// The cap bounds what is READ, not just what is kept: a tool that
+    /// floods its stdout and then hangs is stopped at the cap and answers
+    /// at once (it used to be read whole and then waited out to the
+    /// deadline, which reads as "unanswered").
+    #[tokio::test]
+    async fn run_checked_caps_a_flood() {
+        let dir = test_dir("flood");
+        let flood = dir.join("flood");
+        tools(
+            &dir,
+            &[("flood", "#!/bin/sh\n. \"$(dirname \"$0\")/case.sh\"\n")],
+        );
+        let case = |body: &str| std::fs::write(dir.join("case.sh"), body).unwrap();
+        case("exit 0\n");
+        runnable(&flood);
+        case("head -c 3000000 /dev/zero\nexec sleep 30\n");
+        let started = Instant::now();
+        let out = run_checked(&flood.to_string_lossy(), &[])
+            .await
+            .expect("answers before the deadline");
+        assert!(started.elapsed() < CMD_TIMEOUT, "{:?}", started.elapsed());
+        assert!(out.stdout.len() <= MAX_OUTPUT);
+        assert!(!out.success, "a capped read is not a clean answer");
+        // Under the cap, output and status come through untouched.
+        case("echo hi\necho err >&2\n");
+        let out = run_checked(&flood.to_string_lossy(), &[]).await.unwrap();
+        assert!(out.success);
+        assert_eq!(
+            (out.stdout.as_str(), out.stderr.as_str()),
+            ("hi\n", "err\n")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A time left no clock can hold states the rule without an end, and
+    /// never panics the bake.
+    #[test]
+    fn job_context_survives_a_hostile_time_left() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_784_118_840);
+        let hostile = SelfAllocation {
+            time_left: "200000000000000-00:00:00".into(),
+            ..alloc()
+        };
+        let text = job_context_text(&hostile, None, now, &AgentRules::default(), None);
+        assert!(text.contains("The job ends at its time limit"), "{text}");
     }
 
     /// Run a just-written stand-in until the kernel lets it (a fork in

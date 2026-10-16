@@ -93,6 +93,9 @@ fn job_dir(home: RemoteHome, jid: &str) -> String {
 /// reads, so a script whose early commands fill the stdout pipe would
 /// otherwise deadlock against our still-pending write.
 async fn run_script(host: &str, script: &str, secs: u64) -> anyhow::Result<std::process::Output> {
+    // Every cluster command dials through here: a user's stricter host-key
+    // setting must be known before the first one.
+    super::learn_ssh_config(host).await;
     let mut cmd = ssh_cmd(host);
     cmd.arg("sh -s")
         .stdin(std::process::Stdio::piped())
@@ -148,14 +151,57 @@ fn eof_token() -> String {
 }
 
 /// Shell lines that atomically write `content` to `path` (a `$`-anchored,
-/// double-quotable path) under the script's `umask 077`.
+/// double-quotable path) under the script's `umask 077`. The temp name is
+/// unique per writer (pid + random), so two clients writing the same file on
+/// the shared home never truncate each other's temp; a failed write removes
+/// its temp and exits 6 rather than renaming a short file into place.
 fn write_file_lines(path: &str, content: &str) -> String {
     let eof = eof_token();
+    let tmp = format!("{path}.tmp.$$.{}", &chimaera_core::generate_token()[..12]);
     let mut body = content.to_string();
     if !body.ends_with('\n') {
         body.push('\n');
     }
-    format!("cat > \"{path}.tmp\" <<'{eof}'\n{body}{eof}\nmv -f \"{path}.tmp\" \"{path}\"\n")
+    format!(
+        "cat > \"{tmp}\" <<'{eof}' && mv -f \"{tmp}\" \"{path}\" || {{ rm -f \"{tmp}\"; exit 6; }}\n{body}{eof}\n"
+    )
+}
+
+/// Shell lines that take the lock directory `lock` (a double-quotable path)
+/// for the rest of the script: `mkdir` is atomic on every shared filesystem.
+/// The holder writes its token into `owner`, and its exit removes the lock
+/// only while that token is still there. One held longer than ~10 s exits 5.
+/// The script then finishes whatever happens to its connection (`HUP`/`PIPE`
+/// ignored) and the lock goes with it.
+///
+/// A crashed writer's lock (directory and owner both over two minutes old)
+/// is broken by renaming it to a name only this breaker uses — of two
+/// breakers only one can move it — then checked again where it landed: a
+/// lock taken meanwhile (fresh owner) is put back, a stale one removed. Two
+/// limits: ages come from `find -mmin` (GNU and BSD `find`; without it a
+/// stale lock is never broken and edits report busy), and they compare the
+/// file server's timestamps with this node's clock, so a node more than two
+/// minutes off its file server could judge a live lock stale.
+fn lock_lines(lock: &str) -> String {
+    let token = &chimaera_core::generate_token()[..16];
+    format!(
+        "trap '' HUP PIPE\n\
+         L=\"{lock}\"; T=\"$$.{token}\"; n=0\n\
+         while :; do\n\
+         \x20 if mkdir \"$L\" 2>/dev/null; then printf '%s\\n' \"$T\" > \"$L/owner\" 2>/dev/null && break\n\
+         \x20 elif [ -n \"$(find \"$L\" -prune -mmin +2 2>/dev/null)\" ] && [ -z \"$(find \"$L/owner\" -mmin -2 2>/dev/null)\" ]; then\n\
+         \x20   S=\"$L.stale.$T\"\n\
+         \x20   if mv \"$L\" \"$S\" 2>/dev/null; then\n\
+         \x20     if [ -n \"$(find \"$S/owner\" -mmin -2 2>/dev/null)\" ]; then mv \"$S\" \"$L\" 2>/dev/null; else rm -rf \"$S\"; fi\n\
+         \x20   fi\n\
+         \x20   continue\n\
+         \x20 fi\n\
+         \x20 n=$((n + 1)); [ \"$n\" -gt 10 ] && {{ printf '===busy\\n'; exit 5; }}\n\
+         \x20 sleep 1\n\
+         done\n\
+         trap '[ \"$(cat \"$L/owner\" 2>/dev/null)\" = \"$T\" ] && rm -f \"$L/owner\" && rmdir \"$L\" 2>/dev/null' EXIT\n\
+         trap 'exit 1' INT TERM\n"
+    )
 }
 
 /// `PATH` prefix so a plain `sh -s` finds the scheduler the login shell
@@ -210,6 +256,11 @@ pub struct JobView {
     /// When the job's time runs out, epoch ms (cluster clock).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ends_at_ms: Option<u64>,
+    /// When Slurm expects a waiting job to start, epoch ms (cluster clock),
+    /// when it has an estimate — from the same queue read, never a query of
+    /// its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_estimate_ms: Option<u64>,
     /// Why a waiting job waits (Slurm's own word), when it isn't plain
     /// priority.
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -340,8 +391,116 @@ pub struct ClusterOverview {
 #[derive(Clone)]
 struct QueueCache {
     at: Instant,
+    /// When it was asked, epoch ms on this client's clock.
     at_ms: u64,
     jobs: Vec<Job>,
+    /// Rows were left out: a job missing from it may still be queued.
+    truncated: bool,
+    /// The cluster's zone (`date +%z`) when it was asked — what `%S` means.
+    tz: String,
+    /// squeue's own text, kept so another process can reparse it.
+    text: String,
+}
+
+/// The most queue rows the page reads. Far past any one user's real queue,
+/// so a crowd of array tasks can't push a Chimaera job out of the read.
+const QUEUE_ROWS: usize = 1000;
+/// The most squeue text kept for other processes.
+const QUEUE_TEXT_MAX: usize = 512 * 1024;
+
+impl QueueCache {
+    fn parse(text: &str, at: Instant, at_ms: u64, tz: &str) -> QueueCache {
+        let mut text = text.to_string();
+        let cut = text.len() > QUEUE_TEXT_MAX;
+        if cut {
+            // A cut text is a truncated read; keep whole lines only.
+            let end = text.as_bytes()[..QUEUE_TEXT_MAX]
+                .iter()
+                .rposition(|&b| b == b'\n')
+                .unwrap_or(0);
+            text.truncate(end);
+        }
+        let (jobs, truncated) = slurm::parse_squeue_capped(&text, QUEUE_ROWS);
+        QueueCache {
+            at,
+            at_ms,
+            jobs,
+            truncated: truncated || cut,
+            tz: tz.to_string(),
+            text,
+        }
+    }
+}
+
+/// The queue as another process (the CLI, a second app) last asked it, on
+/// disk under the local data dir, so the per-host floor holds across
+/// processes: `chimaera compute jobs` run every few seconds asks the
+/// scheduler at most once a minute.
+#[derive(serde::Deserialize, Serialize)]
+struct SavedQueue {
+    host: String,
+    at_ms: u64,
+    #[serde(default)]
+    tz: String,
+    #[serde(default)]
+    truncated: bool,
+    text: String,
+}
+
+fn queue_dir() -> std::path::PathBuf {
+    chimaera_core::data_dir().join("cluster-queues")
+}
+
+fn queue_file(dir: &std::path::Path, host: &str) -> std::path::PathBuf {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(host.as_bytes());
+    let name: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    dir.join(format!("{name}.json"))
+}
+
+fn save_queue(dir: &std::path::Path, host: &str, q: &QueueCache) {
+    let saved = SavedQueue {
+        host: host.to_string(),
+        at_ms: q.at_ms,
+        tz: q.tz.clone(),
+        truncated: q.truncated,
+        text: q.text.clone(),
+    };
+    let written = std::fs::create_dir_all(dir)
+        .map_err(anyhow::Error::from)
+        .and_then(|()| Ok(serde_json::to_vec(&saved)?))
+        .and_then(|bytes| chimaera_core::atomic_write_private(&queue_file(dir, host), &bytes));
+    if let Err(e) = written {
+        tracing::debug!("could not keep {host}'s queue for other processes: {e:#}");
+    }
+}
+
+/// The queue another process asked within the floor, if any. A read from the
+/// future (this clock went back) is never trusted.
+fn load_queue(dir: &std::path::Path, host: &str, now_ms: u64) -> Option<QueueCache> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(queue_file(dir, host))
+        .ok()?
+        .take(2 * QUEUE_TEXT_MAX as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let saved: SavedQueue = serde_json::from_slice(&bytes).ok()?;
+    if saved.host != host || saved.at_ms > now_ms {
+        return None;
+    }
+    let age = Duration::from_millis(now_ms - saved.at_ms);
+    if age >= SQUEUE_FLOOR {
+        return None;
+    }
+    let at = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+    let mut q = QueueCache::parse(&saved.text, at, saved.at_ms, &saved.tz);
+    q.truncated |= saved.truncated;
+    Some(q)
+}
+
+fn forget_saved_queue(dir: &std::path::Path, host: &str) {
+    let _ = std::fs::remove_file(queue_file(dir, host));
 }
 
 static QUEUES: LazyLock<Mutex<HashMap<String, QueueCache>>> = LazyLock::new(Default::default);
@@ -374,6 +533,67 @@ pub fn invalidate_queue(host: &str) {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .remove(host);
+    // The saved copy is unlinked off the async runtime; until then the
+    // tombstone keeps this process from reading it back.
+    FORGOTTEN
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(host.to_string(), now_ms());
+    let host = host.to_string();
+    off_runtime(move || forget_saved_queue(&queue_dir(), &host));
+}
+
+/// When this process last forgot each host's queue (epoch ms): a saved read
+/// from before then is never used again.
+static FORGOTTEN: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(Default::default);
+
+/// Whether a read another process saved at `saved_at_ms` may stand, given
+/// when this process last forgot that host's queue.
+fn saved_queue_stands(saved_at_ms: u64, forgotten_at_ms: Option<u64>) -> bool {
+    forgotten_at_ms.is_none_or(|f| saved_at_ms > f)
+}
+
+/// Run small file work on tokio's blocking pool, never on a reactor thread
+/// (inline when no runtime is current).
+fn off_runtime(f: impl FnOnce() + Send + 'static) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(rt) => {
+            rt.spawn_blocking(f);
+        }
+        Err(_) => f(),
+    }
+}
+
+/// The freshest queue read of `host` this process knows: its own, or a newer
+/// one another process saved.
+async fn freshest_queue(host: &str) -> Option<QueueCache> {
+    let own = cached_queue(host);
+    if own.as_ref().is_some_and(|c| c.at.elapsed() < SQUEUE_FLOOR) {
+        return own;
+    }
+    let name = host.to_string();
+    let saved = tokio::task::spawn_blocking(move || load_queue(&queue_dir(), &name, now_ms()))
+        .await
+        .ok()
+        .flatten();
+    let forgotten = FORGOTTEN
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(host)
+        .copied();
+    match saved {
+        Some(saved)
+            if saved_queue_stands(saved.at_ms, forgotten)
+                && own.as_ref().is_none_or(|c| saved.at_ms > c.at_ms) =>
+        {
+            QUEUES
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(host.to_string(), saved.clone());
+            Some(saved)
+        }
+        _ => own,
+    }
 }
 
 /// Everything the cluster page shows, in one exec: the queue (only when the
@@ -382,7 +602,7 @@ pub fn invalidate_queue(host: &str) {
 pub async fn overview(host: &str, home: RemoteHome) -> anyhow::Result<ClusterOverview> {
     let lock = flight(host);
     let _one = lock.lock().await;
-    let cached = cached_queue(host);
+    let cached = freshest_queue(host).await;
     let ask_queue = cached
         .as_ref()
         .is_none_or(|c| c.at.elapsed() >= SQUEUE_FLOOR);
@@ -396,11 +616,14 @@ pub async fn overview(host: &str, home: RemoteHome) -> anyhow::Result<ClusterOve
     ));
     script.push_str(
         "printf '===now %s\\n' \"$(date +%s)\"\nprintf '===node %s\\n' \"$(uname -n)\"\n\
-         printf '===home %s\\n' \"$HOME\"\n",
+         printf '===home %s\\n' \"$HOME\"\nprintf '===tz %s\\n' \"$(date +%z)\"\n",
     );
     if ask_queue {
+        // `%S` in Slurm's standard format, whatever the user's environment
+        // asks for.
         script.push_str(&format!(
-            "q=$(squeue -u \"$(id -un)\" --noheader -o '{}' 2>/dev/null); rc=$?\n\
+            "unset SLURM_TIME_FORMAT\n\
+             q=$(squeue -u \"$(id -un)\" --noheader -o '{}' 2>/dev/null); rc=$?\n\
              printf '===squeue %s\\n' \"$rc\"\nprintf '%s\\n' \"$q\"\n",
             slurm::SQUEUE_FORMAT
         ));
@@ -428,16 +651,18 @@ pub async fn overview(host: &str, home: RemoteHome) -> anyhow::Result<ClusterOve
     let queue = if ask_queue {
         let rc = marker_arg(&secs, "squeue").unwrap_or("1");
         if rc == "0" {
-            let (jobs, _) = slurm::parse_squeue(section(&secs, "squeue").unwrap_or(""));
-            let fresh = QueueCache {
-                at: Instant::now(),
-                at_ms: now_ms(),
-                jobs,
-            };
+            let fresh = QueueCache::parse(
+                section(&secs, "squeue").unwrap_or(""),
+                Instant::now(),
+                now_ms(),
+                marker_arg(&secs, "tz").unwrap_or("+0000"),
+            );
             QUEUES
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .insert(host.to_string(), fresh.clone());
+            let (name, kept) = (host.to_string(), fresh.clone());
+            off_runtime(move || save_queue(&queue_dir(), &name, &kept));
             Some(fresh)
         } else {
             degraded = true;
@@ -469,13 +694,16 @@ pub async fn overview(host: &str, home: RemoteHome) -> anyhow::Result<ClusterOve
         .as_ref()
         .map(|q| q.at.elapsed().as_millis() as u64)
         .unwrap_or(0);
-    let built = build(
+    let mut built = build(
         &config,
         &state.unwrap_or_default(),
         jobs,
-        queue.is_some(),
+        queue_is_complete(queue.as_ref()),
         remote_now_ms.saturating_sub(queue_age_ms),
     );
+    if let Some(q) = &queue {
+        apply_start_estimates(&mut built.jobs, &q.jobs, &q.tz);
+    }
     let mut other = OtherJobs::default();
     for j in jobs.iter().filter(|j| !is_chimaera_job(&j.name)) {
         if j.state.starts_with("PENDING") {
@@ -685,6 +913,23 @@ fn build(
         hosts,
         endpoints,
         records,
+    }
+}
+
+/// Whether a job missing from this read is gone. A truncated read left rows
+/// out, so only a complete one can say so.
+fn queue_is_complete(queue: Option<&QueueCache>) -> bool {
+    queue.is_some_and(|q| !q.truncated)
+}
+
+/// Slurm's own estimate of when each waiting job starts, from the queue
+/// read's `%S` in the cluster's zone `tz`.
+fn apply_start_estimates(jobs: &mut [JobView], queue: &[Job], tz: &str) {
+    for v in jobs.iter_mut().filter(|v| v.state == "waiting") {
+        v.start_estimate_ms = queue
+            .iter()
+            .find(|j| Some(&j.id) == v.slurm_job_id.as_ref())
+            .and_then(|j| parse_slurm_timestamp(&j.start, tz));
     }
 }
 
@@ -912,25 +1157,34 @@ pub async fn write_config(
     config: &ClusterConfig,
     expected_sum: &str,
 ) -> anyhow::Result<()> {
-    let c = home.cluster_dir();
     let json = serde_json::to_string_pretty(config)?;
-    let mut script = format!(
-        "umask 077\nC=\"{c}\"\nmkdir -p \"$C/w\" \"$C/j\" || exit 3\n\
-         now=$(cksum < \"$C/cluster.json\" 2>/dev/null | cut -d' ' -f1)\n\
-         [ \"$now\" = {} ] || {{ printf 'changed\\n'; exit 4; }}\n",
-        sh_quote(expected_sum)
-    );
-    script.push_str(&write_file_lines("$C/cluster.json", &json));
-    script.push_str("printf 'ok\\n'\n");
+    let script = config_write_script(home.cluster_dir(), &json, expected_sum);
     let out = run_script(host, &script, EXEC_SECS).await?;
     match out.status.code() {
         Some(0) => Ok(()),
         Some(4) => bail!("the cluster's workspace list changed meanwhile — reload and try again"),
+        Some(5) => bail!("another edit of {host}'s workspace list is still saving — try again"),
         _ => bail!(
             "saving {host}'s workspace list failed: {}",
             super::ssh_failure_line(&out.stderr, &out.status)
         ),
     }
+}
+
+/// The compare-and-swap of `cluster.json` in cluster folder `c`: under the
+/// folder's lock, so two clients that both read the same sum can't both
+/// write. Exit 4: it changed since it was read; 5: the lock stayed busy.
+fn config_write_script(c: &str, json: &str, expected_sum: &str) -> String {
+    let mut script = format!("umask 077\nC=\"{c}\"\nmkdir -p \"$C/w\" \"$C/j\" || exit 3\n");
+    script.push_str(&lock_lines("$C/.cluster.lock.d"));
+    script.push_str(&format!(
+        "now=$(cksum < \"$C/cluster.json\" 2>/dev/null | cut -d' ' -f1)\n\
+         [ \"$now\" = {} ] || {{ printf 'changed\\n'; exit 4; }}\n",
+        sh_quote(expected_sum)
+    ));
+    script.push_str(&write_file_lines("$C/cluster.json", json));
+    script.push_str("printf 'ok\\n'\n");
+    script
 }
 
 /// Read-modify-write `cluster.json` with one retry on a concurrent change.
@@ -1201,18 +1455,22 @@ pub async fn set_startup(
         );
         set_scope(&mut v, workspace, text);
         let json = serde_json::to_string_pretty(&v)?;
-        let mut write = format!(
-            "umask 077\nG=\"{g}\"\nmkdir -p \"$G\" || exit 3\n\
-             now=$(cksum < \"$G/env-profiles.json\" 2>/dev/null | cut -d' ' -f1)\n\
+        let mut write = format!("umask 077\nG=\"{g}\"\nmkdir -p \"$G\" || exit 3\n");
+        write.push_str(&lock_lines("$G/.env-profiles.lock.d"));
+        write.push_str(&format!(
+            "now=$(cksum < \"$G/env-profiles.json\" 2>/dev/null | cut -d' ' -f1)\n\
              [ \"$now\" = {} ] || exit 4\n",
             sh_quote(&sum)
-        );
+        ));
         write.push_str(&write_file_lines("$G/env-profiles.json", &json));
         let out = run_script(host, &write, EXEC_SECS).await?;
         match out.status.code() {
             Some(0) => return Ok(()),
-            Some(4) if attempt == 0 => continue,
+            Some(4 | 5) if attempt == 0 => continue,
             Some(4) => bail!("the startup commands changed meanwhile — reload and try again"),
+            Some(5) => {
+                bail!("another edit of {host}'s startup commands is still saving — try again")
+            }
             _ => bail!(
                 "saving {host}'s startup commands failed: {}",
                 super::ssh_failure_line(&out.stderr, &out.status)
@@ -1350,6 +1608,7 @@ pub async fn start_job(
         replaces: req.replaces.map(str::to_string),
         slurm_job_id: (!req.attached).then(|| "__CHIMAERA_JOB_ID__".to_string()),
         attached: req.attached,
+        // This client's clock until the start script puts the cluster's in.
         submitted_ms: now_ms(),
         ..Default::default()
     };
@@ -1370,28 +1629,10 @@ pub async fn start_job(
         state_home: home.job_state_home(),
         rules_source,
     });
-
-    let mut s = String::from("umask 077\nunset SLURM_JOB_ID SLURM_JOBID\n");
-    s.push_str(&path_line(host));
-    s.push_str(&format!("D=\"{dir}\"\nmkdir -p \"$D\" || exit 3\n"));
-    s.push_str(&write_file_lines("$D/job.sh", &script_text));
-    s.push_str(&write_file_lines("$D/startup.sh", req.run_startup));
-    s.push_str(&write_file_lines(
-        "$D/agent-rules.md",
-        &config.agent_rules.text,
-    ));
-    s.push_str(&write_file_lines(
-        "$D/facts.json",
-        &serde_json::to_string(&facts)?,
-    ));
+    let facts_json = serde_json::to_string(&facts)?;
     let record_json = serde_json::to_string_pretty(&record)?;
-    if req.attached {
-        s.push_str(&write_file_lines("$D/job.json", &record_json));
-        s.push_str("printf '===rc 0\\n===end\\n'\n");
-    } else {
-        s.push_str(&write_file_lines("$D/job.pending", &record_json));
-        let args: Vec<String> = spec
-            .sbatch_args(&job_name, "@OUTPUT@", req.facts.gpu_flag)
+    let sbatch = (!req.attached).then(|| {
+        spec.sbatch_args(&job_name, "@OUTPUT@", req.facts.gpu_flag)
             .into_iter()
             .map(|a| {
                 if a == "--output=@OUTPUT@" {
@@ -1400,48 +1641,248 @@ pub async fn start_job(
                     sh_quote(&a)
                 }
             })
-            .collect();
-        s.push_str(&format!(
-            "out=$(sbatch {} \"$D/job.sh\" 2>\"$D/.sbatch.err\"); rc=$?\n\
-             id=${{out%%;*}}\n\
-             case \"$id\" in ''|*[!0-9_]*) [ \"$rc\" -eq 0 ] && rc=97 ;; esac\n\
-             if [ \"$rc\" -eq 0 ]; then\n\
-             \x20 sed \"s/__CHIMAERA_JOB_ID__/$id/\" \"$D/job.pending\" > \"$D/job.json.tmp\" && mv -f \"$D/job.json.tmp\" \"$D/job.json\"\n\
-             fi\n\
-             rm -f \"$D/job.pending\"\n\
-             printf '===rc %s\\n===id %s\\n===err\\n' \"$rc\" \"$id\"; cat \"$D/.sbatch.err\" 2>/dev/null; rm -f \"$D/.sbatch.err\"\n\
-             [ \"$rc\" -eq 0 ] || rm -rf \"$D\"\n\
-             printf '===end\\n'\n",
-            args.join(" ")
-        ));
-    }
-    let out = run_script(host, &s, EXEC_SECS).await?;
+            .collect::<Vec<_>>()
+            .join(" ")
+    });
+    let s = start_script(&StartScript {
+        path_line: &path_line(host),
+        dir: &dir,
+        files: [
+            ("job.sh", &script_text),
+            ("startup.sh", req.run_startup),
+            ("agent-rules.md", &config.agent_rules.text),
+            ("facts.json", &facts_json),
+        ],
+        record_json: &record_json,
+        sbatch: sbatch.as_deref(),
+    });
+    let unclear = |cause: String| StartUnclear {
+        job: jid.clone(),
+        message: format!(
+            "couldn't tell whether {host} took the job ({cause}) — it shows in the list if it did"
+        ),
+    };
+    let out = match run_script(host, &s, EXEC_SECS).await {
+        Ok(out) => out,
+        Err(e) => return Err(unclear(format!("{e:#}")).into()),
+    };
     let stdout = String::from_utf8_lossy(&out.stdout);
     let secs = sections(&stdout);
-    if section(&secs, "end").is_none() {
-        bail!(
-            "starting a job on {host} failed: {}",
-            super::ssh_failure_line(&out.stderr, &out.status)
-        );
-    }
     invalidate_queue(host);
+    if section(&secs, "end").is_none() {
+        let cause = super::ssh_failure_line(&out.stderr, &out.status);
+        if out.status.code() == Some(3) {
+            bail!("starting a job on {host} failed: {cause}");
+        }
+        return Err(unclear(cause).into());
+    }
     if req.attached {
         return Ok(StartOutcome::Attached { job: jid, job_name });
     }
-    let rc = marker_arg(&secs, "rc").unwrap_or("1");
-    if rc != "0" {
-        let message = clean_tool_stderr(section(&secs, "err").unwrap_or(""), "sbatch");
-        return Err(StartRefused {
-            kind: classify_refusal(&message),
-            message,
+    match marker_arg(&secs, "rc").unwrap_or("1") {
+        "0" => Ok(StartOutcome::Submitted {
+            job: jid,
+            slurm_job_id: marker_arg(&secs, "id").unwrap_or("").to_string(),
+        }),
+        // sbatch took it but printed no readable id: the job is recorded
+        // without one and found by its unique name.
+        "97" => Ok(StartOutcome::Submitted {
+            job: jid,
+            slurm_job_id: String::new(),
+        }),
+        _ => {
+            let raw = section(&secs, "err").unwrap_or("");
+            let message = clean_tool_stderr(raw, "sbatch");
+            let kind = classify_refusal(&message);
+            if !refusal_is_definite(kind, raw) {
+                return Err(unclear(message).into());
+            }
+            // Nothing was queued: the folder goes (its record would read as
+            // an ended job).
+            if let Err(e) = dismiss_job(host, home, &jid).await {
+                tracing::debug!("could not remove the refused job's folder on {host}: {e:#}");
+            }
+            Err(StartRefused { kind, message }.into())
         }
-        .into());
     }
-    let id = marker_arg(&secs, "id").unwrap_or("").to_string();
-    Ok(StartOutcome::Submitted {
-        job: jid,
-        slurm_job_id: id,
-    })
+}
+
+/// Whether sbatch's failure means nothing was queued. A refusal of a known
+/// kind always does; so does any other stated reason, unless it reads like
+/// a lost conversation with the controller (a timeout, no contact) — after
+/// which the job may well be queued. No message at all is no answer either.
+fn refusal_is_definite(kind: Refusal, stderr: &str) -> bool {
+    if kind != Refusal::Other {
+        return true;
+    }
+    let m = stderr.to_ascii_lowercase();
+    let transient = [
+        "timed out",
+        "timeout",
+        "unable to contact",
+        "zero bytes",
+        "connection",
+        "communication",
+        "try again",
+        "temporarily",
+    ];
+    !m.trim().is_empty() && !transient.iter().any(|t| m.contains(t))
+}
+
+/// A start whose outcome the client couldn't see (the connection failed or
+/// was cut after the script may have run). Never a reason to submit again:
+/// [`recover_start`] reads what happened from the job's folder.
+#[derive(Clone, Debug)]
+pub struct StartUnclear {
+    /// The job id the start minted (its folder's name).
+    pub job: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for StartUnclear {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for StartUnclear {}
+
+/// What became of a start that ended in [`StartUnclear`]: `Some` — it was
+/// submitted (or, attached, written and ready to hold); `None` — nothing was
+/// submitted, so starting again is safe. An error means it still can't be
+/// told: check the queue first. A record without a Slurm id (sbatch's answer
+/// was lost) is looked up in the queue by its unique name, once.
+pub async fn recover_start(
+    host: &str,
+    home: RemoteHome,
+    jid: &str,
+) -> anyhow::Result<Option<StartOutcome>> {
+    anyhow::ensure!(valid_job_id(jid), "unknown job");
+    let script = recover_script(&path_line(host), &job_dir(home, jid));
+    let out = run_script(host, &script, EXEC_SECS).await?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let secs = sections(&stdout);
+    recovered(host, &secs, &out)
+}
+
+/// What [`recover_start`] asks of job folder `dir`.
+fn recover_script(path_line: &str, dir: &str) -> String {
+    let mut script = path_line.to_string();
+    script.push_str(&format!(
+        "D=\"{dir}\"\n\
+         if [ -f \"$D/job.json\" ]; then printf '===job\\n'; cat \"$D/job.json\"; printf '\\n';\n\
+         \x20 n=$(sed -n 's/^ *\"job_name\": \"\\([^\"]*\\)\",*$/\\1/p' \"$D/job.json\" | head -n 1)\n\
+         \x20 if ! grep -q '\"slurm_job_id\": \"' \"$D/job.json\" && [ -n \"$n\" ]; then\n\
+         \x20   printf '===queued\\n'; squeue -u \"$(id -un)\" -h -n \"$n\" -o '%i' 2>/dev/null | head -n 1\n\
+         \x20 fi\n\
+         elif [ -d \"$D\" ]; then printf '===partial\\n'; fi\n\
+         printf '===end\\n'\n"
+    ));
+    script
+}
+
+/// [`recover_start`]'s answer from what [`recover_script`] printed.
+fn recovered(
+    host: &str,
+    secs: &[(String, String)],
+    out: &std::process::Output,
+) -> anyhow::Result<Option<StartOutcome>> {
+    anyhow::ensure!(
+        section(secs, "end").is_some(),
+        "reading the job on {host} failed: {}",
+        super::ssh_failure_line(&out.stderr, &out.status)
+    );
+    if let Some(text) = section(secs, "job") {
+        let mut record: JobRecord =
+            serde_json::from_str(text.trim()).context("the job's record is unreadable")?;
+        if !record.attached && record.slurm_job_id.is_none() {
+            let id = section(secs, "queued").unwrap_or("").trim().to_string();
+            anyhow::ensure!(
+                valid_slurm_job_id(&id),
+                "{host} didn't confirm the job and it isn't in the queue — if it doesn't \
+                 show up within a minute, nothing was submitted: dismiss it and start again"
+            );
+            record.slurm_job_id = Some(id);
+        }
+        return Ok(Some(outcome_of(record)));
+    }
+    anyhow::ensure!(
+        section(secs, "partial").is_none(),
+        "the job's start on {host} is still unclear — check the queue before starting another"
+    );
+    Ok(None)
+}
+
+/// The outcome a written job record stands for.
+fn outcome_of(record: JobRecord) -> StartOutcome {
+    if record.attached {
+        StartOutcome::Attached {
+            job: record.id,
+            job_name: record.job_name,
+        }
+    } else {
+        StartOutcome::Submitted {
+            job: record.id,
+            slurm_job_id: record.slurm_job_id.unwrap_or_default(),
+        }
+    }
+}
+
+/// What [`start_script`] writes and runs.
+struct StartScript<'a> {
+    path_line: &'a str,
+    /// The job's folder, a double-quotable `$`-anchored path.
+    dir: &'a str,
+    /// Files written into the folder before anything is submitted.
+    files: [(&'a str, &'a str); 4],
+    record_json: &'a str,
+    /// The `sbatch` arguments, shell-quoted; `None` for an attached start.
+    sbatch: Option<&'a str>,
+}
+
+/// The job start, as one POSIX sh script — pure, so tests run it under a
+/// real `sh` with a stand-in `sbatch`.
+///
+/// One brace group: sh parses all of it before running any of it, so a
+/// connection cut while the script still arrives runs nothing (never half a
+/// start). Once it runs, nothing about the connection stops it (`HUP` and
+/// `PIPE` ignored), and the record is written before anything is printed, so
+/// a client that gave up still finds a submitted job on the page. The script
+/// never removes the folder: sbatch can fail after the controller queued the
+/// job (a timed-out reply), so any start without a readable id is recorded
+/// without one and found by its unique name; the client removes the folder
+/// only for a refusal it can read as one ([`refusal_is_definite`]).
+fn start_script(p: &StartScript) -> String {
+    let mut s = String::from("{\ntrap '' HUP PIPE\numask 077\nunset SLURM_JOB_ID SLURM_JOBID\n");
+    s.push_str(p.path_line);
+    s.push_str(&format!("D=\"{}\"\nmkdir -p \"$D\" || exit 3\n", p.dir));
+    for (name, content) in p.files {
+        s.push_str(&write_file_lines(&format!("$D/{name}"), content));
+    }
+    s.push_str(&write_file_lines("$D/job.pending", p.record_json));
+    // The submit time on the cluster's clock — the one every later read
+    // compares it with (a laptop's clock may be minutes off).
+    s.push_str(
+        "ms=$(date +%s 2>/dev/null)000\n\
+         case \"$ms\" in 000|*[!0-9]*) sub='s/^$//' ;; *) sub=\"s/\\\"submitted_ms\\\": [0-9][0-9]*/\\\"submitted_ms\\\": $ms/\" ;; esac\n\
+         fin() {\n\
+         \x20 sed -e \"$sub\" -e \"s/\\\"slurm_job_id\\\": \\\"__CHIMAERA_JOB_ID__\\\"/\\\"slurm_job_id\\\": $1/\" \"$D/job.pending\" > \"$D/job.json.tmp.$$\" \\\n\
+         \x20   && mv -f \"$D/job.json.tmp.$$\" \"$D/job.json\" && rm -f \"$D/job.pending\"\n\
+         }\n",
+    );
+    match p.sbatch {
+        None => s.push_str("fin null\nprintf '===rc 0\\n===end\\n'\n"),
+        Some(args) => s.push_str(&format!(
+            "out=$(sbatch {args} \"$D/job.sh\" 2>\"$D/.sbatch.err\"); rc=$?\n\
+             id=$(printf '%s\\n' \"$out\" | tail -n 1 | tr -d ' \\r'); id=${{id%%;*}}\n\
+             case \"$id\" in ''|*[!0-9_]*) [ \"$rc\" -eq 0 ] && rc=97 ;; esac\n\
+             if [ \"$rc\" -eq 0 ]; then fin \"\\\"$id\\\"\"; else fin null; fi\n\
+             printf '===rc %s\\n===id %s\\n===err\\n' \"$rc\" \"$id\"; cat \"$D/.sbatch.err\" 2>/dev/null; rm -f \"$D/.sbatch.err\"\n\
+             printf '===end\\n'\n"
+        )),
+    }
+    s.push_str("}\n");
+    s
 }
 
 /// Hold an attached job in the foreground: `ssh -tt host srun … job.sh`. The
@@ -1594,20 +2035,11 @@ pub async fn stop_job(host: &str, home: RemoteHome, record: &JobRecord) -> anyho
         Some(id) if valid_slurm_job_id(id) => sh_quote(id),
         _ => format!("--name={} -u \"$(id -un)\"", sh_quote(&record.job_name)),
     };
-    let mut marked = record.clone();
-    marked.stopped_by_user = true;
     let mut s = path_line(host);
-    s.push_str(&format!("umask 077\nD=\"{}\"\n", job_dir(home, &record.id)));
+    s.push_str(&format!("D=\"{}\"\n", job_dir(home, &record.id)));
     s.push_str(&scancel_lines(&target));
-    // Marked only when the stop took (or the job was already gone): a stop
-    // that failed must not make a job that later ends on its own read as
-    // "stopped by you".
-    s.push_str("if [ \"$ok\" = 1 ] && [ -d \"$D\" ]; then\n");
-    s.push_str(&write_file_lines(
-        "$D/job.json",
-        &serde_json::to_string_pretty(&marked)?,
-    ));
-    s.push_str("fi\nprintf '===end\\n'\n");
+    s.push_str(&read_job_lines());
+    s.push_str("printf '===end\\n'\n");
     let out = run_script(host, &s, EXEC_SECS).await?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let secs = sections(&stdout);
@@ -1624,6 +2056,13 @@ pub async fn stop_job(host: &str, home: RemoteHome, record: &JobRecord) -> anyho
             clean_tool_stderr(section(&secs, "err").unwrap_or(""), "scancel")
         );
     }
+    // Marked only now the stop took (or the job was already gone): a stop
+    // that failed must not make a job that later ends on its own read as
+    // "stopped by you". Only this field changes, on the record as it is now.
+    update_job(host, home, &record.id, job_read(&secs), |r| {
+        !std::mem::replace(&mut r.stopped_by_user, true)
+    })
+    .await?;
     Ok(())
 }
 
@@ -1642,64 +2081,189 @@ pub async fn queue_open(
     if record.open.iter().any(|w| w == wid) {
         return Ok(());
     }
-    let mut next = record.clone();
-    next.open.push(wid.to_string());
-    let mut s = format!(
-        "umask 077\nD=\"{}\"\n[ -f \"$D/job.json\" ] || exit 3\n",
-        job_dir(home, &record.id)
-    );
-    s.push_str(&write_file_lines(
-        "$D/job.json",
-        &serde_json::to_string_pretty(&next)?,
-    ));
-    s.push_str("printf '===end\\n'\n");
-    let out = run_script(host, &s, EXEC_SECS).await?;
-    anyhow::ensure!(
-        section(&sections(&String::from_utf8_lossy(&out.stdout)), "end").is_some(),
-        "couldn't update the job on {host}: {}",
-        super::ssh_failure_line(&out.stderr, &out.status)
-    );
+    let written = update_job(host, home, &record.id, None, |r| {
+        let add = !r.open.iter().any(|w| w == wid);
+        if add {
+            r.open.push(wid.to_string());
+        }
+        add
+    })
+    .await?;
+    anyhow::ensure!(written.is_some(), "that job is gone from {host}");
     invalidate_queue(host);
     Ok(())
 }
 
-/// Ask accounting once how a job ended and keep the answer in its record.
-/// Clusters without accounting answer "ENDED".
-pub async fn record_end(host: &str, home: RemoteHome, record: &JobRecord) -> anyhow::Result<Ended> {
+/// Ask accounting how a job ended and keep the answer in its record.
+/// `Ok(None)`: accounting still calls it live (it lags the queue by seconds
+/// to minutes) — nothing is recorded, so the true reason (TIMEOUT, OOM, …) is
+/// not lost to a premature "ENDED"; ask again later. Clusters without
+/// accounting answer "ENDED".
+pub async fn record_end(
+    host: &str,
+    home: RemoteHome,
+    record: &JobRecord,
+) -> anyhow::Result<Option<Ended>> {
     anyhow::ensure!(valid_job_id(&record.id), "unknown job");
     let id = record.slurm_job_id.clone().unwrap_or_default();
     let mut s = path_line(host);
+    s.push_str(&format!("D=\"{}\"\n", job_dir(home, &record.id)));
     if valid_slurm_job_id(&id) {
         s.push_str(&format!(
-            "printf '===sacct\\n'; sacct -nX -j {} -o State 2>/dev/null | head -n 1\n",
+            "printf '===sacct\\n'; sacct -nX -j {} -o State 2>/dev/null | head -n 5\n",
             sh_quote(&id)
         ));
     }
+    s.push_str(&read_job_lines());
     s.push_str("printf '===now %s\\n===end\\n' \"$(date +%s)\"\n");
     let out = run_script(host, &s, EXEC_SECS).await?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let secs = sections(&stdout);
-    let state = section(&secs, "sacct")
-        .and_then(|t| slurm::terminal_state(t.trim()))
-        .unwrap_or("ENDED")
-        .to_string();
+    anyhow::ensure!(
+        section(&secs, "end").is_some(),
+        "asking how the job on {host} ended failed: {}",
+        super::ssh_failure_line(&out.stderr, &out.status)
+    );
+    let Some(state) = ended_state_from_sacct(section(&secs, "sacct").unwrap_or("")) else {
+        return Ok(None);
+    };
     let at_ms = marker_arg(&secs, "now")
         .and_then(|n| n.parse::<u64>().ok())
-        .map(|n| n * 1000)
+        .and_then(|n| n.checked_mul(1000))
         .unwrap_or_else(now_ms);
-    let ended = Ended { state, at_ms };
-    let mut kept = record.clone();
-    kept.ended = Some(ended.clone());
-    let mut w = format!(
-        "umask 077\nD=\"{}\"\n[ -d \"$D\" ] || exit 0\n",
-        job_dir(home, &record.id)
+    let ended = Ended {
+        state: state.to_string(),
+        at_ms,
+    };
+    let mut kept = None;
+    update_job(host, home, &record.id, job_read(&secs), |r| {
+        match &r.ended {
+            // Another client recorded it first: its answer stands.
+            Some(e) => {
+                kept = Some(e.clone());
+                false
+            }
+            None => {
+                r.ended = Some(ended.clone());
+                true
+            }
+        }
+    })
+    .await?;
+    Ok(Some(kept.unwrap_or(ended)))
+}
+
+/// How `sacct -nX -j <id> -o State` says a job ended: a terminal state is
+/// the answer, and no line at all (no accounting) is "ENDED". A state that
+/// is still live (RUNNING, COMPLETING, PENDING — accounting lags the queue)
+/// is no answer yet: `None`, never "ENDED".
+fn ended_state_from_sacct(text: &str) -> Option<&'static str> {
+    match text.lines().map(str::trim).find(|l| !l.is_empty()) {
+        None => Some("ENDED"),
+        Some(line) => slurm::terminal_state(line),
+    }
+}
+
+/// Shell lines printing the job record in `$D` with its cksum (`===job
+/// <sum>`; an empty sum when there is none).
+fn read_job_lines() -> String {
+    "printf '===job %s\\n' \"$(cksum < \"$D/job.json\" 2>/dev/null | cut -d' ' -f1)\"; \
+     cat \"$D/job.json\" 2>/dev/null; printf '\\n'\n"
+        .to_string()
+}
+
+/// What [`read_job_lines`] printed: `None` when it didn't run, `Some(None)`
+/// when the job has no (readable) record.
+fn job_read(secs: &[(String, String)]) -> Option<Option<(JobRecord, String)>> {
+    let body = section(secs, "job")?;
+    let sum = marker_arg(secs, "job").unwrap_or("").to_string();
+    let record = (!sum.is_empty())
+        .then(|| serde_json::from_str::<JobRecord>(body.trim()).ok())
+        .flatten();
+    Some(record.map(|r| (r, sum)))
+}
+
+/// Read job `jid`'s record as it is on the cluster now (`None`: it has none).
+async fn read_job(
+    host: &str,
+    home: RemoteHome,
+    jid: &str,
+) -> anyhow::Result<Option<(JobRecord, String)>> {
+    let mut s = format!("D=\"{}\"\n", job_dir(home, jid));
+    s.push_str(&read_job_lines());
+    s.push_str("printf '===end\\n'\n");
+    let out = run_script(host, &s, EXEC_SECS).await?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let secs = sections(&stdout);
+    anyhow::ensure!(
+        section(&secs, "end").is_some(),
+        "reading the job on {host} failed: {}",
+        super::ssh_failure_line(&out.stderr, &out.status)
     );
-    w.push_str(&write_file_lines(
-        "$D/job.json",
-        &serde_json::to_string_pretty(&kept)?,
+    Ok(job_read(&secs).flatten())
+}
+
+/// The compare-and-swap of job folder `dir`'s `job.json`, under the folder's
+/// lock: written only if the record still reads as `sum`. Exit 3: the record
+/// is gone; 4: it changed since it was read; 5: the lock stayed busy.
+fn job_write_script(dir: &str, json: &str, sum: &str) -> String {
+    let mut s = format!("umask 077\nD=\"{dir}\"\n[ -f \"$D/job.json\" ] || exit 3\n");
+    s.push_str(&lock_lines("$D/.job.lock.d"));
+    s.push_str(&format!(
+        "now=$(cksum < \"$D/job.json\" 2>/dev/null | cut -d' ' -f1)\n\
+         [ \"$now\" = {} ] || exit 4\n",
+        sh_quote(sum)
     ));
-    run_script(host, &w, EXEC_SECS).await?;
-    Ok(ended)
+    s.push_str(&write_file_lines("$D/job.json", json));
+    s.push_str("printf '===end\\n'\n");
+    s
+}
+
+/// Change job `jid`'s record field by field on the cluster: `edit` runs on the
+/// record as it is there now (from `first`, a read the caller already made,
+/// else a fresh one) and says whether it changed anything; the write is a
+/// compare-and-swap, re-read and re-applied when another client wrote in
+/// between. Rewriting a whole record from a stale copy would undo that
+/// client's change (a queued open, a stop, how it ended). `None`: the job has
+/// no record.
+async fn update_job(
+    host: &str,
+    home: RemoteHome,
+    jid: &str,
+    first: Option<Option<(JobRecord, String)>>,
+    mut edit: impl FnMut(&mut JobRecord) -> bool,
+) -> anyhow::Result<Option<JobRecord>> {
+    let mut read = first;
+    for _ in 0..3 {
+        let current = match read.take() {
+            Some(r) => r,
+            None => read_job(host, home, jid).await?,
+        };
+        let Some((record, sum)) = current else {
+            return Ok(None);
+        };
+        let mut next = record.clone();
+        if !edit(&mut next) {
+            return Ok(Some(record));
+        }
+        let json = serde_json::to_string_pretty(&next)?;
+        let out = run_script(
+            host,
+            &job_write_script(&job_dir(home, jid), &json, &sum),
+            EXEC_SECS,
+        )
+        .await?;
+        match out.status.code() {
+            Some(0) => return Ok(Some(next)),
+            Some(3) => return Ok(None),
+            Some(4 | 5) => continue,
+            _ => bail!(
+                "updating the job on {host} failed: {}",
+                super::ssh_failure_line(&out.stderr, &out.status)
+            ),
+        }
+    }
+    bail!("the job's record on {host} kept changing — try again")
 }
 
 /// Forget an ended job: remove its folder (its script and Slurm's output).
@@ -1709,24 +2273,6 @@ pub async fn dismiss_job(host: &str, home: RemoteHome, jid: &str) -> anyhow::Res
     let script = format!("rm -rf -- \"{}\"\n", job_dir(home, jid));
     run_script(host, &script, EXEC_SECS).await?;
     Ok(())
-}
-
-/// Slurm's own estimate of when a waiting job starts (epoch ms, cluster
-/// clock), when it has one.
-pub async fn start_estimate(host: &str, slurm_job_id: &str) -> anyhow::Result<Option<u64>> {
-    anyhow::ensure!(valid_slurm_job_id(slurm_job_id), "invalid job id");
-    let mut s = path_line(host);
-    s.push_str(&format!(
-        "printf '===start\\n'; squeue --start -h -j {} -o '%S' 2>/dev/null | head -n 1\n\
-         printf '===now %s\\n===tz %s\\n===end\\n' \"$(date +%s)\" \"$(date +%z)\"\n",
-        sh_quote(slurm_job_id)
-    ));
-    let out = run_script(host, &s, EXEC_SECS).await?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let secs = sections(&stdout);
-    let text = section(&secs, "start").unwrap_or("").trim();
-    let tz = marker_arg(&secs, "tz").unwrap_or("+0000");
-    Ok(parse_slurm_timestamp(text, tz))
 }
 
 /// `2026-10-03T14:20:00` in the cluster's local zone (`+hhmm`) → epoch ms.
@@ -2085,6 +2631,7 @@ mod tests {
             elapsed: String::new(),
             workdir: String::new(),
             reason: reason.into(),
+            start: String::new(),
         }
     }
 
@@ -2754,21 +3301,29 @@ mod tests {
             .split("<<'")
             .nth(1)
             .unwrap()
-            .trim_end_matches('\'');
+            .split('\'')
+            .next()
+            .unwrap();
         assert!(delim.starts_with("CHIMAERA_EOF_") && delim.len() > 20);
         let out = std::process::Command::new("sh")
             .arg("-c")
             .arg(format!(
-                "D=$(mktemp -d)\n{lines}cat \"$D/x\"; rm -rf \"$D\"\n"
+                "D=$(mktemp -d)\n{lines}cat \"$D/x\"; ls -a \"$D\"; rm -rf \"$D\"\n"
             ))
             .output();
         if let Ok(out) = out {
             assert_eq!(
                 String::from_utf8_lossy(&out.stdout),
-                "EOF\nCHIMAERA_EOF\n$HOME `x` 'y'\n",
-                "the quoted heredoc keeps content literal"
+                "EOF\nCHIMAERA_EOF\n$HOME `x` 'y'\n.\n..\nx\n",
+                "the quoted heredoc keeps content literal, and no temp is left"
             );
         }
+        // Two writers of one file never share a temp.
+        let temp = |l: &str| l.split('"').nth(1).unwrap().to_string();
+        assert_ne!(
+            temp(&write_file_lines("$C/cluster.json", "a")),
+            temp(&write_file_lines("$C/cluster.json", "b"))
+        );
     }
 
     /// The scripts that run on the login node parse as POSIX sh.
@@ -2783,6 +3338,591 @@ mod tests {
                 "{}",
                 String::from_utf8_lossy(&out.stderr)
             );
+        }
+    }
+
+    /// More than a page of someone's array tasks ahead of ours: our job is
+    /// still read, and a read that did leave rows out never ends a job.
+    #[test]
+    fn a_job_missing_from_a_truncated_queue_is_not_ended() {
+        let row = |i: usize, name: &str| {
+            format!("{i}|batch|RUNNING|1:00:00|n1|1|1G|0:10|/w|None|N/A|{name}\n")
+        };
+        let mut text: String = (100..160).map(|i| row(i, "array")).collect();
+        text.push_str(&row(77, "chimaera-long~ab12cd"));
+        let q = QueueCache::parse(&text, Instant::now(), NOW, "+0000");
+        assert!(!q.truncated, "sixty rows are one read");
+        let r = record("j-0000aaaa", Some("77"), NOW - 10_000_000);
+        let (v, _) = job_view(&r, None, None, &q.jobs, queue_is_complete(Some(&q)), NOW);
+        assert_eq!(v.state, "starting", "found past the old 50-row cap");
+
+        let mut huge: String = (1000..2100).map(|i| row(i, "array")).collect();
+        huge.push_str(&row(77, "chimaera-long~ab12cd"));
+        let q = QueueCache::parse(&huge, Instant::now(), NOW, "+0000");
+        assert!(q.truncated);
+        let state = BrowseState {
+            jobs: vec![JobFiles {
+                record: r,
+                host: None,
+                egress: None,
+                hosting: None,
+            }],
+            ..Default::default()
+        };
+        let b = build(
+            &ClusterConfig::default(),
+            &state,
+            &q.jobs,
+            queue_is_complete(Some(&q)),
+            NOW,
+        );
+        assert_ne!(b.jobs[0].state, "ended");
+        assert!(queue_is_complete(Some(&QueueCache::parse(
+            "",
+            Instant::now(),
+            NOW,
+            ""
+        ))));
+        assert!(!queue_is_complete(None));
+
+        // A text cut at its byte cap is a truncated read, cut on a line.
+        let long: String = (0..20_000).map(|i| row(i, "x\u{e9}")).collect();
+        let q = QueueCache::parse(&long, Instant::now(), NOW, "+0000");
+        assert!(q.truncated);
+        assert!(q.text.len() <= QUEUE_TEXT_MAX);
+        assert!(q.text.ends_with("x\u{e9}"));
+    }
+
+    #[test]
+    fn a_waiting_job_carries_slurms_start_estimate() {
+        let r = record("j-0000aaaa", Some("77"), NOW - 500_000);
+        let mut pending = queue_row("77", "PENDING", "", "7-00:00:00", "Resources");
+        pending.start = "2026-07-15T05:34:00".into();
+        let mut running = queue_row("78", "RUNNING", "n1", "1:00", "None");
+        running.start = "2026-07-15T05:00:00".into();
+        let queue = [pending, running];
+        let (waiting, _) = job_view(&r, None, None, &queue, true, NOW);
+        let (started, _) = job_view(
+            &record("j-0000bbbb", Some("78"), 0),
+            None,
+            None,
+            &queue,
+            true,
+            NOW,
+        );
+        let mut jobs = vec![waiting, started];
+        apply_start_estimates(&mut jobs, &queue, "-0700");
+        assert_eq!(jobs[0].start_estimate_ms, Some(1_784_118_840_000));
+        assert_eq!(jobs[1].start_estimate_ms, None, "only a waiting job waits");
+        let json = serde_json::to_value(&jobs[0]).unwrap();
+        assert_eq!(json["start_estimate_ms"], 1_784_118_840_000u64);
+        assert!(serde_json::to_value(&jobs[1])
+            .unwrap()
+            .get("start_estimate_ms")
+            .is_none());
+    }
+
+    #[test]
+    fn queue_floor_survives_a_new_process() {
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-queues-{}",
+            &chimaera_core::generate_token()[..12]
+        ));
+        let text =
+            "77|batch|PENDING|1:00:00||1|1G|0:00|/w|Priority|2026-07-15T12:34:00|chimaera-x\n";
+        let asked = QueueCache::parse(text, Instant::now(), NOW, "+0000");
+        save_queue(&dir, "cluster", &asked);
+        // Another process, 30 s later: the floor holds, the rows come along.
+        let later = load_queue(&dir, "cluster", NOW + 30_000).expect("within the floor");
+        assert_eq!(later.jobs, asked.jobs);
+        assert_eq!((later.at_ms, later.tz.as_str()), (NOW, "+0000"));
+        assert!(later.at.elapsed() >= Duration::from_secs(29));
+        assert!(
+            load_queue(&dir, "other", NOW + 30_000).is_none(),
+            "per host"
+        );
+        assert!(
+            load_queue(&dir, "cluster", NOW + 60_000).is_none(),
+            "past the floor"
+        );
+        assert!(
+            load_queue(&dir, "cluster", NOW - 1).is_none(),
+            "a clock gone back"
+        );
+        forget_saved_queue(&dir, "cluster");
+        assert!(load_queue(&dir, "cluster", NOW + 1).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_readable_refusal_means_nothing_was_queued() {
+        let definite =
+            |m: &str| refusal_is_definite(classify_refusal(&clean_tool_stderr(m, "sbatch")), m);
+        assert!(definite(
+            "sbatch: error: Batch job submission failed: Invalid partition name specified"
+        ));
+        assert!(definite("sbatch: error: Batch job submission failed: Invalid account or account/partition combination specified"));
+        assert!(definite("sbatch: error: invalid partition specified: x"));
+        for lost in [
+            "sbatch: error: Batch job submission failed: Socket timed out on send/recv operation",
+            "sbatch: error: Batch job submission failed: Unable to contact slurm controller (connect failure)",
+            "sbatch: error: Batch job submission failed: Zero Bytes were transmitted or received",
+            "",
+        ] {
+            assert!(!definite(lost), "{lost}");
+        }
+        // A known kind of refusal is definite whatever else it says.
+        assert!(refusal_is_definite(
+            Refusal::AccountRequired,
+            "connection noted"
+        ));
+    }
+
+    #[test]
+    fn a_forgotten_queue_is_never_read_back() {
+        assert!(saved_queue_stands(10, None));
+        assert!(saved_queue_stands(11, Some(10)), "asked again since");
+        assert!(!saved_queue_stands(10, Some(10)));
+        assert!(!saved_queue_stands(9, Some(10)));
+    }
+
+    #[test]
+    fn sacct_lag_is_no_answer_yet() {
+        assert_eq!(ended_state_from_sacct("TIMEOUT\n"), Some("TIMEOUT"));
+        assert_eq!(
+            ended_state_from_sacct("  CANCELLED by 1234\n"),
+            Some("CANCELLED")
+        );
+        assert_eq!(
+            ended_state_from_sacct("\nOUT_OF_MEMORY \n"),
+            Some("OUT_OF_MEMORY")
+        );
+        assert_eq!(ended_state_from_sacct(""), Some("ENDED"), "no accounting");
+        for live in ["RUNNING", "COMPLETING", "PENDING", "REQUEUED", "SUSPENDED"] {
+            assert_eq!(ended_state_from_sacct(live), None, "{live}");
+        }
+    }
+
+    /// The submit time is the cluster's, so a laptop's skewed clock can't make
+    /// a fresh submit read as ended (or an old one as fresh).
+    #[test]
+    fn the_submit_grace_runs_on_one_clock() {
+        for (submitted, state) in [
+            (NOW + 300_000, "waiting"),
+            (NOW - 60_000, "waiting"),
+            (NOW - 300_000, "ended"),
+        ] {
+            let r = record("j-0000aaaa", Some("77"), submitted);
+            assert_eq!(job_view(&r, None, None, &[], true, NOW).0.state, state);
+        }
+    }
+
+    #[cfg(unix)]
+    mod sh {
+        use super::*;
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::{Path, PathBuf};
+        use std::process::{Command, Stdio};
+
+        pub(super) fn scratch(label: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "chimaera-{label}-{}",
+                &chimaera_core::generate_token()[..12]
+            ));
+            std::fs::create_dir_all(dir.join("bin")).unwrap();
+            dir
+        }
+
+        fn tool(dir: &Path, name: &str, body: &str) {
+            let p = dir.join("bin").join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        fn record_json(attached: bool) -> String {
+            let r = JobRecord {
+                id: "j-0000abcd".into(),
+                name: "Long".into(),
+                job_name: "chimaera-long~ab12cd".into(),
+                startup: "echo __CHIMAERA_JOB_ID__ \"submitted_ms\": 1".into(),
+                slurm_job_id: (!attached).then(|| "__CHIMAERA_JOB_ID__".to_string()),
+                attached,
+                submitted_ms: 1,
+                ..Default::default()
+            };
+            serde_json::to_string_pretty(&r).unwrap()
+        }
+
+        fn script(dir: &Path, attached: bool) -> String {
+            let path_line = format!(
+                "PATH=\"{}:$PATH\"; export PATH\n",
+                dir.join("bin").display()
+            );
+            let job_dir = dir.join("j/j-0000abcd").display().to_string();
+            let record = record_json(attached);
+            start_script(&StartScript {
+                path_line: &path_line,
+                dir: &job_dir,
+                files: [
+                    ("job.sh", "exec chimaera job-host\n"),
+                    ("startup.sh", "export X=1\n"),
+                    ("agent-rules.md", ""),
+                    ("facts.json", "{}"),
+                ],
+                record_json: &record,
+                sbatch: (!attached).then_some("'--parsable' '--job-name=chimaera-long~ab12cd'"),
+            })
+        }
+
+        fn run(script: &str) -> std::process::Output {
+            let mut child = Command::new("sh")
+                .arg("-s")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            // A script that exits early (a lost compare-and-swap) stops
+            // reading the rest of itself.
+            let _ = child.stdin.take().unwrap().write_all(script.as_bytes());
+            child.wait_with_output().unwrap()
+        }
+
+        fn wait_for(path: &Path) {
+            for _ in 0..1000 {
+                if path.exists() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("{} never appeared", path.display());
+        }
+
+        fn written(dir: &Path) -> Option<JobRecord> {
+            let text = std::fs::read_to_string(dir.join("j/j-0000abcd/job.json")).ok()?;
+            Some(serde_json::from_str(&text).unwrap())
+        }
+
+        /// The client gave up mid-submit: its session hung up and nobody reads
+        /// the output. The job sbatch took is still recorded, on the cluster's
+        /// clock, so it shows on the page and is never submitted twice.
+        #[test]
+        fn start_script_records_the_job_even_if_the_session_hangs_up() {
+            let dir = scratch("start-hup");
+            let started = dir.join("started");
+            tool(
+                &dir,
+                "sbatch",
+                &format!(
+                    "touch '{}'; sleep 1; echo '12345;cluster'\n",
+                    started.display()
+                ),
+            );
+            let mut child = Command::new("sh")
+                .arg("-s")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut stdin = child.stdin.take().unwrap();
+            stdin.write_all(script(&dir, false).as_bytes()).unwrap();
+            drop(stdin);
+            drop(child.stdout.take());
+            wait_for(&started);
+            Command::new("kill")
+                .args(["-HUP", &child.id().to_string()])
+                .status()
+                .unwrap();
+            let _ = child.wait();
+            let r = written(&dir).expect("job.json written");
+            assert_eq!(r.slurm_job_id.as_deref(), Some("12345"));
+            assert_eq!(
+                r.startup, "echo __CHIMAERA_JOB_ID__ \"submitted_ms\": 1",
+                "content is never rewritten"
+            );
+            let now = now_ms();
+            assert!(
+                r.submitted_ms > now - 60_000 && r.submitted_ms <= now,
+                "the cluster's clock, not the client's"
+            );
+            assert!(!dir.join("j/j-0000abcd/job.pending").exists());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A script cut off while it still arrives runs none of itself — never
+        /// a submit without the lines that record it.
+        #[test]
+        fn a_cut_start_script_runs_nothing() {
+            let dir = scratch("start-cut");
+            let started = dir.join("started");
+            tool(
+                &dir,
+                "sbatch",
+                &format!("touch '{}'; echo 12345\n", started.display()),
+            );
+            let full = script(&dir, false);
+            let cut = &full[..full.find("rc=$?").unwrap() + 5];
+            let out = run(cut);
+            assert!(!out.status.success());
+            assert!(!started.exists(), "sbatch never ran");
+            assert!(!dir.join("j").exists(), "nothing was written");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_start_keeps_a_queued_jobs_folder_and_drops_a_refused_one() {
+            // sbatch took it but its id is unreadable: recorded without an id
+            // (found by its unique name), its folder kept.
+            let dir = scratch("start-97");
+            tool(
+                &dir,
+                "sbatch",
+                "echo 'Submitted batch job 12345'; echo 'site note'\n",
+            );
+            let out = run(&script(&dir, false));
+            let secs = sections(&String::from_utf8_lossy(&out.stdout));
+            assert_eq!(marker_arg(&secs, "rc"), Some("97"));
+            assert_eq!(written(&dir).expect("kept").slurm_job_id, None);
+            // Recovery finds it in the queue by its unique name, once.
+            let asked = dir.join("asked");
+            tool(
+                &dir,
+                "squeue",
+                &format!(
+                    "echo \"$*\" >> '{}'; [ \"$4 $5\" = \"-n chimaera-long~ab12cd\" ] && echo 12345\n",
+                    asked.display()
+                ),
+            );
+            let job_dir = dir.join("j/j-0000abcd").display().to_string();
+            let path_line = format!(
+                "PATH=\"{}:$PATH\"; export PATH\n",
+                dir.join("bin").display()
+            );
+            let out = run(&recover_script(&path_line, &job_dir));
+            let secs = sections(&String::from_utf8_lossy(&out.stdout));
+            assert_eq!(
+                recovered("cluster", &secs, &out).unwrap(),
+                Some(StartOutcome::Submitted {
+                    job: "j-0000abcd".into(),
+                    slurm_job_id: "12345".into()
+                })
+            );
+            assert_eq!(std::fs::read_to_string(&asked).unwrap().lines().count(), 1);
+            // Not in the queue: still unclear, never "go ahead".
+            tool(&dir, "squeue", "exit 0\n");
+            let out = run(&recover_script(&path_line, &job_dir));
+            let secs = sections(&String::from_utf8_lossy(&out.stdout));
+            assert!(recovered("cluster", &secs, &out).is_err());
+            // A record with its id needs no queue question; no folder means
+            // nothing was submitted.
+            std::fs::write(
+                dir.join("j/j-0000abcd/job.json"),
+                record_json(false).replace("__CHIMAERA_JOB_ID__", "777"),
+            )
+            .unwrap();
+            tool(&dir, "squeue", "exit 9\n");
+            let out = run(&recover_script(&path_line, &job_dir));
+            let secs = sections(&String::from_utf8_lossy(&out.stdout));
+            assert!(section(&secs, "queued").is_none());
+            assert!(matches!(
+                recovered("cluster", &secs, &out).unwrap(),
+                Some(StartOutcome::Submitted { slurm_job_id, .. }) if slurm_job_id == "777"
+            ));
+            let gone = run(&recover_script(
+                &path_line,
+                &dir.join("j/j-0000ffff").display().to_string(),
+            ));
+            let secs = sections(&String::from_utf8_lossy(&gone.stdout));
+            assert_eq!(recovered("cluster", &secs, &gone).unwrap(), None);
+            let _ = std::fs::remove_dir_all(&dir);
+
+            // A failed sbatch may still have queued it (a lost reply): the
+            // script keeps the folder and its record, whatever the reason;
+            // the client removes it only for a refusal it can read as one.
+            for stderr in [
+                "sbatch: error: Invalid partition name specified",
+                "sbatch: error: Batch job submission failed: Socket timed out on send/recv operation",
+            ] {
+                let dir = scratch("start-failed");
+                tool(&dir, "sbatch", &format!("echo '{stderr}' >&2; exit 1\n"));
+                let out = run(&script(&dir, false));
+                let secs = sections(&String::from_utf8_lossy(&out.stdout));
+                assert_eq!(marker_arg(&secs, "rc"), Some("1"));
+                assert!(section(&secs, "err").unwrap().contains(&stderr[15..40]));
+                assert!(section(&secs, "end").is_some());
+                assert_eq!(written(&dir).expect("kept").slurm_job_id, None);
+                assert!(dir.join("j/j-0000abcd/job.sh").exists());
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            // An attached start only writes: its record, on the cluster clock.
+            let dir = scratch("start-attached");
+            let out = run(&script(&dir, true));
+            assert!(section(&sections(&String::from_utf8_lossy(&out.stdout)), "end").is_some());
+            let r = written(&dir).expect("written");
+            assert!(r.attached && r.slurm_job_id.is_none() && r.submitted_ms > 1);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Clients writing `cluster.json` at once: exactly one of those that
+        /// read the same version wins, the rest are told it changed, and the
+        /// file is always one whole version.
+        #[test]
+        fn concurrent_config_writes_never_corrupt_or_both_win() {
+            let dir = scratch("config-cas");
+            let c = dir.join("cluster");
+            std::fs::create_dir_all(&c).unwrap();
+            std::fs::write(c.join("cluster.json"), "{\"version\":2}\n").unwrap();
+            let sum = String::from_utf8(
+                Command::new("sh")
+                    .arg("-c")
+                    .arg(format!(
+                        "cksum < '{}' | cut -d' ' -f1",
+                        c.join("cluster.json").display()
+                    ))
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+            .trim()
+            .to_string();
+            let c_path = c.display().to_string();
+            let writers: Vec<_> = (0..6)
+                .map(|i| {
+                    let json = format!(
+                        "{{\"version\":2,\"writer\":{i},\"pad\":\"{}\"}}",
+                        "x".repeat(200_000)
+                    );
+                    let s = config_write_script(&c_path, &json, &sum);
+                    std::thread::spawn(move || run(&s).status.code())
+                })
+                .collect();
+            let codes: Vec<_> = writers.into_iter().map(|w| w.join().unwrap()).collect();
+            assert_eq!(
+                codes.iter().filter(|c| **c == Some(0)).count(),
+                1,
+                "{codes:?}"
+            );
+            assert!(codes.iter().all(|c| matches!(c, Some(0 | 4))), "{codes:?}");
+            let text = std::fs::read_to_string(c.join("cluster.json")).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert!(v["writer"].is_number());
+            let left: Vec<_> = std::fs::read_dir(&c)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+                .filter(|n| n.contains(".tmp") || n.contains(".lock"))
+                .collect();
+            assert!(left.is_empty(), "no temp or lock is left: {left:?}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A held lock is waited for, and a crashed writer's (over a minute
+        /// old) is broken rather than blocking every edit forever.
+        #[test]
+        fn the_shared_home_lock_waits_and_breaks_a_stale_one() {
+            let dir = scratch("lock");
+            let lock = dir.join("held.d");
+            std::fs::create_dir(&lock).unwrap();
+            let s = format!(
+                "{}printf 'in\\n'\n",
+                lock_lines(&lock.display().to_string())
+            );
+            let releaser = {
+                let lock = lock.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(1500));
+                    std::fs::remove_dir(&lock).unwrap();
+                })
+            };
+            let at = Instant::now();
+            let out = run(&s);
+            releaser.join().unwrap();
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "in\n");
+            assert!(at.elapsed() >= Duration::from_millis(1400), "it waited");
+            assert!(!lock.exists(), "and let go");
+
+            std::fs::create_dir(&lock).unwrap();
+            let old = Command::new("touch")
+                .args(["-t", "200001010000", &lock.display().to_string()])
+                .status()
+                .unwrap();
+            assert!(old.success());
+            let out = run(&s);
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "in\n");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_job_record_is_written_only_over_the_version_read() {
+            let dir = scratch("job-cas");
+            let d = dir.join("j");
+            std::fs::create_dir_all(&d).unwrap();
+            let d_path = d.display().to_string();
+            assert_eq!(
+                run(&job_write_script(&d_path, "{}", "1")).status.code(),
+                Some(3),
+                "no record"
+            );
+            std::fs::write(d.join("job.json"), "{\"id\":\"a\"}\n").unwrap();
+            let read = run(&format!(
+                "D=\"{d_path}\"\n{}printf '===end\\n'\n",
+                read_job_lines()
+            ));
+            let secs = sections(&String::from_utf8_lossy(&read.stdout));
+            let sum = marker_arg(&secs, "job").unwrap().to_string();
+            assert_eq!(
+                run(&job_write_script(&d_path, "{\"id\":\"b\"}", "999"))
+                    .status
+                    .code(),
+                Some(4)
+            );
+            assert_eq!(
+                run(&job_write_script(&d_path, "{\"id\":\"b\"}", &sum))
+                    .status
+                    .code(),
+                Some(0)
+            );
+            assert_eq!(
+                std::fs::read_to_string(d.join("job.json")).unwrap(),
+                "{\"id\":\"b\"}\n"
+            );
+            assert_eq!(
+                run(&job_write_script(&d_path, "{\"id\":\"c\"}", &sum))
+                    .status
+                    .code(),
+                Some(4),
+                "a stale copy never wins"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Every script sent to a login node parses as POSIX sh.
+        #[test]
+        fn every_cluster_script_parses_as_sh() {
+            let dir = scratch("parse");
+            for script in [
+                script(&dir, false),
+                script(&dir, true),
+                config_write_script("$HOME/.chimaera/cluster", "{}", ""),
+                job_write_script("$HOME/.chimaera/cluster/j/j-0000abcd", "{}", "1"),
+                format!("D=x\n{}", read_job_lines()),
+                lock_lines("$C/.cluster.lock.d"),
+                scancel_lines("'123'"),
+            ] {
+                let out = Command::new("sh")
+                    .args(["-n", "-c", &script])
+                    .output()
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "{}\n{script}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }

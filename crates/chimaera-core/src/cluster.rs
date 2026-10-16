@@ -400,6 +400,19 @@ pub const BROWSE_MAX_JOBS: usize = 100;
 pub const BROWSE_MAX_FOLDERS: usize = 2000;
 /// Folders checked for a `.git` (one stat each, on a network filesystem).
 const BROWSE_GIT_CHECKS: usize = 500;
+/// The most `j/` entries `browse --state` even stats.
+const BROWSE_SCAN_JOBS: usize = 10_000;
+
+/// The `n` most recently changed job folders, newest first — chosen from one
+/// stat each, before any of their files is read.
+fn newest_job_dirs(
+    mut folders: Vec<(String, std::time::SystemTime)>,
+    n: usize,
+) -> Vec<(String, std::time::SystemTime)> {
+    folders.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+    folders.truncate(n);
+    folders
+}
 
 fn read_json_file<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Option<T> {
     use std::io::Read;
@@ -418,35 +431,41 @@ pub fn browse_state(cluster_dir: &std::path::Path) -> BrowseState {
     let config: ClusterConfig =
         read_json_file(&cluster_dir.join("cluster.json")).unwrap_or_default();
     let mut jobs: Vec<(std::time::SystemTime, JobFiles)> = Vec::new();
+    // One stat per folder first, then the JSON of only the newest: every
+    // overview runs this on a network filesystem.
+    let mut folders = Vec::new();
     if let Ok(entries) = std::fs::read_dir(cluster_dir.join("j")) {
-        for e in entries.flatten() {
+        for e in entries.flatten().take(BROWSE_SCAN_JOBS) {
             let name = e.file_name().to_string_lossy().to_string();
             if !valid_job_id(&name) {
-                continue;
-            }
-            let dir = e.path();
-            let Some(record) = read_json_file::<JobRecord>(&dir.join("job.json")) else {
-                continue;
-            };
-            if record.id != name {
                 continue;
             }
             let modified = e
                 .metadata()
                 .and_then(|m| m.modified())
                 .unwrap_or(std::time::UNIX_EPOCH);
-            let egress = read_json_file::<serde_json::Value>(&dir.join("caps.json"))
-                .and_then(|c| c.get("egress").and_then(|v| v.as_bool()));
-            jobs.push((
-                modified,
-                JobFiles {
-                    record,
-                    host: read_json_file(&dir.join("host.json")),
-                    egress,
-                    hosting: read_json_file(&dir.join("workspaces.json")),
-                },
-            ));
+            folders.push((name, modified));
         }
+    }
+    for (name, modified) in newest_job_dirs(folders, BROWSE_MAX_JOBS) {
+        let dir = cluster_dir.join("j").join(&name);
+        let Some(record) = read_json_file::<JobRecord>(&dir.join("job.json")) else {
+            continue;
+        };
+        if record.id != name {
+            continue;
+        }
+        let egress = read_json_file::<serde_json::Value>(&dir.join("caps.json"))
+            .and_then(|c| c.get("egress").and_then(|v| v.as_bool()));
+        jobs.push((
+            modified,
+            JobFiles {
+                record,
+                host: read_json_file(&dir.join("host.json")),
+                egress,
+                hosting: read_json_file(&dir.join("workspaces.json")),
+            },
+        ));
     }
     jobs.sort_by(|a, b| {
         b.1.record
@@ -875,6 +894,19 @@ mod tests {
         assert!(browse_dir(&projects.join("notes.txt").to_string_lossy(), None).is_err());
         assert!(browse_dir("/no/such/place", None).is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn browse_state_reads_only_the_newest_jobs() {
+        let at = |s: u64| std::time::UNIX_EPOCH + std::time::Duration::from_secs(s);
+        let folders: Vec<(String, std::time::SystemTime)> = (0..250u64)
+            .map(|i| (format!("j-{i:08x}"), at(i * 7 % 250)))
+            .collect();
+        let picked = newest_job_dirs(folders, BROWSE_MAX_JOBS);
+        assert_eq!(picked.len(), BROWSE_MAX_JOBS);
+        assert_eq!(picked[0].1, at(249));
+        assert!(picked.windows(2).all(|w| w[0].1 >= w[1].1));
+        assert!(picked.iter().all(|(_, t)| *t >= at(150)));
     }
 
     #[test]
