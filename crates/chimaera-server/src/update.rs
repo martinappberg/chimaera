@@ -125,8 +125,10 @@ fn releases_api_url() -> Option<String> {
 /// once after the same boot delay and then every
 /// `plugins::releases::CHECK_INTERVAL`. Dev builds stay silent (and off the
 /// network) for each unless its endpoint is explicitly overridden; users
-/// can turn all of it off with the `update.autoCheck` setting.
+/// can turn all of it off with the `update.autoCheck` setting — but not the
+/// admin's plugin policy, which has its own tick (`trust::watch_policy`).
 pub(crate) async fn run_checker(state: Arc<AppState>) {
+    tokio::spawn(crate::plugins::trust::watch_policy(state.clone()));
     let dev = chimaera_core::VERSION == "0.0.1";
     let own = !dev || std::env::var("CHIMAERA_RELEASES_API").is_ok();
     let plugins = !dev || std::env::var("CHIMAERA_PLUGIN_RELEASES_API").is_ok();

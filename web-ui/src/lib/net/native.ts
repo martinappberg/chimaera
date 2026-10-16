@@ -772,12 +772,14 @@ export interface HostStatusEvent {
    *  "ended" = a job window's job left the queue (its composite
    *  `<alias>#job<id>` key only) — `reason` then carries Slurm's state
    *  (TIMEOUT, CANCELLED, FAILED, PREEMPTED, …) or "stopped" when the user
-   *  stopped it. A "down" without "ended" is still just a connection blip. */
-  status: "connected" | "down" | "error" | "ended";
+   *  stopped it. A "down" without "ended" is still just a connection blip;
+   *  "cluster" = the host now runs workspaces as jobs (no tunnel). */
+  status: "connected" | "down" | "error" | "ended" | "cluster";
   /** Local end of the tunnel (may change across a reconnect). */
   local_port: number | null;
-  /** New daemon token, on "connected" only — lets a window re-home if the
-   *  remote daemon restarted. Absent on "down"/"error". */
+  /** New daemon token, on the window's own host's "connected" only — lets a
+   *  window re-home if the remote daemon restarted. Absent on every other
+   *  status, on compute keys, and on the copy local windows (Home) get. */
   token?: string;
   /** The connect failure, on "error" only — so a home screen that merely
    *  observed the attempt (startup restore) can surface it instead of
@@ -794,10 +796,12 @@ export interface HostStatusEvent {
 }
 
 /**
- * Subscribe to tunnel liveness transitions. Broadcast to every window, so a
- * handler filters on its own host alias. A remote window uses `down` to arm
- * its reconnect UI and `connected` to re-home when the port/token moved;
- * the home screen uses it to keep host rows live. Returns an unsubscribe.
+ * Subscribe to tunnel liveness transitions. Scoped by the shell: a remote
+ * window gets only its own host's events; local windows (Home) get every
+ * host's, without `token`. A handler still filters on its own alias. A
+ * remote window uses `down` to arm its reconnect UI and `connected` to
+ * re-home when the port/token moved; the home screen uses it to keep host
+ * rows live. Returns an unsubscribe.
  */
 export function onHostStatus(
   handler: (e: HostStatusEvent) => void,

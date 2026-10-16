@@ -542,3 +542,223 @@ async fn ledger_stop_during_the_boot_read_never_overwrites_the_file() {
     ledger::final_flush(&state).await;
     assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
 }
+
+/// What a previous daemon left in a real workspace: two claude chats (one
+/// carrying state its process held) and a shell, the shell linked to the
+/// first chat. Written to `data`'s ledger; claude is a fake on `state`.
+async fn mid_restore_ledger(
+    state: &Arc<AppState>,
+    data: &std::path::Path,
+    label: &str,
+) -> (String, ledger::BootLedger) {
+    let workspace_id = make_workspace(state, &format!("{label}-ws")).await;
+    let root = lock(&state.workspaces).get(&workspace_id).unwrap().root;
+    let chat = |id: &str, title: &str| ledger::LedgerEntry {
+        id: id.to_string(),
+        workspace_id: workspace_id.clone(),
+        cwd: root.clone(),
+        pinned_name: None,
+        cols: 120,
+        rows: 40,
+        theme: "dark".to_string(),
+        created_at: 1_700_000_000,
+        agent: Some(ledger::LedgerAgent {
+            kind: agents::AgentKind::Claude,
+            resume: None,
+            transcript: None,
+            title: title.to_string(),
+            ui: chimaera_agent::model::SessionUi::Chat,
+            model: None,
+            carryover: Some(chimaera_agent::Carryover {
+                turn_in_flight: true,
+                pickup_at_ms: 1_700_000_000_000,
+                ..Default::default()
+            }),
+        }),
+    };
+    let shell = ledger::LedgerEntry {
+        agent: None,
+        cols: 100,
+        rows: 30,
+        ..chat("s-shell", "")
+    };
+    let boot = ledger::BootLedger {
+        sessions: vec![
+            chat("s-chat-a", "plot the survival curves"),
+            chat("s-chat-b", "port the parser"),
+            shell,
+        ],
+        links: [("s-shell".to_string(), "s-chat-a".to_string())].into(),
+        written_at: 0,
+    };
+    let mut store = ledger::LedgerStore::new(data.join("sessions.json"));
+    store.load_boot();
+    store.write_if_changed(&boot.sessions, &boot.links);
+    preset_fake_claude(state, label);
+    (workspace_id, boot)
+}
+
+fn preset_fake_claude(state: &Arc<AppState>, label: &str) {
+    preset_agent(
+        state,
+        agents::AgentKind::Claude,
+        Ok(write_fake_claude(&format!("{label}-fake"))),
+        Some("9.9.9-fake"),
+    );
+}
+
+/// Each boot entry's id, once per row of the ledger at `data`.
+fn ledger_ids(data: &std::path::Path) -> Vec<String> {
+    let mut ids: Vec<String> = ledger::LedgerStore::new(data.join("sessions.json"))
+        .load_boot()
+        .sessions
+        .into_iter()
+        .map(|e| e.id)
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// The successor: a fresh daemon over the same data dir restores every
+/// entry exactly once (a duplicate row's second spawn would fail and retire
+/// into Recents) and retires nothing.
+async fn successor_restores_each_once(data: PathBuf, workspace_id: &str, label: &str) {
+    let state2 = test_state_with_data_dir(0, data);
+    preset_fake_claude(&state2, &format!("{label}-2"));
+    let boot = lock(&state2.ledger).load_boot();
+    assert_eq!(boot.sessions.len(), 3, "{:?}", boot.sessions);
+    state2.restored.send_replace(false);
+    ledger::consume_boot(&state2, boot).await;
+    for id in ["s-chat-a", "s-chat-b"] {
+        assert!(
+            state2.chat.get(id).is_some_and(|c| c.alive),
+            "{id} resurrected"
+        );
+    }
+    let shells: Vec<String> = state2.sessions.list().into_iter().map(|i| i.id).collect();
+    assert_eq!(shells, ["s-shell"]);
+    assert!(lock(&state2.recents).list(workspace_id).is_empty());
+    crate::chat::stop_all_for_exit(&state2).await;
+    state2.sessions.kill("s-shell").ok();
+}
+
+/// A stop that lands after the boot read but before restore respawns
+/// anything: nothing spawns, nothing retires, and the stop's write keeps
+/// every entry verbatim (it used to write the empty live roster over them).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ledger_stop_before_restore_keeps_every_entry() {
+    let data = test_dir("ledger-stop-early");
+    let state = test_state_with_data_dir(0, data.clone());
+    let (workspace_id, old) = mid_restore_ledger(&state, &data, "ledger-stop-early").await;
+    state
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    state.restored.send_replace(false);
+    let task = tokio::spawn(ledger::run(state.clone()));
+    until("restore", || *state.restored.borrow()).await;
+    ledger::final_flush(&state).await;
+    task.abort();
+
+    let kept = ledger::LedgerStore::new(data.join("sessions.json")).load_boot();
+    assert_eq!(kept.sessions, old.sessions);
+    assert_eq!(kept.links, old.links);
+    assert!(state.chat.list().is_empty(), "nothing spawned");
+    assert!(state.sessions.list().is_empty(), "nothing spawned");
+    assert!(lock(&state.recents).list(&workspace_id).is_empty());
+}
+
+/// A stop after the first entry respawned: restore goes no further, the
+/// stop's write holds every conversation once (the unreached ones
+/// verbatim), and the successor brings each back exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ledger_stop_mid_restore_restores_each_conversation_once() {
+    let data = test_dir("ledger-stop-mid");
+    let state = test_state_with_data_dir(0, data.clone());
+    let (workspace_id, old) = mid_restore_ledger(&state, &data, "ledger-stop-mid").await;
+    let weak = Arc::downgrade(&state);
+    lock(&state.ledger).set_restore_step_for_tests(Arc::new(move || {
+        if let Some(state) = weak.upgrade() {
+            state
+                .stopping
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }));
+    state.restored.send_replace(false);
+    let task = tokio::spawn(ledger::run(state.clone()));
+    until("restore", || *state.restored.borrow()).await;
+    assert!(state.chat.get("s-chat-a").is_some_and(|c| c.alive));
+    assert!(!state.chat.contains("s-chat-b"), "restore stopped");
+    assert!(state.sessions.list().is_empty(), "restore stopped");
+
+    ledger::final_flush(&state).await;
+    task.abort();
+    assert_eq!(ledger_ids(&data), ["s-chat-a", "s-chat-b", "s-shell"]);
+    let kept = ledger::LedgerStore::new(data.join("sessions.json")).load_boot();
+    for old in &old.sessions[1..] {
+        assert_eq!(kept.sessions.iter().find(|e| e.id == old.id), Some(old));
+    }
+    assert!(lock(&state.recents).list(&workspace_id).is_empty());
+    crate::chat::stop_all_for_exit(&state).await;
+
+    successor_restores_each_once(data, &workspace_id, "ledger-stop-mid").await;
+}
+
+/// A crash mid-restore (the task dies, no stop runs): nothing has written
+/// the ledger, so the file is the old one byte for byte and the successor
+/// restores each entry once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ledger_crash_mid_restore_leaves_the_old_file() {
+    let data = test_dir("ledger-crash-mid");
+    let state = test_state_with_data_dir(0, data.clone());
+    let (workspace_id, _) = mid_restore_ledger(&state, &data, "ledger-crash-mid").await;
+    let before = std::fs::read(data.join("sessions.json")).unwrap();
+    // The crash is the task dying right after the first entry's outcome. A
+    // panic ends it there; an abort would only land at its next await, after
+    // the next entry may already have started.
+    lock(&state.ledger).set_restore_step_for_tests(Arc::new(|| {
+        std::panic::resume_unwind(Box::new("simulated crash mid-restore"))
+    }));
+    state.restored.send_replace(false);
+    let task = tokio::spawn(ledger::run(state.clone()));
+    assert!(task.await.unwrap_err().is_panic());
+    assert!(!state.chat.contains("s-chat-b"), "the crash came first");
+    assert_eq!(std::fs::read(data.join("sessions.json")).unwrap(), before);
+    // A crashed daemon sees none of its chats die, so none retires.
+    state
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    crate::chat::stop_all_for_exit(&state).await;
+
+    successor_restores_each_once(data, &workspace_id, "ledger-crash-mid").await;
+}
+
+/// A restore that never finishes cannot hold the stop past the callers'
+/// stop budget (the app and the remote stop script give up after ~10 s):
+/// the flush waits `FLUSH_RESTORE_WAIT`, no longer, and still writes every
+/// pending entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ledger_stop_waits_for_a_stuck_restore_only_within_the_stop_budget() {
+    assert!(ledger::FLUSH_RESTORE_WAIT <= std::time::Duration::from_secs(5));
+    let data = test_dir("ledger-stop-stuck");
+    let state = test_state_with_data_dir(0, data.clone());
+    let (_, old) = mid_restore_ledger(&state, &data, "ledger-stop-stuck").await;
+    // The boot read landed and restore is still on its first entry.
+    lock(&state.ledger).load_boot();
+    state.restored.send_replace(false);
+    state
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let started = std::time::Instant::now();
+    ledger::final_flush(&state).await;
+    let waited = started.elapsed();
+    assert!(waited >= ledger::FLUSH_RESTORE_WAIT, "{waited:?}");
+    assert!(
+        waited < ledger::FLUSH_RESTORE_WAIT + std::time::Duration::from_secs(2),
+        "{waited:?}"
+    );
+    let kept = ledger::LedgerStore::new(data.join("sessions.json")).load_boot();
+    assert_eq!(
+        kept.sessions, old.sessions,
+        "still pending, written verbatim"
+    );
+}

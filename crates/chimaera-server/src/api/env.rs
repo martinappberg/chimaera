@@ -57,17 +57,55 @@ pub(crate) fn spawn_env_remove(env: &[(String, String)]) -> Vec<String> {
 /// conversations silently lose `--resume`. The whole CLAUDE* family goes:
 /// none of it can describe a chimaera session truthfully, and anything the
 /// user set in their own profile comes back through the login-shell wrap.
+///
+/// The native app's askpass wiring goes too, when a daemon inherited it from
+/// an older app: a session's ssh would otherwise prompt through the app's
+/// modal (or hang with none open), and any agent could raise a native prompt
+/// for a real host. A user's own `SSH_ASKPASS` is kept.
 pub(crate) fn launcher_context_env() -> Vec<String> {
-    std::env::vars()
+    let vars: Vec<(String, String)> = std::env::vars().collect();
+    // Fixed for the daemon's life; `runtime_dir()` creates the directory, so
+    // not once per spawn.
+    static APP_SHIM: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    let app_shim = APP_SHIM.get_or_init(|| chimaera_core::runtime_dir().join("askpass.sh"));
+    let mut names: Vec<String> = vars
+        .iter()
         .map(|(name, _)| name)
         .filter(|name| {
-            name == "CLAUDECODE"
-                || name == "CLAUDE_EFFORT"
-                || name == "AI_AGENT"
+            *name == "CLAUDECODE"
+                || *name == "CLAUDE_EFFORT"
+                || *name == "AI_AGENT"
                 || name.starts_with("CLAUDE_CODE_")
                 || name.starts_with("CLAUDE_AGENT_")
         })
-        .collect()
+        .cloned()
+        .collect();
+    names.extend(app_askpass_env(&vars, app_shim));
+    names
+}
+
+/// The app's askpass variables present in `vars`. Its own markers always;
+/// `SSH_ASKPASS` (+ `_REQUIRE`) only when they are the app's — the shim it
+/// writes, or set alongside its socket marker.
+fn app_askpass_env(vars: &[(String, String)], app_shim: &std::path::Path) -> Vec<String> {
+    let has = |name: &str| vars.iter().any(|(k, _)| k == name);
+    let app_owned_askpass = has("CHIMAERA_ASKPASS_SOCK")
+        || vars
+            .iter()
+            .any(|(k, v)| k == "SSH_ASKPASS" && std::path::Path::new(v) == app_shim);
+    let mut names: Vec<String> = ["CHIMAERA_ASKPASS_SOCK", "CHIMAERA_ASKPASS_ALIAS"]
+        .into_iter()
+        .filter(|n| has(n))
+        .map(str::to_string)
+        .collect();
+    if app_owned_askpass {
+        for name in ["SSH_ASKPASS", "SSH_ASKPASS_REQUIRE"] {
+            if has(name) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
 }
 
 /// The spawned session's PATH: shim dir first, then the daemon's inherited
@@ -98,12 +136,63 @@ mod scrub_tests {
         assert!(scrub.iter().any(|n| n == "CLAUDE_CODE_CHILD_SESSION"));
         assert!(scrub.iter().any(|n| n == "CLAUDE_AGENT_SDK_VERSION"));
         assert!(
-            !scrub.iter().any(|n| n.starts_with("CHIMAERA")),
+            !scrub
+                .iter()
+                .any(|n| n.starts_with("CHIMAERA") && !n.starts_with("CHIMAERA_ASKPASS_")),
             "only claude-context markers are scrubbed: {scrub:?}"
         );
         assert!(!scrub.iter().any(|n| n == "PATH" || n == "HOME"));
         std::env::remove_var("CLAUDE_CODE_CHILD_SESSION");
         std::env::remove_var("CLAUDE_AGENT_SDK_VERSION");
         std::env::remove_var("CHIMAERA_SCRUB_TEST_INNOCENT");
+    }
+
+    #[test]
+    fn the_apps_askpass_wiring_is_scrubbed_and_a_users_own_askpass_kept() {
+        let shim = std::path::Path::new("/home/u/.chimaera/run/askpass.sh");
+        let env = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let mut app = super::app_askpass_env(
+            &env(&[
+                ("SSH_ASKPASS", "/home/u/.chimaera/run/askpass.sh"),
+                ("SSH_ASKPASS_REQUIRE", "force"),
+                (
+                    "CHIMAERA_ASKPASS_SOCK",
+                    "/home/u/.chimaera/run/askpass.sock",
+                ),
+                ("PATH", "/usr/bin"),
+            ]),
+            shim,
+        );
+        app.sort();
+        assert_eq!(
+            app,
+            [
+                "CHIMAERA_ASKPASS_SOCK",
+                "SSH_ASKPASS",
+                "SSH_ASKPASS_REQUIRE"
+            ]
+        );
+        // The app's shim alone (a socket marker lost) is still the app's.
+        assert_eq!(
+            super::app_askpass_env(
+                &env(&[("SSH_ASKPASS", "/home/u/.chimaera/run/askpass.sh")]),
+                shim
+            ),
+            ["SSH_ASKPASS"]
+        );
+        // The user's own askpass program stays.
+        assert!(super::app_askpass_env(
+            &env(&[
+                ("SSH_ASKPASS", "/usr/libexec/ssh-askpass"),
+                ("SSH_ASKPASS_REQUIRE", "prefer"),
+            ]),
+            shim
+        )
+        .is_empty());
     }
 }

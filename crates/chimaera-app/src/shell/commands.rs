@@ -117,7 +117,11 @@ pub(super) async fn list_hosts(state: State<'_, Shell>) -> Result<Vec<HostState>
 /// talks to `~/.chimaera-dev` on both ends — see `RemoteHome::current`), so
 /// there is nothing dev-related to save per host.
 #[tauri::command]
-pub(super) async fn add_host(alias: String) -> Result<HostState, String> {
+pub(super) async fn add_host(
+    window: tauri::WebviewWindow,
+    alias: String,
+) -> Result<HostState, String> {
+    super::require_local(window.app_handle(), window.label())?;
     let alias = alias.trim().to_string();
     if alias.is_empty() || alias.starts_with('-') {
         return Err("that does not look like an ssh alias".to_string());
@@ -127,7 +131,14 @@ pub(super) async fn add_host(alias: String) -> Result<HostState, String> {
 }
 
 #[tauri::command]
-pub(super) async fn remove_host(state: State<'_, Shell>, alias: String) -> Result<(), String> {
+pub(super) async fn remove_host(
+    window: tauri::WebviewWindow,
+    state: State<'_, Shell>,
+    alias: String,
+) -> Result<(), String> {
+    super::require_local(window.app_handle(), window.label())?;
+    // An in-flight connect would re-add the host it was reaching.
+    super::connect::cancel_connect(window.app_handle(), &alias);
     let tunnel = state.tunnels.lock().await.remove(&alias);
     lock(&state.unhealthy_tunnels).remove(&alias);
     lock(&state.wedge_suspects).remove(&alias);
@@ -135,16 +146,22 @@ pub(super) async fn remove_host(state: State<'_, Shell>, alias: String) -> Resul
     if let Some(tunnel) = tunnel {
         tunnel.close().await;
     }
-    with_hosts(move |hosts| hosts.remove(&alias)).await?;
+    let removed = alias.clone();
+    with_hosts(move |hosts| hosts.remove(&removed)).await?;
+    // A forgotten host's windows must not come back (and reconnect) at the
+    // next launch.
+    super::restore::forget_host_windows(window.app_handle(), &alias);
     Ok(())
 }
 
 #[tauri::command]
 pub(super) async fn connect_host(
     app: AppHandle,
+    window: tauri::WebviewWindow,
     alias: String,
     update_daemon: Option<bool>,
 ) -> Result<HostState, String> {
+    super::require_target(&app, window.label(), Some(&alias))?;
     // On Windows ssh MUST run inside the WSL distro (Win32-OpenSSH has no
     // ControlMaster). If the transport never got wired, fail with the real
     // reason instead of letting host ssh produce baffling per-host errors.
@@ -160,7 +177,17 @@ pub(super) async fn connect_host(
 }
 
 #[tauri::command]
-pub(super) async fn disconnect_host(state: State<'_, Shell>, alias: String) -> Result<(), String> {
+pub(super) async fn disconnect_host(
+    window: tauri::WebviewWindow,
+    state: State<'_, Shell>,
+    alias: String,
+) -> Result<(), String> {
+    super::require_target(window.app_handle(), window.label(), Some(&alias))?;
+    // Stop an in-flight connect first: otherwise it lands minutes later,
+    // installs its tunnel and reopens this host's windows. Its install
+    // re-checks the cancel under the tunnels lock taken next, so a tunnel it
+    // did install before the cancel is the one removed below.
+    super::connect::cancel_connect(window.app_handle(), &alias);
     let tunnel = state.tunnels.lock().await.remove(&alias);
     lock(&state.unhealthy_tunnels).remove(&alias);
     // A deliberate teardown: the next connect is a first connect, not a
@@ -177,9 +204,11 @@ pub(super) async fn disconnect_host(state: State<'_, Shell>, alias: String) -> R
 /// fresh immediately (no reconnect). Proxied in-band through the tunnel.
 #[tauri::command]
 pub(super) async fn end_host_sessions(
+    window: tauri::WebviewWindow,
     state: State<'_, Shell>,
     alias: String,
 ) -> Result<(), String> {
+    super::require_target(window.app_handle(), window.label(), Some(&alias))?;
     let (port, token) = {
         let tunnels = state.tunnels.lock().await;
         let t = tunnels
@@ -209,7 +238,12 @@ pub(super) async fn end_host_sessions(
 /// later starts a fresh daemon. Driven in-band via `POST /shutdown` through the
 /// tunnel: the daemon replies before it exits, then we cancel the forward.
 #[tauri::command]
-pub(super) async fn shutdown_host(state: State<'_, Shell>, alias: String) -> Result<(), String> {
+pub(super) async fn shutdown_host(
+    window: tauri::WebviewWindow,
+    state: State<'_, Shell>,
+    alias: String,
+) -> Result<(), String> {
+    super::require_local(window.app_handle(), window.label())?;
     let (port, token) = {
         let tunnels = state.tunnels.lock().await;
         let t = tunnels
@@ -255,17 +289,20 @@ pub(super) async fn local_state(state: State<'_, Shell>) -> Result<LocalState, S
 }
 
 /// Explicit local-daemon update: graceful stop, respawn our build, then
-/// broadcast the new port + token so every window on the local daemon can
-/// re-home itself (the old origin is gone).
+/// tell every window on the local daemon the new port + token so it can
+/// re-home itself (the old origin is gone). The token goes to local windows
+/// only — never to a remote host's page.
 #[tauri::command]
 pub(super) async fn update_local_daemon(
     app: AppHandle,
+    window: tauri::WebviewWindow,
     state: State<'_, Shell>,
 ) -> Result<(), String> {
+    super::require_local(&app, window.label())?;
     tracing::info!("ipc: update_local_daemon");
     let fresh = crate::daemon::update_local_daemon()
         .await
-        .map_err(|e| format!("{e:#}"))?;
+        .map_err(|e| e.message)?;
     let moved = LocalDaemonMoved {
         port: fresh.port,
         token: fresh.token.clone(),
@@ -274,7 +311,12 @@ pub(super) async fn update_local_daemon(
     authorize_scope_origin(&app, None, fresh.port)
         .map_err(|e| format!("could not authorize the updated daemon origin: {e}"))?;
     *lock(&state.local) = fresh;
-    let _ = app.emit("local-daemon-updated", moved);
+    let targets = super::local_event_targets(&lock(&state.windows));
+    for label in targets {
+        if let Err(error) = super::deliver_to(&app, &label, "local-daemon-updated", &moved) {
+            tracing::warn!(%error, window = label, "could not deliver local-daemon-updated");
+        }
+    }
     Ok(())
 }
 
@@ -282,9 +324,11 @@ pub(super) async fn update_local_daemon(
 /// (the home page's own origin cannot reach another daemon's port).
 #[tauri::command]
 pub(super) async fn remote_workspaces(
+    window: tauri::WebviewWindow,
     state: State<'_, Shell>,
     alias: String,
 ) -> Result<serde_json::Value, String> {
+    super::require_target(window.app_handle(), window.label(), Some(&alias))?;
     let (port, token) = {
         let tunnels = state.tunnels.lock().await;
         let t = tunnels
@@ -317,12 +361,18 @@ pub(super) async fn remote_workspaces(
 #[tauri::command]
 pub(super) async fn open_window(
     app: AppHandle,
+    window: tauri::WebviewWindow,
     state: State<'_, Shell>,
     alias: Option<String>,
     ws_id: Option<String>,
     new_window: Option<bool>,
 ) -> Result<(), String> {
     let new_window = new_window.unwrap_or(false);
+    // Opening Home is any window's; a window onto a daemon (persisted into
+    // windows.json) only for a host the caller may act on.
+    if alias.is_some() || ws_id.is_some() {
+        super::require_target(&app, window.label(), alias.as_deref())?;
+    }
     tracing::info!("ipc: open_window alias={alias:?} ws={ws_id:?} new_window={new_window}");
     // Home is the one exception to explicit `new_window`: it is the app's
     // singleton navigation hub, so every route raises or recreates that same
@@ -536,8 +586,10 @@ fn target_rects(
         .collect()
 }
 
+/// Per-window delivery: a drop carries the dragged tabs' layout, which
+/// `emit_to` would also hand to every other page's catch-all listener.
 fn emit_xdrag(app: &AppHandle, label: &str, event: XdragEvent) {
-    let _ = app.emit_to(label, "xdrag", event);
+    let _ = super::deliver_to(app, label, "xdrag", &event);
 }
 
 /// Unlight a hovered target. Every path that ends a drag must send this —
@@ -777,10 +829,11 @@ pub(super) fn adopt_ack(
             Some(_) => transfers.remove(&transfer).expect("checked present"),
         }
     };
-    let _ = app.emit_to(
+    let _ = super::deliver_to(
+        &app,
         entry.source.as_str(),
         "xdrag-ack",
-        XdragAck { transfer, ok },
+        &XdragAck { transfer, ok },
     );
     Ok(())
 }
@@ -1080,7 +1133,12 @@ pub(super) fn report_window_scope(
         // stale copies from the promoted workbench, whose narrowed scope can
         // no longer answer them.
         for prompt in pending_before_promotion {
-            if let Err(error) = webview.emit("ssh-askpass-done", prompt.id()) {
+            if let Err(error) = super::deliver_to(
+                webview.app_handle(),
+                webview.label(),
+                "ssh-askpass-done",
+                &prompt.id(),
+            ) {
                 tracing::warn!(
                     %error,
                     window = webview.label(),
@@ -1106,7 +1164,12 @@ pub(super) fn report_window_scope(
     // strand an already-waiting SSH password/2FA request.
     if let Some(scope) = reclaimed_scope {
         for prompt in askpass.pending_scoped(&scope) {
-            if let Err(error) = webview.emit("ssh-askpass", prompt) {
+            if let Err(error) = super::deliver_to(
+                webview.app_handle(),
+                webview.label(),
+                "ssh-askpass",
+                &prompt,
+            ) {
                 tracing::warn!(%error, window = webview.label(), "could not replay SSH prompt");
             }
         }
@@ -1237,23 +1300,13 @@ pub(super) fn write_clipboard(app: AppHandle, text: String) -> Result<(), String
 /// The path of a file on THIS machine that a window may hand to the OS.
 ///
 /// A daemon-served page names the path, and remote hosts' pages hold the same
-/// command grants — so only a window the shell registered on the local daemon
-/// may ask (its paths are this machine's; a remote page's would name whatever
-/// happens to sit at that path here). On Windows the local daemon lives inside
-/// WSL2, so its paths are not host paths either.
-fn local_file_path(
-    webview: &tauri::WebviewWindow,
-    state: &Shell,
-    path: &str,
-) -> Result<std::path::PathBuf, String> {
+/// command grants — so the callers first `require_local` (a local window's
+/// paths are this machine's; a remote page's would name whatever happens to
+/// sit at that path here). On Windows the local daemon lives inside WSL2, so
+/// its paths are not host paths either.
+fn local_file_path(path: &str) -> Result<std::path::PathBuf, String> {
     if cfg!(windows) {
         return Err("not available on Windows".to_string());
-    }
-    let local = state
-        .window_scope(webview.label())
-        .is_some_and(|scope| scope.alias.is_none() && !scope.navigation_pending());
-    if !local {
-        return Err("only a window on this machine can do that".to_string());
     }
     existing_absolute_path(path)
 }
@@ -1278,10 +1331,10 @@ fn existing_absolute_path(path: &str) -> Result<std::path::PathBuf, String> {
 #[tauri::command]
 pub(super) async fn copy_file_to_clipboard(
     webview: tauri::WebviewWindow,
-    state: State<'_, Shell>,
     path: String,
 ) -> Result<(), String> {
-    let path = local_file_path(&webview, &state, &path)?;
+    super::require_local(webview.app_handle(), webview.label())?;
+    let path = local_file_path(&path)?;
     // X11 and Wayland serve a selection from the process that owns it, so the
     // clipboard that set it must outlive this call.
     static CLIPBOARD: Mutex<Option<arboard::Clipboard>> = Mutex::new(None);
@@ -1306,10 +1359,10 @@ pub(super) async fn copy_file_to_clipboard(
 #[tauri::command]
 pub(super) async fn reveal_in_file_manager(
     webview: tauri::WebviewWindow,
-    state: State<'_, Shell>,
     path: String,
 ) -> Result<(), String> {
-    let path = local_file_path(&webview, &state, &path)?;
+    super::require_local(webview.app_handle(), webview.label())?;
+    let path = local_file_path(&path)?;
     tauri::async_runtime::spawn_blocking(move || reveal(&path))
         .await
         .map_err(|e| e.to_string())?
@@ -1401,19 +1454,24 @@ pub(super) fn open_external(url: String) -> Result<(), String> {
 /// tab, and session. Diverges on success; on failure the intent is cleared
 /// so nothing acts on it later.
 #[tauri::command]
-pub(super) async fn begin_update(app: AppHandle) -> Result<(), String> {
+pub(super) async fn begin_update(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
     use tauri_plugin_updater::UpdaterExt;
+    // The restart ends every local session's terminal programs (the intent
+    // replaces the local daemon), so only a window on this machine may ask.
+    super::require_local(&app, window.label())
+        .map_err(|_| "update the app from a window on this machine (Home)".to_string())?;
+    let _claim = crate::update::claim_install()
+        .ok_or_else(|| "the update is already being installed".to_string())?;
     tracing::info!("ipc: begin_update");
     // The relaunch at the end is a restart, which Tauri will not let the
     // unsaved-edits guard hold, so refuse up front instead of dropping them.
-    match super::unsaved::windows_with_unsaved(&app) {
-        0 => {}
-        1 => return Err("A window has unsaved edits — save or discard them, then update.".into()),
-        n => {
-            return Err(format!(
-                "{n} windows have unsaved edits — save or discard them, then update."
-            ))
-        }
+    if let Some(refusal) =
+        crate::update::unsaved_refusal(super::unsaved::windows_with_unsaved(&app), false)
+    {
+        return Err(refusal);
     }
     let updater = app.updater().map_err(|e| e.to_string())?;
     let update = updater
@@ -1421,20 +1479,23 @@ pub(super) async fn begin_update(app: AppHandle) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "no update available".to_string())?;
-    crate::update::write_intent().map_err(|e| format!("{e:#}"))?;
-    match update
+    update
         .download_and_install(|_downloaded, _total| {}, || {})
         .await
+        .map_err(|e| e.to_string())?;
+    // Edits made during the download: the restart would drop them. The new
+    // bundle is in place and the next launch runs it; without an intent its
+    // daemon stays an offered update rather than a silent replacement.
+    if let Some(refusal) =
+        crate::update::unsaved_refusal(super::unsaved::windows_with_unsaved(&app), true)
     {
-        Ok(()) => {
-            tracing::info!("app update {} installed; relaunching", update.version);
-            app.restart();
-        }
-        Err(e) => {
-            crate::update::clear_intent();
-            Err(e.to_string())
-        }
+        return Err(refusal);
     }
+    // Consent for the new process to replace the local daemon, written only
+    // now that the relaunch is certain.
+    crate::update::write_intent().map_err(|e| format!("{e:#}"))?;
+    tracing::info!("app update {} installed; relaunching", update.version);
+    app.restart();
 }
 
 // --- WSL setup (the Windows first-run wizard; clean errors elsewhere) -----

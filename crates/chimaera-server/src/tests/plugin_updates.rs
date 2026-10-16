@@ -1754,3 +1754,47 @@ async fn a_copy_this_daemon_cannot_load_is_listed_with_why_and_removable() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(!dir.exists());
 }
+
+/// A caller that looked the plugin up before an update (a long tool's
+/// resume, a route mid-flight) never runs the build it holds once another
+/// is current: its code and `[access]` are no longer what runs (D4).
+#[tokio::test]
+async fn a_call_holding_the_build_an_update_replaced_never_runs_it() {
+    let fake = FakeReleases::start().await;
+    let state = state_for(&fake);
+    let gh = "acme/up-stale";
+    fake.publish(
+        gh,
+        "0.1.0",
+        &manifest(false, "up-stale", "0.1.0", ""),
+        &v1_wasm(),
+    );
+    assert_eq!(install(&state, gh, None).await.0, StatusCode::OK);
+    let (ws, sid) = workspace_with(&state, "up-stale", "kst", &["up-stale"]).await;
+    let old = crate::plugins::manifest(&state, "up-stale").unwrap();
+    fake.publish(
+        gh,
+        "0.2.0",
+        &manifest(true, "up-stale", "0.2.0", ""),
+        &v2_wasm(),
+    );
+    let (status, body) = post(&state, "/api/v1/plugins/up-stale/update").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let answer = state
+        .plugin_runtime
+        .call_tool(&state, &old, &ws, &sid, "echo", &json!({}))
+        .await;
+    assert_eq!(answer["isError"], true, "{answer}");
+    assert!(
+        answer["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("was updated"),
+        "{answer}"
+    );
+    assert_eq!(state.plugin_runtime.live_instances("up-stale"), 0);
+    let (is_err, text) = mcp_tool_call(&state, &sid, "kst", "version", json!({})).await;
+    assert!(!is_err, "{text}");
+    assert_eq!(text, "0.2.0");
+    state.sessions.kill(&sid).ok();
+}

@@ -464,14 +464,15 @@ fn prune(dir: &Path, current: &str, previous: Option<&str>) {
 
 /// After any change: the catalog re-read, the plugin's instances and
 /// compiled offers dropped (the next call runs the version now current),
-/// what it answered Knowledge with dropped, footprints re-detected, windows
-/// told.
+/// its jobs of programs that build no longer declares stopped, what it
+/// answered Knowledge with dropped, footprints re-detected, windows told.
 async fn after_change(state: &Arc<AppState>, id: &str) {
     let reloading = state.clone();
     if let Err(err) = tokio::task::spawn_blocking(move || reloading.plugin_catalog.reload()).await {
         tracing::error!(%err, "plugin catalog reload failed");
     }
     state.plugin_runtime.forget_plugin(id);
+    super::jobs::cancel_undeclared(state, id);
     crate::lock(&state.knowledge).forget_provider(id, None);
     crate::lock(&state.plugin_detect).clear();
     // The new build compiled before a window asks for it.
@@ -1190,12 +1191,16 @@ async fn remove(state: &Arc<AppState>, pid: &str) -> Result<(), Refusal> {
         return Err(super::not_installed(pid));
     }
     state.plugin_releases.forget(pid);
+    // Out of the catalog first: a call still in flight on the old instance
+    // finds its build gone (`still_current`) and can't start a job or
+    // write what is about to be forgotten.
+    after_change(state, pid).await;
     // What it kept in the daemon goes with it; so does the user's trust: a
     // later install of the id is a new question.
     crate::lock(&state.plugin_state).forget_plugin(pid);
     super::platform::forget_plugin(state, pid).await;
     super::trust::forget(state, pid).await;
-    after_change(state, pid).await;
+    state.changes.notify_waiters();
     tracing::info!(plugin = %pid, "plugin removed");
     super::activity::record(state, pid, json!({"kind": "remove"})).await;
     // A third-party plugin's switches go with it: nothing is left to show

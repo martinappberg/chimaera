@@ -45,7 +45,12 @@ import {
   type HostStatusEvent,
 } from "./native";
 import { healthPollDelayMs, type PollHandle } from "./poll";
-import { createReconnectListenerGate, selectRemoteReconnectSurface } from "./remoteReconnect";
+import {
+  connectResultError,
+  createReconnectListenerGate,
+  hostStatusAction,
+  selectRemoteReconnectSurface,
+} from "./remoteReconnect";
 import { rehomeUrl } from "./rehome";
 import { resetLinkRtt } from "./rtt";
 import { noteDaemonLink } from "../shared/editing";
@@ -280,7 +285,8 @@ export class Connection {
         }
         await clusterOpen(this.hostAlias, this.jobCtx.cws);
       } else {
-        await connectHost(this.hostAlias);
+        const failure = connectResultError(await connectHost(this.hostAlias), this.hostAlias);
+        if (failure !== null) throw new Error(failure);
       }
       // Every successful shell connect republishes `host-status: connected`,
       // which clears the overlay and re-homes this window when needed.
@@ -315,37 +321,41 @@ export class Connection {
   }
 
   #handleHostStatus(e: HostStatusEvent): void {
-    if (!this.canReconnect || e.alias !== this.statusAlias) return;
-    if (e.status === "ended") {
-      // Only a job window's composite key ends; a "down" without it is still
-      // just a connection blip (the reconnect below).
-      if (this.jobCtx === null) return;
-      this.jobEnded = { reason: e.reason ?? null };
-      this.#finishReconnect();
-      return;
+    const action = hostStatusAction(e, {
+      canReconnect: this.canReconnect,
+      statusAlias: this.statusAlias,
+      hostAlias: this.hostAlias,
+      isJobWindow: this.jobCtx !== null,
+      jobEnded: this.jobEnded !== null,
+      port: location.port,
+      token: getToken(),
+    });
+    switch (action.kind) {
+      case "ignore":
+        return;
+      case "jobEnded":
+        this.jobEnded = { reason: action.reason };
+        this.#finishReconnect();
+        return;
+      case "reconnect":
+        this.#beginReconnect(action.reason);
+        return;
+      case "stranded":
+        this.reconnectReason = null;
+        this.reconnectError = action.message;
+        this.showReconnect = true;
+        return;
+      case "healed":
+        break;
     }
-    if (this.jobEnded !== null) return;
-    if (e.status === "down") {
-      this.#beginReconnect(e.reason ?? "The remote connection stopped responding.");
-      return;
-    }
-    if (e.status === "error") return;
     this.#finishReconnect();
-    const port = e.local_port;
-    // Compute-status events carry no token (compute tokens stay in the
-    // shell's Rust side); a rebuilt job tunnel lands on the SAME daemon,
-    // so this window's own token still holds — carry it across the origin
-    // move ourselves.
-    const token = e.token ?? (this.jobCtx !== null ? getToken() : null);
-    const portMoved = port !== null && String(port) !== location.port;
-    const tokenMoved = token !== null && token !== getToken();
     const buildMoved = this.daemonBuildChanged(e.build);
-    if (portMoved || tokenMoved) {
+    if (action.moved) {
       this.#deps.assets.requireNavigation(
         buildMoved ? "build" : "connection",
         rehomeUrl({
-          port: port ?? location.port,
-          token,
+          port: action.port,
+          token: action.token,
           win: this.#deps.windowKey(),
           ws: this.#deps.activeWsId(),
           hub: this.#shouldCarryHomeHub(),

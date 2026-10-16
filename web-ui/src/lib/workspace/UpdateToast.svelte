@@ -24,6 +24,7 @@
     snoozeUpdate,
     skipUpdateVersion,
   } from "./update.svelte";
+  import { isRemoteHost } from "../net/api";
   import { beginUpdate, connectHost, updateLocalDaemon } from "../net/native";
   import { openInSystemBrowser } from "../shared/urlOpen";
 
@@ -95,7 +96,8 @@
   const action = $derived.by(() => {
     switch (notice.kind) {
       case "app":
-        return "update now";
+        // The shell installs app updates only from a window on this machine.
+        return isRemoteHost() ? null : "update now";
       case "daemon-local":
         return "update daemon";
       case "daemon-remote":

@@ -2,7 +2,8 @@
 //! joined by every concurrent caller, plus the host-row wire vocabulary the
 //! shell reports to the UI.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use chimaera_remote::hosts::{HostEntry, HostsStore};
 use chimaera_remote::{ComputeTunnel, ConnectOpts, Phase, Tunnel};
@@ -15,22 +16,134 @@ use crate::windows::WindowRecord;
 
 type ConnectFlightOwner = tokio::sync::watch::Sender<Option<Result<(), String>>>;
 
+/// One flight's cancel switch: `true` once the user disconnected mid-flight.
+/// Shared by the owner (which races its work against it and re-reads it
+/// under the tunnels lock before installing anything) and `cancel_connect`.
+type FlightCancel = Arc<tokio::sync::watch::Sender<bool>>;
+type CancelMap = Mutex<HashMap<String, FlightCancel>>;
+
+/// The cancel switch of every owned flight, by alias. Beside `Shell::
+/// connecting` rather than inside it so the flight type joiners wait on stays
+/// a plain receiver; lock order is always `connecting`, then this.
+static FLIGHT_CANCELS: LazyLock<CancelMap> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// What a cancelled flight answers its owner and every joiner.
+const CANCELLED: &str = "connect cancelled";
+
 /// Claim the complete connect invocation synchronously, before its first
 /// tunnel lock or liveness-probe await. Home promotion treats this map as the
-/// authoritative "SSH may still ask for credentials" set.
+/// authoritative "SSH may still ask for credentials" set. The owner's cancel
+/// switch is registered under the same lock, so a cancel can never fall
+/// between a flight becoming visible and becoming cancellable.
 fn claim_connect_flight(
-    connecting: &std::sync::Mutex<std::collections::HashMap<String, ConnectFlight>>,
+    connecting: &Mutex<HashMap<String, ConnectFlight>>,
+    cancels: &CancelMap,
     alias: &str,
-) -> Result<ConnectFlightOwner, ConnectFlight> {
+) -> Result<(ConnectFlightOwner, FlightCancel), ConnectFlight> {
     let mut connecting = lock(connecting);
     match connecting.get(alias) {
         Some(rx) => Err(rx.clone()),
         None => {
             let (tx, rx) = tokio::sync::watch::channel(None);
             connecting.insert(alias.to_string(), rx);
-            Ok(tx)
+            let cancel: FlightCancel = Arc::new(tokio::sync::watch::channel(false).0);
+            lock(cancels).insert(alias.to_string(), cancel.clone());
+            Ok((tx, cancel))
         }
     }
+}
+
+/// Flip the in-flight cancel switch for `alias` (false: no flight owns it).
+fn cancel_flight(
+    connecting: &Mutex<HashMap<String, ConnectFlight>>,
+    cancels: &CancelMap,
+    alias: &str,
+) -> bool {
+    let _connecting = lock(connecting);
+    match lock(cancels).remove(alias) {
+        Some(cancel) => {
+            cancel.send_replace(true);
+            true
+        }
+        None => false,
+    }
+}
+
+/// The owner is done: drop its switch, unless a newer flight already holds
+/// the alias's slot.
+fn release_flight(cancels: &CancelMap, alias: &str, mine: &FlightCancel) {
+    let mut cancels = lock(cancels);
+    if cancels.get(alias).is_some_and(|c| Arc::ptr_eq(c, mine)) {
+        cancels.remove(alias);
+    }
+}
+
+/// The owner's cleanup: free the alias for the next flight and tell every
+/// joiner how this one went.
+fn finish_flight<T>(
+    connecting: &Mutex<HashMap<String, ConnectFlight>>,
+    cancels: &CancelMap,
+    alias: &str,
+    tx: &ConnectFlightOwner,
+    cancel: &FlightCancel,
+    result: &Result<T, String>,
+) {
+    lock(connecting).remove(alias);
+    release_flight(cancels, alias, cancel);
+    let _ = tx.send(Some(match result {
+        Ok(_) => Ok(()),
+        Err(e) => Err(e.clone()),
+    }));
+}
+
+fn is_cancelled(cancel: &FlightCancel) -> bool {
+    *cancel.borrow()
+}
+
+/// Run `work` unless the flight is cancelled first. A cancel drops `work`
+/// at its current await: every ssh/scp child it holds is `kill_on_drop`, and
+/// nothing after that await — installing a tunnel, reopening windows — runs.
+async fn cancellable<T>(
+    cancel: &FlightCancel,
+    work: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    let mut switch = cancel.subscribe();
+    tokio::select! {
+        // A cancel already flipped wins over work that is also ready.
+        biased;
+        _ = switch.wait_for(|cancelled| *cancelled) => Err(CANCELLED.to_string()),
+        result = work => result,
+    }
+}
+
+/// Abort the in-flight connect for `alias`: joiners get [`CANCELLED`], its
+/// ssh children die with the dropped future, its pending askpass prompts are
+/// withdrawn, and it never installs a tunnel or reopens windows afterwards
+/// (the owner re-checks the switch under the tunnels lock before installing,
+/// so a caller that takes that lock after this returns sees any tunnel the
+/// flight did install). True when there was a flight to cancel.
+pub(super) fn cancel_connect(app: &AppHandle, alias: &str) -> bool {
+    let state = app.state::<Shell>();
+    let cancelled = cancel_flight(&state.connecting, &FLIGHT_CANCELS, alias);
+    if cancelled {
+        tracing::info!("cancelled the in-flight connect to {alias}");
+        if let Some(askpass) = app.try_state::<crate::askpass::Askpass>() {
+            askpass.discard_alias(alias);
+        }
+    }
+    cancelled
+}
+
+/// Send a `host-status` to the windows allowed to see it: the full event
+/// (with any token) to `status.alias`'s own windows, a tokenless copy to
+/// local windows (Home's rows), nothing to other hosts' windows.
+pub(super) fn emit_host_status(app: &AppHandle, status: HostStatus) {
+    let public = HostStatus {
+        token: None,
+        ..status.clone()
+    };
+    let alias = status.alias.clone();
+    super::emit_host_scoped(app, "host-status", &alias, status, Some(public));
 }
 
 /// Host list entry as the UI sees it (see HostState in native.ts).
@@ -230,7 +343,7 @@ async fn publish_connected_state(app: &AppHandle, state: &Shell, alias: &str) ->
     // navigate and invoke native commands; none should queue behind delivery.
     lock(&state.unhealthy_tunnels).remove(alias);
     lock(&state.wedge_suspects).remove(alias);
-    let _ = app.emit("host-status", event);
+    emit_host_status(app, event);
     Some(reply)
 }
 
@@ -302,7 +415,7 @@ pub(super) async fn do_connect(
     let state = app.state::<Shell>();
     tracing::info!("ipc: connect_host {alias} (update_daemon: {update_daemon})");
     loop {
-        let tx = match claim_connect_flight(&state.connecting, &alias) {
+        let (tx, cancel) = match claim_connect_flight(&state.connecting, &FLIGHT_CANCELS, &alias) {
             // Someone else owns the attempt: await its outcome. The clone
             // frees the watch borrow before we touch `rx` again below.
             Err(mut rx) => {
@@ -345,47 +458,54 @@ pub(super) async fn do_connect(
         // We own the complete invocation, including the healthy-tunnel probe.
         // Publishing the flight before that first await keeps the only Home
         // fallback alive in case this path proceeds into password/2FA SSH.
-        let reused = if update_daemon {
-            None
-        } else {
-            // Probe liveness WITHOUT holding the tunnels lock: this is a ~2s
-            // HTTP round-trip, and holding the map locked across it would
-            // stall every other tunnel op. A 401 from a stale/foreign daemon
-            // on a recycled port is not a live tunnel.
-            let endpoint = state
-                .tunnels
-                .lock()
-                .await
-                .get(&alias)
-                .map(|t| (t.local_port, t.manifest.token.clone()));
-            if let Some((port, token)) = endpoint {
-                if chimaera_remote::http_alive_authed(port, &token).await {
-                    publish_connected_state(app, &state, &alias).await
+        let owned = async {
+            let reused = if update_daemon {
+                None
+            } else {
+                // Probe liveness WITHOUT holding the tunnels lock: this is a
+                // ~2s HTTP round-trip, and holding the map locked across it
+                // would stall every other tunnel op. A 401 from a
+                // stale/foreign daemon on a recycled port is not a live
+                // tunnel.
+                let endpoint = state
+                    .tunnels
+                    .lock()
+                    .await
+                    .get(&alias)
+                    .map(|t| (t.local_port, t.manifest.token.clone()));
+                if let Some((port, token)) = endpoint {
+                    if chimaera_remote::http_alive_authed(port, &token).await {
+                        publish_connected_state(app, &state, &alias).await
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
-            } else {
-                None
+            };
+            match reused {
+                Some(reply) => Ok(reply),
+                None => run_flight(app, &alias, update_daemon, &cancel).await,
             }
         };
         // Every owner path lands in the shared cleanup below so joiners never
-        // hang, whether this reused a healthy tunnel or built a new one.
-        let result = match reused {
-            Some(reply) => Ok(reply),
-            None => run_flight(app, &alias, update_daemon).await,
-        };
-        lock(&state.connecting).remove(&alias);
-        let _ = tx.send(Some(match &result {
-            Ok(_) => Ok(()),
-            Err(e) => Err(e.clone()),
-        }));
+        // hang: a reused tunnel, a new one, a failure, or a cancel.
+        let result = cancellable(&cancel, owned).await;
+        finish_flight(
+            &state.connecting,
+            &FLIGHT_CANCELS,
+            &alias,
+            &tx,
+            &cancel,
+            &result,
+        );
         // Surfaces that only watch events (a home screen observing a
         // startup-restore connect) need the failure too, or their row sits
         // in "connecting" forever. Windows ignore this status: it carries no
         // port/token to re-home to, and only "down" arms their reconnect.
         if let Err(e) = &result {
-            let _ = app.emit(
-                "host-status",
+            emit_host_status(
+                app,
                 HostStatus {
                     alias: alias.clone(),
                     status: "error",
@@ -409,6 +529,7 @@ async fn run_flight(
     app: &AppHandle,
     alias: &str,
     update_daemon: bool,
+    cancel: &FlightCancel,
 ) -> Result<HostState, String> {
     let state = app.state::<Shell>();
     // Attribute the whole pre-connect stall — the wedge ladder and the old
@@ -505,7 +626,17 @@ async fn run_flight(
     authorize_scope_origin(app, Some(alias), tunnel.local_port)
         .map_err(|e| format!("could not authorize {alias}'s daemon origin: {e}"))?;
     let (port, token) = (tunnel.local_port, tunnel.manifest.token.clone());
-    state.tunnels.lock().await.insert(alias.to_string(), tunnel);
+    {
+        // The switch is read under the lock a disconnect takes next, so a
+        // cancel either stops this install or finds the tunnel to remove.
+        let mut tunnels = state.tunnels.lock().await;
+        if is_cancelled(cancel) {
+            drop(tunnels);
+            tunnel.close().await;
+            return Err(CANCELLED.to_string());
+        }
+        tunnels.insert(alias.to_string(), tunnel);
+    }
     // Publish only after installation, through the same path used by reuse
     // and flight joiners. Build identity is independently load-bearing: a
     // window from another immutable asset set must reload even on one port.
@@ -516,6 +647,9 @@ async fn run_flight(
     // The registry keeps records across a failed launch-time restore
     // precisely so the first connect that DOES land — a home-screen click,
     // a window's reconnect — restores them, not just the next app start.
+    if is_cancelled(cancel) {
+        return Err(CANCELLED.to_string());
+    }
     reopen_windows(app, alias, port, &token);
     Ok(host_state)
 }
@@ -571,8 +705,8 @@ async fn drop_compute_tunnels_of(app: &AppHandle, state: &Shell, alias: &str) {
         // `-O cancel` fails fast against the socket that is no longer there).
         tunnel.close().await;
         tracing::info!("dropped compute tunnel {key}: its login ControlMaster was reset");
-        let _ = app.emit(
-            "host-status",
+        emit_host_status(
+            app,
             HostStatus {
                 alias: key,
                 status: "down",
@@ -642,8 +776,8 @@ async fn landed_on_cluster(
             registry.remove(&id);
         }
     }
-    let _ = app.emit(
-        "host-status",
+    emit_host_status(
+        app,
         HostStatus {
             alias: alias.to_string(),
             status: "cluster",
@@ -715,7 +849,13 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    use super::{claim_connect_flight, connected_status, reusable_tunnel_port};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use super::{
+        cancel_flight, cancellable, claim_connect_flight, connected_status, finish_flight,
+        is_cancelled, release_flight, reusable_tunnel_port, CANCELLED,
+    };
     use crate::shell::lock;
 
     #[test]
@@ -747,8 +887,15 @@ mod tests {
     #[test]
     fn connect_flight_is_published_before_async_work_can_begin() {
         let connecting = Mutex::new(HashMap::new());
-        let owner = claim_connect_flight(&connecting, "cluster").expect("first caller owns");
-        let joiner = claim_connect_flight(&connecting, "cluster").expect_err("second caller joins");
+        let cancels = Mutex::new(HashMap::new());
+        let owner =
+            claim_connect_flight(&connecting, &cancels, "cluster").expect("first caller owns");
+        let joiner = claim_connect_flight(&connecting, &cancels, "cluster")
+            .expect_err("second caller joins");
+        assert!(
+            lock(&cancels).contains_key("cluster"),
+            "the flight is cancellable from the moment it is visible"
+        );
 
         let registered = lock(&connecting)
             .get("cluster")
@@ -756,5 +903,90 @@ mod tests {
             .clone();
         assert!(registered.same_channel(&joiner));
         drop(owner);
+    }
+
+    #[test]
+    fn a_cancel_flips_only_the_flight_that_owns_the_alias() {
+        let connecting = Mutex::new(HashMap::new());
+        let cancels = Mutex::new(HashMap::new());
+        assert!(!cancel_flight(&connecting, &cancels, "host"), "no flight");
+        let (_tx, first) = claim_connect_flight(&connecting, &cancels, "host").unwrap();
+        let (_other_tx, other) = claim_connect_flight(&connecting, &cancels, "other").unwrap();
+        assert!(cancel_flight(&connecting, &cancels, "host"));
+        assert!(is_cancelled(&first));
+        assert!(!is_cancelled(&other), "another host's flight runs on");
+        assert!(
+            !cancel_flight(&connecting, &cancels, "host"),
+            "one cancel per flight"
+        );
+
+        // The cancelled owner's late release must not drop a newer flight's
+        // switch.
+        lock(&connecting).remove("host");
+        let (_tx2, second) = claim_connect_flight(&connecting, &cancels, "host").unwrap();
+        release_flight(&cancels, "host", &first);
+        assert!(lock(&cancels)
+            .get("host")
+            .is_some_and(|c| Arc::ptr_eq(c, &second)));
+    }
+
+    /// Dropped with the work future, as a `kill_on_drop` ssh child would be.
+    struct Child(Arc<AtomicBool>);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_mid_await_drops_the_work_and_fails_every_joiner() {
+        let connecting = Arc::new(Mutex::new(HashMap::new()));
+        let cancels = Arc::new(Mutex::new(HashMap::new()));
+        let killed = Arc::new(AtomicBool::new(false));
+        let installed = Arc::new(AtomicBool::new(false));
+        let (tx, cancel) = claim_connect_flight(&connecting, &cancels, "host").unwrap();
+        let mut joiner = claim_connect_flight(&connecting, &cancels, "host").unwrap_err();
+
+        let owner = {
+            let (connecting, cancels) = (connecting.clone(), cancels.clone());
+            let (killed, installed) = (killed.clone(), installed.clone());
+            tokio::spawn(async move {
+                let work = async move {
+                    let _child = Child(killed);
+                    std::future::pending::<()>().await;
+                    installed.store(true, Ordering::SeqCst);
+                    Ok::<(), String>(())
+                };
+                let result = cancellable(&cancel, work).await;
+                finish_flight(&connecting, &cancels, "host", &tx, &cancel, &result);
+                result
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(cancel_flight(&connecting, &cancels, "host"));
+
+        assert_eq!(owner.await.unwrap(), Err(CANCELLED.to_string()));
+        let outcome = joiner.wait_for(|v| v.is_some()).await.unwrap().clone();
+        assert_eq!(outcome, Some(Err(CANCELLED.to_string())));
+        assert!(
+            killed.load(Ordering::SeqCst),
+            "the work's children die with it"
+        );
+        assert!(
+            !installed.load(Ordering::SeqCst),
+            "nothing after the await runs"
+        );
+        assert!(lock(&connecting).is_empty() && lock(&cancels).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cancel_before_the_first_poll_still_wins() {
+        let cancels = Mutex::new(HashMap::new());
+        let connecting = Mutex::new(HashMap::new());
+        let (_tx, cancel) = claim_connect_flight(&connecting, &cancels, "host").unwrap();
+        cancel_flight(&connecting, &cancels, "host");
+        // Work that is ready at once still loses to an earlier cancel.
+        let result = cancellable(&cancel, async { Ok::<u8, String>(1) }).await;
+        assert_eq!(result, Err(CANCELLED.to_string()));
     }
 }

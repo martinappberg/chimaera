@@ -58,10 +58,13 @@ startup commands, the lease) in `crates/chimaera-server/src/{compute,lifecycle,e
   summary: "1 job running · ends in 5d 22h", "1 job waiting for a node", …). Clicking it
   connects (nothing starts) and opens the cluster page in place: one card per job —
   **running** (node · resources · time left), **starting**, or **waiting for a node**
-  (Slurm's start estimate and its reason when not plain priority) — listing the
+  (Slurm's start estimate, read from the same `squeue` as everything else, and its
+  reason when not plain priority) — listing the
   workspaces open in it (open · opening · closing, and what their chats are doing);
   ended jobs as one line each (why: time limit, cancelled, failed, preempted, its node
-  failed, out of memory — asked of `sacct` once and kept); the workspaces not open
+  failed, out of memory — asked of `sacct` and kept once accounting has a final
+  state; while it still calls the job live, nothing is kept and it is asked again
+  later); the workspaces not open
   anywhere; one quiet count of the user's other Slurm jobs. Masthead: Home, Terminal (a
   terminal-only window, "<host> · login node", running `ssh <host>` over the app's
   ControlMaster — never listed as a workspace, never restored, its session ends when the
@@ -119,6 +122,17 @@ Nothing site-specific is ever coded.
   on the cluster — every file rides the ssh exec's stdin, never argv. Partitions that take
   only interactive jobs get an `srun` held in the foreground by the app's own ssh
   connection (`ssh -tt`): it stops when the app disconnects, and the UI says so.
+- **A start is recorded or not at all.** The start script is one brace group, so a
+  connection cut while it still arrives runs none of it; once it runs it ignores hangups
+  and closed output, and it writes `job.json` (with the cluster's clock as the submit
+  time) before it prints anything. A start whose answer was lost is never submitted
+  again: the client reads the job's folder instead (`recover_start` — submitted, not
+  submitted, or still unclear; a record without a Slurm id is looked up in the queue by
+  its unique name, once). The script never removes the folder, because `sbatch` can fail
+  after the controller queued the job: any start without a readable id keeps a record
+  without one, found by its unique name. The client removes the folder only for a
+  refusal that says why; a lost reply from the controller (a timeout, no contact) is
+  "unclear", never "refused".
 - **The job script** probes whether the node reaches the internet and `exec`s
   `chimaera job-host --job-dir …`: job-host is the job, so walltime and `scancel` stop it
   with SIGTERM first. It writes `host.json` (node, port, token; 0600), keeps
@@ -126,7 +140,10 @@ Nothing site-specific is ever coded.
   start list, and serves a token-gated API (`GET /api/v1/job`,
   `POST /api/v1/job/workspaces/{id}/open|close`). Each workspace's chimaera runs over the
   workspace's own data folder (`w/<id>/data`, so its chats move from job to job) with a
-  node-local runtime dir; its manifest is the workspace's lease. On SIGTERM job-host
+  private, randomly named node-local runtime dir (job-host won't start without one; it
+  is removed when the job ends). The workspace's lease is `data/lease.json`, taken by an
+  atomic exclusive create: one job at a time, even when two clients open the same
+  workspace at once; a lease is taken over only after Slurm says its job ended. On SIGTERM job-host
   closes every workspace (25 s each to save its chats) and exits.
 - **Reaching it.** The app holds plain `ssh -L <port>:<node>:<port> <host>` forwards
   through the login node — one to job-host, one per open workspace window — for as long
@@ -146,7 +163,7 @@ Nothing site-specific is ever coded.
   state also reads as stopping, including after reopening the page. These jobs are
   no longer offered as destinations for opening a workspace.
 - **Continue in a new job.** Queues the next job with the same setup and workspaces now;
-  once it runs, its job-host stops the old job (once, by the Slurm id in its record); each
+  once it runs, its job-host stops the old job (once, by the Slurm id in its record, and only when the queue shows that id under the old job's name); each
   workspace's chimaera waits for the old lease to go, then resumes its chats idle. The
   old windows say "moving" and reopen in the new job. Nothing restarts on its own: a
   person starts every job. An attached job can't continue (the app holds it); its window
@@ -188,7 +205,19 @@ Nothing site-specific is ever coded.
 
 - **Polite to the scheduler:** at least 60 s between status checks everywhere, only while
   something is visible or a job this app started is alive; one combined exec per refresh;
-  files are read instead of asking the scheduler wherever a file answers.
+  files are read instead of asking the scheduler wherever a file answers. The client's
+  last queue read per host is kept in the local data dir (`cluster-queues/`), so separate
+  processes — the CLI run in a loop, a second app — share the floor; starting or stopping
+  a job forgets it. `?refresh=true` on `/compute` re-detects the tools at most once a
+  minute and never bypasses the 60 s queue floor.
+- **A partial queue never ends a job:** the page reads up to 1000 rows; a read that left
+  rows out says nothing about a job missing from it.
+- **Shared-home writes:** every file goes to a unique temp, then `mv`; a failed write
+  never renames a short file into place. `cluster.json`, `env-profiles.json` and each
+  `job.json` change by compare-and-swap inside a `mkdir` lock that names its owner (a
+  lock over two minutes old is a crashed writer's; one breaker wins it by renaming it
+  away), and a job's record changes field by field on the
+  record as it is now — a stop, a queued open and how it ended never undo each other.
 - **Owner-only on a shared filesystem:** the cluster folder is written under `umask 077`;
   manifests and `host.json` carry tokens.
 - **Test knob:** `CHIMAERA_SLURM_BINDIR` for the daemon's own detection; the client side is

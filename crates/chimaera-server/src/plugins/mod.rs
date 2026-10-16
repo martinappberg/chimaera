@@ -81,6 +81,9 @@ pub(crate) const API: &str = "0.2";
 /// them; a WIT bump adds a version here and keeps the old ones (0.1 through
 /// its own bindings, `runtime::v1`).
 pub(crate) const SERVED_APIS: &[&str] = &["0.1", API];
+/// MCP tools one plugin may name (`provides.mcp_tools`): each is offered,
+/// with its schema, in every session's `tools/list` where it is on.
+pub(crate) const MCP_TOOLS_MAX: usize = 64;
 
 /// The test-only plugins (the host's fixture, and the first-party releases
 /// the lock pins, which tests install by path): embedded by test builds
@@ -532,6 +535,13 @@ pub(crate) fn validate(m: &Manifest) -> Result<(), String> {
             ));
         }
     }
+    // Every tool rides every session's `tools/list` in the workspace.
+    if m.provides.mcp_tools.len() > MCP_TOOLS_MAX {
+        return Err(format!(
+            "a plugin offers at most {MCP_TOOLS_MAX} MCP tools (this one names {})",
+            m.provides.mcp_tools.len()
+        ));
+    }
     let mut tools = BTreeSet::new();
     for tool in &m.provides.mcp_tools {
         // No dots: codex pre-approves a tool through a dotted config key
@@ -842,6 +852,35 @@ pub(crate) fn catalog(state: &AppState) -> Arc<Vec<Arc<Manifest>>> {
 
 pub(crate) fn manifest(state: &AppState, id: &str) -> Option<Arc<Manifest>> {
     state.plugin_catalog.get(id)
+}
+
+/// Whether `m` is still the build that runs as its id, and may run: not
+/// updated, rolled back or removed since it was looked up, no fault, not
+/// held — and, with `ws`, still switched on there. Work that began before
+/// such a change (a call's resume, a guest call's host functions, a job
+/// start awaiting the login shell) checks this before it acts afterwards.
+pub(crate) fn still_current(
+    state: &AppState,
+    m: &Manifest,
+    ws: Option<&str>,
+) -> Result<(), String> {
+    let now = match manifest(state, &m.id) {
+        Some(now) if now.wasm.sha256 == m.wasm.sha256 => now,
+        Some(_) => return Err(format!("{} was updated; call again", m.name)),
+        None => return Err(format!("{} is no longer installed", m.name)),
+    };
+    if now.origin.fault.is_some() || trust::hold(state, &now).is_some() {
+        return Err(format!("{} can't run here now", m.name));
+    }
+    let on = ws.is_none_or(|ws| {
+        crate::lock(&state.workspaces)
+            .get(ws)
+            .is_some_and(|w| w.plugins_on.iter().any(|p| p == &m.id))
+    });
+    if !on {
+        return Err(format!("{} is not switched on in this workspace", m.name));
+    }
+    Ok(())
 }
 
 /// Why a change to `pid` needs an installed copy it doesn't have: a
@@ -2089,6 +2128,25 @@ id = "future-kit"
         assert!(
             demo("version='0.1.0'\napi='0.1'\n[provides]\nmcp_tools=['my_plugin.echo']").is_err()
         );
+    }
+
+    #[test]
+    fn a_plugin_names_at_most_sixty_four_tools() {
+        let names = |n: usize| {
+            (0..n)
+                .map(|i| format!("'t{i}'"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let with = |n: usize| {
+            demo(&format!(
+                "version='0.1.0'\napi='0.1'\n[provides]\nmcp_tools=[{}]",
+                names(n)
+            ))
+        };
+        assert!(with(MCP_TOOLS_MAX).is_ok());
+        let err = with(MCP_TOOLS_MAX + 1).unwrap_err();
+        assert!(err.contains("at most 64 MCP tools"), "{err}");
     }
 
     #[test]

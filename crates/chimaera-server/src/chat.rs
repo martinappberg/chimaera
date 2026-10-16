@@ -3907,7 +3907,14 @@ pub(crate) async fn resurrect_chat(
         // no stamp → let the spawn stamp now, as before).
         created_at_ms: (entry.created_at > 0).then(|| entry.created_at * 1000),
     };
-    match spawn_chat_session(state, entry.id.clone(), recipe, None).await {
+    // A stop that landed meanwhile: the entry stays in the ledger for the
+    // next boot, and no process starts that the stop would not end.
+    let spawned = if state.stopping.load(std::sync::atomic::Ordering::Relaxed) {
+        Err(crate::ledger::RestoreStopped.into())
+    } else {
+        spawn_chat_session(state, entry.id.clone(), recipe, None).await
+    };
+    match spawned {
         Ok(_) => {
             // Same lifetime watcher every freshly-created chat gets (see
             // create_session): it tails the transcript for title records and is
@@ -3926,8 +3933,11 @@ pub(crate) async fn resurrect_chat(
             // Never in a cluster workspace job: a job may start hours after
             // the click that queued it, with nobody there to watch the turn
             // it would start — its chats come back idle and wait for the user.
+            // Nor once the daemon is stopping: the turn would be cut off at
+            // once, and the ledger keeps the carryover for the next boot.
             let enabled = crate::lock(&state.settings).resume_after_restart()
-                && !state.compute.is_cluster_job();
+                && !state.compute.is_cluster_job()
+                && !state.stopping.load(std::sync::atomic::Ordering::Relaxed);
             let pick_up = pickup_message(
                 &entry.id,
                 carry.as_ref(),

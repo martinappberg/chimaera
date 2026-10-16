@@ -54,6 +54,10 @@ pub(crate) const TRUST_MAX: usize = 8 << 20;
 /// The machine-wide policy (an admin's; users can't loosen it).
 const POLICY_FILE: &str = "/etc/chimaera/policy.json";
 const POLICY_MAX: usize = 64 << 10;
+/// How often the policy file is looked at (a stat; it is read again only
+/// when that changed). Not tied to `update.autoCheck`: that setting is the
+/// user's opt-out from network calls, and an admin's policy is neither.
+const POLICY_TICK: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct Record {
@@ -138,6 +142,59 @@ struct FilePolicy {
     error: Option<String>,
 }
 
+/// What tells one policy file from another without reading it: its inode
+/// (an atomic replace makes a new one), size and both times (an edit in
+/// place within the same second still moves ctime's nanoseconds). `None`:
+/// there is none, or it can't be looked at — the read then decides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PolicyStamp {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+fn policy_stamp(path: &Path) -> Option<PolicyStamp> {
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::metadata(path).ok()?;
+    Some(PolicyStamp {
+        dev: md.dev(),
+        ino: md.ino(),
+        len: md.len(),
+        mtime: (md.mtime(), md.mtime_nsec()),
+        ctime: (md.ctime(), md.ctime_nsec()),
+    })
+}
+
+/// One policy tick: a policy file that changed is read again, and what it
+/// now refuses stops at once (instances, jobs, offers — `revoke::apply`,
+/// which re-applies the kill switch's lists with it). Whether it changed.
+pub(crate) async fn policy_tick(state: &Arc<AppState>) -> bool {
+    let reading = state.clone();
+    let changed =
+        tokio::task::spawn_blocking(move || reading.plugin_guard.reload_policy_if_changed())
+            .await
+            .unwrap_or(false);
+    if changed {
+        tracing::info!("plugin policy file changed: applied");
+        revoke::apply(state).await;
+    }
+    changed
+}
+
+/// The policy tick, every `POLICY_TICK` for the daemon's life (spawned by
+/// `update::run_checker`, whatever `update.autoCheck` says).
+pub(crate) async fn watch_policy(state: Arc<AppState>) {
+    let mut every = tokio::time::interval(POLICY_TICK);
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    every.tick().await;
+    loop {
+        every.tick().await;
+        policy_tick(&state).await;
+    }
+}
+
 fn load_policy_file(path: &Path) -> FilePolicy {
     #[derive(Deserialize)]
     struct Top {
@@ -199,6 +256,8 @@ pub(crate) struct Guard {
     writing: tokio::sync::Mutex<()>,
     policy_path: RwLock<PathBuf>,
     policy_file: RwLock<FilePolicy>,
+    /// What the policy file looked like when it was last read.
+    policy_seen: Mutex<Option<PolicyStamp>>,
     pub(crate) revoked: RwLock<revoke::Revocations>,
 }
 
@@ -252,6 +311,7 @@ impl Guard {
             path,
             store: Mutex::new(store),
             writing: tokio::sync::Mutex::new(()),
+            policy_seen: Mutex::new(policy_stamp(&policy_path)),
             policy_file: RwLock::new(load_policy_file(&policy_path)),
             policy_path: RwLock::new(policy_path),
             revoked: RwLock::new(revoke::Revocations::load(&catalog.root)),
@@ -281,7 +341,20 @@ impl Guard {
     /// Re-read the machine-wide policy file (blocking).
     pub(crate) fn reload_policy(&self) {
         let path = super::read(&self.policy_path).clone();
+        *crate::lock(&self.policy_seen) = policy_stamp(&path);
         *super::write(&self.policy_file) = load_policy_file(&path);
+    }
+
+    /// Re-read the policy file when it changed since it was last read
+    /// (created, removed, rewritten or replaced); whether it did
+    /// (blocking: one stat, and a read only on a change).
+    pub(crate) fn reload_policy_if_changed(&self) -> bool {
+        let path = super::read(&self.policy_path).clone();
+        if *crate::lock(&self.policy_seen) == policy_stamp(&path) {
+            return false;
+        }
+        self.reload_policy();
+        true
     }
 
     /// Tests only: read the policy from `path` instead.

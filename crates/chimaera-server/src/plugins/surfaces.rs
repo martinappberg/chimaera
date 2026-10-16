@@ -8,8 +8,9 @@
 //!   workspace's windows to fetch it again.
 //! - `diagnostics/1` and `output/1` are small and live in memory;
 //!   `sourcemap/1`, `knowledge/1` and `references/1` (up to 4 MiB) are
-//!   written to the plugin's output folder (`.surfaces/`) and read back per
-//!   request, so megabytes never sit in the daemon.
+//!   written to the plugin's output folder (`.surfaces/`), charged against
+//!   its quota, and read back per request, so megabytes never sit in the
+//!   daemon.
 //! - `references/1` is ids a plugin answers for (`\label` keys, issue
 //!   numbers): the client's reference registry turns them into chips in
 //!   chats, previews and the Timeline.
@@ -423,6 +424,9 @@ pub(crate) async fn publish(
             .strip_prefix(&output)
             .map(PathBuf::from)
             .unwrap_or_default();
+        // In the output folder, so under its quota (256 keys × 4 MiB would
+        // be 1 GiB per surface).
+        super::output::charge(state, plugin, text.len() as u64).await?;
         let bytes = text.as_bytes().to_vec();
         let dir = output.clone();
         tokio::task::spawn_blocking(move || super::output::write(&dir, &rel, &bytes))

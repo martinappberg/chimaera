@@ -28,6 +28,17 @@
 //! When a job ends the plugin hears `job-finished` (with the 30 s budget
 //! `knowledge` has), a `job` frame tells the workspace's windows, and an
 //! agent tool waiting on it (`tool-result.wait`) is answered.
+//!
+//! A job starts only for the build that runs now and only where its plugin
+//! is switched on, checked when it is asked for and again when it leaves
+//! the queue; an update that drops a program stops that program's jobs. A
+//! tool's setup step is registered like a job, so a block, an untrust, a
+//! remove and the daemon's exit reach it too.
+//!
+//! What the host can't stop: a program that leaves its process group
+//! (`setsid`, a double fork) outlives the group's SIGKILL; its CPU is still
+//! bounded by `ulimit -t`, and the host stops reading its output after the
+//! grace, never holding a task for it.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -47,6 +58,8 @@ const WAITING_MAX: usize = 8;
 const WALL_DEFAULT: u64 = 60;
 const WALL_MAX: u64 = 600;
 const TERM_GRACE: Duration = Duration::from_secs(5);
+/// How long a job's output is still read after its group is gone.
+const DRAIN_GRACE: Duration = Duration::from_secs(5);
 /// Address space, in KiB (`ulimit -v`).
 const AS_KB: u64 = 4 << 20;
 /// A written file, in 512-byte blocks (`ulimit -f`, POSIX units): 256 MiB.
@@ -225,11 +238,21 @@ struct Captured {
     at: Instant,
 }
 
+/// A tool's setup step while it runs: not a queued job, but stopped like one.
+struct Setup {
+    plugin: String,
+    cancel: tokio::sync::Notify,
+    group: std::sync::atomic::AtomicI32,
+}
+
 /// The host's jobs (on `Platform`).
 #[derive(Default)]
 pub(crate) struct Jobs {
     inner: Mutex<Inner>,
     envs: tokio::sync::Mutex<HashMap<String, Captured>>,
+    /// Tests only: each login-environment capture first waits this long.
+    #[cfg(test)]
+    capture_delay_ms: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Default)]
@@ -239,9 +262,20 @@ struct Inner {
     waiting: Vec<Arc<Job>>,
     live: HashMap<String, Arc<Job>>,
     finished: VecDeque<Arc<Job>>,
+    setups: Vec<Arc<Setup>>,
 }
 
 impl Jobs {
+    /// Tests only: every login-environment capture first waits `delay` (a
+    /// slow login shell, as module loads make one on a cluster).
+    #[cfg(test)]
+    pub(crate) fn set_capture_delay_for_tests(&self, delay: Duration) {
+        self.capture_delay_ms.store(
+            delay.as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     pub(crate) fn get(&self, id: &str) -> Option<Arc<Job>> {
         let inner = crate::lock(&self.inner);
         inner
@@ -255,12 +289,16 @@ impl Jobs {
     /// stopping: `kill_on_drop` would reach only each group's leader, and
     /// what it started would run on unowned).
     pub(crate) fn kill_all(&self) {
-        let groups: Vec<i32> = crate::lock(&self.inner)
+        let inner = crate::lock(&self.inner);
+        let groups: Vec<i32> = inner
             .live
             .values()
-            .map(|j| j.group.load(std::sync::atomic::Ordering::Relaxed))
+            .map(|j| &j.group)
+            .chain(inner.setups.iter().map(|s| &s.group))
+            .map(|g| g.load(std::sync::atomic::Ordering::Relaxed))
             .filter(|g| *g > 0)
             .collect();
+        drop(inner);
         for g in groups {
             let _ = nix::sys::signal::killpg(
                 nix::unistd::Pid::from_raw(g),
@@ -345,13 +383,42 @@ pub(crate) fn cancel(state: &Arc<AppState>, id: &str) {
     });
 }
 
-/// Stop every job of `plugin` (a hard block, a remove), or only those in
-/// `workspace` (switched off there).
+/// Stop every job of `plugin` and its tool setup steps (a hard block, an
+/// untrust, a remove), or only its jobs in `workspace` (switched off there).
 pub(crate) fn cancel_where(state: &Arc<AppState>, plugin: &str, workspace: Option<&str>) {
-    let ids: Vec<String> = crate::lock(&state.plugin_platform.jobs.inner)
+    let inner = crate::lock(&state.plugin_platform.jobs.inner);
+    let ids: Vec<String> = inner
         .live
         .values()
         .filter(|j| j.plugin == plugin && workspace.is_none_or(|w| j.workspace == w))
+        .map(|j| j.id.clone())
+        .collect();
+    if workspace.is_none() {
+        for setup in inner.setups.iter().filter(|s| s.plugin == plugin) {
+            setup.cancel.notify_one();
+        }
+    }
+    drop(inner);
+    for id in ids {
+        cancel(state, &id);
+    }
+}
+
+/// `plugin`'s build changed (an update, a rollback, a remove): its jobs
+/// whose program the build now current no longer declares stop — all of
+/// them when nothing of it is installed. The rest keep running; they run
+/// what the user's build still declares.
+pub(crate) fn cancel_undeclared(state: &Arc<AppState>, plugin: &str) {
+    let current = super::manifest(state, plugin);
+    let ids: Vec<String> = crate::lock(&state.plugin_platform.jobs.inner)
+        .live
+        .values()
+        .filter(|j| {
+            j.plugin == plugin
+                && current
+                    .as_ref()
+                    .is_none_or(|m| !m.programs.iter().any(|p| p.name == j.program))
+        })
         .map(|j| j.id.clone())
         .collect();
     for id in ids {
@@ -384,8 +451,29 @@ fn frame(state: &AppState, job: &Job) {
 }
 
 /// The login environment for `ws` (the user's shell, `-l`, and the
-/// prelude), captured once per prelude text and `ENV_TTL`.
-async fn login_env(
+/// prelude), captured once per prelude text and `ENV_TTL`. The capture runs
+/// on its own task: a job start inside a guest call can be abandoned at the
+/// call's budget, and a slow login shell (module loads) must still finish
+/// and be cached for the next try instead of being killed with the caller.
+pub(crate) async fn login_env(
+    state: &Arc<AppState>,
+    ws: Option<&str>,
+) -> Result<Arc<Vec<(String, String)>>, String> {
+    let (state, ws) = (state.clone(), ws.map(str::to_string));
+    tokio::spawn(async move { login_env_cached(&state, ws.as_deref()).await })
+        .await
+        .map_err(|e| format!("the login environment: {e}"))?
+}
+
+/// Capture `ws`'s login environment ahead of a job (a plugin with programs
+/// switched on, a new build), so the job start finds it cached.
+pub(crate) async fn warm_env(state: &Arc<AppState>, ws: &str) {
+    if let Err(err) = login_env(state, Some(ws)).await {
+        tracing::debug!(workspace = ws, %err, "login environment not captured ahead");
+    }
+}
+
+async fn login_env_cached(
     state: &Arc<AppState>,
     ws: Option<&str>,
 ) -> Result<Arc<Vec<(String, String)>>, String> {
@@ -452,7 +540,17 @@ async fn capture_env(
         cmd.env_remove(name);
     }
     cmd.envs(env);
+    #[cfg(test)]
+    let delay = Duration::from_millis(
+        state
+            .plugin_platform
+            .jobs
+            .capture_delay_ms
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
     let out = async {
+        #[cfg(test)]
+        tokio::time::sleep(delay).await;
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("the login shell did not start: {e}"))?;
@@ -579,6 +677,9 @@ pub(crate) async fn start(
     ws: &str,
     spec: &str,
 ) -> Result<String, String> {
+    // The instance asking may be one an update, a remove or a switch-off
+    // already superseded (its call still in flight).
+    super::still_current(state, m, Some(ws))?;
     if spec.len() > STDIN_MAX + (1 << 20) {
         return Err("a job spec is at most 5 MiB".into());
     }
@@ -684,6 +785,8 @@ pub(crate) async fn start(
         job_env.push((k, v));
     }
 
+    // Again after the awaits above (the login shell can take seconds).
+    super::still_current(state, m, Some(ws))?;
     let (done, _) = tokio::sync::watch::channel(false);
     let jobs = &state.plugin_platform.jobs;
     let job = {
@@ -783,10 +886,13 @@ fn dispatch(state: &Arc<AppState>) {
             }
             job
         };
-        // A plugin blocked, untrusted or refused since its job queued never
-        // starts it.
-        let held = super::manifest(state, &next.plugin)
-            .is_none_or(|m| m.origin.fault.is_some() || super::trust::hold(state, &m).is_some());
+        // A plugin blocked, untrusted, refused, removed or switched off
+        // since its job queued never starts it, nor does a build that no
+        // longer declares its program.
+        let held = super::manifest(state, &next.plugin).is_none_or(|m| {
+            super::still_current(state, &m, Some(&next.workspace)).is_err()
+                || !m.programs.iter().any(|p| p.name == next.program)
+        });
         if held {
             let jobs = &state.plugin_platform.jobs;
             crate::lock(&jobs.inner).running -= 1;
@@ -954,13 +1060,14 @@ async fn run_process(
     if let (Some(slot), Some(g)) = (group_slot, group) {
         slot.store(g.as_raw(), std::sync::atomic::Ordering::Relaxed);
     }
+    let mut tasks = Vec::with_capacity(3);
     if let (Some(bytes), Some(mut stdin)) = (launch.stdin, child.stdin.take()) {
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             let _ = stdin.write_all(&bytes).await;
-        });
+        }));
     }
-    let out_task = copy_capped(child.stdout.take(), out_file);
-    let err_task = copy_capped(child.stderr.take(), err_file);
+    tasks.push(copy_capped(child.stdout.take(), out_file));
+    tasks.push(copy_capped(child.stderr.take(), err_file));
     let signal = |sig: nix::sys::signal::Signal| {
         if let Some(g) = group {
             let _ = nix::sys::signal::killpg(g, sig);
@@ -990,16 +1097,29 @@ async fn run_process(
     };
     // Whatever the program left behind in its group goes too.
     signal(nix::sys::signal::Signal::SIGKILL);
-    let _ = tokio::time::timeout(Duration::from_secs(5), async {
-        let _ = out_task.await;
-        let _ = err_task.await;
-    })
-    .await;
+    settle(tasks, DRAIN_GRACE).await;
     Outcome {
         exit: status.and_then(|s| s.code()),
         timed_out,
         cancelled,
         error: None,
+    }
+}
+
+/// Wait at most `grace` for a job's pipe tasks, then abort what is left: a
+/// process that escaped the group (`setsid`) can hold stdout open, or never
+/// read its stdin, for as long as it lives.
+async fn settle(tasks: Vec<tokio::task::JoinHandle<()>>, grace: Duration) {
+    let aborts: Vec<_> = tasks.iter().map(|t| t.abort_handle()).collect();
+    let all = async {
+        for task in tasks {
+            let _ = task.await;
+        }
+    };
+    if tokio::time::timeout(grace, all).await.is_err() {
+        for abort in aborts {
+            abort.abort();
+        }
     }
 }
 
@@ -1045,6 +1165,34 @@ pub(crate) async fn run_setup(
     program: &str,
     args: &[String],
 ) -> Result<(), String> {
+    let setup = Arc::new(Setup {
+        plugin: m.id.clone(),
+        cancel: tokio::sync::Notify::new(),
+        group: std::sync::atomic::AtomicI32::new(0),
+    });
+    let jobs = &state.plugin_platform.jobs;
+    // Registered before the check below: a block or a remove after it
+    // cancels this step, one before it is what the check sees.
+    crate::lock(&jobs.inner).setups.push(setup.clone());
+    let result = setup_step(state, m, bin, cwd, program, args, &setup).await;
+    crate::lock(&jobs.inner)
+        .setups
+        .retain(|s| !Arc::ptr_eq(s, &setup));
+    result
+}
+
+async fn setup_step(
+    state: &Arc<AppState>,
+    m: &Manifest,
+    bin: &Path,
+    cwd: &Path,
+    program: &str,
+    args: &[String],
+    setup: &Setup,
+) -> Result<(), String> {
+    // A download can take an hour: the plugin may have been blocked,
+    // untrusted, updated or removed since the user asked for its tool.
+    super::still_current(state, m, None)?;
     let env = login_env(state, None).await?;
     let path = absolute_path(
         env.iter()
@@ -1085,9 +1233,13 @@ pub(crate) async fn run_setup(
         output: cwd.to_path_buf(),
     };
     tracing::info!(plugin = %m.id, %program, "plugin tool setup step");
-    let outcome = run_process(launch, None, None, out, err).await;
+    let outcome = run_process(launch, Some(&setup.cancel), Some(&setup.group), out, err).await;
     match (outcome.error, outcome.exit, outcome.timed_out) {
         (Some(err), _, _) => Err(err),
+        _ if outcome.cancelled => Err(format!(
+            "{program} was stopped: {} can't run here now",
+            m.name
+        )),
         (None, _, true) => Err(format!("{program} ran past {WALL_MAX} s")),
         (None, Some(0), false) => Ok(()),
         (None, code, false) => Err(format!(
@@ -1228,6 +1380,74 @@ mod tests {
             "/opt/tex/bin:/usr/bin"
         );
         assert_eq!(absolute_path(".:"), "/usr/local/bin:/usr/bin:/bin");
+    }
+
+    /// A pipe whose writer never closes (a process that left the job's
+    /// group still holds it): its drain is aborted after the grace, never
+    /// left reading for as long as that process lives.
+    #[tokio::test]
+    async fn a_drain_held_open_is_aborted_after_the_grace() {
+        let (reader, _writer) = tokio::io::duplex(64);
+        let file = tempfile_for("drain");
+        let task = copy_capped(Some(reader), file);
+        let abort = task.abort_handle();
+        let started = Instant::now();
+        settle(vec![task], Duration::from_millis(200)).await;
+        assert!(started.elapsed() < Duration::from_secs(2));
+        for _ in 0..50 {
+            if abort.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(abort.is_finished(), "the drain task outlived its grace");
+    }
+
+    /// A program that ignores SIGTERM gets SIGKILL `TERM_GRACE` later.
+    #[tokio::test]
+    async fn a_job_that_ignores_sigterm_is_killed_after_the_grace() {
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-jobs-term-{}-{}",
+            std::process::id(),
+            &chimaera_core::generate_token()[..8]
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let launch = Launch {
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), "trap '' TERM; sleep 30".into()],
+            cwd: dir.clone(),
+            env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+            stdin: None,
+            wall: Duration::from_secs(1),
+            output: dir.clone(),
+        };
+        let started = Instant::now();
+        let outcome = run_process(
+            launch,
+            None,
+            None,
+            tempfile_for("term-out"),
+            tempfile_for("term-err"),
+        )
+        .await;
+        let took = started.elapsed();
+        assert!(outcome.timed_out);
+        assert!(
+            took >= TERM_GRACE && took < TERM_GRACE + Duration::from_secs(4),
+            "stopped after {took:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn tempfile_for(label: &str) -> std::fs::File {
+        let path = std::env::temp_dir().join(format!(
+            "chimaera-jobs-{label}-{}-{}",
+            std::process::id(),
+            &chimaera_core::generate_token()[..8]
+        ));
+        let file = std::fs::File::create(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        file
     }
 
     #[test]

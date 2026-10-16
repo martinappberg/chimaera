@@ -725,3 +725,158 @@ async fn an_oversized_or_unreadable_trust_file_fails_closed_and_is_left_alone() 
         "the first file is written"
     );
 }
+
+/// An admin's block reaches a running plugin within a policy tick, with
+/// the user's update checks off: the tick is the policy's own, not the
+/// daily release check's.
+#[tokio::test]
+async fn an_admin_block_applies_without_update_checks() {
+    let fake = FakeReleases::start().await;
+    let state = state_for(&fake);
+    let (status, body) = request(
+        &state,
+        Method::PUT,
+        "/api/v1/settings",
+        Some(json!({"update.autoCheck": false})),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+    let gh = "acme/tr-tick";
+    fake.publish(
+        gh,
+        "0.1.0",
+        &manifest(false, "tr-tick", "0.1.0", ""),
+        &v1_wasm(),
+    );
+    assert_eq!(install(&state, gh, None).await.0, StatusCode::OK);
+    let (ws, sid) = workspace_with(&state, "tr-tick", "kt9", &["tr-tick"]).await;
+    let (is_err, _) = mcp_tool_call(&state, &sid, "kt9", "echo", json!({})).await;
+    assert!(!is_err);
+    assert_eq!(state.plugin_runtime.live_instances("tr-tick"), 1);
+
+    let file = test_dir("policy-tick").join("policy.json");
+    state.plugin_guard.set_policy_path_for_tests(file.clone());
+    assert!(!trust::policy_tick(&state).await, "no file, still none");
+    std::fs::write(&file, r#"{"plugins": {"blocked": ["tr-tick"]}}"#).unwrap();
+    assert!(trust::policy_tick(&state).await);
+    assert_eq!(
+        state.plugin_runtime.live_instances("tr-tick"),
+        0,
+        "stopped at once"
+    );
+    assert!(active_ids(&state, &ws).await.is_empty());
+    assert_eq!(
+        listed(&state, "tr-tick").await["hold"]["reason"],
+        "this host's policy blocks it"
+    );
+    assert!(!trust::policy_tick(&state).await, "read only on a change");
+
+    // Lifted: back on at the next tick.
+    std::fs::remove_file(&file).unwrap();
+    assert!(trust::policy_tick(&state).await);
+    assert_eq!(active_ids(&state, &ws).await, ["tr-tick"]);
+    state.sessions.kill(&sid).ok();
+}
+
+/// `watch` tells a plugin whether and when a workspace path changes, which
+/// is what reading it would: refused to a build without `[access] files`.
+#[tokio::test]
+async fn watching_files_needs_file_access() {
+    let text = test_catalog::dist_test_text("test-platform/plugin.toml")
+        .replacen("id = \"test-platform\"", "id = \"tr-blind\"", 1)
+        .replacen("files = \"read\"", "files = \"none\"", 1);
+    assert!(text.contains("files = \"none\""));
+    test_catalog::add(
+        &text,
+        test_catalog::dist_test_bytes("test-platform/plugin.wasm"),
+    );
+    let state = test_state();
+    let ws = make_workspace(&state, "tr-blind").await;
+    let (status, body) = switch(&state, &ws, "tr-blind", true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = request(
+        &state,
+        Method::POST,
+        &format!("/api/v1/workspaces/{ws}/plugins/tr-blind/views/board/actions"),
+        Some(json!({"action": "watch", "payload": {"paths": ["notes.txt"]}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["problems"].to_string().contains("[access] files"),
+        "{body}"
+    );
+}
+
+/// Each write a plugin makes into its output folder is charged before it
+/// lands, so the quota holds between the once-a-minute measures: a second
+/// write inside the same minute that would pass it evicts the oldest first.
+#[tokio::test]
+async fn output_writes_are_charged_against_the_quota_before_they_land() {
+    use crate::plugins::output;
+    let state = test_state();
+    let dir = output::folder(&state.plugin_platform.output_root, "tr-quota", "w-1");
+    let quota = 1000;
+    output::charge_within(&state, "tr-quota", 600, quota)
+        .await
+        .unwrap();
+    output::write(&dir, std::path::Path::new("old"), &[0; 600]).unwrap();
+    output::charge_within(&state, "tr-quota", 600, quota)
+        .await
+        .unwrap();
+    assert!(!dir.join("old").exists(), "the oldest went to make room");
+    output::write(&dir, std::path::Path::new("new"), &[0; 600]).unwrap();
+    // Within the figure: counted, nothing measured or evicted.
+    output::charge_within(&state, "tr-quota", 300, quota)
+        .await
+        .unwrap();
+    assert!(dir.join("new").exists());
+    // More than the whole quota: refused, and nothing evicted for it.
+    let err = output::charge_within(&state, "tr-quota", 1001, quota)
+        .await
+        .unwrap_err();
+    assert!(err.contains("quota"), "{err}");
+    assert!(dir.join("new").exists());
+}
+
+/// A guest call that began before an update keeps its old build's instance
+/// for a few seconds: its side effects (output files, kept state, surfaces,
+/// Timeline notes) are refused from then on, the switch checked only where
+/// a `switched-off` handler could not be writing.
+#[tokio::test]
+async fn a_call_holding_a_replaced_build_cannot_write_or_keep_state() {
+    use crate::plugins::hostfns::build_current;
+    let fake = FakeReleases::start().await;
+    let state = state_for(&fake);
+    let gh = "acme/tr-stale";
+    fake.publish(
+        gh,
+        "0.1.0",
+        &manifest(false, "tr-stale", "0.1.0", ""),
+        &v1_wasm(),
+    );
+    assert_eq!(install(&state, gh, None).await.0, StatusCode::OK);
+    let (ws, sid) = workspace_with(&state, "tr-stale", "kt10", &["tr-stale"]).await;
+    let old = crate::plugins::manifest(&state, "tr-stale").unwrap();
+    assert_eq!(build_current(&state, Some(&old), Some(&ws)), Ok(()));
+
+    // Off here: a workspace write is refused, a build-only check is not.
+    let (status, body) = switch(&state, &ws, "tr-stale", false).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(build_current(&state, Some(&old), Some(&ws)).is_err());
+    assert_eq!(build_current(&state, Some(&old), None), Ok(()));
+
+    fake.publish(
+        gh,
+        "0.2.0",
+        &manifest(true, "tr-stale", "0.2.0", ""),
+        &v2_wasm(),
+    );
+    let (status, body) = post(&state, "/api/v1/plugins/tr-stale/update").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let err = build_current(&state, Some(&old), None).unwrap_err();
+    assert!(err.contains("was updated"), "{err}");
+    let new = crate::plugins::manifest(&state, "tr-stale").unwrap();
+    assert_eq!(build_current(&state, Some(&new), None), Ok(()));
+    state.sessions.kill(&sid).ok();
+}

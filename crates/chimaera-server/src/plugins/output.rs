@@ -13,7 +13,11 @@
 //!   temporary name and renamed into place.
 //! - A quota per plugin across its workspaces (1 GiB): past it, the least
 //!   recently changed top-level entries go. Usage is measured by a bounded
-//!   walk, at most once a minute per plugin unless a Clear reset it.
+//!   walk, at most once a minute per plugin unless a Clear reset it; in
+//!   between, every write the plugin makes itself (a file, a large
+//!   surface) is charged against that figure before it lands (`charge`),
+//!   and one that would pass the quota measures again, evicts to make room,
+//!   or is refused.
 //! - The UI reads output files through the ordinary file routes by their
 //!   absolute path (`GET …/plugins/{pid}/output` answers the folder), so the
 //!   PDF viewer, the log view and `/raw` tickets work unchanged.
@@ -268,10 +272,9 @@ pub(crate) fn create_file(dir: &Path, rel: &Path) -> Result<File, String> {
     Ok(File::from(fd))
 }
 
-/// Write `bytes` to `rel` (a temporary name, then a rename: a reader never
-/// sees half a file) (blocking).
-pub(crate) fn write(dir: &Path, rel: &Path, bytes: &[u8]) -> Result<(), String> {
-    if bytes.len() > WRITE_MAX {
+/// A file of `len` bytes is one the plugin may write itself.
+pub(crate) fn fits(rel: &Path, len: usize) -> Result<(), String> {
+    if len > WRITE_MAX {
         return Err(io(
             rel,
             format!(
@@ -280,6 +283,13 @@ pub(crate) fn write(dir: &Path, rel: &Path, bytes: &[u8]) -> Result<(), String> 
             ),
         ));
     }
+    Ok(())
+}
+
+/// Write `bytes` to `rel` (a temporary name, then a rename: a reader never
+/// sees half a file) (blocking).
+pub(crate) fn write(dir: &Path, rel: &Path, bytes: &[u8]) -> Result<(), String> {
+    fits(rel, bytes.len())?;
     let root = open_root(dir)?;
     let (parent, name) = parent_of(&root, rel)?;
     let tmp = format!(
@@ -517,6 +527,20 @@ impl Usage {
             .map(|(b, _)| *b)
     }
 
+    /// Count `n` bytes about to be written against the fresh figure: true
+    /// when they fit under `quota` (and are now counted). A missing or stale
+    /// figure, or one they would push past `quota`, is false: the caller
+    /// measures again.
+    fn charge(&mut self, plugin: &str, n: u64, quota: u64) -> bool {
+        match self.by_plugin.get_mut(plugin) {
+            Some((bytes, at)) if at.elapsed() < USAGE_TTL && bytes.saturating_add(n) <= quota => {
+                *bytes += n;
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn record(&mut self, plugin: &str, bytes: u64) {
         self.by_plugin
             .insert(plugin.to_string(), (bytes, Instant::now()));
@@ -542,6 +566,50 @@ pub(crate) async fn usage(state: &AppState, plugin: &str, force: bool) -> u64 {
         .unwrap_or(0);
     crate::lock(&state.plugin_platform.usage).record(plugin, bytes);
     bytes
+}
+
+/// Charge `n` bytes `plugin` is about to write against its quota: within
+/// the fresh figure they just count; otherwise it is measured again, its
+/// oldest entries evicted to leave room for them, and refused when even
+/// that leaves no room. Without this a plugin could write 8 MiB a call for
+/// a whole minute between measures.
+pub(crate) async fn charge(state: &AppState, plugin: &str, n: u64) -> Result<(), String> {
+    charge_within(state, plugin, n, QUOTA).await
+}
+
+pub(crate) async fn charge_within(
+    state: &AppState,
+    plugin: &str,
+    n: u64,
+    quota: u64,
+) -> Result<(), String> {
+    if crate::lock(&state.plugin_platform.usage).charge(plugin, n, quota) {
+        return Ok(());
+    }
+    // Never evict everything for a write that could not fit anyway.
+    if n > quota {
+        return Err(format!(
+            "{n} bytes is more than this plugin's output quota ({} MiB)",
+            quota >> 20
+        ));
+    }
+    let root = state.plugin_platform.output_root.clone();
+    let id = plugin.to_string();
+    let room = quota.saturating_sub(n);
+    let measured = tokio::task::spawn_blocking(move || Usage::enforce(&root, &id, room))
+        .await
+        .map_err(|e| format!("measuring the output folder failed: {e}"))?;
+    let mut usage = crate::lock(&state.plugin_platform.usage);
+    usage.record(plugin, measured);
+    if usage.charge(plugin, n, quota) {
+        Ok(())
+    } else {
+        Err(format!(
+            "this plugin's output folders are full ({} of {} MiB)",
+            measured >> 20,
+            quota >> 20
+        ))
+    }
 }
 
 /// A removed plugin: every output folder it had (blocking).
@@ -774,5 +842,24 @@ mod tests {
         assert_eq!(Usage::enforce(&root, "p", 1000), 600);
         assert!(!ws.join("old").exists());
         assert!(ws.join("new").exists());
+    }
+
+    #[test]
+    fn a_write_is_charged_against_the_fresh_figure_until_it_would_pass_the_quota() {
+        let mut usage = Usage::default();
+        // Nothing measured yet: the caller measures first.
+        assert!(!usage.charge("p", 10, 1000));
+        usage.record("p", 600);
+        assert!(usage.charge("p", 300, 1000));
+        assert_eq!(usage.fresh("p"), Some(900));
+        // Past the quota: not counted, measured again.
+        assert!(!usage.charge("p", 200, 1000));
+        assert_eq!(usage.fresh("p"), Some(900));
+        assert!(usage.charge("p", 100, 1000));
+        // A stale figure is never trusted.
+        usage
+            .by_plugin
+            .insert("q".into(), (0, Instant::now() - USAGE_TTL));
+        assert!(!usage.charge("q", 1, 1000));
     }
 }

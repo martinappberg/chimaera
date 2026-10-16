@@ -284,14 +284,18 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   - **Host functions, each bounded** (`hostfns.rs`): workspace-relative `read` / `stat` /
     `list` walked with `O_NOFOLLOW` on every component (`..`, absolute paths and symlinks
     refused), reads ≤ 8 MiB and listings ≤ 4,096 entries, off the reactor behind the filesystem
-    semaphore; `state` — 64 KiB per (plugin, workspace), in memory (a restart clears it);
+    semaphore; `state` — 64 KiB per (plugin, workspace), in memory (a restart clears it;
+    `state-keep` keys are written to disk and come back);
     `sessions`; `timeline-append` of `note` entries only (≤ 2 KiB, from a session's call, under
     the per-session posts-per-minute window agent messages share; a plugin's note is shown on the Timeline, never delivered into an agent) and `timeline-recent`;
-    `emit` (one JSON object ≤ 16 KiB); `now-ms`; `log` (≤ 64 lines a call). The host serves the
+    `emit` (one JSON object ≤ 16 KiB); `now-ms`; `log` (≤ 64 lines a call). JSON a guest hands
+    over is measured against its cap before it is parsed (a parsed value costs many times its
+    text). The host serves the
     workspace and session of the call in flight, never the context a guest passes back.
   - **What a plugin hands back is capped too** — a tool result at 256 KiB, the instruction
     paragraph at 8 KiB, a hook line at 1 KiB, a tool description at 2 KiB; a tool input
-    schema must be a JSON object schema (≤ 16 KiB) — and a component whose `tools()` names differ
+    schema must be a JSON object schema (≤ 16 KiB); at most 64 MCP tools per plugin, their
+    input schemas ≤ 256 KiB together — and a component whose `tools()` names differ
     from its manifest's `provides.mcp_tools` is refused everywhere (the card's Adds line and the
     call gate come from the manifest). Tool names are unique within a manifest, 1–64 ASCII
     letters, digits, underscores or dashes (dots are refused to keep Codex approval keys literal); built-in tool names are reserved. If active
@@ -556,6 +560,8 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     `/etc/chimaera/policy.json` (`{"plugins": {"allowUnverified", "allowPrivileged": "all" |
     "verified" | "none", "blocked": [ids]}}`) can only tighten it; a file that doesn't parse
     fails closed (no unverified and no program-running plugin) and the install form says so.
+    The daemon looks at the file every minute, whatever `update.autoCheck` says, and a change
+    applies at once: what it now refuses stops (instances, jobs, offers).
 - **Where it lives.** `plugins/capabilities.rs` (`Access`, `Caps`: the atoms, `digest`, `tier`,
   `covers` / `beyond`, `lines`), `plugins/trust.rs` (`Guard` on `AppState` — trust records in
   `<data dir>/plugins/trust.json`, the policy file, the revocations —; `standing`, `hold`,
@@ -634,7 +640,9 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     their checks, the file patterns, the per-daemon `Platform`), `screens.rs` (the `ui/1`
     check, render / action / file-action / query routes, invalidation at ≤ 4 a second),
     `surfaces.rs` (`diagnostics/1`, `output/1`, `sourcemap/1`, `knowledge/1`, `references/1`), `output.rs`
-    (output folders under the cache dir, the 1 GiB quota, Save to workspace), `pdata.rs`
+    (output folders under the cache dir, the 1 GiB quota — each file the plugin writes and each
+    large surface charged before it lands, the oldest entries evicted to make room —, Save to
+    workspace), `pdata.rs`
     (durable state and setting values, capped JSON under `<data>/plugins/.data/`), `files.rs`
     (file events from every write the daemon knows of via `git::mark_path_dirty`, the save
     mark, per-file debounce, the watch sweep while a view is open, `settings-changed`).
@@ -665,6 +673,10 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   - A plugin never writes into the workspace itself: **Save to workspace** is the user's click.
   - Nothing polls: a screen renders on open, on an action and on the plugin's `invalidate`; the
     watch sweep runs only while one of its views was open in the last 10 minutes.
+  - `watch` needs `[access] files = "read"`: when a path changes is what reading it would tell.
+  - A guest call that began before an update, a removal or a block can't write its output
+    folder, keep state, publish or post a note once its build is no longer current; a tool
+    download or install stops at the next chunk, and before its new version is switched in.
   - Claiming a file kind is on the **Can** list, so a release that claims a new one asks again.
   - The author's guide has every node, prop, surface and limit:
     [docs/agent-guides/plugins.md](../agent-guides/plugins.md#the-platform-api-02).
@@ -702,10 +714,15 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   - **Only declared programs, by name.** No path to a binary, no shell between the plugin and
     the program; a URL that moves (`/latest/`) doesn't validate.
   - **Limits for every job:** 2 running on the host, 1 per plugin, 8 waiting; 60 s by default,
-    600 s at most, then the whole process group is stopped; 4 GiB of memory, 256 MiB per
+    600 s at most, then the job's process group gets SIGTERM and, 5 s later, SIGKILL (a
+    program that leaves its group, with `setsid` or a double fork, outlives that; its CPU time
+    is still capped, and its output is no longer read); 4 GiB of memory, 256 MiB per
     written file, low CPU and I/O priority; stdout and stderr to 16 MiB logs in the output
     folder, never in the daemon's memory; the host's own variables (`PATH`, `HOME`, `LD_*`, …)
     can't be set.
+  - An update or rollback stops jobs of programs the new build no longer declares; a job
+    queued by a build that is no longer current, or in a workspace where the plugin was
+    switched off, never starts.
   - **A tool is checked before it counts:** https only, the declared size and sha256 while it
     streams; unpacked into an empty folder that refuses `..`, absolute paths, hard links,
     devices and links that leave it; nothing outside `~/.chimaera/tools/<plugin>/<tool>/`
@@ -714,7 +731,8 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     Folder** (`plugins.toolsDir`, `~` and `$VARIABLES` expanded) names another — on a cluster
     whose home is a small quota, `$SCRATCH` or a group folder. An install first checks the
     folder has room for the download and about three times it unpacked, with 1 GB to spare,
-    and otherwise says so and points at the setting (a cluster home at 880 MB free would
+    and otherwise says so and points at the setting; the unpack itself stops before it would
+    take that last 1 GB (a cluster home at 880 MB free would
     otherwise have taken a 415 MB TeX Live). Tools already installed stay where they were.
   - **The lock covers downloads too:** the lock pins the manifest and the manifest pins each
     download's sha256, and the lock bump fetches every download and compares.
