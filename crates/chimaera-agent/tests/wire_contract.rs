@@ -2,7 +2,7 @@
 //!
 //! `SeqEvent` and `AgentEvent` are serialized straight onto `/ws/chat/{id}` and
 //! into the durable journal — the Svelte chat store reducer folds them directly.
-//! No DTO layer, and the client has no automated tests, so a field rename/retag
+//! No DTO layer, and the client has no component/browser tests (only reducer tests), so a field rename/retag
 //! here silently breaks chat mode. These pin the exact shape; a module reshuffle
 //! must keep them green, and a deliberate wire change updates them in the same
 //! commit. They also pin the invariant `journal::parse_seq` depends on: every
