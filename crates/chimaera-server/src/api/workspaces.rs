@@ -11,6 +11,24 @@ use serde_json::json;
 use crate::workspaces::Workspace;
 use crate::AppState;
 
+/// A store save that failed: 503 with the plain reason when the saved list
+/// can't be read right now (the store already logged that, once), else 500.
+fn save_failed(err: anyhow::Error, what: &str) -> Response {
+    if err.is::<crate::workspaces::Held>() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response();
+    }
+    tracing::error!(%err, "failed to persist {what}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": err.to_string()})),
+    )
+        .into_response()
+}
+
 #[derive(Deserialize)]
 pub(crate) struct PatchWorkspace {
     /// The launcher's "new agents in a worktree" choice.
@@ -47,11 +65,7 @@ pub(crate) async fn patch_workspace(
             Json(ws).into_response()
         }
         Ok(None) => not_found(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": err.to_string()})),
-        )
-            .into_response(),
+        Err(err) => save_failed(err, "the workspace's worktree choice"),
     }
 }
 
@@ -113,14 +127,7 @@ pub(crate) async fn create_workspace(
     };
     match added {
         Ok(workspace) => Json(workspace).into_response(),
-        Err(err) => {
-            tracing::error!(%err, "failed to persist workspace");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": err.to_string()})),
-            )
-                .into_response()
-        }
+        Err(err) => save_failed(err, "workspace"),
     }
 }
 
@@ -483,13 +490,6 @@ pub(crate) async fn delete_workspace(
             Json(json!({"error": "unknown workspace"})),
         )
             .into_response(),
-        Err(err) => {
-            tracing::error!(%err, "failed to persist workspace removal");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": err.to_string()})),
-            )
-                .into_response()
-        }
+        Err(err) => save_failed(err, "workspace removal"),
     }
 }

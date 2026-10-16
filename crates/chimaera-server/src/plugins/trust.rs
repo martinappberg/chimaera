@@ -45,9 +45,15 @@ use crate::AppState;
 
 const TRUST_FILE: &str = "trust.json";
 const RECORDS_MAX: usize = 512;
+/// Read cap for `trust.json`: `RECORDS_MAX` records of an id, a source (a
+/// `path:` source is up to PATH_MAX), a digest and a version — ~8 KiB each
+/// pretty-printed at the worst, a few hundred bytes in practice — plus one
+/// skip and one allowed block per installed plugin. Past 8 MiB the file is
+/// not one this daemon wrote, and it fails closed like a corrupt one.
+pub(crate) const TRUST_MAX: usize = 8 << 20;
 /// The machine-wide policy (an admin's; users can't loosen it).
 const POLICY_FILE: &str = "/etc/chimaera/policy.json";
-const POLICY_MAX: u64 = 64 << 10;
+const POLICY_MAX: usize = 64 << 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct Record {
@@ -138,12 +144,13 @@ fn load_policy_file(path: &Path) -> FilePolicy {
         #[serde(default)]
         plugins: Option<PolicyPlugins>,
     }
-    let text = match std::fs::metadata(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return FilePolicy::default(),
-        Ok(md) if md.len() > POLICY_MAX => Err(format!("over its {} KiB cap", POLICY_MAX >> 10)),
-        _ => std::fs::read_to_string(path).map_err(|e| e.to_string()),
+    let bytes = match crate::persist::read_bounded(path, POLICY_MAX) {
+        crate::persist::Bounded::Missing => return FilePolicy::default(),
+        crate::persist::Bounded::Ok(bytes) => Ok(bytes),
+        crate::persist::Bounded::TooLarge => Err(format!("over its {} KiB cap", POLICY_MAX >> 10)),
+        crate::persist::Bounded::Io(err) => Err(err.to_string()),
     };
-    let parsed = text.and_then(|t| serde_json::from_str::<Top>(&t).map_err(|e| e.to_string()));
+    let parsed = bytes.and_then(|b| serde_json::from_slice::<Top>(&b).map_err(|e| e.to_string()));
     match parsed {
         Ok(top) => FilePolicy {
             present: true,
@@ -200,8 +207,12 @@ impl Guard {
     /// the policy file and the revocation lists (blocking; boot).
     pub(crate) fn load(catalog: &super::Catalog) -> Guard {
         let path = catalog.root.join(TRUST_FILE);
-        let store = match std::fs::read_to_string(&path) {
-            Ok(text) => match serde_json::from_str::<TrustFile>(&text) {
+        // Oversized or unreadable fails closed like a corrupt file: only a
+        // MISSING file grandfathers what is installed. A trust the user
+        // grants afterwards rewrites the file (the module doc's rule).
+        let store = match crate::persist::read_bounded(&path, TRUST_MAX) {
+            crate::persist::Bounded::Ok(bytes) => match serde_json::from_slice::<TrustFile>(&bytes)
+            {
                 Ok(file) if file.schema == 1 => TrustStore { file, broken: None },
                 Ok(file) => TrustStore {
                     file: TrustFile::default(),
@@ -212,7 +223,7 @@ impl Guard {
                     broken: Some(err.to_string()),
                 },
             },
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            crate::persist::Bounded::Missing => {
                 let store = TrustStore {
                     file: grandfathered(catalog),
                     broken: None,
@@ -222,7 +233,11 @@ impl Guard {
                 }
                 store
             }
-            Err(err) => TrustStore {
+            crate::persist::Bounded::TooLarge => TrustStore {
+                file: TrustFile::default(),
+                broken: Some(format!("over its {} MiB cap", TRUST_MAX >> 20)),
+            },
+            crate::persist::Bounded::Io(err) => TrustStore {
                 file: TrustFile::default(),
                 broken: Some(err.to_string()),
             },
@@ -861,6 +876,12 @@ pub(crate) async fn forget(state: &AppState, id: &str) {
     if let Err(r) = persist(state).await {
         tracing::warn!(plugin = id, error = %r.message, "trust records not updated after a remove");
     }
+}
+
+/// Tests only: why the trust file on disk isn't trusted, if it isn't.
+#[cfg(test)]
+pub(crate) fn broken_for_tests(state: &AppState) -> Option<String> {
+    crate::lock(&state.plugin_guard.store).broken.clone()
 }
 
 /// Tests only: the records in force.

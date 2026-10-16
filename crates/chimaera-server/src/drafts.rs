@@ -22,7 +22,6 @@
 //! that burst must never take the shared `fs::FILESYSTEM_WORK` permits.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -56,9 +55,17 @@ pub(crate) const MAX_DRAFT_BODY_BYTES: usize = 7 * 1024 * 1024;
 /// A temp file left by a crash mid-write is swept once it is this old (a
 /// live write finishes in well under a second).
 const STALE_TEMP_AGE: Duration = Duration::from_secs(600);
+/// Largest draft file a read accepts: every string field at its cap, each
+/// byte at serde_json's worst escape (`\u0000`, sixfold), plus the numbers
+/// and keys. A real draft is about its text's size; this bound is what PUT
+/// can produce, kept under `MAX_DRAFT_BODY_BYTES` so a draft never reads
+/// back larger than one could be sent.
+pub(crate) const MAX_DRAFT_FILE_BYTES: usize = 6
+    * (MAX_DRAFT_TEXT_BYTES + MAX_DRAFT_PATH_BYTES + MAX_BASE_HASH_BYTES + MAX_WRITER_BYTES)
+    + 1024;
 /// Largest sidecar a listing reads: a real one is under 4.5 KiB (the path
 /// and hash caps), so anything bigger is not ours.
-const MAX_META_FILE_BYTES: u64 = 16 * 1024;
+const MAX_META_FILE_BYTES: usize = 16 * 1024;
 
 /// A full eviction scan also runs after this many writes, even under the
 /// caps: it notices another daemon sharing the directory and sweeps a
@@ -422,14 +429,12 @@ pub(crate) async fn put_draft(
 /// oversized, or names a path whose id is not `id`.
 fn read_meta(file: &Path, id: &str) -> Option<DraftMeta> {
     let read = || -> anyhow::Result<DraftMeta> {
-        let mut bytes = Vec::new();
-        std::fs::File::open(file)?
-            .take(MAX_META_FILE_BYTES + 1)
-            .read_to_end(&mut bytes)?;
-        anyhow::ensure!(
-            bytes.len() as u64 <= MAX_META_FILE_BYTES,
-            "sidecar too large"
-        );
+        let bytes = match crate::persist::read_bounded(file, MAX_META_FILE_BYTES) {
+            crate::persist::Bounded::Ok(bytes) => bytes,
+            crate::persist::Bounded::Missing => anyhow::bail!("no sidecar"),
+            crate::persist::Bounded::TooLarge => anyhow::bail!("sidecar too large"),
+            crate::persist::Bounded::Io(err) => return Err(err.into()),
+        };
         let meta: DraftMeta = serde_json::from_slice(&bytes)?;
         anyhow::ensure!(draft_id(&meta.path) == id, "sidecar names another path");
         Ok(meta)
@@ -494,10 +499,15 @@ pub(crate) async fn get_draft(
     let root = state.drafts_root.clone();
     blocking(move || {
         let file = draft_file(&root, &draft_id(&query.path));
-        let stored = match std::fs::read(&file) {
-            Ok(bytes) => serde_json::from_slice::<StoredDraft>(&bytes).ok(),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-            Err(err) => {
+        let stored = match crate::persist::read_bounded(&file, MAX_DRAFT_FILE_BYTES) {
+            crate::persist::Bounded::Ok(bytes) => serde_json::from_slice::<StoredDraft>(&bytes).ok(),
+            crate::persist::Bounded::Missing => None,
+            // No PUT writes one this big: not a draft of ours, so none.
+            crate::persist::Bounded::TooLarge => {
+                tracing::warn!(path = %file.display(), "draft exceeds {MAX_DRAFT_FILE_BYTES} bytes; ignoring it");
+                None
+            }
+            crate::persist::Bounded::Io(err) => {
                 return Err(
                     anyhow::Error::new(err).context(format!("failed to read {}", file.display()))
                 );
@@ -522,13 +532,19 @@ pub(crate) async fn get_draft(
 }
 
 /// Who wrote the stored draft `id` for `path`: its sidecar's `writer`, else
-/// (no readable sidecar) the draft file's. `None` when neither reads — then
-/// there is nothing a writer could own.
+/// (no readable sidecar) the draft file's. `None` when there is no draft of
+/// ours (missing, oversized, corrupt, another path's) — nothing a writer
+/// could own. A draft file that is there but unreadable is `Some(None)`: an
+/// unknown writer, so a writer-scoped delete leaves it.
 fn stored_writer(root: &Path, id: &str, path: &str) -> Option<Option<String>> {
     if let Some(meta) = read_meta(&meta_file(root, id), id) {
         return Some(meta.writer);
     }
-    let bytes = std::fs::read(draft_file(root, id)).ok()?;
+    let bytes = match crate::persist::read_bounded(&draft_file(root, id), MAX_DRAFT_FILE_BYTES) {
+        crate::persist::Bounded::Ok(bytes) => bytes,
+        crate::persist::Bounded::Io(_) => return Some(None),
+        crate::persist::Bounded::Missing | crate::persist::Bounded::TooLarge => return None,
+    };
     let draft: StoredDraft = serde_json::from_slice(&bytes).ok()?;
     (draft.path == path).then_some(draft.writer)
 }

@@ -97,8 +97,8 @@ pub(crate) fn read_bounded(path: &Path, max_bytes: usize) -> Bounded {
 ///
 /// Lock order: this gate, then the store's `std::sync::Mutex`. Inside a job
 /// the mutex is taken only briefly — never across the job's I/O, never
-/// across an `.await`. (A store's synchronous getters, which bypass the
-/// gate, still stat and read under the mutex.)
+/// across an `.await`. The settings and environment getters bypass the gate
+/// by reading only the cache.
 #[derive(Clone, Default)]
 pub(crate) struct DiskGate(Arc<tokio::sync::Mutex<()>>);
 
@@ -214,6 +214,52 @@ pub(crate) fn look<T: Default>(
         Bounded::Ok(bytes) => parse(&bytes),
     };
     Look::Loaded(data, on_disk)
+}
+
+/// A whole-file store's hold on a state file it can't read (recents,
+/// workspaces, the archive, the ledger, view-state): while held, nothing is
+/// written over the file — an I/O hiccup must never read as "the user
+/// cleared it". Each write retries the read; the store merges what it finds
+/// and calls [`Hold::release`]. One warn per hold, however many writes it
+/// refuses.
+#[derive(Debug, Default)]
+pub(crate) struct Hold {
+    held: bool,
+    logged: bool,
+}
+
+impl Hold {
+    /// `held` with nothing said yet (the ledger is held until its boot read
+    /// lands; that wait is not news).
+    pub(crate) fn new(held: bool) -> Self {
+        Hold {
+            held,
+            logged: false,
+        }
+    }
+
+    pub(crate) fn is_held(&self) -> bool {
+        self.held
+    }
+
+    /// The file can't be read (again): hold, warning once per hold.
+    pub(crate) fn note(&mut self, path: &Path, name: &str, reason: impl std::fmt::Display) {
+        self.held = true;
+        if !self.logged {
+            self.logged = true;
+            tracing::warn!(path = %path.display(), %reason, "{name} unreadable; not writing over it until it reads again");
+        }
+    }
+
+    /// The file read again and was merged: writes go ahead. Logged only for
+    /// a hold that was announced.
+    pub(crate) fn release(&mut self, path: &Path, name: &str) {
+        if self.logged {
+            tracing::info!(path = %path.display(), "{name} readable again; merged");
+        }
+        self.held = false;
+        self.logged = false;
+    }
 }
 
 #[cfg(test)]

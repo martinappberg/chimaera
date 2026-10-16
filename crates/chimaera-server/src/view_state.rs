@@ -3,7 +3,6 @@
 //! object file, `view-state.json`, load-tolerant like `workspaces.json`.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -24,6 +23,62 @@ const MAX_STATE_BYTES: usize = 64 * 1024;
 /// rewritten on every layout change. Live windows re-PUT on every change,
 /// which keeps them newest; the eviction only ever reaches tabs long gone.
 const MAX_KEYS: usize = 128;
+/// Read cap for `view-state.json`: `MAX_KEYS` blobs of `MAX_STATE_BYTES`
+/// is 8 MiB, doubled because a blob is stored re-serialized, not as sent
+/// (a float like `1e15` re-encodes longer), and for the keys and
+/// separators. A file past it is corruption (or a legacy store from before
+/// `MAX_KEYS`): it loads empty — windows fall back to their default layout —
+/// and the next put replaces it.
+pub(crate) const MAX_STATE_FILE_BYTES: usize = 2 * MAX_KEYS * MAX_STATE_BYTES;
+
+type Blobs = Vec<(String, Arc<serde_json::Value>)>;
+
+/// The store's file name, for its log lines.
+const VIEW_STATE_FILE: &str = "view-state.json";
+
+/// One bounded read of `view-state.json`: `Err` when it couldn't be read;
+/// missing, oversized and corrupt are empty (logged).
+fn read_state(
+    path: &std::path::Path,
+) -> Result<serde_json::Map<String, serde_json::Value>, std::io::Error> {
+    Ok(
+        match crate::persist::read_bounded(path, MAX_STATE_FILE_BYTES) {
+            crate::persist::Bounded::Ok(contents) => {
+                match serde_json::from_slice::<serde_json::Value>(&contents) {
+                    Ok(serde_json::Value::Object(map)) => map,
+                    Ok(_) => {
+                        tracing::warn!(path = %path.display(), "view-state.json is not a JSON object; starting with empty view state");
+                        serde_json::Map::new()
+                    }
+                    Err(err) => {
+                        tracing::warn!(path = %path.display(), %err, "corrupt view-state.json; starting with empty view state");
+                        serde_json::Map::new()
+                    }
+                }
+            }
+            crate::persist::Bounded::Missing => serde_json::Map::new(),
+            crate::persist::Bounded::TooLarge => {
+                tracing::warn!(path = %path.display(), "view-state.json exceeds {MAX_STATE_FILE_BYTES} bytes; starting with empty view state");
+                serde_json::Map::new()
+            }
+            crate::persist::Bounded::Io(err) => return Err(err),
+        },
+    )
+}
+
+/// The persist side, behind the one lock every write takes.
+#[derive(Default)]
+struct Writer {
+    /// The last put stamp flushed.
+    last: u64,
+    /// The file is there but can't be read: nothing is written over it.
+    /// Each write retries the read first; once it reads, the hold lifts.
+    hold: crate::persist::Hold,
+    /// What a held file held once it read again, the keys this daemon had
+    /// no value for: every write carries them until the store folds them
+    /// into memory (its next put or get).
+    recovered: Blobs,
+}
 
 /// In-memory key -> JSON value map backed by a single JSON object file
 /// (save-on-change). Values are opaque to the server and shared behind an
@@ -39,34 +94,24 @@ pub(crate) struct ViewStateStore {
     /// its key to the back, so the front is the least recently written.
     recency: VecDeque<String>,
     /// Serializes writers on the blocking pool so a slow NFS rename can never
-    /// let an older snapshot land after a newer one (see [`Self::put`]).
-    writer: Arc<Mutex<u64>>,
+    /// let an older snapshot land after a newer one (see [`Self::put`]), and
+    /// owns the hold on an unreadable file.
+    writer: Arc<Mutex<Writer>>,
     /// Monotonic per-put stamp; the writer records the last one it flushed.
     seq: u64,
 }
 
 impl ViewStateStore {
-    /// Load the store from `path`. A missing or corrupt file yields an empty
-    /// store (with a warning for the corrupt case).
+    /// Load the store from `path` (blocking; boot). A missing, oversized or
+    /// corrupt file yields an empty store (with a warning for the latter
+    /// two); an unreadable one an empty store whose writes are held until
+    /// the file reads again (puts still serve this daemon's windows).
     pub(crate) fn load(path: PathBuf) -> Self {
-        let loaded = match std::fs::read_to_string(&path) {
-            Ok(contents) => match serde_json::from_str::<serde_json::Value>(&contents) {
-                Ok(serde_json::Value::Object(map)) => map,
-                Ok(_) => {
-                    tracing::warn!(path = %path.display(), "view-state.json is not a JSON object; starting with empty view state");
-                    serde_json::Map::new()
-                }
-                Err(err) => {
-                    tracing::warn!(path = %path.display(), %err, "corrupt view-state.json; starting with empty view state");
-                    serde_json::Map::new()
-                }
-            },
-            Err(err) if err.kind() == ErrorKind::NotFound => serde_json::Map::new(),
-            Err(err) => {
-                tracing::warn!(path = %path.display(), %err, "failed to read view-state.json; starting with empty view state");
-                serde_json::Map::new()
-            }
-        };
+        let mut writer = Writer::default();
+        let loaded = read_state(&path).unwrap_or_else(|err| {
+            writer.hold.note(&path, VIEW_STATE_FILE, err);
+            serde_json::Map::new()
+        });
         let items: BTreeMap<String, Arc<serde_json::Value>> = loaded
             .into_iter()
             .map(|(key, value)| (key, Arc::new(value)))
@@ -81,8 +126,31 @@ impl ViewStateStore {
             path,
             recency: items.keys().cloned().collect(),
             items,
-            writer: Arc::new(Mutex::new(0)),
+            writer: Arc::new(Mutex::new(writer)),
             seq: 0,
+        }
+    }
+
+    /// Fold in what a once-held file turned out to hold: keys this daemon
+    /// has no value for, oldest in the eviction order.
+    /// Runs on the reactor (from `get`/`put`), so it never waits on the
+    /// writer: a write in progress holds that lock across its read and
+    /// rename (slow on NFS). When the writer is busy this skips, and the
+    /// next get or put absorbs — meanwhile every write carries the
+    /// recovered keys itself.
+    fn absorb(&mut self) {
+        let mut writer = match self.writer.try_lock() {
+            Ok(writer) => writer,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        };
+        let recovered = std::mem::take(&mut writer.recovered);
+        drop(writer);
+        for (key, value) in recovered.into_iter().rev() {
+            if !self.items.contains_key(&key) {
+                self.recency.push_front(key.clone());
+                self.items.insert(key, value);
+            }
         }
     }
 
@@ -109,6 +177,7 @@ impl ViewStateStore {
     /// reads its blob, and that must keep it out of the eviction queue's
     /// front even when it never edits its layout afterwards.
     pub(crate) fn get(&mut self, key: &str) -> Option<Arc<serde_json::Value>> {
+        self.absorb();
         let value = self.items.get(key).cloned()?;
         self.touch(key);
         Some(value)
@@ -124,12 +193,15 @@ impl ViewStateStore {
     /// both run on the blocking pool (`~/.chimaera` may be NFS, and this
     /// fires on a 500 ms debounce per divider drag, per window — never on
     /// the reactor). Returns the write task so a handler can await the
-    /// outcome.
+    /// outcome. While the file on disk can't be read the write is skipped
+    /// (logged once) and answers `Ok`: view state is reconstructible, and
+    /// the value is in memory for this daemon's windows.
     pub(crate) fn put(
         &mut self,
         key: String,
         value: serde_json::Value,
     ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+        self.absorb();
         self.items.insert(key.clone(), Arc::new(value));
         self.touch(&key);
         self.evict();
@@ -140,21 +212,42 @@ impl ViewStateStore {
         // The snapshot is the key list plus one Arc bump per value;
         // formatting up to MAX_KEYS × MAX_STATE_BYTES of JSON is CPU that
         // belongs on the pool, not on a reactor worker under the store lock.
-        let items: Vec<(String, Arc<serde_json::Value>)> = self
+        let mut items: Blobs = self
             .items
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
         tokio::task::spawn_blocking(move || {
-            let bytes = serialize_items(&items)?;
             // Writers queue on this lock; a snapshot older than the last one
             // flushed is dropped rather than rolling the file back.
-            let mut last = crate::lock(&writer);
-            if seq <= *last {
+            let mut w = crate::lock(&writer);
+            if seq <= w.last {
                 return Ok(());
             }
+            if w.hold.is_held() {
+                match read_state(&path) {
+                    Ok(disk) => {
+                        w.recovered = disk
+                            .into_iter()
+                            .filter(|(key, _)| !items.iter().any(|(k, _)| k == key))
+                            .map(|(key, value)| (key, Arc::new(value)))
+                            .collect();
+                        w.hold.release(&path, VIEW_STATE_FILE);
+                    }
+                    Err(err) => {
+                        w.hold.note(&path, VIEW_STATE_FILE, err);
+                        return Ok(());
+                    }
+                }
+            }
+            for (key, value) in &w.recovered {
+                if !items.iter().any(|(k, _)| k == key) {
+                    items.push((key.clone(), value.clone()));
+                }
+            }
+            let bytes = serialize_items(&items)?;
             crate::persist::atomic_write_json(&path, bytes)?;
-            *last = seq;
+            w.last = seq;
             Ok(())
         })
     }
@@ -219,7 +312,9 @@ pub(crate) async fn get_view_state(
 }
 
 /// PUT /api/v1/view-state/{key} — store any JSON value up to 64KB; 204 on
-/// success.
+/// success, including while the file on disk can't be read (the value is
+/// then kept in memory only — view state is reconstructible, and refusing
+/// would fail every window's layout save for the daemon's life).
 pub(crate) async fn put_view_state(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
@@ -268,6 +363,32 @@ pub(crate) async fn put_view_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `get` runs on the reactor: it must not wait while a write holds the
+    /// writer lock (a slow NFS rename).
+    #[test]
+    fn get_never_waits_on_a_busy_writer() {
+        let mut store = temp_store("busy-writer");
+        store.items.insert("k".into(), Arc::new(json!(1)));
+        let writer = store.writer.clone();
+        let (locked_tx, locked) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _busy = crate::lock(&writer);
+            locked_tx.send(()).unwrap();
+            let _ = released.recv_timeout(std::time::Duration::from_secs(10));
+        });
+        locked.recv().unwrap();
+        let (got_tx, got) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            got_tx.send(store.get("k").map(|v| (*v).clone())).unwrap();
+        });
+        let value = got.recv_timeout(std::time::Duration::from_secs(5));
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        reader.join().unwrap();
+        assert_eq!(value.expect("get waited on the writer"), Some(json!(1)));
+    }
 
     fn got(store: &mut ViewStateStore, key: &str) -> Option<serde_json::Value> {
         store.get(key).map(|value| (*value).clone())
