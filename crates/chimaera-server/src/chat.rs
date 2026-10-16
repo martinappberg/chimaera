@@ -1384,6 +1384,20 @@ pub(crate) struct SwitchView {
     relaunch: bool,
 }
 
+/// A chat opened before its worktree exists has nothing to respawn into
+/// until the checkout ends (`AppState::worktree_setups`).
+fn worktree_still_setting_up(state: &AppState, id: &str) -> Option<Response> {
+    crate::lock(&state.worktree_setups)
+        .contains_key(id)
+        .then(|| {
+            (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "this chat's worktree is still being set up"})),
+            )
+                .into_response()
+        })
+}
+
 /// POST /api/v1/sessions/{id}/view — switch a session between the chat and
 /// terminal surfaces by stopping the current process and resuming the same
 /// conversation in the other mode (same chimaera session id throughout).
@@ -1393,6 +1407,9 @@ pub(crate) async fn switch_view(
     Json(body): Json<SwitchView>,
 ) -> Response {
     let err = |code: StatusCode, msg: String| (code, Json(json!({"error": msg}))).into_response();
+    if let Some(busy) = worktree_still_setting_up(&state, &id) {
+        return busy;
+    }
     if body.ui != "chat" && body.ui != "term" {
         return err(
             StatusCode::BAD_REQUEST,
@@ -1900,6 +1917,9 @@ pub(crate) async fn rewind_session(
     Json(body): Json<RewindBody>,
 ) -> Response {
     let err = |code: StatusCode, msg: String| (code, Json(json!({"error": msg}))).into_response();
+    if let Some(busy) = worktree_still_setting_up(&state, &id) {
+        return busy;
+    }
     let Some(info) = state.chat.get(&id) else {
         return err(
             StatusCode::NOT_FOUND,
@@ -2809,6 +2829,9 @@ pub(crate) async fn fork_session(
     Json(body): Json<ForkBody>,
 ) -> Response {
     let err = |code: StatusCode, msg: String| (code, Json(json!({"error": msg}))).into_response();
+    if let Some(busy) = worktree_still_setting_up(&state, &id) {
+        return busy;
+    }
     let Some(source_info) = state.chat.get(&id) else {
         return err(
             StatusCode::NOT_FOUND,
@@ -3163,8 +3186,14 @@ pub(crate) async fn spawn_fresh_chat_at(
     // Hook injection + theme (claude-only), unless the user's settings pick a
     // theme themselves. Codex needs no files — its MCP injection rides argv.
     let (settings, mcp_config) = if spec.kind == AgentKind::Claude {
+        // A worktree still being checked out has no files yet; its project
+        // settings are its repository's, committed at the same HEAD.
+        let settings_dir = crate::lock(&state.worktree_setups)
+            .get(&id)
+            .map_or_else(|| root.clone(), |setup| setup.mirrors.clone());
         let (theme_set, user_statusline) =
-            crate::runtimes::claude_settings_gates(&state.claude_settings_path, &root).await;
+            crate::runtimes::claude_settings_gates(&state.claude_settings_path, &settings_dir)
+                .await;
         let settings_theme = (!theme_set).then_some(spec.theme.as_str());
         let plugin_tools = crate::plugins::spawn_allow(state, &workspace.id).await;
         let s = crate::agents::write_settings(
@@ -3477,6 +3506,11 @@ pub(crate) async fn spawn_chat_session(
     let argv = crate::launcher::wrap_login_shell(&crate::launcher::login_shell(), argv);
     let mut spec =
         chimaera_agent::driver::SpawnSpec::new(id.clone(), argv, recipe.workspace_root.clone());
+    // A chat whose worktree is still being checked out starts its driver
+    // now and its process once the folder exists.
+    spec.start_gate = crate::lock(&state.worktree_setups)
+        .get(&id)
+        .map(|setup| setup.gate.clone());
     // A driver respawn is a real spawn: re-materialize the environment
     // prelude (picks up config edits; the login-wrapper sources it).
     let prelude = crate::environment::materialize_prelude(
