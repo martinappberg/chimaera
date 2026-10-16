@@ -756,8 +756,9 @@ pub(crate) fn installation_status(state: &AppState, kind: AgentKind) -> Option<s
 }
 
 /// Watch an install session; when it ends, re-detect that agent (bypassing
-/// the daemon-lifetime cache) and regenerate the shims so the next spawn —
-/// and the open popover, via the change notification — sees the new binary.
+/// the daemon-lifetime cache, `launcher::verify`) and regenerate the shims so
+/// the next spawn — and the open popover, via the change notification — sees
+/// the new binary.
 fn spawn_install_watch(
     state: Arc<AppState>,
     kind: AgentKind,
@@ -776,7 +777,9 @@ fn spawn_install_watch(
             prune_install_versions(state.managed_root.clone(), kind).await;
         }
         drop(install_lock);
-        let detection = crate::launcher::detect(&state, kind, true).await;
+        // Someone is watching this pane: give a slow login shell the patient
+        // budget rather than calling a fresh install missing.
+        let detection = crate::launcher::verify(&state, kind).await;
         tracing::info!(
             agent = kind.as_str(),
             installed = detection.path.is_ok(),
@@ -912,6 +915,7 @@ pub(crate) async fn uninstall_agent(
     // The shim for it now disappears (unless an explicit path keeps it), and the
     // detection cache must forget the managed binary.
     regenerate_shims(&state);
+    crate::lock(&state.agent_bins).remove(&kind);
     state.changes.notify_waiters();
     Json(json!({"removed": removed})).into_response()
 }
@@ -1043,10 +1047,13 @@ pub(crate) fn explicit_agent_paths(state: &AppState) -> HashMap<AgentKind, Strin
     map
 }
 
-/// Regenerate the shims from current settings + managed installs, and drop the
-/// agent detection cache so the next spawn re-resolves. Called at daemon start
-/// and after anything that changes resolution: an install, an uninstall, or a
-/// settings edit to `agents.*.path`.
+/// Regenerate the shims from current settings + managed installs. Called at
+/// daemon start and after anything that changes resolution: an install, an
+/// uninstall, or a settings edit to `agents.*.path`. It leaves the detection
+/// cache alone: each caller forgets exactly what it changed (an install's own
+/// check re-detects its agent), because a dropped hit is re-probed through the
+/// login shell — on a slow host, every installed agent would read "couldn't
+/// check" after any one install.
 pub(crate) fn regenerate_shims(state: &AppState) {
     let explicit = explicit_agent_paths(state);
     if let Err(err) = write_shims_for(
@@ -1056,9 +1063,6 @@ pub(crate) fn regenerate_shims(state: &AppState) {
     ) {
         tracing::warn!(%err, "failed to regenerate shims");
     }
-    // The next detection must see the new world (a removed managed binary, a
-    // new explicit path), so clear the daemon-lifetime cache.
-    crate::lock(&state.agent_bins).clear();
 }
 
 /// Generate `~/.chimaera/shims/*`: called at daemon start and after every

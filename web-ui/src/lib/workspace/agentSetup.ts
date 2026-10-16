@@ -9,11 +9,19 @@ const SETUP_AGENTS: ReadonlySet<string> = new Set(Object.keys(AGENT_PRODUCT_NAME
 
 export type SetupAction = "install" | "update" | "reinstall";
 export interface SetupRequest { agent: AgentInfo; workspaceId: string; action: SetupAction; showResult: boolean }
+/** What the daemon found when it looked for the executable after a clean
+ *  installer exit; null while running, or when the installer failed. Only
+ *  `found` is a success: `unchecked` means the login shell couldn't answer. */
+export type SetupVerified =
+  | { state: "found"; path: string; version: string | null }
+  | { state: "unchecked"; reason: string }
+  | { state: "missing" };
 export interface SetupProgress extends OperationProgress {
   action: SetupAction;
   exit_status: number | null;
   output: string;
   truncated: boolean;
+  verified?: SetupVerified | null;
 }
 export interface SetupDetails { host: string; root: string; operation: SetupProgress | null }
 export const agentSetup = writable<SetupRequest | null>(null);

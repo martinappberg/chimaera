@@ -12,7 +12,8 @@ ended conversations.
 sessions.ts}` + the rail/split-button in `web-ui/src/App.svelte`. Daemon:
 `crates/chimaera-server/src/{api/sessions.rs,launcher.rs,agents.rs,runtimes.rs,agent_setup.rs,operation.rs,agent_state.rs,
 spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /api/v1/agents`,
-`POST/DELETE /api/v1/agents/{id}/install`, `GET /api/v1/agents/claude/sessions`,
+`POST/DELETE /api/v1/agents/{id}/install`, `POST /api/v1/agents/{id}/detect`,
+`GET /api/v1/agents/claude/sessions`,
 `GET /api/v1/recents`, `POST /agent-events/{id}?key=`, and `/ws/events` for the roster.
 
 ## Your existing agent setup
@@ -48,8 +49,12 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   `-lc` — the claude installer's PATH line lives in `.zshrc`, and `claude` isn't on the
   non-interactive ssh PATH on HPC nodes), then the daemon's inherited PATH, well-known prefixes,
   and the managed bin dir. Fallback requires a completed shell probe; a timeout or startup failure
-  asks the user to retry or set an explicit executable in Settings. A runnable explicit path wins
-  without probing the shell; a
+  asks the user to retry or set an explicit executable in Settings. The catalog row then carries
+  `unchecked` (the shell's failure in plain words, e.g. "Your login shell (/bin/zsh) took longer
+  than 6 seconds to start.") and every surface reads it as *couldn't check* with a Retry, never as
+  not installed with an Install. Retry is `POST /api/v1/agents/{id}/detect`: the same resolution
+  with a 30 s shell budget (`launcher::verify`; spawns keep 6 s), answering what the row will say.
+  A runnable explicit path wins without probing the shell; a
   hit is cached for the daemon's life, a miss for 90 s (`launcher::MISS_TTL`, so a catalog read
   with uninstalled agents doesn't pay the login-shell probe each time) — the launcher's own
   refresh, a runnable explicit path and a landed managed install see past it, and a changed path
@@ -71,12 +76,14 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   (chat or terminal); ⌘/Ctrl-click starts it in the terminal. The same default is what ⇧⌘E and the
   dashboard's **+ new agent** start. With the worktree switch on, the row shows a branch glyph. A
   default that can't start keeps the row with a small accent step instead of spawning a doomed
-  pane: **install** (curated install, opens the setup dialog), **set up chat**, or **set up** (no
-  curated install → Settings → Agents).
+  pane: **retry** (the login shell couldn't say whether it's installed; looks again, never
+  installs, and never starts the agent half a minute later), **install** (curated install, opens
+  the setup dialog), **set up chat**, or **set up** (no curated install → Settings → Agents).
 - **The agent menu.** The chevron opens it on hover, click, or ArrowDown. The installed agents
   come first, the saved default leading (no built-in bias); the ones not installed stay folded
   behind one *other agents* row (remembered open/closed), and with nothing installed every agent
-  shows. Each row is one line: glyph, name, version in mono (binary + path in the tooltip; a dated
+  shows. One the login shell couldn't check stays up front — it may well be installed — reading
+  *couldn't check* (the reason in its tooltip) with a **retry** chip. Each row is one line: glyph, name, version in mono (binary + path in the tooltip; a dated
   build such as Cursor's `2026.10.14-941492e` reads as its date), `→ <new>` when a newer release is
   known, and a terminal glyph that fades in on hover — the row itself opens the chat — or, when
   not ready, *not installed* / *needs an update* / *chat needs setup* with an install/update/set-up
@@ -118,7 +125,15 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   and the exit code when available; Retry is explicit. Storage/quota, permission, and incompatible
   system-library failures explain what to fix. Results last until the daemon restarts; a lost
   connection is unknown status, never success.
-- **Installation is one step.** A zero installer exit code says files were installed, not that
+- **An install is checked, not assumed.** A zero installer exit code is followed by a look for the
+  executable with the 30 s shell budget (`launcher::verify`); only a found one is a success, and the
+  result (`verified` on the operation) shows the version and the path new sessions will run —
+  which can be your own copy, by the usual resolution order. A completed look that finds nothing
+  fails the install. A login shell that couldn't answer fails it with *Couldn't check* and its
+  reason, offering **Check again** (not another install); a later look that finds the executable
+  — that button, a Retry elsewhere, a spawn — turns the result into a success
+  (`agent_setup::confirm`), so Settings stops saying it needs attention.
+- **Installation is one step.** A found executable says files were installed, not that
   the account is signed in or structured chat works. Afterward the dialog shows the agent's
   [sign-in card](#sign-in) unless the CLI already reports a login (then "Signed in. Open chat
   when you're ready."); Open chat starts a chat using the account on the host, and a chat started

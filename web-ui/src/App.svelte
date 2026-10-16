@@ -77,6 +77,7 @@
     listAgents,
     listRecents,
     primaryStart,
+    recheckAgent,
     relativeAge,
     setAgentDefault,
     type AgentInfo,
@@ -4045,14 +4046,28 @@
     void spawnSession("shell");
   }
 
+  /** The rail's default whose login-shell check is being retried. */
+  let railRechecking = $state(false);
+
   /** One rail quick start: spawn that agent instantly in the default view
    *  (`term` = the ⌘/ctrl-click terminal path) — or, when it could only open
-   *  a doomed pane, the step that unblocks it: the curated install / chat
-   *  setup (managed runtimes) or Settings → Agents. A quick start does NOT
-   *  change the saved default: the rows never reorder under the pointer;
-   *  choosing in the launcher menu is what moves the primary. */
+   *  a doomed pane, the step that unblocks it: a retry of a check the login
+   *  shell couldn't finish, the curated install / chat setup (managed
+   *  runtimes) or Settings → Agents. A quick start does NOT change the saved
+   *  default: the rows never reorder under the pointer; choosing in the
+   *  launcher menu is what moves the primary. */
   function quickStart(q: PrimaryStart, term = false): void {
     launcherOpen = false;
+    if (q.action === "check") {
+      // Look again only: a start that lands half a minute later would
+      // surprise. The row reads ready once the check finds it.
+      if (railRechecking) return;
+      railRechecking = true;
+      void recheckAgent(q.id)
+        .catch(() => {})
+        .finally(() => (railRechecking = false));
+      return;
+    }
     if (term && q.info?.installed !== false) {
       void spawnSession("agent", { agent: q.id, ui: "term" });
       return;
@@ -5912,7 +5927,9 @@
                 class="row new quick-start"
                 class:want-setup={q.action !== "start"}
                 data-agent={q.id}
-                title={q.action === "install"
+                title={q.action === "check"
+                  ? `couldn't check ${q.name}: ${q.info?.unchecked ?? "your login shell didn't answer."} Click to check again.`
+                  : q.action === "install"
                   ? `install ${q.name}`
                   : q.action === "setup-chat"
                     ? `set up chat for ${q.name}`
@@ -5940,7 +5957,15 @@
                 {/if}
                 {#if q.action !== "start"}
                   <span class="new-need"
-                    >{q.action === "install" ? "install" : q.action === "setup-chat" ? "set up chat" : "set up"}</span
+                    >{q.action === "check"
+                      ? railRechecking
+                        ? "checking…"
+                        : "retry"
+                      : q.action === "install"
+                        ? "install"
+                        : q.action === "setup-chat"
+                          ? "set up chat"
+                          : "set up"}</span
                   >
                 {/if}
               </button>

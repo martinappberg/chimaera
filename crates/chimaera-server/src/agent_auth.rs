@@ -1291,6 +1291,7 @@ mod tests {
                 managed: false,
                 explicit: false,
                 mtime: None,
+                unchecked: None,
             },
         );
         // Prints a URL and a device code, then waits for the pasted code.

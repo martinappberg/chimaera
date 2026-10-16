@@ -155,13 +155,14 @@ pub(crate) struct AppState {
     /// cached per agent for the daemon's lifetime;
     /// `GET /api/v1/agents?refresh=true` bypasses and refills it.
     pub(crate) agent_bins: Mutex<HashMap<agents::AgentKind, launcher::AgentDetection>>,
-    /// Recent detection MISSES (the reason + when), served only to the
-    /// catalog read (`launcher::detect_for_catalog`, `GET /agents` without
-    /// `refresh`) for `launcher::MISS_TTL`, so a launcher paint or a Settings
-    /// poll doesn't re-run a login shell per uninstalled agent. Spawns and
-    /// refreshes always probe (a refresh that misses re-stamps it); forgotten
-    /// by a changed `agents.<id>.path`, Extensions' re-check, and the next hit.
-    pub(crate) agent_misses: Mutex<HashMap<agents::AgentKind, (String, Instant)>>,
+    /// Recent detection MISSES (the reason, whether the login shell couldn't
+    /// answer, and when), served only to the catalog read
+    /// (`launcher::detect_for_catalog`, `GET /agents` without `refresh`) for
+    /// `launcher::MISS_TTL`, so a launcher paint or a Settings poll doesn't
+    /// re-run a login shell per uninstalled agent. Spawns and refreshes always
+    /// probe (a refresh that misses re-stamps it); forgotten by a changed
+    /// `agents.<id>.path`, Extensions' re-check, and the next hit.
+    pub(crate) agent_misses: Mutex<HashMap<agents::AgentKind, (launcher::Unresolved, Instant)>>,
     /// Root of Claude Code's per-project transcript store, normally
     /// `~/.claude/projects`; tests point it at a fixture dir.
     pub(crate) claude_projects_dir: PathBuf,

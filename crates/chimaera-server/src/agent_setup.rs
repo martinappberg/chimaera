@@ -1,10 +1,14 @@
 //! Noninteractive managed installs. One bounded result per built-in provider,
 //! shared host install locks, and no PTY/session/ledger entries. Account and
-//! chat readiness are deliberately not inferred from an installer exit code.
+//! chat readiness are deliberately not inferred from an installer exit code,
+//! and neither is the install: a clean exit is followed by a patient look for
+//! the executable (`verified`), and only a found one is a success.
 //! The operation itself — join, cancel, output cap, the process loop — is
 //! `operation`'s; this module owns the install script, the words and the
 //! shared install lock.
 use std::{path::PathBuf, sync::Arc, time::Duration};
+
+use futures::future::BoxFuture;
 
 use axum::{
     extract::{Path, State},
@@ -17,6 +21,7 @@ use serde_json::json;
 
 use crate::{
     agents::AgentKind,
+    launcher::AgentDetection,
     lock,
     operation::{self, CancelRefused, Exit, OutputEnd, Phase, Run, Stdin},
     AppState,
@@ -45,7 +50,29 @@ pub(crate) struct Progress {
     message: String,
     output: String,
     truncated: bool,
+    /// What the look after a clean installer exit found; `None` while it
+    /// runs, and when the installer failed or was cancelled.
+    verified: Option<Verified>,
 }
+
+/// The check that decides an install's outcome.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub(crate) enum Verified {
+    /// The executable new sessions will run (the user's own copy can win
+    /// over the one just installed: the usual resolution order decides).
+    Found {
+        path: PathBuf,
+        version: Option<String>,
+    },
+    /// The login shell couldn't answer (`reason`, plain words): the install
+    /// may well be fine. A later check that finds it confirms it
+    /// ([`confirm`]).
+    Unchecked { reason: String },
+    /// A completed look found no executable.
+    Missing,
+}
+
 impl operation::Progress for Progress {
     fn id(&self) -> &str {
         &self.id
@@ -138,7 +165,15 @@ pub(crate) async fn start(
             "This agent has no managed installer.",
         );
     };
-    start_script(state, kind, workspace.root, body, script).await
+    start_script(state, kind, workspace.root, body, script, look_patiently).await
+}
+
+/// How a clean exit is checked: `launcher::verify` here; tests pass a stand-in
+/// so a verdict never depends on what the test host has installed.
+type Look = fn(Arc<AppState>, AgentKind) -> BoxFuture<'static, AgentDetection>;
+
+fn look_patiently(state: Arc<AppState>, kind: AgentKind) -> BoxFuture<'static, AgentDetection> {
+    Box::pin(async move { crate::launcher::verify(&state, kind).await })
 }
 
 async fn start_script(
@@ -147,6 +182,7 @@ async fn start_script(
     cwd: PathBuf,
     body: Request,
     script: String,
+    look: Look,
 ) -> Response {
     let install_lock = match crate::runtimes::lock_install(&state.managed_root, kind).await {
         Ok(file) => file,
@@ -167,6 +203,7 @@ async fn start_script(
         message: "Downloading and installing the official release…".into(),
         output: String::new(),
         truncated: false,
+        verified: None,
     };
     // Decided under the lock, after the await above: an exceptionally fast
     // first call can already have finished and released the install lock
@@ -177,14 +214,22 @@ async fn start_script(
     };
     tokio::spawn(async move {
         crate::runtimes::prune_install_versions(state.managed_root.clone(), kind).await;
-        let (phase, code, message) = run(&state, &operation, cwd, script).await;
+        let (mut phase, code, mut message) = run(&state, &operation, cwd, script).await;
         if phase == Phase::Succeeded {
             crate::runtimes::prune_install_versions(state.managed_root.clone(), kind).await;
         }
-        operation.set_message("Refreshing the installed version…");
         // Keep the shared lock through detection; there must be no false
         // completion while a competing workspace changes the executable.
-        crate::launcher::detect(&state, kind, true).await;
+        let verified = if phase == Phase::Succeeded {
+            operation.set_message("Checking the installation…");
+            let (checked, words, verified) = verdict(kind, look(state.clone(), kind).await);
+            (phase, message) = (checked, words);
+            Some(verified)
+        } else {
+            operation.set_message("Refreshing the installed version…");
+            crate::launcher::detect(&state, kind, true).await;
+            None
+        };
         let update = state.clone();
         let _ =
             tokio::task::spawn_blocking(move || crate::runtimes::regenerate_shims(&update)).await;
@@ -193,6 +238,7 @@ async fn start_script(
             p.phase = phase;
             p.exit_status = code;
             p.message = message;
+            p.verified = verified;
         });
         state.changes.notify_waiters();
     });
@@ -252,11 +298,8 @@ async fn run(
             None,
             format!("Could not start the installer: {err}"),
         ),
-        Exit::Exited(Some(0)) => (
-            Phase::Succeeded,
-            Some(0),
-            "Installation finished. Sign-in and chat have not been checked.".into(),
-        ),
+        // Provisional: `verdict` decides once the executable is looked for.
+        Exit::Exited(Some(0)) => (Phase::Succeeded, Some(0), String::new()),
         Exit::Exited(code) => (
             Phase::Failed,
             code,
@@ -274,6 +317,66 @@ async fn run(
         ),
     }
 }
+/// A clean installer exit is a success only once the executable is found.
+/// A login shell that couldn't answer fails the operation — it needs
+/// attention — but with a retry of the check, not of the install.
+fn verdict(kind: AgentKind, found: AgentDetection) -> (Phase, String, Verified) {
+    let name = kind.product_name();
+    match (found.path, found.unchecked) {
+        (Ok(path), _) => (
+            Phase::Succeeded,
+            installed(kind),
+            Verified::Found {
+                path,
+                version: found.version,
+            },
+        ),
+        (Err(_), Some(reason)) => (
+            Phase::Failed,
+            format!("The installer finished, but Chimaera couldn't check where {name} is. {reason}"),
+            Verified::Unchecked { reason },
+        ),
+        (Err(_), None) => (
+            Phase::Failed,
+            format!("The installer finished, but {name} still can't be found. Review the output below, then retry."),
+            Verified::Missing,
+        ),
+    }
+}
+
+/// Found is all a success says: an account and chat are separate checks.
+fn installed(kind: AgentKind) -> String {
+    format!(
+        "{} is installed. Sign-in and chat have not been checked.",
+        kind.product_name()
+    )
+}
+
+/// A later look found the executable an install couldn't check: its result
+/// now says so, wherever it is shown. Only a finished, unchecked result
+/// changes; never a running operation or a verdict already reached.
+pub(crate) fn confirm(state: &AppState, kind: AgentKind, found: &AgentDetection) {
+    let Ok(path) = &found.path else { return };
+    let Some(operation) = state.agent_setup.get(kind) else {
+        return;
+    };
+    let confirmed = operation.update(|p| {
+        if !matches!(p.verified, Some(Verified::Unchecked { .. })) {
+            return false;
+        }
+        p.phase = Phase::Succeeded;
+        p.message = installed(kind);
+        p.verified = Some(Verified::Found {
+            path: path.clone(),
+            version: found.version.clone(),
+        });
+        true
+    });
+    if confirmed {
+        state.changes.notify_waiters();
+    }
+}
+
 fn failure_hint(output: &str) -> &'static str {
     let lower = output.to_ascii_lowercase();
     if lower.contains("no space left") || lower.contains("disk quota") {
@@ -316,6 +419,30 @@ mod tests {
             request_id: id.into(),
         }
     }
+    fn detection(path: Result<PathBuf, String>, unchecked: Option<&str>) -> AgentDetection {
+        AgentDetection {
+            path,
+            version: Some("codex-cli 9.9.9".into()),
+            managed: true,
+            explicit: false,
+            mtime: None,
+            unchecked: unchecked.map(str::to_string),
+        }
+    }
+    fn found(_: Arc<AppState>, _: AgentKind) -> BoxFuture<'static, AgentDetection> {
+        Box::pin(async { detection(Ok("/fixture/codex".into()), None) })
+    }
+    fn unchecked(_: Arc<AppState>, _: AgentKind) -> BoxFuture<'static, AgentDetection> {
+        Box::pin(async {
+            detection(
+                Err("login shell `/bin/zsh` timed out".into()),
+                Some("Your login shell (/bin/zsh) took longer than 30 seconds to start."),
+            )
+        })
+    }
+    fn missing(_: Arc<AppState>, _: AgentKind) -> BoxFuture<'static, AgentDetection> {
+        Box::pin(async { detection(Err("codex not found".into()), None) })
+    }
     async fn completed(state: &AppState) -> Progress {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -337,6 +464,7 @@ mod tests {
             "/tmp".into(),
             request("one"),
             "echo 'No space left on device' >&2; exit 23".into(),
+            found,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -356,6 +484,7 @@ mod tests {
             "/tmp".into(),
             request("one"),
             "trap 'echo cleanup' EXIT; echo started; sleep 120".into(),
+            found,
         )
         .await;
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -375,6 +504,7 @@ mod tests {
             "/tmp".into(),
             request("two"),
             "echo WRONG".into(),
+            found,
         )
         .await;
         assert_eq!(snapshot(&state, AgentKind::Codex).unwrap().id, "one");
@@ -395,6 +525,7 @@ mod tests {
             "/tmp".into(),
             request("one"),
             "head -c 100000 /dev/zero | tr '\\0' x; echo end".into(),
+            found,
         )
         .await;
         let p = completed(&state).await;
@@ -409,9 +540,124 @@ mod tests {
             "/tmp".into(),
             request("one"),
             "echo WRONG; exit 9".into(),
+            found,
         )
         .await;
         assert_eq!(snapshot(&state, AgentKind::Codex).unwrap().output, p.output);
+    }
+    #[tokio::test]
+    async fn a_clean_exit_succeeds_only_once_the_executable_is_found() {
+        let state = state();
+        start_script(
+            state.clone(),
+            AgentKind::Codex,
+            "/tmp".into(),
+            request("one"),
+            "exit 0".into(),
+            found,
+        )
+        .await;
+        let p = completed(&state).await;
+        assert!(p.phase == Phase::Succeeded);
+        assert_eq!(
+            p.verified,
+            Some(Verified::Found {
+                path: "/fixture/codex".into(),
+                version: Some("codex-cli 9.9.9".into())
+            })
+        );
+
+        let state = self::state();
+        start_script(
+            state.clone(),
+            AgentKind::Codex,
+            "/tmp".into(),
+            request("two"),
+            "exit 0".into(),
+            missing,
+        )
+        .await;
+        let p = completed(&state).await;
+        assert!(p.phase == Phase::Failed);
+        assert_eq!(p.exit_status, Some(0));
+        assert_eq!(p.verified, Some(Verified::Missing));
+        assert!(p.message.contains("still can't be found"));
+
+        // A failed installer is never looked for: nothing is verified.
+        let state = self::state();
+        start_script(
+            state.clone(),
+            AgentKind::Codex,
+            "/tmp".into(),
+            request("three"),
+            "exit 3".into(),
+            found,
+        )
+        .await;
+        assert_eq!(completed(&state).await.verified, None);
+    }
+    #[tokio::test]
+    async fn a_shell_that_cannot_answer_reads_as_unchecked_until_a_later_look_finds_it() {
+        let state = state();
+        start_script(
+            state.clone(),
+            AgentKind::Codex,
+            "/tmp".into(),
+            request("one"),
+            "exit 0".into(),
+            unchecked,
+        )
+        .await;
+        let p = completed(&state).await;
+        assert!(p.phase == Phase::Failed);
+        assert!(p.message.contains("took longer than 30 seconds"));
+        assert!(matches!(p.verified, Some(Verified::Unchecked { .. })));
+        assert_eq!(
+            summary(&state, AgentKind::Codex).unwrap()["phase"],
+            "failed"
+        );
+
+        // A later look that also can't answer changes nothing.
+        confirm(
+            &state,
+            AgentKind::Codex,
+            &detection(Err("again".into()), Some("again")),
+        );
+        assert!(snapshot(&state, AgentKind::Codex).unwrap().phase == Phase::Failed);
+        // One that finds it confirms the install, wherever it is shown.
+        confirm(
+            &state,
+            AgentKind::Codex,
+            &detection(Ok("/later/codex".into()), None),
+        );
+        let p = snapshot(&state, AgentKind::Codex).unwrap();
+        assert!(p.phase == Phase::Succeeded);
+        assert!(
+            matches!(p.verified, Some(Verified::Found { ref path, .. }) if path == std::path::Path::new("/later/codex"))
+        );
+        assert_eq!(p.exit_status, Some(0));
+
+        // A missing result is a verdict, not a pending check.
+        let state = self::state();
+        start_script(
+            state.clone(),
+            AgentKind::Codex,
+            "/tmp".into(),
+            request("two"),
+            "exit 0".into(),
+            missing,
+        )
+        .await;
+        completed(&state).await;
+        confirm(
+            &state,
+            AgentKind::Codex,
+            &detection(Ok("/later/codex".into()), None),
+        );
+        assert_eq!(
+            snapshot(&state, AgentKind::Codex).unwrap().verified,
+            Some(Verified::Missing)
+        );
     }
     #[test]
     fn incompatible_libraries_do_not_offer_an_unhelpful_retry() {

@@ -18,6 +18,17 @@ describe("extensible agent catalog", () => {
     expect(rows[0].models).toEqual([{id:"a",label:"A"}]);
     expect(normalizeAgentCatalog(Array.from({length:100},(_,i)=>({id:`plugin/${i}`})))).toHaveLength(64);
   });
+  it("tells a check the login shell couldn't finish from a missing agent", () => {
+    const [slow, missing, installed] = normalizeAgentCatalog([
+      { id: "claude", installed: false, unchecked: "Your login shell (/bin/zsh) took longer than 6 seconds to start." },
+      { id: "codex", installed: false },
+      { id: "grok", installed: true, unchecked: "stale" },
+    ]);
+    expect(slow.unchecked).toBe("Your login shell (/bin/zsh) took longer than 6 seconds to start.");
+    expect(missing.unchecked).toBeNull();
+    // A found executable is never "couldn't check".
+    expect(installed.unchecked).toBeNull();
+  });
   it("carries the daemon's sign-in verdict and descriptor, unknown when absent", () => {
     const [agent] = normalizeAgentCatalog([{id:"cursor", installed:true, signed_in:false, sign_in:{how:"browser", command:"cursor-agent login", accepts_code:false, operation:{id:"op-1", running:true, phase:"running"}}}]);
     expect(agent.signedIn).toBe(false);
