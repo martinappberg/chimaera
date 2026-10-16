@@ -122,19 +122,75 @@ pub async fn ensure_local_daemon() -> anyhow::Result<LocalDaemon> {
     )
 }
 
+/// Why an explicit local-daemon update failed, which decides what is left
+/// running: the old daemon (the stop failed), or nothing yet.
+#[derive(Debug)]
+pub enum UpdateFailure {
+    /// The old daemon refused to stop and is still serving.
+    StopFailed(anyhow::Error),
+    /// The old daemon stopped (or was never found) and no new one came up.
+    RespawnFailed(anyhow::Error),
+}
+
+/// A failed update, after recovery: `kept_old` says the app's current
+/// `LocalDaemon` is still the live one; otherwise no local daemon answered
+/// even after one more start, and the old port is dead.
+#[derive(Debug)]
+pub struct UpdateError {
+    pub kept_old: bool,
+    pub message: String,
+}
+
 /// Explicit local-daemon update (the home screen affordance): gracefully
 /// stop whatever is running — regardless of session count; the affordance
-/// says what it ends — and bring up a fresh daemon of our build.
+/// says what it ends — and bring up a fresh daemon of our build. A respawn
+/// that fails after the stop gets one more `ensure_local_daemon`, so the app
+/// is never left pointing at a stopped daemon's port without saying so.
+pub async fn update_local_daemon() -> Result<LocalDaemon, UpdateError> {
+    recover_update(update_once(), ensure_local_daemon).await
+}
+
+/// The recovery policy, over injectable steps (tested with fakes).
+pub(crate) async fn recover_update<U, E, F>(
+    update: U,
+    ensure: E,
+) -> Result<LocalDaemon, UpdateError>
+where
+    U: std::future::Future<Output = Result<LocalDaemon, UpdateFailure>>,
+    E: FnOnce() -> F,
+    F: std::future::Future<Output = anyhow::Result<LocalDaemon>>,
+{
+    match update.await {
+        Ok(fresh) => Ok(fresh),
+        Err(UpdateFailure::StopFailed(e)) => Err(UpdateError {
+            kept_old: true,
+            message: format!("{e:#}"),
+        }),
+        Err(UpdateFailure::RespawnFailed(first)) => {
+            tracing::warn!("local daemon did not come back after the update ({first:#}); retrying");
+            ensure().await.map_err(|second| UpdateError {
+                kept_old: false,
+                message: format!(
+                    "the local daemon stopped for the update and could not be started again \
+                     ({second:#}); quit and reopen chimaera"
+                ),
+            })
+        }
+    }
+}
+
 #[cfg(unix)]
-pub async fn update_local_daemon() -> anyhow::Result<LocalDaemon> {
+async fn update_once() -> Result<LocalDaemon, UpdateFailure> {
     if let Some(m) = probe().await {
         if chimaera_core::builds_match(chimaera_core::BUILD_ID, m.build.as_deref()) {
             // Already ours (updated elsewhere since the UI last looked).
             return Ok(attached(m, false, None));
         }
-        stop_local(&m).await?;
+        stop_local(&m).await.map_err(UpdateFailure::StopFailed)?;
     }
-    ensure_local_daemon().await
+    ensure_local_daemon()
+        .await
+        .map_err(UpdateFailure::RespawnFailed)
 }
 
 // On Windows the local daemon is the Linux musl binary inside WSL2; the wsl
@@ -147,9 +203,14 @@ pub async fn ensure_local_daemon() -> anyhow::Result<LocalDaemon> {
     crate::wsl::adopt_daemon().await
 }
 
+/// The WSL engine does not say whether the old daemon stopped; adopting is
+/// safe either way (it attaches whatever is running), so every failure is
+/// treated as a failed respawn and retried once.
 #[cfg(windows)]
-pub async fn update_local_daemon() -> anyhow::Result<LocalDaemon> {
-    crate::wsl::update_daemon(&|_| {}).await
+async fn update_once() -> Result<LocalDaemon, UpdateFailure> {
+    crate::wsl::update_daemon(&|_| {})
+        .await
+        .map_err(UpdateFailure::RespawnFailed)
 }
 
 /// Manifest → LocalDaemon, shared by the unix adopt path and the WSL engine.
@@ -257,12 +318,130 @@ fn spawn_detached() -> anyhow::Result<()> {
         .with_context(|| format!("failed to open {}", log.display()))?;
     let err = out.try_clone()?;
     tracing::info!("starting local daemon: {} --daemon", exe.display());
+    daemon_command(&exe, crate::askpass::user_askpass_env())
+        .stdout(out)
+        .stderr(err)
+        .spawn()?;
+    Ok(())
+}
+
+/// The daemon's command line and environment. The app exports its askpass
+/// wiring for its OWN ssh children; the daemon (and every terminal and agent
+/// it starts) must not inherit it, or their ssh would prompt through the
+/// app's modal and any agent could raise a native prompt for a real host.
+/// The user's own askpass settings from before the app's (`user`) go back.
+#[cfg(unix)]
+fn daemon_command(exe: &std::path::Path, user: &[(String, String)]) -> std::process::Command {
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("--daemon")
         .stdin(std::process::Stdio::null())
-        .stdout(out)
-        .stderr(err)
         .process_group(0);
-    cmd.spawn()?;
-    Ok(())
+    for key in crate::askpass::APP_ASKPASS_ENV {
+        cmd.env_remove(key);
+    }
+    for (key, value) in user {
+        cmd.env(key, value);
+    }
+    cmd
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn daemon(port: u16) -> LocalDaemon {
+        LocalDaemon {
+            port,
+            token: "t".into(),
+            build: None,
+            outdated: false,
+            live_sessions: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_daemon_never_inherits_the_apps_askpass_wiring() {
+        let cmd = daemon_command(std::path::Path::new("/opt/chimaera"), &[]);
+        let envs: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        for key in crate::askpass::APP_ASKPASS_ENV {
+            assert_eq!(
+                envs.get(std::ffi::OsStr::new(key)),
+                Some(&None),
+                "{key} must be removed"
+            );
+        }
+        assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["--daemon"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_users_own_askpass_reaches_the_daemon_instead_of_the_apps() {
+        let user = [
+            (
+                "SSH_ASKPASS".to_string(),
+                "/usr/libexec/ssh-askpass".to_string(),
+            ),
+            ("SSH_ASKPASS_REQUIRE".to_string(), "prefer".to_string()),
+        ];
+        let cmd = daemon_command(std::path::Path::new("/opt/chimaera"), &user);
+        let envs: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        let get = |k: &str| envs.get(std::ffi::OsStr::new(k)).cloned();
+        assert_eq!(
+            get("SSH_ASKPASS"),
+            Some(Some(std::ffi::OsStr::new("/usr/libexec/ssh-askpass")))
+        );
+        assert_eq!(
+            get("SSH_ASKPASS_REQUIRE"),
+            Some(Some(std::ffi::OsStr::new("prefer")))
+        );
+        assert_eq!(get("CHIMAERA_ASKPASS_SOCK"), Some(None));
+    }
+
+    #[tokio::test]
+    async fn a_failed_respawn_is_retried_once_and_a_failed_stop_keeps_the_old_daemon() {
+        // Stop refused: the old daemon still serves; nothing is restarted.
+        let ensured = std::cell::Cell::new(false);
+        let out = recover_update(
+            async { Err(UpdateFailure::StopFailed(anyhow::anyhow!("busy"))) },
+            || {
+                ensured.set(true);
+                async { Ok(daemon(2)) }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(out.kept_old);
+        assert!(!ensured.get(), "a running old daemon is not replaced again");
+
+        // Stopped, respawn failed, the retry brings one up: use it.
+        let out = recover_update(
+            async { Err(UpdateFailure::RespawnFailed(anyhow::anyhow!("slow"))) },
+            || async { Ok(daemon(3)) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.port, 3);
+
+        // Stopped and nothing comes back: say so, never "the old one serves".
+        let out = recover_update(
+            async { Err(UpdateFailure::RespawnFailed(anyhow::anyhow!("slow"))) },
+            || async { Err(anyhow::anyhow!("still down")) },
+        )
+        .await
+        .unwrap_err();
+        assert!(!out.kept_old);
+        assert!(
+            out.message.contains("could not be started again"),
+            "{}",
+            out.message
+        );
+
+        let out = recover_update(async { Ok(daemon(4)) }, || async {
+            Err(anyhow::anyhow!("unused"))
+        })
+        .await
+        .unwrap();
+        assert_eq!(out.port, 4);
+    }
 }

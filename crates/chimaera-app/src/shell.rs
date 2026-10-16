@@ -29,6 +29,8 @@ pub(crate) mod notices;
 #[cfg(target_os = "macos")]
 mod print_frame;
 mod restore;
+#[cfg(test)]
+mod surface_tests;
 mod unsaved;
 
 pub use restore::open_ui_window;
@@ -36,12 +38,28 @@ pub use restore::open_ui_window;
 /// Permissions exposed to a daemon-served workbench window. These grants are
 /// installed at runtime for one volatile window label and one exact loopback
 /// origin; the only static capability is the shell-local WSL wizard.
-const DAEMON_UI_CORE_PERMISSIONS: &[&str] = &[
-    "core:default",
+///
+/// Exactly what the web UI and Tauri's injected drag-region script call —
+/// never `core:default`: remote hosts' pages hold these grants too, and the
+/// default set would hand them local PNG reads (`core:image`), the app menu
+/// and tray (`core:menu`, `core:tray`) and forged shell events
+/// (`core:event:allow-emit*`) into other windows.
+pub(crate) const DAEMON_UI_CORE_PERMISSIONS: &[&str] = &[
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
     "core:window:allow-close",
     "core:window:allow-start-dragging",
+    "core:window:allow-internal-toggle-maximize",
     "core:window:allow-set-title",
 ];
+
+/// Debug builds only: the devtools shortcut script Tauri injects there calls
+/// this (release builds have no devtools to toggle).
+pub(crate) const DAEMON_UI_DEBUG_PERMISSIONS: &[&str] = if cfg!(debug_assertions) {
+    &["core:webview:allow-internal-toggle-devtools"]
+} else {
+    &[]
+};
 
 static DAEMON_CAPABILITY_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Unique ids for test notifications (each must be a new alert, not a
@@ -398,6 +416,182 @@ impl Shell {
     }
 }
 
+// --- event delivery to one window -------------------------------------------
+//
+// Tauri's `emit_to(label, …)` does NOT confine delivery to that label: its
+// JS fan-out visits every webview and fires every listener registered with
+// target `Any` — which is what the global `__TAURI__.event.listen` registers
+// (tauri `event/listener.rs`, `match_any_or_filter`). Any daemon page, a
+// remote host's included, could therefore read another window's token-bearing
+// event. `deliver_to` instead evaluates Tauri's own dispatch inside the one
+// target webview, so other webviews never see the payload at all.
+
+/// Tauri's per-webview listener table and dispatch function (tauri
+/// `event/listener.rs`, `event/mod.rs`); `surface_tests` pins both against
+/// the locked tauri source so an upgrade that renames them fails a test
+/// instead of silently dropping events.
+pub(crate) const TAURI_JS_LISTENERS: &str = "__internal_unstable_listeners_object_id__";
+pub(crate) const TAURI_JS_DISPATCH: &str = "__internal_unstable_listeners_function_id__";
+
+/// The script that runs every `event` listener this one document registered,
+/// with `payload` (already JSON). Listener ids are the table's own property
+/// names (non-enumerable, hence `getOwnPropertyNames`). Tauri's unlisten only
+/// unregisters the callback and leaves the table entry, so an entry whose
+/// callback is gone is deleted here rather than dispatched (each would log
+/// "Couldn't find callback id", and the table would grow per listen cycle).
+fn dispatch_script(event: &str, payload_json: &str) -> String {
+    let event = serde_json::Value::from(event).to_string();
+    format!(
+        "(function(){{var t=window['{TAURI_JS_LISTENERS}'];var f=window['{TAURI_JS_DISPATCH}'];\
+         var l=t&&t[{event}];if(!f||!l)return;\
+         var i=window.__TAURI_INTERNALS__;var c=i&&i.callbacks;\
+         var ids=Object.getOwnPropertyNames(l).map(Number).filter(function(id){{\
+         var e=l[id];if(c&&typeof c.has==='function'&&e&&!c.has(e.handlerId)){{delete l[id];return false}}\
+         return true}});\
+         if(ids.length)f({{event:{event},payload:{payload_json}}},ids)}})()"
+    )
+}
+
+/// Deliver `event` to the listeners of exactly one window. A missing window
+/// is not an error: it closed between the target pick and the send.
+pub(crate) fn deliver_to<T: serde::Serialize + ?Sized>(
+    app: &AppHandle,
+    label: &str,
+    event: &str,
+    payload: &T,
+) -> Result<(), String> {
+    let Some(window) = app.get_webview_window(label) else {
+        return Ok(());
+    };
+    let payload = serde_json::to_string(payload).map_err(|e| e.to_string())?;
+    window
+        .eval(dispatch_script(event, &payload))
+        .map_err(|e| e.to_string())
+}
+
+/// Who receives a host's status event: `(full, public)` labels. `full` (the
+/// copy that may carry the host's token) goes only to windows registered on
+/// exactly `alias`; `public` (tokenless) goes to local windows and to the
+/// Home hub wherever it is browsing, so host rows stay live. Another host's
+/// window gets neither. A window mid-navigation still runs its OLD document,
+/// so it never gets the full copy.
+pub(crate) fn host_event_targets(
+    windows: &HashMap<String, WindowScope>,
+    alias: &str,
+) -> (Vec<String>, Vec<String>) {
+    let mut full = Vec::new();
+    let mut public = Vec::new();
+    for (label, scope) in windows {
+        let own = scope.alias.as_deref() == Some(alias);
+        if own && !scope.navigation_pending {
+            full.push(label.clone());
+        } else if own || scope.alias.is_none() || scope.home_hub {
+            public.push(label.clone());
+        }
+    }
+    full.sort();
+    public.sort();
+    (full, public)
+}
+
+/// Send a host-scoped event (C2): `full` to that host's own windows, `public`
+/// (when given) to local windows and the Home hub, nothing anywhere else.
+pub(crate) fn emit_host_scoped<T: serde::Serialize + Clone>(
+    app: &AppHandle,
+    event: &str,
+    alias: &str,
+    full: T,
+    public: Option<T>,
+) {
+    let Some(shell) = app.try_state::<Shell>() else {
+        return;
+    };
+    let (full_labels, public_labels) = host_event_targets(&lock(&shell.windows), alias);
+    for label in full_labels {
+        if let Err(error) = deliver_to(app, &label, event, &full) {
+            tracing::warn!(%error, window = label, event, "could not deliver host event");
+        }
+    }
+    let Some(public) = public else {
+        return;
+    };
+    for label in public_labels {
+        if let Err(error) = deliver_to(app, &label, event, &public) {
+            tracing::warn!(%error, window = label, event, "could not deliver host event");
+        }
+    }
+}
+
+/// Events for the local daemon's windows only (`alias` None, not mid-
+/// navigation): the local daemon's token rides `local-daemon-updated`.
+pub(crate) fn local_event_targets(windows: &HashMap<String, WindowScope>) -> Vec<String> {
+    let mut labels: Vec<String> = windows
+        .iter()
+        .filter(|(_, scope)| caller_is_local(scope))
+        .map(|(label, _)| label.clone())
+        .collect();
+    labels.sort();
+    labels
+}
+
+// --- caller authority (C3) ----------------------------------------------------
+//
+// Every daemon window holds the same command grants, remote hosts' pages
+// included, so a command that names a host must check that the CALLER may act
+// on it. The caller is the shell-registered scope of the invoking window's
+// label, never anything the page says about itself.
+
+/// Whether a window may act on `alias` (None = the local daemon). A local
+/// window may target any host; a remote window only its own alias; a compute
+/// (job) window its composite alias and its login host. A window that is
+/// mid-navigation still runs its old document and may target nothing.
+pub(crate) fn caller_may_target(scope: &WindowScope, alias: Option<&str>) -> bool {
+    if scope.navigation_pending {
+        return false;
+    }
+    match scope.alias.as_deref() {
+        None => true,
+        Some(own) => alias == Some(own) || (alias.is_some() && alias == scope.appearance_alias()),
+    }
+}
+
+/// Whether a window is on this machine's daemon (host and update management,
+/// local file hand-offs).
+pub(crate) fn caller_is_local(scope: &WindowScope) -> bool {
+    scope.alias.is_none() && !scope.navigation_pending
+}
+
+fn caller_scope(app: &AppHandle, caller_label: &str) -> Result<WindowScope, String> {
+    app.try_state::<Shell>()
+        .and_then(|shell| shell.window_scope(caller_label))
+        .ok_or_else(|| "this window is not registered".to_string())
+}
+
+/// C3: refuse unless the calling window may act on `alias` (None = local).
+pub(crate) fn require_target(
+    app: &AppHandle,
+    caller_label: &str,
+    alias: Option<&str>,
+) -> Result<(), String> {
+    if caller_may_target(&caller_scope(app, caller_label)?, alias) {
+        Ok(())
+    } else {
+        Err(format!(
+            "this window cannot act on {}",
+            alias.unwrap_or("this machine")
+        ))
+    }
+}
+
+/// C3: refuse unless the calling window is on this machine's daemon.
+pub(crate) fn require_local(app: &AppHandle, caller_label: &str) -> Result<(), String> {
+    if caller_is_local(&caller_scope(app, caller_label)?) {
+        Ok(())
+    } else {
+        Err("only a window on this machine can do that".to_string())
+    }
+}
+
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
@@ -423,7 +617,10 @@ pub(super) fn authorize_daemon_origin(
         .window(window_label)
         .local(false)
         .remote(format!("http://127.0.0.1:{port}/*"));
-    for permission in DAEMON_UI_CORE_PERMISSIONS {
+    for permission in DAEMON_UI_CORE_PERMISSIONS
+        .iter()
+        .chain(DAEMON_UI_DEBUG_PERMISSIONS)
+    {
         capability = capability.permission(*permission);
     }
     for command in crate::command_manifest::DAEMON_UI_COMMANDS {
@@ -985,6 +1182,31 @@ fn open_setup_window(handle: &tauri::AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// How long quit waits for every tunnel's teardown together. Each close can
+/// take its own ~12 s on a dead link (reap + `-O cancel`); one at a time,
+/// a few hosts after sleep held quit for a minute. Past the deadline the
+/// rest are dropped, and dropping a tunnel kills its ssh child.
+const QUIT_TUNNEL_DEADLINE: Duration = Duration::from_secs(5);
+
+type TunnelClose = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+/// Run every close at once, bounded by one `deadline`.
+async fn close_all_within(closes: Vec<TunnelClose>, deadline: Duration) {
+    let mut set = tokio::task::JoinSet::new();
+    for close in closes {
+        set.spawn(close);
+    }
+    let drained =
+        tokio::time::timeout(deadline, async { while set.join_next().await.is_some() {} }).await;
+    if drained.is_err() {
+        tracing::warn!(
+            left = set.len(),
+            "tunnels still closing at the quit deadline; dropping them"
+        );
+    }
+    // Dropping the set aborts whatever is left.
+}
+
 /// Build and run the Tauri app.
 pub fn run() {
     tauri::Builder::default()
@@ -1236,7 +1458,16 @@ pub fn run() {
                     Ok(fresh) => local = fresh,
                     // The old daemon keeps serving; the update stays a
                     // visible affordance instead of a silent failure.
-                    Err(e) => tracing::warn!("daemon update after app update failed: {e:#}"),
+                    Err(e) if e.kept_old => {
+                        tracing::warn!("daemon update after app update failed: {}", e.message)
+                    }
+                    // Stopped and not restartable: opening windows on the
+                    // dead port would show blank pages. Fail like a failed
+                    // first start does.
+                    Err(e) => {
+                        tracing::error!("{}", e.message);
+                        return Err(std::io::Error::other(e.message).into());
+                    }
                 }
             }
             // Uncontended here (no windows exist yet), but the gate must
@@ -1319,12 +1550,15 @@ pub fn run() {
                     // reliably deliver each window's Destroyed first.
                     cluster::end_all_terminals(app);
                     cluster::end_attached_jobs(app);
+                    // An in-flight connect would otherwise finish after the
+                    // drain below and leave its tunnel's ssh behind.
+                    let in_flight: Vec<String> = lock(&state.connecting).keys().cloned().collect();
+                    for alias in in_flight {
+                        connect::cancel_connect(app, &alias);
+                    }
                     tauri::async_runtime::block_on(async {
                         let tunnels: Vec<_> =
                             state.tunnels.lock().await.drain().map(|(_, t)| t).collect();
-                        for tunnel in tunnels {
-                            tunnel.close().await;
-                        }
                         // Compute-node tunnels too: closing a job's window
                         // does not tear its forward down (a reconnect to the
                         // same job reuses it), so quit is their cleanup.
@@ -1335,9 +1569,14 @@ pub fn run() {
                             .drain()
                             .map(|(_, t)| t)
                             .collect();
-                        for tunnel in compute {
-                            tunnel.close().await;
+                        let mut closes: Vec<TunnelClose> = Vec::new();
+                        for tunnel in tunnels {
+                            closes.push(Box::pin(tunnel.close()));
                         }
+                        for tunnel in compute {
+                            closes.push(Box::pin(tunnel.close()));
+                        }
+                        close_all_within(closes, QUIT_TUNNEL_DEADLINE).await;
                     });
                 }
             }

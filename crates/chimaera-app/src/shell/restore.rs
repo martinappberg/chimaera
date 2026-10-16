@@ -8,9 +8,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 
-use super::connect::{do_connect, HostStatus};
+use super::connect::{do_connect, emit_host_status, with_hosts, HostStatus};
 use super::{
     authorize_daemon_origin, daemon_navigation_allowed, is_srcdoc_frame, lock, Shell, WindowScope,
 };
@@ -505,8 +505,8 @@ pub(super) fn spawn_health_monitor(handle: AppHandle) {
                         lock(&shell.wedge_suspects).insert(endpoint.key.clone());
                     }
                 }
-                let _ = handle.emit(
-                    "host-status",
+                emit_host_status(
+                    &handle,
                     HostStatus {
                         alias: endpoint.key,
                         status: if recovered { "connected" } else { "down" },
@@ -598,19 +598,73 @@ pub(super) fn restore_windows(handle: &AppHandle, port: u16, token: &str) -> tau
         tracing::info!("startup home window open on 127.0.0.1:{port}");
     }
 
-    for alias in remote_aliases {
-        let handle = handle.clone();
-        tauri::async_runtime::spawn(async move {
-            // Window reopening rides the connect itself (`reopen_windows` in
-            // `run_flight`), and the records survive failure: the windows
-            // come back with the first connect that lands — a home-screen
-            // click, a window's reconnect, or the next launch.
-            if let Err(e) = do_connect(&handle, alias.clone(), false).await {
-                tracing::warn!("could not reconnect {alias} to restore windows: {e}");
-            }
-        });
+    if remote_aliases.is_empty() {
+        return Ok(());
     }
+    let handle = handle.clone();
+    tauri::async_runtime::spawn(async move {
+        // A host the user forgot must not come back: a connect would dial it
+        // and re-add it to hosts.json. An unreadable hosts.json forgets
+        // nothing (the records wait for the next launch).
+        let known = with_hosts(|hosts| {
+            Ok(hosts
+                .list()
+                .into_iter()
+                .map(|entry| entry.alias)
+                .collect::<HashSet<String>>())
+        })
+        .await
+        .map_err(|e| tracing::warn!("could not read hosts.json to restore windows: {e}"))
+        .ok();
+        let (restore, forgotten) = restorable_aliases(remote_aliases, known.as_ref());
+        for alias in forgotten {
+            tracing::info!("not restoring windows of {alias}: it is no longer a saved host");
+            forget_host_windows(&handle, &alias);
+        }
+        for alias in restore {
+            let handle = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                // Window reopening rides the connect itself (`reopen_windows`
+                // in `run_flight`), and the records survive failure: the
+                // windows come back with the first connect that lands — a
+                // home-screen click, a window's reconnect, or the next launch.
+                if let Err(e) = do_connect(&handle, alias.clone(), false).await {
+                    tracing::warn!("could not reconnect {alias} to restore windows: {e}");
+                }
+            });
+        }
+    });
     Ok(())
+}
+
+/// Split the hosts a restore would connect into (still saved, forgotten).
+/// `known` None = hosts.json could not be read: restore them all.
+fn restorable_aliases(
+    aliases: Vec<String>,
+    known: Option<&HashSet<String>>,
+) -> (Vec<String>, Vec<String>) {
+    aliases
+        .into_iter()
+        .partition(|alias| known.is_none_or(|known| known.contains(alias)))
+}
+
+/// Drop every persisted window record of `alias` (its job windows included):
+/// the user removed the host, so neither a launch nor a later connect may
+/// reopen them.
+pub(super) fn forget_host_windows(app: &AppHandle, alias: &str) {
+    let Some(shell) = app.try_state::<Shell>() else {
+        return;
+    };
+    let mut registry = lock(&shell.registry);
+    let ids: Vec<String> = registry
+        .list()
+        .into_iter()
+        .filter(|record| record.alias.as_deref() == Some(alias))
+        .map(|record| record.id)
+        .collect();
+    for id in ids {
+        registry.remove(&id);
+    }
 }
 
 /// Older builds allowed File → New Window to persist several local Home
@@ -638,8 +692,8 @@ fn needs_startup_home(opened: bool, home_opened: bool, has_remote: bool) -> bool
 #[cfg(test)]
 mod tests {
     use super::{
-        dedupe_local_homes, needs_startup_home, HealthConfidence, HEALTH_BACKOFF_CAP_COMPUTE_TICKS,
-        HEALTH_BACKOFF_CAP_TICKS, HEALTH_FAILURES_BEFORE_DOWN,
+        dedupe_local_homes, needs_startup_home, restorable_aliases, HealthConfidence,
+        HEALTH_BACKOFF_CAP_COMPUTE_TICKS, HEALTH_BACKOFF_CAP_TICKS, HEALTH_FAILURES_BEFORE_DOWN,
     };
     use crate::windows::WindowRecord;
 
@@ -800,6 +854,17 @@ mod tests {
         for expected in [None, None, Some(false)] {
             assert_eq!(health.sample(false, HEALTH_BACKOFF_CAP_TICKS), expected);
         }
+    }
+
+    #[test]
+    fn restore_skips_hosts_the_user_removed_unless_hosts_json_is_unreadable() {
+        let aliases = vec!["kept".to_string(), "removed".to_string()];
+        let known = std::collections::HashSet::from(["kept".to_string()]);
+        assert_eq!(
+            restorable_aliases(aliases.clone(), Some(&known)),
+            (vec!["kept".to_string()], vec!["removed".to_string()])
+        );
+        assert_eq!(restorable_aliases(aliases.clone(), None), (aliases, vec![]));
     }
 
     #[test]

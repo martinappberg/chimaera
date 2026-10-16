@@ -9,6 +9,7 @@
    * ordinary `update.autoCheck` schema row.
    */
   import { onMount } from "svelte";
+  import { isRemoteHost } from "../net/api";
   import {
     appUpdateStatus,
     beginUpdate,
@@ -120,7 +121,8 @@
         verdict: `${a.available} available`,
         tone: "new",
         sub: "updates the app, then its local daemon — windows, tabs and sessions come back",
-        action: { label: "update now", run: beginUpdate },
+        // The shell installs app updates only from a window on this machine.
+        action: isRemoteHost() ? undefined : { label: "update now", run: beginUpdate },
         link: notes?.version === a.available ? { label: "release notes", url: notes.url } : undefined,
       };
     }

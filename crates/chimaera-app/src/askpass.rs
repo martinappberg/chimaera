@@ -10,8 +10,8 @@
 //! Keyboard-interactive prompts (Duo's "Passcode or option (1-3):") reach
 //! askpass too, so the same modal — prompt text over a single input — covers
 //! both password and 2FA. Host-key confirmation is not an askpass prompt and
-//! is out of scope here (a first connect to an unknown host still needs the
-//! key in `~/.ssh/known_hosts`).
+//! is out of scope here (chimaera-remote's ssh options decide whether an
+//! unknown host's key is recorded; a changed key always stops the connect).
 //! Each child also frames its normalized host alias with the prompt, so the
 //! native relay can target only that host's windows (plus local home).
 //!
@@ -37,7 +37,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
@@ -47,6 +47,19 @@ use tokio::sync::oneshot;
 /// passes its environment through to the askpass program it runs).
 #[cfg(unix)]
 const SOCK_ENV: &str = "CHIMAERA_ASKPASS_SOCK";
+
+/// Every variable `install` (or a connect, for the alias) puts in this
+/// process's environment for its OWN ssh children. The local daemon must not
+/// inherit them: its terminals and agents would then prompt through the app's
+/// modal (hanging with no Home open, and letting any agent raise a native
+/// prompt labelled with a real host) — see `daemon::spawn_detached`.
+#[cfg(unix)]
+pub(crate) const APP_ASKPASS_ENV: &[&str] = &[
+    "SSH_ASKPASS",
+    "SSH_ASKPASS_REQUIRE",
+    "CHIMAERA_ASKPASS_SOCK",
+    chimaera_remote::ASKPASS_ALIAS_ENV,
+];
 pub(crate) const SCOPE_FRAME: &str = "chimaera-askpass-scope-v1";
 
 /// Exit status of `--askpass` for a prompt that got no answer (cancelled,
@@ -183,6 +196,16 @@ impl Askpass {
         lock(&self.pending).remove(&id);
     }
 
+    /// Drop every prompt for `alias` (its connect was cancelled: the ssh that
+    /// asked is gone). Dropping the answer channel ends each prompt's wait at
+    /// once, which discards it and tells its windows it is done.
+    pub(crate) fn discard_alias(&self, alias: &str) -> usize {
+        let mut pending = lock(&self.pending);
+        let before = pending.len();
+        pending.retain(|_, prompt| prompt.alias.as_deref() != Some(alias));
+        before - pending.len()
+    }
+
     /// Resolve a prompt only when the shell-owned caller scope is allowed to
     /// see its alias. Authorization and removal share one lock, so a caller
     /// cannot race a scope check against another answer.
@@ -222,24 +245,17 @@ impl Askpass {
     }
 }
 
-/// Emit an askpass event only to shell-registered windows allowed to observe
-/// this host. Tauri event subscriptions are directly available to daemon
-/// pages, so app-wide broadcast plus a Svelte filter is not an auth boundary.
-fn emit_scoped<T: Clone + Serialize>(
-    app: &AppHandle,
-    event: &str,
-    payload: T,
-    alias: Option<&str>,
-) {
+/// Deliver an askpass event only to shell-registered windows allowed to
+/// observe this host. Tauri event subscriptions are directly available to
+/// daemon pages, and even `emit_to` reaches every page's catch-all listener,
+/// so only per-window delivery (`shell::deliver_to`) is an auth boundary.
+fn emit_scoped<T: Serialize>(app: &AppHandle, event: &str, payload: T, alias: Option<&str>) {
     let Some(shell) = app.try_state::<crate::shell::Shell>() else {
         return;
     };
     for label in shell.askpass_targets(alias) {
-        let Some(window) = app.get_webview_window(&label) else {
-            continue;
-        };
-        if let Err(error) = window.emit(event, payload.clone()) {
-            tracing::warn!("askpass: could not emit {event} to {label}: {error}");
+        if let Err(error) = crate::shell::deliver_to(app, &label, event, &payload) {
+            tracing::warn!("askpass: could not deliver {event} to {label}: {error}");
         }
     }
 }
@@ -281,17 +297,70 @@ fn socket_dir(runtime_dir: &Path) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn socket_path() -> PathBuf {
-    let dir = socket_dir(&chimaera_core::runtime_dir());
-    // The /tmp fallback dir is ours alone — same 0700 as the runtime dir it
-    // stands in for (the socket carries ssh secrets). Best-effort like the
-    // core dir resolvers: the bind reports the real failure.
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true).mode(0o700);
-    if let Err(e) = builder.create(&dir) {
-        tracing::warn!("failed to create askpass socket dir {}: {e}", dir.display());
+fn socket_path() -> Result<PathBuf> {
+    let runtime = chimaera_core::runtime_dir();
+    let dir = socket_dir(&runtime);
+    if dir == runtime {
+        // The runtime dir itself: best-effort like the core dir resolvers,
+        // the bind reports the real failure.
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        if let Err(e) = builder.create(&dir) {
+            tracing::warn!("failed to create askpass socket dir {}: {e}", dir.display());
+        }
+    } else {
+        ensure_private_fallback(&dir)?;
     }
-    dir.join(SOCK_LEAF)
+    Ok(dir.join(SOCK_LEAF))
+}
+
+/// The `/tmp` fallback's name is predictable, so another local user could
+/// pre-create it (or its parent) and later swap our socket for a relay that
+/// reads every typed secret. Both levels must be real directories this user
+/// owns with no group/other access; otherwise askpass stays off.
+#[cfg(unix)]
+fn ensure_private_fallback(dir: &Path) -> Result<()> {
+    if let Some(parent) = dir.parent() {
+        chimaera_core::ensure_private_dir(parent)
+            .with_context(|| format!("askpass socket dir {}", parent.display()))?;
+    }
+    chimaera_core::ensure_private_dir(dir)
+        .with_context(|| format!("askpass socket dir {}", dir.display()))
+}
+
+/// `SSH_ASKPASS` / `SSH_ASKPASS_REQUIRE` as they were before `install`, for
+/// the local daemon's environment. Never the app's own shim (an app started
+/// from a terminal whose daemon inherited it from an older app).
+#[cfg(unix)]
+static USER_ASKPASS: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+
+#[cfg(unix)]
+fn remember_user_askpass(shim: &Path) {
+    let current: Vec<(String, String)> = ["SSH_ASKPASS", "SSH_ASKPASS_REQUIRE"]
+        .iter()
+        .filter_map(|key| Some((key.to_string(), std::env::var(key).ok()?)))
+        .collect();
+    let _ = USER_ASKPASS.set(user_askpass(current, shim));
+}
+
+/// The user's askpass settings among `current`: none at all when
+/// `SSH_ASKPASS` is unset or names the app's shim.
+#[cfg(unix)]
+fn user_askpass(current: Vec<(String, String)>, shim: &Path) -> Vec<(String, String)> {
+    let theirs = current
+        .iter()
+        .any(|(k, v)| k == "SSH_ASKPASS" && !v.is_empty() && Path::new(v) != shim);
+    if theirs {
+        current
+    } else {
+        Vec::new()
+    }
+}
+
+/// What `remember_user_askpass` kept (empty before `install` or when none).
+#[cfg(unix)]
+pub(crate) fn user_askpass_env() -> &'static [(String, String)] {
+    USER_ASKPASS.get().map_or(&[], Vec::as_slice)
 }
 
 #[cfg(unix)]
@@ -313,7 +382,7 @@ fn shim_script(exe: &Path) -> String {
 /// start the socket listener. Called once at startup, before any connect.
 #[cfg(unix)]
 pub fn install(app: &AppHandle) -> Result<()> {
-    let sock = socket_path();
+    let sock = socket_path()?;
     // A stale socket from a previous run would refuse the bind.
     std::fs::remove_file(&sock).ok();
 
@@ -325,6 +394,9 @@ pub fn install(app: &AppHandle) -> Result<()> {
     perms.set_mode(0o700);
     std::fs::set_permissions(&shim, perms)?;
 
+    // The user's own askpass, if any, before ours replaces it: the daemon's
+    // sessions get it back (`daemon::spawn_detached`).
+    remember_user_askpass(&shim);
     // ssh children inherit these. REQUIRE=force makes ssh use askpass even
     // when a tty exists — the default only kicks in with no tty, and a GUI
     // app's environment is murky enough that we don't want to depend on it.
@@ -484,15 +556,51 @@ async fn serve_one_tcp(app: AppHandle, mut stream: tokio::net::TcpStream, token:
     let _ = stream.shutdown().await;
 }
 
+/// A generous ceiling for any real ssh prompt request, and how long a client
+/// may take to send it. Any same-user process can connect to the socket;
+/// without bounds one could stream without end into a String or pin a task.
+#[cfg(unix)]
+const MAX_PROMPT_REQUEST: u64 = 64 * 1024;
+#[cfg(unix)]
+const PROMPT_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Read one whole request (to the client's half-close), or `None` when it is
+/// larger than `max` bytes, not UTF-8, or not finished within `timeout`.
+#[cfg(unix)]
+async fn read_request<R: tokio::io::AsyncRead + Unpin>(
+    stream: &mut R,
+    max: u64,
+    timeout: Duration,
+) -> Option<String> {
+    let mut request = String::new();
+    // One byte past the cap tells "exactly max" from "too long".
+    let read =
+        tokio::time::timeout(timeout, stream.take(max + 1).read_to_string(&mut request)).await;
+    match read {
+        Ok(Ok(_)) if request.len() as u64 <= max => Some(request),
+        Ok(Ok(_)) => {
+            tracing::warn!("askpass: prompt request over {max} bytes refused");
+            None
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("askpass: could not read prompt: {e}");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("askpass: prompt request timed out");
+            None
+        }
+    }
+}
+
 /// Serve one askpass request: read the prompt (the helper half-closes its
 /// write side to mark the end), ask the UI, write the answer back.
 #[cfg(unix)]
 async fn serve_one(app: AppHandle, mut stream: UnixStream) {
-    let mut request = String::new();
-    if let Err(e) = stream.read_to_string(&mut request).await {
-        tracing::warn!("askpass: could not read prompt: {e}");
+    let Some(request) = read_request(&mut stream, MAX_PROMPT_REQUEST, PROMPT_READ_TIMEOUT).await
+    else {
         return;
-    }
+    };
     let (alias, prompt) = split_prompt_request(request);
     let answer = resolve_prompt(&app, alias, prompt).await;
     let _ = stream.write_all(&encode_reply(answer.as_deref())).await;
@@ -842,5 +950,137 @@ mod tests {
             AnswerResult::Answered(Some("cluster".into()))
         );
         assert_eq!(rx.blocking_recv().unwrap(), Some("secret".into()));
+    }
+
+    /// A cancelled connect drops exactly its own host's prompts, and each
+    /// dropped prompt's waiter sees the sender go (so `resolve_prompt` ends
+    /// it and dismisses it in its windows) instead of waiting out 180 s.
+    #[test]
+    fn discarding_an_alias_drops_only_that_hosts_prompts() {
+        let askpass = Askpass::default();
+        let (tx_a, rx_a) = oneshot::channel();
+        let (tx_a2, rx_a2) = oneshot::channel();
+        let (tx_b, mut rx_b) = oneshot::channel();
+        let (tx_none, mut rx_none) = oneshot::channel();
+        askpass.register(Some("host-a".into()), "Password:".into(), tx_a);
+        askpass.register(Some("host-a".into()), "Passcode:".into(), tx_a2);
+        askpass.register(Some("host-b".into()), "Password:".into(), tx_b);
+        askpass.register(None, "Password:".into(), tx_none);
+
+        assert_eq!(askpass.discard_alias("host-a"), 2);
+        assert!(rx_a.blocking_recv().is_err(), "the waiter is released");
+        assert!(rx_a2.blocking_recv().is_err());
+        assert!(rx_b
+            .try_recv()
+            .is_err_and(|e| e == oneshot::error::TryRecvError::Empty));
+        assert!(rx_none
+            .try_recv()
+            .is_err_and(|e| e == oneshot::error::TryRecvError::Empty));
+        let home = crate::shell::WindowScope::new(None, None, "home".into());
+        assert_eq!(askpass.pending_scoped(&home).len(), 2);
+        assert_eq!(askpass.discard_alias("host-a"), 0);
+    }
+
+    /// Any same-user process can connect to the relay socket: a request past
+    /// the cap or one that never finishes is dropped, never read without end.
+    #[tokio::test]
+    async fn a_prompt_request_is_bounded_in_size_and_time() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let writer = tokio::spawn(async move {
+            client.write_all(&[b'x'; 200]).await.unwrap();
+            client.shutdown().await.unwrap();
+        });
+        assert_eq!(
+            read_request(&mut server, 200, Duration::from_secs(5)).await,
+            Some("x".repeat(200)),
+            "exactly the cap is a request"
+        );
+        writer.await.unwrap();
+
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let writer = tokio::spawn(async move {
+            // Past the cap; the reader stops after cap + 1 bytes.
+            let _ = client.write_all(&[b'x'; 900]).await;
+        });
+        assert_eq!(
+            read_request(&mut server, 200, Duration::from_secs(5)).await,
+            None
+        );
+        writer.abort();
+
+        // Opened and never finished: the deadline ends the read.
+        let (_client, mut server) = tokio::io::duplex(1024);
+        assert_eq!(
+            read_request(&mut server, 200, Duration::from_millis(50)).await,
+            None
+        );
+    }
+
+    /// The daemon gets back the user's own askpass, never the app's shim.
+    #[test]
+    fn only_the_users_own_askpass_is_remembered_for_the_daemon() {
+        let shim = Path::new("/home/u/.chimaera/run/askpass.sh");
+        let pairs = |list: &[(&str, &str)]| -> Vec<(String, String)> {
+            list.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let theirs = pairs(&[
+            ("SSH_ASKPASS", "/usr/libexec/ssh-askpass"),
+            ("SSH_ASKPASS_REQUIRE", "prefer"),
+        ]);
+        assert_eq!(user_askpass(theirs.clone(), shim), theirs);
+        let ours = pairs(&[
+            ("SSH_ASKPASS", "/home/u/.chimaera/run/askpass.sh"),
+            ("SSH_ASKPASS_REQUIRE", "force"),
+        ]);
+        assert!(user_askpass(ours, shim).is_empty());
+        assert!(user_askpass(pairs(&[("SSH_ASKPASS_REQUIRE", "force")]), shim).is_empty());
+        assert!(user_askpass(Vec::new(), shim).is_empty());
+    }
+
+    /// The `/tmp` fallback is refused when another user could have planted
+    /// it: a world-accessible dir at either level, or a symlink.
+    #[test]
+    fn the_tmp_fallback_dir_must_be_private_at_both_levels() {
+        let root = std::env::temp_dir().join(format!("askpass-private-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).unwrap();
+
+        let fresh = root.join("fresh").join("run");
+        ensure_private_fallback(&fresh).unwrap();
+        for dir in [fresh.parent().unwrap(), fresh.as_path()] {
+            let mode = std::fs::metadata(dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "{}", dir.display());
+        }
+
+        let planted_parent = root.join("planted");
+        std::fs::create_dir(&planted_parent).unwrap();
+        std::fs::set_permissions(&planted_parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(ensure_private_fallback(&planted_parent.join("run")).is_err());
+        assert!(
+            !planted_parent.join("run").exists(),
+            "nothing created inside it"
+        );
+
+        let planted_leaf = root.join("leaf");
+        std::fs::create_dir(&planted_leaf).unwrap();
+        std::fs::create_dir(planted_leaf.join("run")).unwrap();
+        std::fs::set_permissions(
+            planted_leaf.join("run"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::set_permissions(&planted_leaf, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(ensure_private_fallback(&planted_leaf.join("run")).is_err());
+
+        let linked = root.join("linked");
+        std::os::unix::fs::symlink(&fresh, &linked).unwrap();
+        assert!(ensure_private_fallback(&linked.join("run")).is_err());
+
+        std::fs::set_permissions(&planted_parent, std::fs::Permissions::from_mode(0o700)).ok();
+        std::fs::remove_dir_all(&root).ok();
     }
 }

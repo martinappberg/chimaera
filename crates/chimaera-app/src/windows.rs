@@ -107,10 +107,16 @@ impl WindowRegistry {
                 Vec::new()
             }
         };
+        let (items, dropped) = dedupe_ids(items);
+        if dropped > 0 {
+            tracing::warn!(path = %path.display(), dropped,
+                "windows.json repeated window ids; keeping the first of each");
+        }
         WindowRegistry {
             path,
             items,
-            dirty: false,
+            // Rewrite the cleaned set at the next save.
+            dirty: dropped > 0,
         }
     }
 
@@ -208,9 +214,50 @@ impl WindowRegistry {
     }
 }
 
+/// One record per id, the first kept. Two windows restored on one id would
+/// share view state, and closing either would delete the record of both.
+fn dedupe_ids(items: Vec<WindowRecord>) -> (Vec<WindowRecord>, usize) {
+    let total = items.len();
+    let mut seen = std::collections::HashSet::new();
+    let kept: Vec<WindowRecord> = items
+        .into_iter()
+        .filter(|record| seen.insert(record.id.clone()))
+        .collect();
+    let dropped = total - kept.len();
+    (kept, dropped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_repeated_window_id_loads_once_and_the_file_is_rewritten() {
+        let dir = std::env::temp_dir().join(format!("chimaera-windows-dup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("windows.json");
+        let mut first = WindowRecord::new(None, Some("ws-1".into()));
+        first.id = "w-same".into();
+        let mut second = WindowRecord::new(Some("other".into()), Some("ws-2".into()));
+        second.id = "w-same".into();
+        let third = WindowRecord::new(None, None);
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&vec![first, second, third.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let mut reg = WindowRegistry::load(path.clone());
+        let rows = reg.list();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, "w-same");
+        assert_eq!(rows[0].ws.as_deref(), Some("ws-1"), "the first record wins");
+        assert_eq!(rows[1].id, third.id);
+        reg.save_if_dirty();
+        assert_eq!(WindowRegistry::load(path).list().len(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn registry_round_trips_and_removes() {

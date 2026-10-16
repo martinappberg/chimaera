@@ -26,6 +26,13 @@
 //! of one prompt proceeds outright, so not even a page that keeps answering
 //! `shown` without ever showing a usable dialog can hold a window or the app.
 //!
+//! **The timeout is not an escape when the journal cannot hold the text.**
+//! A remote window whose tunnel is down (or gone) is *at risk*: its daemon
+//! mirror fails, and its IndexedDB belongs to a loopback origin the next
+//! connect usually does not reuse, so the draft would be unreachable. The
+//! hung-page timeout never closes such a window; the user's third ask still
+//! does, as an explicit choice.
+//!
 //! The decisions live in [`Guard`] (pure, unit-tested); the Tauri glue at the
 //! bottom only turns its [`Action`]s into window operations.
 
@@ -155,6 +162,9 @@ pub(crate) struct Guard {
     /// Windows already settled in the quit being negotiated; `None` = no
     /// quit in progress.
     quit: Option<HashSet<String>>,
+    /// Windows whose drafts cannot be journaled right now (see the module
+    /// doc); refreshed by the glue before every decision.
+    at_risk: HashSet<String>,
     next_id: u64,
 }
 
@@ -162,6 +172,20 @@ impl Guard {
     /// The page's unsaved-file count.
     pub(crate) fn report(&mut self, label: &str, count: u32) {
         self.counts.insert(label.to_string(), count);
+    }
+
+    /// The timer for `(id, ping)` found a hung page it may not close.
+    pub(crate) fn kept_at_risk(&self, label: &str, id: u64, ping: u64) -> bool {
+        self.at_risk.contains(label)
+            && self
+                .prompts
+                .get(label)
+                .is_some_and(|p| p.id == id && p.ping == ping && !p.acked)
+    }
+
+    /// Which windows are at risk now (the glue's [`at_risk_windows`]).
+    pub(crate) fn set_at_risk(&mut self, labels: HashSet<String>) {
+        self.at_risk = labels;
     }
 
     /// Windows currently holding unsaved files.
@@ -239,7 +263,8 @@ impl Guard {
     }
 
     /// The hung-page timer for `(id, ping)` fired. Proceeds unless the page
-    /// showed the prompt, answered it, or was asked again since.
+    /// showed the prompt, answered it, or was asked again since, or its
+    /// drafts are at risk (the prompt stays; a later ask re-pings it).
     pub(crate) fn ack_timeout(
         &mut self,
         label: &str,
@@ -247,6 +272,9 @@ impl Guard {
         ping: u64,
         order: &[String],
     ) -> Action {
+        if self.at_risk.contains(label) {
+            return Action::Nothing;
+        }
         match self.prompts.get(label) {
             Some(prompt) if prompt.id == id && prompt.ping == ping && !prompt.acked => {
                 self.settle(label, order)
@@ -367,7 +395,48 @@ impl Guard {
     }
 }
 
+/// The windows whose drafts the journal cannot keep: remote windows (a
+/// host or a job alias) whose tunnel is missing from `live` or marked
+/// unhealthy. `live` None = the tunnel maps could not be read without
+/// waiting, so every remote window counts as at risk (a held close is
+/// cheaper than lost text; the next ask decides again). Local windows never
+/// are: their daemon is this machine's.
+pub(crate) fn at_risk_windows(
+    windows: &HashMap<String, super::WindowScope>,
+    live: Option<&HashSet<String>>,
+    unhealthy: &HashSet<String>,
+) -> HashSet<String> {
+    windows
+        .iter()
+        .filter(|(_, scope)| {
+            scope.alias.as_deref().is_some_and(|alias| {
+                unhealthy.contains(alias) || live.is_none_or(|live| !live.contains(alias))
+            })
+        })
+        .map(|(label, _)| label.clone())
+        .collect()
+}
+
 // --- Tauri glue ---------------------------------------------------------------
+
+/// Recompute [`Guard`]'s at-risk set from the shell's tunnel state. Runs on
+/// the main thread (window events), so the async tunnel maps are only
+/// `try_lock`ed, never awaited.
+fn refresh_at_risk(shell: &Shell) {
+    let live = match (shell.tunnels.try_lock(), shell.compute_tunnels.try_lock()) {
+        (Ok(tunnels), Ok(compute)) => Some(
+            tunnels
+                .keys()
+                .chain(compute.keys())
+                .cloned()
+                .collect::<HashSet<String>>(),
+        ),
+        _ => None,
+    };
+    let unhealthy = lock(&shell.unhealthy_tunnels).clone();
+    let at_risk = at_risk_windows(&lock(&shell.windows), live.as_ref(), &unhealthy);
+    lock(&shell.unsaved).set_at_risk(at_risk);
+}
 
 /// Every open workbench window, most recently focused first, then the rest by
 /// label. Never holds a shell lock while the caller takes the guard's.
@@ -389,6 +458,7 @@ pub(crate) fn hold_window_close(app: &AppHandle, label: &str) -> bool {
     };
     let quitting = shell.quitting.load(Ordering::Relaxed);
     let order = window_order(&shell);
+    refresh_at_risk(&shell);
     let verdict = lock(&shell.unsaved).close_requested(label, quitting, &order, Instant::now());
     match verdict {
         Some(action) => {
@@ -407,6 +477,7 @@ pub(crate) fn quit_may_proceed(app: &AppHandle) -> bool {
         return true;
     };
     let order = window_order(&shell);
+    refresh_at_risk(&shell);
     let action = lock(&shell.unsaved).quit_requested(&order, Instant::now());
     if action == Action::Exit {
         return true;
@@ -586,8 +657,15 @@ fn perform(app: &AppHandle, action: Action) {
                     return;
                 };
                 let order = window_order(&shell);
+                refresh_at_risk(&shell);
                 let action = lock(&shell.unsaved).ack_timeout(&label, id, ping, &order);
-                if action != Action::Nothing {
+                if action == Action::Nothing && lock(&shell.unsaved).kept_at_risk(&label, id, ping)
+                {
+                    tracing::warn!(
+                        window = %label,
+                        "window did not answer the unsaved-edits prompt; keeping it (its host is unreachable, so its drafts are not journaled)"
+                    );
+                } else if action != Action::Nothing {
                     // Proceeding is safe: the page's dirty text is in the
                     // draft journal (IndexedDB + the daemon mirror), and
                     // reopening the file offers it back.
@@ -921,6 +999,124 @@ mod tests {
         assert_eq!(label, "b");
         assert_eq!(guard.forget("b", &[]), Action::Exit);
         assert_eq!(guard.windows_with_unsaved(), 0);
+    }
+
+    fn at_risk(labels: &[&str]) -> HashSet<String> {
+        labels.iter().map(|label| label.to_string()).collect()
+    }
+
+    #[test]
+    fn a_hung_page_whose_host_is_unreachable_is_kept() {
+        let mut clock = Clock::new();
+        let mut guard = Guard::default();
+        guard.report("w", 1);
+        guard.set_at_risk(at_risk(&["w"]));
+        let (_, id, _, ping) = ask(&close(&mut guard, "w", &mut clock).unwrap());
+        assert!(guard.kept_at_risk("w", id, ping));
+        assert_eq!(guard.ack_timeout("w", id, ping, &[]), Action::Nothing);
+        // The prompt survives: the page can still answer it.
+        assert_eq!(
+            guard.reply("w", id, Reply::Proceed, &[]),
+            Action::Close("w".into())
+        );
+    }
+
+    #[test]
+    fn insisting_still_closes_an_at_risk_window_on_the_third_ask() {
+        let mut clock = Clock::new();
+        let mut guard = Guard::default();
+        guard.report("w", 1);
+        guard.set_at_risk(at_risk(&["w"]));
+        let (_, id, _, ping) = ask(&close(&mut guard, "w", &mut clock).unwrap());
+        assert_eq!(guard.ack_timeout("w", id, ping, &[]), Action::Nothing);
+        let (_, same, _, ping) = ask(&close(&mut guard, "w", &mut clock).unwrap());
+        assert_eq!(same, id);
+        assert_eq!(
+            guard.ack_timeout("w", id, ping, &[]),
+            Action::Nothing,
+            "a re-pinged hung page is still kept by the timer"
+        );
+        assert_eq!(
+            close(&mut guard, "w", &mut clock),
+            Some(Action::Close("w".into())),
+            "the user's third ask is the explicit escape"
+        );
+    }
+
+    #[test]
+    fn a_quit_waits_for_an_at_risk_hung_window_until_the_user_insists() {
+        let mut clock = Clock::new();
+        let mut guard = Guard::default();
+        let windows = order(&["safe", "remote"]);
+        guard.report("safe", 1);
+        guard.report("remote", 1);
+        guard.set_at_risk(at_risk(&["remote"]));
+        let (label, id, _, ping) = ask(&guard.quit_requested(&windows, clock.tick()));
+        assert_eq!(label, "safe");
+        let (label, next, _, ping2) = ask(&guard.ack_timeout("safe", id, ping, &windows));
+        assert_eq!(label, "remote");
+        assert_eq!(
+            guard.ack_timeout("remote", next, ping2, &windows),
+            Action::Nothing
+        );
+        // Held, not skipped: the user's asks still count toward the escape.
+        let (label, _, _, _) = ask(&guard.quit_requested(&windows, clock.tick()));
+        assert_eq!(label, "remote");
+        assert_eq!(
+            guard.quit_requested(&windows, clock.tick()),
+            Action::Exit,
+            "the third ask quits"
+        );
+    }
+
+    #[test]
+    fn only_remote_windows_without_a_healthy_tunnel_are_at_risk() {
+        use crate::shell::WindowScope;
+        let windows = HashMap::from([
+            (
+                "local".to_string(),
+                WindowScope::new(None, Some("ws".into()), "a".into()),
+            ),
+            ("home".to_string(), WindowScope::new(None, None, "b".into())),
+            (
+                "up".to_string(),
+                WindowScope::new(Some("up.example".into()), Some("ws".into()), "c".into()),
+            ),
+            (
+                "sick".to_string(),
+                WindowScope::new(Some("sick.example".into()), None, "d".into()),
+            ),
+            (
+                "gone".to_string(),
+                WindowScope::new(Some("gone.example".into()), None, "e".into()),
+            ),
+            (
+                "job".to_string(),
+                WindowScope::new_compute(
+                    "up.example#job7~w1".into(),
+                    "up.example".into(),
+                    None,
+                    "f".into(),
+                ),
+            ),
+        ]);
+        let live = at_risk(&["up.example", "sick.example"]);
+        let unhealthy = at_risk(&["sick.example"]);
+        assert_eq!(
+            at_risk_windows(&windows, Some(&live), &unhealthy),
+            at_risk(&["sick", "gone", "job"]),
+            "a job window rides its own tunnel, not the login host's"
+        );
+        let with_job = at_risk(&["up.example", "up.example#job7~w1"]);
+        assert_eq!(
+            at_risk_windows(&windows, Some(&with_job), &HashSet::new()),
+            at_risk(&["sick", "gone"])
+        );
+        assert_eq!(
+            at_risk_windows(&windows, None, &HashSet::new()),
+            at_risk(&["up", "sick", "gone", "job"]),
+            "unreadable tunnel state counts every remote window"
+        );
     }
 
     #[test]

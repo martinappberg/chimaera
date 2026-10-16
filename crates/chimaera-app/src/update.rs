@@ -17,6 +17,7 @@
 //! instead of waiting six hours for the next one.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -72,6 +73,45 @@ pub fn consume_intent() -> bool {
         return false;
     };
     unix_now().saturating_sub(intent.written_at) <= INTENT_MAX_AGE_SECS
+}
+
+static INSTALL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// One app update at a time: two clicks (or two windows) must not run two
+/// downloads and two installs over the same bundle. Released on drop, so a
+/// failed attempt can be retried.
+pub(crate) struct InstallClaim(());
+
+impl Drop for InstallClaim {
+    fn drop(&mut self) {
+        INSTALL_IN_FLIGHT.store(false, Ordering::SeqCst);
+    }
+}
+
+pub(crate) fn claim_install() -> Option<InstallClaim> {
+    INSTALL_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+        .then_some(InstallClaim(()))
+}
+
+/// The refusal for `n` windows holding unsaved edits, or None to go ahead.
+/// Asked before the download and again right before the relaunch: Tauri's
+/// restart cannot be held by the unsaved-edits guard, and the download can
+/// take minutes of editing.
+pub(crate) fn unsaved_refusal(n: usize, installed: bool) -> Option<String> {
+    let who = match n {
+        0 => return None,
+        1 => "A window has unsaved edits".to_string(),
+        n => format!("{n} windows have unsaved edits"),
+    };
+    Some(if installed {
+        format!(
+            "The update is installed. {who} — save or discard them, then quit and reopen chimaera."
+        )
+    } else {
+        format!("{who} — save or discard them, then update.")
+    })
 }
 
 fn unix_now() -> u64 {
@@ -180,6 +220,28 @@ pub fn spawn_update_watch(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_install_at_a_time_and_a_finished_one_frees_the_claim() {
+        let first = claim_install().expect("nothing in flight");
+        assert!(claim_install().is_none(), "a second click is refused");
+        drop(first);
+        assert!(claim_install().is_some(), "a failed attempt can retry");
+    }
+
+    #[test]
+    fn unsaved_edits_block_the_restart_even_after_the_install() {
+        assert_eq!(unsaved_refusal(0, false), None);
+        assert_eq!(unsaved_refusal(0, true), None);
+        assert!(unsaved_refusal(1, false)
+            .unwrap()
+            .starts_with("A window has unsaved edits"));
+        let after = unsaved_refusal(2, true).unwrap();
+        assert!(
+            after.contains("installed") && after.contains("2 windows"),
+            "{after}"
+        );
+    }
 
     #[test]
     fn intent_consumes_once_and_expires() {

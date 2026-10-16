@@ -21,13 +21,13 @@ use std::time::{Duration, Instant};
 use chimaera_core::cluster::HostedState;
 use chimaera_core::slurm::LaunchSpec;
 use chimaera_remote::cluster::{
-    self, ClusterOverview, HostOpen, JobStart, StartOutcome, StartRefused,
+    self, ClusterOverview, HostOpen, JobStart, StartOutcome, StartRefused, StartUnclear,
 };
 use chimaera_remote::RemoteHome;
 use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use super::connect::{do_connect, state_for, with_hosts, HostState, HostStatus};
+use super::connect::{do_connect, emit_host_status, state_for, with_hosts, HostState, HostStatus};
 use super::restore::open_compute_window;
 use super::{authorize_scope_origin, lock, Shell};
 use crate::windows::{ComputeScope, WindowRecord};
@@ -57,10 +57,8 @@ pub(crate) struct ClusterLive {
     queued_opens: HashSet<(String, String)>,
     /// One notification per (kind, job).
     notified: HashSet<String>,
-    /// Slurm start estimates for waiting jobs, asked at most every 5 min.
-    estimates: HashMap<String, (Instant, Option<u64>)>,
-    /// Jobs whose end reason was already asked of accounting.
-    ended_asked: HashSet<String>,
+    /// Accounting questions about each ended job (see [`may_ask_end`]).
+    end_asks: HashMap<String, EndAsk>,
     /// Each job's Slurm id as last seen. An attached job's record never has
     /// one (srun starts it), yet its windows are keyed by it — so once it
     /// leaves the queue, only this still knows which windows were its.
@@ -75,6 +73,33 @@ pub(crate) struct ClusterLive {
 pub(crate) struct ClusterInfo {
     pub(crate) scheduler: chimaera_core::slurm::Scheduler,
     pub(crate) login_daemon: Option<chimaera_remote::LoginDaemon>,
+}
+
+/// The accounting questions asked about one ended job's end reason.
+#[derive(Clone, Copy, Debug, Default)]
+struct EndAsk {
+    tries: u32,
+    last: Option<Instant>,
+    /// Accounting answered and the reason is recorded: never ask again.
+    settled: bool,
+}
+
+/// At most this many accounting questions per ended job. Accounting lags
+/// the queue by seconds to minutes, so an early answer is "still running"
+/// (nothing recorded); later overviews ask again.
+const END_ASK_TRIES: u32 = 10;
+
+/// Whether an overview may ask accounting how a job ended now: once settled
+/// never, otherwise at most once per queue floor and [`END_ASK_TRIES`] in
+/// all — so a job whose accounting never settles costs a bounded few execs.
+fn may_ask_end(ask: Option<&EndAsk>, now: Instant) -> bool {
+    ask.is_none_or(|ask| {
+        !ask.settled
+            && ask.tries < END_ASK_TRIES
+            && ask
+                .last
+                .is_none_or(|last| now.saturating_duration_since(last) >= cluster::SQUEUE_FLOOR)
+    })
 }
 
 /// How long a window just opened is taken as open whatever the cluster
@@ -193,8 +218,8 @@ async fn end_tunnel(app: &AppHandle, key: String, reason: &str) {
     if let Some(t) = tunnel {
         t.close().await;
     }
-    let _ = app.emit(
-        "host-status",
+    emit_host_status(
+        app,
         HostStatus {
             alias: key,
             status: "ended",
@@ -358,7 +383,14 @@ async fn absorb(app: &AppHandle, alias: &str, ov: &ClusterOverview) {
                     }
                     ended.push((host_key(alias, &j.id), reason));
                 }
-                if j.ended.is_none() && !j.stopped_by_user && c.ended_asked.insert(j.id.clone()) {
+                let now = Instant::now();
+                if j.ended.is_none()
+                    && !j.stopped_by_user
+                    && may_ask_end(c.end_asks.get(&j.id), now)
+                {
+                    let ask = c.end_asks.entry(j.id.clone()).or_default();
+                    ask.tries += 1;
+                    ask.last = Some(now);
                     if let Some(r) = ov.records.get(&j.id) {
                         // An attached job's record learns its Slurm id here,
                         // so accounting can say how it ended.
@@ -462,8 +494,23 @@ async fn absorb(app: &AppHandle, alias: &str, ov: &ClusterOverview) {
         let alias = alias.to_string();
         tauri::async_runtime::spawn(async move {
             for rec in ask_end {
-                if let Err(e) = cluster::record_end(&alias, home(), &rec).await {
-                    tracing::debug!("could not ask how {alias}'s job ended: {e:#}");
+                match cluster::record_end(&alias, home(), &rec).await {
+                    Ok(Some(_)) => {
+                        let shell = app.state::<Shell>();
+                        let mut clusters = lock(&shell.clusters);
+                        if let Some(ask) = clusters
+                            .get_mut(&alias)
+                            .and_then(|c| c.end_asks.get_mut(&rec.id))
+                        {
+                            ask.settled = true;
+                        }
+                    }
+                    // Accounting still calls it live: the next overview
+                    // past the floor asks again.
+                    Ok(None) => {
+                        tracing::debug!("{alias}: accounting has not settled job {}", rec.id)
+                    }
+                    Err(e) => tracing::debug!("could not ask how {alias}'s job ended: {e:#}"),
                 }
             }
             let _ = app.emit("cluster-changed", json!({ "alias": alias }));
@@ -645,68 +692,34 @@ async fn overlay_live(app: &AppHandle, alias: &str, ov: &mut ClusterOverview) {
     }
 }
 
-/// The overview as a page gets it: no endpoints, plus Slurm's start
-/// estimate for waiting jobs (asked at most every five minutes per job).
+/// The overview as a page gets it: no endpoints. A waiting job's start
+/// estimate rides its row from the overview's own queue read (no per-job
+/// scheduler question).
 async fn page_overview(app: &AppHandle, alias: &str) -> Result<serde_json::Value, String> {
     let ov = live_overview(app, alias).await?;
     absorb(app, alias, &ov).await;
-    let shell = app.state::<Shell>();
-    let mut wanted: Vec<String> = Vec::new();
-    let mut estimates: HashMap<String, Option<u64>> = HashMap::new();
-    {
-        let clusters = lock(&shell.clusters);
-        let c = clusters.get(alias);
-        for j in ov.jobs.iter().filter(|j| j.state == "waiting") {
-            let Some(slurm) = &j.slurm_job_id else {
-                continue;
-            };
-            match c.and_then(|c| c.estimates.get(slurm)) {
-                Some((at, est)) if at.elapsed() < Duration::from_secs(300) => {
-                    estimates.insert(slurm.clone(), *est);
-                }
-                _ => wanted.push(slurm.clone()),
-            }
-        }
-    }
-    for slurm in wanted {
-        let est = cluster::start_estimate(alias, &slurm).await.ok().flatten();
-        estimates.insert(slurm.clone(), est);
-        lock(&shell.clusters)
-            .entry(alias.to_string())
-            .or_default()
-            .estimates
-            .insert(slurm, (Instant::now(), est));
-    }
-    let mut v = serde_json::to_value(&ov).map_err(|e| e.to_string())?;
-    if let Some(list) = v.get_mut("jobs").and_then(|w| w.as_array_mut()) {
-        for j in list {
-            let est = j
-                .get("slurm_job_id")
-                .and_then(|s| s.as_str())
-                .and_then(|s| estimates.get(s).copied().flatten());
-            if let (Some(obj), Some(est)) = (j.as_object_mut(), est) {
-                obj.insert("start_estimate_ms".into(), json!(est));
-            }
-        }
-    }
-    Ok(v)
+    serde_json::to_value(&ov).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub(super) async fn cluster_overview(
+    window: tauri::WebviewWindow,
     app: AppHandle,
     alias: String,
 ) -> Result<serde_json::Value, String> {
+    super::require_target(window.app_handle(), window.label(), Some(&alias))?;
     ensure_cluster(&app, &alias).await?;
     page_overview(&app, &alias).await
 }
 
 #[tauri::command]
 pub(super) async fn cluster_facts(
+    window: tauri::WebviewWindow,
     app: AppHandle,
     alias: String,
     refresh: Option<bool>,
 ) -> Result<chimaera_core::cluster::ClusterFacts, String> {
+    super::require_target(window.app_handle(), window.label(), Some(&alias))?;
     ensure_cluster(&app, &alias).await?;
     cluster::facts(&alias, refresh.unwrap_or(false))
         .await
@@ -715,11 +728,13 @@ pub(super) async fn cluster_facts(
 
 #[tauri::command]
 pub(super) async fn cluster_add_workspace(
+    window: tauri::WebviewWindow,
     app: AppHandle,
     alias: String,
     path: String,
     name: String,
 ) -> Result<chimaera_core::cluster::ClusterWorkspace, String> {
+    super::require_target(window.app_handle(), window.label(), Some(&alias))?;
     ensure_cluster(&app, &alias).await?;
     let ws = cluster::add_workspace(&alias, home(), &path, &name)
         .await
@@ -730,10 +745,12 @@ pub(super) async fn cluster_add_workspace(
 
 #[tauri::command]
 pub(super) async fn cluster_remove_workspace(
+    window: tauri::WebviewWindow,
     app: AppHandle,
     alias: String,
     workspace_id: String,
 ) -> Result<(), String> {
+    super::require_target(window.app_handle(), window.label(), Some(&alias))?;
     valid_ws(&workspace_id)?;
     ensure_cluster(&app, &alias).await?;
     cluster::remove_workspace(&alias, home(), &workspace_id)
@@ -746,10 +763,12 @@ pub(super) async fn cluster_remove_workspace(
 /// One folder's subfolders, for choosing a workspace (the folder picker).
 #[tauri::command]
 pub(super) async fn cluster_list_dir(
+    window: tauri::WebviewWindow,
     app: AppHandle,
     alias: String,
     path: String,
 ) -> Result<chimaera_core::cluster::DirListing, String> {
+    super::require_target(window.app_handle(), window.label(), Some(&alias))?;
     ensure_cluster(&app, &alias).await?;
     ensure_binary(&app, &alias).await?;
     cluster::list_dir(&alias, home(), &path).await.map_err(err)
@@ -839,6 +858,18 @@ async fn submit_job(
     };
     let outcome = match cluster::start_job(alias, home(), &config, &req).await {
         Ok(outcome) => outcome,
+        // The start may have run: read what it left instead of failing (a
+        // job the page then offers to start again would be a duplicate).
+        Err(e) if e.downcast_ref::<StartUnclear>().is_some() => {
+            let unclear = e.downcast_ref::<StartUnclear>().expect("checked above");
+            tracing::warn!(
+                "{alias}: start of {} unclear: {}",
+                unclear.job,
+                unclear.message
+            );
+            let recovered = cluster::recover_start(alias, home(), &unclear.job).await;
+            settle_unclear_start(recovered, unclear)?
+        }
         Err(e) => {
             return match e.downcast_ref::<StartRefused>() {
                 Some(refused) => {
@@ -892,6 +923,27 @@ async fn submit_job(
     let _ = app.emit("cluster-changed", json!({ "alias": alias }));
     ensure_watcher(app, alias);
     Ok(answer)
+}
+
+/// What the page hears about a start whose outcome was unclear, from what
+/// the job's folder says: a recorded job is a start like any other; nothing
+/// submitted says so (starting again is safe); still unclear keeps the
+/// original message, which points at the list (never a resubmit).
+fn settle_unclear_start(
+    recovered: anyhow::Result<Option<StartOutcome>>,
+    unclear: &StartUnclear,
+) -> Result<StartOutcome, String> {
+    match recovered {
+        Ok(Some(outcome)) => Ok(outcome),
+        Ok(None) => Err(format!(
+            "the job didn't reach the cluster ({}); nothing was submitted, so start it again",
+            unclear.message
+        )),
+        Err(e) => {
+            tracing::warn!("could not recover the start of {}: {e:#}", unclear.job);
+            Err(unclear.message.clone())
+        }
+    }
 }
 
 /// Hold an attached job in the foreground for as long as this app runs (or
@@ -972,6 +1024,7 @@ fn hold_attached(app: &AppHandle, alias: &str, jid: &str, mut child: tokio::proc
 #[tauri::command]
 #[allow(clippy::too_many_arguments)] // the page's start sheet, one field each
 pub(super) async fn cluster_start_job(
+    window: tauri::WebviewWindow,
     app: AppHandle,
     alias: String,
     spec: LaunchSpec,
@@ -981,6 +1034,7 @@ pub(super) async fn cluster_start_job(
     save_as: Option<String>,
     attached: bool,
 ) -> Result<serde_json::Value, String> {
+    super::require_target(window.app_handle(), window.label(), Some(&alias))?;
     for w in &open {
         valid_ws(w)?;
     }
@@ -1019,6 +1073,7 @@ pub(super) async fn cluster_start_job(
 /// (every workspace saves its chats) and opens them; their windows follow.
 #[tauri::command]
 pub(super) async fn cluster_continue_job(
+    window: tauri::WebviewWindow,
     app: AppHandle,
     alias: String,
     job_id: Option<String>,
@@ -1026,6 +1081,7 @@ pub(super) async fn cluster_continue_job(
     spec: Option<LaunchSpec>,
     run_startup: Option<String>,
 ) -> Result<serde_json::Value, String> {
+    super::require_target(window.app_handle(), window.label(), Some(&alias))?;
     if let Some(j) = &job_id {
         valid_job(j)?;
     }
@@ -1095,11 +1151,13 @@ pub(super) async fn cluster_continue_job(
 
 #[tauri::command]
 pub(super) async fn cluster_stop_job(
+    window: tauri::WebviewWindow,
     app: AppHandle,
     state: State<'_, Shell>,
     alias: String,
     job_id: String,
 ) -> Result<(), String> {
+    super::require_target(window.app_handle(), window.label(), Some(&alias))?;
     valid_job(&job_id)?;
     ensure_cluster(&app, &alias).await?;
     tracing::info!("ipc: cluster_stop_job {alias} {job_id}");
@@ -1157,10 +1215,12 @@ pub(super) async fn cluster_stop_job(
 /// Forget an ended job (its line on the page).
 #[tauri::command]
 pub(super) async fn cluster_dismiss_job(
+    window: tauri::WebviewWindow,
     app: AppHandle,
     alias: String,
     job_id: String,
 ) -> Result<(), String> {
+    super::require_target(window.app_handle(), window.label(), Some(&alias))?;
     valid_job(&job_id)?;
     ensure_cluster(&app, &alias).await?;
     let ov = cluster::overview(&alias, home()).await.map_err(err)?;
@@ -1367,8 +1427,8 @@ async fn open_ws_window(
         c.last_ws.insert(wid.to_string(), endpoint.job.clone());
         c.opened_at.insert(wid.to_string(), Instant::now());
     }
-    let _ = app.emit(
-        "host-status",
+    emit_host_status(
+        app,
         HostStatus {
             alias: key,
             status: "connected",
@@ -1388,11 +1448,13 @@ async fn open_ws_window(
 /// in a job that hasn't started says so.
 #[tauri::command]
 pub(super) async fn cluster_open(
+    window: tauri::WebviewWindow,
     app: AppHandle,
     alias: String,
     workspace_id: String,
     job_id: Option<String>,
 ) -> Result<(), String> {
+    super::require_target(window.app_handle(), window.label(), Some(&alias))?;
     valid_ws(&workspace_id)?;
     if let Some(j) = &job_id {
         valid_job(j)?;
@@ -1428,10 +1490,12 @@ pub(super) async fn cluster_open(
 /// Close a workspace in its job (its chimaera saves the chats and exits).
 #[tauri::command]
 pub(super) async fn cluster_close(
+    window: tauri::WebviewWindow,
     app: AppHandle,
     alias: String,
     workspace_id: String,
 ) -> Result<(), String> {
+    super::require_target(window.app_handle(), window.label(), Some(&alias))?;
     valid_ws(&workspace_id)?;
     ensure_cluster(&app, &alias).await?;
     tracing::info!("ipc: cluster_close {alias} {workspace_id}");
@@ -1473,11 +1537,13 @@ pub(super) async fn cluster_close(
 /// chimaera saves the chats), open it here; its window follows.
 #[tauri::command]
 pub(super) async fn cluster_move(
+    window: tauri::WebviewWindow,
     app: AppHandle,
     alias: String,
     workspace_id: String,
     job_id: String,
 ) -> Result<(), String> {
+    super::require_target(window.app_handle(), window.label(), Some(&alias))?;
     valid_ws(&workspace_id)?;
     valid_job(&job_id)?;
     ensure_cluster(&app, &alias).await?;
@@ -1544,11 +1610,13 @@ pub(super) async fn cluster_move(
 /// once it runs).
 #[tauri::command]
 pub(super) async fn cluster_queue_open(
+    window: tauri::WebviewWindow,
     app: AppHandle,
     alias: String,
     workspace_id: String,
     job_id: String,
 ) -> Result<(), String> {
+    super::require_target(window.app_handle(), window.label(), Some(&alias))?;
     valid_ws(&workspace_id)?;
     valid_job(&job_id)?;
     ensure_cluster(&app, &alias).await?;
@@ -1593,11 +1661,13 @@ pub(super) async fn cluster_queue_open(
 /// commands — the cluster's Environment settings, edited from here.
 #[tauri::command]
 pub(super) async fn cluster_set_startup(
+    window: tauri::WebviewWindow,
     app: AppHandle,
     alias: String,
     workspace_id: Option<String>,
     text: String,
 ) -> Result<(), String> {
+    super::require_target(window.app_handle(), window.label(), Some(&alias))?;
     if let Some(id) = &workspace_id {
         valid_ws(id)?;
     }
@@ -1611,10 +1681,12 @@ pub(super) async fn cluster_set_startup(
 
 #[tauri::command]
 pub(super) async fn cluster_forget_setup(
+    window: tauri::WebviewWindow,
     app: AppHandle,
     alias: String,
     name: String,
 ) -> Result<(), String> {
+    super::require_target(window.app_handle(), window.label(), Some(&alias))?;
     ensure_cluster(&app, &alias).await?;
     cluster::forget_setup(&alias, home(), &name)
         .await
@@ -1622,10 +1694,12 @@ pub(super) async fn cluster_forget_setup(
 }
 #[tauri::command]
 pub(super) async fn cluster_set_agent_rules(
+    window: tauri::WebviewWindow,
     app: AppHandle,
     alias: String,
     rules: chimaera_core::cluster::AgentRules,
 ) -> Result<(), String> {
+    super::require_target(window.app_handle(), window.label(), Some(&alias))?;
     ensure_cluster(&app, &alias).await?;
     cluster::set_agent_rules(&alias, home(), &rules)
         .await
@@ -1634,10 +1708,12 @@ pub(super) async fn cluster_set_agent_rules(
 
 #[tauri::command]
 pub(super) async fn cluster_set_login_serve(
+    window: tauri::WebviewWindow,
     state: State<'_, Shell>,
     alias: String,
     on: bool,
 ) -> Result<HostState, String> {
+    super::require_target(window.app_handle(), window.label(), Some(&alias))?;
     tracing::info!("ipc: cluster_set_login_serve {alias} {on}");
     let owned = alias.clone();
     let entry = with_hosts(move |hosts| hosts.set_login_serve(&owned, on)).await?;
@@ -1653,10 +1729,12 @@ pub(super) async fn cluster_set_login_serve(
 /// a daemon started there doesn't tell its agents they're on a login node.
 #[tauri::command]
 pub(super) async fn set_not_cluster(
+    window: tauri::WebviewWindow,
     state: State<'_, Shell>,
     alias: String,
     on: bool,
 ) -> Result<HostState, String> {
+    super::require_target(window.app_handle(), window.label(), Some(&alias))?;
     tracing::info!("ipc: set_not_cluster {alias} {on}");
     let owned = alias.clone();
     let entry = with_hosts(move |hosts| hosts.set_not_cluster(&owned, on)).await?;
@@ -1671,9 +1749,11 @@ pub(super) async fn set_not_cluster(
 /// (never -9: it may still be saving sessions).
 #[tauri::command]
 pub(super) async fn cluster_stop_login_daemon(
+    window: tauri::WebviewWindow,
     state: State<'_, Shell>,
     alias: String,
 ) -> Result<(), String> {
+    super::require_target(window.app_handle(), window.label(), Some(&alias))?;
     tracing::info!("ipc: cluster_stop_login_daemon {alias}");
     if let Some((manifest, true)) = chimaera_remote::locate_daemon(&alias, home())
         .await
@@ -1779,11 +1859,13 @@ fn terminals_workspace(port: u16, token: &str) -> Result<String, String> {
 /// next launch ([`sweep_terminals`]).
 #[tauri::command]
 pub(super) async fn cluster_open_terminal(
+    window: tauri::WebviewWindow,
     app: AppHandle,
     state: State<'_, Shell>,
     alias: String,
 ) -> Result<(), String> {
     let alias = chimaera_remote::hosts::normalize_alias(&alias).map_err(err)?;
+    super::require_target(window.app_handle(), window.label(), Some(&alias))?;
     tracing::info!("ipc: cluster_open_terminal {alias}");
     let (port, token) = {
         let local = lock(&state.local);
@@ -1953,6 +2035,50 @@ pub(crate) fn sweep_terminals(port: u16, token: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unclear_start_never_reads_as_a_failure_to_retry_blindly() {
+        let unclear = StartUnclear {
+            job: "j1".into(),
+            message: "couldn't tell whether it took the job".into(),
+        };
+        let submitted = StartOutcome::Submitted {
+            job: "j1".into(),
+            slurm_job_id: "12345".into(),
+        };
+        match settle_unclear_start(Ok(Some(submitted)), &unclear) {
+            Ok(StartOutcome::Submitted { slurm_job_id, .. }) => assert_eq!(slurm_job_id, "12345"),
+            _ => panic!("a recorded job is a start"),
+        }
+        let none = settle_unclear_start(Ok(None), &unclear).unwrap_err();
+        assert!(none.contains("start it again"), "{none}");
+        let still = settle_unclear_start(Err(anyhow::anyhow!("ssh failed")), &unclear).unwrap_err();
+        assert_eq!(
+            still, unclear.message,
+            "still unclear never invites a retry"
+        );
+    }
+
+    #[test]
+    fn accounting_is_asked_again_after_the_floor_until_it_settles() {
+        let start = Instant::now();
+        assert!(may_ask_end(None, start), "the first ended sighting asks");
+        let mut ask = EndAsk {
+            tries: 1,
+            last: Some(start),
+            settled: false,
+        };
+        assert!(!may_ask_end(Some(&ask), start + Duration::from_secs(5)));
+        assert!(
+            may_ask_end(Some(&ask), start + cluster::SQUEUE_FLOOR),
+            "an unsettled answer is asked again once the floor passed"
+        );
+        ask.tries = END_ASK_TRIES;
+        assert!(!may_ask_end(Some(&ask), start + Duration::from_secs(3600)));
+        ask.tries = 2;
+        ask.settled = true;
+        assert!(!may_ask_end(Some(&ask), start + Duration::from_secs(3600)));
+    }
 
     #[test]
     fn a_notice_says_the_time_actually_left() {
