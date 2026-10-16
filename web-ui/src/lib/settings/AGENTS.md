@@ -23,9 +23,14 @@ the resumed conversation's own settings still win. Permission-mode memory is ind
 **Exception — Environment.** The Environment category is store-backed, not
 schema-backed: `EnvironmentSettings.svelte` edits the daemon's prelude map over
 `/api/v1/environment` (persisted as `env-profiles.json`, not `settings.json`).
-No schema rows, an explicit Save (fetch-merge-put — the PUT replaces the whole
-map, so other workspaces' entries must round-trip), and an empty editor deletes
-its scope's entry rather than persisting `{text: ""}`.
+No schema rows, and an explicit Save that PATCHes only the scopes whose editor
+changed (`planEnvironmentSave`): an unchanged scope stays out of the body, so a
+value another window saved meanwhile survives, and the daemon serializes
+concurrent patches behind the store's disk gate (deliberately not its mutex,
+which is never held across I/O). An empty editor sends `null`, deleting
+its scope's entry rather than persisting `{text: ""}`. The editors stay live
+during a save; each sent scope's baseline becomes the text that was sent, so
+keystrokes typed meanwhile remain unsaved.
 
 **Exception — Documents.** Also store-backed: `DocumentsSettings.svelte` drives
 the opt-in "teach agents the document dialect" installs over
@@ -61,13 +66,14 @@ wakes row always shows.
 |---|---|
 | `SettingsView.svelte` | The surface itself, loaded lazily (`layout/lazyViews.ts`). Mounted in two places: a singleton layout tab in a workspace, and a full page over Home (`App.svelte` `homeSettingsOpen`) where no workspace is open, so it must not assume one. |
 | `schema.ts` | The settings schema: keys, types, defaults, labels, groups. Ground truth. |
-| `store.svelte.ts` | The reactive settings store: load/patch/persist against `/api/v1/settings`, sparse-map semantics, the `dirtySince` echo-guard, and document-wide theme/interface/editor CSS variables. |
+| `store.svelte.ts` | The reactive settings store: load/patch against `/api/v1/settings`, sparse-map semantics, the echo-guard, `settingsSaveState()`, and document-wide theme/interface/editor CSS variables. |
+| `settingsWriter.ts` | The single writer behind `PUT /api/v1/settings`: `idle → pending → inflight → idle`, `failed` (no answer; bounded, visibility-floored backoff via `net/reconnect.ts` `retryDelayMs`) or `rejected` (refused, with the daemon's reason). The map is the queue: one body, the current one. |
 | `themes.ts` | The curated light/dark theme definitions + `applyAppearance`. |
 | `AgentsSettings.svelte` | Installed-agent cards; Advanced paths and removal. A card the login shell couldn't check (`unchecked`) reads "Couldn't check" with the shell's reason and a Retry (`recheckAgent`, the patient re-detect) instead of Install; a second miss says "Still couldn't check." Opens the shared `../workspace/AgentSetupDialog.svelte` through `agentSetup.ts` for install/update/reinstall and recoverable progress/results; the compact dialog keeps technical output under Details and, after an install lands for a signed-out agent, shows the in-app sign-in card (`../workspace/AgentSignInCard.svelte`), never the agent's terminal. A signed-out card's **Sign in** opens that same card under its row (`signingIn`; the card a chat shows), which follows the login and reloads the catalog once the CLI confirms it. Each Claude / Codex / Grok / Antigravity card has a **Plan usage** section beside Advanced, collapsed by default (`agentUsage.ts`, read when first opened and on Refresh, drawn with `../shared/UsageBars.svelte`). Polls only while visible and preserves unfinished edits. |
 | `agentUsage.ts` | `getAgentUsage` for `GET /api/v1/agents/{id}/usage` (the account's plan windows, read live from the agent's CLI) and `USAGE_AGENTS` (the agents that have such a read; Cursor doesn't). `ACCOUNT_USAGE_IN_CHAT` names the agents whose chat stream reports no limits (Antigravity), so their chat header shows this read instead; the others' streams report their own, and a chat never spawns a CLI ahead of them. |
 | `agentStatus.ts` | Honest update and installer status rules; unknown/failure never means up to date or installed. |
 | `EnvironmentSettings.svelte` | The Environment prelude panel (bespoke, `/api/v1/environment`-backed — see the exception above). |
-| `environment.ts` | Wire types + `getEnvironment`/`putEnvironment` for the prelude map. |
+| `environment.ts` | Wire types + `getEnvironment`/`patchEnvironment` (and the whole-map `putEnvironment`) for the prelude map; `planEnvironmentSave`/`baselinesAfterSave`, the panel's save logic. |
 | `DocumentsSettings.svelte` | The Documents panel: the opt-in AGENTS.md / Claude skill installs (see the exception above). |
 | `agentDocs.ts` | Wire types + `getAgentDocs`/`installAgentDocs` for `/api/v1/agent-docs`. |
 | `PluginsSettings.svelte` | Settings → Plugins: every installed plugin's declared settings (see the exception above); slotted after Extensions. |
@@ -98,9 +104,23 @@ wakes row always shows.
   (`getSetting`, or `settings.rs` for daemon keys) and applies live; the PR that adds
   it says where. Numeric rows can carry a display `unit`; a slider shows only when the
   range has ≤120 steps.
-- **The `dirtySince` echo-guard** ignores our own writes coming back over the
-  `/ws/events` settings-change push, so a local edit doesn't fight itself. Keep it
-  when you touch the persist path.
+- **The echo-guard** (`pending`, `inflight` or `failed`) ignores settings frames
+  from the first local edit until the daemon accepts it, so neither our own echo nor an
+  older broadcast reverts what the user is typing. Keep it when you touch the
+  persist path.
+- **A failed write is retried, never dropped.** The writer retries a transient
+  failure (no answer, 5xx, 408, 429) on its backoff; a settings frame while
+  `failed` means the events socket reconnected, so it re-sends at once instead
+  of being ignored. A refused map (`rejected`, any other 4xx such as 413) is
+  never re-sent unprompted and does not guard: re-sending cannot succeed, and
+  guarding would deafen the window to every other window, so the next frame
+  replaces it. An older PUT's answer never clears newer edits: only an accepted
+  body equal to the current map returns to `idle`. `flushSettings()` resolves
+  `true` once the daemon holds every edit made before the call; it aborts an
+  outstanding older PUT and its waiters follow the newer one. The abort cannot
+  recall a request already delivered, so the daemon may still apply it.
+  Settings shows **unsaved** while `failed` or `rejected` (the tooltip says
+  which, with the daemon's reason); clicking it re-sends now.
 - **UI quality is an acceptance criterion.** Use the theme tokens; light and dark
   both hold.
 - **Setup survives a missed catalog refresh.** `workspace/agentSetup.ts` remembers

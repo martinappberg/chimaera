@@ -110,6 +110,12 @@ scripts/worktree-gc --self [--sweep] [--apply]   # this worktree's own target/
 bash scripts/worktree-gc.test.sh       # the safety rules, against a throwaway repo
 ```
 
+The test runs in two sections. The deterministic section checks every
+classification rule, previews included, against fixture process tables served by
+fake `lsof` and `ps` on PATH. The integration section starts real previews and
+stops them. It first probes `ps` and `lsof`; where a sandbox denies them, it prints
+the missing capability and counts its cases as skipped, not failed. CI runs both.
+
 Knobs: `git config worktree-gc.auto false` stops the hooks from deleting anything
 (they still flag low disk; `git config --get worktree-gc.auto` shows whether a
 machine opted out), `WORKTREE_GC=off` silences them entirely, and

@@ -7,7 +7,13 @@
    * spec-pinned chords render read-only at the end of the Keyboard section.
    */
   import { CATEGORIES, SETTINGS, type SettingDef } from "./schema";
-  import { isModified, settingsLoaded } from "./store.svelte";
+  import {
+    flushSettings,
+    isModified,
+    settingsLoaded,
+    settingsSaveRejection,
+    settingsSaveState,
+  } from "./store.svelte";
   import SettingRow from "./SettingRow.svelte";
   import SettingsJson from "./SettingsJson.svelte";
   import AgentsSettings from "./AgentsSettings.svelte";
@@ -74,6 +80,18 @@
   }
 
   const visible = $derived(SETTINGS.filter(matches));
+
+  /** The unsaved indicator's tooltip, by why the write did not land. */
+  const unsavedTitle = $derived.by(() => {
+    switch (settingsSaveState()) {
+      case "failed":
+        return "Couldn't reach the daemon — retrying. Click to retry now.";
+      case "rejected":
+        return `Not saved: ${settingsSaveRejection()}. Click to send again.`;
+      default:
+        return null;
+    }
+  });
   const modifiedCount = $derived(SETTINGS.filter((d) => isModified(d.id)).length);
 
   /**
@@ -234,6 +252,13 @@
       />
     {/if}
     <span class="status">
+      {#if unsavedTitle !== null}
+        <!-- Only a failed or refused write shows: the debounce and the PUT
+             itself are too brief to be worth a flicker. A click re-sends now. -->
+        <button class="unsaved" title={unsavedTitle} onclick={() => void flushSettings()}>
+          <span class="dot" aria-hidden="true"></span>unsaved
+        </button>
+      {/if}
       {#if !settingsLoaded()}
         loading…
       {:else if modifiedCount > 0}
@@ -443,9 +468,37 @@
 
   .status {
     margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 10px;
     font-size: var(--text-sm);
     color: var(--muted);
     white-space: nowrap;
+  }
+
+  .unsaved {
+    appearance: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    border: 0;
+    background: none;
+    padding: 2px 6px;
+    border-radius: 5px;
+    font: inherit;
+    color: var(--warn);
+    cursor: pointer;
+  }
+
+  .unsaved:hover {
+    background: color-mix(in srgb, var(--warn) 10%, transparent);
+  }
+
+  .dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
   }
 
   .tabs {

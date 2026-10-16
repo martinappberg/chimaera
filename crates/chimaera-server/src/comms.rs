@@ -348,8 +348,8 @@ async fn ensure_loaded(state: &Arc<AppState>, ws: &str) {
     }
     let path = state.comms.path(ws);
     let loaded = tokio::task::spawn_blocking(move || -> Inbox {
-        match std::fs::read(&path) {
-            Ok(bytes) if bytes.len() <= 1024 * 1024 => {
+        match crate::persist::read_bounded(&path, 1024 * 1024) {
+            crate::persist::Bounded::Ok(bytes) => {
                 serde_json::from_slice(&bytes).unwrap_or_default()
             }
             _ => Inbox::default(),

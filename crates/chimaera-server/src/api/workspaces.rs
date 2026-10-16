@@ -457,7 +457,7 @@ pub(crate) async fn delete_workspace(
             }
             // Its environment prelude goes with it. Explicit-delete only —
             // no boot sweep (see `environment::EnvPreludes`).
-            crate::lock(&state.env_preludes).remove_workspace(&id);
+            crate::environment::remove_workspace(&state, &id).await;
             // And the git service's per-workspace state — notably the status
             // share's slot, which pins a parsed status until evicted — plus
             // the quick-open index, tens of MB nothing could query again.

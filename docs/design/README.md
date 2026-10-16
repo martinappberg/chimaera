@@ -26,6 +26,10 @@ and area maps. The [documentation index](../README.md) separates these from plan
 These records preserve the proposals and decisions behind major features. Each
 links to current behavior; a planned item in a record is not a shipping promise.
 
+The [repository robustness and agent experience plan](robustness-and-agent-experience-plan.md)
+records the 2026-10-15 inventory, targeted findings, and proposed improvement work.
+It covers feature boundaries, architecture, tests, agent guidance, and worktree workflows.
+
 | Area | Design record | Current guide |
 |---|---|---|
 | Workspace and files | [Document workbench](document-workbench-plan.md) | [Files and previews](../features/files-and-previews.md) |

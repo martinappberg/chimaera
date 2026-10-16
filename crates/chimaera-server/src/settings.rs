@@ -11,8 +11,7 @@
 //! on-disk edit). The events path itself never stats — see
 //! [`SettingsStore::generation_cached`].
 
-use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -23,20 +22,60 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
 
+use crate::persist::{DiskGate, Encode, Hook, Look};
 use crate::AppState;
 
 /// Maximum stored settings size (the raw PUT body / on-disk file).
 const MAX_SETTINGS_BYTES: usize = 256 * 1024;
 
+type Map = serde_json::Map<String, serde_json::Value>;
+
 /// In-memory settings map backed by `settings.json`, mtime-checked on read
 /// so external edits (vim over SSH) surface without a daemon restart.
+///
+/// The routes and the watcher do their disk work through [`refresh`] and
+/// [`put_settings`]: on the blocking pool, one job at a time (`gate`), with
+/// this struct's mutex held only to snapshot and to install — never across a
+/// stat, read or write. The synchronous [`Self::current`] getters other
+/// modules call still stat (and on a change read) under the mutex.
 pub(crate) struct SettingsStore {
     path: PathBuf,
-    map: serde_json::Map<String, serde_json::Value>,
+    map: Map,
     /// mtime of the file the cached map was read from (None = no file).
     mtime: Option<SystemTime>,
     /// Bumped on every observed content change; /ws/events diffs against it.
     generation: u64,
+    gate: DiskGate,
+    /// Test hooks run on the blocking pool (see [`crate::persist::Hook`]):
+    /// before each off-lock read, and after a PUT's file lands.
+    before_read: Option<Hook>,
+    after_write: Option<Hook>,
+}
+
+/// One look at settings.json (environment.rs's store reads the same way).
+type Disk = Look<Map>;
+
+/// [`crate::persist::look`] for settings.json: a non-object or corrupt file
+/// is an empty map.
+fn look(path: &Path, recorded: Option<SystemTime>, hook: Option<&Hook>) -> Disk {
+    crate::persist::look(
+        path,
+        recorded,
+        MAX_SETTINGS_BYTES,
+        "settings.json",
+        hook,
+        |bytes| match serde_json::from_slice::<serde_json::Value>(bytes) {
+            Ok(serde_json::Value::Object(map)) => map,
+            Ok(_) => {
+                tracing::warn!(path = %path.display(), "settings.json is not a JSON object; ignoring");
+                Map::new()
+            }
+            Err(err) => {
+                tracing::warn!(path = %path.display(), %err, "corrupt settings.json; ignoring");
+                Map::new()
+            }
+        },
+    )
 }
 
 impl SettingsStore {
@@ -46,53 +85,41 @@ impl SettingsStore {
     pub(crate) fn load(path: PathBuf) -> Self {
         let mut store = SettingsStore {
             path,
-            map: serde_json::Map::new(),
+            map: Map::new(),
             mtime: None,
             generation: 0,
+            gate: DiskGate::default(),
+            before_read: None,
+            after_write: None,
         };
-        store.read_from_disk();
+        store.refresh();
         store
     }
 
-    fn read_from_disk(&mut self) {
-        let (map, mtime) = match std::fs::read(&self.path) {
-            Ok(bytes) if bytes.len() > MAX_SETTINGS_BYTES => {
-                tracing::warn!(path = %self.path.display(), "settings.json exceeds {MAX_SETTINGS_BYTES} bytes; ignoring");
-                (serde_json::Map::new(), file_mtime(&self.path))
-            }
-            Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
-                Ok(serde_json::Value::Object(map)) => (map, file_mtime(&self.path)),
-                Ok(_) => {
-                    tracing::warn!(path = %self.path.display(), "settings.json is not a JSON object; ignoring");
-                    (serde_json::Map::new(), file_mtime(&self.path))
-                }
-                Err(err) => {
-                    tracing::warn!(path = %self.path.display(), %err, "corrupt settings.json; ignoring");
-                    (serde_json::Map::new(), file_mtime(&self.path))
-                }
-            },
-            Err(err) if err.kind() == ErrorKind::NotFound => (serde_json::Map::new(), None),
-            Err(err) => {
-                tracing::warn!(path = %self.path.display(), %err, "failed to read settings.json");
-                (serde_json::Map::new(), None)
-            }
+    /// Fold one look in; true when the content generation moved.
+    fn install(&mut self, disk: Disk) -> bool {
+        let Disk::Loaded(map, mtime) = disk else {
+            return false;
         };
-        if map != self.map {
-            self.generation += 1;
-        }
-        self.map = map;
         self.mtime = mtime;
+        if map == self.map {
+            return false;
+        }
+        self.generation += 1;
+        self.map = map;
+        true
     }
 
-    /// Re-read when the file changed on disk since the cached read.
+    /// Re-read when the file changed on disk since the cached read. Blocking,
+    /// under the caller's lock: only for the synchronous getters.
     fn refresh(&mut self) {
-        if file_mtime(&self.path) != self.mtime {
-            self.read_from_disk();
-        }
+        let disk = look(&self.path, self.mtime, None);
+        self.install(disk);
     }
 
     /// The current settings map (mtime-checked against on-disk edits).
-    pub(crate) fn current(&mut self) -> &serde_json::Map<String, serde_json::Value> {
+    /// Blocking: async code awaits [`refresh`] and reads [`Self::map_cached`].
+    pub(crate) fn current(&mut self) -> &Map {
         self.refresh();
         &self.map
     }
@@ -101,7 +128,7 @@ impl SettingsStore {
     /// path, which runs per client on every wake and must never do blocking
     /// fs on the reactor. External edits are folded in by
     /// [`watch_external_edits`] (off-reactor), not by this read.
-    pub(crate) fn map_cached(&self) -> &serde_json::Map<String, serde_json::Value> {
+    pub(crate) fn map_cached(&self) -> &Map {
         &self.map
     }
 
@@ -112,18 +139,16 @@ impl SettingsStore {
     }
 
     /// Replace the whole map and persist (pretty-printed, atomic rename).
-    pub(crate) fn put(
-        &mut self,
-        map: serde_json::Map<String, serde_json::Value>,
-    ) -> anyhow::Result<()> {
-        let mut body = serde_json::to_vec_pretty(&map)?;
-        body.push(b'\n');
-        crate::persist::atomic_write_json(&self.path, body)?;
-        if map != self.map {
-            self.generation += 1;
-        }
-        self.map = map;
-        self.mtime = file_mtime(&self.path);
+    /// Blocking, under the caller's lock: the route goes through
+    /// [`put_settings`] instead.
+    #[cfg(test)]
+    pub(crate) fn put(&mut self, map: Map) -> anyhow::Result<()> {
+        let body = encode(&map).map_err(|err| match err {
+            WriteError::TooLarge => anyhow::anyhow!("settings exceed {MAX_SETTINGS_BYTES} bytes"),
+            WriteError::Failed(err) => err,
+        })?;
+        let mtime = crate::persist::atomic_write_json_modified(&self.path, body)?;
+        self.install(Disk::Loaded(map, mtime));
         Ok(())
     }
 
@@ -251,10 +276,90 @@ impl SettingsStore {
     pub(crate) fn force_stale_for_tests(&mut self) {
         self.mtime = Some(std::time::UNIX_EPOCH);
     }
+
+    /// Run `hook` on the blocking pool right before each off-lock read (see
+    /// [`crate::persist::Hook`]).
+    #[cfg(test)]
+    pub(crate) fn set_before_read_for_tests(&mut self, hook: Hook) {
+        self.before_read = Some(hook);
+    }
+
+    /// Run `hook` on the blocking pool right after a PUT's file lands, before
+    /// the store installs it.
+    #[cfg(test)]
+    pub(crate) fn set_after_write_for_tests(&mut self, hook: Hook) {
+        self.after_write = Some(hook);
+    }
 }
 
-fn file_mtime(path: &std::path::Path) -> Option<SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+/// Why a settings write didn't land.
+enum WriteError {
+    /// The encoded file would exceed what a read accepts: writing it would
+    /// turn the next read into an empty map.
+    TooLarge,
+    Failed(anyhow::Error),
+}
+
+/// The pretty-printed file body, refused over the read cap.
+fn encode(map: &Map) -> Result<Vec<u8>, WriteError> {
+    crate::persist::encode_pretty(map, MAX_SETTINGS_BYTES).map_err(|err| match err {
+        Encode::TooLarge => WriteError::TooLarge,
+        Encode::Failed(err) => WriteError::Failed(err.into()),
+    })
+}
+
+/// One off-lock refresh, side effects included. Blocking; runs inside the
+/// store's [`DiskGate`]. The mutex is taken twice, briefly: to snapshot the
+/// path and recorded mtime, and to install. A synchronous getter that
+/// refreshed in between already installed a read at least as new, so the
+/// install is skipped then. True when the content changed.
+///
+/// The quick-open clear and the `/ws/events` wake happen HERE, not in the
+/// awaiting handler: a handler dropped mid-job (a closed window) must not
+/// lose them once the change is installed.
+fn refresh_job(state: &AppState) -> bool {
+    let (path, recorded, hook) = {
+        let store = crate::lock(&state.settings);
+        (store.path.clone(), store.mtime, store.before_read.clone())
+    };
+    let disk = look(&path, recorded, hook.as_ref());
+    if !matches!(disk, Disk::Loaded(..)) {
+        return false;
+    }
+    let (changed, ignore_changed) = {
+        let mut store = crate::lock(&state.settings);
+        if store.mtime != recorded {
+            return false;
+        }
+        let ignore_before = store.map.get("quickOpen.ignoreDirs").cloned();
+        let changed = store.install(disk);
+        (
+            changed,
+            ignore_before != store.map.get("quickOpen.ignoreDirs").cloned(),
+        )
+    };
+    if ignore_changed {
+        // Same rule as the PUT path: an index built under the old ignore
+        // list must not be served for its freshness window.
+        crate::lock(&state.quickopen).clear();
+    }
+    if changed {
+        state.changes.notify_waiters();
+    }
+    changed
+}
+
+/// Fold an on-disk edit into the store, off the reactor, and wake
+/// `/ws/events` when the content changed; true when it did.
+pub(crate) async fn refresh(state: &Arc<AppState>) -> bool {
+    let gate = crate::lock(&state.settings).gate.clone();
+    let job_state = state.clone();
+    gate.run(move || refresh_job(&job_state))
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(%err, "settings refresh failed");
+            false
+        })
 }
 
 /// Cadence of the external-edit poll. Hand-edits are rare and were already
@@ -268,90 +373,86 @@ const SETTINGS_POLL: Duration = Duration::from_secs(2);
 /// cached generation/map — the old stat-on-every-wake ran per client under
 /// the settings mutex ON the reactor, where one NFS hiccup stalls everything
 /// — so this task owns the steady-state external-edit detection instead.
-/// Scope note: REST reads (`current` — GET /settings, the daemon-consumed
-/// key getters, `git::configured_git`) still refresh inline, and PUT still
-/// writes, on the reactor; those are rare, user-driven paths, accepted
-/// as-is. The loop has no exit path; a failed poll pass is logged inside
-/// [`poll_external_edit`] rather than silently swallowed.
+/// The loop has no exit path; a failed pass is logged inside [`refresh`].
 pub(crate) async fn watch_external_edits(state: Arc<AppState>) {
     loop {
         tokio::time::sleep(SETTINGS_POLL).await;
-        if poll_external_edit(&state).await {
-            state.changes.notify_waiters();
-        }
+        poll_external_edit(&state).await;
     }
 }
 
 /// One poll pass: true when the on-disk file changed the settings content
-/// (the caller broadcasts). Stat and conditional reload run in ONE
-/// `spawn_blocking` hop; the settings mutex is held only for the reload, and
-/// only when the mtime actually moved — a rare, bounded window (≤256 KiB
-/// read), not a stat per events wake. A FAILED stat (an NFS hiccup — not the
-/// file being absent, which is a legitimate state) is treated as no-change:
-/// reloading through a failing filesystem would broadcast an empty map and
-/// flash every window's theme/font back to defaults until the next pass.
+/// (already broadcast by [`refresh`]). A failed stat — an NFS hiccup, not the file
+/// being absent, which is a legitimate state — is no change.
 pub(crate) async fn poll_external_edit(state: &Arc<AppState>) -> bool {
-    let task = {
-        let state = state.clone();
-        tokio::task::spawn_blocking(move || {
-            let (path, recorded) = {
-                let store = crate::lock(&state.settings);
-                (store.path.clone(), store.mtime)
-            };
-            let on_disk = match std::fs::metadata(&path) {
-                Ok(meta) => meta.modified().ok(),
-                Err(err) if err.kind() == ErrorKind::NotFound => None,
-                Err(err) => {
-                    tracing::debug!(path = %path.display(), %err,
-                        "settings watcher stat failed; skipping this pass");
-                    return false;
-                }
-            };
-            if on_disk == recorded {
-                return false;
-            }
-            let (changed, ignore_changed) = {
-                let mut store = crate::lock(&state.settings);
-                let before = store.generation;
-                let ignore_before = store.current().get("quickOpen.ignoreDirs").cloned();
-                store.read_from_disk();
-                (
-                    store.generation != before,
-                    ignore_before != store.current().get("quickOpen.ignoreDirs").cloned(),
-                )
-            };
-            if ignore_changed {
-                // Same rule as the PUT path: an index built under the old
-                // ignore list must not be served for its freshness window.
-                crate::lock(&state.quickopen).clear();
-            }
-            changed
-        })
-    };
-    match task.await {
-        Ok(changed) => changed,
-        Err(err) => {
-            tracing::warn!(%err, "settings watcher poll task failed");
-            false
-        }
-    }
+    refresh(state).await
 }
 
 /// GET /api/v1/settings
 pub(crate) async fn get_settings(State(state): State<Arc<AppState>>) -> Response {
-    let map = crate::lock(&state.settings).current().clone();
+    refresh(&state).await;
+    let map = crate::lock(&state.settings).map.clone();
     Json(json!({"settings": map})).into_response()
+}
+
+/// The PUT's disk work and everything that follows from it. Blocking; runs
+/// inside the store's [`DiskGate`], so it is ordered against every other
+/// refresh and write of this store, and it runs to the end even when the
+/// handler awaiting it is dropped (a superseded save aborted on page hide):
+/// the shim rebuild, the quick-open clear and the wake can't be lost once
+/// the file is written. A hand-edit is folded in first so the diff is
+/// against what was really on disk, and `before` is taken BEFORE the write
+/// — a synchronous getter that re-reads the new file between the rename
+/// and the install would otherwise make the diff empty.
+fn put_job(state: &AppState, map: Map) -> Result<(), WriteError> {
+    refresh_job(state);
+    let body = encode(&map)?;
+    let (path, before, ignore_before, after_write) = {
+        let store = crate::lock(&state.settings);
+        (
+            store.path.clone(),
+            agent_path_snapshot(&store.map),
+            store.map.get("quickOpen.ignoreDirs").cloned(),
+            store.after_write.clone(),
+        )
+    };
+    let mtime =
+        crate::persist::atomic_write_json_modified(&path, body).map_err(WriteError::Failed)?;
+    crate::persist::run_hook(after_write.as_ref());
+    let agent_paths_changed = before != agent_path_snapshot(&map);
+    let ignore_dirs_changed = ignore_before.as_ref() != map.get("quickOpen.ignoreDirs");
+    crate::lock(&state.settings).install(Disk::Loaded(map, mtime));
+    // The settings mutex is released: regenerate_shims re-locks it.
+    if agent_paths_changed {
+        // A per-agent binary override moved: rebuild the shims (add/remove/point
+        // one) and drop the detection cache so the next spawn resolves anew.
+        crate::runtimes::regenerate_shims(state);
+        crate::lock(&state.agent_bins).clear();
+        crate::launcher::forget_misses(state);
+    }
+    if ignore_dirs_changed {
+        // The quick-open index is served stale for its whole freshness window;
+        // an index built under the old ignore list must not outlive the edit.
+        crate::lock(&state.quickopen).clear();
+    }
+    // Wake /ws/events subscribers so every window converges live.
+    state.changes.notify_waiters();
+    Ok(())
+}
+
+fn too_large() -> Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(json!({"error": format!("settings exceed {MAX_SETTINGS_BYTES} bytes")})),
+    )
+        .into_response()
 }
 
 /// PUT /api/v1/settings — replace the whole map (a JSON object ≤ 256KB);
 /// 204 on success. Unknown keys are preserved verbatim (forward compat).
 pub(crate) async fn put_settings(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     if body.len() > MAX_SETTINGS_BYTES {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Json(json!({"error": format!("settings exceed {MAX_SETTINGS_BYTES} bytes")})),
-        )
-            .into_response();
+        return too_large();
     }
     let map = match serde_json::from_slice::<serde_json::Value>(&body) {
         Ok(serde_json::Value::Object(map)) => map,
@@ -370,48 +471,25 @@ pub(crate) async fn put_settings(State(state): State<Arc<AppState>>, body: Bytes
                 .into_response();
         }
     };
-    // Persist, tracking whether any per-agent path override moved so we can
-    // rebuild the shims for it. Scoped so the settings lock is released before
-    // regenerate_shims (which re-locks settings) — no deadlock.
-    let (agent_paths_changed, ignore_dirs_changed) = {
-        let mut settings = crate::lock(&state.settings);
-        let before = agent_path_snapshot(settings.current());
-        let ignore_before = settings.current().get("quickOpen.ignoreDirs").cloned();
-        if let Err(err) = settings.put(map) {
+    let gate = crate::lock(&state.settings).gate.clone();
+    let job_state = state.clone();
+    match gate.run(move || put_job(&job_state, map)).await {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(WriteError::TooLarge)) => too_large(),
+        Ok(Err(WriteError::Failed(err))) | Err(err) => {
             tracing::error!(%err, "failed to persist settings");
-            return (
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": err.to_string()})),
             )
-                .into_response();
+                .into_response()
         }
-        (
-            before != agent_path_snapshot(settings.current()),
-            ignore_before != settings.current().get("quickOpen.ignoreDirs").cloned(),
-        )
-    };
-    if agent_paths_changed {
-        // A per-agent binary override moved: rebuild the shims (add/remove/point
-        // one) and drop the detection cache so the next spawn resolves anew.
-        crate::runtimes::regenerate_shims(&state);
-        crate::lock(&state.agent_bins).clear();
-        crate::launcher::forget_misses(&state);
     }
-    if ignore_dirs_changed {
-        // The quick-open index is served stale for its whole freshness window;
-        // an index built under the old ignore list must not outlive the edit.
-        crate::lock(&state.quickopen).clear();
-    }
-    // Wake /ws/events subscribers so every window converges live.
-    state.changes.notify_waiters();
-    StatusCode::NO_CONTENT.into_response()
 }
 
 /// The `agents.<kind>.path` entries of a settings map, for diffing a PUT: only
 /// these keys drive shim regeneration.
-fn agent_path_snapshot(
-    map: &serde_json::Map<String, serde_json::Value>,
-) -> std::collections::BTreeMap<String, String> {
+fn agent_path_snapshot(map: &Map) -> std::collections::BTreeMap<String, String> {
     map.iter()
         .filter(|(k, _)| k.starts_with("agents.") && k.ends_with(".path"))
         .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))

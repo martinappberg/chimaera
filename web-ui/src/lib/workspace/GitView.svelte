@@ -96,8 +96,9 @@
       // "" removes the override (resolve from login shell / PATH). Flush now so
       // the daemon has the new value before we ask it to re-resolve.
       setSetting("git.path", gitPathInput.trim());
-      await flushSettings();
-      refreshGit();
+      // Re-resolve only once the daemon holds the value; a refused write
+      // keeps the Settings "unsaved" indicator up with the reason.
+      if (await flushSettings()) refreshGit();
     } finally {
       savingGit = false;
     }

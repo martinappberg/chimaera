@@ -3,8 +3,9 @@
  * holds) over the schema defaults. Components read through `getSetting()`
  * inside reactive contexts; plain-TS consumers (termPool) subscribe with
  * `onSettingsChange`. Writes go local-first, then a debounced PUT persists
- * the sparse map on the daemon, which broadcasts it back to every window
- * over /ws/events (`applyRemote`).
+ * the sparse map on the daemon (`settingsWriter.ts`, one writer that retries
+ * a failed PUT), which broadcasts it back to every window over /ws/events
+ * (`applyRemoteSettings`).
  *
  * Appearance (theme, accent, interface typography, and the editor font) is
  * applied to the document HERE, synchronously with every change, so CSS
@@ -24,11 +25,14 @@ import {
   type SettingId,
   type SettingsMap,
 } from "./schema";
+import { SettingsWriter, type PutResult, type SavePhase } from "./settingsWriter";
 import { defaultThemeFor, themeById, type ThemeDef } from "./themes";
 
-const PUT_DEBOUNCE_MS = 400;
 /** Keep in lockstep with the pre-module bootstrap in web-ui/index.html. */
 const APPEARANCE_BOOTSTRAP_KEY = "chimaera.appearanceBootstrap.v1";
+/** The largest body a browser accepts on a `keepalive` fetch (64 KiB, shared
+ *  by every keepalive request in flight) — under it with room to spare. */
+const KEEPALIVE_BODY_MAX = 60 * 1024;
 
 function isAppearanceBootstrap(
   value: Partial<AppearanceBootstrap> | null | undefined,
@@ -75,10 +79,41 @@ let loaded = $state(false);
 let authoritativeSettingsApplied = false;
 
 const listeners = new Set<() => void>();
-let putTimer: ReturnType<typeof setTimeout> | null = null;
-/** True from the first local edit until its PUT lands: remote echoes of
- *  older state must not revert what the user is typing. */
-let dirtySince: number | null = null;
+let savePhase = $state<SavePhase>("idle");
+let saveRejection = $state("");
+
+async function putSettings(body: string, signal: AbortSignal): Promise<PutResult> {
+  const res = await api("/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body,
+    signal,
+    // Lets the page-hide flush outlive the page. Browsers refuse a keepalive
+    // body over 64 KiB before sending it, and the writer would retry that
+    // refusal forever; a map that large goes as an ordinary request instead.
+    keepalive: body.length <= KEEPALIVE_BODY_MAX,
+  });
+  if (res.ok || res.status < 400 || res.status >= 500) return { status: res.status };
+  try {
+    const body = (await res.json()) as { error?: unknown };
+    if (typeof body.error === "string") return { status: res.status, error: body.error };
+  } catch {
+    // non-JSON refusal; the writer words it from the status
+  }
+  return { status: res.status };
+}
+
+/** Dirty from the first local edit until the daemon accepts (or refuses) it:
+ *  remote echoes of older state must not revert what the user is typing. */
+const writer = new SettingsWriter({
+  snapshot: () => JSON.stringify(user),
+  put: putSettings,
+  hidden: () => typeof document !== "undefined" && document.visibilityState === "hidden",
+  onChange: () => {
+    savePhase = writer.phase;
+    saveRejection = writer.rejection;
+  },
+});
 
 /** The effective value of a setting: sanitized user value, else the default. */
 export function getSetting<K extends SettingId>(id: K): SettingsMap[K] {
@@ -98,6 +133,18 @@ export function isModified(id: string): boolean {
 /** True once the initial GET /settings resolved (or failed — defaults hold). */
 export function settingsLoaded(): boolean {
   return loaded;
+}
+
+/** Whether local edits have reached the daemon: `idle` once accepted,
+ *  `failed` while a write waits to be retried, `rejected` when the daemon
+ *  refused the map (`settingsSaveRejection()` says why). */
+export function settingsSaveState(): SavePhase {
+  return savePhase;
+}
+
+/** The daemon's reason for refusing the last map, while `rejected`. */
+export function settingsSaveRejection(): string {
+  return saveRejection;
 }
 
 /** The raw sparse map (for the JSON editor). */
@@ -134,44 +181,28 @@ export function replaceSettings(map: Record<string, unknown>): void {
 
 function applyLocal(next: Record<string, unknown>): void {
   user = next;
-  dirtySince = Date.now();
+  writer.edited();
   applyAppearance();
   notify();
-  if (putTimer !== null) clearTimeout(putTimer);
-  putTimer = setTimeout(() => {
-    putTimer = null;
-    void flushSettings();
-  }, PUT_DEBOUNCE_MS);
 }
 
-/** Push the pending write now (also called on pagehide). */
-export async function flushSettings(): Promise<void> {
-  if (dirtySince === null) return;
-  if (putTimer !== null) {
-    clearTimeout(putTimer);
-    putTimer = null;
-  }
-  const body = JSON.stringify(user);
-  try {
-    const res = await api("/settings", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body,
-      keepalive: true,
-    });
-    // Only clear dirty when what we sent is still what we have — a keystroke
-    // mid-flight keeps the guard up for the next flush.
-    if (res.ok && JSON.stringify(user) === body) dirtySince = null;
-  } catch {
-    // daemon unreachable; the next change (or reconnect echo) retries
-  }
+/** Push the pending write now (pagehide, and callers that need the daemon to
+ *  hold the value before they continue). Resolves true once the daemon holds
+ *  every edit made so far, false when that write failed or was refused. */
+export function flushSettings(): Promise<boolean> {
+  return writer.flush();
 }
 
 /** A settings frame from /ws/events (including the echo of our own PUT). */
 export function applyRemoteSettings(map: Record<string, unknown>): void {
   loaded = true;
-  // Never clobber unsent local edits with an older broadcast.
-  if (dirtySince !== null) return;
+  // Never clobber edits the daemon has not accepted with an older broadcast;
+  // a frame after a failed write means the daemon is back, so retry it. A
+  // refused map is not guarded (see settingsWriter.ts): this frame replaces it.
+  if (writer.dirty()) {
+    writer.remoteFrame();
+    return;
+  }
   const firstAuthoritativeMap = !authoritativeSettingsApplied;
   authoritativeSettingsApplied = true;
   if (JSON.stringify(map) === JSON.stringify(user)) {
@@ -229,7 +260,7 @@ systemDark?.addEventListener("change", () => {
 
 /** The mode actually in effect right now ("light" | "dark"). */
 export function resolvedTheme(): "light" | "dark" {
-  if (!loaded && dirtySince === null && appearanceBootstrap !== null) {
+  if (!loaded && !writer.dirty() && appearanceBootstrap !== null) {
     return appearanceBootstrap.mode;
   }
   const pref = getSetting("appearance.theme");
@@ -262,7 +293,7 @@ export function appearanceBootstrapForNavigation(): AppearanceBootstrap {
 function applyAppearance(): void {
   const root = document.documentElement;
   const mode = resolvedTheme();
-  const bootstrapping = !loaded && dirtySince === null && appearanceBootstrap !== null;
+  const bootstrapping = !loaded && !writer.dirty() && appearanceBootstrap !== null;
   const id = bootstrapping
     ? appearanceBootstrap.themeId
     : getSetting(mode === "dark" ? "appearance.darkTheme" : "appearance.lightTheme");
@@ -296,7 +327,7 @@ function applyAppearance(): void {
   // navigation/window creation. Do not overwrite a real saved choice during
   // the module-load defaults pass; wait for a daemon-confirmed map or a local
   // edit.
-  if (loaded || dirtySince !== null) {
+  if (loaded || writer.dirty()) {
     const serialized = JSON.stringify(appliedAppearance);
     try {
       localStorage.setItem(APPEARANCE_BOOTSTRAP_KEY, serialized);

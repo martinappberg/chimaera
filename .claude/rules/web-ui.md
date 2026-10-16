@@ -9,8 +9,15 @@ Svelte 5 (runes). Build/check needs **Node 26** (`.nvmrc`; `nvm use`).
 Depth: [chat/AGENTS.md](../../web-ui/src/lib/chat/AGENTS.md),
 [dashboard/AGENTS.md](../../web-ui/src/lib/dashboard/AGENTS.md),
 [settings/AGENTS.md](../../web-ui/src/lib/settings/AGENTS.md),
-[knowledge/AGENTS.md](../../web-ui/src/lib/knowledge/AGENTS.md), and
-[plugins/AGENTS.md](../../web-ui/src/lib/plugins/AGENTS.md).
+[knowledge/AGENTS.md](../../web-ui/src/lib/knowledge/AGENTS.md),
+[plugins/AGENTS.md](../../web-ui/src/lib/plugins/AGENTS.md),
+[net/AGENTS.md](../../web-ui/src/lib/net/AGENTS.md),
+[layout/AGENTS.md](../../web-ui/src/lib/layout/AGENTS.md),
+[previews/AGENTS.md](../../web-ui/src/lib/previews/AGENTS.md),
+[terminal/AGENTS.md](../../web-ui/src/lib/terminal/AGENTS.md),
+[browser/AGENTS.md](../../web-ui/src/lib/browser/AGENTS.md),
+[workspace/AGENTS.md](../../web-ui/src/lib/workspace/AGENTS.md), and
+[shared/AGENTS.md](../../web-ui/src/lib/shared/AGENTS.md).
 
 `src/lib/` is grouped by concern, not flat: **`net/`** (api, ws-adjacent transport,
 reconnect, native bridge, the `/ws/events` socket) · **`layout/`** (the split/pane/tab

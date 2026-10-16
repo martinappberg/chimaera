@@ -3,7 +3,7 @@
 //! The daemon serializes these types STRAIGHT to the daemon<->UI wire — session
 //! rows (`GET /api/v1/sessions`), `/ws/sessions` events, and exec responses — with
 //! NO DTO layer in between. So a field rename/removal/retag here silently breaks
-//! the Svelte client, which has no automated tests of its own. These pin the exact
+//! the Svelte client, which has reducer tests but no component/browser tests. These pin the exact
 //! JSON shape: a behavior-preserving refactor (e.g. splitting this crate's modules)
 //! MUST keep them green, and a *deliberate* wire change updates them in the same
 //! commit so the break is visible in review.

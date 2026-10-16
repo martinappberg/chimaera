@@ -58,16 +58,16 @@ fn path(root: &Path, plugin: &str, scope: &str) -> PathBuf {
 }
 
 fn read_doc(file: &Path) -> Doc {
-    match std::fs::read(file) {
-        Ok(bytes) if bytes.len() <= FILE_MAX => serde_json::from_slice(&bytes).unwrap_or_else(|err| {
+    match crate::persist::read_bounded(file, FILE_MAX) {
+        crate::persist::Bounded::Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|err| {
             tracing::warn!(path = %file.display(), %err, "plugin data unreadable; starting it over");
             Doc::default()
         }),
-        Ok(_) => {
+        crate::persist::Bounded::TooLarge => {
             tracing::warn!(path = %file.display(), "plugin data over its cap; starting it over");
             Doc::default()
         }
-        Err(_) => Doc::default(),
+        crate::persist::Bounded::Missing | crate::persist::Bounded::Io(_) => Doc::default(),
     }
 }
 
