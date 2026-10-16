@@ -97,6 +97,7 @@ rustls-native-certs = "0.8"
 libproc = "0.14"
 
 [dev-dependencies]
+chimaera-wire-fixtures.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tokio-tungstenite = "0.30"

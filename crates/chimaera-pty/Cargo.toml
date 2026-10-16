@@ -17,4 +17,5 @@ alacritty_terminal.workspace = true
 nix.workspace = true
 
 [dev-dependencies]
+chimaera-wire-fixtures.workspace = true
 serde_json.workspace = true

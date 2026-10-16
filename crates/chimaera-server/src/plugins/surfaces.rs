@@ -485,13 +485,7 @@ pub(crate) async fn publish(
     if let Some((dir, rel)) = dropped.as_deref().and_then(stored_parts) {
         let _ = tokio::task::spawn_blocking(move || super::output::remove(&dir, &rel)).await;
     }
-    let frame = json!({
-        "type": "surface",
-        "plugin": plugin,
-        "workspace": ws,
-        "surface": surface,
-        "key": key,
-    });
+    let frame = crate::ws::frames::plugin_surface(&plugin, &ws, &surface, &key);
     state.plugin_runtime.push_event(ws, frame.to_string());
     state.changes.notify_waiters();
     Ok(())

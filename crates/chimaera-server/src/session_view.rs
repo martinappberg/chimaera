@@ -197,27 +197,18 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
     let mut rows: Vec<(u64, serde_json::Value)> = sessions
         .iter()
         .map(|info| {
-            let mut row = session_json(
-                info,
-                workspaces.get(&info.id).cloned(),
-                agents.get(&info.id),
-                names.get(&info.id).map(String::as_str),
-                cwds.get(&info.id).map(PathBuf::as_path),
-                execs.get(&info.id).copied(),
-                is_mastermind(&info.id),
-            );
-            if let serde_json::Value::Object(map) = &mut row {
-                map.insert("ui".to_string(), json!("term"));
-                let chat_capable = agents.get(&info.id).is_some_and(|a| a.kind.chat_capable());
-                map.insert("chat_capable".to_string(), json!(chat_capable));
-                map.insert(
-                    "view_switchable".to_string(),
-                    json!(agents
-                        .get(&info.id)
-                        .is_some_and(|a| a.kind.native_chat_controls())),
-                );
-            }
-            (info.created_at, row)
+            (
+                info.created_at,
+                pty_row(
+                    info,
+                    workspaces.get(&info.id).cloned(),
+                    agents.get(&info.id),
+                    names.get(&info.id).map(String::as_str),
+                    cwds.get(&info.id).map(PathBuf::as_path),
+                    execs.get(&info.id).copied(),
+                    is_mastermind(&info.id),
+                ),
+            )
         })
         .collect();
     rows.extend(chats.iter().map(|info| {
@@ -247,76 +238,135 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
         };
         rows.push((
             u64::MAX,
-            json!({
-                "id": id,
-                "name": record.kind.as_str(),
-                "cwd": "",
-                "cols": 0,
-                "rows": 0,
-                "created_at": 0,
-                "alive": true,
-                "exit_status": null,
-                "title": null,
-                "pid": null,
-                "renamed": false,
-                "phase": "unknown",
-                "cwd_current": "",
-                "exec_stage": null,
-                "workspace_id": workspaces.get(id),
-                "kind": "agent",
-                "agent_kind": record.kind.as_str(),
-                "agent_state": record.state.as_str(),
-                "agent_title": record.title(),
-                "files_touched": record.files_touched,
-                "output_active": null,
-                "stalled": null,
-                "subagents": null,
-                "now_line": null,
-                "usage": null,
-                "mastermind": if is_mastermind(id) { json!(true) } else { json!(null) },
-                "display_name": record.display_name(None),
-                "ui": target,
-                "chat_capable": true,
-                "view_switchable": record.kind.native_chat_controls(),
-            }),
+            switching_row(
+                id,
+                record,
+                workspaces.get(id).cloned(),
+                target,
+                is_mastermind(id),
+            ),
         ));
     }
     rows.sort_by_key(|(created, _)| *created);
     rows.into_iter()
-        .map(|(_, mut row)| {
-            // Additive: `git` ({repo, worktree, branch, detached, head} or
-            // null outside a repository), and an agent's hook-reported cwd
-            // as its `cwd_current` (a shell's polled cwd is already there).
-            if let serde_json::Value::Object(map) = &mut row {
-                let facts = map
-                    .get("id")
-                    .and_then(|id| id.as_str())
-                    .and_then(|id| git_rows.get(id));
-                if let Some(cwd) = facts.and_then(|f| f.hook_cwd.as_ref()) {
-                    if map.get("kind").and_then(|k| k.as_str()) == Some("agent") {
-                        map.insert("cwd_current".to_string(), json!(cwd));
-                    }
-                }
-                map.insert(
-                    "git".to_string(),
-                    facts.map_or(serde_json::Value::Null, |f| f.git.clone()),
-                );
-                // Additive: the Chimaera-managed worktree an agent was
-                // started in (its spawn folder under the managed root), so
-                // the UI can label it and offer removal once it ends.
-                let id = map.get("id").and_then(|i| i.as_str()).unwrap_or_default();
-                let managed = (map.get("kind").and_then(|k| k.as_str()) == Some("agent"))
-                    .then(|| map.get("cwd").and_then(|c| c.as_str()))
-                    .flatten()
-                    .filter(|c| !c.is_empty())
-                    .and_then(|c| {
-                        crate::git::managed_worktree_of(state, id, std::path::Path::new(c))
-                    });
-                map.insert("managed_worktree".to_string(), json!(managed));
-            }
-            row
+        .map(|(_, row)| {
+            let id = row
+                .get("id")
+                .and_then(|i| i.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let managed = (row.get("kind").and_then(|k| k.as_str()) == Some("agent"))
+                .then(|| row.get("cwd").and_then(|c| c.as_str()))
+                .flatten()
+                .filter(|c| !c.is_empty())
+                .and_then(|c| crate::git::managed_worktree_of(state, &id, std::path::Path::new(c)));
+            finish_row(row, git_rows.get(&id), managed)
         })
         .collect()
+}
+
+/// One PTY-backed row: [`session_json`] plus the surface fields a terminal
+/// row carries — `ui` (always `term` here), `chat_capable` (the agent kind
+/// has a chat adapter) and `view_switchable` (claude/codex native controls).
+pub(crate) fn pty_row(
+    info: &chimaera_pty::SessionInfo,
+    workspace_id: Option<String>,
+    agent: Option<&crate::agents::AgentRecord>,
+    polled: Option<&str>,
+    polled_cwd: Option<&std::path::Path>,
+    exec_stage: Option<chimaera_pty::ExecStage>,
+    mastermind: bool,
+) -> serde_json::Value {
+    let mut row = session_json(
+        info,
+        workspace_id,
+        agent,
+        polled,
+        polled_cwd,
+        exec_stage,
+        mastermind,
+    );
+    if let serde_json::Value::Object(map) = &mut row {
+        map.insert("ui".to_string(), json!("term"));
+        map.insert(
+            "chat_capable".to_string(),
+            json!(agent.is_some_and(|a| a.kind.chat_capable())),
+        );
+        map.insert(
+            "view_switchable".to_string(),
+            json!(agent.is_some_and(|a| a.kind.native_chat_controls())),
+        );
+    }
+    row
+}
+
+/// The placeholder row for a session mid view-switch (in neither registry):
+/// the same keys as a real row, zeroed, carrying the TARGET surface in `ui`.
+pub(crate) fn switching_row(
+    id: &str,
+    record: &crate::agents::AgentRecord,
+    workspace_id: Option<String>,
+    target: &str,
+    mastermind: bool,
+) -> serde_json::Value {
+    json!({
+        "id": id,
+        "name": record.kind.as_str(),
+        "cwd": "",
+        "cols": 0,
+        "rows": 0,
+        "created_at": 0,
+        "alive": true,
+        "exit_status": null,
+        "title": null,
+        "pid": null,
+        "renamed": false,
+        "phase": "unknown",
+        "cwd_current": "",
+        "exec_stage": null,
+        "workspace_id": workspace_id,
+        "kind": "agent",
+        "agent_kind": record.kind.as_str(),
+        "agent_state": record.state.as_str(),
+        "agent_title": record.title(),
+        "files_touched": record.files_touched,
+        "output_active": null,
+        "stalled": null,
+        "subagents": null,
+        "now_line": null,
+        "usage": null,
+        "mastermind": if mastermind { json!(true) } else { json!(null) },
+        "display_name": record.display_name(None),
+        "ui": target,
+        "chat_capable": true,
+        "view_switchable": record.kind.native_chat_controls(),
+    })
+}
+
+/// The additive tail every row carries, from facts the git tracker already
+/// resolved: `git` ({repo, worktree, branch, detached, head}, or null outside
+/// a repository); an agent's hook-reported cwd as its `cwd_current` (a shell's
+/// polled cwd is already there); and `managed_worktree`, the Chimaera-managed
+/// worktree an agent was started in (so the UI can label it and offer
+/// removal once it ends), else null.
+pub(crate) fn finish_row(
+    mut row: serde_json::Value,
+    facts: Option<&crate::git::SessionRow>,
+    managed_worktree: Option<PathBuf>,
+) -> serde_json::Value {
+    if let serde_json::Value::Object(map) = &mut row {
+        if let Some(cwd) = facts.and_then(|f| f.hook_cwd.as_ref()) {
+            if map.get("kind").and_then(|k| k.as_str()) == Some("agent") {
+                map.insert("cwd_current".to_string(), json!(cwd));
+            }
+        }
+        map.insert(
+            "git".to_string(),
+            facts.map_or(serde_json::Value::Null, |f| f.git.clone()),
+        );
+        map.insert("managed_worktree".to_string(), json!(managed_worktree));
+    }
+    row
 }
 
 /// How long a built events-bus sessions frame stays reusable within one
@@ -413,12 +463,8 @@ pub(crate) async fn shared_sessions_snapshot(state: &AppState) -> Arc<String> {
     state
         .sessions_snapshot
         .get_or_build(generation, EVENTS_SNAPSHOT_REUSE, || {
-            json!({
-                "type": "sessions",
-                "sessions": sessions_json(state),
-                "links": crate::links::links_json(state),
-            })
-            .to_string()
+            crate::ws::frames::sessions(sessions_json(state), crate::links::links_json(state))
+                .to_string()
         })
         .await
 }
@@ -727,6 +773,222 @@ mod tests {
         assert!(
             canary_ran_during_build.load(Ordering::SeqCst),
             "the second worker was parked during the build — waiters must yield"
+        );
+    }
+
+    /// Every session-row shape the rail can receive, written to
+    /// `web-ui/src/lib/net/fixtures/wire/session-rows.json` for the web UI's
+    /// consumer tests: PTY rows (shells, claude/codex TUIs with every
+    /// status-feed field), chat rows (every additive field), the Mastermind
+    /// flag, and the mid-switch placeholder — each finished with the git tail.
+    #[test]
+    fn session_rows_fixture() {
+        use crate::agent_state::AgentUsage;
+        use crate::ws::frames::samples;
+        use chimaera_wire_fixtures::{case, pin};
+
+        let git_facts = |hook_cwd: Option<&str>| crate::git::SessionRow {
+            hook_cwd: hook_cwd.map(PathBuf::from),
+            git: json!({
+                "repo": "/home/u/proj",
+                "worktree": "/home/u/proj",
+                "branch": "main",
+                "detached": false,
+                "head": null,
+            }),
+        };
+        let no_repo = crate::git::SessionRow {
+            hook_cwd: None,
+            git: serde_json::Value::Null,
+        };
+        let shell = |id: &str, alive: bool, last_output_at: u64| chimaera_pty::SessionInfo {
+            last_output_at,
+            ..samples::session_info(id, alive)
+        };
+        let fresh = now_ms();
+        let quiet = now_ms() - STALL_QUIET.as_millis() as u64 - 1_000;
+
+        let mut claude_running = AgentRecord::new("k".into(), AgentKind::Claude);
+        claude_running.state = AgentState::Running;
+        claude_running.custom_title = Some("Fix the build".into());
+        claude_running.files_touched = vec!["/home/u/proj/src/lib.rs".into()];
+        claude_running.subagent_started("a1", "Explore", 1_700_000_000_000);
+        claude_running.now_line = Some("ran Bash".into());
+        claude_running.usage = Some(AgentUsage {
+            model: Some("Opus".into()),
+            context_pct: Some(42),
+            cost_cents: Some(12),
+        });
+        let mut claude_waiting = AgentRecord::new("k".into(), AgentKind::Claude);
+        claude_waiting.state = AgentState::NeedsPermission;
+        let codex_fresh = AgentRecord::new("k".into(), AgentKind::Codex);
+        let mut grok_finished = AgentRecord::new("k".into(), AgentKind::Grok);
+        grok_finished.state = AgentState::Finished;
+
+        let pty = |info: &chimaera_pty::SessionInfo,
+                   agent: Option<&AgentRecord>,
+                   polled: Option<&str>,
+                   exec: Option<chimaera_pty::ExecStage>,
+                   mastermind: bool| {
+            pty_row(
+                info,
+                Some("w1".into()),
+                agent,
+                polled,
+                Some(std::path::Path::new("/home/u/proj/src")),
+                exec,
+                mastermind,
+            )
+        };
+        let chat =
+            |info: &chimaera_agent::ChatInfo, agent: Option<&AgentRecord>, mastermind: bool| {
+                crate::chat::chat_session_json(info, Some("w1".into()), agent, mastermind)
+            };
+
+        pin(
+            "session-rows",
+            "crates/chimaera-server/src/session_view.rs",
+            "Session rows as GET /api/v1/sessions and the /ws/events `sessions` frame carry them: PTY rows (session_view::pty_row), chat rows (chat::chat_session_json), the mid-switch placeholder, each finished with the git tail (finish_row).",
+            vec![
+                case(
+                    "shell_at_prompt",
+                    "a live shell at its prompt in a repository, polled name + cwd, no agent",
+                    finish_row(
+                        pty(&shell("s-shell1", true, fresh), None, Some("zsh"), None, false),
+                        Some(&git_facts(None)),
+                        None,
+                    ),
+                ),
+                case(
+                    "shell_exec_queued",
+                    "a shell with an agent exec waiting for its prompt, outside any repository",
+                    finish_row(
+                        pty(
+                            &shell("s-shell2", true, fresh),
+                            None,
+                            None,
+                            Some(chimaera_pty::ExecStage::Queued),
+                            false,
+                        ),
+                        Some(&no_repo),
+                        None,
+                    ),
+                ),
+                case(
+                    "shell_exited",
+                    "a shell that exited 1 (pid gone), renamed by the user",
+                    finish_row(
+                        pty(
+                            &chimaera_pty::SessionInfo {
+                                renamed: true,
+                                name: "builds".into(),
+                                ..shell("s-shell3", false, quiet)
+                            },
+                            None,
+                            None,
+                            None,
+                            false,
+                        ),
+                        None,
+                        None,
+                    ),
+                ),
+                case(
+                    "claude_tui_running",
+                    "a live claude TUI mid-turn: every status-feed field, a hook cwd, a managed worktree",
+                    finish_row(
+                        pty(&shell("s-claude1", true, fresh), Some(&claude_running), None, None, false),
+                        Some(&git_facts(Some("/home/u/.chimaera/worktrees/proj/fix-build"))),
+                        Some(PathBuf::from("/home/u/.chimaera/worktrees/proj/fix-build")),
+                    ),
+                ),
+                case(
+                    "claude_tui_stalled",
+                    "a claude TUI whose Running claim went silent past the stall window",
+                    finish_row(
+                        pty(&shell("s-claude2", true, quiet), Some(&claude_running), None, None, false),
+                        Some(&git_facts(None)),
+                        None,
+                    ),
+                ),
+                case(
+                    "claude_tui_needs_permission",
+                    "a claude TUI blocked on a permission (hooks tier)",
+                    finish_row(
+                        pty(&shell("s-claude3", true, fresh), Some(&claude_waiting), None, None, false),
+                        Some(&git_facts(None)),
+                        None,
+                    ),
+                ),
+                case(
+                    "codex_tui_active",
+                    "a hook-less codex TUI streaming output (output_active true, state unknown)",
+                    finish_row(
+                        pty(&shell("s-codex1", true, fresh), Some(&codex_fresh), None, None, false),
+                        Some(&git_facts(None)),
+                        None,
+                    ),
+                ),
+                case(
+                    "codex_tui_quiet",
+                    "the same codex TUI gone quiet (output_active false)",
+                    finish_row(
+                        pty(&shell("s-codex2", true, quiet), Some(&codex_fresh), None, None, false),
+                        None,
+                        None,
+                    ),
+                ),
+                case(
+                    "grok_tui_finished",
+                    "an ACP-adapter agent (grok) whose turn finished",
+                    finish_row(
+                        pty(&shell("s-grok1", true, quiet), Some(&grok_finished), None, None, false),
+                        None,
+                        None,
+                    ),
+                ),
+                case(
+                    "chat_claude_rich",
+                    "a running claude chat: status line, pending permission, a wakeup, a goal, Remote Control, background work",
+                    finish_row(
+                        chat(&samples::chat_info("s-chat1", true), Some(&claude_waiting), false),
+                        Some(&git_facts(Some("/home/u/proj"))),
+                        None,
+                    ),
+                ),
+                case(
+                    "chat_claude_plain",
+                    "an idle claude chat with nothing optional set",
+                    finish_row(
+                        chat(&samples::chat_info("s-chat2", false), Some(&codex_fresh), false),
+                        None,
+                        None,
+                    ),
+                ),
+                case(
+                    "chat_mastermind",
+                    "the workspace's Mastermind chat (mastermind true; the UI keeps it off the rail)",
+                    finish_row(
+                        chat(&samples::chat_info("s-mm", false), Some(&claude_running), true),
+                        Some(&git_facts(None)),
+                        None,
+                    ),
+                ),
+                case(
+                    "chat_no_record",
+                    "a chat row whose agent record is gone (every agent field null)",
+                    finish_row(chat(&samples::chat_info("s-chat3", false), None, false), None, None),
+                ),
+                case(
+                    "switching_placeholder",
+                    "a session mid view-switch toward chat: zeroed row carrying the target surface",
+                    finish_row(
+                        switching_row("s-sw1", &claude_running, Some("w1".into()), "chat", false),
+                        None,
+                        None,
+                    ),
+                ),
+            ],
         );
     }
 }

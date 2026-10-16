@@ -867,3 +867,944 @@ fn loop_and_goal_wire_shapes_are_additive() {
     .validate_ingress()
     .is_err());
 }
+
+/// Every `AgentEvent` variant, wrapped as the `SeqEvent` the journal and
+/// `/ws/chat` carry, written to `web-ui/src/lib/net/fixtures/wire/chat-events.json`
+/// for the web UI's consumer tests (`web-ui/src/lib/net/wireFixtures.test.ts`):
+/// the chat socket decoder and the store reducer must accept each one. The
+/// assertions above pin individual shapes; this pins the whole vocabulary
+/// where the client can read it. Adding a variant without a case here is a
+/// compile error (the match below is exhaustive by construction: every
+/// variant is listed once).
+#[test]
+fn chat_events_fixture() {
+    use chimaera_agent::capabilities::ChatCapabilities;
+    use chimaera_agent::elicitation::Elicitation;
+    use chimaera_agent::model::{
+        BackgroundTask, BackgroundTaskClose, GoalEnd, GoalState, McpServerInfo, ModeInfo,
+        ModelInfo, PlanEntry, PlanStatus, QuestionOption, ScheduledJob, ScheduledWakeup, SessionUi,
+        SlashCommand, ToolContent, Usage, UsageWindow, WorkflowAgent,
+    };
+    use chimaera_wire_fixtures::{case, pin, Case};
+
+    let events: Vec<(&'static str, &'static str, AgentEvent)> = vec![
+        (
+            "startup_progress",
+            "latest startup phase while the driver initializes",
+            AgentEvent::StartupProgress {
+                detail: "Starting claude".into(),
+            },
+        ),
+        (
+            "fork_context_consumed",
+            "the agent accepted the copied fork context (journal marker)",
+            AgentEvent::ForkContextConsumed,
+        ),
+        (
+            "capabilities",
+            "the adapter's control snapshot (claude's legacy map)",
+            AgentEvent::Capabilities {
+                capabilities: ChatCapabilities::legacy("claude"),
+            },
+        ),
+        (
+            "catalog",
+            "catalog refresh: models, modes, slash commands",
+            AgentEvent::Catalog {
+                models: vec![ModelInfo {
+                    id: "opus".into(),
+                    label: "Opus".into(),
+                    description: Some("Most capable".into()),
+                    resolved: Some("claude-opus-5-5".into()),
+                    efforts: vec!["low".into(), "high".into()],
+                    default_effort: Some("high".into()),
+                }],
+                modes: vec![ModeInfo {
+                    id: "plan".into(),
+                    label: "Plan".into(),
+                }],
+                slash_commands: vec![SlashCommand {
+                    name: "review".into(),
+                    description: "Review the diff".into(),
+                    skill_path: Some("/home/me/.codex/skills/review".into()),
+                }],
+            },
+        ),
+        (
+            "init_minimal",
+            "driver handshake with nothing optional set",
+            AgentEvent::Init {
+                native_session_id: "sess-1".into(),
+                model: None,
+                modes: vec![],
+                current_mode: None,
+                slash_commands: vec![],
+                models: vec![],
+                agent_version: None,
+                remote_control_available: false,
+                remote_control_auto_enable: false,
+                remote_control: None,
+            },
+        ),
+        (
+            "init_full",
+            "driver handshake with the full catalog and a live Remote Control bridge",
+            AgentEvent::Init {
+                native_session_id: "sess-1".into(),
+                model: Some("claude-opus-5-5".into()),
+                modes: vec![
+                    ModeInfo {
+                        id: "default".into(),
+                        label: "Default".into(),
+                    },
+                    ModeInfo {
+                        id: "plan".into(),
+                        label: "Plan".into(),
+                    },
+                ],
+                current_mode: Some("default".into()),
+                slash_commands: vec![SlashCommand {
+                    name: "compact".into(),
+                    description: String::new(),
+                    skill_path: None,
+                }],
+                models: vec![ModelInfo {
+                    id: "sonnet".into(),
+                    label: "Sonnet".into(),
+                    description: None,
+                    resolved: None,
+                    efforts: vec![],
+                    default_effort: None,
+                }],
+                agent_version: Some("2.1.283 (Claude Code)".into()),
+                remote_control_available: true,
+                remote_control_auto_enable: true,
+                remote_control: Some(RemoteControlSnapshot {
+                    state: RemoteControlState::Connected,
+                    session_url: Some("https://claude.ai/code/session_01X".into()),
+                    name: Some("chimaera dev".into()),
+                }),
+            },
+        ),
+        (
+            "turn_started",
+            "a turn opened",
+            AgentEvent::TurnStarted {
+                turn_id: "t1".into(),
+            },
+        ),
+        (
+            "message_chunk",
+            "a prose delta",
+            AgentEvent::MessageChunk {
+                turn_id: "t1".into(),
+                text: "Hello, ".into(),
+            },
+        ),
+        (
+            "message_identity",
+            "the native message id a prose run belongs to",
+            AgentEvent::MessageIdentity {
+                turn_id: "t1".into(),
+                message_id: "msg_01".into(),
+            },
+        ),
+        (
+            "thought_chunk",
+            "a thinking delta",
+            AgentEvent::ThoughtChunk {
+                turn_id: "t1".into(),
+                text: "Considering…".into(),
+            },
+        ),
+        (
+            "thinking_tokens",
+            "the thinking budget in force",
+            AgentEvent::ThinkingTokens { tokens: 31_999 },
+        ),
+        (
+            "user_message_plain",
+            "a turn-opening send, nothing optional",
+            AgentEvent::UserMessage {
+                text: "hi".into(),
+                attachments: 0,
+                attachment_paths: vec![],
+                id: None,
+                queued: false,
+                after_turn: false,
+                origin: None,
+            },
+        ),
+        (
+            "user_message_queued_with_images",
+            "a mid-turn send parked in the queue, with saved image copies",
+            AgentEvent::UserMessage {
+                text: "meanwhile do X".into(),
+                attachments: 1,
+                attachment_paths: vec!["/home/me/.chimaera/uploads/s1/image-1.png".into()],
+                id: Some("u1".into()),
+                queued: true,
+                after_turn: true,
+                origin: None,
+            },
+        ),
+        (
+            "user_message_from_agent",
+            "another agent's message the daemon delivered as a send",
+            AgentEvent::UserMessage {
+                text: "[from worker] done".into(),
+                attachments: 0,
+                attachment_paths: vec![],
+                id: Some("u2".into()),
+                queued: false,
+                after_turn: false,
+                origin: Some("agent".into()),
+            },
+        ),
+        (
+            "tool_call",
+            "a tool started, with its command and a touched location",
+            AgentEvent::ToolCall {
+                id: "toolu_1".into(),
+                kind: ToolKind::Execute,
+                title: "cargo test".into(),
+                locations: vec!["/home/me/proj/Cargo.toml".into()],
+                status: ToolStatus::InProgress,
+                cross_turn: false,
+                command: Some("cargo test -p chimaera-agent".into()),
+            },
+        ),
+        (
+            "tool_call_subagent_cross_turn",
+            "a delegated agent row that outlives its turn",
+            AgentEvent::ToolCall {
+                id: "agent:child".into(),
+                kind: ToolKind::Agent,
+                title: "Agent: child".into(),
+                locations: vec![],
+                status: ToolStatus::InProgress,
+                cross_turn: true,
+                command: None,
+            },
+        ),
+        (
+            "tool_call_update_output",
+            "a tool finished with captured output",
+            AgentEvent::ToolCallUpdate {
+                id: "toolu_1".into(),
+                status: ToolStatus::Completed,
+                content: Some(ToolContent::Output {
+                    text: "test result: ok. 3 passed\n".into(),
+                    truncated: false,
+                }),
+            },
+        ),
+        (
+            "tool_call_update_diff",
+            "an edit finished with a per-file diff",
+            AgentEvent::ToolCallUpdate {
+                id: "toolu_2".into(),
+                status: ToolStatus::Completed,
+                content: Some(ToolContent::Diff {
+                    path: "/home/me/proj/src/lib.rs".into(),
+                    old_text: Some("fn a() {}\n".into()),
+                    new_text: "fn a() { b() }\n".into(),
+                    truncated: false,
+                }),
+            },
+        ),
+        (
+            "tool_call_update_batch",
+            "codex-style aggregated changes, one truncated",
+            AgentEvent::ToolCallUpdate {
+                id: "toolu_3".into(),
+                status: ToolStatus::Failed,
+                content: Some(ToolContent::Batch {
+                    diffs: vec![ToolContent::Diff {
+                        path: "a.txt".into(),
+                        old_text: None,
+                        new_text: "x".into(),
+                        truncated: true,
+                    }],
+                }),
+            },
+        ),
+        (
+            "tool_call_update_bare",
+            "a status change with no content",
+            AgentEvent::ToolCallUpdate {
+                id: "toolu_1".into(),
+                status: ToolStatus::Pending,
+                content: None,
+            },
+        ),
+        (
+            "tool_render_data",
+            "exact native tool input/output for Mod renderers",
+            AgentEvent::ToolRenderData {
+                id: "toolu_1".into(),
+                name: Some("Bash".into()),
+                input: Some(json!({ "command": "pwd" })),
+                output: Some(json!({ "stdout": "/tmp", "stderr": "" })),
+            },
+        ),
+        (
+            "tool_output_delta",
+            "streamed tool output",
+            AgentEvent::ToolOutputDelta {
+                id: "toolu_1".into(),
+                text: "Compiling…\n".into(),
+            },
+        ),
+        (
+            "plan",
+            "the task list with every claude Task* field",
+            AgentEvent::Plan {
+                entries: vec![
+                    PlanEntry {
+                        content: "Write tests".into(),
+                        status: PlanStatus::InProgress,
+                        id: Some("1".into()),
+                        active_form: Some("Writing tests".into()),
+                        description: Some("Cover the decoder".into()),
+                        owner: Some("worker-a".into()),
+                        blocked_by: vec![],
+                    },
+                    PlanEntry {
+                        content: "Ship".into(),
+                        status: PlanStatus::Todo,
+                        blocked_by: vec!["1".into()],
+                        ..Default::default()
+                    },
+                ],
+            },
+        ),
+        (
+            "permission_request",
+            "a tool permission with the four ACP option kinds",
+            AgentEvent::PermissionRequest {
+                request_id: "perm-1".into(),
+                tool_call_id: Some("toolu_1".into()),
+                title: "Bash".into(),
+                options: vec![
+                    PermissionOption {
+                        id: "allow_once".into(),
+                        label: "Allow".into(),
+                        kind: PermissionOptionKind::AllowOnce,
+                    },
+                    PermissionOption {
+                        id: "allow_always".into(),
+                        label: "Always allow".into(),
+                        kind: PermissionOptionKind::AllowAlways,
+                    },
+                    PermissionOption {
+                        id: "reject_once".into(),
+                        label: "Deny".into(),
+                        kind: PermissionOptionKind::RejectOnce,
+                    },
+                    PermissionOption {
+                        id: "reject_always".into(),
+                        label: "Never".into(),
+                        kind: PermissionOptionKind::RejectAlways,
+                    },
+                ],
+                input_preview: json!({ "command": "rm -rf build" }),
+                plan: None,
+            },
+        ),
+        (
+            "permission_request_plan",
+            "a plan approval (ExitPlanMode) carrying the plan text",
+            AgentEvent::PermissionRequest {
+                request_id: "perm-2".into(),
+                tool_call_id: None,
+                title: "ExitPlanMode".into(),
+                options: vec![PermissionOption {
+                    id: "allow_once".into(),
+                    label: "Approve".into(),
+                    kind: PermissionOptionKind::AllowOnce,
+                }],
+                input_preview: json!({}),
+                plan: Some("## Plan\n1. Do it".into()),
+            },
+        ),
+        (
+            "permission_resolved",
+            "the answer to a permission",
+            AgentEvent::PermissionResolved {
+                request_id: "perm-1".into(),
+                option_id: "allow_once".into(),
+            },
+        ),
+        (
+            "elicitation_request",
+            "an MCP form elicitation",
+            AgentEvent::ElicitationRequest {
+                request_id: "el-1".into(),
+                server: "github".into(),
+                message: "Pick a repository".into(),
+                elicitation: Elicitation::parse(
+                    "form",
+                    &json!({
+                        "type": "object",
+                        "required": ["repo"],
+                        "properties": {
+                            "repo": { "type": "string", "title": "Repository", "minLength": 1 },
+                            "private": { "type": "boolean", "title": "Private", "default": false }
+                        }
+                    }),
+                    None,
+                ),
+            },
+        ),
+        (
+            "elicitation_resolved",
+            "the elicitation's outcome",
+            AgentEvent::ElicitationResolved {
+                request_id: "el-1".into(),
+                action: "accept".into(),
+            },
+        ),
+        (
+            "question_request",
+            "a structured question with options and a deadline",
+            AgentEvent::QuestionRequest {
+                request_id: "q-1".into(),
+                questions: vec![Question {
+                    id: "store".into(),
+                    header: "Storage".into(),
+                    question: "Which store?".into(),
+                    options: vec![
+                        QuestionOption {
+                            label: "SQLite".into(),
+                            description: "Single file".into(),
+                        },
+                        QuestionOption {
+                            label: "JSONL".into(),
+                            description: String::new(),
+                        },
+                    ],
+                    multi_select: false,
+                }],
+                expires_at_ms: Some(1_700_000_005_000),
+            },
+        ),
+        (
+            "question_resolved",
+            "the answers to a question",
+            AgentEvent::QuestionResolved {
+                request_id: "q-1".into(),
+                answers: std::collections::HashMap::from([(
+                    "store".to_string(),
+                    vec!["JSONL".to_string()],
+                )]),
+            },
+        ),
+        (
+            "mode_changed",
+            "the user picked a permission mode",
+            AgentEvent::ModeChanged {
+                mode_id: "plan".into(),
+                chosen: true,
+            },
+        ),
+        (
+            "effort_state",
+            "effort and ultracode as they stand",
+            AgentEvent::EffortState {
+                effort: Some("xhigh".into()),
+                ultracode: true,
+                chosen: false,
+            },
+        ),
+        (
+            "turn_completed",
+            "a turn ended with usage",
+            AgentEvent::TurnCompleted {
+                turn_id: "t1".into(),
+                usage: Usage {
+                    cost_usd: Some(0.0123),
+                    input_tokens: 1200,
+                    output_tokens: 340,
+                    total_tokens: 1540,
+                    duration_ms: 4200,
+                    ..Default::default()
+                },
+            },
+        ),
+        (
+            "turn_aborted",
+            "the user interrupted the turn",
+            AgentEvent::TurnAborted {
+                turn_id: "t1".into(),
+                reason: "interrupted".into(),
+                interrupted: true,
+            },
+        ),
+        (
+            "context_usage",
+            "context window fill",
+            AgentEvent::ContextUsage {
+                total_tokens: 84_000,
+                max_tokens: 200_000,
+                percentage: 42.0,
+            },
+        ),
+        (
+            "context_compaction",
+            "compaction completed",
+            AgentEvent::ContextCompaction {
+                phase: CompactionPhase::Completed,
+                pre_tokens: Some(168_000),
+            },
+        ),
+        (
+            "usage_report",
+            "account usage windows (get_usage)",
+            AgentEvent::UsageReport {
+                windows: vec![UsageWindow {
+                    label: "5h".into(),
+                    utilization: 37.0,
+                    resets_at: Some("2026-10-16T18:00:00Z".into()),
+                }],
+            },
+        ),
+        (
+            "rate_limit",
+            "a streamed rate-limit event that hit the limit",
+            AgentEvent::RateLimit {
+                utilization: 1.0,
+                resets_at: Some("2026-10-16T18:00:00Z".into()),
+                label: Some("5h".into()),
+                limit_reached: true,
+                windows: vec![UsageWindow {
+                    label: "7d".into(),
+                    utilization: 61.0,
+                    resets_at: None,
+                }],
+            },
+        ),
+        (
+            "model_switched",
+            "the runtime switched models mid-session",
+            AgentEvent::ModelSwitched {
+                from: Some("claude-opus-5-5".into()),
+                to: "claude-sonnet-5-5".into(),
+                reason: Some("fast mode".into()),
+                retract_current_turn: true,
+            },
+        ),
+        (
+            "messages_superseded",
+            "the native transcript replaced the shown messages",
+            AgentEvent::MessagesSuperseded,
+        ),
+        (
+            "thought_retracted",
+            "the tail of a thinking run was withdrawn",
+            AgentEvent::ThoughtRetracted {
+                turn_id: "t1".into(),
+                utf16_len: 12,
+            },
+        ),
+        (
+            "session_title",
+            "the agent named the conversation",
+            AgentEvent::SessionTitle {
+                title: "Wire fixtures".into(),
+            },
+        ),
+        (
+            "checkpoint",
+            "a rewind checkpoint for a user message",
+            AgentEvent::Checkpoint {
+                user_message_id: "u1".into(),
+                preceding_uuid: Some("p0".into()),
+            },
+        ),
+        (
+            "rewind_result",
+            "a rewind dry run answered",
+            AgentEvent::RewindResult {
+                user_message_id: "u1".into(),
+                can_rewind: true,
+                files_changed: vec!["/home/me/proj/src/lib.rs".into()],
+                applied: false,
+                error: None,
+            },
+        ),
+        (
+            "mcp_servers",
+            "the MCP inventory",
+            AgentEvent::McpServers {
+                servers: vec![
+                    McpServerInfo {
+                        name: "github".into(),
+                        status: "connected".into(),
+                        tools: 12,
+                        error: None,
+                    },
+                    McpServerInfo {
+                        name: "db".into(),
+                        status: "failed".into(),
+                        tools: 0,
+                        error: Some("connection refused".into()),
+                    },
+                ],
+            },
+        ),
+        (
+            "notice",
+            "a one-line notice",
+            AgentEvent::Notice {
+                text: "Context compacted".into(),
+            },
+        ),
+        (
+            "prompt_suggestion",
+            "a suggested next prompt",
+            AgentEvent::PromptSuggestion {
+                text: "Run the tests".into(),
+            },
+        ),
+        (
+            "truncated",
+            "journal history was trimmed",
+            AgentEvent::Truncated,
+        ),
+        (
+            "mode_switch",
+            "the session moved to a terminal",
+            AgentEvent::ModeSwitch {
+                to: SessionUi::Term,
+            },
+        ),
+        (
+            "forked",
+            "this journal was forked from another session",
+            AgentEvent::Forked {
+                source_agent: "claude".into(),
+                source_seq: 118,
+                native: true,
+            },
+        ),
+        (
+            "error_sign_in",
+            "a fatal error asking the user to sign in",
+            AgentEvent::Error {
+                message: "Not logged in".into(),
+                fatal: true,
+                sign_in: true,
+            },
+        ),
+        (
+            "exited",
+            "the driver process ended",
+            AgentEvent::Exited { status: Some(0) },
+        ),
+        (
+            "exited_unknown_status",
+            "the driver process ended without a status",
+            AgentEvent::Exited { status: None },
+        ),
+        (
+            "user_message_update",
+            "a queued message was read",
+            AgentEvent::UserMessageUpdate {
+                id: "u1".into(),
+                state: UserMessageState::Sent,
+            },
+        ),
+        (
+            "background_tasks",
+            "the background level-set: a workflow with agents, a monitor, a close",
+            AgentEvent::BackgroundTasks {
+                tasks: vec![
+                    BackgroundTask {
+                        id: "bg-1".into(),
+                        task_type: "local_workflow".into(),
+                        description: "review-changes".into(),
+                        status: "running".into(),
+                        started_at_ms: 1_700_000_000_000,
+                        workflow_name: Some("review-changes".into()),
+                        agents: vec![WorkflowAgent {
+                            index: 1,
+                            label: "review:bugs".into(),
+                            state: "done".into(),
+                            result_preview: Some("2 findings".into()),
+                        }],
+                        agents_total: 2,
+                        agents_done: 1,
+                        monitor: false,
+                        ambient: false,
+                        model: None,
+                        tool_use_id: None,
+                    },
+                    BackgroundTask {
+                        id: "bg-2".into(),
+                        task_type: "local_bash".into(),
+                        description: "Watch the build log".into(),
+                        status: "running".into(),
+                        started_at_ms: 1_700_000_001_000,
+                        workflow_name: None,
+                        agents: vec![],
+                        agents_total: 0,
+                        agents_done: 0,
+                        monitor: true,
+                        ambient: true,
+                        model: Some("sonnet".into()),
+                        tool_use_id: None,
+                    },
+                ],
+                closed: vec![BackgroundTaskClose {
+                    id: "bg-0".into(),
+                    description: "cargo build".into(),
+                    status: "completed".into(),
+                    summary: Some("Finished".into()),
+                    output_file: Some("/tmp/bg-0.log".into()),
+                    monitor: false,
+                }],
+            },
+        ),
+        (
+            "session_status",
+            "the agent's post-turn status line",
+            AgentEvent::SessionStatus {
+                category: Some("review_ready".into()),
+                detail: "PR open, waiting on review".into(),
+                needs_action: true,
+            },
+        ),
+        (
+            "remote_control",
+            "the Remote Control bridge failed",
+            AgentEvent::RemoteControl {
+                state: RemoteControlState::Error,
+                session_url: None,
+                name: Some("chimaera dev".into()),
+                detail: Some("refused by policy".into()),
+            },
+        ),
+        (
+            "tool_summary",
+            "a summary line over a batch of tools",
+            AgentEvent::ToolSummary {
+                summary: "Listed files in directory".into(),
+                tool_ids: vec!["toolu_1".into(), "toolu_2".into()],
+            },
+        ),
+        (
+            "subagent_finished",
+            "a subagent's closing words",
+            AgentEvent::SubagentFinished {
+                id: Some("toolu_2".into()),
+                label: "Measure file sizes".into(),
+                status: "completed".into(),
+                result: Some("Both files are 6 bytes.".into()),
+                stats: Some("2 tools · 12.3k tokens · 4s".into()),
+            },
+        ),
+        (
+            "subagent_info",
+            "a subagent's identity once known",
+            AgentEvent::SubagentInfo {
+                id: "toolu_2".into(),
+                agent_id: Some("agent-7f".into()),
+                model: Some("claude-sonnet-5-5".into()),
+                agent_type: Some("Explore".into()),
+            },
+        ),
+        (
+            "turn_tokens",
+            "output tokens so far this turn",
+            AgentEvent::TurnTokens { output: 1240 },
+        ),
+        (
+            "activity_line",
+            "what the agent says it is doing",
+            AgentEvent::ActivityLine {
+                detail: Some("Counting files".into()),
+            },
+        ),
+        (
+            "agent_message",
+            "a message from another agent, a reply to an earlier one",
+            AgentEvent::agent_message(
+                7,
+                "s-worker",
+                "worker-a",
+                Some("codex"),
+                "Tests are green.",
+                false,
+                false,
+                Some(3),
+            ),
+        ),
+        (
+            "schedule",
+            "the loop level-set: a wakeup and a job",
+            AgentEvent::Schedule {
+                wakeup: Some(ScheduledWakeup {
+                    at_ms: 1_700_000_600_000,
+                    scheduled_at_ms: 1_700_000_000_000,
+                    reason: "Check the deploy".into(),
+                    prompt: "/loop check deploy".into(),
+                }),
+                jobs: vec![ScheduledJob {
+                    id: "f2143f41".into(),
+                    cron: "*/10 * * * *".into(),
+                    schedule: "Every 10 minutes".into(),
+                    prompt: "post the graph".into(),
+                    recurring: true,
+                    next_at_ms: Some(1_700_000_600_000),
+                    created_at_ms: 1_700_000_000_000,
+                }],
+            },
+        ),
+        (
+            "goal",
+            "a goal as it stands (codex, with a budget)",
+            AgentEvent::Goal {
+                goal: Some(GoalState {
+                    objective: "all tests pass".into(),
+                    status: "active".into(),
+                    set_at_ms: 1_700_000_000_000,
+                    turns: None,
+                    last_check: None,
+                    tokens_used: Some(10),
+                    token_budget: Some(100),
+                    time_used_secs: Some(42),
+                }),
+                ended: None,
+            },
+        ),
+        (
+            "goal_ended",
+            "a goal ended (claude, achieved after three checks)",
+            AgentEvent::Goal {
+                goal: None,
+                ended: Some(GoalEnd {
+                    outcome: "achieved".into(),
+                    objective: "all tests pass".into(),
+                    reason: Some("The suite is green.".into()),
+                    turns: Some(3),
+                    tokens: None,
+                    duration_secs: Some(300),
+                }),
+            },
+        ),
+        (
+            "turn_cause",
+            "what resumed the agent on its own",
+            AgentEvent::TurnCause {
+                turn_id: "t2".into(),
+                kind: "job".into(),
+                detail: Some("post the graph".into()),
+                schedule: Some("Every 10 minutes".into()),
+            },
+        ),
+    ];
+
+    // Exhaustiveness: a new variant must get a case here. Written as a
+    // match so the compiler, not a reviewer, notices the gap.
+    fn tag(ev: &AgentEvent) -> &'static str {
+        match ev {
+            AgentEvent::StartupProgress { .. } => "startup_progress",
+            AgentEvent::ForkContextConsumed => "fork_context_consumed",
+            AgentEvent::Capabilities { .. } => "capabilities",
+            AgentEvent::Catalog { .. } => "catalog",
+            AgentEvent::Init { .. } => "init",
+            AgentEvent::TurnStarted { .. } => "turn_started",
+            AgentEvent::MessageChunk { .. } => "message_chunk",
+            AgentEvent::MessageIdentity { .. } => "message_identity",
+            AgentEvent::ThoughtChunk { .. } => "thought_chunk",
+            AgentEvent::ThinkingTokens { .. } => "thinking_tokens",
+            AgentEvent::UserMessage { .. } => "user_message",
+            AgentEvent::ToolCall { .. } => "tool_call",
+            AgentEvent::ToolCallUpdate { .. } => "tool_call_update",
+            AgentEvent::ToolRenderData { .. } => "tool_render_data",
+            AgentEvent::ToolOutputDelta { .. } => "tool_output_delta",
+            AgentEvent::Plan { .. } => "plan",
+            AgentEvent::PermissionRequest { .. } => "permission_request",
+            AgentEvent::PermissionResolved { .. } => "permission_resolved",
+            AgentEvent::ElicitationRequest { .. } => "elicitation_request",
+            AgentEvent::ElicitationResolved { .. } => "elicitation_resolved",
+            AgentEvent::QuestionRequest { .. } => "question_request",
+            AgentEvent::QuestionResolved { .. } => "question_resolved",
+            AgentEvent::ModeChanged { .. } => "mode_changed",
+            AgentEvent::EffortState { .. } => "effort_state",
+            AgentEvent::TurnCompleted { .. } => "turn_completed",
+            AgentEvent::TurnAborted { .. } => "turn_aborted",
+            AgentEvent::ContextUsage { .. } => "context_usage",
+            AgentEvent::ContextCompaction { .. } => "context_compaction",
+            AgentEvent::UsageReport { .. } => "usage_report",
+            AgentEvent::RateLimit { .. } => "rate_limit",
+            AgentEvent::ModelSwitched { .. } => "model_switched",
+            AgentEvent::MessagesSuperseded => "messages_superseded",
+            AgentEvent::ThoughtRetracted { .. } => "thought_retracted",
+            AgentEvent::SessionTitle { .. } => "session_title",
+            AgentEvent::Checkpoint { .. } => "checkpoint",
+            AgentEvent::RewindResult { .. } => "rewind_result",
+            AgentEvent::McpServers { .. } => "mcp_servers",
+            AgentEvent::Notice { .. } => "notice",
+            AgentEvent::PromptSuggestion { .. } => "prompt_suggestion",
+            AgentEvent::Truncated => "truncated",
+            AgentEvent::ModeSwitch { .. } => "mode_switch",
+            AgentEvent::Forked { .. } => "forked",
+            AgentEvent::Error { .. } => "error",
+            AgentEvent::Exited { .. } => "exited",
+            AgentEvent::UserMessageUpdate { .. } => "user_message_update",
+            AgentEvent::BackgroundTasks { .. } => "background_tasks",
+            AgentEvent::SessionStatus { .. } => "session_status",
+            AgentEvent::RemoteControl { .. } => "remote_control",
+            AgentEvent::ToolSummary { .. } => "tool_summary",
+            AgentEvent::SubagentFinished { .. } => "subagent_finished",
+            AgentEvent::SubagentInfo { .. } => "subagent_info",
+            AgentEvent::TurnTokens { .. } => "turn_tokens",
+            AgentEvent::ActivityLine { .. } => "activity_line",
+            AgentEvent::AgentMessage { .. } => "agent_message",
+            AgentEvent::Schedule { .. } => "schedule",
+            AgentEvent::Goal { .. } => "goal",
+            AgentEvent::TurnCause { .. } => "turn_cause",
+        }
+    }
+    let covered: std::collections::BTreeSet<&str> =
+        events.iter().map(|(_, _, ev)| tag(ev)).collect();
+    let cases: Vec<Case> = events
+        .iter()
+        .enumerate()
+        .map(|(i, (name, note, ev))| {
+            let wire = serde_json::to_value(ev).expect("event serializes");
+            // The serde tag is the match arm's tag: the two can't drift.
+            assert_eq!(wire["type"], json!(tag(ev)), "{name}");
+            // Every event round-trips through its own deserializer (what the
+            // journal replays), so the fixture is also what replay yields.
+            assert_eq!(
+                &serde_json::from_value::<AgentEvent>(wire.clone()).unwrap(),
+                ev,
+                "{name}"
+            );
+            case(
+                name,
+                note,
+                serde_json::to_value(SeqEvent {
+                    seq: i as u64 + 1,
+                    ts: 1_700_000_000_000 + i as u64,
+                    ev: ev.clone(),
+                })
+                .unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        covered.len(),
+        57,
+        "every AgentEvent variant has at least one case"
+    );
+    pin(
+        "chat-events",
+        "crates/chimaera-agent/tests/wire_contract.rs",
+        "SeqEvent envelopes ({seq, ts, ev}) for every AgentEvent variant, as /ws/chat `ev` and `batch` frames carry them and the journal replays them.",
+        cases,
+    );
+}

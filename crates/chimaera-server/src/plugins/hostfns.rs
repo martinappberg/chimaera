@@ -561,11 +561,7 @@ impl host::Host for HostState {
                 return;
             }
         };
-        let mut frame = Value::Object(fields);
-        // The host's keys last, so an event can't pose as another frame.
-        frame["type"] = json!("plugin");
-        frame["plugin"] = json!(self.plugin);
-        frame["workspace"] = json!(self.workspace);
+        let frame = crate::ws::frames::plugin_emit(fields, &self.plugin, &self.workspace);
         app.plugin_runtime
             .push_event(&self.workspace, frame.to_string());
         app.changes.notify_waiters();

@@ -488,6 +488,7 @@ name = "chimaera-agent"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "chimaera-wire-fixtures",
  "nix 0.31.3",
  "rand 0.10.3",
  "serde",
@@ -528,6 +529,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "bytes",
+ "chimaera-wire-fixtures",
  "nix 0.31.3",
  "portable-pty",
  "rand 0.10.3",
@@ -565,6 +567,7 @@ dependencies = [
  "chimaera-agent",
  "chimaera-core",
  "chimaera-pty",
+ "chimaera-wire-fixtures",
  "comrak",
  "csv",
  "ed25519-dalek",
@@ -598,6 +601,13 @@ dependencies = [
  "wasmtime",
  "wasmtime-wasi",
  "zip 9.0.3",
+]
+
+[[package]]
+name = "chimaera-wire-fixtures"
+version = "0.0.1"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

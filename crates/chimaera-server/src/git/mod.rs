@@ -28,6 +28,7 @@ mod resolve;
 mod rev;
 mod service;
 mod session;
+pub(crate) use session::SessionRow;
 mod worktree;
 
 pub(crate) use history::{compare, log, show};

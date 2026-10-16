@@ -30,8 +30,13 @@ pub(crate) fn links_json(state: &AppState) -> Vec<serde_json::Value> {
     entries.sort_by(|a, b| a.0.cmp(b.0));
     entries
         .into_iter()
-        .map(|(terminal, agent)| json!({"terminal_id": terminal, "agent_id": agent}))
+        .map(|(terminal, agent)| link_json(terminal, agent))
         .collect()
+}
+
+/// One agent↔terminal edge as the sessions frame and `GET /links` carry it.
+pub(crate) fn link_json(terminal_id: &str, agent_id: &str) -> serde_json::Value {
+    json!({"terminal_id": terminal_id, "agent_id": agent_id})
 }
 
 /// Terminal ids linked to `agent_id` (the agent's MCP access scope), pruned

@@ -20,6 +20,10 @@ check: plugins
     cargo clippy --manifest-path plugins/Cargo.toml --all-targets -- -D warnings
     cargo test --workspace
     cargo test --manifest-path plugins/Cargo.toml
+    # The Rust tests just rewrote the daemon↔UI wire fixtures (web-ui/src/lib/net/
+    # fixtures/wire) from the current shapes; a dirty fixture is a contract change
+    # nobody committed. CI runs the same tests in check mode instead.
+    test -z "$(git status --porcelain -- web-ui/src/lib/net/fixtures/wire)" || { echo "wire fixtures changed: review the diff (a daemon↔UI contract change), run the web-ui tests, and commit web-ui/src/lib/net/fixtures/wire"; git status --short -- web-ui/src/lib/net/fixtures/wire; exit 1; }
 
 fmt:
     cargo fmt --all

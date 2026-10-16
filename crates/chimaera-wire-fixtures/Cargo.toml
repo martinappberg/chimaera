@@ -1,0 +1,11 @@
+[package]
+name = "chimaera-wire-fixtures"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Test-only: writes the daemon↔UI wire shapes the Rust tests pin into web-ui fixtures the Vitest consumer tests read"
+
+[dependencies]
+serde_json.workspace = true

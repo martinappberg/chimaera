@@ -376,10 +376,7 @@ pub(crate) async fn wait(state: &AppState, plugin: &str, id: &str, limit: Durati
 }
 
 fn frame(state: &AppState, job: &Job) {
-    let mut v = job.json();
-    v["type"] = json!("job");
-    v["plugin"] = json!(job.plugin);
-    v["workspace"] = json!(job.workspace);
+    let v = crate::ws::frames::plugin_job(job.json(), &job.plugin, &job.workspace);
     state
         .plugin_runtime
         .push_event(&job.workspace, v.to_string());

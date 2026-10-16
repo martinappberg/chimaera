@@ -351,7 +351,7 @@ impl Screens {
 }
 
 fn view_frame(plugin: &str, ws: &str, view: &str) -> String {
-    json!({"type": "view", "plugin": plugin, "workspace": ws, "view": view}).to_string()
+    crate::ws::frames::plugin_view(plugin, ws, view).to_string()
 }
 
 /// `invalidate(view)`: windows showing it render it again, at most
