@@ -14,7 +14,7 @@
    */
   import { untrack } from "svelte";
   import { basename, fsDownload } from "./files";
-  import { retain, release, type FileEntry } from "./fileStore.svelte";
+  import { onDiskVersion, paneVisibility, useFileEntry } from "./viewLifecycle.svelte";
   import { fetchRawBytes, TooLargeError } from "./rawBytes";
   import { sanitizeRendered } from "./officeSafety";
   import { captureBlobUrls, revokeAll } from "./blobUrls";
@@ -24,9 +24,11 @@
 
   interface Props {
     path: string;
+    /** The pane shows this tab (Pane, via FileView); unset: watch the layer. */
+    visible?: boolean;
   }
 
-  let { path }: Props = $props();
+  let { path, visible = undefined }: Props = $props();
 
   /** Largest document opened (the whole file is parsed in the page). */
   const MAX_DOCX_BYTES = 50 * 1024 * 1024;
@@ -42,23 +44,22 @@
     urls: string[];
   }
 
-  let entry = $state<FileEntry | null>(null);
-  $effect(() => {
-    const e = retain(path);
-    entry = e;
-    void e.ensureMtime();
-    return () => release(path);
-  });
+  const file = useFileEntry(
+    () => path,
+    (e) => void e.ensureMtime(),
+  );
 
   let rendered = $state.raw<Rendered | null>(null);
   let error = $state<string | null>(null);
   let tooLarge = $state(false);
 
   let docx: Promise<typeof import("docx-preview")> | null = null;
-  async function build(p: string): Promise<Rendered> {
-    const bytes = await fetchRawBytes(p, MAX_DOCX_BYTES);
+  async function build(p: string, signal: AbortSignal): Promise<Rendered> {
+    const bytes = await fetchRawBytes(p, MAX_DOCX_BYTES, signal);
     docx ??= import("docx-preview");
     const lib = await docx;
+    // Superseded or closed while the bytes came: skip the parse.
+    signal.throwIfAborted();
     let nodes: Node[];
     let urls: string[] = [];
     try {
@@ -126,42 +127,33 @@
   };
 
   // (Re)render on open and on every on-disk version; the last render stays
-  // up until the next is ready.
-  let seen: string | null | undefined;
-  let gen = 0;
-  $effect(() => {
-    const m = entry?.mtime ?? null;
-    if (seen !== undefined && (m === null || m === seen || seen === null)) {
-      if (m !== null) seen = m;
-      return;
-    }
-    seen = m;
-    const mine = ++gen;
-    void build(path).then(
-      (r) => {
-        if (mine !== gen) {
-          revokeAll(r.urls);
-          return;
-        }
-        // The old render's nodes leave the page as this one attaches.
-        const old = rendered;
-        rendered = r;
-        if (old !== null) revokeAll(old.urls);
-        error = null;
-        tooLarge = false;
-      },
-      (e: unknown) => {
-        if (mine !== gen) return;
-        tooLarge = e instanceof TooLargeError;
-        error = e instanceof Error ? e.message : "the document could not be opened";
-      },
-    );
+  // up until the next is ready. A version that lands while the tab is parked
+  // is rendered detached and attached by the reveal.
+  const onScreen = paneVisibility(
+    () => visible,
+    () => scroller,
+  );
+  onDiskVersion(() => file.current, () => onScreen.pane, {
+    load: (signal) => build(path, signal),
+    apply: (r) => {
+      // The old render's nodes leave the page as this one attaches.
+      const old = rendered;
+      rendered = r;
+      if (old !== null) revokeAll(old.urls);
+      error = null;
+      tooLarge = false;
+    },
+    fail: (e) => {
+      tooLarge = e instanceof TooLargeError;
+      error = e instanceof Error ? e.message : "the document could not be opened";
+    },
+    // Never shown (superseded, or the view went): its blob URLs go now.
+    discard: (r) => revokeAll(r.urls),
+    whileHidden: "defer",
   });
 
-  // Gone: nothing shows this render's blob URLs any more, and a build still
-  // in flight lands on a stale generation (and revokes its own).
+  // Gone: nothing shows this render's blob URLs any more.
   $effect(() => () => {
-    gen += 1;
     const r = untrack(() => rendered);
     if (r !== null) revokeAll(r.urls);
   });

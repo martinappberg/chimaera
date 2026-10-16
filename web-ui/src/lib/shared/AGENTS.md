@@ -8,7 +8,8 @@ Orientation for coding agents. This area owns leaf modules that many areas impor
 |---|---|
 | Glyphs and marks | `icons.ts` (generated, see below), `FileIcon.svelte`, `FolderIcon.svelte`, `TerminalIcon.svelte`, `SessionGlyph.svelte`, `BrandMark.svelte`, `Chevron.svelte`, `BranchChip.svelte`, `agentNames.ts` (fallback agent names) |
 | Controls | `Switch.svelte`, `Segmented.svelte`, `SlowLoad.svelte`, `UsageBars.svelte` + `usage.ts`, `WorkTray.svelte` + `WorkTrayRow.svelte`, `ExtensionCode.svelte` + `extensionCode.ts`; `ui/` (`Badge`, `Callout`, `FileCard`, `KeyValue`, `Row`, `tone.ts`: the `ui/1` props shared with Knowledge and plugins) |
-| Dialogs, menus, focus | `ConfirmDialog.svelte`, `contextMenu.svelte.ts` + `ContextMenuHost.svelte` (the one context menu), `dismiss.ts` (outside-click/Escape action), `modalFocus.ts`, `focusOnMount.ts`, `toolbarPopover.ts`, `tabNavigation.ts`, `scrollRegion.ts` |
+| Dialogs, menus, focus | `ConfirmDialog.svelte`, `contextMenu.svelte.ts` + `ContextMenuHost.svelte` (the one context menu), `dismiss.ts` (outside-click/Escape action), `modalFocus.ts`, `returnFocus.ts` (the restore half of `modalFocus` for a pane-local dialog or popover: focus goes back to the opener on close, no trap, chords stay live), `focusOnMount.ts`, `toolbarPopover.ts`, `tabNavigation.ts`, `scrollRegion.ts`, `flash.svelte.ts` (the window's one feedback chip: `showFlash(text)` replaces the shown message and restarts its 3.2 s timer; App renders `flash.text`) |
+| Inline edits and resizing | `inlineRename.svelte.ts` (`InlineRename`: the F2/double-click rename and inline create input's state machine, plus the `renameFocus` action), `resizeDrag.ts` (`startResizeDrag`: the one divider/handle drag; `resizeKeydown`: arrows/Home/End on a focusable separator) |
 | Keys | `keys.ts` (the chord engine: every action and default chord), `keybindings.ts` (`keyHint`, `matchAction` over live settings), `chordHints.svelte.ts` (held-modifier hints) |
 | References and links | `fileRef.ts` (the one file-mention parser), `locator.ts` (the `#L12` / `#page=` grammar), `reference.ts` (selection → agent input text), `references.ts` (ids as links), `provenance.ts` (copy provenance), `ReferenceChip.svelte`, `ReferenceButton.svelte`, `askAgent.ts` (draft into a composer, never send), `openPath.ts` (open a daemon path; App registers the opener), `reveal.ts` (one-shot scroll-to-line request), `urlOpen.ts` (link policy: proxyable → browser pane, else system browser) |
 | Rendering policies | `math.ts` (KaTeX → sanitized MathML), `mermaid.ts`, `inlineMarkdown.ts` (escape-first inline subset), `copyDecor.ts`, `pdfCanvas.ts` (PDF raster limits) |
@@ -42,6 +43,7 @@ Tests: `*.test.ts` beside the modules; `fileRefs.fixture.json` feeds `fileRef.te
 - **`askAgent` drafts and never sends** (`askAgent.ts` header).
 - **A reveal is a one-shot gesture.** It is not tab or layout state and is never persisted (`reveal.ts` header).
 - **Gate recurring work on `$pageVisible`** in components. See the rule bullet on recurring work.
+- **One inline rename, one resize drag.** A name that turns into an input (tree, Finder, tab) runs on `InlineRename`, which owns blank/unchanged/invalid handling, Escape-before-blur and the one-submit-per-edit guard; a splitter or panel edge runs on `startResizeDrag`, which owns capture, the rAF throttle and Escape/pointercancel restore. Don't hand-roll either; App's rail rows and `layout/railResize.ts` already run on them.
 
 ## Checks
 

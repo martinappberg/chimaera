@@ -63,6 +63,8 @@ font-size: var(--text-sm);
 | On/off | `lib/shared/Switch.svelte` | `<Switch on label onToggle />` (`role="switch"`) |
 | Tab strip | `lib/shared/tabNavigation.ts` | `use:tabNavigation` on the `role="tablist"` element |
 | Toned note | `lib/shared/ui/Callout.svelte`, `ui/tone.ts` | `<Callout tone title text />`; a tone always carries its word |
+| Inline rename or create | `lib/shared/inlineRename.svelte.ts` | `new InlineRename<T>({ check, submit, errorText, onClose })`; the input takes `bind:value={r.draft}`, `use:renameFocus={selectStem}`, `onkeydown={(e) => r.keydown(e)}`, `onblur={() => r.blur()}` |
+| Resize a split or panel | `lib/shared/resizeDrag.ts` | `startResizeDrag(e, { axis, initial, compute, apply, onEnd })` from the handle's pointerdown; `resizeKeydown(e, …)` on a focusable `role="separator"` |
 
 **Contract.**
 
@@ -70,7 +72,7 @@ font-size: var(--text-sm);
   show them. `lib/shared/nativeDialogs.test.ts` fails on a new call.
 - Mark a destructive action with `danger`: the `ConfirmDialog` prop or the
   `danger: true` field of a context-menu item
-  (`lib/workspace/FileTree.svelte:885`).
+  (`lib/workspace/FileTree.svelte:846`).
 - Keep a dialog open on failure. Pass the reason in `error`.
 - Give a toolbar popup an opener with `aria-haspopup`. `toolbarPopover` places
   the popup, moves focus into it, handles arrow keys, Home and End, and gives
@@ -80,9 +82,9 @@ font-size: var(--text-sm);
 **Observed.** `ConfirmDialog` has 9 uses in 6 files. Its focus starts on Cancel
 unless `enterConfirms` is set. `toolbarPopover` does not handle Escape. Its
 hosts pair it with `dismiss` (`lib/chat/ChatView.svelte:2895`,
-`lib/previews/DocIssues.svelte:171`).
+`lib/previews/DocIssues.svelte:152`).
 
-**Example** (`App.svelte:6751-6758`):
+**Example** (`App.svelte:5096-5102`):
 
 ```svelte
 <ConfirmDialog
@@ -101,7 +103,7 @@ hosts pair it with `dismiss` (`lib/chat/ChatView.svelte:2895`,
 - `modalFocus` (`lib/shared/modalFocus.ts`): Tab containment, restoration to
   the opener on close, stacked modals by `priority`, and modals parked in an
   `inert` keep-alive layer. `modalOpen()` tells App that a modal owns the
-  keyboard, and App's chords stand down (`App.svelte:2834`).
+  keyboard, and App's chords stand down (`App.svelte:2144`).
 - `focusOnMount` (`lib/shared/focusOnMount.ts`): initial focus, one microtask
   after mount, so `modalFocus` records the real opener.
 - `keys.ts` is the chord registry (`ACTIONS`). `keybindings.ts` joins it with
@@ -137,9 +139,9 @@ use:modalFocus
 - `SlowLoad.svelte`: a `role="status"` line that shows only after 800 ms. Put
   it in an `{#await}` pending branch.
 - `lib/layout/Pane.svelte`: every pane surface renders inside a
-  `<svelte:boundary>` (`:683-688`). A render error shows `viewCrash` with
+  `<svelte:boundary>` (`:671-676`). A render error shows `viewCrash` with
   "try again" (the boundary `reset`) and "reload window". A failed lazy chunk
-  shows `loadFailure` with "retry" (`:353-359`).
+  shows `loadFailure` with "retry" (`:340-346`).
 - Settings writes: `lib/settings/settingsWriter.ts` `SavePhase`
   (`idle | pending | inflight | failed | rejected`). Settings shows an
   "unsaved" button only for `failed` or `rejected`; a press calls
@@ -150,7 +152,7 @@ use:modalFocus
 - Connection: `lib/net/reconnect.ts` (`Reconnector`, `retryDelayMs`) and
   `lib/net/poll.ts` (`startVisibilityPoll`). App shows a `role="status"` reconnect
   strip, or a `role="alertdialog"` with retry when reconnect fails
-  (`App.svelte:6905-6950`).
+  (`App.svelte:5223-5297`).
 
 **Contract.** A surface that loads shows each state in words. Do not flash a
 loading line for a fast load. Show an error with the reason and one recovery
@@ -158,10 +160,10 @@ action (retry, reload or dismiss). Show a stale or conflicting state; do not
 replace the user's text without asking.
 
 **Observed.** Previews write their own loading and error text (for example
-`lib/previews/PdfView.svelte:1686`). `SlowLoad` has two uses, both in
+`lib/previews/PdfView.svelte:1700`). `SlowLoad` has two uses, both in
 `App.svelte`.
 
-**Example** (`lib/layout/Pane.svelte:683-688`):
+**Example** (`lib/layout/Pane.svelte:671-676`):
 
 ```svelte
 <svelte:boundary onerror={(e) => console.error("pane view failed", e)}>
@@ -199,10 +201,10 @@ replace the user's text without asking.
   not trap the user.
 - App defers its automatic asset reload, and the native Reload Window, while
   `dirtyFiles` or `volatileChatDrafts` is not empty, unless the transition is
-  forced (`App.svelte:1597`). App installs a `beforeunload` guard while
-  `dirtyFiles` is not empty (`:3208-3216`).
+  forced (`lib/layout/assetGate.svelte.ts:61-62`). App installs a `beforeunload` guard while
+  `dirtyFiles` is not empty (`App.svelte:2518-2531`).
 
-**Example** (`App.svelte:6782-6790`):
+**Example** (`App.svelte:5127-5135`):
 
 ```svelte
 <CloseDirtyDialog
@@ -222,15 +224,23 @@ replace the user's text without asking.
 
 - `lib/shared/visibility.ts`: `pageVisible`, a store that is `true` while the
   document is visible.
-- The `html.app-hidden` root class (`App.svelte:1568-1571`). Each infinite
+- The `html.app-hidden` root class (`App.svelte:1104-1107`). Each infinite
   animation pauses itself with a `:global(html.app-hidden)` rule beside it.
 - `lib/shared/asyncDisposer.ts`: `asyncDisposer(promise)` turns an async
   unlisten (Tauri `listen()`) into a synchronous teardown.
 - `lib/terminal/termPool.ts` and `termPoolRuntime.ts`: one warm xterm per
   session, at most `POOL_CAP` (12). A parked terminal buffers raw bytes and
   does not parse them.
-- Pane keep-alive (`lib/layout/Pane.svelte:680`): one `.layer` per tab, hidden
-  with `opacity: 0` and `inert={!active}`.
+- Pane keep-alive (`lib/layout/Pane.svelte`): one `.layer` per tab, hidden
+  with `opacity: 0` and `inert={!active}`, at most `LIVE_CAP` (8) views
+  mounted per pane (`trimLive` in `lib/layout/layout.ts`). Pane passes
+  `visible={active}` to every surface, FileView, FinderView and DiffView
+  included; FileView hands it to its renderers.
+- `lib/previews/viewLifecycle.svelte.ts`: `paneVisibility` (the `visible`
+  prop, else the layer's `inert`, with `$pageVisible`), `viewSignal` and
+  `onDiskVersion` (a preview's loads end with the view; a disk change that
+  lands while parked is applied by the reveal, before it paints),
+  `useFileEntry` and `ownedObjectUrls`.
 
 **Contract.** Follow the recurring-work and keep-alive bullets in
 [.claude/rules/web-ui.md](../../.claude/rules/web-ui.md):
@@ -240,7 +250,16 @@ replace the user's text without asking.
 2. Give every timer and listener an `$effect` teardown.
 3. Hide a keep-alive view with `opacity: 0` and `inert`. Do not use
    `display: none`, `visibility: hidden` or a `z-index` on the shown layer.
+   The one exception is dormancy: a layer parked for `DORMANT_AFTER_MS`
+   (30 s) gets `visibility: hidden` (`.layer.dormant` in
+   `lib/layout/Pane.svelte`). That drops the backing stores WebKit keeps for
+   a merely transparent scroller. The inherited toggle is applied from idle
+   time, off the switch path, so a quick switch back stays a two-element
+   restyle and only the reveal of a long-parked tab pays it, once.
 4. Do not steal focus from a hidden view. Check the `visible` prop first.
+5. End a preview's loads with the view and apply a disk change that lands
+   while parked on the reveal (`viewSignal`, `onDiskVersion`), not into the
+   parked layer.
 
 **Example** (`lib/settings/UpdatesStatus.svelte:65-70`):
 
@@ -271,17 +290,17 @@ $effect(() => {
 - Zoom: `appearance.interfaceFontSize` scales the chrome. `fontChord`
   (`lib/shared/keys.ts:556`) steps the text size of a focused terminal or
   markdown pane. Everywhere else, browser zoom keeps working
-  (`App.svelte:2835-2837`).
+  (`App.svelte:2145-2149`).
 
 **Contract.** Give every control an accessible name. Announce a transient
 outcome with `role="status"` and `aria-live="polite"`. Add a
 `prefers-reduced-motion` override for every new animation, and an
 `html.app-hidden` pause for an infinite one.
 
-**Example** (`App.svelte:6824`):
+**Example** (`App.svelte:5169`):
 
 ```svelte
-<div class="flash-chip" role="status" aria-live="polite">{flash}</div>
+<div class="flash-chip" role="status" aria-live="polite">{flash.text}</div>
 ```
 
 ## 8. Product terms and provider-native vocabulary
@@ -320,24 +339,25 @@ These are proposals, not current behavior. None of them is built.
    lists in eight files handle keys ad hoc or not at all:
    `lib/settings/SettingsView.svelte:268`, `lib/plugins/ui/PluginFileGate.svelte:148`,
    `lib/plugins/ui/UiNode.svelte:367`, `lib/previews/XlsxView.svelte:130`,
-   `lib/previews/BoardView.svelte:450`, `lib/previews/HtmlView.svelte:125`,
-   `lib/previews/ParquetView.svelte:142`, `lib/previews/FileView.svelte:275`, `:286`
-   and `:297`.
-4. **Modal focus.** Two `aria-modal="true"` overlays focus a panel on open but
-   do not use `modalFocus`: `lib/chat/ImagePreview.svelte:35` and
-   `lib/chat/PlanApprovalCard.svelte:136`. Their Tab containment and focus
-   restoration are not verified.
+   `lib/previews/BoardView.svelte:474`, `lib/previews/HtmlView.svelte:125`,
+   `lib/previews/ParquetView.svelte:142`, `lib/previews/FileView.svelte:289`, `:300`
+   and `:311`.
+4. **Pane-local overlays.** `lib/previews/CompareView.svelte` is a
+   `role="dialog"` layer over one editor, not a window modal, so it does not
+   use `modalFocus` (that would hold focus and stand App's chords down for
+   every other pane). It handles Escape but does not return focus on close.
 5. **Escape.** Each dialog handles Escape itself on its backdrop (for example
    `lib/shared/ConfirmDialog.svelte:52-56`). A shared helper could own it.
 6. **Preview states.** No shared loading, empty or error component exists for
    previews (section 4).
 7. **Announcements.** No shared live-region announcer exists (section 7).
-8. **Keyboard resize.** The split edit/preview divider is pointer-only
-   (`lib/previews/SplitEditPreview.svelte:57`, `role="separator"`, no
-   `tabindex`). The Finder divider has arrow keys
-   (`lib/previews/FinderView.svelte:988-1007`). A fix needs a live check.
+8. **Keyboard resize.** The split edit/preview divider, the pane split
+   dividers and the Mastermind panel edge are pointer-only (`role="separator"`,
+   no `tabindex`). The Finder's `.preview-divider` has arrow keys through
+   `resizeKeydown` (`lib/shared/resizeDrag.ts`); the others can adopt it. A fix
+   needs a live check.
 9. **Recents.** "Archive all" is available only from the Recents context menu
-   (`App.svelte:6044-6056`).
+   (`App.svelte:4389-4398`).
 10. **Native zoom.** This review did not check whole-window zoom in the native
     app.
 
@@ -363,71 +383,71 @@ Recurring reasons:
 
 | file:line | code(s) | decision | reason |
 |---|---|---|---|
-| `App.svelte:5790` | autofocus | keep | Rename input appears on a user command (F2 or double-click). |
-| `App.svelte:5809` | no_static_element_interactions | keep | Double-click is a mouse shortcut; F2 on the row is the keyboard path. |
-| `App.svelte:6044` | no_static_element_interactions | keep | Context-menu shortcut; see Gaps 9. |
+| `App.svelte:4143` | autofocus | keep | Rename input appears on a user command (F2 or double-click). |
+| `App.svelte:4153` | no_static_element_interactions | keep | Double-click is a mouse shortcut; F2 on the row is the keyboard path. |
+| `App.svelte:4389` | no_static_element_interactions | keep | Context-menu shortcut; see Gaps 9. |
 | `lib/chat/ChatView.svelte:2953` | no_noninteractive_tabindex, no_noninteractive_element_interactions | keep | `role="log"` transcript is a scroll region; listeners only observe scrolling. |
-| `lib/chat/ImagePreview.svelte:35` | no_noninteractive_element_interactions | removed (stale) | `role="dialog"` with a key handler does not warn. |
-| `lib/chat/ImagePreview.svelte:37` | no_noninteractive_tabindex | removed (stale) | `tabindex="-1"` does not warn. |
+| `lib/chat/ImagePreview.svelte:38` | no_noninteractive_element_interactions | removed (stale) | `role="dialog"` with a key handler does not warn. |
+| `lib/chat/ImagePreview.svelte:40` | no_noninteractive_tabindex | removed (stale) | `tabindex="-1"` does not warn. |
 | `lib/chat/Markdown.svelte:1055` | no_static_element_interactions | keep | Delegation for links, copy and context menu in rendered markdown. |
 | `lib/chat/ModClient.svelte:170` | no_noninteractive_tabindex | keep | Focusable only when the Mod registers key or pointer listeners (`role="application"`). |
 | `lib/chat/ModNode.svelte:33` | no_static_element_interactions | removed (stale) | A capture-phase click listener does not warn. |
 | `lib/chat/ModSite.svelte:155` | no_noninteractive_tabindex | keep | Dynamic `tabindex` is `-1` or absent; the checker cannot see that. |
 | `lib/chat/PermissionCard.svelte:116` | no_noninteractive_tabindex | keep | Card keys. |
 | `lib/chat/PermissionCard.svelte:117` | no_noninteractive_element_interactions | keep | Card keys. |
-| `lib/chat/PlanApprovalCard.svelte:84` | no_noninteractive_tabindex | keep | Card keys. |
-| `lib/chat/PlanApprovalCard.svelte:85` | no_noninteractive_element_interactions | keep | Card keys. |
-| `lib/chat/PlanApprovalCard.svelte:136` | no_noninteractive_element_interactions | removed (stale) | `role="dialog"` with a key handler does not warn. |
-| `lib/chat/PlanApprovalCard.svelte:150` | no_noninteractive_tabindex | removed (stale) | `tabindex="-1"` does not warn. |
+| `lib/chat/PlanApprovalCard.svelte:87` | no_noninteractive_tabindex | keep | Card keys. |
+| `lib/chat/PlanApprovalCard.svelte:88` | no_noninteractive_element_interactions | keep | Card keys. |
+| `lib/chat/PlanApprovalCard.svelte:139` | no_noninteractive_element_interactions | removed (stale) | `role="dialog"` with a key handler does not warn. |
+| `lib/chat/PlanApprovalCard.svelte:154` | no_noninteractive_tabindex | removed (stale) | `tabindex="-1"` does not warn. |
 | `lib/dashboard/AgentCard.svelte:337` | no_static_element_interactions, click_events_have_key_events | keep | Wrapper only stops propagation to the card's open handler. |
 | `lib/knowledge/EntryBody.svelte:126` | click_events_have_key_events, no_static_element_interactions | keep | Delegation. |
 | `lib/knowledge/KnowledgeView.svelte:334` | no_static_element_interactions | keep | Delegation for chips and view keys. |
 | `lib/layout/CloseDirtyDialog.svelte:60` | click_events_have_key_events | keep (trimmed) | Dialog panel; unused `no_static_element_interactions` removed. |
-| `lib/layout/PaneTabs.svelte:716` | no_static_element_interactions | keep | Context-menu shortcut; the "Pane actions" button is the keyboard path. |
-| `lib/layout/PaneTabs.svelte:730` | click_events_have_key_events | keep | `tabNavigation` on the strip handles Enter and Space. |
-| `lib/layout/PaneTabs.svelte:921` | autofocus | removed (stale) | Input focuses through `use:renameFocus`, not `autofocus`. |
-| `lib/layout/PaneTabs.svelte:1097` | no_noninteractive_element_interactions | removed (stale) | `onpointerdown` is not a checked handler. |
+| `lib/layout/PaneTabs.svelte:676` | no_static_element_interactions | keep | Context-menu shortcut; the "Pane actions" button is the keyboard path. |
+| `lib/layout/PaneTabs.svelte:690` | click_events_have_key_events | keep | `tabNavigation` on the strip handles Enter and Space. |
+| `lib/layout/PaneTabs.svelte:881` | autofocus | removed (stale) | Input focuses through `use:renameFocus`, not `autofocus`. |
+| `lib/layout/PaneTabs.svelte:1057` | no_noninteractive_element_interactions | removed (stale) | `onpointerdown` is not a checked handler. |
 | `lib/plugins/ActivityDialog.svelte:51` | click_events_have_key_events | keep (trimmed) | Dialog panel. |
 | `lib/plugins/AttachSheet.svelte:313` | click_events_have_key_events | keep (trimmed) | Dialog panel. |
 | `lib/plugins/TrustDialog.svelte:53` | click_events_have_key_events | keep (trimmed) | Dialog panel. |
 | `lib/plugins/ui/UiNode.svelte:416` | no_noninteractive_tabindex | keep | Scroll region (capped code block). |
-| `lib/previews/BoardView.svelte:474` | no_noninteractive_tabindex | keep | `role="application"` pan and zoom surface. |
-| `lib/previews/BoardView.svelte:475` | no_noninteractive_element_interactions | keep | Same surface. |
+| `lib/previews/BoardView.svelte:498` | no_noninteractive_tabindex | keep | `role="application"` pan and zoom surface. |
+| `lib/previews/BoardView.svelte:499` | no_noninteractive_element_interactions | keep | Same surface. |
 | `lib/previews/boards/CanvasBoard.svelte:265` | click_events_have_key_events | keep | Delegation. |
 | `lib/previews/boards/CanvasBoard.svelte:266` | no_static_element_interactions | keep | Delegation. |
 | `lib/previews/CompareView.svelte:83` | no_noninteractive_element_interactions | removed (stale) | `role="dialog"` with a key handler does not warn. |
-| `lib/previews/DocxView.svelte:374` | no_noninteractive_tabindex | keep | Scroll region (`role="document"`). |
-| `lib/previews/DocxView.svelte:375` | no_noninteractive_element_interactions | keep | Its key handler pages the document. |
-| `lib/previews/FinderView.svelte:870` | autofocus | removed (stale) | Input focuses through `use:editFocus`. |
-| `lib/previews/FinderView.svelte:900` | autofocus | removed (stale) | Input focuses through `use:editFocus`. |
-| `lib/previews/FinderView.svelte:988` | no_noninteractive_tabindex, no_noninteractive_element_interactions | keep | Focusable `role="separator"` with value and arrow keys. |
+| `lib/previews/DocxView.svelte:366` | no_noninteractive_tabindex | keep | Scroll region (`role="document"`). |
+| `lib/previews/DocxView.svelte:367` | no_noninteractive_element_interactions | keep | Its key handler pages the document. |
+| `lib/previews/FinderView.svelte:847` | autofocus | removed (stale) | Input focuses through `use:renameFocus`. |
+| `lib/previews/FinderView.svelte:877` | autofocus | removed (stale) | Input focuses through `use:renameFocus`. |
+| `lib/previews/FinderView.svelte:965` | no_noninteractive_tabindex, no_noninteractive_element_interactions | keep | Focusable `role="separator"` with value and arrow keys. |
 | `lib/previews/ImageView.svelte:508` | no_noninteractive_element_interactions | keep | `role="application"` zoom and pan viewport. |
 | `lib/previews/ImageView.svelte:509` | no_noninteractive_tabindex | removed (stale) | `tabindex="-1"` does not warn. |
-| `lib/previews/LogView.svelte:516` | no_noninteractive_tabindex | keep | Scroll region (`role="log"`). |
+| `lib/previews/LogView.svelte:511` | no_noninteractive_tabindex | keep | Scroll region (`role="log"`). |
 | `lib/previews/MarkdownView.svelte:1592` | no_static_element_interactions | keep | Delegation. |
 | `lib/previews/MarkdownView.svelte:1593` | click_events_have_key_events | keep | Delegation. |
 | `lib/previews/MarkdownView.svelte:1612` | no_noninteractive_tabindex, no_noninteractive_element_interactions | keep | Scroll region; Enter starts editing in live mode. |
 | `lib/previews/MarkdownView.svelte:1662` | no_static_element_interactions | keep | Edit layer forwards editor keys. |
-| `lib/previews/MediaView.svelte:366` | media_has_caption | keep | A workspace video has no caption track to offer. |
-| `lib/previews/NotebookView.svelte:441` | click_events_have_key_events | keep | Delegation. |
-| `lib/previews/NotebookView.svelte:442` | no_noninteractive_element_interactions | keep | Delegation. |
-| `lib/previews/NotebookView.svelte:443` | no_noninteractive_tabindex | keep | Scroll region. |
-| `lib/previews/PdfView.svelte:1507` | no_static_element_interactions | keep | View-level keys (paging, find). |
-| `lib/previews/PdfView.svelte:1669` | no_noninteractive_tabindex | keep | Scroll region (`role="document"`). |
-| `lib/previews/PptxView.svelte:452` | no_noninteractive_tabindex | keep | Slide stage takes paging keys. |
-| `lib/previews/PptxView.svelte:453` | no_noninteractive_element_interactions | keep | Same stage. |
-| `lib/previews/PptxView.svelte:454` | click_events_have_key_events | removed (stale) | The stage already has `onkeydown`. |
+| `lib/previews/MediaView.svelte:367` | media_has_caption | keep | A workspace video has no caption track to offer. |
+| `lib/previews/NotebookView.svelte:465` | click_events_have_key_events | keep | Delegation. |
+| `lib/previews/NotebookView.svelte:466` | no_noninteractive_element_interactions | keep | Delegation. |
+| `lib/previews/NotebookView.svelte:467` | no_noninteractive_tabindex | keep | Scroll region. |
+| `lib/previews/PdfView.svelte:1521` | no_static_element_interactions | keep | View-level keys (paging, find). |
+| `lib/previews/PdfView.svelte:1683` | no_noninteractive_tabindex | keep | Scroll region (`role="document"`). |
+| `lib/previews/PptxView.svelte:447` | no_noninteractive_tabindex | keep | Slide stage takes paging keys. |
+| `lib/previews/PptxView.svelte:448` | no_noninteractive_element_interactions | keep | Same stage. |
+| `lib/previews/PptxView.svelte:449` | click_events_have_key_events | removed (stale) | The stage already has `onkeydown`. |
 | `lib/previews/SlidesView.svelte:353` | no_noninteractive_tabindex | keep | Slide stage takes paging keys. |
 | `lib/previews/SlidesView.svelte:354` | no_noninteractive_element_interactions | keep | Same stage. |
-| `lib/previews/SplitEditPreview.svelte:57` | no_static_element_interactions | removed (stale) | `role="separator"` does not warn; keyboard resize is Gaps 8. |
+| `lib/previews/SplitEditPreview.svelte:64` | no_static_element_interactions | removed (stale) | `role="separator"` does not warn; keyboard resize is Gaps 8. |
 | `lib/shared/ConfirmDialog.svelte:63` | click_events_have_key_events | keep (trimmed) | Dialog panel. |
 | `lib/shared/embed/MarkdownBody.svelte:144` | click_events_have_key_events, no_static_element_interactions | keep | Delegation. |
 | `lib/shared/embed/MediaBody.svelte:47` | media_has_caption | keep | A workspace video has no caption track to offer. |
 | `lib/shared/embed/NotebookBody.svelte:155` | click_events_have_key_events, no_static_element_interactions | keep | Delegation. |
 | `lib/shared/FindBar.svelte:31` | no_noninteractive_element_interactions | keep | `role="search"` handles Escape for every control inside it. |
 | `lib/workspace/AgentSetupDialog.svelte:165` | no_noninteractive_tabindex | keep | Scroll region (installer output). |
-| `lib/workspace/FileTree.svelte:1117` | autofocus | removed (stale) | Input focuses through an action. |
-| `lib/workspace/FileTree.svelte:1229` | autofocus | removed (stale) | Input focuses through an action. |
+| `lib/workspace/FileTree.svelte:1078` | autofocus | removed (stale) | Input focuses through an action. |
+| `lib/workspace/FileTree.svelte:1190` | autofocus | removed (stale) | Input focuses through an action. |
 | `lib/workspace/FolderPicker.svelte:612` | autofocus | removed (stale) | Input focuses through `use:focusOnMount`. |
 | `lib/workspace/HomeScreen.svelte:955` | autofocus | keep | Add-host input appears on a user command. |
 

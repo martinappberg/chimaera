@@ -3,18 +3,22 @@
   import FileIcon from "../shared/FileIcon.svelte";
   import EmbedCard from "../shared/embed/EmbedCard.svelte";
   import { pathTarget, resolveTargets, type TargetResult } from "../shared/embed/embed";
-  import { watchPaneVisible } from "./paneVisible";
-  import { pageVisible } from "../shared/visibility";
+  import { paneVisibility } from "./viewLifecycle.svelte";
   import { isMac } from "../shared/keys";
   import Spinner from "./Spinner.svelte";
 
-  let { entry, onOpen }: {
+  let { entry, onOpen, visible = undefined }: {
     entry: FsEntry | null;
     onOpen: (newSplit: boolean) => void;
+    /** The Finder's pane shows it; unset: watch the layer. */
+    visible?: boolean;
   } = $props();
 
   let host = $state<HTMLElement | null>(null);
-  let visible = $state(true);
+  const onScreen = paneVisibility(
+    () => visible,
+    () => host,
+  );
   const path = $derived(entry?.path ?? null);
   const broken = $derived(entry?.broken === true);
   // Key the card by path: a slow response from the previous selection must
@@ -22,12 +26,11 @@
   let ready = $state<string | null>(null);
   let resolver = $state<(() => Promise<TargetResult | null>) | null>(null);
 
-  $effect(() => host === null ? undefined : watchPaneVisible(host, (v) => { visible = v; }));
   $effect(() => {
     const p = path;
     ready = null;
     resolver = null;
-    if (p === null || !visible || !$pageVisible || broken) return;
+    if (p === null || !onScreen.shown || broken) return;
     const abort = new AbortController();
     const target = pathTarget(p);
     const timer = setTimeout(() => {

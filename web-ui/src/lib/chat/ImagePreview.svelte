@@ -4,8 +4,11 @@
    * the screenshot is the right one. The picture has no file yet, so this
    * is an overlay, not a pane (a sent picture opens in a pane). Esc, the
    * backdrop and ✕ close it; "remove" drops the attachment and closes.
-   * Same overlay shape as the plan card's full-plan view.
+   * Same overlay shape as the plan card's full-plan view. A modal
+   * (`modalFocus`): Tab stays inside, focus returns to the opener on close.
    */
+  import { modalFocus } from "../shared/modalFocus";
+
   interface Props {
     src: string;
     label: string;
@@ -32,7 +35,7 @@
   }
 </script>
 
-<div class="preview" role="dialog" aria-modal="true" aria-label="preview {label}" tabindex="-1" onkeydown={onKeydown}>
+<div class="preview" role="dialog" aria-modal="true" aria-label="preview {label}" tabindex="-1" use:modalFocus onkeydown={onKeydown}>
   <button class="backdrop" type="button" aria-label="close preview" onclick={onClose}></button>
   <div class="panel" tabindex="-1" bind:this={panel}>
     <img {src} alt={label} draggable="false" />

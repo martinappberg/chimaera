@@ -24,7 +24,8 @@
   import { basename, fsDownload, midTruncate, viewKindFor } from "../previews/files";
   import { isRemoteHost } from "../net/api";
   import { fsRenameOp } from "../workspace/fsEvents";
-  import { stemLength, validateEntryName } from "../shared/fsNames";
+  import { validateEntryName } from "../shared/fsNames";
+  import { InlineRename, renameFocus } from "../shared/inlineRename.svelte";
   import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
   import { revealEntries, writeClipboard } from "../net/native";
   import { dirtyFiles } from "../shared/editing";
@@ -501,10 +502,34 @@
   // renames the file ON DISK (open tabs follow via App's mutation
   // subscription). The tab label is never an independent alias.
 
+  /** The tab being renamed inline. Its tabKey pins the identity (session id
+   *  or path), so the tab captured at begin is the one committed. */
+  const inline = new InlineRename<Tab>({
+    check(tab, name) {
+      if (tab.surface === "terminal") return name === label(tab) ? "unchanged" : "submit";
+      if (tab.surface !== "file" || name === basename(tab.path)) return "unchanged";
+      const invalid = validateEntryName(name, { allowSlashes: false });
+      return invalid === null ? "submit" : { invalid };
+    },
+    async submit(tab, name, close) {
+      if (tab.surface === "terminal") {
+        close();
+        renameSession(tab.sessionId, name).catch(() => {
+          // next sessions snapshot restores the truth (rail-rename semantics)
+        });
+        return;
+      }
+      if (tab.surface !== "file") return;
+      const i = tab.path.lastIndexOf("/");
+      const parent = i > 0 ? tab.path.slice(0, i) : "";
+      await fsRenameOp(tab.path, `${parent}/${name}`);
+      // App's mutation subscription rewrites this tab
+    },
+    errorText: (e) => (e instanceof Error ? e.message : "rename failed"),
+  });
   /** tabKey of the tab being renamed inline, if any. */
-  let renamingTab = $state<string | null>(null);
-  let renameDraft = $state("");
-  let renameError = $state<string | null>(null);
+  const renamingTab = $derived(inline.target === null ? null : tabKey(inline.target));
+  const renameError = $derived(inline.error);
 
   // Everything that moves the strip's fold without resizing the strip — the
   // tab set, their labels, an inline rename (a 12ch input replaces the name)
@@ -517,72 +542,7 @@
   });
 
   function beginTabRename(tab: Tab): void {
-    renamingTab = tabKey(tab);
-    renameDraft = tab.surface === "file" ? basename(tab.path) : label(tab);
-    renameError = null;
-  }
-
-  function cancelTabRename(): void {
-    renamingTab = null;
-    renameDraft = "";
-    renameError = null;
-  }
-
-  /** Focus the rename input; file names preselect the stem. */
-  function renameFocus(node: HTMLInputElement, selectStem: boolean): void {
-    node.focus();
-    if (selectStem) node.setSelectionRange(0, stemLength(node.value));
-  }
-
-  async function commitTabRename(tab: Tab, viaBlur = false): Promise<void> {
-    if (renamingTab !== tabKey(tab)) return;
-    const name = renameDraft.trim();
-    if (name === "") {
-      cancelTabRename();
-      return;
-    }
-    if (tab.surface === "terminal") {
-      cancelTabRename();
-      if (name !== label(tab)) {
-        renameSession(tab.sessionId, name).catch(() => {
-          // next sessions snapshot restores the truth (rail-rename semantics)
-        });
-      }
-      return;
-    }
-    if (tab.surface !== "file") {
-      cancelTabRename();
-      return;
-    }
-    if (name === basename(tab.path)) {
-      cancelTabRename();
-      return;
-    }
-    const invalid = validateEntryName(name, { allowSlashes: false });
-    if (invalid !== null) {
-      if (viaBlur) cancelTabRename();
-      else renameError = invalid;
-      return;
-    }
-    try {
-      const i = tab.path.lastIndexOf("/");
-      const parent = i > 0 ? tab.path.slice(0, i) : "";
-      await fsRenameOp(tab.path, `${parent}/${name}`);
-      cancelTabRename(); // App's mutation subscription rewrites this tab
-    } catch (e) {
-      renameError = e instanceof Error ? e.message : "rename failed";
-    }
-  }
-
-  function onRenameKeydown(e: KeyboardEvent, tab: Tab): void {
-    e.stopPropagation(); // chords and terminal keys stay out
-    if (e.key === "Enter") {
-      e.preventDefault();
-      void commitTabRename(tab);
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      cancelTabRename(); // nulled before blur fires, so blur no-ops
-    }
+    inline.begin(tab, tab.surface === "file" ? basename(tab.path) : label(tab));
   }
 
   async function copyPath(p: string): Promise<void> {
@@ -926,10 +886,10 @@
               autocomplete="off"
               aria-label="rename"
               title={renameError ?? undefined}
-              bind:value={renameDraft}
+              bind:value={inline.draft}
               use:renameFocus={tab.surface === "file"}
-              onkeydown={(e) => onRenameKeydown(e, tab)}
-              onblur={() => void commitTabRename(tab, true)}
+              onkeydown={(e) => inline.keydown(e)}
+              onblur={() => inline.blur()}
             />
           {:else}
             <!-- data-label feeds the ::after bold duplicate that reserves the

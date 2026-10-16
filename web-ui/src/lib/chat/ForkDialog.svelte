@@ -3,8 +3,16 @@
    * Destination picker for a non-destructive transcript branch. Same-agent
    * exact boundaries advertise the native protocol; every cross-agent choice
    * uses Chimaera's normalized transcript handoff.
+   *
+   * A pane-local dialog, not a window modal: no `modalFocus` (that would
+   * stand App's chords down and pull focus back from every other pane), and
+   * no `aria-modal` (the rest of the window stays usable). Focus starts on
+   * cancel (the safe default), Escape cancels, and focus returns to the
+   * opener on close when it was still inside the dialog.
    */
   import SessionGlyph from "../shared/SessionGlyph.svelte";
+  import { focusOnMount } from "../shared/focusOnMount";
+  import { returnFocus } from "../shared/returnFocus";
 
   interface AgentChoice {
     id: string;
@@ -33,7 +41,20 @@
 </script>
 
 <div class="dialog-veil">
-  <div class="dialog" role="dialog" aria-label="fork conversation">
+  <div
+    class="dialog"
+    role="dialog"
+    aria-label="fork conversation"
+    tabindex="-1"
+    use:returnFocus
+    onkeydown={(e) => {
+      if (e.key !== "Escape") return;
+      // Escape never reaches the chat's own Escape (interrupt) behind it.
+      e.preventDefault();
+      e.stopPropagation();
+      if (!applying) onCancel();
+    }}
+  >
     <div class="dialog-title">continue in a new chat</div>
     <div class="dialog-note">
       {restoreDraft
@@ -67,7 +88,7 @@
     </details>
 
     <div class="dialog-actions">
-      <button class="opt quiet" disabled={applying} onclick={onCancel}>cancel</button>
+      <button class="opt quiet" disabled={applying} use:focusOnMount onclick={onCancel}>cancel</button>
     </div>
   </div>
 </div>

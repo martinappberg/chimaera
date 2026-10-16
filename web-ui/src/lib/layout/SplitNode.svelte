@@ -7,6 +7,7 @@
   import type { DashCtx } from "../dashboard/dash";
   import Pane from "./Pane.svelte";
   import Self from "./SplitNode.svelte";
+  import { startResizeDrag } from "../shared/resizeDrag";
 
   interface Props {
     node: LayoutNode;
@@ -52,79 +53,36 @@
   let dividerActive = $state(false);
 
   /**
-   * Divider resize with pointer capture: rAF-throttled ratio updates (60fps,
-   * no synchronous layout thrash), 120px minimum pane size, Escape restores
-   * the starting ratio. Terminal refits are suppressed for the whole drag
+   * Divider resize (`shared/resizeDrag`: pointer capture, rAF-throttled ratio
+   * updates, Escape and pointercancel restore the starting ratio) with a 120px
+   * minimum pane size. Terminal refits are suppressed for the whole drag
    * via ctrl.dividerDrag and flushed once at pointer-up.
    */
   function onDividerDown(e: PointerEvent) {
     if (node.type !== "split" || el === null || e.button !== 0) return;
     e.preventDefault();
     const split = node;
-    const divider = e.currentTarget as HTMLElement;
     const rect = el.getBoundingClientRect();
     const horizontal = split.dir === "row";
     const total = (horizontal ? rect.width : rect.height) - DIVIDER_PX;
     if (total <= 0) return;
-    const startRatio = split.ratio;
     const min = Math.max(Math.min(MIN_PANE_PX / total, 0.5), MIN_RATIO);
-    const pointerId = e.pointerId;
-    let raf = 0;
-    let last = horizontal ? e.clientX : e.clientY;
-    let done = false;
 
-    try {
-      divider.setPointerCapture(pointerId);
-    } catch {
-      // capture unavailable; window-level listeners still track the drag
-    }
     dividerActive = true;
     ctrl.dividerDrag(true);
-
-    const apply = () => {
-      raf = 0;
-      const pos = (horizontal ? last - rect.left : last - rect.top) - DIVIDER_PX / 2;
-      const ratio = Math.min(Math.max(pos / total, min), 1 - min);
-      ctrl.setRatio(split.id, ratio);
-    };
-
-    const onMove = (ev: PointerEvent) => {
-      if (ev.pointerId !== pointerId) return;
-      last = horizontal ? ev.clientX : ev.clientY;
-      if (raf === 0) raf = requestAnimationFrame(apply);
-    };
-
-    const finish = (cancel: boolean) => {
-      if (done) return;
-      done = true;
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
-      window.removeEventListener("pointercancel", onCancel);
-      window.removeEventListener("keydown", onKey, true);
-      if (raf !== 0) cancelAnimationFrame(raf);
-      if (cancel) ctrl.setRatio(split.id, startRatio);
-      dividerActive = false;
-      ctrl.dividerDrag(false);
-    };
-
-    const onUp = (ev: PointerEvent) => {
-      if (ev.pointerId === pointerId) finish(false);
-    };
-    const onCancel = (ev: PointerEvent) => {
-      if (ev.pointerId === pointerId) finish(true);
-    };
-    const onKey = (ev: KeyboardEvent) => {
-      if (ev.key === "Escape") {
-        ev.preventDefault();
-        ev.stopPropagation();
-        finish(true);
-      }
-    };
-
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
-    window.addEventListener("pointercancel", onCancel);
-    window.addEventListener("keydown", onKey, true);
+    startResizeDrag(e, {
+      axis: horizontal ? "x" : "y",
+      initial: split.ratio,
+      compute: (at) => {
+        const pos = (horizontal ? at - rect.left : at - rect.top) - DIVIDER_PX / 2;
+        return Math.min(Math.max(pos / total, min), 1 - min);
+      },
+      apply: (ratio) => ctrl.setRatio(split.id, ratio),
+      onEnd: () => {
+        dividerActive = false;
+        ctrl.dividerDrag(false);
+      },
+    });
   }
 </script>
 

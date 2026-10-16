@@ -17,7 +17,7 @@
   import { api } from "../net/api";
   import { dismiss } from "../shared/dismiss";
   import { requestReveal } from "../shared/reveal";
-  import { pageVisible } from "../shared/visibility";
+  import { paneVisibility } from "./viewLifecycle.svelte";
 
   interface Props {
     path: string;
@@ -72,14 +72,12 @@
     if (flagged.length === 0) open = false;
   });
 
-  /** On screen: the window is visible and this view's pane layer is active. */
-  function shown(el: HTMLElement): boolean {
-    return (
-      document.visibilityState === "visible" &&
-      el.closest("[inert]") === null &&
-      el.getClientRects().length > 0
-    );
-  }
+  /** On screen: the window is visible and this view's pane layer is active
+   *  (MarkdownView passes no `visible`, so the layer is watched). */
+  const onScreen = paneVisibility(
+    () => undefined,
+    () => host,
+  );
 
   async function check(key: string, signal: AbortSignal): Promise<void> {
     const forPath = path;
@@ -108,38 +106,21 @@
     }
   }
 
+  // A parked or hidden view waits: the effect re-runs on the reveal, and
+  // the debounce starts from there.
   $effect(() => {
     const el = host;
     const key = `${path}\n${mtime ?? ""}\n${wsRoot ?? ""}`;
-    if (el === null || !$pageVisible || key === checkedKey) return;
+    if (el === null || !onScreen.shown || key === checkedKey) return;
     const ctl = new AbortController();
-    let timer = 0;
-    let observer: MutationObserver | null = null;
-    const run = (): void => {
-      if (shown(el)) {
-        void check(key, ctl.signal);
-        return;
-      }
-      // Parked in a hidden tab: wait for its layer to become active. (A
-      // hidden window re-runs this effect through $pageVisible instead.)
-      const parked = el.closest("[inert]");
-      if (parked === null || observer !== null) return;
-      observer = new MutationObserver(() => {
-        if (!shown(el)) return;
-        observer?.disconnect();
-        observer = null;
-        schedule();
-      });
-      observer.observe(parked, { attributes: true, attributeFilter: ["inert"] });
-    };
-    const schedule = (): void => {
-      window.clearTimeout(timer);
-      timer = window.setTimeout(run, checkedKey === null ? FIRST_DELAY_MS : DEBOUNCE_MS);
-    };
-    schedule();
+    const timer = window.setTimeout(
+      () => {
+        if (el.getClientRects().length > 0) void check(key, ctl.signal);
+      },
+      checkedKey === null ? FIRST_DELAY_MS : DEBOUNCE_MS,
+    );
     return () => {
       window.clearTimeout(timer);
-      observer?.disconnect();
       ctl.abort();
     };
   });

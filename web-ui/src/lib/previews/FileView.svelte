@@ -37,9 +37,14 @@
     /** Show where an out-of-workspace file lives (off inside a plugin's
      *  screen, which names what it shows). */
     pathBar?: boolean;
+    /** This tab's pane layer is the one on screen (Pane passes it). Handed
+     *  to the renderers that defer or pause parked work; unset outside a
+     *  Pane, where they watch their layer themselves. */
+    visible?: boolean;
   }
 
-  let { path, wsRoot = null, fontSize = undefined, plugins = true, pathBar = true }: Props = $props();
+  let { path, wsRoot = null, fontSize = undefined, plugins = true, pathBar = true, visible = undefined }: Props =
+    $props();
 
   const kind = $derived(viewKindFor(path));
 
@@ -89,16 +94,25 @@
   }> | null>(null);
   let HtmlView = $state<Component<{ path: string }> | null>(null);
   let XlsxView = $state<Component<{ path: string }> | null>(null);
-  let PdfView = $state<Component<{ path: string }> | null>(null);
-  let NotebookView = $state<Component<{ path: string; wsRoot?: string | null }> | null>(null);
-  let LogView = $state<Component<{ path: string; onBinary?: (size: number) => void }> | null>(null);
+  let PdfView = $state<Component<{ path: string; visible?: boolean }> | null>(null);
+  let NotebookView = $state<Component<{ path: string; wsRoot?: string | null; visible?: boolean }> | null>(
+    null,
+  );
+  let LogView = $state<Component<{ path: string; onBinary?: (size: number) => void; visible?: boolean }> | null>(
+    null,
+  );
   let SlidesView = $state<Component<{ path: string; switcher?: Snippet }> | null>(null);
   let MermaidView = $state<Component<{ path: string; chunk: FileChunk; switcher?: Snippet }> | null>(
     null,
   );
-  let DocxView = $state<Component<{ path: string }> | null>(null);
-  let PptxView = $state<Component<{ path: string }> | null>(null);
-  let BoardView = $state<Component<{ path: string; wsRoot?: string | null; switcher?: Snippet }> | null>(null);
+  let DocxView = $state<Component<{ path: string; visible?: boolean }> | null>(null);
+  let PptxView = $state<Component<{ path: string; visible?: boolean }> | null>(null);
+  let BoardView = $state<Component<{
+    path: string;
+    wsRoot?: string | null;
+    switcher?: Snippet;
+    visible?: boolean;
+  }> | null>(null);
   let ParquetView = $state<Component<{ path: string }> | null>(null);
   let lazyError = $state<string | null>(null);
   const wantsCode = $derived(
@@ -370,7 +384,7 @@
           {@render lazyFallback()}
         {/if}
       {:else if kind === "table"}
-        <TableView {path} />
+        <TableView {path} {visible} />
       {:else if kind === "xlsx"}
         {#if XlsxView !== null}
           {#key version}
@@ -382,7 +396,7 @@
       {:else if kind === "pdf"}
         {#if PdfView !== null}
           {#key version}
-            <PdfView {path} />
+            <PdfView {path} {visible} />
           {/key}
         {:else}
           {@render lazyFallback()}
@@ -390,10 +404,10 @@
       {:else if kind === "video" || kind === "audio"}
         <!-- Not keyed on mtime like the other ticketed views: MediaView
              swaps a re-minted URL in place and keeps the playhead. -->
-        <MediaView {path} {kind} />
+        <MediaView {path} {kind} {visible} />
       {:else if kind === "notebook"}
         {#if NotebookView !== null}
-          <NotebookView {path} {wsRoot} />
+          <NotebookView {path} {wsRoot} {visible} />
         {:else}
           {@render lazyFallback()}
         {/if}
@@ -401,7 +415,7 @@
         <BinaryView {path} knownSize={logBinary} />
       {:else if kind === "log"}
         {#if LogView !== null}
-          <LogView {path} onBinary={(size) => (logBinary = size)} />
+          <LogView {path} {visible} onBinary={(size) => (logBinary = size)} />
         {:else}
           {@render lazyFallback()}
         {/if}
@@ -413,19 +427,19 @@
         {/if}
       {:else if kind === "docx"}
         {#if DocxView !== null}
-          <DocxView {path} />
+          <DocxView {path} {visible} />
         {:else}
           {@render lazyFallback()}
         {/if}
       {:else if kind === "pptx"}
         {#if PptxView !== null}
-          <PptxView {path} />
+          <PptxView {path} {visible} />
         {:else}
           {@render lazyFallback()}
         {/if}
       {:else if kind === "board" && boardMode === "board"}
         {#if BoardView !== null}
-          <BoardView {path} {wsRoot} switcher={boardSwitch} />
+          <BoardView {path} {wsRoot} {visible} switcher={boardSwitch} />
         {:else}
           {@render lazyFallback()}
         {/if}

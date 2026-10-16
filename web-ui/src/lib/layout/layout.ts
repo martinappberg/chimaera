@@ -243,6 +243,24 @@ export function keepsPaneViewAlive(t: Tab, sessionUi?: "chat" | "term"): boolean
   return t.surface !== "terminal" || sessionUi === "chat";
 }
 
+/**
+ * Trim a pane's kept-alive view keys (most recent first) to `cap` from the
+ * cold end, never evicting a file view with unsaved edits (`f:<path>` with
+ * the path in `dirty`): its buffer would survive in the store anyway, but its
+ * view (scroll, search panel, selection chip) is what the user left. The
+ * front key (the active view) always stays; dirty files can hold the set
+ * above `cap`.
+ */
+export function trimLive(keys: string[], dirty: ReadonlySet<string>, cap: number): string[] {
+  if (keys.length <= cap) return keys;
+  const out = [...keys];
+  for (let i = out.length - 1; i > 0 && out.length > cap; i--) {
+    const k = out[i];
+    if (!(k.startsWith("f:") && dirty.has(k.slice(2)))) out.splice(i, 1);
+  }
+  return out;
+}
+
 export interface PaneNode {
   type: "pane";
   id: string;

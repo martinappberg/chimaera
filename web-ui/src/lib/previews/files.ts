@@ -96,10 +96,10 @@ async function json<T>(res: Response): Promise<T> {
   return (await res.json()) as T;
 }
 
-export async function fsList(path: string, hidden = false): Promise<FsListing> {
+export async function fsList(path: string, hidden = false, signal?: AbortSignal): Promise<FsListing> {
   const q = new URLSearchParams({ path });
   if (hidden) q.set("hidden", "true");
-  return json(await api(`/fs/list?${q.toString()}`));
+  return json(await api(`/fs/list?${q.toString()}`, signal !== undefined ? { signal } : {}));
 }
 
 export async function fsFile(

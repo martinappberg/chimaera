@@ -31,3 +31,36 @@ export function captureBlobUrls(doc: unknown): string[] {
 export function revokeAll(urls: string[]): void {
   for (const u of urls.splice(0)) URL.revokeObjectURL(u);
 }
+
+/**
+ * Every object URL one view owns, revoked together: what it minted itself
+ * (`own`) and what a library minted into a cache map it was handed
+ * (`cache()`, e.g. pptx-renderer's `mediaUrlCache`). `revokeAll` frees them
+ * all; `viewLifecycle.ownedObjectUrls` also runs it when the view goes.
+ */
+export class OwnedUrls {
+  private loose: string[] = [];
+  private caches: Map<string, string>[] = [];
+
+  /** Take ownership of `url`; returns it. */
+  own(url: string): string {
+    this.loose.push(url);
+    return url;
+  }
+
+  /** A fresh map for a library to mint into; its values are owned here. */
+  cache(): Map<string, string> {
+    const map = new Map<string, string>();
+    this.caches.push(map);
+    return map;
+  }
+
+  /** Revoke everything owned so far (the cache maps are emptied and dropped). */
+  revokeAll(): void {
+    revokeAll(this.loose);
+    for (const map of this.caches.splice(0)) {
+      for (const url of map.values()) URL.revokeObjectURL(url);
+      map.clear();
+    }
+  }
+}
