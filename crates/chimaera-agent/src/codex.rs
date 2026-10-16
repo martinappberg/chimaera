@@ -966,11 +966,8 @@ enum PendingRpc {
         /// thread's effort).
         chosen: bool,
     },
-    /// account/rateLimits/read — the account's usage limits; `report` also
-    /// renders /usage.
-    RateLimitsRead {
-        report: bool,
-    },
+    /// account/rateLimits/read — the account's usage limits, for /usage.
+    RateLimitsRead,
     /// thread/compact/start ack; the compaction itself runs as its own turn
     /// whose contextCompaction item lands the "context compacted" notice.
     Compact,
@@ -1316,7 +1313,8 @@ impl RateLimits {
     }
 
     /// A rolling update is sparse: a null field is unknown, not cleared. The
-    /// next read (each turn end) settles anything a merge left stale.
+    /// next read (`/usage`) or a later update settles anything a merge left
+    /// stale.
     fn merge(&mut self, snapshot: &Value) {
         let theirs = snapshot["limitId"].as_str();
         if let (Some(ours), Some(theirs)) = (self.limit_id.as_deref(), theirs) {
@@ -2380,9 +2378,13 @@ impl CodexMapper {
                             .events
                             .push(AgentEvent::TurnCompleted { turn_id, usage }),
                     }
-                    // Refresh the usage limits once per turn: a rolling
-                    // account/rateLimits/updated need not follow every turn.
-                    self.read_rate_limits(false, &mut step);
+                    // No usage read here: codex sends the rolling
+                    // account/rateLimits/updated during every turn (live
+                    // 0.162.1, before turn/completed), and a read still in
+                    // flight at turn end held the app-server open long
+                    // enough that an immediate resume of the thread
+                    // (rewind, relaunch) was refused: "thread … already has
+                    // an active writer".
                 }
                 self.reset_turn_state();
                 if was_active {
@@ -2829,14 +2831,12 @@ impl CodexMapper {
                     });
                 }
             }
-            (PendingRpc::RateLimitsRead { report }, Some(_)) => {
+            (PendingRpc::RateLimitsRead, Some(_)) => {
                 // No plan limits to read (an API-key login): the chip stays
                 // empty, and /usage says so instead of never answering.
-                if report {
-                    step.events.push(AgentEvent::UsageReport {
-                        windows: Vec::new(),
-                    });
-                }
+                step.events.push(AgentEvent::UsageReport {
+                    windows: Vec::new(),
+                });
             }
             (PendingRpc::Compact, Some(err)) => {
                 step.events.push(AgentEvent::Error {
@@ -2877,9 +2877,9 @@ impl CodexMapper {
                     self.emit_effort_state_marked(Some(effort_id), chosen, step);
                 }
             }
-            (PendingRpc::RateLimitsRead { report }, None) => {
+            (PendingRpc::RateLimitsRead, None) => {
                 self.rate_limits = RateLimits::read(&frame["result"]);
-                self.emit_rate_limits(report, step);
+                self.emit_rate_limits(true, step);
             }
             (
                 PendingRpc::Steer {
@@ -2955,10 +2955,9 @@ impl CodexMapper {
 
     /// account/rateLimits/read. Reset-credit details cost the backend a
     /// second lookup, and nothing here shows them.
-    fn read_rate_limits(&mut self, report: bool, step: &mut DriverStep) {
+    fn read_rate_limits(&mut self, step: &mut DriverStep) {
         let id = self.rpc_id();
-        self.pending_rpcs
-            .insert(id, PendingRpc::RateLimitsRead { report });
+        self.pending_rpcs.insert(id, PendingRpc::RateLimitsRead);
         step.outbound.push(json!({
             "id": id, "method": "account/rateLimits/read",
             "params": { "excludeResetCreditDetails": true },
@@ -5547,7 +5546,7 @@ impl CodexMapper {
                     }));
                 }
             }
-            AgentCommand::GetUsage => self.read_rate_limits(true, &mut step),
+            AgentCommand::GetUsage => self.read_rate_limits(&mut step),
             AgentCommand::Answer {
                 request_id,
                 answers,
@@ -10365,33 +10364,39 @@ mod tests {
     }
 
     #[test]
-    fn rate_limits_poll_each_turn_end_and_merge_rolling_updates() {
+    fn rate_limits_follow_rolling_updates_with_no_read_at_turn_end() {
         let mut m = mapper();
         m.on_frame(&json!({
             "method": "turn/started",
             "params": { "threadId": "thr-1", "turn": { "id": "turn-A" } },
         }));
-        let end = m.on_frame(&json!({
-            "method": "turn/completed",
-            "params": { "threadId": "thr-1", "turn": { "id": "turn-A", "status": "completed" } },
+        // Codex sends the rolling update mid-turn (live 0.162.1, Pro: one
+        // weekly window, no session window)…
+        let step = m.on_frame(&json!({
+            "method": "account/rateLimits/updated",
+            "params": { "rateLimits": rate_snapshot(
+                json!({ "usedPercent": 0, "windowDurationMins": 10080, "resetsAt": 1792652719u64 }),
+                Value::Null,
+            ) },
         }));
-        // Live 0.162.1 Pro account: one weekly window, no session window.
-        let step = answer_rate_limits(
-            &mut m,
-            end,
-            json!({
-                "ordinaryUsageAllowed": true,
-                "rateLimits": rate_snapshot(
-                    json!({ "usedPercent": 0, "windowDurationMins": 10080, "resetsAt": 1792652719u64 }),
-                    Value::Null,
-                ),
-            }),
-        );
         assert!(matches!(
             &step.events[..],
             [AgentEvent::RateLimit { utilization, label: Some(label), .. }]
                 if *utilization == 0.0 && label == "weekly limit"
         ));
+        // …so the turn's end asks nothing: a read still in flight there held
+        // the app-server open past an immediate resume.
+        let end = m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "threadId": "thr-1", "turn": { "id": "turn-A", "status": "completed" } },
+        }));
+        assert!(
+            end.outbound
+                .iter()
+                .all(|f| f["method"] != "account/rateLimits/read"),
+            "{:?}",
+            end.outbound
+        );
 
         // A rolling update is sparse: the session window it adds joins the
         // weekly one it leaves out.
@@ -10507,8 +10512,8 @@ mod tests {
 
     #[test]
     fn usage_answers_even_without_plan_limits() {
-        // An API-key login has no plan limits: the per-turn poll stays
-        // silent, /usage still gets its (empty) answer.
+        // An API-key login has no plan limits: /usage still gets its
+        // (empty) answer.
         let mut m = mapper();
         let usage = m.on_command(AgentCommand::GetUsage);
         let id = usage.outbound[0]["id"].clone();
