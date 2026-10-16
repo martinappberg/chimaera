@@ -42,6 +42,8 @@ implementation, and current limits.
   boundaries and adding or changing an agent adapter.
 - [Architecture](agent-guides/architecture.md) explains implementation structure
   and constraints.
+- [UI contracts](agent-guides/ui-contracts.md) lists the shared web-UI
+  primitives and the contracts they implement.
 - [Releases](agent-guides/releases.md) covers versioning, packaging, and publishing.
 - [Cloud development](agent-guides/cloud-sessions.md) covers the cloud session workflow.
 
