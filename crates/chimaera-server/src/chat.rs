@@ -3187,14 +3187,13 @@ pub(crate) async fn spawn_fresh_chat_at(
     // theme themselves. Codex needs no files — its MCP injection rides argv.
     let (settings, mcp_config) = if spec.kind == AgentKind::Claude {
         // A worktree still being checked out has no files yet; its project
-        // settings are the workspace's own, committed at the same HEAD.
-        let settings_dir = if crate::lock(&state.worktree_setups).contains_key(&id) {
-            &workspace.root
-        } else {
-            &root
-        };
+        // settings are its repository's, committed at the same HEAD.
+        let settings_dir = crate::lock(&state.worktree_setups)
+            .get(&id)
+            .map_or_else(|| root.clone(), |setup| setup.mirrors.clone());
         let (theme_set, user_statusline) =
-            crate::runtimes::claude_settings_gates(&state.claude_settings_path, settings_dir).await;
+            crate::runtimes::claude_settings_gates(&state.claude_settings_path, &settings_dir)
+                .await;
         let settings_theme = (!theme_set).then_some(spec.theme.as_str());
         let plugin_tools = crate::plugins::spawn_allow(state, &workspace.id).await;
         let s = crate::agents::write_settings(
@@ -3509,7 +3508,9 @@ pub(crate) async fn spawn_chat_session(
         chimaera_agent::driver::SpawnSpec::new(id.clone(), argv, recipe.workspace_root.clone());
     // A chat whose worktree is still being checked out starts its driver
     // now and its process once the folder exists.
-    spec.start_gate = crate::lock(&state.worktree_setups).get(&id).cloned();
+    spec.start_gate = crate::lock(&state.worktree_setups)
+        .get(&id)
+        .map(|setup| setup.gate.clone());
     // A driver respawn is a real spawn: re-materialize the environment
     // prelude (picks up config edits; the login-wrapper sources it).
     let prelude = crate::environment::materialize_prelude(

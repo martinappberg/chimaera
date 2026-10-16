@@ -101,7 +101,11 @@ fn refuse(status: StatusCode, message: impl Into<String>) -> Refusal {
 /// it grows with the repository — a few seconds for tens of thousands of
 /// files on a laptop, more on a network filesystem — far past the budget
 /// git reads get, but still bounded.
+#[cfg(not(test))]
 const CHECKOUT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Short in tests, so a checkout cut off at its deadline can be driven.
+#[cfg(test)]
+const CHECKOUT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Parallel checkout workers (git 2.32+; an older git ignores the key).
 /// Writing the files is most of a worktree's creation, and a few workers
@@ -199,9 +203,12 @@ async fn prepare_path(
 }
 
 /// `git worktree add` into a prepared folder, then the `.worktreeinclude`
-/// copy and the epoch bump. A failed checkout — or one past its deadline,
-/// for which git is killed — leaves nothing behind: not the half-written
-/// folder, not its registration, not a branch made for it.
+/// copy and the epoch bump. A new branch is made first, on its own: a call
+/// racing for the same name fails there, before touching anything, and a
+/// branch this call made is provably its own to drop again. A failed
+/// checkout leaves nothing of this call's: git removes what a failed `add`
+/// made; one killed past its deadline can't, so its half-written folder and
+/// registration go here.
 #[allow(clippy::too_many_arguments)]
 async fn check_out(
     state: &Arc<AppState>,
@@ -214,42 +221,45 @@ async fn check_out(
     path: &Path,
 ) -> Result<Created, Refusal> {
     let procs = &state.git.procs;
-    let path_str = path.to_string_lossy().into_owned();
-    let workers = checkout_workers();
-    let mut args: Vec<&str> = vec!["-c", &workers, "worktree", "add"];
-    if exists {
-        args.push(&path_str);
-        args.push(branch);
-    } else {
-        args.push("-b");
-        args.push(branch);
-        args.push(&path_str);
+    if !exists {
+        let mut args = vec!["branch", branch];
         if let Some(base) = base {
             args.push(base);
         }
+        let made = run_git(git, procs, &repo.toplevel, &args, 4096)
+            .await
+            .map_err(|err| refuse(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        if !made.success {
+            return Err(refuse(StatusCode::CONFLICT, made.stderr));
+        }
     }
+    let path_str = path.to_string_lossy().into_owned();
+    let workers = checkout_workers();
     let added = run_git_within(
         git,
         procs,
         &repo.toplevel,
-        &args,
+        &["-c", &workers, "worktree", "add", &path_str, branch],
         64 * 1024,
         CHECKOUT_TIMEOUT,
     )
     .await;
-    let refusal = match added {
+    let failed = match added {
         Ok(out) if out.success => None,
         // git's own message is the most useful thing we can say here (branch
-        // already checked out in another worktree, bad base, …).
-        Ok(out) => Some(refuse(StatusCode::CONFLICT, out.stderr)),
-        Err(err) => Some(refuse(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+        // already checked out in another worktree, …).
+        Ok(out) => Some((refuse(StatusCode::CONFLICT, out.stderr), false)),
+        Err(err) => Some((
+            refuse(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+            true,
+        )),
     };
-    if let Some(refusal) = refusal {
+    if let Some((refusal, killed)) = failed {
         undo_failed_add(
             git,
             procs,
             &repo.toplevel,
-            path,
+            killed.then_some(path),
             (!exists).then_some(branch),
         )
         .await;
@@ -283,43 +293,44 @@ async fn check_out(
     })
 }
 
-/// What a failed or killed `worktree add` may leave: a half-written folder
-/// git still has locked as "initializing" (so only a double `--force`
-/// removes its registration), the folder itself when git never registered
-/// it, and the branch `-b` made. The folder is always this call's own: it
-/// was empty or missing before git ran, under the managed root.
+/// Undo a failed checkout's own leftovers. `killed_at`: the folder of an
+/// `add` killed past its deadline — git keeps it registered and locked as
+/// "initializing", so only a double `--force` drops the registration — this
+/// call's alone (it was empty or missing, under the managed root, and this
+/// call's git was writing it). `made_branch`: the branch this call made.
 async fn undo_failed_add(
     git: &Path,
     procs: &Semaphore,
     toplevel: &Path,
-    path: &Path,
-    new_branch: Option<&str>,
+    killed_at: Option<&Path>,
+    made_branch: Option<&str>,
 ) {
-    let path_str = path.to_string_lossy().into_owned();
-    let _ = run_git(
-        git,
-        procs,
-        toplevel,
-        &["worktree", "remove", "--force", "--force", &path_str],
-        4096,
-    )
-    .await;
-    let leftover = path.to_path_buf();
-    let _ = tokio::task::spawn_blocking(move || {
-        if leftover.exists() {
-            if let Err(err) = std::fs::remove_dir_all(&leftover) {
-                tracing::warn!(path = %leftover.display(), %err,
-                    "could not remove a failed worktree checkout");
+    if let Some(path) = killed_at {
+        let path_str = path.to_string_lossy().into_owned();
+        let _ = run_git(
+            git,
+            procs,
+            toplevel,
+            &["worktree", "remove", "--force", "--force", &path_str],
+            4096,
+        )
+        .await;
+        let leftover = path.to_path_buf();
+        let _ = tokio::task::spawn_blocking(move || {
+            if leftover.exists() {
+                if let Err(err) = std::fs::remove_dir_all(&leftover) {
+                    tracing::warn!(path = %leftover.display(), %err,
+                        "could not remove a cut-off worktree checkout");
+                }
             }
-        }
-    })
-    .await;
-    if let Some(branch) = new_branch {
-        // `-d`, never `-D`: the branch was made by this call at its base, so
-        // it holds nothing of its own; anything else is not ours to drop.
+        })
+        .await;
+    }
+    if let Some(branch) = made_branch {
+        // `-d`, never `-D`: made by this call at its base, it holds nothing
+        // of its own, and `-d` refuses one another checkout now uses.
         match run_git(git, procs, toplevel, &["branch", "-d", branch], 4096).await {
             Ok(out) if out.success => {}
-            Ok(out) if out.stderr.contains("not found") => {}
             Ok(out) => tracing::warn!(%branch, stderr = %out.stderr,
                 "kept the branch of a failed worktree checkout"),
             Err(err) => tracing::warn!(%branch, %err,
@@ -403,6 +414,11 @@ pub(crate) struct PlannedWorktree {
 }
 
 impl PlannedWorktree {
+    /// The repository's top level, which the new worktree copies at HEAD.
+    pub(crate) fn source(&self) -> &Path {
+        &self.repo.toplevel
+    }
+
     pub(crate) async fn check_out(self, state: &Arc<AppState>) -> Result<Created, Refusal> {
         check_out(
             state,

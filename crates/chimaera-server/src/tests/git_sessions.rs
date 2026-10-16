@@ -916,7 +916,7 @@ async fn a_chat_in_its_own_worktree_opens_before_its_checkout() {
         Ok(claude_noting_cwd("sg-wt-early-bin", &marker)),
         None,
     );
-    git_around_add(&state, "sg-wt-early-git", "sleep 4", "exit $?");
+    git_around_add(&state, "sg-wt-early-git", "sleep 1.5", "exit $?");
     let (ws, _) = add_workspace(&state, &repo).await;
 
     let (status, session) = request(
@@ -969,7 +969,7 @@ async fn a_chat_in_its_own_worktree_opens_before_its_checkout() {
     state.chat.kill(&id);
 }
 
-/// A checkout that fails after its chat opened ends the chat's startup with
+/// A checkout git refuses after its chat opened ends the chat's startup with
 /// git's words and leaves no worktree, folder or branch behind.
 #[tokio::test]
 async fn a_failed_checkout_ends_the_chat_and_leaves_nothing() {
@@ -981,12 +981,12 @@ async fn a_failed_checkout_ends_the_chat_and_leaves_nothing() {
         Ok(write_fake_claude("sg-wt-cut-bin")),
         None,
     );
-    // The real checkout completes, then "fails": everything it made must go.
+    // git refuses the checkout; the branch made for it must go again.
     git_around_add(
         &state,
         "sg-wt-cut-git",
+        "echo 'fatal: cut short' >&2; exit 128",
         ":",
-        "echo 'fatal: cut short' >&2; exit 1",
     );
     let (ws, _) = add_workspace(&state, &repo).await;
 
@@ -1037,4 +1037,117 @@ async fn a_failed_checkout_ends_the_chat_and_leaves_nothing() {
     assert!(branches.is_empty(), "no branch left: {branches}");
     assert!(!cwd.exists(), "no folder left: {cwd:?}");
     assert!(lock(&state.worktree_setups).is_empty());
+}
+
+/// A checkout killed at its deadline (3 s in tests) leaves nothing either:
+/// git can't clean up after a kill, so its registration, folder and branch
+/// are removed here.
+#[tokio::test]
+async fn a_checkout_cut_off_at_its_deadline_leaves_nothing() {
+    let repo = init_temp_repo("sg-wt-slow");
+    let state = test_state();
+    preset_agent(
+        &state,
+        crate::agents::AgentKind::Claude,
+        Ok(lingering_agent("sg-wt-slow-bin")),
+        None,
+    );
+    // The real checkout completes, then hangs past the deadline.
+    git_around_add(&state, "sg-wt-slow-git", ":", "sleep 10");
+    let (ws, _) = add_workspace(&state, &repo).await;
+    let (status, err) = request(
+        &state,
+        Method::POST,
+        "/api/v1/sessions",
+        Some(serde_json::json!({"workspace_id": ws, "kind": "agent", "worktree": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{err}");
+    assert!(
+        err["error"].as_str().unwrap().contains("timed out"),
+        "{err}"
+    );
+    let list = git_in(&repo, &["worktree", "list", "--porcelain"]);
+    assert_eq!(
+        list.lines().filter(|l| l.starts_with("worktree ")).count(),
+        1,
+        "only the main checkout remains: {list}"
+    );
+    let branches = git_in(&repo, &["branch", "--list", "chimaera/*"]);
+    assert!(branches.is_empty(), "no branch left: {branches}");
+    let managed = std::fs::canonicalize(&state.worktrees_root).unwrap();
+    let leftovers: Vec<_> = walk_leaves(&managed);
+    assert!(leftovers.is_empty(), "no folder left: {leftovers:?}");
+}
+
+/// A chat closed while its worktree is still being checked out never used
+/// it, so the worktree and its branch go once the checkout ends.
+#[tokio::test]
+async fn a_chat_closed_during_its_checkout_leaves_no_worktree() {
+    let repo = init_temp_repo("sg-wt-closed");
+    let state = test_state();
+    preset_agent(
+        &state,
+        crate::agents::AgentKind::Claude,
+        Ok(write_fake_claude("sg-wt-closed-bin")),
+        None,
+    );
+    git_around_add(&state, "sg-wt-closed-git", "sleep 2", "exit $?");
+    let (ws, _) = add_workspace(&state, &repo).await;
+    let (status, session) = request(
+        &state,
+        Method::POST,
+        "/api/v1/sessions",
+        Some(serde_json::json!({
+            "workspace_id": ws, "kind": "agent", "worktree": true, "ui": "chat",
+        })),
+    )
+    .await;
+    assert!(status.is_success(), "spawn failed: {session}");
+    let id = session["id"].as_str().unwrap().to_string();
+    let (status, body) = request(
+        &state,
+        Method::DELETE,
+        &format!("/api/v1/sessions/{id}"),
+        None,
+    )
+    .await;
+    assert!(status.is_success(), "close failed: {body}");
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let list = git_in(&repo, &["worktree", "list", "--porcelain"]);
+        let branches = git_in(&repo, &["branch", "--list", "chimaera/*"]);
+        let worktrees = list.lines().filter(|l| l.starts_with("worktree ")).count();
+        if worktrees == 1 && branches.is_empty() && lock(&state.worktree_setups).is_empty() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the unused worktree stayed: {list} {branches}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// Every leaf (a file, or a folder with nothing in it but folders) under
+/// `root`, skipping the empty `<repo>/chimaera/` parents worktree planning
+/// makes.
+fn walk_leaves(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    out
 }

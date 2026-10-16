@@ -143,10 +143,11 @@ repos,branches,log,show,compare}`, `GET/POST/DELETE /api/v1/git/worktrees`,
   registration. (Maintainer, 2026-09-29: the whole window jumping to a new branch "feels bad UI UX" —
   "that one agent could be in just that branch".) Create is additive; names go through `check-ref-format`, the base through
   `rev::resolve_commit`; 409 if the branch is already checked out; path containment under the managed
-  root is asserted. The checkout runs with a few parallel workers (`checkout.workers`, at most 4 — the
-  daemon's ceiling on concurrent git processes; an older git ignores it) under its own 120 s deadline,
-  since it grows with the repository; one that fails or is cut off leaves nothing — not the folder,
-  its registration, nor a branch it made. `.worktreeinclude` (Claude Code's file, gitignore syntax) copies files that are both
+  root is asserted. A new branch is made in its own step first, so a call racing for the same name
+  fails there without touching anything. The checkout runs with a few parallel workers
+  (`checkout.workers`, at most 4 — the daemon's ceiling on concurrent git processes; an older git
+  ignores it) under its own 120 s deadline, since it grows with the repository; one that fails or is
+  cut off leaves nothing of its own — not the folder, its registration, nor the branch it made. `.worktreeinclude` (Claude Code's file, gitignore syntax) copies files that are both
   git-ignored and matched — ≤200 files / 64 MB, symlinks never followed or copied, nothing overwritten.
   Remove is **fenced five ways**: under the managed root, not the current workspace, no live session
   inside (any surface, including an agent's hook-reported folder), clean, and no commits that are
@@ -198,7 +199,8 @@ repos,branches,log,show,compare}`, `GET/POST/DELETE /api/v1/git/worktrees`,
   background): the branch and folder are settled up front (one `rev-parse`), the chat answers in
   milliseconds with its startup line reading "Setting up worktree…", the composer takes messages at
   once, and the agent's process starts once the files are there (`AppState::worktree_setups`, the
-  driver's `SpawnSpec::start_gate`). Measured on a 1,165-file repository, the old synchronous create
+  driver's `SpawnSpec::start_gate`); the session tracker is then asked to look again, since it may
+  have seen the folder before it was a repository. Measured on a 1,165-file repository, the old synchronous create
   answered in 0.5–3.4 s with nothing on screen. A failed checkout ends the chat's startup with git's
   words; a chat closed before its checkout finished gets its worktree removed again; view switch,
   rewind and fork answer 409 until the checkout ends. A terminal agent still waits for its

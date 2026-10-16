@@ -233,9 +233,12 @@ impl WorktreeSetup {
         let (ready, gate) = tokio::sync::watch::channel(None);
         crate::lock(&state.worktree_setups).insert(
             id.clone(),
-            chimaera_agent::driver::StartGate {
-                waiting: "Setting up worktree…".to_string(),
-                ready: gate,
+            crate::state::WorktreeSetupGate {
+                gate: chimaera_agent::driver::StartGate {
+                    waiting: "Setting up worktree…".to_string(),
+                    ready: gate,
+                },
+                mirrors: plan.source().to_path_buf(),
             },
         );
         Self { id, plan, ready }
@@ -255,7 +258,12 @@ impl WorktreeSetup {
                     path = %created.path.display(), "new agent session worktree");
                 if ready.send(Some(Ok(()))).is_err() {
                     crate::git::discard_session_worktree(&state, &workspace, &created).await;
+                    return;
                 }
+                // The tracker may already have looked while the folder was
+                // no repository yet.
+                state.git.sessions.recheck(&id);
+                state.changes.notify_waiters();
             }
             Err((_, msg)) => {
                 tracing::warn!(workspace = %workspace.id, %msg,
