@@ -2764,3 +2764,253 @@ async fn codex_steer_ends_a_parent_wait_on_a_subagent() {
         .await
         .expect("shutdown");
 }
+
+/// Drive a ChatManager session until `done` says so, allowing every
+/// permission ask on the way (loop and goal smoke turns use plain tools).
+async fn drive_until(
+    manager: &std::sync::Arc<ChatManager>,
+    id: &str,
+    rx: &mut tokio::sync::broadcast::Receiver<std::sync::Arc<chimaera_agent::journal::SeqEvent>>,
+    within: Duration,
+    what: &str,
+    mut done: impl FnMut(&AgentEvent) -> bool,
+) {
+    use chimaera_agent::model::PermissionOptionKind;
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let entry = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+            .expect("broadcast closed");
+        if let AgentEvent::PermissionRequest {
+            request_id,
+            options,
+            ..
+        } = &entry.ev
+        {
+            if let Some(allow) = options
+                .iter()
+                .find(|o| o.kind == PermissionOptionKind::AllowOnce)
+            {
+                manager
+                    .command(
+                        id,
+                        AgentCommand::Permission {
+                            request_id: request_id.clone(),
+                            option_id: allow.id.clone(),
+                            destination: None,
+                            feedback: None,
+                        },
+                    )
+                    .await
+                    .expect("allow");
+            }
+        }
+        if done(&entry.ev) {
+            return;
+        }
+    }
+}
+
+fn claude_manager(dir: &tempfile::TempDir, id: &str) -> std::sync::Arc<ChatManager> {
+    let manager = std::sync::Arc::new(ChatManager::new(
+        dir.path().join("chat"),
+        Box::new(|_, _| {}),
+        Box::new(|_, _| {}),
+    ));
+    let mut argv = vec!["claude".to_string()];
+    argv.extend(chat_args(Some(CLAUDE_TEST_MODEL), None));
+    let spec = SpawnSpec::new(id, argv, dir.path().to_path_buf());
+    manager.spawn(&ClaudeAdapter, spec).expect("spawn driver");
+    manager
+}
+
+async fn send(manager: &ChatManager, id: &str, text: &str) {
+    manager
+        .command(
+            id,
+            AgentCommand::Send {
+                blocks: vec![ContentBlock::Text { text: text.into() }],
+            },
+        )
+        .await
+        .expect("send");
+}
+
+/// `/loop`'s self-paced wakeup on the live wire (PROTOCOL.md Pass 46):
+/// `ScheduleWakeup`'s result is the pending wakeup on the `Schedule`
+/// level-set; when it fires, the CLI opens a turn no message started and the
+/// driver names it (`TurnCause` wakeup, the agent's reason) and spends it.
+#[tokio::test]
+#[ignore = "live: spawns real claude, needs auth, bills two tiny turns and waits ~2 min"]
+async fn claude_wakeup_fires_as_a_named_turn() {
+    let dir = tmpdir();
+    let manager = claude_manager(&dir, "s-wake");
+    let mut rx = manager.attach("s-wake", 0).expect("attach").live;
+    send(
+        &manager,
+        "s-wake",
+        "Call the ScheduleWakeup tool once with delaySeconds 60, reason \"smoke wake\" and \
+         prompt \"Reply with the single word woke.\". Then end your turn without doing anything else.",
+    )
+    .await;
+    let mut at = 0;
+    drive_until(
+        &manager,
+        "s-wake",
+        &mut rx,
+        TURN,
+        "the pending wakeup",
+        |ev| {
+            if let AgentEvent::Schedule {
+                wakeup: Some(w), ..
+            } = ev
+            {
+                at = w.at_ms;
+                assert_eq!(w.reason, "smoke wake");
+                true
+            } else {
+                false
+            }
+        },
+    )
+    .await;
+    assert!(at > 0, "scheduledFor is the wakeup's time");
+    // Claude rounds the delay up to the next minute: up to two minutes.
+    let mut named = false;
+    drive_until(
+        &manager,
+        "s-wake",
+        &mut rx,
+        Duration::from_secs(200),
+        "the woken turn",
+        |ev| {
+            if let AgentEvent::TurnCause { kind, detail, .. } = ev {
+                assert_eq!(kind, "wakeup");
+                assert_eq!(detail.as_deref(), Some("smoke wake"));
+                named = true;
+            }
+            named && matches!(ev, AgentEvent::TurnCompleted { .. })
+        },
+    )
+    .await;
+    assert!(
+        manager.get("s-wake").expect("info").next_wake.is_none(),
+        "the wakeup is spent"
+    );
+    manager.kill("s-wake");
+}
+
+/// `/goal` on the live wire: the CLI's own reply sets the goal (a synthetic
+/// frame naming `local_command_run goal`), it survives an interrupt, and
+/// `/goal clear` ends it as cleared — no prose repeats either reply.
+#[tokio::test]
+#[ignore = "live: spawns real claude, needs auth, bills one tiny turn"]
+async fn claude_goal_sets_and_clears() {
+    let dir = tmpdir();
+    let manager = claude_manager(&dir, "s-goal");
+    let mut rx = manager.attach("s-goal", 0).expect("attach").live;
+    let cond = "the file never.txt in the current directory contains the word smoke";
+    send(&manager, "s-goal", &format!("/goal {cond}")).await;
+    drive_until(&manager, "s-goal", &mut rx, TURN, "the goal set", |ev| {
+        matches!(ev, AgentEvent::Goal { goal: Some(g), ended: None }
+            if g.objective == cond && g.status == "active")
+    })
+    .await;
+    // Stop the work toward it: the goal itself stays set.
+    manager
+        .command("s-goal", AgentCommand::Interrupt)
+        .await
+        .expect("interrupt");
+    drive_until(
+        &manager,
+        "s-goal",
+        &mut rx,
+        TURN,
+        "the stopped turn",
+        |ev| {
+            matches!(
+                ev,
+                AgentEvent::TurnAborted { .. } | AgentEvent::TurnCompleted { .. }
+            )
+        },
+    )
+    .await;
+    send(&manager, "s-goal", "/goal clear").await;
+    drive_until(
+        &manager,
+        "s-goal",
+        &mut rx,
+        TURN,
+        "the goal cleared",
+        |ev| {
+            matches!(ev, AgentEvent::Goal { goal: None, ended: Some(e) }
+            if e.outcome == "cleared" && e.objective == cond)
+        },
+    )
+    .await;
+    manager.kill("s-goal");
+}
+
+/// Codex thread goals on the live wire: set (clear-then-set when one exists),
+/// pause, clear — each a `Goal` level-set in Codex's own status words.
+#[tokio::test]
+#[ignore = "live: spawns real codex, needs auth, bills a short turn"]
+async fn codex_goal_sets_pauses_and_clears() {
+    use chimaera_agent::codex::CodexAdapter;
+    let dir = tmpdir();
+    let manager = std::sync::Arc::new(ChatManager::new(
+        dir.path().join("chat"),
+        Box::new(|_, _| {}),
+        Box::new(|_, _| {}),
+    ));
+    let spec = SpawnSpec::new(
+        "s-cgoal",
+        vec!["codex".into(), "app-server".into()],
+        dir.path().to_path_buf(),
+    );
+    manager.spawn(&CodexAdapter, spec).expect("spawn driver");
+    let mut rx = manager.attach("s-cgoal", 0).expect("attach").live;
+    drive_until(&manager, "s-cgoal", &mut rx, HANDSHAKE, "init", |ev| {
+        matches!(ev, AgentEvent::Init { .. })
+    })
+    .await;
+    let objective = "Create the file goal-smoke.txt containing the word smoke, one file only.";
+    manager
+        .command(
+            "s-cgoal",
+            AgentCommand::SetGoal {
+                objective: objective.into(),
+                token_budget: Some(200_000),
+            },
+        )
+        .await
+        .expect("set goal");
+    drive_until(&manager, "s-cgoal", &mut rx, TURN, "the goal", |ev| {
+        matches!(ev, AgentEvent::Goal { goal: Some(g), .. }
+            if g.objective == objective && g.status == "active" && g.token_budget == Some(200_000))
+    })
+    .await;
+    manager
+        .command("s-cgoal", AgentCommand::PauseGoal)
+        .await
+        .expect("pause");
+    drive_until(
+        &manager,
+        "s-cgoal",
+        &mut rx,
+        TURN,
+        "the pause",
+        |ev| matches!(ev, AgentEvent::Goal { goal: Some(g), .. } if g.status == "paused"),
+    )
+    .await;
+    manager
+        .command("s-cgoal", AgentCommand::ClearGoal)
+        .await
+        .expect("clear");
+    drive_until(&manager, "s-cgoal", &mut rx, TURN, "the clear", |ev| {
+        matches!(ev, AgentEvent::Goal { goal: None, ended: Some(e) } if e.outcome == "cleared")
+    })
+    .await;
+    manager.kill("s-cgoal");
+}

@@ -718,8 +718,8 @@ file list is therefore honest about exactly what will revert.
   completed item's aggregatedOutput replaces it).
 - Items: `mcpToolCall {server, tool, arguments, status, result (MCP
   CallToolResult), error, durationMs}`; `webSearch {query, action:{type,
-  url}}`; `contextCompaction`; `enteredReviewMode`/`exitedReviewMode`/
-  `sleep` render nothing. Plans: `turn/plan/updated {plan:[{step, status:
+  url}}`; `contextCompaction`; `enteredReviewMode`/`exitedReviewMode` render nothing
+  (`sleep` draws a "sleep: 5m 00s" row since Pass 46). Plans: `turn/plan/updated {plan:[{step, status:
   pending|inProgress|completed}], explanation}` is the todo list;
   `item/plan/delta` streams the PROPOSED plan markdown (plan mode).
 - `thread/name/updated {threadId, threadName}` (codex names threads
@@ -1073,7 +1073,7 @@ the park deadline.
 ### Codex: misc notifications seen live (tolerated silently)
 
 `thread/started` (first turn/start), `thread/goal/cleared` (after
-rollback), `mcpServer/startupStatus/updated`, `remoteControl/status/changed`.
+rollback; mapped since Pass 46), `mcpServer/startupStatus/updated`, `remoteControl/status/changed`.
 `userMessage` items carry `clientId` (null unless the client sent
 `clientUserMessageId`). `account/rateLimits/updated` params here were
 `{rateLimits:{limitId, primary:{usedPercent, windowDurationMins,
@@ -2327,7 +2327,7 @@ CronList, DesignSync.
   webSearch`. ADOPTED: `imageView {id, path}` → a Read row whose location
   opens the image; `dynamicToolCall {namespace?, tool, status, success}` → a
   generic row; `hookPrompt {fragments[{text, hookRunId}]}` → a "hook: …"
-  Notice. `functionCallOutput`, `plan`, `sleep` stay silent.
+  Notice. `functionCallOutput`, `plan` stay silent (`sleep`: a row, Pass 46).
 - New notifications: `warning {threadId?, message}`, `configWarning
   {summary, details?, path?, range?}`, `deprecationNotice {summary,
   details?}` (ADOPTED as bounded Notices; a deprecation is said once per
@@ -2335,7 +2335,7 @@ CronList, DesignSync.
   HookRunSummary}`, `thread/queue/changed {threadId}` (a server-side queue
   exists now — `codex queue` — chimaera keeps its client FIFO), `thread/
   reverted` + `thread/revert {threadId, beforeTurnId}` (alongside
-  `thread/rollback`), `thread/goal/*`, `thread/environment/*`,
+  `thread/rollback`), `thread/goal/*` (mapped since Pass 46), `thread/environment/*`,
   `thread/realtime/*` (voice), `process/*`, `command/exec/*`, `fs/changed`,
   `skills/changed`, `app/list/updated`, `autoApprovalReview/
   strictReviewRequired`, `model/verification`, `windows*` — all tolerated by
@@ -3383,3 +3383,51 @@ The Codex limit chip and `/usage` panel had been empty: the driver read limits f
 
 - Hermetic (`codex.rs`): `thread_name_and_usage_limits_map` (now the read's shape), `rate_limits_follow_rolling_updates_with_no_read_at_turn_end`, `rate_limits_say_when_usage_is_refused`, `rate_limit_windows_never_repeat_a_label`, `usage_answers_even_without_plan_limits`. A live probe also showed 0.162.1 ignores an unknown param on this read, so `excludeResetCreditDetails` cannot break a build that predates it.
 - Live: `codex_steer_settings_and_account_surface` now pins `account/rateLimits/read`'s snapshot and window shape. Through the isolated daemon, a Codex chat's `/usage` (no turn) went from an empty report on main to `weekly limit · 6%` plus the matching chip. The codex half of `just chat-smoke` was run.
+
+## Pass 46 (2026-10-15 — live probes claude 2.1.300, codex 0.162.1): loops and goals — work that resumes the agent on its own. ADOPTED.
+
+Claude's `/loop` (a self-paced `ScheduleWakeup`, or `CronCreate` jobs for an interval), Claude's `/goal` and Codex's thread goals all ran in chat, but nothing showed a pending wakeup or job, a woken turn read only "Resumed on its own", an idle chat between ticks looked finished, a restart silently ended a loop, and Codex `thread/goal/*` fell through. The facts below are what the surface is built on.
+
+**Method.** Raw probes with the driver's own argv (`-p` stream-json, `--permission-prompt-tool stdio`, plus `--include-hook-events`) on a scratch cwd, driven from a FIFO, every frame logged with a timestamp; a `--resume` of the same session afterwards; the native transcript read for the records stdout lacks; the 2.1.300 binary grepped where a behavior had no frame. Codex: a raw `app-server` client (`experimentalApi`, `gpt-5.6-luna`) setting, pausing, resuming and clearing a goal. **The probing shell had `CLAUDE_CODE_DISABLE_CRON` set** (Claude Code's own desktop host sets it for its children): the probes and `just chat-smoke` scrub every `CLAUDE*` variable, or a child CLI has no loops at all.
+
+### Claude: `/loop`
+
+- `/loop <prompt>` with no interval: the bundled skill calls `ScheduleWakeup {delaySeconds 60–3600, reason, prompt, noop}` each tick. Result: `tool_use_result {scheduledFor (epoch ms), clampedDelaySeconds, wasClamped}`; the text says "Next wakeup scheduled for 17:00:00 (in 63s)". **Claude rounds up to the next minute**: 60 s asked at :56 fires at :00 (63 s), 60 s asked at :01 fires the minute after (119 s). `scheduledFor` is the truth. A wakeup fired ~3 s before it.
+- `{stop: true}` → `{scheduledFor: 0, clampedDelaySeconds: 0, wasClamped: false, stopped: true, cancelledWakeups: N}`; it ends a dynamic loop only (its text: a fixed-interval loop "is NOT stopped by this call — cancel it with CronDelete").
+- `/loop 1m <prompt>`: `ToolSearch select:CronCreate`, then `CronCreate {cron: "*/1 * * * *", prompt, recurring: true}` → `{id: "f2143f41", humanSchedule: "Every minute", recurring, durable: false, nextFireAt: 1792108888368.6433}` (a float). Recurring jobs are **jittered by a stable per-job offset**: +28.37 s on an every-minute job, +30 min on `17 3 * * *` ("Every day at 3:17 AM. Next run: Oct 16 3:47am"). The model has sent `recurring: "true"` (a string); the job was still recurring. Jobs are session-only and expire 7 days on.
+- `CronList` → `{jobs: [{id, cron, humanSchedule, prompt, recurring, durable, nextFireAt}]}` (the whole set); `CronDelete {id}` → `{id}`.
+- **A fired wakeup or job opens a turn no message started**: `command_lifecycle {state: "started", command_uuid: <unminted>}`, a fresh `system/init`, the turn, `result`, `command_lifecycle {state: "completed"}` — no `user` frame, nothing naming the trigger.
+- No control request lists, reports or cancels loops; the skill tells the model to stop when "the user asked you to stop". If a tick ends without rescheduling or stopping, the CLI arms one hidden **keepalive** wakeup (1200 s, budget 1; `[loop] keepalive armed`) with no frame.
+- **`--resume` restores the session's jobs** (CronList in the resumed process listed the job) **but not a pending wakeup**: the binary has a "re-armed pending wakeup … after resume" path, yet a wakeup due 13 minutes after a resume never fired in the resumed `-p` process.
+
+### Claude: `/goal`
+
+- `/goal <condition>` answers locally: a `<synthetic>` assistant frame "Goal set: <condition>" carrying `local_command_run {command: "goal", args}` (and `local_command_source`), then the model starts working in the same turn. The condition is capped at 4000 characters.
+- The goal is a session Stop hook a small model checks each time the agent stops. **A failed check reaches stdout as a `user` frame with `isSynthetic: true`**: `"Stop hook feedback:\n[<condition>]: <reason>"`, and the model goes on in the same turn (no `--include-hook-events` needed; any Stop hook's feedback has the same envelope with its own command in the brackets).
+- **Achieved, or could not be achieved, never reaches stdout**: the turn just ends. Only the native transcript records it — `attachment {type: "goal_status", met: true, condition, reason, iterations, durationMs, tokens}`, `failed: true` for an impossible one, `met: false` for each failed check, `sentinel: true` at set. `active_goal` frames exist in the binary but are not emitted to this host.
+- `/goal clear|stop|off|reset|none|cancel` → "Goal cleared: <condition>" (or "No goal set"); bare `/goal` → "Goal active: <condition> (N turns)" plus "Last check: …", or "(not yet evaluated)" before a check. Each is a local command that still enters the model's context, so the driver never polls it.
+- An interrupted turn leaves the goal set, and **`--resume` keeps it** ("Goal active: … (not yet evaluated)" in the resumed process). `system/notification {key: "stop-hook-block-cap", text}` says the check blocked the stop too often and the turn ended anyway (the goal stays).
+- Claude's own words: "Goal achieved", "Goal could not be achieved", "Goal not yet met… continuing"; it counts checks as "turns".
+
+### Codex: thread goals
+
+- `thread/goal/get {threadId}` → `{goal: null | {threadId, objective, status, tokenBudget, tokensUsed, timeUsedSeconds, createdAt (epoch s), updatedAt}}`. `thread/goal/set {threadId, origin: "user", objective?, status?, tokenBudget?}` → `{goal}` + `thread/goal/updated {threadId, turnId|null, goal}`. Status: `active | paused | blocked | usageLimited | budgetLimited | complete`.
+- An active goal starts a turn at once, and **the server starts continuation turns itself**, back to back (no userMessage item), until the model marks it `complete`. `thread/goal/updated` arrives after every tool call with growing `tokensUsed`/`timeUsedSeconds`.
+- **Setting a new objective on a `complete` goal keeps `status: complete`, the old tokens and `createdAt`**: clear first for a fresh goal.
+- `{status: "paused"}` stops continuations; `{status: "active"}` resumes and starts a turn immediately. `thread/goal/clear` → `{cleared: true}` + `thread/goal/cleared {threadId}`; a running turn finishes, none follows.
+- `turn/interrupt` does NOT pause a goal (the TUI also sends `{status: "paused"}` on Stop). Codex's TUI: "Usage: /goal [<objective>|clear|edit|pause|resume]", "Goal paused (/goal resume)", "Goal stalled", "Goal hit usage limit", "Goal budget reached", "Goal achieved".
+- The model's `clock.sleep` arrives as `sleep {id, durationMs}` items.
+
+### ADOPTED
+
+- **Events** (`model.rs`, additive): `Schedule {wakeup?, jobs}` — a level-set of claude's pending wakeup (`at_ms` = `scheduledFor`, `scheduled_at_ms`, reason, prompt) and session jobs (id, cron, `schedule` = `humanSchedule`, prompt, recurring, `next_at_ms`, `created_at_ms`; ≤ 50); `Goal {goal?, ended?}` — latest-wins state in the agent's own status word, plus a one-shot `ended {outcome: achieved|failed|cleared, objective, reason, turns, tokens, duration_secs}`; `TurnCause {turn_id, kind: wakeup|job|goal, detail, schedule}` right after the turn's `TurnStarted`. Commands `SetGoal {objective, token_budget?}`, `PauseGoal`, `ResumeGoal`, `ClearGoal` (codex capabilities `set_goal`, `pause_goal`, `resume_goal`, `clear_goal`).
+- **Claude** (`autonomy.rs`, fed by `claude.rs`): the tracker keeps the schedule from the tools' calls and structured results (a failed call changes nothing; CronList is the whole truth; a job's jitter is learned at creation and its next run computed after each fire by `cron.rs`, a 5-field local-time cron with DST-safe stepping). A `command_lifecycle started` for a uuid the driver never minted, while idle, marks the next turn as the CLI's own; when it opens, the earliest item due (up to 2 minutes early) is what fired — a wakeup is spent, a recurring job moves on, a one-shot job leaves — and nothing due (a monitor, the keepalive) means no cause. `/goal`'s replies set and clear the goal (their prose is not repeated); a synthetic Stop-hook frame whose brackets hold the goal's condition counts a check; a "Goal active" status reply adopts a goal the driver never saw set; synthetic user frames never read as Remote Control messages. `stop-hook-block-cap` becomes a Notice.
+- **The goal's end** (`chimaera-server/src/goal_outcome.rs`): after a Claude turn completes with a goal active, the daemon reads the transcript's tail (≤ 1 MiB, off the reactor, three tries) for the goal's latest `goal_status` and journals `Goal {ended: achieved|failed}` through `annotate`; a "not met" record leaves the goal set.
+- **Codex** (`codex.rs`): `thread/goal/updated|cleared` for its own thread map to `Goal` (status verbatim; tokens/time throttled to one event per 10 s, flushed at turn end; the move into `complete` ends it `achieved` once); the goal is read once the thread opens; a server-started turn while the goal is active carries `TurnCause goal`; `SetGoal` clears an existing goal first; the user's Stop pauses an active goal before interrupting (a Send-now interrupt does not); `sleep` items draw a "sleep: 5m 00s" row.
+- **Session row and notices**: `ChatInfo.next_wake {at_ms, from_ms, label, count}` and `goal {objective, status}` ride the chat row; the turn-end "done" notice is held while anything is scheduled, so a loop's notice is its last tick's.
+- **Restart**: `Carryover` keeps the wakeup, the jobs and the goal (without counters). A lost wakeup counts as interrupted work: the pick-up message names it ("…due in 6 minutes" / "which came due 2 minutes ago") and asks the agent to reschedule it with ScheduleWakeup; claude's jobs and goal seed the new driver (`SpawnSpec.carried_jobs`, `carried_goal`), and the manager journals `Schedule {jobs}` and `Goal` at every spawn ahead of the driver's events (a dead wakeup never survives into the new process's view; Codex re-reads its thread's goal).
+
+### Gate (Pass 46)
+
+- Hermetic: `autonomy.rs` (7 tests: wakeups, stop, jitter and next run, delete/list level-set, one-shot and expiry, goal set/check/clear, status resync and adoption), `cron.rs` (10), `claude.rs` `a_fired_wakeup_opens_a_turn_named_by_its_reason`, `only_an_unsent_command_with_something_due_is_a_wake`, `goal_set_check_and_clear_map_from_the_cli_frames`, the codex goal tests (`goal_updates_map_the_status_verbatim_and_ignore_other_threads` … `sleep_items_render_a_waiting_row`), `tests/manager.rs` `a_loop_wakeup_fires_as_a_named_turn_and_the_row_knows_whats_next` (fake-claude `loop`), `tests/wire_contract.rs` `loop_and_goal_wire_shapes_are_additive`, `chimaera-server` `goal_outcome` (3) and `restart_message_asks_to_reschedule_a_lost_wakeup`.
+- Live: `just chat-smoke` adds `claude_wakeup_fires_as_a_named_turn`, `claude_goal_sets_and_clears`, `codex_goal_sets_pauses_and_clears`.

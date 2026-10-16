@@ -133,7 +133,8 @@ const TRANSCRIPT_EVENTS = new Set([
   "turn_completed",
   "turn_aborted",
   "turn_cause",
-  "goal",
+  // "goal" is deliberately absent: a Codex goal reports its token count
+  // every few seconds; only the lines it adds touch the transcript.
   "truncated",
   "mode_switch",
   "forked",
@@ -1132,9 +1133,11 @@ export class ChatStore {
       case "goal": {
         const next = parseGoal(ev.goal);
         const ended = ev.ended && typeof ev.ended === "object" ? (ev.ended as Record<string, unknown>) : null;
-        for (const line of goalLines(this.goal, next, ended, this.lastGoalObjective)) {
+        const lines = goalLines(this.goal, next, ended, this.lastGoalObjective);
+        for (const line of lines) {
           this.blocks.push(this.stamp({ kind: "goal", ...line }));
         }
+        if (lines.length > 0) this.touchTranscript();
         if (next !== null) this.lastGoalObjective = next.objective;
         this.goal = next;
         break;

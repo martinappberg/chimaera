@@ -764,3 +764,106 @@ fn transcript_surface_wire_shapes_are_additive() {
     assert_eq!(flagged["monitor"], json!(true));
     assert_eq!(flagged["ambient"], json!(true));
 }
+
+/// Loops and goals (PROTOCOL.md Pass 46) ride three additive event shapes —
+/// the `schedule` level-set, the latest-wins `goal` with its one-shot
+/// `ended`, and `turn_cause` — and four goal commands. Empty parts are
+/// omitted, so an empty schedule is just its tag.
+#[test]
+fn loop_and_goal_wire_shapes_are_additive() {
+    use chimaera_agent::model::{GoalEnd, GoalState, ScheduledJob, ScheduledWakeup};
+    assert_eq!(
+        serde_json::to_value(AgentEvent::Schedule {
+            wakeup: None,
+            jobs: vec![]
+        })
+        .unwrap(),
+        json!({ "type": "schedule" })
+    );
+    assert_eq!(
+        serde_json::to_value(AgentEvent::Schedule {
+            wakeup: Some(ScheduledWakeup {
+                at_ms: 2,
+                scheduled_at_ms: 1,
+                reason: "Check the deploy".into(),
+                prompt: String::new(),
+            }),
+            jobs: vec![ScheduledJob {
+                id: "f2143f41".into(),
+                cron: "*/10 * * * *".into(),
+                schedule: "Every 10 minutes".into(),
+                prompt: "post the graph".into(),
+                recurring: true,
+                next_at_ms: None,
+                created_at_ms: 1,
+            }],
+        })
+        .unwrap(),
+        json!({
+            "type": "schedule",
+            "wakeup": { "at_ms": 2, "scheduled_at_ms": 1, "reason": "Check the deploy" },
+            "jobs": [{ "id": "f2143f41", "cron": "*/10 * * * *", "schedule": "Every 10 minutes",
+                       "prompt": "post the graph", "recurring": true, "created_at_ms": 1 }],
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(AgentEvent::Goal {
+            goal: Some(GoalState {
+                objective: "all tests pass".into(),
+                status: "usageLimited".into(),
+                tokens_used: Some(10),
+                token_budget: Some(100),
+                ..Default::default()
+            }),
+            ended: None,
+        })
+        .unwrap(),
+        json!({ "type": "goal", "goal": { "objective": "all tests pass", "status": "usageLimited",
+                "tokens_used": 10, "token_budget": 100 } })
+    );
+    assert_eq!(
+        serde_json::to_value(AgentEvent::Goal {
+            goal: None,
+            ended: Some(GoalEnd {
+                outcome: "achieved".into(),
+                objective: "x".into(),
+                turns: Some(3),
+                ..Default::default()
+            }),
+        })
+        .unwrap(),
+        json!({ "type": "goal", "ended": { "outcome": "achieved", "objective": "x", "turns": 3 } })
+    );
+    assert_eq!(
+        serde_json::to_value(AgentEvent::TurnCause {
+            turn_id: "t2".into(),
+            kind: "job".into(),
+            detail: Some("post the graph".into()),
+            schedule: Some("Every 10 minutes".into()),
+        })
+        .unwrap(),
+        json!({ "type": "turn_cause", "turn_id": "t2", "kind": "job",
+                "detail": "post the graph", "schedule": "Every 10 minutes" })
+    );
+    for (cmd, wire) in [
+        (
+            AgentCommand::SetGoal {
+                objective: "o".into(),
+                token_budget: None,
+            },
+            json!({ "type": "set_goal", "objective": "o" }),
+        ),
+        (AgentCommand::PauseGoal, json!({ "type": "pause_goal" })),
+        (AgentCommand::ResumeGoal, json!({ "type": "resume_goal" })),
+        (AgentCommand::ClearGoal, json!({ "type": "clear_goal" })),
+    ] {
+        assert_eq!(serde_json::to_value(&cmd).unwrap(), wire);
+        assert_eq!(serde_json::from_value::<AgentCommand>(wire).unwrap(), cmd);
+    }
+    assert!(AgentCommand::SetGoal {
+        objective: "  ".into(),
+        token_budget: None
+    }
+    .validate_ingress()
+    .is_err());
+}

@@ -138,7 +138,8 @@
     if (goal.tokenBudget !== null && goal.tokensUsed !== null) {
       return `${compactCount(goal.tokensUsed)} / ${compactCount(goal.tokenBudget)}`;
     }
-    if (goal.tokensUsed !== null) return `${compactCount(goal.tokensUsed)} tokens`;
+    // A fresh goal has spent nothing yet: say nothing rather than "0 tokens".
+    if (goal.tokensUsed !== null && goal.tokensUsed > 0) return `${compactCount(goal.tokensUsed)} tokens`;
     if (goal.turns !== null && goal.turns > 0) return `${goal.turns} ${goal.turns === 1 ? "turn" : "turns"}`;
     return "";
   });
