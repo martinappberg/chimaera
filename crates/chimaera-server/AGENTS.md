@@ -9,8 +9,8 @@ Orientation for coding agents. This crate is the daemon: every HTTP route, every
 | `lib.rs`, `state.rs`, `router.rs`, `assets.rs` | Wiring, `AppState` + `lock()`, the route table, embedded UI files. |
 | `lifecycle.rs`, `job_host.rs`, `ledger.rs` | Daemon `run()`, the cluster lease, the job's host process, restart snapshot/restore. |
 | `api/`, `exec.rs` | REST by resource; `run_exec`, the shared type-a-command helper. |
-| `persist.rs`, `session_view.rs` | Atomic small-JSON writes; the session-row JSON builders. |
-| `ws.rs` | PTY, chat, events sockets; `native_ui` frames for Claude Mods. |
+| `persist.rs`, `session_view.rs` | Atomic small-JSON writes; the session-row JSON builders (`pty_row` / `switching_row` / `finish_row`; their tests write `session-rows.json`, [reference](REFERENCE.md#session_viewrs)). |
+| `ws.rs`, `ws/frames.rs` | PTY, chat, events sockets; **every daemon→UI frame is built in `frames.rs`**, whose tests write the wire fixtures ([reference](REFERENCE.md#wsframesrs)); `native_ui` frames for Claude Mods. |
 | `chat.rs` | Chat-mode glue: which driver runs, what surrounds its lifecycle. |
 | `claude_store.rs`, `goal_outcome.rs` | Where a Claude transcript lives; how a `/goal` ended. |
 | `operation.rs`, `agent_setup.rs`, `agent_auth.rs` | Per-agent bounded jobs: installs, sign-in. |

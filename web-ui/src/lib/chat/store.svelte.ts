@@ -1979,11 +1979,36 @@ export class ChatStore {
         // no-op — it covers old journals recorded before that fix.
         this.expirePendingAsks();
         break;
+      // Journaled for other consumers, nothing for the transcript: the fork
+      // handoff marker (driver-internal), the post-turn status line (folded
+      // into the session row by the daemon; the rail reads it there) and the
+      // conversation title (the pool/rail reads it from the roster). Listed
+      // so the wire-fixture consumer test can tell "ignored on purpose" from
+      // "a vocabulary the reducer never learned".
+      case "fork_context_consumed":
+      case "session_status":
+      case "session_title":
+        break;
       default:
+        this.noteUnhandled(ev.type);
         break;
     }
     this.trimBlocks();
     if (TRANSCRIPT_EVENTS.has(ev.type)) this.touchTranscript();
+  }
+
+  /**
+   * Event types the reducer had no case for, bounded (the daemon's event
+   * vocabulary is finite; an agent cannot mint types). Read by the wire-
+   * fixture consumer test, which feeds every daemon-produced event through
+   * `apply` and expects this to stay empty; at runtime a non-empty set means
+   * the daemon is newer than this client, which is allowed (additive wire).
+   */
+  readonly unhandledEventTypes = new Set<string>();
+
+  private noteUnhandled(type: string): void {
+    if (this.unhandledEventTypes.size >= 64) return;
+    this.unhandledEventTypes.add(type);
   }
 
   /** Client-side reducer cap. The daemon journal compacts its own history;

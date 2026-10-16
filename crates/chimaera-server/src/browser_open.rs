@@ -24,8 +24,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde_json::json;
-
 use crate::proxy::{self, Refusal};
 use crate::AppState;
 
@@ -315,14 +313,13 @@ pub(crate) async fn open(state: &AppState, session_id: &str, url: &str) -> Resul
         .get(session_id)
         .cloned();
     state.browser_opens.push(
-        json!({
-            "type": "browser_open",
-            "session_id": session_id,
-            "workspace_id": workspace_id,
-            "host": host,
-            "port": target.port,
-            "path": target.path,
-        })
+        crate::ws::frames::browser_open(
+            session_id,
+            workspace_id.as_deref(),
+            &host,
+            &target.port,
+            &target.path,
+        )
         .to_string(),
     );
     state.changes.notify_waiters();

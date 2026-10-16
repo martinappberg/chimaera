@@ -17,6 +17,8 @@ use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
 use crate::AppState;
 
+pub(crate) mod frames;
+
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 /// One interactive terminal message may contain a sizeable paste, but must
 /// not be allowed to use tungstenite's much larger default allocation.
@@ -180,11 +182,7 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
     let auth = match authenticate(&mut socket, &state).await {
         Some(auth) => auth,
         None => {
-            let _ = send_json(
-                &mut socket,
-                &json!({"type": "error", "message": "unauthorized"}),
-            )
-            .await;
+            let _ = send_json(&mut socket, &frames::error("unauthorized")).await;
             return;
         }
     };
@@ -216,16 +214,8 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
             // still gets an honest pane: replay the final screen once,
             // then close as exited. Blank panes teach nothing.
             if let Some(words) = state.sessions.last_words(&id) {
-                let mut ready = match serde_json::to_value(&words.info) {
-                    Ok(serde_json::Value::Object(map)) => map,
-                    _ => serde_json::Map::new(),
-                };
-                ready.insert("type".to_string(), json!("ready"));
-                ready.insert("cwd_current".to_string(), json!(words.info.cwd.clone()));
-                if send_json(&mut socket, &serde_json::Value::Object(ready))
-                    .await
-                    .is_err()
-                {
+                let ready = frames::pty_ready(&words.info, &words.info.cwd);
+                if send_json(&mut socket, &ready).await.is_err() {
                     return;
                 }
                 // A parked client discards any snapshot on this connection
@@ -240,11 +230,7 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                 {
                     return;
                 }
-                let _ = send_json(
-                    &mut socket,
-                    &json!({"type": "exited", "status": words.info.exit_status}),
-                )
-                .await;
+                let _ = send_json(&mut socket, &frames::exited(words.info.exit_status)).await;
                 return;
             }
             tracing::debug!(%id, %err, "ws attach failed");
@@ -252,31 +238,22 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                 &mut socket,
                 // Retryable: mid view-switch the id exists but its process
                 // is being respawned; clients back off and re-attach.
-                &json!({"type": "error", "code": "unknown_session",
-                        "message": format!("unknown session {id}")}),
+                &frames::error_coded("unknown_session", &format!("unknown session {id}")),
             )
             .await;
             return;
         }
     };
 
-    // Ready frame: {"type":"ready", ...SessionInfo fields..., "cwd_current"}
-    let mut ready = match serde_json::to_value(&attachment.info) {
-        Ok(serde_json::Value::Object(map)) => map,
-        _ => serde_json::Map::new(),
-    };
-    ready.insert("type".to_string(), json!("ready"));
-    // Same field as REST/events session JSON: the polled cwd (shell naming
-    // watcher), falling back to the spawn cwd.
+    // Ready frame: {"type":"ready", ...SessionInfo fields..., "cwd_current"},
+    // `cwd_current` being the polled cwd (shell naming watcher), falling
+    // back to the spawn cwd — the same field as REST/events session JSON.
     let cwd_current = crate::lock(&state.current_cwds)
         .get(&id)
         .cloned()
         .unwrap_or_else(|| attachment.info.cwd.clone());
-    ready.insert("cwd_current".to_string(), json!(cwd_current));
-    if send_json(&mut socket, &serde_json::Value::Object(ready))
-        .await
-        .is_err()
-    {
+    let ready = frames::pty_ready(&attachment.info, &cwd_current);
+    if send_json(&mut socket, &ready).await.is_err() {
         return;
     }
 
@@ -428,7 +405,7 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                     // from the last-words replay: the client latches its
                     // parked buffer desynced on an exit while parked, and
                     // adopt resyncs into a fresh attach that replays it.
-                    match serde_json::to_value(&event) {
+                    match frames::pty_event(&event) {
                         Ok(value) => {
                             // Ordered send: batched output first, so an event
                             // never overtakes the bytes it postdates.
@@ -474,7 +451,7 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                             let _ = send_ordered_json(
                                 &mut socket,
                                 &mut batch,
-                                &json!({"type": "exited", "status": null}),
+                                &frames::exited(None),
                             )
                             .await;
                             return;
@@ -642,11 +619,7 @@ async fn repaint(
             return false;
         }
     };
-    let frame = json!({
-        "type": "resync",
-        "cols": fresh.info.cols,
-        "rows": fresh.info.rows,
-    });
+    let frame = frames::pty_resync(fresh.info.cols, fresh.info.rows);
     if send_json(socket, &frame).await.is_err() {
         return false;
     }
@@ -712,11 +685,7 @@ impl Drop for NativeUiAttachment {
 
 async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
     let Some(last_seq) = chat_authenticate(&mut socket, &state).await else {
-        let _ = send_json(
-            &mut socket,
-            &json!({"type": "error", "message": "unauthorized"}),
-        )
-        .await;
+        let _ = send_json(&mut socket, &frames::error("unauthorized")).await;
         return;
     };
 
@@ -732,25 +701,23 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
             let _ = send_json(
                 &mut socket,
                 // Retryable: mid view-switch the driver may not be up yet.
-                &json!({"type": "error", "code": "unknown_session",
-                        "message": format!("unknown chat session {id}")}),
+                &frames::error_coded("unknown_session", &format!("unknown chat session {id}")),
             )
             .await;
             return;
         }
     };
 
-    let ready = json!({
-        "type": "ready",
-        "session": attachment.info,
-        // Tell every client the cursor the daemon actually honored. This can
-        // differ from auth.last_seq after a server-side journal reset.
-        "replay_from": attachment.replay_from,
-        // The journal's highest seq now. A client whose own last_seq exceeds
-        // this is stale (the journal was recreated and numbering restarted);
-        // it hard-resets rather than silently dropping every replayed event.
-        "head": attachment.head_seq,
-    });
+    // `replay_from` tells every client the cursor the daemon actually honored
+    // (it can differ from auth.last_seq after a server-side journal reset);
+    // `head` is the journal's highest seq now, so a client whose own
+    // last_seq exceeds it knows the journal was recreated and hard-resets
+    // rather than silently dropping every replayed event.
+    let ready = frames::chat_ready(
+        &attachment.info,
+        attachment.replay_from,
+        attachment.head_seq,
+    );
     if send_json(&mut socket, &ready).await.is_err() {
         return;
     }
@@ -777,9 +744,9 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
         tokio::select! {
             event = native_ui.recv(), if native_ui_open => {
                 let frame = match event {
-                    Ok(event) if event.for_client(&client_id) => json!({"type":"native_ui","event":event}),
+                    Ok(event) if event.for_client(&client_id) => frames::native_ui(&event),
                     Ok(_) => continue,
-                    Err(RecvError::Lagged(_)) => json!({"type":"native_ui_reset"}),
+                    Err(RecvError::Lagged(_)) => frames::native_ui_reset(),
                     Err(RecvError::Closed) => { native_ui_open = false; continue },
                 };
                 if send_json(&mut socket, &frame).await.is_err() { return }
@@ -790,7 +757,7 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                     if entry.seq <= sent_seq {
                         continue;
                     }
-                    let frame = json!({"type": "ev", "seq": entry.seq, "ts": entry.ts, "ev": entry.ev});
+                    let frame = frames::chat_event(&entry);
                     if send_json(&mut socket, &frame).await.is_err() {
                         return;
                     }
@@ -828,13 +795,11 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                     // - otherwise: the session genuinely exited.
                     let switching = crate::lock(&state.chat_switching).get(&id).cloned();
                     let frame = match switching.as_deref() {
-                        Some("term") => json!({"type": "degraded"}),
-                        Some("closed") => json!({"type": "exited", "status": null}),
-                        Some(_) => json!({"type": "error", "code": "unknown_session",
-                                          "message": "session switching"}),
-                        None if state.sessions.get(&id).is_some() => json!({"type": "degraded"}),
-                        None => json!({"type": "exited",
-                                       "status": state.chat.get(&id).and_then(|c| c.exit_status)}),
+                        Some("term") => frames::chat_degraded(),
+                        Some("closed") => frames::exited(None),
+                        Some(_) => frames::error_coded("unknown_session", "session switching"),
+                        None if state.sessions.get(&id).is_some() => frames::chat_degraded(),
+                        None => frames::exited(state.chat.get(&id).and_then(|c| c.exit_status)),
                     };
                     let _ = send_json(&mut socket, &frame).await;
                     return;
@@ -851,8 +816,8 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                             let result = chimaera_agent::native_ui::NativeUiCommand::new(&client_id, request_id, frame["request"].clone())
                                 .and_then(|command| state.chat.native_ui(&id, command));
                             if let Err(error) = result {
-                                let frame = json!({"type":"native_ui","event":{"kind":"response","client_id":client_id,
-                                    "request_id":request_id.chars().take(64).collect::<String>(),"error":error.to_string()}});
+                                let frame = frames::native_ui(&json!({"kind":"response","client_id":client_id,
+                                    "request_id":request_id.chars().take(64).collect::<String>(),"error":error.to_string()}));
                                 if send_json(&mut socket, &frame).await.is_err() { return }
                             }
                             continue;
@@ -871,8 +836,7 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                                 // can correct the payload and retry.
                                 let _ = send_json(
                                     &mut socket,
-                                    &json!({"type": "error", "code": "invalid_command",
-                                            "message": err.to_string()}),
+                                    &frames::error_coded("invalid_command", &err.to_string()),
                                 )
                                 .await;
                                 continue;
@@ -912,8 +876,7 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                                 };
                                 let _ = send_json(
                                     &mut socket,
-                                    &json!({"type": "error", "code": code,
-                                            "message": message}),
+                                    &frames::error_coded(code, &message),
                                 )
                                 .await;
                             }
@@ -940,14 +903,7 @@ async fn send_chat_batches(
     while start < replay.len() {
         let end = chat_batch_end(replay, start);
         let chunk = &replay[start..end];
-        let events: Vec<serde_json::Value> = chunk
-            .iter()
-            .map(|e| json!({"seq": e.seq, "ts": e.ts, "ev": e.ev}))
-            .collect();
-        if send_json(socket, &json!({"type": "batch", "events": events}))
-            .await
-            .is_err()
-        {
+        if send_json(socket, &frames::chat_batch(chunk)).await.is_err() {
             return false;
         }
         if let Some(last) = chunk.last() {
@@ -1024,11 +980,7 @@ const EVENTS_TICK: Duration = Duration::from_secs(1);
 
 async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
     if authenticate(&mut socket, &state).await.is_none() {
-        let _ = send_json(
-            &mut socket,
-            &json!({"type": "error", "message": "unauthorized"}),
-        )
-        .await;
+        let _ = send_json(&mut socket, &frames::error("unauthorized")).await;
         return;
     }
 
@@ -1282,7 +1234,7 @@ async fn send_agent_plugins_snapshot(
     if *last_epoch == Some(epoch) {
         return Ok(());
     }
-    send_json(socket, &json!({"type": "agent_plugins", "epoch": epoch})).await?;
+    send_json(socket, &frames::agent_plugins(epoch)).await?;
     *last_epoch = Some(epoch);
     Ok(())
 }
@@ -1296,14 +1248,7 @@ async fn send_fs_changes(
     if changes.is_empty() {
         return Ok(());
     }
-    let frame = json!({
-        "type": "fs",
-        "files": changes.files,
-        "removed": changes.removed,
-        "dirs": changes.dirs,
-        "removed_dirs": changes.removed_dirs,
-    })
-    .to_string();
+    let frame = frames::fs(&changes).to_string();
     socket.send(Message::Text(frame.into())).await
 }
 
@@ -1321,8 +1266,7 @@ async fn send_update_snapshot(
     if *last_epoch == Some(epoch) {
         return Ok(());
     }
-    let mut frame = crate::lock(&state.update).to_json();
-    frame["type"] = serde_json::json!("update");
+    let frame = frames::update(crate::lock(&state.update).to_json());
     socket.send(Message::Text(frame.to_string().into())).await?;
     *last_epoch = Some(epoch);
     Ok(())
@@ -1342,7 +1286,7 @@ async fn send_recents_snapshot(
     if *last_epoch == Some(epoch) {
         return Ok(());
     }
-    let frame = json!({"type": "recents", "epoch": epoch}).to_string();
+    let frame = frames::recents(epoch).to_string();
     socket.send(Message::Text(frame.into())).await?;
     *last_epoch = Some(epoch);
     Ok(())
@@ -1359,7 +1303,7 @@ async fn send_timeline_snapshot(
 ) -> Result<(), axum::Error> {
     let epochs: std::collections::BTreeMap<String, u64> =
         state.timeline.epochs_snapshot().into_iter().collect();
-    let frame = json!({"type": "timeline", "epochs": epochs}).to_string();
+    let frame = frames::timeline(&epochs).to_string();
     if last.as_deref() == Some(frame.as_str()) {
         return Ok(());
     }
@@ -1379,7 +1323,7 @@ async fn send_comms_snapshot(
 ) -> Result<(), axum::Error> {
     let epochs: std::collections::BTreeMap<String, u64> =
         state.comms.epochs_snapshot().into_iter().collect();
-    let frame = json!({"type": "comms", "epochs": epochs}).to_string();
+    let frame = frames::comms(&epochs).to_string();
     if last.as_deref() == Some(frame.as_str()) {
         return Ok(());
     }
@@ -1408,7 +1352,7 @@ async fn send_settings_snapshot(
         }
         (generation, store.map_cached().clone())
     };
-    let frame = json!({"type": "settings", "settings": map}).to_string();
+    let frame = frames::settings(&map).to_string();
     socket.send(Message::Text(frame.into())).await?;
     *last_gen = Some(generation);
     Ok(())
@@ -1441,7 +1385,7 @@ async fn send_git_snapshot(
             )
         })
         .collect();
-    let frame = json!({"type": "git", "epochs": epochs, "repos": repos}).to_string();
+    let frame = frames::git(&epochs, &repos).to_string();
     if last.as_deref() == Some(frame.as_str()) {
         return Ok(());
     }
@@ -1602,5 +1546,238 @@ mod tests {
         }));
         let encoded = serde_json::to_vec(&AgentCommand::Send { blocks }).unwrap();
         assert!(encoded.len() <= MAX_CHAT_COMMAND_MESSAGE);
+    }
+
+    /// The `/ws/sessions/{id}` text frames → `pty-socket.json` (the binary
+    /// snapshot and output frames carry no JSON and are not pinned).
+    #[test]
+    fn pty_socket_fixture() {
+        use chimaera_pty::{SessionEvent, ShellPhase};
+        use chimaera_wire_fixtures::{case, pin};
+        use frames::samples;
+
+        let live = samples::session_info("s-abc123", true);
+        let dead = samples::session_info("s-dead", false);
+        pin(
+            "pty-socket",
+            "crates/chimaera-server/src/ws.rs",
+            "/ws/sessions/{id} text frames (ws::frames): ready, resync, the SessionEvent frames, exited, and the errors. Each ready/resync is followed by the snapshot as one binary frame.",
+            vec![
+                case(
+                    "ready",
+                    "attach accepted: the SessionInfo fields plus cwd_current (the polled cwd)",
+                    frames::pty_ready(&live, std::path::Path::new("/home/u/proj/src")),
+                ),
+                case(
+                    "ready_last_words",
+                    "a session that died before the attach: its final screen replays, then `exited`",
+                    frames::pty_ready(&dead, &dead.cwd),
+                ),
+                case("resync", "repaint at this grid; the next binary frame is the snapshot", frames::pty_resync(100, 40)),
+                case(
+                    "title",
+                    "the terminal title changed",
+                    frames::pty_event(&SessionEvent::Title { title: "vim lib.rs".into() }).unwrap(),
+                ),
+                case(
+                    "resized",
+                    "another client resized the grid",
+                    frames::pty_event(&SessionEvent::Resized { cols: 100, rows: 40 }).unwrap(),
+                ),
+                case(
+                    "shell_phase",
+                    "OSC 133 shell phase (the client reads phase from session rows; this frame is informational)",
+                    frames::pty_event(&SessionEvent::Shell { phase: ShellPhase::Running }).unwrap(),
+                ),
+                case(
+                    "exited_event",
+                    "the child exited, as the session's own event",
+                    frames::pty_event(&SessionEvent::Exited { status: Some(0) }).unwrap(),
+                ),
+                case("exited", "the daemon's own exited frame after a last-words replay", frames::exited(Some(1))),
+                case("exited_unknown", "the session is gone with no status", frames::exited(None)),
+                case("error_unauthorized", "bad first frame: the socket closes", frames::error("unauthorized")),
+                case(
+                    "error_unknown_session",
+                    "no such session (retryable mid view-switch)",
+                    frames::error_coded("unknown_session", "unknown session s-abc123"),
+                ),
+            ],
+        );
+    }
+
+    /// The `/ws/chat/{id}` frames → `chat-socket.json`.
+    #[test]
+    fn chat_socket_fixture() {
+        use chimaera_agent::native_ui::NativeUiEvent;
+        use chimaera_wire_fixtures::{case, pin};
+        use frames::samples;
+
+        let replay = vec![replay_entry(1, "hel"), replay_entry(2, "lo")];
+        pin(
+            "chat-socket",
+            "crates/chimaera-server/src/ws.rs",
+            "/ws/chat/{id} frames (ws::frames): ready (ChatInfo), batch replay, live ev, the end frames, the Mod UI frames, and the errors; `ev` payloads are chat-events.json's.",
+            vec![
+                case(
+                    "ready",
+                    "attach accepted, with every additive ChatInfo field set",
+                    frames::chat_ready(&samples::chat_info("s-chat1", true), 0, 118),
+                ),
+                case(
+                    "ready_plain",
+                    "attach accepted for an idle chat, replaying from a client cursor",
+                    frames::chat_ready(&samples::chat_info("s-chat2", false), 40, 41),
+                ),
+                case("batch", "a replay slice, in seq order", frames::chat_batch(&replay)),
+                case("batch_empty", "an empty replay slice (nothing since the cursor)", frames::chat_batch(&[])),
+                case("ev", "one live journal entry", frames::chat_event(&replay[0])),
+                case("degraded", "the session moved to a terminal under the same id", frames::chat_degraded()),
+                case("exited", "the driver exited 0", frames::exited(Some(0))),
+                case("exited_unknown", "the driver is gone with no status", frames::exited(None)),
+                case(
+                    "native_ui_response",
+                    "a Mod UI request answered for this client",
+                    frames::native_ui(&NativeUiEvent::Response {
+                        client_id: "c1".into(),
+                        request_id: "r1".into(),
+                        result: Some(serde_json::json!({"ok": true})),
+                        error: None,
+                    }),
+                ),
+                case(
+                    "native_ui_notification",
+                    "a Mod UI notification",
+                    frames::native_ui(&NativeUiEvent::Notification {
+                        payload: serde_json::json!({"method": "ui/notify", "params": {"text": "hi"}}),
+                    }),
+                ),
+                case(
+                    "native_ui_refused",
+                    "a Mod UI request the daemon refused before the Mod saw it",
+                    frames::native_ui(&serde_json::json!({"kind":"response","client_id":"c1",
+                        "request_id":"r2","error":"request too large"})),
+                ),
+                case("native_ui_reset", "the Mod UI stream lagged: drop request state", frames::native_ui_reset()),
+                case("error_unauthorized", "bad first frame: the socket closes", frames::error("unauthorized")),
+                case(
+                    "error_unknown_session",
+                    "no such chat (retryable mid view-switch)",
+                    frames::error_coded("unknown_session", "unknown chat session s-chat1"),
+                ),
+                case(
+                    "error_invalid_command",
+                    "one command refused at ingress; the socket stays up",
+                    frames::error_coded("invalid_command", "text block exceeds 262144 byte/item limit (got 300000)"),
+                ),
+                case(
+                    "error_command_failed",
+                    "the agent could not take the command; the socket stays up",
+                    frames::error_coded("command_failed", "agent unavailable"),
+                ),
+            ],
+        );
+    }
+
+    /// The `/ws/events` bus frames → `events-bus.json`. The plugin `job`
+    /// frame (`frames::plugin_job` over a running `plugins::jobs::Job`) is not
+    /// pinned: it needs a live job; its envelope is `plugin_emit`'s.
+    #[test]
+    fn events_bus_fixture() {
+        use crate::agent_state::{AgentKind, AgentRecord, AgentState};
+        use crate::notices::{Notice, NoticeKind};
+        use chimaera_wire_fixtures::{case, pin};
+        use frames::samples;
+        use std::collections::BTreeMap;
+
+        let mut claude = AgentRecord::new("k".into(), AgentKind::Claude);
+        claude.state = AgentState::Running;
+        let shell = samples::session_info("s-shell1", true);
+        let rows = vec![
+            crate::session_view::finish_row(
+                crate::session_view::pty_row(
+                    &shell,
+                    Some("w1".into()),
+                    None,
+                    Some("zsh"),
+                    None,
+                    None,
+                    false,
+                ),
+                None,
+                None,
+            ),
+            crate::session_view::finish_row(
+                crate::chat::chat_session_json(
+                    &samples::chat_info("s-chat1", true),
+                    Some("w1".into()),
+                    Some(&claude),
+                    false,
+                ),
+                None,
+                None,
+            ),
+        ];
+        let links = vec![crate::links::link_json("s-shell1", "s-chat1")];
+        let epochs: BTreeMap<String, u64> = BTreeMap::from([("w1".to_string(), 3)]);
+        let repos: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::from([(
+            "w1".to_string(),
+            BTreeMap::from([("/home/u/proj".to_string(), 3)]),
+        )]);
+        let notice = Notice::fixture(NoticeKind::Permission);
+        let notice_created = notice.created();
+        let mut update = crate::update::UpdateStatus::default().to_json();
+        // Stamped per build; pinned to constants so the fixture is stable.
+        update["current"] = serde_json::json!("0.70.0");
+        update["build"] = serde_json::json!("abc1234");
+        update["dev"] = serde_json::json!(false);
+        let mut emitted = serde_json::Map::new();
+        emitted.insert("event".into(), serde_json::json!("compiled"));
+        emitted.insert("pages".into(), serde_json::json!(12));
+
+        pin(
+            "events-bus",
+            "crates/chimaera-server/src/ws.rs",
+            "/ws/events frames (ws::frames): the sessions roster + links, settings, the invalidation frames, fs changes, update status, notices, browser_open, the plugin platform frames, and the error.",
+            vec![
+                case("sessions", "the full roster (a shell row, a chat row; session-rows.json has every row shape) and one link", frames::sessions(rows, links)),
+                case("sessions_empty", "no sessions, no links", frames::sessions(vec![], vec![])),
+                case(
+                    "settings",
+                    "the settings map (settings.json ground truth, any JSON)",
+                    frames::settings(&serde_json::json!({"theme": "dark", "agents": {"claude": {"path": "/usr/local/bin/claude"}}})),
+                ),
+                case("git", "git epochs per workspace and per repository", frames::git(&epochs, &repos)),
+                case("timeline", "timeline epochs per workspace", frames::timeline(&epochs)),
+                case("comms", "agent-communication epochs per workspace", frames::comms(&epochs)),
+                case("recents", "recents changed", frames::recents(3)),
+                case("agent_plugins", "agent plugin installs/trust changed", frames::agent_plugins(2)),
+                case(
+                    "fs",
+                    "mounted paths that changed on disk",
+                    frames::fs(&crate::fs_watch::FsChanges {
+                        files: vec!["/home/u/proj/README.md".into()],
+                        removed: vec!["/home/u/proj/old.txt".into()],
+                        dirs: vec!["/home/u/proj/src".into()],
+                        removed_dirs: vec![],
+                    }),
+                ),
+                case("update", "release knowledge (same body as GET /api/v1/update), nothing checked yet", frames::update(update)),
+                case(
+                    "notices",
+                    "new notices since the client's mark (age_ms measured on the daemon's clock)",
+                    frames::notices(&[std::sync::Arc::new(notice)], notice_created),
+                ),
+                case(
+                    "browser_open",
+                    "an agent asked for a browser pane",
+                    frames::browser_open("s-chat1", Some("w1"), &"127.0.0.1", &5173u16, &"/docs"),
+                ),
+                case("plugin_view", "a plugin screen should re-render", frames::plugin_view("latex", "w1", "preview")),
+                case("plugin_surface", "a plugin published a data surface key", frames::plugin_surface(&"latex", &"w1", &"figures", &"fig-1")),
+                case("plugin_emit", "a plugin's own event, host keys last", frames::plugin_emit(emitted, "latex", "w1")),
+                case("error_unauthorized", "bad first frame: the socket closes", frames::error("unauthorized")),
+            ],
+        );
     }
 }

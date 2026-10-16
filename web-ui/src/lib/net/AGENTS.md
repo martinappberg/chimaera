@@ -17,6 +17,8 @@ Orientation for coding agents. This area owns the client side of every daemon co
 
 Tests: `*.test.ts` beside each module; `uploadNames.fixture.json` feeds `uploadNames.test.ts`.
 
+**`fixtures/wire/*.json` are written by the daemon's tests, never by hand.** One file per shape family — `chat-events` (every `AgentEvent` as a `SeqEvent`), `chat-socket`, `pty-socket`, `pty-types`, `events-bus`, `session-rows` — each case `{name, note, frame}`. `wireFixtures.test.ts` feeds every frame through the real decoders with a fake `WebSocket` (`EventsSocket` here, `chat/chatWs.ts` + the reducer, `terminal/ws.ts`, the `workspace/sessions.ts` row helpers), once as sent and once with an unknown field spliced in, and asserts each lands in a known handler. A Rust change that moves a shape rewrites the fixture (`cargo test`); `just check` and CI refuse a stale one (`crates/chimaera-wire-fixtures`). If this test fails after a Rust change, the client no longer accepts what the daemon sends — fix the client in the same PR, or revert the shape.
+
 ## State owners
 
 | State | Owner | Who mutates |
@@ -36,7 +38,7 @@ Tests: `*.test.ts` beside each module; `uploadNames.fixture.json` feeds `uploadN
 - **`native.ts` command and event names are a contract with `crates/chimaera-app`.** Change them in the same PR on both sides (`native.ts` header).
 - **The hash is the bootstrap channel.** `api.ts` reads `win` from it so a reopened window restores the same layout. Do not write app state into `location.hash`.
 - **A failed upload types nothing.** The error shows on the job chip (`uploadAndInsert` doc comment). Only App knows how to insert a path into a chat composer or a PTY.
-- **The `/ws/events` frame shapes are the daemon↔UI wire.** Do not change a handler's frame shape as a side effect of a refactor (root AGENTS.md).
+- **The `/ws/events` frame shapes are the daemon↔UI wire.** Do not change a handler's frame shape as a side effect of a refactor (root AGENTS.md). The daemon builds them in `crates/chimaera-server/src/ws/frames.rs`; `fixtures/wire/events-bus.json` is their current form.
 
 ## Checks
 

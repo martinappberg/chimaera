@@ -18,7 +18,7 @@ Orientation for coding agents. This area owns the browser half of a terminal: th
 | `terminalKeys.ts` | macOS Option+Left/Right → readline Meta-b/f, outside full-screen TUIs. |
 | `terminalMetrics.ts` | Font settings and cell measurement without loading xterm (`estimateSize`). |
 
-Tests: `*.test.ts` beside the modules.
+Tests: `*.test.ts` beside the modules. `net/fixtures/wire/pty-socket.json` + `pty-types.json` (written by the daemon's tests) go through `SessionSocket` in `net/wireFixtures.test.ts`: the text-frame vocabulary of `/ws/sessions` as the daemon sends it.
 
 ## State owners
 

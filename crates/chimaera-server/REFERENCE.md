@@ -44,7 +44,11 @@ REST, split by resource: `workspaces`/`sessions`/`exec`/`shutdown`/`env` + `mod.
 
 ## session_view.rs
 
-The session-row JSON builders (`session_json`/`sessions_json`), shared by `api/` and `ws.rs` (so `ws` doesn't depend on `api`).
+The session-row JSON builders, shared by `api/` and `ws.rs` (so `ws` doesn't depend on `api`): `session_json` (the PTY row body), `pty_row` (+ `ui`/`chat_capable`/`view_switchable`), `switching_row` (the mid-switch placeholder), `finish_row` (the `git`/`cwd_current`/`managed_worktree` tail every row gets), `sessions_json` (the whole roster; chat rows come from `chat::chat_session_json`). Its tests write `web-ui/src/lib/net/fixtures/wire/session-rows.json` (see `ws/frames.rs`).
+
+## ws/frames.rs
+
+**Every daemon→UI WebSocket frame, built in one place**: `error`/`error_coded`/`exited`, the `/ws/sessions` `pty_*` frames, the `/ws/chat` `chat_*` + `native_ui*` frames, and the `/ws/events` `sessions`/`settings`/`git`/`timeline`/`comms`/`recents`/`agent_plugins`/`fs`/`update`/`notices`/`browser_open`/`plugin_*` frames. The handlers (`ws.rs`, `notices.rs`, `browser_open.rs`, `plugins/{screens,surfaces,hostfns,jobs}.rs`) call these; the wire-fixture tests in `ws.rs` serialize the same functions into `web-ui/src/lib/net/fixtures/wire/{pty-socket,chat-socket,events-bus}.json` (`crates/chimaera-wire-fixtures`), so a frame change is a fixture diff and a web-ui consumer-test run, never a silent client break. `samples` (test-only) holds the shared sample `SessionInfo`/`ChatInfo`.
 
 ## ws.rs
 

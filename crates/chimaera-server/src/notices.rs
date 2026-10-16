@@ -144,6 +144,32 @@ pub(crate) struct Notice {
     created: Instant,
 }
 
+#[cfg(test)]
+impl Notice {
+    /// A fully populated notice for the wire fixtures (`created` is private).
+    pub(crate) fn fixture(kind: NoticeKind) -> Self {
+        Notice {
+            id: 7,
+            kind,
+            session_id: "s-chat1".into(),
+            workspace_id: Some("w1".into()),
+            workspace: Some("proj".into()),
+            agent: Some("claude".into()),
+            name: "Fix the build".into(),
+            title: "Bash".into(),
+            subtitle: "rm -rf build".into(),
+            body: "Allow once / always / deny".into(),
+            at_ms: 1_700_000_000_000,
+            created: Instant::now(),
+        }
+    }
+
+    /// When it was created, for a fixture's deterministic `age_ms`.
+    pub(crate) fn created(&self) -> Instant {
+        self.created
+    }
+}
+
 impl Notice {
     /// Wire shape. `age_ms` is measured on THIS daemon's clock, so a
     /// consumer on another machine can judge freshness without clock sync.
@@ -811,14 +837,7 @@ pub(crate) fn frame_since(state: &AppState, last: &mut u64) -> Option<String> {
     let notices = state.notices.since(*last);
     let newest = notices.iter().map(|n| n.id).max()?;
     *last = newest;
-    let now = Instant::now();
-    Some(
-        json!({
-            "type": "notices",
-            "notices": notices.iter().map(|n| n.to_json(now)).collect::<Vec<_>>(),
-        })
-        .to_string(),
-    )
+    Some(crate::ws::frames::notices(&notices, Instant::now()).to_string())
 }
 
 #[cfg(test)]

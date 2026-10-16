@@ -25,6 +25,7 @@ has subtle repaint invariants — read the architecture guide before touching th
 | `marks.rs` | The OSC 133/633/7 marks scanner → shell phase + a bounded command journal. Most methods are exec-internal correlation; the server uses `phase()`/`journal()`. |
 | `exec.rs` | The exec engine that types agent commands into a live shell (integrated or sentinel mode) and correlates completion via marks. |
 | `tests.rs` | PTY + snapshot-replay tests (feed a synthetic `Term` via the vte processor). Extend these when you touch screen state. |
+| `tests/wire_contract.rs` | Golden tests of the serialized shapes (`SessionInfo`, `SessionEvent`, `ExecOutcome`); `pty_types_fixture` writes them to `web-ui/src/lib/net/fixtures/wire/pty-types.json` for the web UI's consumer test (`crates/chimaera-wire-fixtures`). |
 
 ## Invariants (breaking these is a review failure)
 

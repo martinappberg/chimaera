@@ -45,6 +45,7 @@ Each area carries its own `AGENTS.md` map (file table + the invariants that bite
 | `crates/chimaera-agent` | the structured-agent engine (drivers, journal) | [map](crates/chimaera-agent/AGENTS.md) · [protocol index](crates/chimaera-agent/PROTOCOL.md) |
 | `crates/chimaera-remote` | SSH orchestration for `connect`, deployment, tunnels, and cluster jobs | [map](crates/chimaera-remote/AGENTS.md) |
 | `crates/chimaera-server` | the daemon: every route + WS + business logic; embeds `web-ui/dist` and the plugins lock (no plugin bytes) | [map](crates/chimaera-server/AGENTS.md) · [reference](crates/chimaera-server/REFERENCE.md) |
+| `crates/chimaera-wire-fixtures` | test-only: the Rust wire tests write the daemon↔UI shapes to `web-ui/src/lib/net/fixtures/wire/`, the web UI's consumer test reads them | [header](crates/chimaera-wire-fixtures/src/lib.rs) |
 | `crates/chimaera-plugin-api` | the plugin interface: the `chimaera:plugin` WIT world + the Rust side plugins implement | [map](crates/chimaera-plugin-api/AGENTS.md) |
 | `plugins/` | `plugins.lock` (the curated first-party plugins: the release of each that installs, and its sha256s; each plugin lives in its own repository) + the host's test fixture | [map](plugins/AGENTS.md) |
 | `crates/chimaera-app` | the Tauri 2 native shell (its own standalone workspace) | [map](crates/chimaera-app/AGENTS.md) |
@@ -125,6 +126,13 @@ pane and no HPC access; a SessionStart hook installs the web-UI deps and builds
   you add an entry point, never a new hard-coded list.
 - **The daemon↔UI wire is a stable public interface.** Core structs serialize
   straight to it — don't let its shape drift as a side effect of a refactor.
+  The Rust wire tests write every shape family to
+  `web-ui/src/lib/net/fixtures/wire/*.json` (`cargo test` regenerates them;
+  `just check` fails on an uncommitted change, CI runs the tests with
+  `CHIMAERA_WIRE_FIXTURES=check`), and `web-ui/src/lib/net/wireFixtures.test.ts`
+  feeds each fixture through the real client decoders. A shape change rewrites
+  a fixture: review that diff as the contract change it is, in the same PR as
+  the client side.
 - **Agent wire formats are pinned, not trusted** — a driver or agent-CLI change
   needs `just chat-smoke` for Claude/Codex or `just chat-smoke-acp` for ACP
   adapters (live, billed). **Terminal state is

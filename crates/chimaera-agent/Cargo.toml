@@ -16,4 +16,5 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+chimaera-wire-fixtures.workspace = true
 tempfile = "3"

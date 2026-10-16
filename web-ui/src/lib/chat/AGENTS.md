@@ -60,6 +60,7 @@ daemon  ──WS /ws/chat/{id}──▶  chatWs.ts (ChatSocket)
 - **Streaming is never more permissive than settle** ([pipeline](REFERENCE.md#the-streaming-render-pipeline)).
 - **Trust the daemon's seq: a gap heals by replay, and fork points are event-backed** ([reducer](REFERENCE.md#reducer-invariants)).
 - **A queued send becomes a block only once read, and agents' messages are cards** ([reducer](REFERENCE.md#reducer-invariants)).
+- **The reducer's vocabulary is pinned by daemon-written fixtures.** `net/fixtures/wire/chat-events.json` (every `AgentEvent` variant, written by chimaera-agent's wire test) goes through `ChatStore.apply` in `net/wireFixtures.test.ts`, which expects `store.unhandledEventTypes` to stay empty — a type the reducer ignores on purpose is an explicit `case`, never the `default:`.
 - **Never lose a user action to a closed socket; hiding a chat never stops its agent** ([transport](REFERENCE.md#transport-invariants)).
 - **Rows key by stable uid, never array index** ([file map](REFERENCE.md#file-map-in-full)).
 - **Scroll has one writer; never write `scrollTop` mid-gesture** ([scroll](REFERENCE.md#scroll-invariants)).
