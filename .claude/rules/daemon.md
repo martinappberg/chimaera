@@ -21,10 +21,14 @@ criterion in every placement. Depth + module map:
   reconstructible — it gets night-scrubbed; never assume it survives.
 - **No blocking fs on the async reactor.** Wrap journal reads/copies/canonicalize in
   `spawn_blocking`. Never hold a `std::sync::Mutex` guard across an `.await`.
-- **Auth every new route.** REST goes behind the bearer middleware; WS authenticates
-  on its first frame; `/raw` uses a short-lived ticket. The only unauthed routes are
-  the key-in-URL hook/MCP endpoints (`/agent-events/{id}`, `/mcp/{id}`) — claude's
-  hooks/MCP can't know the daemon token. Don't add an unauthenticated endpoint.
+- **Auth every new route.** Pick one authority class in `router.rs`; don't add another:
+  - `/api/v1` REST (incl. `/health`): register it before `route_layer(api::auth)` — `Authorization: Bearer <token>`.
+  - WebSocket (`/ws/sessions|chat|events|voice`): the first text frame carries the token within 5 s.
+  - `/agent-events/{id}`, `/mcp/{id}`: after the `route_layer`; the per-session key (`?key=` or Bearer), because claude's hooks/MCP can't know the daemon token.
+  - `/raw/{ticket}`, `/download/{ticket}`: a single-path ticket from bearer-authed `POST /fs/ticket` (10 min TTL), because `<iframe>`/`<img>`/`<a href>` can't send headers.
+  - `/proxy/{id}` data plane: the unguessable id pinned to one host:port is the capability; mint/list/revoke/health under `/api/v1/proxy` need the bearer.
+  - Fallback: embedded UI assets, unauthenticated; its proxy rescue serves only a live proxy id (Referer/cookie).
+  - Plugin host imports are not routes: `plugins/hostfns.rs` scopes each call to its workspace and the manifest's `[access]`.
 - **The daemon↔UI wire is a stable public interface.** Core structs (`SessionInfo`,
   `SessionEvent`, `ExecOutcome`, chat `SeqEvent`/`AgentCommand`) serialize straight to
   the wire — changing a field changes the contract. Treat it deliberately; don't let
