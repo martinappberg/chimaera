@@ -1,0 +1,170 @@
+{
+  "_about": "Imports out of web-ui/src/lib/shared and web-ui/src/lib/net that break the dependency direction (shared/ and net/ import from no feature area; net/ imports no .svelte component). scripts/check-dependency-direction.mjs fails on any such edge not listed here and on any entry whose edge is gone, so this list only shrinks: never add an entry for new code; when you move a helper and an edge disappears, delete its entry in the same change.",
+  "ui": [
+    {
+      "from": "web-ui/src/lib/net/events.ts",
+      "to": "web-ui/src/lib/browser/agentOpen.ts",
+      "why": "The /ws/events socket parses browser_open frames with the browser pane's parser; move parseAgentBrowserOpen and its type into net beside the other frame shapes."
+    },
+    {
+      "from": "web-ui/src/lib/net/events.ts",
+      "to": "web-ui/src/lib/plugins/platform.ts",
+      "why": "The /ws/events handler table names the plugin platform frame type; move PlatformFrame into net with the other wire frame types."
+    },
+    {
+      "from": "web-ui/src/lib/net/events.ts",
+      "to": "web-ui/src/lib/workspace/agentLinks.ts",
+      "why": "The /ws/events handler table names the agent Link type it delivers; move that wire type into net."
+    },
+    {
+      "from": "web-ui/src/lib/net/events.ts",
+      "to": "web-ui/src/lib/workspace/notices.ts",
+      "why": "The /ws/events handler table names the Notice frame type; move that wire type into net."
+    },
+    {
+      "from": "web-ui/src/lib/net/events.ts",
+      "to": "web-ui/src/lib/workspace/sessions.ts",
+      "why": "The /ws/events sessions snapshot is typed with the workspace Session type; move the Session wire type into net or shared."
+    },
+    {
+      "from": "web-ui/src/lib/net/events.ts",
+      "to": "web-ui/src/lib/workspace/update.svelte.ts",
+      "why": "The /ws/events socket parses update-status frames with the workspace update store's parser; move parseUpdateStatus and UpdateStatus into net."
+    },
+    {
+      "from": "web-ui/src/lib/net/native.ts",
+      "to": "web-ui/src/lib/workspace/sessions.ts",
+      "why": "The native bridge types remote_workspaces results with the workspace Workspace type; move that wire type into net or shared."
+    },
+    {
+      "from": "web-ui/src/lib/net/uploads.ts",
+      "to": "web-ui/src/lib/chat/images.ts",
+      "why": "Upload path insertion carries the chat ImageAttachment type to the App-registered inserter; move that type into net or shared."
+    },
+    {
+      "from": "web-ui/src/lib/shared/BranchChip.svelte",
+      "to": "web-ui/src/lib/workspace/sessions.ts",
+      "why": "The branch chip formats git labels with the workspace session helpers; move baseName, branchLabel and SessionGit into shared."
+    },
+    {
+      "from": "web-ui/src/lib/shared/clipboard.ts",
+      "to": "web-ui/src/lib/previews/files.ts",
+      "why": "Copying a file builds its /raw URL and detects images with the previews file helpers; move fsRawUrl and isImagePath into shared."
+    },
+    {
+      "from": "web-ui/src/lib/shared/embed/CodeBody.svelte",
+      "to": "web-ui/src/lib/previews/files.ts",
+      "why": "The code embed reads file text and sniffs binary content with the previews file client; move fsFile and looksBinary into shared."
+    },
+    {
+      "from": "web-ui/src/lib/shared/embed/CodeBody.svelte",
+      "to": "web-ui/src/lib/previews/highlight.ts",
+      "why": "The code embed lazily loads the editor's syntax highlighter so embeds colour code like the editor; move highlight.ts into shared."
+    },
+    {
+      "from": "web-ui/src/lib/shared/embed/CodeBody.svelte",
+      "to": "web-ui/src/lib/previews/languages.ts",
+      "why": "The code embed lazily loads the editor's language list to pick a grammar by file name; move languages.ts into shared."
+    },
+    {
+      "from": "web-ui/src/lib/shared/embed/embed.ts",
+      "to": "web-ui/src/lib/previews/files.ts",
+      "why": "The embed resolver picks a body by the previews view kind and path basename; move viewKindFor and basename into shared."
+    },
+    {
+      "from": "web-ui/src/lib/shared/embed/EmbedCard.svelte",
+      "to": "web-ui/src/lib/previews/files.ts",
+      "why": "The embed card shows size, mtime, download and table headers with the previews file helpers; move those helpers into shared."
+    },
+    {
+      "from": "web-ui/src/lib/shared/embed/EmbedCard.svelte",
+      "to": "web-ui/src/lib/workspace/diskWatch.ts",
+      "why": "The embed card retains a disk watch on its file so it refreshes on change; move the disk-watch registry into shared or net."
+    },
+    {
+      "from": "web-ui/src/lib/shared/embed/fragment.ts",
+      "to": "web-ui/src/lib/previews/files.ts",
+      "why": "Table fragments are typed with the previews TablePage type; move that wire type into shared."
+    },
+    {
+      "from": "web-ui/src/lib/shared/embed/fragment.ts",
+      "to": "web-ui/src/lib/previews/tableGrid.ts",
+      "why": "Table fragment labels reuse the table viewer's row-count formatter; move formatRowCount into shared."
+    },
+    {
+      "from": "web-ui/src/lib/shared/embed/MarkdownBody.svelte",
+      "to": "web-ui/src/lib/previews/files.ts",
+      "why": "The markdown embed reads its file with the previews file client; move fsFile into shared."
+    },
+    {
+      "from": "web-ui/src/lib/shared/embed/MarkdownBody.svelte",
+      "to": "web-ui/src/lib/previews/marp.ts",
+      "why": "The markdown embed detects Marp sources to hand them to the slide body; move frontmatterOf and isMarpSource into shared."
+    },
+    {
+      "from": "web-ui/src/lib/shared/embed/NotebookBody.svelte",
+      "to": "web-ui/src/lib/previews/ansi.ts",
+      "why": "The notebook embed strips ANSI from cell output with the previews helper; move stripAnsi into shared."
+    },
+    {
+      "from": "web-ui/src/lib/shared/embed/NotebookBody.svelte",
+      "to": "web-ui/src/lib/previews/highlight.ts",
+      "why": "The notebook embed lazily loads the editor's syntax highlighter for code cells; move highlight.ts into shared."
+    },
+    {
+      "from": "web-ui/src/lib/shared/embed/NotebookBody.svelte",
+      "to": "web-ui/src/lib/previews/notebook.ts",
+      "why": "The notebook embed parses .ipynb with the notebook viewer's parser so both render the same cells; move notebook.ts into shared."
+    },
+    {
+      "from": "web-ui/src/lib/shared/embed/NotebookBody.svelte",
+      "to": "web-ui/src/lib/previews/NotebookHtml.svelte",
+      "why": "The notebook embed renders HTML outputs with the notebook viewer's sandboxed frame; move NotebookHtml.svelte into shared."
+    },
+    {
+      "from": "web-ui/src/lib/shared/embed/SlideBody.svelte",
+      "to": "web-ui/src/lib/previews/files.ts",
+      "why": "The slide embed resolves image paths with the previews dirname helper; move dirname into shared."
+    },
+    {
+      "from": "web-ui/src/lib/shared/embed/SlideBody.svelte",
+      "to": "web-ui/src/lib/previews/marp.ts",
+      "why": "The slide embed renders a deck with the slides viewer's Marp pipeline so both look the same; move marp.ts into shared."
+    },
+    {
+      "from": "web-ui/src/lib/shared/embed/TableBody.svelte",
+      "to": "web-ui/src/lib/previews/files.ts",
+      "why": "The table embed pages CSV and spreadsheet data with the previews table clients; move fsTable, fsXlsx and their types into shared."
+    },
+    {
+      "from": "web-ui/src/lib/shared/ExtensionCode.svelte",
+      "to": "web-ui/src/lib/previews/highlight.ts",
+      "why": "Extension code blocks lazily load the editor's syntax highlighter; move highlight.ts into shared."
+    },
+    {
+      "from": "web-ui/src/lib/shared/ExtensionCode.svelte",
+      "to": "web-ui/src/lib/previews/languages.ts",
+      "why": "Extension code blocks lazily load the editor's language list to pick a grammar; move languages.ts into shared."
+    },
+    {
+      "from": "web-ui/src/lib/shared/FileIcon.svelte",
+      "to": "web-ui/src/lib/previews/files.ts",
+      "why": "The file icon picks its glyph with the previews iconFor mapping; move iconFor into shared beside icons.ts."
+    },
+    {
+      "from": "web-ui/src/lib/shared/keybindings.ts",
+      "to": "web-ui/src/lib/settings/store.svelte.ts",
+      "why": "Key hints and chord matching read user overrides from the live settings store; inject a settings reader instead of importing the store."
+    },
+    {
+      "from": "web-ui/src/lib/shared/references.ts",
+      "to": "web-ui/src/lib/previews/doc/hoverController.svelte.ts",
+      "why": "Reference links plug into the document hover controller and name its HostTarget type; move that type into shared."
+    },
+    {
+      "from": "web-ui/src/lib/shared/WakeRing.svelte",
+      "to": "web-ui/src/lib/chat/ahead.ts",
+      "why": "The wake ring draws its countdown with the chat loops helpers; move ringFraction and untilLabel into shared."
+    }
+  ]
+}

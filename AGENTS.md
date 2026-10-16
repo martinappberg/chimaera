@@ -81,6 +81,9 @@ node scripts/check-doc-links.mjs   # every relative markdown link + #anchor reso
 node scripts/check-site.mjs        # public-site links, search/sharing metadata, and sitemap
 node scripts/check-agent-assets.mjs # Claude/Codex skill + agent bridges stay in sync
 node scripts/check-workflow-security.mjs # immutable Actions pins + explicit permissions
+node scripts/check-feature-registry.mjs # docs/features/registry.json: every page has an entry, every owning path/map/rule exists; --write regenerates the README routing table
+node scripts/change-impact.mjs     # feature pages + area maps this diff (origin/main...HEAD) touches; CI posts it on the PR and fails unless they changed too or the body says "Docs unaffected: <ids> — <reason>"
+node scripts/check-dependency-direction.mjs # crate edges (core depends on nothing internal, server never on app) + shared/ and net/ UI imports against scripts/dependency-direction-exceptions.json
 scripts/worktree-gc                # which worktrees are idle + what cleanup frees (dry run)
 bash scripts/worktree-gc.test.sh   # worktree-gc's rules on a throwaway repo; skips real-process cases where ps is denied
 ```
@@ -116,6 +119,10 @@ pane and no HPC access; a SessionStart hook installs the web-UI deps and builds
   **[worktree-lifecycle](.claude/skills/worktree-lifecycle/SKILL.md)** skill: remove
   your worktree once its PR merges, run `scripts/worktree-gc` before a big build when
   disk is low, and never touch a worktree it calls ACTIVE.
+- **Feature ownership is data, not prose.** `docs/features/registry.json` maps every
+  feature page to its owning code paths, maps, rules and checks; the doc-drift hook, the
+  CI change-impact report and the README routing table all read it. Add a path there when
+  you add an entry point, never a new hard-coded list.
 - **The daemon↔UI wire is a stable public interface.** Core structs serialize
   straight to it — don't let its shape drift as a side effect of a refactor.
 - **Agent wire formats are pinned, not trusted** — a driver or agent-CLI change

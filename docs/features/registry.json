@@ -1,0 +1,816 @@
+{
+  "areas": [
+    {
+      "id": "chimaera-server",
+      "map": "crates/chimaera-server/AGENTS.md",
+      "paths": [
+        "crates/chimaera-server/src/**"
+      ]
+    },
+    {
+      "id": "chimaera-agent",
+      "map": "crates/chimaera-agent/AGENTS.md",
+      "paths": [
+        "crates/chimaera-agent/src/**"
+      ]
+    },
+    {
+      "id": "chimaera-pty",
+      "map": "crates/chimaera-pty/AGENTS.md",
+      "paths": [
+        "crates/chimaera-pty/src/**"
+      ]
+    },
+    {
+      "id": "chimaera-app",
+      "map": "crates/chimaera-app/AGENTS.md",
+      "paths": [
+        "crates/chimaera-app/src/**"
+      ]
+    },
+    {
+      "id": "chimaera-core",
+      "map": "crates/chimaera-core/AGENTS.md",
+      "paths": [
+        "crates/chimaera-core/src/**"
+      ]
+    },
+    {
+      "id": "chimaera-cli",
+      "map": "crates/chimaera/AGENTS.md",
+      "paths": [
+        "crates/chimaera/src/**"
+      ]
+    },
+    {
+      "id": "chimaera-remote",
+      "map": "crates/chimaera-remote/AGENTS.md",
+      "paths": [
+        "crates/chimaera-remote/src/**"
+      ]
+    },
+    {
+      "id": "chimaera-plugin-api",
+      "map": "crates/chimaera-plugin-api/AGENTS.md",
+      "paths": [
+        "crates/chimaera-plugin-api/**"
+      ]
+    },
+    {
+      "id": "plugin-api",
+      "map": "docs/agent-guides/plugins.md",
+      "paths": [
+        "crates/chimaera-plugin-api/**"
+      ]
+    },
+    {
+      "id": "plugins-dir",
+      "map": "plugins/AGENTS.md",
+      "paths": [
+        "plugins/**"
+      ]
+    },
+    {
+      "id": "chat-ui",
+      "map": "web-ui/src/lib/chat/AGENTS.md",
+      "paths": [
+        "web-ui/src/lib/chat/**"
+      ]
+    },
+    {
+      "id": "dashboard-ui",
+      "map": "web-ui/src/lib/dashboard/AGENTS.md",
+      "paths": [
+        "web-ui/src/lib/dashboard/**"
+      ]
+    },
+    {
+      "id": "settings-ui",
+      "map": "web-ui/src/lib/settings/AGENTS.md",
+      "paths": [
+        "web-ui/src/lib/settings/**"
+      ]
+    },
+    {
+      "id": "knowledge-ui",
+      "map": "web-ui/src/lib/knowledge/AGENTS.md",
+      "paths": [
+        "web-ui/src/lib/knowledge/**"
+      ]
+    },
+    {
+      "id": "plugins-ui",
+      "map": "web-ui/src/lib/plugins/AGENTS.md",
+      "paths": [
+        "web-ui/src/lib/plugins/**"
+      ]
+    },
+    {
+      "id": "browser-ui",
+      "map": "web-ui/src/lib/browser/AGENTS.md",
+      "paths": [
+        "web-ui/src/lib/browser/**"
+      ]
+    },
+    {
+      "id": "layout-ui",
+      "map": "web-ui/src/lib/layout/AGENTS.md",
+      "paths": [
+        "web-ui/src/lib/layout/**"
+      ]
+    },
+    {
+      "id": "net-ui",
+      "map": "web-ui/src/lib/net/AGENTS.md",
+      "paths": [
+        "web-ui/src/lib/net/**"
+      ]
+    },
+    {
+      "id": "previews-ui",
+      "map": "web-ui/src/lib/previews/AGENTS.md",
+      "paths": [
+        "web-ui/src/lib/previews/**"
+      ]
+    },
+    {
+      "id": "terminal-ui",
+      "map": "web-ui/src/lib/terminal/AGENTS.md",
+      "paths": [
+        "web-ui/src/lib/terminal/**"
+      ]
+    },
+    {
+      "id": "workspace-ui",
+      "map": "web-ui/src/lib/workspace/AGENTS.md",
+      "paths": [
+        "web-ui/src/lib/workspace/**"
+      ]
+    },
+    {
+      "id": "shared-ui",
+      "map": "web-ui/src/lib/shared/AGENTS.md",
+      "paths": [
+        "web-ui/src/lib/shared/**"
+      ]
+    },
+    {
+      "id": "claude-wire",
+      "map": "crates/chimaera-agent/protocol/claude-code.md",
+      "paths": [
+        "crates/chimaera-agent/src/claude.rs"
+      ]
+    },
+    {
+      "id": "codex-wire",
+      "map": "crates/chimaera-agent/protocol/codex.md",
+      "paths": [
+        "crates/chimaera-agent/src/codex.rs"
+      ]
+    },
+    {
+      "id": "acp-wire",
+      "map": "crates/chimaera-agent/protocol/acp.md",
+      "paths": [
+        "crates/chimaera-agent/src/acp.rs"
+      ]
+    },
+    {
+      "id": "mods-wire",
+      "map": "crates/chimaera-agent/protocol/mods.md",
+      "paths": [
+        "crates/chimaera-agent/src/native_ui.rs"
+      ]
+    }
+  ],
+  "features": [
+    {
+      "id": "agent-communication",
+      "name": "Agent communication",
+      "page": "docs/features/agent-communication.md",
+      "paths": [
+        "crates/chimaera-server/src/comms.rs",
+        "web-ui/src/lib/workspace/comms.svelte.ts",
+        "web-ui/src/lib/chat/agentMessages.ts",
+        "web-ui/src/lib/chat/AgentMessageCards.svelte",
+        "web-ui/src/lib/dashboard/WakeRequestCard.svelte"
+      ],
+      "maps": [
+        "crates/chimaera-server/AGENTS.md",
+        "web-ui/src/lib/chat/AGENTS.md",
+        "web-ui/src/lib/dashboard/AGENTS.md",
+        "web-ui/src/lib/workspace/AGENTS.md"
+      ],
+      "rules": [
+        ".claude/rules/daemon.md",
+        ".claude/rules/web-ui.md"
+      ],
+      "checks": [
+        "cargo test -p chimaera-server",
+        "npm --prefix web-ui run check",
+        "npm --prefix web-ui run test"
+      ]
+    },
+    {
+      "id": "agents",
+      "name": "Agents — launch, lifecycle & runtimes",
+      "page": "docs/features/agents.md",
+      "paths": [
+        "crates/chimaera-server/src/launcher.rs",
+        "crates/chimaera-server/src/runtimes.rs",
+        "crates/chimaera-server/src/doc_check.rs",
+        "crates/chimaera-server/src/agent_docs.rs",
+        "crates/chimaera-server/src/agents.rs",
+        "crates/chimaera-server/src/agent_setup.rs",
+        "crates/chimaera-server/src/recents.rs",
+        "web-ui/src/lib/workspace/Launcher.svelte",
+        "web-ui/src/lib/workspace/launcher.ts"
+      ],
+      "maps": [
+        "crates/chimaera-server/AGENTS.md",
+        "web-ui/src/lib/workspace/AGENTS.md"
+      ],
+      "rules": [
+        ".claude/rules/daemon.md",
+        ".claude/rules/web-ui.md"
+      ],
+      "checks": [
+        "cargo test -p chimaera-server",
+        "npm --prefix web-ui run check",
+        "npm --prefix web-ui run test"
+      ]
+    },
+    {
+      "id": "browser-pane",
+      "name": "Browser pane (reverse-proxied web apps)",
+      "page": "docs/features/browser-pane.md",
+      "paths": [
+        "crates/chimaera-server/src/proxy.rs",
+        "crates/chimaera-server/src/browser_open.rs",
+        "web-ui/src/lib/browser/**",
+        "web-ui/src/lib/terminal/urlLinks.ts"
+      ],
+      "maps": [
+        "crates/chimaera-server/AGENTS.md",
+        "web-ui/src/lib/browser/AGENTS.md",
+        "web-ui/src/lib/terminal/AGENTS.md"
+      ],
+      "rules": [
+        ".claude/rules/daemon.md",
+        ".claude/rules/web-ui.md"
+      ],
+      "checks": [
+        "cargo test -p chimaera-server",
+        "npm --prefix web-ui run check",
+        "npm --prefix web-ui run test"
+      ]
+    },
+    {
+      "id": "chat-mode",
+      "name": "Structured chat mode (Tier B)",
+      "page": "docs/features/chat-mode.md",
+      "paths": [
+        "crates/chimaera-agent/src/**",
+        "web-ui/src/lib/chat/**",
+        "crates/chimaera-server/src/chat.rs"
+      ],
+      "maps": [
+        "crates/chimaera-server/AGENTS.md",
+        "crates/chimaera-agent/AGENTS.md",
+        "web-ui/src/lib/chat/AGENTS.md"
+      ],
+      "rules": [
+        ".claude/rules/agent-protocol.md",
+        ".claude/rules/daemon.md",
+        ".claude/rules/web-ui.md"
+      ],
+      "checks": [
+        "cargo test -p chimaera-server",
+        "cargo test -p chimaera-agent",
+        "npm --prefix web-ui run check",
+        "npm --prefix web-ui run test",
+        "just chat-smoke"
+      ]
+    },
+    {
+      "id": "claude-mods",
+      "name": "Claude Mods in structured chat",
+      "page": "docs/features/claude-mods.md",
+      "paths": [
+        "crates/chimaera-agent/src/native_ui.rs",
+        "web-ui/src/lib/chat/[Mm]od*",
+        "web-ui/src/lib/chat/nativeUi*",
+        "crates/chimaera-agent/tests/native_ui_live.rs"
+      ],
+      "maps": [
+        "crates/chimaera-agent/AGENTS.md",
+        "web-ui/src/lib/chat/AGENTS.md"
+      ],
+      "rules": [
+        ".claude/rules/agent-protocol.md",
+        ".claude/rules/web-ui.md"
+      ],
+      "checks": [
+        "cargo test -p chimaera-agent",
+        "npm --prefix web-ui run check",
+        "npm --prefix web-ui run test",
+        "just chat-smoke",
+        "just chat-mods-smoke"
+      ]
+    },
+    {
+      "id": "cli",
+      "name": "CLI — the `chimaera` binary",
+      "page": "docs/features/cli.md",
+      "paths": [
+        "crates/chimaera/src/**"
+      ],
+      "maps": [
+        "crates/chimaera/AGENTS.md"
+      ],
+      "rules": [
+        ".claude/rules/daemon.md"
+      ],
+      "checks": [
+        "cargo test -p chimaera"
+      ]
+    },
+    {
+      "id": "compute",
+      "name": "Clusters (HPC + Slurm)",
+      "page": "docs/features/compute.md",
+      "paths": [
+        "crates/chimaera-server/src/compute.rs",
+        "crates/chimaera-remote/src/cluster.rs",
+        "crates/chimaera-server/src/job_host.rs",
+        "crates/chimaera/src/compute.rs",
+        "crates/chimaera-core/src/slurm.rs",
+        "crates/chimaera-core/src/cluster.rs",
+        "crates/chimaera-app/src/shell/cluster.rs"
+      ],
+      "maps": [
+        "crates/chimaera-server/AGENTS.md",
+        "crates/chimaera-app/AGENTS.md",
+        "crates/chimaera-core/AGENTS.md",
+        "crates/chimaera/AGENTS.md",
+        "crates/chimaera-remote/AGENTS.md"
+      ],
+      "rules": [
+        ".claude/rules/daemon.md",
+        ".claude/rules/native-app.md"
+      ],
+      "checks": [
+        "cargo test -p chimaera-server",
+        "just app-check",
+        "cargo test -p chimaera-core",
+        "cargo test -p chimaera",
+        "cargo test -p chimaera-remote"
+      ]
+    },
+    {
+      "id": "dashboard",
+      "name": "The workspace dashboard",
+      "page": "docs/features/dashboard.md",
+      "paths": [
+        "web-ui/src/lib/dashboard/**"
+      ],
+      "maps": [
+        "web-ui/src/lib/dashboard/AGENTS.md"
+      ],
+      "rules": [
+        ".claude/rules/web-ui.md"
+      ],
+      "checks": [
+        "npm --prefix web-ui run check",
+        "npm --prefix web-ui run test"
+      ]
+    },
+    {
+      "id": "drag-drop-and-uploads",
+      "name": "File dragging, references & desktop uploads",
+      "page": "docs/features/drag-drop-and-uploads.md",
+      "paths": [
+        "crates/chimaera-server/src/upload.rs",
+        "web-ui/src/lib/net/uploads.ts",
+        "web-ui/src/lib/chat/images.ts",
+        "web-ui/src/lib/shared/reference.ts"
+      ],
+      "maps": [
+        "crates/chimaera-server/AGENTS.md",
+        "web-ui/src/lib/chat/AGENTS.md",
+        "web-ui/src/lib/net/AGENTS.md",
+        "web-ui/src/lib/shared/AGENTS.md"
+      ],
+      "rules": [
+        ".claude/rules/daemon.md",
+        ".claude/rules/web-ui.md"
+      ],
+      "checks": [
+        "cargo test -p chimaera-server",
+        "npm --prefix web-ui run check",
+        "npm --prefix web-ui run test"
+      ]
+    },
+    {
+      "id": "environment",
+      "name": "Environment preludes",
+      "page": "docs/features/environment.md",
+      "paths": [
+        "crates/chimaera-server/src/environment.rs",
+        "web-ui/src/lib/settings/EnvironmentSettings.svelte",
+        "web-ui/src/lib/settings/environment.ts"
+      ],
+      "maps": [
+        "crates/chimaera-server/AGENTS.md",
+        "web-ui/src/lib/settings/AGENTS.md"
+      ],
+      "rules": [
+        ".claude/rules/daemon.md",
+        ".claude/rules/web-ui.md"
+      ],
+      "checks": [
+        "cargo test -p chimaera-server",
+        "npm --prefix web-ui run check",
+        "npm --prefix web-ui run test"
+      ]
+    },
+    {
+      "id": "files-and-previews",
+      "name": "Files & previews",
+      "page": "docs/features/files-and-previews.md",
+      "paths": [
+        "web-ui/src/lib/previews/**",
+        "crates/chimaera-server/src/fs.rs",
+        "crates/chimaera-server/src/notebook.rs",
+        "web-ui/src/lib/workspace/FileTree.svelte"
+      ],
+      "maps": [
+        "crates/chimaera-server/AGENTS.md",
+        "web-ui/src/lib/previews/AGENTS.md",
+        "web-ui/src/lib/workspace/AGENTS.md"
+      ],
+      "rules": [
+        ".claude/rules/daemon.md",
+        ".claude/rules/web-ui.md"
+      ],
+      "checks": [
+        "cargo test -p chimaera-server",
+        "npm --prefix web-ui run check",
+        "npm --prefix web-ui run test"
+      ]
+    },
+    {
+      "id": "git",
+      "name": "Git & source control",
+      "page": "docs/features/git.md",
+      "paths": [
+        "crates/chimaera-server/src/git/**",
+        "web-ui/src/lib/workspace/Git*",
+        "web-ui/src/lib/workspace/git*.ts",
+        "web-ui/src/lib/workspace/SessionChangesView.svelte"
+      ],
+      "maps": [
+        "crates/chimaera-server/AGENTS.md",
+        "web-ui/src/lib/workspace/AGENTS.md"
+      ],
+      "rules": [
+        ".claude/rules/daemon.md",
+        ".claude/rules/web-ui.md"
+      ],
+      "checks": [
+        "cargo test -p chimaera-server",
+        "npm --prefix web-ui run check",
+        "npm --prefix web-ui run test"
+      ]
+    },
+    {
+      "id": "lifecycle-and-persistence",
+      "name": "Lifecycle & persistence",
+      "page": "docs/features/lifecycle-and-persistence.md",
+      "paths": [
+        "crates/chimaera-server/src/ledger.rs",
+        "crates/chimaera-server/src/lifecycle.rs",
+        "crates/chimaera-server/src/persist.rs",
+        "crates/chimaera-server/src/update.rs",
+        "crates/chimaera-server/src/api/shutdown.rs",
+        "crates/chimaera/src/kill.rs"
+      ],
+      "maps": [
+        "crates/chimaera-server/AGENTS.md",
+        "crates/chimaera/AGENTS.md"
+      ],
+      "rules": [
+        ".claude/rules/daemon.md"
+      ],
+      "checks": [
+        "cargo test -p chimaera-server",
+        "cargo test -p chimaera"
+      ]
+    },
+    {
+      "id": "linked-terminals",
+      "name": "Linked terminals (the \"leash\") & the MCP server",
+      "page": "docs/features/linked-terminals.md",
+      "paths": [
+        "crates/chimaera-server/src/mcp.rs",
+        "crates/chimaera-server/src/links.rs",
+        "web-ui/src/lib/workspace/agentLinks.ts"
+      ],
+      "maps": [
+        "crates/chimaera-server/AGENTS.md",
+        "web-ui/src/lib/workspace/AGENTS.md"
+      ],
+      "rules": [
+        ".claude/rules/daemon.md",
+        ".claude/rules/web-ui.md"
+      ],
+      "checks": [
+        "cargo test -p chimaera-server",
+        "npm --prefix web-ui run check",
+        "npm --prefix web-ui run test"
+      ]
+    },
+    {
+      "id": "loops-and-goals",
+      "name": "Loops and goals",
+      "page": "docs/features/loops-and-goals.md",
+      "paths": [
+        "crates/chimaera-agent/src/autonomy.rs",
+        "crates/chimaera-agent/src/cron.rs",
+        "crates/chimaera-server/src/goal_outcome.rs",
+        "web-ui/src/lib/chat/AheadCard*",
+        "web-ui/src/lib/chat/WorkStrip*",
+        "web-ui/src/lib/chat/ahead*"
+      ],
+      "maps": [
+        "crates/chimaera-server/AGENTS.md",
+        "crates/chimaera-agent/AGENTS.md",
+        "web-ui/src/lib/chat/AGENTS.md"
+      ],
+      "rules": [
+        ".claude/rules/agent-protocol.md",
+        ".claude/rules/daemon.md",
+        ".claude/rules/web-ui.md"
+      ],
+      "checks": [
+        "cargo test -p chimaera-server",
+        "cargo test -p chimaera-agent",
+        "npm --prefix web-ui run check",
+        "npm --prefix web-ui run test",
+        "just chat-smoke"
+      ]
+    },
+    {
+      "id": "native-app",
+      "name": "Native app (the Tauri shell)",
+      "page": "docs/features/native-app.md",
+      "paths": [
+        "crates/chimaera-app/src/**",
+        "web-ui/src/lib/net/native.ts",
+        "web-ui/src/lib/workspace/UpdateToast.svelte",
+        "web-ui/src/lib/workspace/update.svelte.ts"
+      ],
+      "maps": [
+        "crates/chimaera-app/AGENTS.md",
+        "web-ui/src/lib/net/AGENTS.md",
+        "web-ui/src/lib/workspace/AGENTS.md"
+      ],
+      "rules": [
+        ".claude/rules/native-app.md",
+        ".claude/rules/web-ui.md"
+      ],
+      "checks": [
+        "just app-check",
+        "npm --prefix web-ui run check",
+        "npm --prefix web-ui run test"
+      ]
+    },
+    {
+      "id": "notifications",
+      "name": "Notifications & attention",
+      "page": "docs/features/notifications.md",
+      "paths": [
+        "crates/chimaera-server/src/notices.rs",
+        "crates/chimaera-app/src/shell/notices.rs",
+        "crates/chimaera-app/src/notify.rs",
+        "web-ui/src/lib/workspace/notices.ts",
+        "web-ui/src/lib/settings/NotificationStatus.svelte"
+      ],
+      "maps": [
+        "crates/chimaera-server/AGENTS.md",
+        "crates/chimaera-app/AGENTS.md",
+        "web-ui/src/lib/settings/AGENTS.md",
+        "web-ui/src/lib/workspace/AGENTS.md"
+      ],
+      "rules": [
+        ".claude/rules/daemon.md",
+        ".claude/rules/native-app.md",
+        ".claude/rules/web-ui.md"
+      ],
+      "checks": [
+        "cargo test -p chimaera-server",
+        "just app-check",
+        "npm --prefix web-ui run check",
+        "npm --prefix web-ui run test"
+      ]
+    },
+    {
+      "id": "plugins",
+      "name": "Plugins & skills",
+      "page": "docs/features/plugins.md",
+      "paths": [
+        "crates/chimaera-server/src/plugins/**",
+        "crates/chimaera-server/src/agent_probe.rs",
+        "plugins/plugins.lock",
+        "web-ui/src/lib/plugins/**",
+        "crates/chimaera-plugin-api/**",
+        "crates/chimaera/src/plugin.rs"
+      ],
+      "maps": [
+        "crates/chimaera-server/AGENTS.md",
+        "crates/chimaera/AGENTS.md",
+        "crates/chimaera-plugin-api/AGENTS.md",
+        "docs/agent-guides/plugins.md",
+        "plugins/AGENTS.md",
+        "web-ui/src/lib/plugins/AGENTS.md"
+      ],
+      "rules": [
+        ".claude/rules/daemon.md",
+        ".claude/rules/web-ui.md"
+      ],
+      "checks": [
+        "cargo test -p chimaera-server",
+        "cargo test -p chimaera",
+        "cargo test -p chimaera-plugin-api",
+        "bash scripts/build-plugins.sh",
+        "npm --prefix web-ui run check",
+        "npm --prefix web-ui run test"
+      ]
+    },
+    {
+      "id": "remote-connect",
+      "name": "Remote connect (SSH orchestration)",
+      "page": "docs/features/remote-connect.md",
+      "paths": [
+        "crates/chimaera-remote/src/**",
+        "crates/chimaera/src/connect.rs",
+        "crates/chimaera-app/src/shell/connect.rs",
+        "crates/chimaera-app/src/askpass.rs",
+        "web-ui/src/lib/workspace/AskpassModal.svelte",
+        "web-ui/src/lib/workspace/ReauthOverlay.svelte"
+      ],
+      "maps": [
+        "crates/chimaera-app/AGENTS.md",
+        "crates/chimaera/AGENTS.md",
+        "crates/chimaera-remote/AGENTS.md",
+        "web-ui/src/lib/workspace/AGENTS.md"
+      ],
+      "rules": [
+        ".claude/rules/daemon.md",
+        ".claude/rules/native-app.md",
+        ".claude/rules/web-ui.md"
+      ],
+      "checks": [
+        "just app-check",
+        "cargo test -p chimaera",
+        "cargo test -p chimaera-remote",
+        "npm --prefix web-ui run check",
+        "npm --prefix web-ui run test"
+      ]
+    },
+    {
+      "id": "session-history",
+      "name": "Session history & activity",
+      "page": "docs/features/session-history.md",
+      "paths": [
+        "crates/chimaera-server/src/history/**",
+        "crates/chimaera-server/src/recents_archive.rs",
+        "web-ui/src/lib/workspace/SessionsView.svelte",
+        "web-ui/src/lib/workspace/SessionEdits.svelte",
+        "web-ui/src/lib/workspace/SameFileNotice.svelte",
+        "web-ui/src/lib/workspace/sameFile.svelte.ts",
+        "web-ui/src/lib/workspace/history.ts"
+      ],
+      "maps": [
+        "crates/chimaera-server/AGENTS.md",
+        "web-ui/src/lib/workspace/AGENTS.md"
+      ],
+      "rules": [
+        ".claude/rules/daemon.md",
+        ".claude/rules/web-ui.md"
+      ],
+      "checks": [
+        "cargo test -p chimaera-server",
+        "npm --prefix web-ui run check",
+        "npm --prefix web-ui run test"
+      ]
+    },
+    {
+      "id": "settings",
+      "name": "Settings",
+      "page": "docs/features/settings.md",
+      "paths": [
+        "web-ui/src/lib/settings/**",
+        "crates/chimaera-server/src/settings.rs"
+      ],
+      "maps": [
+        "crates/chimaera-server/AGENTS.md",
+        "web-ui/src/lib/settings/AGENTS.md"
+      ],
+      "rules": [
+        ".claude/rules/daemon.md",
+        ".claude/rules/web-ui.md"
+      ],
+      "checks": [
+        "cargo test -p chimaera-server",
+        "npm --prefix web-ui run check",
+        "npm --prefix web-ui run test"
+      ]
+    },
+    {
+      "id": "terminals",
+      "name": "Terminals",
+      "page": "docs/features/terminals.md",
+      "paths": [
+        "crates/chimaera-pty/src/**",
+        "web-ui/src/lib/terminal/**",
+        "crates/chimaera-server/src/exec.rs",
+        "crates/chimaera-server/src/api/exec.rs",
+        "web-ui/src/lib/net/reconnect.ts"
+      ],
+      "maps": [
+        "crates/chimaera-server/AGENTS.md",
+        "crates/chimaera-pty/AGENTS.md",
+        "web-ui/src/lib/net/AGENTS.md",
+        "web-ui/src/lib/terminal/AGENTS.md"
+      ],
+      "rules": [
+        ".claude/rules/daemon.md",
+        ".claude/rules/pty.md",
+        ".claude/rules/web-ui.md"
+      ],
+      "checks": [
+        "cargo test -p chimaera-server",
+        "cargo test -p chimaera-pty",
+        "npm --prefix web-ui run check",
+        "npm --prefix web-ui run test"
+      ]
+    },
+    {
+      "id": "timeline-and-knowledge",
+      "name": "Timeline & Knowledge",
+      "page": "docs/features/timeline-and-knowledge.md",
+      "paths": [
+        "crates/chimaera-server/src/timeline.rs",
+        "crates/chimaera-server/src/episodes.rs",
+        "crates/chimaera-server/src/knowledge.rs",
+        "plugins/plugins.lock",
+        "web-ui/src/lib/knowledge/**",
+        "web-ui/src/lib/workspace/[Tt]imeline*",
+        "web-ui/src/lib/workspace/knowledge.ts"
+      ],
+      "maps": [
+        "crates/chimaera-server/AGENTS.md",
+        "plugins/AGENTS.md",
+        "web-ui/src/lib/knowledge/AGENTS.md",
+        "web-ui/src/lib/workspace/AGENTS.md"
+      ],
+      "rules": [
+        ".claude/rules/daemon.md",
+        ".claude/rules/web-ui.md"
+      ],
+      "checks": [
+        "cargo test -p chimaera-server",
+        "bash scripts/build-plugins.sh",
+        "npm --prefix web-ui run check",
+        "npm --prefix web-ui run test"
+      ]
+    },
+    {
+      "id": "workbench",
+      "name": "Workbench — panes, tabs, workspaces & navigation",
+      "page": "docs/features/workbench.md",
+      "paths": [
+        "web-ui/src/lib/layout/**",
+        "crates/chimaera-server/src/workspaces.rs",
+        "crates/chimaera-server/src/view_state.rs",
+        "crates/chimaera-server/src/quickopen.rs",
+        "web-ui/src/lib/shared/keys.ts"
+      ],
+      "maps": [
+        "crates/chimaera-server/AGENTS.md",
+        "web-ui/src/lib/layout/AGENTS.md",
+        "web-ui/src/lib/shared/AGENTS.md"
+      ],
+      "rules": [
+        ".claude/rules/daemon.md",
+        ".claude/rules/web-ui.md"
+      ],
+      "checks": [
+        "cargo test -p chimaera-server",
+        "npm --prefix web-ui run check",
+        "npm --prefix web-ui run test"
+      ]
+    }
+  ]
+}
