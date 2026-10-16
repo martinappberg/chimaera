@@ -721,6 +721,28 @@ Two Opus lanes in one worktree, disjoint files, one API contract set up front (e
 - Loaders: `recents.rs` (8 MiB), `workspaces.rs` (8 MiB), `view_state.rs` (16 MiB = 2 × keys × per-key cap), `ledger.rs` (16 MiB; boot load now on the blocking pool), `recents_archive.rs` (16 MiB), `plugins/trust.rs` (8 MiB), `drafts.rs` (≈6 MiB from the worst-case escaping of its capped fields; the sidecar too). Each cap is a named const with its reason. An oversized file is corruption for recents, workspaces, view-state and the ledger: it loads empty with one warning and the next write replaces it; the archive holds instead (replacing it would un-hide every conversation) and trust fails closed. An unreadable file (`Bounded::Io`) is never overwritten: the store holds its writes, retries the bounded read on the next write (the ledger on every reconcile tick), merges what is on disk with this daemon's state by that store's own rule once it reads (ledger: the old daemon's agents retire to Recents; workspaces: this daemon's record wins per id and root; recents and the archive: union by key; view-state: disk keys this daemon lacks are kept), then releases. While held: a workspace add rolls back and answers 503, a view-state put keeps memory and answers 204 (hot state), recents and the ledger log once per hold. The ledger starts held until its boot read lands, so a stop during that read writes nothing; if it is still held at a graceful stop, `ledger::final_flush` retires every live agent session to Recents so nothing vanishes. An independent review (Opus) is what turned the first cut's lifetime holds into this rule.
 - Known limits, deliberate: five boot-time loads still run synchronously inside `AppState::new`, before the listener accepts connections, so nothing is waiting on the reactor yet; the ledger's and recents' own writes still run synchronously under their mutex where they always did; `materialize_prelude` still writes its small per-session file where it is called. Moving these is a `lifecycle.rs`/`state.rs` change that was not in scope.
 
+### Execution record: wave 3 (workflow and UI contracts), 2026-10-16
+
+One coordinator ran two writing lanes at once in a single worktree, then one read-only review. The lanes owned disjoint files. No Rust was built in this wave (another session held the build); every check here is a Node or documentation check.
+
+| Lane | Model | Owned files | Result |
+|---|---|---|---|
+| UI contracts guide + a11y review (§5) | Opus | `docs/agent-guides/ui-contracts.md`, `.claude/rules/web-ui.md` (one bullet), `web-ui/src/lib/shared/AGENTS.md` (one sentence), `docs/README.md`, root `AGENTS.md`, `web-ui/src/**/*.svelte` (comments only) | Eight contract sections, each with the primitive, the helper, the states and one cited example; a Gaps section with ten proposals and nothing built; all 67 `svelte-ignore a11y_*` suppressions reviewed one by one: 51 kept with a reason, 16 removed as stale (no element or behavior changed), 0 defects fixed; 92 icon-only buttons scanned, all named |
+| Skills (§10 table) | Sonnet | the ten `.claude/skills/*/SKILL.md` | Every required improvement present; no command, path, flag or gotcha dropped (a span-by-span check against `HEAD`); the bridges unchanged because every `name` and `description` stayed |
+| Independent review | Opus | read-only | Sampled 10 guide claims (6 true, 3 imprecise, 1 false) and 10 skill commands (8 OK, 2 imprecise); 12 findings, no blocker; all fixed before the PR opened |
+
+Evidence:
+
+- The stale suppressions were found by disabling all 67 at once and reading `svelte-check`'s 58 warnings; the review re-compiled the 11 edited files with `svelte/compiler` and found 0 a11y warnings, with the kept suppressions warning as expected when disabled.
+- `svelte-check`: 1083 files, 0 errors, 0 warnings, before and after. Vitest: 147 files, 2332 tests pass, 3 skipped. `node scripts/check-doc-links.mjs` (129 files) and `node scripts/check-agent-assets.mjs` pass.
+- The review's false claim (`tabNavigation` had three consumers, not two) and the imprecise ones (the `--muted` on `--row-active` floor is 4.0:1; `--accent-text` keeps 75% accent; the reload gate only defers the asset reload and Reload Window) are corrected in the guide. Six `preview_*` tool names that no session exposes were replaced in three skills with the tools that exist.
+
+Left for later, with the evidence that scopes it:
+
+- The guide's Gaps section: no spacing tokens or breakpoints; `Segmented` and four other radio groups without arrow keys; ten tab lists in eight files not on `tabNavigation`; two `aria-modal` overlays not on `modalFocus`; no shared Escape helper, preview state component, or live-region announcer; the split edit/preview divider is pointer-only. Each needs a live check and is not a documentation change.
+- The §5 component/browser checks (modal focus, permission answers, disconnected composer, unsaved close, pane switching, error boundaries) were not started; the guide names the behaviors they would cover.
+- Native-app whole-window zoom was not checked.
+
 ### Execution record: wave 4 (Phase 2, the §6 document split), 2026-10-16
 
 Docs only, no Rust built. One coordinator, an inventory first (every file that links into the three documents; no inbound link carried an anchor, so file paths were the only contract to keep), then three concurrent Opus lanes on disjoint files, a Sonnet lane for the pointers once they handed back, two independent read-only Opus reviews, and two clean-context exercises on the finished tree.
@@ -752,6 +774,7 @@ Clean-context exercises (fresh Sonnet agents, read-only, told to orient from the
 Gaps the exercises reported, for the next documentation wave: no doc names which probe deadline a new timeout setting should feed, or where a new `agents.*` row goes in the bespoke Agents settings category; there is no single "add an event" checklist (the pieces are in the chat-mode skill, one chat reference bullet and `cross-agent.md`); no doc states how an unknown event tag is treated by the UI reducer or by an older daemon reading a newer journal; the root map does not say which rule files apply to a chat event. Two entry documents are still over budget and were out of this wave's scope: `web-ui/src/lib/settings/AGENTS.md` (11.4k chars) and `crates/chimaera-agent/AGENTS.md` (20.8k chars; its `lib.rs` row alone is a wall of text).
 
 Left as follow-ups with their evidence: the agent-protocol rule's argv sentence said argv never lives in a driver, while `claude::chat_args` supplies the stream-json flags (the rule now says who owns which arguments); the `TESTED_CURSOR_VERSION` doc comment in `acp.rs` still says turn-level facts await a signed-in run, though Pass 45 recorded them (Rust untouched in this wave); the Rust and docs references that read "PROTOCOL.md Pass N" are correct but now name the index rather than `protocol/passes.md`; the Timeline and status-feed sections of the server reference are long paragraphs the source never broke.
+||||||| 5c5bdf32
 
 ## 10. Keep the repository healthy as it grows
 

@@ -15,6 +15,10 @@ This skill closes that gap. It has two jobs, and the split is load-bearing:
   **maintainer's ground truth**, exactly like a feature's `## Intent`. You never invent or
   "helpfully improve" it alone. You surface the tensions and *brainstorm*; the maintainer decides.
 
+Keep public positioning separate from internal engineering language. Public copy
+describes what a person can do. Internal terms, plan names, and agent procedure stay
+in the docs.
+
 ## The public surfaces (keep them in sync)
 
 | File | What it is |
@@ -106,7 +110,7 @@ session; record them in the PR body so the next run knows what was deliberate.
   content stays inside a static `div` with `data-nosnippet` so it cannot supply search snippets.
 - **Eyeball it:** serve the static site and look at the hero, a new feature card, and the changed
   FAQ in **both** light and dark. Use the existing `site` entry in `.claude/launch.json`
-  (`preview_start` → `preview_screenshot`) when that tooling is available, or run
+  (`preview_start`, then a screenshot) when that tooling is available, or run
   `python3 -m http.server --directory site` and open it with the available browser tools.
 
 ## Step 5 — ship
