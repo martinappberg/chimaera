@@ -43,6 +43,93 @@ Run it sooner and it releases the newest commit that *has* passed, which leaves 
 fix for the next run. The run's `version` job logs the merges it read and its
 decision.
 
+## macOS signing and notarization
+
+The native-app release uses **Developer ID Application: Lieberose Consulting AB
+(8PPK8S7967)**. The identity and team ID are public and pinned in `release.yml`.
+The base Tauri config keeps `signingIdentity: "-"` for development and PR builds;
+`APPLE_SIGNING_IDENTITY` overrides it on releases. Keep `Entitlements.plist`: the
+app also runs the daemon, whose Wasmtime plugins need executable memory, and
+voice dictation needs microphone access.
+
+Three independent credentials protect distribution:
+
+- A Developer ID Application certificate and its private key sign the Mac app.
+- An App Store Connect team API key authenticates notarization with Apple.
+- The existing `TAURI_SIGNING_PRIVATE_KEY*` secrets sign updater archives. Keep
+  these unchanged when configuring Apple signing so installed clients can update.
+
+### One-time credentials
+
+1. In Xcode's Apple Accounts settings, select Lieberose Consulting AB and create
+   a Developer ID Application certificate. Check the installed identity with
+   `security find-identity -v -p codesigning`.
+2. Export that certificate **with its private key** as a password-protected `.p12`.
+   Keep it outside the repository. Encode it for GitHub with
+   `openssl base64 -A -in /absolute/path/to/certificate.p12`.
+3. In App Store Connect, request API access if necessary. Create a **team** API
+   key with Developer access and download its `.p8` file. Keep the downloaded
+   private key safe: Apple permits one download. Record the Key ID and Issuer ID.
+4. Set the following repository Actions secrets. Send private-key contents
+   through stdin or the GitHub secrets form, never commit them or log them.
+
+| Secret | Value |
+|---|---|
+| `APPLE_CERTIFICATE` | Base64 of the certificate and private key `.p12` |
+| `APPLE_CERTIFICATE_PASSWORD` | The `.p12` export password |
+| `APPLE_API_ISSUER` | App Store Connect team Issuer ID |
+| `APPLE_API_KEY` | App Store Connect Key ID |
+| `APPLE_API_PRIVATE_KEY` | Contents of the downloaded `.p8` file |
+
+The workflow writes the `.p8` to a private runner-temporary file and sets
+`APPLE_API_KEY_PATH`. It validates notarization authentication before building
+and deletes the temporary key in an `always()` step. Tauri imports the `.p12`
+for signing. Apple secrets are used only by the macOS release job; PRs do not
+receive them. Missing credentials stop publication.
+
+### Local build
+
+Use the installed certificate, so no `.p12` export is needed locally. Set
+`APPLE_SIGNING_IDENTITY` to the identity above, `APPLE_TEAM_ID=8PPK8S7967`,
+`APPLE_API_ISSUER`, `APPLE_API_KEY`, and `APPLE_API_KEY_PATH` to your downloaded
+key's absolute path. Follow the [develop preflight](../../.claude/skills/develop/SKILL.md#preflight-what-can-this-session-do)
+before building, including Node 26 and one Rust build at a time. Then, from the
+repository root:
+
+```sh
+just app-build-signed
+```
+
+For automatic local setup, put those exports in
+`~/.config/chimaera/signing/env.sh` with mode `0600` and keep the `.p8` in the same
+private directory. The wrapper loads that file outside CI. Do not store signing
+credentials in a worktree, which may be removed after a PR merges.
+
+macOS may ask you to authorize `codesign` to use the private key in your login
+Keychain. Approve that system prompt locally when it appears. CI uses the
+certificate imported into Tauri's temporary keychain instead.
+
+This local build disables only updater artifact creation; Apple signing and
+notarization remain required. For Apple-ID authentication instead of an API key,
+set `APPLE_ID`, `APPLE_PASSWORD` (an app-specific password), and `APPLE_TEAM_ID`.
+Keep credentials out of shell history and version control.
+
+### Publication gate
+
+`scripts/build-macos-release.sh` is tauri-action's custom build command. It builds
+once, verifies the exact app's signature and expected certificate/team, validates
+its stapled notarization ticket, checks Gatekeeper acceptance, and exercises the
+real plugin reader under the hardened runtime. The action uploads only after all
+checks succeed. The DMG contains this notarized app. The separate macOS CLI daemon
+artifact is outside this app-signing flow.
+
+`node --test scripts/build-macos-release.test.mjs` verifies failure propagation
+with mocked platform tools; it does not prove Apple acceptance. A real signed,
+notarized build and plugin smoke are required for that evidence.
+
+References: [Apple Developer ID](https://developer.apple.com/help/account/certificates/create-developer-id-certificates/),
+[Tauri macOS signing](https://v2.tauri.app/distribute/sign/macos/).
+
 ## Linux runner migration
 
 `ci.yml` and the four release jobs formerly using `ubuntu-latest` are temporarily

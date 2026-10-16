@@ -108,8 +108,10 @@ Two repo secrets sign updates:
 The matching public key lives in `crates/chimaera-app/tauri.conf.json` under
 `plugins.updater.pubkey` and is safe to commit. Rotating the private key means bumping the
 public key there, and clients on the old key will stop auto-updating until they reinstall.
-Until an Apple Developer ID is configured the bundles are unsigned by Apple (Gatekeeper),
-which is independent of update signing; see the note in `.github/workflows/app.yml`.
+Apple Developer ID signing and notarization are independent of update signing.
+The macOS release job requires Apple credentials and verifies the signed bundle
+before publication; PR builds remain ad hoc signed. See the
+[macOS signing setup](../docs/agent-guides/releases.md#macos-signing-and-notarization).
 
 ## License and CLA
 

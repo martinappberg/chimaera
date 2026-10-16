@@ -565,6 +565,8 @@
       "name": "Native app (the Tauri shell)",
       "page": "docs/features/native-app.md",
       "paths": [
+        "scripts/build-macos-release.sh",
+        "scripts/build-macos-release.test.mjs",
         "crates/chimaera-app/src/**",
         "web-ui/src/lib/net/native.ts",
         "web-ui/src/lib/workspace/UpdateToast.svelte",
@@ -581,6 +583,8 @@
       ],
       "checks": [
         "just app-check",
+        "just app-build-signed",
+        "node --test scripts/build-macos-release.test.mjs",
         "npm --prefix web-ui run check",
         "npm --prefix web-ui run test"
       ]

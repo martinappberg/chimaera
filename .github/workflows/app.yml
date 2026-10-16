@@ -130,10 +130,9 @@ jobs:
       # The bundle is the shippable artifact; the raw .app is a directory
       # with symlinks that artifact-zipping would flatten.
       #
-      # macOS is unsigned until Apple signing lands: to sign + notarize, add
-      # APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_SIGNING_IDENTITY
-      # / APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID as repo secrets and export
-      # them on the build step (tauri picks them up).
+      # PR artifacts stay ad hoc signed and do not receive Apple credentials.
+      # release.yml owns Developer ID signing + notarization; setup is in
+      # docs/agent-guides/releases.md#macos-signing-and-notarization.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.artifact }}
