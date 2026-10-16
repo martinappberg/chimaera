@@ -54,6 +54,9 @@
   import { backgroundKind } from "./backgroundKinds";
   import AgentsTray from "./AgentsTray.svelte";
   import BackgroundTray from "./BackgroundTray.svelte";
+  import AheadCard from "./AheadCard.svelte";
+  import WorkStrip from "./WorkStrip.svelte";
+  import { goalLive, jobPeriodMs, type GoalInfo, type ScheduledJob, type ScheduledWakeup } from "./ahead";
   import SubagentBanner from "./SubagentBanner.svelte";
   import { SubagentSocket } from "./subagentSocket.svelte";
   import { subagentChatId, subagentModel, subagentRunning } from "./subagentView";
@@ -1730,6 +1733,28 @@
         // the same data from account/read.
         if (!supports("get_usage")) return false;
         return sendCommand({ type: "get_usage" }, "usage request not sent");
+      case "goal": {
+        // Codex's own `/goal [<objective>|clear|edit|pause|resume]`, on its
+        // thread-goal RPCs. Claude's `/goal` is its own command and rides
+        // its catalog to the CLI.
+        if (!supports("set_goal")) return false;
+        const rest = args.trim();
+        if (arg === "clear") return sendCommand({ type: "clear_goal" }, "goal change not sent");
+        if (arg === "pause") return sendCommand({ type: "pause_goal" }, "goal change not sent");
+        if (arg === "resume") return sendCommand({ type: "resume_goal" }, "goal change not sent");
+        if (arg === "edit" || rest === "") {
+          if (goalLive(store.goal) && composerApi !== undefined) {
+            // Codex's `/goal edit`: the objective back in the composer to
+            // change. After the composer clears the handled slash.
+            const text = `/goal ${store.goal.objective}`;
+            void tick().then(() => composerApi?.nativeFill(text, "replace"));
+            return true;
+          }
+          store.notice("Usage: /goal [<objective>|clear|edit|pause|resume]", "info");
+          return true;
+        }
+        return sendCommand({ type: "set_goal", objective: rest }, "goal not sent");
+      }
       case "compact":
         // Codex has no slash catalog; thread/compact/start is the native
         // path (the compaction turn's notice confirms completion). Claude's
@@ -1987,6 +2012,12 @@
     }
     if (supports("compact")) {
       native.push({ name: "compact", description: "compact conversation context" });
+    }
+    if (supports("set_goal")) {
+      native.push({
+        name: "goal",
+        description: "set a goal Codex keeps working toward (clear, edit, pause, resume)",
+      });
     }
     const nativeNames = new Set(native.map((n) => n.name.toLowerCase()));
     return [
@@ -2271,6 +2302,25 @@
     return formatElapsedSeconds(Math.floor(totalSec));
   }
 
+  /** A turn nobody typed, said by what started it. */
+  function wakeLabel(block: Extract<ChatBlock, { kind: "wake" }>): string {
+    const label = block.label;
+    switch (block.cause) {
+      case "monitor":
+        return `Woke on a monitor event${label !== null ? ` · “${label}”` : ""}`;
+      case "background":
+        return "Woke on background work";
+      case "wakeup":
+        return `Woke up${label !== null ? ` · ${label}` : ""}`;
+      case "job":
+        return `Woke on schedule${label !== null ? ` · “${label}”` : ""}`;
+      case "goal":
+        return "Continuing toward the goal";
+      default:
+        return "Resumed on its own";
+    }
+  }
+
   type ActiveAgent = Extract<ChatBlock, { kind: "tool" }>;
 
   /** Live auxiliary surfaces are deliberately distinct from transcript rows.
@@ -2290,9 +2340,15 @@
   let pinnedQuestions = $state.raw<PendingQuestion[]>([]);
   let pinnedElicitations = $state.raw<PendingElicitation[]>([]);
   let pinnedSends = $state.raw<PendingSend[]>([]);
+  let pinnedWakeup = $state.raw<ScheduledWakeup | null>(null);
+  let pinnedJobs = $state.raw<ScheduledJob[]>([]);
+  let pinnedGoal = $state.raw<GoalInfo | null>(null);
   $effect(() => {
     if (!visible) {
       untrack(() => {
+        pinnedWakeup = $state.snapshot(store.wakeup);
+        pinnedJobs = $state.snapshot(store.jobs);
+        pinnedGoal = $state.snapshot(store.goal);
         pinnedAgents = $state.snapshot(liveActiveAgents);
         pinnedBackgroundTasks = $state.snapshot(store.backgroundTasks);
         pinnedPlan = $state.snapshot(store.plan);
@@ -2312,7 +2368,67 @@
     pinnedQuestions = store.questions;
     pinnedElicitations = store.elicitations;
     pinnedSends = store.pendingSends;
+    pinnedWakeup = store.wakeup;
+    pinnedJobs = store.jobs;
+    pinnedGoal = store.goal;
   });
+  /** What resumes this agent on its own — nothing does in a dead process. */
+  const aheadGoal = $derived(store.exited === null && goalLive(pinnedGoal) ? pinnedGoal : null);
+  const aheadWakeup = $derived(store.exited === null ? pinnedWakeup : null);
+  const aheadJobs = $derived(store.exited === null ? pinnedJobs : []);
+  const aheadScheduled = $derived.by(() => {
+    let at: number | null = aheadWakeup?.atMs ?? null;
+    let from = aheadWakeup?.scheduledAtMs ?? 0;
+    for (const job of aheadJobs) {
+      if (job.nextAtMs !== null && (at === null || job.nextAtMs < at)) {
+        at = job.nextAtMs;
+        from = job.nextAtMs - jobPeriodMs(job.cron);
+      }
+    }
+    return { count: (aheadWakeup !== null ? 1 : 0) + aheadJobs.length, at, from };
+  });
+  /** Kinds of work pinned above the composer at once. Three or more fold
+   *  into one strip; it unfolds only when one kind is left, so the stack
+   *  doesn't flip back and forth as subagents come and go. */
+  const workKinds = $derived(
+    (aheadGoal !== null ? 1 : 0) +
+      (aheadScheduled.count > 0 ? 1 : 0) +
+      (pinnedAgents.length > 0 ? 1 : 0) +
+      (pinnedBackgroundTasks.length > 0 ? 1 : 0),
+  );
+  let workFolded = $state(false);
+  $effect(() => {
+    const kinds = workKinds;
+    untrack(() => {
+      if (kinds >= 3) workFolded = true;
+      else if (kinds <= 1) workFolded = false;
+    });
+  });
+  /** Claude stops a loop only when asked (its own `/loop` says so); the
+   *  message shows in the transcript like any other. */
+  const canAskClaude = $derived(!readOnly && agentKind === "claude" && store.exited === null);
+  function askAgent(text: string) {
+    if (!sendMessage(text, [], false)) store.notice("message not sent — reconnecting", "error");
+  }
+  const stopLoop = $derived(canAskClaude ? () => askAgent("Stop the loop.") : undefined);
+  const cancelJob = $derived(
+    canAskClaude ? (id: string) => askAgent(`Cancel scheduled job ${id}.`) : undefined,
+  );
+  const goalPause = $derived(
+    !readOnly && supports("pause_goal") ? () => sendCommand({ type: "pause_goal" }, "goal change not sent") : undefined,
+  );
+  const goalResume = $derived(
+    !readOnly && supports("resume_goal") ? () => sendCommand({ type: "resume_goal" }, "goal change not sent") : undefined,
+  );
+  const goalClear = $derived(
+    readOnly
+      ? undefined
+      : supports("clear_goal")
+        ? () => sendCommand({ type: "clear_goal" }, "goal change not sent")
+        : canAskClaude
+          ? () => askAgent("/goal clear")
+          : undefined,
+  );
   /** Another agent's message waiting on the user to wake this one (rare,
    *  and read from the workspace's comms store, so it is not frozen with
    *  the pinned cards while hidden). */
@@ -3054,25 +3170,60 @@
       {:else if item.block.kind === "finished"}
         {@render finishedRow(item.block, item.index)}
       {:else if item.block.kind === "wake"}
-        <div class="wake activity" data-block-index={item.index} data-block-uid={item.block.uid}>
-          <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true"
-            ><path
-              d="M13 8a5 5 0 1 1-1.5-3.55M13 3v2.5h-2.5"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.4"
-              stroke-linecap="round"
-              stroke-linejoin="round"
+        <!-- One line, the agent's own words; a long one opens on click. -->
+        <button
+          type="button"
+          class="wake activity"
+          data-block-index={item.index}
+          data-block-uid={item.block.uid}
+          title={item.block.schedule ?? undefined}
+          onclick={(e) => e.currentTarget.toggleAttribute("data-open")}
+        >
+          {#if item.block.cause === "goal"}
+            <svg class="goal-glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true"
+              ><circle cx="8" cy="8" r="5.6" fill="none" stroke="currentColor" stroke-width="1.4" /><circle
+                cx="8"
+                cy="8"
+                r="2.1"
+                fill="currentColor"
+              /></svg
+            >
+          {:else}
+            <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true"
+              ><path
+                d="M13 8a5 5 0 1 1-1.5-3.55M13 3v2.5h-2.5"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              /></svg
+            >
+          {/if}
+          <span class="wake-text">{wakeLabel(item.block)}</span>
+        </button>
+      {:else if item.block.kind === "goal"}
+        <button
+          type="button"
+          class="wake activity goal-line {item.block.tone}"
+          data-block-index={item.index}
+          data-block-uid={item.block.uid}
+          title={item.block.title ?? undefined}
+          onclick={(e) => e.currentTarget.toggleAttribute("data-open")}
+        >
+          <svg class="goal-glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true"
+            ><circle cx="8" cy="8" r="5.6" fill="none" stroke="currentColor" stroke-width="1.4" /><circle
+              cx="8"
+              cy="8"
+              r="2.1"
+              fill="currentColor"
             /></svg
           >
-          <span
-            >{item.block.cause === "monitor"
-              ? `Woke on a monitor event${item.block.label !== null ? ` · “${item.block.label}”` : ""}`
-              : item.block.cause === "background"
-                ? "Woke on background work"
-                : "Resumed on its own"}</span
+          <span class="wake-text"
+            ><span class="goal-label">{item.block.label}</span
+            >{#if item.block.detail !== null}<span class="goal-detail">{" · "}{item.block.detail}</span>{/if}</span
           >
-        </div>
+        </button>
       {:else if item.block.kind === "notice"}
         {@const hook = item.block.tone === "info" ? hookNotice(item.block.text) : null}
         {#if hook}
@@ -3335,27 +3486,70 @@
     <ReferenceChip x={quoteChip.x} y={quoteChip.y} quote />
   {/if}
 
-  {#if pinnedAgents.length > 0}
+  {#snippet agentsTray(embedded: boolean)}
     <AgentsTray
       agents={pinnedAgents}
       subagents={store.subagents}
       {modelName}
       {visible}
+      {embedded}
       onOpen={onOpenSubagent}
       onStop={!readOnly && supports("stop_task") ? stopTask : undefined}
     />
-  {/if}
-
-  {#if pinnedBackgroundTasks.length > 0}
+  {/snippet}
+  {#snippet backgroundTray(embedded: boolean)}
     <!-- Background work (backgrounded Bash / workflows) — stopTask sends the
          native task key the wire gave us; the driver passes it through. -->
     <BackgroundTray
       tasks={pinnedBackgroundTasks}
       {modelName}
       {visible}
+      {embedded}
       onOpen={onOpenSubagent}
       onStop={!readOnly && supports("stop_task") ? stopTask : undefined}
     />
+  {/snippet}
+  {#snippet aheadCard(part: "all" | "goal" | "schedule", embedded: boolean)}
+    <AheadCard
+      wakeup={aheadWakeup}
+      jobs={aheadJobs}
+      goal={aheadGoal}
+      running={agentBusy}
+      {visible}
+      {part}
+      {embedded}
+      onStopLoop={stopLoop}
+      onCancelJob={cancelJob}
+      onGoalPause={goalPause}
+      onGoalResume={goalResume}
+      onGoalClear={goalClear}
+    />
+  {/snippet}
+
+  {#if workFolded && workKinds >= 2}
+    <!-- Three or more kinds of work at once fold into one line. -->
+    <WorkStrip
+      agents={pinnedAgents}
+      tasks={pinnedBackgroundTasks}
+      goal={aheadGoal}
+      scheduled={aheadScheduled}
+      {visible}
+    >
+      {#snippet agentRows()}{@render agentsTray(true)}{/snippet}
+      {#snippet backgroundRows()}{@render backgroundTray(true)}{/snippet}
+      {#snippet goalRows()}{@render aheadCard("goal", true)}{/snippet}
+      {#snippet scheduleRows()}{@render aheadCard("schedule", true)}{/snippet}
+    </WorkStrip>
+  {:else}
+    {#if pinnedAgents.length > 0}
+      {@render agentsTray(false)}
+    {/if}
+    {#if pinnedBackgroundTasks.length > 0}
+      {@render backgroundTray(false)}
+    {/if}
+    {#if aheadGoal !== null || aheadScheduled.count > 0}
+      {@render aheadCard("all", false)}
+    {/if}
   {/if}
 
   <!-- The card is for the plan in flight and the one just finished: a
@@ -3590,6 +3784,8 @@
   /* The pinned cards (subagents, background, plan) keep their borders on
      the column's text edges and stack 6px apart. */
   .chat > :global(.plan-card),
+  .chat > :global(.ahead.pinned-card),
+  .chat > :global(.strip),
   .chat > :global(.tray),
   .chat > :global(.wake-card) {
     width: calc(100% - 36px);
@@ -3597,7 +3793,7 @@
     margin: 6px auto;
     box-sizing: border-box;
   }
-  .chat > :global(:is(.tray, .plan-card, .wake-card) + :is(.tray, .plan-card, .wake-card)) {
+  .chat > :global(:is(.tray, .plan-card, .wake-card, .ahead, .strip) + :is(.tray, .plan-card, .wake-card, .ahead, .strip)) {
     margin-top: 0;
   }
   .startup-detail {
@@ -3853,12 +4049,43 @@
   /* A turn the agent started itself: a quiet marker above its reply. */
   .wake {
     display: flex;
-    align-items: center;
+    align-items: baseline;
     gap: 6px;
+    width: 100%;
+    min-width: 0;
     padding: 2px 0;
+    border: none;
+    background: none;
+    font: inherit;
+    text-align: left;
     color: var(--activity-fg, var(--muted));
     font-size: var(--text-xs);
     line-height: 1.4;
+    cursor: default;
+  }
+  .wake > svg {
+    flex: none;
+    align-self: center;
+  }
+  /* One line until opened: a reason or a check can run to a paragraph. */
+  .wake-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .wake:global([data-open]) .wake-text {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .goal-line.done .goal-glyph {
+    color: var(--accent);
+  }
+  .goal-line.warn .goal-glyph {
+    color: var(--warn);
+  }
+  .goal-label {
+    color: color-mix(in srgb, var(--activity-fg, var(--muted)) 70%, var(--fg));
   }
   .status-part {
     font-variant-numeric: tabular-nums;

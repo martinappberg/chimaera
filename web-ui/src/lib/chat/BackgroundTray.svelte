@@ -1,3 +1,26 @@
+<script module lang="ts">
+  import { countKinds as count } from "./backgroundKinds";
+  import type { BackgroundTask as Task } from "./store.svelte";
+
+  /** The collapsed header says exactly what is out, and doubles as the
+   *  session's "still waiting on something" signal between turns: a watch is
+   *  named ("Watching “build log”"), everything else counted per kind
+   *  ("1 command · 1 agent in the background"). Shared with the folded work
+   *  strip's tooltip. */
+  export function backgroundLabel(tasks: Task[]): string {
+    const monitors = tasks.filter((t) => t.monitor);
+    const watch =
+      monitors.length === 1
+        ? `Watching “${monitors[0].description}”`
+        : monitors.length > 1
+          ? `Watching ${monitors.length} monitors`
+          : "";
+    const rest = count(tasks, ["monitor"]);
+    if (watch === "") return `${rest} in the background`;
+    return rest === "" ? watch : `${watch} · ${rest} in the background`;
+  }
+</script>
+
 <script lang="ts">
   import { elapsedSince } from "../shared/time";
   import { liveClock } from "../shared/liveClock.svelte";
@@ -5,7 +28,7 @@
   import WorkTrayRow from "../shared/WorkTrayRow.svelte";
   import SubagentChip from "./SubagentChip.svelte";
   import ModelChip from "./ModelChip.svelte";
-  import { backgroundKind, countKinds } from "./backgroundKinds";
+  import { backgroundKind } from "./backgroundKinds";
   import type { BackgroundTask } from "./store.svelte";
 
   /**
@@ -34,8 +57,10 @@
     onStop?: (id: string) => void;
     /** False while the owning retained chat tab is hidden. */
     visible?: boolean;
+    /** Rows only, inside the folded work strip (which draws the chrome). */
+    embedded?: boolean;
   }
-  let { tasks, modelName, onOpen, onStop, visible = true }: Props = $props();
+  let { tasks, modelName, onOpen, onStop, visible = true, embedded = false }: Props = $props();
 
   /** Bound to the shell's expanded state — the clock below gates on it. */
   let open = $state(false);
@@ -43,7 +68,7 @@
   /** The shared 1 Hz clock, read only while the rows are actually visible:
    *  collapsed (the default) nothing reads it, so a long-running task
    *  doesn't tick a wake-up per second for hours. */
-  const clock = liveClock(() => visible && open);
+  const clock = liveClock(() => visible && (open || embedded));
 
   /** Elapsed since the driver first saw the task. */
   const elapsed = (t: BackgroundTask): string => elapsedSince(t.startedAtMs, clock.ms);
@@ -53,22 +78,8 @@
    *  stays the honest total. */
   const DOTS_MAX = 24;
 
-  /** The collapsed header says exactly what is out, and doubles as the
-   *  session's "still waiting on something" signal between turns: a watch is
-   *  named ("Watching “build log”"), everything else counted per kind
-   *  ("1 command · 1 agent in the background"). */
   const monitors = $derived(tasks.filter((t) => t.monitor));
-  const label = $derived.by(() => {
-    const watch =
-      monitors.length === 1
-        ? `Watching “${monitors[0].description}”`
-        : monitors.length > 1
-          ? `Watching ${monitors.length} monitors`
-          : "";
-    const rest = countKinds(tasks, ["monitor"]);
-    if (watch === "") return `${rest} in the background`;
-    return rest === "" ? watch : `${watch} · ${rest} in the background`;
-  });
+  const label = $derived(backgroundLabel(tasks));
 
   function dotClass(state: string): string {
     if (state === "done") return "done";
@@ -77,12 +88,7 @@
   }
 </script>
 
-<WorkTray
-  glyph={monitors.length > 0 ? "◉" : "⧖"}
-  bind:open
-  {visible}
-  {label}
->
+{#snippet rows()}
   {#each tasks as task (task.id)}
     {@const e = elapsed(task)}
     <WorkTrayRow
@@ -138,7 +144,15 @@
       {/if}
     </WorkTrayRow>
   {/each}
-</WorkTray>
+{/snippet}
+
+{#if embedded}
+  {@render rows()}
+{:else}
+  <WorkTray glyph={monitors.length > 0 ? "◉" : "⧖"} bind:open {visible} {label}>
+    {@render rows()}
+  </WorkTray>
+{/if}
 
 <style>
   .name {

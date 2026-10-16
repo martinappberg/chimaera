@@ -1801,6 +1801,76 @@ describe("ChatStore wake markers (turns nobody typed)", () => {
   });
 });
 
+describe("ChatStore loops and goals", () => {
+  const WAKE = { at_ms: 1_000_000, scheduled_at_ms: 940_000, reason: "Check the deploy", prompt: "/loop check" };
+  const JOB = { id: "f2143f41", cron: "*/10 * * * *", schedule: "Every 10 minutes", prompt: "post the graph",
+    recurring: true, next_at_ms: 1_300_000, created_at_ms: 1 };
+
+  it("keeps the schedule as the latest level-set, deduped by job id, gone with the process", () => {
+    const store = fold([
+      { type: "schedule", wakeup: WAKE, jobs: [JOB, JOB] },
+    ]);
+    expect(store.wakeup).toMatchObject({ atMs: 1_000_000, reason: "Check the deploy" });
+    expect(store.jobs.map((j) => j.id)).toEqual(["f2143f41"]);
+    store.apply({ seq: 2, ts: 2, ev: { type: "exited", status: 0 } } as SeqEvent);
+    expect(store.wakeup).toBeNull();
+    expect(store.jobs).toEqual([]);
+  });
+
+  it("names a woken turn by what fired it", () => {
+    const store = fold([
+      { type: "user_message", text: "/loop check", attachments: 0 },
+      { type: "turn_started", turn_id: "t1" },
+      { type: "turn_completed", turn_id: "t1", usage: {} },
+      { type: "turn_started", turn_id: "t2" },
+      { type: "turn_cause", turn_id: "t2", kind: "wakeup", detail: "Check the deploy" },
+      { type: "turn_completed", turn_id: "t2", usage: {} },
+      { type: "turn_started", turn_id: "t3" },
+      { type: "turn_cause", turn_id: "t3", kind: "job", detail: "post the graph", schedule: "Every 10 minutes" },
+    ]);
+    expect(store.blocks.filter((b) => b.kind === "wake")).toEqual([
+      expect.objectContaining({ cause: "wakeup", label: "Check the deploy" }),
+      expect.objectContaining({ cause: "job", label: "post the graph", schedule: "Every 10 minutes" }),
+    ]);
+  });
+
+  it("writes one line per goal move in the agent's own words", () => {
+    const goal = { objective: "all tests pass", status: "active", turns: 0 };
+    const store = fold([
+      { type: "goal", goal },
+      // A restart re-reports the same goal: not a new one.
+      { type: "goal", goal },
+      { type: "goal", goal: { ...goal, turns: 1, last_check: "2 still fail" } },
+      { type: "goal", goal: null, ended: { outcome: "achieved", objective: "all tests pass",
+        reason: "48 passed", turns: 3, tokens: 41_000, duration_secs: 840 } },
+    ]);
+    expect(store.blocks.filter((b) => b.kind === "goal").map((b) => b.kind === "goal" && [b.label, b.detail])).toEqual([
+      ["Goal set", "all tests pass"],
+      ["Goal not yet met", "2 still fail"],
+      ["Goal achieved", "14m · 3 turns · 41k tokens"],
+    ]);
+    expect(store.goal).toBeNull();
+  });
+
+  it("says when a Codex goal stops, resumes and could not be achieved", () => {
+    const g = { objective: "migrate", status: "active", tokens_used: 10, token_budget: 100 };
+    const store = fold([
+      { type: "goal", goal: g },
+      { type: "goal", goal: { ...g, status: "paused" } },
+      { type: "goal", goal: { ...g, status: "active" } },
+      { type: "goal", goal: { ...g, status: "budgetLimited" } },
+      { type: "goal", goal: null, ended: { outcome: "failed", objective: "x", reason: "impossible" } },
+    ]);
+    expect(store.blocks.filter((b) => b.kind === "goal").map((b) => b.kind === "goal" && b.label)).toEqual([
+      "Goal set",
+      "Goal paused",
+      "Goal resumed",
+      "Goal reached its token budget",
+      "Goal could not be achieved",
+    ]);
+  });
+});
+
 describe("ChatStore turn artifacts (the made-this-turn gallery)", () => {
   /** Fold with explicit journal timestamps: `[ts, event]`. */
   function foldAt(events: [number, Record<string, unknown>][]): ChatStore {

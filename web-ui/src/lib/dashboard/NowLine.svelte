@@ -6,7 +6,8 @@
    * terminals fold into a count. "show cards" flips the roster setting.
    */
   import { inlineMarkdown } from "../shared/inlineMarkdown";
-  import { isBusy, needsAttention, type Session } from "../workspace/sessions";
+  import { isBusy, needsAttention, scheduledWake, type Session } from "../workspace/sessions";
+  import { untilLabel } from "../chat/ahead";
 
   interface Props {
     agents: Session[];
@@ -30,6 +31,11 @@
         tone: s.agent_state === "errored" ? "err" : "warn",
         markdown: false,
       };
+    }
+    const wake = scheduledWake(s);
+    if (wake !== null) {
+      const when = wake.at_ms !== null ? `wakes ${untilLabel(wake.at_ms, Date.now())}` : "scheduled";
+      return { text: when, tone: "muted", markdown: false };
     }
     if (isBusy(s)) {
       const now = s.now_line ?? s.status_detail;

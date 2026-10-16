@@ -40,7 +40,8 @@
 //! first message schedules a `ScheduleWakeup` that fires after
 //! `FAKE_LOOP_DELAY_MS` as a turn opened by an unsent command, `FAKE_LOOP_TICKS`
 //! times, plus an every-10-minutes `CronCreate` job; `/goal <cond>` sets a goal
-//! and fails one check; `/goal clear` clears it; "Stop the loop." stops both).
+//! and fails one check; `/goal clear` clears it; "Stop the loop." stops both;
+//! a message with "everything" runs the `showcase` turn instead).
 
 use std::io::{BufRead, Write};
 
@@ -1288,6 +1289,12 @@ fn run_loop_turn(frame: &Value, stop: &std::sync::Arc<std::sync::atomic::AtomicB
         stream(json!({ "type": "message_start", "message": { "id": "mg-3" } }));
         stream_text("mg-3", "Still working on the token refresh.");
         loop_result();
+        return;
+    }
+    // The showcase turn leaves background work running: with a loop and a
+    // goal that is three kinds of work at once (the folded strip).
+    if text.contains("everything") {
+        run_showcase_turn();
         return;
     }
     if text.trim() == "Stop the loop." || text.starts_with("Cancel scheduled job") {

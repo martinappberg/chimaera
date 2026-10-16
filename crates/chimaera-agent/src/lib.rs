@@ -303,6 +303,10 @@ pub struct NextWake {
     /// Epoch ms of the earliest known run; `None` when the only items are
     /// jobs whose next run is unknown.
     pub at_ms: Option<u64>,
+    /// When the wait for `at_ms` began (a wakeup's scheduling time) — a
+    /// countdown's full span; `None` for a job.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_ms: Option<u64>,
     /// The agent's words for it: a wakeup's reason, a job's prompt.
     pub label: String,
     /// Scheduled items in all (one wakeup plus the jobs).
@@ -322,23 +326,26 @@ impl NextWake {
         if count == 0 {
             return None;
         }
-        let mut next: Option<(u64, String)> = wakeup.map(|w| (w.at_ms, w.reason.clone()));
+        let mut next: Option<(u64, Option<u64>, String)> =
+            wakeup.map(|w| (w.at_ms, Some(w.scheduled_at_ms), w.reason.clone()));
         for job in jobs {
             if let Some(at) = job.next_at_ms {
-                if next.as_ref().is_none_or(|(n, _)| at < *n) {
-                    next = Some((at, job.prompt.clone()));
+                if next.as_ref().is_none_or(|(n, _, _)| at < *n) {
+                    next = Some((at, None, job.prompt.clone()));
                 }
             }
         }
-        let (at_ms, label) = match next {
-            Some((at, label)) => (Some(at), label),
+        let (at_ms, from_ms, label) = match next {
+            Some((at, from, label)) => (Some(at), from, label),
             None => (
+                None,
                 None,
                 jobs.first().map(|j| j.prompt.clone()).unwrap_or_default(),
             ),
         };
         Some(NextWake {
             at_ms,
+            from_ms,
             label: model::truncate_label(&label, 200),
             count,
         })

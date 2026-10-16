@@ -128,6 +128,7 @@ export function blockWeight(
       if (block.tone === "info" && hookNotice(block.text)) return 1;
       return textLines(block.text, charsPerLine) + 0.5;
     case "wake":
+    case "goal":
     case "finished":
       return 1;
   }

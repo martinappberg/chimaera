@@ -23,6 +23,7 @@
   import {
     agentKind,
     backgrounded,
+    scheduledWake,
     dotState,
     dotTitle,
     type Session,
@@ -31,6 +32,7 @@
   import { unreadFor } from "../workspace/comms.svelte";
   import SameFileNotice from "../workspace/SameFileNotice.svelte";
   import { inlineMarkdown } from "../shared/inlineMarkdown";
+  import { untilLabel } from "../chat/ahead";
   import type { BackgroundTask, ChatBlock, ChatStore } from "../chat/store.svelte";
   import { provenanceOf, provenanceTitle , relPath as sharedRelPath} from "./dash";
 
@@ -72,12 +74,22 @@
   const waiting = $derived(unreadFor(session.id));
   const touched = $derived(session.files_touched ?? []);
 
+  /** Ticks the "wakes in 4m" line while it shows. */
+  const wakeClock = liveClock(() => visible && scheduledWake(session) !== null);
+
   /** One honest line about what the session is doing right now. */
   const nowLine = $derived.by(() => {
     // Dead first: a SIGKILLed TUI fires no clearing hook, so the record can
     // carry a stale present-tense now_line until the watcher retires the
     // row — "exited" must win over every activity line.
     if (!session.alive) return "exited";
+    // Between loop ticks the agent is waiting on its own schedule; say when
+    // it runs next and what it said it will do (the rail ring's words).
+    const wake = scheduledWake(session);
+    if (wake !== null && (store === null || store.activity === null)) {
+      const when = wake.at_ms !== null ? `wakes ${untilLabel(wake.at_ms, wakeClock.ms)}` : "scheduled";
+      return wake.label !== "" ? `${when} · ${wake.label}` : when;
+    }
     if (store !== null) {
       if (store.compacting) return "compacting context";
       const act = store.activity;

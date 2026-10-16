@@ -60,6 +60,7 @@
     type Workspace,
     isMastermind,
     needsAttention,
+    scheduledWake,
   } from "./lib/workspace/sessions";
   // Type-only: the panel (and the ChatView it embeds) loads on first open,
   // never in the always-loaded entry bundle.
@@ -437,6 +438,7 @@
   import Launcher from "./lib/workspace/Launcher.svelte";
   import SessionGlyph from "./lib/shared/SessionGlyph.svelte";
   import BranchChip from "./lib/shared/BranchChip.svelte";
+  import WakeRing from "./lib/shared/WakeRing.svelte";
   import { archiveRecents, nudgeHistory, unarchiveRecents } from "./lib/workspace/history";
   import { sameFile, setSameFileOpener } from "./lib/workspace/sameFile.svelte";
   import { requestSettingsSection } from "./lib/settings/jump";
@@ -5803,6 +5805,11 @@
                   </span>
                   {#if s.kind === "agent" && s.git && s.git.worktree !== s.git.repo}
                     <span class="wt-mark"><BranchChip git={s.git} /></span>
+                  {/if}
+                  {#if scheduledWake(s) !== null}
+                    {@const wake = scheduledWake(s)}
+                    <!-- Between loop ticks: it will run again on its own. -->
+                    <WakeRing at={wake?.at_ms ?? null} from={wake?.from_ms ?? null} label={wake?.label ?? ""} />
                   {/if}
                 </span>
               {/if}
