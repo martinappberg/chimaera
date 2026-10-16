@@ -621,21 +621,20 @@ async fn invalidations_coalesce_to_four_a_second() {
 }
 
 #[tokio::test]
-async fn file_events_are_debounced_and_reach_only_claimed_or_watched_files() {
+async fn file_events_reach_only_claimed_or_watched_files() {
     let (state, ws) = platform_workspace("platform-files").await;
     let root = root_of(&state, &ws);
     let notes = root.join("notes.fixture");
     std::fs::write(&notes, "v0\n").unwrap();
-    // Three quick saves from the editor: one `file-saved`.
-    for i in 1..=3 {
-        let (status, _, _) = put_raw(
-            &state,
-            &format!("/api/v1/fs/file?path={}", notes.display()),
-            format!("v{i}\n").into_bytes(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
-    }
+    // HTTP/file I/O may outlast the fixture's 100 ms debounce window.
+    // Burst timing is covered with explicit instants in plugins::files::tests.
+    let (status, _, _) = put_raw(
+        &state,
+        &format!("/api/v1/fs/file?path={}", notes.display()),
+        b"v1\n".to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
     let events = events_until(&state, &ws, |e| {
         e.iter().any(|x| x == "saved notes.fixture")
     })
