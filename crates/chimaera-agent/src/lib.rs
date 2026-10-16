@@ -850,7 +850,7 @@ impl ChatManager {
     pub fn spawn(
         self: &Arc<Self>,
         adapter: &dyn AgentAdapter,
-        spec: SpawnSpec,
+        mut spec: SpawnSpec,
     ) -> Result<ChatInfo> {
         let id = spec.session_id.clone();
         {
@@ -862,6 +862,19 @@ impl ChatManager {
         }
 
         let journal = Arc::new(Journal::open(&self.journal_dir, &id)?);
+        // Claude's `--resume` keeps the conversation's jobs and goal, so a
+        // respawn the restart ledger did not seed (a view switch, a relaunch,
+        // a reopen) starts from what this journal last said about them —
+        // never from a wakeup, which dies with its process.
+        if adapter.kind() == "claude" {
+            let reopened = journal.reopened();
+            if spec.carried_goal.is_none() {
+                spec.carried_goal = reopened.goal.clone().filter(|g| g.status == "active");
+            }
+            if spec.carried_jobs.is_empty() {
+                spec.carried_jobs = reopened.jobs.clone();
+            }
+        }
         let (cmd_tx, cmd_rx) = mpsc::channel(CMD_QUEUE);
         let (ev_tx, mut ev_rx) = mpsc::channel::<AgentEvent>(EVENT_QUEUE);
         let (events_tx, _) = broadcast::channel(BROADCAST_QUEUE);

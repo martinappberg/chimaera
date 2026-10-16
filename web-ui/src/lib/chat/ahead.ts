@@ -233,13 +233,14 @@ export function ringFraction(atMs: number | null, fromMs: number, nowMs: number)
 /** A recurring job's span for its ring: the gap between runs when the cron
  *  is a plain step (`*\/N * * * *`, `0 *\/N * * *`), else ten minutes. */
 export function jobPeriodMs(cron: string): number {
-  const f = cron.trim().split(/\s+/);
-  if (f.length !== 5) return 600_000;
-  const step = (field: string) => (/^\*\/(\d+)$/.exec(field) ? Number(/^\*\/(\d+)$/.exec(field)?.[1]) : null);
-  if (step(f[0]) !== null && f.slice(1).every((x) => x === "*")) return (step(f[0]) as number) * 60_000;
-  if (f[0] === "*" && f.slice(1).every((x) => x === "*")) return 60_000;
-  if (/^\d+$/.test(f[0]) && step(f[1]) !== null && f.slice(2).every((x) => x === "*")) return (step(f[1]) as number) * 3_600_000;
-  if (/^\d+$/.test(f[0]) && f[1] === "*" && f.slice(2).every((x) => x === "*")) return 3_600_000;
-  if (/^\d+$/.test(f[0]) && /^\d+$/.test(f[1]) && f.slice(2).every((x) => x === "*")) return 86_400_000;
+  const [min, hour, ...rest] = cron.trim().split(/\s+/);
+  if (rest.length !== 3 || !rest.every((f) => f === "*")) return 600_000;
+  const step = (f: string) => Number(/^\*\/(\d+)$/.exec(f)?.[1] ?? NaN);
+  const fixed = (f: string) => /^\d+$/.test(f);
+  if (hour === "*" && min === "*") return 60_000;
+  if (hour === "*" && step(min) > 0) return step(min) * 60_000;
+  if (fixed(min) && hour === "*") return 3_600_000;
+  if (fixed(min) && step(hour) > 0) return step(hour) * 3_600_000;
+  if (fixed(min) && fixed(hour)) return 86_400_000;
   return 600_000;
 }

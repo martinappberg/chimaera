@@ -3741,6 +3741,10 @@ impl ClaudeMapper {
         self.end_thinking_block(false, step);
         self.released_thought = None;
         self.prose_blocks.clear();
+        // The turn is over: a CLI command that never opened one is not the
+        // next turn's cause, and a schedule call cut off never answers.
+        self.cli_turn = false;
+        self.schedule.end_turn();
         if let Some(flushed) = self.coalescer.flush() {
             step.events.push(flushed);
         }
@@ -3944,6 +3948,8 @@ impl ClaudeMapper {
             // What the agent wrote before this step lands above the bubble.
             self.flush_prose(step);
             if !self.turn_active {
+                // Our message opens this turn, whatever the CLI started too.
+                self.cli_turn = false;
                 // It opens the next turn, so it is a rewind boundary, anchored
                 // after everything the finished turn wrote. A message folded
                 // into a running turn is not one (the same rule as a steered
@@ -4033,6 +4039,7 @@ impl ClaudeMapper {
             // quiet stop, nor let its armed watchdog abort it.
             self.interrupt_requested = false;
             self.interrupt_grace = None;
+            self.cli_turn = false;
             self.reset_compaction_for_new_turn();
             self.turn_n += 1;
             self.turn_active = true;
@@ -10865,7 +10872,8 @@ pub(crate) mod tests {
             "ScheduleWakeup",
             json!({"delaySeconds": 60, "reason": "Checking the deploy", "prompt": "/loop check"}),
         ));
-        let at = crate::now_ms() + 60_000;
+        // Due in 20 s: inside the few seconds early a wakeup fires.
+        let at = crate::now_ms() + 20_000;
         let step = m.on_frame(&tool_result_frame(
             "tu-w",
             json!({"scheduledFor": at, "clampedDelaySeconds": 60, "wasClamped": false}),
@@ -10906,6 +10914,33 @@ pub(crate) mod tests {
         assert!(
             matches!(&step.events[2], AgentEvent::Schedule { wakeup: None, jobs } if jobs.is_empty())
         );
+    }
+
+    /// A CLI command that never opened a turn leaves no stale mark: the
+    /// next turn — here one our queued message opens — is not a wake, and
+    /// does not spend a wakeup that is due.
+    #[test]
+    fn a_stale_cli_command_never_names_a_later_turn() {
+        let mut m = native_mapper_mid_turn();
+        m.on_frame(&tool_use_frame(
+            "tu-w",
+            "ScheduleWakeup",
+            json!({"delaySeconds": 60, "reason": "r"}),
+        ));
+        m.on_frame(&tool_result_frame(
+            "tu-w",
+            json!({"scheduledFor": crate::now_ms() + 10_000}),
+        ));
+        m.on_frame(&lifecycle("cli-x", "started"));
+        let (queued, _) = send_text(&mut m, "next", false);
+        m.on_frame(&result_frame());
+        m.on_frame(&lifecycle(&queued, "started"));
+        let step = m.on_frame(&text_frame("msg-q", "claude-sonnet-5-5", "hi"));
+        assert!(!step
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnCause { .. })));
+        assert!(!m.schedule.is_empty(), "the wakeup is still pending");
     }
 
     /// A turn the CLI opens with nothing due (a monitor event, the hidden

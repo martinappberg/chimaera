@@ -22,8 +22,11 @@ const PENDING_CAP: usize = 16;
 /// Claude expires a recurring session job 7 days after it was made.
 const RECURRING_LIFETIME_MS: u64 = 7 * 24 * 3600 * 1000;
 /// How early a fire may come: a wakeup fired ~3 s before `scheduledFor`
-/// live, and Claude lets a one-shot job fire up to 90 s early.
-const EARLY_FIRE_MS: u64 = 120_000;
+/// live, and a recurring job's jitter only delays it; Claude lets a one-shot
+/// job fire up to 90 s early. Kept tight: a monitor or background turn that
+/// opens inside the window would be taken for the item and spend it.
+const EARLY_FIRE_MS: u64 = 30_000;
+const EARLY_ONE_SHOT_MS: u64 = 120_000;
 
 /// What fired a turn the CLI started by itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -111,6 +114,12 @@ impl ScheduleTracker {
             _ => return,
         };
         self.pending.insert(id.to_string(), call);
+    }
+
+    /// A turn ended: every call it made has had its result (an interrupted
+    /// one never will), so nothing pending may outlive it.
+    pub fn end_turn(&mut self) {
+        self.pending.clear();
     }
 
     pub fn tracks(&self, id: &str) -> bool {
@@ -234,9 +243,14 @@ impl ScheduleTracker {
             .iter()
             .enumerate()
             .filter_map(|(i, j)| {
+                let early = if j.job.recurring {
+                    EARLY_FIRE_MS
+                } else {
+                    EARLY_ONE_SHOT_MS
+                };
                 j.job
                     .next_at_ms
-                    .filter(|at| *at <= horizon)
+                    .filter(|at| *at <= now_ms.saturating_add(early))
                     .map(|at| (i, at))
             })
             .min_by_key(|(_, at)| *at);
@@ -493,8 +507,9 @@ mod tests {
         assert_eq!((wakeup.at_ms, wakeup.scheduled_at_ms), (T0 + 64_000, T0));
         assert_eq!(wakeup.reason, "Check the deploy");
         assert!(jobs.is_empty());
-        // Too early: a turn the CLI starts a minute before is something else.
-        assert!(t.on_cli_turn(T0 + 64_000 - 3 * 60_000).is_none());
+        // Too early: a turn the CLI starts 45 s before is something else
+        // (a monitor event), and must not spend the wakeup.
+        assert!(t.on_cli_turn(T0 + 64_000 - 45_000).is_none());
         // Live, it fired ~3 s early.
         let (fired, schedule) = t.on_cli_turn(T0 + 61_000).expect("fired");
         assert_eq!(fired.kind, "wakeup");

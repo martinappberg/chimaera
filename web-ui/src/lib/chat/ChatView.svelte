@@ -2420,13 +2420,33 @@
   const goalResume = $derived(
     !readOnly && supports("resume_goal") ? () => sendCommand({ type: "resume_goal" }, "goal change not sent") : undefined,
   );
+  /** Claude's goal is a Stop hook: while its turn runs, the turn cannot end
+   *  until the goal is met, so a queued `/goal clear` would never be read.
+   *  Stop the turn first (the goal survives an interrupt), then clear it. */
+  let clearGoalAfterStop = $state(false);
+  function clearClaudeGoal() {
+    if (!store.running) {
+      askAgent("/goal clear");
+      return;
+    }
+    // An interrupt drops what is queued behind it: send once the turn ends.
+    if (sendCommand({ type: "interrupt" }, "stop not sent")) clearGoalAfterStop = true;
+  }
+  $effect(() => {
+    if (clearGoalAfterStop && !store.running) {
+      untrack(() => {
+        clearGoalAfterStop = false;
+        askAgent("/goal clear");
+      });
+    }
+  });
   const goalClear = $derived(
     readOnly
       ? undefined
       : supports("clear_goal")
         ? () => sendCommand({ type: "clear_goal" }, "goal change not sent")
         : canAskClaude
-          ? () => askAgent("/goal clear")
+          ? clearClaudeGoal
           : undefined,
   );
   /** Another agent's message waiting on the user to wake this one (rare,

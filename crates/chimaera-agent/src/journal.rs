@@ -104,9 +104,25 @@ pub struct Journal {
     /// disk already refused).
     written_seq: Arc<AtomicU64>,
     caps: JournalCaps,
+    /// What resumes the agent on its own, as the file ended when opened (the
+    /// last `Goal` state and `Schedule` jobs). A respawn of the same
+    /// conversation starts from it: claude's `--resume` keeps both.
+    reopened: Reopened,
+}
+
+/// See [`Journal::reopened`].
+#[derive(Clone, Debug, Default)]
+pub struct Reopened {
+    pub goal: Option<crate::model::GoalState>,
+    pub jobs: Vec<crate::model::ScheduledJob>,
 }
 
 impl Journal {
+    /// The goal and session jobs the journal held when it was opened.
+    pub fn reopened(&self) -> &Reopened {
+        &self.reopened
+    }
+
     pub fn open(dir: &Path, session_id: &str) -> Result<Self> {
         Self::open_with(dir, session_id, JournalCaps::default())
     }
@@ -124,6 +140,7 @@ impl Journal {
         // next write starts on a clean boundary.
         let mut last_seq = 0u64;
         let mut size = 0u64;
+        let mut reopened = Reopened::default();
         if let Ok(bytes) = fs::read(&path) {
             size = bytes.len() as u64;
             let mut line_start = 0usize;
@@ -133,6 +150,11 @@ impl Journal {
                     if let Ok(entry) = serde_json::from_slice::<SeqEvent>(&bytes[line_start..i]) {
                         last_seq = last_seq.max(entry.seq);
                         good_end = (i + 1) as u64;
+                        match entry.ev {
+                            AgentEvent::Goal { goal, .. } => reopened.goal = goal,
+                            AgentEvent::Schedule { jobs, .. } => reopened.jobs = jobs,
+                            _ => {}
+                        }
                     }
                     line_start = i + 1;
                 }
@@ -182,6 +204,7 @@ impl Journal {
             writer: Some(handle),
             written_seq,
             caps,
+            reopened,
         })
     }
 
@@ -1020,6 +1043,53 @@ mod tests {
                 .join()
                 .unwrap()
         })
+    }
+
+    /// A reopened journal remembers the last goal and session jobs, the
+    /// latest of each winning — what a claude respawn starts from.
+    #[tokio::test]
+    async fn reopening_remembers_the_last_goal_and_jobs() {
+        use crate::model::{GoalState, ScheduledJob};
+        let dir = tempfile::tempdir().unwrap();
+        let job = |id: &str| ScheduledJob {
+            id: id.into(),
+            cron: "*/10 * * * *".into(),
+            schedule: String::new(),
+            prompt: "p".into(),
+            recurring: true,
+            next_at_ms: None,
+            created_at_ms: 1,
+        };
+        {
+            let journal = Journal::open(dir.path(), "s-re").unwrap();
+            let goal = |o: &str| AgentEvent::Goal {
+                goal: Some(GoalState {
+                    objective: o.into(),
+                    status: "active".into(),
+                    ..Default::default()
+                }),
+                ended: None,
+            };
+            journal.append(goal("old")).await;
+            journal
+                .append(AgentEvent::Schedule {
+                    wakeup: None,
+                    jobs: vec![job("a"), job("b")],
+                })
+                .await;
+            journal.append(goal("new")).await;
+            journal
+                .append(AgentEvent::Schedule {
+                    wakeup: None,
+                    jobs: vec![job("b")],
+                })
+                .await;
+            journal.sync_async().await;
+        }
+        let reopened = Journal::open(dir.path(), "s-re").unwrap();
+        assert_eq!(reopened.reopened().goal.as_ref().unwrap().objective, "new");
+        assert_eq!(reopened.reopened().jobs.len(), 1);
+        assert_eq!(reopened.reopened().jobs[0].id, "b");
     }
 
     #[tokio::test]
