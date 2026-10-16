@@ -84,6 +84,11 @@ struct RingState {
     ring: VecDeque<(Arc<SeqEvent>, usize)>,
     ring_bytes: usize,
     next_seq: u64,
+    /// What resumes the agent on its own, as the file ended when opened and
+    /// folded with every `Goal` / `Schedule` appended since (see
+    /// [`Journal::reopened`]). Kept here, under the one lock `append` already
+    /// takes, so a respawn never has to read the file for it.
+    latest: Reopened,
 }
 
 pub struct Journal {
@@ -104,10 +109,6 @@ pub struct Journal {
     /// disk already refused).
     written_seq: Arc<AtomicU64>,
     caps: JournalCaps,
-    /// What resumes the agent on its own, as the file ended when opened (the
-    /// last `Goal` state and `Schedule` jobs). A respawn of the same
-    /// conversation starts from it: claude's `--resume` keeps both.
-    reopened: Reopened,
 }
 
 /// See [`Journal::reopened`].
@@ -118,9 +119,18 @@ pub struct Reopened {
 }
 
 impl Journal {
-    /// The goal and session jobs the journal held when it was opened.
-    pub fn reopened(&self) -> &Reopened {
-        &self.reopened
+    /// The goal and session jobs this journal holds NOW: what the file said
+    /// when it was opened, folded with every `Goal` / `Schedule` appended
+    /// since. A respawn of the same conversation starts from it (claude's
+    /// `--resume` keeps both), and it must not depend on the writer thread
+    /// having flushed: `ChatManager::spawn` reads it off the still-live
+    /// journal of the process that just exited.
+    pub fn reopened(&self) -> Reopened {
+        self.state
+            .lock()
+            .expect("journal state lock")
+            .latest
+            .clone()
     }
 
     pub fn open(dir: &Path, session_id: &str) -> Result<Self> {
@@ -199,12 +209,12 @@ impl Journal {
                 ring: VecDeque::new(),
                 ring_bytes: 0,
                 next_seq: last_seq + 1,
+                latest: reopened,
             }),
             tx: Some(tx),
             writer: Some(handle),
             written_seq,
             caps,
-            reopened,
         })
     }
 
@@ -252,6 +262,13 @@ impl Journal {
                 Some(seq),
                 "seq must be the first serialized key for the write-path scan"
             );
+            // The entry as journaled (an oversized Schedule became an Error
+            // marker above, and the file will say so too).
+            match &entry.ev {
+                AgentEvent::Goal { goal, .. } => state.latest.goal = goal.clone(),
+                AgentEvent::Schedule { jobs, .. } => state.latest.jobs = jobs.clone(),
+                _ => {}
+            }
 
             let line_len = line.len();
             state.ring.push_back((Arc::clone(&entry), line_len));
@@ -1025,7 +1042,31 @@ pub fn prune_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Usage;
+    use crate::model::{GoalState, ScheduledJob, Usage};
+
+    /// A session job and an active goal, for the reopen tests.
+    fn job(id: &str) -> ScheduledJob {
+        ScheduledJob {
+            id: id.into(),
+            cron: "*/10 * * * *".into(),
+            schedule: String::new(),
+            prompt: "p".into(),
+            recurring: true,
+            next_at_ms: None,
+            created_at_ms: 1,
+        }
+    }
+
+    fn goal(objective: &str) -> AgentEvent {
+        AgentEvent::Goal {
+            goal: Some(GoalState {
+                objective: objective.into(),
+                status: "active".into(),
+                ..Default::default()
+            }),
+            ended: None,
+        }
+    }
 
     fn msg(text: &str) -> AgentEvent {
         AgentEvent::MessageChunk {
@@ -1049,27 +1090,9 @@ mod tests {
     /// latest of each winning — what a claude respawn starts from.
     #[tokio::test]
     async fn reopening_remembers_the_last_goal_and_jobs() {
-        use crate::model::{GoalState, ScheduledJob};
         let dir = tempfile::tempdir().unwrap();
-        let job = |id: &str| ScheduledJob {
-            id: id.into(),
-            cron: "*/10 * * * *".into(),
-            schedule: String::new(),
-            prompt: "p".into(),
-            recurring: true,
-            next_at_ms: None,
-            created_at_ms: 1,
-        };
         {
             let journal = Journal::open(dir.path(), "s-re").unwrap();
-            let goal = |o: &str| AgentEvent::Goal {
-                goal: Some(GoalState {
-                    objective: o.into(),
-                    status: "active".into(),
-                    ..Default::default()
-                }),
-                ended: None,
-            };
             journal.append(goal("old")).await;
             journal
                 .append(AgentEvent::Schedule {
@@ -1090,6 +1113,38 @@ mod tests {
         assert_eq!(reopened.reopened().goal.as_ref().unwrap().objective, "new");
         assert_eq!(reopened.reopened().jobs.len(), 1);
         assert_eq!(reopened.reopened().jobs[0].id, "b");
+    }
+
+    /// The live journal answers `reopened()` from memory the moment an
+    /// event is appended, whether or not the writer thread has flushed it:
+    /// a same-id respawn reads it off the previous process's journal.
+    #[tokio::test]
+    async fn reopened_tracks_appends_before_the_writer_flushes() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(dir.path(), "s-live").unwrap();
+        assert!(journal.reopened().jobs.is_empty());
+        journal
+            .append(AgentEvent::Schedule {
+                wakeup: None,
+                jobs: vec![job("a"), job("b")],
+            })
+            .await;
+        journal.append(goal("now")).await;
+        // No sync: the file may hold nothing yet.
+        let live = journal.reopened();
+        assert_eq!(
+            live.jobs.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert_eq!(live.goal.as_ref().unwrap().objective, "now");
+        journal
+            .append(AgentEvent::Schedule {
+                wakeup: None,
+                jobs: Vec::new(),
+            })
+            .await;
+        assert!(journal.reopened().jobs.is_empty());
+        assert_eq!(journal.reopened().goal.as_ref().unwrap().objective, "now");
     }
 
     #[tokio::test]

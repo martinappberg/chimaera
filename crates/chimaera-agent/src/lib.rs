@@ -35,7 +35,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -813,6 +813,12 @@ pub struct ChatManager {
     /// [`journal::AgentPrefsStore`]) — what a new chat of that kind starts
     /// with. Fed from user-initiated `ModelSwitched` and `EffortState`.
     prefs: Arc<journal::AgentPrefsStore>,
+    /// Every journal this manager opened, by session id, held weakly: a
+    /// respawn of the same id continues the journal of the process that just
+    /// exited while that journal is still alive (see [`ChatManager::spawn`]).
+    /// Dead entries are pruned on each lookup, so it is bounded by the live
+    /// journals plus the spawns since the last one.
+    journals: Mutex<HashMap<String, Weak<Journal>>>,
 }
 
 impl ChatManager {
@@ -825,7 +831,26 @@ impl ChatManager {
             on_event,
             on_exit,
             latest_models: Mutex::new(HashMap::new()),
+            journals: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The journal a spawn of `id` writes: the still-live one of a session
+    /// with this id when there is one (its pump may be draining the writer
+    /// after the driver's exit, or its last `Arc` may simply not have dropped
+    /// yet), else a fresh open of the file. Lookup and registration happen
+    /// under one lock, so two spawns of the same id can never each open a
+    /// writer on the file (the registry refuses the second spawn, but only
+    /// after this point).
+    fn journal_for(&self, id: &str) -> Result<Arc<Journal>> {
+        let mut journals = self.journals.lock().expect("journals lock");
+        journals.retain(|_, j| j.strong_count() > 0);
+        if let Some(journal) = journals.get(id).and_then(Weak::upgrade) {
+            return Ok(journal);
+        }
+        let journal = Arc::new(Journal::open(&self.journal_dir, id)?);
+        journals.insert(id.to_string(), Arc::downgrade(&journal));
+        Ok(journal)
     }
 
     /// The last model / effort the user chose on this agent kind (`"claude"`
@@ -861,7 +886,17 @@ impl ChatManager {
             );
         }
 
-        let journal = Arc::new(Journal::open(&self.journal_dir, &id)?);
+        // A respawn of the same id while the previous process's journal is
+        // still alive continues THAT journal: same writer thread, same ring,
+        // continuous seq. The exit is observable on the wire (`Exited` is
+        // broadcast the moment it is queued) before the pump has drained the
+        // writer, so opening a second Journal on the file here would read
+        // whatever the lagging writer had flushed — the respawn could lose
+        // its carried jobs and goal, number its first events over lines
+        // still in flight, and leave two writers on one file. Nothing
+        // interleaves: `Exited` is the harness's last event, so the previous
+        // pump appends nothing after it.
+        let journal = self.journal_for(&id)?;
         // Claude's `--resume` keeps the conversation's jobs and goal, so a
         // respawn the restart ledger did not seed (a view switch, a relaunch,
         // a reopen) starts from what this journal last said about them —
@@ -872,10 +907,10 @@ impl ChatManager {
         } else if adapter.kind() == "claude" {
             let reopened = journal.reopened();
             if spec.carried_goal.is_none() {
-                spec.carried_goal = reopened.goal.clone().filter(|g| g.status == "active");
+                spec.carried_goal = reopened.goal.filter(|g| g.status == "active");
             }
             if spec.carried_jobs.is_empty() {
-                spec.carried_jobs = reopened.jobs.clone();
+                spec.carried_jobs = reopened.jobs;
             }
         }
         let (cmd_tx, cmd_rx) = mpsc::channel(CMD_QUEUE);
