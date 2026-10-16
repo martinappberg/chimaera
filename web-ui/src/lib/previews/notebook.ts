@@ -50,9 +50,14 @@ export interface NotebookPage {
 /** Server cap on cells per page. */
 export const NOTEBOOK_PAGE_MAX = 100;
 
-export async function fsNotebook(path: string, offset: number, limit: number): Promise<NotebookPage> {
+export async function fsNotebook(
+  path: string,
+  offset: number,
+  limit: number,
+  signal?: AbortSignal,
+): Promise<NotebookPage> {
   const q = new URLSearchParams({ path, offset: String(offset), limit: String(limit) });
-  const res = await api(`/fs/notebook?${q.toString()}`);
+  const res = await api(`/fs/notebook?${q.toString()}`, signal !== undefined ? { signal } : {});
   if (!res.ok) {
     let message = `request failed with status ${res.status}`;
     try {

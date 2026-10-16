@@ -22,13 +22,16 @@
   import { revealRequest, takeReveal } from "../shared/reveal";
   import ReferenceButton from "../shared/ReferenceButton.svelte";
   import Spinner from "./Spinner.svelte";
+  import { paneVisibility } from "./viewLifecycle.svelte";
 
   interface Props {
     path: string;
     kind: "video" | "audio";
+    /** The pane shows this tab (Pane, via FileView); unset: watch the layer. */
+    visible?: boolean;
   }
 
-  let { path, kind }: Props = $props();
+  let { path, kind, visible = undefined }: Props = $props();
 
   let entry = $state<FileEntry | null>(null);
   $effect(() => {
@@ -263,16 +266,14 @@
   // A parked pane keeps this view alive but unseen: a video pauses rather
   // than decode frames nobody sees (it does not resume by itself). Audio
   // keeps playing — listening while working elsewhere is the point.
+  const onScreen = paneVisibility(
+    () => visible,
+    () => media,
+  );
   $effect(() => {
     const el = media;
-    if (el === null || kind !== "video") return;
-    const layer = el.closest<HTMLElement>(".layer");
-    if (layer === null) return;
-    const watch = new MutationObserver(() => {
-      if (layer.inert && !el.paused) el.pause();
-    });
-    watch.observe(layer, { attributes: true, attributeFilter: ["inert"] });
-    return () => watch.disconnect();
+    if (el === null || kind !== "video" || onScreen.pane) return;
+    if (!el.paused) el.pause();
   });
 
   // Dropping the element alone can leave its range request open until GC;

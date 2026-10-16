@@ -16,7 +16,7 @@
   import type { SlideHandle } from "@aiden0z/pptx-renderer";
   import { renderSlide } from "@aiden0z/pptx-renderer";
   import { basename, fsDownload } from "./files";
-  import { retain, release, type FileEntry } from "./fileStore.svelte";
+  import { onDiskVersion, ownedObjectUrls, paneVisibility, useFileEntry } from "./viewLifecycle.svelte";
   import { fetchRawBytes, TooLargeError } from "./rawBytes";
   import { loadDeck, loadNotes, type Deck } from "./pptxDeck";
   import { sanitizeRendered } from "./officeSafety";
@@ -27,9 +27,11 @@
 
   interface Props {
     path: string;
+    /** The pane shows this tab (Pane, via FileView); unset: watch the layer. */
+    visible?: boolean;
   }
 
-  let { path }: Props = $props();
+  let { path, visible = undefined }: Props = $props();
 
   const MAX_PPTX_BYTES = 100 * 1024 * 1024;
   const THUMB_H = 62;
@@ -39,13 +41,10 @@
   /** Thumbnails mounted beyond the strip's visible span, per side. */
   const THUMB_OVERSCAN = 6;
 
-  let entry = $state<FileEntry | null>(null);
-  $effect(() => {
-    const e = retain(path);
-    entry = e;
-    void e.ensureMtime();
-    return () => release(path);
-  });
+  const file = useFileEntry(
+    () => path,
+    (e) => void e.ensureMtime(),
+  );
 
   let deck = $state.raw<Deck | null>(null);
   let error = $state<string | null>(null);
@@ -60,72 +59,68 @@
   /** Bumped when a new deck lands, so the mount effects start over. */
   let deckGen = $state(0);
 
-  /** Blob URLs for the deck's media, shared by every slide render. */
-  let mediaUrls = new Map<string, string>();
+  /** Blob URLs for the deck's media, shared by every slide render; revoked
+   *  when the next deck lands and when the view goes. */
+  const media = ownedObjectUrls();
+  let mediaUrls = media.cache();
 
   function revokeMedia(): void {
-    for (const u of mediaUrls.values()) URL.revokeObjectURL(u);
-    mediaUrls = new Map();
+    media.revokeAll();
+    mediaUrls = media.cache();
   }
 
-  let seen: string | null | undefined;
-  let gen = 0;
-  $effect(() => {
-    const m = entry?.mtime ?? null;
-    if (seen !== undefined && (m === null || m === seen || seen === null)) {
-      if (m !== null) seen = m;
-      return;
+  async function readDeck(signal: AbortSignal): Promise<{ d: Deck; bytes: ArrayBuffer }> {
+    const bytes = await fetchRawBytes(path, MAX_PPTX_BYTES, signal);
+    let d: Deck;
+    try {
+      d = await loadDeck(bytes);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "";
+      throw new Error(
+        /limit exceeded/i.test(msg)
+          ? `this deck is past the viewer's safety limits (${msg.replace(/^.*limit exceeded:\s*/i, "")})`
+          : "this file couldn't be read as a PowerPoint deck (legacy .ppt files aren't supported)",
+      );
     }
-    seen = m;
-    const mine = ++gen;
-    void (async () => {
-      const bytes = await fetchRawBytes(path, MAX_PPTX_BYTES);
-      let d: Deck;
-      try {
-        d = await loadDeck(bytes);
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : "";
-        throw new Error(
-          /limit exceeded/i.test(msg)
-            ? `this deck is past the viewer's safety limits (${msg.replace(/^.*limit exceeded:\s*/i, "")})`
-            : "this file couldn't be read as a PowerPoint deck (legacy .ppt files aren't supported)",
-        );
-      }
-      if (d.presentation.slides.length === 0) throw new Error("this deck has no slides");
-      return { d, bytes };
-    })().then(
-      ({ d, bytes }) => {
-        if (mine !== gen) return;
-        disposeAll();
-        revokeMedia();
-        deck = d;
-        deckGen += 1;
-        error = null;
-        tooLarge = false;
-        nodeErrors = 0;
-        hasNotes = false;
-        const want = pendingSlide ?? untrack(() => current);
-        pendingSlide = null;
-        current = Math.min(Math.max(0, want), d.presentation.slides.length - 1);
-        void loadNotes(bytes, d).then(
-          (any) => {
-            if (mine === gen) hasNotes = any;
-          },
-          () => {},
-        );
-      },
-      (e: unknown) => {
-        if (mine !== gen) return;
-        tooLarge = e instanceof TooLargeError;
-        error = e instanceof Error ? e.message : "the deck could not be opened";
-      },
-    );
+    if (d.presentation.slides.length === 0) throw new Error("this deck has no slides");
+    return { d, bytes };
+  }
+
+  // Open, and re-read on every on-disk version. A version that lands while
+  // the tab is parked is parsed off screen and drawn by the reveal.
+  const onScreen = paneVisibility(
+    () => visible,
+    () => slot,
+  );
+  onDiskVersion(() => file.current, () => onScreen.pane, {
+    load: readDeck,
+    apply: ({ d, bytes }, still) => {
+      disposeAll();
+      revokeMedia();
+      deck = d;
+      deckGen += 1;
+      error = null;
+      tooLarge = false;
+      nodeErrors = 0;
+      hasNotes = false;
+      const want = pendingSlide ?? current;
+      pendingSlide = null;
+      current = Math.min(Math.max(0, want), d.presentation.slides.length - 1);
+      void loadNotes(bytes, d).then(
+        (any) => {
+          if (still()) hasNotes = any;
+        },
+        () => {},
+      );
+    },
+    fail: (e) => {
+      tooLarge = e instanceof TooLargeError;
+      error = e instanceof Error ? e.message : "the deck could not be opened";
+    },
+    whileHidden: "defer",
   });
 
-  $effect(() => () => {
-    disposeAll();
-    revokeMedia();
-  });
+  $effect(() => () => disposeAll());
 
   const count = $derived(deck?.presentation.slides.length ?? 0);
   const w = $derived(deck?.presentation.width ?? 960);

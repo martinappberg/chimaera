@@ -18,7 +18,7 @@
    * names is fetched from the network.
    */
   import { untrack, type Component, type Snippet } from "svelte";
-  import { retain, release, type FileEntry } from "./fileStore.svelte";
+  import { onDiskVersion, paneVisibility, useFileEntry } from "./viewLifecycle.svelte";
   import { fetchRawBytes, saveBlob, TooLargeError } from "./rawBytes";
   import { activeTheme } from "../settings/store.svelte";
   import { boardFormat, boardStem, fitView, zoomAround, type Rect } from "./boards/format";
@@ -31,9 +31,11 @@
     wsRoot?: string | null;
     /** The host's view switch (board ⇄ source), drawn at the bar's end. */
     switcher?: Snippet;
+    /** The pane shows this tab (Pane, via FileView); unset: watch the layer. */
+    visible?: boolean;
   }
 
-  let { path, wsRoot = null, switcher }: Props = $props();
+  let { path, wsRoot = null, switcher, visible = undefined }: Props = $props();
 
   const format = $derived(boardFormat(path));
   const CAPS = { canvas: 16, excalidraw: 50, drawio: 16 } as const;
@@ -52,13 +54,10 @@
   }
   type Scene = SvgScene | CanvasScene;
 
-  let entry = $state<FileEntry | null>(null);
-  $effect(() => {
-    const e = retain(path);
-    entry = e;
-    void e.ensureMtime();
-    return () => release(path);
-  });
+  const file = useFileEntry(
+    () => path,
+    (e) => void e.ensureMtime(),
+  );
 
   let scene = $state.raw<Scene | null>(null);
   let error = $state<string | null>(null);
@@ -66,10 +65,10 @@
   let page = $state(untrack(() => memory.get(path)?.page ?? 0));
   let CanvasBoard = $state<Component<{ doc: CanvasDoc; path: string; wsRoot?: string | null }> | null>(null);
 
-  async function load(p: string): Promise<{ text: string }> {
+  async function load(p: string, signal?: AbortSignal): Promise<{ text: string }> {
     const fmt = boardFormat(p);
     const cap = (fmt === null ? 16 : CAPS[fmt]) * 1024 * 1024;
-    const bytes = await fetchRawBytes(p, cap);
+    const bytes = await fetchRawBytes(p, cap, signal);
     return { text: new TextDecoder().decode(bytes) };
   }
 
@@ -115,48 +114,73 @@
   }
 
   // (Re)build on open, on every on-disk version, and on a page switch. The
-  // last drawing stays up until the next is ready.
+  // last drawing stays up until the next is ready: the latest started build
+  // (a page switch or a disk version) is the one shown.
   let text: string | null = null;
-  let seen: string | null | undefined;
   let gen = 0;
-  function rebuild(reread: boolean): void {
+
+  function show(res: { scene: Scene; pages: DrawioPage[] }): void {
+    const first = scene === null;
+    scene = res.scene;
+    pages = res.pages;
+    error = null;
+    if (first) restoreView();
+    else if (fitMode) applyFit();
+  }
+
+  function failed(e: unknown): void {
+    error = e instanceof TooLargeError || e instanceof Error ? e.message : "the board could not be drawn";
+  }
+
+  /** A page switch: rebuild from the text already read. */
+  function rebuild(): void {
     const mine = ++gen;
     const want = page;
     void (async () => {
-      if (reread || text === null) text = (await load(path)).text;
+      text ??= (await load(path)).text;
       return build(text, want);
     })().then(
       (res) => {
-        if (mine !== gen) return;
-        const first = scene === null;
-        scene = res.scene;
-        pages = res.pages;
-        error = null;
-        if (first) restoreView();
-        else if (fitMode) applyFit();
+        if (mine === gen) show(res);
       },
       (e: unknown) => {
-        if (mine !== gen) return;
-        error = e instanceof TooLargeError || e instanceof Error ? e.message : "the board could not be drawn";
+        if (mine === gen) failed(e);
       },
     );
   }
 
-  $effect(() => {
-    const m = entry?.mtime ?? null;
-    if (seen !== undefined && (m === null || m === seen || seen === null)) {
-      if (m !== null) seen = m;
-      return;
-    }
-    seen = m;
-    untrack(() => rebuild(true));
+  // Open and every on-disk version: read and draw off to the side; a version
+  // that lands while the tab is parked is shown by the reveal.
+  const onScreen = paneVisibility(
+    () => visible,
+    () => viewport,
+  );
+  let diskGen = 0;
+  onDiskVersion(() => file.current, () => onScreen.pane, {
+    load: async (signal) => {
+      diskGen = ++gen;
+      const want = page;
+      text = (await load(path, signal)).text;
+      return build(text, want);
+    },
+    apply: (res) => {
+      if (diskGen === gen) show(res);
+      // A page switch raced the read: `text` already holds the new version,
+      // so redraw the page the user is on from it instead of leaving the old
+      // drawing up until the next change.
+      else rebuild();
+    },
+    fail: (e) => {
+      if (diskGen === gen) failed(e);
+    },
+    whileHidden: "defer",
   });
 
   function showPage(i: number): void {
     if (i === page) return;
     page = i;
     fitMode = true;
-    rebuild(false);
+    rebuild();
   }
 
   // --- the surface ----------------------------------------------------------------

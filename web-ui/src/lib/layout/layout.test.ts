@@ -60,6 +60,7 @@ import {
   focusPane,
   rewriteTabPaths,
   cycleTab,
+  trimLive,
 } from "./layout";
 
 describe("adaptive empty panes and stable numbered destinations", () => {
@@ -840,5 +841,34 @@ describe("git views open as preview tabs", () => {
     expect(restored).not.toBeNull();
     const tabs = panes(restored!.root)[0].tabs;
     expect(tabs.map(isPreviewTab)).toEqual([true, false]);
+  });
+});
+
+describe("trimLive", () => {
+  const keys = (n: number) => Array.from({ length: n }, (_, i) => `f:/w/${i}.md`);
+
+  it("leaves a set at or under the cap alone", () => {
+    const k = keys(8);
+    expect(trimLive(k, new Set(), 8)).toBe(k);
+  });
+
+  it("trims the cold end to the cap", () => {
+    expect(trimLive(keys(11), new Set(), 8)).toEqual(keys(8));
+  });
+
+  it("never evicts a dirty file view", () => {
+    const k = [...keys(9), "t:sess", "f:/w/cold.py"];
+    const out = trimLive(k, new Set(["/w/cold.py", "/w/8.md"]), 8);
+    expect(out).toHaveLength(8);
+    expect(out).toContain("f:/w/cold.py");
+    expect(out).toContain("f:/w/8.md");
+    expect(out).not.toContain("t:sess");
+    expect(out[0]).toBe("f:/w/0.md");
+  });
+
+  it("keeps every dirty view even past the cap, and the active one", () => {
+    const k = keys(10);
+    const out = trimLive(k, new Set(k.slice(1).map((key) => key.slice(2))), 8);
+    expect(out).toEqual(k);
   });
 });

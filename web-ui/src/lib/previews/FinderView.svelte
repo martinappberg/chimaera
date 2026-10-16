@@ -39,13 +39,16 @@
     isCutPending,
     pasteInto,
   } from "../workspace/fileClipboard.svelte";
-  import { stemLength, validateEntryName } from "../shared/fsNames";
+  import { validateEntryName } from "../shared/fsNames";
+  import { InlineRename, renameFocus } from "../shared/inlineRename.svelte";
+  import { resizeKeydown, startResizeDrag } from "../shared/resizeDrag";
   import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
   import { revealEntries, writeClipboard } from "../net/native";
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
   import Spinner from "./Spinner.svelte";
   import FinderPreview from "./FinderPreview.svelte";
+  import { viewSignal } from "./viewLifecycle.svelte";
   import { isMac } from "../shared/keys";
 
   /** Local-daemon windows hide Download (the file already lives here). */
@@ -73,9 +76,12 @@
      *  alone, never also a column that happens to show the same dir. */
     dropOnRow?: boolean;
     dropAction?: "upload" | "move" | "copy";
+    /** This tab's pane layer is the one on screen (Pane passes it); the
+     *  side preview loads only while it is. */
+    visible?: boolean;
   }
 
-  let { path, wsRoot, onNavigate, onOpenFile, onDragStart, dropDir = null, dropOnRow = false, dropAction = "upload" }: Props = $props();
+  let { path, wsRoot, onNavigate, onOpenFile, onDragStart, dropDir = null, dropOnRow = false, dropAction = "upload", visible = undefined }: Props = $props();
   const finderId = $props.id();
 
   interface Column {
@@ -92,6 +98,10 @@
   // A kept-alive Finder monitors exactly the columns it preserves. Returning
   // to the tab is still instant, while directories outside the workspace and
   // outside Git remain coherent.
+  // Visibility exemption (rules/web-ui.md): a parked Finder still re-lists
+  // its columns on fs and disk events (`refreshVisible`). The work is
+  // event-driven, debounced and bounded by the shown columns, never a
+  // ticker, and it is what keeps the return instant and correct.
   $effect(() => setDiskDirs(diskDirOwner, columns.map((column) => column.dir)));
   $effect(() => () => clearDiskDirs(diskDirOwner));
   /** The canonical current directory (deepest column). Set optimistically so
@@ -112,15 +122,28 @@
   let previewWidth = $state(380);
   let shownWidth = $state(380);
   const previewMax = $derived(Math.max(240, Math.min(640, bodyWidth * 0.6)));
-  let resize = $state<{ id: number; x: number; width: number; before: number } | null>(null);
+  let resizing = $state(false);
 
+  /** The preview sits right of the divider: dragging left grows it. Unthrottled;
+   *  Escape and pointercancel restore the width the drag started from. */
   function resizePreview(e: PointerEvent): void {
     if (e.button !== 0) return;
-    e.preventDefault();
-    const handle = e.currentTarget as HTMLElement;
-    handle.focus({ preventScroll: true });
-    handle.setPointerCapture(e.pointerId);
-    resize = { id: e.pointerId, x: e.clientX, width: shownWidth, before: previewWidth };
+    (e.currentTarget as HTMLElement).focus({ preventScroll: true });
+    const width = shownWidth;
+    resizing = true;
+    startResizeDrag(e, {
+      axis: "x",
+      initial: previewWidth,
+      frame: false,
+      endOnLostCapture: true,
+      compute: (x, startX) => Math.max(240, Math.min(previewMax, width + startX - x)),
+      apply: (w) => {
+        previewWidth = w;
+      },
+      onEnd: () => {
+        resizing = false;
+      },
+    });
   }
 
   function setPreviewWidth(width: number): void {
@@ -128,16 +151,7 @@
   }
 
   function resizeKey(e: KeyboardEvent): void {
-    if (e.key === "Escape" && resize !== null) {
-      previewWidth = resize.before;
-      resize = null;
-    } else if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
-      setPreviewWidth(shownWidth + (e.key === "ArrowLeft" ? 20 : -20));
-    } else if (e.key === "Home") setPreviewWidth(240);
-    else if (e.key === "End") setPreviewWidth(previewMax);
-    else return;
-    e.preventDefault();
-    e.stopPropagation();
+    resizeKeydown(e, { axis: "x", value: shownWidth, min: 240, max: previewMax, step: 20, invert: true, apply: setPreviewWidth });
   }
 
   $effect(() => {
@@ -428,20 +442,46 @@
 
   // --- inline create/rename + the context menu -------------------------------
 
+  type FinderEdit =
+    | { mode: "create"; kind: "file" | "dir"; colIndex: number; dir: string }
+    | { mode: "rename"; colIndex: number; path: string; name: string; kind: "dir" | "file" };
+
   /** The one in-flight inline edit (create at the top of a column, or a
    *  rename replacing an entry row). */
-  let edit = $state<
-    | { mode: "create"; kind: "file" | "dir"; colIndex: number; dir: string }
-    | { mode: "rename"; colIndex: number; path: string; name: string; kind: "dir" | "file" }
-    | null
-  >(null);
-  let editDraft = $state("");
-  let editError = $state<string | null>(null);
+  const inline = new InlineRename<FinderEdit>({
+    check(cur, name) {
+      const invalid = validateEntryName(name, { allowSlashes: cur.mode === "create" });
+      if (invalid !== null) return { invalid };
+      return cur.mode === "rename" && name === cur.name ? "unchanged" : "submit";
+    },
+    async submit(cur, name, close) {
+      if (cur.mode === "create") {
+        const base = cur.dir === "/" ? "" : cur.dir;
+        const created = await fsCreateOp(`${base}/${name}`, cur.kind);
+        close();
+        if (cur.kind === "file") onOpenFile(created, false);
+        // The fsEpoch rebuild below refreshes the columns.
+      } else {
+        const i = cur.path.lastIndexOf("/");
+        const parent = i > 0 ? cur.path.slice(0, i) : "";
+        await fsRenameOp(cur.path, `${parent}/${name}`);
+      }
+    },
+    errorText: (e) => message(e),
+    onClose() {
+      const restoreFocus = colsEl?.contains(document.activeElement) ?? false;
+      // Removing the input otherwise drops keyboard focus onto the document.
+      // A blur toward a toolbar/control must keep the focus the user chose.
+      if (restoreFocus) void tick().then(() => {
+        if (document.activeElement === document.body) colsEl?.focus({ preventScroll: true });
+      });
+    },
+  });
+  const edit = $derived(inline.target);
+  const editError = $derived(inline.error);
 
   function beginCreate(kind: "file" | "dir", colIndex: number, dir: string): void {
-    edit = { mode: "create", kind, colIndex, dir };
-    editDraft = "";
-    editError = null;
+    inline.begin({ mode: "create", kind, colIndex, dir }, "");
   }
 
   /** Create INSIDE a dir entry: open its column first, then edit there. */
@@ -454,74 +494,7 @@
   }
 
   function beginRename(colIndex: number, entry: FsEntry): void {
-    edit = { mode: "rename", colIndex, path: entry.path, name: entry.name, kind: entry.kind };
-    editDraft = entry.name;
-    editError = null;
-  }
-
-  function cancelEdit(): void {
-    const restoreFocus = colsEl?.contains(document.activeElement) ?? false;
-    edit = null;
-    editDraft = "";
-    editError = null;
-    // Removing the input otherwise drops keyboard focus onto the document.
-    // A blur toward a toolbar/control must keep the focus the user chose.
-    if (restoreFocus) void tick().then(() => {
-      if (document.activeElement === document.body) colsEl?.focus({ preventScroll: true });
-    });
-  }
-
-  /** Focus the fresh inline input; renames preselect the stem. */
-  function editFocus(node: HTMLInputElement, selectStem: boolean): void {
-    node.focus();
-    if (selectStem) node.setSelectionRange(0, stemLength(node.value));
-  }
-
-  async function commitEdit(viaBlur = false): Promise<void> {
-    const cur = edit;
-    if (cur === null) return;
-    const name = editDraft.trim();
-    if (name === "") {
-      cancelEdit();
-      return;
-    }
-    const invalid = validateEntryName(name, { allowSlashes: cur.mode === "create" });
-    if (invalid !== null) {
-      if (viaBlur) cancelEdit();
-      else editError = invalid;
-      return;
-    }
-    try {
-      if (cur.mode === "create") {
-        const base = cur.dir === "/" ? "" : cur.dir;
-        const created = await fsCreateOp(`${base}/${name}`, cur.kind);
-        cancelEdit();
-        if (cur.kind === "file") onOpenFile(created, false);
-        // The fsEpoch rebuild below refreshes the columns.
-      } else {
-        if (name === cur.name) {
-          cancelEdit();
-          return;
-        }
-        const i = cur.path.lastIndexOf("/");
-        const parent = i > 0 ? cur.path.slice(0, i) : "";
-        await fsRenameOp(cur.path, `${parent}/${name}`);
-        cancelEdit();
-      }
-    } catch (e) {
-      editError = message(e);
-    }
-  }
-
-  function onEditKeydown(e: KeyboardEvent): void {
-    e.stopPropagation(); // the cols container owns arrows/Enter otherwise
-    if (e.key === "Enter") {
-      e.preventDefault();
-      void commitEdit();
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      cancelEdit(); // nulling first makes the following blur a no-op
-    }
+    inline.begin({ mode: "rename", colIndex, path: entry.path, name: entry.name, kind: entry.kind }, entry.name);
   }
 
   async function copyPath(p: string): Promise<void> {
@@ -654,15 +627,19 @@
     }, REFRESH_DEBOUNCE_MS);
   }
 
+  /** Ends the event-driven re-lists with the view (never renewed: two
+   *  refreshes of different columns must not cancel each other). */
+  const relists = viewSignal();
+
   async function refreshVisible(targets: Set<string>): Promise<void> {
     const seq = navSeq;
-    const visible = columns.filter((column) => targets.has(column.dir));
-    if (visible.length === 0) return;
+    const shown = columns.filter((column) => targets.has(column.dir));
+    if (shown.length === 0) return;
     try {
       const listings = await Promise.all(
-        visible.map((column) => fsList(column.dir, getSetting("files.showHidden"))),
+        shown.map((column) => fsList(column.dir, getSetting("files.showHidden"), relists.signal)),
       );
-      if (seq !== navSeq) return;
+      if (seq !== navSeq || relists.disposed) return;
       const byDir = new Map(listings.map((listing) => [listing.path, listing]));
       columns = columns.map((column) => {
         const listing = byDir.get(column.dir);
@@ -680,7 +657,7 @@
       });
       error = null;
     } catch (e) {
-      if (seq === navSeq) error = message(e);
+      if (seq === navSeq && !relists.disposed) error = message(e);
     }
   }
 
@@ -864,7 +841,7 @@
               {#if edit.kind === "dir"}
                 <FolderIcon size={14} />
               {:else}
-                <FileIcon path={editDraft} size={14} />
+                <FileIcon path={inline.draft} size={14} />
               {/if}
             </span>
             <input
@@ -874,10 +851,10 @@
               autocomplete="off"
               aria-label={edit.kind === "dir" ? "new folder name" : "new file name"}
               placeholder={edit.kind === "dir" ? "folder name" : "name.ext — a/b nests"}
-              bind:value={editDraft}
-              use:editFocus={false}
-              onkeydown={onEditKeydown}
-              onblur={() => void commitEdit(true)}
+              bind:value={inline.draft}
+              use:renameFocus={false}
+              onkeydown={(e) => inline.keydown(e)}
+              onblur={() => inline.blur()}
             />
           </div>
           {#if editError !== null}
@@ -903,10 +880,10 @@
                 spellcheck="false"
                 autocomplete="off"
                 aria-label="rename to"
-                bind:value={editDraft}
-                use:editFocus={true}
-                onkeydown={onEditKeydown}
-                onblur={() => void commitEdit(true)}
+                bind:value={inline.draft}
+                use:renameFocus={true}
+                onkeydown={(e) => inline.keydown(e)}
+                onblur={() => inline.blur()}
               />
             </div>
             {#if editError !== null}
@@ -986,29 +963,16 @@
 
   <!-- This is a focusable window splitter: separator + value and arrow keys. -->
   <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
-  <div class="preview-divider" class:resizing={resize !== null}
+  <div class="preview-divider" class:resizing
     role="separator" tabindex="0" aria-label="Preview width" aria-orientation="vertical"
     aria-valuemin={240} aria-valuemax={Math.round(previewMax)} aria-valuenow={Math.round(shownWidth)}
     title="Drag to resize preview · double-click to reset"
     onpointerdown={resizePreview}
-    onpointermove={(e) => {
-      if (resize?.id === e.pointerId) setPreviewWidth(resize.width + resize.x - e.clientX);
-    }}
-    onpointerup={(e) => {
-      if (resize?.id !== e.pointerId) return;
-      resize = null;
-      (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
-    }}
-    onpointercancel={() => {
-      if (resize !== null) previewWidth = resize.before;
-      resize = null;
-    }}
-    onlostpointercapture={() => { resize = null; }}
     onkeydown={resizeKey}
     ondblclick={() => { previewWidth = 380; }}
   ></div>
   <div class="preview-column" style:--preview-width="{previewWidth}px" bind:clientWidth={shownWidth}>
-    <FinderPreview entry={previewEntry} onOpen={(split) => {
+    <FinderPreview entry={previewEntry} {visible} onOpen={(split) => {
       if (previewEntry !== null) openFile(activeCol, previewEntry, split);
     }} />
   </div>

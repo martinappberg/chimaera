@@ -18,6 +18,7 @@
   import { rfcToDataRow, tableFragment, tableLabel, tsvQuote, TSV_LIMITS, type TableBlock } from "../shared/locator";
   import ReferenceChip from "../shared/ReferenceChip.svelte";
   import Spinner from "./Spinner.svelte";
+  import { paneVisibility, whenRevealed } from "./viewLifecycle.svelte";
   import {
     autoColumnWidths,
     formatRowCount,
@@ -45,9 +46,11 @@
      *  `nonce` re-triggers an identical one. Without a host, the grid takes
      *  `#row=`/`#col=`/`#cell=` reveals for `path` from the reveal store. */
     reveal?: { table: NonNullable<Reveal["table"]>; nonce: number } | null;
+    /** The pane shows this tab (Pane, via FileView); unset: watch the layer. */
+    visible?: boolean;
   }
 
-  let { path, fetchPage = undefined, locate = undefined, reveal = null }: Props = $props();
+  let { path, fetchPage = undefined, locate = undefined, reveal = null, visible = undefined }: Props = $props();
 
   /** Rows per fetched page (settings ground truth, read per request). */
   const pageRows = () => getSetting("files.tableRowsPerPage");
@@ -195,12 +198,22 @@
   // instant cache hit on return, or a live refresh after a disk change (which
   // resets to the fresh first page, dropping any paged-in window). Only the
   // entry's payload is a dependency: `apply` reads the grid's own state.
+  // A refresh that lands while the tab is parked is applied by the reveal's
+  // own update, before it paints; the first page applies at once.
+  const onScreen = paneVisibility(
+    () => visible,
+    () => root,
+  );
+  const revealed = whenRevealed(() => onScreen.pane);
+  let shownEntry: FileEntry | null = null;
   $effect(() => {
     const e = entry;
     if (e === null) return;
     const page = e.table;
     const failure = e.tableError;
-    untrack(() => {
+    const refresh = shownEntry === e;
+    if (page !== null || failure !== null) shownEntry = e;
+    const show = () => {
       if (page !== null) {
         apply(page, "replace");
         loading = false;
@@ -210,6 +223,11 @@
         error = failure;
         loading = false;
       }
+    };
+    untrack(() => {
+      if (refresh) return revealed.run(show);
+      revealed.clear();
+      show();
     });
   });
 

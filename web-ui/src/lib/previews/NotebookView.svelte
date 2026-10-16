@@ -18,9 +18,8 @@
   import DOMPurify from "dompurify";
   import { Marked } from "marked";
   import type { Parser } from "@lezer/common";
-  import { untrack } from "svelte";
   import { lastRawTicketUrl, rawTicketUrl, resolveDocPath, safeDecodeUri } from "./files";
-  import { retain, release, type FileEntry } from "./fileStore.svelte";
+  import { onDiskVersion, paneVisibility, useFileEntry, viewSignal } from "./viewLifecycle.svelte";
   import {
     NOTEBOOK_PAGE_MAX,
     base64Url,
@@ -50,9 +49,11 @@
     path: string;
     /** Active workspace root — `/docs/x.md` links resolve against it. */
     wsRoot?: string | null;
+    /** The pane shows this tab (Pane, via FileView); unset: watch the layer. */
+    visible?: boolean;
   }
 
-  let { path, wsRoot = null }: Props = $props();
+  let { path, wsRoot = null, visible = undefined }: Props = $props();
 
   /** First page (small: the first paint), then pages as the reader scrolls. */
   const FIRST = 24;
@@ -72,54 +73,77 @@
   const proseFont = $derived(getSetting("editor.markdownFontSize"));
   const palette = $derived(ansiVars(activeTheme().ansi));
 
-  let entry = $state<FileEntry | null>(null);
-  $effect(() => {
-    const e = retain(path);
-    entry = e;
-    void e.ensureMtime();
-    return () => release(path);
-  });
+  const file = useFileEntry(
+    () => path,
+    (e) => void e.ensureMtime(),
+  );
+  /** Ends this view's page reads (`loadMore`, a reveal's read) with it. */
+  const reads = viewSignal();
 
-  /** Read cells [0, count) and adopt them unless a newer read started
-   *  meanwhile. The daemon may answer a payload-heavy page short: `fill`
-   *  keeps asking (re-reading what was loaded, reaching a revealed cell);
-   *  the first open takes one page, so it paints after one parse. */
+  interface Read {
+    gen: number;
+    cells: NotebookCell[];
+    total: number;
+    language: string | null;
+  }
+
+  /** Read cells [0, count). The daemon may answer a payload-heavy page
+   *  short: `fill` keeps asking (re-reading what was loaded, reaching a
+   *  revealed cell); the first open takes one page, so it paints after one
+   *  parse. Starting a read supersedes every read already in flight. */
   let generation = 0;
-  async function readFirst(count: number, fill = true): Promise<void> {
+  async function readCells(count: number, fill: boolean, signal: AbortSignal): Promise<Read> {
     const gen = ++generation;
     const got: NotebookCell[] = [];
     let t = 0;
     let lang: string | null = null;
     while (got.length < count) {
-      const page = await fsNotebook(path, got.length, Math.min(NOTEBOOK_PAGE_MAX, count - got.length));
+      const page = await fsNotebook(path, got.length, Math.min(NOTEBOOK_PAGE_MAX, count - got.length), signal);
       got.push(...page.cells);
       t = page.total;
       lang = page.language;
       if (!fill || page.cells.length === 0 || got.length >= t) break;
     }
-    if (gen !== generation) return;
-    cells = got;
-    total = t;
-    language = lang;
+    return { gen, cells: got, total: t, language: lang };
+  }
+
+  /** Adopt a read unless a newer one started meanwhile. */
+  function adopt(r: Read): void {
+    if (r.gen !== generation) return;
+    cells = r.cells;
+    total = r.total;
+    language = r.language;
     loadError = null;
     loaded = true;
   }
 
+  async function readFirst(count: number): Promise<void> {
+    try {
+      adopt(await readCells(count, true, reads.signal));
+    } catch (e) {
+      // The view went mid-read: nothing is waiting for it.
+      if (!reads.disposed) throw e;
+    }
+  }
+
   // Open, and re-read the loaded cells whenever the file changes on disk
   // (keeping the scroll position: cells are keyed by index). The version
-  // token arriving for the first time is not a change.
-  let seen: string | null | undefined;
-  $effect(() => {
-    const m = entry?.mtime ?? null;
-    if (seen !== undefined && (m === null || m === seen || seen === null)) {
-      if (m !== null) seen = m;
-      return;
-    }
-    seen = m;
-    const have = untrack(() => cells.length);
-    readFirst(Math.max(FIRST, have), have > 0).catch((e: unknown) => {
+  // token arriving for the first time is not a change. A change that lands
+  // while the tab is parked is read off screen and drawn by the reveal.
+  const onScreen = paneVisibility(
+    () => visible,
+    () => scrollEl,
+  );
+  onDiskVersion(() => file.current, () => onScreen.pane, {
+    load: (signal) => {
+      const have = cells.length;
+      return readCells(Math.max(FIRST, have), have > 0, signal);
+    },
+    apply: adopt,
+    fail: (e) => {
       loadError = e instanceof Error ? e.message : "failed to read the notebook";
-    });
+    },
+    whileHidden: "defer",
   });
 
   /** How far below the view the next page starts loading. */
@@ -131,7 +155,7 @@
     const gen = generation;
     let added = false;
     try {
-      const page = await fsNotebook(path, cells.length, MORE);
+      const page = await fsNotebook(path, cells.length, MORE, reads.signal);
       if (gen !== generation) return;
       // A page can come back short (the daemon's payload budget); the next
       // one starts where this ended.

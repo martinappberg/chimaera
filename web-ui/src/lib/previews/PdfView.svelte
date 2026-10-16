@@ -36,6 +36,7 @@
   // Vite bundles the worker as a local asset; nothing is fetched from a CDN.
   import workerUrl from "pdfjs-dist/legacy/build/pdf.worker.min.mjs?url";
   import { retain, release } from "./fileStore.svelte";
+  import { paneVisibility } from "./viewLifecycle.svelte";
   import { revealRequest, takeReveal, type Reveal } from "../shared/reveal";
   import { activateUrl, isWebUrl } from "../shared/urlOpen";
   import { findInPage, findPattern, pageText, type ItemRange, type PageText } from "./pdfFind";
@@ -54,9 +55,11 @@
 
   interface Props {
     path: string;
+    /** The pane shows this tab (Pane, via FileView); unset: watch the layer. */
+    visible?: boolean;
   }
 
-  let { path }: Props = $props();
+  let { path, visible = undefined }: Props = $props();
 
   interface PageInfo {
     num: number;
@@ -272,6 +275,11 @@
           : String(e);
   }
 
+  const onScreen = paneVisibility(
+    () => visible,
+    () => scroller,
+  );
+
   onMount(() => {
     disposed = false;
     const mem = memory.get(path);
@@ -327,6 +335,12 @@
         void loadOutline(d);
         let changed = false;
         for (let n = 2; n <= d.numPages; n++) {
+          // Each visit is a ranged read: a parked tab stops walking and
+          // picks up where it was when shown again.
+          if (!onScreen.pane) {
+            await onScreen.whenVisible();
+            if (disposed) return;
+          }
           const page = await d.getPage(n);
           if (disposed) {
             page.cleanup();

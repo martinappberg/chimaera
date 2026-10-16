@@ -19,23 +19,23 @@
    * so off-screen pages cost no layout.
    */
   import { tick } from "svelte";
-  import { pageVisible } from "../shared/visibility";
   import { activeTheme, getSetting } from "../settings/store.svelte";
   import { api, ApiError } from "../net/api";
   import { humanSize, looksBinary } from "./files";
-  import { retain, release, type FileEntry } from "./fileStore.svelte";
   import { ansiVars, appendRuns, collapseCarriageReturns, parseAnsi, plainStyle, type AnsiStyle } from "./ansi";
   import { lineLevel, splitLines, wholeLines } from "./logText";
-  import { watchPaneVisible } from "./paneVisible";
+  import { paneVisibility, useFileEntry } from "./viewLifecycle.svelte";
   import Spinner from "./Spinner.svelte";
 
   interface Props {
     path: string;
     /** The tail turned out to be binary: the host shows its info card. */
     onBinary?: (size: number) => void;
+    /** The pane shows this tab (Pane, via FileView); unset: watch the layer. */
+    visible?: boolean;
   }
 
-  let { path, onBinary }: Props = $props();
+  let { path, onBinary, visible = undefined }: Props = $props();
 
   /** One page: the first read, "load earlier", "load later". */
   const PAGE = 256 * 1024;
@@ -77,7 +77,6 @@
   let following = $state(true);
   let newBelow = $state(false);
   let wrap = $state(readWrap());
-  let paneVisible = $state(true);
   /** Bytes after `hi` up to EOF with no newline yet (a line being written). */
   let partialLen = $state(0);
 
@@ -386,13 +385,15 @@
 
   // --- lifecycle ------------------------------------------------------------------
 
-  let entry = $state<FileEntry | null>(null);
-  $effect(() => {
-    const e = retain(path);
-    entry = e;
-    void e.ensureMtime();
-    return () => release(path);
-  });
+  const file = useFileEntry(
+    () => path,
+    (e) => void e.ensureMtime(),
+  );
+  const entry = $derived(file.current);
+  const onScreen = paneVisibility(
+    () => visible,
+    () => scrollEl,
+  );
 
   // Open: one small read; a log that fits arrives whole, a bigger one
   // costs a second read for its tail.
@@ -417,7 +418,7 @@
   // Follow: poll the tail while it is on and anyone can see it. Re-running
   // on a visibility return is the catch-up.
   $effect(() => {
-    if (!ready || !following || !paneVisible || !$pageVisible) return;
+    if (!ready || !following || !onScreen.shown) return;
     const pull = () =>
       void serial(async () => {
         if (!following) return;
@@ -440,12 +441,6 @@
       await pullNew(1);
       if (hi + partialLen > before) newBelow = true;
     });
-  });
-
-  $effect(() => {
-    const el = scrollEl;
-    if (el === null) return;
-    return watchPaneVisible(el, (v) => (paneVisible = v));
   });
 
   /** Scroll to the next marked line below (or above) the top of the view. */
