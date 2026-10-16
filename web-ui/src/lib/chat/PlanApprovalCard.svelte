@@ -8,6 +8,7 @@
    * feedback-denial). Option ids/labels come from the driver verbatim.
    */
   import Markdown from "./Markdown.svelte";
+  import { modalFocus } from "../shared/modalFocus";
   import type { OpenPathFn, PathResolver } from "./paths";
   import type { PendingPermission } from "./store.svelte";
 
@@ -36,8 +37,10 @@
   let panelEl = $state<HTMLDivElement | null>(null);
   $effect(() => {
     // Focus the overlay when it opens so Esc closes it (preventScroll: the
-    // transcript's own stick-to-bottom owns scrolling).
-    if (visible && expanded) panelEl?.focus({ preventScroll: true });
+    // transcript's own stick-to-bottom owns scrolling). A microtask later,
+    // so `modalFocus` records the "full plan" button as the focus to return.
+    const el = panelEl;
+    if (visible && expanded && el !== null) queueMicrotask(() => el.focus({ preventScroll: true }));
   });
   function onOverlayKeydown(e: KeyboardEvent) {
     // Esc here just closes the overlay back to the card — the actual
@@ -139,6 +142,7 @@
     aria-modal="true"
     aria-label="full plan"
     tabindex="-1"
+    use:modalFocus
     onkeydown={onOverlayKeydown}
   >
     <button

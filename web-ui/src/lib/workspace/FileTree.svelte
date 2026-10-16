@@ -28,7 +28,8 @@
     pasteInto,
   } from "./fileClipboard.svelte";
   import { isRemoteHost } from "../net/api";
-  import { stemLength, validateEntryName } from "../shared/fsNames";
+  import { validateEntryName } from "../shared/fsNames";
+  import { InlineRename, renameFocus } from "../shared/inlineRename.svelte";
   import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
   import { hasLocalFiles, revealEntries, writeClipboard } from "../net/native";
   import FileIcon from "../shared/FileIcon.svelte";
@@ -758,14 +759,48 @@
 
   // --- inline create/rename + the context menu -------------------------------
 
-  /** The one in-flight inline edit (create under a dir, or rename a row). */
-  let edit = $state<
+  type TreeEdit =
     | { mode: "create"; kind: "file" | "dir"; parent: string }
-    | { mode: "rename"; path: string; name: string; kind: "file" | "dir" }
-    | null
-  >(null);
-  let editDraft = $state("");
-  let editError = $state<string | null>(null);
+    | { mode: "rename"; path: string; name: string; kind: "file" | "dir" };
+
+  /** The one in-flight inline edit (create under a dir, or rename a row).
+   *  A validation error on blur cancels: never a floating error beside an
+   *  unfocused ghost input. */
+  const inline = new InlineRename<TreeEdit>({
+    check(cur, name) {
+      const invalid = validateEntryName(name, { allowSlashes: cur.mode === "create" });
+      if (invalid !== null) return { invalid };
+      return cur.mode === "rename" && name === cur.name ? "unchanged" : "submit";
+    },
+    async submit(cur, name, close) {
+      if (cur.mode === "create") {
+        const base = cur.parent === "/" ? "" : cur.parent;
+        const created = await fsCreateOp(`${base}/${name}`, cur.kind);
+        close();
+        // doReveal refreshes every ancestor listing (nested a/b/c names just
+        // work), expands the chain, scrolls + flashes the new row.
+        await doReveal(created);
+        // A just-created file is for editing → open it as a permanent tab.
+        if (cur.kind === "file") onOpenPinned(created);
+      } else {
+        const parent = dirname(cur.path);
+        await fsRenameOp(cur.path, `${parent === "/" ? "" : parent}/${name}`);
+        // the fsEpoch bump re-lists; App rewrites open tabs
+      }
+    },
+    errorText: (err) => (err instanceof Error ? err.message : "failed"),
+    onClose(cur) {
+      const restoreFocus = treeEl?.contains(document.activeElement) ?? false;
+      const path = cur.mode === "rename" ? cur.path : cur.parent;
+      if (restoreFocus) void tick().then(() => {
+        if (document.activeElement !== document.body) return;
+        const row = treeEl?.querySelector<HTMLElement>(`.node[data-path="${CSS.escape(path)}"]`);
+        (row ?? treeEl)?.focus({ preventScroll: true });
+      });
+    },
+  });
+  const edit = $derived(inline.target);
+  const editError = $derived(inline.error);
 
   /** Where the create row renders: after this row index; -1 = top (root). */
   const createAfterIndex = $derived.by(() => {
@@ -780,86 +815,12 @@
       expanded = new Set(expanded).add(parent);
       void load(parent);
     }
-    edit = { mode: "create", kind, parent };
-    editDraft = "";
-    editError = null;
+    inline.begin({ mode: "create", kind, parent }, "");
   }
 
   function beginRename(entry: FsEntry): void {
     closeFilter();
-    edit = { mode: "rename", path: entry.path, name: entry.name, kind: entry.kind };
-    editDraft = entry.name;
-    editError = null;
-  }
-
-  function cancelEdit(): void {
-    const restoreFocus = treeEl?.contains(document.activeElement) ?? false;
-    const path = edit?.mode === "rename" ? edit.path : edit?.parent;
-    edit = null;
-    editDraft = "";
-    editError = null;
-    if (restoreFocus) void tick().then(() => {
-      if (document.activeElement !== document.body) return;
-      const row = path === undefined ? null : treeEl?.querySelector<HTMLElement>(`.node[data-path="${CSS.escape(path)}"]`);
-      (row ?? treeEl)?.focus({ preventScroll: true });
-    });
-  }
-
-  /** Focus the fresh inline input; renames preselect the stem. */
-  function editFocus(node: HTMLInputElement, selectStem: boolean): void {
-    node.focus();
-    if (selectStem) node.setSelectionRange(0, stemLength(node.value));
-  }
-
-  /** Commit the inline edit. `viaBlur` demotes a validation error to a
-   *  cancel — never a floating error beside an unfocused ghost input. */
-  async function commitEdit(viaBlur = false): Promise<void> {
-    const cur = edit;
-    if (cur === null) return;
-    const name = editDraft.trim();
-    if (name === "") {
-      cancelEdit();
-      return;
-    }
-    const invalid = validateEntryName(name, { allowSlashes: cur.mode === "create" });
-    if (invalid !== null) {
-      if (viaBlur) cancelEdit();
-      else editError = invalid;
-      return;
-    }
-    try {
-      if (cur.mode === "create") {
-        const base = cur.parent === "/" ? "" : cur.parent;
-        const created = await fsCreateOp(`${base}/${name}`, cur.kind);
-        cancelEdit();
-        // doReveal refreshes every ancestor listing (nested a/b/c names just
-        // work), expands the chain, scrolls + flashes the new row.
-        await doReveal(created);
-        // A just-created file is for editing → open it as a permanent tab.
-        if (cur.kind === "file") onOpenPinned(created);
-      } else {
-        if (name === cur.name) {
-          cancelEdit();
-          return;
-        }
-        const parent = dirname(cur.path);
-        await fsRenameOp(cur.path, `${parent === "/" ? "" : parent}/${name}`);
-        cancelEdit(); // the fsEpoch bump re-lists; App rewrites open tabs
-      }
-    } catch (err) {
-      editError = err instanceof Error ? err.message : "failed";
-    }
-  }
-
-  function onEditKeydown(e: KeyboardEvent): void {
-    e.stopPropagation(); // keep row/tree handlers and app chords away
-    if (e.key === "Enter") {
-      e.preventDefault();
-      void commitEdit();
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      cancelEdit(); // nulling first makes the following blur a no-op
-    }
+    inline.begin({ mode: "rename", path: entry.path, name: entry.name, kind: entry.kind }, entry.name);
   }
 
   async function copyPath(path: string): Promise<void> {
@@ -1111,7 +1072,7 @@
           {#if edit.kind === "dir"}
             <FolderIcon open={false} size={14} />
           {:else}
-            <FileIcon path={editDraft} size={14} />
+            <FileIcon path={inline.draft} size={14} />
           {/if}
         </span>
         <input
@@ -1121,10 +1082,10 @@
           autocomplete="off"
           aria-label={edit.kind === "dir" ? "new folder name" : "new file name"}
           placeholder={edit.kind === "dir" ? "folder name" : "name.ext — a/b nests"}
-          bind:value={editDraft}
-          use:editFocus={false}
-          onkeydown={onEditKeydown}
-          onblur={() => void commitEdit(true)}
+          bind:value={inline.draft}
+          use:renameFocus={false}
+          onkeydown={(e) => inline.keydown(e)}
+          onblur={() => inline.blur()}
         />
       </div>
       {#if editError !== null}
@@ -1232,10 +1193,10 @@
           spellcheck="false"
           autocomplete="off"
           aria-label="rename to"
-          bind:value={editDraft}
-          use:editFocus={true}
-          onkeydown={onEditKeydown}
-          onblur={() => void commitEdit(true)}
+          bind:value={inline.draft}
+          use:renameFocus={true}
+          onkeydown={(e) => inline.keydown(e)}
+          onblur={() => inline.blur()}
         />
       {:else}
         <span

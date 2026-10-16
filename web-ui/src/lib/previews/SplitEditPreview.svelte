@@ -12,6 +12,7 @@
    * type" in sync is the host's job — it renders the editor's live buffer.
    */
   import type { Snippet } from "svelte";
+  import { startResizeDrag } from "../shared/resizeDrag";
 
   interface Props {
     editor: Snippet;
@@ -29,23 +30,29 @@
 
   function onPointerDown(e: PointerEvent): void {
     if (host === null) return;
+    const el = host;
     dragging = true;
-    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    e.preventDefault();
-  }
-
-  function onPointerMove(e: PointerEvent): void {
-    if (!dragging || host === null) return;
-    const rect = host.getBoundingClientRect();
-    if (rect.width === 0) return;
-    const r = (e.clientX - rect.left) / rect.width;
-    ratio = Math.min(1 - MIN, Math.max(MIN, r));
-  }
-
-  function onPointerUp(e: PointerEvent): void {
-    if (!dragging) return;
-    dragging = false;
-    (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
+    // Pointer-only and unthrottled, with no Escape restore; a cancelled
+    // pointer ends the drag where it is.
+    startResizeDrag(e, {
+      axis: "x",
+      initial: ratio,
+      frame: false,
+      escape: false,
+      cancelRestores: false,
+      endOnLostCapture: true,
+      compute: (x) => {
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0) return null;
+        return Math.min(1 - MIN, Math.max(MIN, (x - rect.left) / rect.width));
+      },
+      apply: (r) => {
+        ratio = r;
+      },
+      onEnd: () => {
+        dragging = false;
+      },
+    });
   }
 </script>
 
@@ -59,8 +66,6 @@
       role="separator"
       aria-orientation="vertical"
       onpointerdown={onPointerDown}
-      onpointermove={onPointerMove}
-      onpointerup={onPointerUp}
     ></div>
     <div class="pane preview">
       {@render preview()}

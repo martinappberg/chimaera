@@ -9,6 +9,7 @@
    * ever opens on the user's own click / ⌘J (see mastermindPanelState.svelte.ts).
    */
   import MastermindDock from "./MastermindDock.svelte";
+  import { startResizeDrag } from "../shared/resizeDrag";
   import type { Session } from "../workspace/sessions";
   import type { LayoutCtrl } from "../layout/dnd";
   import {
@@ -56,27 +57,26 @@
 
   function onResizeDown(e: PointerEvent): void {
     if (e.button !== 0) return;
-    e.preventDefault();
-    const handle = e.currentTarget as HTMLElement;
-    handle.setPointerCapture(e.pointerId);
-    const startX = e.clientX;
     const startW = width;
     dragWidth = startW;
-    const move = (ev: PointerEvent) => {
-      dragWidth = Math.min(Math.max(startW + (startX - ev.clientX), PANEL_MIN), maxWidth);
-    };
-    // A cancelled pointer (an OS gesture, lost capture) ends the drag too, or
-    // the panel would stay in its resizing state with the listener attached.
-    const up = () => {
-      handle.removeEventListener("pointermove", move);
-      handle.removeEventListener("pointerup", up);
-      handle.removeEventListener("pointercancel", up);
-      if (dragWidth !== null) setMastermindPanelWidth(dragWidth);
-      dragWidth = null;
-    };
-    handle.addEventListener("pointermove", move);
-    handle.addEventListener("pointerup", up);
-    handle.addEventListener("pointercancel", up);
+    // No Escape restore here, and a cancelled pointer (an OS gesture, lost
+    // capture) commits like pointerup: the panel never stays in its resizing
+    // state with the listeners attached.
+    startResizeDrag(e, {
+      axis: "x",
+      initial: startW,
+      frame: false,
+      escape: false,
+      cancelRestores: false,
+      compute: (x, startX) => Math.min(Math.max(startW + (startX - x), PANEL_MIN), maxWidth),
+      apply: (w) => {
+        dragWidth = w;
+      },
+      onEnd: () => {
+        if (dragWidth !== null) setMastermindPanelWidth(dragWidth);
+        dragWidth = null;
+      },
+    });
   }
 
   // The accent hairline follows keyboard focus inside the panel, like a
