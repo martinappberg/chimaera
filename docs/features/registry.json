@@ -153,6 +153,34 @@
       "paths": [
         "web-ui/src/lib/shared/**"
       ]
+    },
+    {
+      "id": "claude-wire",
+      "map": "crates/chimaera-agent/protocol/claude-code.md",
+      "paths": [
+        "crates/chimaera-agent/src/claude.rs"
+      ]
+    },
+    {
+      "id": "codex-wire",
+      "map": "crates/chimaera-agent/protocol/codex.md",
+      "paths": [
+        "crates/chimaera-agent/src/codex.rs"
+      ]
+    },
+    {
+      "id": "acp-wire",
+      "map": "crates/chimaera-agent/protocol/acp.md",
+      "paths": [
+        "crates/chimaera-agent/src/acp.rs"
+      ]
+    },
+    {
+      "id": "mods-wire",
+      "map": "crates/chimaera-agent/protocol/mods.md",
+      "paths": [
+        "crates/chimaera-agent/src/native_ui.rs"
+      ]
     }
   ],
   "features": [

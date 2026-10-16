@@ -10,8 +10,9 @@ of a PTY, and renders the result in a rich UI. It spans three places — read th
 AGENTS.md that governs the part you're touching first, they are the fast map:
 
 - Engine: [`crates/chimaera-agent/AGENTS.md`](../../../crates/chimaera-agent/AGENTS.md)
-  — drivers, journal, registry, event model. Wire facts:
-  [`PROTOCOL.md`](../../../crates/chimaera-agent/PROTOCOL.md).
+  — drivers, journal, registry, event model. Wire facts: the
+  [`PROTOCOL.md`](../../../crates/chimaera-agent/PROTOCOL.md) index and its topic files in
+  [`protocol/`](../../../crates/chimaera-agent/protocol/).
 - Server glue: [`crates/chimaera-server/AGENTS.md`](../../../crates/chimaera-server/AGENTS.md)
   — `chat.rs`, the WS/REST seams, the lifecycle locks.
 - UI: [`web-ui/src/lib/chat/AGENTS.md`](../../../web-ui/src/lib/chat/AGENTS.md)
@@ -19,9 +20,11 @@ AGENTS.md that governs the part you're touching first, they are the fast map:
 
 ## Route by provider
 
-Find the provider and driver first. Then read only that provider's section of
-[`PROTOCOL.md`](../../../crates/chimaera-agent/PROTOCOL.md). Wire facts live there
-and in the engine `AGENTS.md`; do not restate them in a PR or in this skill.
+Find the provider and driver first. Then read only that provider's topic file, named in
+the [`PROTOCOL.md`](../../../crates/chimaera-agent/PROTOCOL.md) index's provider table
+(`protocol/claude-code.md`, `codex.md`, `acp.md`, `mods.md`; shared rules in
+`cross-agent.md`). Wire facts live there and in the engine `AGENTS.md`; do not restate
+them in a PR or in this skill.
 
 | Provider | Protocol | Driver | Version pin | Live gate |
 |---|---|---|---|---|
@@ -67,7 +70,7 @@ break, reset, or renumber it anywhere.
    negotiates v1 but still needs **`just chat-smoke-acp`** when its driver or
    CLIs change (`CHIMAERA_TEST_AGY_ACP` / `CHIMAERA_TEST_GROK` name the official
    executables). Hermetic tests cannot prove real-agent behavior. Record any
-   new wire fact in `PROTOCOL.md` the moment you learn it.
+   new wire fact in its `protocol/` topic file the moment you learn it, then add a dated entry to `protocol/passes.md`.
 
    **Live version evidence.** When a driver or a CLI changes, the PR states
    three things: which `TESTED_*_VERSION` pin you set or kept, which gate you ran
@@ -81,7 +84,7 @@ Current Codex app-server builds can emit a version-matched TypeScript or JSON
 schema (`codex app-server generate-ts --out DIR` / `generate-json-schema --out
 DIR`). Before editing `codex.rs`, generate into a temporary directory and diff
 the request/notification types you are touching against the mapper and
-`PROTOCOL.md`. This is a fast, non-billable drift check and the authoritative
+the `protocol/codex.md` topic file. This is a fast, non-billable drift check and the authoritative
 shape inventory for that installed binary; it **does not replace**
 `just chat-smoke`, because ordering, conditional emission, and lifecycle
 behavior are not proven by a schema.
