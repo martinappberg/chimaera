@@ -50,6 +50,12 @@ describe("quick action", () => {
     expect(quickAction(agy, "terminal")).toBe("start");
     expect(quickAction({ ...agy, managedInstall: false }, "chat")).toBe("setup");
   });
+  it("looks again, never installs, when the login shell couldn't answer", () => {
+    const slow = { ...claude, installed: false, managedInstall: true, unchecked: "Your login shell took too long." };
+    expect(quickAction(slow, "chat")).toBe("check");
+    expect(quickAction(slow, "terminal")).toBe("check");
+    expect(primaryStart(normalizeAgentCatalog([{ id: "claude", installed: false, managed_install: true, unchecked: "slow" }]), "claude", "chat").action).toBe("check");
+  });
   it("still starts an outdated build (the spawn answers honestly)", () => {
     expect(quickAction({ ...claude, outdated: true }, "chat")).toBe("start");
   });
@@ -64,6 +70,12 @@ describe("launcher groups", () => {
   it("leads with whichever installed agent is the default", () => {
     const { installed } = groupAgents(catalog, "grok");
     expect(installed.map((a) => a.id)).toEqual(["grok", "claude", "codex"]);
+  });
+  it("keeps an agent the login shell couldn't check up front: it may well be installed", () => {
+    const slow = catalog.map((a) => (a.id === "agy" ? { ...a, unchecked: "Your login shell took too long." } : a));
+    const { installed, others } = groupAgents(slow, "claude");
+    expect(installed.map((a) => a.id)).toEqual(["claude", "codex", "agy", "grok"]);
+    expect(others.map((a) => a.id)).toEqual(["cursor"]);
   });
   it("shows every agent up front when none is installed", () => {
     const none = catalog.map((a) => ({ ...a, installed: false }));

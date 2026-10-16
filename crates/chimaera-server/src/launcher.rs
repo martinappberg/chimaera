@@ -23,7 +23,9 @@
 //! `.zshrc` — a login-only `-lc` (or a GUI launch with no usable `$SHELL`)
 //! misses both, so a plain `which` from the daemon's environment is not enough.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -205,6 +207,33 @@ pub(crate) struct AgentDetection {
     /// (see [`validate_cache_hit`]). `None` = stat failed at detection time
     /// (or a test preset): the entry is trusted as before.
     pub(crate) mtime: Option<std::time::SystemTime>,
+    /// On a miss: the login shell couldn't answer, in plain words. The agent
+    /// may well be installed, so this reads as "couldn't check", never as
+    /// "not installed" — and, like every failed probe, authorizes no fallback.
+    pub(crate) unchecked: Option<String>,
+}
+
+/// Why an executable didn't resolve: the full reason (logs, spawn errors)
+/// and, when the login shell couldn't answer, that in plain words.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Unresolved {
+    pub(crate) reason: String,
+    pub(crate) unchecked: Option<String>,
+}
+
+impl From<String> for Unresolved {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            unchecked: None,
+        }
+    }
+}
+
+impl From<&str> for Unresolved {
+    fn from(reason: &str) -> Self {
+        reason.to_string().into()
+    }
 }
 
 /// Cache-hit staleness verdict (see [`detect`]).
@@ -243,7 +272,7 @@ fn validate_cache_hit(hit: &AgentDetection) -> CacheHit {
 /// an update that replaced or moved the binary is noticed at the next spawn
 /// (without re-running the 6s login-shell probe the cache exists to avoid).
 pub(crate) async fn detect(state: &AppState, kind: AgentKind, refresh: bool) -> AgentDetection {
-    detect_inner(state, kind, refresh, false).await
+    detect_inner(state, kind, refresh, false, SHELL_PROBE_TIMEOUT).await
 }
 
 /// The catalog's read (`GET /agents` without `refresh`): the ONE caller a
@@ -256,7 +285,14 @@ pub(crate) async fn detect_for_catalog(
     kind: AgentKind,
     refresh: bool,
 ) -> AgentDetection {
-    detect_inner(state, kind, refresh, true).await
+    detect_inner(state, kind, refresh, true, SHELL_PROBE_TIMEOUT).await
+}
+
+/// A refresh someone is waiting on — the check after an install, a Retry —
+/// with the patient login-shell budget: on a loaded host a shell that needs
+/// more than the spawn budget still answers instead of failing the check.
+pub(crate) async fn verify(state: &AppState, kind: AgentKind) -> AgentDetection {
+    detect_inner(state, kind, true, false, SHELL_PROBE_PATIENT).await
 }
 
 async fn detect_inner(
@@ -264,13 +300,16 @@ async fn detect_inner(
     kind: AgentKind,
     refresh: bool,
     serve_miss: bool,
+    shell_budget: Duration,
 ) -> AgentDetection {
     detect_with_resolver(
         state,
         kind,
         refresh,
         serve_miss,
-        |managed, explicit| async move { resolve_bin(kind, &managed, explicit).await },
+        |managed, explicit| async move {
+            resolve_bin(&state.shell_probes, kind, &managed, explicit, shell_budget).await
+        },
     )
     .await
 }
@@ -284,7 +323,29 @@ async fn detect_with_resolver<F, Fut>(
 ) -> AgentDetection
 where
     F: FnOnce(PathBuf, Option<String>) -> Fut,
-    Fut: std::future::Future<Output = Result<PathBuf, String>>,
+    Fut: std::future::Future<Output = Result<PathBuf, Unresolved>>,
+{
+    let (detection, looked) = look(state, kind, refresh, serve_miss, resolve).await;
+    // Any look — a cached hit included — can settle an install whose own
+    // check couldn't conclude; a stamped miss is old news and can't.
+    if looked {
+        crate::agent_setup::settle(state, kind, &detection);
+    }
+    detection
+}
+
+/// The detection, and whether it was looked for now (false only for a
+/// stamped miss served to the catalog).
+async fn look<F, Fut>(
+    state: &AppState,
+    kind: AgentKind,
+    refresh: bool,
+    serve_miss: bool,
+    resolve: F,
+) -> (AgentDetection, bool)
+where
+    F: FnOnce(PathBuf, Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<PathBuf, Unresolved>>,
 {
     // A hit that still validates outlives a transient probe miss (a slow rc
     // on NFS, a login shell that timed out): on a refresh it is kept and no
@@ -307,7 +368,7 @@ where
                 });
             if same_install {
                 match validate_cache_hit(&hit) {
-                    CacheHit::Fresh => return hit,
+                    CacheHit::Fresh => return (hit, true),
                     CacheHit::Changed(mtime) => {
                         // In-place update: the path still serves, but the cached
                         // version is stale news — is_outdated/chat_capable and the
@@ -319,7 +380,7 @@ where
                         }
                         fresh.mtime = Some(mtime);
                         crate::lock(&state.agent_bins).insert(kind, fresh.clone());
-                        return fresh;
+                        return (fresh, true);
                     }
                     CacheHit::Gone => {
                         crate::lock(&state.agent_bins).remove(&kind);
@@ -329,16 +390,20 @@ where
         }
         if serve_miss {
             if let Some(miss) = cached_miss(state, kind) {
-                return miss;
+                return (miss, false);
             }
         }
     }
     let explicit = crate::lock(&state.settings).agent_path(kind);
-    let path = resolve(
+    let (path, unchecked) = match resolve(
         crate::runtimes::managed_bin_for(state, kind.as_str()),
         explicit.clone(),
     )
-    .await;
+    .await
+    {
+        Ok(path) => (Ok(path), None),
+        Err(Unresolved { reason, unchecked }) => (Err(reason), unchecked),
+    };
     let version = match &path {
         Ok(bin) => probe_version(bin).await,
         Err(_) => None,
@@ -359,6 +424,7 @@ where
         managed,
         explicit: used_explicit,
         mtime,
+        unchecked,
     };
     // A positive result is cached for the daemon's lifetime. A miss is often
     // transient — the daemon started before the login environment was ready,
@@ -376,16 +442,30 @@ where
         }
         Err(reason) => {
             tracing::warn!(agent = kind.as_str(), %reason, "agent executable resolution failed");
-            if let Some(hit) = validating_hit {
+            if let Some(mut hit) = validating_hit {
                 // The executable is still there: the probe, not the install,
-                // failed this time.
+                // failed this time. An update replaced it in place, though,
+                // so what it reports must be the new build's version.
                 tracing::info!(agent = kind.as_str(), path = ?hit.path, "retaining cached agent executable");
-                return hit;
+                if let Ok(bin) = &hit.path {
+                    let changed =
+                        |now: &std::time::SystemTime| hit.mtime.is_some_and(|was| was != *now);
+                    if let Some(now) = exec_mtime(bin).filter(changed) {
+                        hit.version = probe_version(bin).await;
+                        hit.mtime = Some(now);
+                        crate::lock(&state.agent_bins).insert(kind, hit.clone());
+                    }
+                }
+                return (hit, true);
             }
-            crate::lock(&state.agent_misses).insert(kind, (reason.clone(), Instant::now()));
+            let miss = Unresolved {
+                reason: reason.clone(),
+                unchecked: detection.unchecked.clone(),
+            };
+            crate::lock(&state.agent_misses).insert(kind, (miss, Instant::now()));
         }
     }
-    detection
+    (detection, true)
 }
 
 /// How long a detection miss is served without re-running the login shell.
@@ -397,16 +477,17 @@ pub(crate) const MISS_TTL: Duration = Duration::from_secs(90);
 /// spawn, a changed path setting and an install's own re-detect are the
 /// ways a landed executable is noticed before the stamp expires.
 fn cached_miss(state: &AppState, kind: AgentKind) -> Option<AgentDetection> {
-    let (reason, at) = crate::lock(&state.agent_misses).get(&kind).cloned()?;
+    let (miss, at) = crate::lock(&state.agent_misses).get(&kind).cloned()?;
     if at.elapsed() >= MISS_TTL {
         return None;
     }
     Some(AgentDetection {
-        path: Err(reason),
+        path: Err(miss.reason),
         version: None,
         managed: false,
         explicit: false,
         mtime: None,
+        unchecked: miss.unchecked,
     })
 }
 
@@ -471,7 +552,37 @@ fn well_known_agent_paths(bin: &str, home: Option<&Path>) -> Vec<PathBuf> {
 
 /// A slow/blocked rc is an error, not evidence that the agent is absent.
 const SHELL_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
+/// The budget for a check someone is waiting on ([`verify`]): a loaded host
+/// can take longer than a spawn's budget to start an interactive zsh.
+const SHELL_PROBE_PATIENT: Duration = Duration::from_secs(30);
 const SHELL_PROBE_OUTPUT_CAP: u64 = 64 * 1024;
+
+/// A login shell that couldn't answer `command -v`: `reason` for the logs,
+/// `plain` for the person deciding whether to retry.
+#[derive(Clone, Debug)]
+pub(crate) struct ShellProbeError {
+    reason: String,
+    plain: String,
+}
+
+impl ShellProbeError {
+    fn new(reason: String, plain: String) -> Self {
+        Self { reason, plain }
+    }
+}
+
+impl std::fmt::Display for ShellProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+#[cfg(test)]
+impl From<&str> for ShellProbeError {
+    fn from(reason: &str) -> Self {
+        Self::new(reason.into(), reason.into())
+    }
+}
 
 /// Kill rc children as well as the shell on timeout or cancellation. The
 /// guard drops before the child is reaped, while its process-group id is owned.
@@ -485,10 +596,10 @@ impl Drop for ShellProbeGroup {
     }
 }
 
-/// `command -v` in the interactive login shell. Nonce markers separate the
-/// answer from startup/logout banners and prove startup reached our command.
-/// A completed empty answer is the ONLY shell result that permits fallback.
-async fn resolve_via_login_shell(shell: &str, bin: &str) -> Result<Option<PathBuf>, String> {
+async fn resolve_via_login_shell(
+    shell: &str,
+    bin: &str,
+) -> Result<Option<PathBuf>, ShellProbeError> {
     probe_login_shell(shell, bin, SHELL_PROBE_TIMEOUT).await
 }
 
@@ -496,14 +607,40 @@ async fn probe_login_shell(
     shell: &str,
     bin: &str,
     timeout: Duration,
-) -> Result<Option<PathBuf>, String> {
+) -> Result<Option<PathBuf>, ShellProbeError> {
+    let mut answers = probe_login_shell_all(shell, &[bin], timeout).await?;
+    answers.pop().expect("one answer per bin")
+}
+
+/// One shell's answers: per bin, the path, nothing, or an answer that isn't
+/// a path (that bin's error alone); the whole shell failing is the outer one.
+type ShellAnswers = Result<Vec<Result<Option<PathBuf>, ShellProbeError>>, ShellProbeError>;
+
+/// `command -v` for each of `bins` in ONE interactive login shell. Nonce
+/// markers separate the answers from each other and from startup/logout
+/// banners, and prove startup reached our command. A completed empty answer
+/// is the ONLY shell result that permits fallback.
+async fn probe_login_shell_all(shell: &str, bins: &[&str], timeout: Duration) -> ShellAnswers {
     use tokio::io::AsyncReadExt;
     let nonce = chimaera_core::generate_token();
     let start = format!("chimaera-{nonce}-start");
+    let next = format!("chimaera-{nonce}-next");
     let end = format!("chimaera-{nonce}-end");
-    // `bin` is a fixed registration name, never user-supplied shell text.
+    let incomplete = || {
+        ShellProbeError::new(
+            format!("login shell `{shell}` did not complete executable discovery"),
+            format!("Your login shell ({shell}) stopped before it finished starting."),
+        )
+    };
+    // Each bin is a fixed registration name, never user-supplied shell text.
     // Semicolons + printf work in both POSIX shells and fish.
-    let script = format!("printf '\\n{start}\\n'; command -v {bin} || true; printf '\\n{end}\\n'");
+    let mut script = format!("printf '\\n{start}\\n';");
+    for (i, bin) in bins.iter().enumerate() {
+        let after = if i + 1 == bins.len() { &end } else { &next };
+        script.push_str(&format!(
+            " command -v {bin} || true; printf '\\n{after}\\n';"
+        ));
+    }
     let mut child = tokio::process::Command::new(shell)
         .arg("-ilc")
         .arg(script)
@@ -513,7 +650,12 @@ async fn probe_login_shell(
         .process_group(0)
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| format!("could not start login shell `{shell}`: {e}"))?;
+        .map_err(|e| {
+            ShellProbeError::new(
+                format!("could not start login shell `{shell}`: {e}"),
+                format!("Your login shell ({shell}) couldn't start: {e}."),
+            )
+        })?;
     let mut group = ShellProbeGroup(child.id().map(|pid| nix::unistd::Pid::from_raw(pid as i32)));
     let stdout = child.stdout.take().expect("piped stdout");
     let work = async {
@@ -522,50 +664,76 @@ async fn probe_login_shell(
             .take(SHELL_PROBE_OUTPUT_CAP + 1)
             .read_to_end(&mut bytes)
             .await
-            .map_err(|e| format!("could not read login shell `{shell}`: {e}"))?;
+            .map_err(|e| {
+                ShellProbeError::new(
+                    format!("could not read login shell `{shell}`: {e}"),
+                    format!("Your login shell ({shell}) couldn't be read: {e}."),
+                )
+            })?;
         if bytes.len() as u64 > SHELL_PROBE_OUTPUT_CAP {
-            return Err(format!("login shell `{shell}` exceeded the output limit"));
+            return Err(ShellProbeError::new(
+                format!("login shell `{shell}` exceeded the output limit"),
+                format!("Your login shell ({shell}) printed more than 64 KB while starting."),
+            ));
         }
-        let status = child
-            .wait()
-            .await
-            .map_err(|e| format!("could not wait for login shell `{shell}`: {e}"))?;
+        let status = child.wait().await.map_err(|e| {
+            ShellProbeError::new(
+                format!("could not wait for login shell `{shell}`: {e}"),
+                format!("Your login shell ({shell}) couldn't be waited for: {e}."),
+            )
+        })?;
         // The leader has been reaped: never signal this group id again.
         group.0 = None;
         if !status.success() {
-            return Err(format!("login shell `{shell}` exited with {status}"));
+            return Err(ShellProbeError::new(
+                format!("login shell `{shell}` exited with {status}"),
+                format!(
+                    "Your login shell ({shell}) stopped with an error while starting ({status})."
+                ),
+            ));
         }
         let text = String::from_utf8_lossy(&bytes);
         let mut lines = text.lines().skip_while(|line| *line != start);
         if lines.next().is_none() {
-            return Err(format!(
-                "login shell `{shell}` did not complete executable discovery"
-            ));
+            return Err(incomplete());
         }
-        let mut answer = None;
+        let mut answers = Vec::with_capacity(bins.len());
+        let mut answer = Ok(None);
         for line in lines {
-            if line == end {
-                return Ok(answer);
-            }
-            if !line.is_empty() {
-                if answer.is_some() || !Path::new(line).is_absolute() {
-                    return Err(format!(
-                        "login shell `{shell}` returned an unsupported executable for {bin}"
-                    ));
+            if line == next || line == end {
+                answers.push(std::mem::replace(&mut answer, Ok(None)));
+                if line == end {
+                    return if answers.len() == bins.len() {
+                        Ok(answers)
+                    } else {
+                        Err(incomplete())
+                    };
                 }
-                answer = Some(PathBuf::from(line));
+                continue;
             }
+            let Some(bin) = bins.get(answers.len()) else {
+                return Err(incomplete());
+            };
+            if line.is_empty() || answer.is_err() {
+                continue;
+            }
+            answer = match answer {
+                Ok(None) if Path::new(line).is_absolute() => Ok(Some(PathBuf::from(line))),
+                _ => Err(ShellProbeError::new(
+                    format!("login shell `{shell}` returned an unsupported executable for {bin}"),
+                    format!("Your login shell ({shell}) answered `{bin}` with something other than a file path, such as an alias."),
+                )),
+            };
         }
-        Err(format!(
-            "login shell `{shell}` did not complete executable discovery"
-        ))
+        Err(incomplete())
     };
     let result = tokio::time::timeout(timeout, work)
         .await
         .unwrap_or_else(|_| {
-            Err(format!(
-                "login shell `{shell}` timed out after {} seconds",
-                timeout.as_secs_f64()
+            let secs = timeout.as_secs_f64();
+            Err(ShellProbeError::new(
+                format!("login shell `{shell}` timed out after {secs} seconds"),
+                format!("Your login shell ({shell}) took longer than {secs} seconds to start."),
             ))
         });
     if group.0.is_some() {
@@ -574,6 +742,75 @@ async fn probe_login_shell(
         // deadline waiting for a process stuck in uninterruptible filesystem IO.
     }
     result
+}
+
+/// The login shell answers `command -v` for every catalog agent at once, and
+/// each detection that needs an answer while that shell runs shares it: a
+/// cold catalog read starts one interactive shell instead of one per agent
+/// (five rc files at once is part of what makes each one slow on a loaded
+/// host). A flight is keyed by shell and budget, so a spawn never waits out
+/// a patient check's 30 s; it runs as its own task, so a caller that goes
+/// away can't strand it; and it ends with its shell — answers are never kept
+/// past it (`agent_bins` / `agent_misses` are the cache).
+#[derive(Default)]
+pub(crate) struct ShellProbes {
+    flights: std::sync::Mutex<HashMap<FlightKey, (Arc<AtomicBool>, Flight)>>,
+}
+
+/// The login shell and the budget a flight runs with.
+type FlightKey = (String, Duration);
+type Flight = futures::future::Shared<futures::future::BoxFuture<'static, Arc<ShellAnswers>>>;
+
+impl ShellProbes {
+    async fn answer(
+        &self,
+        shell: &str,
+        kind: AgentKind,
+        budget: Duration,
+    ) -> Result<Option<PathBuf>, ShellProbeError> {
+        use futures::FutureExt;
+        let Some(index) = AgentKind::ALL.iter().position(|k| *k == kind) else {
+            // Retired from the catalog (gemini): asked on its own.
+            return probe_login_shell(shell, kind.path_bin(), budget).await;
+        };
+        let flight = {
+            let mut flights = crate::lock(&self.flights);
+            let key = (shell.to_string(), budget);
+            match flights.get(&key) {
+                // Joined only while its shell still runs: the task marks the
+                // end itself, since a flight no caller polled to the end
+                // never shows as finished on the shared future.
+                Some((done, flight)) if !done.load(Ordering::Acquire) => flight.clone(),
+                _ => {
+                    let shell = shell.to_string();
+                    let done = Arc::new(AtomicBool::new(false));
+                    let finished = done.clone();
+                    let probe = tokio::spawn(async move {
+                        let bins = AgentKind::ALL.map(AgentKind::path_bin);
+                        let answers = probe_login_shell_all(&shell, &bins, budget).await;
+                        finished.store(true, Ordering::Release);
+                        answers
+                    });
+                    let flight = async move {
+                        Arc::new(probe.await.unwrap_or_else(|e| {
+                            Err(ShellProbeError::new(
+                                format!("login shell probe failed: {e}"),
+                                "Chimaera couldn't ask your login shell.".into(),
+                            ))
+                        }))
+                    }
+                    .boxed()
+                    .shared();
+                    flights.insert(key, (done, flight.clone()));
+                    flight
+                }
+            }
+        };
+        match flight.await.as_ref() {
+            Ok(answers) => answers[index].clone(),
+            Err(e) => Err(e.clone()),
+        }
+    }
 }
 
 struct BinarySearch {
@@ -597,12 +834,14 @@ impl BinarySearch {
 /// prefixes → managed install. Never rank by version: an older CLI can be the
 /// user's deliberate choice. A failed shell cannot authorize another install.
 async fn resolve_bin(
+    probes: &ShellProbes,
     kind: AgentKind,
     managed_bin: &Path,
     explicit: Option<String>,
-) -> Result<PathBuf, String> {
+    shell_budget: Duration,
+) -> Result<PathBuf, Unresolved> {
     let search = BinarySearch::current(kind);
-    let probe = resolve_via_login_shell(&search.shell, kind.path_bin());
+    let probe = probes.answer(&search.shell, kind, shell_budget);
     resolve_with_search(kind, managed_bin, explicit, &search, probe).await
 }
 
@@ -611,21 +850,24 @@ async fn resolve_with_search(
     managed_bin: &Path,
     explicit: Option<String>,
     search: &BinarySearch,
-    probe: impl std::future::Future<Output = Result<Option<PathBuf>, String>>,
-) -> Result<PathBuf, String> {
+    probe: impl std::future::Future<Output = Result<Option<PathBuf>, ShellProbeError>>,
+) -> Result<PathBuf, Unresolved> {
     // Preserve the existing stale/typo'd-setting behavior: fall through when
     // it isn't runnable. A valid explicit setting needs no shell at all.
     let explicit = explicit.map(PathBuf::from);
     let explicit = tokio::task::spawn_blocking(move || explicit.filter(|p| is_executable(p)))
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| Unresolved::from(e.to_string()))?;
     if let Some(path) = explicit {
         return Ok(resolved_binary(kind, "explicit setting", path));
     }
-    let shell_path = probe.await.map_err(|reason| format!(
-        "{reason}; could not determine the configured {bin} executable. Retry, fix your login shell, or set agents.{id}.path to the intended executable in Settings",
-        bin = kind.path_bin(), id = kind.as_str(),
-    ))?;
+    let shell_path = probe.await.map_err(|e| Unresolved {
+        reason: format!(
+            "{}; could not determine the configured {bin} executable. Retry, fix your login shell, or set agents.{id}.path to the intended executable in Settings",
+            e.reason, bin = kind.path_bin(), id = kind.as_str(),
+        ),
+        unchecked: Some(e.plain),
+    })?;
     let search_path = search.path.clone();
     let well_known = search.well_known.clone();
     let managed_bin = managed_bin.to_path_buf();
@@ -658,7 +900,7 @@ async fn resolve_with_search(
         managed_fallback(kind.as_str(), &managed_bin)
             .map(|path| resolved_binary(kind, "managed install", path))
             .ok_or(miss)
-    }).await.map_err(|e| e.to_string())?
+    }).await.map_err(|e| e.to_string())?.map_err(Unresolved::from)
 }
 
 fn resolved_binary(kind: AgentKind, source: &str, path: PathBuf) -> PathBuf {
@@ -772,7 +1014,7 @@ pub(crate) async fn list_agents(
             let mut row = serde_json::Map::new();
             row.insert("id".into(), json!(kind.as_str()));
             row.insert("name".into(), json!(kind.product_name()));
-            row.insert("installed".into(), json!(detection.path.is_ok()));
+            resolution_fields(&mut row, &detection);
             // Additive: `signed_in` is the CLI's own verdict (null = unknown
             // or not installed); `sign_in` says how this agent signs in from
             // the app and names any sign-in in progress.
@@ -785,12 +1027,6 @@ pub(crate) async fn list_agents(
             }
             if let Some(setup) = crate::agent_setup::summary(&state, kind) {
                 row.insert("setup".into(), setup);
-            }
-            if let Ok(path) = &detection.path {
-                row.insert("path".into(), json!(path));
-            }
-            if let Some(version) = &detection.version {
-                row.insert("version".into(), json!(version));
             }
             if detection.path.is_ok() && is_outdated(kind, detection.version.as_deref()) {
                 // Installed but too old to run usefully: the UI offers the
@@ -872,6 +1108,38 @@ pub(crate) async fn list_agents(
         })
         .collect();
     Json(serde_json::Value::Array(rows))
+}
+
+/// POST /api/v1/agents/{id}/detect — look for one agent again, now, with the
+/// patient login-shell budget: the Retry of a check that couldn't conclude.
+/// Answers what that agent's catalog row will say (`installed`, `path`,
+/// `version`, `unchecked`); the result is cached like any detection.
+pub(crate) async fn detect_agent(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let Some(kind) = crate::operation::kind(&id) else {
+        return crate::operation::error(StatusCode::NOT_FOUND, "Unknown agent.");
+    };
+    let mut body = serde_json::Map::new();
+    resolution_fields(&mut body, &verify(&state, kind).await);
+    Json(serde_json::Value::Object(body)).into_response()
+}
+
+/// What a catalog row says about where an agent resolves — shared with the
+/// Retry's answer so the two never disagree. `unchecked` is additive: the
+/// login shell couldn't answer, in plain words — a retry, never an install.
+fn resolution_fields(row: &mut serde_json::Map<String, serde_json::Value>, d: &AgentDetection) {
+    row.insert("installed".into(), json!(d.path.is_ok()));
+    if let Some(why) = &d.unchecked {
+        row.insert("unchecked".into(), json!(why));
+    }
+    if let Ok(path) = &d.path {
+        row.insert("path".into(), json!(path));
+    }
+    if let Some(version) = &d.version {
+        row.insert("version".into(), json!(version));
+    }
 }
 
 /// Charset guard for resume and other native ids that land in argv. Argv cannot
@@ -2243,6 +2511,7 @@ mod tests {
             managed: false,
             explicit: false,
             mtime,
+            unchecked: None,
         };
         let recorded = exec_mtime(&bin).expect("stamp");
 
@@ -2277,6 +2546,7 @@ mod tests {
                 managed: false,
                 explicit: false,
                 mtime: None,
+                unchecked: None,
             }),
             CacheHit::Fresh
         ));

@@ -12,7 +12,8 @@
    * - then "other agents", folded behind one row: the ones not installed,
    *   "not installed" with an install chip (a curated managed install) or a
    *   set-up chip into Settings → Agents. With nothing installed every agent
-   *   shows up front;
+   *   shows up front. One the login shell couldn't check stays up front as
+   *   "couldn't check" with a retry chip — it may well be installed;
    * - a footer link into Settings → Agents, where every agent is managed.
    *
    * Installed rows read as just a version; whose binary it is ("installed by
@@ -37,9 +38,12 @@
    */
   import { onMount } from "svelte";
   import {
+    agentCatalog,
+    agentRechecks,
     getAgentDefault,
     groupAgents,
     listAgents,
+    recheckAgent,
     versionNumber,
     type AgentInfo,
     type LaunchPick,
@@ -149,6 +153,20 @@
 
   let hl = $state(0);
   let rootEl = $state<HTMLElement | null>(null);
+  /** Look again for an agent the login shell couldn't check; the shared
+   *  catalog then carries the answer to these rows and the rail. */
+  async function recheck(a: AgentInfo): Promise<void> {
+    try {
+      await recheckAgent(a.id);
+      const fresh = $agentCatalog;
+      if (fresh.length > 0) {
+        adopt(fresh);
+        onAgents?.(fresh);
+      }
+    } catch {
+      // The row keeps saying it couldn't check; its chip offers the retry again.
+    }
+  }
 
   /** Version tooltip: whose binary this is and where it resolves — the
    *  answer to "chimaera's install or mine?" the row alone doesn't spell out. */
@@ -163,6 +181,8 @@
 
   /** The row's one quiet state word: a version when it can run, else what it needs. */
   function stateLine(a: AgentInfo): string {
+    if (!a.installed && $agentRechecks.has(a.id)) return "checking…";
+    if (!a.installed && a.unchecked !== null) return "couldn't check";
     if (!a.installed) return "not installed";
     if (a.outdated) return "needs an update";
     if (a.chatSetupRequired) return "chat needs setup";
@@ -265,6 +285,10 @@
     }
     const a = rowAt(i);
     if (a === null) return;
+    if (!a.installed && a.unchecked !== null) {
+      void recheck(a);
+      return;
+    }
     if (!a.installed || (a.chatSetupRequired && ui !== "term")) {
       // No curated install: Settings → Agents is where it gets set up.
       if (a.managedInstall) onInstall(a);
@@ -341,7 +365,7 @@
     <span class="gslot"><SessionGlyph kind="agent" agentKind={a.id} size={13} /></span>
     <span class="aname">{a.name}</span>
     <span class="asub">
-      <span class="aver" class:managed={a.managed && a.installed} title={a.installed ? whereTitle(a) : undefined}>{stateLine(a)}</span>
+      <span class="aver" class:managed={a.managed && a.installed} title={a.installed ? whereTitle(a) : (a.unchecked ?? undefined)}>{stateLine(a)}</span>
       {#if a.installed && !a.outdated && a.updateAvailable && a.latestVersion !== null}
         {#if a.managed}
           <!-- One-click update of chimaera's own install: the same curated,
@@ -364,7 +388,23 @@
         {/if}
       {/if}
     </span>
-    {#if !a.installed || a.chatSetupRequired || a.outdated}
+    {#if !a.installed && a.unchecked !== null}
+      <!-- The login shell couldn't answer: look again (patiently), never
+           install over what may already be there. -->
+      <button
+        class="achip"
+        class:solid={i < installedCount}
+        tabindex="-1"
+        disabled={$agentRechecks.has(a.id)}
+        title="{a.unchecked} Check again."
+        onclick={(e) => {
+          e.stopPropagation();
+          void recheck(a);
+        }}
+      >
+        retry
+      </button>
+    {:else if !a.installed || a.chatSetupRequired || a.outdated}
       <!-- The one explicit click that unblocks it: a curated install/update
            (visible progress in agent setup), or Settings → Agents when
            chimaera has no curated install for it. -->
@@ -766,6 +806,12 @@
 
   .achip:active {
     transform: translateY(0.5px);
+  }
+
+  /* A retry in flight: the row's state word says "checking…". */
+  .achip:disabled {
+    opacity: 0.5;
+    cursor: default;
   }
 
   .achip:focus-visible {

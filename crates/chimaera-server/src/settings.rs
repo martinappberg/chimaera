@@ -394,6 +394,7 @@ pub(crate) async fn put_settings(State(state): State<Arc<AppState>>, body: Bytes
         // A per-agent binary override moved: rebuild the shims (add/remove/point
         // one) and drop the detection cache so the next spawn resolves anew.
         crate::runtimes::regenerate_shims(&state);
+        crate::lock(&state.agent_bins).clear();
         crate::launcher::forget_misses(&state);
     }
     if ignore_dirs_changed {

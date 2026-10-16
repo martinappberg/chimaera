@@ -4,7 +4,7 @@
   import { modalFocus } from "../shared/modalFocus";
   import { pageVisible } from "../shared/visibility";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
-  import { agentCatalog, pollAgents, type LaunchPick } from "./launcher";
+  import { agentCatalog, agentRechecks, pollAgents, recheckAgent, versionNumber, type LaunchPick } from "./launcher";
   import { acknowledgeSetupResult, cancelAgentSetup, getAgentSetup, pendingSetupId, recoverSetupResult, startAgentSetup, type SetupDetails, type SetupRequest } from "./agentSetup";
   import { operationRunning } from "./operations";
   import AgentSignInCard from "./AgentSignInCard.svelte";
@@ -22,12 +22,20 @@
   let disposed = false;
   const operation = $derived(details?.operation ?? null);
   const running = $derived(operationRunning(operation));
+  const verified = $derived(operation?.verified ?? null);
+  /** The installer finished but the login shell couldn't say where the
+   *  agent is: the way on is to look again, not to install again. */
+  const unchecked = $derived(operation?.phase === "failed" && verified?.state === "unchecked");
+  const rechecking = $derived($agentRechecks.has(request.agent.id));
+  /** A check asked for while one runs runs after it: a Check again must
+   *  show the result it caused, not one fetched before. */
+  let checkAgain = false;
   const agent = $derived($agentCatalog.find(a => a.id === request.agent.id) ?? request.agent);
   const verb = $derived(({ install: "Install", update: "Update", reinstall: "Reinstall" })[request.action]);
-  const title = $derived(operation?.phase === "succeeded" ? `${agent.name} ${operation.action === "update" ? "updated" : operation.action === "reinstall" ? "reinstalled" : "installed"}` : operation?.phase === "failed" ? `Couldn't install ${agent.name}` : operation?.phase === "cancelled" ? "Installation cancelled" : operation?.phase === "cancelling" ? "Stopping installation…" : running ? `${operation?.action === "update" ? "Updating" : operation?.action === "reinstall" ? "Reinstalling" : "Installing"} ${agent.name}…` : `${verb} ${agent.name}`);
+  const title = $derived(operation?.phase === "succeeded" ? `${agent.name} ${operation.action === "update" ? "updated" : operation.action === "reinstall" ? "reinstalled" : "installed"}` : unchecked ? `Couldn't check ${agent.name}` : operation?.phase === "failed" ? `Couldn't install ${agent.name}` : operation?.phase === "cancelled" ? "Installation cancelled" : operation?.phase === "cancelling" ? "Stopping installation…" : running ? `${operation?.action === "update" ? "Updating" : operation?.action === "reinstall" ? "Reinstalling" : "Installing"} ${agent.name}…` : `${verb} ${agent.name}`);
 
   async function check(): Promise<void> {
-    if (checking) return;
+    if (checking) { checkAgain = true; return; }
     checking = true;
     try {
       const next = await getAgentSetup(agent.id);
@@ -53,7 +61,10 @@
         connected = false;
         refreshError = `Couldn't refresh setup. ${e instanceof Error ? e.message : "Check the connection."} The installer may still be running.`;
       }
-    } finally { checking = false; }
+    } finally {
+      checking = false;
+      if (checkAgain && !disposed) { checkAgain = false; void check(); }
+    }
   }
   onMount(() => { void check(); return () => { disposed = true; }; });
   $effect(() => {
@@ -90,6 +101,22 @@
     catch (e) { error = e instanceof Error ? e.message : "Couldn't stop the installer."; }
     finally { busy = false; }
   }
+  /** Look for the agent again with the patient budget. A find confirms the
+   *  install on the daemon; refetching the result shows it. */
+  async function recheck(): Promise<void> {
+    if (rechecking) return;
+    error = null;
+    try {
+      const found = await recheckAgent(agent.id);
+      if (disposed) return;
+      // A find or a completed miss settles the result on the daemon (a
+      // success, or missing with Retry installation); refetch to show it.
+      await check();
+      if (!found.installed && found.unchecked !== null) error = "Still couldn't check.";
+    } catch (e) {
+      if (!disposed) error = e instanceof Error ? e.message : "Couldn't check.";
+    }
+  }
   function launch(ui: "chat" | "term"): void {
     // Start while the request still exists: closing clears the shared store
     // and invalidates this component’s derived agent synchronously.
@@ -107,18 +134,21 @@
     </header>
     <div class="body">
       {#if operation?.phase === "succeeded"}
+        <!-- What was checked, shown rather than claimed: the build and the
+             executable new sessions will run. -->
+        {#if verified?.state === "found"}
+          <p class="found">{#if verified.version}<span class="version" title={verified.version}>{versionNumber(verified.version)}</span>{/if}<code>{verified.path}</code></p>
+        {/if}
         {#if agent.installed && agent.signedIn === true}
           <p class="intro">Signed in. Open chat when you're ready.</p>
         {:else if agent.installed}
           <!-- The same sign-in every surface uses; the terminal is never the way in. -->
           <div class="signin"><AgentSignInCard {agent} workspaceId={request.workspaceId} onSignedIn={() => { void pollAgents(AbortSignal.timeout(15_000)).catch(() => {}); }} /></div>
-        {:else}
-          <p class="intro">Installed. Open chat when you're ready.</p>
         {/if}
       {:else if running}
         <p class="intro">You can keep working. Check back in Settings → Agents.</p>
       {:else if operation}
-        <p class="intro" class:error={operation.phase === "failed"} role="status">{operation.message}</p>
+        <p class="intro" class:error={operation.phase === "failed" && !unchecked} role="status">{operation.message}</p>
       {:else}
         <p class="intro">Install the latest version. Your account and conversations are kept.</p>
       {/if}
@@ -148,6 +178,8 @@
         {:else if operation?.phase === "succeeded"}
           {#if agent.installed && !agent.chatCapable}<button class="opt" onclick={() => launch("term")}>Open terminal</button>{/if}
           {#if agent.installed && agent.chatCapable}<button class="opt primary" onclick={() => launch("chat")}>Open chat</button>{/if}
+        {:else if unchecked}
+          <button class="opt primary" disabled={rechecking || !connected} onclick={() => void recheck()}>{rechecking ? "Checking…" : "Check again"}</button>
         {:else}
           <button class="opt primary" disabled={busy || !connected} onclick={() => void start()}>{busy ? "Starting…" : operation ? "Retry installation" : verb}</button>
         {/if}
@@ -165,6 +197,9 @@
   .close { margin-left:auto; align-self:flex-start; background:none; border:0; color:var(--muted); font-size:24px; cursor:pointer; }
   .body { padding:20px 24px; }
   .intro { color:var(--muted); font-size:13px; line-height:1.6; margin:0 0 16px; }
+  .found { display:flex; align-items:baseline; gap:8px; flex-wrap:wrap; margin:0 0 16px; font-size:13px; }
+  .found .version { font:12px var(--mono); color:var(--fg); }
+  .found code { color:var(--muted); }
   .signin { margin:0 0 16px; }
   code { overflow-wrap:anywhere; color:var(--fg); font-size:11px; }
   .details { color:var(--muted); font-size:12px; }

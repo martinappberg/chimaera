@@ -193,6 +193,7 @@ pub(super) fn preset_agent(
             // (nonexistent), and `mtime: None` entries skip cache validation
             // — presets must never fall through to the real login shell.
             mtime: None,
+            unchecked: None,
         },
     );
 }

@@ -328,6 +328,7 @@ async fn detect_reprobes_version_when_binary_changes_in_place() {
             managed: false,
             explicit: false,
             mtime: Some(std::time::UNIX_EPOCH),
+            unchecked: None,
         },
     );
 
@@ -584,6 +585,28 @@ async fn agent_launcher_endpoints_without_token_are_401() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    // The Retry's re-detect runs a login shell: auth, and only catalog agents.
+    let res = app(test_state())
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/agents/claude/detect")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    for unknown in ["nope", "gemini"] {
+        let (status, _) = request(
+            &test_state(),
+            Method::POST,
+            &format!("/api/v1/agents/{unknown}/detect"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{unknown}");
+    }
 }
 
 /// POST /api/v1/agents/{id}/install: the pinned contract — 404 unknown
@@ -1392,6 +1415,22 @@ async fn sign_in_routes_refuse_what_they_must_and_the_catalog_names_the_operatio
     assert_eq!(status, StatusCode::NOT_FOUND, "no sign-in reads a code yet");
 }
 
+/// Rebuilding the shims (after an install) keeps every agent's found
+/// executable: a dropped hit is re-probed through the login shell, and on a
+/// slow host one install made every agent read "couldn't check".
+#[test]
+fn a_shim_rebuild_keeps_every_found_executable() {
+    let state = test_state();
+    preset_agent(
+        &state,
+        agents::AgentKind::Claude,
+        Ok("/fixture/claude".into()),
+        None,
+    );
+    runtimes::regenerate_shims(&state);
+    assert!(lock(&state.agent_bins).contains_key(&agents::AgentKind::Claude));
+}
+
 /// A detection miss is served for a short window, to the catalog read only:
 /// a spawn probes, a refresh probes, a hit is never shadowed, and a refresh
 /// whose probe misses keeps a hit that still validates.
@@ -1401,7 +1440,7 @@ async fn a_cached_miss_serves_only_catalog_reads_and_never_shadows_a_hit() {
     let state = test_state();
     let kind = agents::AgentKind::Grok;
     let stamp = |state: &Arc<AppState>, reason: &str, at: std::time::Instant| {
-        lock(&state.agent_misses).insert(kind, (reason.to_string(), at));
+        lock(&state.agent_misses).insert(kind, (reason.into(), at));
     };
 
     // The catalog read serves it, with the recorded reason.
@@ -1471,7 +1510,7 @@ async fn a_cached_miss_serves_only_catalog_reads_and_never_shadows_a_hit() {
 async fn a_changed_agent_path_and_an_extensions_recheck_forget_cached_misses() {
     let state = test_state();
     let kind = agents::AgentKind::Grok;
-    lock(&state.agent_misses).insert(kind, ("x".to_string(), std::time::Instant::now()));
+    lock(&state.agent_misses).insert(kind, ("x".into(), std::time::Instant::now()));
     let (status, _) = request(
         &state,
         Method::PUT,
@@ -1485,7 +1524,7 @@ async fn a_changed_agent_path_and_an_extensions_recheck_forget_cached_misses() {
         "the settings route forgets misses"
     );
 
-    lock(&state.agent_misses).insert(kind, ("x".to_string(), std::time::Instant::now()));
+    lock(&state.agent_misses).insert(kind, ("x".into(), std::time::Instant::now()));
     agent_probe::refresh_probes(&state).await;
     assert!(
         lock(&state.agent_misses).is_empty(),

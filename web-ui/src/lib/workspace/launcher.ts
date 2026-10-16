@@ -12,6 +12,10 @@ export interface AgentInfo {
   id: string;
   name: string;
   installed: boolean;
+  /** The login shell couldn't answer whether it's installed (plain words,
+   *  e.g. it took too long to start). Not "not installed": the way on is a
+   *  retry of the check (`recheckAgent`), never an install. */
+  unchecked: string | null;
   /** Installed but too old to run usefully — offer an in-app update
    *  instead of spawning blind (npm-era codex, pre-login). */
   outdated: boolean;
@@ -111,8 +115,9 @@ export function primaryAgentId(defaultId: string, catalog: readonly AgentInfo[] 
 
 /** The launcher menu's two groups, with no built-in bias: the agents this
  *  host has installed (the saved default first, then catalog order), and —
- *  folded behind one row — the ones it has not. With nothing installed there
- *  is nothing to prefer, so every agent shows up front. */
+ *  folded behind one row — the ones it has not. One the login shell couldn't
+ *  check stays up front: it may well be installed. With nothing installed
+ *  there is nothing to prefer, so every agent shows up front. */
 export function groupAgents(
   agents: readonly AgentInfo[],
   defaultId: string,
@@ -121,19 +126,22 @@ export function groupAgents(
     ...list.filter((a) => a.id === defaultId),
     ...list.filter((a) => a.id !== defaultId),
   ];
-  const installed = agents.filter((a) => a.installed);
+  const front = (a: AgentInfo) => a.installed || a.unchecked !== null;
+  const installed = agents.filter(front);
   if (installed.length === 0) return { installed: lead(agents), others: [] };
-  return { installed: lead(installed), others: agents.filter((a) => !a.installed) };
+  return { installed: lead(installed), others: agents.filter((a) => !front(a)) };
 }
 
 /** What the rail's row does when clicked: start the agent, or — when it
- *  could only open a doomed pane — the setup step that unblocks it
- *  (a curated install / chat setup in the setup dialog, else Settings →
- *  Agents). An unloaded catalog starts: the daemon answers honestly. */
-export type QuickAction = "start" | "install" | "setup-chat" | "setup";
+ *  could only open a doomed pane — the step that unblocks it (a check the
+ *  login shell couldn't finish, a curated install / chat setup in the setup
+ *  dialog, else Settings → Agents). An unloaded catalog starts: the daemon
+ *  answers honestly. */
+export type QuickAction = "start" | "check" | "install" | "setup-chat" | "setup";
 
 export function quickAction(a: AgentInfo | null, defaultView: "chat" | "terminal"): QuickAction {
   if (a === null) return "start";
+  if (!a.installed && a.unchecked !== null) return "check";
   if (!a.installed) return a.managedInstall ? "install" : "setup";
   if (a.chatSetupRequired && defaultView === "chat") return a.managedInstall ? "setup-chat" : "setup";
   return "start";
@@ -230,6 +238,7 @@ export function normalizeAgentCatalog(body: unknown): AgentInfo[] {
         id: a.id,
         name: typeof a.name === "string" ? a.name : a.id,
         installed: a.installed === true,
+        unchecked: a.installed !== true && typeof a.unchecked === "string" ? a.unchecked.slice(0, 512) : null,
         outdated: a.outdated === true,
         version: typeof a.version === "string" ? a.version : null,
         managed: a.managed === true,
@@ -273,6 +282,55 @@ function normalizeSignIn(raw: unknown): AgentSignIn | undefined {
     operation: op && typeof op.id === "string" && op.id.length <= 128 && typeof op.phase === "string"
       ? { id: op.id, phase: op.phase, running: op.running === true } : undefined,
   };
+}
+
+/** What a re-check found (`recheckAgent`). */
+export interface AgentCheck {
+  installed: boolean;
+  path: string | null;
+  version: string | null;
+  unchecked: string | null;
+}
+
+/** Each agent's Retry in flight, shared by every surface that offers one
+ *  (the rail, the menu, Settings, the setup dialog): one retry reads
+ *  "checking…" everywhere, and a second click joins it. */
+const rechecks = new Map<string, Promise<AgentCheck>>();
+const recheckIds = writable<ReadonlySet<string>>(new Set());
+export const agentRechecks = { subscribe: recheckIds.subscribe };
+
+/** POST /api/v1/agents/{id}/detect — look for one agent again, now, giving
+ *  its login shell the patient budget (the Retry of "couldn't check"), then
+ *  fold the answer into the shared catalog so every surface agrees. */
+export function recheckAgent(agentId: string): Promise<AgentCheck> {
+  const joined = rechecks.get(agentId);
+  if (joined !== undefined) return joined;
+  const run = detectAgain(agentId).finally(() => {
+    rechecks.delete(agentId);
+    recheckIds.set(new Set(rechecks.keys()));
+  });
+  rechecks.set(agentId, run);
+  recheckIds.set(new Set(rechecks.keys()));
+  return run;
+}
+
+/** Allows the daemon's whole patient budget plus the trip. */
+async function detectAgain(agentId: string): Promise<AgentCheck> {
+  const body = await json<Record<string, unknown>>(
+    await api(`/agents/${encodeURIComponent(agentId)}/detect`, {
+      method: "POST",
+      signal: AbortSignal.timeout(45_000),
+    }),
+  );
+  const check: AgentCheck = {
+    installed: body.installed === true,
+    path: typeof body.path === "string" ? body.path : null,
+    version: typeof body.version === "string" ? body.version : null,
+    unchecked: body.installed !== true && typeof body.unchecked === "string" ? body.unchecked.slice(0, 512) : null,
+  };
+  // The daemon cached that answer: a plain read now returns it everywhere.
+  await pollAgents(AbortSignal.timeout(15_000)).catch(() => {});
+  return check;
 }
 
 /** Fold one agent's fresh sign-in verdict into the shared catalog, so every
