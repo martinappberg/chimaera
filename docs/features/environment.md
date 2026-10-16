@@ -12,7 +12,7 @@ axis* — deep design in the
 route + per-session materialization) and `crates/chimaera-core/src/shellint.rs`
 (`PRELUDE_SNIPPET_POSIX` + the rc/fish hooks). UI
 `web-ui/src/lib/settings/EnvironmentSettings.svelte` + `environment.ts`. Wire:
-`GET/PUT /api/v1/environment` (bearer-authed) and the optional `prelude` field on
+`GET/PUT/PATCH /api/v1/environment` (bearer-authed) and the optional `prelude` field on
 `POST /api/v1/sessions`.
 
 ## The prelude model
@@ -22,8 +22,9 @@ route + per-session materialization) and `crates/chimaera-core/src/shellint.rs`
   `conda activate hello`") ⊕ **launch** (one-off text on a single session create).
   Commands run in sequence, which is the HPC mental model; env vars merge last-wins.
 - **How it's used.** Settings → **Environment**: a multiline editor for this machine's
-  prelude and one for the active workspace's, explicit Save (no autosave), whole-map
-  fetch-merge-put so one window's save can't clobber another workspace's entry. The launch
+  prelude and one for the active workspace's, explicit Save (no autosave). A save sends
+  only the scopes the user changed, as a `PATCH`, so a window can't put back its stale copy
+  of a scope another window saved since. The launch
   scope rides `POST /api/v1/sessions` `{"prelude": "..."}` (wire only in slice 1 — no
   launcher UI yet).
 - **Where it lives.** Storage: `~/.config/chimaera/env-profiles.json` (`EnvPreludeStore` —
@@ -50,7 +51,25 @@ route + per-session materialization) and `crates/chimaera-core/src/shellint.rs`
   - **Respawns re-materialize.** View-switch/rewind respawns re-run the current config (the
     `ChatRecipe` carries `workspace_id` + the launch text); daemon-restart resurrection
     re-runs the durable scopes only (launch text is not in the ledger — deliberate).
-  - **Caps:** 32 KB per scope (413), 256 KB whole store; NUL bytes rejected (400). Empty
+  - **Wire.** `GET` answers the whole map `{"host"?: {"text"}, "workspaces"?: {"<id>": {"text"}}}`.
+    `PUT` replaces the whole map (kept for older clients). `PATCH` takes the same shape with
+    per-scope semantics: a scope present replaces it, `null` deletes it, absent leaves it
+    alone (`{"host": null, "workspaces": {"w-1": {"text": "ml git"}, "w-2": null}}`);
+    unknown top-level keys are refused (400). A PATCH re-reads the file first (a hand-edit
+    survives it). The store's `persist::DiskGate` serializes every write (PUT, PATCH, the
+    workspace-delete prune) and every route read, so two windows' patches of different
+    scopes both land and a delete is never undone by a patch that read the store before
+    it; two patches of the same scope are last-write-wins. An unreadable file (not a missing one) answers 503 and is never
+    overwritten. Both writes answer 204.
+  - **Off the reactor.** Every stat, read and write the routes do runs on the blocking pool,
+    one job at a time per store (`persist::DiskGate`), with the store's mutex held only to
+    snapshot and to install — a hung home directory never stalls other routes. The
+    synchronous `current()` the spawn paths call still stats (and on a change reads) under
+    that mutex. Reads are
+    bounded by the read itself (`persist::read_bounded`), not by a stat.
+  - **Caps:** 32 KB per scope (413), 256 KB whole store — a `PUT` or `PATCH` whose
+    resulting file would exceed it is refused (413) rather than written for the next read
+    to ignore; NUL bytes rejected (400). Empty
     text deletes the entry. Deleting a workspace prunes its entry (explicit delete only —
     no boot sweep, so a transiently unreadable `workspaces.json` can't wipe preludes).
   - **Zero delta when unused:** no prelude → no env var, byte-identical spawns.

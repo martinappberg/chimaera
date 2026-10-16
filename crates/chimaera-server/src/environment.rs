@@ -23,11 +23,13 @@
 //! first-class (reads re-stat the file, like `settings`). Entries are
 //! objects, not bare strings, so named profiles can land later without a
 //! shape break. No /ws/events frame in v1 — the Environment panel fetches on
-//! mount and saves explicitly; concurrent editors are last-write-wins.
+//! mount and saves explicitly. PATCH changes only the scopes it names, so two
+//! windows editing different scopes both keep their edit; two edits of the
+//! SAME scope are last-write-wins.
 
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -39,6 +41,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::persist::{DiskGate, Encode, Hook, Look};
 use crate::AppState;
 
 /// Per-scope text cap: generous for "commands you'd type into a fresh
@@ -138,11 +141,56 @@ impl EnvPreludes {
 
 /// In-memory prelude store backed by `env-profiles.json`, mtime-checked on
 /// read so external edits (vim over SSH) surface without a daemon restart.
+///
+/// The routes do their disk work on the blocking pool, one job at a time
+/// (`gate`), with this struct's mutex held only to snapshot and to install —
+/// never across a stat, read or write. The synchronous [`Self::current`]
+/// that spawn paths call still stats (and on a change reads) under the mutex.
 pub(crate) struct EnvPreludeStore {
     path: PathBuf,
     data: EnvPreludes,
     /// mtime of the file the cached data was read from (None = no file).
     mtime: Option<SystemTime>,
+    gate: DiskGate,
+    /// Test hook run on the blocking pool before each off-lock read (see
+    /// [`crate::persist::Hook`]).
+    before_read: Option<Hook>,
+}
+
+/// One look at env-profiles.json (settings.rs's store reads the same way).
+type Disk = Look<EnvPreludes>;
+
+/// [`crate::persist::look`] for env-profiles.json: a corrupt file is empty.
+fn look(path: &Path, recorded: Option<SystemTime>, hook: Option<&Hook>) -> Disk {
+    crate::persist::look(
+        path,
+        recorded,
+        MAX_FILE_BYTES,
+        "env-profiles.json",
+        hook,
+        |bytes| {
+            serde_json::from_slice(bytes).unwrap_or_else(|err| {
+                tracing::warn!(path = %path.display(), %err, "corrupt env-profiles.json; ignoring");
+                EnvPreludes::default()
+            })
+        },
+    )
+}
+
+/// The pretty-printed file body, refused over the read cap: a file the
+/// next read would ignore must never be written.
+fn encode(data: &EnvPreludes) -> Result<Vec<u8>, WriteError> {
+    crate::persist::encode_pretty(data, MAX_FILE_BYTES).map_err(|err| match err {
+        Encode::TooLarge => WriteError::TooLarge,
+        Encode::Failed(err) => WriteError::Failed(err.into()),
+    })
+}
+
+/// Why a write didn't land.
+enum WriteError {
+    TooLarge,
+    Unreadable,
+    Failed(anyhow::Error),
 }
 
 impl EnvPreludeStore {
@@ -154,61 +202,31 @@ impl EnvPreludeStore {
             path,
             data: EnvPreludes::default(),
             mtime: None,
+            gate: DiskGate::default(),
+            before_read: None,
         };
-        store.read_from_disk();
+        store.refresh();
         store
     }
 
-    fn read_from_disk(&mut self) {
-        let (data, mtime) = match std::fs::read(&self.path) {
-            Ok(bytes) if bytes.len() > MAX_FILE_BYTES => {
-                tracing::warn!(path = %self.path.display(), "env-profiles.json exceeds {MAX_FILE_BYTES} bytes; ignoring");
-                (EnvPreludes::default(), file_mtime(&self.path))
-            }
-            Ok(bytes) => match serde_json::from_slice::<EnvPreludes>(&bytes) {
-                Ok(data) => (data, file_mtime(&self.path)),
-                Err(err) => {
-                    tracing::warn!(path = %self.path.display(), %err, "corrupt env-profiles.json; ignoring");
-                    (EnvPreludes::default(), file_mtime(&self.path))
-                }
-            },
-            Err(err) if err.kind() == ErrorKind::NotFound => (EnvPreludes::default(), None),
-            Err(err) => {
-                tracing::warn!(path = %self.path.display(), %err, "failed to read env-profiles.json");
-                (EnvPreludes::default(), None)
-            }
-        };
-        self.data = data;
-        self.mtime = mtime;
+    fn install(&mut self, disk: Disk) {
+        if let Disk::Loaded(data, mtime) = disk {
+            self.data = data;
+            self.mtime = mtime;
+        }
+    }
+
+    /// Blocking, under the caller's lock: only for the synchronous callers.
+    fn refresh(&mut self) {
+        let disk = look(&self.path, self.mtime, None);
+        self.install(disk);
     }
 
     /// The current preludes (mtime-checked against on-disk edits).
+    /// Blocking: async code uses [`snapshot`].
     pub(crate) fn current(&mut self) -> &EnvPreludes {
-        if file_mtime(&self.path) != self.mtime {
-            self.read_from_disk();
-        }
+        self.refresh();
         &self.data
-    }
-
-    /// Replace the whole store and persist (pretty-printed, atomic rename).
-    pub(crate) fn put(&mut self, data: EnvPreludes) -> anyhow::Result<()> {
-        let data = data.normalized();
-        let mut body = serde_json::to_vec_pretty(&data)?;
-        body.push(b'\n');
-        crate::persist::atomic_write_json(&self.path, body)?;
-        self.data = data;
-        self.mtime = file_mtime(&self.path);
-        Ok(())
-    }
-
-    /// Drop one workspace's entry (the explicit workspace-delete hook).
-    pub(crate) fn remove_workspace(&mut self, workspace_id: &str) {
-        let mut data = self.current().clone();
-        if data.workspaces.remove(workspace_id).is_some() {
-            if let Err(err) = self.put(data) {
-                tracing::warn!(%err, "failed to prune workspace prelude");
-            }
-        }
     }
 
     /// Invalidate the mtime cache so the next read hits the disk. Tests
@@ -217,10 +235,68 @@ impl EnvPreludeStore {
     pub(crate) fn force_stale_for_tests(&mut self) {
         self.mtime = Some(std::time::UNIX_EPOCH);
     }
+
+    /// Run `hook` on the blocking pool right before each off-lock read.
+    #[cfg(test)]
+    pub(crate) fn set_before_read_for_tests(&mut self, hook: Hook) {
+        self.before_read = Some(hook);
+    }
 }
 
-fn file_mtime(path: &std::path::Path) -> Option<SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+/// Did a refresh leave the cache trustworthy?
+enum Refreshed {
+    Fresh,
+    Unreadable,
+}
+
+/// One off-lock refresh. Blocking; runs inside the store's [`DiskGate`]. The
+/// mutex is taken twice, briefly: to snapshot the path and recorded mtime,
+/// and to install. A synchronous caller that refreshed in between already
+/// installed a read at least as new, so the install is skipped then.
+fn refresh_job(state: &AppState) -> Refreshed {
+    let (path, recorded, hook) = {
+        let store = crate::lock(&state.env_preludes);
+        (store.path.clone(), store.mtime, store.before_read.clone())
+    };
+    match look(&path, recorded, hook.as_ref()) {
+        Disk::Same => Refreshed::Fresh,
+        Disk::Unreadable => Refreshed::Unreadable,
+        disk => {
+            let mut store = crate::lock(&state.env_preludes);
+            if store.mtime == recorded {
+                store.install(disk);
+            }
+            Refreshed::Fresh
+        }
+    }
+}
+
+/// Write `data` (already normalized) and install it. Blocking; inside the gate.
+fn write_job(state: &AppState, data: EnvPreludes) -> Result<(), WriteError> {
+    let body = encode(&data)?;
+    let path = crate::lock(&state.env_preludes).path.clone();
+    let mtime =
+        crate::persist::atomic_write_json_modified(&path, body).map_err(WriteError::Failed)?;
+    crate::lock(&state.env_preludes).install(Disk::Loaded(data, mtime));
+    Ok(())
+}
+
+/// Run `job` as this store's next disk job.
+async fn run_job<T: Send + 'static>(
+    state: &Arc<AppState>,
+    job: impl FnOnce(&AppState) -> T + Send + 'static,
+) -> anyhow::Result<T> {
+    let gate = crate::lock(&state.env_preludes).gate.clone();
+    let job_state = state.clone();
+    gate.run(move || job(&job_state)).await
+}
+
+/// The current preludes, refreshed from disk off the reactor.
+pub(crate) async fn snapshot(state: &Arc<AppState>) -> EnvPreludes {
+    if let Err(err) = run_job(state, refresh_job).await {
+        tracing::warn!(%err, "environment refresh failed");
+    }
+    crate::lock(&state.env_preludes).data.clone()
 }
 
 /// The cluster job's startup commands: the text of the file
@@ -351,60 +427,190 @@ pub(crate) fn remove_prelude_path(path: &std::path::Path) {
 
 /// GET /api/v1/environment — the whole prelude map.
 pub(crate) async fn get_environment(State(state): State<Arc<AppState>>) -> Response {
-    let data = crate::lock(&state.env_preludes).current().clone();
-    Json(data).into_response()
+    Json(snapshot(&state).await).into_response()
 }
 
-/// PUT /api/v1/environment — replace the whole map; 204 on success. The
-/// client sends back everything it fetched (whole-map semantics like
-/// settings), so partial writes can't silently drop other workspaces.
-pub(crate) async fn put_environment(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
-    if body.len() > MAX_FILE_BYTES {
-        return (
+fn error(status: StatusCode, message: String) -> Response {
+    (status, Json(json!({"error": message}))).into_response()
+}
+
+/// The checks every scope's text passes, on PUT and PATCH alike: the
+/// refusal to answer, if any.
+fn check_texts<'a>(texts: impl Iterator<Item = &'a str>) -> Option<Response> {
+    for text in texts {
+        if text.len() > MAX_SCOPE_BYTES {
+            return Some(error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("a prelude exceeds {MAX_SCOPE_BYTES} bytes"),
+            ));
+        }
+        if text.contains('\0') {
+            return Some(error(
+                StatusCode::BAD_REQUEST,
+                "prelude text contains a NUL byte".into(),
+            ));
+        }
+    }
+    None
+}
+
+fn body_too_large(body: &Bytes) -> Option<Response> {
+    (body.len() > MAX_FILE_BYTES).then(|| {
+        error(
             StatusCode::PAYLOAD_TOO_LARGE,
-            Json(json!({"error": format!("environment preludes exceed {MAX_FILE_BYTES} bytes")})),
+            format!("environment preludes exceed {MAX_FILE_BYTES} bytes"),
         )
-            .into_response();
+    })
+}
+
+/// The answer to a finished write job.
+fn written(outcome: anyhow::Result<Result<(), WriteError>>) -> Response {
+    match outcome {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(WriteError::TooLarge)) => error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("environment preludes exceed {MAX_FILE_BYTES} bytes"),
+        ),
+        Ok(Err(WriteError::Unreadable)) => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "env-profiles.json can't be read right now; nothing was changed".into(),
+        ),
+        Ok(Err(WriteError::Failed(err))) | Err(err) => {
+            tracing::error!(%err, "failed to persist environment preludes");
+            error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+        }
+    }
+}
+
+/// PUT /api/v1/environment — replace the whole map; 204 on success. Kept
+/// for older clients; a window that edits one scope sends PATCH, so it
+/// can't put back another window's older text for a scope it never touched.
+pub(crate) async fn put_environment(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    if let Some(refused) = body_too_large(&body) {
+        return refused;
     }
     let data = match serde_json::from_slice::<EnvPreludes>(&body) {
         Ok(data) => data,
         Err(err) => {
-            return (
+            return error(
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("invalid environment JSON: {err}")})),
-            )
-                .into_response();
+                format!("invalid environment JSON: {err}"),
+            );
         }
     };
-    let texts = std::iter::once(&data.host)
-        .filter_map(|h| h.as_ref())
-        .map(|e| &e.text)
-        .chain(data.workspaces.values().map(|e| &e.text));
-    for text in texts {
-        if text.len() > MAX_SCOPE_BYTES {
-            return (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                Json(json!({"error": format!("a prelude exceeds {MAX_SCOPE_BYTES} bytes")})),
-            )
-                .into_response();
+    let texts = data
+        .host
+        .iter()
+        .chain(data.workspaces.values())
+        .map(|e| e.text.as_str());
+    if let Some(refused) = check_texts(texts) {
+        return refused;
+    }
+    let data = data.normalized();
+    written(run_job(&state, move |state| write_job(state, data)).await)
+}
+
+/// A PATCH body: a scope present replaces it, `null` deletes it, absent
+/// leaves it alone. Unknown top-level keys are refused, so a misspelt scope
+/// can't answer 204 having changed nothing.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EnvPatch {
+    #[serde(default, deserialize_with = "present")]
+    host: Option<Option<PreludeEntry>>,
+    #[serde(default)]
+    workspaces: BTreeMap<String, Option<PreludeEntry>>,
+}
+
+/// Wraps whatever the key held in `Some`, so `"host": null` reads as
+/// `Some(None)` while an absent key keeps `default`'s `None`.
+fn present<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(de).map(Some)
+}
+
+impl EnvPatch {
+    fn texts(&self) -> impl Iterator<Item = &str> {
+        self.host
+            .iter()
+            .flatten()
+            .chain(self.workspaces.values().flatten())
+            .map(|e| e.text.as_str())
+    }
+
+    fn apply(self, mut data: EnvPreludes) -> EnvPreludes {
+        if let Some(host) = self.host {
+            data.host = host;
         }
-        if text.contains('\0') {
-            return (
+        for (id, entry) in self.workspaces {
+            match entry {
+                Some(entry) => {
+                    data.workspaces.insert(id, entry);
+                }
+                None => {
+                    data.workspaces.remove(&id);
+                }
+            }
+        }
+        data.normalized()
+    }
+}
+
+/// The PATCH's read-modify-write. Blocking; inside the store's gate, so two
+/// windows' patches apply one after the other, each to the other's result.
+/// The file is re-read first: a hand-edit since the last read is kept.
+fn patch_job(state: &AppState, patch: EnvPatch) -> Result<(), WriteError> {
+    if let Refreshed::Unreadable = refresh_job(state) {
+        return Err(WriteError::Unreadable);
+    }
+    let current = crate::lock(&state.env_preludes).data.clone();
+    let next = patch.apply(current.clone());
+    if next == current {
+        return Ok(());
+    }
+    write_job(state, next)
+}
+
+/// Drop one workspace's entry (the explicit workspace-delete hook): a PATCH
+/// of that scope to null, so it queues behind — never races — a window's
+/// PATCH that read the store before the delete.
+pub(crate) async fn remove_workspace(state: &Arc<AppState>, workspace_id: &str) {
+    let patch = EnvPatch {
+        host: None,
+        workspaces: BTreeMap::from([(workspace_id.to_string(), None)]),
+    };
+    match run_job(state, move |state| patch_job(state, patch)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(WriteError::Failed(err))) | Err(err) => {
+            tracing::warn!(%err, "failed to prune workspace prelude");
+        }
+        Ok(Err(WriteError::TooLarge | WriteError::Unreadable)) => {
+            tracing::warn!("env-profiles.json can't be rewritten; workspace prelude kept");
+        }
+    }
+}
+
+/// PATCH /api/v1/environment — change only the scopes named; 204 on success.
+pub(crate) async fn patch_environment(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    if let Some(refused) = body_too_large(&body) {
+        return refused;
+    }
+    let patch = match serde_json::from_slice::<EnvPatch>(&body) {
+        Ok(patch) => patch,
+        Err(err) => {
+            return error(
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "prelude text contains a NUL byte"})),
-            )
-                .into_response();
+                format!("invalid environment JSON: {err}"),
+            );
         }
+    };
+    if let Some(refused) = check_texts(patch.texts()) {
+        return refused;
     }
-    if let Err(err) = crate::lock(&state.env_preludes).put(data) {
-        tracing::error!(%err, "failed to persist environment preludes");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": err.to_string()})),
-        )
-            .into_response();
-    }
-    StatusCode::NO_CONTENT.into_response()
+    written(run_job(&state, move |state| patch_job(state, patch)).await)
 }
 
 #[cfg(test)]

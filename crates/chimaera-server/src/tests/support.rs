@@ -588,3 +588,60 @@ pub(super) fn age_file(path: &std::path::Path, secs: u64) {
     file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(secs))
         .unwrap();
 }
+
+/// A stand-in for a hung disk: [`Stall::hook`] blocks the store's read (on
+/// the blocking pool) until [`Stall::release`]. The holder thread lets go on
+/// its own after 5 s, so a regression that blocks the reactor fails a timing
+/// assertion instead of hanging the suite.
+pub(super) struct Stall {
+    lock: Arc<std::sync::Mutex<()>>,
+    entered: Arc<std::sync::atomic::AtomicBool>,
+    release: std::sync::mpsc::Sender<()>,
+    holder: std::thread::JoinHandle<()>,
+}
+
+impl Stall {
+    pub(super) fn new() -> Self {
+        let lock = Arc::new(std::sync::Mutex::new(()));
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (locked_tx, locked) = std::sync::mpsc::channel::<()>();
+        let held = lock.clone();
+        let holder = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = released.recv_timeout(std::time::Duration::from_secs(5));
+        });
+        locked.recv().unwrap();
+        Stall {
+            lock,
+            entered: Arc::default(),
+            release,
+            holder,
+        }
+    }
+
+    pub(super) fn hook(&self) -> crate::persist::Hook {
+        let lock = self.lock.clone();
+        let entered = self.entered.clone();
+        Arc::new(move || {
+            entered.store(true, std::sync::atomic::Ordering::SeqCst);
+            drop(lock.lock());
+        })
+    }
+
+    /// Wait (yielding to the runtime) until a read is parked in the hook.
+    pub(super) async fn wait_entered(&self) {
+        for _ in 0..500 {
+            if self.entered.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("no read reached the stalled disk");
+    }
+
+    pub(super) fn release(self) {
+        let _ = self.release.send(());
+        self.holder.join().unwrap();
+    }
+}

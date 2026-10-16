@@ -326,7 +326,9 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         )
         .route(
             "/environment",
-            get(environment::get_environment).put(environment::put_environment),
+            get(environment::get_environment)
+                .put(environment::put_environment)
+                .patch(environment::patch_environment),
         )
         .route("/fs/home", get(fs::home))
         .route("/fs/dirs", get(fs::dirs))
