@@ -703,6 +703,24 @@ async fn a_resumed_respawn_keeps_its_jobs_and_a_fresh_one_does_not() {
         };
         assert!(wakeup.is_none(), "a wakeup never survives");
         assert_eq!(carried.len(), jobs, "resumes={resumes}");
+        // The respawn continued the conversation's journal: its first event
+        // follows the exit directly, and nothing was renumbered over lines
+        // the previous process's writer still had in flight (the seq is the
+        // contract; a second Journal on the same file would have collided).
+        wait_for(&mut rx, &mut seen, "the respawn's init", |ev| {
+            matches!(ev, AgentEvent::Init { .. })
+        })
+        .await;
+        let seqs: Vec<u64> = dedup_by_seq(&seen).iter().map(|e| e.seq).collect();
+        assert_eq!(
+            seqs[0],
+            exited.seq + 1,
+            "resumes={resumes}: replay starts after the exit"
+        );
+        assert!(
+            seqs.windows(2).all(|w| w[1] == w[0] + 1),
+            "resumes={resumes}: gap-free, monotonic seq across the respawn: {seqs:?}"
+        );
     }
 }
 
