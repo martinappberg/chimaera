@@ -591,8 +591,9 @@ pub(super) fn age_file(path: &std::path::Path, secs: u64) {
 
 /// A stand-in for a hung disk: [`Stall::hook`] blocks the store's read (on
 /// the blocking pool) until [`Stall::release`]. The holder thread lets go on
-/// its own after 5 s, so a regression that blocks the reactor fails a timing
-/// assertion instead of hanging the suite.
+/// its own after 15 s — it only bounds a hang (every test releases
+/// explicitly), so a regression that blocks the reactor fails an assertion
+/// instead of hanging the suite, with room above any budget a test sets.
 pub(super) struct Stall {
     lock: Arc<std::sync::Mutex<()>>,
     entered: Arc<std::sync::atomic::AtomicBool>,
@@ -609,7 +610,7 @@ impl Stall {
         let holder = std::thread::spawn(move || {
             let _guard = held.lock().unwrap();
             locked_tx.send(()).unwrap();
-            let _ = released.recv_timeout(std::time::Duration::from_secs(5));
+            let _ = released.recv_timeout(std::time::Duration::from_secs(15));
         });
         locked.recv().unwrap();
         Stall {

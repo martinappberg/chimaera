@@ -1063,15 +1063,17 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
     // dropped on every exit path below.
     let _consumer = state.browser_opens.consumer();
     // A new window's FIRST settings frame gets one fresh disk read (off the
-    // reactor): a hand-edit inside the watcher's poll window must not greet
-    // a fresh window with stale settings. Steady-state sends stay cached.
-    {
-        let state = state.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            let _ = crate::lock(&state.settings).current();
-        })
-        .await;
-    }
+    // reactor, through the store's gate): a hand-edit inside the watcher's
+    // poll window must not greet a fresh window with stale settings.
+    // Steady-state sends stay cached. Bounded: behind a hung read the frame
+    // (and the sessions snapshot after it) must still come, so past one poll
+    // period it goes out from the cache and the edit catches up on a later
+    // poll's wake.
+    let _ = tokio::time::timeout(
+        crate::settings::SETTINGS_POLL,
+        crate::settings::refresh(&state),
+    )
+    .await;
     if send_settings_snapshot(&mut socket, &state, &mut last_settings_gen)
         .await
         .is_err()

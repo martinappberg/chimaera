@@ -281,16 +281,11 @@ async fn settings_read_on_slow_storage_leaves_the_runtime_free() {
     });
     stall.wait_entered().await;
 
-    let started = std::time::Instant::now();
     let (status, _) = request(&state, Method::GET, "/api/v1/health", None).await;
     assert_eq!(status, StatusCode::OK);
     let (status, _) = request(&state, Method::GET, "/api/v1/environment", None).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(2),
-        "other routes waited on the stalled settings read"
-    );
-    assert!(!parked.is_finished());
+    assert!(!parked.is_finished(), "the stalled read let go early");
 
     stall.release();
     let (status, body) = parked.await.unwrap();
@@ -357,16 +352,20 @@ async fn settings_put_side_effects_survive_a_dropped_handler() {
     );
 }
 
-/// A synchronous getter that re-reads settings.json between the PUT's
-/// rename and its install must not hide the change from the PUT's diff.
+/// The getters read only the cache: one called between a PUT's rename and
+/// its install still answers the old value (no re-read of the new file), and
+/// the PUT's diff sees the moved agent path.
 #[tokio::test]
-async fn settings_put_diff_survives_a_getter_rereading_mid_write() {
+async fn settings_getters_read_the_cache_during_a_put() {
     let state = test_state();
     plant_claude_miss(&state);
     let weak = Arc::downgrade(&state);
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let seen_in_hook = seen.clone();
     lock(&state.settings).set_after_write_for_tests(Arc::new(move || {
         if let Some(state) = weak.upgrade() {
-            let _ = lock(&state.settings).current();
+            let path = lock(&state.settings).agent_path(crate::agents::AgentKind::Claude);
+            *seen_in_hook.lock().unwrap() = Some(path);
         }
     }));
     let (status, _) = request(
@@ -377,8 +376,129 @@ async fn settings_put_diff_survives_a_getter_rereading_mid_write() {
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        Some(None),
+        "a getter mid-write must answer the cache, not the new file"
+    );
     assert!(
         claude_miss_cleared(&state),
         "the moved agent path went unnoticed"
     );
+    assert_eq!(
+        lock(&state.settings)
+            .agent_path(crate::agents::AgentKind::Claude)
+            .as_deref(),
+        Some("/opt/tools/claude")
+    );
+}
+
+/// With settings.json's read parked on a hung disk, the daemon-side getters
+/// and a spawn's prelude answer from the caches at once — never a stat under
+/// the store mutex — and an unrelated route answers too. The on-disk edit
+/// reaches the getters only once the refresh lands.
+#[tokio::test(flavor = "current_thread")]
+async fn settings_getters_answer_from_the_cache_while_the_read_is_stalled() {
+    let data_dir = test_dir("settings-getters-stalled");
+    let path = settings_path(&data_dir);
+    std::fs::write(
+        &path,
+        r#"{"daemon.scrollbackLines": 5000, "git.path": "/opt/git-old/bin/git"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        data_dir.join("config").join("env-profiles.json"),
+        r#"{"host": {"text": "ml cached-host"}}"#,
+    )
+    .unwrap();
+    let state = test_state_with_data_dir(0, data_dir.clone());
+
+    let stall = Stall::new();
+    lock(&state.settings).set_before_read_for_tests(stall.hook());
+    std::fs::write(
+        &path,
+        r#"{"daemon.scrollbackLines": 9000, "git.path": "/opt/git-new/bin/git"}"#,
+    )
+    .unwrap();
+    lock(&state.settings).force_stale_for_tests();
+    let parked = tokio::spawn({
+        let state = state.clone();
+        async move { request(&state, Method::GET, "/api/v1/settings", None).await }
+    });
+    stall.wait_entered().await;
+
+    assert_eq!(lock(&state.settings).scrollback_lines(), Some(5_000));
+    assert_eq!(
+        lock(&state.settings).git_path().as_deref(),
+        Some("/opt/git-old/bin/git")
+    );
+    let session = format!("settings-stalled-{}", std::process::id());
+    let prelude = crate::environment::materialize_prelude(&state, &session, "w-1", None, None)
+        .expect("the cached host prelude");
+    let text = std::fs::read_to_string(&prelude).unwrap();
+    crate::environment::remove_prelude_file(&session);
+    assert!(text.contains("ml cached-host"), "{text}");
+    let (status, _) = request(&state, Method::GET, "/api/v1/health", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!parked.is_finished(), "the stalled read let go early");
+
+    stall.release();
+    let (status, body) = parked.await.unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["settings"]["daemon.scrollbackLines"], 9000);
+    assert_eq!(lock(&state.settings).scrollback_lines(), Some(9_000));
+    assert_eq!(
+        lock(&state.settings).git_path().as_deref(),
+        Some("/opt/git-new/bin/git")
+    );
+}
+
+/// A new window's first `/ws/events` settings frame refreshes first, but a
+/// hung settings read can't hold it: past one poll period the frame goes out
+/// from the cache.
+#[tokio::test(flavor = "current_thread")]
+async fn first_events_settings_frame_comes_from_the_cache_behind_a_stalled_read() {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    let data_dir = test_dir("settings-events-stalled");
+    let path = settings_path(&data_dir);
+    std::fs::write(&path, r#"{"terminal.fontSize": 11}"#).unwrap();
+    let state = test_state_with_data_dir(0, data_dir.clone());
+    let stall = Stall::new();
+    lock(&state.settings).set_before_read_for_tests(stall.hook());
+    std::fs::write(&path, r#"{"terminal.fontSize": 19}"#).unwrap();
+    lock(&state.settings).force_stale_for_tests();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = app(state.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/events"))
+        .await
+        .unwrap();
+    socket
+        .send(WsMessage::text(
+            serde_json::json!({"type": "auth", "token": "test-token"}).to_string(),
+        ))
+        .await
+        .unwrap();
+    stall.wait_entered().await;
+
+    // The Stall lets go on its own at 15 s; the frame must come well before.
+    let frame = tokio::time::timeout(
+        crate::settings::SETTINGS_POLL + std::time::Duration::from_secs(5),
+        next_ws_frame(&mut socket),
+    )
+    .await
+    .expect("no settings frame behind the stalled read");
+    let settings = match frame {
+        WsMessage::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+        other => panic!("expected a settings text frame, got {other:?}"),
+    };
+    assert_eq!(settings["type"], "settings");
+    assert_eq!(settings["settings"]["terminal.fontSize"], 11);
+    stall.release();
 }
