@@ -39,6 +39,7 @@
   import { onMount } from "svelte";
   import {
     agentCatalog,
+    agentRechecks,
     getAgentDefault,
     groupAgents,
     listAgents,
@@ -152,14 +153,9 @@
 
   let hl = $state(0);
   let rootEl = $state<HTMLElement | null>(null);
-  /** Agents whose login-shell check is being retried from a row. */
-  let rechecking = $state<Record<string, boolean>>({});
-
   /** Look again for an agent the login shell couldn't check; the shared
    *  catalog then carries the answer to these rows and the rail. */
   async function recheck(a: AgentInfo): Promise<void> {
-    if (rechecking[a.id]) return;
-    rechecking[a.id] = true;
     try {
       await recheckAgent(a.id);
       const fresh = $agentCatalog;
@@ -169,8 +165,6 @@
       }
     } catch {
       // The row keeps saying it couldn't check; its chip offers the retry again.
-    } finally {
-      rechecking[a.id] = false;
     }
   }
 
@@ -187,7 +181,7 @@
 
   /** The row's one quiet state word: a version when it can run, else what it needs. */
   function stateLine(a: AgentInfo): string {
-    if (!a.installed && rechecking[a.id]) return "checking…";
+    if (!a.installed && $agentRechecks.has(a.id)) return "checking…";
     if (!a.installed && a.unchecked !== null) return "couldn't check";
     if (!a.installed) return "not installed";
     if (a.outdated) return "needs an update";
@@ -401,7 +395,7 @@
         class="achip"
         class:solid={i < installedCount}
         tabindex="-1"
-        disabled={rechecking[a.id]}
+        disabled={$agentRechecks.has(a.id)}
         title="{a.unchecked} Check again."
         onclick={(e) => {
           e.stopPropagation();

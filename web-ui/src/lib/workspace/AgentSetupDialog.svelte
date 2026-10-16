@@ -4,7 +4,7 @@
   import { modalFocus } from "../shared/modalFocus";
   import { pageVisible } from "../shared/visibility";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
-  import { agentCatalog, pollAgents, recheckAgent, versionNumber, type LaunchPick } from "./launcher";
+  import { agentCatalog, agentRechecks, pollAgents, recheckAgent, versionNumber, type LaunchPick } from "./launcher";
   import { acknowledgeSetupResult, cancelAgentSetup, getAgentSetup, pendingSetupId, recoverSetupResult, startAgentSetup, type SetupDetails, type SetupRequest } from "./agentSetup";
   import { operationRunning } from "./operations";
   import AgentSignInCard from "./AgentSignInCard.svelte";
@@ -26,13 +26,16 @@
   /** The installer finished but the login shell couldn't say where the
    *  agent is: the way on is to look again, not to install again. */
   const unchecked = $derived(operation?.phase === "failed" && verified?.state === "unchecked");
-  let rechecking = $state(false);
+  const rechecking = $derived($agentRechecks.has(request.agent.id));
+  /** A check asked for while one runs runs after it: a Check again must
+   *  show the result it caused, not one fetched before. */
+  let checkAgain = false;
   const agent = $derived($agentCatalog.find(a => a.id === request.agent.id) ?? request.agent);
   const verb = $derived(({ install: "Install", update: "Update", reinstall: "Reinstall" })[request.action]);
   const title = $derived(operation?.phase === "succeeded" ? `${agent.name} ${operation.action === "update" ? "updated" : operation.action === "reinstall" ? "reinstalled" : "installed"}` : unchecked ? `Couldn't check ${agent.name}` : operation?.phase === "failed" ? `Couldn't install ${agent.name}` : operation?.phase === "cancelled" ? "Installation cancelled" : operation?.phase === "cancelling" ? "Stopping installation…" : running ? `${operation?.action === "update" ? "Updating" : operation?.action === "reinstall" ? "Reinstalling" : "Installing"} ${agent.name}…` : `${verb} ${agent.name}`);
 
   async function check(): Promise<void> {
-    if (checking) return;
+    if (checking) { checkAgain = true; return; }
     checking = true;
     try {
       const next = await getAgentSetup(agent.id);
@@ -58,7 +61,10 @@
         connected = false;
         refreshError = `Couldn't refresh setup. ${e instanceof Error ? e.message : "Check the connection."} The installer may still be running.`;
       }
-    } finally { checking = false; }
+    } finally {
+      checking = false;
+      if (checkAgain && !disposed) { checkAgain = false; void check(); }
+    }
   }
   onMount(() => { void check(); return () => { disposed = true; }; });
   $effect(() => {
@@ -99,15 +105,17 @@
    *  install on the daemon; refetching the result shows it. */
   async function recheck(): Promise<void> {
     if (rechecking) return;
-    rechecking = true; error = null;
+    error = null;
     try {
       const found = await recheckAgent(agent.id);
       if (disposed) return;
+      // A find or a completed miss settles the result on the daemon (a
+      // success, or missing with Retry installation); refetch to show it.
       await check();
-      if (!found.installed) error = found.unchecked !== null ? "Still couldn't check." : `${agent.name} still can't be found.`;
+      if (!found.installed && found.unchecked !== null) error = "Still couldn't check.";
     } catch (e) {
       if (!disposed) error = e instanceof Error ? e.message : "Couldn't check.";
-    } finally { rechecking = false; }
+    }
   }
   function launch(ui: "chat" | "term"): void {
     // Start while the request still exists: closing clears the shared store

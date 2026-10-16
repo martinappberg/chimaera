@@ -66,8 +66,7 @@ pub(crate) enum Verified {
         version: Option<String>,
     },
     /// The login shell couldn't answer (`reason`, plain words): the install
-    /// may well be fine. A later check that finds it confirms it
-    /// ([`confirm`]).
+    /// may well be fine. A later look settles it ([`settle`]).
     Unchecked { reason: String },
     /// A completed look found no executable.
     Missing,
@@ -154,10 +153,18 @@ pub(crate) async fn start(
             "Finish signing in to this agent first.",
         );
     }
-    if !matches!(body.action, Action::Install)
-        && !crate::launcher::detect(&state, kind, false).await.managed
-    {
-        return operation::error(StatusCode::BAD_REQUEST, "Chimaera only updates or reinstalls its own copy. Check the executable in Agents settings.");
+    if !matches!(body.action, Action::Install) {
+        let found = crate::launcher::detect(&state, kind, false).await;
+        if let (false, Some(why)) = (found.managed, &found.unchecked) {
+            // Which copy runs is unknown, not someone else's: say so.
+            return operation::error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("Couldn't check which copy of {} is installed. {why} Retry in Agents settings, then update.", kind.product_name()),
+            );
+        }
+        if !found.managed {
+            return operation::error(StatusCode::BAD_REQUEST, "Chimaera only updates or reinstalls its own copy. Check the executable in Agents settings.");
+        }
     }
     let Some(script) = crate::runtimes::install_script(kind, &state.managed_root) else {
         return operation::error(
@@ -352,27 +359,27 @@ fn installed(kind: AgentKind) -> String {
     )
 }
 
-/// A later look found the executable an install couldn't check: its result
-/// now says so, wherever it is shown. Only a finished, unchecked result
-/// changes; never a running operation or a verdict already reached.
-pub(crate) fn confirm(state: &AppState, kind: AgentKind, found: &AgentDetection) {
-    let Ok(path) = &found.path else { return };
+/// A later look settles an install whose own check couldn't conclude: a
+/// found executable makes it a success, a completed look that found nothing
+/// makes it missing (so the way on is another install), and a shell that
+/// again couldn't answer leaves it waiting. Only a finished, unchecked
+/// result changes; never a running operation or a verdict already reached.
+pub(crate) fn settle(state: &AppState, kind: AgentKind, found: &AgentDetection) {
+    if found.path.is_err() && found.unchecked.is_some() {
+        return;
+    }
     let Some(operation) = state.agent_setup.get(kind) else {
         return;
     };
-    let confirmed = operation.update(|p| {
+    let settled = operation.update(|p| {
         if !matches!(p.verified, Some(Verified::Unchecked { .. })) {
             return false;
         }
-        p.phase = Phase::Succeeded;
-        p.message = installed(kind);
-        p.verified = Some(Verified::Found {
-            path: path.clone(),
-            version: found.version.clone(),
-        });
+        let (phase, message, verified) = verdict(kind, found.clone());
+        (p.phase, p.message, p.verified) = (phase, message, Some(verified));
         true
     });
-    if confirmed {
+    if settled {
         state.changes.notify_waiters();
     }
 }
@@ -618,14 +625,14 @@ mod tests {
         );
 
         // A later look that also can't answer changes nothing.
-        confirm(
+        settle(
             &state,
             AgentKind::Codex,
             &detection(Err("again".into()), Some("again")),
         );
         assert!(snapshot(&state, AgentKind::Codex).unwrap().phase == Phase::Failed);
         // One that finds it confirms the install, wherever it is shown.
-        confirm(
+        settle(
             &state,
             AgentKind::Codex,
             &detection(Ok("/later/codex".into()), None),
@@ -649,7 +656,7 @@ mod tests {
         )
         .await;
         completed(&state).await;
-        confirm(
+        settle(
             &state,
             AgentKind::Codex,
             &detection(Ok("/later/codex".into()), None),
@@ -658,6 +665,29 @@ mod tests {
             snapshot(&state, AgentKind::Codex).unwrap().verified,
             Some(Verified::Missing)
         );
+
+        // A later look that completes and finds nothing settles it as
+        // missing: the way on is another install, not another check.
+        let state = self::state();
+        start_script(
+            state.clone(),
+            AgentKind::Codex,
+            "/tmp".into(),
+            request("three"),
+            "exit 0".into(),
+            unchecked,
+        )
+        .await;
+        completed(&state).await;
+        settle(
+            &state,
+            AgentKind::Codex,
+            &detection(Err("codex not found".into()), None),
+        );
+        let p = snapshot(&state, AgentKind::Codex).unwrap();
+        assert!(p.phase == Phase::Failed);
+        assert_eq!(p.verified, Some(Verified::Missing));
+        assert!(p.message.contains("still can't be found"));
     }
     #[test]
     fn incompatible_libraries_do_not_offer_an_unhelpful_retry() {

@@ -756,9 +756,8 @@ pub(crate) fn installation_status(state: &AppState, kind: AgentKind) -> Option<s
 }
 
 /// Watch an install session; when it ends, re-detect that agent (bypassing
-/// the daemon-lifetime cache, `launcher::verify`) and regenerate the shims so
-/// the next spawn — and the open popover, via the change notification — sees
-/// the new binary.
+/// the daemon-lifetime cache) and regenerate the shims so the next spawn —
+/// and the open popover, via the change notification — sees the new binary.
 fn spawn_install_watch(
     state: Arc<AppState>,
     kind: AgentKind,
@@ -777,9 +776,7 @@ fn spawn_install_watch(
             prune_install_versions(state.managed_root.clone(), kind).await;
         }
         drop(install_lock);
-        // Someone is watching this pane: give a slow login shell the patient
-        // budget rather than calling a fresh install missing.
-        let detection = crate::launcher::verify(&state, kind).await;
+        let detection = crate::launcher::detect(&state, kind, true).await;
         tracing::info!(
             agent = kind.as_str(),
             installed = detection.path.is_ok(),

@@ -4,7 +4,7 @@
   import { pageVisible } from "../shared/visibility";
   import { openInSystemBrowser } from "../shared/urlOpen";
   import {
-    agentCatalog, listAgents, pollAgents, recheckAgent, uninstallAgent,
+    agentCatalog, agentRechecks, listAgents, pollAgents, recheckAgent, uninstallAgent,
     versionNumber, type AgentInfo,
   } from "../workspace/launcher";
   import { openAgentSetup, type SetupAction } from "../workspace/agentSetup";
@@ -38,9 +38,8 @@
   /** Agents whose sign-in card is open under their row (a click, or a
    *  sign-in already running on the daemon). */
   let signingIn = $state<Record<string, boolean>>({});
-  /** Agents whose login-shell check is being retried, and those whose retry
-   *  couldn't check either (said only while the card still reads so). */
-  let rechecking = $state<Record<string, boolean>>({});
+  /** Agents whose retry couldn't check either (said only while the card
+   *  still reads so). */
   let stillUnchecked = $state<Record<string, boolean>>({});
   let uninstallError = $state<string | null>(null);
   let removing = $state(false);
@@ -115,15 +114,12 @@
 
   /** Retry a check the login shell couldn't finish; a second miss says so. */
   async function recheck(a: AgentInfo): Promise<void> {
-    if (rechecking[a.id]) return;
-    rechecking[a.id] = true;
     rowError[a.id] = null;
     stillUnchecked[a.id] = false;
     try {
       const found = await recheckAgent(a.id);
       stillUnchecked[a.id] = found.unchecked !== null;
     } catch (e) { rowError[a.id] = e instanceof Error ? e.message : "Couldn't check"; }
-    finally { rechecking[a.id] = false; }
   }
 
   function install(a: AgentInfo, action: SetupAction = "install", showResult = false): void {
@@ -176,14 +172,14 @@
             <p class="state">{!a.installed ? (a.unchecked !== null ? "Couldn't check" : "Not installed") : a.outdated ? "Needs an update" : a.chatSetupRequired ? "Installed · Chat companion missing" : needsSignIn(a) ? "Installed · Not signed in" : a.chatCapable ? "Installed · Supports chat and terminal" : "Installed · Terminal only"}</p>
             {#if a.installed}<p class="detail" title={a.latestError ?? undefined}>{a.managed ? "Managed by Chimaera" : "Your installation"}{#if status.text} · {status.text}{/if}</p>
             {:else if a.unchecked !== null}<p class="detail">{a.unchecked}</p>
-              {#if stillUnchecked[a.id] && !rechecking[a.id]}<p class="detail" role="status">Still couldn't check.</p>{/if}{/if}
+              {#if stillUnchecked[a.id] && !$agentRechecks.has(a.id)}<p class="detail" role="status">Still couldn't check.</p>{/if}{/if}
           </div>
           <div class="actions">
             {#if a.setup?.running}<button class="btn" onclick={() => install(a, "install", true)}>View progress</button>
             {:else if a.installation?.running}<span class="detail" role="status">Installing in a terminal…</span>
             {:else if !a.installed && a.unchecked !== null}
               <!-- It may well be installed: look again, never install over it. -->
-              <button class="btn primary" disabled={rechecking[a.id]} onclick={() => void recheck(a)}>{rechecking[a.id] ? "Checking…" : "Retry"}</button>
+              <button class="btn primary" disabled={$agentRechecks.has(a.id)} onclick={() => void recheck(a)}>{$agentRechecks.has(a.id) ? "Checking…" : "Retry"}</button>
             {:else if (!a.installed || a.chatSetupRequired) && a.managedInstall}
               <button class="btn primary" disabled={wsId === null} onclick={() => void install(a)}>{a.chatSetupRequired ? "Set up chat" : "Install"}</button>
             {:else if a.managed && (a.updateAvailable || a.outdated)}

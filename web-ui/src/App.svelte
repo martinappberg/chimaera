@@ -77,6 +77,7 @@
     listAgents,
     listRecents,
     primaryStart,
+    agentRechecks,
     recheckAgent,
     relativeAge,
     setAgentDefault,
@@ -4057,9 +4058,6 @@
     void spawnSession("shell");
   }
 
-  /** The rail's default whose login-shell check is being retried. */
-  let railRechecking = $state(false);
-
   /** One rail quick start: spawn that agent instantly in the default view
    *  (`term` = the ⌘/ctrl-click terminal path) — or, when it could only open
    *  a doomed pane, the step that unblocks it: a retry of a check the login
@@ -4072,11 +4070,7 @@
     if (q.action === "check") {
       // Look again only: a start that lands half a minute later would
       // surprise. The row reads ready once the check finds it.
-      if (railRechecking) return;
-      railRechecking = true;
-      void recheckAgent(q.id)
-        .catch(() => {})
-        .finally(() => (railRechecking = false));
+      void recheckAgent(q.id).catch(() => {});
       return;
     }
     if (term && q.info?.installed !== false) {
@@ -5969,7 +5963,7 @@
                 {#if q.action !== "start"}
                   <span class="new-need"
                     >{q.action === "check"
-                      ? railRechecking
+                      ? $agentRechecks.has(q.id)
                         ? "checking…"
                         : "retry"
                       : q.action === "install"

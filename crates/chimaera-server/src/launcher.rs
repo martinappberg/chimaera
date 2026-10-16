@@ -25,6 +25,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -324,6 +325,28 @@ where
     F: FnOnce(PathBuf, Option<String>) -> Fut,
     Fut: std::future::Future<Output = Result<PathBuf, Unresolved>>,
 {
+    let (detection, looked) = look(state, kind, refresh, serve_miss, resolve).await;
+    // Any look — a cached hit included — can settle an install whose own
+    // check couldn't conclude; a stamped miss is old news and can't.
+    if looked {
+        crate::agent_setup::settle(state, kind, &detection);
+    }
+    detection
+}
+
+/// The detection, and whether it was looked for now (false only for a
+/// stamped miss served to the catalog).
+async fn look<F, Fut>(
+    state: &AppState,
+    kind: AgentKind,
+    refresh: bool,
+    serve_miss: bool,
+    resolve: F,
+) -> (AgentDetection, bool)
+where
+    F: FnOnce(PathBuf, Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<PathBuf, Unresolved>>,
+{
     // A hit that still validates outlives a transient probe miss (a slow rc
     // on NFS, a login shell that timed out): on a refresh it is kept and no
     // miss is recorded over it.
@@ -345,7 +368,7 @@ where
                 });
             if same_install {
                 match validate_cache_hit(&hit) {
-                    CacheHit::Fresh => return hit,
+                    CacheHit::Fresh => return (hit, true),
                     CacheHit::Changed(mtime) => {
                         // In-place update: the path still serves, but the cached
                         // version is stale news — is_outdated/chat_capable and the
@@ -357,7 +380,7 @@ where
                         }
                         fresh.mtime = Some(mtime);
                         crate::lock(&state.agent_bins).insert(kind, fresh.clone());
-                        return fresh;
+                        return (fresh, true);
                     }
                     CacheHit::Gone => {
                         crate::lock(&state.agent_bins).remove(&kind);
@@ -367,7 +390,7 @@ where
         }
         if serve_miss {
             if let Some(miss) = cached_miss(state, kind) {
-                return miss;
+                return (miss, false);
             }
         }
     }
@@ -416,7 +439,6 @@ where
         Ok(_) => {
             crate::lock(&state.agent_bins).insert(kind, detection.clone());
             crate::lock(&state.agent_misses).remove(&kind);
-            crate::agent_setup::confirm(state, kind, &detection);
         }
         Err(reason) => {
             tracing::warn!(agent = kind.as_str(), %reason, "agent executable resolution failed");
@@ -434,7 +456,7 @@ where
                         crate::lock(&state.agent_bins).insert(kind, hit.clone());
                     }
                 }
-                return hit;
+                return (hit, true);
             }
             let miss = Unresolved {
                 reason: reason.clone(),
@@ -443,7 +465,7 @@ where
             crate::lock(&state.agent_misses).insert(kind, (miss, Instant::now()));
         }
     }
-    detection
+    (detection, true)
 }
 
 /// How long a detection miss is served without re-running the login shell.
@@ -732,9 +754,11 @@ async fn probe_login_shell_all(shell: &str, bins: &[&str], timeout: Duration) ->
 /// past it (`agent_bins` / `agent_misses` are the cache).
 #[derive(Default)]
 pub(crate) struct ShellProbes {
-    flights: std::sync::Mutex<HashMap<(String, Duration), (Instant, Flight)>>,
+    flights: std::sync::Mutex<HashMap<FlightKey, (Arc<AtomicBool>, Flight)>>,
 }
 
+/// The login shell and the budget a flight runs with.
+type FlightKey = (String, Duration);
 type Flight = futures::future::Shared<futures::future::BoxFuture<'static, Arc<ShellAnswers>>>;
 
 impl ShellProbes {
@@ -753,18 +777,19 @@ impl ShellProbes {
             let mut flights = crate::lock(&self.flights);
             let key = (shell.to_string(), budget);
             match flights.get(&key) {
-                // Still running: a flight can't outlive its budget, and one
-                // nobody polled to the end may have finished unobserved.
-                Some((started, flight))
-                    if flight.peek().is_none() && started.elapsed() < budget =>
-                {
-                    flight.clone()
-                }
+                // Joined only while its shell still runs: the task marks the
+                // end itself, since a flight no caller polled to the end
+                // never shows as finished on the shared future.
+                Some((done, flight)) if !done.load(Ordering::Acquire) => flight.clone(),
                 _ => {
                     let shell = shell.to_string();
+                    let done = Arc::new(AtomicBool::new(false));
+                    let finished = done.clone();
                     let probe = tokio::spawn(async move {
                         let bins = AgentKind::ALL.map(AgentKind::path_bin);
-                        probe_login_shell_all(&shell, &bins, budget).await
+                        let answers = probe_login_shell_all(&shell, &bins, budget).await;
+                        finished.store(true, Ordering::Release);
+                        answers
                     });
                     let flight = async move {
                         Arc::new(probe.await.unwrap_or_else(|e| {
@@ -776,7 +801,7 @@ impl ShellProbes {
                     }
                     .boxed()
                     .shared();
-                    flights.insert(key, (Instant::now(), flight.clone()));
+                    flights.insert(key, (done, flight.clone()));
                     flight
                 }
             }
@@ -989,12 +1014,7 @@ pub(crate) async fn list_agents(
             let mut row = serde_json::Map::new();
             row.insert("id".into(), json!(kind.as_str()));
             row.insert("name".into(), json!(kind.product_name()));
-            row.insert("installed".into(), json!(detection.path.is_ok()));
-            // Additive: the login shell couldn't answer, in plain words. Not
-            // "not installed": the UI offers a retry, never an install.
-            if let Some(why) = &detection.unchecked {
-                row.insert("unchecked".into(), json!(why));
-            }
+            resolution_fields(&mut row, &detection);
             // Additive: `signed_in` is the CLI's own verdict (null = unknown
             // or not installed); `sign_in` says how this agent signs in from
             // the app and names any sign-in in progress.
@@ -1007,12 +1027,6 @@ pub(crate) async fn list_agents(
             }
             if let Some(setup) = crate::agent_setup::summary(&state, kind) {
                 row.insert("setup".into(), setup);
-            }
-            if let Ok(path) = &detection.path {
-                row.insert("path".into(), json!(path));
-            }
-            if let Some(version) = &detection.version {
-                row.insert("version".into(), json!(version));
             }
             if detection.path.is_ok() && is_outdated(kind, detection.version.as_deref()) {
                 // Installed but too old to run usefully: the UI offers the
@@ -1107,19 +1121,25 @@ pub(crate) async fn detect_agent(
     let Some(kind) = crate::operation::kind(&id) else {
         return crate::operation::error(StatusCode::NOT_FOUND, "Unknown agent.");
     };
-    let detection = verify(&state, kind).await;
     let mut body = serde_json::Map::new();
-    body.insert("installed".into(), json!(detection.path.is_ok()));
-    if let Ok(path) = &detection.path {
-        body.insert("path".into(), json!(path));
-    }
-    if let Some(version) = &detection.version {
-        body.insert("version".into(), json!(version));
-    }
-    if let Some(why) = &detection.unchecked {
-        body.insert("unchecked".into(), json!(why));
-    }
+    resolution_fields(&mut body, &verify(&state, kind).await);
     Json(serde_json::Value::Object(body)).into_response()
+}
+
+/// What a catalog row says about where an agent resolves — shared with the
+/// Retry's answer so the two never disagree. `unchecked` is additive: the
+/// login shell couldn't answer, in plain words — a retry, never an install.
+fn resolution_fields(row: &mut serde_json::Map<String, serde_json::Value>, d: &AgentDetection) {
+    row.insert("installed".into(), json!(d.path.is_ok()));
+    if let Some(why) = &d.unchecked {
+        row.insert("unchecked".into(), json!(why));
+    }
+    if let Ok(path) = &d.path {
+        row.insert("path".into(), json!(path));
+    }
+    if let Some(version) = &d.version {
+        row.insert("version".into(), json!(version));
+    }
 }
 
 /// Charset guard for resume and other native ids that land in argv. Argv cannot

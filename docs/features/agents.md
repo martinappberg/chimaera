@@ -132,9 +132,11 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   result (`verified` on the operation) shows the version and the path new sessions will run —
   which can be your own copy, by the usual resolution order. A completed look that finds nothing
   fails the install. A login shell that couldn't answer fails it with *Couldn't check* and its
-  reason, offering **Check again** (not another install); a later look that finds the executable
-  — that button, a Retry elsewhere, a spawn — turns the result into a success
-  (`agent_setup::confirm`), so Settings stops saying it needs attention.
+  reason, offering **Check again** (not another install); any later look — that button, a Retry
+  elsewhere, a spawn, a catalog read — settles it (`agent_setup::settle`): found is a success, so
+  Settings stops saying it needs attention, and a completed look that finds nothing turns it into
+  a failed install with **Retry installation**. A Retry started anywhere reads *checking…* on every
+  surface and a second click joins it (`launcher.ts` `agentRechecks`).
 - **Installation is one step.** A found executable says files were installed, not that
   the account is signed in or structured chat works. Afterward the dialog shows the agent's
   [sign-in card](#sign-in) unless the CLI already reports a login (then "Signed in. Open chat

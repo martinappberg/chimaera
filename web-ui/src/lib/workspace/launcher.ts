@@ -292,11 +292,30 @@ export interface AgentCheck {
   unchecked: string | null;
 }
 
+/** Each agent's Retry in flight, shared by every surface that offers one
+ *  (the rail, the menu, Settings, the setup dialog): one retry reads
+ *  "checking…" everywhere, and a second click joins it. */
+const rechecks = new Map<string, Promise<AgentCheck>>();
+const recheckIds = writable<ReadonlySet<string>>(new Set());
+export const agentRechecks = { subscribe: recheckIds.subscribe };
+
 /** POST /api/v1/agents/{id}/detect — look for one agent again, now, giving
  *  its login shell the patient budget (the Retry of "couldn't check"), then
- *  fold the answer into the shared catalog so every surface agrees. Allow
- *  the daemon's whole budget plus the trip. */
-export async function recheckAgent(agentId: string): Promise<AgentCheck> {
+ *  fold the answer into the shared catalog so every surface agrees. */
+export function recheckAgent(agentId: string): Promise<AgentCheck> {
+  const joined = rechecks.get(agentId);
+  if (joined !== undefined) return joined;
+  const run = detectAgain(agentId).finally(() => {
+    rechecks.delete(agentId);
+    recheckIds.set(new Set(rechecks.keys()));
+  });
+  rechecks.set(agentId, run);
+  recheckIds.set(new Set(rechecks.keys()));
+  return run;
+}
+
+/** Allows the daemon's whole patient budget plus the trip. */
+async function detectAgain(agentId: string): Promise<AgentCheck> {
   const body = await json<Record<string, unknown>>(
     await api(`/agents/${encodeURIComponent(agentId)}/detect`, {
       method: "POST",

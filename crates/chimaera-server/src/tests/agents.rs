@@ -585,6 +585,28 @@ async fn agent_launcher_endpoints_without_token_are_401() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    // The Retry's re-detect runs a login shell: auth, and only catalog agents.
+    let res = app(test_state())
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/agents/claude/detect")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    for unknown in ["nope", "gemini"] {
+        let (status, _) = request(
+            &test_state(),
+            Method::POST,
+            &format!("/api/v1/agents/{unknown}/detect"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{unknown}");
+    }
 }
 
 /// POST /api/v1/agents/{id}/install: the pinned contract — 404 unknown
