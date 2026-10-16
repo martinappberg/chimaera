@@ -39,6 +39,7 @@
   import ChatFind from "./ChatFind.svelte";
   import { legacyCapabilities } from "./capabilities";
   import Markdown from "./Markdown.svelte";
+  import type { TerminalOption } from "./terminalMentions";
   import UserText from "./UserText.svelte";
   import ThoughtRow from "./ThoughtRow.svelte";
   import ToolGroup from "./ToolGroup.svelte";
@@ -135,7 +136,9 @@
      *  focus: an unfocused split is still visible and should keep animating. */
     visible?: boolean;
     /** Workspace terminals for @term: mention grants. */
-    terminals?: { id: string; name: string }[];
+    terminals?: TerminalOption[];
+    onOpenTerminal?: (id: string) => void;
+    onUnlinkTerminal?: (id: string) => void;
     /** Open a file path in an adjacent pane (the workbench path-click flow). */
     onOpenFile?: (path: string) => void;
     /** Kind-aware open: files → viewer pane, dirs → the Finder. A fallback:
@@ -165,6 +168,8 @@
     focused,
     visible = true,
     terminals = [],
+    onOpenTerminal,
+    onUnlinkTerminal,
     onOpenFile,
     onOpenPath,
     onForked,
@@ -2954,9 +2959,9 @@
               <div class="bubble">
                 {#if agentKind === "claude" && block.checkpoint?.id}
                   <ModSite {mods} component="UserMessage" instanceId={block.checkpoint.id} active={visible && $pageVisible} props={{ text: block.text, origin: { kind: block.origin ? "unclassified" : "composer" }, isExpanded: true }}>
-                    {#snippet children(draw)}<UserText text={typeof draw.text === "string" ? draw.text : block.text} onOpenPath={openProsePath} resolvePaths={prosePaths} />{/snippet}
+                    {#snippet children(draw)}<UserText {terminals} {onOpenTerminal} text={typeof draw.text === "string" ? draw.text : block.text} onOpenPath={openProsePath} resolvePaths={prosePaths} />{/snippet}
                   </ModSite>
-                {:else}<UserText text={block.text} onOpenPath={openProsePath} resolvePaths={prosePaths} />{/if}
+                {:else}<UserText {terminals} {onOpenTerminal} text={block.text} onOpenPath={openProsePath} resolvePaths={prosePaths} />{/if}
               </div>
             {/if}
           </div>
@@ -3268,7 +3273,7 @@
                 {@render sentImages(send.attachmentPaths)}
               {:else}
                 <div class="bubble">
-                  <UserText
+                  <UserText {terminals} {onOpenTerminal}
                     text={send.text}
                     onOpenPath={openProsePath}
                     resolvePaths={prosePaths}
@@ -3467,6 +3472,8 @@
     slashCommands={composerCommands}
     workspaceId={session.workspace_id ?? null}
     {terminals}
+    {onOpenTerminal}
+    {onUnlinkTerminal}
     {focused}
     {visible}
     {onSubmit}
