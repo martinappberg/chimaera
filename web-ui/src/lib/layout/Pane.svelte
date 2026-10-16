@@ -389,7 +389,14 @@
           visible={active}
           terminals={[...sessions.values()]
             .filter((t) => t.kind === "shell" && t.alive && t.workspace_id === s.workspace_id)
-            .map((t) => ({ id: t.id, name: names.get(t.id) ?? t.name }))}
+            .map((t) => ({ id: t.id, name: names.get(t.id) ?? t.name,
+              referenceName: t.display_name ?? t.name,
+              cwd: t.cwd_current ?? t.cwd,
+              status: t.exec_stage === "executing" ? "Agent running" : t.exec_stage === "queued" ? "Queued" : t.phase === "running" ? "Running" : t.phase === "ready" ? "At prompt" : "Live",
+              linkedAgentId: links.get(t.id), linkedAgentName: names.get(links.get(t.id) ?? ""),
+            }))}
+          onOpenTerminal={(id: string) => linkCtrl.reveal(id, node.id)}
+          onUnlinkTerminal={(id: string) => linkCtrl.unlink(id)}
           onOpenFile={(p: string) => ctrl.openFileFrom(node.id, p, false)}
           onOpenPath={(p: string, k: "file" | "dir") => ctrl.openPathFrom(node.id, p, k, false)}
           onForked={(forked: Session) =>

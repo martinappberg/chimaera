@@ -145,9 +145,14 @@ pub(crate) async fn create_session(
         },
     };
 
-    // A new agent in a worktree of its own: made here, before either surface
-    // spawns, so both (chat and terminal, every agent) simply start there.
+    // A new agent in a worktree of its own. Its branch and folder are settled
+    // here, before either surface spawns. A terminal waits for the checkout;
+    // a chat opens at once and its process starts once the files are there
+    // (`AppState::worktree_setups`): the checkout grows with the repository,
+    // and a click that shows nothing for seconds reads as a click that
+    // didn't take.
     let mut made: Option<crate::git::Created> = None;
+    let mut setup: Option<WorktreeSetup> = None;
     if body.worktree {
         if body.kind != SessionKind::Agent {
             return bad_request("worktree requires kind \"agent\"".to_string());
@@ -164,27 +169,111 @@ pub(crate) async fn create_session(
         if let Err(msg) = crate::launcher::detect(&state, kind, false).await.path {
             return (StatusCode::CONFLICT, Json(json!({"error": msg}))).into_response();
         }
-        match crate::git::create_session_worktree(&state, &workspace, kind.as_str()).await {
-            Ok(created) => {
-                tracing::info!(workspace = %workspace.id, branch = %created.branch,
-                    path = %created.path.display(), "new agent session worktree");
-                start_cwd = Some(created.path.clone());
-                made = Some(created);
-            }
+        let plan = match crate::git::plan_session_worktree(&state, &workspace, kind.as_str()).await
+        {
+            Ok(plan) => plan,
             Err((status, msg)) => return (status, Json(json!({"error": msg}))).into_response(),
+        };
+        start_cwd = Some(plan.path.clone());
+        if body.ui.as_deref() == Some("chat") {
+            setup = Some(WorktreeSetup::hold(&state, plan));
+        } else {
+            match plan.check_out(&state).await {
+                Ok(created) => {
+                    tracing::info!(workspace = %workspace.id, branch = %created.branch,
+                        path = %created.path.display(), "new agent session worktree");
+                    made = Some(created);
+                }
+                Err((status, msg)) => return (status, Json(json!({"error": msg}))).into_response(),
+            }
         }
     }
 
     // Everything past this point can fail; a worktree made for this spawn
     // must not outlive a spawn that never happened (it is new, clean and
-    // empty, so the fenced removal takes it, branch included).
-    let response = spawn_requested(&state, body, workspace.clone(), theme_owned, start_cwd).await;
+    // empty, so the fenced removal takes it, branch included). One still to
+    // be checked out simply never is.
+    let preset_id = setup.as_ref().map(|s| s.id.clone());
+    let response = spawn_requested(
+        &state,
+        body,
+        workspace.clone(),
+        theme_owned,
+        start_cwd,
+        preset_id,
+    )
+    .await;
     if !response.status().is_success() {
         if let Some(created) = made {
             crate::git::discard_session_worktree(&state, &workspace, &created).await;
         }
+        if let Some(setup) = setup {
+            crate::lock(&state.worktree_setups).remove(&setup.id);
+        }
+        return response;
+    }
+    if let Some(setup) = setup {
+        tokio::spawn(setup.finish(Arc::clone(&state), workspace));
     }
     response
+}
+
+/// A chat's own worktree, planned but not yet checked out: the chat's id,
+/// minted ahead so its driver finds the gate at spawn, and the sender that
+/// opens it.
+struct WorktreeSetup {
+    id: String,
+    plan: crate::git::PlannedWorktree,
+    ready: tokio::sync::watch::Sender<Option<Result<(), String>>>,
+}
+
+impl WorktreeSetup {
+    fn hold(state: &AppState, plan: crate::git::PlannedWorktree) -> Self {
+        let id = crate::agents::fresh_session_id();
+        let (ready, gate) = tokio::sync::watch::channel(None);
+        crate::lock(&state.worktree_setups).insert(
+            id.clone(),
+            crate::state::WorktreeSetupGate {
+                gate: chimaera_agent::driver::StartGate {
+                    waiting: "Setting up worktree…".to_string(),
+                    ready: gate,
+                },
+                mirrors: plan.source().to_path_buf(),
+            },
+        );
+        Self { id, plan, ready }
+    }
+
+    /// The slow half, after the chat has opened: check the worktree out,
+    /// then let the chat's process start there, or end its startup with
+    /// git's words. A chat closed while it waited never used the worktree
+    /// (nothing holds the gate any more), so the worktree goes again.
+    async fn finish(self, state: Arc<AppState>, workspace: crate::workspaces::Workspace) {
+        let Self { id, plan, ready } = self;
+        let checked_out = plan.check_out(&state).await;
+        crate::lock(&state.worktree_setups).remove(&id);
+        match checked_out {
+            Ok(created) => {
+                tracing::info!(workspace = %workspace.id, branch = %created.branch,
+                    path = %created.path.display(), "new agent session worktree");
+                if ready.send(Some(Ok(()))).is_err() {
+                    crate::git::discard_session_worktree(&state, &workspace, &created).await;
+                    return;
+                }
+                // The tracker may already have looked while the folder was
+                // no repository yet.
+                state.git.sessions.recheck(&id);
+                state.changes.notify_waiters();
+            }
+            Err((_, msg)) => {
+                tracing::warn!(workspace = %workspace.id, %msg,
+                    "a chat's worktree could not be checked out");
+                let _ = ready.send(Some(Err(format!(
+                    "Couldn't set up this chat's worktree: {msg}"
+                ))));
+            }
+        }
+    }
 }
 
 /// The rest of `create_session` once the workspace, theme, prelude and
@@ -197,6 +286,7 @@ async fn spawn_requested(
     workspace: crate::workspaces::Workspace,
     theme_owned: String,
     start_cwd: Option<std::path::PathBuf>,
+    preset_id: Option<String>,
 ) -> Response {
     let bad_request =
         |msg: String| (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
@@ -245,7 +335,10 @@ async fn spawn_requested(
         }
     };
     if chat_ui {
-        return spawn_chat_ui(state, body, workspace, theme, start_cwd, resume_cwd).await;
+        return spawn_chat_ui(
+            state, body, workspace, theme, start_cwd, resume_cwd, preset_id,
+        )
+        .await;
     }
 
     let kind = match body.kind {
@@ -347,6 +440,7 @@ async fn spawn_chat_ui(
     theme: &str,
     start_cwd: Option<std::path::PathBuf>,
     resume_cwd: Option<std::path::PathBuf>,
+    preset_id: Option<String>,
 ) -> Response {
     let bad_request =
         |msg: String| (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
@@ -408,7 +502,7 @@ async fn spawn_chat_ui(
             state,
             workspace,
             crate::chat::FreshChat {
-                id: None,
+                id: preset_id,
                 kind: agent_kind,
                 model: body.model,
                 name: body.name,

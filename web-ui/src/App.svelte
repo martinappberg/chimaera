@@ -441,7 +441,7 @@
   import WakeRing from "./lib/shared/WakeRing.svelte";
   import { archiveRecents, nudgeHistory, unarchiveRecents } from "./lib/workspace/history";
   import { sameFile, setSameFileOpener } from "./lib/workspace/sameFile.svelte";
-  import { requestSettingsSection } from "./lib/settings/jump";
+  import { requestSettingsSection, settingsOpen } from "./lib/settings/jump";
   import { setAgentNames } from "./lib/chat/toolLabels";
   import QuickOpen from "./lib/workspace/QuickOpen.svelte";
   import FileTree from "./lib/workspace/FileTree.svelte";
@@ -3671,6 +3671,17 @@
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
 
+  // A surface that can't reach these callbacks (a chat's usage popover)
+  // asks for Settings at a section through the store.
+  $effect(() => {
+    const section = $settingsOpen;
+    if (section === null) return;
+    untrack(() => {
+      settingsOpen.set(null);
+      openSettingsAt(section);
+    });
+  });
+
   /** Open/focus the workspace dashboard (rail row, ⌘0, the landing default). */
   function openDashboardSurface(): void {
     if (activeWsId === null || !layoutReady) return;
@@ -5244,7 +5255,8 @@
     ];
     try {
       await putLink(terminalId, agentId);
-    } catch {
+    } catch (err) {
+      showFlash(`Could not link terminal: ${err instanceof Error ? err.message : "request failed"}`);
       links = await listLinks().catch(() => links);
     }
   }
@@ -5268,10 +5280,9 @@
     if (agentTab === undefined || agentTab.surface !== "terminal") return;
     const agentId = agentTab.sessionId;
     void doLink(terminalId, agentId);
-    const name = displayNames.get(terminalId) ?? terminalId;
     // The context bridge's typing path: pooled socket when warm, one-shot
     // socket otherwise — the reference lands even in a cold agent pane.
-    typeIntoSession(agentId, `${termReference(name)} `);
+    typeIntoSession(agentId, `${termReference(terminalId)} `);
     revealSession(terminalId, agentPaneId);
     pool.focusTerminal(agentId);
   }
@@ -5291,8 +5302,7 @@
       layout = splitPane(layout, beside, "row");
       layout = openSession(layout, agentId);
     }
-    const name = displayNames.get(terminalId) ?? terminalId;
-    typeIntoSession(agentId, `${termReference(name)} `);
+    typeIntoSession(agentId, `${termReference(terminalId)} `);
     pool.focusTerminal(agentId);
   }
 
@@ -5314,7 +5324,8 @@
     },
     unlink(terminalId) {
       links = links.filter((l) => l.terminal_id !== terminalId);
-      deleteLink(terminalId).catch(async () => {
+      deleteLink(terminalId).catch(async (err) => {
+        showFlash(`Could not unlink terminal: ${err instanceof Error ? err.message : "request failed"}`);
         links = await listLinks().catch(() => links);
       });
     },

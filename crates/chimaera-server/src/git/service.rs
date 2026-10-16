@@ -853,6 +853,19 @@ pub(super) async fn run_git(
     args: &[&str],
     stdout_cap: usize,
 ) -> anyhow::Result<GitOutput> {
+    run_git_within(git, procs, dir, args, stdout_cap, GIT_TIMEOUT).await
+}
+
+/// [`run_git`] with its own deadline, for the one call whose work grows with
+/// the repository rather than the change (a worktree checkout).
+pub(super) async fn run_git_within(
+    git: &Path,
+    procs: &Semaphore,
+    dir: &Path,
+    args: &[&str],
+    stdout_cap: usize,
+    timeout: Duration,
+) -> anyhow::Result<GitOutput> {
     let _permit = procs
         .acquire()
         .await
@@ -893,7 +906,7 @@ pub(super) async fn run_git(
         Ok::<_, std::io::Error>((stdout_bytes, stderr_bytes, status, truncated))
     };
 
-    match tokio::time::timeout(GIT_TIMEOUT, fut).await {
+    match tokio::time::timeout(timeout, fut).await {
         Ok(Ok((stdout, stderr, status, truncated))) => Ok(GitOutput {
             stdout,
             stderr: String::from_utf8_lossy(&stderr).trim().to_string(),
@@ -901,7 +914,7 @@ pub(super) async fn run_git(
             truncated,
         }),
         Ok(Err(e)) => Err(anyhow::Error::from(e).context("git io error")),
-        Err(_) => anyhow::bail!("git timed out after {}s", GIT_TIMEOUT.as_secs()),
+        Err(_) => anyhow::bail!("git timed out after {}s", timeout.as_secs()),
     }
 }
 

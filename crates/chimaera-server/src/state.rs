@@ -77,6 +77,11 @@ pub(crate) struct AppState {
     /// the moment the id is in neither registry — a vanishing row would make
     /// every window prune the session's tabs mid-toggle.
     pub(crate) chat_switching: Mutex<HashMap<String, String>>,
+    /// Chats opened before their worktree is checked out (id -> the gate
+    /// their driver waits on). The first spawn takes the gate; the entry
+    /// stays until the checkout ends, and while it does nothing respawns the
+    /// chat (view switch, rewind, fork) into a folder that isn't there yet.
+    pub(crate) worktree_setups: Mutex<HashMap<String, WorktreeSetupGate>>,
     /// Workspaces with a Mastermind PUT/DELETE in flight. The routes are
     /// multi-step (retire old → bind → spawn, with rollback); two racing
     /// callers would leak the loser's spawned session and could clobber the
@@ -329,6 +334,7 @@ impl AppState {
             chat_signals: Mutex::new(Some(chat_signals_rx)),
             chat_recipes: Mutex::new(HashMap::new()),
             chat_switching: Mutex::new(HashMap::new()),
+            worktree_setups: Mutex::new(HashMap::new()),
             mastermind_switching: Mutex::new(std::collections::HashSet::new()),
             spawn_reservations: Mutex::new(HashMap::new()),
             session_workspaces: Mutex::new(HashMap::new()),
@@ -478,6 +484,15 @@ pub(crate) fn real_path(path: &std::path::Path) -> PathBuf {
             _ => return path.to_path_buf(),
         }
     }
+}
+
+/// A chat's worktree still being checked out (`AppState::worktree_setups`).
+pub(crate) struct WorktreeSetupGate {
+    /// What the chat's driver waits on.
+    pub(crate) gate: chimaera_agent::driver::StartGate,
+    /// The checkout the new worktree copies (the repository's top level):
+    /// what to read the project's files from until its own exist.
+    pub(crate) mirrors: PathBuf,
 }
 
 #[cfg(test)]

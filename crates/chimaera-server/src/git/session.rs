@@ -21,7 +21,7 @@
 //! released when the last agent inside it ends. Locks another tool made are
 //! never touched, and stale chimaera locks are reconciled at daemon start.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -71,6 +71,9 @@ pub(crate) struct SessionGits {
     probes: Mutex<HashMap<PathBuf, Option<RepoInfo>>>,
     /// Managed worktrees chimaera locked, and the session each names.
     locks: Mutex<HashMap<PathBuf, String>>,
+    /// Sessions whose folder became a repository without moving, asked
+    /// again on the next pass ([`SessionGits::recheck`]).
+    recheck: Mutex<HashSet<String>>,
 }
 
 #[derive(Clone)]
@@ -187,6 +190,13 @@ impl SessionGits {
             probes.clear();
         }
         probes.insert(cwd, repo);
+    }
+
+    /// Ask again, on the next pass, where session `id` runs: a chat opens on
+    /// its worktree before the checkout has made the folder a repository,
+    /// and a session is otherwise asked only when its folder moves.
+    pub(crate) fn recheck(&self, id: &str) {
+        crate::lock(&self.recheck).insert(id.to_string());
     }
 
     /// A git epoch moved: a folder that was not a repository may be one now
@@ -356,6 +366,7 @@ async fn pass(state: &Arc<AppState>, seen_epochs: &mut HashMap<String, u64>) {
         state.git.sessions.forget_negative_probes();
         *seen_epochs = epochs;
     }
+    let recheck = std::mem::take(&mut *crate::lock(&state.git.sessions.recheck));
     let (live, switching) = live_sessions(state);
     // A hook cwd outlives nothing: drop the ones whose agent record is gone
     // (a session that ended before this tracker ever saw it).
@@ -370,8 +381,11 @@ async fn pass(state: &Arc<AppState>, seen_epochs: &mut HashMap<String, u64>) {
     for session in &live {
         let prior = previous.get(&session.id);
         let mut tracked = match prior {
-            Some(t) if t.cwd == session.cwd => t.clone(),
+            Some(t) if t.cwd == session.cwd && !recheck.contains(&session.id) => t.clone(),
             _ => {
+                if recheck.contains(&session.id) {
+                    crate::lock(&state.git.sessions.probes).remove(&session.cwd);
+                }
                 let repo = if git.adequate {
                     resolve_cwd(state, &git.path, &session.cwd).await
                 } else {

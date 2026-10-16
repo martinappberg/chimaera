@@ -469,6 +469,12 @@ pub enum AgentEvent {
         /// The agent reports the limit as actually hit (requests failing).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         limit_reached: bool,
+        /// Every window reported alongside (Claude's `unifiedWindows`,
+        /// Codex's primary/secondary), for the header's usage popover; the
+        /// fields above stay the most constrained one. Empty from older
+        /// journals and agents that report one window.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        windows: Vec<UsageWindow>,
     },
     /// The serving model changed mid-conversation (claude
     /// model_refusal_fallback / model_consent_fallback; codex

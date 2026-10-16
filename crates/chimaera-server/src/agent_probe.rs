@@ -38,6 +38,7 @@ use crate::AppState;
 pub(crate) mod actions;
 pub(crate) mod connections;
 mod extensions;
+pub(crate) mod usage;
 
 const CACHE_TTL: Duration = Duration::from_secs(60);
 const CLI_TIMEOUT: Duration = Duration::from_secs(20);

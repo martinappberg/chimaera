@@ -39,6 +39,7 @@
   import ChatFind from "./ChatFind.svelte";
   import { legacyCapabilities } from "./capabilities";
   import Markdown from "./Markdown.svelte";
+  import type { TerminalOption } from "./terminalMentions";
   import UserText from "./UserText.svelte";
   import ThoughtRow from "./ThoughtRow.svelte";
   import ToolGroup from "./ToolGroup.svelte";
@@ -71,6 +72,8 @@
   import PlanApprovalCard from "./PlanApprovalCard.svelte";
   import PlanCard from "./PlanCard.svelte";
   import { planShows } from "./planCard";
+  import { openSettingsAt } from "../settings/jump";
+  import { ACCOUNT_USAGE_IN_CHAT, getAgentUsage, type AgentUsage } from "../settings/agentUsage";
   import WakeRequestBar from "./WakeRequestBar.svelte";
   import { commsStore, wakeRequestFor } from "../workspace/comms.svelte";
   import QuestionCard from "./QuestionCard.svelte";
@@ -138,7 +141,9 @@
      *  focus: an unfocused split is still visible and should keep animating. */
     visible?: boolean;
     /** Workspace terminals for @term: mention grants. */
-    terminals?: { id: string; name: string }[];
+    terminals?: TerminalOption[];
+    onOpenTerminal?: (id: string) => void;
+    onUnlinkTerminal?: (id: string) => void;
     /** Open a file path in an adjacent pane (the workbench path-click flow). */
     onOpenFile?: (path: string) => void;
     /** Kind-aware open: files → viewer pane, dirs → the Finder. A fallback:
@@ -168,6 +173,8 @@
     focused,
     visible = true,
     terminals = [],
+    onOpenTerminal,
+    onUnlinkTerminal,
     onOpenFile,
     onOpenPath,
     onForked,
@@ -311,7 +318,7 @@
   // position instead of snapping to the bottom.
   // svelte-ignore state_referenced_locally
   let atBottom = $state(chatScroll(chatId).atBottom);
-  let menu = $state<"model" | "mode" | "effort" | "mcp" | "remote" | "options" | null>(null);
+  let menu = $state<"model" | "mode" | "effort" | "mcp" | "remote" | "options" | "usage" | null>(null);
 
   // --- bounded transcript DOM ------------------------------------------------
   // The reducer/socket always fold the complete bounded journal so background
@@ -2228,6 +2235,43 @@
    *  "Counting files"), else the phase: starting → thinking / writing /
    *  running tools → working (between steps). */
   const agentBusy = $derived(store.running || store.compacting);
+  /** The usage popover's Compact: the same path as typing `/compact` (Codex's
+   *  native command, else Claude's own slash command), offered while idle. */
+  const canCompact = $derived(
+    !readOnly && !agentBusy && store.contextPct !== null && (agentKind === "claude" || supports("compact")),
+  );
+  function compactNow(): void {
+    menu = null;
+    if (!onSlash("compact")) onSubmit("/compact", []);
+  }
+  function openAgentSettings(): void {
+    menu = null;
+    openSettingsAt("Agents");
+  }
+
+  /** The account's limits from Agent settings' live read, for an agent whose
+   *  chat stream reports none (Antigravity). Asked while the chat shows and
+   *  idles — again after each turn — and the daemon answers from its minute
+   *  cache. */
+  let accountUsage = $state<AgentUsage | null>(null);
+  let accountUsageReading = false;
+  $effect(() => {
+    if (!visible || !$pageVisible || readOnly || agentBusy) return;
+    if (store.rateLimit !== null || !ACCOUNT_USAGE_IN_CHAT.has(agentKind)) return;
+    untrack(() => {
+      if (accountUsageReading) return;
+      accountUsageReading = true;
+      getAgentUsage(agentKind)
+        .then((read) => {
+          if (read.error === null) accountUsage = read;
+        })
+        .catch(() => {})
+        .finally(() => {
+          accountUsageReading = false;
+        });
+    });
+  });
+
   const activityLabel = $derived.by(() => {
     if (store.compacting) return "Compacting context";
     if (store.activityLine !== null) return store.activityLine;
@@ -2893,6 +2937,10 @@
     onToggleThinking={toggleThinking}
     onInterrupt={interrupt}
     onSetRemoteControl={setRemoteControl}
+    onCompact={canCompact ? compactNow : undefined}
+    onOpenSettings={readOnly ? undefined : openAgentSettings}
+    accountLimits={accountUsage?.rows}
+    accountLimitReached={accountUsage?.limitReached}
   />
   {/if}
 
@@ -3090,9 +3138,9 @@
               <div class="bubble">
                 {#if agentKind === "claude" && block.checkpoint?.id}
                   <ModSite {mods} component="UserMessage" instanceId={block.checkpoint.id} active={visible && $pageVisible} props={{ text: block.text, origin: { kind: block.origin ? "unclassified" : "composer" }, isExpanded: true }}>
-                    {#snippet children(draw)}<UserText text={typeof draw.text === "string" ? draw.text : block.text} onOpenPath={openProsePath} resolvePaths={prosePaths} />{/snippet}
+                    {#snippet children(draw)}<UserText {terminals} {onOpenTerminal} text={typeof draw.text === "string" ? draw.text : block.text} onOpenPath={openProsePath} resolvePaths={prosePaths} />{/snippet}
                   </ModSite>
-                {:else}<UserText text={block.text} onOpenPath={openProsePath} resolvePaths={prosePaths} />{/if}
+                {:else}<UserText {terminals} {onOpenTerminal} text={block.text} onOpenPath={openProsePath} resolvePaths={prosePaths} />{/if}
               </div>
             {/if}
           </div>
@@ -3439,7 +3487,7 @@
                 {@render sentImages(send.attachmentPaths)}
               {:else}
                 <div class="bubble">
-                  <UserText
+                  <UserText {terminals} {onOpenTerminal}
                     text={send.text}
                     onOpenPath={openProsePath}
                     resolvePaths={prosePaths}
@@ -3681,6 +3729,8 @@
     slashCommands={composerCommands}
     workspaceId={session.workspace_id ?? null}
     {terminals}
+    {onOpenTerminal}
+    {onUnlinkTerminal}
     {focused}
     {visible}
     {onSubmit}
