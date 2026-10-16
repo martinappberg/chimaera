@@ -213,9 +213,10 @@ which is the survival property that matters.
 
 ## Decisions log
 
+- **2026-10-16 — Agent entry documents split into map + reference + history.** The server map, the chat UI map and PROTOCOL.md are lean maps/indexes within the §6 budget of [`docs/design/robustness-and-agent-experience-plan.md`](robustness-and-agent-experience-plan.md); detail moved to `REFERENCE.md` files and `crates/chimaera-agent/protocol/`, with one canonical home per fact and every prior invariant kept.
 - **2026-07-08 — Full protocol coverage for the chat surface.** Everything the official
   VS Code extensions drive is now mapped (or explicitly recorded as out of scope) in
-  `crates/chimaera-agent/PROTOCOL.md`: claude checkpoints/rewind (client-minted user-frame
+  the index `crates/chimaera-agent/PROTOCOL.md` and its topic files under `crates/chimaera-agent/protocol/` (history in `protocol/passes.md`): claude checkpoints/rewind (client-minted user-frame
   uuids anchor `rewind_files`; the conversation forks via `--fork-session
   --resume-session-at` through `POST /sessions/{id}/rewind`; needs
   `CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING=true`), subagent task rows, the /mcp panel,
@@ -239,7 +240,7 @@ which is the survival property that matters.
   `codex resume <uuid>`); a mid-task switch requires an explicit confirm. Chat journals:
   seq-numbered append-only JSONL, 4→2 MiB turn-boundary compaction, 100 MiB/200-file dir
   budget, gap-replay reconnects. Wire-format facts + extension-mined protocol inventory
-  live in `crates/chimaera-agent/PROTOCOL.md`.
+  live in the index `crates/chimaera-agent/PROTOCOL.md` and the topic files under `crates/chimaera-agent/protocol/` (history in `protocol/passes.md`).
 - **2026-07-06 — Frontend: Svelte 5** + TypeScript + Vite (author's call).
 - **2026-07-06 — Primary agent mode: PTY/TUI + hooks.** Claude Code runs inside Chimaera the
   way it runs in VS Code's integrated terminal — the real interactive TUI in a pane, normal

@@ -42,13 +42,13 @@ Each area carries its own `AGENTS.md` map (file table + the invariants that bite
 | `crates/chimaera` | the binary: CLI + daemon entrypoint (delegation-only) | [map](crates/chimaera/AGENTS.md) |
 | `crates/chimaera-core` | shared types, version/build-id, shell integration | [map](crates/chimaera-core/AGENTS.md) |
 | `crates/chimaera-pty` | the persistent PTY / terminal engine | [map](crates/chimaera-pty/AGENTS.md) |
-| `crates/chimaera-agent` | the structured-agent engine (drivers, journal) | [map](crates/chimaera-agent/AGENTS.md) · [PROTOCOL](crates/chimaera-agent/PROTOCOL.md) |
+| `crates/chimaera-agent` | the structured-agent engine (drivers, journal) | [map](crates/chimaera-agent/AGENTS.md) · [protocol index](crates/chimaera-agent/PROTOCOL.md) |
 | `crates/chimaera-remote` | SSH orchestration for `connect`, deployment, tunnels, and cluster jobs | [map](crates/chimaera-remote/AGENTS.md) |
-| `crates/chimaera-server` | the daemon: every route + WS + business logic; embeds `web-ui/dist` and the plugins lock (no plugin bytes) | [map](crates/chimaera-server/AGENTS.md) |
+| `crates/chimaera-server` | the daemon: every route + WS + business logic; embeds `web-ui/dist` and the plugins lock (no plugin bytes) | [map](crates/chimaera-server/AGENTS.md) · [reference](crates/chimaera-server/REFERENCE.md) |
 | `crates/chimaera-plugin-api` | the plugin interface: the `chimaera:plugin` WIT world + the Rust side plugins implement | [map](crates/chimaera-plugin-api/AGENTS.md) |
 | `plugins/` | `plugins.lock` (the curated first-party plugins: the release of each that installs, and its sha256s; each plugin lives in its own repository) + the host's test fixture | [map](plugins/AGENTS.md) |
 | `crates/chimaera-app` | the Tauri 2 native shell (its own standalone workspace) | [map](crates/chimaera-app/AGENTS.md) |
-| `web-ui/` | the Svelte 5 client the daemon serves | [chat](web-ui/src/lib/chat/AGENTS.md) · [dashboard](web-ui/src/lib/dashboard/AGENTS.md) · [settings](web-ui/src/lib/settings/AGENTS.md) · [knowledge](web-ui/src/lib/knowledge/AGENTS.md) · [plugins](web-ui/src/lib/plugins/AGENTS.md) · [net](web-ui/src/lib/net/AGENTS.md) · [layout](web-ui/src/lib/layout/AGENTS.md) · [previews](web-ui/src/lib/previews/AGENTS.md) · [terminal](web-ui/src/lib/terminal/AGENTS.md) · [browser](web-ui/src/lib/browser/AGENTS.md) · [workspace](web-ui/src/lib/workspace/AGENTS.md) · [shared](web-ui/src/lib/shared/AGENTS.md) |
+| `web-ui/` | the Svelte 5 client the daemon serves | [chat](web-ui/src/lib/chat/AGENTS.md) ([ref](web-ui/src/lib/chat/REFERENCE.md)) · [dashboard](web-ui/src/lib/dashboard/AGENTS.md) · [settings](web-ui/src/lib/settings/AGENTS.md) · [knowledge](web-ui/src/lib/knowledge/AGENTS.md) · [plugins](web-ui/src/lib/plugins/AGENTS.md) · [net](web-ui/src/lib/net/AGENTS.md) · [layout](web-ui/src/lib/layout/AGENTS.md) · [previews](web-ui/src/lib/previews/AGENTS.md) · [terminal](web-ui/src/lib/terminal/AGENTS.md) · [browser](web-ui/src/lib/browser/AGENTS.md) · [workspace](web-ui/src/lib/workspace/AGENTS.md) · [shared](web-ui/src/lib/shared/AGENTS.md) |
 
 The maps above tell you how the code is *structured*. For what the app **does** — feature
 by feature, with how each is used and where it's wired — see the **[feature catalog](docs/features/README.md)**

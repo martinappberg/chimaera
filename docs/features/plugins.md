@@ -751,7 +751,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   agent's invocation, copyable), **File** (open SKILL.md), **Problems** (load errors).
 - **Where it lives.** `agent_probe.rs` (`claude_state`, `codex_raw` / `codex_state`,
   `CodexRpc`, `agent_plugins`, `skills`, `scan_skills`); UI `SkillsView.svelte`,
-  `skillsModel.ts`. Wire facts: [PROTOCOL.md Pass 35](../../crates/chimaera-agent/PROTOCOL.md).
+  `skillsModel.ts`. Wire facts: [PROTOCOL.md Pass 35](../../crates/chimaera-agent/protocol/passes.md#pass-35-2026-09-25--live-probes-codex-01530--claude-21259-agent-side-plugin-skill-and-hook-state-for-the-plugins-tab-adopted-daemon-agent_probers-not-a-driver).
 - **Key behaviors.** Every child is login-shell wrapped, time-boxed (20 s CLI, 15 s per RPC),
   output-capped, `kill_on_drop`; **one probe runs daemon-wide at a time** (a semaphore — three
   windows on the tab never spawn three app-servers); answers are cached 60 s; `?refresh=true`,
