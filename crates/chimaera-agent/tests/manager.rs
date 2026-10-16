@@ -665,8 +665,21 @@ async fn a_resumed_respawn_keeps_its_jobs_and_a_fresh_one_does_not() {
         let mut again = spec("s-re", &fx.cwd, "loop");
         again.resumes = resumes;
         fx.manager.spawn(&ClaudeAdapter, again).expect("respawn");
-        // From the exit on, so the replay is served from the ring.
-        let att = fx.manager.attach("s-re", exited.seq).expect("attach");
+        // From the exit on. Usually the ring still covers that cursor, but
+        // the respawn's first journal entries race this attach: once they
+        // push the ring's front past `exited.seq`, `replay_from` reads the
+        // file and drains the writer with a blocking barrier — legal only off
+        // the runtime, which is why the daemon's `/ws/chat` handler wraps
+        // `attach` in `spawn_blocking` (seen once in CI as "Cannot block the
+        // current thread from within a runtime").
+        let att = {
+            let manager = Arc::clone(&fx.manager);
+            let from = exited.seq;
+            tokio::task::spawn_blocking(move || manager.attach("s-re", from))
+                .await
+                .expect("attach task")
+                .expect("attach")
+        };
         seen = att.replay.clone();
         rx = att.live;
         let first = match seen
