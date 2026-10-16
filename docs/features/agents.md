@@ -46,7 +46,10 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   `safe_arg`).
 - **Key behaviors.** The binary is resolved through the interactive **login** shell (`-ilc`, not
   `-lc` — the claude installer's PATH line lives in `.zshrc`, and `claude` isn't on the
-  non-interactive ssh PATH on HPC nodes), then well-known prefixes, then the managed bin dir; a
+  non-interactive ssh PATH on HPC nodes), then the daemon's inherited PATH, well-known prefixes,
+  and the managed bin dir. Fallback requires a completed shell probe; a timeout or startup failure
+  asks the user to retry or set an explicit executable in Settings. A runnable explicit path wins
+  without probing the shell; a
   hit is cached for the daemon's life, a miss for 90 s (`launcher::MISS_TTL`, so a catalog read
   with uninstalled agents doesn't pay the login-shell probe each time) — the launcher's own
   refresh, a runnable explicit path and a landed managed install see past it, and a changed path
@@ -285,14 +288,24 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   `is_outdated`, `claude_resumables`); upstream latest-release probes in `agent_updates.rs`.
   Routes `GET /api/v1/agents`, `GET /api/v1/agents/claude/sessions`.
 - **Key behaviors.** Detection runs the registered agents' login shells + version probes concurrently (serial would
-  visibly stall the popover), with a 6s timeout backstopped by well-known paths. A hit is cached for
+  visibly stall the popover), with a 6s timeout and a 64 KiB output cap. A runnable
+  `agents.<id>.path` wins, followed by the interactive login shell's choice. Only a completed
+  shell probe with no choice falls back to the daemon's inherited PATH (absolute directories,
+  in order), well-known installer paths, then the managed install. This covers nvm and other
+  version managers through PATH without guessing among their installed versions. Versions are
+  never ranked: an explicitly selected older install remains authoritative. Invalid explicit
+  paths retain the existing fallback behavior. A timeout, failed startup, incomplete answer, or
+  vanished shell-selected executable returns an actionable error instead of silently selecting
+  another installation. Timed-out probes kill their shell and startup children. Successful
+  resolutions log the agent, source, and path; failures log their reason. A hit is cached for
   the daemon's lifetime (stat-validated, so an in-place update is noticed); a miss is stamped for 90 s
   and served to **the catalog read only** (`GET /agents` without `refresh`), so a launcher paint or a
   Settings poll doesn't re-run a login shell per uninstalled agent per call. Everything else probes:
   a spawn, a refresh (the launcher's own open, Settings' load), Extensions' Check again (which also
   forgets the stamps), and a changed `agents.<id>.path` (which forgets them too). A refresh whose
-  probe misses keeps a hit that still validates — a slow login shell never turns an installed agent
-  into "not installed". `is_outdated` flags
+  probe fails keeps a hit that still validates and logs that decision — a slow login shell never
+  replaces a known executable with a fallback. Without a prior hit, the failure is served to catalog
+  reads for the same 90 s window, while the next spawn or explicit refresh retries immediately. `is_outdated` flags
   npm-era codex (0.1.x). The Antigravity IDE's `agy` symlink (which just opens the GUI) is detected
   and refused. Resumables are scanned off the reactor, exclude transcripts already open in a live
   session, and are titled by the same custom > ai > first-prompt chain as live naming. Latest

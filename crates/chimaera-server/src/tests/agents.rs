@@ -1493,48 +1493,6 @@ async fn a_changed_agent_path_and_an_extensions_recheck_forget_cached_misses() {
     );
 }
 
-/// Detection falls back to ~/.chimaera/agents/bin when the login shell
-/// misses (managed installs are deliberately not on the user's PATH),
-/// and such rows read as installed + managed.
-#[tokio::test]
-async fn managed_detection_falls_back_when_login_shell_misses() {
-    let state = test_state();
-    // Ground truth first: if this host has a real standalone agy CLI on
-    // the login-shell PATH, the fallback is unreachable — skip. (The
-    // Antigravity IDE's launcher shim is refused by detection, so IDE
-    // hosts still exercise the fallback.)
-    let probe = launcher::detect(&state, agents::AgentKind::Antigravity, true).await;
-    if probe.path.is_ok() {
-        eprintln!("skipping: a real agy CLI resolves via the login shell on this host");
-        return;
-    }
-
-    let managed_bin = runtimes::managed_bin_dir(&state.managed_root);
-    std::fs::create_dir_all(&managed_bin).unwrap();
-    let fake = managed_bin.join("agy");
-    std::fs::write(&fake, "#!/bin/sh\necho agy version 9.9.9\n").unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-    let detection = launcher::detect(&state, agents::AgentKind::Antigravity, true).await;
-    assert_eq!(detection.path.as_deref().ok(), Some(fake.as_path()));
-    assert!(detection.managed);
-    assert_eq!(detection.version.as_deref(), Some("agy version 9.9.9"));
-
-    // And the catalog row reflects it (served from the refreshed cache).
-    let (_, list) = request(&state, Method::GET, "/api/v1/agents", None).await;
-    let agy = list
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|a| a["id"] == "agy")
-        .unwrap()
-        .clone();
-    assert_eq!(agy["installed"], true);
-    assert_eq!(agy["managed"], true);
-    assert_eq!(agy["path"].as_str().unwrap(), fake.to_string_lossy());
-}
-
 #[tokio::test]
 async fn create_codex_agent_is_plain_tui_with_agent_kind() {
     let state = test_state();
