@@ -230,7 +230,7 @@
         <h2 id="first-workspace">Your first workspace</h2>
         <ol>
           <li><strong>Open a folder</strong> from the app’s home screen. Choose a project you want to work on.</li>
-          <li><strong>Start an agent.</strong> Choose a provider in the launcher. Install its CLI if needed, then complete its sign-in flow on the host where the workspace runs.</li>
+          <li><strong>Start an agent.</strong> Choose a provider in the launcher. Install its CLI if needed, then choose Sign in to follow the provider’s login flow from the app. The login belongs to the host where the workspace runs.</li>
           <li><strong>Give it a concrete task.</strong> For example, summarize the files in this folder, improve a document, or make a change to an app.</li>
           <li><strong>Open the result beside the conversation.</strong> Click a file in the tree or an output in the chat. Select the part you want changed and refer to it in a follow-up.</li>
           <li><strong>Shape the workspace.</strong> Split a pane, add a terminal, start another agent, or open the dashboard to see where things stand.</li>
@@ -304,19 +304,24 @@
         <p>Add a <strong>Mastermind</strong> when you want a coordinator. Ask it to brief you, read the workspace’s activity, or help direct work across agents. You choose its authority; the workspace’s attention controls keep decisions visible.</p>
 
         <h2 id="agents">Agents</h2>
-        <p>Chimaera launches the agent’s own runtime in your workspace, using that host’s account, environment, project instructions, skills, and configured connections. A local workspace uses your local setup; an SSH workspace uses your setup on the remote host. The launcher detects installed agent CLIs and offers managed install and update flows from their official sources.</p>
+        <p>Chimaera launches the agent’s own runtime in your workspace, using that host’s account, environment, project instructions, skills, and configured connections. A local workspace uses your local setup; an SSH workspace uses your setup on the remote host. The launcher detects installed agent CLIs and offers managed install and update flows from their official sources. Choose <strong>Sign in</strong> in the launcher or Settings → Agents, or type <code>/login</code> in chat to open the provider’s sign-in card.</p>
         <ul>
           <li><strong>Claude Code</strong> and <strong>Codex</strong>: structured chat and real terminal sessions, with conversation switching between those views.</li>
-          <li><strong>Antigravity</strong> and <strong>Grok Build</strong>: structured chat through ACP, plus their CLI launch paths. Use chat for Chimaera’s workspace messaging integration.</li>
+          <li><strong>Antigravity</strong>, <strong>Grok Build</strong>, and <strong>Cursor CLI</strong>: structured chat through ACP, plus their CLI launch paths. Use chat for Chimaera’s workspace messaging integration.</li>
           <li><strong>Plain shells</strong>: workspace terminals for running commands directly or linking to an agent.</li>
         </ul>
         <p>Chimaera adds workspace tools for agent communication, linked terminals, and extensions. Models, reasoning controls, permissions, and resume behavior follow each provider’s integration. The launcher and chat show the controls available for that agent. Sign-in, usage limits, and billing are governed by the provider; Chimaera does not include model usage.</p>
 
         <h2 id="chat">Chat mode &amp; the TUI</h2>
         <p>New supported agent sessions open in <strong>chat mode</strong> by default. It renders streamed responses, tool calls, permission prompts, questions, and file outputs around a composer. Provider-specific controls appear where supported.</p>
-        <p>Claude Code and Codex can switch a conversation between chat and their <strong>real terminal UI</strong>. The switch resumes the conversation in the chosen surface; it is not a simultaneous view of one running process. Antigravity and Grok do not offer that same-session switch.</p>
+        <p>Claude Code and Codex can switch a conversation between chat and their <strong>real terminal UI</strong>. The switch resumes the conversation in the chosen surface; it is not a simultaneous view of one running process. Antigravity, Grok Build, and Cursor CLI do not offer that same-session switch.</p>
         <p>Use <code>agents.defaultView</code> to choose the starting view for new sessions. Saved conversations reopen in their saved view. Failed chats that already contain a prompt or saved conversation retain their error and recovery actions.</p>
         <p>Rewind and conversation branching are available for supported Claude/Codex operations. See the <a href="https://github.com/martinappberg/chimaera/blob/main/docs/features/chat-mode.md">chat guide</a> for provider-specific behavior.</p>
+
+        <h3>Follow the work</h3>
+        <p>When an agent shares a plan, a card above the composer shows its steps and progress. Open a supported subagent’s conversation from its activity row to inspect the work in a separate, read-only chat.</p>
+        <p>Claude Code’s <code>/loop</code> and <code>/goal</code>, and Codex’s <code>/goal</code>, show up in an <strong>Ahead</strong> card. See what will resume the agent, when, and why. Open a row for details and the controls available for that provider. A conversation with pending work stays unfinished in the rail and dashboard, and its done notification waits until that work ends. See <a href="https://github.com/martinappberg/chimaera/blob/main/docs/features/loops-and-goals.md">loops and goals</a>.</p>
+        <p>The chat header’s usage meter shows context and plan limits where the agent reports them, drawing attention as a limit approaches. Click it for details, or open <strong>Settings → Agents → Plan usage</strong> for account limits and reset times. Cursor CLI does not currently expose usage to Chimaera.</p>
 
         <h2 id="previews">File previews &amp; precise feedback</h2>
         <p>Open a file from the tree or chat to view it beside the agent. Split panes and tabs let you compare outputs and keep source material close.</p>
@@ -329,7 +334,7 @@
         </ul>
         <p><strong>Point to the part that matters.</strong> Reference a passage, PDF area, image region, table selection, notebook cell, slide, or media moment in a chat. Chimaera carries the file and location into your feedback.</p>
         <p>Text and Markdown support lightweight editing with save conflict handling and draft recovery. Other formats use dedicated viewers. Size limits, paging, and bounded reads depend on the format; see <a href="https://github.com/martinappberg/chimaera/blob/main/docs/features/files-and-previews.md">files and previews</a>.</p>
-        <p><strong>Live apps:</strong> open a detected localhost URL from a terminal, or add a browser pane, to use a web app beside your agent. Chimaera’s proxy also reaches apps on the remote workspace’s host.</p>
+        <p><strong>Live apps:</strong> ask an agent to open its web app, open a detected localhost URL from a terminal, or add a browser pane, to use a web app beside your agent. Chimaera’s proxy also reaches apps on the remote workspace’s host.</p>
 
         <h2 id="files">Files &amp; uploads</h2>
         <p>
@@ -337,6 +342,7 @@
           not just a read-only tree.
         </p>
         <ul>
+          <li><strong>Preview as you browse.</strong> Select a file in the Finder-style browser to see a preview beside the folder columns. Double-click, press Enter, or choose Open to give it a full file tab.</li>
           <li><strong>Manage files.</strong> Create, rename, delete, and copy / cut / paste files and folders from a right-click menu or the keyboard. Copies and moves run server-side, so bytes never round-trip the browser. Symlinks are marked (broken ones too).</li>
           <li><strong>Reference by drag.</strong> Drag a file or folder from the tree onto a session to type its path: an <code>@mention</code> for an agent, a shell-quoted path for a terminal. Nothing is copied; the file is already on the host.</li>
           <li><strong>Bring files in.</strong> Drop a file from your desktop onto a session or a folder, or paste a screenshot. The bytes stream to the daemon that owns the session, so a file you drag from your laptop lands on the remote host the agent can read. Uploads are capped and streamed, never buffered in RAM.</li>
@@ -354,6 +360,7 @@
         <ul>
           <li><strong>History.</strong> Browse repository commits, file history, and branch changes. Session records connect an agent’s work to its changed files and available Git history.</li>
           <li><strong>Worktrees.</strong> Spin a branch into its own openable window: create a worktree under a managed root and spawn an agent or terminal into it. Removal is fenced (managed root only, no live session, clean tree), and the branch itself survives.</li>
+          <li><strong>Start a chat in isolation.</strong> Turn on <strong>In a new worktree</strong> in the agent launcher to give a new chat a fresh branch and checkout. The chat opens immediately while Chimaera prepares the worktree.</li>
           <li><strong>A branch per agent.</strong> The Branches view maps which session runs in which worktree, derived from each session's working directory, so you can jump straight to the agent on another branch.</li>
           <li><strong>Session-scoped changes.</strong> Review exactly what one agent touched, cross-referenced with live git status.</li>
         </ul>

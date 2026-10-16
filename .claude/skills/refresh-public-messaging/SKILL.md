@@ -90,7 +90,7 @@ session; record them in the PR body so the next run knows what was deliberate.
   HTML — reuse existing components/classes (`.feature`, `.qa`, `.showcase`, `.codecard`); don't
   invent new CSS unless the design genuinely needs it.
 - **Don't overclaim.** Verify current capabilities in code: git provides review, history and
-  worktree management, with no commit/push UI. Claude Code, Codex, Antigravity and Grok Build
+  worktree management, with no commit/push UI. Claude Code, Codex, Antigravity, Grok Build and Cursor CLI
   have structured chat adapters; Gemini is retained for saved history, not new launches.
   Only Claude/Codex support verified terminal/chat switching and the Mastermind role.
   Closing a view or losing its connection leaves daemon-owned work running while its

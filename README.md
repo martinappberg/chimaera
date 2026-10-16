@@ -40,7 +40,7 @@ project in view.
    daemon and provides signed updates.
 2. **Open a folder**, locally or on a remote host. The app opens a workspace around it.
 3. **Choose an agent.** Use the launcher to install a supported CLI if needed,
-   sign in with its provider, and start a conversation.
+   sign in through the app, and start a conversation.
 4. **Open the output beside the chat.** Arrange panes, reference files, and bring
    another agent into the same project when you need one.
 
@@ -62,11 +62,16 @@ see questions and approvals in the dashboard, and follow recent activity. Agents
 can exchange messages within the workspace. An optional **Mastermind** coordinator
 helps brief you and direct the work.
 
-All five supported agents — Claude Code, Codex, Antigravity, Grok Build and Cursor CLI — have structured chat. Claude Code and Codex also let you
+All five supported agents have structured chat. Claude Code and Codex also let you
 switch the same conversation between chat and their real terminal interfaces.
 Provider authentication, usage limits, and billing apply to the mode you use.
 
-[Agents](docs/features/agents.md) · [Coordination](docs/features/agent-communication.md)
+Follow an agent's plan as it works. Claude Code's loops and goals, and Codex goals,
+show what will happen next and why a conversation resumed. Check context and plan
+usage from the chat header and Agent settings where the provider reports it.
+
+[Agents](docs/features/agents.md) · [Coordination](docs/features/agent-communication.md) ·
+[Loops and goals](docs/features/loops-and-goals.md)
 
 ### Files you can see and work with
 
@@ -75,9 +80,10 @@ notebooks, diagrams, video, audio, and HTML reports. Keep a live web app in a
 browser pane. Edit text and Markdown directly. Give an agent a file reference,
 text selection, table cell, image region, or media timestamp as context.
 
-The file manager handles uploads, downloads, moves, and copies. Git views bring
-status, diffs, history, and worktrees into the workspace. Session history records
-changes even in folders without a Git repository.
+Browse files with a preview beside the folder listing. The file manager handles
+uploads, downloads, moves, and copies. Git views bring status, diffs, history, and
+worktrees into the workspace. Start a chat on its own branch and worktree from the
+launcher. Session history records changes even in folders without a Git repository.
 
 [Files and previews](docs/features/files-and-previews.md) ·
 [Browser panes](docs/features/browser-pane.md) · [Git](docs/features/git.md)
