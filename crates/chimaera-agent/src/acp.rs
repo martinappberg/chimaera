@@ -266,6 +266,10 @@ enum Pending {
     /// Grok's `/always-approve on|off` prompt: (on, chosen).
     AlwaysApprove(bool, bool),
     Model(String),
+    /// Grok's `_x.ai/session/info`: the context window after a turn.
+    GrokSessionInfo,
+    /// Grok's `_x.ai/billing`: the account's credit window after a turn.
+    GrokBilling,
 }
 struct Queued {
     id: String,
@@ -292,6 +296,8 @@ pub struct AcpMapper {
     /// Grok advertises no modes; this adapter offers its always-approve
     /// toggle as one (see `offer_grok_modes`).
     grok_modes: bool,
+    /// The limit chip last sent, so an unchanged billing read adds nothing.
+    rate_limit_sent: Option<AgentEvent>,
     always_approve: bool,
     /// An always-approve change travels as a prompt, which Grok runs only
     /// between turns, and its command is listed only after the handshake.
@@ -321,6 +327,41 @@ pub struct AcpMapper {
     /// id into it: (id, content, status) in the order first seen.
     todos: Vec<(String, String, String)>,
 }
+/// A context-window reading from `used` of `size` tokens.
+fn context_usage(used: &Value, size: &Value) -> Option<AgentEvent> {
+    let (used, size) = (used.as_u64()?, size.as_u64()?);
+    (size > 0).then(|| AgentEvent::ContextUsage {
+        total_tokens: used,
+        max_tokens: size,
+        percentage: (used as f64 / size as f64 * 100.0).clamp(0.0, 100.0),
+    })
+}
+
+/// Grok's `_x.ai/billing` answer (live 1.0.46: `{config: {creditUsagePercent
+/// 0-100, currentPeriod: {type: "USAGE_PERIOD_TYPE_WEEKLY", start, end}},
+/// subscription_tier}`) as a usage window, and whether it is spent. Public
+/// for the daemon's Agent-settings read.
+pub fn grok_billing_usage(result: &Value) -> (Vec<UsageWindow>, bool) {
+    let config = &result["config"];
+    let Some(pct) = config["creditUsagePercent"].as_f64() else {
+        return (Vec::new(), false);
+    };
+    let period = &config["currentPeriod"];
+    let label = match period["type"].as_str() {
+        Some("USAGE_PERIOD_TYPE_WEEKLY") => "weekly limit",
+        Some("USAGE_PERIOD_TYPE_MONTHLY") => "monthly limit",
+        Some("USAGE_PERIOD_TYPE_DAILY") => "daily limit",
+        _ => "usage limit",
+    };
+    let pct = pct.clamp(0.0, 100.0);
+    let window = UsageWindow {
+        label: label.to_string(),
+        utilization: pct,
+        resets_at: period["end"].as_str().map(|end| truncate_label(end, 40)),
+    };
+    (vec![window], pct >= 100.0)
+}
+
 fn text(v: &Value) -> String {
     cap_output(v.as_str().unwrap_or_default()).0
 }
@@ -413,6 +454,7 @@ impl AcpMapper {
             portable_context: None,
             restoring: false,
             grok_modes: false,
+            rate_limit_sent: None,
             always_approve: false,
             deferred_mode: None,
             kind,
@@ -1063,6 +1105,22 @@ impl Mapper for AcpMapper {
                             turn_id,
                             usage: Usage::default(),
                         });
+                        if self.kind == GROK.kind {
+                            // Free reads (no model call), live 1.0.46.
+                            let session = json!({"sessionId": self.native});
+                            self.request(
+                                "_x.ai/session/info",
+                                session,
+                                Pending::GrokSessionInfo,
+                                &mut step,
+                            );
+                            self.request(
+                                "_x.ai/billing",
+                                json!({}),
+                                Pending::GrokBilling,
+                                &mut step,
+                            );
+                        }
                     }
                     self.turn = None;
                     self.mcp_calls.clear();
@@ -1097,6 +1155,36 @@ impl Mapper for AcpMapper {
                         });
                     }
                     self.resume(&mut step);
+                }
+                // Telemetry: an older Grok without these reads just shows none.
+                Pending::GrokSessionInfo | Pending::GrokBilling if error.is_some() => {}
+                Pending::GrokSessionInfo => {
+                    let info = &frame["result"];
+                    // Live 1.0.46 nests the answer once more: `result.result`.
+                    let context = if info["result"]["context"].is_object() {
+                        &info["result"]["context"]
+                    } else {
+                        &info["context"]
+                    };
+                    if let Some(event) = context_usage(&context["used"], &context["total"]) {
+                        step.events.push(event);
+                    }
+                }
+                Pending::GrokBilling => {
+                    let (windows, limit_reached) = grok_billing_usage(&frame["result"]);
+                    if let Some(top) = windows.first().cloned() {
+                        let chip = AgentEvent::RateLimit {
+                            utilization: top.utilization,
+                            resets_at: top.resets_at,
+                            label: Some(top.label),
+                            limit_reached,
+                            windows,
+                        };
+                        if self.rate_limit_sent.as_ref() != Some(&chip) {
+                            self.rate_limit_sent = Some(chip.clone());
+                            step.events.push(chip);
+                        }
+                    }
                 }
                 _ if error.is_some() => step.events.push(AgentEvent::Error {
                     message: error.unwrap(),
@@ -1226,6 +1314,13 @@ impl Mapper for AcpMapper {
         }
         let update = &params["update"];
         match update["sessionUpdate"].as_str().unwrap_or_default() {
+            // ACP's own context report (`{used, size, cost?}`, stable since
+            // schema 1.25.0); none of the three agents sends it yet.
+            "usage_update" => {
+                if let Some(event) = context_usage(&update["used"], &update["size"]) {
+                    step.events.push(event);
+                }
+            }
             "agent_message_chunk" | "agent_thought_chunk" => {
                 if update["content"]["type"] == "text" {
                     if update["content"]["text"]
@@ -1648,6 +1743,88 @@ mod tests {
         agy.offer_grok_modes(ANTIGRAVITY.kind);
         commands(&mut agy, &["always-approve"]);
         assert!(agy.modes.is_empty());
+    }
+    #[test]
+    fn usage_update_is_the_context_window_for_any_agent() {
+        let mut m = mapper();
+        let step = m.on_frame(&json!({"method":"session/update","params":{"sessionId":"session","update":{
+            "sessionUpdate":"usage_update","used":53000,"size":200000,"cost":{"amount":0.4,"currency":"USD"}}}}));
+        assert!(matches!(
+            &step.events[..],
+            [AgentEvent::ContextUsage { total_tokens: 53000, max_tokens: 200000, percentage }] if (*percentage - 26.5).abs() < 0.01
+        ));
+        // A report without a size says nothing.
+        let step = m.on_frame(
+            &json!({"method":"session/update","params":{"sessionId":"session","update":{
+            "sessionUpdate":"usage_update","used":53000}}}),
+        );
+        assert!(step.events.is_empty());
+    }
+    #[test]
+    fn grok_reports_its_context_and_credit_window_after_a_turn() {
+        let mut m = AcpMapper::new("session".into(), &json!({}), &json!({}), GROK.kind);
+        let turn = send(&mut m, "hi");
+        let done =
+            m.on_frame(&json!({"id":turn.outbound[0]["id"],"result":{"stopReason":"end_turn"}}));
+        let asked: Vec<_> = done
+            .outbound
+            .iter()
+            .map(|f| f["method"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(asked, ["_x.ai/session/info", "_x.ai/billing"]);
+        assert_eq!(done.outbound[0]["params"]["sessionId"], "session");
+        // Live 1.0.46 shapes.
+        let info = m.on_frame(&json!({"id":done.outbound[0]["id"],"result":{"result":{
+            "sessionId":"session","context":{"used":20721,"total":256000,"usagePct":8}}}}));
+        assert!(matches!(
+            &info.events[..],
+            [AgentEvent::ContextUsage {
+                total_tokens: 20721,
+                max_tokens: 256000,
+                ..
+            }]
+        ));
+        let billing = json!({"config":{"creditUsagePercent":81.5,"currentPeriod":{
+            "type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-10-12T22:01:10+00:00","end":"2026-10-19T22:01:10+00:00"}},
+            "subscription_tier":"SuperGrok Lite"});
+        let step = m.on_frame(&json!({"id":done.outbound[1]["id"],"result":billing}));
+        match &step.events[..] {
+            [AgentEvent::RateLimit {
+                utilization,
+                label,
+                resets_at,
+                limit_reached,
+                windows,
+            }] => {
+                assert!((utilization - 81.5).abs() < 0.01);
+                assert_eq!(label.as_deref(), Some("weekly limit"));
+                assert_eq!(resets_at.as_deref(), Some("2026-10-19T22:01:10+00:00"));
+                assert!(!limit_reached);
+                assert_eq!(windows.len(), 1);
+            }
+            other => panic!("expected one RateLimit, got {other:?}"),
+        }
+        // The next turn's unchanged read journals nothing; a refused read
+        // (an older Grok) is silent.
+        let turn = send(&mut m, "again");
+        let done =
+            m.on_frame(&json!({"id":turn.outbound[0]["id"],"result":{"stopReason":"end_turn"}}));
+        let same = m.on_frame(&json!({"id":done.outbound[1]["id"],"result":billing}));
+        assert!(same.events.is_empty(), "{:?}", same.events);
+        let refused = m
+            .on_frame(&json!({"id":done.outbound[0]["id"],"error":{"code":-32601,"message":"no"}}));
+        assert!(refused.events.is_empty(), "{:?}", refused.events);
+    }
+    #[test]
+    fn other_acp_agents_ask_nothing_after_a_turn() {
+        let mut m = AcpMapper::new("session".into(), &json!({}), &json!({}), ANTIGRAVITY.kind);
+        let turn = send(&mut m, "hi");
+        let done =
+            m.on_frame(&json!({"id":turn.outbound[0]["id"],"result":{"stopReason":"end_turn"}}));
+        assert!(done
+            .outbound
+            .iter()
+            .all(|f| !f["method"].as_str().unwrap_or("").starts_with("_x.ai/")));
     }
     fn send(mapper: &mut AcpMapper, text: &str) -> DriverStep {
         mapper.on_command(AgentCommand::Send {

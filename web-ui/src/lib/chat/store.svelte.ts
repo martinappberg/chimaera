@@ -1,3 +1,4 @@
+import { usageRows, type UsageRow } from "../shared/usage";
 import { SvelteMap } from "svelte/reactivity";
 import type { PendingElicitation } from "./elicitation";
 /**
@@ -449,6 +450,10 @@ export interface RateLimitInfo {
   label: string | null;
   resetsAt: string | null;
   limitReached: boolean;
+  /** Every window the agent reported with it (Claude's session + weekly,
+   *  Codex's primary/secondary); empty from older journals and agents that
+   *  report one window — the fields above are then the only one. */
+  windows: UsageRow[];
 }
 
 export interface RewindReport {
@@ -1677,6 +1682,7 @@ export class ChatStore {
           label: (ev.label as string) ?? null,
           resetsAt: (ev.resets_at as string) ?? null,
           limitReached: ev.limit_reached === true,
+          windows: usageRows(ev.windows as Parameters<typeof usageRows>[0]),
         };
         break;
       case "model_switched": {

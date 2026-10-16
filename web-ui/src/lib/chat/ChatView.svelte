@@ -68,6 +68,8 @@
   import PlanApprovalCard from "./PlanApprovalCard.svelte";
   import PlanCard from "./PlanCard.svelte";
   import { planShows } from "./planCard";
+  import { openSettingsAt } from "../settings/jump";
+  import { USAGE_AGENTS, getAgentUsage, type AgentUsage } from "../settings/agentUsage";
   import WakeRequestBar from "./WakeRequestBar.svelte";
   import { commsStore, wakeRequestFor } from "../workspace/comms.svelte";
   import QuestionCard from "./QuestionCard.svelte";
@@ -308,7 +310,7 @@
   // position instead of snapping to the bottom.
   // svelte-ignore state_referenced_locally
   let atBottom = $state(chatScroll(chatId).atBottom);
-  let menu = $state<"model" | "mode" | "effort" | "mcp" | "remote" | "options" | null>(null);
+  let menu = $state<"model" | "mode" | "effort" | "mcp" | "remote" | "options" | "usage" | null>(null);
 
   // --- bounded transcript DOM ------------------------------------------------
   // The reducer/socket always fold the complete bounded journal so background
@@ -2197,6 +2199,43 @@
    *  "Counting files"), else the phase: starting → thinking / writing /
    *  running tools → working (between steps). */
   const agentBusy = $derived(store.running || store.compacting);
+  /** The usage popover's Compact: the same path as typing `/compact` (Codex's
+   *  native command, else Claude's own slash command), offered while idle. */
+  const canCompact = $derived(
+    !readOnly && !agentBusy && store.contextPct !== null && (agentKind === "claude" || supports("compact")),
+  );
+  function compactNow(): void {
+    menu = null;
+    if (!onSlash("compact")) onSubmit("/compact", []);
+  }
+  function openAgentSettings(): void {
+    menu = null;
+    openSettingsAt("Agents");
+  }
+
+  /** The account's limits from Agent settings' live read, for a chat whose
+   *  own stream has reported none (a fresh chat, Codex before its first turn
+   *  ends, Antigravity always). Asked while the chat shows and idles — again
+   *  after each turn — and the daemon answers from its minute cache. */
+  let accountUsage = $state<AgentUsage | null>(null);
+  let accountUsageReading = false;
+  $effect(() => {
+    if (!visible || !$pageVisible || readOnly || agentBusy) return;
+    if (store.rateLimit !== null || !USAGE_AGENTS.has(agentKind)) return;
+    untrack(() => {
+      if (accountUsageReading) return;
+      accountUsageReading = true;
+      getAgentUsage(agentKind)
+        .then((read) => {
+          if (read.error === null) accountUsage = read;
+        })
+        .catch(() => {})
+        .finally(() => {
+          accountUsageReading = false;
+        });
+    });
+  });
+
   const activityLabel = $derived.by(() => {
     if (store.compacting) return "Compacting context";
     if (store.activityLine !== null) return store.activityLine;
@@ -2757,6 +2796,10 @@
     onToggleThinking={toggleThinking}
     onInterrupt={interrupt}
     onSetRemoteControl={setRemoteControl}
+    onCompact={canCompact ? compactNow : undefined}
+    onOpenSettings={readOnly ? undefined : openAgentSettings}
+    accountLimits={accountUsage?.rows}
+    accountLimitReached={accountUsage?.limitReached}
   />
   {/if}
 

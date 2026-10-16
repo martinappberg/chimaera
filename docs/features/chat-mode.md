@@ -302,9 +302,21 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   Codex's Remote Control belongs to its shared app-server daemon (`codex remote-control start`
   / `codex remote-control pair`), not to the per-session app-server chimaera drives, so a Codex chat
   only relays its status; the popover says how to turn it on.
-- **Live telemetry chips.** A rate-limit chip appears at ≥80% / reached; a context chip shows "42%
-  ctx". Subscription usage (`/usage`, `/cost`) shows **percentages, never dollars**.
-- **Where.** `ChatHeader.svelte`, `EffortPopover.svelte`, `UsagePanel.svelte`; store fields fed by
+- **Usage, quiet until it matters.** One usage meter at the header's right edge stands for the
+  context window and the plan limits. At rest it is a faint gauge whose needle sits at the fullest
+  reading, with no number. Once a reading reaches 80% it says which and how full ("weekly 86%",
+  "context 84%") in the warn colour; a limit the agent reports as spent reads "weekly limit reached"
+  in the error colour. A click opens the detail: the context window (tokens used of the window, and
+  **Compact** while the agent is idle — the same path as typing `/compact`), then every plan window
+  this chat knows, each with when it resets ("in 1h 40m", "Thu 09:00"), and **All limits** →
+  Settings → Agents. Claude reports both plan windows on every request (`unifiedWindows`), Codex its
+  primary/secondary windows, Grok its weekly credit window after each turn; a chat whose own stream
+  has reported none yet (a fresh chat, Codex before its first turn ends, Antigravity always) shows
+  the account's live read from Agent settings instead ([agents.md](agents.md#plan-usage)). Nothing
+  shows for an agent that reports neither (Cursor). Subscription usage (`/usage`, `/cost`, the
+  meter) shows **percentages, never dollars**.
+- **Where.** `ChatHeader.svelte`, `UsageMeter.svelte`, `EffortPopover.svelte`, `UsagePanel.svelte`,
+  `../shared/UsageBars.svelte` + `../shared/usage.ts` (levels, reset wording, the headline); store fields fed by
   `model_switched`/`effort_state`/`mode_changed`/`rate_limit`/`context_usage`/`remote_control`
   events. Commands `set_model`/`set_effort`/`set_mode`/`set_thinking`/`set_ultracode`/`get_usage`/
   `set_remote_control`.
@@ -1223,6 +1235,15 @@ _Captured 2026-10-05 (from the maintainer, in-session, PR #259)._
 - **On the first version leaving out Always-approve (verbatim):** “why is always approve not in the picker ?” — the PR was held until it was.
 - **Scope (verbatim):** “that should work with the other providers too (if it is not fully grok specific)” — the effort scale's faster → smarter ordering applies to every agent; the mode offer itself is Grok's.
 - **Grade:** parity with the other agents' header, limited to what was verified against Grok (Normal and Always-approve). Plan waits on the approval reply format.
+
+### Usage that stays quiet until it matters — why it exists
+_Captured 2026-10-15 (from the maintainer, in-session, while the chat-UX batch was being tested)._
+
+- **Problem it solves (verbatim, relayed by the loops session and confirmed in-session):** people want to see their usage limits and context %, "not only via /usage", and "the limit chip that shows up today should look and work better".
+- **The shape (verbatim):** “I think A instead ? but only show it when it gets much, otherwise just a faint "usage" icon of some sort that if you click shows more?” — A was meters in the chat header; the faint gauge, the 80% threshold and the click-through detail are that sentence.
+- **What was turned down (verbatim):** “I dont like B because it puts it into your head too much” — B kept every agent's limits always visible in the workbench chrome. “but I feel like we could put it on Agent settings ?” — hence the live read on each agent's card.
+- **Scope (verbatim):** “and we do this for all agent providers right ?” — every agent that reports anything (Claude, Codex, Grok, Antigravity); none is invented for one that doesn't (Cursor).
+- **Grade:** shipped as the design picked in-session; thresholds (80%) and the wording are the builder's, open to change.
 
 ### Pre-allowed tools and the plan card on ACP chats — why it exists
 _Intent pending — not yet captured from the maintainer (shipped 2026-10-15, autonomous session)._
