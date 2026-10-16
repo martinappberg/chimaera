@@ -6,13 +6,13 @@ before you write code.
 
 ## Dev setup
 
-Use Node 22 (`.nvmrc`) and the Rust toolchain pinned in `rust-toolchain.toml`
-(currently 1.96.0). Rustup selects that toolchain inside the repo. Build the UI
+Use Node 26 (`.nvmrc`) and the Rust toolchain pinned in `rust-toolchain.toml`
+(currently 1.99.1). Rustup selects that toolchain inside the repo. Build the UI
 before Rust checks: `chimaera-server` embeds `web-ui/dist`.
 
 ```sh
 # Web UI, then Rust and plugin test assets
-nvm use 22
+nvm use
 npm --prefix web-ui ci
 npm --prefix web-ui run check     # svelte-check
 npm --prefix web-ui run test      # targeted Vitest suites
@@ -48,7 +48,7 @@ Changing the proxy target does not change the manifest path.
 
 ## Code style
 
-- `cargo +1.96.0 fmt --all --check` and
+- `cargo +1.99.1 fmt --all --check` and
   `cargo clippy --workspace --all-targets -- -D warnings` must pass clean;
   CI uses the pinned toolchain. `just check` covers both Rust workspaces.
 - Comments state constraints and invariants, not narration. Explain *why* the code must be

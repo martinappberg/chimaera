@@ -1247,7 +1247,9 @@ mod tests {
         kind: AgentKind,
         done: impl Fn(&Progress) -> bool,
     ) -> Progress {
-        tokio::time::timeout(Duration::from_secs(10), async {
+        // Completion can include the status probe's full deadline. The test
+        // must leave time for its timeout verdict to reach the operation.
+        tokio::time::timeout(PROBE_TIMEOUT + Duration::from_secs(5), async {
             loop {
                 if let Some(p) = snapshot(state, kind).filter(&done) {
                     return p;
@@ -1256,7 +1258,14 @@ mod tests {
             }
         })
         .await
-        .expect("the operation settles")
+        .unwrap_or_else(|_| {
+            let p = snapshot(state, kind).unwrap();
+            panic!(
+                "the operation settles: {} output={:?}",
+                serde_json::to_string(&p).unwrap(),
+                p.output
+            );
+        })
     }
 
     #[tokio::test]

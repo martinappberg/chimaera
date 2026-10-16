@@ -39,6 +39,10 @@ fn not_found(message: &str) -> Response {
 }
 
 /// Resolve the workspace, git and the repository a history request names.
+#[allow(
+    clippy::result_large_err,
+    reason = "Return the HTTP error directly without a second allocation"
+)]
 async fn open_repo(
     state: &Arc<AppState>,
     ws_id: &str,

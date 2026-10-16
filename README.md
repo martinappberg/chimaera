@@ -151,7 +151,7 @@ chimaera plugin list            # list available and installed workbench plugins
 
 ## Build from source
 
-You need **Node 22**, npm, Rust through **rustup**, and a C/C++ build toolchain.
+You need **Node 26**, npm, Rust through **rustup**, and a C/C++ build toolchain.
 The repository pins Rust in [rust-toolchain.toml](rust-toolchain.toml); rustup
 selects it automatically. Run these commands on macOS, Linux, or inside WSL2 on
 Windows. Build the UI first because the daemon embeds it.

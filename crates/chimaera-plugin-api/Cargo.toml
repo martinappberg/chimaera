@@ -12,4 +12,4 @@ serde.workspace = true
 serde_json.workspace = true
 # The guest bindings for `wit/chimaera.wit`. Plugins build for wasm32-wasip2;
 # natively (tests, clippy) every host import is a stub that aborts.
-wit-bindgen = "0.62"
+wit-bindgen = "0.63"

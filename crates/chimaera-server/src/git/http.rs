@@ -41,6 +41,10 @@ const MAX_WORKTREE_LOOKUPS: usize = 8;
 /// reports for one of those — never an arbitrary path (git never runs inside
 /// a folder before it is validated). Absent, it is the primary, exactly as
 /// before: `Ok(outcome)` of the root's probe.
+#[allow(
+    clippy::result_large_err,
+    reason = "Return the HTTP error directly without a second allocation"
+)]
 pub(super) async fn pick_repo(
     state: &AppState,
     git: &Path,

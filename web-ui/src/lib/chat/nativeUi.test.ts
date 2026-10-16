@@ -71,6 +71,20 @@ describe("isolated Client module graph", () => {
     await expect(prepareClientBundle(bundle([{ key: "entry", source: 'import "https://example.com/payload.js";' }]), "counter.js")).rejects.toThrow("outside");
     await expect(prepareClientBundle(bundle([{ key: "entry", source: 'export default (path) => import(path);' }]), "counter.js")).rejects.toThrow("outside");
   });
+  it("keeps interpolated imports outside the literal graph and preserves import.meta", async () => {
+    await expect(prepareClientBundle(bundle([
+      { key: "entry", source: 'export default (name) => import(`./${name}.js`);' },
+      { key: "./*.js", source: "export default 1;" },
+    ]), "counter.js")).rejects.toThrow("outside");
+    const source = 'export { x } from "util"; export const url = import.meta.url;';
+    const linked = await prepareClientBundle(bundle([
+      { key: "entry", source }, { key: "util", source: "export const x = 1;" },
+    ]), "counter.js");
+    expect(linked.files[1].imports).toHaveLength(1);
+    const ref = linked.files[1].imports[0];
+    expect(source.slice(ref.start, ref.end)).toBe("util");
+    expect(ref.dynamic).toBe(false);
+  });
   it("reports circular imports without recursing indefinitely", async () => {
     await expect(prepareClientBundle(bundle([{ key: "entry", source: 'import "util";' }, { key: "util", source: 'import "entry";' }]), "counter.js")).rejects.toThrow("circular");
   });

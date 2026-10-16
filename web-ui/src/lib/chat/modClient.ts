@@ -1,4 +1,6 @@
-import { init, parse } from "es-module-lexer";
+// Supplied bundles are JavaScript; the minimal lexer preserves literal-only
+// import resolution without adding the full build's TypeScript/SIMD runtime.
+import { init, parse } from "es-module-lexer/minimal";
 import { isRecord, type NativeUiTransport, type UiRecord } from "./nativeUi";
 
 let workers = 0;
@@ -106,7 +108,7 @@ export async function prepareClientBundle(value: UiRecord, module: string): Prom
   if (bytes > 8 * 1024 * 1024) throw new Error("Claude Mod modules exceed their size limit");
   const keys = new Set(files.map((file) => file.key));
   if (keys.size !== files.length || !keys.has(value.runtime) || !keys.has(entry.entry)) throw new Error("Invalid Claude Mod module graph");
-  await init;
+  await init();
   const linked = files.map((file) => ({ ...file, imports: parse(file.source)[0].filter((item) => item.d !== -2).map((item) => {
     if (!item.n || !keys.has(item.n)) throw new Error("Claude Mod module imports code outside its supplied bundle");
     return { start: item.s, end: item.e, key: item.n, dynamic: item.d >= 0 };

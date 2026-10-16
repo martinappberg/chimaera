@@ -11,7 +11,7 @@ name: app
 #
 # No `web-ui/**` path: the app's own frontend is crates/chimaera-app/assets,
 # and web-ui reaches the bundle only as the dist chimaera-server embeds, which
-# ci.yml's `ui` job already builds. A UI-only change can't break this build,
+# ci.yml's `ui-build` job already builds. A UI-only change can't break this build,
 # and it was most PRs' slowest check.
 #
 # `ready_for_review` is in `types` (which overrides the default set, so the
@@ -24,6 +24,14 @@ on:
     paths:
       - "crates/chimaera-app/**"
       - "crates/chimaera-server/**"
+      - "crates/chimaera-agent/**"
+      - "crates/chimaera-core/**"
+      - "crates/chimaera-pty/**"
+      - "crates/chimaera-remote/**"
+      - "crates/chimaera-plugin-api/**"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+      - ".nvmrc"
       - "plugins/**"
       - "scripts/build-plugins.sh"
       - "scripts/smoke-macos-plugins.mjs"
@@ -69,12 +77,14 @@ jobs:
         # for the JSON --config argument.
         shell: bash
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .nvmrc
           cache: npm
-          cache-dependency-path: crates/chimaera-app/package-lock.json
+          cache-dependency-path: |
+            crates/chimaera-app/package-lock.json
+            web-ui/package-lock.json
       # Tauri v2's documented webkit2gtk-4.1 prerequisite set.
       - if: runner.os == 'Linux'
         run: |
@@ -82,7 +92,7 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
             libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
       - run: rustup show
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: crates/chimaera-app
           # rust-cache keys include the OS, so "app" pairs each leg with the
@@ -95,7 +105,7 @@ jobs:
         working-directory: crates/chimaera-app
       # tauri's beforeBuildCommand installs and builds web-ui;
       # setup-node above guarantees it sees a modern node — the UI build
-      # needs >= 18 (styleText), which is why .nvmrc exists. The windows
+      # uses the exact version in .nvmrc. The windows
       # overlay SKIPS that command: nothing in the Windows bundle consumes
       # web-ui/dist (chimaera-server, its only consumer, is cfg(unix)).
       #
@@ -124,7 +134,7 @@ jobs:
       # APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_SIGNING_IDENTITY
       # / APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID as repo secrets and export
       # them on the build step (tauri picks them up).
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.bundle }}

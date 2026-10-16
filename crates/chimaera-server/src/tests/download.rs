@@ -83,15 +83,11 @@ async fn download_dir_zips_recursively_skipping_symlinks() {
     );
     assert_eq!(&bytes[..4], b"PK\x03\x04");
 
-    // Parse the archive back with async_zip's read side.
-    let reader = async_zip::base::read::mem::ZipFileReader::new(bytes.to_vec())
-        .await
-        .expect("valid zip");
+    // An independent reader validates the streamed writer's ZIP output.
+    let mut reader = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).expect("valid zip");
     let names: Vec<String> = reader
-        .file()
-        .entries()
-        .iter()
-        .map(|e| e.filename().as_str().unwrap().to_string())
+        .file_names()
+        .map(|name| name.unwrap().into_owned())
         .collect();
     // Walk order is filesystem-dependent: assert membership, not order.
     for expected in [
@@ -111,20 +107,17 @@ async fn download_dir_zips_recursively_skipping_symlinks() {
     assert_eq!(names.len(), 5, "{names:?}");
 
     // Content survives the deflate round trip.
-    let index = names.iter().position(|n| n == "proj/file.txt").unwrap();
-    let mut entry = reader.reader_with_entry(index).await.unwrap();
+    let mut entry = reader.by_name("proj/file.txt").unwrap();
     let mut content = Vec::new();
-    entry.read_to_end_checked(&mut content).await.unwrap();
+    std::io::Read::read_to_end(&mut entry, &mut content).unwrap();
     assert_eq!(&content[..], b"round trip me");
 
     // Real mtimes ride into the archive — an extracted file must never read
     // as 1980 (the unstamped DOS epoch).
-    let year = reader.file().entries()[index]
-        .last_modification_date()
-        .year();
+    let year = entry.last_modified().unwrap().year();
     assert!(year >= 2026, "zip entry stamped {year}");
     // And real unix modes — unstamped attribute bits extract as mode-000.
-    let mode = reader.file().entries()[index].unix_permissions();
+    let mode = entry.unix_mode();
     assert_eq!(mode.map(|m| m & 0o777), Some(0o644), "{mode:?}");
 
     std::fs::remove_dir_all(&base).ok();

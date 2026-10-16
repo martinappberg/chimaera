@@ -102,65 +102,64 @@ const INSERTS = ["x", " ", "\n", "\n\n", "- ", "```", "# ", "## ", "> ", "|", "*
 const TYPING = ["x", " ", "ab"];
 
 describe("the live field's incremental update", () => {
-  it("matches a full recomputation after every edit", () => {
+  // Keep each deterministic 400-edit run inside its own timeout budget. This
+  // preserves all 2,800 edits and identifies the failing seed on busy runners.
+  it.each([
+    [7, true, DOC],
+    [11, false, DOC],
+    [23, true, DOC],
+    [42, true, DOC],
+    [13, true, DUPS, TYPING],
+    [29, true, DUPS, TYPING],
+    [5, true, FENCED_FM + DOC],
+  ] as const)("matches a full recomputation after every edit (seed %i)", (seed, focused, text, inserts = INSERTS) => {
     let treeDiffs = 0;
     let steps = 0;
-    const runs = [
-      [7, true, DOC],
-      [11, false, DOC],
-      [23, true, DOC],
-      [42, true, DOC],
-      [13, true, DUPS, TYPING],
-      [29, true, DUPS, TYPING],
-      [5, true, FENCED_FM + DOC],
-    ] as const;
-    for (const [seed, focused, text, inserts = INSERTS] of runs) {
-      const typing = inserts === TYPING;
-      const next = rng(seed);
-      let focus: boolean = focused;
-      let state = fresh(text, 30, focus);
-      for (let step = 0; step < 400; step++) {
-        steps++;
-        const len = state.doc.length;
-        const at = Math.floor(next() * (len + 1));
-        let spec: TransactionSpec;
-        const roll = next();
-        if (roll < 0.2) {
-          // A cursor move or a selection across blocks, no edit.
-          const head = Math.min(len, at + Math.floor(next() * 3) * Math.floor(next() * 60));
-          spec = { selection: { anchor: at, head } };
-        } else if (roll < 0.25) {
-          focus = !focus;
-          spec = { effects: liveFocus(focus) };
-        } else if (roll < 0.5 && len > 0) {
-          const to = Math.min(len, at + 1 + (typing ? 0 : Math.floor(next() * 12)));
-          spec = { changes: { from: at, to }, selection: { anchor: at } };
-        } else {
-          const ins = inserts[Math.floor(next() * inserts.length)];
-          spec = { changes: { from: at, insert: ins }, selection: { anchor: at + ins.length } };
-        }
-        state = state.update(spec).state;
-        ensureSyntaxTree(state, state.doc.length, 5000);
-        const sel = state.selection.main;
-        let base = fresh(state.doc.toString(), sel.head, focus);
-        if (!sel.empty) base = base.update({ selection: { anchor: sel.anchor, head: sel.head } }).state;
-        // Parse completion may land a transaction later: settle both.
-        state = state.update({}).state;
-        // The oracle is the same computation from scratch over the same
-        // tree; where lezer's incremental reparse and a fresh parse disagree
-        // (a `$$` block's extent, rarely), the trees are not comparable.
-        if (shape(state) !== shape(base)) {
-          treeDiffs++;
-          continue;
-        }
-        const want = summary(base);
-        const got = summary(state);
-        const where = `seed ${seed} step ${step}`;
-        expect(got.segs, where).toEqual(want.segs);
-        expect(got.keys, where).toEqual(want.keys);
-        expect(got.revealed, where).toEqual(want.revealed);
-        expect(got.deco, where).toEqual(want.deco);
+    const typing = inserts === TYPING;
+    const next = rng(seed);
+    let focus: boolean = focused;
+    let state = fresh(text, 30, focus);
+    for (let step = 0; step < 400; step++) {
+      steps++;
+      const len = state.doc.length;
+      const at = Math.floor(next() * (len + 1));
+      let spec: TransactionSpec;
+      const roll = next();
+      if (roll < 0.2) {
+        // A cursor move or a selection across blocks, no edit.
+        const head = Math.min(len, at + Math.floor(next() * 3) * Math.floor(next() * 60));
+        spec = { selection: { anchor: at, head } };
+      } else if (roll < 0.25) {
+        focus = !focus;
+        spec = { effects: liveFocus(focus) };
+      } else if (roll < 0.5 && len > 0) {
+        const to = Math.min(len, at + 1 + (typing ? 0 : Math.floor(next() * 12)));
+        spec = { changes: { from: at, to }, selection: { anchor: at } };
+      } else {
+        const ins = inserts[Math.floor(next() * inserts.length)];
+        spec = { changes: { from: at, insert: ins }, selection: { anchor: at + ins.length } };
       }
+      state = state.update(spec).state;
+      ensureSyntaxTree(state, state.doc.length, 5000);
+      const sel = state.selection.main;
+      let base = fresh(state.doc.toString(), sel.head, focus);
+      if (!sel.empty) base = base.update({ selection: { anchor: sel.anchor, head: sel.head } }).state;
+      // Parse completion may land a transaction later: settle both.
+      state = state.update({}).state;
+      // The oracle is the same computation from scratch over the same
+      // tree; where lezer's incremental reparse and a fresh parse disagree
+      // (a `$$` block's extent, rarely), the trees are not comparable.
+      if (shape(state) !== shape(base)) {
+        treeDiffs++;
+        continue;
+      }
+      const want = summary(base);
+      const got = summary(state);
+      const where = `seed ${seed} step ${step}`;
+      expect(got.segs, where).toEqual(want.segs);
+      expect(got.keys, where).toEqual(want.keys);
+      expect(got.revealed, where).toEqual(want.revealed);
+      expect(got.deco, where).toEqual(want.deco);
     }
     // Nearly every step compares.
     expect(treeDiffs).toBeLessThan(steps / 10);

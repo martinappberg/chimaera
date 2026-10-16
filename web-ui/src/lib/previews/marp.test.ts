@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { Marp } from "@marp-team/marp-core";
 import {
   frontmatterOf,
   isMarpFrontmatter,
@@ -11,6 +12,28 @@ import {
   slideDocument,
   slideSize,
 } from "./marp";
+
+describe("Marp's patched KaTeX integration", () => {
+  it("renders MathML while refusing trusted commands and raw HTML", () => {
+    const marp = new Marp({
+      html: false,
+      script: false,
+      math: { lib: "katex", katexOption: { output: "mathml", trust: false, maxExpand: 1000 }, katexFontPath: false },
+    });
+    const { html } = marp.render(String.raw`# Math
+
+$x^2 + y^2 = z^2$
+
+$\href{javascript:alert(1)}{click}$
+
+$\includegraphics{https://example.com/track.png}$
+
+<script>alert(1)</script>`);
+    expect(html).toContain("<math");
+    expect(html).toContain("<msup>");
+    expect(html).not.toMatch(/<(?:script|img)\b|href=["']javascript:/i);
+  });
+});
 
 describe("marp detection", () => {
   it("finds marp: true in frontmatter, with or without fences", () => {

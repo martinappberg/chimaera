@@ -50,9 +50,9 @@ WIT host imports; verify those in an isolated daemon or host integration tests.
 
 ```sh
 bash scripts/build-plugins.sh      # or `just plugins`; test-only; needs the wasm32-wasip2 target (and network the first time)
-cargo +1.96.0 clippy --manifest-path plugins/Cargo.toml --all-targets -- -D warnings
-cargo +1.96.0 test --manifest-path plugins/Cargo.toml
-cargo +1.96.0 fmt --all --manifest-path plugins/Cargo.toml --check
+cargo +1.99.1 clippy --manifest-path plugins/Cargo.toml --all-targets -- -D warnings
+cargo +1.99.1 test --manifest-path plugins/Cargo.toml
+cargo +1.99.1 fmt --all --manifest-path plugins/Cargo.toml --check
 ```
 
 The script is for the tests only; building or running the daemon doesn't need

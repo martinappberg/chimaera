@@ -44,7 +44,7 @@ mkdir -p "$CHIMAERA_HOME"
 
 BUILD_BIN="$ROOT/crates/chimaera-app/target/debug/chimaera"
 if [ ! -f "$ROOT/web-ui/dist/index.html" ]; then
-  echo "web-ui not built — run first (Node 22):  npm --prefix web-ui ci && npm --prefix web-ui run build" >&2
+  echo "web-ui not built — run first (Node 26):  npm --prefix web-ui ci && npm --prefix web-ui run build" >&2
   exit 1
 fi
 

@@ -375,7 +375,11 @@
     const e = retain(p);
     entry = e;
     untrack(() => void openDefault(e));
-    return () => release(p);
+    return () => {
+      // Pending reads must stop before touching derived state after unmount.
+      entry = null;
+      release(p);
+    };
   });
 
   /** Adopt the fetched source into local state. Oversized/binary chunks are

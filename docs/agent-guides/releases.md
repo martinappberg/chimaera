@@ -43,6 +43,78 @@ Run it sooner and it releases the newest commit that *has* passed, which leaves 
 fix for the next run. The run's `version` job logs the merges it read and its
 decision.
 
+## Linux runner migration
+
+`ci.yml` and the four release jobs formerly using `ubuntu-latest` are temporarily
+pinned to `ubuntu-24.04`. GitHub's [runner migration notice](https://github.com/actions/runner-images/issues/14748)
+sets the Ubuntu 26.04 rollout window to October 19–November 19, 2026. This is a
+validation hold, not a confirmed Ubuntu 26 incompatibility. An OS label still
+receives image updates; it does not freeze every installed package.
+
+The October 15 [successful CI run](https://github.com/martinappberg/chimaera/actions/runs/38783104803)
+used Ubuntu 24.04 image `20261012.334.1` and Zig `0.17.0` for both musl targets.
+The workflow and toolchain files inspected locally matched remote `main` during
+the audit. Both workflows now explicitly select that Zig version: the pinned
+[`setup-zig` action](https://github.com/mlugg/setup-zig/blob/d1434d08867e3ee9daa34448df10607b98908d29/action.yml)
+otherwise falls back to the latest release when there is no `build.zig.zon`.
+Keep these two Zig pins aligned. `cargo-zigbuild` is now at `0.23.4` with
+`--locked`, Rust at `1.99.1` via `rust-toolchain.toml`, and Node at `26.12.0` via
+`.nvmrc` and `setup-node`.
+
+The exposure is the native host environment: C compiler/linker, glibc, shell
+utilities, certificates, and downloaded tools running on that host. The published
+[Ubuntu 24 image](https://github.com/actions/runner-images/blob/ubuntu24/20261012.334/images/ubuntu/Ubuntu2404-Readme.md)
+and [Ubuntu 26 image](https://github.com/actions/runner-images/blob/ubuntu26/20260927.149/images/ubuntu/Ubuntu2604-Readme.md)
+have different GCC/Clang, CMake, Bash, jq, curl, and OpenSSL versions. Root-workspace
+native dependencies include `ring` and `libmimalloc-sys` through `cc`; it uses
+rustls/ring rather than `openssl-sys` or `aws-lc-sys`, so the image's OpenSSL/CMake
+changes alone do not establish a daemon build failure. `gh`, jq, rustup, and Node
+22 remain available in the published Ubuntu 26 inventory. No affected command
+has been shown to fail on Ubuntu 26 in this audit.
+
+The Linux Tauri app in both `app.yml` and `release.yml` already builds on
+`ubuntu-22.04`. Its apt prerequisites (`libwebkit2gtk-4.1-dev`, `libxdo-dev`,
+`libssl-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev`, and build utilities)
+are therefore outside this label migration. Changing that runner also changes
+the AppImage's glibc floor and needs a separate compatibility decision. The
+static musl daemon builds do not inherit the host's glibc floor in the same way.
+
+Before lifting the temporary pin, use a validation PR with explicit
+`ubuntu-26.04` runners and retain the run URLs and image versions:
+
+1. Run every `ci.yml` job, including dependency review on a PR event, UI
+   install/check/test/build, script tests, the Rust/plugin checks, and both musl
+   targets. Keep Node, Rust, Zig, and cargo-zigbuild unchanged to isolate the OS.
+2. Test once without restored build caches, then with caches created on Ubuntu
+   26. The pinned [Rust cache action](https://github.com/Swatinem/rust-cache/blob/6323deb102c322ba6fcbdcafc7e3dddab59af2b6/src/config.ts)
+   explicitly keys by OS family/architecture, not Ubuntu release or Zig version;
+   other hashed inputs may differ, but do not rely on that for isolation. Give
+   the validation caches a distinct `prefix-key`, include the Ubuntu label in
+   the eventual cache namespace, and separate musl targets and Zig versions.
+   Isolate or disable `setup-zig`'s build cache too.
+3. Exercise the release daemon build steps in a build-only validation job with
+   read-only permissions and no publishing/signing steps. Remove CI's
+   `CARGO_PROFILE_RELEASE_LTO` and `CARGO_PROFILE_RELEASE_CODEGEN_UNITS` overrides
+   so this also tests the release profile's fat LTO and single codegen unit.
+   Check both binaries with `file` and `readelf`: correct architecture, no ELF
+   interpreter, and no dynamic `NEEDED` libraries. Run `--version` and an
+   isolated daemon smoke on x86_64 and an actual arm64 runner (or documented
+   emulation), including an older supported Linux environment.
+4. Check release coordination separately: `gh run list` and release reads with
+   a read-only token, `scripts/version-bump.test.sh`, and the plugin-pins tests.
+   Exercise artifact upload/download in the validation workflow. A successful
+   scheduled release may have skipped every build because no release was due;
+   it is not build evidence. Dispatching `release.yml` from a feature branch
+   also skips its `version` job and cannot validate these paths. Validate actual
+   release writes only in a disposable repository, never by removing main's
+   publishing guard.
+
+After those checks pass, move the pinned Ubuntu 24 job definitions in CI/release to
+explicit `ubuntu-26.04` together and record the evidence here. Review this hold
+before November 19, 2026; the date alone is not a reason to lift it. Local
+`actionlint`, workflow-security, and documentation checks validate the patch,
+but cannot establish hosted-runner compatibility.
+
 ## The version mapping (read from the SUBJECT)
 
 | Subject prefix | Result | When to use it |
@@ -90,3 +162,48 @@ request a release in the same run.
 by `scripts/version-bump.test.sh` (a characterization matrix) which runs in
 `ci.yml`'s `scripts` job. When you change the policy, change the script **and** the
 test in the same commit.
+
+## CI build reuse
+
+CI's `ui-build` job produces the embedded web assets before the separate `ui`
+validation job. Rust checks and both musl builds can then run alongside the UI's
+check/test steps. `ui` explicitly fails if the asset build failed, preserving
+its required-check behavior. Main's complete CI run remains the release gate.
+
+Release builds produce the UI once at `needs.version.outputs.sha`, then download
+that artifact into each Unix build. Tauri's release steps disable only the
+redundant frontend build command; signing, plugin smoke, and publishing gates
+remain intact. Daemon attachment downloads only `chimaera-*` artifacts.
+
+Rust CI caches include the plugin workspace. Musl Rust and Zig caches separate
+Ubuntu image families and target architectures; Rust caches also name the Zig
+version. Keep CI and release pins in sync when upgrading. Node uses the exact
+`.nvmrc` version, and Rust uses the minimal profile with explicit components and
+targets in `rust-toolchain.toml`. App PR checks also run for shared Rust crates
+and toolchain changes, so a compiler upgrade gets all three desktop build gates.
+
+TypeScript stays on 6 while `svelte-check`'s peer dependency excludes 7; update
+that constraint only once the checker supports it. The frozen plugin API 0.1
+keeps its existing guest bindings; the current API uses the latest bindings.
+
+Marp remains on its stable v4 line (v5 is still a release candidate). Its KaTeX
+dependency is overridden to the UI's current version to address
+[GHSA-238p-pmpm-9mq7](https://github.com/advisories/GHSA-238p-pmpm-9mq7).
+Keep slide rendering and untrusted-math checks in the upgrade validation; remove
+the override once Marp's stable dependency range includes the patched version.
+
+The October 15, 2026 dependency refresh uses Rust 1.99.1 and Node 26.12.0
+(Node's Current line, not LTS). Registry checks covered every direct Rust
+dependency and both npm manifests. `npm audit` reports zero vulnerabilities
+for both npm projects. `cargo audit` reports no vulnerability-class findings
+in the daemon, plugins, or app lockfiles; the app still has two informational
+warnings through Tauri 2.12.4's Linux GTK3 stack:
+
+- `glib 0.18.5`: [RUSTSEC-2024-0429](https://rustsec.org/advisories/RUSTSEC-2024-0429.html),
+  an unsound `VariantStrIter`, fixed in GLib bindings 0.20 and later.
+- `proc-macro-error 1.0.4`: [RUSTSEC-2024-0370](https://rustsec.org/advisories/RUSTSEC-2024-0370.html),
+  unmaintained, pulled in by `glib-macros` and `gtk3-macros`.
+
+These are existing upstream constraints, not Ubuntu 26 failures. Recheck them
+when Tauri updates its GTK dependency chain; forcing GLib 0.20 into dependencies
+requiring 0.18 is not a compatible lockfile update. No advisory is suppressed.

@@ -86,7 +86,7 @@ struct Slot;
 impl Slot {
     fn take() -> Option<Slot> {
         ACTIVE
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < MAX_SESSIONS).then_some(n + 1)
             })
             .ok()
@@ -421,9 +421,11 @@ impl Session {
             return;
         }
         let sum: f64 = audio
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|s| {
-                let v = f64::from(i16::from_le_bytes([s[0], s[1]])) / 32768.0;
+                let v = f64::from(i16::from_le_bytes(*s)) / 32768.0;
                 v * v
             })
             .sum();

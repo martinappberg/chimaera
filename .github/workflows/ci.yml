@@ -26,12 +26,21 @@ concurrency:
 permissions:
   contents: read
 
+# Hold the Ubuntu 24 baseline while validating Ubuntu 26 before switching both
+# CI and release. Exit criteria: docs/agent-guides/releases.md#linux-runner-migration.
 jobs:
   ui:
-    runs-on: ubuntu-latest
+    needs: ui-build
+    # A failed asset build must fail the required `ui` check, not skip it.
+    if: always()
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - name: Require successful UI build
+        env:
+          UI_BUILD_RESULT: ${{ needs.ui-build.result }}
+        run: test "$UI_BUILD_RESULT" = success
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .nvmrc
           cache: npm
@@ -42,9 +51,23 @@ jobs:
         working-directory: web-ui
       - run: npm run test
         working-directory: web-ui
+
+  # Rust only needs the built assets. Let compilation overlap UI validation;
+  # the required `ui` check and the full main CI run still gate shipping.
+  ui-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: web-ui/package-lock.json
+      - run: npm ci
+        working-directory: web-ui
       - run: npm run build
         working-directory: web-ui
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: web-ui-dist
           path: web-ui/dist
@@ -52,12 +75,12 @@ jobs:
   # Fast repo-hygiene checks, no build needed: the release semver decision
   # (the most behavior-critical release piece), the destructive-command guard,
   # worktree-gc's deletion rules, docs, and agent-asset parity. jq is
-  # preinstalled on ubuntu-latest.
+  # preinstalled on ubuntu-24.04.
   scripts:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .nvmrc
       - run: bash scripts/version-bump.test.sh
@@ -71,30 +94,34 @@ jobs:
 
   dependency-review:
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
           fail-on-severity: moderate
 
   rust:
-    needs: ui
-    runs-on: ubuntu-latest
+    needs: ui-build
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: web-ui-dist
           path: web-ui/dist
       # No toolchain arg: rustup installs the channel + components pinned in
       # rust-toolchain.toml, so CI lints against the same compiler as local.
       - run: rustup show
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         # Main saves, PRs restore. A PR-scoped cache is unreadable by every
         # other PR, yet still consumes the repo's 10 GiB LRU cache quota — left
         # unchecked it evicts the very main entries this job exists to prime.
         with:
+          key: ubuntu-24.04
+          workspaces: |
+            .
+            plugins
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # What chimaera-server's TEST build embeds and installs: plugins/dist-test
       # (the fixture, built from the plugins/ cargo workspace, and the releases
@@ -109,8 +136,8 @@ jobs:
       - run: cargo test --manifest-path plugins/Cargo.toml
 
   musl:
-    needs: ui
-    runs-on: ubuntu-latest
+    needs: ui-build
+    runs-on: ubuntu-24.04
     # This gate proves the static cross-build compiles and links; the binaries
     # users get are built by release.yml. So it skips the `release` profile's
     # fat LTO and single codegen unit, whose whole-program link dominates the
@@ -124,25 +151,29 @@ jobs:
       matrix:
         target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: web-ui-dist
           path: web-ui/dist
       # rust-toolchain.toml pins the channel and both musl targets.
       - run: rustup show
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          # Keep aligned with release.yml; otherwise this action selects latest.
+          version: 0.17.0
+          cache-key: ubuntu-24.04-${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # One cache per target. rust-cache keys on the job name, not the
           # matrix, so without this both legs share one entry: whichever
           # saves first wins, and the other leg restores it and recompiles
           # its whole target dependency tree (wasmtime, cranelift, tokio).
-          key: ${{ matrix.target }}
+          key: ubuntu-24.04-${{ matrix.target }}-zig-0.17.0
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo install cargo-zigbuild --locked --version 0.23.0
+      - run: cargo install cargo-zigbuild --locked --version 0.23.4
       - run: cargo zigbuild --release --target ${{ matrix.target }} -p chimaera
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: chimaera-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/chimaera

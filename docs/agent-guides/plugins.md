@@ -158,11 +158,11 @@ From the plugin directory, use the same pinned compiler as the current
 Chimaera checkout (check `rust-toolchain.toml` when it changes):
 
 ```sh
-rustup target add --toolchain 1.96.0 wasm32-wasip2
-cargo +1.96.0 fmt --all --check
-cargo +1.96.0 clippy --all-targets -- -D warnings
-cargo +1.96.0 test
-cargo +1.96.0 build --release --target wasm32-wasip2
+rustup target add --toolchain 1.99.1 wasm32-wasip2
+cargo +1.99.1 fmt --all --check
+cargo +1.99.1 clippy --all-targets -- -D warnings
+cargo +1.99.1 test
+cargo +1.99.1 build --release --target wasm32-wasip2
 mkdir -p dist
 cp target/wasm32-wasip2/release/chimaera_plugin_hello.wasm dist/plugin.wasm
 cp plugin.toml dist/plugin.toml

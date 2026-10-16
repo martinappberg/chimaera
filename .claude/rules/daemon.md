@@ -30,4 +30,4 @@ criterion in every placement. Depth + module map:
   the wire — changing a field changes the contract. Treat it deliberately; don't let
   its shape drift as a side effect of a refactor.
 - **`chimaera serve` is a load-bearing CLI string** (chimaera-remote runs it over ssh).
-- **Format with `cargo +1.96.0 fmt`** — the pinned toolchain, matching CI's fmt check.
+- **Format with `cargo +1.99.1 fmt`** — the pinned toolchain, matching CI's fmt check.
