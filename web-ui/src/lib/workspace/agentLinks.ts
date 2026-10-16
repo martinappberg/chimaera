@@ -72,7 +72,7 @@ export async function deleteLink(terminalId: string): Promise<void> {
   await ok(await api(`/links/${terminalId}`, { method: "DELETE" }));
 }
 
-/** The `@term:` reference for a terminal, quoted when the name needs it. */
-export function termReference(name: string): string {
-  return /\s/.test(name) ? `@term:"${name}"` : `@term:${name}`;
+/** A selected terminal always travels by ID: display names can collide or change. */
+export function termReference(sessionId: string): string {
+  return `@term:${sessionId}`;
 }

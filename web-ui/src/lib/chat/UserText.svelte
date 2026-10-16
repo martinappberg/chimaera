@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { terminalMentions, mentionedTerminal, terminalLabel, type TerminalOption } from "./terminalMentions";
+  import TerminalIcon from "../shared/TerminalIcon.svelte";
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
   import { extractFileRefs, revealOf, type FileRef } from "../shared/fileRef";
@@ -31,15 +33,18 @@
    */
   interface Props {
     text: string;
+    terminals?: TerminalOption[];
+    onOpenTerminal?: (id: string) => void;
     onOpenPath?: OpenPathFn;
     resolvePaths?: PathResolver;
   }
 
-  let { text, onOpenPath, resolvePaths }: Props = $props();
+  let { text, terminals = [], onOpenTerminal, onOpenPath, resolvePaths }: Props = $props();
 
   interface Token {
     /** Verbatim text: a plain run, or exactly the reference's span. */
     text: string;
+    terminal?: string;
     ref: FileRef | null;
     mention: boolean;
     math: { source: string; display: boolean } | null;
@@ -47,7 +52,7 @@
     quote: boolean;
   }
 
-  function appendPlain(out: Token[], run: string, quote: boolean) {
+  function appendFiles(out: Token[], run: string, quote: boolean) {
     const plain = (t: string): Token => ({ text: t, ref: null, mention: false, math: null, quote });
     let last = 0;
     for (const f of extractFileRefs(run)) {
@@ -57,6 +62,16 @@
       last = f.end;
     }
     if (last < run.length) out.push(plain(run.slice(last)));
+  }
+
+  function appendPlain(out: Token[], run: string, quote: boolean) {
+    let last = 0;
+    for (const mention of terminalMentions(run)) {
+      appendFiles(out, run.slice(last, mention.start), quote);
+      out.push({ text: run.slice(mention.start, mention.end), terminal: mention.target, ref: null, mention: true, math: null, quote });
+      last = mention.end;
+    }
+    appendFiles(out, run.slice(last), quote);
   }
 
   const tokens = $derived.by(() => {
@@ -184,7 +199,7 @@
      newline/indent between blocks would render as literal extra spacing. -->
 <!-- prettier-ignore -->
 <span class="usertext" bind:this={root} oncopy={onCopy}
-  >{#snippet chip(t: Token, label: string, res: Resolution | undefined)}{#if isDir(t, res)}<FolderIcon size={12} />{:else}<FileIcon path={t.ref?.path ?? label} size={12} />{/if}<span class="chip-name">{label}</span>{/snippet}{#each tokens as t, i (i)}{@const res = resFor(t)}{@const label = chipLabel(t)}{#if t.math !== null}<MathText source={t.math.source} display={t.math.display} />{:else if label !== null && res !== undefined}<button
+  >{#snippet chip(t: Token, label: string, res: Resolution | undefined)}{#if isDir(t, res)}<FolderIcon size={12} />{:else}<FileIcon path={t.ref?.path ?? label} size={12} />{/if}<span class="chip-name">{label}</span>{/snippet}{#each tokens as t, i (i)}{@const res = resFor(t)}{@const label = chipLabel(t)}{@const terminal = t.terminal === undefined ? undefined : mentionedTerminal(t.terminal, terminals)}{#if t.terminal !== undefined}{#if terminal && onOpenTerminal}<button class="chip" class:quote={t.quote} title={[terminal.cwd, t.text, "Open terminal"].filter(Boolean).join(" · ")} data-full={t.text} onclick={() => onOpenTerminal?.(terminal.id)}><TerminalIcon size={12} /><span class="chip-name">{terminalLabel(terminal, terminals)}</span></button>{:else}<span class="chip inert" class:quote={t.quote} title={terminal ? [terminal.cwd, t.text].filter(Boolean).join(" · ") : `${t.text} · terminal unavailable or ambiguous`} data-full={t.text}><TerminalIcon size={12} /><span class="chip-name">{terminal ? terminalLabel(terminal, terminals) : t.terminal}</span></span>{/if}{:else if t.math !== null}<MathText source={t.math.source} display={t.math.display} />{:else if label !== null && res !== undefined}<button
         class="chip"
         class:quote={t.quote}
         class:ambiguous={res.state === "ambiguous"}

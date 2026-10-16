@@ -18,10 +18,20 @@ leash-drawing in `web-ui/src/App.svelte`; the drag band that arms a link is in
   already-set-up shell instead of a fresh, unconfigured one.
 - **How it's used.** Three ways, all user-initiated: drag a terminal's tab (or the pane-bar link
   icon) onto an agent pane/tab/rail-row; use the pane-bar "Link to agent…" menu; or type
-  `@term:NAME` in a chat composer (which auto-links). Linking auto-reveals the target session as a
-  split beside the agent.
+  `@term:NAME` in a chat composer (which auto-links on send). The composer's **Terminal +**
+  opens the same picker: search by name, session ID, or directory, with current activity and
+  whether sending will link here or move access from another agent. Already-linked terminals
+  appear beside the input with open and unlink controls. A drag onto an agent pane also reveals
+  the terminal beside it; mentioning alone does not rearrange the layout.
+- **Precise references.** Picker and drag references carry `@term:SESSION_ID`, so duplicate shell
+  names and later renames cannot change the selected target. Drafts show readable, atomic chips;
+  send, copy, and saved drafts retain the ID. Sent messages show terminal-icon chips that open
+  the live terminal. A manually typed name remains supported and must be unique; an unavailable
+  or ambiguous reference stays inert rather than opening a guessed terminal.
 - **Where it lives.** `agentLinks.ts` (`listLinks`/`putLink`/`deleteLink`, `termReference`,
-  `agentHue`), `App.svelte` (`LinkCtrl`, `doLink`). Server `links.rs` (`put_link`/`delete_link`/
+  `agentHue`), `App.svelte` (`LinkCtrl`, `doLink`), chat `terminalMentions.ts`
+  (identity, labels and short forms), `Composer.svelte` (picker/access controls), and
+  `UserText.svelte` (sent-reference chips). Server `links.rs` (`put_link`/`delete_link`/
   `terminals_of`). Routes `GET/PUT /api/v1/links`, `DELETE /api/v1/links/{terminal_id}`.
 - **Key behaviors.** **One agent per terminal** (the map is keyed by terminal id) — re-linking
   *moves* the leash (PUT overwrites). An agent may hold many. Unlink is idempotent and optimistic

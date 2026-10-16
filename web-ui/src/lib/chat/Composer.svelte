@@ -44,10 +44,9 @@
     type SlashChoice,
   } from "./composer";
 
-  export interface TerminalOption {
-    id: string;
-    name: string;
-  }
+  import { collapseTerminalMentions, terminalDescription, terminalLabel, type TerminalOption } from "./terminalMentions";
+  import TerminalIcon from "../shared/TerminalIcon.svelte";
+  import { termReference } from "../workspace/agentLinks";
 
   interface Props {
     /** Registers this composer for workbench insert flows (references,
@@ -63,9 +62,11 @@
     slashCommands: ComposerCommand[];
     /** Quick-open scope for @-mentions; null disables them. */
     workspaceId: string | null;
-    /** Workspace terminals offered by @term: mentions (linked-terminal
-     *  grants — the daemon's UserPromptSubmit hook resolves them). */
+    /** Live workspace terminals; sending a mention grants access through
+     *  the daemon's protocol-input resolver. */
     terminals: TerminalOption[];
+    onOpenTerminal?: (id: string) => void;
+    onUnlinkTerminal?: (id: string) => void;
     focused: boolean;
     /** False while the owning retained chat tab is hidden. The draft remains
      *  mounted, but invisible running chrome must stay still. */
@@ -98,6 +99,8 @@
     slashCommands,
     workspaceId,
     terminals,
+    onOpenTerminal,
+    onUnlinkTerminal,
     focused,
     visible = true,
     onSubmit,
@@ -119,12 +122,15 @@
   // it, so the draft must live in the session-keyed module store, not here.
   // svelte-ignore state_referenced_locally
   const savedDraft = sessionId !== null ? loadDraft(sessionId) : { text: "", images: [] };
-  /** A dropped file's mention reads as its name here, where it sits in the
-   *  sentence, and edits as one unit (`uploadTokens.ts`, `uploadChips.ts`);
+  /** Uploaded files and picked terminals read as names in the sentence
+   *  and edit as one unit (`uploadTokens.ts`, `uploadChips.ts`);
    *  the whole mention goes back into every text that leaves the composer —
    *  the send, a copy, and the saved draft. */
   const uploadTokens: UploadTokens = new Map();
-  let draft = $state(collapseUploadMentions(savedDraft.text, uploadTokens));
+  function collapseMentions(text: string, context = ""): string {
+    return collapseTerminalMentions(collapseUploadMentions(text, uploadTokens, context), terminals, uploadTokens, context);
+  }
+  let draft = $state(collapseMentions(savedDraft.text));
   let images = $state<ImageAttachment[]>(savedDraft.images.slice(0, IMAGE_MAX_ATTACHMENTS));
   let attachmentError = $state<string | null>(null);
 
@@ -430,7 +436,7 @@
       (inserted, placement, image) => {
         if (image !== undefined) addImage(image);
         if (inserted !== "") {
-          const text = collapseUploadMentions(inserted, uploadTokens, draft);
+          const text = collapseMentions(inserted, draft);
           draft = draftWithInsert(draft, text, placement);
           focusAt(draft.length);
         } else {
@@ -693,7 +699,7 @@
     }
     fileToken = token;
     // @term: tokens complete against workspace terminals, not files.
-    if (token.text.startsWith("@term")) {
+    if (token.text === "@term" || token.text.startsWith("@term:")) {
       fileMatches = [];
       return;
     }
@@ -720,15 +726,16 @@
   /** @term: mentions — Chimaera's linked-terminal grants. */
   const termMatches = $derived.by(() => {
     const token = fileToken;
-    if (token === null || !token.text.startsWith("@term:")) return [];
+    if (token === null || !(token.text === "@term" || token.text.startsWith("@term:"))) return [];
     const q = token.text.slice(6).toLowerCase();
-    return terminals.filter((t) => t.name.toLowerCase().includes(q) || t.id.includes(q)).slice(0, 8);
+    return terminals.filter((t) => `${t.name} ${t.id} ${t.cwd ?? ""}`.toLowerCase().includes(q))
+      .toSorted((a, b) => Number(b.linkedAgentId === sessionId) - Number(a.linkedAgentId === sessionId)).slice(0, 8);
   });
 
   const popover = $derived(
     slashMatches.length > 0
       ? "slash"
-      : termMatches.length > 0
+      : fileToken !== null && (fileToken.text === "@term" || fileToken.text.startsWith("@term:"))
         ? "term"
         : fileMatches.length > 0
           ? "file"
@@ -743,6 +750,18 @@
     void termMatches.length;
     void fileMatches.length;
     selected = 0;
+  });
+
+  let terminalPopover = $state<HTMLDivElement | null>(null);
+  $effect(() => {
+    const menu = terminalPopover;
+    if (!menu || popover !== "term" || !visible) return;
+    const row = menu.querySelector<HTMLElement>(`[id="${uid}-opt-${selected}"]`);
+    if (!row) return;
+    if (row.offsetTop < menu.scrollTop) menu.scrollTop = row.offsetTop;
+    else if (row.offsetTop + row.offsetHeight > menu.scrollTop + menu.clientHeight) {
+      menu.scrollTop = row.offsetTop + row.offsetHeight - menu.clientHeight;
+    }
   });
 
   function focusAt(position: number) {
@@ -792,10 +811,7 @@
   }
 
   function pickTerm(t: TerminalOption) {
-    // The daemon's mention resolver tokenizes on whitespace: a spaced name
-    // can only be granted by id.
-    const handle = /^\S+$/.test(t.name) ? t.name : t.id;
-    replaceToken(`@term:${handle} `);
+    replaceToken(`${collapseMentions(termReference(t.id), draft)} `);
   }
 
   function replaceToken(replacement: string) {
@@ -887,11 +903,12 @@
             : fileMatches.length;
       if (e.key === "ArrowDown" || e.key === "ArrowUp") {
         e.preventDefault();
-        selected = (selected + (e.key === "ArrowDown" ? 1 : items - 1)) % items;
+        if (items > 0) selected = (selected + (e.key === "ArrowDown" ? 1 : items - 1)) % items;
         return;
       }
       if (e.key === "Tab" || e.key === "Enter") {
         e.preventDefault();
+        if (items === 0) return;
         if (popover === "slash") pickSlash(slashMatches[selected]);
         else if (popover === "term") pickTerm(termMatches[selected]);
         else pickFile(fileMatches[selected]);
@@ -981,7 +998,9 @@
       {/each}
     </div>
   {:else if popover === "term"}
-    <div class="overlay-surface pop" id="{uid}-pop" role="listbox" aria-label="terminals">
+    <div class="overlay-surface pop terminal-pop" bind:this={terminalPopover} id="{uid}-pop" role="listbox" aria-label="terminals">
+      <div class="terminal-picker-heading">Use a live terminal <span>Access is granted when you send</span></div>
+      {#if termMatches.length === 0}<div class="terminal-empty">No matching terminals. Try a name or directory.</div>{/if}
       {#each termMatches as t, i (t.id)}
         <button
           class="overlay-row pop-row"
@@ -992,8 +1011,11 @@
           onclick={() => pickTerm(t)}
         >
           <span class="pop-ptr" aria-hidden="true">❯</span>
-          <span class="pop-name">@term:{t.name}</span>
-          <span class="pop-desc">link this terminal to the agent</span>
+          <TerminalIcon size={16} />
+          <span class="terminal-choice">
+            <span class="terminal-choice-top"><span>{terminalLabel(t, terminals)}</span><span class="terminal-state">{terminalDescription(t, sessionId)}</span></span>
+            <span class="terminal-cwd" title={t.cwd}>{t.cwd ?? t.id}</span>
+          </span>
         </button>
       {/each}
     </div>
@@ -1024,6 +1046,25 @@
     </div>
   {/if}
 
+  {#if terminals.length > 0}
+    <div class="terminal-links" aria-label="Terminal access">
+      <button class="terminal-add" disabled={disabled || spoken !== null} title="Mention a terminal · access is granted when you send"
+        onmousedown={(e) => e.preventDefault()}
+        onclick={() => {
+          const at = el?.selectionStart ?? draft.length;
+          const prefix = at > 0 && !/\s/.test(draft[at - 1]) ? " " : "";
+          draft = draft.slice(0, at) + prefix + "@term:" + draft.slice(el?.selectionEnd ?? at);
+          focusAt(at + prefix.length + 6);
+        }}><TerminalIcon size={13} /> Terminal <span aria-hidden="true">+</span></button>
+      {#each terminals.filter((t) => t.linkedAgentId === sessionId) as t (t.id)}
+        <span class="terminal-link">
+          <button class="terminal-open" title={[t.cwd, t.status, "Open linked terminal"].filter(Boolean).join(" · ")}
+            onclick={() => onOpenTerminal?.(t.id)}>{terminalLabel(t, terminals)}</button>
+          {#if onUnlinkTerminal}<button class="terminal-unlink" aria-label={`Unlink ${terminalLabel(t, terminals)}`} title="Remove this agent's terminal access" onclick={() => onUnlinkTerminal?.(t.id)}>×</button>{/if}
+        </span>
+      {/each}
+    </div>
+  {/if}
   {#if images.length > 0}
     <div class="attachments">
       <AttachmentStrip drafts={images} onRemove={removeImage} onPreview={(i) => (previewing = i)} />
@@ -1069,7 +1110,7 @@
       bind:this={el}
       bind:value={draft}
       data-pane-arrows
-      {@attach uploadChips(uploadTokens, trackCaret)}
+      {@attach uploadChips(uploadTokens, trackCaret, collapseMentions)}
       onkeydown={onKeydown}
       onkeyup={() => { trackCaret(); pendingNativeKey = undefined; }}
       onselect={trackCaret}
@@ -1097,7 +1138,7 @@
       aria-expanded={popover !== null}
       aria-controls="{uid}-pop"
       aria-autocomplete="list"
-      aria-activedescendant={popover !== null ? `${uid}-opt-${selected}` : undefined}
+      aria-activedescendant={popover !== null && (popover !== "term" || termMatches.length > 0) ? `${uid}-opt-${selected}` : undefined}
       class:voice={voiceOn}
       class:dictating={spoken !== null}
       class:mod-decorated={hasNativeDecorations && spoken === null}
@@ -1210,6 +1251,98 @@
 </div>
 
 <style>
+  .terminal-pop {
+    max-height: min(360px, 45vh);
+    overflow-y: auto;
+  }
+  .terminal-picker-heading {
+    padding: 8px 10px;
+    font-size: var(--text-xs);
+    color: var(--fg);
+  }
+  .terminal-picker-heading span {
+    display: block;
+    margin-top: 3px;
+    color: var(--muted);
+    font-size: var(--text-xs);
+  }
+  .terminal-empty {
+    padding: 10px;
+    color: var(--muted);
+    font-size: var(--text-xs);
+  }
+  .terminal-links {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 5px;
+    margin-bottom: 6px;
+  }
+  .terminal-links button {
+    font: inherit;
+    font-size: var(--text-xs);
+    border: 0;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .terminal-links button:hover {
+    color: var(--fg);
+    background: var(--hover-tint);
+  }
+  .terminal-add {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 5px;
+    border-radius: 5px;
+  }
+  .terminal-add:disabled {
+    opacity: .5;
+    cursor: default;
+  }
+  .terminal-link {
+    display: inline-flex;
+    min-width: 0;
+    max-width: 100%;
+    border: 1px solid var(--edge);
+    border-radius: 5px;
+  }
+  .terminal-open {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding: 2px 5px;
+  }
+  .terminal-unlink {
+    padding: 2px 5px;
+    border-left: 1px solid var(--edge) !important;
+  }
+  .terminal-choice {
+    display: flex;
+    flex: 1;
+    min-width: 0;
+    flex-direction: column;
+    gap: 3px;
+    text-align: left;
+  }
+  .terminal-choice-top {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 12px;
+  }
+  .terminal-state {
+    font-size: var(--text-xs);
+    color: var(--muted);
+  }
+  .terminal-cwd {
+    font-size: var(--text-xs);
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
   .composer {
     position: relative;
     flex: none;

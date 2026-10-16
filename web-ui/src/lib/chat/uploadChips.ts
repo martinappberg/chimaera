@@ -64,8 +64,13 @@ function rewrite(el: HTMLTextAreaElement, current: string, next: string): void {
  * @param tokens the composer's short forms (read at every event)
  * @param moved called after the caret or selection was moved here, so the
  *   composer's caret-driven completions follow
+ * @param collapse recognizes additional short forms (terminal references) on paste
  */
-export function uploadChips(tokens: UploadTokens, moved: () => void): Attachment<HTMLTextAreaElement> {
+export function uploadChips(
+  tokens: UploadTokens,
+  moved: () => void,
+  collapse: (text: string, context: string) => string = (text, context) => collapseUploadMentions(text, tokens, context),
+): Attachment<HTMLTextAreaElement> {
   return (el) => {
     /** The field as it was before the edit in flight (set at `beforeinput`,
      *  or at composition start for the whole composition). */
@@ -211,12 +216,10 @@ export function uploadChips(tokens: UploadTokens, moved: () => void): Attachment
       // A picture paste is the composer's attachment path.
       if (data === null || [...data.items].some((i) => i.type.startsWith("image/"))) return;
       const text = data.getData("text/plain");
-      if (text === "" || (tokens.size === 0 && !text.includes("/uploads/"))) return;
+      if (text === "" || (tokens.size === 0 && !text.includes("/uploads/") && !text.includes("@term:"))) return;
       const start = el.selectionStart;
       const end = el.selectionEnd;
-      let shown = text.includes("/uploads/")
-        ? collapseUploadMentions(text, tokens, el.value.slice(0, start) + el.value.slice(end))
-        : text;
+      let shown = collapse(text, el.value.slice(0, start) + el.value.slice(end));
       // Pasted against a short form's end: a space first, as typing does.
       if (!keepsTokens(el.value, start, end, shown, tokens) && keepsTokens(el.value, start, end, ` ${shown}`, tokens)) {
         shown = ` ${shown}`;
