@@ -110,6 +110,7 @@
    *  steps fold into the summary line instead of snapping. */
   let card = $state<HTMLElement | undefined>();
   let heightBefore = 0;
+  let heightMotion: Animation | null = null;
   $effect.pre(() => {
     void folded;
     heightBefore = card?.offsetHeight ?? 0;
@@ -122,13 +123,21 @@
     if (el === undefined || from === 0 || !animates()) return;
     const to = el.offsetHeight;
     if (Math.abs(to - from) < 2) return;
+    // One at a time, from wherever the last one had got to (the measure
+    // above read its animated height); only the latest unclips the card.
+    heightMotion?.cancel();
     // Clipped only while it moves: at rest the card's focus rings show.
     el.style.overflow = "hidden";
     const motion = el.animate([{ height: `${from}px` }, { height: `${to}px` }], {
       duration: 240,
       easing: "cubic-bezier(0.2, 0, 0, 1)",
     });
-    motion.onfinish = motion.oncancel = () => el.style.removeProperty("overflow");
+    heightMotion = motion;
+    motion.onfinish = motion.oncancel = () => {
+      if (heightMotion !== motion) return;
+      heightMotion = null;
+      el.style.removeProperty("overflow");
+    };
   });
 
   const MARK_WORD: Record<StepMark, string> = {

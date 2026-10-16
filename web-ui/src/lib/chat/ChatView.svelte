@@ -67,6 +67,7 @@
   import type { PendingElicitation } from "./elicitation";
   import PlanApprovalCard from "./PlanApprovalCard.svelte";
   import PlanCard from "./PlanCard.svelte";
+  import { planShows } from "./planCard";
   import WakeRequestBar from "./WakeRequestBar.svelte";
   import { commsStore, wakeRequestFor } from "../workspace/comms.svelte";
   import QuestionCard from "./QuestionCard.svelte";
@@ -2312,9 +2313,6 @@
     pinnedElicitations = store.elicitations;
     pinnedSends = store.pendingSends;
   });
-  const planAllDone = $derived(
-    pinnedPlan.length > 0 && pinnedPlan.every((p) => p.status === "done"),
-  );
   /** Another agent's message waiting on the user to wake this one (rare,
    *  and read from the workspace's comms store, so it is not frozen with
    *  the pinned cards while hidden). */
@@ -2326,11 +2324,7 @@
    *  (both change at `turn_started`), or a retiring card unfolds for a frame
    *  and its outro freezes it that way. The snapshot while hidden. */
   const planTouched = $derived(visible ? store.planTouched : pinnedPlanTouched);
-  /** A finished plan stays to be glanced at (folded to one line once its
-   *  turn ends) until the agent moves on: the next turn that starts without
-   *  touching it retires it, and only a changed plan brings the card back
-   *  (maintainer, 2026-10-15). */
-  const showPlan = $derived(pinnedPlan.length > 0 && (!planAllDone || planTouched));
+  const showPlan = $derived(planShows(pinnedPlan, planTouched));
 
   const jumpLabel = $derived(
     followedVersion !== store.transcriptVersion

@@ -5588,7 +5588,7 @@
         </nav>
         <div class="home-settings-content">
           {#await homeSettingsLoad}
-            <p>Loading settings…</p>
+            <SlowLoad>Loading settings…</SlowLoad>
           {:then SettingsView}
             {#if SettingsView}
               <svelte:boundary onerror={(e) => console.error("settings failed", e)}>

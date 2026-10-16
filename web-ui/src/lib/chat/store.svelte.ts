@@ -588,6 +588,12 @@ function catalogRows(value: unknown, key: string): Record<string, unknown>[] {
   });
 }
 
+/** A plan's steps and their states — what the agent changing its plan
+ *  means, without the detail fields a resync may fill in or drop. */
+function planSteps(plan: readonly PlanEntry[]): string {
+  return JSON.stringify(plan.map((e) => [e.id, e.content, e.status]));
+}
+
 export class ChatStore {
   blocks = $state<ChatBlock[]>([]);
   pending = $state<PendingPermission[]>([]);
@@ -1480,9 +1486,10 @@ export class ChatStore {
           // reworded TaskList line parsed twice, a journal from another build)
           // would throw and take the whole view down.
           .filter((e, i, arr) => e.id === null || arr.findIndex((o) => o.id === e.id) === i);
-        // A re-sent identical list (a TaskList read, a repeated update_plan)
+        // Touched means the steps or their states changed: a re-sent list
+        // (a TaskList read, a repeated update_plan, a detail line filled in)
         // is not this turn's work.
-        if (JSON.stringify(next) !== JSON.stringify(this.plan)) this.planTouched = true;
+        if (planSteps(next) !== planSteps(this.plan)) this.planTouched = true;
         this.plan = next;
         break;
       }
