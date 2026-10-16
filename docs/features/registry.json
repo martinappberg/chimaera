@@ -224,11 +224,13 @@
         "crates/chimaera-server/src/agent_setup.rs",
         "crates/chimaera-server/src/recents.rs",
         "web-ui/src/lib/workspace/Launcher.svelte",
-        "web-ui/src/lib/workspace/launcher.ts"
+        "web-ui/src/lib/workspace/launcher.ts",
+        "web-ui/src/lib/shared/SessionGlyph.svelte"
       ],
       "maps": [
         "crates/chimaera-server/AGENTS.md",
-        "web-ui/src/lib/workspace/AGENTS.md"
+        "web-ui/src/lib/workspace/AGENTS.md",
+        "web-ui/src/lib/shared/AGENTS.md"
       ],
       "rules": [
         ".claude/rules/daemon.md",
