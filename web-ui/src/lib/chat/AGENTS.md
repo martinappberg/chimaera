@@ -38,7 +38,7 @@ the agent's brand, or shorten an unlisted model ID by guessing its naming scheme
                                      └──────────────────────────────────────────▶ daemon
 ```
 
-**`ChatStore.apply(entry)` is the heart.** It is a reducer: one `SeqEvent` in,
+**`ChatStore.apply(entry)` is the heart.** Its vocabulary is pinned by `net/fixtures/wire/chat-events.json` (every `AgentEvent` variant, written by chimaera-agent's wire test) and `net/wireFixtures.test.ts`, which folds each one and expects `store.unhandledEventTypes` to stay empty — so a type the reducer ignores on purpose is an explicit `case`, never the `default:`. It is a reducer: one `SeqEvent` in,
 store mutation out. Events below or at `lastSeq` are dropped (dedupe). A throwing
 event is caught in `chatWs` so it can't strand the batch. On `ready`, if the
 journal `head` is below our `lastSeq` the journal was reset — the store

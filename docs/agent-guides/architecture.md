@@ -246,6 +246,19 @@ handle `WebglAddon.onContextLoss` explicitly; keep the Terminal instance out of 
 (Svelte adapter) for large tables/lists, CodeMirror 6 read-mostly for code viewing
 (framework-agnostic), pdf.js vendored.
 
+The daemon↔UI wire is a stable public interface with no DTO layer: core structs and the
+`json!`-built frames serialize straight to it. It is pinned twice. Rust golden tests
+assert the shapes, and the same tests write every shape family to
+`web-ui/src/lib/net/fixtures/wire/*.json` (`crates/chimaera-wire-fixtures`: regenerated
+by `cargo test`, refused when stale by `just check` and by CI's `CHIMAERA_WIRE_FIXTURES=check`).
+`web-ui/src/lib/net/wireFixtures.test.ts` then feeds each fixture through the real
+client decoders (the three sockets with a fake `WebSocket`, the chat reducer, the
+session-row helpers), once as sent and once with an unknown field added, so additive
+evolution stays legal and a shape change is a reviewed fixture diff plus a client-side
+test run — never a silent break. The client types stay deliberately loose (`type:
+string` + unknown fields); generating them from the Rust types was evaluated and
+deferred (robustness plan §9, wave 3).
+
 The production entry is an application shell, not a roll-up of every surface: pane views are
 dynamic feature boundaries, and xterm/WebGL sits behind a lightweight pool facade so it is fetched
 only with the first terminal (in parallel with that view chunk). Vite enforces a 500 kB minified

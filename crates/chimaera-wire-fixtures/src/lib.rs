@@ -129,10 +129,10 @@ fn mode() -> Mode {
 /// `<repo>/web-ui/src/lib/net/fixtures/wire/<family>.json`, resolved from
 /// this crate's own manifest dir so every workspace crate lands in one place.
 pub fn fixture_path(family: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(FIXTURE_DIR)
-        .join(format!("{family}.json"))
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    // Canonical so a failure names the real file, not `crates/x/../../…`.
+    let root = root.canonicalize().unwrap_or(root);
+    root.join(FIXTURE_DIR).join(format!("{family}.json"))
 }
 
 fn stale_message(path: &Path, on_disk: Option<&str>, fresh: &str) -> String {

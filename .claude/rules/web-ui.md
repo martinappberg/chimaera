@@ -34,6 +34,13 @@ KaTeX math policy). The
   targeted Vitest suite, and `svelte-check` covers types; a visible UI change is
   still only verified once you've driven it in the preview (see **verify-app** /
   **debug-live-app**). Don't claim a UI change works from unit/type checks alone.
+- **The wire is pinned by daemon-written fixtures.** `net/fixtures/wire/*.json` is
+  what the Rust tests serialize; `net/wireFixtures.test.ts` feeds every frame
+  through the real decoders (`chat/chatWs.ts` + the reducer, `terminal/ws.ts`,
+  `net/events.ts`, the `workspace/sessions.ts` row helpers), once as sent and once
+  with an unknown field added. Keep decoders tolerant of additive fields; a type the
+  reducer ignores on purpose is an explicit `case`, never the `default:` branch
+  (`ChatStore.unhandledEventTypes`). Never edit a fixture by hand.
 - **Agent output is untrusted.** Anything the model emits (prose, tool output, echoed
   file contents) is attacker-influenced. Render it through `chat/Markdown.svelte`'s
   sanitizer; never `{@html}` raw agent text; never build a live external link without

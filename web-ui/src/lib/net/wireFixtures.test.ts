@@ -48,6 +48,8 @@ vi.mock(import("../net/api"), async (importOriginal) => ({
 
 interface Fixture {
   family: string;
+  source: string;
+  about: string;
   cases: { name: string; note: string; frame: Record<string, unknown> }[];
 }
 const families: Record<string, Fixture> = {
@@ -117,7 +119,7 @@ describe("wire fixtures are what the Rust tests wrote", () => {
     for (const [key, fixture] of Object.entries(families)) {
       expect(fixture.cases.length, key).toBeGreaterThan(0);
       expect(fixture.family, key).toMatch(/^[a-z0-9-]+$/);
-      expect((fixture as { source: string }).source, key).toMatch(/^crates\//);
+      expect(fixture.source, key).toMatch(/^crates\//);
       const names = fixture.cases.map((c) => c.name);
       expect(new Set(names).size, `${key}: duplicate case names`).toBe(names.length);
     }
@@ -175,7 +177,7 @@ describe("chat-events: every AgentEvent variant through the chat socket and the 
     // A few shapes the reducer must have read structurally, not just skipped.
     expect(store.model).toBe("claude-sonnet-5-5");
     expect(store.plan.map((p) => p.content)).toEqual(["Write tests", "Ship"]);
-    expect(store.mcpServers.map((s) => s.name)).toEqual(["github", "db"]);
+    expect(store.mcpServers?.map((s) => s.name)).toEqual(["github", "db"]);
     expect(store.backgroundTasks.map((t) => t.id)).toEqual(["bg-1", "bg-2"]);
     expect(store.jobs.map((j) => j.id)).toEqual(["f2143f41"]);
   });
@@ -435,7 +437,9 @@ describe("session-rows: every row shape through the workspace helpers", () => {
       expect(dotState(s)).toBe("");
       expect(dotTitle(s)).toBe("exited");
       expect(displayName(s)).toBe("builds");
-      expect(s.renamed).toBe(true);
+      // `renamed` rides every row; no client surface reads it yet (the daemon
+      // already folds the pin into display_name), so the type omits it.
+      expect((s as unknown as { renamed: boolean }).renamed).toBe(true);
     },
     claude_tui_running: (s) => {
       expect(agentKind(s)).toBe("claude");
