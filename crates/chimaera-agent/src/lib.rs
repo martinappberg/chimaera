@@ -866,7 +866,10 @@ impl ChatManager {
         // respawn the restart ledger did not seed (a view switch, a relaunch,
         // a reopen) starts from what this journal last said about them —
         // never from a wakeup, which dies with its process.
-        if adapter.kind() == "claude" {
+        if !spec.resumes {
+            spec.carried_jobs.clear();
+            spec.carried_goal = None;
+        } else if adapter.kind() == "claude" {
             let reopened = journal.reopened();
             if spec.carried_goal.is_none() {
                 spec.carried_goal = reopened.goal.clone().filter(|g| g.status == "active");

@@ -3676,7 +3676,10 @@ pub(crate) async fn spawn_chat_session(
         // has a new Chimaera id, but seed_resumed_journal copied its marker.
         spec.portable_context = recover_portable_context_from_disk(state, &id, recipe.kind).await;
     }
-    if recipe.kind == AgentKind::Claude {
+    // Only a resumed conversation brings its jobs and goal back (a
+    // resurrection whose transcript is gone starts fresh).
+    spec.resumes = recipe.resume.is_some();
+    if recipe.kind == AgentKind::Claude && spec.resumes {
         spec.carried_jobs = recipe.carried.jobs.clone();
         spec.carried_goal = recipe.carried.goal.clone();
     }

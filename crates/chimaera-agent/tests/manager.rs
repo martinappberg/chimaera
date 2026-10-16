@@ -631,6 +631,68 @@ async fn a_loop_wakeup_fires_as_a_named_turn_and_the_row_knows_whats_next() {
     );
 }
 
+/// Claude's `--resume` keeps a conversation's jobs (and goal) but no
+/// wakeup: a respawn that resumes starts from what the journal last said
+/// about them; a fresh conversation in the same journal starts with none.
+#[tokio::test]
+async fn a_resumed_respawn_keeps_its_jobs_and_a_fresh_one_does_not() {
+    let fx = fixture();
+    let mut first = spec("s-re", &fx.cwd, "loop");
+    first.env = vec![("FAKE_LOOP_TICKS".into(), "0".into())];
+    fx.manager.spawn(&ClaudeAdapter, first).expect("spawn");
+    let att = fx.manager.attach("s-re", 0).expect("attach");
+    let (mut seen, mut rx) = (att.replay.clone(), att.live);
+    send_text(&fx, "s-re", "/loop check the deploy").await;
+    wait_for(
+        &mut rx,
+        &mut seen,
+        "the job",
+        |ev| matches!(ev, AgentEvent::Schedule { jobs, .. } if jobs.len() == 1),
+    )
+    .await;
+    wait_for(&mut rx, &mut seen, "turn end", |ev| {
+        matches!(ev, AgentEvent::TurnCompleted { .. })
+    })
+    .await;
+
+    for (resumes, jobs) in [(true, 1usize), (false, 0)] {
+        assert!(fx.manager.kill("s-re"));
+        let exited = wait_for(&mut rx, &mut seen, "exit", |ev| {
+            matches!(ev, AgentEvent::Exited { .. })
+        })
+        .await;
+        fx.manager.remove("s-re");
+        let mut again = spec("s-re", &fx.cwd, "loop");
+        again.resumes = resumes;
+        fx.manager.spawn(&ClaudeAdapter, again).expect("respawn");
+        // From the exit on, so the replay is served from the ring.
+        let att = fx.manager.attach("s-re", exited.seq).expect("attach");
+        seen = att.replay.clone();
+        rx = att.live;
+        let first = match seen
+            .iter()
+            .find(|e| matches!(e.ev, AgentEvent::Schedule { .. }))
+        {
+            Some(e) => Arc::clone(e),
+            None => {
+                wait_for(&mut rx, &mut seen, "the spawn's schedule", |ev| {
+                    matches!(ev, AgentEvent::Schedule { .. })
+                })
+                .await
+            }
+        };
+        let AgentEvent::Schedule {
+            wakeup,
+            jobs: carried,
+        } = &first.ev
+        else {
+            unreachable!()
+        };
+        assert!(wakeup.is_none(), "a wakeup never survives");
+        assert_eq!(carried.len(), jobs, "resumes={resumes}");
+    }
+}
+
 /// The 2.1.281 transcript surfaces end to end (fake-claude `showcase`):
 /// narration journals as PROSE, tool batches get their labels, a subagent
 /// closes with exactly one finished line (report + footprint) and a clean
