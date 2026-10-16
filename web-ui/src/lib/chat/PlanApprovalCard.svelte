@@ -133,7 +133,6 @@
 {#if expanded}
   <!-- Full-plan overlay: the card's controls ride the bottom so a decision can
        be made from the full read; Esc / backdrop / ✕ close back to the card. -->
-  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div
     class="plan-overlay"
     role="dialog"
@@ -148,7 +147,6 @@
       aria-label="close full plan"
       onclick={() => (expanded = false)}
     ></button>
-    <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
     <div class="plan-panel" tabindex="-1" bind:this={panelEl}>
       <div class="panel-head">
         <span class="mark">✓</span>
