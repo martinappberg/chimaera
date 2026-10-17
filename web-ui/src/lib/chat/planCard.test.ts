@@ -53,7 +53,7 @@ describe("the plan card's reading of every runtime's plan", () => {
       expect(p.current?.content).toBe("Run tests");
       expect(planSummary(plan)).toBe(runtime === "claude" ? "Running tests" : "Run tests");
       expect(planFolds(plan, true)).toBe(false);
-      expect(planFolds(plan, false)).toBe(false);
+      expect(planFolds(plan, false)).toBe(true);
     });
   }
 
@@ -118,6 +118,7 @@ describe("the plan card's reading of every runtime's plan", () => {
     const [read, run, write] = fold([CLAUDE_PLAN]).plan;
     expect(stepText(read)).toBe("Read the config");
     expect(stepText(run)).toBe("Running tests");
+    expect(stepText(run, false)).toBe("Run tests");
     // Not in flight: the subject, not the active form.
     expect(stepText({ ...run, status: "todo" })).toBe("Run tests");
     expect(stepDetail(write)).toBe("Summarize failures");
@@ -158,5 +159,19 @@ describe("the plan card's reading of every runtime's plan", () => {
     expect(planShows(done, true)).toBe(true);
     expect(planShows(done, false)).toBe(false);
     expect(planShows([], true)).toBe(false);
+  });
+
+  it("an unfinished plan becomes a folded report when a turn ends, without completing its steps", () => {
+    const store = fold([
+      { type: "turn_started", turn_id: "t1" },
+      CLAUDE_PLAN,
+      { type: "turn_completed", turn_id: "t1", usage: {} },
+    ]);
+    expect(store.running).toBe(false);
+    expect(planFolds(store.plan, store.running)).toBe(true);
+    expect(planSummary(store.plan, false)).toBe("Run tests");
+    expect(store.plan.map((e) => e.status)).toEqual(["done", "in_progress", "todo"]);
+    expect(planProgress(store.plan).done).toBe(1);
+    expect(planFolds(store.plan, true)).toBe(false);
   });
 });

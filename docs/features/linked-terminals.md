@@ -18,10 +18,10 @@ leash-drawing in `web-ui/src/App.svelte`; the drag band that arms a link is in
   already-set-up shell instead of a fresh, unconfigured one.
 - **How it's used.** Three ways, all user-initiated: drag a terminal's tab (or the pane-bar link
   icon) onto an agent pane/tab/rail-row; use the pane-bar "Link to agent…" menu; or type
-  `@term:NAME` in a chat composer (which auto-links on send). The composer's **Terminal +**
-  opens the same picker: search by name, session ID, or directory, with current activity and
+  `@term:NAME` in a chat composer (which auto-links on send). Typing `@term` opens the picker;
+  there is no permanent terminal launcher in the composer. Search by name, session ID, or directory, with current activity and
   whether sending will link here or move access from another agent. Already-linked terminals
-  appear beside the input with open and unlink controls. A drag onto an agent pane also reveals
+  share the branch/worktree context row with open and unlink controls. A drag onto an agent pane also reveals
   the terminal beside it; mentioning alone does not rearrange the layout.
 - **Precise references.** Picker and drag references carry `@term:SESSION_ID`, so duplicate shell
   names and later renames cannot change the selected target. Drafts show readable, atomic chips;

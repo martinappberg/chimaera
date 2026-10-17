@@ -24,7 +24,7 @@ repos,branches,log,show,compare}`, `GET/POST/DELETE /api/v1/git/worktrees`,
 - **What & when.** A singleton pane surface. With one repository: a branch header plus every changed
   path grouped into Conflicts / Staged / Changes / Untracked (click-to-diff), then two collapsible
   sections, **Branches** and **History**. With several repositories: a compact list instead.
-- **How it's used.** The header names the branch (`No branch (at 3f2a1c9)` when detached, `No commits
+- **How it's used.** The header names the branch (`Commit 3f2a1c9` when detached, `No commits
   yet` when unborn) with `↑N`/`↓N` (tooltip in words: "2 commits to push · 1 to pull from
   origin/main") and a refresh button. Each changed row shows a file glyph, a mid-truncated
   repo-relative path, a rename `←` marker, and a letter badge. Clicking a row opens its diff in an
@@ -103,8 +103,10 @@ repos,branches,log,show,compare}`, `GET/POST/DELETE /api/v1/git/worktrees`,
 - **What & when.** Which repository and branch each session works in — including an agent that
   entered a worktree mid-session.
 - **How it's used.** Chat sessions show one quiet line above the input (branch, and the worktree
-  folder when it isn't the main checkout; click opens "Changes on this branch"); dashboard cards show
-  the same label in their meta line. Nothing on the rail. The Branches section lists each session under
+  folder when it isn't the main checkout; click opens "Changes on this branch"). Linked terminals
+  share that row when present; `@term` opens the terminal picker. A detached checkout reads
+  `Commit <hash>` with a commit glyph and an explanatory tooltip; a folder outside Git shows no
+  Git row. Dashboard cards and rail metadata use the same branch label. The Branches section lists each session under
   the worktree it is in.
 - **Where it lives.** Daemon `git/session.rs` (the tracker task, `note_hook_cwd`, `session_git`),
   `git/anchor.rs`, `agents.rs` (the hook's `cwd`), `session_view.rs` (the additive `git` row field and

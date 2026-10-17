@@ -198,7 +198,7 @@ export interface SessionGit {
   head: string | null;
 }
 
-/** A branch as people read it: the name, "No branch (at 3f2a1c9)" for a
+/** A branch as people read it: the name, "Commit 3f2a1c9" for a
  *  detached HEAD, or "No commits yet" on an unborn branch — plain words, no
  *  git jargon. */
 export function branchLabel(git: {
@@ -207,7 +207,7 @@ export function branchLabel(git: {
   head: string | null;
 }): string {
   if (git.branch) return git.branch;
-  return git.detached ? `No branch (at ${git.head ?? "?"})` : "No commits yet";
+  return git.detached ? (git.head ? `Commit ${git.head}` : "Detached checkout") : "No commits yet";
 }
 
 /** The last path component. */

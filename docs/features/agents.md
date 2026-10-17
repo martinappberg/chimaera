@@ -70,6 +70,8 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
 
 ## The launcher — the new-agent row & the agent menu
 
+- **Agent icons.** Shared session icons identify each runtime in the launcher, tabs and rail.
+  Cursor uses a mouse pointer, so its mark reads as a cursor at small sizes.
 - **What & when.** The primary way to start an agent. The rail's **Agents** section ends in one
   split row, **+ new agent · <saved default>**, styled like **+ terminal**. Every other agent waits
   one step away in the agent menu behind the row's chevron, so the rail never lists every runtime

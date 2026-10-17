@@ -57,6 +57,7 @@
   import BackgroundTray from "./BackgroundTray.svelte";
   import AheadCard from "./AheadCard.svelte";
   import WorkStrip from "./WorkStrip.svelte";
+  import { workParts, foldWork } from "./workStrip";
   import { goalLive, jobPeriodMs, type GoalInfo, type ScheduledJob, type ScheduledWakeup } from "./ahead";
   import SubagentBanner from "./SubagentBanner.svelte";
   import { SubagentSocket } from "./subagentSocket.svelte";
@@ -2431,21 +2432,26 @@
     }
     return { count: (aheadWakeup !== null ? 1 : 0) + aheadJobs.length, at, from };
   });
+  /** Live while visible: it has to flip in the same render as `agentBusy`
+   *  (both change at `turn_started`), or a retiring card unfolds for a frame
+   *  and its outro freezes it that way. The snapshot while hidden. */
+  const planTouched = $derived(visible ? store.planTouched : pinnedPlanTouched);
+  const showPlan = $derived(planShows(pinnedPlan, planTouched));
   /** Kinds of work pinned above the composer at once. Three or more fold
    *  into one strip; it unfolds only when one kind is left, so the stack
    *  doesn't flip back and forth as subagents come and go. */
-  const workKinds = $derived(
-    (aheadGoal !== null ? 1 : 0) +
-      (aheadScheduled.count > 0 ? 1 : 0) +
-      (pinnedAgents.length > 0 ? 1 : 0) +
-      (pinnedBackgroundTasks.length > 0 ? 1 : 0),
-  );
+  const pinnedWork = $derived(workParts({
+    goal: aheadGoal !== null,
+    plan: showPlan,
+    agents: pinnedAgents.length > 0,
+    background: pinnedBackgroundTasks.length > 0,
+    schedule: aheadScheduled.count > 0,
+  }));
   let workFolded = $state(false);
   $effect(() => {
-    const kinds = workKinds;
+    const parts = pinnedWork;
     untrack(() => {
-      if (kinds >= 3) workFolded = true;
-      else if (kinds <= 1) workFolded = false;
+      workFolded = foldWork(parts, workFolded);
     });
   });
   /** Claude stops a loop only when asked (its own `/loop` says so); the
@@ -2500,11 +2506,6 @@
   const wakeFailure = $derived(
     readOnly ? null : (commsStore.wakeFailures.find((f) => f.request.to_sid === session.id) ?? null),
   );
-  /** Live while visible: it has to flip in the same render as `agentBusy`
-   *  (both change at `turn_started`), or a retiring card unfolds for a frame
-   *  and its outro freezes it that way. The snapshot while hidden. */
-  const planTouched = $derived(visible ? store.planTouched : pinnedPlanTouched);
-  const showPlan = $derived(planShows(pinnedPlan, planTouched));
 
   const jumpLabel = $derived(
     followedVersion !== store.transcriptVersion
@@ -3594,9 +3595,16 @@
     />
   {/snippet}
 
-  {#if workFolded && workKinds >= 2}
+  {#snippet planCard(embedded: boolean)}
+    <PlanCard entries={pinnedPlan} running={agentBusy && planTouched} {visible} {embedded} />
+  {/snippet}
+
+  {#if workFolded && pinnedWork.length >= 2}
     <!-- Three or more kinds of work at once fold into one line. -->
     <WorkStrip
+      parts={pinnedWork}
+      plan={pinnedPlan}
+      planRunning={agentBusy && planTouched}
       agents={pinnedAgents}
       tasks={pinnedBackgroundTasks}
       goal={aheadGoal}
@@ -3607,6 +3615,7 @@
       {#snippet backgroundRows()}{@render backgroundTray(true)}{/snippet}
       {#snippet goalRows()}{@render aheadCard("goal", true)}{/snippet}
       {#snippet scheduleRows()}{@render aheadCard("schedule", true)}{/snippet}
+      {#snippet planRows()}{@render planCard(true)}{/snippet}
     </WorkStrip>
   {:else}
     {#if pinnedAgents.length > 0}
@@ -3618,16 +3627,9 @@
     {#if aheadGoal !== null || aheadScheduled.count > 0}
       {@render aheadCard("all", false)}
     {/if}
-  {/if}
-
-  <!-- The card is for the plan in flight and the one just finished: a
-       finished plan folds to "n tasks done" and folds away when the agent
-       moves on; a plan with open steps stays through the idle gap for the
-       next turn. -->
-  {#if showPlan}
-    <!-- Running means running for THIS plan: a turn that hasn't touched a
-         finished one must not unfold it while it folds away. -->
-    <PlanCard entries={pinnedPlan} running={agentBusy && planTouched} {visible} />
+    {#if showPlan}
+      {@render planCard(false)}
+    {/if}
   {/if}
 
   {#if wakeRequest !== null || wakeFailure !== null}
@@ -3697,26 +3699,19 @@
     </div>
   {/if}
 
-  {#if !readOnly && (session.git || sameFile.notesFor(session.id).length > 0)}
-    <!-- One quiet line just above the input. Left: the branch this
-         conversation works on (only in a repository; hover names the
-         worktree; never a prompt to do anything with git). Right: another
-         live session wrote a file this one wrote. -->
-    <div class="branch-line">
-      {#if session.git}
-        <span class="branch-slot"
-          ><BranchChip git={session.git} onOpen={() => session.git && openBranchChanges(session.git)} /></span
-        >
-      {/if}
-      <span class="branch-line-end"><SameFileNotice sessionId={session.id} {visible} /></span>
-    </div>
-  {/if}
-
   {#if agentKind === "claude" && store.exited === null && !readOnly}
     <ModsWorkbench transport={socket.nativeUi} host={chatEl} onDockWidth={(width) => (modDockWidth = width)} {visible} {focused} running={agentBusy} hasSurvey={store.questions.length > 0 || store.elicitations.length > 0} composer={composerApi} canEdit={!composerDisabled && store.pending.length === 0 && store.questions.length === 0 && store.elicitations.length === 0 && rewindIntent === null && forkIntent === null} canFocus={focused && !composerEngaged && !agentBusy && store.pending.length === 0 && store.questions.length === 0 && store.elicitations.length === 0 && rewindIntent === null && forkIntent === null} />
   {/if}
 
   {#if !readOnly}
+  {#snippet branchContext()}
+    {#if session.git}
+      <BranchChip git={session.git} onOpen={() => session.git && openBranchChanges(session.git)} />
+    {/if}
+  {/snippet}
+  {#snippet fileNotice()}
+    <SameFileNotice sessionId={session.id} {visible} />
+  {/snippet}
   <Composer
     bind:this={composerApi}
     onNativeEdit={agentKind === "claude" && mods.attached ? (request) => socket.nativeUi.request(request) : undefined}
@@ -3729,6 +3724,8 @@
     slashCommands={composerCommands}
     workspaceId={session.workspace_id ?? null}
     {terminals}
+    context={session.git ? branchContext : undefined}
+    contextEnd={sameFile.notesFor(session.id).length > 0 ? fileNotice : undefined}
     {onOpenTerminal}
     {onUnlinkTerminal}
     {focused}
@@ -3836,8 +3833,7 @@
   /* The composer and its satellites share the column; their 18px side
      padding rides OUTSIDE the measure so text edges line up with it. */
   .chat > :global(.composer),
-  .chat > .suggestion-row,
-  .chat > .branch-line {
+  .chat > .suggestion-row {
     width: 100%;
     max-width: calc(var(--chat-column) + 36px);
     margin-left: auto;
@@ -4295,29 +4291,6 @@
   }
   .cancel-btn:hover {
     color: var(--err);
-  }
-  .branch-line {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    min-width: 0;
-    padding-top: 4px;
-  }
-  .branch-slot {
-    display: inline-flex;
-    min-width: 0;
-    flex: 0 1 auto;
-  }
-  .branch-line-end {
-    display: inline-flex;
-    justify-content: flex-end;
-    min-width: 0;
-    flex: 0 1 auto;
-    margin-left: auto;
-  }
-  .branch-line-end:empty {
-    display: none;
   }
   .suggestion-row {
     display: flex;

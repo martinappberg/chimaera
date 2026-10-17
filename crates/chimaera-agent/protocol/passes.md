@@ -1405,3 +1405,25 @@ Claude's `/loop` (a self-paced `ScheduleWakeup`, or `CronCreate` jobs for an int
 
 - Hermetic: `autonomy.rs` (7 tests: wakeups, stop, jitter and next run, delete/list level-set, one-shot and expiry, goal set/check/clear, status resync and adoption), `cron.rs` (10), `claude.rs` `a_fired_wakeup_opens_a_turn_named_by_its_reason`, `only_an_unsent_command_with_something_due_is_a_wake`, `goal_set_check_and_clear_map_from_the_cli_frames`, the codex goal tests (`goal_updates_map_the_status_verbatim_and_ignore_other_threads` … `sleep_items_render_a_waiting_row`), `tests/manager.rs` `a_loop_wakeup_fires_as_a_named_turn_and_the_row_knows_whats_next` (fake-claude `loop`) and `a_resumed_respawn_keeps_its_jobs_and_a_fresh_one_does_not`, `journal.rs` `reopening_remembers_the_last_goal_and_jobs`, `claude.rs` `a_stale_cli_command_never_names_a_later_turn`, `tests/wire_contract.rs` `loop_and_goal_wire_shapes_are_additive`, `chimaera-server` `goal_outcome` (3) and `restart_message_asks_to_reschedule_a_lost_wakeup`.
 - Live: `just chat-smoke` adds `claude_wakeup_fires_as_a_named_turn`, `claude_goal_sets_and_clears`, `codex_goal_sets_pauses_and_clears`.
+
+
+## Pass 48 — 2026-10-16: native Codex task tool at thread open
+
+Installed Codex 0.158.0; `TESTED_CODEX_VERSION` remains 0.162.1. Generated the installed CLI's experimental JSON schema before editing the driver; start, resume and fork accept the `config` map. The [official configuration schema](https://developers.openai.com/codex/config-schema.json) describes `tools.update_plan.enabled`, default false.
+
+### Findings and adoption
+
+- A new thread had no native `update_plan`. An app-server launch override `tools.update_plan.enabled=true` appeared in `config/read` but still left the tool absent. The boolean form `tools.update_plan=true` fails config parsing.
+- Opening the thread with `config: {"tools.update_plan.enabled": true}` enabled the native tool. With no Chimaera MCP configured, a two-step arithmetic turn emitted three `turn/plan/updated` level-sets through both-completed before its final reply.
+- `thread_open_request` sets this thread configuration on start, resume and fork; its hermetic test covers all three and portable context. Codex gets no Chimaera MCP task tool. Existing native plan mapping and the daemon–UI wire are unchanged.
+- Chat instructions require agents to update a list they created or used before the final reply, leaving unfinished work pending and only genuinely running work in progress. A simple reply needs no new list.
+
+### Gate (Pass 48)
+
+- Native task-tool regression passed against installed Codex 0.158.0: three native plan updates through completion, no Chimaera MCP task tool. The rebuilt isolated daemon also passed a real Codex turn: Chimaera `list_terminals` worked, then the native plan advanced through three updates to both done before the final reply. Thread config preserves the workbench MCP connection.
+- `just chat-smoke` against Claude 2.1.300 and Codex 0.158.0: 34 passed, one Codex instant-steering case was blocked before its first response. Isolated retries exposed the native HTTP 400: `gpt-6.1-sol` is not supported with the signed-in ChatGPT account on this installed CLI; its model metadata was also absent. The test retains its requested model and now logs the diagnostic instead of hiding the cause behind `turn failed`. An initial attempt was blocked by expired Claude authentication; the user refreshed it before the full run.
+- Real Claude chat through the isolated daemon: its task tool emitted in-progress/pending → done/in-progress → done/done before the final reply.
+- UI: svelte-check clean, 2,877 tests passed (3 skipped), production build passed. The real UI and a gallery of all 32 activity combinations were inspected, including agents alone, a background agent alone, narrow overflow and keyboard access.
+- Final `RUST_TEST_THREADS=1 just check` passed with normal host access: formatting, both workspace clippy checks, all daemon and plugin workspace tests (including all 1,004 server tests), and unchanged wire fixtures. Earlier concurrent runs intermittently timed out in existing Slurm subprocess tests; those passed in the serial run. The installer completion-watcher test timed out in earlier restricted runs, then passed both alone with normal host access and in the final full gate. No production timeout or installer code changed.
+
+- Isolated preview resource check after verification: ~28 MiB RSS, 0.0% CPU at idle. Preview ownership: this verification run owns the isolated daemon on port 52328 and the component gallery on port 57924.

@@ -185,6 +185,7 @@
           <CountdownRing fraction={ringFraction(row.at, row.from, now)} soon={row.at !== null && row.at - now < 60_000} />
         {/if}
       </span>
+      <span class="kind">{row.kind === "wakeup" ? "Loop" : "Scheduled"}</span>
       <span class="text"
         >{#if row.kind === "job" && row.job.schedule !== ""}<span class="sched">{row.job.schedule}</span>{" · "}{/if}{row.text}</span
       >
@@ -228,6 +229,7 @@
     <div class="row">
       <button type="button" class="main" aria-expanded={opened === "goal"} onclick={() => toggle("goal")}>
         <span class="glyph"><GoalGlyph tone={goalTone} /></span>
+        <span class="kind">Goal</span>
         <span class="text goal-text">{goal.objective}</span>
       </button>
       <span class="trail">
@@ -354,6 +356,12 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .kind {
+    flex: none;
+    font-size: var(--text-xs);
+    font-weight: 500;
+    color: var(--muted);
   }
   .goal-text {
     color: color-mix(in srgb, var(--muted) 45%, var(--fg));

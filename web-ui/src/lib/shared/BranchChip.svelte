@@ -24,14 +24,18 @@
       : baseName(git.worktree),
   );
   const tip = $derived(
-    git.worktree === git.repo
+    (git.detached ? "Working at a commit, not on a branch · " : "") + (git.worktree === git.repo
       ? `${label} — ${git.repo}`
-      : `${label} — ${git.worktree} — a worktree of ${git.repo}`,
+      : `${label} — ${git.worktree} — a worktree of ${git.repo}`),
   );
 </script>
 
 {#snippet body()}
   <svg viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
+    {#if git.detached}
+      <path d="M1.5 8h3m7 0h3" fill="none" stroke="currentColor" stroke-width="1.4" />
+      <circle cx="8" cy="8" r="3.3" fill="none" stroke="currentColor" stroke-width="1.4" />
+    {:else}
     <path
       d="M5 3v7.5M5 12.5v.5M11 3v3a2.5 2.5 0 0 1-2.5 2.5H5"
       fill="none"
@@ -42,6 +46,7 @@
     <circle cx="5" cy="12.6" r="1.6" fill="none" stroke="currentColor" stroke-width="1.4" />
     <circle cx="5" cy="2.4" r="1.6" fill="none" stroke="currentColor" stroke-width="1.4" />
     <circle cx="11" cy="2.4" r="1.6" fill="none" stroke="currentColor" stroke-width="1.4" />
+    {/if}
   </svg>
   <span class="bname">{label}{#if folder}<span class="bfolder"> · {folder}</span>{/if}</span>
 {/snippet}

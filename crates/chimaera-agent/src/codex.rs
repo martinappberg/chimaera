@@ -768,6 +768,9 @@ fn thread_open_request(spec: &SpawnSpec, id: u64, effort: Option<&str>) -> Value
             "params": { "cwd": spec.cwd },
         }),
     };
+    // Native planning defaults to disabled. Set it on the thread itself:
+    // app-server launch flags alone did not expose the tool (Pass 48).
+    open["params"]["config"] = json!({"tools.update_plan.enabled": true});
     // The launcher's model selection is thread configuration, not argv, for
     // app-server. Passing it while opening the thread avoids the old seam
     // where a Codex chat silently fell back to the user's default until they
@@ -9450,6 +9453,13 @@ mod tests {
             contextual["params"]["developerInstructions"],
             "quiet imported transcript"
         );
+        for open in [&start, &resume, &fork, &contextual] {
+            assert_eq!(
+                open["params"]["config"],
+                json!({"tools.update_plan.enabled": true}),
+                "native planning must be enabled on every thread-open path"
+            );
+        }
     }
 
     #[test]

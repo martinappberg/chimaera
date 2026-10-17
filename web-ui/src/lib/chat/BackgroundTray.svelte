@@ -28,6 +28,7 @@
   import WorkTrayRow from "../shared/WorkTrayRow.svelte";
   import SubagentChip from "./SubagentChip.svelte";
   import ModelChip from "./ModelChip.svelte";
+  import ActivityGlyph from "../shared/ActivityGlyph.svelte";
   import { backgroundKind } from "./backgroundKinds";
   import type { BackgroundTask } from "./store.svelte";
 
@@ -146,10 +147,12 @@
   {/each}
 {/snippet}
 
+{#snippet activityGlyph()}<ActivityGlyph />{/snippet}
+
 {#if embedded}
   {@render rows()}
 {:else}
-  <WorkTray glyph={monitors.length > 0 ? "◉" : "⧖"} bind:open {visible} {label}>
+  <WorkTray glyph={monitors.length > 0 ? "◉" : activityGlyph} bind:open {visible} {label}>
     {@render rows()}
   </WorkTray>
 {/if}

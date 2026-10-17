@@ -189,12 +189,15 @@ workspace-relative as `path:line`, `path#L10-L20` or a relative markdown link.";
 /// terminal (TUI) session gets no paragraph: its own task list renders in
 /// its terminal, and there is no card to draw. Live-captured shapes:
 /// PROTOCOL.md Pass 45.
-fn task_list_instructions(kind: Option<crate::agents::AgentKind>, chat: bool) -> &'static str {
+fn task_list_instructions(
+    kind: Option<crate::agents::AgentKind>,
+    chat: bool,
+) -> std::borrow::Cow<'static, str> {
     use crate::agents::AgentKind;
     if !chat {
-        return "";
+        return "".into();
     }
-    match kind {
+    let instructions = match kind {
         Some(AgentKind::Claude) => {
             "\n\n\
 Plan card: for any request that edits files or runs more than one command, \
@@ -246,8 +249,26 @@ plan up front, one step in progress at a time, each marked done as it \
 finishes. The user follows it as a card beside the chat while you work; a \
 plan written as a file or prose draws nothing there."
         }
+    };
+    if kind == Some(AgentKind::Antigravity) {
+        return instructions.into();
     }
+    format!("{instructions}\n\n{TASK_LIST_FINISH_INSTRUCTIONS}").into()
 }
+
+/// Finishing the task includes updating its list, without making the user
+/// request it. A stopped or blocked step is not evidence of completion.
+const TASK_LIST_FINISH_INSTRUCTIONS: &str = "\
+If you have a task tool, keep the task list current yourself; never ask the user to refresh it. \
+Before your final reply, use your task tool to update any list you created \
+or worked from, even if the only change is marking the final step completed. \
+If no task list exists for this work, skip this step; do not create a list \
+just to finish a reply. \
+Mark only work you actually finished as completed. Leave unfinished work \
+pending and explain what remains in your reply. Use in_progress only for \
+work that is still running, including work continuing in the background. \
+Do not leave a finished step in_progress or mark unfinished work completed \
+just to clear the list.";
 
 /// Extra instructions when the session is its workspace's Mastermind.
 const MASTERMIND_INSTRUCTIONS: &str = "\n\n\
@@ -418,7 +439,7 @@ fn initialize_result(
         .and_then(|v| v.as_str())
         .unwrap_or(PROTOCOL_FALLBACK);
     let mut instructions = format!("{INSTRUCTIONS}{DOCUMENTS_INSTRUCTIONS}");
-    instructions.push_str(task_list_instructions(kind, chat));
+    instructions.push_str(&task_list_instructions(kind, chat));
     if comms_on {
         instructions.push_str(&crate::comms::instructions(
             agent_id,
@@ -782,7 +803,10 @@ fn update_plan_tool_def() -> Value {
                         each completed as it finishes, pending for the rest. Call it with \
                         the first tool call of any request that edits files or runs more \
                         than one command, and again as each step finishes or the plan \
-                        changes. It draws the card and nothing else; a plan written as a \
+                        changes. Before your final reply, call it again to reflect what \
+                        actually finished; leave unfinished work pending, and use \
+                        in_progress only for work still running. Do not ask the user to \
+                        refresh the list. It draws the card and nothing else; a plan written as a \
                         file, a checklist or prose shows nothing there.",
         "inputSchema": {
             "type": "object",
@@ -2367,6 +2391,47 @@ fn mention_tokens(prompt: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn chat_initialization_requires_a_final_task_update_without_a_user_reminder() {
+        use crate::agents::AgentKind;
+        for kind in [
+            AgentKind::Claude,
+            AgentKind::Codex,
+            AgentKind::Cursor,
+            AgentKind::Grok,
+        ] {
+            for chat in [false, true] {
+                let result = initialize_result(
+                    &json!({}),
+                    "test-agent",
+                    Some(kind),
+                    chat,
+                    false,
+                    false,
+                    false,
+                    &[],
+                );
+                let instructions = result["instructions"].as_str().unwrap();
+                assert_eq!(instructions.contains(TASK_LIST_FINISH_INSTRUCTIONS), chat);
+            }
+        }
+        // Antigravity has no task tool: do not tell it to call one.
+        let result = initialize_result(
+            &json!({}),
+            "test-agent",
+            Some(AgentKind::Antigravity),
+            true,
+            false,
+            false,
+            false,
+            &[],
+        );
+        assert!(!result["instructions"]
+            .as_str()
+            .unwrap()
+            .contains(TASK_LIST_FINISH_INSTRUCTIONS));
+    }
 
     /// The plan paragraph and tool follow the runtime and the surface: a
     /// Claude chat gets chimaera's `update_plan`, a Codex chat is pointed at
