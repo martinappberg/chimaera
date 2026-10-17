@@ -18,6 +18,8 @@ Start with the guide for what you want to do.
 - [Agents](features/agents.md), [dashboard](features/dashboard.md), and
   [communication](features/agent-communication.md): work with several agents and
   use a Mastermind coordinator.
+- [Chat](features/chat-mode.md) and [loops and goals](features/loops-and-goals.md):
+  follow an agent's plan, see scheduled work and goals, and check reported usage.
 - [Files and previews](features/files-and-previews.md) and
   [browser panes](features/browser-pane.md): inspect outputs and reference them in a conversation.
 - [Session history](features/session-history.md) and

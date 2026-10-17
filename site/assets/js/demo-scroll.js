@@ -1,12 +1,44 @@
-/* Brief resistance at pane edges, then ordinary page scrolling. */
+/* Scroll the page until the visitor engages the sample workspace. */
 (function () {
   "use strict";
   var root = document.getElementById("workspace-demo");
   if (!root) return;
   var edge = null;
+  var keyboardNavigation = false;
+  var hint = document.getElementById("wb-scroll-hint");
+
+  function setActive(active) {
+    root.dataset.scrollActive = String(active);
+    edge = null;
+    if (hint) hint.textContent = active
+      ? "Scroll inside the preview. Click outside or press Escape to return to page scrolling."
+      : "Click inside to scroll the preview. Click outside to return to page scrolling.";
+  }
+
+  setActive(false);
+  // A swipe over the inactive demo should still scroll the page. Activate on
+  // click (including a tap), not pointerdown, which also begins touch scrolling.
+  document.addEventListener("click", function (event) {
+    setActive(root.contains(event.target));
+  }, true);
+  document.addEventListener("pointerdown", function (event) {
+    keyboardNavigation = false;
+    if (!root.contains(event.target)) setActive(false);
+  }, true);
+  document.addEventListener("keydown", function (event) {
+    if (event.key === "Tab") keyboardNavigation = true;
+    if (event.key === "Escape") setActive(false);
+  });
+  document.addEventListener("focusin", function (event) {
+    if (keyboardNavigation || !root.contains(event.target)) {
+      setActive(root.contains(event.target));
+    }
+  });
+  window.addEventListener("blur", function () { setActive(false); });
 
   root.addEventListener("pointerleave", function () { edge = null; });
   root.addEventListener("wheel", function (event) {
+    if (root.dataset.scrollActive !== "true") return;
     // Keep zoom, horizontal gestures, and the expanded workspace native.
     if (event.ctrlKey || event.metaKey || event.shiftKey || !event.cancelable ||
         Math.abs(event.deltaX) >= Math.abs(event.deltaY) || root.classList.contains("wb-expanded")) return;

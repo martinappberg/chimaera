@@ -167,5 +167,12 @@
 .wb-app .wb-browser-content .dp-live-stats { margin-top: 8px; }
 .wb-app .wb-browser-content .dp-live-chart { height: 65px; margin-top: 4px; }
 
-/* Touch stays native; wheel gestures use a short boundary hold. */
+/* Inactive panes let wheel and touch gestures reach the page natively, including
+   nested tables, source views, tabs, and the draft's textarea. */
+.wb-app[data-scroll-active="false"] :is(.wb-files, .wb-preview, .wb-chat-messages, .wb-browser-content, .wb-tabs, .wb-source, textarea, .dp-grid-scroll, .dp-column-types, .dp-thumbnails, .dp-code-lines, .dp-nb-cell pre) {
+  overflow: hidden;
+  overscroll-behavior: auto;
+}
+.wb-app:focus-visible { outline: 2px solid var(--wb-accent); outline-offset: 3px; }
+/* Active wheel gestures retain the short boundary hold; touch stays native. */
 .wb-expanded :is(.wb-files, .wb-preview, .wb-chat-messages, .wb-browser-content) { overscroll-behavior: contain; }

@@ -140,5 +140,13 @@ with the maintainer when the product changes substantially.
 Keep the dedicated knowledge and extensions section broad. Document compilers are
 examples, not the platform story. Preserve the larger hero download action and
 keep the social preview image aligned with the approved workspace headline.
-Within the demo, a short wheel-scroll hold at a pane boundary should release to
-the page with continued scrolling; touch and keyboard navigation remain native.
+The 2026-10-16 follow-up keeps this framing and refreshes the public guides for
+Cursor, in-app sign-in, chat plans, loops and goals, usage indicators, Finder
+previews, and starting chats in worktrees.
+
+At the maintainer's request, the demo scrolls internally only after a click inside
+its container; clicking outside disables internal scrolling again. Tabbing into
+the demo also enables it for keyboard use, and Escape releases it. While active,
+a short wheel-scroll hold at a pane boundary releases to the page with continued
+scrolling. Touch gestures remain native; swiping over an inactive demo scrolls
+the page until the visitor taps inside.

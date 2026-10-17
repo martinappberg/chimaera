@@ -11,7 +11,7 @@
     />
     <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="assets/css/styles.css?v=20261001" />
-    <link rel="stylesheet" href="assets/css/demo.css?v=20261001.1" />
+    <link rel="stylesheet" href="assets/css/demo.css?v=20261016" />
     <link rel="stylesheet" href="assets/css/demo-previews.css?v=20261001" />
     <link rel="canonical" href="https://chimaera.sh/" />
     <link rel="sitemap" type="application/xml" href="sitemap.xml" />
@@ -179,7 +179,7 @@
           </div>
 
           <figure class="workspace-demo" id="workspace">
-            <div class="wb-app" id="workspace-demo" data-nosnippet data-mobile-panel="file" data-pane-focus="" role="region" aria-label="Interactive sample Chimaera workspace">
+            <div class="wb-app" id="workspace-demo" data-scroll-active="false" tabindex="0" aria-describedby="wb-scroll-hint" data-nosnippet data-mobile-panel="file" data-pane-focus="" role="region" aria-label="Interactive sample Chimaera workspace">
               <div class="wb-titlebar">
                 <img src="assets/img/favicon.svg" width="16" height="16" alt="">
                 <strong>chimaera</strong>
@@ -204,7 +204,7 @@
                     <div class="wb-rail-label">agents</div>
                     <button type="button" data-agent="claude" aria-pressed="true"><svg class="wb-agent-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5l1.4 3.6 3.6 1.4-3.6 1.4L8 12.5 6.6 8.9 3 7.5l3.6-1.4z"/></svg>Claude Code</button>
                     <button type="button" data-agent="codex" aria-pressed="false"><svg class="wb-agent-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M6.4 4.8L3.6 8l2.8 3.2M9.6 4.8L12.4 8l-2.8 3.2"/></svg>Codex</button>
-                    <details class="wb-agent-menu"><summary>+ agent ⌄</summary><div><button type="button" data-agent="agy">Antigravity</button><button type="button" data-agent="grok">Grok Build</button></div></details>
+                    <details class="wb-agent-menu"><summary>+ agent ⌄</summary><div><button type="button" data-agent="agy">Antigravity</button><button type="button" data-agent="grok">Grok Build</button><button type="button" data-agent="cursor">Cursor CLI</button></div></details>
                   </nav>
                   <div class="wb-files-section">
                     <div class="wb-files-heading"><span>FILES</span><small>14</small><button type="button" class="wb-icon-button" data-action="search" aria-label="Search sample files" title="Search files"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="6.5" cy="6.5" r="4"/><path d="m10 10 3.5 3.5"/></svg></button></div>
@@ -239,7 +239,7 @@
               </div>
               <span id="wb-status" class="wb-sr-only" aria-live="polite"></span>
             </div>
-            <figcaption>Interactive preview. Sample files and conversations.</figcaption>
+            <figcaption>Interactive preview. Sample files and conversations. <span id="wb-scroll-hint">Click inside to scroll the preview. Click outside to return to page scrolling.</span></figcaption>
           </figure>
         </div>
       </section>
@@ -261,12 +261,12 @@
 
       <section class="section" id="features">
         <div class="wrap">
-          <div class="section-head"><span class="eyebrow">inside the workspace</span><h2>From the first prompt to the next decision.</h2><p>For code, documents, data, and the projects that cross all three.</p></div>
+          <div class="section-head"><span class="eyebrow">inside the workspace</span><h2>Your agents, files, and tools. Together.</h2><p>Work with your agents, open what they make, and keep the whole project in view.</p></div>
           <div class="features">
-            <article class="feature"><span class="eyebrow">agents + coordination</span><h3>Choose your agent. Keep your workspace.</h3><p>Chimaera runs your own Claude Code, Codex, Antigravity, or Grok Build, with the skills and connections configured on the workspace’s host. Keep your setup and give it a workspace.</p><a href="docs.html#agents">Meet the agent workspace →</a></article>
+            <article class="feature"><span class="eyebrow">agents + coordination</span><h3>Choose your agent. Keep your workspace.</h3><p>Chimaera runs your own Claude Code, Codex, Antigravity, Grok Build, or Cursor CLI, with your accounts, skills, and connections. Follow plans in chat, with loops and goals for supported agents.</p><a href="docs.html#agents">Meet the agent workspace →</a></article>
             <article class="feature"><span class="eyebrow">files + feedback</span><h3>Work with what they make.</h3><p>Documents, spreadsheets, PDFs, images, notebooks, diagrams, and media beside the chat. Select a passage, region, or cell to give precise feedback. Edit text and Markdown in place.</p><a href="docs.html#previews">Explore files and previews →</a></article>
             <article class="feature"><span class="eyebrow">context + continuity</span><h3>Put your project files to work.</h3><p>Reference a file, a passage, or a region in the conversation. Keep notes and decisions nearby, and follow the work through session history and Timeline.</p><a href="docs.html#knowledge">Put project context to work →</a></article>
-            <article class="feature"><span class="eyebrow">tools + review</span><h3>Keep your hands on the work.</h3><p>Persistent terminals, Git diffs and history, worktrees, and live web apps in panes. Give an agent access to a specific shell, with its commands visible to you.</p><a href="docs.html#git">Review and run the work →</a></article>
+            <article class="feature"><span class="eyebrow">tools + review</span><h3>Keep your hands on the work.</h3><p>Review Git diffs and history, start an agent in its own worktree, and keep live web apps in panes. Give an agent access to a specific terminal, with its commands visible to you.</p><a href="docs.html#git">Review and run the work →</a></article>
             <article class="feature"><span class="eyebrow">local + remote</span><h3>Go where the work is.</h3><p>Start with a folder on your machine. Connect a server over SSH, or open workspaces inside Slurm jobs. Bring the same agents, files, and tools to each project.</p><a href="docs.html#connect">Connect your machines →</a></article>
             <article class="feature"><span class="eyebrow">extensions + skills</span><h3>Make room for your workflow.</h3><p>Bring project Knowledge into view. Compile LaTeX and Typst to PDF beside the source. Add agent skills and connections, or build new tools and views with the extension platform.</p><a href="docs.html#extensions">Extend the workbench →</a></article>
           </div>
@@ -444,7 +444,7 @@
           </div>
           <div class="faq">
             <details class="qa"><summary>What kind of tool is Chimaera?<svg class="plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></summary><div class="qa__body">An agent workbench: a folder-centered place to work with agents and their outputs. It combines conversations, file viewing, lightweight editing, terminals, review, and project context. Start with one agent and a local folder; add more agents, remote machines, or extensions when they help.</div></details>
-            <details class="qa"><summary>Which agents can I use?<svg class="plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></summary><div class="qa__body">Chimaera runs Claude Code, Codex, Antigravity, and Grok Build themselves, using your provider accounts and the skills and connections configured on the workspace’s host. Claude Code and Codex also support switching between chat and their real terminal UI. See <a href="docs.html#agents">agent support</a>.</div></details>
+            <details class="qa"><summary>Which agents can I use?<svg class="plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></summary><div class="qa__body">Chimaera runs Claude Code, Codex, Antigravity, Grok Build, and Cursor CLI themselves, using your provider accounts and the skills and connections configured on the workspace’s host. All five support structured chat. Claude Code and Codex also support switching between chat and their real terminal UI. See <a href="docs.html#agents">agent support</a>.</div></details>
             <details class="qa"><summary>How do accounts and billing work?<svg class="plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></summary><div class="qa__body">Use your own agent-provider accounts on the host where the agents run. Chimaera launches the agent CLIs using those accounts. Your provider handles authentication, usage limits, and billing for the mode you use.</div></details>
             <details class="qa"><summary>How does it keep project context together?<svg class="plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></summary><div class="qa__body">Session history and Timeline connect the work to the agents and files involved. With a knowledge plugin enabled, you can browse recorded findings, decisions, and handoffs beside the project. Your files remain on the workspace’s host, with uploads and downloads for moving them where you need them.</div></details>
             <details class="qa"><summary>What can I work on?<svg class="plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></summary><div class="qa__body">You can use a local folder for writing, working with data, building software, or mixed projects. Remote hosts and Slurm jobs extend where that workspace can run. They are optional.</div></details>
@@ -498,7 +498,7 @@
     <script src="assets/js/site.js?v=20261001" defer></script>
     <script src="assets/js/demo-icons.js?v=20261001" defer></script>
     <script src="assets/js/demo-previews.js?v=20261001" defer></script>
-    <script src="assets/js/demo.js?v=20261001.1" defer></script>
-    <script src="assets/js/demo-scroll.js?v=20261001" defer></script>
+    <script src="assets/js/demo.js?v=20261016" defer></script>
+    <script src="assets/js/demo-scroll.js?v=20261016" defer></script>
   </body>
 </html>
