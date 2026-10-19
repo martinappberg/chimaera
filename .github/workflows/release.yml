@@ -254,8 +254,8 @@ jobs:
           sed -i "" "s/^version = \"0.0.1\"/version = \"${{ needs.version.outputs.version }}\"/" Cargo.toml
       - name: Prepare plugin smoke assets
         run: bash scripts/build-plugins.sh
-      # The custom build command verifies Developer ID, the stapled ticket,
-      # Gatekeeper acceptance, and plugin execution before the action uploads.
+      # The custom build command verifies the app, then notarizes/staples the
+      # DMG and checks its Gatekeeper acceptance before the action uploads.
       - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

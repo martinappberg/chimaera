@@ -119,15 +119,40 @@ Keep credentials out of shell history and version control.
 `scripts/build-macos-release.sh` is tauri-action's custom build command. It builds
 once, verifies the exact app's signature and expected certificate/team, validates
 its stapled notarization ticket, checks Gatekeeper acceptance, and exercises the
-real plugin reader under the hardened runtime. The action uploads only after all
-checks succeed. The DMG contains this notarized app. The separate macOS CLI daemon
-artifact is outside this app-signing flow.
+real plugin reader under the hardened runtime. The wrapper then requires exactly
+one DMG and passes it to
+`scripts/notarize-macos-dmg.sh`. That helper verifies the container's signature and
+expected certificate/team, submits it to Apple, and requires an `Accepted`
+verdict within a 20-minute wait. It staples and validates the ticket, rechecks
+the signature, and assesses the DMG with Gatekeeper's `open` policy. The action
+uploads only after all checks succeed. Notarizing only the enclosed app does not
+satisfy this gate.
+The separate macOS CLI daemon artifact is outside this app-signing flow.
 
 `node --test scripts/build-macos-release.test.mjs` verifies failure propagation
 with mocked platform tools; it does not prove Apple acceptance. A real signed,
 notarized build and plugin smoke are required for that evidence.
 
+### Repair an existing DMG
+
+The same helper can notarize an already-signed release DMG without rebuilding or
+changing the enclosed app. Use a copy of the published asset and keep the original
+for rollback. Verify its SHA-256 against the release API's `digest` before repair.
+With the local credentials above configured:
+
+```sh
+bash scripts/notarize-macos-dmg.sh /absolute/path/to/copied-release.dmg
+```
+
+After the helper succeeds, mount the repaired image read-only and verify the app's
+signature, ticket, and Gatekeeper acceptance. Replace only the matching release
+asset, keeping its filename. Download it again and verify its new SHA-256, ticket,
+and Gatekeeper acceptance. Stapling changes the DMG's digest; the app and its
+separate signed updater archive do not change. Asset replacement resets that
+asset's GitHub download counter.
+
 References: [Apple Developer ID](https://developer.apple.com/help/account/certificates/create-developer-id-certificates/),
+[Apple distribution packaging](https://developer.apple.com/documentation/xcode/packaging-mac-software-for-distribution),
 [Tauri macOS signing](https://v2.tauri.app/distribute/sign/macos/).
 
 ## Linux runner migration

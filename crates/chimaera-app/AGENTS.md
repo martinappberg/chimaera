@@ -88,7 +88,10 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
   Developer ID + notarization on releases, both with the hardened runtime.
   `scripts/build-macos-release.sh` is tauri-action's build command: it checks
   the certificate/team, stapled ticket, Gatekeeper, and plugin execution on
-  the finished bundle before the action can publish it. Credential setup:
+  the finished app, then calls `scripts/notarize-macos-dmg.sh` to notarize and
+  staple the DMG and check its signature and Gatekeeper acceptance before the
+  action can publish it. The DMG's notarization is separate from the app's.
+  Credential setup:
   [releases.md](../../docs/agent-guides/releases.md#macos-signing-and-notarization).
   Keep `Entitlements.plist` wired into the bundle:
   Wasmtime 49 uses mmap/mprotect, so `allow-jit` alone cannot authorize its code

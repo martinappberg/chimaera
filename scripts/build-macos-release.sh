@@ -53,3 +53,13 @@ spctl --assess --type execute --verbose=2 "$app"
 # Wasmtime must execute inside this hardened-runtime signature, not merely
 # inside an unsigned cargo-test binary. Test assets are prepared before build.
 node "$root/scripts/smoke-macos-plugins.mjs" "$app"
+
+# Tauri notarizes the app before packaging; Gatekeeper also assesses the DMG.
+# Reject missing/ambiguous output rather than publish an unchecked container.
+shopt -s nullglob
+dmgs=("$root/crates/chimaera-app/target/release/bundle/dmg/"*.dmg)
+if [ "${#dmgs[@]}" -ne 1 ]; then
+  echo 'Expected exactly one release DMG to notarize.' >&2
+  exit 1
+fi
+bash "$root/scripts/notarize-macos-dmg.sh" "${dmgs[0]}"
