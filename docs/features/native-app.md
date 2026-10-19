@@ -192,8 +192,9 @@ app-build` (never the root `cargo`).
   [lifecycle-and-persistence.md](lifecycle-and-persistence.md). Version stamping matches the literal `0.0.1` sentinel via `sed`; a pre-bumped value silently
   no-ops and ships the wrong version. Updater signing is release-only. macOS release
   bundles also require Developer ID signing and notarization: the release build
-  checks the certificate/team, stapled ticket, Gatekeeper acceptance, and live plugin
-  execution before publication. PR bundles keep their ad hoc signature. See
+  checks the app's certificate/team, stapled ticket, Gatekeeper acceptance, and live plugin
+  execution. It then separately notarizes and staples the DMG, verifies its signature,
+  and requires Gatekeeper acceptance before publication. PR bundles keep their ad hoc signature. See
   [signing setup](../agent-guides/releases.md#macos-signing-and-notarization).
 - **Every check's outcome is kept** (`update::status`: this version, `checked_at`, `available`, the
   failure's `error`, `dev`): `app_update_status(refresh)` answers from it instantly, so a window opened

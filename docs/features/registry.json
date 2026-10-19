@@ -574,6 +574,7 @@
       "paths": [
         "scripts/build-macos-release.sh",
         "scripts/build-macos-release.test.mjs",
+        "scripts/notarize-macos-dmg.sh",
         "crates/chimaera-app/src/**",
         "web-ui/src/lib/net/native.ts",
         "web-ui/src/lib/workspace/UpdateToast.svelte",
