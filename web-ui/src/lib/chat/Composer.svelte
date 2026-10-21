@@ -1003,7 +1003,7 @@
       {/each}
     </div>
   {:else if popover === "term"}
-    <div class="overlay-surface pop terminal-pop" bind:this={terminalPopover} id="{uid}-pop" role="listbox" aria-label="terminals">
+    <div class="overlay-surface pop terminal-pop quiet-scrollbar" bind:this={terminalPopover} id="{uid}-pop" role="listbox" aria-label="terminals">
       <div class="terminal-picker-heading">Use a live terminal <span>Access is granted when you send</span></div>
       {#if termMatches.length === 0}<div class="terminal-empty">No matching terminals. Try a name or directory.</div>{/if}
       {#each termMatches as t, i (t.id)}

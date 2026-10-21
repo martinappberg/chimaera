@@ -114,7 +114,7 @@
     {/if}
   </div>
   {#if request.plan !== null && request.plan.length > 0}
-    <div class="plan-body">
+    <div class="plan-body quiet-scrollbar">
       <Markdown text={request.plan} {onOpenPath} {resolvePaths} />
     </div>
   {/if}
@@ -157,7 +157,7 @@
         <span class="label">plan</span>
         <button class="close" type="button" aria-label="close" onclick={() => (expanded = false)}>✕</button>
       </div>
-      <div class="panel-body">
+      <div class="panel-body quiet-scrollbar">
         <Markdown text={request.plan ?? ""} {onOpenPath} {resolvePaths} />
       </div>
       <div class="panel-foot">
