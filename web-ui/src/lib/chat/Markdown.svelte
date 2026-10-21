@@ -69,6 +69,7 @@
   import ProseChip from "./ProseChip.svelte";
   import type { Reveal } from "../shared/reveal";
   import { openPath } from "../shared/openPath";
+  import { isAbsolute } from "../shared/paths";
 
   interface Props {
     text: string;
@@ -164,7 +165,7 @@
       img.before(slot);
       img.classList.add("md-embed-src");
       const resolver = embeds;
-      if (resolver === undefined && !shown.startsWith("/")) {
+      if (resolver === undefined && !isAbsolute(shown)) {
         // Nowhere to resolve a relative path: say what was meant, quietly.
         slot.classList.add("md-embed-text");
         slot.textContent = alt !== "" ? `${alt} (${shown})` : shown;

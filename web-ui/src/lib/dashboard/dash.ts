@@ -10,6 +10,7 @@
 import type { RecentConvo } from "../workspace/launcher";
 import type { Session } from "../workspace/sessions";
 import { agentKind } from "../workspace/sessions";
+import { relativeTo } from "../shared/paths";
 
 export interface DashCtx {
   /** Active workspace display name (the folder basename). */
@@ -79,5 +80,6 @@ export function rosterWeight(s: Session): number {
 
 /** Workspace-relative display path (verbatim when outside the root). */
 export function relPath(wsRoot: string | null, p: string): string {
-  return wsRoot !== null && p.startsWith(`${wsRoot}/`) ? p.slice(wsRoot.length + 1) : p;
+  const r = wsRoot === null ? null : relativeTo(p, wsRoot);
+  return r === null || r === "." ? p : r;
 }

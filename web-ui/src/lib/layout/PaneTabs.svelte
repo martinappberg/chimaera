@@ -22,6 +22,7 @@
   import type { DropSpot, LayoutCtrl } from "./dnd";
   import { agentHue, type LinkCtrl } from "../workspace/agentLinks";
   import { basename, fsDownload, midTruncate, viewKindFor } from "../previews/files";
+  import { dirname, joinPath } from "../shared/paths";
   import { isRemoteHost } from "../net/api";
   import { fsRenameOp } from "../workspace/fsEvents";
   import { validateEntryName } from "../shared/fsNames";
@@ -508,7 +509,7 @@
     check(tab, name) {
       if (tab.surface === "terminal") return name === label(tab) ? "unchanged" : "submit";
       if (tab.surface !== "file" || name === basename(tab.path)) return "unchanged";
-      const invalid = validateEntryName(name, { allowSlashes: false });
+      const invalid = validateEntryName(name, { allowSlashes: false, dir: dirname(tab.path) });
       return invalid === null ? "submit" : { invalid };
     },
     async submit(tab, name, close) {
@@ -520,9 +521,7 @@
         return;
       }
       if (tab.surface !== "file") return;
-      const i = tab.path.lastIndexOf("/");
-      const parent = i > 0 ? tab.path.slice(0, i) : "";
-      await fsRenameOp(tab.path, `${parent}/${name}`);
+      await fsRenameOp(tab.path, joinPath(dirname(tab.path), name));
       // App's mutation subscription rewrites this tab
     },
     errorText: (e) => (e instanceof Error ? e.message : "rename failed"),

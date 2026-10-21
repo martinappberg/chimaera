@@ -7,6 +7,7 @@
  * singleton surface names. Exactly one entry may carry `focused: true` —
  * the active tab of the focused pane.
  */
+import { relativeTo } from "../shared/paths";
 import { findPane, panes, type Layout, type Tab } from "./layout";
 
 export interface SurfaceRef {
@@ -21,7 +22,8 @@ export interface SurfaceRef {
 export const SURFACES_CAP = 40;
 
 function rel(wsRoot: string | null, p: string): string {
-  return wsRoot !== null && p.startsWith(`${wsRoot}/`) ? p.slice(wsRoot.length + 1) : p;
+  const r = wsRoot === null ? null : relativeTo(p, wsRoot);
+  return r === null || r === "." ? p : r;
 }
 
 function refOf(t: Tab, wsRoot: string | null): SurfaceRef {
