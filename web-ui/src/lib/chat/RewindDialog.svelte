@@ -72,7 +72,7 @@
         {/if}
       </div>
       {#if report.filesChanged.length > 0}
-        <ul class="dialog-files">
+        <ul class="dialog-files quiet-scrollbar">
           {#each report.filesChanged as f (f)}
             <li>
               <button class="file-link" title="open in a pane" onclick={() => onOpenFile?.(f)}>
