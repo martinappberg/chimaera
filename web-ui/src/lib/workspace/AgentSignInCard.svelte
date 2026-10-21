@@ -51,6 +51,9 @@
     status?.operation && (operationRunning(status.operation) || status.operation.id === ownAttempt) ? status.operation : null,
   );
   const running = $derived(operationRunning(operation));
+  /** Signed in, and this CLI's login can't replace the account (its
+   *  headless login only finds the existing one): nothing to start. */
+  const noSecondSignIn = $derived(agent.signedIn === true && agent.signIn?.relogin === false);
   const pageHost = $derived.by(() => {
     try { return operation?.url ? new URL(operation.url).hostname : null; } catch { return null; }
   });
@@ -72,7 +75,7 @@
     } finally { checking = false; }
   }
   onMount(() => {
-    void check().then(() => { if (autostart && !running) void start(); });
+    void check().then(() => { if (autostart && !running && !noSecondSignIn) void start(); });
     return () => { disposed = true; };
   });
   // Only a sign-in in progress needs the daemon again, and only while someone
@@ -176,7 +179,7 @@
     <p class="line" class:failure={operation?.phase === "failed"} role="status">
       {#if operation?.phase === "failed" || operation?.phase === "cancelled"}
         {operation.message}
-      {:else if agent.signedIn === true && agent.signIn?.relogin === false}
+      {:else if noSecondSignIn}
         {agent.name} is signed in on this host.
       {:else if agent.signedIn === true}
         {agent.name} is signed in on this host. Sign in again to switch accounts or refresh the login.
@@ -187,7 +190,7 @@
       {/if}
     </p>
     <div class="actions">
-      {#if !(agent.signedIn === true && agent.signIn?.relogin === false)}
+      {#if !noSecondSignIn}
         <button class="opt primary" disabled={busy || workspaceId === null || !status} onclick={() => void start()}>
           {busy ? "Starting…" : operation ? "Try again" : agent.signedIn === true ? "Sign in again" : "Sign in"}
         </button>

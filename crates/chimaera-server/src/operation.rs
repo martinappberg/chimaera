@@ -339,6 +339,15 @@ pub(crate) fn append_capped(buf: &mut String, text: &str) -> bool {
     true
 }
 
+/// [`append_capped`] for raw bytes: append, keeping the newest
+/// [`OUTPUT_LIMIT`].
+pub(crate) fn append_bytes_capped(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(bytes);
+    if buf.len() > OUTPUT_LIMIT {
+        buf.drain(..buf.len() - OUTPUT_LIMIT);
+    }
+}
+
 /// Terminal output minus its controls: ANSI CSI/OSC sequences and other
 /// control characters, newlines and tabs kept.
 pub(crate) fn strip_controls(text: &str) -> String {

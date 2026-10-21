@@ -200,7 +200,9 @@ fn parse_probe(kind: AgentKind, success: bool, stdout: &str, stderr: &str) -> Op
     let lower = text.to_ascii_lowercase();
     match kind {
         // `claude auth status --json` → {"loggedIn": bool, …}
-        AgentKind::Claude => status_json(stdout).and_then(|v| v.get("loggedIn")?.as_bool()),
+        AgentKind::Claude => serde_json::from_str::<serde_json::Value>(stdout.trim())
+            .ok()
+            .and_then(|v| v.get("loggedIn")?.as_bool()),
         // `codex login status` → "Logged in using ChatGPT" (0) / "Not logged in" (1)
         AgentKind::Codex => {
             if lower.contains("not logged in") {
@@ -212,7 +214,9 @@ fn parse_probe(kind: AgentKind, success: bool, stdout: &str, stderr: &str) -> Op
             }
         }
         // `cursor-agent status --format json` → {"isAuthenticated": bool, …}
-        AgentKind::Cursor => status_json(stdout).and_then(|v| v.get("isAuthenticated")?.as_bool()),
+        AgentKind::Cursor => serde_json::from_str::<serde_json::Value>(stdout.trim())
+            .ok()
+            .and_then(|v| v.get("isAuthenticated")?.as_bool()),
         // `grok models` → "You are logged in with grok.com." / "You are not authenticated."
         AgentKind::Grok => {
             if lower.contains("not authenticated") {
@@ -243,18 +247,12 @@ fn parse_probe(kind: AgentKind, success: bool, stdout: &str, stderr: &str) -> Op
     }
 }
 
-/// A status command's JSON answer: the whole stdout, else the object that
-/// starts a line and runs to the end — a login shell's banner or a profile
-/// script may print ahead of the CLI on the same stdout.
-fn status_json(stdout: &str) -> Option<serde_json::Value> {
-    let parse = |s: &str| serde_json::from_str::<serde_json::Value>(s.trim()).ok();
-    parse(stdout).or_else(|| {
-        stdout
-            .match_indices('\n')
-            .map(|(at, _)| &stdout[at + 1..])
-            .filter(|rest| rest.trim_start().starts_with('{'))
-            .find_map(parse)
-    })
+/// The CLI's part of one of its pipes, read whole: what follows
+/// [`CLI_START`]. No marker means the CLI never ran (the login shell failed
+/// first), which answers nothing.
+fn cli_part(text: &str) -> &str {
+    text.find(CLI_START)
+        .map_or("", |at| &text[at + CLI_START.len()..])
 }
 
 fn probe_argv(kind: AgentKind) -> Option<&'static [&'static str]> {
@@ -275,11 +273,12 @@ fn probe_argv(kind: AgentKind) -> Option<&'static [&'static str]> {
 async fn run_probe(state: &Arc<AppState>, kind: AgentKind, bin: &Path) -> Option<bool> {
     let argv = probe_argv(kind)?;
     let prelude = crate::agent_probe::ProbePrelude::write(state, None).await;
-    let mut cmd = crate::agent_probe::base_command(
-        &crate::agent_probe::wrapped(bin, argv),
-        None,
-        prelude.path(),
-    );
+    // Behind the same marker as the login: a banner's words ("logged in",
+    // a stray `{`) must never be the verdict.
+    let mut command = vec![bin.to_string_lossy().into_owned()];
+    command.extend(argv.iter().map(|a| a.to_string()));
+    let argv = crate::launcher::wrap_login_shell(&crate::launcher::login_shell(), marked(command));
+    let mut cmd = crate::agent_probe::base_command(&argv, None, prelude.path());
     cmd.process_group(0);
     let mut child = cmd.spawn().ok()?;
     let pid = nix::unistd::Pid::from_raw(child.id()? as i32);
@@ -291,7 +290,7 @@ async fn run_probe(state: &Arc<AppState>, kind: AgentKind, bin: &Path) -> Option
         Some((status.success(), out, err))
     };
     match tokio::time::timeout(PROBE_TIMEOUT, work).await {
-        Ok(Some((success, out, err))) => parse_probe(kind, success, &out, &err),
+        Ok(Some((success, out, err))) => parse_probe(kind, success, cli_part(&out), cli_part(&err)),
         Ok(None) => None,
         Err(_) => {
             // The leader is unreaped: the group id is still its own.
@@ -501,11 +500,11 @@ impl operation::Progress for Progress {
         let pipe = &mut self.pipes[stream as usize];
         let fresh = match &mut pipe.cli {
             Some(cli) => {
-                append_bytes_capped(cli, bytes);
+                operation::append_bytes_capped(cli, bytes);
                 bytes.to_vec()
             }
             None => {
-                append_bytes_capped(&mut pipe.shell, bytes);
+                operation::append_bytes_capped(&mut pipe.shell, bytes);
                 let Some(at) = find_bytes(&pipe.shell, CLI_START.as_bytes()) else {
                     return;
                 };
@@ -516,8 +515,16 @@ impl operation::Progress for Progress {
                 after
             }
         };
-        append_bytes_capped(&mut self.cli, &fresh);
-        let plain = strip_controls(&String::from_utf8_lossy(&self.cli));
+        operation::append_bytes_capped(&mut self.cli, &fresh);
+        // Only the tail reaches the card: strip a window of it, from a line
+        // start (a cut mid-character or mid-escape would show as noise).
+        let from = self.cli.len().saturating_sub(PRINTED_LIMIT * 4);
+        let window = &self.cli[from..];
+        let window = match window.iter().position(|&b| b == b'\n') {
+            Some(at) if from > 0 => &window[at + 1..],
+            _ => window,
+        };
+        let plain = strip_controls(&String::from_utf8_lossy(window));
         let skip = plain.chars().count().saturating_sub(PRINTED_LIMIT);
         self.printed = plain
             .chars()
@@ -566,14 +573,6 @@ impl Progress {
             .map(|p| String::from_utf8_lossy(&p.shell).into_owned())
             .collect::<Vec<_>>()
             .join("\n")
-    }
-}
-
-/// Append, keeping the newest [`operation::OUTPUT_LIMIT`] bytes.
-fn append_bytes_capped(buf: &mut Vec<u8>, bytes: &[u8]) {
-    buf.extend_from_slice(bytes);
-    if buf.len() > operation::OUTPUT_LIMIT {
-        buf.drain(..buf.len() - operation::OUTPUT_LIMIT);
     }
 }
 
@@ -933,13 +932,15 @@ async fn run_login(
 
 /// `argv` behind a `/bin/sh` that writes [`CLI_START`] on stdout and on
 /// stderr, then execs it: each pipe splits into the login shell's part and
-/// the CLI's.
+/// the CLI's. The marker is printed in two halves so it never appears whole
+/// in an argv a tracing shell (`set -x`) echoes ahead of the real one.
 fn marked(argv: Vec<String>) -> Vec<String> {
+    let (head, tail) = CLI_START.split_at(CLI_START.len() / 2);
     let mut cmd = vec![
         "/bin/sh".to_string(),
         "-c".to_string(),
         format!(
-            "printf '\\n%s\\n' '{CLI_START}'; printf '\\n%s\\n' '{CLI_START}' >&2; exec \"$@\""
+            "printf '\\n%s%s\\n' '{head}' '{tail}'; printf '\\n%s%s\\n' '{head}' '{tail}' >&2; exec \"$@\""
         ),
         "sh".to_string(),
     ];
@@ -1252,16 +1253,24 @@ mod tests {
     }
 
     #[test]
-    fn a_status_answer_after_a_banner_still_reads() {
-        let out =
-            "Welcome to the cluster.\nSee https://portal.example.test\n{\"loggedIn\": true}\n";
-        assert_eq!(parse_probe(AgentKind::Claude, true, out, ""), Some(true));
-        let out = "motd line\n{\n  \"isAuthenticated\": false\n}\n";
-        assert_eq!(parse_probe(AgentKind::Cursor, true, out, ""), Some(false));
+    fn a_status_answer_is_read_from_the_cli_s_part_only() {
+        let banner = "Welcome. You are logged in to the cluster.\n{\"motd\": 1}\n";
+        let out = format!("{banner}\n{CLI_START}\n{{\"loggedIn\": false}}\n");
         assert_eq!(
-            parse_probe(AgentKind::Claude, true, "banner only\n", ""),
+            parse_probe(AgentKind::Claude, true, cli_part(&out), ""),
+            Some(false)
+        );
+        // Grok offline: the banner's "logged in" is not its answer.
+        let out = format!("{banner}\n{CLI_START}\nError: network unreachable\n");
+        assert_eq!(
+            parse_probe(AgentKind::Grok, false, cli_part(&out), ""),
             None
         );
+        // The CLI never ran: no verdict.
+        assert_eq!(cli_part(banner), "");
+        // The wrapper never carries the marker whole in its argv.
+        let argv = marked(vec!["codex".into()]);
+        assert!(argv.iter().all(|a| !a.contains(CLI_START)), "{argv:?}");
     }
 
     #[test]

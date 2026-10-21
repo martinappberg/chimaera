@@ -280,8 +280,8 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   output on the card instead, and the fix is the host table. Known limits: a CLI that writes its
   link only to a terminal or holds it in a pipe buffer shows nothing until it exits; a flow that
   returns to `localhost` can only finish in a browser on the daemon's machine (every recipe here
-  uses a device code or a hosted callback for that reason). A status command's JSON (Claude,
-  Cursor) is read past a banner on the same stdout.
+  uses a device code or a hosted callback for that reason). The status command runs behind
+  the same marker and is read from it, so a banner's words never answer it either.
   A clean exit is never success by itself — the status command is asked again. Concurrent status probes for one agent share a run. The
   chat view shows one line per failure: a startup error that a fatal banner shows
   is not repeated as a transcript line, and a fatal banner is not followed by *agent exited*.

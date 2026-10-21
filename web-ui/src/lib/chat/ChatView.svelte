@@ -2991,7 +2991,12 @@
            startup failure (if one lands) folds into it below. -->
       <div class="empty" role="status">
         <SessionGlyph kind="agent" {agentKind} size={18} />
-        <AgentSignInCard agent={catalogAgent} workspaceId={session.workspace_id ?? null} sessionId={session.id} framed onSignedIn={() => void getSignIn(agentKind, true).catch(() => {})} />
+        <!-- The one card while the chat waits on a login: Chat options →
+             Sign in restarts it here (keyed) instead of queueing a second
+             card that would start another login once this one lands. -->
+        {#key signInRequested}
+          <AgentSignInCard agent={catalogAgent} workspaceId={session.workspace_id ?? null} sessionId={session.id} framed autostart={signInRequested} onSignedIn={() => { signInRequested = false; void getSignIn(agentKind, true).catch(() => {}); }} />
+        {/key}
       </div>
     {:else if store.exited === null && !store.fatalError && (!store.initialized || store.blocks.length === 0)}
       <div class="empty" role="status">
