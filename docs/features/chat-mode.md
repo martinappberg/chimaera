@@ -162,7 +162,8 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   [sign-in card](agents.md#sign-in) at the transcript's tail and starts the CLI's own login under
   the daemon — whether or not the agent is currently signed in (a switch of account, a stale
   login) — and the chat relaunches in place once it lands; chimaera never touches the
-  credentials. Claude's native `/login` remains in its terminal view (the
+  credentials. **Chat options → Sign in to {agent}…** does the same in every state, including a
+  chat that ended or failed to start, whose composer can no longer take `/login`. Claude's native `/login` remains in its terminal view (the
   [view switch](#view-switch-rewind-and-branch)) for anyone who prefers it.
 - **Voice dictation — the mic button.** Every chat composer has a mic beside
   send (on by default; shown only where the daemon's host can dictate — `GET /api/v1/voice`,
@@ -218,7 +219,7 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
 
 - **Model / effort / mode / thinking / ultracode pickers.** Model, permission mode, and
   effort are direct header selectors (also `/model`, `/effort`, `/mode`). Thinking and
-  ultracode live in **Chat options** (the ellipsis). The header is one 30px row at wide
+  ultracode live in **Chat options** (the ellipsis), with **Sign in to {agent}…**. The header is one 30px row at wide
   widths, or two fixed rows below 480px: session/status above, selectors below. Long labels
   truncate with their full value in the tooltip and accessible name. Usage-limit warnings
   (80%+ or reached) and high context usage (80%+) remain visible in the header, including
