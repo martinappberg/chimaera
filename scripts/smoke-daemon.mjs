@@ -66,6 +66,7 @@ console.log(`workspace ${workspace.id} → shell session ${session.id}`);
 // subexpression there too), and the typed echo of the command never contains
 // the computed marker.
 const command = 'echo chimaera-smoke-$((6*7))';
+const marker = 'chimaera-smoke-42';
 try {
   await new Promise((resolveRun, reject) => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws/sessions/${session.id}`);
