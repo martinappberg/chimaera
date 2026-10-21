@@ -74,6 +74,7 @@ async fn workspace_entry(state: &Arc<AppState>, ws: &str) -> serde_json::Value {
 }
 
 /// Poll GET /sessions until `id` disappears (chat teardown reaps async).
+#[cfg(unix)]
 async fn wait_session_gone(state: &Arc<AppState>, id: &str) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
@@ -187,6 +188,7 @@ async fn put_mastermind_validates_and_rolls_back() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+#[cfg(unix)]
 /// The full lifecycle against a scripted claude: PUT creates-and-binds (ask
 /// settings, wire flag), re-PUT retires the old session (no Recents leak)
 /// and rebinds with auto settings, DELETE unbinds and kills.
@@ -446,6 +448,7 @@ async fn mcp_tier_gates_on_the_binding() {
     state.sessions.kill(&worker).ok();
 }
 
+#[cfg(unix)]
 /// read_agent: every agent reads another AGENT in its workspace; a shell's
 /// screen stays behind the leash for workers (read_terminal, linked only)
 /// and open to the Mastermind; other workspaces are walled off.
@@ -524,6 +527,7 @@ async fn read_agent_scopes_to_the_workspace_and_the_leash() {
     }
 }
 
+#[cfg(unix)]
 /// The Mastermind's message_agent carries direction: to a chat worker it is
 /// an ordinary send, tagged `origin: "mastermind"` under the Mastermind
 /// header; a terminal agent gets it on its next hook, never typed in; and
@@ -637,6 +641,7 @@ async fn mastermind_messages_carry_direction_and_never_type_into_tuis() {
     state.sessions.kill(&tui).ok();
 }
 
+#[cfg(unix)]
 /// spawn_terminal opens a real shell in the workspace; spawn_agent refuses
 /// junk and spawns a scripted worker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -727,6 +732,7 @@ async fn spawn_tools_create_workspace_sessions() {
     state.sessions.kill(&mastermind).ok();
 }
 
+#[cfg(unix)]
 /// One Mastermind change per workspace at a time: the routes are multi-step
 /// (retire → bind → spawn, with rollback), so a second caller mid-flight gets
 /// a 409 instead of racing — and the guard releases on every exit path.

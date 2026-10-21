@@ -23,6 +23,7 @@ async fn fixture_workspace(label: &str, key: &str) -> (Arc<AppState>, String, St
     (state, ws, sid)
 }
 
+#[cfg(unix)]
 fn root_of(state: &Arc<AppState>, ws: &str) -> PathBuf {
     lock(&state.workspaces).get(ws).unwrap().root
 }
@@ -158,6 +159,7 @@ async fn a_panicking_plugin_is_an_error_and_the_next_call_works() {
     state.sessions.kill(&sid).ok();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn reads_stay_in_the_workspace_refuse_symlinks_and_stop_at_the_cap() {
     let (state, ws, sid) = fixture_workspace("host-read", "k5").await;

@@ -5,10 +5,7 @@ use crate::*;
 async fn fs_home_returns_real_home() {
     let (status, json) = request(&test_state(), Method::GET, "/api/v1/fs/home", None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        json["path"].as_str().unwrap(),
-        std::env::var("HOME").unwrap()
-    );
+    assert_eq!(json["path"].as_str().unwrap(), wire(&home()));
 }
 
 #[tokio::test]
@@ -29,10 +26,7 @@ async fn fs_mkdir_creates_nested_idempotently_and_rejects_empty() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(target.is_dir());
-    assert_eq!(
-        json["path"].as_str().unwrap(),
-        std::fs::canonicalize(&target).unwrap().to_string_lossy()
-    );
+    assert_eq!(json["path"].as_str().unwrap(), wire(&canonical(&target)));
 
     // Idempotent: an existing directory is a success, not a conflict.
     let (status, _) = request(
@@ -75,10 +69,7 @@ async fn fs_create_makes_parents_and_conflicts_on_existing() {
     .await;
     assert_eq!(status, StatusCode::OK, "{json}");
     assert!(file.is_file());
-    assert_eq!(
-        json["path"].as_str().unwrap(),
-        std::fs::canonicalize(&file).unwrap().to_string_lossy()
-    );
+    assert_eq!(json["path"].as_str().unwrap(), wire(&canonical(&file)));
 
     // An explicit New File on an existing path is a conflict, never a
     // silent truncate-or-succeed.
@@ -126,6 +117,7 @@ async fn fs_create_makes_parents_and_conflicts_on_existing() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn fs_rename_moves_files_dirs_symlinks_and_guards() {
     let state = test_state();
@@ -149,10 +141,7 @@ async fn fs_rename_moves_files_dirs_symlinks_and_guards() {
     assert_eq!(std::fs::read_to_string(&new).unwrap(), "data");
     // The echoed path is parent-canonical (on macOS /var resolves to
     // /private/var), so canonicalize the expectation too.
-    assert_eq!(
-        json["path"].as_str().unwrap(),
-        std::fs::canonicalize(&new).unwrap().to_string_lossy()
-    );
+    assert_eq!(json["path"].as_str().unwrap(), wire(&canonical(&new)));
 
     // Dir rename carries children along.
     let dir = root.join("proj");
@@ -195,6 +184,7 @@ async fn fs_rename_moves_files_dirs_symlinks_and_guards() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn fs_delete_removes_files_dirs_symlinks_and_refuses_home() {
     let state = test_state();
@@ -231,7 +221,7 @@ async fn fs_delete_removes_files_dirs_symlinks_and_refuses_home() {
     assert!(std::fs::symlink_metadata(&link).is_err());
 
     // Guards: the home directory is refused; a missing path is a plain 400.
-    let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+    let home = home();
     let (status, json) = del(&home).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(json["error"].as_str().unwrap().contains("refusing"));
@@ -241,6 +231,7 @@ async fn fs_delete_removes_files_dirs_symlinks_and_refuses_home() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn fs_copy_files_dirs_symlinks_unique_and_guards() {
     let state = test_state();
@@ -297,9 +288,7 @@ async fn fs_copy_files_dirs_symlinks_unique_and_guards() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         json["path"].as_str().unwrap(),
-        std::fs::canonicalize(root.join("b copy.txt"))
-            .unwrap()
-            .to_string_lossy()
+        wire(&canonical(&root.join("b copy.txt")))
     );
 
     // Refuse copying a directory into its own subtree.
@@ -341,7 +330,7 @@ async fn fs_move_relocates_and_guards() {
     assert_eq!(std::fs::read_to_string(&keep).unwrap(), "keep");
 
     // Home and dir-into-itself are refused; a missing source is a 400.
-    let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+    let home = home();
     let (status, _) = mv(&home, &root.join("x")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let (status, _) = mv(&root.join("nope"), &root.join("y")).await;
@@ -350,6 +339,7 @@ async fn fs_move_relocates_and_guards() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn fs_dirs_lists_only_directories_sorted() {
     let state = test_state();
@@ -406,8 +396,8 @@ async fn fs_dirs_lists_only_directories_sorted() {
 async fn fs_dirs_expands_tilde() {
     let (status, json) = request(&test_state(), Method::GET, "/api/v1/fs/dirs?path=~", None).await;
     assert_eq!(status, StatusCode::OK);
-    let home = std::fs::canonicalize(std::env::var("HOME").unwrap()).unwrap();
-    assert_eq!(json["path"].as_str().unwrap(), home.to_str().unwrap());
+    let home = canonical(&home());
+    assert_eq!(json["path"].as_str().unwrap(), wire(&home));
     assert!(json["parent"].is_string());
     assert!(json["dirs"].is_array());
 }
@@ -503,8 +493,8 @@ async fn fs_validate_resolves_relative_absolute_missing_and_dirs() {
     std::fs::write(base.join("top.rs"), "x").unwrap();
     // The base may itself be uncanonical (macOS /var -> /private/var);
     // resolved paths in the answer are always canonical.
-    let canon = std::fs::canonicalize(&base).unwrap();
-    let abs = canon.join("top.rs").to_string_lossy().into_owned();
+    let canon = canonical(&base);
+    let abs = wire(&canon.join("top.rs"));
 
     let (status, body) = request(
         &state,
@@ -528,12 +518,12 @@ async fn fs_validate_resolves_relative_absolute_missing_and_dirs() {
     assert_eq!(valid.len(), 4, "{body}");
     assert_eq!(
         valid["sub/real.txt"]["path"],
-        serde_json::json!(canon.join("sub").join("real.txt").to_string_lossy())
+        serde_json::json!(wire(&canon.join("sub").join("real.txt")))
     );
     assert_eq!(valid["sub/real.txt"]["kind"], "file");
     assert_eq!(
         valid["sub"]["path"],
-        serde_json::json!(canon.join("sub").to_string_lossy())
+        serde_json::json!(wire(&canon.join("sub")))
     );
     assert_eq!(valid["sub"]["kind"], "dir");
     assert_eq!(valid[&abs]["path"], serde_json::json!(abs));
@@ -643,7 +633,7 @@ async fn fs_validate_bare_basename_falls_back_to_unique_workspace_file() {
     .await;
     assert_eq!(status, StatusCode::OK, "{ws}");
     let ws_id = ws["id"].as_str().unwrap();
-    let canon = std::fs::canonicalize(&root).unwrap();
+    let canon = canonical(&root);
 
     let valid = validate_in_workspace(
         &state,
@@ -665,13 +655,13 @@ async fn fs_validate_bare_basename_falls_back_to_unique_workspace_file() {
     let valid = valid.as_object().unwrap();
     assert_eq!(
         valid["FIGURE_PLAN.md"]["path"],
-        serde_json::json!(canon.join("paper/FIGURE_PLAN.md").to_string_lossy()),
+        serde_json::json!(wire(&canon.join("paper/FIGURE_PLAN.md"))),
         "{valid:?}"
     );
     assert_eq!(valid["FIGURE_PLAN.md"]["kind"], "file");
     assert_eq!(
         valid["top.md"]["path"],
-        serde_json::json!(canon.join("top.md").to_string_lossy())
+        serde_json::json!(wire(&canon.join("top.md")))
     );
     assert_eq!(valid.len(), 2, "only the two hits answer: {valid:?}");
 
@@ -749,6 +739,7 @@ fn quickopen_walk_guards_cap_entries_depth_and_time() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn fs_list_dirs_first_sorted_with_metadata() {
     let state = test_state();
@@ -1869,11 +1860,7 @@ async fn fs_quickopen_ranks_matches_and_ignores() {
     assert_eq!(first["name"], "main.rs");
     assert_eq!(
         first["path"].as_str().unwrap(),
-        std::fs::canonicalize(&root)
-            .unwrap()
-            .join("src/main.rs")
-            .to_str()
-            .unwrap()
+        wire(&canonical(&root).join("src/main.rs"))
     );
     assert!(first["mtime"].as_u64().unwrap() > 0);
 

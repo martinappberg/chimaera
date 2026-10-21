@@ -1,3 +1,5 @@
+// Every agent-probe test drives sh stand-ins for the agent CLIs.
+#[cfg(unix)]
 mod agent_probe;
 mod agent_view;
 mod agents;
@@ -26,6 +28,7 @@ mod notices;
 mod plugin_host;
 mod plugin_jobs;
 mod plugin_platform;
+#[cfg(unix)]
 mod plugin_retired;
 mod plugin_trust;
 mod plugin_updates;

@@ -99,12 +99,14 @@ async fn ws_bridge_auth_snapshot_and_echo() {
 
     // 4. Send input; the echoed output must come back as binary frames.
     socket
-        .send(WsMessage::binary(&b"echo ws-test\n"[..]))
+        .send(WsMessage::binary(
+            format!("echo ws-test{ENTER}").into_bytes(),
+        ))
         .await
         .unwrap();
 
     let mut collected = Vec::new();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + SHELL_WAIT;
     while !String::from_utf8_lossy(&collected).contains("ws-test") {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -174,11 +176,13 @@ async fn ws_parked_attach_withholds_until_unpark_repaints() {
     // input handle so this connection's own pipe stays quiet).
     let mut side = state.sessions.attach(&info.id).expect("side attach");
     side.input
-        .send(bytes::Bytes::from_static(b"echo park-withheld-marker\n"))
+        .send(bytes::Bytes::from(format!(
+            "echo park-withheld-marker{ENTER}"
+        )))
         .await
         .expect("side input");
     // Wait until the session demonstrably produced the output.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + SHELL_WAIT;
     loop {
         match tokio::time::timeout_at(deadline, side.output.recv()).await {
             Ok(Ok(chunk)) => {
@@ -309,10 +313,12 @@ async fn ws_park_frame_stops_output_and_unpark_resumes_from_ring() {
         .unwrap();
     let mut side = state.sessions.attach(&info.id).expect("side attach");
     side.input
-        .send(bytes::Bytes::from_static(b"echo ring-resume-marker\n"))
+        .send(bytes::Bytes::from(format!(
+            "echo ring-resume-marker{ENTER}"
+        )))
         .await
         .expect("side input");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + SHELL_WAIT;
     loop {
         match tokio::time::timeout_at(deadline, side.output.recv()).await {
             Ok(Ok(chunk)) => {
@@ -438,6 +444,21 @@ async fn ws_resize_round_trip() {
     state.sessions.kill(&info.id).ok();
 }
 
+/// A program that prints its last words and exits 1 at once.
+fn dying_command() -> Vec<String> {
+    #[cfg(unix)]
+    let argv = [
+        "/bin/bash",
+        "--norc",
+        "--noprofile",
+        "-c",
+        "echo Missing API key; exit 1",
+    ];
+    #[cfg(windows)]
+    let argv = ["cmd.exe", "/d", "/c", "echo Missing API key& exit 1"];
+    argv.iter().map(|a| a.to_string()).collect()
+}
+
 /// Attaching to a session that already died replays its final screen
 /// (last words) and closes as exited — never a blank pane. This is the
 /// fast-agent-failure path: codex without OPENAI_API_KEY printed its
@@ -455,13 +476,7 @@ async fn ws_attach_to_dead_session_replays_last_words() {
             name: None,
             cols: 80,
             rows: 24,
-            command: Some(vec![
-                "/bin/bash".to_string(),
-                "--norc".to_string(),
-                "--noprofile".to_string(),
-                "-c".to_string(),
-                "echo Missing API key; exit 1".to_string(),
-            ]),
+            command: Some(dying_command()),
             id: None,
             env: Vec::new(),
             env_remove: Vec::new(),

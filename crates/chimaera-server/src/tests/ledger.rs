@@ -12,7 +12,7 @@ async fn ledger_resurrects_sessions_across_restart() {
     let state = test_state_with_data_dir(0, data.clone());
     // Canonicalized like create_workspace canonicalizes it (macOS /var
     // is a symlink to /private/var).
-    let root = std::fs::canonicalize(test_dir("ledger-restart-root")).unwrap();
+    let root = canonical(&test_dir("ledger-restart-root"));
     let (_, ws) = request(
         &state,
         Method::POST,
@@ -186,6 +186,7 @@ async fn ledger_restore_disabled_still_lands_recents() {
     assert_eq!(recents[0].last_active, 1_750_000_000);
 }
 
+#[cfg(unix)]
 /// Chats outlive the daemon, so the journals a boot ledger resurrects are
 /// routinely the OLDEST in the chat dir — and they are what those chats
 /// replay and resume from. The dir budget must spare them at construction
@@ -204,6 +205,7 @@ async fn journal_budget_spares_chats_the_ledger_resurrects() {
             .set_times(std::fs::FileTimes::new().set_modified(mtime))
             .unwrap();
     }
+    #[cfg(unix)]
     fn journals(dir: &std::path::Path) -> Vec<String> {
         std::fs::read_dir(dir)
             .unwrap()
@@ -415,6 +417,7 @@ fn ledger_store_oversized_file_boots_empty_and_is_replaced() {
     assert_eq!(boot.sessions, vec![ledger_shell("s-1")]);
 }
 
+#[cfg(unix)]
 /// Unreadable at boot: the previous daemon's sessions are still in the
 /// file, unresurrected — no write replaces it for this daemon's lifetime,
 /// so the next boot can try again.
@@ -447,6 +450,7 @@ fn old_ledger(ws: &str) -> String {
     .to_string()
 }
 
+#[cfg(unix)]
 async fn until(what: &str, mut done: impl FnMut() -> bool) {
     for _ in 0..300 {
         if done() {
@@ -457,6 +461,7 @@ async fn until(what: &str, mut done: impl FnMut() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
+#[cfg(unix)]
 /// The production boot path (`run`: the boot read on the blocking pool,
 /// then the hold): an unreadable ledger holds every write; once it reads,
 /// the next tick retires the previous daemon's agents into Recents and the
@@ -543,6 +548,7 @@ async fn ledger_stop_during_the_boot_read_never_overwrites_the_file() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
 }
 
+#[cfg(unix)]
 /// What a previous daemon left in a real workspace: two claude chats (one
 /// carrying state its process held) and a shell, the shell linked to the
 /// first chat. Written to `data`'s ledger; claude is a fake on `state`.
@@ -598,6 +604,7 @@ async fn mid_restore_ledger(
     (workspace_id, boot)
 }
 
+#[cfg(unix)]
 fn preset_fake_claude(state: &Arc<AppState>, label: &str) {
     preset_agent(
         state,
@@ -608,6 +615,7 @@ fn preset_fake_claude(state: &Arc<AppState>, label: &str) {
 }
 
 /// Each boot entry's id, once per row of the ledger at `data`.
+#[cfg(unix)]
 fn ledger_ids(data: &std::path::Path) -> Vec<String> {
     let mut ids: Vec<String> = ledger::LedgerStore::new(data.join("sessions.json"))
         .load_boot()
@@ -619,6 +627,7 @@ fn ledger_ids(data: &std::path::Path) -> Vec<String> {
     ids
 }
 
+#[cfg(unix)]
 /// The successor: a fresh daemon over the same data dir restores every
 /// entry exactly once (a duplicate row's second spawn would fail and retire
 /// into Recents) and retires nothing.
@@ -642,6 +651,7 @@ async fn successor_restores_each_once(data: PathBuf, workspace_id: &str, label: 
     state2.sessions.kill("s-shell").ok();
 }
 
+#[cfg(unix)]
 /// A stop that lands after the boot read but before restore respawns
 /// anything: nothing spawns, nothing retires, and the stop's write keeps
 /// every entry verbatim (it used to write the empty live roster over them).
@@ -667,6 +677,7 @@ async fn ledger_stop_before_restore_keeps_every_entry() {
     assert!(lock(&state.recents).list(&workspace_id).is_empty());
 }
 
+#[cfg(unix)]
 /// A stop after the first entry respawned: restore goes no further, the
 /// stop's write holds every conversation once (the unreached ones
 /// verbatim), and the successor brings each back exactly once.
@@ -703,6 +714,7 @@ async fn ledger_stop_mid_restore_restores_each_conversation_once() {
     successor_restores_each_once(data, &workspace_id, "ledger-stop-mid").await;
 }
 
+#[cfg(unix)]
 /// A crash mid-restore (the task dies, no stop runs): nothing has written
 /// the ledger, so the file is the old one byte for byte and the successor
 /// restores each entry once.
@@ -732,6 +744,7 @@ async fn ledger_crash_mid_restore_leaves_the_old_file() {
     successor_restores_each_once(data, &workspace_id, "ledger-crash-mid").await;
 }
 
+#[cfg(unix)]
 /// A restore that never finishes cannot hold the stop past the callers'
 /// stop budget (the app and the remote stop script give up after ~10 s):
 /// the flush waits `FLUSH_RESTORE_WAIT`, no longer, and still writes every

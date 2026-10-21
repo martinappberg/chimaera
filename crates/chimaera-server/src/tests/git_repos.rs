@@ -120,7 +120,7 @@ async fn a_folder_of_repositories_lists_each_with_its_kind() {
     assert_eq!(tool["submodule"], true);
     assert_eq!(
         tool["parent"],
-        serde_json::json!(root.join("pipeline")),
+        serde_json::json!(wire(&root.join("pipeline"))),
         "the submodule sits in its superproject"
     );
     assert!(

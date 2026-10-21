@@ -2,6 +2,7 @@
 //! reads, the `expect_hash` precondition with its idempotent retry, and the
 //! hardened write path (mode, owner, hard links, symlinks, temp hygiene).
 
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use super::support::*;
@@ -102,6 +103,7 @@ async fn fs_file_hash_only_for_the_whole_raw_file() {
     assert!(headers.get("x-content-hash").is_none());
 }
 
+#[cfg(unix)]
 /// The `expect_hash` protocol end to end: a save chains on the returned
 /// hash, a retry after a lost reply is a no-op success, a foreign write is a
 /// 409 that describes the disk, and `expect_hash` wins over `expect_mtime`.
@@ -184,6 +186,7 @@ async fn fs_put_file_expect_hash_chain_retry_and_conflict() {
     assert!(strays(&root, &["doc.md"]).is_empty());
 }
 
+#[cfg(unix)]
 /// The temp is born with the target's mode and gets its exact bits (the
 /// umask cannot strip a shared file's group write), and the owner and group
 /// are carried over where the daemon may (root here re-owns to a stranger).
@@ -208,6 +211,7 @@ async fn fs_put_file_keeps_mode_and_owner() {
     assert!(strays(&root, &["shared.sh"]).is_empty());
 }
 
+#[cfg(unix)]
 /// A hard-linked file is rewritten in place: every name sees the new bytes
 /// and the link count survives (a rename would have split the links).
 #[tokio::test]
@@ -238,6 +242,7 @@ async fn fs_put_file_rewrites_hard_links_in_place() {
     assert!(strays(&root, &["a.txt", "b.txt"]).is_empty());
 }
 
+#[cfg(unix)]
 /// A live symlink is written through (the link survives, its target
 /// changes); a dangling one is refused rather than replaced by a file.
 #[tokio::test]
@@ -290,6 +295,7 @@ async fn fs_put_file_saves_names_near_the_length_limit() {
 }
 
 /// A special file is not something to save over.
+#[cfg(unix)] // `/dev/null` is a Unix device file
 #[tokio::test]
 async fn fs_put_file_refuses_non_regular_files() {
     let state = test_state();

@@ -50,11 +50,14 @@ impl FakeReleases {
         FakeReleases { base, files, hits }
     }
 
-    /// Serve `bytes` at `path` (a tool download, say).
+    /// Serve `bytes` at `path` (a tool download, say). The tool tests that
+    /// use it are POSIX-only.
+    #[cfg(unix)]
     pub(super) fn put(&self, path: &str, bytes: Vec<u8>) {
         lock(&self.files).insert(path.to_string(), bytes);
     }
 
+    #[cfg(unix)]
     pub(super) fn base(&self) -> &str {
         &self.base
     }
@@ -252,9 +255,18 @@ pub(super) fn plugin_dir(state: &Arc<AppState>, id: &str) -> PathBuf {
 }
 
 pub(super) fn link(state: &Arc<AppState>, id: &str, name: &str) -> Option<String> {
-    std::fs::read_link(plugin_dir(state, id).join(name))
-        .ok()
-        .map(|t| t.to_string_lossy().into_owned())
+    let at = plugin_dir(state, id).join(name);
+    #[cfg(unix)]
+    {
+        std::fs::read_link(at)
+            .ok()
+            .map(|t| t.to_string_lossy().into_owned())
+    }
+    // A Windows link is a pointer file holding the version name.
+    #[cfg(windows)]
+    {
+        std::fs::read_to_string(at).ok()
+    }
 }
 
 /// No staging left behind under the plugin's directory.
@@ -363,7 +375,7 @@ async fn install_writes_the_version_dir_and_current_and_lists_it_installed() {
     );
     assert_eq!(entry["sha256_wasm"], crate::fs::sha256_hex(&v1_wasm()));
     assert_eq!(entry["repo"], "acme/up-install");
-    assert_eq!(entry["path"], json!(dir.join("0.1.0")));
+    assert_eq!(entry["path"], json!(wire(&dir.join("0.1.0"))));
     for absent in [
         "pinned_version",
         "local_path",
@@ -1054,9 +1066,9 @@ async fn a_local_build_installs_from_a_directory_and_replaces_itself() {
     );
     let (status, body) = path_install(json!(src)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let canonical = src.canonicalize().unwrap();
+    let canonical = canonical(&src);
     let e = &body["plugin"];
-    assert_eq!(e["local_path"], json!(canonical));
+    assert_eq!(e["local_path"], json!(wire(&canonical)));
     assert_eq!(e["verified"], false, "no SHA256SUMS beside it");
     assert_eq!(e["first_party"], false);
     assert_eq!(
@@ -1725,6 +1737,7 @@ async fn a_removal_whose_caller_went_away_still_reloads_the_catalog() {
     assert!(!plugin_dir(&state, id).exists());
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_copy_this_daemon_cannot_load_is_listed_with_why_and_removable() {
     let state = test_state();
