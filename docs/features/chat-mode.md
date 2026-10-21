@@ -865,7 +865,9 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   fork action to create a new idle chat immediately after that response. The composer is empty and no
   synthetic prompt or agent turn is sent. Forking from your own message instead branches immediately
   **before** that message and restores its text into the new composer as an unsent draft, ready to
-  edit. The picker can target any installed chat-capable agent. An exact same-agent boundary uses the
+  edit. The picker is a pane-local dialog: Escape anywhere in its pane or a press in the pane outside
+  the dialog cancels it, other panes keep their keys, and it never interrupts a running turn behind
+  it. The picker can target any installed chat-capable agent. An exact same-agent boundary uses the
   vendor's native history: Claude can use the selected user checkpoint's preceding message; Codex
   uses `thread/fork` through a completed turn. Every other combination — cross-agent, a same-agent
   boundary the native API cannot represent exactly, or a source with no reusable native id — copies

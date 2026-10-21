@@ -4,13 +4,20 @@
    * exact boundaries advertise the native protocol; every cross-agent choice
    * uses Chimaera's normalized transcript handoff.
    *
-   * A pane-local dialog, not a window modal: no `modalFocus` (that would
-   * stand App's chords down and pull focus back from every other pane), and
-   * no `aria-modal` (the rest of the window stays usable). Focus starts on
-   * cancel (the safe default), Escape cancels, and focus returns to the
-   * opener on close when it was still inside the dialog.
+   * A pane-local dialog (ui-contracts §3), not a window modal: no
+   * `modalFocus` (that would stand App's chords down and pull focus back
+   * from every other pane), no `aria-modal` (the rest of the window stays
+   * usable), and Tab is not trapped. Focus starts on cancel (the safe
+   * default). Escape anywhere in its pane, or a press in its pane outside the
+   * dialog (the veil, the tab strip), cancels — so focus that Tabbed out to
+   * the composer behind the veil can still close it, and that Escape never
+   * reaches the composer's interrupt. Other panes keep their own Escape and
+   * presses. While a fork is applying, cancel is blocked but Escape is still
+   * swallowed. Focus returns to the opener on close when it was still inside
+   * the dialog or nowhere.
    */
   import SessionGlyph from "../shared/SessionGlyph.svelte";
+  import { dismiss } from "../shared/dismiss";
   import { focusOnMount } from "../shared/focusOnMount";
   import { returnFocus } from "../shared/returnFocus";
 
@@ -38,21 +45,29 @@
     onCancel,
     onConfirm,
   }: Props = $props();
+
+  let veil = $state<HTMLElement | null>(null);
+
+  /** The pane this dialog sits in (`layout/Pane.svelte`'s root); the chat
+   *  itself when it is hosted outside a pane. */
+  function pane(): Element | null {
+    return veil?.closest("[data-pane-id]") ?? veil?.parentElement ?? null;
+  }
 </script>
 
-<div class="dialog-veil">
+<div class="dialog-veil" bind:this={veil}>
   <div
     class="dialog"
     role="dialog"
     aria-label="fork conversation"
     tabindex="-1"
     use:returnFocus
-    onkeydown={(e) => {
-      if (e.key !== "Escape") return;
-      // Escape never reaches the chat's own Escape (interrupt) behind it.
-      e.preventDefault();
-      e.stopPropagation();
-      if (!applying) onCancel();
+    use:dismiss={{
+      enabled: true,
+      region: pane,
+      onDismiss: () => {
+        if (!applying) onCancel();
+      },
     }}
   >
     <div class="dialog-title">continue in a new chat</div>
