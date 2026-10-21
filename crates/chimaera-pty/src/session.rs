@@ -118,13 +118,60 @@ struct TermReplies {
 /// name better, so it counts as no title. Any other title is kept.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn console_title(title: String) -> Option<String> {
-    let bytes = title.as_bytes();
+    // An elevated console prefixes its role in the user's language
+    // ("Administrator: C:\\…\\pwsh.exe"), so the path is the title's tail.
+    let path = title
+        .rsplit_once(": ")
+        .map_or(title.as_str(), |(_, tail)| tail);
+    let bytes = path.as_bytes();
     let is_drive_path = bytes.len() > 3
         && bytes[0].is_ascii_alphabetic()
         && bytes[1] == b':'
         && (bytes[2] == b'\\' || bytes[2] == b'/');
-    let default = is_drive_path && title.to_ascii_lowercase().ends_with(".exe");
+    let default = is_drive_path && path.to_ascii_lowercase().ends_with(".exe");
     (!default).then_some(title)
+}
+
+/// ConPTY's startup cursor query (`PSEUDOCONSOLE_INHERIT_CURSOR`, set by
+/// portable-pty): it is the console's first output, and the console draws
+/// nothing until it is answered. A client may or may not be attached by then,
+/// and an attached one may not answer (a parked view receives no output), so
+/// the daemon answers this one query itself — a fresh console starts at the
+/// top left — and keeps it off the stream clients see, so no xterm answers
+/// it a second time. Later queries take the usual path.
+#[cfg(windows)]
+struct StartupQuery {
+    input: mpsc::Sender<Bytes>,
+    /// Output bytes looked at so far without finding the query.
+    seen: usize,
+}
+
+/// How far into a console's output its startup query is looked for.
+#[cfg(windows)]
+const STARTUP_QUERY_WINDOW: usize = 4096;
+
+/// Answer and strip [`StartupQuery`] when `chunk` holds it: `Some(chunk
+/// without it)`, or `None` to use the chunk as read.
+#[cfg(windows)]
+fn answer_startup_query(pending: &mut Option<StartupQuery>, chunk: &[u8]) -> Option<Vec<u8>> {
+    const QUERY: &[u8] = b"\x1b[6n";
+    let query = pending.as_mut()?;
+    match chunk.windows(QUERY.len()).position(|w| w == QUERY) {
+        Some(at) => {
+            let _ = query.input.try_send(Bytes::from_static(b"\x1b[1;1R"));
+            *pending = None;
+            let mut rest = chunk[..at].to_vec();
+            rest.extend_from_slice(&chunk[at + QUERY.len()..]);
+            Some(rest)
+        }
+        None => {
+            query.seen += chunk.len();
+            if query.seen > STARTUP_QUERY_WINDOW {
+                *pending = None;
+            }
+            None
+        }
+    }
 }
 
 impl EventListener for EventProxy {
@@ -328,6 +375,11 @@ impl Session {
             let marks = Arc::clone(&marks);
             let last_output_at = Arc::clone(&last_output_at);
             let id = id.clone();
+            #[cfg(windows)]
+            let mut handshake = Some(StartupQuery {
+                input: input_tx.clone(),
+                seen: 0,
+            });
             std::thread::Builder::new()
                 .name(format!("pty-read-{id}"))
                 .spawn(move || {
@@ -338,12 +390,18 @@ impl Session {
                         match reader.read(&mut buf) {
                             Ok(0) => break,
                             Ok(n) => {
+                                #[cfg(windows)]
+                                let answered = answer_startup_query(&mut handshake, &buf[..n]);
+                                #[cfg(windows)]
+                                let chunk: &[u8] = answered.as_deref().unwrap_or(&buf[..n]);
+                                #[cfg(not(windows))]
+                                let chunk: &[u8] = &buf[..n];
                                 last_output_at.store(now_ms(), Ordering::Relaxed);
-                                marks.feed(&buf[..n]);
+                                marks.feed(chunk);
                                 {
                                     let mut term = lock_unpoisoned(&term);
-                                    parser.advance(&mut *term, &buf[..n]);
-                                    let _ = output_tx.send(Bytes::copy_from_slice(&buf[..n]));
+                                    parser.advance(&mut *term, chunk);
+                                    let _ = output_tx.send(Bytes::copy_from_slice(chunk));
                                 }
                                 let now = marks.phase();
                                 if now != phase {

@@ -554,13 +554,21 @@ async fn ws_live_session_exit_closes_the_socket() {
             name: None,
             cols: 80,
             rows: 24,
-            command: Some(vec![
-                "/bin/bash".to_string(),
-                "--norc".to_string(),
-                "--noprofile".to_string(),
-                "-c".to_string(),
-                "sleep 2; echo goodbye-from-pty; exit 3".to_string(),
-            ]),
+            command: Some(if cfg!(windows) {
+                vec![
+                    "cmd.exe".to_string(),
+                    "/C".to_string(),
+                    "ping -n 3 127.0.0.1 >NUL & echo goodbye-from-pty & exit 3".to_string(),
+                ]
+            } else {
+                vec![
+                    "/bin/bash".to_string(),
+                    "--norc".to_string(),
+                    "--noprofile".to_string(),
+                    "-c".to_string(),
+                    "sleep 2; echo goodbye-from-pty; exit 3".to_string(),
+                ]
+            }),
             id: None,
             env: Vec::new(),
             env_remove: Vec::new(),

@@ -192,7 +192,10 @@ async fn repo_param_selects_a_known_repository_and_refuses_anything_else() {
     .await;
     assert_eq!(code, StatusCode::OK, "{status}");
     assert_eq!(status["repo"], true);
-    assert_eq!(status["toplevel"], serde_json::json!(analysis));
+    assert_eq!(
+        status["toplevel"],
+        serde_json::json!(wire(&canonical(&analysis)))
+    );
     assert_eq!(status["entries"][0]["rel"], "notebook.py");
 
     // Never an arbitrary path — not even a real repository elsewhere.

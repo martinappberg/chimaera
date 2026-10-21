@@ -1246,6 +1246,27 @@ mod tests {
         }
     }
 
+    /// Windows runs the CLI with no shell in front of it: every byte on its
+    /// pipes is the CLI's, so the page and code are read from the first line.
+    #[cfg(windows)]
+    #[test]
+    fn windows_reads_the_cli_from_its_first_byte() {
+        use operation::{Progress as _, Stream};
+        let mut p = progress(AgentKind::Codex);
+        p.on_output(
+            Stream::Stderr,
+            b"1. Open this link\r\n   https://auth.openai.com/codex/device\r\n\r\n2. Enter this code\r\n   WXYZ-12345\r\n",
+        );
+        assert_eq!(
+            p.url.as_deref(),
+            Some("https://auth.openai.com/codex/device")
+        );
+        assert_eq!(p.code.as_deref(), Some("WXYZ-12345"));
+        assert_eq!(cli_part("{\"loggedIn\": true}"), "{\"loggedIn\": true}");
+    }
+
+    // The login shell's marker exists on Unix only (Windows runs the CLI bare).
+    #[cfg(unix)]
     #[test]
     fn each_pipe_is_read_from_its_own_marker_so_the_login_shell_never_supplies_the_page() {
         use operation::{Progress as _, Stream};
@@ -1288,6 +1309,8 @@ mod tests {
         assert!(failure_tail(&p.failure_text()).contains("No such file"));
     }
 
+    // The login shell's marker exists on Unix only (Windows runs the CLI bare).
+    #[cfg(unix)]
     #[test]
     fn a_page_the_table_doesn_t_know_is_shown_as_the_cli_s_output_never_guessed() {
         use operation::{Progress as _, Stream};
@@ -1314,6 +1337,8 @@ mod tests {
         assert!(p.url.is_some());
     }
 
+    // The login shell's marker exists on Unix only (Windows runs the CLI bare).
+    #[cfg(unix)]
     #[test]
     fn a_status_answer_is_read_from_the_cli_s_part_only() {
         let banner = "Welcome. You are logged in to the cluster.\n{\"motd\": 1}\n";

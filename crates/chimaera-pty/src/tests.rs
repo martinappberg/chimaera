@@ -700,6 +700,10 @@ fn a_consoles_default_title_is_no_title() {
     );
     assert_eq!(console_title("C:/tools/node.EXE".into()), None);
     assert_eq!(
+        console_title(r"Administrator: C:\Program Files\PowerShell\7\pwsh.exe".into()),
+        None
+    );
+    assert_eq!(
         console_title("Administrator: Windows PowerShell".into()).as_deref(),
         Some("Administrator: Windows PowerShell")
     );
