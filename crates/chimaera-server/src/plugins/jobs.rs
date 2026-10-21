@@ -39,6 +39,13 @@
 //! (`setsid`, a double fork) outlives the group's SIGKILL; its CPU is still
 //! bounded by `ulimit -t`, and the host stops reading its output after the
 //! grace, never holding a task for it.
+//!
+//! On Windows there is no shell between the host and the program at all:
+//! the program runs directly in a Job Object that carries the limits
+//! (memory per process, the job's CPU time, below-normal priority; no
+//! per-file size or I/O priority limit exists there), the environment is
+//! the daemon's own, and a stop has no SIGTERM: the grace passes, then the
+//! job is killed. A job's processes can't leave it.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -63,6 +70,7 @@ const DRAIN_GRACE: Duration = Duration::from_secs(5);
 /// Address space, in KiB (`ulimit -v`).
 const AS_KB: u64 = 4 << 20;
 /// A written file, in 512-byte blocks (`ulimit -f`, POSIX units): 256 MiB.
+#[cfg(unix)]
 const FSIZE_BLOCKS: u64 = (256 << 20) / 512;
 pub(crate) const LOG_MAX: u64 = 16 << 20;
 const STDIN_MAX: usize = 4 << 20;
@@ -81,6 +89,7 @@ const ACTIVITY_ARGS: usize = 4;
 /// How long the captured login environment is trusted before it is
 /// captured again (a profile edit, a new module).
 const ENV_TTL: Duration = Duration::from_secs(10 * 60);
+#[cfg(unix)]
 const ENV_CAPTURE_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long an agent's tool call waits on its job before answering
 /// "still running" (under the agents' MCP timeouts).
@@ -164,8 +173,8 @@ pub(crate) struct Job {
     launch: Mutex<Option<Launch>>,
     /// Its `stdin`'s size, held until it starts.
     stdin_bytes: usize,
-    /// Its process group once it runs (0 before): what `kill_all` stops.
-    group: std::sync::atomic::AtomicI32,
+    /// Its process tree once it runs (None before): what `kill_all` stops.
+    group: TreeSlot,
 }
 
 #[derive(Clone)]
@@ -242,8 +251,12 @@ struct Captured {
 struct Setup {
     plugin: String,
     cancel: tokio::sync::Notify,
-    group: std::sync::atomic::AtomicI32,
+    group: TreeSlot,
 }
+
+/// A running process's tree (its process group, or its Job Object), shared
+/// with `kill_all`.
+type TreeSlot = Mutex<Option<Arc<chimaera_core::proc::ProcessTree>>>;
 
 /// The host's jobs (on `Platform`).
 #[derive(Default)]
@@ -251,7 +264,7 @@ pub(crate) struct Jobs {
     inner: Mutex<Inner>,
     envs: tokio::sync::Mutex<HashMap<String, Captured>>,
     /// Tests only: each login-environment capture first waits this long.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     capture_delay_ms: std::sync::atomic::AtomicU64,
 }
 
@@ -268,7 +281,7 @@ struct Inner {
 impl Jobs {
     /// Tests only: every login-environment capture first waits `delay` (a
     /// slow login shell, as module loads make one on a cluster).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn set_capture_delay_for_tests(&self, delay: Duration) {
         self.capture_delay_ms.store(
             delay.as_millis() as u64,
@@ -290,20 +303,16 @@ impl Jobs {
     /// what it started would run on unowned).
     pub(crate) fn kill_all(&self) {
         let inner = crate::lock(&self.inner);
-        let groups: Vec<i32> = inner
+        let trees: Vec<Arc<chimaera_core::proc::ProcessTree>> = inner
             .live
             .values()
             .map(|j| &j.group)
             .chain(inner.setups.iter().map(|s| &s.group))
-            .map(|g| g.load(std::sync::atomic::Ordering::Relaxed))
-            .filter(|g| *g > 0)
+            .filter_map(|g| crate::lock(g).clone())
             .collect();
         drop(inner);
-        for g in groups {
-            let _ = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(g),
-                nix::sys::signal::Signal::SIGKILL,
-            );
+        for tree in trees {
+            tree.kill();
         }
     }
 
@@ -506,6 +515,37 @@ async fn login_env_cached(
     Ok(env)
 }
 
+/// Windows has no login shell to ask: the daemon's own environment is the
+/// one its terminals and agents get, so it is a job's too.
+#[cfg(windows)]
+async fn capture_env(
+    _state: &Arc<AppState>,
+    _ws: Option<&str>,
+) -> Result<Vec<(String, String)>, String> {
+    let launcher = crate::api::launcher_context_env();
+    let env: Vec<(String, String)> = std::env::vars()
+        .filter(|(k, _)| {
+            !k.is_empty()
+                && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !k.to_ascii_uppercase().starts_with("CHIMAERA_")
+                && !launcher.iter().any(|n| n.eq_ignore_ascii_case(k))
+        })
+        // One spelling: Windows names it `Path`, the job code looks up `PATH`.
+        .map(|(k, v)| {
+            if k.eq_ignore_ascii_case("PATH") {
+                ("PATH".to_string(), v)
+            } else {
+                (k, v)
+            }
+        })
+        .collect();
+    if env.is_empty() {
+        return Err("the daemon has no environment".into());
+    }
+    Ok(env)
+}
+
+#[cfg(unix)]
 async fn capture_env(
     state: &Arc<AppState>,
     ws: Option<&str>,
@@ -594,6 +634,22 @@ async fn capture_env(
 /// `path`'s absolute entries. A job starts in the workspace, so a relative
 /// one (`.`, an empty entry, `bin`) would find a project's file first — for
 /// the preamble's `nice`, and for every program the program starts.
+#[cfg(windows)]
+fn absolute_path(path: &str) -> String {
+    let kept: Vec<PathBuf> = std::env::split_paths(path)
+        .filter(|d| d.is_absolute())
+        .collect();
+    let joined = std::env::join_paths(&kept)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|p| !p.is_empty());
+    joined.unwrap_or_else(|| {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        format!(r"{root}\System32;{root}")
+    })
+}
+
+#[cfg(unix)]
 fn absolute_path(path: &str) -> String {
     let kept: Vec<&str> = path.split(':').filter(|d| d.starts_with('/')).collect();
     if kept.is_empty() {
@@ -606,6 +662,7 @@ fn absolute_path(path: &str) -> String {
 /// `name` in the first absolute `path` folder holding an executable file.
 /// A relative entry (`.`, `bin`) is skipped: the job starts in the
 /// workspace, so it would run whatever file of that name the project has.
+#[cfg(unix)]
 fn on_path(name: &str, path: &str) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     path.split(':')
@@ -615,6 +672,24 @@ fn on_path(name: &str, path: &str) -> Option<PathBuf> {
             let meta = std::fs::metadata(&candidate).ok()?;
             (meta.is_file() && meta.permissions().mode() & 0o111 != 0).then_some(candidate)
         })
+}
+
+/// Windows: the same search, `name` tried as written and with each
+/// `PATHEXT` extension in every absolute folder.
+#[cfg(windows)]
+fn on_path(name: &str, path: &str) -> Option<PathBuf> {
+    if Path::new(name).components().count() != 1 {
+        return None;
+    }
+    let absolute =
+        std::env::join_paths(std::env::split_paths(path).filter(|d| d.is_absolute())).ok()?;
+    chimaera_core::paths::find_on_path(name, Some(&absolute))
+}
+
+/// `bin` first on `path`, a whole PATH value kept as it is.
+fn prepend_path(bin: &Path, path: &str) -> String {
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    format!("{}{separator}{path}", bin.display())
 }
 
 /// Where `program` runs from: the user's copy on the login PATH, unless
@@ -772,7 +847,7 @@ pub(crate) async fn start(
     let mut job_env: Vec<(String, String)> =
         env.iter().filter(|(k, _)| k != "PATH").cloned().collect();
     let job_path = match &tool_bin {
-        Some((_, bin)) => format!("{}:{path}", bin.display()),
+        Some((_, bin)) => prepend_path(bin, &path),
         None => path,
     };
     let from = tool_bin
@@ -839,7 +914,7 @@ pub(crate) async fn start(
                 output,
             })),
             stdin_bytes,
-            group: std::sync::atomic::AtomicI32::new(0),
+            group: Mutex::new(None),
         });
         inner.live.insert(job.id.clone(), job.clone());
         inner.waiting.push(job.clone());
@@ -918,6 +993,7 @@ fn dispatch(state: &Arc<AppState>) {
 
 /// The limits' preamble: POSIX `sh`, fixed text, the program and its
 /// arguments passed through as `"$0" "$@"` (nothing interpolated).
+#[cfg(unix)]
 fn preamble(wall: Duration) -> String {
     let cpu = wall.as_secs() + 30;
     format!(
@@ -976,7 +1052,7 @@ async fn run(state: &Arc<AppState>, job: &Arc<Job>) {
         "workspace": job.workspace,
         "program": job.program,
         "args": launch.args.iter().take(ACTIVITY_ARGS).map(|a| super::runtime::clip(a, 120)).collect::<Vec<_>>(),
-        "cwd": launch.cwd.to_string_lossy(),
+        "cwd": chimaera_core::paths::wire_path(&launch.cwd),
     });
     let outcome = run_process(
         launch,
@@ -1024,15 +1100,22 @@ struct Outcome {
 async fn run_process(
     launch: Launch,
     cancel: Option<&tokio::sync::Notify>,
-    group_slot: Option<&std::sync::atomic::AtomicI32>,
+    group_slot: Option<&TreeSlot>,
     out_file: std::fs::File,
     err_file: std::fs::File,
 ) -> Outcome {
-    let mut cmd = tokio::process::Command::new("/bin/sh");
-    cmd.arg("-c")
-        .arg(preamble(launch.wall))
-        .arg(&launch.program)
-        .args(&launch.args)
+    #[cfg(unix)]
+    let mut cmd = {
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(preamble(launch.wall))
+            .arg(&launch.program);
+        cmd
+    };
+    // No shell: the limits are the job's (`ProcessTree::limit` below).
+    #[cfg(windows)]
+    let mut cmd = tokio::process::Command::new(&launch.program);
+    cmd.args(&launch.args)
         .current_dir(&launch.cwd)
         .env_clear()
         .envs(launch.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
@@ -1043,8 +1126,11 @@ async fn run_process(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .process_group(0);
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    #[cfg(windows)]
+    cmd.creation_flags(chimaera_core::proc::TREE_CREATION_FLAGS);
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
@@ -1056,9 +1142,37 @@ async fn run_process(
             }
         }
     };
-    let group = child.id().map(|pid| nix::unistd::Pid::from_raw(pid as i32));
-    if let (Some(slot), Some(g)) = (group_slot, group) {
-        slot.store(g.as_raw(), std::sync::atomic::Ordering::Relaxed);
+    let group = child
+        .id()
+        .and_then(|pid| chimaera_core::proc::ProcessTree::adopt(pid).ok())
+        .map(Arc::new);
+    #[cfg(windows)]
+    {
+        let limited = group.as_ref().is_some_and(|tree| {
+            tree.limit(chimaera_core::proc::JobLimits {
+                memory_bytes: Some(AS_KB * 1024),
+                cpu_seconds: Some(launch.wall.as_secs() + 30),
+                below_normal_priority: true,
+            })
+            .is_ok()
+        });
+        // A job the host can neither stop as a whole nor bound never runs.
+        if !limited {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Outcome {
+                exit: None,
+                timed_out: false,
+                cancelled: false,
+                error: Some(format!(
+                    "{} could not be given its limits",
+                    launch.program.display()
+                )),
+            };
+        }
+    }
+    if let (Some(slot), Some(g)) = (group_slot, &group) {
+        *crate::lock(slot) = Some(g.clone());
     }
     let mut tasks = Vec::with_capacity(3);
     if let (Some(bytes), Some(mut stdin)) = (launch.stdin, child.stdin.take()) {
@@ -1068,9 +1182,14 @@ async fn run_process(
     }
     tasks.push(copy_capped(child.stdout.take(), out_file));
     tasks.push(copy_capped(child.stderr.take(), err_file));
-    let signal = |sig: nix::sys::signal::Signal| {
-        if let Some(g) = group {
-            let _ = nix::sys::signal::killpg(g, sig);
+    let terminate = || {
+        if let Some(g) = &group {
+            g.terminate();
+        }
+    };
+    let kill = || {
+        if let Some(g) = &group {
+            g.kill();
         }
     };
     let never = tokio::sync::Notify::new();
@@ -1085,18 +1204,24 @@ async fn run_process(
     let status = match status {
         Some(s) => Some(s),
         None => {
-            signal(nix::sys::signal::Signal::SIGTERM);
+            // Windows: no SIGTERM, so the grace is only a chance to finish.
+            terminate();
             match tokio::time::timeout(TERM_GRACE, child.wait()).await {
                 Ok(s) => s.ok(),
                 Err(_) => {
-                    signal(nix::sys::signal::Signal::SIGKILL);
+                    kill();
                     child.wait().await.ok()
                 }
             }
         }
     };
     // Whatever the program left behind in its group goes too.
-    signal(nix::sys::signal::Signal::SIGKILL);
+    kill();
+    // The job handle is let go with the job (a group id needs no closing).
+    #[cfg(windows)]
+    if let Some(slot) = group_slot {
+        *crate::lock(slot) = None;
+    }
     settle(tasks, DRAIN_GRACE).await;
     Outcome {
         exit: status.and_then(|s| s.code()),
@@ -1168,7 +1293,7 @@ pub(crate) async fn run_setup(
     let setup = Arc::new(Setup {
         plugin: m.id.clone(),
         cancel: tokio::sync::Notify::new(),
-        group: std::sync::atomic::AtomicI32::new(0),
+        group: Mutex::new(None),
     });
     let jobs = &state.plugin_platform.jobs;
     // Registered before the check below: a block or a remove after it
@@ -1201,7 +1326,7 @@ async fn setup_step(
     );
     let mut job_env: Vec<(String, String)> =
         env.iter().filter(|(k, _)| k != "PATH").cloned().collect();
-    job_env.push(("PATH".into(), format!("{}:{path}", bin.display())));
+    job_env.push(("PATH".into(), prepend_path(bin, &path)));
     job_env.push(("TERM".into(), "dumb".into()));
     let exe = bin.join(program);
     if tokio::fs::metadata(&exe).await.is_err() {
@@ -1349,6 +1474,7 @@ mod tests {
         assert!(!reserved("max_print_line"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_relative_path_entry_is_never_searched() {
         let dir = std::env::temp_dir().join(format!(
@@ -1373,6 +1499,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_jobs_path_keeps_only_absolute_entries() {
         assert_eq!(
@@ -1404,6 +1531,7 @@ mod tests {
     }
 
     /// A program that ignores SIGTERM gets SIGKILL `TERM_GRACE` later.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_job_that_ignores_sigterm_is_killed_after_the_grace() {
         let dir = std::env::temp_dir().join(format!(
@@ -1450,6 +1578,98 @@ mod tests {
         file
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_jobs_path_keeps_absolute_folders_and_finds_by_pathext() {
+        let system = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let system32 = format!(r"{system}\System32");
+        let path = format!(r".;bin;;{system32};relative\x");
+        assert_eq!(absolute_path(&path), system32);
+        assert!(absolute_path(".;bin").contains("System32"));
+        let found = on_path("cmd", &path).expect("cmd.exe on the absolute PATH");
+        assert!(found
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .ends_with("cmd.exe"));
+        assert_eq!(on_path("cmd", ".;bin"), None);
+        assert_eq!(
+            prepend_path(Path::new(r"C:\tools"), "C:\\a;C:\\b"),
+            r"C:\tools;C:\a;C:\b"
+        );
+    }
+
+    /// A stop reaches what the program started, not just the program.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_cancelled_windows_job_ends_its_whole_tree() {
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-jobs-tree-{}-{}",
+            std::process::id(),
+            &chimaera_core::generate_token()[..8]
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("grandchild.pid");
+        let script = format!(
+            "$g = Start-Process -PassThru -NoNewWindow -FilePath ping.exe -ArgumentList '-n','120','127.0.0.1'; \
+             Set-Content -Path '{}' -Value $g.Id; Start-Sleep 120",
+            pid_file.display()
+        );
+        let launch = Launch {
+            program: PathBuf::from("powershell.exe"),
+            args: vec![
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                script,
+            ],
+            cwd: dir.clone(),
+            env: std::env::vars().collect(),
+            stdin: None,
+            wall: Duration::from_secs(600),
+            output: dir.clone(),
+        };
+        let cancel = tokio::sync::Notify::new();
+        let slot: TreeSlot = Mutex::new(None);
+        let run = run_process(
+            launch,
+            Some(&cancel),
+            Some(&slot),
+            tempfile_for("tree-out"),
+            tempfile_for("tree-err"),
+        );
+        tokio::pin!(run);
+        let grandchild = loop {
+            tokio::select! {
+                _ = &mut run => panic!("the job ended on its own"),
+                () = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|t| t.trim().parse::<u32>().ok())
+            {
+                break pid;
+            }
+        };
+        assert!(chimaera_core::proc::pid_alive(grandchild));
+        assert!(slot.lock().unwrap().is_some(), "kill_all can reach it");
+        cancel.notify_one();
+        let outcome = tokio::time::timeout(TERM_GRACE + Duration::from_secs(20), run)
+            .await
+            .expect("the cancel ends the job");
+        assert!(outcome.cancelled);
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "the job handle was released"
+        );
+        let gone = (0..100).any(|_| {
+            std::thread::sleep(Duration::from_millis(50));
+            !chimaera_core::proc::pid_alive(grandchild)
+        });
+        assert!(gone, "the grandchild outlived the cancel");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn the_preamble_never_interpolates_the_program() {
         let p = preamble(Duration::from_secs(60));

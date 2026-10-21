@@ -14,7 +14,10 @@
 //! A per-shell-session watcher polls the PTY's foreground process (~2s):
 //! the fg pid comes from `tcgetpgrp` on the PTY master (via portable-pty,
 //! portable across unixes); its name and cwd come from `/proc` on Linux and
-//! from libproc (`proc_name` / `PROC_PIDVNODEPATHINFO`) on macOS. Resolved
+//! from libproc (`proc_name` / `PROC_PIDVNODEPATHINFO`) on macOS. A Windows
+//! console has no foreground process group: the newest live descendant of
+//! the shell (a ToolHelp32 process snapshot) stands in, and the cwd is the
+//! shell integration's last OSC 7 report. Resolved
 //! names land in `AppState::display_names`, the polled cwd in
 //! `AppState::current_cwds` (the `cwd_current` session field, for the context
 //! bridge); both nudge the events bus, which already throttles snapshot
@@ -81,6 +84,14 @@ pub(crate) fn spawn_shell_watch(state: Arc<AppState>, session_id: String) {
                         .pid
                         .and_then(|pid| i32::try_from(pid).ok())
                         .and_then(proc_info::cwd);
+                    #[cfg(windows)]
+                    let cwd = cwd.or_else(|| {
+                        state
+                            .sessions
+                            .marks(&info.id)
+                            .and_then(|m| m.cwd())
+                            .map(PathBuf::from)
+                    });
                     let name = resolve_shell_name(&state, &info, cwd.clone());
                     (cwd, name)
                 })
@@ -169,7 +180,7 @@ pub(crate) fn shell_display_name(info: &chimaera_pty::SessionInfo, polled: Optio
         .as_deref()
         .map(str::trim)
         .filter(|t| !t.is_empty())
-        .filter(|t| !is_shell_prompt_title(t))
+        .filter(|t| !is_shell_prompt_title(t) && !is_console_default_title(t))
     {
         return title.to_string();
     }
@@ -197,10 +208,37 @@ fn is_shell_prompt_title(title: &str) -> bool {
         && !host.contains(char::is_whitespace)
 }
 
+/// Windows titles a console with its program until the program sets its own
+/// (the PTY layer reduces that to the name): for a shell the title is then
+/// just "powershell", which names nothing the polled name doesn't and would
+/// hide the running command or the cwd for good.
+fn is_console_default_title(title: &str) -> bool {
+    cfg!(windows)
+        && matches!(
+            title.to_ascii_lowercase().as_str(),
+            "powershell" | "pwsh" | "cmd"
+        )
+}
+
 /// One poll: resolve what the shell is doing right now, per naming rule zero.
 /// Executable name of a pid (exec-policy checks reuse the naming lookup).
 pub(crate) fn comm_name(pid: i32) -> Option<String> {
     proc_info::comm(pid)
+}
+
+/// The process in the foreground of a session's terminal: `tcgetpgrp` on
+/// the PTY on Unix; on Windows the newest live descendant of the session's
+/// shell, or the shell itself while it runs nothing.
+pub(crate) fn foreground_pid(state: &AppState, id: &str) -> Option<i32> {
+    #[cfg(not(windows))]
+    {
+        state.sessions.foreground_pid(id)
+    }
+    #[cfg(windows)]
+    {
+        let child = i32::try_from(state.sessions.get(id)?.pid?).ok()?;
+        Some(proc_info::newest_descendant(child).unwrap_or(child))
+    }
 }
 
 /// `polled_cwd` is the watcher's fresh cwd reading for this tick, if any.
@@ -210,7 +248,10 @@ fn resolve_shell_name(
     polled_cwd: Option<PathBuf>,
 ) -> Option<String> {
     let child = i32::try_from(info.pid?).ok()?;
+    #[cfg(not(windows))]
     let fg = state.sessions.foreground_pid(&info.id).unwrap_or(child);
+    #[cfg(windows)]
+    let fg = proc_info::newest_descendant(child).unwrap_or(child);
 
     // A foreground process group other than the shell's own means a command
     // is running — its name is the most specific thing we know. But trust it
@@ -232,7 +273,7 @@ fn resolve_shell_name(
     let shell = proc_info::comm(child).unwrap_or_else(default_shell_name);
     match workspace_root(state, &info.id) {
         Some(root) => match cwd.strip_prefix(&root) {
-            Ok(rel) if !rel.as_os_str().is_empty() => Some(rel.to_string_lossy().into_owned()),
+            Ok(rel) if !rel.as_os_str().is_empty() => Some(chimaera_core::paths::wire_path(rel)),
             Ok(_) => Some(shell),               // at the root: the shell itself
             Err(_) => Some(display_path(&cwd)), // wandered outside the workspace
         },
@@ -271,6 +312,7 @@ fn workspace_root(state: &AppState, session_id: &str) -> Option<PathBuf> {
 }
 
 /// Basename of `$SHELL`, the same binary shell sessions spawn by default.
+#[cfg(not(windows))]
 pub(crate) fn default_shell_name() -> String {
     std::env::var("SHELL")
         .ok()
@@ -282,7 +324,18 @@ pub(crate) fn default_shell_name() -> String {
         .unwrap_or_else(|| "shell".to_string())
 }
 
+/// The login shell's program name without `.exe` ("powershell", "pwsh"),
+/// the same binary shell sessions spawn by default.
+#[cfg(windows)]
+pub(crate) fn default_shell_name() -> String {
+    Path::new(&chimaera_core::login_shell())
+        .file_stem()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "shell".to_string())
+}
+
 /// Human path for a cwd outside the workspace: home-relative when possible.
+#[cfg(not(windows))]
 fn display_path(path: &Path) -> String {
     if let Ok(home) = std::env::var("HOME") {
         if let Ok(rel) = path.strip_prefix(&home) {
@@ -294,6 +347,23 @@ fn display_path(path: &Path) -> String {
         }
     }
     path.display().to_string()
+}
+
+/// [`display_path`] in the wire form: home-relative under the profile
+/// folder, forward slashes throughout.
+#[cfg(windows)]
+fn display_path(path: &Path) -> String {
+    use chimaera_core::paths::wire_path;
+    if let Some(home) = chimaera_core::paths::home_dir() {
+        if let Ok(rel) = path.strip_prefix(&home) {
+            return if rel.as_os_str().is_empty() {
+                "~".to_string()
+            } else {
+                format!("~/{}", wire_path(rel))
+            };
+        }
+    }
+    wire_path(path)
 }
 
 /// Process name + cwd lookups, Linux flavor: straight out of `/proc`.
@@ -382,9 +452,142 @@ mod proc_info {
     }
 }
 
+/// Process lookups, Windows flavor: one ToolHelp32 process snapshot per
+/// call (pid, parent pid, exe name). A process's cwd lives in its PEB and is
+/// not worth a cross-process memory read; the watcher uses the shell
+/// integration's OSC 7 report instead.
+#[cfg(windows)]
+mod proc_info {
+    use std::path::PathBuf;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    struct Entry {
+        pid: u32,
+        ppid: u32,
+        exe: String,
+    }
+
+    /// Every process on the machine, or empty when the snapshot fails.
+    fn snapshot() -> Vec<Entry> {
+        // SAFETY: plain call; INVALID_HANDLE_VALUE is the failure case.
+        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snap == INVALID_HANDLE_VALUE || snap.is_null() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: the snapshot handle is open and `entry` is sized for it.
+        let mut more = unsafe { Process32FirstW(snap, &mut entry) } != 0;
+        while more {
+            let len = entry
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(entry.szExeFile.len());
+            out.push(Entry {
+                pid: entry.th32ProcessID,
+                ppid: entry.th32ParentProcessID,
+                exe: String::from_utf16_lossy(&entry.szExeFile[..len]),
+            });
+            // SAFETY: as above.
+            more = unsafe { Process32NextW(snap, &mut entry) } != 0;
+        }
+        // SAFETY: opened above, closed once.
+        unsafe { CloseHandle(snap) };
+        out
+    }
+
+    /// Creation time of `pid` in 100 ns ticks, when it can be opened.
+    fn created(pid: u32) -> Option<u64> {
+        // SAFETY: plain call; null is the failure case.
+        let process: HANDLE = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if process.is_null() {
+            return None;
+        }
+        let zero = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let (mut create, mut exit, mut kernel, mut user) = (zero, zero, zero, zero);
+        // SAFETY: the handle is open and every out-pointer outlives the call.
+        let ok =
+            unsafe { GetProcessTimes(process, &mut create, &mut exit, &mut kernel, &mut user) }
+                != 0;
+        // SAFETY: opened above, closed once.
+        unsafe { CloseHandle(process) };
+        ok.then(|| (u64::from(create.dwHighDateTime) << 32) | u64::from(create.dwLowDateTime))
+    }
+
+    /// Executable name of `pid` without `.exe` ("ssh", "ping"), the form
+    /// the Unix lookups return.
+    pub(super) fn comm(pid: i32) -> Option<String> {
+        let pid = u32::try_from(pid).ok()?;
+        let exe = snapshot().into_iter().find(|e| e.pid == pid)?.exe;
+        let name = match exe.len().checked_sub(4) {
+            Some(cut) if exe[cut..].eq_ignore_ascii_case(".exe") => &exe[..cut],
+            _ => exe.as_str(),
+        };
+        (!name.is_empty()).then(|| name.to_string())
+    }
+
+    pub(super) fn cwd(_pid: i32) -> Option<PathBuf> {
+        None
+    }
+
+    pub(super) fn ppid(pid: i32) -> Option<i32> {
+        let pid = u32::try_from(pid).ok()?;
+        let entry = snapshot().into_iter().find(|e| e.pid == pid)?;
+        i32::try_from(entry.ppid).ok()
+    }
+
+    /// The most recently started live descendant of `root`. Windows reuses
+    /// pids and keeps a dead parent's pid in its children's entries, so a
+    /// candidate must also have started after `root` did: an older process
+    /// naming a recycled pid as its parent is no descendant.
+    pub(super) fn newest_descendant(root: i32) -> Option<i32> {
+        let root = u32::try_from(root).ok()?;
+        let root_created = created(root)?;
+        let all = snapshot();
+        let mut frontier = vec![root];
+        let mut best: Option<(u64, u32)> = None;
+        let mut seen = 0usize;
+        while let Some(parent) = frontier.pop() {
+            for entry in all.iter().filter(|e| e.ppid == parent && e.pid != parent) {
+                seen += 1;
+                // A cycle through recycled pids cannot outgrow the snapshot.
+                if seen > all.len() {
+                    return best.and_then(|(_, pid)| i32::try_from(pid).ok());
+                }
+                let Some(at) = created(entry.pid) else {
+                    continue;
+                };
+                if at < root_created {
+                    continue;
+                }
+                if best.is_none_or(|(t, _)| at > t) {
+                    best = Some((at, entry.pid));
+                }
+                frontier.push(entry.pid);
+            }
+        }
+        best.and_then(|(_, pid)| i32::try_from(pid).ok())
+    }
+}
+
 /// Fallback for other platforms: no foreground introspection; the watcher
 /// then keeps the title/name fallbacks from `shell_display_name`.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 mod proc_info {
     use std::path::PathBuf;
 
@@ -433,6 +636,22 @@ mod tests {
         ] {
             assert!(is_shell_prompt_title(t), "{t:?} should read as a prompt");
         }
+    }
+
+    /// A Windows console's default title (its shell's name) never hides
+    /// the polled name; elsewhere a program called that keeps its title.
+    #[test]
+    fn a_consoles_default_title_yields_to_the_polled_name() {
+        for title in ["powershell", "pwsh", "cmd"] {
+            assert_eq!(
+                shell_display_name(&info(Some(title)), Some("crates")),
+                if cfg!(windows) { "crates" } else { title }
+            );
+        }
+        assert_eq!(
+            shell_display_name(&info(Some("vim README.md")), Some("crates")),
+            "vim README.md"
+        );
     }
 
     #[test]

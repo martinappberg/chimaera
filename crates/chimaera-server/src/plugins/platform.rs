@@ -229,11 +229,46 @@ pub(crate) struct ProgramDecl {
 }
 
 /// Programs that run anything they are given: a plugin declaring one gets
-/// the strongest wording on its card.
+/// the strongest wording on its card. One list on every host — a manifest
+/// names its programs the same way wherever it runs — matched by
+/// [`is_shell`] without regard to case or a Windows extension.
 pub(crate) const SHELLS: &[&str] = &[
-    "sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh", "python", "python3", "perl", "ruby",
-    "node", "env", "xargs",
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "dash",
+    "ksh",
+    "csh",
+    "tcsh",
+    "python",
+    "python3",
+    "perl",
+    "ruby",
+    "node",
+    "env",
+    "xargs",
+    "powershell",
+    "pwsh",
+    "cmd",
+    "wscript",
+    "cscript",
+    "wsl",
 ];
+
+/// Whether `program` (a bare name or a path, either separator) is one of
+/// [`SHELLS`]: compared case-insensitively, with a trailing `.exe`, `.cmd`,
+/// `.bat` or `.com` ignored, because Windows resolves `PowerShell.EXE` and
+/// `powershell` to the same program.
+pub(crate) fn is_shell(program: &str) -> bool {
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let lower = name.to_ascii_lowercase();
+    let stem = [".exe", ".cmd", ".bat", ".com"]
+        .iter()
+        .find_map(|ext| lower.strip_suffix(ext))
+        .unwrap_or(&lower);
+    SHELLS.contains(&stem)
+}
 
 /// `[[tools]]`: a side program the host downloads on the user's click.
 #[derive(Deserialize, Debug, Clone)]
@@ -256,7 +291,8 @@ pub(crate) struct ToolDecl {
 #[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ArtifactDecl {
-    /// `linux-x86_64`, `linux-aarch64`, `macos-x86_64`, `macos-aarch64`.
+    /// One of [`PLATFORMS`]: `linux-x86_64`, `linux-aarch64`, `macos-x86_64`,
+    /// `macos-aarch64`, `windows-x86_64`, `windows-aarch64`.
     pub(crate) platform: String,
     pub(crate) url: String,
     pub(crate) sha256: String,
@@ -283,6 +319,8 @@ pub(crate) const PLATFORMS: &[&str] = &[
     "linux-aarch64",
     "macos-x86_64",
     "macos-aarch64",
+    "windows-x86_64",
+    "windows-aarch64",
 ];
 const UNPACKS: &[&str] = &["tar", "tar.gz", "tar.xz", "zip", "none"];
 /// A tool download's ceiling, whatever it declares.
@@ -297,6 +335,8 @@ pub(crate) fn this_platform() -> Option<&'static str> {
         ("linux", "aarch64") => Some("linux-aarch64"),
         ("macos", "x86_64") => Some("macos-x86_64"),
         ("macos", "aarch64") => Some("macos-aarch64"),
+        ("windows", "x86_64") => Some("windows-x86_64"),
+        ("windows", "aarch64") => Some("windows-aarch64"),
         _ => None,
     }
 }
@@ -802,6 +842,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shells_match_whatever_the_case_or_windows_extension() {
+        for program in [
+            "sh",
+            "bash",
+            "PowerShell.EXE",
+            "pwsh",
+            "cmd.exe",
+            r"C:\Windows\System32\cmd.exe",
+            "/bin/sh",
+            "Python3",
+        ] {
+            assert!(is_shell(program), "{program}");
+        }
+        for program in ["latexmk", "typst", "shell", "cmdline.exe", "git"] {
+            assert!(!is_shell(program), "{program}");
+        }
+    }
+
+    #[test]
     fn globs_match_like_a_shell() {
         assert!(matches("*.tex", "main.tex"));
         assert!(matches("*.tex", "chapters/intro.tex"));
@@ -843,6 +902,15 @@ mod tests {
         let escaped = with(r"Evil\u001B[2KGood").unwrap_err();
         assert!(escaped.contains("control characters"), "{escaped}");
         assert!(with("  ").unwrap_err().contains("the name"));
+    }
+
+    /// Every host a daemon runs on picks its own `[[tools.artifacts]]`
+    /// entry; Windows hosts included.
+    #[test]
+    fn this_host_names_its_tool_downloads() {
+        let here = this_platform().expect("a platform for this host");
+        assert!(PLATFORMS.contains(&here), "{here}");
+        assert_eq!(here.starts_with("windows-"), cfg!(windows), "{here}");
     }
 
     #[test]

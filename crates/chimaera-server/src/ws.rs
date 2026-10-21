@@ -1380,7 +1380,7 @@ async fn send_git_snapshot(
             (
                 ws,
                 m.into_iter()
-                    .map(|(top, e)| (top.to_string_lossy().into_owned(), e))
+                    .map(|(top, e)| (chimaera_core::paths::wire_path(&top), e))
                     .collect(),
             )
         })

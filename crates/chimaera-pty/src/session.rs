@@ -19,6 +19,7 @@ use bytes::Bytes;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use tokio::sync::{broadcast, mpsc};
 
+use crate::exec::ShellKind;
 use crate::{
     lock_unpoisoned, marks::now_ms, marks::Marks, marks::ShellPhase, snapshot, validate_dimensions,
     Attachment, SessionEvent, SessionId, SessionInfo, SpawnOpts,
@@ -90,12 +91,50 @@ struct SessionState {
 pub(crate) struct EventProxy {
     events_tx: broadcast::Sender<SessionEvent>,
     title: Arc<Mutex<Option<String>>>,
+    #[cfg(windows)]
+    replies: Option<TermReplies>,
+}
+
+/// Where the headless `Term` answers terminal queries on Windows. ConPTY
+/// (created with `PSEUDOCONSOLE_INHERIT_CURSOR` by portable-pty) asks for the
+/// cursor position at startup and holds back all output until it is
+/// answered, so a session nobody has attached to yet would never draw its
+/// first prompt. The headless `Term` answers only while no client receives
+/// the live stream: an attached xterm.js answers the same query itself, and
+/// a second reply would land in the shell as typed input. `send_event` runs
+/// inside `parser.advance` under the term lock, the same lock `attach`
+/// subscribes under, so the receiver count is exact for the chunk at hand.
+#[cfg(windows)]
+#[derive(Clone)]
+struct TermReplies {
+    output_tx: broadcast::Sender<Bytes>,
+    input_tx: mpsc::Sender<Bytes>,
+}
+
+/// A console window's title as a name. Windows titles a console with its
+/// program's full path (`C:\\WINDOWS\\System32\\...\\powershell.exe`) until
+/// the program sets its own; that path is reduced to the program's name, the
+/// way a Unix shell's terminal reads `zsh`. Any other title is kept.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn console_title(title: String) -> String {
+    let bytes = title.as_bytes();
+    let is_drive_path = bytes.len() > 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/');
+    if !is_drive_path || !title.to_ascii_lowercase().ends_with(".exe") {
+        return title;
+    }
+    let name = title.rsplit(['\\', '/']).next().unwrap_or(&title);
+    name[..name.len() - ".exe".len()].to_string()
 }
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: TermEvent) {
         match event {
             TermEvent::Title(title) => {
+                #[cfg(windows)]
+                let title = console_title(title);
                 *lock_unpoisoned(&self.title) = Some(title.clone());
                 let _ = self.events_tx.send(SessionEvent::Title { title });
             }
@@ -104,6 +143,16 @@ impl EventListener for EventProxy {
             }
             // Bell is intentionally ignored for now.
             TermEvent::Bell => {}
+            #[cfg(windows)]
+            TermEvent::PtyWrite(reply) => {
+                if let Some(replies) = &self.replies {
+                    if replies.output_tx.receiver_count() == 0 {
+                        // A full input queue means the shell is not reading;
+                        // dropping a query reply then costs nothing more.
+                        let _ = replies.input_tx.try_send(Bytes::from(reply));
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -131,6 +180,13 @@ pub(crate) struct Session {
     last_output_at: Arc<AtomicU64>,
     /// Serializes agent execs against this session's shell.
     exec_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Which shell language the exec engine's sentinel line is typed in.
+    shell: ShellKind,
+    /// The child's Job Object: portable-pty's killer ends only the direct
+    /// child, and a console has no hangup that reaches its descendants.
+    /// `None` when assignment failed (the kill then ends the child alone).
+    #[cfg(windows)]
+    tree: Option<chimaera_core::proc::ProcessTree>,
 }
 
 impl Session {
@@ -160,19 +216,23 @@ impl Session {
             })
             .context("openpty failed")?;
 
-        let mut cmd = match &opts.command {
+        let (mut cmd, shell) = match &opts.command {
             Some(argv) => {
                 let program = argv
                     .first()
                     .ok_or_else(|| anyhow::anyhow!("empty command"))?;
                 let mut cmd = CommandBuilder::new(program);
                 cmd.args(&argv[1..]);
-                cmd
+                (cmd, ShellKind::of(program))
             }
             None => {
+                #[cfg(unix)]
                 let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+                #[cfg(windows)]
+                let shell = chimaera_core::login_shell();
+                let kind = ShellKind::of(&shell);
                 // A shell whose stdin is a PTY starts in interactive mode.
-                CommandBuilder::new(shell)
+                (CommandBuilder::new(shell), kind)
             }
         };
         cmd.cwd(&cwd);
@@ -199,6 +259,19 @@ impl Session {
         let mut writer = master.take_writer().context("failed to take pty writer")?;
         let killer = child.clone_killer();
         let child_pid = child.process_id();
+        // Adopt at once: a grandchild started before this is outside the job.
+        // The job dies with this session (or the daemon): ConPTY has no
+        // hangup to end a shell whose terminal is gone, as a Unix PTY does.
+        #[cfg(windows)]
+        let tree = child_pid.and_then(|pid| {
+            let tree = chimaera_core::proc::ProcessTree::adopt(pid)
+                .map_err(|e| tracing::warn!(session = %id, error = %e, "no job object for the session's process tree"))
+                .ok()?;
+            if let Err(e) = tree.end_with_owner() {
+                tracing::warn!(session = %id, error = %e, "the session's processes may outlive it");
+            }
+            Some(tree)
+        });
 
         let (output_tx, _) = broadcast::channel::<Bytes>(OUTPUT_CHANNEL_CAPACITY);
         let (events_tx, _) = broadcast::channel::<SessionEvent>(EVENT_CHANNEL_CAPACITY);
@@ -208,6 +281,11 @@ impl Session {
         let proxy = EventProxy {
             events_tx: events_tx.clone(),
             title: Arc::clone(&title),
+            #[cfg(windows)]
+            replies: Some(TermReplies {
+                output_tx: output_tx.clone(),
+                input_tx: input_tx.clone(),
+            }),
         };
         let term_config = TermConfig {
             scrolling_history: opts
@@ -361,6 +439,9 @@ impl Session {
             marks,
             last_output_at,
             exec_lock: Arc::new(tokio::sync::Mutex::new(())),
+            shell,
+            #[cfg(windows)]
+            tree,
         }))
     }
 
@@ -415,6 +496,11 @@ impl Session {
     /// Per-session exec serialization lock.
     pub(crate) fn exec_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
         Arc::clone(&self.exec_lock)
+    }
+
+    /// The shell language this session's sentinel execs are typed in.
+    pub(crate) fn shell(&self) -> ShellKind {
+        self.shell
     }
 
     /// Plain-text rendering of the last `last_n` logical lines on screen.
@@ -522,9 +608,17 @@ impl Session {
     /// in the registry forever. Non-blocking: the escalation runs on a detached
     /// thread. Killing a session whose child already exited is a no-op. Reaping
     /// and state bookkeeping still happen on the wait thread.
+    ///
+    /// Windows has no hangup to deliver: the job ends the whole tree at once,
+    /// and portable-pty's killer (TerminateProcess) still ends the child when
+    /// the job could not be created.
     pub(crate) fn kill(&self) {
         if !lock_unpoisoned(&self.state).alive {
             return;
+        }
+        #[cfg(windows)]
+        if let Some(tree) = &self.tree {
+            tree.kill();
         }
         if let Err(e) = lock_unpoisoned(&self.killer).kill() {
             // Racing with a natural exit is fine; the wait thread has the
@@ -544,10 +638,7 @@ impl Session {
             // the daemon's SIGTERM-then-poll stop paths already accept.
             if lock_unpoisoned(&state).alive {
                 tracing::warn!(session = %id, pid, "child ignored SIGHUP; sending SIGKILL");
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(pid as i32),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
+                chimaera_core::proc::kill_pid(pid);
             }
         });
     }

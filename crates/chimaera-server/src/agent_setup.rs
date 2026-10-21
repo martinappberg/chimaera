@@ -166,11 +166,24 @@ pub(crate) async fn start(
             return operation::error(StatusCode::BAD_REQUEST, "Chimaera only updates or reinstalls its own copy. Check the executable in Agents settings.");
         }
     }
-    let Some(script) = crate::runtimes::install_script(kind, &state.managed_root) else {
-        return operation::error(
-            StatusCode::BAD_REQUEST,
-            "This agent has no managed installer.",
-        );
+    // Managed installs are POSIX scripts (curl, tar, symlinks); on Windows
+    // the user's own install is detected instead.
+    let script = if cfg!(windows) {
+        None
+    } else {
+        crate::runtimes::install_script(kind, &state.managed_root)
+    };
+    let Some(script) = script else {
+        let message = if cfg!(windows) {
+            format!(
+                "Chimaera can't install {} on Windows yet. Install it yourself in PowerShell with `{}`, then Retry in Agents settings.",
+                kind.product_name(),
+                crate::launcher::install_command(kind)
+            )
+        } else {
+            "This agent has no managed installer.".to_string()
+        };
+        return operation::error(StatusCode::BAD_REQUEST, &message);
     };
     start_script(state, kind, workspace.root, body, script, look_patiently).await
 }
@@ -284,7 +297,20 @@ async fn run(
 ) -> (Phase, Option<i32>, String) {
     let env = crate::api::session_env(state, &op.snapshot().id, "dark", None);
     let remove = crate::api::spawn_env_remove(&env);
+    #[cfg(unix)]
     let argv = vec!["/bin/bash".to_string(), "-c".to_string(), script];
+    // No route starts one on Windows today (`start`); a script that does
+    // run there is PowerShell.
+    #[cfg(windows)]
+    let argv = vec![
+        "powershell.exe".to_string(),
+        "-NoProfile".to_string(),
+        "-NonInteractive".to_string(),
+        "-ExecutionPolicy".to_string(),
+        "Bypass".to_string(),
+        "-Command".to_string(),
+        script,
+    ];
     let exit = op
         .run(Run {
             command: operation::command(&argv, &cwd, env, remove),
@@ -400,7 +426,8 @@ fn failure_hint(output: &str) -> &'static str {
     }
 }
 
-#[cfg(test)]
+// The installer fixtures are POSIX shell scripts.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::operation::Progress as _;

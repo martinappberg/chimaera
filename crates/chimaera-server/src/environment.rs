@@ -413,8 +413,15 @@ pub(crate) fn materialize_probe_prelude(
     write_prelude(&name, &text)
 }
 
+/// Whether a composed prelude reaches a spawn. Prelude text is POSIX shell,
+/// sourced by the shell-integration rc and the agent login-wrapper; Windows
+/// sessions run neither (no login-shell wrap there), so nothing would ever
+/// source the file. The profiles stay stored and editable there; a Windows
+/// session starts without them.
+const PRELUDES_APPLY: bool = cfg!(unix);
+
 fn write_prelude(file_name: &str, text: &str) -> Option<PathBuf> {
-    if text.is_empty() {
+    if text.is_empty() || !PRELUDES_APPLY {
         return None;
     }
     let dir = chimaera_core::runtime_dir().join("preludes");

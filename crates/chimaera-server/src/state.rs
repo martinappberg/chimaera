@@ -297,9 +297,7 @@ impl AppState {
         data_dir: PathBuf,
         config_dir: PathBuf,
     ) -> Self {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
+        let home = chimaera_core::paths::home_dir().unwrap_or_else(|| PathBuf::from("."));
         let (chat, chat_signals_rx) = chat::new_manager(data_dir.join("chat"));
         let plugin_catalog = plugins::Catalog::load(data_dir.join("plugins"));
         let plugin_guard = plugins::trust::Guard::load(&plugin_catalog);
@@ -478,7 +476,7 @@ pub(crate) fn real_path(path: &std::path::Path) -> PathBuf {
     let mut tail = Vec::new();
     let mut cur = path;
     loop {
-        if let Ok(real) = std::fs::canonicalize(cur) {
+        if let Ok(real) = chimaera_core::paths::canonicalize(cur) {
             return tail.iter().rev().fold(real, |acc: PathBuf, c| acc.join(c));
         }
         match (cur.parent(), cur.file_name()) {

@@ -241,6 +241,10 @@ fn curl_command(
         url,
     ]);
     cmd.kill_on_drop(true);
+    // Windows 10+ ships curl.exe; a console child of a windowless daemon
+    // would flash a console window.
+    #[cfg(windows)]
+    cmd.creation_flags(chimaera_core::CREATE_NO_WINDOW);
     cmd
 }
 

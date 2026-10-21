@@ -63,6 +63,12 @@ const ALERT_TYPES: [&str; 5] = ["NOTE", "TIP", "IMPORTANT", "WARNING", "CAUTION"
 /// Absolute local-path prefixes that never belong in a shared document.
 const LOCAL_PREFIXES: [&str; 4] = ["/home/", "/Users/", "/scratch/", "/tmp/"];
 
+/// A drive path behind a leading slash (`/C:/x`, the path of a `file:///C:/x`
+/// link), as machine-local as `/home/`.
+fn is_slashed_drive_path(s: &str) -> bool {
+    s.strip_prefix('/').is_some_and(is_windows_absolute)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Severity {
@@ -114,11 +120,14 @@ pub(crate) struct CheckQuery {
 /// GET /api/v1/fs/check_document?path=&root= — `{issues, truncated}`.
 pub(crate) async fn check_document(Query(query): Query<CheckQuery>) -> Response {
     let result = run_blocking(move || {
-        let path = expand_tilde(&query.path);
+        let path = chimaera_core::paths::expand_tilde(&query.path);
         if !path.is_absolute() {
             anyhow::bail!("path {:?} is not absolute", query.path);
         }
-        let root = query.root.as_deref().map(expand_tilde);
+        let root = query
+            .root
+            .as_deref()
+            .map(chimaera_core::paths::expand_tilde);
         check_path(&path, root.as_deref())
     })
     .await;
@@ -169,21 +178,6 @@ where
     .map_err(|join| anyhow::anyhow!("document check failed: {join}"))?
 }
 
-fn expand_tilde(raw: &str) -> PathBuf {
-    let home = || std::env::var_os("HOME").filter(|h| !h.is_empty());
-    if raw == "~" {
-        if let Some(home) = home() {
-            return PathBuf::from(home);
-        }
-    }
-    if let Some(rest) = raw.strip_prefix("~/") {
-        if let Some(home) = home() {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-    PathBuf::from(raw)
-}
-
 /// An agent's `path`: absolute (or `~`) as given; otherwise the first of
 /// `cwd/path`, `root/path` that exists.
 fn resolve_for_agent(
@@ -195,7 +189,7 @@ fn resolve_for_agent(
     if raw.is_empty() {
         anyhow::bail!("missing required argument: path");
     }
-    let given = expand_tilde(raw);
+    let given = chimaera_core::paths::expand_tilde(raw);
     if given.is_absolute() {
         return Ok(given);
     }
@@ -223,7 +217,8 @@ fn resolve_for_agent(
 
 /// Check the markdown file at `path`.
 pub(crate) fn check_path(path: &Path, root: Option<&Path>) -> anyhow::Result<Report> {
-    let doc = std::fs::canonicalize(path).with_context(|| path.display().to_string())?;
+    let doc =
+        chimaera_core::paths::canonicalize(path).with_context(|| path.display().to_string())?;
     let meta =
         std::fs::metadata(&doc).with_context(|| format!("{}: failed to stat", doc.display()))?;
     if !meta.is_file() {
@@ -247,7 +242,8 @@ pub(crate) fn check_path(path: &Path, root: Option<&Path>) -> anyhow::Result<Rep
             )
         })?;
     let text = String::from_utf8_lossy(&bytes);
-    let root = root.map(|r| std::fs::canonicalize(r).unwrap_or_else(|_| r.to_path_buf()));
+    let root =
+        root.map(|r| chimaera_core::paths::canonicalize(r).unwrap_or_else(|_| r.to_path_buf()));
     Ok(check_text(&text, &doc, root.as_deref()))
 }
 
@@ -980,7 +976,10 @@ impl Checker<'_> {
             return;
         }
         if windows {
-            self.absolute_path(t, url, None);
+            // On a Windows host a drive path is a local one, so the fix can
+            // name it relative to this document; elsewhere it is not ours.
+            let local = cfg!(windows).then(|| PathBuf::from(percent_decode(url)));
+            self.absolute_path(t, url, local.as_deref());
             return;
         }
         let (before_fragment, fragment) = match url.split_once('#') {
@@ -993,9 +992,14 @@ impl Checker<'_> {
             return;
         }
         let (resolved, spelling) = if decoded == "~" || decoded.starts_with("~/") {
-            (expand_tilde(&decoded), Spelling::Absolute)
+            (
+                chimaera_core::paths::expand_tilde(&decoded),
+                Spelling::Absolute,
+            )
         } else if decoded.starts_with('/') {
-            if LOCAL_PREFIXES.iter().any(|p| decoded.starts_with(p)) {
+            if LOCAL_PREFIXES.iter().any(|p| decoded.starts_with(p))
+                || is_slashed_drive_path(&decoded)
+            {
                 (PathBuf::from(&decoded), Spelling::Absolute)
             } else {
                 match self.root {
@@ -1559,7 +1563,7 @@ fn percent_decode(s: &str) -> String {
 }
 
 fn encode_spaces(path: &Path) -> String {
-    path.to_string_lossy().replace(' ', "%20")
+    chimaera_core::paths::wire_path(path).replace(' ', "%20")
 }
 
 /// Resolve `.` and `..` lexically (no disk access; symlinks are the stat's

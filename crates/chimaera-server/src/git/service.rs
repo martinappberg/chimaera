@@ -49,7 +49,7 @@ const STATUS_REUSE: Duration = Duration::from_secs(1);
 /// workspace. The primary repository uses its own top level too, so a
 /// request naming it and one naming nothing share one slot.
 pub(super) fn repo_slot(ws_id: &str, toplevel: &Path) -> String {
-    format!("{ws_id}\u{0}{}", toplevel.display())
+    format!("{ws_id}\u{0}{}", chimaera_core::paths::wire_path(toplevel))
 }
 
 fn slot_prefix(ws_id: &str) -> String {
@@ -1029,10 +1029,12 @@ pub(crate) async fn mark_path_dirty(state: &AppState, path: &str) {
     // (a just-deleted file) — that preserves the prior behavior for that case.
     let target = {
         let expanded = expanded.clone();
-        tokio::task::spawn_blocking(move || std::fs::canonicalize(&expanded))
-            .await
-            .ok()
-            .and_then(Result::ok)
+        tokio::task::spawn_blocking(move || {
+            chimaera_core::paths::canonicalize(Path::new(&expanded))
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
     }
     .unwrap_or_else(|| std::path::PathBuf::from(&expanded));
     // Tell watching windows first, whether or not a workspace holds the path
@@ -1056,7 +1058,12 @@ pub(crate) async fn mark_path_dirty(state: &AppState, path: &str) {
             continue;
         }
         if let Ok(rel) = target.strip_prefix(&ws.root) {
-            crate::plugins::files::touched(state, &expanded, &ws.id, &rel.to_string_lossy());
+            crate::plugins::files::touched(
+                state,
+                &expanded,
+                &ws.id,
+                &chimaera_core::paths::wire_path(rel),
+            );
         }
         // Only the repository containing the path refreshes (and a
         // submodule's superproject, whose status marks it). We just
@@ -1084,12 +1091,7 @@ pub(crate) async fn mark_path_dirty(state: &AppState, path: &str) {
 }
 
 fn expand_tilde(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return Path::new(&home).join(rest).to_string_lossy().into_owned();
-        }
-    }
-    path.to_string()
+    chimaera_core::paths::wire_path(&chimaera_core::paths::expand_tilde(path))
 }
 
 /// Backstop poll: for each workspace a connected client is looking at, recompute
@@ -1559,7 +1561,7 @@ mod tests {
         // Workspace roots are stored canonical (the create handler
         // canonicalizes) — match that, or the macOS /var -> /private/var
         // symlink defeats mark_path_dirty's prefix check.
-        let root = std::fs::canonicalize(&root).unwrap();
+        let root = chimaera_core::paths::canonicalize(&root).unwrap();
         let state = crate::AppState::new(
             "t".into(),
             "h".into(),

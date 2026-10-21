@@ -255,9 +255,11 @@ async fn run_probe(state: &Arc<AppState>, kind: AgentKind, bin: &Path) -> Option
         None,
         prelude.path(),
     );
-    cmd.process_group(0);
+    crate::agent_probe::own_tree(&mut cmd);
     let mut child = cmd.spawn().ok()?;
-    let pid = nix::unistd::Pid::from_raw(child.id()? as i32);
+    // Dropping it never kills: only the deadline below does, while the
+    // leader is unreaped.
+    let tree = chimaera_core::proc::ProcessTree::adopt(child.id()?).ok()?;
     let stdout = child.stdout.take()?;
     let stderr = child.stderr.take()?;
     let work = async {
@@ -270,7 +272,7 @@ async fn run_probe(state: &Arc<AppState>, kind: AgentKind, bin: &Path) -> Option
         Ok(None) => None,
         Err(_) => {
             // The leader is unreaped: the group id is still its own.
-            let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
+            tree.kill();
             let _ = child.wait().await;
             None
         }
@@ -358,6 +360,7 @@ async fn probe_and_store(state: &Arc<AppState>, kind: AgentKind, bin: &Path) -> 
 }
 
 /// A verdict as if just probed — tests plant what a CLI would have said.
+#[cfg_attr(not(unix), allow(dead_code))]
 #[cfg(test)]
 pub(crate) fn preset_verdict(
     state: &AppState,
@@ -773,8 +776,8 @@ async fn run_login(
     let prelude = crate::agent_probe::ProbePrelude::write(state, Some(&workspace)).await;
     let mut env = crate::api::session_env(state, &id, "dark", prelude.path());
     if no_browser {
-        match no_browser_dir().await {
-            Ok(dir) => env = with_path_prefix(env, &dir),
+        match no_browser_env(env).await {
+            Ok(quiet) => env = quiet,
             Err(err) => {
                 return (
                     Phase::Failed,
@@ -829,19 +832,50 @@ async fn run_login(
     }
 }
 
-/// A folder whose `open` and `xdg-open` do nothing, for a login that would
-/// open a browser itself (the app opens the page). Under the runtime dir;
-/// rewritten when missing.
+/// `env` for a login that would open a browser itself (the app opens the
+/// page). Unix: a folder whose `open` and `xdg-open` do nothing goes first
+/// on PATH. Windows opens a browser through the shell, not a program on
+/// PATH, so the most that can be done is `BROWSER` naming a no-op script:
+/// a CLI that honors it stays quiet, one that doesn't opens the system
+/// browser as well.
+async fn no_browser_env(env: Vec<(String, String)>) -> std::io::Result<Vec<(String, String)>> {
+    let dir = no_browser_dir().await?;
+    #[cfg(unix)]
+    {
+        Ok(with_path_prefix(env, &dir))
+    }
+    #[cfg(windows)]
+    {
+        let mut env = env;
+        env.retain(|(k, _)| !k.eq_ignore_ascii_case("BROWSER"));
+        env.push((
+            "BROWSER".into(),
+            dir.join("no-browser.cmd").display().to_string(),
+        ));
+        Ok(env)
+    }
+}
+
+/// The folder of [`no_browser_env`]'s do-nothing programs. Under the runtime
+/// dir; rewritten when missing.
 async fn no_browser_dir() -> std::io::Result<PathBuf> {
     let dir = chimaera_core::runtime_dir().join("no-browser");
     tokio::task::spawn_blocking(move || {
-        use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir_all(&dir)?;
+        #[cfg(unix)]
         for name in ["open", "xdg-open"] {
+            use std::os::unix::fs::PermissionsExt;
             let path = dir.join(name);
             if !path.exists() {
                 std::fs::write(&path, "#!/bin/sh\nexit 0\n")?;
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+            }
+        }
+        #[cfg(windows)]
+        {
+            let path = dir.join("no-browser.cmd");
+            if !path.exists() {
+                std::fs::write(&path, "@exit /b 0\r\n")?;
             }
         }
         Ok(dir)
@@ -850,15 +884,22 @@ async fn no_browser_dir() -> std::io::Result<PathBuf> {
     .map_err(|_| std::io::Error::other("the no-browser folder could not be prepared"))?
 }
 
+/// `PATH`'s separator, for a prefix put before a whole PATH value as is.
+const PATH_SEPARATOR: char = if cfg!(windows) { ';' } else { ':' };
+
 /// `dir` first on the environment's PATH (the session PATH, else the
 /// daemon's).
+#[cfg_attr(windows, allow(dead_code))]
 fn with_path_prefix(mut env: Vec<(String, String)>, dir: &Path) -> Vec<(String, String)> {
     let prefix = dir.display().to_string();
     if let Some(entry) = env.iter_mut().find(|(k, _)| k == "PATH") {
-        entry.1 = format!("{prefix}:{}", entry.1);
+        entry.1 = format!("{prefix}{PATH_SEPARATOR}{}", entry.1);
     } else {
         let inherited = std::env::var("PATH").unwrap_or_default();
-        env.push(("PATH".into(), format!("{prefix}:{inherited}")));
+        env.push((
+            "PATH".into(),
+            format!("{prefix}{PATH_SEPARATOR}{inherited}"),
+        ));
     }
     env
 }
@@ -1201,7 +1242,7 @@ mod tests {
             vec![("PATH".into(), "/usr/bin".into())],
             Path::new("/x/no-browser"),
         );
-        assert_eq!(env[0].1, "/x/no-browser:/usr/bin");
+        assert_eq!(env[0].1, format!("/x/no-browser{PATH_SEPARATOR}/usr/bin"));
         assert_eq!(with_path_prefix(vec![], Path::new("/x"))[0].0, "PATH");
     }
 
@@ -1213,6 +1254,8 @@ mod tests {
         assert!(failure_tail(&"x".repeat(1000)).chars().count() <= 301);
     }
 
+    // The login stand-ins are shell scripts.
+    #[cfg(unix)]
     fn state() -> Arc<AppState> {
         let root =
             std::env::temp_dir().join(format!("chimaera-auth-{}", chimaera_core::generate_token()));
@@ -1225,6 +1268,7 @@ mod tests {
             root.join("config"),
         ))
     }
+    #[cfg(unix)]
     fn request(id: &str) -> Request {
         Request {
             workspace_id: "test".into(),
@@ -1233,6 +1277,7 @@ mod tests {
             theme: None,
         }
     }
+    #[cfg(unix)]
     fn script(body: &str, stdin: bool) -> Launch {
         Launch::Browser {
             argv: vec!["/bin/bash".into(), "-c".into(), body.into()],
@@ -1242,6 +1287,7 @@ mod tests {
             no_browser: false,
         }
     }
+    #[cfg(unix)]
     async fn wait_for(
         state: &AppState,
         kind: AgentKind,
@@ -1268,6 +1314,7 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_browser_login_shows_its_page_and_code_takes_a_pasted_code_and_never_claims_success_itself(
     ) {
@@ -1357,6 +1404,7 @@ mod tests {
         assert!(op.snapshot().output.contains("got PASTED-1"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_failed_login_carries_a_short_tail_and_cancel_stops_a_waiting_one() {
         let state = state();

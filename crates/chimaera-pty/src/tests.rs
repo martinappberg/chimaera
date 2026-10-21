@@ -6,14 +6,26 @@ use std::time::Duration;
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener};
 use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::{Column, Line, Point};
+#[cfg(unix)]
+use alacritty_terminal::index::Point;
+use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
-use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, StdSyncHandler};
+#[cfg(unix)]
+use alacritty_terminal::term::TermMode;
+use alacritty_terminal::term::{Config as TermConfig, Term};
+#[cfg(unix)]
+use alacritty_terminal::vte::ansi::NamedColor;
+use alacritty_terminal::vte::ansi::{Color, Processor, StdSyncHandler};
+#[cfg(unix)]
 use bytes::Bytes;
 use tokio::sync::broadcast;
 
-use crate::{Attachment, SessionEvent, SessionManager, SpawnOpts, MAX_TERMINAL_COLS};
+#[cfg(unix)]
+use crate::{Attachment, MAX_TERMINAL_COLS};
+use crate::{SessionEvent, SessionManager, SpawnOpts};
+
+#[cfg(windows)]
+mod windows;
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -54,6 +66,7 @@ fn bash() -> Option<Vec<String>> {
 }
 
 /// Accumulate broadcast output (lossy UTF-8) until it contains `needle`.
+#[cfg(unix)]
 async fn read_until(rx: &mut broadcast::Receiver<Bytes>, needle: &str) -> String {
     let deadline = tokio::time::Instant::now() + TIMEOUT;
     let mut acc = String::new();
@@ -105,6 +118,7 @@ async fn wait_gone(mgr: &SessionManager, id: &str) {
 }
 
 /// Poll fresh attachments until the snapshot contains `needle`.
+#[cfg(unix)]
 async fn attach_when_snapshot_contains(mgr: &SessionManager, id: &str, needle: &str) -> Attachment {
     let deadline = tokio::time::Instant::now() + TIMEOUT;
     loop {
@@ -125,6 +139,7 @@ async fn attach_when_snapshot_contains(mgr: &SessionManager, id: &str, needle: &
 /// The reader pump must stamp `last_output_at` on output: the daemon derives
 /// the hook-less-agent busy signal from it, and no other test observes the
 /// stamping itself (the server's session_view test only pins the derivation).
+#[cfg(unix)]
 #[tokio::test]
 async fn reader_pump_advances_last_output_at() {
     let mgr = SessionManager::new();
@@ -207,6 +222,7 @@ fn visible_cells<T>(term: &Term<T>) -> Vec<Vec<CellSnap>> {
         .collect()
 }
 
+#[cfg(unix)]
 fn visible_text<T>(term: &Term<T>) -> Vec<String> {
     visible_cells(term)
         .iter()
@@ -228,6 +244,7 @@ fn visible_text<T>(term: &Term<T>) -> Vec<String> {
 /// overlays still apply — the daemon relies on this to scrub launcher
 /// -context markers (a Claude Code session having started the daemon)
 /// without touching anything it deliberately injects.
+#[cfg(unix)]
 #[tokio::test]
 async fn spawn_env_remove_strips_inherited_variables() {
     // Unique name: set_var is process-global, but nothing else reads it.
@@ -258,6 +275,7 @@ async fn spawn_env_remove_strips_inherited_variables() {
 /// attach_quiet subscribes without rendering: the snapshot comes back empty
 /// (the parked-attach contract — the first unpark repaints via a full
 /// attach), but the output subscription is live from the attach point.
+#[cfg(unix)]
 #[tokio::test]
 async fn attach_quiet_skips_snapshot_but_streams_output() {
     let mgr = SessionManager::new();
@@ -281,6 +299,7 @@ async fn attach_quiet_skips_snapshot_but_streams_output() {
     assert!(seen.contains("quiet-attach-live"));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn spawn_echo_collects_output_and_exited_event() {
     let mgr = SessionManager::new();
@@ -316,6 +335,7 @@ async fn spawn_echo_collects_output_and_exited_event() {
 
 /// (b) Server-side state survives detach: output produced while attached is
 /// present in the snapshot of a later, completely fresh attachment.
+#[cfg(unix)]
 #[tokio::test]
 async fn detached_session_state_survives_in_snapshot() {
     let mgr = SessionManager::new();
@@ -349,6 +369,7 @@ async fn detached_session_state_survives_in_snapshot() {
 /// (c) Snapshot fidelity: replaying the snapshot into a fresh terminal
 /// reproduces the live session's visible grid cell-for-cell, including
 /// color/bold attributes and the cursor position.
+#[cfg(unix)]
 #[tokio::test]
 async fn snapshot_replay_matches_live_grid() {
     let mgr = SessionManager::new();
@@ -417,6 +438,7 @@ fn spawn_rejects_zero_dims() {
 /// The PTY boundary, not just the UI, rejects allocation-hostile viewports.
 /// Raw WebSocket clients can send arbitrary u16 dimensions, so accepting the
 /// type's maximum here would attempt to allocate a multi-billion-cell grid.
+#[cfg(unix)]
 #[test]
 fn spawn_and_resize_reject_oversized_dims() {
     let mgr = SessionManager::new();
@@ -439,6 +461,7 @@ fn spawn_and_resize_reject_oversized_dims() {
 
 /// (d) resize() changes the child's winsize (visible via `stty size`) and
 /// broadcasts a Resized event.
+#[cfg(unix)]
 #[tokio::test]
 async fn resize_reaches_child_and_broadcasts_event() {
     let mgr = SessionManager::new();
@@ -476,6 +499,7 @@ async fn resize_reaches_child_and_broadcasts_event() {
 /// child arms `trap '' HUP` and only prints READY afterward, so by the time we
 /// kill it the SIGHUP is provably ignored — only the SIGKILL escalation can
 /// reap it, and `wait_gone` would hang (and fail) without it.
+#[cfg(unix)]
 #[tokio::test]
 async fn kill_escalates_to_sigkill_when_sighup_ignored() {
     let mgr = SessionManager::new();
@@ -502,6 +526,7 @@ async fn kill_escalates_to_sigkill_when_sighup_ignored() {
 /// winch. Attached clients mirror resize events back as their own resize
 /// requests; without the short-circuit each real resize echoes into repaint
 /// storms across every client.
+#[cfg(unix)]
 #[tokio::test]
 async fn noop_resize_broadcasts_nothing() {
     let mgr = SessionManager::new();
@@ -538,6 +563,7 @@ async fn noop_resize_broadcasts_nothing() {
 /// re-arms those modes on replay. TUIs assert them once at startup and never
 /// again, so a snapshot that drops them silently breaks scrolling and clicks
 /// in every reattached client.
+#[cfg(unix)]
 #[tokio::test]
 async fn snapshot_restores_tui_modes() {
     let mgr = SessionManager::new();
@@ -569,6 +595,7 @@ async fn snapshot_restores_tui_modes() {
 }
 
 /// (e) Two concurrent attachments both receive subsequent output.
+#[cfg(unix)]
 #[tokio::test]
 async fn multi_attach_fans_out_output() {
     let mgr = SessionManager::new();
@@ -595,6 +622,7 @@ async fn multi_attach_fans_out_output() {
 /// overriding pair (PATH here) replaces the inherited value rather than
 /// duplicating it — asserted through the child's own eyes via /usr/bin/env
 /// on a real PTY.
+#[cfg(unix)]
 #[tokio::test]
 async fn spawn_env_pairs_reach_the_child() {
     let mgr = SessionManager::new();
@@ -634,6 +662,7 @@ async fn spawn_env_pairs_reach_the_child() {
 /// (f) A session that dies fast still leaves a readable final screen: the
 /// manager remembers its last words (info + snapshot) after unregistration,
 /// so a client attaching just too late sees what happened, not a blank pane.
+#[cfg(unix)]
 #[tokio::test]
 async fn fast_death_leaves_readable_last_words() {
     let mgr = SessionManager::new();
@@ -660,4 +689,19 @@ async fn fast_death_leaves_readable_last_words() {
     );
 
     assert!(mgr.last_words("s-never-existed").is_none());
+}
+
+#[test]
+fn console_titles_name_the_program() {
+    use crate::session::console_title;
+    assert_eq!(
+        console_title(r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe".into()),
+        "powershell"
+    );
+    assert_eq!(console_title("C:/tools/cmd.EXE".into()), "cmd");
+    assert_eq!(
+        console_title("Administrator: Windows PowerShell".into()),
+        "Administrator: Windows PowerShell"
+    );
+    assert_eq!(console_title("user@host: ~".into()), "user@host: ~");
 }

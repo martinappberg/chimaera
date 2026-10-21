@@ -245,10 +245,21 @@ impl Drop for EnqueueReservation<'_> {
     }
 }
 
+/// The wire form of a path (`chimaera_core::paths::wire_path`): forward
+/// slashes and no `\\?\` prefix on Windows; Unix serializes as before.
+#[cfg(windows)]
+fn serialize_wire_path<S: serde::Serializer>(
+    path: &std::path::Path,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&chimaera_core::paths::wire_path(path))
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ChatInfo {
     pub id: String,
     pub agent: String,
+    #[cfg_attr(windows, serde(serialize_with = "serialize_wire_path"))]
     pub cwd: PathBuf,
     pub created_at_ms: u64,
     pub alive: bool,
@@ -1071,6 +1082,14 @@ impl ChatManager {
         } = &mut ev
         {
             *sign_in = model::sign_in_failure(message);
+        }
+        // Agents on Windows name files natively (`C:\\x\\y`); the wire carries
+        // one path form (chimaera_core::paths::wire_path).
+        #[cfg(windows)]
+        if let AgentEvent::ToolCall { locations, .. } = &mut ev {
+            for location in locations.iter_mut() {
+                *location = chimaera_core::paths::wire_path_windows(location);
+            }
         }
         session
             .command_budget

@@ -1200,7 +1200,7 @@ async fn workspace_status(
         .collect();
     tool_text(
         json!({
-            "workspace": {"name": workspace.name, "root": workspace.root},
+            "workspace": {"name": workspace.name, "root": chimaera_core::paths::wire_path(&workspace.root)},
             "git": git,
             "sessions": sessions,
             "links": links,
@@ -1858,7 +1858,7 @@ async fn spawn_agent(
             "on branch {} in {} worktree {}",
             p.branch,
             if p.reused { "its existing" } else { "a new" },
-            p.path.display()
+            chimaera_core::paths::wire_path(&p.path)
         ),
         None => "at the workspace root".to_string(),
     };
@@ -2137,7 +2137,7 @@ fn list_terminals_blocking(state: &AppState, scope: &[String]) -> String {
             .unwrap_or_default();
         out.push_str(&format!(
             "'{name}' [{id}] — {phase}{stage} · cwd {}\n",
-            info.cwd.display()
+            chimaera_core::paths::wire_path(&info.cwd)
         ));
         if let Some(last) = marks.and_then(|m| m.journal(1).pop()) {
             let cmd = last.command.as_deref().unwrap_or("(unknown command)");

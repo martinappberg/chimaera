@@ -1135,6 +1135,7 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[cfg(unix)]
     fn scratch(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "chimaera-job-{label}-{}",
@@ -1250,6 +1251,7 @@ mod tests {
 
     /// End to end with stand-in tools: a reused id that the queue shows
     /// under another name is never scancelled; the real one is, once.
+    #[cfg(unix)] // the stand-in tools are /bin/sh scripts
     #[tokio::test]
     async fn stop_replaced_cancels_only_the_job_it_continues() {
         let dir = scratch("replace");

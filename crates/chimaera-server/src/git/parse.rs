@@ -376,9 +376,9 @@ pub(super) fn status_json(
                 }
             }
             json!({
-                "path": repo.toplevel.join(&e.rel).to_string_lossy(),
+                "path": chimaera_core::paths::wire_path(&repo.toplevel.join(&e.rel)),
                 "rel": e.rel,
-                "orig": e.orig_rel.as_ref().map(|o| repo.toplevel.join(o).to_string_lossy().into_owned()),
+                "orig": e.orig_rel.as_ref().map(|o| chimaera_core::paths::wire_path(&repo.toplevel.join(o))),
                 "orig_rel": e.orig_rel,
                 "x": e.x.to_string(),
                 "y": e.y.to_string(),
@@ -396,7 +396,7 @@ pub(super) fn status_json(
         "workspace_id": ws_id,
         "epoch": epoch,
         // Additive: the checkout this status is of.
-        "toplevel": repo.toplevel.to_string_lossy(),
+        "toplevel": chimaera_core::paths::wire_path(&repo.toplevel),
         "branch": d.branch,
         "detached": d.detached,
         "head": d.head,
