@@ -81,15 +81,15 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         }
     }
 
-    // A predecessor that stopped gracefully left a handoff: rebind its port
-    // with its token so ssh forwards stay valid and every client heals with
-    // a plain reconnect — the "update without losing your windows" half of
-    // the restart story (the ledger is the sessions half). An explicit
-    // conflicting --port wins over the handoff; a crash never leaves one.
-    // A cluster workspace never restarts in place — job-host starts its
-    // chimaera fresh on every open — so a handoff there is one a close left
-    // (in this job or another, maybe on another node): consumed, never
-    // honored. Each open gets its own token.
+    // A predecessor left a fresh handoff (its graceful stop, or the record it
+    // kept current until it crashed): rebind its port with its token so ssh
+    // forwards stay valid and every client heals with a plain reconnect — the
+    // "update without losing your windows" half of the restart story (the
+    // ledger is the sessions half). An explicit conflicting --port wins over
+    // the handoff. A cluster workspace never restarts in place — job-host
+    // starts its chimaera fresh on every open — so a handoff there is one a
+    // close left (in this job or another, maybe on another node): consumed,
+    // never honored. Each open gets its own token.
     let handoff = chimaera_core::Handoff::consume().filter(|_| {
         if workspace_job {
             tracing::info!(
@@ -98,23 +98,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         }
         !workspace_job
     });
-    let (listener, token) = match handoff.filter(|h| cfg.port.is_none() || cfg.port == Some(h.port))
-    {
-        Some(handoff) => match listener_after_handoff(handoff.port, cfg.routable_bind).await? {
-            (listener, true) => (listener, handoff.token),
-            (listener, false) => {
-                tracing::warn!(
-                    port = handoff.port,
-                    "handoff port still busy; started fresh on an OS-assigned port"
-                );
-                (listener, chimaera_core::generate_token())
-            }
-        },
-        None => (
-            fresh_listener(cfg.port, cfg.routable_bind).await?,
-            chimaera_core::generate_token(),
-        ),
-    };
+    let (listener, token) = startup_listener(handoff, cfg.port, cfg.routable_bind).await?;
     let port = listener.local_addr()?.port();
 
     let hostname = hostname::get()
@@ -136,6 +120,27 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         runtime_leases: true,
     };
     manifest.write().context("failed to write manifest")?;
+
+    // Crash durability: the handoff is written now and kept fresh while this
+    // daemon serves, not only at its graceful stop, so a crash restarted
+    // within the freshness window rebinds this port with this token exactly
+    // like a planned restart — a plain browser tab holding the token keeps
+    // working instead of meeting a 401. The trade-off, deliberately taken: a
+    // crash no longer rotates the token (only a daemon dead longer than the
+    // window does). At rest nothing new is exposed: the same file and atomic
+    // 0600 write as the stop-time record, holding the token the manifest
+    // beside it already carries. A cluster workspace never honors a handoff,
+    // so it gets no early record.
+    let handoff_keeper = (!workspace_job).then(|| {
+        HandoffKeeper::start(
+            chimaera_core::Handoff::path(),
+            chimaera_core::Manifest::path(),
+            port,
+            &token,
+            &manifest,
+            Duration::from_secs(chimaera_core::HANDOFF_REFRESH_SECS),
+        )
+    });
 
     println!("chimaera daemon listening on 127.0.0.1:{port}");
     println!("http://127.0.0.1:{port}/#token={token}");
@@ -268,8 +273,25 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     // build is started again on the next save; nothing resumes it).
     state.plugin_platform.jobs.kill_all();
 
-    if let Err(err) = chimaera_core::Handoff::new(port, state.token.clone()).write() {
-        tracing::warn!(%err, "failed to write restart handoff");
+    // The refresher runs until here so a long stop tail never lets the
+    // record age; it is fully stopped before the final write, which takes the
+    // same ownership guard — a daemon whose manifest was taken over never
+    // hands the newcomer's successor this daemon's port.
+    if let Some(keeper) = handoff_keeper {
+        keeper.stop().await;
+    }
+    {
+        let (port, token, own) = (port, state.token.clone(), manifest.clone());
+        let _ = tokio::task::spawn_blocking(move || {
+            refresh_handoff_at(
+                &chimaera_core::Handoff::path(),
+                &chimaera_core::Manifest::path(),
+                port,
+                &token,
+                &own,
+            )
+        })
+        .await;
     }
 
     // Only our own record: on a home shared across nodes a daemon on another
@@ -838,6 +860,120 @@ async fn fresh_listener(port: Option<u16>, routable: bool) -> anyhow::Result<Tcp
         .with_context(|| format!("failed to bind {host}"))
 }
 
+/// The startup listener and token: a fresh handoff whose port agrees with an
+/// explicit `--port` (if any) is rebound with its token; anything else binds
+/// fresh with a new token.
+async fn startup_listener(
+    handoff: Option<chimaera_core::Handoff>,
+    port: Option<u16>,
+    routable: bool,
+) -> anyhow::Result<(TcpListener, String)> {
+    match handoff.filter(|h| port.is_none() || port == Some(h.port)) {
+        Some(handoff) => match listener_after_handoff(handoff.port, routable).await? {
+            (listener, true) => Ok((listener, handoff.token)),
+            (listener, false) => {
+                tracing::warn!(
+                    port = handoff.port,
+                    "handoff port still busy; started fresh on an OS-assigned port"
+                );
+                Ok((listener, chimaera_core::generate_token()))
+            }
+        },
+        None => Ok((
+            fresh_listener(port, routable).await?,
+            chimaera_core::generate_token(),
+        )),
+    }
+}
+
+/// Keeps this daemon's handoff fresh while it serves: written at start, then
+/// rewritten every period until [`HandoffKeeper::stop`] (the graceful stop
+/// writes the final record itself). A wall-clock timestamp refreshed on a
+/// timer is the only way a record left by a crash can say how recently its
+/// daemon was alive, which the freshness rule needs.
+struct HandoffKeeper {
+    stop: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl HandoffKeeper {
+    fn start(
+        handoff_path: PathBuf,
+        manifest_path: PathBuf,
+        port: u16,
+        token: &str,
+        own: &chimaera_core::Manifest,
+        period: Duration,
+    ) -> Self {
+        let keep = refresh_handoff_at(&handoff_path, &manifest_path, port, token, own);
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        let (token, own) = (token.to_string(), own.clone());
+        let task = tokio::spawn(async move {
+            if !keep {
+                return;
+            }
+            let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = &mut stopped => return,
+                    _ = tick.tick() => {}
+                }
+                let (handoff_path, manifest_path) = (handoff_path.clone(), manifest_path.clone());
+                let (token, own) = (token.clone(), own.clone());
+                let keep = tokio::task::spawn_blocking(move || {
+                    refresh_handoff_at(&handoff_path, &manifest_path, port, &token, &own)
+                })
+                .await
+                .unwrap_or(false);
+                if !keep {
+                    return;
+                }
+            }
+        });
+        HandoffKeeper { stop, task }
+    }
+
+    /// Stop refreshing and wait until no refresh is in flight, so no
+    /// periodic write can land after the caller's final one.
+    async fn stop(self) {
+        let _ = self.stop.send(());
+        let _ = self.task.await;
+    }
+}
+
+/// One handoff write, while this daemon still owns the registry. Returns
+/// false once the manifest names another daemon or none (one on another node
+/// of a shared home took over): from then on the record is that daemon's to
+/// keep, and rewriting it here would hand ITS successor this daemon's port.
+/// An unreadable manifest skips one write, never the rest.
+fn refresh_handoff_at(
+    handoff_path: &Path,
+    manifest_path: &Path,
+    port: u16,
+    token: &str,
+    own: &chimaera_core::Manifest,
+) -> bool {
+    match chimaera_core::Manifest::load_at(manifest_path) {
+        Ok(Some(current)) if current == *own => {
+            if let Err(err) =
+                chimaera_core::Handoff::new(port, token.to_string()).write_at(handoff_path)
+            {
+                tracing::warn!(%err, "failed to write restart handoff");
+            }
+            true
+        }
+        Ok(_) => {
+            tracing::info!("the manifest is no longer this daemon's; restart handoff left to it");
+            false
+        }
+        Err(err) => {
+            tracing::debug!(%err, "manifest unreadable; restart handoff write skipped");
+            true
+        }
+    }
+}
+
 /// Acquire the startup listener when a handoff was consumed: rebind the
 /// handoff port, or — if it's STILL busy after `rebind`'s ~5s — an OS-assigned
 /// port. Returns `(listener, reused)`; `reused` = keep the handoff token.
@@ -1358,6 +1494,182 @@ mod tests {
             listener.local_addr().unwrap().ip().is_loopback(),
             "without --bind-routable a rebind stays loopback"
         );
+    }
+
+    /// A crash (kill -9) runs no graceful stop, so the record its successor
+    /// finds is the one the daemon wrote at listen time and kept fresh. Within
+    /// the window it rebinds that port with that token, like a planned
+    /// restart; a record older than the window (a daemon dead longer) is
+    /// dropped, and the successor mints a fresh token.
+    #[tokio::test]
+    async fn crash_restart_reuses_the_kept_fresh_handoff() {
+        let dir =
+            std::env::temp_dir().join(format!("chimaera-crash-handoff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("handoff.json");
+
+        let crashed = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = crashed.local_addr().unwrap().port();
+        let token = chimaera_core::generate_token();
+        chimaera_core::Handoff::new(port, token.clone())
+            .write_at(&path)
+            .unwrap();
+        drop(crashed);
+
+        let (listener, reused) =
+            startup_listener(chimaera_core::Handoff::consume_at(&path), None, false)
+                .await
+                .expect("rebind");
+        assert_eq!(listener.local_addr().unwrap().port(), port);
+        assert_eq!(reused, token, "a crash restart keeps the token");
+        assert!(!path.exists(), "consumed once");
+        drop(listener);
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        chimaera_core::Handoff {
+            written_at: now - chimaera_core::HANDOFF_MAX_AGE_SECS - 1,
+            ..chimaera_core::Handoff::new(port, token.clone())
+        }
+        .write_at(&path)
+        .unwrap();
+        let (_listener, fresh) =
+            startup_listener(chimaera_core::Handoff::consume_at(&path), None, false)
+                .await
+                .expect("fresh bind");
+        assert_ne!(fresh, token, "a stale record never resurrects its token");
+        assert!(!path.exists(), "a stale record is removed too");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn test_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-lifecycle-{label}-{}-{}",
+            std::process::id(),
+            &chimaera_core::generate_token()[..8]
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn keeper_manifest(pid: u32) -> chimaera_core::Manifest {
+        chimaera_core::Manifest {
+            hostname: "here".into(),
+            port: 4242,
+            token: "tok".into(),
+            pid,
+            version: "0".into(),
+            started_at: 1,
+            build: None,
+            slurm_job_id: None,
+            runtime_leases: false,
+        }
+    }
+
+    fn put_manifest(path: &Path, m: &chimaera_core::Manifest) {
+        std::fs::write(path, serde_json::to_vec(m).unwrap()).unwrap();
+    }
+
+    async fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !cond() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    const KEEP: Duration = Duration::from_millis(40);
+
+    /// The keeper writes the record at start (0600, this port + token), keeps
+    /// refreshing through an unreadable manifest (one write skipped, never
+    /// the rest), and stops for good once the manifest names another daemon.
+    #[tokio::test]
+    async fn handoff_keeper_writes_at_start_and_yields_to_a_foreign_manifest() {
+        let dir = test_dir("handoff-keeper");
+        let (hpath, mpath) = (dir.join("handoff.json"), dir.join("manifest.json"));
+        let own = keeper_manifest(100);
+        put_manifest(&mpath, &own);
+
+        let keeper = HandoffKeeper::start(hpath.clone(), mpath.clone(), 4242, "tok", &own, KEEP);
+        let written: chimaera_core::Handoff =
+            serde_json::from_slice(&std::fs::read(&hpath).expect("written at start")).unwrap();
+        assert_eq!((written.port, written.token.as_str()), (4242, "tok"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&hpath).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "the record carries the token");
+        }
+
+        std::fs::write(&mpath, "not json").unwrap();
+        tokio::time::sleep(KEEP * 3).await;
+        std::fs::remove_file(&hpath).unwrap();
+        tokio::time::sleep(KEEP * 3).await;
+        assert!(!hpath.exists(), "an unreadable manifest skips the write");
+        assert!(!keeper.task.is_finished(), "…but never stops the refresher");
+        put_manifest(&mpath, &own);
+        wait_for("the refresh to resume", || hpath.exists()).await;
+
+        put_manifest(&mpath, &keeper_manifest(200));
+        wait_for("the keeper to yield", || keeper.task.is_finished()).await;
+        std::fs::remove_file(&hpath).unwrap();
+        tokio::time::sleep(KEEP * 3).await;
+        assert!(
+            !hpath.exists(),
+            "a foreign manifest stops the refresh for good"
+        );
+        keeper.stop().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// No manifest at all: not this daemon's registry, so no record and no
+    /// refresher.
+    #[tokio::test]
+    async fn handoff_keeper_writes_nothing_without_a_manifest() {
+        let dir = test_dir("handoff-keeper-missing");
+        let (hpath, mpath) = (dir.join("handoff.json"), dir.join("manifest.json"));
+        let keeper = HandoffKeeper::start(
+            hpath.clone(),
+            mpath,
+            4242,
+            "tok",
+            &keeper_manifest(100),
+            KEEP,
+        );
+        wait_for("the keeper to end", || keeper.task.is_finished()).await;
+        assert!(!hpath.exists(), "a missing manifest writes no record");
+        keeper.stop().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The graceful stop: once the keeper is stopped no periodic write lands,
+    /// and the final write takes the same ownership guard — refused on a
+    /// taken-over manifest, written on this daemon's own.
+    #[tokio::test]
+    async fn stop_time_handoff_write_is_guarded_and_final() {
+        let dir = test_dir("handoff-stop");
+        let (hpath, mpath) = (dir.join("handoff.json"), dir.join("manifest.json"));
+        let own = keeper_manifest(100);
+        put_manifest(&mpath, &own);
+
+        let keeper = HandoffKeeper::start(hpath.clone(), mpath.clone(), 4242, "tok", &own, KEEP);
+        keeper.stop().await;
+        std::fs::remove_file(&hpath).unwrap();
+        tokio::time::sleep(KEEP * 3).await;
+        assert!(!hpath.exists(), "a stopped keeper writes nothing more");
+
+        put_manifest(&mpath, &keeper_manifest(200));
+        assert!(!refresh_handoff_at(&hpath, &mpath, 4242, "tok", &own));
+        assert!(!hpath.exists(), "a taken-over daemon hands off nothing");
+
+        put_manifest(&mpath, &own);
+        assert!(refresh_handoff_at(&hpath, &mpath, 4242, "tok", &own));
+        let taken = chimaera_core::Handoff::consume_at(&hpath).expect("fresh final record");
+        assert_eq!((taken.port, taken.token.as_str()), (4242, "tok"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A --bind-routable daemon consuming a handoff must come back routable:
