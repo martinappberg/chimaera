@@ -54,8 +54,9 @@ pub const ASKPASS_CANCELLED: &str = "authentication cancelled";
 /// app's master never collides with the real app's. A normal home is
 /// unaffected — it keeps `data_dir()/cm/%C`.
 fn control_path() -> String {
-    if let Some(t) = wsl_transport() {
-        return wsl_control_path(&t.home);
+    // Win32-OpenSSH has no ControlMaster; there is no socket to place.
+    if !multiplexing() {
+        return "none".to_string();
     }
     let data_dir = chimaera_core::data_dir();
     let dir = control_dir(&data_dir);
@@ -128,48 +129,15 @@ fn tighten_own_dir(dir: &Path, ours: &Path) -> bool {
     }
 }
 
-/// On Windows every ssh/scp runs INSIDE the WSL2 distro that hosts the local
-/// daemon: `connect`'s whole architecture rides on ControlMaster, which
-/// Win32-OpenSSH does not implement — Linux OpenSSH in the distro does. The
-/// shell wires this once the distro is known; `None` (always, on unix) means
-/// spawn the system ssh directly.
-#[derive(Clone, Debug)]
-pub struct WslTransport {
-    /// The distro whose ssh (and daemon) we ride.
-    pub distro: String,
-    /// The distro user every spawn pins with `-u` (the default user can
-    /// change under us — Ubuntu's OOBE flips it on first interactive run).
-    pub user: String,
-    /// The distro-side `$HOME`, anchoring the ControlMaster sockets — a
-    /// socket ssh creates inside the distro cannot live on a Windows path.
-    pub home: String,
+/// Whether ssh calls share a ControlMaster. Windows' built-in OpenSSH does not
+/// implement ControlMaster, so there every call is its own connection and the
+/// `-O` control operations have no master to address.
+const fn multiplexing() -> bool {
+    !cfg!(windows)
 }
 
-static WSL_TRANSPORT: std::sync::RwLock<Option<WslTransport>> = std::sync::RwLock::new(None);
-
-pub fn set_wsl_transport(t: Option<WslTransport>) {
-    *WSL_TRANSPORT.write().unwrap_or_else(|p| p.into_inner()) = t;
-}
-
-fn wsl_transport() -> Option<WslTransport> {
-    WSL_TRANSPORT
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone()
-}
-
-/// Whether the WSL transport is wired and remote connects can work at all
-/// on this host — the shell refuses a connect when wiring failed rather
-/// than silently spawning Win32-OpenSSH (which lacks ControlMaster).
-pub fn wsl_transport_ready() -> bool {
-    wsl_transport().is_some()
-}
-
-/// The ssh/scp process builder, transport-aware. `--exec` bypasses the
-/// distro's login shell; env the ssh children need (`SSH_ASKPASS` et al)
-/// crosses the boundary via `WSLENV`, which the shell exports. The user is
-/// pinned with `-u` so a later change of the distro's default user (Ubuntu
-/// OOBE) can never silently re-home ssh's config/keys/sockets mid-flight.
+/// The ssh/scp process builder. Windows children get no console window (the
+/// app is a GUI process).
 fn transport_command(program: &str) -> Command {
     #[cfg(test)]
     if let Some(fake) = FAKE_TRANSPORT.with(|f| f.borrow().clone()) {
@@ -177,20 +145,11 @@ fn transport_command(program: &str) -> Command {
         c.arg(program);
         return c;
     }
-    match wsl_transport() {
-        Some(t) => {
-            let mut c = Command::new("wsl.exe");
-            c.args(["-d", &t.distro, "-u", &t.user, "--exec", program]);
-            // wsl.exe's own diagnostics are UTF-16LE without this; every
-            // caller decodes stderr as UTF-8 (legacy inbox WSL ignores the
-            // var — its errors stay mojibake, acceptably rare).
-            c.env("WSL_UTF8", "1");
-            #[cfg(windows)]
-            c.creation_flags(chimaera_core::CREATE_NO_WINDOW);
-            c
-        }
-        None => Command::new(program),
-    }
+    #[allow(unused_mut)]
+    let mut c = Command::new(program);
+    #[cfg(windows)]
+    c.creation_flags(chimaera_core::CREATE_NO_WINDOW);
+    c
 }
 
 #[cfg(test)]
@@ -274,9 +233,9 @@ async fn collect_child_bounded(
     }
 }
 
-/// Collect a command's output with hard byte and time bounds. Under the WSL
-/// transport a wedged wsl.exe would otherwise hang forever — ssh's own
-/// `ConnectTimeout` only bounds the TCP connect *inside* the distro.
+/// Collect a command's output with hard byte and time bounds, so a wedged
+/// child cannot hang a caller forever (ssh's own `ConnectTimeout` only bounds
+/// the TCP connect).
 async fn output_bounded(
     cmd: &mut Command,
     secs: u64,
@@ -293,40 +252,6 @@ async fn output_bounded(
         .spawn()
         .with_context(|| format!("failed to run {what}"))?;
     collect_child_bounded(child, secs, what).await
-}
-
-/// ssh runs inside the distro, so its ControlMaster socket must live on a
-/// distro-side path (the shell `mkdir -p`s the dir when wiring the
-/// transport). Deliberately the same `~/.chimaera/cm` an in-distro `connect`
-/// would use: the app and the distro share one authenticated master per
-/// host. Pure so the shape is testable without touching the global.
-fn wsl_control_path(home: &str) -> String {
-    format!("{home}/.chimaera/cm/%C")
-}
-
-/// How a local file path is spelled for a process inside WSL (`C:\x\y` →
-/// `/mnt/c/x/y`) — scp's "local" side runs in the distro under the transport.
-pub fn local_path_for_scp(path: &std::path::Path) -> String {
-    if wsl_transport().is_none() {
-        return path.to_string_lossy().into_owned();
-    }
-    windows_path_as_wsl(&path.to_string_lossy())
-}
-
-/// How a Windows path is spelled for a process inside WSL: drive-letter
-/// absolutes (including `\\?\`-verbatim ones, which `current_exe`/
-/// canonicalize can produce) become `/mnt/<drive>/…`; UNC and other shapes
-/// pass through untouched — callers must treat an un-translated result as
-/// "not reachable from the distro", not silently use it. Shared by scp's
-/// local side AND the shell's askpass-wrapper exe path, so the two can't
-/// drift.
-pub fn windows_path_as_wsl(s: &str) -> String {
-    let s = s.strip_prefix(r"\\?\").unwrap_or(s).replace('\\', "/");
-    if s.len() >= 3 && s.as_bytes()[1] == b':' && s.as_bytes()[2] == b'/' {
-        format!("/mnt/{}{}", s[..1].to_ascii_lowercase(), &s[2..])
-    } else {
-        s
-    }
 }
 
 /// The ControlMaster socket DIRECTORY for a given state dir: `<data_dir>/cm`
@@ -377,14 +302,25 @@ fn control_dir(data_dir: &std::path::Path) -> std::path::PathBuf {
 /// tunnel keeps its local listener open for hours, so every liveness probe
 /// lies "up" and reconnect becomes a no-op.
 fn ssh_opts(host: &str) -> Vec<String> {
-    let mut opts: Vec<String> = vec![
-        "-o".into(),
-        "ControlMaster=auto".into(),
-        "-o".into(),
-        format!("ControlPath={}", control_path()),
-        "-o".into(),
-        "ControlPersist=10m".into(),
-    ];
+    let mut opts: Vec<String> = if multiplexing() {
+        vec![
+            "-o".into(),
+            "ControlMaster=auto".into(),
+            "-o".into(),
+            format!("ControlPath={}", control_path()),
+            "-o".into(),
+            "ControlPersist=10m".into(),
+        ]
+    } else {
+        // Explicit, so a `ControlMaster` in the user's config (which Win32
+        // OpenSSH rejects or ignores) cannot reach these calls.
+        vec![
+            "-o".into(),
+            "ControlMaster=no".into(),
+            "-o".into(),
+            "ControlPath=none".into(),
+        ]
+    };
     opts.extend(host_key_opts(host));
     opts.extend([
         "-o".into(),
@@ -944,6 +880,10 @@ impl Tunnel {
 /// forward must cancel it by the exact spec it was opened with, on the
 /// master (the `route`) it was registered with.
 async fn cancel_master_forward(host: &str, route: &Route, spec: &str) {
+    if !multiplexing() {
+        // No master holds the forward: it dies with its own ssh child.
+        return;
+    }
     if bounded_mux_ssh(host, route, &["-O", "cancel", "-L", spec], &[], 10)
         .await
         .is_none()
@@ -990,6 +930,9 @@ pub async fn clear_wedged_master(host: &str, session_bound_secs: u64) -> bool {
 }
 
 async fn clear_wedged_master_via(host: &str, route: &Route, session_bound_secs: u64) -> bool {
+    if !multiplexing() {
+        return false;
+    }
     match bounded_mux_ssh(host, route, &["-O", "check"], &[], 10).await {
         // No master (or ssh cannot even run): nothing to clear.
         Some(false) => return false,
@@ -1660,12 +1603,9 @@ pub async fn connect(
     let tunnel = open_proven_tunnel(host, local_port, manifest.port, &manifest.token).await;
     let (child, mux_delegated) = match tunnel {
         Ok(tunnel) => tunnel,
-        // The availability probe binds on OUR side, but under the WSL
-        // transport ssh's -L binds inside the distro — a different port
-        // namespace — so the first pick can collide with an in-distro
-        // listener the probe cannot see. A stale mux forward can also accept
-        // locally without reaching this daemon. One retry on a fresh
-        // OS-assigned port covers both; an EXPLICITLY requested port stays a
+        // A stale mux forward can accept locally without reaching this
+        // daemon, and the availability probe can race another bind. One
+        // retry on a fresh OS-assigned port covers both; an EXPLICITLY requested port stays a
         // hard error, and so is anything but a forward failure (a refused
         // sign-in would fail the same way on any port).
         Err(e) if opts.local_port.is_none() && e.downcast_ref::<TunnelPhaseError>().is_some() => {
@@ -2546,8 +2486,8 @@ fn download_cache_path(triple: &str, version: &str) -> PathBuf {
 /// [`resolve_release_asset`] for version-vs-latest selection), caching it under
 /// [`download_cache_path`] keyed by the resolved version. This is the end-user
 /// auto-install path — the app ships no repo and no `just dist` stash. Public
-/// for the Windows shell, which provisions a WSL distro exactly the way
-/// `connect` provisions a remote host: same assets, same cache, same verify.
+/// for the native shell, which provisions a host exactly the way `connect`
+/// provisions a remote one: same assets, same cache, same verify.
 ///
 /// Downloads with the system `curl` (kept dependency-free, like every other
 /// ssh/scp/curl shell-out here) and verifies the bytes against the release's
@@ -2745,9 +2685,7 @@ async fn deploy_binary(
     ssh_run(host, &format!("mkdir -p {}", home.bin_dir())).await?;
     let output = output_bounded(
         scp_cmd(host)
-            // Under the WSL transport scp itself runs in the distro, so the
-            // "local" side must be spelled as a /mnt path.
-            .arg(local_path_for_scp(path))
+            .arg(path)
             .arg(format!("{host}:{}", home.scp_staged_bin())),
         600,
         "scp",
@@ -3021,12 +2959,7 @@ fn pick_local_port(requested: Option<u16>, remote_port: u16) -> anyhow::Result<u
     if let Some(port) = requested {
         return Ok(port);
     }
-    // Under the WSL transport the -L bind happens inside the distro, where
-    // the remote port number is often ALREADY taken (the WSL-hosted local
-    // daemon) — and this Windows-side probe can't see that. Skip straight to
-    // an ephemeral pick there; matching the remote port is only a nicety.
-    if wsl_transport().is_none() && std::net::TcpListener::bind(("127.0.0.1", remote_port)).is_ok()
-    {
+    if std::net::TcpListener::bind(("127.0.0.1", remote_port)).is_ok() {
         return Ok(remote_port);
     }
     ephemeral_port()
@@ -3384,13 +3317,30 @@ fn master_proxy_command(host: &str, pin: Option<&str>) -> String {
             .iter()
             .map(|opt| format!("\"{}\"", opt.replace('%', "%%"))),
     );
-    // The alias is user input that reaches a shell: single-quoted, with `%`
-    // doubled for the outer ssh's own token expansion.
-    words.push(format!(
-        "-W %h:%p '{}'",
-        host.replace('%', "%%").replace('\'', r"'\''")
-    ));
+    words.push(format!("-W %h:%p {}", quote_alias_for_proxy(host)));
     words.join(" ")
+}
+
+/// The alias is user input that reaches a shell: single-quoted for `sh`, with
+/// `%` doubled for the outer ssh's own token expansion.
+#[cfg(not(windows))]
+fn quote_alias_for_proxy(host: &str) -> String {
+    format!("'{}'", host.replace('%', "%%").replace('\'', r"'\''"))
+}
+
+/// Windows ssh hands ProxyCommand to `cmd.exe`, which has no single quotes
+/// and no way to escape its metacharacters inside double quotes (`%`, `^`,
+/// `&`, `|`, `<`, `>`, `!`). An alias containing any of them gets a command
+/// that fails at once, so the rung reads as unavailable rather than running
+/// attacker-shaped text. (Without a ControlMaster the inner ssh dials its
+/// own connection, so this rung re-authenticates; it works, just slowly.)
+#[cfg(windows)]
+fn quote_alias_for_proxy(host: &str) -> String {
+    if host.contains(['"', '%', '^', '&', '|', '<', '>', '!', '\r', '\n']) {
+        "chimaera-invalid-alias".to_string()
+    } else {
+        format!("\"{host}\"")
+    }
 }
 
 /// [`master_proxy_command`] over whichever master the login alias's `route`
@@ -4182,6 +4132,7 @@ mod tests {
     /// unix-socket path limit: the socket falls back to a short /tmp dir keyed
     /// by the home, still ending in `/cm` (so `…/cm/%C` holds), and distinct
     /// homes never collide (a dev master never rides the real app's).
+    #[cfg(unix)]
     #[test]
     fn control_dir_stays_under_sun_path_for_a_deep_home() {
         use std::path::Path;
@@ -4226,33 +4177,40 @@ mod tests {
         );
     }
 
-    /// The WSL transport's path vocabulary, pure halves only (the global
-    /// transport switch is never flipped in tests — other tests exercise the
-    /// direct-ssh path concurrently).
+    #[cfg(windows)]
     #[test]
-    fn wsl_transport_path_spelling() {
-        // scp's "local" side runs in the distro: drive-letter absolutes
-        // become /mnt paths, spaces survive, non-drive paths pass through.
+    fn windows_ssh_opts_never_multiplex() {
+        let opts = ssh_opts("cluster");
         assert_eq!(
-            windows_path_as_wsl(r"C:\Users\First Last\bin\chimaera.exe"),
-            "/mnt/c/Users/First Last/bin/chimaera.exe"
+            &opts[..4],
+            ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
         );
-        assert_eq!(windows_path_as_wsl(r"D:\x"), "/mnt/d/x");
-        // \\?\-verbatim paths (current_exe / canonicalize can produce them).
-        assert_eq!(
-            windows_path_as_wsl(r"\\?\C:\Users\x\chimaera.exe"),
-            "/mnt/c/Users/x/chimaera.exe"
+        assert!(
+            !opts
+                .iter()
+                .any(|o| o.contains("ControlPersist") || o.contains("ControlMaster=auto")),
+            "{opts:?}"
         );
-        // UNC passes through — callers must treat that as unreachable.
-        assert_eq!(windows_path_as_wsl(r"\\server\share\f"), "//server/share/f");
-        assert_eq!(windows_path_as_wsl("/already/unixy"), "/already/unixy");
-        // The in-distro master socket: same ~/.chimaera/cm shape an
-        // in-distro connect uses, comfortably under the sun_path cap.
-        let cp = wsl_control_path("/home/someuser");
-        assert_eq!(cp, "/home/someuser/.chimaera/cm/%C");
-        assert!(cp.len() <= 100);
+        assert_eq!(control_path(), "none");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_proxy_command_quotes_for_cmd() {
+        let proxy = master_proxy_command("pool", None);
+        assert!(proxy.ends_with(r#"-W %h:%p "pool""#), "{proxy}");
+        // cmd.exe metacharacters cannot be escaped: the rung fails closed.
+        assert!(master_proxy_command("a&b", None).ends_with("-W %h:%p chimaera-invalid-alias"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_mux_control_operations_find_nothing() {
+        assert!(!clear_wedged_master_via("cluster", &Route::Alias, 1).await);
+        cancel_master_forward("cluster", &Route::Alias, "1:127.0.0.1:2").await;
+    }
+
+    #[cfg(unix)]
     #[test]
     fn ssh_opts_multiplex_and_accept_new_hosts() {
         let opts = ssh_opts("cluster");
@@ -5676,6 +5634,7 @@ mod tests {
     /// The route's ssh options: a node route overrides only `HostName`; the
     /// via-alias route adds a `-W` first leg over the alias's own master,
     /// with its `%` escaped for the outer ssh's expansion.
+    #[cfg(unix)]
     #[test]
     fn route_options_pin_the_node() {
         assert!(route_opts("pool", &Route::Alias).is_empty());
@@ -5972,6 +5931,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn interactive_and_node_proxy_commands_ride_the_right_master() {
         let argv = interactive_ssh_argv("login.example.edu");
