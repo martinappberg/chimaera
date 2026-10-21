@@ -212,7 +212,12 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   refuses to load an empty session). A chat mid-task is left alone, and a chat that completed a
   turn no longer counts as waiting. The daemon is the one owner of that relaunch; a card only
   refreshes the verdict. `/login` typed in a chat relaunches that chat too (`session_id` on the
-  start request). No sign-in runs beside an install or update of the same agent.
+  start request). No sign-in runs beside an install or update of the same agent. An error in
+  the account's words rather than a missing login — a usage limit, an exhausted quota or credit,
+  a plan without this agent — offers **Sign in with another account** beside it (the newest such
+  notice, or the fatal banner of a chat that died of it), which opens the same card; that works
+  in a chat that has ended too, whose composer can no longer take `/login`, and the chat starts
+  again in place once the login lands.
 - **How it's used.** Click **Sign in** — or type `/login` in any chat, which opens the card there
   even when the agent is signed in (switch accounts, refresh a stale login; Antigravity's headless
   login only finds the existing one, so its card offers no second sign-in). The card shows the page to open (**Open ↗** goes
@@ -261,8 +266,13 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   those (`chat::relaunch_after_sign_in`, at most 8) and clears the mark. The login runs
   as its own process group with a 10-minute deadline, output private to the daemon (64 KiB;
   only the URL, the code and a short failure tail reach the wire), no session or PTY entry;
-  cancel is SIGTERM then SIGKILL to the group. A clean exit is never success by itself — the
-  status command is asked again. Concurrent status probes for one agent share a run. The
+  cancel is SIGTERM then SIGKILL to the group. The page and code are read only from the CLI's own
+  output: the login runs behind a `/bin/sh` that prints a start marker and execs the CLI, and
+  what the login shell printed before it (a remote host's welcome banner, a profile script's
+  portal link, the prelude) is dropped — on a remote host that banner's link used to become the
+  card's page. A URL on the vendor's login host is final; any other is a guess the vendor's
+  replaces. A status command's JSON (Claude, Cursor) is read past a banner on the same stdout.
+  A clean exit is never success by itself — the status command is asked again. Concurrent status probes for one agent share a run. The
   chat view shows one line per failure: a startup error that a fatal banner shows
   is not repeated as a transcript line, and a fatal banner is not followed by *agent exited*.
 

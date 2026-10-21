@@ -33,6 +33,32 @@ export function needsSignIn(a: AgentInfo | null | undefined): boolean {
   return a !== null && a !== undefined && a.installed && a.signedIn === false;
 }
 
+/** The account's words, not a missing login: a usage limit, an exhausted
+ *  quota or credit, or a plan without this agent. Signing in with another
+ *  account is a real way on, so the chat offers it beside the error. A hint
+ *  for an offer, never a verdict. */
+const ACCOUNT_CUES = [
+  "usage limit",
+  "hit your limit",
+  "limit reached",
+  "upgrade to",
+  "credit balance",
+  "out of credits",
+  "insufficient credits",
+  "quota exceeded",
+  "exceeded your quota",
+  "insufficient_quota",
+  "resource_exhausted",
+  "does not have access",
+  "subscription",
+];
+
+export function accountLimited(text: string | null | undefined): boolean {
+  if (!text) return false;
+  const lower = text.toLowerCase();
+  return ACCOUNT_CUES.some((cue) => lower.includes(cue));
+}
+
 const path = (agent: string) => agentOperationPath(agent, "sign-in");
 /** Longer than an install call: `?check=true` runs the CLI's own status
  *  command inline, bounded at 10 s on the daemon. */

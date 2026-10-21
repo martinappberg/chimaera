@@ -43,6 +43,11 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// this; a sign-in, a chat startup failure or `?check=true` re-ask at once.
 const STATUS_TTL: Duration = Duration::from_secs(10 * 60);
 const URL_LIMIT: usize = 8192;
+/// Printed by the wrapper right before it execs the CLI's login. A login
+/// shell's own output (a host's welcome banner, a profile script, the
+/// prelude) comes first and can carry links of its own — a cluster's portal,
+/// say — so only what follows this line is the CLI's.
+const CLI_START: &str = "[chimaera:sign-in-cli-start]";
 
 /// How this agent signs in.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Debug)]
@@ -185,9 +190,7 @@ fn parse_probe(kind: AgentKind, success: bool, stdout: &str, stderr: &str) -> Op
     let lower = text.to_ascii_lowercase();
     match kind {
         // `claude auth status --json` → {"loggedIn": bool, …}
-        AgentKind::Claude => serde_json::from_str::<serde_json::Value>(stdout.trim())
-            .ok()
-            .and_then(|v| v.get("loggedIn")?.as_bool()),
+        AgentKind::Claude => status_json(stdout).and_then(|v| v.get("loggedIn")?.as_bool()),
         // `codex login status` → "Logged in using ChatGPT" (0) / "Not logged in" (1)
         AgentKind::Codex => {
             if lower.contains("not logged in") {
@@ -199,9 +202,7 @@ fn parse_probe(kind: AgentKind, success: bool, stdout: &str, stderr: &str) -> Op
             }
         }
         // `cursor-agent status --format json` → {"isAuthenticated": bool, …}
-        AgentKind::Cursor => serde_json::from_str::<serde_json::Value>(stdout.trim())
-            .ok()
-            .and_then(|v| v.get("isAuthenticated")?.as_bool()),
+        AgentKind::Cursor => status_json(stdout).and_then(|v| v.get("isAuthenticated")?.as_bool()),
         // `grok models` → "You are logged in with grok.com." / "You are not authenticated."
         AgentKind::Grok => {
             if lower.contains("not authenticated") {
@@ -230,6 +231,20 @@ fn parse_probe(kind: AgentKind, success: bool, stdout: &str, stderr: &str) -> Op
         }
         AgentKind::Gemini => None,
     }
+}
+
+/// A status command's JSON answer: the whole stdout, else the object that
+/// starts a line and runs to the end — a login shell's banner or a profile
+/// script may print ahead of the CLI on the same stdout.
+fn status_json(stdout: &str) -> Option<serde_json::Value> {
+    let parse = |s: &str| serde_json::from_str::<serde_json::Value>(s.trim()).ok();
+    parse(stdout).or_else(|| {
+        stdout
+            .match_indices('\n')
+            .map(|(at, _)| &stdout[at + 1..])
+            .filter(|rest| rest.trim_start().starts_with('{'))
+            .find_map(parse)
+    })
 }
 
 fn probe_argv(kind: AgentKind) -> Option<&'static [&'static str]> {
@@ -435,6 +450,10 @@ pub(crate) struct Progress {
     /// it, a failure's tail comes from it. Never on the wire.
     #[serde(skip)]
     output: String,
+    /// [`CLI_START`] has been seen: `output` now holds the CLI's own words
+    /// only. Until then nothing in it is a sign-in page.
+    #[serde(skip)]
+    cli_started: bool,
     #[serde(skip)]
     kind: AgentKind,
 }
@@ -453,6 +472,16 @@ impl operation::Progress for Progress {
     }
     fn on_output(&mut self, bytes: &[u8]) {
         operation::append_capped(&mut self.output, &String::from_utf8_lossy(bytes));
+        if !self.cli_started {
+            let Some(at) = self.output.find(CLI_START) else {
+                return;
+            };
+            // The shell's part is dropped: its links must never be the page,
+            // and a failure tail is the CLI's. A failure before the CLI ran
+            // keeps the whole output for its tail.
+            self.output.drain(..at + CLI_START.len());
+            self.cli_started = true;
+        }
         self.harvest();
     }
 }
@@ -461,7 +490,13 @@ impl Progress {
     /// text up to the last whitespace counts: a URL split across pipe reads
     /// must never reach the UI incomplete.
     fn harvest(&mut self) {
-        if self.url.is_some() && self.code.is_some() {
+        // A page on the vendor's login host is final; any other is the best
+        // guess so far, replaced when the vendor's appears.
+        let settled = self
+            .url
+            .as_deref()
+            .is_some_and(|url| on_login_host(url, self.kind));
+        if settled && self.code.is_some() {
             // Nothing left to find: don't re-scan the tail for every chunk.
             return;
         }
@@ -469,7 +504,7 @@ impl Progress {
         let complete = text
             .rfind(char::is_whitespace)
             .map_or("", |end| &text[..end]);
-        if self.url.is_none() {
+        if !settled {
             if let Some(url) = login_url(complete, self.kind) {
                 self.url = Some(url);
                 self.message = "Finish signing in in your browser.".into();
@@ -657,6 +692,7 @@ async fn start_operation(
         accepts_code: recipe.accepts_code,
         message: "Starting the sign-in…".into(),
         output: String::new(),
+        cli_started: false,
         kind,
     };
     // Decided under the lock: two first clicks must not both start.
@@ -784,7 +820,7 @@ async fn run_login(
         }
     }
     let remove = crate::api::spawn_env_remove(&env);
-    let argv = crate::launcher::wrap_login_shell(&crate::launcher::login_shell(), argv);
+    let argv = crate::launcher::wrap_login_shell(&crate::launcher::login_shell(), marked(argv));
     let mut command = operation::command(&argv, &cwd, env, remove);
     command.envs(extra_env);
     op.set_message("Waiting for the sign-in page…");
@@ -827,6 +863,19 @@ async fn run_login(
             "The sign-in wasn't finished within ten minutes. Try again.".into(),
         ),
     }
+}
+
+/// `argv` behind a `/bin/sh` that prints [`CLI_START`] and execs it, so the
+/// output splits into the login shell's part and the CLI's.
+fn marked(argv: Vec<String>) -> Vec<String> {
+    let mut cmd = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        format!("printf '\\n%s\\n' '{CLI_START}'; exec \"$@\""),
+        "sh".to_string(),
+    ];
+    cmd.extend(argv);
+    cmd
 }
 
 /// A folder whose `open` and `xdg-open` do nothing, for a login that would
@@ -942,22 +991,25 @@ fn login_hosts(kind: AgentKind) -> &'static [&'static str] {
     }
 }
 
+/// Whether `url` is on one of `kind`'s login hosts (or a subdomain).
+fn on_login_host(url: &str, kind: AgentKind) -> bool {
+    url.parse::<axum::http::Uri>()
+        .ok()
+        .and_then(|u| u.host().map(str::to_ascii_lowercase))
+        .is_some_and(|host| {
+            login_hosts(kind)
+                .iter()
+                .any(|h| host == *h || host.ends_with(&format!(".{h}")))
+        })
+}
+
 /// The sign-in page in `text`: a URL on the vendor's login host, else the
 /// LAST URL printed — an update banner's link must not win over the login's.
 pub(crate) fn login_url(text: &str, kind: AgentKind) -> Option<String> {
     let found = urls(text);
     found
         .iter()
-        .find(|url| {
-            url.parse::<axum::http::Uri>()
-                .ok()
-                .and_then(|u| u.host().map(str::to_string))
-                .is_some_and(|host| {
-                    login_hosts(kind)
-                        .iter()
-                        .any(|h| host == *h || host.ends_with(&format!(".{h}")))
-                })
-        })
+        .find(|url| on_login_host(url, kind))
         .or(found.last())
         .cloned()
 }
@@ -1032,6 +1084,81 @@ mod tests {
             Some("https://login.example.test/start")
         );
         assert_eq!(login_url("nothing here", AgentKind::Grok), None);
+    }
+
+    fn progress(kind: AgentKind) -> Progress {
+        Progress {
+            id: "p".into(),
+            how: How::Browser,
+            phase: Phase::Running,
+            workspace_id: "w".into(),
+            started_at: 0,
+            url: None,
+            code: None,
+            accepts_code: false,
+            message: String::new(),
+            output: String::new(),
+            cli_started: false,
+            kind,
+        }
+    }
+
+    #[test]
+    fn a_login_shell_s_banner_link_is_never_the_sign_in_page() {
+        use operation::Progress as _;
+        // A remote host's profile prints its own portal link before the CLI
+        // runs; the page is the CLI's, even when the marker arrives split.
+        let mut p = progress(AgentKind::Codex);
+        p.on_output(b"Welcome! Docs at https://portal.cluster.example.test/help \n");
+        p.on_output(b"Quota: https://portal.cluster.example.test/quota \n[chimaera:sign-in-");
+        assert_eq!(p.url, None, "nothing before the CLI is a page");
+        p.on_output(b"cli-start]\n1. Open this link\n   https://auth.openai.com/codex/device\n\n2. Enter this code\n   ABCD-EFGH1\n");
+        assert_eq!(
+            p.url.as_deref(),
+            Some("https://auth.openai.com/codex/device")
+        );
+        assert_eq!(p.code.as_deref(), Some("ABCD-EFGH1"));
+        assert!(!p.output.contains("portal"), "the shell's part is dropped");
+
+        // A shell that failed before the CLI ran keeps its words for the tail.
+        let mut p = progress(AgentKind::Claude);
+        p.on_output(b"bash: /bad/prelude: No such file or directory\n");
+        assert_eq!(p.url, None);
+        assert!(failure_tail(&p.output).contains("No such file"));
+    }
+
+    #[test]
+    fn the_vendor_s_page_replaces_an_earlier_guess() {
+        use operation::Progress as _;
+        let mut p = progress(AgentKind::Cursor);
+        p.on_output(
+            format!("{CLI_START}\nSee https://docs.example.test/cli for help\n").as_bytes(),
+        );
+        assert_eq!(p.url.as_deref(), Some("https://docs.example.test/cli"));
+        p.on_output(b"Open: https://cursor.com/loginDeepControl?challenge=a&uuid=b \n");
+        assert_eq!(
+            p.url.as_deref(),
+            Some("https://cursor.com/loginDeepControl?challenge=a&uuid=b")
+        );
+        p.on_output(b"also https://docs.example.test/later \n");
+        assert_eq!(
+            p.url.as_deref(),
+            Some("https://cursor.com/loginDeepControl?challenge=a&uuid=b"),
+            "a vendor page is final"
+        );
+    }
+
+    #[test]
+    fn a_status_answer_after_a_banner_still_reads() {
+        let out =
+            "Welcome to the cluster.\nSee https://portal.example.test\n{\"loggedIn\": true}\n";
+        assert_eq!(parse_probe(AgentKind::Claude, true, out, ""), Some(true));
+        let out = "motd line\n{\n  \"isAuthenticated\": false\n}\n";
+        assert_eq!(parse_probe(AgentKind::Cursor, true, out, ""), Some(false));
+        assert_eq!(
+            parse_probe(AgentKind::Claude, true, "banner only\n", ""),
+            None
+        );
     }
 
     #[test]
