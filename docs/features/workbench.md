@@ -38,11 +38,12 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
 
 - **What & when.** Browse the daemon's filesystem to open (or create) a folder as a workspace.
 - **How it's used.** `Mod+O`. Opens at `$HOME`; type to filter the current directory or type
-  an absolute/`~` path for shell-style tab-completion. When the typed path doesn't exist the
-  top row flips to "create folder" (create + open as a workspace in one step). In browse mode
-  a tail **"new folder…"** row swaps to an inline input that creates in the *browsed*
-  directory (`a/b` nests) and navigates into it — "open this folder" is the next Enter.
-  Enter opens here; Cmd/Ctrl+Enter opens in a new window.
+  an absolute/`~` path for shell-style tab-completion. The list only browses (`..` goes up,
+  a row with `›` goes in); a pinned footer holds the commit: a primary **Open <folder>** button
+  (Cmd/Ctrl+Enter, or Enter when no row is highlighted) beside **Open in new window**. When the
+  typed path doesn't exist the button becomes "Create & open". In browse mode a tail
+  **"new folder…"** row swaps to an inline input that creates in the *browsed* directory
+  (`a/b` nests) and navigates into it. Recents open in this window on click.
 - **Where it lives.** `web-ui/src/lib/workspace/FolderPicker.svelte`; `fsHome`/`fsDirs`/`fsMkdir`
   in `sessions.ts`. Routes: `GET /api/v1/fs/home`, `GET /api/v1/fs/dirs`, `POST /api/v1/fs/mkdir`,
   `POST /api/v1/workspaces`.
