@@ -667,8 +667,9 @@ body.dragging {
   }
 }
 
-/* One scrollbar treatment for the session list, Recents and file tree. */
-.sidebar-scrollbar {
+/* One scrollbar treatment for the session list, Recents, file tree and chat trays (.quiet-scrollbar). */
+.sidebar-scrollbar,
+.quiet-scrollbar {
   scrollbar-width: thin;
   scrollbar-color: color-mix(in srgb, var(--fg) 22%, transparent) transparent;
 }
@@ -676,23 +677,29 @@ body.dragging {
 /* Keep a usable drag target around a quiet thumb, including in WKWebView.
    Standard non-auto scrollbar properties override the WebKit dimensions. */
 @supports selector(::-webkit-scrollbar) {
-  .sidebar-scrollbar {
+  .sidebar-scrollbar,
+  .quiet-scrollbar {
     scrollbar-width: auto;
     scrollbar-color: auto;
   }
-  .sidebar-scrollbar::-webkit-scrollbar {
+  .sidebar-scrollbar::-webkit-scrollbar,
+  .quiet-scrollbar::-webkit-scrollbar {
     width: 8px;
+    height: 8px;
   }
-  .sidebar-scrollbar::-webkit-scrollbar-track {
+  .sidebar-scrollbar::-webkit-scrollbar-track,
+  .quiet-scrollbar::-webkit-scrollbar-track {
     background: transparent;
   }
-  .sidebar-scrollbar::-webkit-scrollbar-thumb {
+  .sidebar-scrollbar::-webkit-scrollbar-thumb,
+  .quiet-scrollbar::-webkit-scrollbar-thumb {
     background: color-mix(in srgb, var(--fg) 22%, transparent);
     border: 2px solid transparent;
     border-radius: 4px;
     background-clip: padding-box;
   }
-  .sidebar-scrollbar::-webkit-scrollbar-thumb:hover {
+  .sidebar-scrollbar::-webkit-scrollbar-thumb:hover,
+  .quiet-scrollbar::-webkit-scrollbar-thumb:hover {
     background-color: color-mix(in srgb, var(--fg) 38%, transparent);
   }
 }

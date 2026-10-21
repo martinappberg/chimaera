@@ -256,6 +256,13 @@ pub(crate) fn spawn_signal_task(state: Arc<AppState>) {
             match signal {
                 ChatSignal::Event(id, entry) => {
                     apply_chat_event(&state, &id, &entry.ev);
+                    // AFTER the fold, which reads the record idle.
+                    if matches!(
+                        entry.ev,
+                        AgentEvent::TurnCompleted { .. } | AgentEvent::TurnAborted { .. }
+                    ) {
+                        relaunch_after_turn(&state, &id);
+                    }
                     goals.observe(&state, &id, &entry.ev);
                     // AFTER the fold: a turn end reads the record idle.
                     crate::comms::on_chat_event(&state, &id, &entry.ev);
@@ -1589,10 +1596,12 @@ pub(crate) async fn switch_view(
 }
 
 /// A sign-in landed for `kind`: start every chat of it that waited on a
-/// login again, in place — the ones that died at startup for want of one and
-/// the live ones started while the CLI said signed out (their process never
-/// reloads credentials). The same respawn as the view route's `relaunch`;
-/// a chat mid-task (409) is left alone. Bounded: at most 8 per sign-in.
+/// login again, in place — the ones that died at startup for want of one,
+/// the live ones started while the CLI said signed out, and the one the
+/// sign-in was asked from (their process never reloads credentials). The
+/// same respawn as the view route's `relaunch`. A chat mid-turn is not
+/// interrupted: it relaunches when that turn ends. Bounded: at most 8 per
+/// sign-in.
 pub(crate) async fn relaunch_after_sign_in(state: Arc<AppState>, kind: AgentKind) -> usize {
     // Only chats the registry still knows (dead or alive) count toward the
     // cap; a retired record has nothing to start and is unmarked.
@@ -1616,14 +1625,21 @@ pub(crate) async fn relaunch_after_sign_in(state: Arc<AppState>, kind: AgentKind
     }
     let mut relaunched = 0;
     for id in waiting {
+        if mid_turn(&state, &id) {
+            if let Some(record) = crate::lock(&state.agents).get_mut(&id) {
+                record.signed_out_at_start = false;
+                record.relaunch_after_turn = true;
+            }
+            tracing::info!(%id, "chat relaunches after its turn, for the new sign-in");
+            continue;
+        }
         match relaunch_chat(&state, &id).await {
             Ok(()) => {
                 tracing::info!(%id, kind = kind.as_str(), "chat relaunched after sign-in");
                 relaunched += 1;
             }
             Err(why) => {
-                // Mid-task (409) is an authenticated process doing work; a
-                // refusal of any kind is final for this landing.
+                // A refusal of any kind is final for this landing.
                 tracing::info!(%id, %why, "chat not relaunched after sign-in");
             }
         }
@@ -1632,6 +1648,44 @@ pub(crate) async fn relaunch_after_sign_in(state: Arc<AppState>, kind: AgentKind
         }
     }
     relaunched
+}
+
+/// A turn is running (or parked on an approval) or a send waits to start
+/// one: relaunching now would kill it.
+fn mid_turn(state: &AppState, id: &str) -> bool {
+    state
+        .chat
+        .input_activity(id)
+        .is_some_and(|(carry, pending)| carry.turn_in_flight || pending)
+        || crate::lock(&state.agents)
+            .get(id)
+            .is_some_and(|r| r.state == AgentState::Running)
+}
+
+/// A turn ended: a chat a sign-in landed on mid-turn starts again now, in
+/// place, so it runs on the new login. Still busy (a queued send started the
+/// next turn) defers it to that turn's end.
+fn relaunch_after_turn(state: &Arc<AppState>, id: &str) {
+    let due = crate::lock(&state.agents)
+        .get_mut(id)
+        .is_some_and(|r| std::mem::take(&mut r.relaunch_after_turn));
+    if !due {
+        return;
+    }
+    let state = state.clone();
+    let id = id.to_string();
+    tokio::spawn(async move {
+        if mid_turn(&state, &id) {
+            if let Some(record) = crate::lock(&state.agents).get_mut(&id) {
+                record.relaunch_after_turn = true;
+            }
+            return;
+        }
+        match relaunch_chat(&state, &id).await {
+            Ok(()) => tracing::info!(%id, "chat relaunched after its turn, for the new sign-in"),
+            Err(why) => tracing::info!(%id, %why, "chat not relaunched after its turn"),
+        }
+    });
 }
 
 /// Start a chat again in place — the view route's `relaunch`, for callers

@@ -18,7 +18,7 @@
   import { rfcToDataRow, tableFragment, tableLabel, tsvQuote, TSV_LIMITS, type TableBlock } from "../shared/locator";
   import ReferenceChip from "../shared/ReferenceChip.svelte";
   import Spinner from "./Spinner.svelte";
-  import { paneVisibility, whenRevealed } from "./viewLifecycle.svelte";
+  import { paneVisibility, viewSignal, whenRevealed } from "./viewLifecycle.svelte";
   import {
     autoColumnWidths,
     formatRowCount,
@@ -177,13 +177,13 @@
       void (async () => {
         try {
           const page = await fp(0, pageRows());
-          if (p !== path) return;
+          if (life.disposed || p !== path) return;
           apply(page, "replace");
         } catch (e) {
-          if (p !== path) return;
+          if (life.disposed || p !== path) return;
           error = e instanceof Error ? e.message : "failed to load the sheet";
         } finally {
-          if (p === path) loading = false;
+          if (!life.disposed && p === path) loading = false;
         }
       })();
       return;
@@ -205,6 +205,12 @@
     () => root,
   );
   const revealed = whenRevealed(() => onScreen.pane);
+  /** Disposed on unmount. A page fetch, jump or reveal that lands after the
+   *  view went (success, failure or `finally`) must stop there, before it
+   *  reads `win`/`gutterW` (this view's deriveds) or `path`/`fetchPage`
+   *  (getters into the host, whose deriveds die with it):
+   *  svelte.dev/e/derived_inert. */
+  const life = viewSignal();
   let shownEntry: FileEntry | null = null;
   $effect(() => {
     const e = entry;
@@ -336,6 +342,9 @@
     let reached = -1;
     let page: TablePage | null = null;
     for (let round = 0; round < MAX_SCAN_ROUNDS; round++) {
+      // `fetchPage` is a host's derived and `path` a getter into the host:
+      // neither is read for another round once the view is gone.
+      if (round > 0 && life.disposed) throw new DOMException("view closed", "AbortError");
       page = fetchPage !== undefined ? await fetchPage(offset, limit) : await fsTable(path, offset, limit);
       if (page.scan_limited !== true) return page;
       const next = page.scanned_to ?? 0;
@@ -415,13 +424,13 @@
     const gen = jumpGen;
     try {
       const page = await fetchAt(loadedOffset + rows.length, pageRows());
-      if (p !== path || gen !== jumpGen) return;
+      if (life.disposed || p !== path || gen !== jumpGen) return;
       apply(page, "append");
     } catch (e) {
-      if (p !== path) return;
+      if (life.disposed || p !== path) return;
       error = e instanceof Error ? e.message : "failed to load more rows";
     } finally {
-      if (p === path) loading = false;
+      if (!life.disposed && p === path) loading = false;
     }
     void tick().then(maybePrefetch);
   }
@@ -434,18 +443,18 @@
     const offset = Math.max(0, loadedOffset - pageRows());
     try {
       const page = await fetchAt(offset, loadedOffset - offset);
-      if (p !== path || gen !== jumpGen) return;
+      if (life.disposed || p !== path || gen !== jumpGen) return;
       apply(page, "prepend");
     } catch (e) {
-      if (p !== path) return;
+      if (life.disposed || p !== path) return;
       error = e instanceof Error ? e.message : "failed to load rows";
     } finally {
-      if (p === path) loading = false;
+      if (!life.disposed && p === path) loading = false;
     }
   }
 
   function maybePrefetch(): void {
-    if (rows.length === 0) return;
+    if (life.disposed || rows.length === 0) return;
     if (win.end >= rows.length - PREFETCH_ROWS && !atEnd) void loadMore();
     else if (win.start <= PREFETCH_ROWS && loadedOffset > 0) void loadPrev();
   }
@@ -494,13 +503,13 @@
       let page = await fetchAt(jumpOffset(target + 1), pageRows(), (reached) => {
         if (gen === jumpGen) seeking = `indexing… row ${reached.toLocaleString("en-US")}`;
       });
-      if (gen !== jumpGen || p !== path) return;
+      if (life.disposed || gen !== jumpGen || p !== path) return;
       noteCounts(page);
       if (page.rows.length === 0 && total !== null && total > 0) {
         // Past the end: land on the last row instead.
         target = total - 1;
         page = await fetchAt(jumpOffset(total), pageRows());
-        if (gen !== jumpGen || p !== path) return;
+        if (life.disposed || gen !== jumpGen || p !== path) return;
       }
       if (page.rows.length === 0) {
         error = `row ${(n).toLocaleString("en-US")} is past the end`;
@@ -512,7 +521,7 @@
       scrollToRow(target, Math.max(target, to - 1));
       void tick().then(maybePrefetch);
     } catch (e) {
-      if (gen === jumpGen && p === path) error = e instanceof Error ? e.message : "jump failed";
+      if (!life.disposed && gen === jumpGen && p === path) error = e instanceof Error ? e.message : "jump failed";
     } finally {
       if (gen === jumpGen) seeking = null;
     }
@@ -857,7 +866,7 @@
     const firstRow = t.row !== undefined ? rfcToDataRow(t.row, hasHeader) : 1;
     const lastRow = t.row === undefined ? firstRow : rfcToDataRow(t.endRow ?? t.row, hasHeader);
     await jumpTo(firstRow, lastRow);
-    if (gen !== revealGen) return;
+    if (life.disposed || gen !== revealGen) return;
     const r0 = firstRow - 1;
     const r1 = t.row === undefined ? loadedOffset + rows.length - 1 : lastRow - 1;
     hit = { r0, r1, c0, c1 };

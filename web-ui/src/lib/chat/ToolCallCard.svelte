@@ -309,7 +309,7 @@
     <!-- .body scrolls; the wrapper is the non-scrolling anchor the copy
          button pins to, so it never rides away with the content. -->
     <div class="body-wrap">
-      <div class="body" bind:this={bodyEl}>
+      <div class="body quiet-scrollbar" bind:this={bodyEl}>
         {#if block.content.kind === "output"}
           <pre>{block.content.text}</pre>
           {#if block.streaming}

@@ -42,9 +42,10 @@ PTY snapshot-on-attach ([terminals.md](terminals.md)) and the chat seq-journal g
   says that this specific row must start fresh. A finished Codex chat carries its `ChatInfo` thread id
   into Recents before the chat registry entry is removed.
 - **How it's used.** No route — this is boot/shutdown lifecycle, gated by `daemon.restoreSessions`
-  (default true). A graceful stop also writes a **handoff** (port + token) so a successor daemon rebinds
-  the same port with the same token — ssh forwards stay valid and every client heals with a plain
-  reconnect.
+  (default true). The daemon keeps a **handoff** (port + token) current while it serves — written at
+  listen time, refreshed every 30 s, and written again at a graceful stop — so a successor daemon
+  rebinds the same port with the same token, after a planned restart or a crash alike: ssh forwards
+  stay valid and every client (a plain browser tab included) heals with a plain reconnect.
 - **Where it lives.** `ledger.rs` (`LedgerEntry`/`LedgerAgent` incl. `ui`+`model`, `snapshot` — now
   enumerating `state.chat` alongside the PTY roster — `plan_restore`, `resolve_resume`, `respawn`,
   `retire_to_recents`), `chat.rs::resurrect_chat` (the chat spawn recipe), `lifecycle.rs`
@@ -63,7 +64,8 @@ PTY snapshot-on-attach ([terminals.md](terminals.md)) and the chat seq-journal g
   claude chat reports its id only with its first turn, so until then the ledger keeps the id it was
   resumed from — a chat restarted twice without a turn between still resumes. A client connecting mid-restore waits `wait_restored()` (cap 15s) so it never
   prunes still-respawning tabs. A busy handoff port after ~5s falls back to an OS-assigned port (stay up
-  on a fresh port rather than die); a crash leaves no handoff; an explicit conflicting `--port` wins.
+  on a fresh port rather than die); a handoff older than 120 s (a daemon dead for longer) is dropped and
+  the successor mints a fresh token; an explicit conflicting `--port` wins.
 - **Chat journals survive the restart too.** The chat-journal dir budget (100 MiB / 200 files) waits
   for restore (`ledger::consume_boot` → `chat::prune_journals`): until a ledgered chat respawns it is
   live nowhere, yet its journal is what it replays and resumes from. After that the budget evicts

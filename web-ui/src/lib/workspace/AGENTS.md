@@ -47,6 +47,7 @@ Tests: `*.test.ts` beside the modules.
 - **Cluster words are cluster, job, workspace, chats** — never server, session, or allocation (`cluster.ts` header).
 - **A remote window takes only its own host's SSH prompts.** Null scope is the local fallback (`askpassScope.ts`).
 - **Pending agent setup survives a reload.** `agentSetup.ts` stores the operation id before the POST and clears it only after the result shows ([settings map](../settings/AGENTS.md)).
+- **A deleted or vanished tree row hands focus on, never to `<body>`.** `FileTree` moves focus from a focused row that a re-list drops to the same path, a renamed row's new path, the row now in its place, or the tree. A delete asked from a row also re-checks once the confirm dialog closes, because the disk monitor can re-list before the delete call returns. It only acts when focus was on one of this tree's rows and is now nowhere, and never from an `inert` tree. Its context-menu picks rely on `ContextMenuHost` giving focus back to the right-clicked row before a pick runs, so the dialog records the row as its opener ([ui-contracts §2–3](../../../../docs/agent-guides/ui-contracts.md#2-buttons-dialogs-popovers-menus-tabs-selection-destructive-actions)).
 - **`fsEvents` and `diskWatch` are separate signals.** One in-repo change can refresh twice; both re-lists are idempotent (`fsEvents.ts` header).
 
 ## Checks

@@ -120,7 +120,7 @@
   {/if}
 {/snippet}
 
-<div class="strip pinned-card" class:visible>
+<div class="strip pinned-card quiet-scrollbar" class:visible class:plan-open={shown === "plan"}>
   <div class="line">
     {#each parts as part (part)}
       <button
@@ -182,6 +182,12 @@
     color: var(--muted);
     max-height: 200px;
     overflow-y: auto;
+  }
+  /* The task list inside scrolls itself (and keeps the step in flight in
+     view); a second clamp out here gave the pair two scrollbars. */
+  .strip.plan-open {
+    max-height: none;
+    overflow-y: visible;
   }
   .line {
     display: flex;

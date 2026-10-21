@@ -553,9 +553,11 @@
       page?.cleanup();
       renderingPages.delete(n);
       // A zoom/fit change may land while this page is rasterizing, even
-      // when that draw fails. Finish once, then honor the newer scale.
-      const currentScale = scaleOf(zoom);
-      if (!disposed && currentScale !== s && slot.isConnected) {
+      // when that draw fails. Finish once, then honor the newer scale. The
+      // close cancels in-flight renders into this block: `disposed` is checked
+      // before `scaleOf`, whose `fitScale` is a derived of the destroyed view
+      // (svelte.dev/e/derived_inert).
+      if (!disposed && slot.isConnected && scaleOf(zoom) !== s) {
         void renderPage(n, slot);
       }
     }

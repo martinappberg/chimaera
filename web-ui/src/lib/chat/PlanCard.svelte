@@ -190,7 +190,7 @@
   </button>
   {/if}
   {#if !folded}
-    <ol class="steps" bind:this={list} bind:clientHeight={listHeight}>
+    <ol class="steps quiet-scrollbar" bind:this={list} bind:clientHeight={listHeight}>
       {#each entries as entry, i (keys[i])}
         {@const mark = stepMark(entry)}
         {@const detail = stepDetail(entry)}

@@ -3,6 +3,7 @@
   import { ApiError, getHostLabel } from "../net/api";
   import { openWindow } from "../net/native";
   import { validateEntryName } from "../shared/fsNames";
+  import { isMac } from "../shared/keys";
   import { modalFocus } from "../shared/modalFocus";
   import { ancestors, basename, isAbsolute, isRoot, joinPath, rootOf } from "../shared/paths";
   import {
@@ -32,8 +33,9 @@
   type Row =
     | { kind: "home" }
     | { kind: "recent"; ws: Workspace }
-    | { kind: "here"; path: string }
     | { kind: "dir"; dir: DirEntry }
+    /** ".." — go up to the parent of the browsed directory. */
+    | { kind: "up"; path: string }
     /** The browse-mode "new folder…" affordance (creates in the browsed dir). */
     | { kind: "newfolder" };
 
@@ -56,9 +58,9 @@
   const driveHost = $derived(
     listing !== null && (rootOf(listing.path) !== "/" || listing.dirs.some((d) => rootOf(d.path) !== "/")),
   );
-  /** An absolute (or ~) path typed into the filter: the "open this folder"
-   *  row acts on IT, not on the breadcrumb directory. On a drive host a
-   *  typed `C:\Users` reads as `C:/Users`, and a bare `C:` as its root. */
+  /** An absolute (or ~) path typed into the filter: the footer's Open acts on
+   *  IT, not on the breadcrumb directory. On a drive host a typed `C:\Users`
+   *  reads as `C:/Users`, and a bare `C:` as its root. */
   const typedPath = $derived.by((): string | null => {
     const t = input.trim();
     if (!driveHost) return t.startsWith("/") || t.startsWith("~") ? t : null;
@@ -78,7 +80,7 @@
   // --- typed-path completion -------------------------------------------------
   // When the filter holds an absolute/~ path, list the children of its deepest
   // directory and match the trailing segment — shell-style tab completion,
-  // replacing the old dead-end that only ever offered "open this folder".
+  // replacing the old dead-end that only ever offered to open the typed path.
   let pathDirs = $state<DirEntry[]>([]);
   /** The directory `pathDirs` was listed from (dedupes refetches per keystroke). */
   let pathBase = $state("");
@@ -114,12 +116,11 @@
     return t === "" ? pathDirs : pathDirs.filter((d) => subseq(t, d.name.toLowerCase()));
   });
 
-  /** The navigable dirs under the "open this folder" row, in whichever mode is
+  /** The navigable dirs in the list, in whichever mode is
    *  active (typed-path completion vs. filtering the browsed directory). */
   const browseDirs = $derived(typedPath !== null ? pathMatches : filtered);
 
-  /** The typed path doesn't exist yet — the top row becomes "create folder"
-   *  instead of "open this folder". Judged from the parent listing (which the
+  /** The typed path doesn't exist yet — the footer's Open becomes "Create & open". Judged from the parent listing (which the
    *  completion effect already fetches): once it has settled for this path's
    *  directory, the path is missing when a trailing segment matches no child,
    *  or — for a path ending in "/" — when the directory itself couldn't be
@@ -135,25 +136,28 @@
   /** The active directory was capped by the daemon (very large folder). */
   const listTruncated = $derived(typedPath !== null ? pathTruncated : (listing?.truncated ?? false));
 
+  /** The ".." row: browse mode, unfiltered, below the filesystem root. */
+  const upPath = $derived(
+    typedPath === null && input === "" ? (listing?.parent ?? null) : null,
+  );
+  const upOffset = $derived(upPath !== null ? 1 : 0);
+
   const rows = $derived.by((): Row[] => {
     const out: Row[] = [];
     if (showHome) out.push({ kind: "home" });
     if (showRecents) {
       for (const ws of recents) out.push({ kind: "recent", ws });
     }
-    const here = typedPath ?? listing?.path ?? null;
-    if (here !== null) {
-      if (!driveList) out.push({ kind: "here", path: here });
+    if (typedPath !== null || listing !== null) {
+      if (upPath !== null) out.push({ kind: "up", path: upPath });
       for (const dir of browseDirs) out.push({ kind: "dir", dir });
       // Browse mode only: create in the directory being browsed (the typed-
-      // path mode has its own create — the flipped top row).
+      // path mode has its own create — the footer's "Create & open").
       if (typedPath === null && !driveList) out.push({ kind: "newfolder" });
     }
     return out;
   });
   const browseOffset = $derived(homeOffset + (showRecents ? recents.length : 0));
-  /** Index of the first dir row: after the "open this folder" row. */
-  const dirsOffset = $derived(browseOffset + (driveList ? 0 : 1));
   /** Breadcrumbs, each drawn after a `/` separator. A Unix root is that
    *  leading separator alone; a drive host leads with its drive list. */
   const crumbs = $derived.by((): { name: string; path: string; sep: boolean }[] => {
@@ -167,20 +171,10 @@
     return out;
   });
 
-  function rowPath(row: Row | undefined): string | null {
-    if (row === undefined) return listing?.path ?? null;
-    switch (row.kind) {
-      case "home":
-        return null; // not a folder — Enter goes Home
-      case "recent":
-        return row.ws.root;
-      case "here":
-        return row.path;
-      case "dir":
-        return row.dir.path;
-      case "newfolder":
-        return null; // not a navigable target — Enter enters create mode
-    }
+  /** The last path segment — what "open" will actually open ("/" for the root). */
+  function folderName(p: string): string {
+    const t = p.replace(/\/+$/, "");
+    return t === "" ? "/" : t.slice(t.lastIndexOf("/") + 1) || t;
   }
 
   function resetHighlight(): void {
@@ -203,11 +197,10 @@
         }
       }
     }
-    // Else the first subdirectory (Enter descends); fall back to "open this
-    // folder" when nothing matches.
+    // Else the first subdirectory (Enter descends); with none, nothing is
+    // highlighted and Enter falls through to the footer's Open.
     const firstDir = rows.findIndex((r) => r.kind === "dir");
-    // Never default onto the Home row: a stray Enter keeps its old meaning.
-    highlight = firstDir >= 0 ? firstDir : homeOffset;
+    highlight = firstDir >= 0 ? firstDir : -1;
   }
 
   async function browse(path: string): Promise<boolean> {
@@ -227,6 +220,18 @@
       input = "";
       resetHighlight();
     }
+  }
+
+  /** What the footer's Open acts on: the typed path, else the browsed folder
+   *  (nothing on a drive host's drive list, which is not a folder). */
+  const target = $derived(driveList ? null : (typedPath ?? listing?.path ?? null));
+
+  /** The footer's primary action (also Cmd/Ctrl+Enter, and Enter when no row
+   *  is highlighted): open the target, creating it first when it doesn't exist. */
+  function primary(): void {
+    if (target === null) return;
+    if (typedPathMissing) void createFolder(target);
+    else void openHere(target);
   }
 
   async function openHere(path: string | null): Promise<void> {
@@ -259,7 +264,7 @@
   // --- browse-mode "new folder…" (create in the browsed directory) -----------
   // Unlike the typed-path create (createFolder above, which opens the new
   // folder as a workspace immediately), this creates and NAVIGATES INTO it —
-  // "open this folder" is then one Enter away, and the user can keep nesting.
+  // the footer's Open is then one Enter away, and the user can keep nesting.
 
   let creating = $state(false);
   let createDraft = $state("");
@@ -299,7 +304,7 @@
       creating = false;
       createDraft = "";
       filterEl?.focus();
-      await navigate(created); // fresh folder is empty → "open this folder" highlights
+      await navigate(created); // fresh folder is empty → nothing highlights, Enter opens it
     } catch (e) {
       error = e instanceof ApiError ? e.message : "could not create folder";
     } finally {
@@ -361,28 +366,26 @@
         onHome?.();
         return;
       }
+      if (row?.kind === "up") {
+        void navigate(row.path);
+        return;
+      }
       // The tail row is a mode switch, with or without modifiers.
       if (row?.kind === "newfolder") {
         startCreate();
         return;
       }
-      // Cmd/Ctrl+Enter always opens the highlighted target as a workspace —
-      // creating the folder first when the typed path doesn't exist yet.
-      if (e.metaKey || e.ctrlKey) {
-        if (row?.kind === "here" && typedPathMissing) void createFolder(row.path);
-        else void openHere(rowPath(row));
+      if (row?.kind === "recent") {
+        void openHere(row.ws.root);
         return;
       }
-      // Follow the highlight: a directory descends (this is how a typed path
-      // is entered — its matching completion is highlighted); the top row
-      // opens the current/typed path as a workspace, or creates it first when
-      // it doesn't exist.
-      if (row?.kind === "dir") {
+      // Cmd/Ctrl+Enter always opens what the footer names; plain Enter follows
+      // the highlight (a directory descends — how a typed path is entered) and
+      // opens the footer's target when nothing is highlighted.
+      if (e.metaKey || e.ctrlKey || row?.kind !== "dir") {
+        primary();
+      } else {
         void navigate(row.dir.path);
-      } else if (row?.kind === "here" && typedPathMissing) {
-        void createFolder(row.path);
-      } else if (row !== undefined) {
-        void openHere(rowPath(row));
       }
     }
   }
@@ -443,7 +446,7 @@
         })
         .catch(() => {
           if (seq !== pathSeq) return;
-          // Parent doesn't exist yet: no completions — the top row offers to
+          // Parent doesn't exist yet: no completions — the footer offers to
           // create the typed path instead of opening it.
           pathDirs = [];
           pathTruncated = false;
@@ -467,18 +470,6 @@
       stroke-linejoin="round"
     />
   </svg>
-{/snippet}
-
-{#snippet newWindow(path: string)}
-  <button
-    class="side"
-    tabindex="-1"
-    onmousedown={keepFocus}
-    onclick={(e) => {
-      e.stopPropagation();
-      void openNewWindow(path);
-    }}>new window</button
-  >
 {/snippet}
 
 <div class="overlay">
@@ -507,9 +498,9 @@
         {#if crumbs.length === 0}
           <span class="sep">/</span>
         {:else}
-          {#each crumbs as c (c.path)}
+          {#each crumbs as c, ci (c.path)}
             {#if c.sep}<span class="sep">/</span>{/if}
-            <button class="crumb" tabindex="-1" onmousedown={keepFocus} onclick={() => void navigate(c.path)}
+            <button class="crumb" class:current={typedPath === null && ci === crumbs.length - 1} tabindex="-1" onmousedown={keepFocus} onclick={() => void navigate(c.path)}
               >{c.name}</button
             >
           {/each}
@@ -557,43 +548,34 @@
             >
               <span class="name">{ws.name}</span>
             </button>
-            {@render newWindow(ws.root)}
           </div>
         {/each}
         <div class="section">browse</div>
       {/if}
       {#if typedPath !== null || listing !== null}
-        {@const herePath = typedPath ?? listing?.path ?? null}
-        {#if herePath !== null && !driveList}
+        {#if upPath !== null}
+          {@const ui = browseOffset}
           <div
             class="rowwrap"
             role="presentation"
-            class:hl={highlight === browseOffset}
-            data-idx={browseOffset}
-            onmouseenter={() => (highlight = browseOffset)}
+            class:hl={highlight === ui}
+            data-idx={ui}
+            onmouseenter={() => (highlight = ui)}
           >
             <button
               class="row"
               tabindex="-1"
-              title={typedPathMissing ? `create ${herePath}` : herePath}
+              title={upPath}
               onmousedown={keepFocus}
-              onclick={() =>
-                typedPathMissing ? void createFolder(herePath) : void openHere(herePath)}
+              onclick={() => void navigate(upPath)}
             >
-              <span class="name here-label" class:create={typedPathMissing}>
-                {typedPathMissing ? "create folder" : "open this folder"}
-              </span>
-              {#if typedPath !== null}
-                <span class="here-path">{typedPath}</span>
-              {/if}
+              <span class="name up-name">..</span>
+              <span class="up-hint">{folderName(upPath)}</span>
             </button>
-            {#if !typedPathMissing}
-              {@render newWindow(herePath)}
-            {/if}
           </div>
         {/if}
         {#each browseDirs as dir, j (dir.path)}
-          {@const idx = dirsOffset + j}
+          {@const idx = browseOffset + upOffset + j}
           <div
             class="rowwrap"
             role="presentation"
@@ -611,11 +593,10 @@
               <span class="name">{dir.name}</span>
               {@render chevron()}
             </button>
-            {@render newWindow(dir.path)}
           </div>
         {/each}
         {#if typedPath === null && listing !== null && !driveList}
-          {@const nfIdx = dirsOffset + browseDirs.length}
+          {@const nfIdx = browseOffset + upOffset + browseDirs.length}
           <div
             class="rowwrap"
             role="presentation"
@@ -656,6 +637,38 @@
         {/if}
       {/if}
     </div>
+    {#if target !== null}
+      <div class="foot">
+        <button
+          class="primary"
+          tabindex="-1"
+          title={target}
+          onmousedown={keepFocus}
+          onclick={primary}
+        >
+          <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+            <path
+              d="M2 4.5A1.5 1.5 0 0 1 3.5 3h2.6l1.4 1.5h5A1.5 1.5 0 0 1 14 6v5.5a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5z"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.3"
+              stroke-linejoin="round"
+            />
+          </svg>
+          <span class="verb">{typedPathMissing ? "Create & open" : "Open"}</span>
+          <span class="who">{folderName(target)}</span>
+          <kbd>{isMac ? "⌘↵" : "Ctrl+↵"}</kbd>
+        </button>
+        {#if !typedPathMissing}
+          <button
+            class="alt"
+            tabindex="-1"
+            onmousedown={keepFocus}
+            onclick={() => void openNewWindow(target)}>Open in new window</button
+          >
+        {/if}
+      </div>
+    {/if}
   </div>
 </div>
 
@@ -845,21 +858,15 @@
     flex: none;
   }
 
-  /* "create folder" — distinguish the make-a-new-directory action from the
-     plain "open this folder" so it's clearly not just opening what you typed. */
+  /* "new folder…" — accent-coloured so the make-a-directory row reads apart
+     from the plain navigation rows. */
   .name.here-label.create {
     color: var(--accent);
   }
 
-  .here-path {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-family: var(--mono);
-    font-size: var(--text-sm);
-    color: var(--muted);
+  .crumb.current {
+    color: var(--fg);
+    font-weight: 600;
   }
 
   .chev {
@@ -868,25 +875,85 @@
     opacity: 0.6;
   }
 
-  .side {
+  .foot {
     flex: none;
-    display: none;
+    display: flex;
+    justify-content: flex-end;
+    gap: 6px;
+    padding: 6px 8px;
+    border-top: 1px solid var(--edge);
+  }
+
+  /* The one commit action, named after the folder it will open. */
+  .primary {
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 70%;
+    display: flex;
+    align-items: center;
+    gap: 6px;
     appearance: none;
-    border: none;
-    background: none;
+    border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--edge));
+    border-radius: 5px;
+    background: color-mix(in srgb, var(--accent) 9%, transparent);
+    color: var(--fg);
+    font: inherit;
+    font-size: var(--text-sm);
+    padding: 4px 10px;
+    cursor: pointer;
+    text-align: left;
+    transition: background-color 0.12s ease;
+  }
+
+  .primary:hover {
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+  }
+
+  .primary svg {
+    flex: none;
+    color: var(--accent);
+  }
+
+  .primary .verb {
+    flex: none;
+    color: var(--muted);
+  }
+
+  .primary .who {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--mono);
+    font-weight: 600;
+  }
+
+  .primary kbd {
+    flex: none;
     font: inherit;
     font-size: var(--text-xs);
     color: var(--muted);
-    padding: 0.2rem 8px;
+  }
+
+  .alt {
+    order: -1;
+    flex: none;
+    appearance: none;
+    border: 1px solid var(--edge);
+    border-radius: 5px;
+    background: none;
+    color: var(--muted);
+    font: inherit;
+    font-size: var(--text-sm);
+    padding: 4px 10px;
     cursor: pointer;
+    white-space: nowrap;
   }
 
-  .side:hover {
+  .alt:hover {
     color: var(--fg);
-  }
-
-  .rowwrap.hl .side {
-    display: block;
+    background: var(--row-active);
   }
 
   .home-ico { flex: none; color: var(--muted); }

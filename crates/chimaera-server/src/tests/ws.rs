@@ -528,6 +528,98 @@ async fn ws_attach_to_dead_session_replays_last_words() {
     };
     assert_eq!(exited["type"], "exited");
     assert_eq!(exited["status"], 1);
+    match next_ws_frame(&mut socket).await {
+        WsMessage::Close(Some(frame)) => assert_eq!(
+            frame.code,
+            tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal
+        ),
+        other => panic!("expected a normal close after exited, got {other:?}"),
+    }
+}
+
+/// A session that exits while attached ends its socket from the daemon side:
+/// `exited` (with the real status), its final bytes, then a normal Close
+/// after the linger — the connection never waits on the client to hang up.
+#[tokio::test]
+async fn ws_live_session_exit_closes_the_socket() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    let state = test_state();
+    let info = state
+        .sessions
+        .spawn(chimaera_pty::SpawnOpts {
+            cwd: test_dir("ws-exit-cwd"),
+            name: None,
+            cols: 80,
+            rows: 24,
+            command: Some(vec![
+                "/bin/bash".to_string(),
+                "--norc".to_string(),
+                "--noprofile".to_string(),
+                "-c".to_string(),
+                "sleep 2; echo goodbye-from-pty; exit 3".to_string(),
+            ]),
+            id: None,
+            env: Vec::new(),
+            env_remove: Vec::new(),
+            scrollback: None,
+        })
+        .expect("spawn session");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = app(state.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let url = format!("ws://{addr}/ws/sessions/{}", info.id);
+    let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    socket
+        .send(WsMessage::text(
+            serde_json::json!({"type": "auth", "token": "test-token"}).to_string(),
+        ))
+        .await
+        .unwrap();
+
+    let mut output = Vec::new();
+    let mut exited = None;
+    let close = loop {
+        match next_ws_frame(&mut socket).await {
+            WsMessage::Text(text) => {
+                let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if frame["type"] == "exited" {
+                    assert!(exited.is_none(), "exactly one exited frame");
+                    exited = Some((frame["status"].clone(), tokio::time::Instant::now()));
+                }
+            }
+            WsMessage::Binary(bytes) => output.extend_from_slice(&bytes),
+            WsMessage::Close(frame) => break frame,
+            other => panic!("unexpected frame {other:?}"),
+        }
+    };
+    let (status, exited_at) = exited.expect("exited before the close");
+    assert_eq!(status, 3);
+    assert!(
+        String::from_utf8_lossy(&output).contains("goodbye-from-pty"),
+        "the final bytes arrive before the close"
+    );
+    assert_eq!(close.expect("a close frame").code, CloseCode::Normal);
+    let lingered = exited_at.elapsed();
+    assert!(
+        lingered >= std::time::Duration::from_millis(500),
+        "the close lingers for the final bytes, got {lingered:?}"
+    );
+    // The client's reply completes the handshake; the stream then ends.
+    let rest = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+        .await
+        .expect("the daemon ends the connection");
+    assert!(
+        !matches!(rest, Some(Ok(WsMessage::Text(_) | WsMessage::Binary(_)))),
+        "nothing after the close: {rest:?}"
+    );
 }
 
 #[tokio::test]

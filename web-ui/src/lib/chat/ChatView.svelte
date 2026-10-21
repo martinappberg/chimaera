@@ -294,8 +294,10 @@
    *  chat keeps its composer — the verdict may be stale, or the login may
    *  have landed outside the app — and the card offers Check again. */
   const preflightSignIn = $derived(signInNeeded && !store.initialized && store.exited === null && store.fatalError === null && !readOnly);
-  /** `/login` typed here: the card runs whether or not the catalog thinks
-   *  the agent is signed in (a switch of account, a stale login). */
+  /** `/login` typed here, or Sign in from Chat options: the card runs in
+   *  any state — whatever the catalog thinks of the login (a switch of
+   *  account, a limit on this one, a stale login), mid-turn, or in a chat
+   *  that has ended — and the daemon relaunches the chat once it lands. */
   let signInRequested = $state(false);
   void listAgents().then((agents) => {
     const info = agents.find((a) => a.id === agentKind);
@@ -2940,6 +2942,7 @@
     onSetRemoteControl={setRemoteControl}
     onCompact={canCompact ? compactNow : undefined}
     onOpenSettings={readOnly ? undefined : openAgentSettings}
+    onSignIn={readOnly || !catalogAgent?.signIn ? undefined : () => (signInRequested = true)}
     accountLimits={accountUsage?.rows}
     accountLimitReached={accountUsage?.limitReached}
   />
@@ -2988,7 +2991,12 @@
            startup failure (if one lands) folds into it below. -->
       <div class="empty" role="status">
         <SessionGlyph kind="agent" {agentKind} size={18} />
-        <AgentSignInCard agent={catalogAgent} workspaceId={session.workspace_id ?? null} sessionId={session.id} framed onSignedIn={() => void getSignIn(agentKind, true).catch(() => {})} />
+        <!-- The one card while the chat waits on a login: Chat options →
+             Sign in restarts it here (keyed) instead of queueing a second
+             card that would start another login once this one lands. -->
+        {#key signInRequested}
+          <AgentSignInCard agent={catalogAgent} workspaceId={session.workspace_id ?? null} sessionId={session.id} framed autostart={signInRequested} onSignedIn={() => { signInRequested = false; void getSignIn(agentKind, true).catch(() => {}); }} />
+        {/key}
       </div>
     {:else if store.exited === null && !store.fatalError && (!store.initialized || store.blocks.length === 0)}
       <div class="empty" role="status">
@@ -3411,11 +3419,17 @@
       </div>
     {/if}
 
-    {#if (liveSignIn || (signInRequested && store.fatalError === null && store.exited === null)) && catalogAgent !== null}
+    {#if (liveSignIn || (signInRequested && !(signInNeeded && !store.initialized))) && catalogAgent !== null}
       <div class="live-signin">
         <!-- The daemon relaunches a chat that waited on the login (and the
              one /login was typed in); the card only refreshes the verdict. -->
-        <AgentSignInCard agent={catalogAgent} workspaceId={session.workspace_id ?? null} sessionId={session.id} framed autostart={signInRequested} onSignedIn={() => { signInRequested = false; void getSignIn(agentKind, true).catch(() => {}); }} onDismiss={signInRequested ? () => { signInRequested = false; } : undefined} />
+        <AgentSignInCard agent={catalogAgent} workspaceId={session.workspace_id ?? null} sessionId={session.id} framed autostart={signInRequested} onSignedIn={() => {
+          signInRequested = false;
+          void getSignIn(agentKind, true).catch(() => {});
+          // The daemon never interrupts a turn for a login: it relaunches
+          // this chat when the turn ends (`relaunch_after_turn`).
+          if (store.running) store.notice(`Signed in — ${agentName} switches to it when this turn ends.`, "info");
+        }} onDismiss={signInRequested ? () => { signInRequested = false; } : undefined} />
       </div>
     {/if}
     {#if store.fatalError !== null && signInNeeded}

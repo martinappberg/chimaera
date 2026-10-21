@@ -15,6 +15,9 @@ export interface SignInProgress extends OperationProgress {
   code: string | null;
   /** The page will show a code to paste back (Claude). */
   accepts_code: boolean;
+  /** What the CLI itself printed (plain text, its newest part) — shown when
+   *  its page isn't one the daemon recognizes, so that is never a dead end. */
+  printed?: string;
 }
 
 export interface SignInStatus {

@@ -33,6 +33,8 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   in a terminal/chat reveals + flashes its row. File rows drag out (drop into a pane/split, or
   onto an agent to reference). Arrow keys move focus, expand/collapse folders, and return
   to the parent; Home/End jump to the ends. F2 renames and Delete asks for confirmation.
+  Closing the confirmation returns focus to the row; after a delete it moves to the
+  neighbouring row (the next one, or the new last one), so the arrow keys keep working.
 - **Finding your place in a deep tree.** **Indent guides** — one hairline per depth under each
   level's chevron; hovering a row draws its parent folder's guide strong, so "which folder am I
   in" is answered without scrolling up. **Sticky ancestors** — while scrolled inside a folder,
@@ -106,7 +108,9 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   a Finder column or a FILES-tree folder to upload into it (see
   [drag-drop-and-uploads.md](drag-drop-and-uploads.md)). Delete always confirms in a modal
   (permanent — no server-side trash), which names any file under the path with unsaved edits:
-  the delete discards those buffers too. Download streams a single file as-is (forced via the
+  the delete discards those buffers too. Whether it is asked from the context menu or the
+  Delete key, focus goes back to the tree row on cancel and to the neighbouring row after
+  the delete. Download streams a single file as-is (forced via the
   anchor `download` attribute so it never navigates the native webview), a folder as
   `<name>.zip`; it is **hidden on local workspaces** (the file already lives on this machine)
   and shown only on remote ones, where the window's origin *is* the ssh tunnel.

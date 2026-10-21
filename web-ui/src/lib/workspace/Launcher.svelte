@@ -153,6 +153,12 @@
 
   let hl = $state(0);
   let rootEl = $state<HTMLElement | null>(null);
+  /** The menu closed (Escape, outside press, a pick). The forced re-detect
+   *  and a recheck can land after that: the window still takes the fresh
+   *  catalog (`onAgents`), but `adopt` must not run, since it writes
+   *  `catalog` and then reads `groups`, a derived of this destroyed component
+   *  (svelte.dev/e/derived_inert). */
+  let closed = false;
   /** Look again for an agent the login shell couldn't check; the shared
    *  catalog then carries the answer to these rows and the rail. */
   async function recheck(a: AgentInfo): Promise<void> {
@@ -160,7 +166,7 @@
       await recheckAgent(a.id);
       const fresh = $agentCatalog;
       if (fresh.length > 0) {
-        adopt(fresh);
+        if (!closed) adopt(fresh);
         onAgents?.(fresh);
       }
     } catch {
@@ -218,12 +224,12 @@
     void first
       .then((a) => {
         if (catalog === null) {
-          catalog = a;
+          if (!closed) catalog = a;
           onAgents?.(a);
         }
         return listAgents(true).then((fresh) => {
           if (fresh.length > 0) {
-            adopt(fresh);
+            if (!closed) adopt(fresh);
             onAgents?.(fresh);
           }
         });
@@ -248,7 +254,10 @@
       onClose();
     };
     window.addEventListener("pointerdown", onDown, true);
-    return () => window.removeEventListener("pointerdown", onDown, true);
+    return () => {
+      closed = true;
+      window.removeEventListener("pointerdown", onDown, true);
+    };
   });
 
   /** Fixed position: below the anchor, clamped into the viewport.

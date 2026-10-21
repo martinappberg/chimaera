@@ -234,7 +234,10 @@ official `@xterm/addon-search`; shared routing is described in
   (`crates/chimaera/src/kill.rs`).
 - **Key behaviors.** Escalation is a detached thread (non-blocking) — a caller about to `exit()`
   must wait the grace after `kill_all` for the force-kill to land. The reaper snapshots the final
-  screen *before* unregistering (a 60ms drain lets the reader catch the last bytes).
+  screen *before* unregistering (a 60ms drain lets the reader catch the last bytes). The daemon ends
+  an attached socket itself once its session is over: `exited`, a 1 s linger for those last bytes,
+  then a normal WebSocket close (`ws.rs`, `EXITED_LINGER`); the client keeps the final screen and does
+  not reconnect.
 
 ---
 

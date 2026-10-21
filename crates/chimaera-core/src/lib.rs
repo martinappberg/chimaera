@@ -393,7 +393,13 @@ impl Manifest {
 
     /// Load the manifest if it exists. `Ok(None)` when the file is absent.
     pub fn load() -> anyhow::Result<Option<Manifest>> {
-        let contents = match std::fs::read_to_string(Self::path()) {
+        Self::load_at(&Self::path())
+    }
+
+    /// [`Manifest::load`] against an explicit path (pure of [`data_dir`], so
+    /// tests need no HOME mutation).
+    pub fn load_at(path: &Path) -> anyhow::Result<Option<Manifest>> {
+        let contents = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
@@ -474,12 +480,17 @@ pub fn same_node(a: &str, b: &str) -> bool {
     a.trim().eq_ignore_ascii_case(b.trim())
 }
 
-/// Carryover from a daemon stopped for a *planned* restart (update/replace):
-/// the successor rebinds the same port with the same token, so existing ssh
-/// forwards stay valid and every attached client heals with a plain WebSocket
-/// reconnect — no re-home, no re-auth. Written by whoever drives the restart
-/// (the app, `chimaera connect`), consumed exactly once by the next `serve`.
-/// A crash never writes one, so unplanned restarts keep fresh credentials.
+/// Carryover from a daemon to its successor: the successor rebinds the same
+/// port with the same token, so existing ssh forwards stay valid and every
+/// attached client heals with a plain WebSocket reconnect — no re-home, no
+/// re-auth. Written by the daemon itself — at listen time, refreshed every
+/// [`HANDOFF_REFRESH_SECS`] while it serves, and once more at its graceful
+/// stop — and consumed exactly once by the next `serve`. Writing it before
+/// any stop is what makes a crash restart (kill -9, OOM, panic) keep its
+/// credentials like a planned one. The trade-off: a crash no longer rotates
+/// the token — only a daemon dead for longer than the freshness window leaves
+/// a stale record whose successor mints a fresh one. At rest nothing new is
+/// exposed: the manifest beside this file holds the same token at 0600.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Handoff {
     pub port: u16,
@@ -489,9 +500,17 @@ pub struct Handoff {
     pub written_at: u64,
 }
 
-/// A handoff older than this is orphaned (the planned restart never happened
-/// or already consumed a fallback path) and must not resurrect its token.
-const HANDOFF_MAX_AGE_SECS: u64 = 120;
+/// A handoff older than this is orphaned (the restart never happened or
+/// already consumed a fallback path) and must not resurrect its token.
+pub const HANDOFF_MAX_AGE_SECS: u64 = 120;
+
+/// How often a serving daemon rewrites its handoff. Well inside
+/// [`HANDOFF_MAX_AGE_SECS`], so a crash restart within
+/// `HANDOFF_MAX_AGE_SECS - HANDOFF_REFRESH_SECS` of the crash always finds a
+/// fresh record. One tiny atomic rewrite per period: cheap even on NFS.
+pub const HANDOFF_REFRESH_SECS: u64 = 30;
+
+const _: () = assert!(HANDOFF_REFRESH_SECS * 2 <= HANDOFF_MAX_AGE_SECS);
 
 impl Handoff {
     /// Path of the handoff file: `data_dir()/handoff.json`.
