@@ -124,7 +124,7 @@
     </button>
   </div>
   {#if showInput}
-    <pre class="input">{preview}</pre>
+    <pre class="input quiet-scrollbar">{preview}</pre>
   {/if}
   <div class="actions">
     {#each request.options as option (option.id)}
