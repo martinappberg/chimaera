@@ -2336,7 +2336,10 @@ async fn stale_attach_reports_the_clamped_replay_cursor() {
 /// Set a file's mtime to `secs_ago` seconds in the past.
 fn backdate(path: &Path, secs_ago: u64) {
     let mtime = std::time::SystemTime::now() - Duration::from_secs(secs_ago);
-    std::fs::File::open(path)
+    // Write access: Windows refuses to set times through a read-only handle.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
         .expect("open to backdate")
         .set_times(std::fs::FileTimes::new().set_modified(mtime))
         .expect("set mtime");

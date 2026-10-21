@@ -176,7 +176,9 @@ jobs:
       - run: bash scripts/build-plugins.sh
         shell: bash
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      # Every test binary runs even after one fails: a Windows regression
+      # rarely comes alone, and one run should show all of them.
+      - run: cargo test --workspace --no-fail-fast
         env:
           CHIMAERA_WIRE_FIXTURES: check
       - name: Native daemon smoke

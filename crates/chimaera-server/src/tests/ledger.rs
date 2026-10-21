@@ -200,7 +200,10 @@ async fn journal_budget_spares_chats_the_ledger_resurrects() {
 
     fn backdate(path: &std::path::Path, secs_ago: u64) {
         let mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(secs_ago);
-        std::fs::File::open(path)
+        // Write access: Windows refuses to set times through a read-only handle.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(mtime))
             .unwrap();
