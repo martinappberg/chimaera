@@ -43,8 +43,15 @@ versions). Run `cargo test` in the app workspace too when you touch core deps.
   (`this_node()` vs `hostname`, via `same_node`) before trusting `is_alive()`, and
   remove with `remove_if_owned()` (same node + pid + start) so a daemon never unlinks
   another node's live record.
-- **`Handoff` is consume-once, ~120s fresh, 0600**, and is written by the **daemon
-  on its own graceful shutdown** (a crash leaves none) — not by "the app/connect".
+- **`Handoff` is consume-once, ~120s fresh, 0600**, and is written only by the
+  **daemon itself** — at listen time, refreshed every `HANDOFF_REFRESH_SECS` (30 s)
+  while it serves, and at its graceful shutdown — not by "the app/connect". So a
+  crash restart within the window keeps port + token like a planned one; a daemon
+  dead longer than the window leaves a stale record and its successor mints a
+  fresh token — so a crash no longer rotates the token (at rest the manifest beside
+  it already holds the same token at 0600). Keep the refresh period at most half the
+  window (a const assert). `Manifest::load_at`/`Handoff::write_at`/`consume_at` take
+  explicit paths for tests.
 - **`CHIMAERA_HOME` moves only the daemon's bookkeeping dirs.** Spawned shells/agents
   keep the real `$HOME`, so `~/.claude` auth still works under an isolated daemon.
   Unstamped dev builds default to `~/.chimaera-dev`; release builds use

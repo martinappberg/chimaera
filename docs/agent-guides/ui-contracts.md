@@ -58,7 +58,7 @@ font-size: var(--text-sm);
 | Right-click menu | `lib/shared/contextMenu.svelte.ts`, rendered once by `ContextMenuHost.svelte` | `contextMenu.openAt(e, items)`; `contextMenu.openAtPoint(x, y, items, { alignRight })` for a button |
 | Toolbar picker | `lib/shared/toolbarPopover.ts` | `use:toolbarPopover={{ onClose }}` on the popup surface (`role="menu"` or `role="dialog"`) |
 | In-pane find | `lib/shared/FindBar.svelte` | `<FindBar />` inside a `findTarget` host; its `role="search"` handles Escape for every control inside it |
-| Close on outside press or Escape | `lib/shared/dismiss.ts` | `use:dismiss={{ enabled, onDismiss, keepOpenWithin }}` |
+| Close on outside press or Escape | `lib/shared/dismiss.ts` | `use:dismiss={{ enabled, onDismiss, keepOpenWithin, region }}`; `onDismiss(reason)` gets `"outside"` or `"escape"` |
 | One of N | `lib/shared/Segmented.svelte` | `<Segmented options value label onChange />` (`role="radiogroup"`) |
 | On/off | `lib/shared/Switch.svelte` | `<Switch on label onToggle />` (`role="switch"`) |
 | Tab strip | `lib/shared/tabNavigation.ts` | `use:tabNavigation` on the `role="tablist"` element |
@@ -77,6 +77,11 @@ font-size: var(--text-sm);
 - Give a toolbar popup an opener with `aria-haspopup`. `toolbarPopover` places
   the popup, moves focus into it, handles arrow keys, Home and End, and gives
   focus back to the opener on close.
+- The context menu gives focus back to whatever held it when it opened (a menu
+  button, or the row a right-click focused) before a pick runs, and on Escape
+  or Tab. A dialog the pick opens therefore records that row as its opener, not
+  the menu that is about to unmount. After an outside press, focus stays where
+  the press put it.
 - Give `Segmented` and `Switch` an accessible name in `label`.
 
 **Observed.** `ConfirmDialog` has 9 uses in 6 files. Its focus starts on Cancel
@@ -106,6 +111,8 @@ hosts pair it with `dismiss` (`lib/chat/ChatView.svelte:2895`,
   keyboard, and App's chords stand down (`App.svelte:2144`).
 - `focusOnMount` (`lib/shared/focusOnMount.ts`): initial focus, one microtask
   after mount, so `modalFocus` records the real opener.
+- `returnFocus` (`lib/shared/returnFocus.ts`): the restore half of `modalFocus`
+  for a pane-local dialog or popover, with no trap and no chord stand-down.
 - `keys.ts` is the chord registry (`ACTIONS`). `keybindings.ts` joins it with
   the live settings: `matchAction(e)` to match, `keyHint(id)` and
   `keyHintSuffix(id)` to show a chord.
@@ -117,13 +124,32 @@ hosts pair it with `dismiss` (`lib/chat/ChatView.svelte:2895`,
 
 1. Choose the initial focus with `focusOnMount`. For a destructive dialog, put
    it on the safe button.
-2. Add `use:modalFocus` to every `aria-modal="true"` element.
+2. Add `use:modalFocus` to every `aria-modal="true"` element. On close, focus
+   returns to the opener. If a dialog's action removes the opener (a deleted
+   tree row), the surface that owned it hands focus on: `FileTree` moves it to
+   the row now in that place, or to the tree.
 3. Handle Escape in the component. `modalFocus` does not handle it. Call
    `e.stopPropagation()` so that an outer surface does not also close.
 4. If a button disables itself while it works, hold focus on the dialog, so
    that Escape still reaches it (`lib/layout/CloseDirtyDialog.svelte:36-40`).
 5. Read chords through `matchAction`. Do not compare `e.key` with a modifier by
    hand for a rebindable action.
+
+**Pane-local dialog.** A dialog that belongs to one pane (`lib/chat/ForkDialog.svelte`)
+is not a window modal: no `modalFocus`, no `aria-modal`, and Tab is not
+trapped, so App's chords and every other pane stay usable.
+
+1. Mark it `role="dialog"`, start focus with `focusOnMount`, and give focus
+   back with `use:returnFocus` (`lib/shared/returnFocus.ts`). It restores the
+   opener only when focus was still inside the dialog or nowhere.
+2. Cancel it with `use:dismiss={{ enabled: true, region, onDismiss }}` on the
+   dialog. `region` returns the pane root (`[data-pane-id]`). Escape anywhere
+   in that pane and a press in that pane outside the dialog cancel it, and
+   `dismiss` stops that Escape before the surface behind sees it (a chat
+   composer's interrupt). Escape and presses in other panes pass through. A
+   dialog parked in an `inert` keep-alive layer ignores both.
+3. While the dialog's action runs, ignore the cancel in `onDismiss`. `dismiss`
+   still swallows the Escape.
 
 **Example** (`lib/layout/CloseDirtyDialog.svelte:68` and `:90`):
 
@@ -346,6 +372,7 @@ These are proposals, not current behavior. None of them is built.
    `role="dialog"` layer over one editor, not a window modal, so it does not
    use `modalFocus` (that would hold focus and stand App's chords down for
    every other pane). It handles Escape but does not return focus on close.
+   It could adopt the pane-local dialog contract (section 3).
 5. **Escape.** Each dialog handles Escape itself on its backdrop (for example
    `lib/shared/ConfirmDialog.svelte:52-56`). A shared helper could own it.
 6. **Preview states.** No shared loading, empty or error component exists for

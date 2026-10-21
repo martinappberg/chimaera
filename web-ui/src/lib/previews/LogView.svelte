@@ -24,7 +24,7 @@
   import { humanSize, looksBinary } from "./files";
   import { ansiVars, appendRuns, collapseCarriageReturns, parseAnsi, plainStyle, type AnsiStyle } from "./ansi";
   import { lineLevel, splitLines, wholeLines } from "./logText";
-  import { paneVisibility, useFileEntry } from "./viewLifecycle.svelte";
+  import { paneVisibility, useFileEntry, viewSignal } from "./viewLifecycle.svelte";
   import Spinner from "./Spinner.svelte";
 
   interface Props {
@@ -112,6 +112,9 @@
   }
 
   async function read(offset: number, limit: number): Promise<Slice> {
+    // A job in flight at unmount stops at its next read, before `path` (a
+    // getter into the host) or any later step runs on the dead view.
+    if (life.disposed) throw new DOMException("view closed", "AbortError");
     const q = new URLSearchParams({ path, offset: String(offset), limit: String(limit) });
     const res = await api(`/fs/file?${q.toString()}`, { signal: AbortSignal.timeout(READ_TIMEOUT_MS) });
     if (!res.ok) {
@@ -135,13 +138,20 @@
 
   /** Every operation that reads and edits the window runs one at a time. */
   let chain: Promise<void> = Promise.resolve();
+  /** Disposed on unmount: a queued job never starts and one in flight stops
+   *  at its next `read`, so nothing reads `atTail` (a derived of the
+   *  destroyed component) or the host's getters afterwards
+   *  (svelte.dev/e/derived_inert). */
+  const life = viewSignal();
   function serial(work: () => Promise<void>): Promise<void> {
     const run = async () => {
+      if (life.disposed) return;
       busy = true;
       try {
         await work();
         loadError = null;
       } catch (e) {
+        if (life.disposed) return;
         loadError = e instanceof Error ? e.message : "failed to read the log";
       } finally {
         busy = false;

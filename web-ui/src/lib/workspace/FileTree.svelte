@@ -17,7 +17,7 @@
     type GitEntry,
   } from "./git";
   import { decoFor, dirColor } from "./gitDeco";
-  import { fsCreateOp, fsEpoch, fsRenameOp, lastFsMutation, requestDelete } from "./fsEvents";
+  import { fsCreateOp, fsEpoch, fsRenameOp, lastFsMutation, pendingDelete, requestDelete } from "./fsEvents";
   import { clearDiskDirs, lastDiskChange, setDiskDirs } from "./diskWatch";
   import {
     clearClip,
@@ -753,7 +753,7 @@
       beginRename(entry);
     } else if (e.key === "Delete") {
       e.preventDefault();
-      requestDelete(entry.path, entry.kind);
+      requestRowDelete(entry);
     }
   }
 
@@ -843,7 +843,7 @@
         { label: "Rename…", onSelect: () => beginRename(entry) },
         { label: "Copy Path", onSelect: () => void copyPath(entry.path) },
         "separator",
-        { label: "Delete…", danger: true, onSelect: () => requestDelete(entry.path, entry.kind) },
+        { label: "Delete…", danger: true, onSelect: () => requestRowDelete(entry) },
       ];
     }
     const dirTarget = entry.kind === "dir" ? entry.path : dirname(entry.path);
@@ -875,7 +875,7 @@
       {
         label: "Delete…",
         danger: true,
-        onSelect: () => requestDelete(entry.path, entry.kind),
+        onSelect: () => requestRowDelete(entry),
       },
     ];
   }
@@ -886,6 +886,80 @@
     if (req == null) return;
     void req.nonce; // track repeats
     untrack(() => beginCreate(req.kind, root));
+  });
+
+  // A focused row that goes away (deleted, renamed, or removed on disk)
+  // hands focus on instead of letting it fall to <body>: to the same path
+  // when its row was only re-created or moved, a renamed row's new path,
+  // else the row now at its place (the next row, or the last one), else the
+  // tree. Only when focus was on one of this tree's rows and is now nowhere,
+  // and never from a hidden (inert) tree.
+  interface FocusedRow {
+    index: number;
+    path: string;
+  }
+
+  function focusedRow(): FocusedRow | null {
+    const active = document.activeElement;
+    return active instanceof HTMLElement && active.matches(".node[data-index]") && treeEl?.contains(active) === true
+      ? { index: Number(active.dataset.index), path: active.dataset.path ?? "" }
+      : null;
+  }
+
+  function handFocusOn(was: FocusedRow): void {
+    if (treeEl === null || treeEl.closest("[inert]") !== null) return;
+    const active = document.activeElement;
+    if (active !== null && active !== document.body) return;
+    const m = $lastFsMutation;
+    const to = m?.kind === "rename" && m.from === was.path ? m.to : was.path;
+    const i = Math.min(was.index, rows.length - 1);
+    const row =
+      treeEl.querySelector<HTMLElement>(`.node[data-path="${CSS.escape(to)}"]`) ??
+      (i >= 0 ? rowElement(i, rows[i].entry.path) : null);
+    (row ?? treeEl).focus({ preventScroll: true });
+  }
+
+  // A re-list that drops the focused row: recorded before the DOM update,
+  // handed on after it. This is the usual delete path — the dialog closes
+  // when the delete call returns, gives focus back to the row, and the
+  // re-list removes the row afterwards.
+  let vanishing: FocusedRow | null = null;
+  $effect.pre(() => {
+    void rows;
+    untrack(() => {
+      vanishing = focusedRow();
+    });
+  });
+  $effect(() => {
+    void rows;
+    untrack(() => {
+      const was = vanishing;
+      vanishing = null;
+      if (was !== null) handFocusOn(was);
+    });
+  });
+
+  // The other order: the disk monitor can re-list before the delete call
+  // returns (a large recursive delete, a slow remote), so the row is gone
+  // while focus is still in the dialog, and the dialog's restore finds a
+  // detached opener. Remember the row a delete was asked from and hand focus
+  // on once the dialog has closed and restored (a task later, after its
+  // microtask restore).
+  let deleteFrom: FocusedRow | null = null;
+
+  function requestRowDelete(entry: FsEntry): void {
+    const row = focusedRow();
+    deleteFrom = row?.path === entry.path ? row : null;
+    requestDelete(entry.path, entry.kind);
+  }
+
+  $effect(() => {
+    if ($pendingDelete !== null) return;
+    const was = deleteFrom;
+    if (was === null) return;
+    deleteFrom = null;
+    const timer = setTimeout(() => handFocusOn(was), 0);
+    return () => clearTimeout(timer);
   });
 
   // Any fs mutation (this tree, the Finder, a tab rename) re-lists the affected

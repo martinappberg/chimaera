@@ -65,6 +65,7 @@ daemon  ──WS /ws/chat/{id}──▶  chatWs.ts (ChatSocket)
 - **Rows key by stable uid, never array index** ([file map](REFERENCE.md#file-map-in-full)).
 - **Scroll has one writer; never write `scrollTop` mid-gesture** ([scroll](REFERENCE.md#scroll-invariants)).
 - **Keep floating chrome off `.column`** ([quote](REFERENCE.md#copy-and-quote-selection)).
+- **`ForkDialog` is pane-local, not a window modal:** no focus trap, so App's chords stay live; Escape anywhere in its pane or a press outside it in its pane cancels, and that Escape never reaches the composer's interrupt ([ui-contracts §3](../../../../docs/agent-guides/ui-contracts.md#3-focus-escape-and-keyboard-navigation)).
 - **Never infer controls from the agent's brand** ([capabilities](REFERENCE.md#session-capabilities)).
 - **Mutate `$state` only in store methods, tear down every `$effect` timer, use theme tokens, share chrome instead of re-pasting it per card** ([conventions](REFERENCE.md#runes-and-ui-conventions)).
 
