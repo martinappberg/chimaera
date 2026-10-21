@@ -849,6 +849,8 @@ mod tests {
         std::fs::canonicalize(&d).unwrap()
     }
 
+    // Cluster folders are remote POSIX paths.
+    #[cfg(unix)]
     #[test]
     fn browse_dir_lists_folders_marking_git_and_workspaces() {
         let root = scratch("dir");

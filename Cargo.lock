@@ -391,6 +391,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cap-fs-ext"
+version = "4.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56ff379b70af8e08307a8f65e7040c7301cb4a572538ade16b4984f0da77847f"
+dependencies = [
+ "cap-primitives",
+ "cap-std",
+ "io-lifetimes 3.0.1",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "cap-primitives"
 version = "4.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -406,6 +418,18 @@ dependencies = [
  "rustix-linux-procfs",
  "windows-sys 0.61.2",
  "winx",
+]
+
+[[package]]
+name = "cap-std"
+version = "4.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1ec78e242cfa2cfe276807ac2ecc00315a6c97786977414bcd1c3963b6c91b8"
+dependencies = [
+ "cap-primitives",
+ "io-extras",
+ "io-lifetimes 3.0.1",
+ "rustix",
 ]
 
 [[package]]
@@ -481,6 +505,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -488,6 +513,7 @@ name = "chimaera-agent"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "chimaera-core",
  "chimaera-wire-fixtures",
  "nix 0.31.3",
  "rand 0.10.3",
@@ -497,6 +523,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -505,12 +532,14 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "dirs",
+ "dunce",
  "hostname",
  "nix 0.31.3",
  "rand 0.10.3",
  "serde",
  "serde_json",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -529,6 +558,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "bytes",
+ "chimaera-core",
  "chimaera-wire-fixtures",
  "nix 0.31.3",
  "portable-pty",
@@ -564,6 +594,8 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "calamine",
+ "cap-fs-ext",
+ "cap-std",
  "chimaera-agent",
  "chimaera-core",
  "chimaera-pty",
@@ -578,6 +610,7 @@ dependencies = [
  "httpdate",
  "hyper",
  "hyper-util",
+ "junction",
  "libproc",
  "lzma-rs",
  "mime_guess",
@@ -600,6 +633,7 @@ dependencies = [
  "tracing",
  "wasmtime",
  "wasmtime-wasi",
+ "windows-sys 0.61.2",
  "zip 9.0.3",
 ]
 
@@ -1126,6 +1160,12 @@ checksum = "cd1511a7b6a56299bd043a9c167a6d2bfb37bf84a6dfceaba651168adfb43c87"
 dependencies = [
  "dtoa",
 ]
+
+[[package]]
+name = "dunce"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "ed25519"
@@ -1824,6 +1864,16 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
+name = "junction"
+version = "1.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8cfc352a66ba903c23239ef51e809508b6fc2b0f90e3476ac7a9ff47e863ae95"
+dependencies = [
+ "scopeguard",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "lazy_static"
