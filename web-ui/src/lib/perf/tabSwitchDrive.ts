@@ -23,8 +23,8 @@ export function stallDriveSpec(): string | null {
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
-const frame = (): Promise<void> =>
-  new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())));
+const oneFrame = (): Promise<void> => new Promise((r) => requestAnimationFrame(() => r()));
+const frame = (): Promise<void> => oneFrame().then(oneFrame);
 /** Force style + layout so a probe's cost lands inside its timing. */
 const force = (): number => document.body.offsetHeight + getComputedStyle(document.body).color.length;
 
@@ -80,11 +80,12 @@ export async function runStallDrive(host: DriveHost, spec: string): Promise<void
   log(`tabs=${kinds.join(",")} pane=${paneId}`);
   const termIdx = kinds.map((k, i) => (k === "terminal" ? i : -1)).filter((i) => i >= 0);
   const fileIdx = kinds.map((k, i) => (k === "file" ? i : -1)).filter((i) => i >= 0);
-  // Where a switch's time goes: the commit (the layout op + Svelte's flush,
-  // including the pool's terminal attach), the first animation frame (the
-  // style/layout/paint the flip forced) and the second.
-  // Element counts of the departing layer at each phase: a reading window
-  // that restores its blocks on departure shows up as a jump here.
+  // Where the last switch's time went — the commit (the layout op + Svelte's
+  // flush, including the pool's terminal attach), the first animation frame
+  // (the style/layout/paint the flip forced) and the second — plus the
+  // departing layer's element count before the switch, after the commit and
+  // after each frame: a reading window restoring its blocks on departure is
+  // a jump there. The counts are taken outside the timed spans.
   let split = "";
   const go = async (idx: number): Promise<number> => {
     const left = activeLayer();
@@ -93,26 +94,28 @@ export async function runStallDrive(host: DriveHost, spec: string): Promise<void
     const t0 = performance.now();
     host.set(activateTab(host.get(), paneId, idx));
     await tick();
-    const t1 = performance.now();
+    const commit = performance.now() - t0;
     const e1 = els();
-    await new Promise<void>((r) => requestAnimationFrame(() => r()));
-    const t2 = performance.now();
+    const t1 = performance.now();
+    await oneFrame();
+    const f1 = performance.now() - t1;
     const e2 = els();
-    await new Promise<void>((r) => requestAnimationFrame(() => r()));
-    const t3 = performance.now();
+    const t2 = performance.now();
+    await oneFrame();
+    const f2 = performance.now() - t2;
     const e3 = els();
-    split = `commit ${(t1 - t0).toFixed(1)} f1 ${(t2 - t1).toFixed(1)} f2 ${(t3 - t2).toFixed(1)} leftEls ${e0}/${e1}/${e2}/${e3}`;
-    return t3 - t0;
+    split = `commit ${commit.toFixed(1)} f1 ${f1.toFixed(1)} f2 ${f2.toFixed(1)} leftEls ${e0}/${e1}/${e2}/${e3}`;
+    return commit + f1 + f2;
   };
-  /** The active layer's DOM weight and the selection's whereabouts, for the
-   *  departure side of a switch. */
+  /** The active layer's text weight and the selection's whereabouts, for the
+   *  departure side of a switch (its element count is go()'s first figure). */
   const departing = (): string => {
     const layer = activeLayer();
     const sel = document.getSelection();
     const anchor = sel?.anchorNode ?? null;
     const where =
       anchor === null ? "none" : layer?.contains(anchor) ? "in-layer" : "elsewhere";
-    return `from chars=${layer?.textContent?.length ?? 0} els=${layer?.querySelectorAll("*").length ?? 0} sel=${where}${sel?.isCollapsed === false ? "(range)" : ""} focus=${document.activeElement?.tagName ?? "none"}`;
+    return `from chars=${layer?.textContent?.length ?? 0} sel=${where}${sel?.isCollapsed === false ? "(range)" : ""} focus=${document.activeElement?.tagName ?? "none"}`;
   };
 
   // Warm terminal instances before introducing documents, so creation's
@@ -281,6 +284,11 @@ export async function runStallDrive(host: DriveHost, spec: string): Promise<void
         document.getSelection()?.removeAllRanges();
       });
     }
+    // The probes' side effects (the reading window re-observing its blocks
+    // on the inert flip, the find closing) deliver on later frames: let them
+    // land before the first mixed switch is timed.
+    await sleep(500);
+    await frame();
     // Terminal-only cycles miss the inherited style work on a document's
     // own layer. Include warm document reveals and departures as well as
     // the dormant reveal above (the terminal cycles exceed 30 seconds).

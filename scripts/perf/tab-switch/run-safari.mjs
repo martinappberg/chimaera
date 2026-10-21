@@ -26,6 +26,10 @@ const secs = Number(secsArg ?? 45);
 // terminal cycles of a full run; the document<->terminal phase of a quick
 // run (CHIMAERA_PERF_QUICK=1) starts around 18.
 const sampleAt = Number(process.env.CHIMAERA_PERF_SAMPLE_AT ?? 25);
+if (!Number.isFinite(sampleAt) || sampleAt < 0) {
+  console.error(`CHIMAERA_PERF_SAMPLE_AT must be a number of seconds, got ${process.env.CHIMAERA_PERF_SAMPLE_AT}`);
+  process.exit(2);
+}
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const spec = encodeURIComponent(`${sessions}|${files}|${logPath}`);
