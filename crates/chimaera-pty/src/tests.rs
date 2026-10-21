@@ -692,16 +692,19 @@ async fn fast_death_leaves_readable_last_words() {
 }
 
 #[test]
-fn console_titles_name_the_program() {
+fn a_consoles_default_title_is_no_title() {
     use crate::session::console_title;
     assert_eq!(
         console_title(r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe".into()),
-        "powershell"
+        None
     );
-    assert_eq!(console_title("C:/tools/cmd.EXE".into()), "cmd");
+    assert_eq!(console_title("C:/tools/node.EXE".into()), None);
     assert_eq!(
-        console_title("Administrator: Windows PowerShell".into()),
-        "Administrator: Windows PowerShell"
+        console_title("Administrator: Windows PowerShell".into()).as_deref(),
+        Some("Administrator: Windows PowerShell")
     );
-    assert_eq!(console_title("user@host: ~".into()), "user@host: ~");
+    assert_eq!(
+        console_title("user@host: ~".into()).as_deref(),
+        Some("user@host: ~")
+    );
 }

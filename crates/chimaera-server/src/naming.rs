@@ -475,8 +475,32 @@ mod proc_info {
         exe: String,
     }
 
-    /// Every process on the machine, or empty when the snapshot fails.
-    fn snapshot() -> Vec<Entry> {
+    /// How long one process snapshot serves every lookup: a naming poll asks
+    /// for the descendant, its name and its parent across every session at
+    /// once, and each walk of the whole process table costs a system call
+    /// per process.
+    const SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_millis(500);
+
+    /// Every process on the machine (shared for [`SNAPSHOT_TTL`]), or empty
+    /// when the snapshot fails.
+    fn snapshot() -> std::sync::Arc<Vec<Entry>> {
+        use std::sync::{Arc, Mutex};
+        use std::time::Instant;
+        static LAST: Mutex<Option<(Instant, Arc<Vec<Entry>>)>> = Mutex::new(None);
+        let mut last = LAST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((at, entries)) = last.as_ref() {
+            if at.elapsed() < SNAPSHOT_TTL {
+                return Arc::clone(entries);
+            }
+        }
+        let entries = Arc::new(take_snapshot());
+        *last = Some((Instant::now(), Arc::clone(&entries)));
+        entries
+    }
+
+    fn take_snapshot() -> Vec<Entry> {
         // SAFETY: plain call; INVALID_HANDLE_VALUE is the failure case.
         let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
         if snap == INVALID_HANDLE_VALUE || snap.is_null() {
@@ -533,7 +557,7 @@ mod proc_info {
     /// the Unix lookups return.
     pub(super) fn comm(pid: i32) -> Option<String> {
         let pid = u32::try_from(pid).ok()?;
-        let exe = snapshot().into_iter().find(|e| e.pid == pid)?.exe;
+        let exe = snapshot().iter().find(|e| e.pid == pid)?.exe.clone();
         let name = match exe.len().checked_sub(4) {
             Some(cut) if exe[cut..].eq_ignore_ascii_case(".exe") => &exe[..cut],
             _ => exe.as_str(),
@@ -547,8 +571,8 @@ mod proc_info {
 
     pub(super) fn ppid(pid: i32) -> Option<i32> {
         let pid = u32::try_from(pid).ok()?;
-        let entry = snapshot().into_iter().find(|e| e.pid == pid)?;
-        i32::try_from(entry.ppid).ok()
+        let ppid = snapshot().iter().find(|e| e.pid == pid)?.ppid;
+        i32::try_from(ppid).ok()
     }
 
     /// The most recently started live descendant of `root`. Windows reuses

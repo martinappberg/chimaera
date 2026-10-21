@@ -111,22 +111,20 @@ struct TermReplies {
     input_tx: mpsc::Sender<Bytes>,
 }
 
-/// A console window's title as a name. Windows titles a console with its
-/// program's full path (`C:\\WINDOWS\\System32\\...\\powershell.exe`) until
-/// the program sets its own; that path is reduced to the program's name, the
-/// way a Unix shell's terminal reads `zsh`. Any other title is kept.
+/// A console window's title, unless it is Windows' default: a console is
+/// titled with its program's full path (`C:\\WINDOWS\\...\\powershell.exe`)
+/// until the program sets its own, and that names nothing the session's own
+/// naming (the shell, the agent's first prompt, the running command) doesn't
+/// name better, so it counts as no title. Any other title is kept.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) fn console_title(title: String) -> String {
+pub(crate) fn console_title(title: String) -> Option<String> {
     let bytes = title.as_bytes();
     let is_drive_path = bytes.len() > 3
         && bytes[0].is_ascii_alphabetic()
         && bytes[1] == b':'
         && (bytes[2] == b'\\' || bytes[2] == b'/');
-    if !is_drive_path || !title.to_ascii_lowercase().ends_with(".exe") {
-        return title;
-    }
-    let name = title.rsplit(['\\', '/']).next().unwrap_or(&title);
-    name[..name.len() - ".exe".len()].to_string()
+    let default = is_drive_path && title.to_ascii_lowercase().ends_with(".exe");
+    (!default).then_some(title)
 }
 
 impl EventListener for EventProxy {
@@ -134,7 +132,10 @@ impl EventListener for EventProxy {
         match event {
             TermEvent::Title(title) => {
                 #[cfg(windows)]
-                let title = console_title(title);
+                let Some(title) = console_title(title) else {
+                    *lock_unpoisoned(&self.title) = None;
+                    return;
+                };
                 *lock_unpoisoned(&self.title) = Some(title.clone());
                 let _ = self.events_tx.send(SessionEvent::Title { title });
             }

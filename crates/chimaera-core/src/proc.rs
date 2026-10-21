@@ -310,7 +310,15 @@ mod windows {
     }
 
     pub(super) fn limit_job(job: &OwnedHandle, limits: super::JobLimits) -> io::Result<()> {
-        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        if limits.memory_bytes.is_none()
+            && limits.cpu_seconds.is_none()
+            && !limits.below_normal_priority
+        {
+            return Ok(());
+        }
+        // Start from the job's current limits so one set earlier (kill on
+        // close) survives this write.
+        let mut info = query_limits(job)?;
         let basic = &mut info.BasicLimitInformation;
         if let Some(bytes) = limits.memory_bytes {
             basic.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
@@ -325,9 +333,6 @@ mod windows {
         if limits.below_normal_priority {
             basic.LimitFlags |= JOB_OBJECT_LIMIT_PRIORITY_CLASS;
             basic.PriorityClass = BELOW_NORMAL_PRIORITY_CLASS;
-        }
-        if basic.LimitFlags == 0 {
-            return Ok(());
         }
         // SAFETY: the job handle is open; `info` is the struct this class
         // takes and outlives the call.
@@ -345,24 +350,30 @@ mod windows {
         Ok(())
     }
 
-    pub(super) fn kill_on_close(job: &OwnedHandle) -> io::Result<()> {
-        let size = std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
+    /// The job's current extended limits, so a write can add to them.
+    fn query_limits(job: &OwnedHandle) -> io::Result<JOBOBJECT_EXTENDED_LIMIT_INFORMATION> {
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         // SAFETY: the job handle is open; `info` is the struct this class
-        // fills and outlives the call. Read first so limits set earlier
-        // (`limit_job`) survive the write below.
+        // fills and outlives the call.
         let ok = unsafe {
             QueryInformationJobObject(
                 job.0,
                 JobObjectExtendedLimitInformation,
                 std::ptr::from_mut(&mut info).cast(),
-                size,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
                 std::ptr::null_mut(),
             )
         };
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }
+        Ok(info)
+    }
+
+    pub(super) fn kill_on_close(job: &OwnedHandle) -> io::Result<()> {
+        let size = std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
+        // Read first so limits set earlier (`limit_job`) survive the write.
+        let mut info = query_limits(job)?;
         info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         // SAFETY: as above.
         let ok = unsafe {

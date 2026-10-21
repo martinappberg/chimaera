@@ -455,11 +455,22 @@ impl Manifest {
         this_node().is_none_or(|node| same_node(&node, &self.hostname))
     }
 
-    /// Whether the recorded pid is alive ([`proc::pid_alive`]). Meaningless
-    /// for a manifest another node wrote — check [`Manifest::written_here`]
-    /// first.
+    /// Whether the recorded pid is a live process of ours. Unix: a signal-0
+    /// probe, where EPERM (a recycled pid now owned by another user) reads
+    /// as dead — on a shared login node a stale manifest must not look like
+    /// a running daemon. Windows: [`proc::pid_alive`]. Meaningless for a
+    /// manifest another node wrote — check [`Manifest::written_here`] first.
     pub fn is_alive(&self) -> bool {
-        proc::pid_alive(self.pid)
+        #[cfg(unix)]
+        {
+            i32::try_from(self.pid).is_ok_and(|pid| {
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            proc::pid_alive(self.pid)
+        }
     }
 }
 
