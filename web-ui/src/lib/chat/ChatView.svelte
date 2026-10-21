@@ -3423,7 +3423,13 @@
       <div class="live-signin">
         <!-- The daemon relaunches a chat that waited on the login (and the
              one /login was typed in); the card only refreshes the verdict. -->
-        <AgentSignInCard agent={catalogAgent} workspaceId={session.workspace_id ?? null} sessionId={session.id} framed autostart={signInRequested} onSignedIn={() => { signInRequested = false; void getSignIn(agentKind, true).catch(() => {}); }} onDismiss={signInRequested ? () => { signInRequested = false; } : undefined} />
+        <AgentSignInCard agent={catalogAgent} workspaceId={session.workspace_id ?? null} sessionId={session.id} framed autostart={signInRequested} onSignedIn={() => {
+          signInRequested = false;
+          void getSignIn(agentKind, true).catch(() => {});
+          // The daemon never interrupts a turn for a login: it relaunches
+          // this chat when the turn ends (`relaunch_after_turn`).
+          if (store.running) store.notice(`Signed in — ${agentName} switches to it when this turn ends.`, "info");
+        }} onDismiss={signInRequested ? () => { signInRequested = false; } : undefined} />
       </div>
     {/if}
     {#if store.fatalError !== null && signInNeeded}

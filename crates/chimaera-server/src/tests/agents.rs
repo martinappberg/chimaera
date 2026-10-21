@@ -1178,10 +1178,11 @@ async fn a_landed_sign_in_relaunches_the_chats_that_waited_on_it() {
 }
 
 /// A live chat that waited on a sign-in is started again in place when the
-/// login lands; one mid-task is left alone (and unmarked); a chat spawned
-/// while the cached verdict said signed out carries the mark from the start.
+/// login lands; one mid-turn is not interrupted but relaunches when that
+/// turn ends; a chat spawned while the cached verdict said signed out
+/// carries the mark from the start.
 #[tokio::test]
-async fn a_live_chat_that_waited_on_a_sign_in_is_relaunched_unless_mid_task() {
+async fn a_live_chat_that_waited_on_a_sign_in_is_relaunched_now_or_after_its_turn() {
     let state = test_state();
     let ws = make_workspace(&state, "signin-live").await;
     let bin = write_fake_claude("signin-live-fake");
@@ -1215,18 +1216,67 @@ async fn a_live_chat_that_waited_on_a_sign_in_is_relaunched_unless_mid_task() {
     );
     let first = state.chat.get(&id).unwrap().created_at_ms;
 
-    // Mid-task: left alone, and no longer waiting (it is authenticated).
-    lock(&state.agents).get_mut(&id).unwrap().state = agent_state::AgentState::Running;
+    // Mid-turn (a real turn through the session's own pump): not
+    // interrupted, but due once the turn ends.
+    use chimaera_agent::model::{AgentEvent, Usage};
+    state
+        .chat
+        .annotate(
+            &id,
+            AgentEvent::TurnStarted {
+                turn_id: "t1".into(),
+            },
+        )
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !state
+            .chat
+            .input_activity(&id)
+            .is_some_and(|(carry, _)| carry.turn_in_flight)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the turn is in flight");
     assert_eq!(
         chat::relaunch_after_sign_in(state.clone(), agents::AgentKind::Claude).await,
         0
     );
-    assert!(!lock(&state.agents).get(&id).unwrap().signed_out_at_start);
+    {
+        let agents = lock(&state.agents);
+        let record = agents.get(&id).unwrap();
+        assert!(!record.signed_out_at_start);
+        assert!(record.relaunch_after_turn, "due when the turn ends");
+    }
     assert_eq!(
         state.chat.get(&id).unwrap().created_at_ms,
         first,
-        "not respawned"
+        "not respawned mid-turn"
     );
+    state
+        .chat
+        .annotate(
+            &id,
+            AgentEvent::TurnCompleted {
+                turn_id: "t1".into(),
+                usage: Usage::default(),
+            },
+        )
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while !state
+            .chat
+            .get(&id)
+            .is_some_and(|c| c.alive && c.created_at_ms != first)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("relaunched in place once the turn ended");
+    assert!(!lock(&state.agents).get(&id).unwrap().relaunch_after_turn);
+    let first = state.chat.get(&id).unwrap().created_at_ms;
 
     // Idle and marked again: a second life under the same id.
     lock(&state.agents).get_mut(&id).unwrap().state = agent_state::AgentState::Finished;

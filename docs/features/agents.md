@@ -209,8 +209,11 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   startup for want of a login and the live ones started while the CLI said signed out (their
   process never reloads credentials). Same session id, a second life in the same journal; a
   conversation that had a prompt resumes by its native id, one that had none starts fresh (Cursor
-  refuses to load an empty session). A chat mid-task is left alone, and a chat that completed a
-  turn no longer counts as waiting. The daemon is the one owner of that relaunch; a card only
+  refuses to load an empty session). A chat mid-turn (running, parked on an approval, or with a
+  send queued) is never interrupted: it relaunches in place when that turn ends
+  (`AgentRecord.relaunch_after_turn`; a queued send that starts the next turn defers it again),
+  and the chat says so — *Signed in — {agent} switches to it when this turn ends.* A chat that
+  completed a turn no longer counts as waiting. The daemon is the one owner of that relaunch; a card only
   refreshes the verdict. `/login` typed in a chat relaunches that chat too (`session_id` on the
   start request). No sign-in runs beside an install or update of the same agent.
 - **How it's used.** Signing in is never gated on a state: Settings → Agents always offers **Sign
