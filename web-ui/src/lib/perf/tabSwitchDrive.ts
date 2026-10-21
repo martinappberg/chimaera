@@ -80,12 +80,39 @@ export async function runStallDrive(host: DriveHost, spec: string): Promise<void
   log(`tabs=${kinds.join(",")} pane=${paneId}`);
   const termIdx = kinds.map((k, i) => (k === "terminal" ? i : -1)).filter((i) => i >= 0);
   const fileIdx = kinds.map((k, i) => (k === "file" ? i : -1)).filter((i) => i >= 0);
+  // Where a switch's time goes: the commit (the layout op + Svelte's flush,
+  // including the pool's terminal attach), the first animation frame (the
+  // style/layout/paint the flip forced) and the second.
+  // Element counts of the departing layer at each phase: a reading window
+  // that restores its blocks on departure shows up as a jump here.
+  let split = "";
   const go = async (idx: number): Promise<number> => {
+    const left = activeLayer();
+    const els = (): number => left?.querySelectorAll("*").length ?? 0;
+    const e0 = els();
     const t0 = performance.now();
     host.set(activateTab(host.get(), paneId, idx));
     await tick();
-    await frame();
-    return performance.now() - t0;
+    const t1 = performance.now();
+    const e1 = els();
+    await new Promise<void>((r) => requestAnimationFrame(() => r()));
+    const t2 = performance.now();
+    const e2 = els();
+    await new Promise<void>((r) => requestAnimationFrame(() => r()));
+    const t3 = performance.now();
+    const e3 = els();
+    split = `commit ${(t1 - t0).toFixed(1)} f1 ${(t2 - t1).toFixed(1)} f2 ${(t3 - t2).toFixed(1)} leftEls ${e0}/${e1}/${e2}/${e3}`;
+    return t3 - t0;
+  };
+  /** The active layer's DOM weight and the selection's whereabouts, for the
+   *  departure side of a switch. */
+  const departing = (): string => {
+    const layer = activeLayer();
+    const sel = document.getSelection();
+    const anchor = sel?.anchorNode ?? null;
+    const where =
+      anchor === null ? "none" : layer?.contains(anchor) ? "in-layer" : "elsewhere";
+    return `from chars=${layer?.textContent?.length ?? 0} els=${layer?.querySelectorAll("*").length ?? 0} sel=${where}${sel?.isCollapsed === false ? "(range)" : ""} focus=${document.activeElement?.tagName ?? "none"}`;
   };
 
   // Warm terminal instances before introducing documents, so creation's
@@ -119,8 +146,9 @@ export async function runStallDrive(host: DriveHost, spec: string): Promise<void
     const text = layer === null ? null : edgeText(layer, true);
     const sel = document.getSelection();
     if (text !== null && sel !== null) sel.collapse(text, text.length);
+    const fromDoc = departing();
     const docToTerm = await go(termIdx[0]);
-    log(`document->terminal switch ${docToTerm.toFixed(1)}ms`);
+    log(`document->terminal switch ${docToTerm.toFixed(1)}ms (${split}) ${fromDoc}`);
     const anchor = sel?.anchorNode ?? null;
     const inParked = anchor !== null && !(activeLayer()?.contains(anchor) ?? false);
     let walk = -1;
@@ -221,20 +249,46 @@ export async function runStallDrive(host: DriveHost, spec: string): Promise<void
       sel.removeAllRanges();
     }
     if (focusedEl instanceof HTMLElement) focusedEl.focus();
-    log(`switch->${idx} ${dt.toFixed(1)}ms walk fwd ${fwd.toFixed(1)}ms back ${back.toFixed(1)}ms`);
+    log(`switch->${idx} ${dt.toFixed(1)}ms (${split}) walk fwd ${fwd.toFixed(1)}ms back ${back.toFixed(1)}ms`);
     if (i % 4 === 3) void write();
     await sleep(3000);
   }
   if (fileIdx.length > 0) {
     const dt = await go(fileIdx[0]);
-    log(`reveal file ${fileIdx[0]} ${dt.toFixed(1)}ms scrollTop=${scroller()?.scrollTop ?? "n/a"}`);
+    log(`reveal file ${fileIdx[0]} ${dt.toFixed(1)}ms (${split}) scrollTop=${scroller()?.scrollTop ?? "n/a"}`);
+    await sleep(500);
+    // The same isolation probes on a document's own layer while it is the
+    // active one: what its departure toggles cost by themselves.
+    {
+      const doc = activeLayer();
+      probe(`doc inert-on+off(active document layer, ${doc?.textContent?.length ?? 0} chars)`, () => {
+        doc?.setAttribute("inert", "");
+        force();
+        doc?.removeAttribute("inert");
+      });
+      probe("doc class-active-off+on", () => {
+        doc?.classList.remove("active");
+        force();
+        doc?.classList.add("active");
+      });
+      probe("doc blur", () => {
+        const f = document.activeElement;
+        if (f instanceof HTMLElement) f.blur();
+        force();
+        if (f instanceof HTMLElement) f.focus();
+      });
+      probe("doc removeAllRanges", () => {
+        document.getSelection()?.removeAllRanges();
+      });
+    }
     // Terminal-only cycles miss the inherited style work on a document's
     // own layer. Include warm document reveals and departures as well as
     // the dormant reveal above (the terminal cycles exceed 30 seconds).
     for (let i = 0; i < 12; i++) {
       const idx = i % 2 === 0 ? termIdx[0] : fileIdx[Math.floor(i / 2) % fileIdx.length];
+      const from = departing();
       const dt = await go(idx);
-      log(`mixed->${idx} ${dt.toFixed(1)}ms scrollTop=${scroller()?.scrollTop ?? "n/a"}`);
+      log(`mixed->${idx} ${dt.toFixed(1)}ms (${split}) scrollTop=${scroller()?.scrollTop ?? "n/a"} ${from}`);
       await sleep(500);
     }
     const scroll = activeLayer()?.querySelector<HTMLElement>(".md-scroll");

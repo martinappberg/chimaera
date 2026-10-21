@@ -44,7 +44,7 @@ Tests: `*.test.ts` beside the modules; `mathBlocks.fixture.json` and `doc/parity
 - **A parked view stops its recurring work.** Gate polls and follow ticks on `paneVisibility(...).shown` (`viewLifecycle.svelte.ts`: the `visible` prop Pane passes through FileView, FinderView and DiffView, else `watchPaneVisible`, and `$pageVisible`; rule bullet on recurring work).
 - **A preview's loads end with the view; disk changes while parked are applied on reveal.** Fetches carry a `viewSignal` / `onDiskVersion` signal, so a closed or superseded load is aborted and its result dropped. Pptx, Docx, Notebook, Board and Table views read a parked change off screen and apply it in the reveal's update, before it paints; PdfView pauses its page-size walk while parked. MarkdownView, CodeView and `buffers.svelte.ts` keep their own disk handling (they own "never lose an edit").
 - **The presence heartbeat is a deliberate visibility exemption.** It runs only while this window holds unsaved edits (`Presence` doc comment).
-- **Large reading documents window their DOM** (`readingWindow.ts`) because WebKit restyles every inline node on a tab switch.
+- **Large reading documents window their DOM** (`readingWindow.ts`) because WebKit restyles every inline node on a tab switch. A `chimaera-find-visibility` event restores every block (`true`) or re-windows the whole document (`false`): the window ignores a value it already has, and `shared/DocumentFind.svelte` dispatches `false` only for a find that was open — a spurious "closed" on departure cost ~500 ms per document→terminal switch (`scripts/perf/tab-switch/README.md`, 2026-10-20).
 
 ## Checks
 

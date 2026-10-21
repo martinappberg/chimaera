@@ -162,7 +162,12 @@ export function createReadingWindow(root: HTMLElement): ReadingWindow {
     restoreAll();
   }
   function onFindVisibility(event: Event): void {
-    finding = (event as CustomEvent<boolean>).detail;
+    const next = (event as CustomEvent<boolean>).detail;
+    // A "closed" while already closed must not re-window: schedule() puts
+    // every block back first, and the next frame then lays out the whole
+    // document again (measured at ~450 ms for 108k inline elements).
+    if (next === finding) return;
+    finding = next;
     if (finding) restoreAll();
     else schedule();
   }
