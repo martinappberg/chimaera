@@ -61,11 +61,19 @@ pub(crate) trait Progress: Clone + Serialize + Send + 'static {
     fn phase(&self) -> Phase;
     fn set_phase(&mut self, phase: Phase);
     fn set_message(&mut self, message: &str);
-    /// A chunk the process wrote to stdout or stderr, in the order read.
-    fn on_output(&mut self, bytes: &[u8]);
+    /// A chunk the process wrote to `stream`. Each pipe's chunks arrive in
+    /// the order written; between the two pipes, only in the order read.
+    fn on_output(&mut self, stream: Stream, bytes: &[u8]);
     fn running(&self) -> bool {
         self.phase().running()
     }
+}
+
+/// Which of the process's pipes a chunk came from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Stream {
+    Stdout,
+    Stderr,
 }
 
 pub(crate) struct Operation<P> {
@@ -142,7 +150,10 @@ impl<P: Progress> Operation<P> {
         let mut reads: Option<JoinHandle<()>> = Some(tokio::spawn({
             let op = self.clone();
             async move {
-                tokio::join!(drain(stdout, &op), drain(stderr, &op));
+                tokio::join!(
+                    drain(stdout, Stream::Stdout, &op),
+                    drain(stderr, Stream::Stderr, &op)
+                );
             }
         }));
         let exit = {
@@ -328,6 +339,15 @@ pub(crate) fn append_capped(buf: &mut String, text: &str) -> bool {
     true
 }
 
+/// [`append_capped`] for raw bytes: append, keeping the newest
+/// [`OUTPUT_LIMIT`].
+pub(crate) fn append_bytes_capped(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(bytes);
+    if buf.len() > OUTPUT_LIMIT {
+        buf.drain(..buf.len() - OUTPUT_LIMIT);
+    }
+}
+
 /// Terminal output minus its controls: ANSI CSI/OSC sequences and other
 /// control characters, newlines and tabs kept.
 pub(crate) fn strip_controls(text: &str) -> String {
@@ -453,13 +473,13 @@ async fn settle_reads(reads: &mut Option<JoinHandle<()>>, grace: Duration) {
     *reads = None;
 }
 
-async fn drain<P: Progress>(mut pipe: impl AsyncRead + Unpin, op: &Operation<P>) {
+async fn drain<P: Progress>(mut pipe: impl AsyncRead + Unpin, stream: Stream, op: &Operation<P>) {
     let mut buf = [0; 4096];
     while let Ok(n) = pipe.read(&mut buf).await {
         if n == 0 {
             break;
         }
-        op.update(|p| p.on_output(&buf[..n]));
+        op.update(|p| p.on_output(stream, &buf[..n]));
     }
 }
 

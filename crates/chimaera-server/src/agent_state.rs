@@ -236,6 +236,10 @@ pub(crate) struct AgentRecord {
     /// startup for want of one: a sign-in landing later relaunches it in
     /// place (`chat::relaunch_after_sign_in`). Cleared by that relaunch.
     pub(crate) signed_out_at_start: bool,
+    /// A sign-in landed while this chat was mid-turn: its process still
+    /// holds the old login, and restarting it then would kill the turn. It
+    /// relaunches in place once that turn ends (`chat::relaunch_after_turn`).
+    pub(crate) relaunch_after_turn: bool,
     /// Live subagents (SubagentStart/Stop hooks), capped at
     /// [`SUBAGENTS_CAP`]; cleared when the turn ends (Stop) or the session
     /// exits (the record dies with it).
@@ -334,6 +338,7 @@ impl AgentRecord {
             files_touched: Vec::new(),
             compute_ctx_delivered: false,
             signed_out_at_start: false,
+            relaunch_after_turn: false,
             subagents: Vec::new(),
             now_line: None,
             usage: None,

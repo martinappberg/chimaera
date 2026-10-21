@@ -209,16 +209,24 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   startup for want of a login and the live ones started while the CLI said signed out (their
   process never reloads credentials). Same session id, a second life in the same journal; a
   conversation that had a prompt resumes by its native id, one that had none starts fresh (Cursor
-  refuses to load an empty session). A chat mid-task is left alone, and a chat that completed a
-  turn no longer counts as waiting. The daemon is the one owner of that relaunch; a card only
+  refuses to load an empty session). A chat mid-turn (running, parked on an approval, or with a
+  send queued) is never interrupted: it relaunches in place when that turn ends
+  (`AgentRecord.relaunch_after_turn`; a queued send that starts the next turn defers it again),
+  and the chat says so — *Signed in — {agent} switches to it when this turn ends.* A chat that
+  completed a turn no longer counts as waiting. The daemon is the one owner of that relaunch; a card only
   refreshes the verdict. `/login` typed in a chat relaunches that chat too (`session_id` on the
   start request). No sign-in runs beside an install or update of the same agent.
-- **How it's used.** Click **Sign in** — or type `/login` in any chat, which opens the card there
-  even when the agent is signed in (switch accounts, refresh a stale login; Antigravity's headless
-  login only finds the existing one, so its card offers no second sign-in). The card shows the page to open (**Open ↗** goes
+- **How it's used.** Signing in is never gated on a state: Settings → Agents always offers **Sign
+  in** / **Sign in again**, and every chat offers it in **Chat options → Sign in to {agent}…** and
+  as `/login` — signed in or not, mid-turn, idle, or ended (a chat that died on a usage limit or
+  a plan without this agent can't take `/login` any more; the menu still opens the card there).
+  That is the way to switch accounts or refresh a stale login; Antigravity's headless login only
+  finds the existing one, so its card offers no second sign-in. The card shows the page to open (**Open ↗** goes
   through the native shell's browser opener, so it works for a daemon on another host;
   **Copy link** for a browser elsewhere), a device code to enter on that page when the CLI's
-  flow uses one, and a field to paste a code back when the page shows one. Finish in the
+  flow uses one, and a field to paste a code back when the page shows one. What the CLI itself
+  printed sits under the page, collapsed — open, with no page, when the CLI printed nothing the
+  daemon recognizes as this agent's sign-in page. Finish in the
   browser; the card says *Signed in* when the CLI itself reports the login, and a waiting chat
   starts again in place. **Cancel** stops the CLI's login; a failure says what the CLI said and
   offers **Try again**. Antigravity's page waits 60 s for the callback (its CLI's limit), so a
@@ -260,9 +268,24 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   session as waiting on a sign-in (`AgentRecord.signed_out_at_start`); a landed sign-in relaunches
   those (`chat::relaunch_after_sign_in`, at most 8) and clears the mark. The login runs
   as its own process group with a 10-minute deadline, output private to the daemon (64 KiB;
-  only the URL, the code and a short failure tail reach the wire), no session or PTY entry;
-  cancel is SIGTERM then SIGKILL to the group. A clean exit is never success by itself — the
-  status command is asked again. Concurrent status probes for one agent share a run. The
+  only the URL, the code, the CLI's own output tail (`printed`, 4000 characters) and a short
+  failure tail reach the wire, and the first three leave it with the operation's end), no session
+  or PTY entry; cancel is SIGTERM then SIGKILL to the group. **How the page is read** — a
+  contract, not a guess: (1) *only the CLI's words*: the login runs behind a `/bin/sh` that
+  writes a start marker on stdout and on stderr and then execs the CLI; each pipe is ordered, so
+  each is read from its own marker, and everything the login shell printed first (a remote host's
+  welcome banner, a profile script's portal link, the prelude) is never searched, however the two
+  pipes' reads interleave — on a remote host that banner's link used to become the card's page;
+  (2) *the page is the first https link on this agent's login hosts* (the table in
+  `agent_auth::login_hosts`, a host or its subdomain; no credentials, no http) — never the last
+  link, never another host; (3) *a device code only for a device flow* (Codex, Grok); (4) *no
+  page is visible, not wrong*: a CLI that moved its login host or changed its flow shows its own
+  output on the card instead, and the fix is the host table. Known limits: a CLI that writes its
+  link only to a terminal or holds it in a pipe buffer shows nothing until it exits; a flow that
+  returns to `localhost` can only finish in a browser on the daemon's machine (every recipe here
+  uses a device code or a hosted callback for that reason). The status command runs behind
+  the same marker and is read from it, so a banner's words never answer it either.
+  A clean exit is never success by itself — the status command is asked again. Concurrent status probes for one agent share a run. The
   chat view shows one line per failure: a startup error that a fatal banner shows
   is not repeated as a transcript line, and a fatal banner is not followed by *agent exited*.
 

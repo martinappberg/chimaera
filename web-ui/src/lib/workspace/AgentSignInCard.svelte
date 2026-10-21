@@ -51,6 +51,9 @@
     status?.operation && (operationRunning(status.operation) || status.operation.id === ownAttempt) ? status.operation : null,
   );
   const running = $derived(operationRunning(operation));
+  /** Signed in, and this CLI's login can't replace the account (its
+   *  headless login only finds the existing one): nothing to start. */
+  const noSecondSignIn = $derived(agent.signedIn === true && agent.signIn?.relogin === false);
   const pageHost = $derived.by(() => {
     try { return operation?.url ? new URL(operation.url).hostname : null; } catch { return null; }
   });
@@ -72,7 +75,7 @@
     } finally { checking = false; }
   }
   onMount(() => {
-    void check().then(() => { if (autostart && !running) void start(); });
+    void check().then(() => { if (autostart && !running && !noSecondSignIn) void start(); });
     return () => { disposed = true; };
   });
   // Only a sign-in in progress needs the daemon again, and only while someone
@@ -161,6 +164,14 @@
         </form>
       {/if}
     {/if}
+    {#if operation?.printed}
+      <!-- The CLI's own words. Open when its page isn't one the daemon
+           knows for this agent: whatever it asked for is right here. -->
+      <details class="printed" open={!operation.url}>
+        <summary>{operation.url ? `What ${status?.command ?? agent.name} printed` : `${agent.name} printed this — no sign-in page recognized yet`}</summary>
+        <pre>{operation.printed}</pre>
+      </details>
+    {/if}
     <div class="actions">
       <button class="opt-link quiet" disabled={busy || operation?.phase === "cancelling"} onclick={() => void cancel()}>{operation?.phase === "cancelling" ? "Stopping…" : "Cancel"}</button>
     </div>
@@ -168,7 +179,7 @@
     <p class="line" class:failure={operation?.phase === "failed"} role="status">
       {#if operation?.phase === "failed" || operation?.phase === "cancelled"}
         {operation.message}
-      {:else if agent.signedIn === true && agent.signIn?.relogin === false}
+      {:else if noSecondSignIn}
         {agent.name} is signed in on this host.
       {:else if agent.signedIn === true}
         {agent.name} is signed in on this host. Sign in again to switch accounts or refresh the login.
@@ -179,7 +190,7 @@
       {/if}
     </p>
     <div class="actions">
-      {#if !(agent.signedIn === true && agent.signIn?.relogin === false)}
+      {#if !noSecondSignIn}
         <button class="opt primary" disabled={busy || workspaceId === null || !status} onclick={() => void start()}>
           {busy ? "Starting…" : operation ? "Try again" : agent.signedIn === true ? "Sign in again" : "Sign in"}
         </button>
@@ -210,4 +221,6 @@
   .paste input { flex: 1; min-width: 0; box-sizing: border-box; border: 1px solid var(--edge); background: var(--term-bg); color: var(--fg); border-radius: 6px; padding: 6px 9px; font: var(--text-sm) var(--mono); }
   .paste input:focus { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
   button:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
+  .printed summary { cursor: pointer; font-size: var(--text-xs); color: var(--muted); }
+  .printed pre { margin: 6px 0 0; max-height: 160px; overflow: auto; padding: 8px 10px; border: 1px solid var(--edge); border-radius: 6px; background: var(--term-bg); color: var(--fg); font: var(--text-xs)/1.45 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
 </style>
