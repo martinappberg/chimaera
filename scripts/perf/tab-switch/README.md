@@ -23,6 +23,22 @@ mixed switches, confirming warm tab selection does not wait for the simulated 30
 Browser verification also covered a disk refresh while parked, full-text Find after a font
 resize (identical full/windowed height), and an unsaved editor draft surviving a tab round trip.
 
+The 2026-10-20 run (issue #327; three 1.42 MB documents of 1,500 paragraphs, 108,000 inline
+elements each, Safari 26.6, a debug daemon, load average ~9 from unrelated system work) found
+document→terminal switches at 527–621 ms (median 548 ms) while terminal→document stayed at
+28–41 ms. The driver's per-phase split showed the cost in the first animation frame, and the
+departing layer growing from 2,110 to 109,534 elements during the commit: the pane's
+`DocumentFind` closed an already-closed find when its layer went `inert`, that dispatched
+`chimaera-find-visibility: false`, and the reading window answered with `schedule()` — every
+block restored, a full layout of the document in the next frame, and the window rebuilt the
+frame after. The same bundle built from `2ead70c0` (before #324) measured 518–593 ms, so the
+cost arrived with find-in-pane (#237), not with the preview lifetime change. With both ends
+fixed (the window ignores a no-change event, the find announces only a real close): first
+document→terminal switch 39 ms, mixed document→terminal 24–40 ms (median 37), terminal→document
+18–55 ms (median 37), 24 terminal cycles 20–124 ms (median 50), the 30-second dormant reveal
+107 ms, selection over 1.13 M characters, identical full/windowed height (513,042 px) and the
+5,000 px restore — all from a run with Safari frontmost and no sampler.
+
 ## Run
 
 ```sh
@@ -32,4 +48,8 @@ node scripts/perf/tab-switch/run-safari.mjs http://127.0.0.1:<port> <token> <ws-
 npm --prefix web-ui run build                      # back to a harness-free bundle
 ```
 
-Node-dense documents are what hurt: markdown over 1 MB (so it opens in reading mode) with `**bold**`, `` `code` `` and `*em*` on every other word — ~235k inline elements per file reproduced the live numbers. Read the sample's call graph: a layout branch means parked content is being re-laid out, `Style::TreeResolver` that it is being re-resolved, `Style::Scope::createDocumentResolver` that a stylesheet changed.
+Node-dense documents are what hurt: markdown over 1 MB (so it opens in reading mode) with `**bold**`, `` `code` `` and `*em*` on every other word — ~235k inline elements per file reproduced the live numbers. Read the sample's call graph: a layout branch means parked content is being re-laid out, `Style::TreeResolver` that it is being re-resolved, `Style::Scope::createDocumentResolver` that a stylesheet changed. An `AXObjectCache::notificationPostTimerFired` branch means an accessibility client is attached (a screen reader, an activity recorder, an accessibility-tree read of Safari): it pulls the frame's layout forward into its own timer, so the cost it shows is the frame's, not its own.
+
+Each switch line carries its split — `commit` (the layout op and Svelte's flush, including the pool's terminal attach), `f1` and `f2` (the two animation frames) — and `leftEls`, the departing layer's element count before the switch, after the commit, and after each frame (counted outside the timed spans): a jump there is a reading window restoring its blocks. `CHIMAERA_PERF_SAMPLE_AT=<secs>` moves the sampler's start (25 by default; the document↔terminal phase of a quick run starts around 18).
+
+The driver waits on animation frames, which Safari stops for a window that is fully covered or minimized (a partly visible window keeps running): a run whose log stops mid-way was covered, not slow. On a shared machine, start the run when input has been idle for a while (`ioreg -c IOHIDSystem`'s `HIDIdleTime`) and record the frontmost app alongside it with `lsappinfo front` — not through System Events, which is itself an accessibility client.

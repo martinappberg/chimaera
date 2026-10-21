@@ -29,13 +29,18 @@
     revealMatch(ranges[current], target);
   }
   function close(restore = true) {
+    const wasOpen = open;
     open = false;
     painter?.destroy(); painter = null;
     // Ranges retain text nodes even if a later document refresh removes them.
     ranges = [];
     clearTimeout(timer);
     timer = undefined;
-    target?.dispatchEvent(new CustomEvent("chimaera-find-visibility", { detail: false }));
+    // Only a real close announces itself: the parked-layer observer and the
+    // effect teardown close an already-closed find too, and the reading
+    // window (previews/readingWindow.ts) re-windows the document on every
+    // "closed" it hears.
+    if (wasOpen) target?.dispatchEvent(new CustomEvent("chimaera-find-visibility", { detail: false }));
     if (restore) target?.focus();
   }
   $effect(() => {

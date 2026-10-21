@@ -22,13 +22,21 @@ if (!logPath) {
   process.exit(2);
 }
 const secs = Number(secsArg ?? 45);
+// When the sample starts, in seconds after Safari opens: 25 reaches the
+// terminal cycles of a full run; the document<->terminal phase of a quick
+// run (CHIMAERA_PERF_QUICK=1) starts around 18.
+const sampleAt = Number(process.env.CHIMAERA_PERF_SAMPLE_AT ?? 25);
+if (!Number.isFinite(sampleAt) || sampleAt < 0) {
+  console.error(`CHIMAERA_PERF_SAMPLE_AT must be a number of seconds, got ${process.env.CHIMAERA_PERF_SAMPLE_AT}`);
+  process.exit(2);
+}
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const spec = encodeURIComponent(`${sessions}|${files}|${logPath}`);
 const quick = process.env.CHIMAERA_PERF_QUICK === "1" ? "&quickdrive" : "";
 execFileSync("open", ["-a", "Safari", `${base}/?stalldrive=${spec}${quick}#token=${token}&ws=${ws}`]);
-console.log("opened; waiting for the driver to park the documents");
-await sleep(25_000);
+console.log(`opened; waiting ${sampleAt}s for the driver to park the documents`);
+await sleep(sampleAt * 1000);
 
 // The busiest WebContent over a 3 s window is the harness page (`top` truncates
 // command names, so the candidates come from `ps`; `top` takes at most 20 pids).
