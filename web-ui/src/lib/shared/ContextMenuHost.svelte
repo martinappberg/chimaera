@@ -6,7 +6,7 @@
    * row shared by mouse hover. z-index sits below modals (FolderPicker is
    * 100) — a dialog always wins over a lingering menu.
    */
-  import { tick } from "svelte";
+  import { tick, untrack } from "svelte";
   import {
     contextMenu,
     type ContextMenuEntry,
@@ -40,9 +40,15 @@
 
   let menuEl = $state<HTMLElement | null>(null);
   /** The menu button that opened this menu (`aria-haspopup="menu"`), which
-   *  gets focus back when the menu closes by a pick or Escape — so a
-   *  keyboard user lands where they were. A right-click menu has none. */
+   *  gets focus back whenever the menu closes — so a keyboard user lands
+   *  where they were. A right-click menu has none. */
   let opener: HTMLElement | null = null;
+  /** Whatever held focus when the menu opened — for a right-click menu, the
+   *  row the press focused. It gets focus back before a pick runs, so a
+   *  dialog the pick opens records it as the control to return to (the menu
+   *  itself is gone by then), and on a keyboard close. An outside press
+   *  leaves focus to where the press lands. */
+  let invoker: HTMLElement | null = null;
   let left = $state(0);
   let top = $state(0);
   let activeIndex = $state(-1);
@@ -68,7 +74,11 @@
     const py = contextMenu.y;
     const alignRight = contextMenu.alignRight;
     const active = document.activeElement;
-    opener = active instanceof HTMLElement && active.getAttribute("aria-haspopup") === "menu" ? active : null;
+    // A retarget while open finds focus on the menu: keep the first owner.
+    if (!(active instanceof Node && untrack(() => menuEl)?.contains(active))) {
+      invoker = active instanceof HTMLElement && active !== document.body ? active : null;
+      opener = invoker?.getAttribute("aria-haspopup") === "menu" ? invoker : null;
+    }
     // Right-aligned: land at the menu's minimum width left of the anchor, so
     // the first frame doesn't hang off the button's right edge.
     left = alignRight ? Math.max(4, px - 172) : px;
@@ -101,18 +111,25 @@
     };
   });
 
-  /** Focus back to the menu button, before a pick runs (a dialog the pick
-   *  opens then takes focus from there). */
-  function refocus(): void {
-    const el = opener;
+  /** Focus back to the menu button — or, on a pick or keyboard close, to
+   *  the invoker — before a pick runs (a dialog the pick opens then takes
+   *  focus from there and returns it here). */
+  function refocus(toInvoker: boolean): void {
+    const button = opener;
+    const held = invoker;
     opener = null;
-    if (el !== null && el.isConnected) el.focus();
+    invoker = null;
+    if (button !== null) {
+      if (button.isConnected) button.focus();
+    } else if (toInvoker && held !== null && held.isConnected) {
+      held.focus({ preventScroll: true });
+    }
   }
 
   function select(item: ContextMenuItem): void {
     if (item.disabled === true) return;
     contextMenu.close();
-    refocus();
+    refocus(true);
     item.onSelect();
   }
 
@@ -167,7 +184,7 @@
       if (entry !== undefined && entry !== "separator") select(entry);
     } else if (e.key === "Tab") {
       contextMenu.close();
-      refocus();
+      refocus(true);
     }
     // Escape is handled by the dismiss action (which also refocuses).
   }
@@ -186,9 +203,9 @@
     style:top={`${top}px`}
     use:dismiss={{
       enabled: contextMenu.open,
-      onDismiss: () => {
+      onDismiss: (reason) => {
         contextMenu.close();
-        refocus();
+        refocus(reason === "escape");
       },
     }}
     onkeydown={onKeydown}
