@@ -6,7 +6,10 @@
 // auth, binary PTY frames), then deletes the session. Zero dependencies; Node 22's
 // built-in WebSocket and fetch.
 //
-//   node scripts/smoke-daemon.mjs [manifest.json] [workspace-root]
+//   node scripts/smoke-daemon.mjs [manifest.json] [workspace-root] [--stop]
+//
+// --stop finishes with POST /api/v1/stop (the session-preserving graceful stop)
+// so a CI step can then assert the daemon process exits.
 //
 // Defaults: the isolated daemon's manifest (.chimaera-dev/data/manifest.json,
 // written by .claude/skills/develop/serve-isolated.sh) and the repo root.
@@ -15,8 +18,15 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const manifestPath = process.argv[2] ?? resolve(root, '.chimaera-dev/data/manifest.json');
-const workspaceRoot = process.argv[3] ?? root;
+const args = process.argv.slice(2);
+if (args.includes('--help') || args.includes('-h')) {
+  console.log('usage: node scripts/smoke-daemon.mjs [manifest.json] [workspace-root] [--stop]');
+  process.exit(0);
+}
+const stopAtEnd = args.includes('--stop');
+const positional = args.filter((a) => !a.startsWith('--'));
+const manifestPath = positional[0] ?? resolve(root, '.chimaera-dev/data/manifest.json');
+const workspaceRoot = positional[1] ?? root;
 const { port, token } = JSON.parse(readFileSync(manifestPath, 'utf8'));
 const base = `http://127.0.0.1:${port}`;
 
@@ -51,8 +61,11 @@ try {
 console.log(`workspace ${workspace.id} → shell session ${session.id}`);
 
 // The marker is computed by the shell, so seeing it proves a real round trip
-// (input reached the PTY, output came back) rather than a local echo.
-const marker = 'chimaera-smoke-42';
+// (input reached the PTY, output came back) rather than a local echo. The
+// same line works in POSIX shells and PowerShell (`$((6*7))` is a
+// subexpression there too), and the typed echo of the command never contains
+// the computed marker.
+const command = 'echo chimaera-smoke-$((6*7))';
 try {
   await new Promise((resolveRun, reject) => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws/sessions/${session.id}`);
@@ -69,7 +82,7 @@ try {
     const timer = setTimeout(() => fail(`no "${marker}" within 15s`), 15000);
     ws.onopen = () => {
       ws.send(JSON.stringify({ type: 'auth', token }));
-      ws.send(new TextEncoder().encode(`echo chimaera-smoke-$((6*7))\r`));
+      ws.send(new TextEncoder().encode(`${command}\r`));
     };
     ws.onmessage = (ev) => {
       if (typeof ev.data === 'string') return; // JSON control frames
@@ -89,4 +102,9 @@ try {
 } finally {
   await api('DELETE', `/api/v1/sessions/${session.id}`).catch(() => {});
   if (addedWorkspace) await api('DELETE', `/api/v1/workspaces/${workspace.id}`).catch(() => {});
+}
+
+if (stopAtEnd) {
+  await api('POST', '/api/v1/stop');
+  console.log('✓ POST /api/v1/stop accepted');
 }
