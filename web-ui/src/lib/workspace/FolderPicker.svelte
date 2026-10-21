@@ -3,6 +3,7 @@
   import { ApiError, getHostLabel } from "../net/api";
   import { openWindow } from "../net/native";
   import { validateEntryName } from "../shared/fsNames";
+  import { isMac } from "../shared/keys";
   import { modalFocus } from "../shared/modalFocus";
   import {
     createWorkspace,
@@ -51,8 +52,8 @@
   /** The Home row leads the list until the user starts filtering or browsing. */
   const showHome = $derived(onHome !== undefined && !navigated && input === "");
   const homeOffset = $derived(showHome ? 1 : 0);
-  /** An absolute (or ~) path typed into the filter: the "open this folder"
-   *  row acts on IT, not on the breadcrumb directory. */
+  /** An absolute (or ~) path typed into the filter: the footer's Open acts on
+   *  IT, not on the breadcrumb directory. */
   const typedPath = $derived.by((): string | null => {
     const t = input.trim();
     return t.startsWith("/") || t.startsWith("~") ? t : null;
@@ -66,7 +67,7 @@
   // --- typed-path completion -------------------------------------------------
   // When the filter holds an absolute/~ path, list the children of its deepest
   // directory and match the trailing segment — shell-style tab completion,
-  // replacing the old dead-end that only ever offered "open this folder".
+  // replacing the old dead-end that only ever offered to open the typed path.
   let pathDirs = $state<DirEntry[]>([]);
   /** The directory `pathDirs` was listed from (dedupes refetches per keystroke). */
   let pathBase = $state("");
@@ -102,12 +103,11 @@
     return t === "" ? pathDirs : pathDirs.filter((d) => subseq(t, d.name.toLowerCase()));
   });
 
-  /** The navigable dirs under the "open this folder" row, in whichever mode is
+  /** The navigable dirs in the list, in whichever mode is
    *  active (typed-path completion vs. filtering the browsed directory). */
   const browseDirs = $derived(typedPath !== null ? pathMatches : filtered);
 
-  /** The typed path doesn't exist yet — the top row becomes "create folder"
-   *  instead of "open this folder". Judged from the parent listing (which the
+  /** The typed path doesn't exist yet — the footer's Open becomes "Create & open". Judged from the parent listing (which the
    *  completion effect already fetches): once it has settled for this path's
    *  directory, the path is missing when a trailing segment matches no child,
    *  or — for a path ending in "/" — when the directory itself couldn't be
@@ -139,7 +139,7 @@
       if (upPath !== null) out.push({ kind: "up", path: upPath });
       for (const dir of browseDirs) out.push({ kind: "dir", dir });
       // Browse mode only: create in the directory being browsed (the typed-
-      // path mode has its own create — the flipped top row).
+      // path mode has its own create — the footer's "Create & open").
       if (typedPath === null) out.push({ kind: "newfolder" });
     }
     return out;
@@ -249,7 +249,7 @@
   // --- browse-mode "new folder…" (create in the browsed directory) -----------
   // Unlike the typed-path create (createFolder above, which opens the new
   // folder as a workspace immediately), this creates and NAVIGATES INTO it —
-  // "open this folder" is then one Enter away, and the user can keep nesting.
+  // the footer's Open is then one Enter away, and the user can keep nesting.
 
   let creating = $state(false);
   let createDraft = $state("");
@@ -289,7 +289,7 @@
       creating = false;
       createDraft = "";
       filterEl?.focus();
-      await navigate(created); // fresh folder is empty → "open this folder" highlights
+      await navigate(created); // fresh folder is empty → nothing highlights, Enter opens it
     } catch (e) {
       error = e instanceof ApiError ? e.message : "could not create folder";
     } finally {
@@ -431,7 +431,7 @@
         })
         .catch(() => {
           if (seq !== pathSeq) return;
-          // Parent doesn't exist yet: no completions — the top row offers to
+          // Parent doesn't exist yet: no completions — the footer offers to
           // create the typed path instead of opening it.
           pathDirs = [];
           pathTruncated = false;
@@ -626,7 +626,6 @@
       <div class="foot">
         <button
           class="primary"
-          class:create={typedPathMissing}
           tabindex="-1"
           title={target}
           onmousedown={keepFocus}
@@ -643,7 +642,7 @@
           </svg>
           <span class="verb">{typedPathMissing ? "Create & open" : "Open"}</span>
           <span class="who">{folderName(target)}</span>
-          <kbd>⌘↵</kbd>
+          <kbd>{isMac ? "⌘↵" : "Ctrl+↵"}</kbd>
         </button>
         {#if !typedPathMissing}
           <button
@@ -844,8 +843,8 @@
     flex: none;
   }
 
-  /* "create folder" — distinguish the make-a-new-directory action from the
-     plain "open this folder" so it's clearly not just opening what you typed. */
+  /* "new folder…" — accent-coloured so the make-a-directory row reads apart
+     from the plain navigation rows. */
   .name.here-label.create {
     color: var(--accent);
   }
