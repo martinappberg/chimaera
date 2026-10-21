@@ -1341,6 +1341,11 @@ pub(super) async fn copy_file_to_clipboard(
             *slot = Some(arboard::Clipboard::new().map_err(|e| e.to_string())?);
         }
         let clipboard = slot.as_mut().expect("just filled");
+        // arboard's Windows file list joins whatever the clipboard holds, so
+        // a paste into a text field would still give the text copied before.
+        // Explorer's Copy replaces it.
+        #[cfg(windows)]
+        clipboard.clear().map_err(|e| e.to_string())?;
         clipboard
             .set()
             .file_list(&[path])
