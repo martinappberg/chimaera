@@ -86,7 +86,7 @@ Never reads a credential. The sign-in operation runs on `operation` (`OutputEnd:
 
 ## launcher.rs
 
-argv assembly (`build_agent_command`, `build_chat_command`, `build_agent_resume_command` — the switch-to-TUI argv), binary `detect` (hits cached for the daemon's lifetime; a miss is stamped for `MISS_TTL` = 90 s in `agent_misses` and served ONLY by `detect_for_catalog` — `GET /agents` without `refresh` — while spawns and refreshes probe, a refresh never records a miss over a hit that still validates, and `forget_misses` runs on a path-setting change and in `agent_probe::refresh_probes`), login-shell wrapping, per-agent binary resolution (runnable explicit setting → completed interactive login-shell choice → inherited absolute PATH entries → known installer paths → managed install; a failed/timed-out shell probe returns a retryable error and never authorizes fallback).
+argv assembly (`build_agent_command`, `build_chat_command`, `build_agent_resume_command` — the switch-to-TUI argv), binary `detect` (hits cached for the daemon's lifetime; a miss is stamped for `MISS_TTL` = 90 s in `agent_misses` and served ONLY by `detect_for_catalog` — `GET /agents` without `refresh` — while spawns and refreshes probe, a refresh never records a miss over a hit that still validates, and `forget_misses` runs on a path-setting change and in `agent_probe::refresh_probes`), login-shell wrapping (none on Windows: PATH + PATHEXT and the vendors' install folders, no shell; npm `.cmd` shims such as Codex's launch as node + script), per-agent binary resolution (runnable explicit setting → completed interactive login-shell choice → inherited absolute PATH entries → known installer paths → managed install; a failed/timed-out shell probe returns a retryable error and never authorizes fallback).
 
 A failed probe also carries its cause in plain words (`ShellProbeError.plain` → `Unresolved.unchecked` → `AgentDetection.unchecked`, kept with a cached miss) and the catalog row's additive `unchecked` field, so the UI reads it as "couldn't check" + Retry, never "not installed" + Install. Spawns and catalog reads give the shell 6 s; `verify` (the post-install check and `POST /agents/{id}/detect`, the Retry) gives it 30 s. One shell answers `command -v` for every catalog agent at once (`probe_login_shell_all`, a nonce marker between answers; an alias answer is that agent's error alone), and concurrent detections join it (`AppState.shell_probes`, `ShellProbes`: one flight per shell + budget, run as its own task, never reused once finished) — a cold catalog read starts one shell, not five.
 
@@ -424,6 +424,8 @@ The ledger's per-chat `carryover` brings back the bridge (`ChatRecipe.remote_con
 ### close-all and shutdown
 
 **`close-all` / `shutdown` must stop chat drivers too** (`kill_all` only covers PTYs).
+
+**`POST /api/v1/stop` is the in-band SIGTERM** (`lifecycle::stop`, bearer-authed): it replies `{"stopping": true}`, then trips `state.shutdown` ~200 ms later, ending no session — the graceful path's final ledger flush and restart `Handoff` bring every session back on the next start. A Windows daemon has no SIGTERM, so its clients stop it this way. `POST /api/v1/shutdown` is different: it ends every session (PTYs and chats) first, then stops.
 
 ### Resource discipline
 

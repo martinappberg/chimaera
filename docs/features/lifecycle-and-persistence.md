@@ -133,6 +133,11 @@ conversation. All five chat providers retain their native resume handle through 
 - **What & when.** End every session (daemon stays up), or end everything and stop the daemon.
 - **How it's used.** `DELETE /api/v1/sessions` kills all sessions; `POST /api/v1/shutdown` kills all then
   stops the daemon. SIGINT/SIGTERM does the same graceful stop.
+- **On Windows**, where there is no SIGTERM, `POST /api/v1/stop` (bearer-authed) is the graceful
+  path SIGTERM takes on Unix: ledger final flush plus the restart `Handoff`, so sessions come back on
+  the next start. `chimaera kill` and the app's updater use it, falling back to `TerminateProcess`
+  (sessions lost). `shutdown` is unchanged. Child process trees end via Job Objects
+  (`chimaera_core::proc::ProcessTree`) rather than process-group signals.
 - **Where it lives.** `api/shutdown.rs` (`delete_all_sessions`, `shutdown`, `kill_all_chat`),
   `lifecycle.rs::shutdown_signal`.
 - **Key behaviors.** Both stop **chat drivers too** (`SessionManager::kill_all` only covers PTYs — chat

@@ -1,7 +1,6 @@
 # chimaera-app — the Tauri 2 native shell
 
-Orientation for coding agents. A native wrapper (macOS + Linux; Windows via the
-WSL2 engine) around the *same* daemon + web UI the browser loads: it opens real
+Orientation for coding agents. A native wrapper (macOS, Linux, Windows) around the *same* daemon + web UI the browser loads: it opens real
 OS windows pointed at `http://127.0.0.1:{port}/#…` (a local daemon, or an
 ssh-tunnelled remote one) and adds native affordances (remote-host management,
 in-app SSH askpass, a signed auto-updater). Parent map: repo-root
@@ -18,15 +17,14 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
    default = the Tauri shell; `--daemon` = a headless `chimaera_server::run` (the
    .app is self-contained — the daemon IS the app binary); `--askpass <prompt>` =
    the tiny `SSH_ASKPASS` relay (must stay lightweight — never spawn a daemon/window).
-3. **Windows is different by design: the daemon is NEVER this exe there** — it is
-   the Linux musl release binary inside the user's WSL2 distro (`wsl.rs` owns
-   detect/provision/spawn/adopt; `--daemon` and `chimaera-server` are cfg'd out of
-   that build). No WSL yet → startup opens the shell-local wizard
-   (`assets/setup.html`) instead of failing. Design + research evidence:
-   [docs/design/windows-wsl-plan.md](../../docs/design/windows-wsl-plan.md); live gate:
-   `.github/workflows/wsl-smoke.yml` (real WSL2 on a Windows runner). macOS
-   cannot compile the Windows target locally — app.yml's `windows` job is the
-   compile gate.
+3. **Windows runs the same way.** `--daemon` is this exe there too (spawned
+   with `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`), and
+   it stops in-band (`POST /api/v1/stop`, the graceful handoff path SIGTERM
+   takes elsewhere; `kill_pid` only as the fallback). A running image cannot
+   be overwritten, so an app update stops the daemon before the installer
+   runs (`begin_update` → `install_from_stopped_daemon`). macOS cannot fully
+   check the Windows target locally — app.yml's `windows` job is the compile
+   gate.
 
 ## File map
 
@@ -41,20 +39,18 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 | `shell/connect.rs` | The `connect` flight state machine (one coalesced ssh attempt per host; a flight for a wedge suspect — or with no live tunnel — first clears a wedged ControlMaster, before the old tunnel's teardown — both masters for an alias routed to its daemon's login node) + the host-row wire vocabulary (`HostState` — incl. `node`, the login node a pool alias is pinned to — /`HostStatus`, and the `routing` progress phase) + `with_hosts`, the app's single path to hosts.json (serialized, off the reactor via `spawn_blocking`; the CLI writes it directly in crates/chimaera/src/connect.rs). A flight is cancellable (`cancel_connect`: Disconnect and Quit); a cancelled flight never installs a tunnel or reopens windows — the switch is re-read under the tunnels lock. Every `host-status` goes through `emit_host_status` (token only to that host's windows). |
 | `shell/cluster.rs` | Clusters: the `cluster_*` commands behind the cluster page — overview, discovery, add/remove a workspace, the folder picker (`cluster_list_dir` → `chimaera browse --dir`), start/continue/stop/dismiss a job (`sbatch`, or an attached `srun` this app holds), open/close/move a workspace in a job (job-host's API over a plain `ssh -L`; one forward per job-host and per workspace window), startup commands (the cluster's Environment scopes), rules for agents, the persisted scheduled-jobs/login-host choice (first-setup completion in `hosts.json`; legacy `set_not_cluster` maps to direct-host mode without suppressing scheduler facts), the login-node terminal (a terminal-only `term=` window, `web-ui/src/lib/terminal/TerminalWindow.svelte`, on a shell in the local daemon's hidden workspace; never restored, its session ends with the window and a crash's leftover at the next launch — `sweep_terminals`). Every read lays each running job's own job-host answer over the cluster folder (`overlay_live`; the folder can show an open or a close a minute late), and a workspace window opens straight into its workspace (`ws=`). Per-cluster live state (endpoints kept Rust-side, the notification diff), `absorb` (toasts: ready / an hour / ten minutes / stopped; a window whose workspace closed, failed, or whose job ended learns why; one on its way to another job is told "moving" and reopened there), and the watcher that runs only while a job this app knows of is alive (woken at the end-of-job marks). A connect that lands on a cluster (`ClusterHost`) is a success in `shell/connect.rs` (`landed_on_cluster`), never a daemon start. Start estimates ride the overview's queue read; an unclear start is recovered from the job's folder (`recover_start`), never resubmitted; accounting is asked again (≥60 s apart, ≤10 tries) until it settles. |
 | `shell/restore.rs` | `open_ui_window`, the tunnel health monitor (a 3 s `interval` tick — a down host's probe burns its 2 s timeout inside it; 3-miss hysteresis; confirmed-down keys back off per miss up to 10 ticks, compute keys 2; a `down` edge files a wedge suspect), and launch-time window restore. |
-| `daemon.rs` | Launch/adopt the local daemon; version/parity policy (unix: spawn-self; windows: delegates to `wsl.rs`). The daemon is spawned without the app's askpass variables (`daemon_command`); the user's own `SSH_ASKPASS*` from before `askpass::install` goes back on it. An explicit update that stopped the old daemon but could not start the new one retries `ensure_local_daemon` once, then fails visibly (`recover_update`); a failed stop keeps the old one. |
-| `wsl.rs` | The WSL2 engine: registry-first detection + version gate, hardened wsl.exe spawns, the persisted target (distro + PINNED `-u` user — wsl.json), provision/replace/spawn/probe/stop, connect wiring (pure parts unit-tested on any host; e2e via wsl-smoke). Startup only ADOPTS; anything that provisions runs in the wizard, visibly. |
-| `assets/setup.html` | The Windows first-run wizard (shell-local page — no daemon origin exists yet to serve the real UI). |
-| `askpass.rs` | The `SSH_ASKPASS` ↔ shell wire protocol (in-app password/Duo prompts). Transport: unix socket (unix) / token-gated loopback TCP fed through a WSL-interop wrapper (windows, installed by `wsl::wire_connect`). A cancelled prompt gets an explicit `cancelled` reply (an answer always ends in `\n`, so an empty reply is a relay fault, not a cancel); the helper exits `CANCELLED_EXIT` and the shim/wrapper ends the asking ssh — OpenSSH would otherwise treat any failed askpass as an empty password and re-ask. Prompts and done events are delivered per window (`shell::deliver_to`) only to `askpass_targets`; a cancelled connect drops its host's prompts (`discard_alias`). A request is capped in size and time; the `/tmp` socket-dir fallback must be private and ours at both levels (`chimaera_core::ensure_private_dir`). |
+| `daemon.rs` | Launch/adopt the local daemon (spawn-self on every platform); version/parity policy; stop = SIGTERM + poll (unix, never SIGKILL) or `POST /api/v1/stop` + poll + terminate fallback (Windows). The daemon is spawned without the app's askpass variables (`daemon_command`); the user's own `SSH_ASKPASS*` from before `askpass::install` goes back on it. An explicit update that stopped the old daemon but could not start the new one retries `ensure_local_daemon` once, then fails visibly (`recover_update`); a failed stop keeps the old one. |
+| `askpass.rs` | The `SSH_ASKPASS` ↔ shell wire protocol (in-app password/Duo prompts). Transport: unix socket + `askpass.sh` shim (unix) / token-gated loopback TCP (Windows), where `SSH_ASKPASS` is this exe itself and the role is the relay env var plus a lone argument (`is_helper_invocation`). Windows OpenSSH has no ControlMaster, so a password/2FA host asks once per ssh call there. A cancelled prompt gets an explicit `cancelled` reply (an answer always ends in `\n`, so an empty reply is a relay fault, not a cancel); the helper exits `CANCELLED_EXIT` and the shim (unix) or the helper itself (Windows: its parent, checked to be `ssh.exe`) ends the asking ssh — OpenSSH would otherwise treat any failed askpass as an empty password and re-ask. Prompts and done events are delivered per window (`shell::deliver_to`) only to `askpass_targets`; a cancelled connect drops its host's prompts (`discard_alias`). A request is capped in size and time; the `/tmp` socket-dir fallback must be private and ours at both levels (`chimaera_core::ensure_private_dir`). |
 | `appearance.rs` | Bounded per-host first-paint palette cache outside volatile daemon origins; persisted atomically and carried in native window URLs. |
 | `shell/commands.rs::open_external` | The ONLY route a rendered link has to the user's real browser: the navigation guard admits just the daemon origin (plus iframes' inline `about:srcdoc` documents — WebKit asks the policy for subframes too, so without them slides, the live HTML preview and notebook HTML output draw blank) and nothing receives a `target="_blank"`, so an external link is otherwise swallowed. **http/https only** — hrefs are agent-authored and the platform opener would act on `file:`/app schemes. |
-| `shell/commands.rs::copy_file_to_clipboard` / `reveal_in_file_manager` | The page names a path and the shell hands it to the OS: the file itself on the clipboard (arboard's file list — the clipboard plugin has no such write), or selected in Finder / the freedesktop `FileManager1` file manager. **Local windows only** (`require_local`): remote hosts' pages hold the same command grants, and their paths would name whatever sits at that path on this machine. Refused on Windows, where the local daemon's paths are WSL2's. |
+| `shell/commands.rs::copy_file_to_clipboard` / `reveal_in_file_manager` | The page names a path and the shell hands it to the OS: the file itself on the clipboard (arboard's file list — the clipboard plugin has no such write), or selected in Finder / the freedesktop `FileManager1` file manager. **Local windows only** (`require_local`): remote hosts' pages hold the same command grants, and their paths would name whatever sits at that path on this machine. Windows: Explorer `/select,` on the backslash form of the wire path. |
 | `shell/unsaved.rs` | Window close / app quit never drop unsaved editor text: the page pushes its unsaved count (`report_unsaved`), so `CloseRequested`/quit decide synchronously; a held one asks the window (`unsaved-prompt` → `reply_unsaved`). Pure `Guard` (unit-tested) + glue; a 4 s hung-page timeout and a third-ask escape keep it from ever trapping the user. A remote window whose tunnel is down or missing is at risk (its drafts can't be journaled): the hung-page timeout never closes it; the user's third ask still does. Also the macOS `applicationShouldTerminate:` hook (Dock › Quit, logout never reach `ExitRequested`). |
 | `shell/notices.rs` | Notices → OS notifications: one long-poll watcher per open daemon (`GET /api/v1/notices`), suppression for the window you're in (the focused workspace window covers every session of its workspace; a torn-off window only what it shows via `report_window_view`), one-alert-per-session supersede/withdraw, click routing (`focus-session` + `take_pending_focus`), the Dock badge/bounce and tray counts. Feature: [notifications.md](../../docs/features/notifications.md). |
 | `shell/print_frame.rs` | macOS: a page's `window.print()` (the slides' and documents' print buttons, each in a one-off same-origin iframe). WKWebView drops it unless the UI delegate answers WebKit's `_webView:printFrame:pdfFirstPageSize:completionHandler:`; this adds that method to wry's delegate class at runtime, re-assigns the delegate (WebKit reads its hooks on assignment), and prints just that frame through the system panel as a sheet. The completion runs only when the panel is done — the page's `print()` blocks until then, and a synchronous run deadlocks. SPI with a fail-closed `respondsToSelector:` check. |
 | `notify.rs` | The platform notifier: macOS `UNUserNotificationCenter` + click delegate + dock tile (needs a signed `.app` — unbundled dev builds degrade to none), `notify-rust` on Linux/Windows. Identifiers encode the click route. |
 | `windows.rs` | The per-window registry (round-trips window↔workspace). Repeated ids load once (the first record wins). |
 | `update.rs` | The auto-updater intent chain (consume-once, expiry) + the kept outcome of every signed-update check (`status`/`check`, behind `app_update_status`). |
-| `menu.rs` | The menu bar. Page-owned items reach the focused window as a `menu` event; Reload Window instead evaluates a fixed script (`RELOAD_WINDOW_JS`) that calls the page's reload hook, so a page that never booted (no listener) still reloads. Settings… is enabled for any focused daemon window, Home included (`shell::focused_daemon_open`); the WSL setup wizard and a login-node terminal window (no settings surface) disable it. |
+| `menu.rs` | The menu bar. Page-owned items reach the focused window as a `menu` event; Reload Window instead evaluates a fixed script (`RELOAD_WINDOW_JS`) that calls the page's reload hook, so a page that never booted (no listener) still reloads. Settings… is enabled for any focused daemon window, Home included (`shell::focused_daemon_open`); a login-node terminal window (no settings surface) disables it. |
 | `tray.rs` | The menu-bar / system-tray status item (`tray-icon` feature). |
 
 ## Invariants / gotchas
@@ -64,15 +60,10 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
   `command_manifest.rs` (consumed by `build.rs` + runtime grants) ↔ committed `permissions/autogenerated/*.toml`
   (plus the `native.ts` wrappers + event-name strings). Add/rename a command in all
   of them and class it in `COMMAND_AUTHORITY`; `cargo test` (`shell::surface_tests::
-  the_command_lockstep_holds`) checks handler ↔ manifest ↔ toml files ↔ `native.ts` ↔
-  wizard grant, and `npx tauri build` (the app.yml path) remains the full check.
-  **Documented exception:** the `wsl_*` commands have NO `native.ts` wrappers on
-  purpose — only the shell-local wizard (`assets/setup.html`, direct
-  `window.__TAURI__` invokes) may call them, and they are granted by
-  `capabilities/wsl-setup.json` (window label `wsl-setup*`, local-only), NEVER by
-  the runtime daemon-window capability: `wsl_install` pops UAC and
-  daemon-served pages include REMOTE hosts' UIs. Each daemon window instead
-  receives a capability for its exact volatile label + current loopback port;
+  the_command_lockstep_holds`) checks handler ↔ manifest ↔ toml files ↔ `native.ts`
+  and that the app has no static capability, and `npx tauri build` (the app.yml
+  path) remains the full check. Daemon-served pages include REMOTE hosts' UIs,
+  so no grant is static: each daemon window receives a capability for its exact volatile label + current loopback port;
   the navigation guard advances with reconnects so stale granted ports cannot
   be revisited after reuse.
 - **The single-instance plugin must stay first** in `shell.rs`'s builder. The

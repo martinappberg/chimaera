@@ -1,6 +1,6 @@
 # Native app (the Tauri shell)
 
-A native app — macOS and Linux today, Windows via WSL2 (beta) — that wraps the same web UI in
+A native app — macOS, Linux and Windows (beta) — that wraps the same web UI in
 **real OS windows** onto a local or ssh-tunnelled daemon. It adds what a browser tab can't:
 a window set that restores after quit/crash, in-app SSH auth, and
 a signed one-click updater for the app and its daemon. The app is a *view layer* — the daemon
@@ -176,8 +176,9 @@ app-build` (never the root `cargo`).
 
 - **What & when.** One-click update: download/verify/install the signed app bundle (it relaunches),
   then — in the new process's startup — replace the local daemon. On macOS/Linux the daemon
-  binary *is* the app binary, so it must go second. Windows replaces the separate Linux
-  daemon in the selected WSL2 distro.
+  binary *is* the app binary, so it must go second. Windows is the same, with one extra step: a
+  running exe can't be overwritten, so the app stops the daemon in-band (`POST /api/v1/stop`)
+  before installing, then restarts it.
 - **Where it lives.** `update.rs` (`begin_update`/`consume_intent`/`spawn_update_watch`, `check`/`status`,
   `CHECK_INTERVAL 6h`, `INTENT_MAX_AGE 10m`), `commands.rs` (`check_app_update`, `app_update_status`),
   `daemon.rs::update_local_daemon`, `menu.rs` ("Check for Updates…").
@@ -220,39 +221,35 @@ app-build` (never the root `cargo`).
   reason and "try again". The deciding source is what can update this window: the app's signed channel in
   the native shell, the daemon's release check in a browser.
 
-## Windows: the WSL2 engine (beta)
+## Windows: the native daemon (beta)
 
-- **What & when.** On Windows the local daemon is **never the app exe** — it is the same Linux
-  musl release binary, provisioned into and spawned inside the user's WSL2 distro; the UI
-  reaches it over WSL's NAT localhost forwarding, so windows/tokens/health work unchanged.
-  Startup only ever **adopts** a healthy daemon; anything needing provisioning (no WSL, no
-  distro, WSL older than the 2.1.1 gate, no/stale daemon) routes through the shell-local
-  **wizard** (`assets/setup.html` — no daemon origin exists to serve the real UI yet), which
-  shows every download/install phase and auto-starts when there is nothing to choose. The
-  distro + a **pinned user** are persisted (`wsl.json`); a wizard-installed Ubuntu gets a real
-  account created up front (with `--no-launch` OOBE never runs, so it would otherwise be
-  root-owned and orphaned when OOBE later flips the default user).
-- **Where it lives.** `wsl.rs` (registry-first detection, hardened `wsl.exe` spawns, provision/
-  spawn/probe/stop — module header documents the researched constraints), `daemon.rs` (windows
-  half of `ensure_local_daemon`), `shell.rs::finish_startup` (the startup the wizard resumes),
-  commands `wsl_status`/`wsl_install`/`wsl_install_distro`/`wsl_setup_daemon`. Deep design +
-  evidence: [docs/design/windows-wsl-plan.md](../design/windows-wsl-plan.md).
-- **Key behaviors.** The daemon start line is the Podman persistence pattern (`setsid nohup` in
-  a wsl.exe session) so sessions survive closing the app; `wsl --shutdown` is treated as a
-  normal event (health-check + re-adopt/respawn); adoption always requires the token health
-  handshake (a bare TCP accept can be a stranger's port under NAT forwarding). Verified live by
-  the `wsl-smoke` workflow — a real WSL2 Ubuntu on a Windows runner runs the full
-  provision→spawn→session→shutdown→revive loop. **Remote hosts:** `connect`'s ssh runs INSIDE
-  the distro (`chimaera_remote::WslTransport` — Linux OpenSSH has the ControlMaster mux
-  Win32-OpenSSH lacks), and password/2FA prompts ride a distro-side `SSH_ASKPASS` wrapper →
-  WSL interop → `chimaera.exe --askpass` → a token-gated loopback TCP relay back to the shell
-  (`wsl::wire_connect` installs all of it on every successful adopt/ensure; a wiring failure
-  degrades like unix — key hosts work, password hosts fail cleanly — and `connect_host`
-  refuses with the real reason if the transport is absent). **Gotcha that needs UX copy
-  wherever hosts surface:** ssh runs in the distro, so aliases/keys resolve against the
-  DISTRO's `~/.ssh`, not the Windows-side config the user's terminal uses. The interop
-  prompt chain still needs a real-hardware pass. The site offers the Windows download
-  explicitly labeled **beta**, matching that verification gap.
+- **What & when.** Windows runs the same `chimaera` daemon natively — there is no WSL2 anywhere.
+  The app spawns its own exe with `--daemon` exactly like macOS/Linux (`DETACHED_PROCESS |
+  CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`, breaking away from the parent's job when allowed),
+  so sessions outlive the window. The WSL2 engine (`wsl.rs`, the setup wizard, the `wsl_*` commands,
+  `WslTransport`, the `wsl-smoke` workflow) is deleted; the July design record
+  [windows-wsl-plan.md](../design/windows-wsl-plan.md) is superseded (issue #282).
+- **Stop.** There is no SIGTERM. `POST /api/v1/stop` (bearer-authed) is the graceful path that
+  SIGTERM takes on Unix: ledger final flush plus a restart `Handoff`, so sessions come back on the
+  next start. `chimaera kill` and the app call `/stop` first and fall back to `TerminateProcess`
+  (sessions are lost in that case). `POST /api/v1/shutdown` still ends every session first.
+- **Reveal / Copy file.** "Show in Explorer" runs `explorer.exe /select,`; Copy file puts the file
+  on the clipboard as `CF_HDROP`.
+- **Remote hosts.** Windows' built-in OpenSSH has no ControlMaster, so every ssh call is its own
+  connection (`ControlMaster=no`, `ControlPath=none`): key auth works, just slower; password/2FA
+  hosts prompt once per ssh call. Prompts go through askpass: `SSH_ASKPASS` is the app exe itself
+  with `SSH_ASKPASS_REQUIRE=force`, relaying over a token-gated loopback socket to the shell. Host
+  aliases and keys resolve against the Windows `~/.ssh`.
+- **Paths.** The daemon speaks forward-slash paths on the wire (`C:/Users/me/proj`, UNC as
+  `//server/share/`); the folder picker's root lists the drives ("This PC").
+- **Not on Windows yet.** Chimaera-managed agent runtime installs (the action shows the vendor's
+  PowerShell command), agent-plugin installs from Extensions, environment preludes (POSIX
+  snippets), the Claude MCP connector sign-in through a PTY (use `/mcp` in a Claude session), a
+  per-file size limit for plugin jobs, and code signing. `connect` has no long-lived ssh
+  connection per host. The site's Windows download stays labeled beta until a real-hardware pass.
+- **Where it lives.** `daemon.rs` (spawn/adopt, shared with the other platforms), `update.rs`,
+  `chimaera_core::proc` and `paths`, `chimaera_remote` (ssh options), CI `windows` job
+  (clippy, tests, native daemon smoke).
 
 ## Menu bar & tray
 
@@ -267,7 +264,7 @@ app-build` (never the root `cargo`).
   Reload Window evaluates a fixed script in the focused window instead (see below).
   **Settings** is daemon-scoped: it opens the settings surface for the focused window's daemon (a
   remote window → the remote daemon's settings), same as the in-UI gear. It is enabled on Home too
-  (Home's Settings page) and disabled for the WSL setup wizard and a login-node terminal window
+  (Home's Settings page) and disabled for a login-node terminal window
   (`shell::focused_daemon_open`).
 - **System tray / menu-bar status item** (`tray.rs`, `tray-icon` feature): a persistent icon whose
   menu lists the **open workspace windows** (click one to raise it) — each with its count of agents
@@ -305,15 +302,14 @@ app-build` (never the root `cargo`).
   re-issue a navigation in flight); the plain path ignores repeats within a second. The shell
   script calls the hook when it exists; a page with no interface mounted (a failed load, a UI
   build half-written) reloads plainly, and a rendered interface without the hook (an older daemon's
-  UI) is left alone because it may hold edits it cannot report. The Windows WSL wizard window is
-  skipped. On Windows the page also claims F5 itself, because WebView2's own browser accelerator
+  UI) is left alone because it may hold edits it cannot report. On Windows the page also claims F5 itself, because WebView2's own browser accelerator
   keys (on in wry) would otherwise reload ungated.
 
 ## Status: partial
 
-- **Windows is beta**: engine + connect transport + askpass relay are implemented and
-  CI-smoked; the wizard flow and the interop askpass chain have not yet been hand-driven on
-  retail Windows hardware.
+- **Windows is beta**: the native daemon, terminals, agents, `/stop` and restart were driven live
+  on a Windows 11 ARM VM (x64 build under emulation) and CI runs a native daemon smoke; the
+  askpass path and the updater have not been hand-driven on retail Windows hardware.
 - **The unsaved-edits guard on close and quit** has unit-tested decisions (the shell's `Guard`,
   the page's dialog controller) and CI's bundle builds, but has not yet been hand-driven in the
   app; the macOS `applicationShouldTerminate:` hook (Dock › Quit, logout) is compile-checked only.
@@ -368,28 +364,24 @@ _Captured 2026-09-25 (from the maintainer)._
   keep notifying), the maintainer chose to keep exiting ("I think exit on last close"). Consequence
   accepted: notifications stop once no window is open. Open to revisiting; not a core bet.
 
-### Linux + Windows(WSL2) apps — why they exist
+### Linux + Windows apps — why they exist
 _Captured 2026-07-11 (from the maintainer, confirming a draft read from the #44 commit body + code)._
 
 - **Problem it solves.** chimaera should be a first-class *native* app wherever developers are —
   Linux workstations and Windows laptops, not macOS-only — built from **one codebase**. The
   maintainer's framing is deliberately plain: *"just want it to work cross-platform."*
 - **How settled it is (intended vs provisional).** The **purpose** (works natively on all three
-  desktops, one codebase) is the settled part. The **mechanism is not frozen** — the Windows model
-  where the *daemon is never the app exe but the same Linux musl binary provisioned into WSL2*
-  (reached over NAT localhost) is *"today's best approach,"* explicitly **not** a core bet. Nothing
-  about the first-run wizard or the askpass interop chain is a promise either — it's how it works for
-  now.
+  desktops, one codebase) is the settled part. The **mechanism is not frozen**. *Superseded
+  (2026-10): the WSL2 model described here — Linux musl daemon in a distro, first-run wizard,
+  interop askpass chain — was replaced by a native Windows daemon (issue #282); the "not a core bet"
+  stance carried over, and the WSL-specific parts of this note no longer apply.*
 - **Deliberate / non-obvious.** **Linux is advertised & shipped** (AppImage/deb/rpm, auto-updating);
-  **Windows is beta and deliberately unadvertised** until a real-hardware pass of the wizard + the
-  interop/Duo askpass chain — a quality gate, not a permanent stance. Release jobs are **serialized**
-  because parallel bundle jobs race on `latest.json` and a platform silently loses auto-update. A
-  standing gotcha: on Windows ssh runs *inside the distro*, so aliases/keys resolve against the
-  **distro's** `~/.ssh`, not the Windows-side config the user's terminal uses.
+  **Windows is beta and deliberately unadvertised** until a real-hardware pass (originally of the WSL wizard + interop/Duo askpass chain; now of the native build) — a quality gate, not a permanent stance. Release jobs are **serialized**
+  because parallel bundle jobs race on `latest.json` and a platform silently loses auto-update. 
+  (The WSL-era gotcha about ssh resolving against the distro's `~/.ssh` is superseded: ssh now runs natively on Windows.)
 - **Do not change (or: open to change):** **open to change** — the whole cross-platform mechanism is
   today's best approach, not a contract. A future agent should preserve the **purpose** (a native app
-  that works across macOS/Linux/Windows from one codebase) but is free to rework the WSL2 engine, the
-  wizard, or the daemon-provisioning model if there's a better cross-platform path. The one thing to
+  that works across macOS/Linux/Windows from one codebase) but is free to rework the Windows daemon model if there's a better cross-platform path. The one thing to
   respect is **beta honesty**: a not-yet-hand-verified platform must be **clearly labeled beta**
   wherever it's offered. (Update 2026-07-11: the maintainer chose to *surface* the Windows download
   on the site as an explicitly-labeled beta — OS-detected primary button included — rather than
