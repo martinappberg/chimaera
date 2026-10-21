@@ -3,11 +3,16 @@
 //!
 //! Browsers cannot set an Authorization header on a WebSocket, so the first
 //! text frame must be `{"type":"auth","token":"..."}` (within 5 seconds).
+//!
+//! A session socket ends with its session: after `exited` the daemon lingers
+//! [`EXITED_LINGER`] for the final PTY bytes, then sends a normal Close and
+//! waits (bounded) for the client's reply, so a finished terminal never pins
+//! a connection until the client gets round to closing it.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::response::Response;
 use bytes::Bytes;
@@ -46,6 +51,17 @@ const OUTPUT_COALESCE_WINDOW: Duration = Duration::from_millis(8);
 /// Byte ceiling for one coalesced output frame; a full batch flushes without
 /// waiting out the window.
 const OUTPUT_COALESCE_MAX_BYTES: usize = 32 * 1024;
+/// How long a session socket stays open after its `exited` frame (or after
+/// the session otherwise vanished). The Exited event races the reader
+/// thread's final PTY bytes — session.rs publishes it, then gives the reader
+/// ~60 ms before reaping — so the bridge keeps forwarding for a beat before
+/// it closes.
+const EXITED_LINGER: Duration = Duration::from_secs(1);
+/// Bound on the closing handshake: after the daemon's Close frame, wait for
+/// the client's Close reply before dropping the connection. Tearing TCP down
+/// while client frames sit unread answers with a RST, and a RST can discard
+/// whatever the client has not read yet — the final screen and `exited`.
+const CLOSE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Unpark catch-up ceiling, in ring chunks: a parked connection whose
 /// backlog exceeds this repaints from the authoritative grid instead of
 /// replaying the ring — a long replay ships megabytes of scrollback the
@@ -230,7 +246,12 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                 {
                     return;
                 }
-                let _ = send_json(&mut socket, &frames::exited(words.info.exit_status)).await;
+                if send_json(&mut socket, &frames::exited(words.info.exit_status))
+                    .await
+                    .is_ok()
+                {
+                    close_gracefully(&mut socket).await;
+                }
                 return;
             }
             tracing::debug!(%id, %err, "ws attach failed");
@@ -308,9 +329,40 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
     tokio::pin!(resync_sleep);
     let flush_sleep = tokio::time::sleep(Duration::ZERO);
     tokio::pin!(flush_sleep);
+    // The session is over (exited, its channels closed, or its input gone):
+    // the connection closes at this deadline (see EXITED_LINGER). Whether an
+    // `exited` frame already went out decides if the close sends one first —
+    // never twice.
+    let mut close_at: Option<tokio::time::Instant> = None;
+    let mut exited_sent = false;
+    let mut input_open = true;
+    let close_sleep = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(close_sleep);
+    // Once the close is armed, nothing repaints: `repaint` re-attaches BY ID,
+    // and an id respawned inside the linger (a view switch) would swap this
+    // closing connection onto the live successor — which the close would
+    // then hang up on. A foreign resize, a lag or an unpark in the linger is
+    // left to the client's own recovery (a resync replays the last words).
     loop {
         tokio::select! {
-            _ = &mut resync_sleep, if resync_at.is_some() => {
+            _ = &mut close_sleep, if close_at.is_some() => {
+                let flushed = if exited_sent {
+                    // The batch holds bytes that arrived after `exited` (the
+                    // reader's final drain); they follow it, as they happened.
+                    send_batch(&mut socket, &mut batch).await
+                } else {
+                    // Ordered send: the batched final bytes precede `exited`.
+                    // The session vanished without its Exited event reaching
+                    // this connection (input died first, or the event was
+                    // lost to a lagged subscription): gone, status unknown.
+                    send_ordered_json(&mut socket, &mut batch, &frames::exited(None)).await
+                };
+                if flushed {
+                    close_gracefully(&mut socket).await;
+                }
+                return;
+            },
+            _ = &mut resync_sleep, if resync_at.is_some() && close_at.is_none() => {
                 resync_at = None;
                 if !repaint(&mut socket, &id, &state, &mut attachment,
                             &mut batch, &mut flush_at, &mut output_open).await {
@@ -347,7 +399,7 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                             }
                         }
                     }
-                    if matches!(drain_err, Some(TryRecvError::Lagged(_))) {
+                    if matches!(drain_err, Some(TryRecvError::Lagged(_))) && close_at.is_none() {
                         tracing::debug!(%id, "ws output lagged; resyncing");
                         resync_at = None;
                         if !repaint(&mut socket, &id, &state, &mut attachment,
@@ -372,6 +424,9 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                             output_open = false;
                         }
                     }
+                }
+                Err(RecvError::Lagged(skipped)) if close_at.is_some() => {
+                    tracing::debug!(%id, skipped, "ws output lagged while closing");
                 }
                 Err(RecvError::Lagged(skipped)) => {
                     tracing::debug!(%id, skipped, "ws output lagged; resyncing");
@@ -412,6 +467,10 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                             if !send_ordered_json(&mut socket, &mut batch, &value).await {
                                 return;
                             }
+                            if matches!(event, chimaera_pty::SessionEvent::Exited { .. }) {
+                                exited_sent = true;
+                                arm_close(&mut close_at, close_sleep.as_mut());
+                            }
                         }
                         Err(err) => tracing::warn!(%id, %err, "failed to serialize session event"),
                     }
@@ -435,26 +494,30 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                     }
                 }
                 Err(RecvError::Lagged(_)) => {}
-                Err(RecvError::Closed) => events_open = false,
+                Err(RecvError::Closed) => {
+                    // The session object is gone (events close only when it
+                    // drops), whether or not its Exited reached us.
+                    events_open = false;
+                    arm_close(&mut close_at, close_sleep.as_mut());
+                }
             },
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Binary(bytes))) => {
                     for chunk in bytes.chunks(TERMINAL_INPUT_CHUNK) {
+                        if !input_open {
+                            break;
+                        }
                         if attachment
                             .input
                             .send(Bytes::copy_from_slice(chunk))
                             .await
                             .is_err()
                         {
-                            // Session is gone; flush the batched tail (its
-                            // last words), tell the client, and hang up.
-                            let _ = send_ordered_json(
-                                &mut socket,
-                                &mut batch,
-                                &frames::exited(None),
-                            )
-                            .await;
-                            return;
+                            // The PTY writer is gone: the session is ending.
+                            // Keep forwarding its last words and its Exited
+                            // (with the real status) through the linger.
+                            input_open = false;
+                            arm_close(&mut close_at, close_sleep.as_mut());
                         }
                     }
                 }
@@ -488,7 +551,7 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                             }
                         }
                         Ok(ClientMessage::Unpark) => {
-                            if parked {
+                            if parked && close_at.is_none() {
                                 parked = false;
                                 // Repaint when the ring can't (or shouldn't)
                                 // catch the client up: no grid yet / reflow
@@ -561,6 +624,41 @@ async fn resize_off_reactor(state: &Arc<AppState>, id: &str, cols: u16, rows: u1
         Ok(Err(err)) => tracing::debug!(%id, %err, "{what} failed"),
         Err(err) => tracing::warn!(%id, %err, "{what} task failed"),
     }
+}
+
+/// Arm the session socket's close deadline ([`EXITED_LINGER`] from now),
+/// unless it is already armed: the first end-of-session signal wins.
+fn arm_close(
+    close_at: &mut Option<tokio::time::Instant>,
+    close_sleep: std::pin::Pin<&mut tokio::time::Sleep>,
+) {
+    if close_at.is_none() {
+        let at = tokio::time::Instant::now() + EXITED_LINGER;
+        close_sleep.reset(at);
+        *close_at = Some(at);
+    }
+}
+
+/// End the connection with a normal Close frame, then wait — at most
+/// [`CLOSE_HANDSHAKE_TIMEOUT`] — for the client's Close reply, discarding
+/// anything it sent meanwhile, so nothing unread is left behind when the
+/// connection drops (see the constant).
+async fn close_gracefully(socket: &mut WebSocket) {
+    let frame = CloseFrame {
+        code: close_code::NORMAL,
+        reason: "".into(),
+    };
+    if socket.send(Message::Close(Some(frame))).await.is_err() {
+        return;
+    }
+    let _ = tokio::time::timeout(CLOSE_HANDSHAKE_TIMEOUT, async {
+        while let Some(Ok(msg)) = socket.recv().await {
+            if matches!(msg, Message::Close(_)) {
+                break;
+            }
+        }
+    })
+    .await;
 }
 
 /// Send the batched output as one frame, if any; false = socket gone.
