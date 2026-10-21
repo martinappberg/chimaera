@@ -56,6 +56,9 @@
     onCompact?: () => void;
     /** Agent settings, where the account's limits are read live. */
     onOpenSettings?: () => void;
+    /** Sign in to the agent here — offered in every state the chat can be
+     *  in (busy, idle, ended); `/login` is the same. */
+    onSignIn?: () => void;
     /** The account's limits from that live read, shown while this chat's
      *  own stream has reported none. */
     accountLimits?: UsageRow[];
@@ -71,6 +74,7 @@
     menu = $bindable(),
     onCompact,
     onOpenSettings,
+    onSignIn,
     accountLimits = [],
     accountLimitReached = false,
     canPickModel,
@@ -271,6 +275,12 @@
         {#if rcShown}
           <button class="overlay-row menu-row" role="menuitem" title={rcTitle} onclick={() => (menu = "remote")}>
             Remote Control <span>{rcState}</span>
+          </button>
+        {/if}
+        {#if onSignIn}
+          <button class="overlay-row menu-row" role="menuitem" title="Sign in again, or with another account — also /login"
+            onclick={() => { menu = null; onSignIn(); }}>
+            Sign in to {agentName}…
           </button>
         {/if}
       </div>

@@ -43,11 +43,13 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// this; a sign-in, a chat startup failure or `?check=true` re-ask at once.
 const STATUS_TTL: Duration = Duration::from_secs(10 * 60);
 const URL_LIMIT: usize = 8192;
-/// Printed by the wrapper right before it execs the CLI's login. A login
-/// shell's own output (a host's welcome banner, a profile script, the
-/// prelude) comes first and can carry links of its own — a cluster's portal,
-/// say — so only what follows this line is the CLI's.
+/// Written on stdout AND stderr by the wrapper right before it execs the
+/// CLI's login. Everything the login shell prints first (a host's welcome
+/// banner, a profile script, the prelude) can carry links of its own — a
+/// cluster's portal, say — so each pipe is read from its own marker on.
 const CLI_START: &str = "[chimaera:sign-in-cli-start]";
+/// How much of the CLI's own output the card can show (characters, newest).
+const PRINTED_LIMIT: usize = 4000;
 
 /// How this agent signs in.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Debug)]
@@ -65,6 +67,9 @@ pub(crate) struct Recipe {
     pub(crate) command: &'static str,
     /// Claude's browser page shows a code the user pastes back.
     pub(crate) accepts_code: bool,
+    /// The CLI prints a one-time code to enter on its page (device flows).
+    /// Only these flows have one read out of their output.
+    pub(crate) device_code: bool,
     /// Signing in while signed in means something (a switch of account):
     /// true for a CLI whose login replaces the stored one; Antigravity's
     /// print mode just finds the existing login and reports it.
@@ -77,24 +82,28 @@ pub(crate) fn recipe(kind: AgentKind) -> Option<Recipe> {
             how: How::Browser,
             command: "claude auth login",
             accepts_code: true,
+            device_code: false,
             relogin: true,
         },
         AgentKind::Codex => Recipe {
             how: How::Browser,
             command: "codex login --device-auth",
             accepts_code: false,
+            device_code: true,
             relogin: true,
         },
         AgentKind::Grok => Recipe {
             how: How::Browser,
             command: "grok login --device-auth",
             accepts_code: false,
+            device_code: true,
             relogin: true,
         },
         AgentKind::Cursor => Recipe {
             how: How::Browser,
             command: "cursor-agent login",
             accepts_code: false,
+            device_code: false,
             relogin: true,
         },
         // No login command, but print mode signs in headlessly: a native
@@ -106,6 +115,7 @@ pub(crate) fn recipe(kind: AgentKind) -> Option<Recipe> {
             how: How::Browser,
             command: "agy -p /skills",
             accepts_code: false,
+            device_code: false,
             relogin: false,
         },
         AgentKind::Gemini => return None,
@@ -446,16 +456,33 @@ pub(crate) struct Progress {
     /// The page will show a code to paste back (Claude).
     accepts_code: bool,
     message: String,
-    /// Private: the login's own output — the page and code are read out of
-    /// it, a failure's tail comes from it. Never on the wire.
+    /// What the CLI itself printed, both pipes in the order read, plain
+    /// text, the newest [`PRINTED_LIMIT`] characters. The card shows it, so
+    /// a CLI whose page this table doesn't recognize is never a dead end.
+    /// Gone with the operation's end, like the page and the code.
+    printed: String,
+    /// Private: the login's stdout and stderr, each split at its marker.
     #[serde(skip)]
-    output: String,
-    /// [`CLI_START`] has been seen: `output` now holds the CLI's own words
-    /// only. Until then nothing in it is a sign-in page.
+    pipes: [Pipe; 2],
+    /// Private: the CLI's part of both pipes in the order read (`printed`
+    /// is its plain tail).
     #[serde(skip)]
-    cli_started: bool,
+    cli: Vec<u8>,
     #[serde(skip)]
     kind: AgentKind,
+}
+
+/// One of the login's pipes. A pipe is ordered, so it splits cleanly at its
+/// own [`CLI_START`]; across the two pipes nothing is ordered, which is why
+/// each is split on its own.
+#[derive(Clone, Default)]
+struct Pipe {
+    /// Before the marker: the login shell's words — never searched for a
+    /// page; kept to explain a failure before the CLI ran.
+    shell: Vec<u8>,
+    /// After the marker: the CLI's words, the only text a page or code is
+    /// read from. `None` until the marker arrives.
+    cli: Option<Vec<u8>>,
 }
 impl operation::Progress for Progress {
     fn id(&self) -> &str {
@@ -470,50 +497,88 @@ impl operation::Progress for Progress {
     fn set_message(&mut self, message: &str) {
         self.message = message.into();
     }
-    fn on_output(&mut self, bytes: &[u8]) {
-        operation::append_capped(&mut self.output, &String::from_utf8_lossy(bytes));
-        if !self.cli_started {
-            let Some(at) = self.output.find(CLI_START) else {
-                return;
-            };
-            // The shell's part is dropped: its links must never be the page,
-            // and a failure tail is the CLI's. A failure before the CLI ran
-            // keeps the whole output for its tail.
-            self.output.drain(..at + CLI_START.len());
-            self.cli_started = true;
-        }
-        self.harvest();
+    fn on_output(&mut self, stream: operation::Stream, bytes: &[u8]) {
+        let pipe = &mut self.pipes[stream as usize];
+        let fresh = match &mut pipe.cli {
+            Some(cli) => {
+                append_bytes_capped(cli, bytes);
+                bytes.to_vec()
+            }
+            None => {
+                append_bytes_capped(&mut pipe.shell, bytes);
+                let Some(at) = find_bytes(&pipe.shell, CLI_START.as_bytes()) else {
+                    return;
+                };
+                let after = pipe.shell.split_off(at + CLI_START.len());
+                // The CLI ran: the shell's words explain nothing now.
+                pipe.shell = Vec::new();
+                pipe.cli = Some(after.clone());
+                after
+            }
+        };
+        append_bytes_capped(&mut self.cli, &fresh);
+        let plain = strip_controls(&String::from_utf8_lossy(&self.cli));
+        let skip = plain.chars().count().saturating_sub(PRINTED_LIMIT);
+        self.printed = plain
+            .chars()
+            .skip(skip)
+            .collect::<String>()
+            .trim()
+            .to_string();
+        self.harvest(stream);
     }
 }
 impl Progress {
-    /// Read the login's URL and code out of what it has printed so far. Only
+    /// Read the page and code out of what the CLI printed on `stream`. Only
     /// text up to the last whitespace counts: a URL split across pipe reads
-    /// must never reach the UI incomplete.
-    fn harvest(&mut self) {
-        // A page on the vendor's login host is final; any other is the best
-        // guess so far, replaced when the vendor's appears.
-        let settled = self
-            .url
-            .as_deref()
-            .is_some_and(|url| on_login_host(url, self.kind));
-        if settled && self.code.is_some() {
-            // Nothing left to find: don't re-scan the tail for every chunk.
+    /// must never reach the UI incomplete. The first match is final.
+    fn harvest(&mut self, stream: operation::Stream) {
+        let wants_code = recipe(self.kind).is_some_and(|r| r.device_code) && self.code.is_none();
+        if self.url.is_some() && !wants_code {
             return;
         }
-        let text = strip_controls(&self.output);
+        let Some(cli) = &self.pipes[stream as usize].cli else {
+            return;
+        };
+        let text = strip_controls(&String::from_utf8_lossy(cli));
         let complete = text
             .rfind(char::is_whitespace)
             .map_or("", |end| &text[..end]);
-        if !settled {
+        if self.url.is_none() {
             if let Some(url) = login_url(complete, self.kind) {
                 self.url = Some(url);
                 self.message = "Finish signing in in your browser.".into();
             }
         }
-        if self.code.is_none() {
+        if wants_code {
             self.code = device_code(complete);
         }
     }
+
+    /// What a failure is explained with: the CLI's own words once it ran,
+    /// else the login shell's (a prelude that failed, a missing command).
+    fn failure_text(&self) -> String {
+        if self.pipes.iter().any(|p| p.cli.is_some()) {
+            return String::from_utf8_lossy(&self.cli).into_owned();
+        }
+        self.pipes
+            .iter()
+            .map(|p| String::from_utf8_lossy(&p.shell).into_owned())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// Append, keeping the newest [`operation::OUTPUT_LIMIT`] bytes.
+fn append_bytes_capped(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(bytes);
+    if buf.len() > operation::OUTPUT_LIMIT {
+        buf.drain(..buf.len() - operation::OUTPUT_LIMIT);
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 type Operation = operation::Operation<Progress>;
@@ -691,8 +756,9 @@ async fn start_operation(
         code: None,
         accepts_code: recipe.accepts_code,
         message: "Starting the sign-in…".into(),
-        output: String::new(),
-        cli_started: false,
+        printed: String::new(),
+        pipes: Default::default(),
+        cli: Vec::new(),
         kind,
     };
     // Decided under the lock: two first clicks must not both start.
@@ -848,7 +914,7 @@ async fn run_login(
         Exit::SpawnFailed(err) => (Phase::Failed, format!("Couldn't start the sign-in: {err}")),
         Exit::Exited(Some(0)) => verify(state, op, kind).await,
         Exit::Exited(_) => {
-            let tail = failure_tail(&op.snapshot().output);
+            let tail = failure_tail(&op.snapshot().failure_text());
             (
                 Phase::Failed,
                 if tail.is_empty() {
@@ -865,13 +931,16 @@ async fn run_login(
     }
 }
 
-/// `argv` behind a `/bin/sh` that prints [`CLI_START`] and execs it, so the
-/// output splits into the login shell's part and the CLI's.
+/// `argv` behind a `/bin/sh` that writes [`CLI_START`] on stdout and on
+/// stderr, then execs it: each pipe splits into the login shell's part and
+/// the CLI's.
 fn marked(argv: Vec<String>) -> Vec<String> {
     let mut cmd = vec![
         "/bin/sh".to_string(),
         "-c".to_string(),
-        format!("printf '\\n%s\\n' '{CLI_START}'; exec \"$@\""),
+        format!(
+            "printf '\\n%s\\n' '{CLI_START}'; printf '\\n%s\\n' '{CLI_START}' >&2; exec \"$@\""
+        ),
         "sh".to_string(),
     ];
     cmd.extend(argv);
@@ -944,9 +1013,11 @@ fn finish(op: &Operation, phase: Phase, message: &str) {
         p.phase = phase;
         p.message = message.into();
         if !p.running() {
-            // A finished page is stale; a code is single-use.
+            // A finished page is stale; a code is single-use (and the CLI's
+            // output carries both).
             p.url = None;
             p.code = None;
+            p.printed = String::new();
         }
     });
 }
@@ -1003,15 +1074,11 @@ fn on_login_host(url: &str, kind: AgentKind) -> bool {
         })
 }
 
-/// The sign-in page in `text`: a URL on the vendor's login host, else the
-/// LAST URL printed — an update banner's link must not win over the login's.
+/// The sign-in page in `text`: the first URL on this agent's login hosts.
+/// Never a guess — an update notice, a docs link or a moved login host is
+/// not the page; the card shows the CLI's own output instead.
 pub(crate) fn login_url(text: &str, kind: AgentKind) -> Option<String> {
-    let found = urls(text);
-    found
-        .iter()
-        .find(|url| on_login_host(url, kind))
-        .or(found.last())
-        .cloned()
+    urls(text).into_iter().find(|url| on_login_host(url, kind))
 }
 
 /// The first https URL in `text` (tests of the URL grammar).
@@ -1072,16 +1139,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_vendor_s_login_page_wins_over_a_banner_s_link_else_the_last_url() {
-        let out = "A new version is available: https://github.com/vendor/cli/releases\nOpen this link: https://auth.openai.com/codex/device\n";
+    fn the_page_is_the_first_link_on_the_agent_s_own_login_hosts_and_nothing_else() {
+        let out = "A new version is available: https://github.com/vendor/cli/releases\nOpen this link: https://auth.openai.com/codex/device\nlater https://auth.openai.com/other\n";
         assert_eq!(
             login_url(out, AgentKind::Codex).as_deref(),
             Some("https://auth.openai.com/codex/device")
         );
-        let out = "see https://docs.example.test/help\nthen https://login.example.test/start\n";
+        // A docs link, an unknown host, a lookalike: never the page.
+        for out in [
+            "see https://docs.example.test/help\nthen https://login.example.test/start\n",
+            "https://cursor.com.evil.test/login https://evilcursor.com/login",
+            "https://user@cursor.com/login http://cursor.com/login",
+        ] {
+            assert_eq!(login_url(out, AgentKind::Cursor), None, "{out}");
+        }
         assert_eq!(
-            login_url(out, AgentKind::Cursor).as_deref(),
-            Some("https://login.example.test/start")
+            login_url(
+                "go https://www.cursor.com/loginDeepControl?x=1",
+                AgentKind::Cursor
+            )
+            .as_deref(),
+            Some("https://www.cursor.com/loginDeepControl?x=1"),
+            "a subdomain of a login host is the host"
         );
         assert_eq!(login_url("nothing here", AgentKind::Grok), None);
     }
@@ -1097,55 +1176,79 @@ mod tests {
             code: None,
             accepts_code: false,
             message: String::new(),
-            output: String::new(),
-            cli_started: false,
+            printed: String::new(),
+            pipes: Default::default(),
+            cli: Vec::new(),
             kind,
         }
     }
 
     #[test]
-    fn a_login_shell_s_banner_link_is_never_the_sign_in_page() {
-        use operation::Progress as _;
-        // A remote host's profile prints its own portal link before the CLI
-        // runs; the page is the CLI's, even when the marker arrives split.
+    fn each_pipe_is_read_from_its_own_marker_so_the_login_shell_never_supplies_the_page() {
+        use operation::{Progress as _, Stream};
+        // A remote host's profile prints its portal on both pipes. Stdout's
+        // marker (split across reads) and the CLI's page arrive while the
+        // shell's stderr line is still in flight: that line, read later,
+        // is still the shell's.
         let mut p = progress(AgentKind::Codex);
-        p.on_output(b"Welcome! Docs at https://portal.cluster.example.test/help \n");
-        p.on_output(b"Quota: https://portal.cluster.example.test/quota \n[chimaera:sign-in-");
+        p.on_output(
+            Stream::Stdout,
+            b"Welcome! Docs at https://auth.openai.com.portal.example.test/x \n[chimaera:sign-in-",
+        );
         assert_eq!(p.url, None, "nothing before the CLI is a page");
-        p.on_output(b"cli-start]\n1. Open this link\n   https://auth.openai.com/codex/device\n\n2. Enter this code\n   ABCD-EFGH1\n");
+        p.on_output(Stream::Stdout, b"cli-start]\n");
+        p.on_output(
+            Stream::Stderr,
+            b"Your quota: https://portal.example.test/q ABCD-EFGH\n",
+        );
+        p.on_output(Stream::Stderr, format!("\n{CLI_START}\n").as_bytes());
+        p.on_output(
+            Stream::Stderr,
+            b"1. Open this link\n   https://auth.openai.com/codex/device\n\n2. Enter this code\n   WXYZ-12345\n",
+        );
         assert_eq!(
             p.url.as_deref(),
             Some("https://auth.openai.com/codex/device")
         );
-        assert_eq!(p.code.as_deref(), Some("ABCD-EFGH1"));
-        assert!(!p.output.contains("portal"), "the shell's part is dropped");
+        assert_eq!(p.code.as_deref(), Some("WXYZ-12345"));
+        assert!(p.printed.starts_with("1. Open this link"), "{}", p.printed);
+        assert!(!p.printed.contains("portal"), "{}", p.printed);
 
-        // A shell that failed before the CLI ran keeps its words for the tail.
+        // A shell that failed before the CLI ran: its words explain it.
         let mut p = progress(AgentKind::Claude);
-        p.on_output(b"bash: /bad/prelude: No such file or directory\n");
+        p.on_output(
+            Stream::Stderr,
+            b"bash: /bad/prelude: No such file or directory\n",
+        );
         assert_eq!(p.url, None);
-        assert!(failure_tail(&p.output).contains("No such file"));
+        assert!(p.printed.is_empty());
+        assert!(failure_tail(&p.failure_text()).contains("No such file"));
     }
 
     #[test]
-    fn the_vendor_s_page_replaces_an_earlier_guess() {
-        use operation::Progress as _;
+    fn a_page_the_table_doesn_t_know_is_shown_as_the_cli_s_output_never_guessed() {
+        use operation::{Progress as _, Stream};
         let mut p = progress(AgentKind::Cursor);
         p.on_output(
-            format!("{CLI_START}\nSee https://docs.example.test/cli for help\n").as_bytes(),
+            Stream::Stdout,
+            format!(
+                "{CLI_START}\nOpen: \x1b[1mhttps://login.cursor-next.example.test/start\x1b[0m\n"
+            )
+            .as_bytes(),
         );
-        assert_eq!(p.url.as_deref(), Some("https://docs.example.test/cli"));
-        p.on_output(b"Open: https://cursor.com/loginDeepControl?challenge=a&uuid=b \n");
+        assert_eq!(p.url, None);
         assert_eq!(
-            p.url.as_deref(),
-            Some("https://cursor.com/loginDeepControl?challenge=a&uuid=b")
+            p.printed,
+            "Open: https://login.cursor-next.example.test/start"
         );
-        p.on_output(b"also https://docs.example.test/later \n");
-        assert_eq!(
-            p.url.as_deref(),
-            Some("https://cursor.com/loginDeepControl?challenge=a&uuid=b"),
-            "a vendor page is final"
+        // A one-time code is read only from a device flow's output.
+        let mut p = progress(AgentKind::Claude);
+        p.on_output(
+            Stream::Stdout,
+            format!("{CLI_START}\nBUILD-2026\nvisit https://claude.com/cai/oauth/authorize?code=true \n").as_bytes(),
         );
+        assert_eq!(p.code, None);
+        assert!(p.url.is_some());
     }
 
     #[test]
@@ -1322,6 +1425,15 @@ mod tests {
         assert!(recipe(AgentKind::Claude).unwrap().accepts_code);
         assert!(!recipe(AgentKind::Antigravity).unwrap().accepts_code);
         assert!(!recipe(AgentKind::Codex).unwrap().accepts_code);
+        for (kind, device) in [
+            (AgentKind::Claude, false),
+            (AgentKind::Codex, true),
+            (AgentKind::Grok, true),
+            (AgentKind::Cursor, false),
+            (AgentKind::Antigravity, false),
+        ] {
+            assert_eq!(recipe(kind).unwrap().device_code, device, "{kind:?}");
+        }
         assert!(login_launch(AgentKind::Antigravity).unwrap().no_browser);
         assert!(!login_launch(AgentKind::Cursor).unwrap().no_browser);
         let env = with_path_prefix(
@@ -1390,7 +1502,7 @@ mod tests {
             panic!(
                 "the operation settles: {} output={:?}",
                 serde_json::to_string(&p).unwrap(),
-                p.output
+                p.failure_text()
             );
         })
     }
@@ -1426,14 +1538,17 @@ mod tests {
             state.clone(),
             AgentKind::Codex,
             request("one"),
-            script("echo 'open https://auth.example.test/device now'; echo '  ABCD-EFGH1  '; read code; echo \"got $code\"; exit 0", true),
+            script("echo 'open https://auth.openai.com/codex/device now'; echo '  ABCD-EFGH1  '; read code; echo \"got $code\"; exit 0", true),
         )
         .await;
         let p = wait_for(&state, AgentKind::Codex, |p| {
             p.url.is_some() && p.code.is_some()
         })
         .await;
-        assert_eq!(p.url.as_deref(), Some("https://auth.example.test/device"));
+        assert_eq!(
+            p.url.as_deref(),
+            Some("https://auth.openai.com/codex/device")
+        );
         assert_eq!(p.code.as_deref(), Some("ABCD-EFGH1"));
         assert!(p.running());
         // A second click joins; a stale cancel is refused.
@@ -1481,7 +1596,7 @@ mod tests {
             p.url.is_none() && p.code.is_none(),
             "a finished page is stale"
         );
-        assert!(op.snapshot().output.contains("got PASTED-1"));
+        assert!(String::from_utf8_lossy(&op.snapshot().cli).contains("got PASTED-1"));
     }
 
     #[tokio::test]

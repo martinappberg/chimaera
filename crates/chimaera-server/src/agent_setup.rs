@@ -85,7 +85,7 @@ impl operation::Progress for Progress {
     fn set_message(&mut self, message: &str) {
         self.message = message.into();
     }
-    fn on_output(&mut self, bytes: &[u8]) {
+    fn on_output(&mut self, _stream: operation::Stream, bytes: &[u8]) {
         // Plain text on the wire: the installer's colours and cursor moves
         // go, newlines and tabs stay.
         let text = operation::strip_controls(&String::from_utf8_lossy(bytes));

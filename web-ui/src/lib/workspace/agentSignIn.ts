@@ -15,6 +15,9 @@ export interface SignInProgress extends OperationProgress {
   code: string | null;
   /** The page will show a code to paste back (Claude). */
   accepts_code: boolean;
+  /** What the CLI itself printed (plain text, its newest part) — shown when
+   *  its page isn't one the daemon recognizes, so that is never a dead end. */
+  printed?: string;
 }
 
 export interface SignInStatus {
@@ -31,32 +34,6 @@ export interface SignInStatus {
  *  surface answers with a Sign in. Unknown stays quiet. */
 export function needsSignIn(a: AgentInfo | null | undefined): boolean {
   return a !== null && a !== undefined && a.installed && a.signedIn === false;
-}
-
-/** The account's words, not a missing login: a usage limit, an exhausted
- *  quota or credit, or a plan without this agent. Signing in with another
- *  account is a real way on, so the chat offers it beside the error. A hint
- *  for an offer, never a verdict. */
-const ACCOUNT_CUES = [
-  "usage limit",
-  "hit your limit",
-  "limit reached",
-  "upgrade to",
-  "credit balance",
-  "out of credits",
-  "insufficient credits",
-  "quota exceeded",
-  "exceeded your quota",
-  "insufficient_quota",
-  "resource_exhausted",
-  "does not have access",
-  "subscription",
-];
-
-export function accountLimited(text: string | null | undefined): boolean {
-  if (!text) return false;
-  const lower = text.toLowerCase();
-  return ACCOUNT_CUES.some((cue) => lower.includes(cue));
 }
 
 const path = (agent: string) => agentOperationPath(agent, "sign-in");

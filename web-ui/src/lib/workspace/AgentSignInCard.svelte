@@ -161,6 +161,14 @@
         </form>
       {/if}
     {/if}
+    {#if operation?.printed}
+      <!-- The CLI's own words. Open when its page isn't one the daemon
+           knows for this agent: whatever it asked for is right here. -->
+      <details class="printed" open={!operation.url}>
+        <summary>{operation.url ? `What ${status?.command ?? agent.name} printed` : `${agent.name} printed this — no sign-in page recognized yet`}</summary>
+        <pre>{operation.printed}</pre>
+      </details>
+    {/if}
     <div class="actions">
       <button class="opt-link quiet" disabled={busy || operation?.phase === "cancelling"} onclick={() => void cancel()}>{operation?.phase === "cancelling" ? "Stopping…" : "Cancel"}</button>
     </div>
@@ -210,4 +218,6 @@
   .paste input { flex: 1; min-width: 0; box-sizing: border-box; border: 1px solid var(--edge); background: var(--term-bg); color: var(--fg); border-radius: 6px; padding: 6px 9px; font: var(--text-sm) var(--mono); }
   .paste input:focus { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
   button:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
+  .printed summary { cursor: pointer; font-size: var(--text-xs); color: var(--muted); }
+  .printed pre { margin: 6px 0 0; max-height: 160px; overflow: auto; padding: 8px 10px; border: 1px solid var(--edge); border-radius: 6px; background: var(--term-bg); color: var(--fg); font: var(--text-xs)/1.45 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
 </style>

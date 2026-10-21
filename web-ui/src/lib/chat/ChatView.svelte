@@ -15,7 +15,7 @@
     type ValidateAnswer,
   } from "./paths";
   import { agentCatalog, listAgents } from "../workspace/launcher";
-  import { accountLimited, getSignIn, needsSignIn } from "../workspace/agentSignIn";
+  import { getSignIn, needsSignIn } from "../workspace/agentSignIn";
   import AgentSignInCard from "../workspace/AgentSignInCard.svelte";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import BranchChip from "../shared/BranchChip.svelte";
@@ -293,22 +293,11 @@
    *  chat keeps its composer — the verdict may be stale, or the login may
    *  have landed outside the app — and the card offers Check again. */
   const preflightSignIn = $derived(signInNeeded && !store.initialized && store.exited === null && store.fatalError === null && !readOnly);
-  /** `/login` typed here, or "Sign in with another account" beside a limit:
-   *  the card runs whether or not the catalog thinks the agent is signed in
-   *  (a switch of account, a stale login), in a chat that ended too — the
-   *  daemon relaunches it once the login lands. */
+  /** `/login` typed here, or Sign in from Chat options: the card runs in
+   *  any state — whatever the catalog thinks of the login (a switch of
+   *  account, a limit on this one, a stale login), mid-turn, or in a chat
+   *  that has ended — and the daemon relaunches the chat once it lands. */
   let signInRequested = $state(false);
-  /** The newest error that reads like the account's limit or plan (not a
-   *  missing login): the one notice that offers another account. A fatal
-   *  banner offers it on its own. */
-  const accountLimitNotice = $derived.by(() => {
-    if (readOnly) return null;
-    for (let i = store.blocks.length - 1; i >= 0 && i >= store.blocks.length - 12; i--) {
-      const b = store.blocks[i];
-      if (b.kind === "notice" && b.tone === "error" && accountLimited(b.text)) return b.uid;
-    }
-    return null;
-  });
   void listAgents().then((agents) => {
     const info = agents.find((a) => a.id === agentKind);
     models = info?.models ?? [];
@@ -2953,6 +2942,7 @@
     onSetRemoteControl={setRemoteControl}
     onCompact={canCompact ? compactNow : undefined}
     onOpenSettings={readOnly ? undefined : openAgentSettings}
+    onSignIn={readOnly || !catalogAgent?.signIn ? undefined : () => (signInRequested = true)}
     accountLimits={accountUsage?.rows}
     accountLimitReached={accountUsage?.limitReached}
   />
@@ -3310,11 +3300,9 @@
         {@const hook = item.block.tone === "info" ? hookNotice(item.block.text) : null}
         {#if hook}
           <HookRow said={hook} sourceIndex={item.index} sourceUid={item.block.uid} />
-        {:else if item.block.signIn === true && !(item.block.uid === accountLimitNotice && !signInNeeded)}
+        {:else if item.block.signIn === true}
           <!-- A login's refusal: the sign-in card while one is needed, a
-               quiet line once it isn't (the raw text never returns) — unless
-               the CLI is signed in and the words are the account's (no plan
-               for this agent): that text stays, with another account. -->
+               quiet line once it isn't (the raw text never returns). -->
           {#if !signInNeeded}
             <div class="notice" data-block-index={item.index} data-block-uid={item.block.uid}>{agentName} needed a sign-in</div>
           {/if}
@@ -3324,9 +3312,7 @@
           class="notice"
           class:error={item.block.tone === "error"}
           data-block-index={item.index}
-          data-block-uid={item.block.uid}>{item.block.text}{#if item.block.uid === accountLimitNotice && !signInRequested && catalogAgent !== null}
-            <button class="opt-link notice-action" onclick={() => (signInRequested = true)}>Sign in with another account</button>
-          {/if}</div
+          data-block-uid={item.block.uid}>{item.block.text}</div
         >
         {/if}
       {:else if item.block.kind === "turn_end"}
@@ -3446,9 +3432,6 @@
           <details><summary>Startup details</summary><pre>{store.fatalError}</pre></details>
         {:else}
           {store.fatalError}
-          {#if !readOnly && !signInRequested && catalogAgent !== null && accountLimited(store.fatalError)}
-            <button class="opt-link notice-action" onclick={() => (signInRequested = true)}>Sign in with another account</button>
-          {/if}
         {/if}
       </div>
     {/if}
@@ -4096,9 +4079,6 @@
   }
   .notice.error {
     color: var(--err);
-  }
-  .notice-action {
-    margin-left: 10px;
   }
   .runtime-error {
     max-width: 64ch;
