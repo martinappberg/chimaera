@@ -685,6 +685,7 @@ body.dragging {
   .sidebar-scrollbar::-webkit-scrollbar,
   .quiet-scrollbar::-webkit-scrollbar {
     width: 8px;
+    height: 8px;
   }
   .sidebar-scrollbar::-webkit-scrollbar-track,
   .quiet-scrollbar::-webkit-scrollbar-track {
