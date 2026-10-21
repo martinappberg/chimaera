@@ -12416,6 +12416,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn command_item(actions: Value) -> Value {
         json!({
             "type": "commandExecution", "id": "cmd-1",
