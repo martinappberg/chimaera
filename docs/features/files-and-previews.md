@@ -1179,7 +1179,9 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   eviction keeps unauthenticated preview URLs bounded even under repeated minting.
 - On Windows every path the daemon sends is in one wire form (`C:/Users/me/x`, via
   `chimaera_core::paths::wire_path`); directory-confined writes (downloads, plugin output) run on
-  cap-std there, so a junction or symlink can't lead out of a root.
+  cap-std there, so a junction or symlink can't lead out of a root. Listings leave out what Explorer
+  hides (the hidden attribute: AppData, a home folder's legacy junctions, `desktop.ini`) the way they
+  leave out dot names, until hidden entries are shown (`fs.rs` `is_hidden`).
 
 ---
 

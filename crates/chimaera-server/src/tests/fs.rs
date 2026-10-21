@@ -392,6 +392,59 @@ async fn fs_dirs_lists_only_directories_sorted() {
     );
 }
 
+/// Windows hides by attribute, not by name: what Explorer hides stays out of
+/// the picker and the file tree until hidden entries are asked for.
+#[cfg(windows)]
+#[tokio::test]
+async fn fs_listings_leave_out_windows_hidden_entries() {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN};
+    let hide = |path: &std::path::Path| {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        // SAFETY: a NUL-terminated path that outlives the call.
+        assert_ne!(
+            unsafe { SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_HIDDEN) },
+            0
+        );
+    };
+    let state = test_state();
+    let root = test_dir("fs-win-hidden");
+    std::fs::create_dir(root.join("shown")).unwrap();
+    std::fs::create_dir(root.join("AppData")).unwrap();
+    hide(&root.join("AppData"));
+    std::fs::write(root.join("notes.txt"), "x").unwrap();
+    std::fs::write(root.join("desktop.ini"), "x").unwrap();
+    hide(&root.join("desktop.ini"));
+
+    let names = |json: &serde_json::Value, key: &str| -> Vec<String> {
+        json[key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let path = wire(&root);
+    for (hidden, dirs, entries) in [
+        ("false", vec!["shown"], vec!["shown", "notes.txt"]),
+        (
+            "true",
+            vec!["AppData", "shown"],
+            vec!["AppData", "shown", "desktop.ini", "notes.txt"],
+        ),
+    ] {
+        let uri = format!("/api/v1/fs/dirs?path={path}&hidden={hidden}");
+        let (status, json) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(names(&json, "dirs"), dirs, "dirs, hidden={hidden}");
+        let uri = format!("/api/v1/fs/list?path={path}&hidden={hidden}");
+        let (status, json) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(names(&json, "entries"), entries, "list, hidden={hidden}");
+    }
+    std::fs::remove_dir_all(&root).ok();
+}
+
 #[tokio::test]
 async fn fs_dirs_expands_tilde() {
     let (status, json) = request(&test_state(), Method::GET, "/api/v1/fs/dirs?path=~", None).await;

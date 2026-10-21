@@ -401,10 +401,33 @@ fn entry_is_dir(entry: &std::fs::DirEntry) -> bool {
     }
 }
 
+/// Whether a listing leaves this entry out unless asked for hidden ones: a
+/// dotted name, and on Windows also what Explorer hides (the hidden
+/// attribute: AppData, the legacy junctions in a home folder that only
+/// answer "access denied", desktop.ini).
+fn is_hidden(name: &str, entry: &std::fs::DirEntry) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        /// `FILE_ATTRIBUTE_HIDDEN` (winnt.h).
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+        // The directory scan already carries the attributes: no extra call.
+        if entry
+            .metadata()
+            .is_ok_and(|m| m.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0)
+        {
+            return true;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = entry;
+    name.starts_with('.')
+}
+
 /// Canonicalize `raw` (after tilde expansion) and list its subdirectories:
-/// directories and symlinks resolving to directories only, dotted names
-/// excluded unless `hidden`, sorted case-insensitively by name, capped at
-/// [`MAX_DIR_ENTRIES`].
+/// directories and symlinks resolving to directories only, hidden ones
+/// ([`is_hidden`]) excluded unless `hidden`, sorted case-insensitively by
+/// name, capped at [`MAX_DIR_ENTRIES`].
 fn list_dirs(raw: &str, hidden: bool) -> anyhow::Result<serde_json::Value> {
     #[cfg(windows)]
     if raw == "/" {
@@ -427,7 +450,7 @@ fn list_dirs(raw: &str, hidden: bool) -> anyhow::Result<serde_json::Value> {
         // Unreadable entries are skipped silently.
         let Ok(entry) = entry else { continue };
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !hidden && name.starts_with('.') {
+        if !hidden && is_hidden(&name, &entry) {
             continue;
         }
         if !entry_is_dir(&entry) {
@@ -539,7 +562,7 @@ pub(crate) async fn list(
 }
 
 /// List all entries of a directory: dirs first then files, each group sorted
-/// case-insensitively; dot entries excluded unless `hidden`; unreadable
+/// case-insensitively; hidden entries ([`is_hidden`]) excluded unless `hidden`; unreadable
 /// entries (including broken symlinks) skipped; capped at [`MAX_DIR_ENTRIES`].
 /// Unlike `list_dirs` this needs each entry's size + mtime, so it stats — the
 /// cap is what bounds that on a huge directory.
@@ -580,7 +603,7 @@ fn list_entries(
         if name == ".git" {
             *saw_git = Some(path.clone());
         }
-        if !hidden && name.starts_with('.') {
+        if !hidden && is_hidden(&name, &entry) {
             continue;
         }
         let entry_path = entry.path();

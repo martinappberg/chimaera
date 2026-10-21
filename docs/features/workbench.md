@@ -53,7 +53,8 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
 - **On Windows.** Paths arrive as `C:/…` (`web-ui/src/lib/shared/paths.ts` handles `/`, drive and
   UNC roots). Above a drive root sits **This PC**: `GET /api/v1/fs/dirs?path=/` lists the drives,
   where the footer has nothing to open and no folder can be created. A typed `C:\Users` reads as
-  `C:/Users`, and names are checked against Windows' reserved characters and device names.
+  `C:/Users`, and names are checked against Windows' reserved characters and device names. Folders
+  Explorer hides (AppData, the home folder's "access denied" junctions) are hidden like dot folders.
 
 ## Quick-open palette
 
