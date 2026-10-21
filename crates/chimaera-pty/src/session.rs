@@ -292,6 +292,13 @@ impl Session {
             cmd.env(name, value);
         }
 
+        // The daemon may have been started ignoring Ctrl+C (a new process
+        // group is), and the shell would inherit that. Cheap and idempotent,
+        // so every spawn makes sure.
+        #[cfg(windows)]
+        if let Err(e) = chimaera_core::proc::take_ctrl_c() {
+            tracing::warn!(session = %id, error = %e, "Ctrl+C may not reach the session's programs");
+        }
         let mut child = pty
             .slave
             .spawn_command(cmd)

@@ -174,6 +174,48 @@ async fn kill_ends_the_process_tree() {
     }
 }
 
+/// A typed Ctrl+C interrupts the running program even when the daemon
+/// ignores Ctrl+C, as one started in its own process group does: the
+/// attribute is inherited, and a session must not hand it to its shell.
+#[tokio::test]
+async fn ctrl_c_interrupts_a_program_when_the_daemon_ignores_it() {
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+    // SAFETY: a null handler registers nothing; TRUE only sets this
+    // process's ignore-Ctrl+C attribute, as CREATE_NEW_PROCESS_GROUP does.
+    assert_ne!(unsafe { SetConsoleCtrlHandler(None, 1) }, 0);
+
+    let (mgr, id) = mgr_spawn(opts(powershell()));
+    wait_screen(&mgr, &id, "PS ").await;
+    type_line(&mgr, &id, "ping -t 127.0.0.1").await;
+    // Only ping's replies carry TTL=, in every display language.
+    wait_screen(&mgr, &id, "TTL=").await;
+    mgr.session(&id)
+        .expect("session vanished")
+        .input()
+        .send(Bytes::from_static(b"\x03"))
+        .await
+        .expect("input send failed");
+    // The prompt is back once ping stops; until then every line it prints
+    // is a reply. Type only then: a Ctrl+C flushes the console's pending input.
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    loop {
+        let screen = mgr.screen_text(&id, 200).expect("session vanished");
+        if screen.trim_end().ends_with('>') {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "ping ignored the Ctrl+C; screen: {screen:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    type_line(&mgr, &id, "echo after-$(2*21)").await;
+    wait_screen(&mgr, &id, "after-42").await;
+
+    mgr.kill(&id).expect("kill failed");
+    wait_gone(&mgr, &id).await;
+}
+
 /// The PowerShell integration's marks survive ConPTY: the prompt reads as
 /// ready, a typed command lands in the journal with its command line and
 /// native exit code, and an agent exec runs in integrated mode.

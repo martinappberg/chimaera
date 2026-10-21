@@ -65,6 +65,19 @@ pub fn spawn_detached(cmd: &mut std::process::Command) -> io::Result<std::proces
     }
 }
 
+/// Let the processes this one starts from now on take Ctrl+C.
+///
+/// A process started with `CREATE_NEW_PROCESS_GROUP` ignores Ctrl+C, and
+/// everything it starts inherits that: the daemon is started so
+/// ([`DETACHED_CREATION_FLAGS`]), and without this a terminal's programs
+/// would never see the Ctrl+C their console makes of a typed 0x03. The
+/// attribute is process-wide; a child spawned with [`TREE_CREATION_FLAGS`]
+/// still leads its own group and ignores Ctrl+C as before.
+#[cfg(windows)]
+pub fn take_ctrl_c() -> io::Result<()> {
+    windows::take_ctrl_c()
+}
+
 /// The kill tree of one spawned child.
 ///
 /// Dropping it never kills anything, on either platform: the call sites that
@@ -411,6 +424,16 @@ mod windows {
         };
         // SAFETY: the handle is open with terminate rights.
         unsafe { TerminateProcess(process.0, 1) != 0 }
+    }
+
+    pub(super) fn take_ctrl_c() -> io::Result<()> {
+        use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+        // SAFETY: a null handler registers nothing; FALSE only clears this
+        // process's inherited ignore-Ctrl+C attribute.
+        if unsafe { SetConsoleCtrlHandler(None, 0) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 }
 
