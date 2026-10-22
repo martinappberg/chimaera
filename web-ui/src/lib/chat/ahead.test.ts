@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { compactCount, goalLive, jobPeriodMs, parseGoal, parseSchedule, ringFraction, untilLabel } from "./ahead";
+import { compactCount, cronWords, goalLive, jobPeriodMs, scheduleWords, parseGoal, parseSchedule, ringFraction, untilLabel } from "./ahead";
 
 describe("ahead", () => {
   it("says when, calmly: minutes, seconds only at the end, a clock time past the hour", () => {
@@ -26,6 +26,18 @@ describe("ahead", () => {
     expect(jobPeriodMs("0 */2 * * *")).toBe(7_200_000);
     expect(jobPeriodMs("17 3 * * *")).toBe(86_400_000);
     expect(jobPeriodMs("0 9 * * MON")).toBe(600_000);
+  });
+
+  it("says a cron in words", () => {
+    expect(cronWords("7,37 * * * *")).toBe("Every hour at :07 and :37");
+    expect(cronWords("*/10 * * * *")).toBe("Every 10 minutes");
+    expect(cronWords("* * * * *")).toBe("Every minute");
+    expect(cronWords("17 3 * * *")).toBe("Every day at 3:17 AM");
+    expect(cronWords("0 9,17 * * 1-5")).toBe("At 9:00 AM and 5:00 PM on weekdays");
+    expect(cronWords("0 */2 * * *")).toBe("Every 2 hours at :00");
+    expect(cronWords("0 0 1 * *")).toBe("");
+    expect(scheduleWords("7,37 * * * *", "7,37 * * * *")).toBe("Every hour at :07 and :37");
+    expect(scheduleWords("Every 10 minutes", "*/10 * * * *")).toBe("Every 10 minutes");
   });
 
   it("parses the wire defensively", () => {
