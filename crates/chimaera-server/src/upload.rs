@@ -280,7 +280,7 @@ pub(crate) async fn upload(
     }
 
     Json(json!({
-        "path": target.to_string_lossy(),
+        "path": chimaera_core::paths::wire_path(&target),
         "name": final_name,
         "size": written,
     }))
@@ -430,7 +430,7 @@ pub(crate) async fn upload_to_dir(
     crate::git::mark_path_dirty(&state, &query.dir).await;
 
     Json(json!({
-        "path": target.to_string_lossy(),
+        "path": chimaera_core::paths::wire_path(&target),
         "name": final_name,
         "size": written,
     }))
@@ -593,7 +593,7 @@ pub(crate) fn save_images_blocking(
         }
         bytes_used += size;
         files_used += 1;
-        saved.push((index, target.to_string_lossy().into_owned()));
+        saved.push((index, chimaera_core::paths::wire_path(&target)));
     }
     saved
 }

@@ -196,6 +196,7 @@ async fn view_state_store_oversized_file_loads_empty_and_is_replaced() {
     assert!(std::fs::metadata(&path).unwrap().len() < 4096);
 }
 
+#[cfg(unix)]
 /// Unreadable: puts still answer success and serve this daemon's windows
 /// from memory, but nothing is written over the file — until it reads
 /// again: then the next put merges (the file's keys this daemon lacks are

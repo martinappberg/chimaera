@@ -134,6 +134,7 @@
   import { activeTheme, getSetting, setSetting } from "../settings/store.svelte";
   import { hostCanDictate, voiceProblem } from "./voice.svelte";
   import { keyHint } from "../shared/keybindings";
+  import { basename } from "../shared/paths";
 
   interface Props {
     session: Session;
@@ -1829,8 +1830,7 @@
   /** Words dictation should favor: where this chat works, and who it's with. */
   const voiceTerms = $derived.by(() => {
     const ctx = linkContext();
-    const base = (p: string | null | undefined) =>
-      p ? (p.replace(/\/+$/, "").split("/").pop() ?? "") : "";
+    const base = (p: string | null | undefined) => (p ? basename(p) : "");
     return ["Chimaera", "Claude", "Codex", base(ctx.root), base(ctx.cwd)].filter(
       (t) => t.length > 0,
     );

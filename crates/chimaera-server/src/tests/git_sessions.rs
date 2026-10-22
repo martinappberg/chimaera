@@ -108,11 +108,11 @@ async fn session_git_follows_the_agent_hook_cwd() {
     )
     .await;
     let row = wait_row(&state, &id, "on main", |r| r["git"]["branch"] == "main").await;
-    assert_eq!(row["git"]["worktree"], serde_json::json!(root));
-    assert_eq!(row["git"]["repo"], serde_json::json!(root));
-    assert_eq!(row["cwd_current"], serde_json::json!(root));
+    assert_eq!(row["git"]["worktree"], serde_json::json!(wire(&root)));
+    assert_eq!(row["git"]["repo"], serde_json::json!(wire(&root)));
+    assert_eq!(row["cwd_current"], serde_json::json!(wire(&root)));
 
-    let linked = std::fs::canonicalize(&linked).unwrap();
+    let linked = canonical(&linked);
     post_hook(
         &state,
         &id,
@@ -124,9 +124,9 @@ async fn session_git_follows_the_agent_hook_cwd() {
         r["git"]["branch"] == "feat/y"
     })
     .await;
-    assert_eq!(row["git"]["worktree"], serde_json::json!(linked));
+    assert_eq!(row["git"]["worktree"], serde_json::json!(wire(&linked)));
     // Still the same repository: every worktree names the main checkout.
-    assert_eq!(row["git"]["repo"], serde_json::json!(root));
+    assert_eq!(row["git"]["repo"], serde_json::json!(wire(&root)));
 
     // A hook fired inside a subagent carries the subagent's folder (its own
     // worktree when isolated): the session has not moved.
@@ -146,7 +146,10 @@ async fn session_git_follows_the_agent_hook_cwd() {
     }
     let row = session_entry(&state, &id).await;
     assert_eq!(row["git"]["branch"], "feat/y");
-    assert_eq!(row["cwd_current"], serde_json::json!(linked.join("")));
+    assert_eq!(
+        row["cwd_current"],
+        serde_json::json!(wire(&linked.join("")))
+    );
 
     // A relative or empty cwd is ignored, never run in.
     post_hook(
@@ -296,6 +299,7 @@ async fn session_git_route_lists_commits_made_during_the_session() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+#[cfg(unix)]
 /// A command finishing in a terminal refreshes git: the terminal's folder is
 /// marked dirty, so the workspace's epoch moves without waiting for the
 /// 12 s backstop (a `git commit` typed there shows at once).
@@ -562,7 +566,7 @@ async fn create_session_accepts_a_cwd_inside_a_worktree() {
     )
     .await;
     assert!(status.is_success(), "spawn failed: {session}");
-    assert_eq!(session["cwd"], serde_json::json!(wt));
+    assert_eq!(session["cwd"], serde_json::json!(wire(&wt)));
     assert_eq!(session["workspace_id"], ws, "it stays in this workspace");
     state.sessions.kill(session["id"].as_str().unwrap()).ok();
 }
@@ -646,6 +650,7 @@ async fn managed_worktrees_are_locked_while_an_agent_runs_inside() {
         "someone else"
     );
 }
+#[cfg(unix)]
 /// A stand-in agent binary that ignores its argv and stays alive for a
 /// while, so its session stays listed while the tracker resolves it.
 fn lingering_agent(label: &str) -> PathBuf {
@@ -658,6 +663,7 @@ fn lingering_agent(label: &str) -> PathBuf {
 }
 
 /// The session's `managed_worktree` once the tracker has resolved it.
+#[cfg(unix)]
 async fn managed_worktree_eventually(state: &Arc<AppState>, id: &str) -> serde_json::Value {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
@@ -673,6 +679,7 @@ async fn managed_worktree_eventually(state: &Arc<AppState>, id: &str) -> serde_j
     }
 }
 
+#[cfg(unix)]
 /// `worktree: true` starts a new agent in a managed worktree of its own on a
 /// fresh `chimaera/<agent>-<hex>` branch, and the row says so; the
 /// per-workspace choice round-trips through PATCH. Refused for shells, with
@@ -720,7 +727,7 @@ async fn a_new_agent_can_start_in_its_own_managed_worktree() {
     assert!(status.is_success(), "spawn failed: {session}");
     let id = session["id"].as_str().unwrap().to_string();
     let cwd = PathBuf::from(session["cwd"].as_str().unwrap());
-    let managed = std::fs::canonicalize(&state.worktrees_root).unwrap();
+    let managed = canonical(&state.worktrees_root);
     assert!(cwd.starts_with(&managed), "{cwd:?} not under {managed:?}");
     let branch = git_in(&cwd, &["rev-parse", "--abbrev-ref", "HEAD"]);
     assert!(branch.starts_with("chimaera/claude-"), "{branch}");
@@ -728,7 +735,7 @@ async fn a_new_agent_can_start_in_its_own_managed_worktree() {
     assert_eq!(session["workspace_id"], ws, "it stays in this workspace");
     assert_eq!(
         managed_worktree_eventually(&state, &id).await,
-        serde_json::json!(cwd)
+        serde_json::json!(wire(&cwd))
     );
     state.sessions.kill(&id).ok();
 
@@ -780,6 +787,7 @@ async fn a_failed_spawn_discards_its_new_worktree_and_branch() {
     }
 }
 
+#[cfg(unix)]
 /// A session started in a SUBFOLDER of a managed worktree reports the
 /// worktree's top as `managed_worktree` (what the Remove offer targets),
 /// never the subfolder. And a managed worktree opened as its own workspace
@@ -817,7 +825,7 @@ async fn managed_worktree_is_the_worktree_top_and_dead_registrations_go() {
     let id = session["id"].as_str().unwrap().to_string();
     assert_eq!(
         managed_worktree_eventually(&state, &id).await,
-        serde_json::json!(wt),
+        serde_json::json!(wire(&wt)),
         "the worktree's top, not the subfolder it started in"
     );
     state.sessions.kill(&id).ok();
@@ -856,6 +864,7 @@ async fn managed_worktree_is_the_worktree_top_and_dead_registrations_go() {
     );
 }
 
+#[cfg(unix)]
 /// A `git` that runs `before` ahead of every `worktree add` and `after`
 /// behind it (the real git's status is dropped when `after` exits), and is
 /// the real git otherwise — set as `git.path`.
@@ -880,6 +889,7 @@ fn git_around_add(state: &Arc<AppState>, label: &str, before: &str, after: &str)
     lock(&state.settings).put(map).unwrap();
 }
 
+#[cfg(unix)]
 /// A fake `claude` chat binary that writes the folder it started in to
 /// `marker`, then answers the handshake and stays.
 fn claude_noting_cwd(label: &str, marker: &std::path::Path) -> PathBuf {
@@ -899,6 +909,7 @@ fn claude_noting_cwd(label: &str, marker: &std::path::Path) -> PathBuf {
     path
 }
 
+#[cfg(unix)]
 /// A new chat in its own worktree opens before its checkout (which grows
 /// with the repository), refuses a view switch while it runs, and its agent
 /// starts inside the finished worktree, at the path the chat reported. The
@@ -964,11 +975,12 @@ async fn a_chat_in_its_own_worktree_opens_before_its_checkout() {
     assert!(branch.starts_with("chimaera/claude-"), "{branch}");
     assert_eq!(
         managed_worktree_eventually(&state, &id).await,
-        serde_json::json!(cwd)
+        serde_json::json!(wire(&cwd))
     );
     state.chat.kill(&id);
 }
 
+#[cfg(unix)]
 /// A checkout git refuses after its chat opened ends the chat's startup with
 /// git's words and leaves no worktree, folder or branch behind.
 #[tokio::test]
@@ -1039,6 +1051,7 @@ async fn a_failed_checkout_ends_the_chat_and_leaves_nothing() {
     assert!(lock(&state.worktree_setups).is_empty());
 }
 
+#[cfg(unix)]
 /// A checkout killed at its deadline (3 s in tests) leaves nothing either:
 /// git can't clean up after a kill, so its registration, folder and branch
 /// are removed here.
@@ -1075,11 +1088,12 @@ async fn a_checkout_cut_off_at_its_deadline_leaves_nothing() {
     );
     let branches = git_in(&repo, &["branch", "--list", "chimaera/*"]);
     assert!(branches.is_empty(), "no branch left: {branches}");
-    let managed = std::fs::canonicalize(&state.worktrees_root).unwrap();
+    let managed = canonical(&state.worktrees_root);
     let leftovers: Vec<_> = walk_leaves(&managed);
     assert!(leftovers.is_empty(), "no folder left: {leftovers:?}");
 }
 
+#[cfg(unix)]
 /// A chat closed while its worktree is still being checked out never used
 /// it, so the worktree and its branch go once the checkout ends.
 #[tokio::test]
@@ -1133,6 +1147,7 @@ async fn a_chat_closed_during_its_checkout_leaves_no_worktree() {
 /// Every leaf (a file, or a folder with nothing in it but folders) under
 /// `root`, skipping the empty `<repo>/chimaera/` parents worktree planning
 /// makes.
+#[cfg(unix)]
 fn walk_leaves(root: &std::path::Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];

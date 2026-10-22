@@ -1,5 +1,7 @@
 # Windows via WSL2 — implementation plan
 
+> **Superseded.** Windows now runs the daemon natively, with no WSL2; see [issue #282](https://github.com/martinappberg/chimaera/issues/282) and [native app](../features/native-app.md). This file is kept as the July 2026 design record only; the WSL engine it describes has been removed.
+
 > **Dated design record.** Windows is now offered as a beta. Use [native app](../features/native-app.md) for current support; the implementation and external research notes below preserve the July 2026 snapshot and its verification limits.
 
 A native Windows chimaera app **without porting the daemon**: the same Tauri shell

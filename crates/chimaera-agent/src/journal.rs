@@ -1610,7 +1610,10 @@ mod tests {
         let path = dir.join(name);
         fs::write(&path, vec![b'x'; bytes]).unwrap();
         let mtime = SystemTime::now() - std::time::Duration::from_secs(secs_ago);
-        fs::File::open(&path)
+        // Write access: Windows refuses to set times through a read-only handle.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(mtime))
             .unwrap();

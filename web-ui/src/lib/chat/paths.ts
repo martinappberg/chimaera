@@ -17,6 +17,7 @@ import {
   type LinkContext,
 } from "../shared/fileRef";
 import type { OpenPathOptions, PathKind } from "../shared/openPath";
+import { basename, isAbsolute } from "../shared/paths";
 import { workspaceRelative } from "../shared/reference";
 import type { Reveal } from "../shared/reveal";
 
@@ -97,8 +98,7 @@ export function mentionChipLabel(text: string, path: string, name: string): stri
   const upload = uploadMentionLabel(text, path);
   if (upload !== null) return upload.slice(1);
   const body = text.startsWith('@"') && text.endsWith('"') ? text.slice(2, -1) : text.slice(1);
-  const segments = path.split("/").filter((s) => s !== "");
-  const last = segments[segments.length - 1] ?? path;
+  const last = basename(path) || path;
   const at = body.lastIndexOf(last);
   return at < 0 ? name : name + body.slice(at + last.length);
 }
@@ -485,7 +485,7 @@ export async function resolveAndOpen(
     const label = (p: string) => resolver?.label(p) ?? p;
     if (openResolution(res, open, { ...opts, label })) return true;
   }
-  if (candidate.startsWith("/")) {
+  if (isAbsolute(candidate)) {
     open(candidate, "file", { split: opts.split, reveal: opts.reveal });
     return true;
   }

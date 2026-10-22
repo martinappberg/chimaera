@@ -15,6 +15,7 @@ Orientation for coding agents. This area owns leaf modules that many areas impor
 | Rendering policies | `math.ts` (KaTeX → sanitized MathML), `mermaid.ts`, `inlineMarkdown.ts` (escape-first inline subset), `copyDecor.ts`, `pdfCanvas.ts` (PDF raster limits) |
 | Embeds | `embed/` — `EmbedCard.svelte` (one card for any embedded file), `embed.ts` (`POST /fs/resolve_targets` client), `fragment.ts`, `mount.svelte.ts` (`mountEmbed` for raw-DOM hosts), `pdfEmbed.ts`, and one body per file kind: `CodeBody`, `HtmlBody`, `ImageBody`, `MarkdownBody`, `MediaBody`, `NotebookBody`, `PdfBody`, `SlideBody`, `TableBody` (`.svelte`) |
 | Find | `find.ts` (`findTarget` registry), `FindBar.svelte`, `DocumentFind.svelte`, `domFind.ts`, `findText.ts` |
+| Paths | `paths.ts` (daemon wire paths: `/`, `C:/` and `//server/share/` roots; `rootOf`, `basename`, `dirname`, `joinPath`, `isUnder`, `relativeTo`, `ancestors`, all working on the three root forms) |
 | Editing and IO | `editing.ts` (`dirtyFiles`, `daemonLinkUp`, close-with-unsaved helpers), `clipboard.ts` (native-first copy), `fsNames.ts` (name validation) |
 | Time and lifecycle | `visibility.ts` (`pageVisible`), `liveClock.svelte.ts` (one shared 1 Hz clock), `time.ts`, `format.ts` (token counts), `asyncDisposer.ts` |
 

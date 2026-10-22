@@ -304,7 +304,7 @@ fn shown(rel: &Path) -> String {
     if rel.as_os_str().is_empty() {
         ".".to_string()
     } else {
-        rel.display().to_string()
+        chimaera_core::paths::wire_path(rel)
     }
 }
 
@@ -324,7 +324,7 @@ fn refused(root: &Path, rel: &Path, err: std::io::Error) -> String {
                 return format!(
                     "{}: {} is a symlink — refused (no component of a path may be one)",
                     shown(rel),
-                    walked.display()
+                    chimaera_core::paths::wire_path(&walked)
                 );
             }
             Ok(_) => {}
@@ -334,15 +334,14 @@ fn refused(root: &Path, rel: &Path, err: std::io::Error) -> String {
     format!("{}: {err}", shown(rel))
 }
 
-/// Open `rel` beneath `root` with every component `O_NOFOLLOW`.
+/// Open `rel` beneath `root` with every component no-follow (a symlink, or
+/// on Windows a junction, anywhere in the path is refused).
 fn open_under(root: &Path, rel: &Path, dir: bool) -> Result<std::fs::File, String> {
-    use rustix::fs::OFlags;
-    let root_dir = std::fs::File::open(root).map_err(|e| format!("the workspace root: {e}"))?;
-    let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
-    if dir {
-        flags |= OFlags::DIRECTORY;
-    }
-    crate::download::open_beneath(&root_dir, rel, flags).map_err(|e| refused(root, rel, e))
+    use crate::download::Beneath;
+    let root_dir =
+        crate::download::open_dir_path(root).map_err(|e| format!("the workspace root: {e}"))?;
+    let kind = if dir { Beneath::Dir } else { Beneath::Any };
+    crate::download::open_beneath(&root_dir, rel, kind).map_err(|e| refused(root, rel, e))
 }
 
 fn read_capped(root: &Path, rel: &Path, cap: usize) -> Result<Vec<u8>, String> {
@@ -377,6 +376,7 @@ fn stat_under(root: &Path, rel: &Path) -> Result<wit::Stat, String> {
     })
 }
 
+#[cfg(unix)]
 fn list_under(root: &Path, rel: &Path, cap: usize) -> Result<Vec<wit::Entry>, String> {
     use rustix::fs::{AtFlags, FileType};
     let dir = open_under(root, rel, true)?;
@@ -403,6 +403,31 @@ fn list_under(root: &Path, rel: &Path, cap: usize) -> Result<Vec<wit::Entry>, St
             name: name.to_string_lossy().into_owned(),
             is_dir: kind == FileType::Directory,
             is_symlink: kind == FileType::Symlink,
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+#[cfg(windows)]
+fn list_under(root: &Path, rel: &Path, cap: usize) -> Result<Vec<wit::Entry>, String> {
+    let dir = open_under(root, rel, true)?;
+    let entries = crate::download::cap_dir(&dir)
+        .and_then(|d| d.entries())
+        .map_err(|e| format!("{}: {e}", shown(rel)))?;
+    let mut out = Vec::new();
+    for entry in entries {
+        if out.len() >= cap {
+            break;
+        }
+        let entry = entry.map_err(|e| format!("{}: {e}", shown(rel)))?;
+        // From the listing itself: a junction reads as a link, never as the
+        // folder it points at.
+        let kind = entry.file_type().ok();
+        out.push(wit::Entry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            is_dir: kind.is_some_and(|t| t.is_dir()),
+            is_symlink: kind.is_some_and(|t| t.is_symlink()),
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -891,7 +916,11 @@ impl platform::Host for HostState {
             &self.plugin,
             &self.workspace,
         );
-        json!({"workspace": root, "output": output}).to_string()
+        json!({
+            "workspace": root.as_deref().map(chimaera_core::paths::wire_path),
+            "output": chimaera_core::paths::wire_path(&output),
+        })
+        .to_string()
     }
 
     async fn job_start(&mut self, _cx: wit::Context, spec: String) -> Result<String, String> {

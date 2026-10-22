@@ -162,8 +162,12 @@ fn target_path(raw: &str) -> Option<String> {
     let t = t.split_once('#').map_or(t, |(path, _)| path);
     let t = t.split_once('?').map_or(t, |(path, _)| path);
     let t = if let Some(rest) = strip_file_scheme(t) {
-        rest
-    } else if has_scheme(t) || t.starts_with("//") {
+        // `file:///C:/x` names `C:/x`.
+        match rest.strip_prefix('/') {
+            Some(drive) if cfg!(windows) && is_drive_path(drive) => drive,
+            _ => rest,
+        }
+    } else if (has_scheme(t) && !(cfg!(windows) && is_drive_path(t))) || t.starts_with("//") {
         return None;
     } else {
         t
@@ -187,6 +191,12 @@ fn strip_file_scheme(t: &str) -> Option<&str> {
             .strip_prefix("localhost")
             .filter(|p| p.starts_with('/')),
     }
+}
+
+/// `C:/x` or `C:\x`: on Windows a path, not a one-letter URL scheme.
+fn is_drive_path(t: &str) -> bool {
+    let b = t.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'/' | b'\\')
 }
 
 /// A URL scheme (`https:`, `data:`, `mailto:`) leads the target.
@@ -227,19 +237,32 @@ fn percent_decode(s: &str) -> String {
 /// misses is tried under the workspace root.
 fn resolve(target: &str, bases: &[PathBuf], root: Option<&Path>) -> Option<PathBuf> {
     let expanded = crate::fs::expand_tilde(target).ok()?;
+    // Windows: `/x` has no drive, so it is not absolute; a document means it
+    // root-relative all the same. Tried under the root, else on each base's
+    // drive as before.
+    #[cfg(windows)]
+    if !expanded.is_absolute() && target.starts_with('/') {
+        let under_root = target.trim_start_matches('/');
+        if let Some(hit) = root
+            .filter(|_| !under_root.is_empty())
+            .and_then(|root| chimaera_core::paths::canonicalize(&root.join(under_root)).ok())
+        {
+            return Some(hit);
+        }
+    }
     if expanded.is_absolute() {
-        if let Ok(hit) = std::fs::canonicalize(&expanded) {
+        if let Ok(hit) = chimaera_core::paths::canonicalize(&expanded) {
             return Some(hit);
         }
         let under_root = target.strip_prefix('/')?.trim_start_matches('/');
         if under_root.is_empty() {
             return None;
         }
-        return std::fs::canonicalize(root?.join(under_root)).ok();
+        return chimaera_core::paths::canonicalize(&root?.join(under_root)).ok();
     }
     bases
         .iter()
-        .find_map(|base| std::fs::canonicalize(base.join(&expanded)).ok())
+        .find_map(|base| chimaera_core::paths::canonicalize(&base.join(&expanded)).ok())
 }
 
 /// The answer for one resolved path; `None` for anything that is neither a
@@ -254,7 +277,7 @@ fn describe(state: &AppState, path: &Path) -> Option<serde_json::Value> {
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
     if meta.is_dir() {
         return Some(json!({
-            "path": path.to_string_lossy(),
+            "path": chimaera_core::paths::wire_path(path),
             "kind": "dir",
             "size": 0,
             "version": version,
@@ -271,7 +294,7 @@ fn describe(state: &AppState, path: &Path) -> Option<serde_json::Value> {
         .unwrap_or_default();
     let mime = mime_guess::from_path(path).first_or_octet_stream();
     let mut info = json!({
-        "path": path.to_string_lossy(),
+        "path": chimaera_core::paths::wire_path(path),
         "kind": "file",
         "size": meta.len(),
         "version": version,
@@ -628,6 +651,26 @@ mod tests {
         b.extend_from_slice(&h.to_be_bytes());
         b.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
         b
+    }
+
+    /// A drive path names a file on Windows; elsewhere `C:` reads as a URL
+    /// scheme, as it always has.
+    #[test]
+    fn drive_paths_are_paths_on_windows() {
+        let windows = cfg!(windows);
+        assert_eq!(
+            target_path("C:/data/plot%20a.png"),
+            windows.then(|| "C:/data/plot a.png".to_string())
+        );
+        assert_eq!(
+            target_path("file:///C:/data/plot.png").as_deref(),
+            Some(if windows {
+                "C:/data/plot.png"
+            } else {
+                "/C:/data/plot.png"
+            })
+        );
+        assert_eq!(target_path("https://example.com/x.png"), None);
     }
 
     #[test]

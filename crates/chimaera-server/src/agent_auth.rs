@@ -251,6 +251,9 @@ fn parse_probe(kind: AgentKind, success: bool, stdout: &str, stderr: &str) -> Op
 /// [`CLI_START`]. No marker means the CLI never ran (the login shell failed
 /// first), which answers nothing.
 fn cli_part(text: &str) -> &str {
+    if cfg!(windows) {
+        return text;
+    }
     text.find(CLI_START)
         .map_or("", |at| &text[at + CLI_START.len()..])
 }
@@ -279,9 +282,11 @@ async fn run_probe(state: &Arc<AppState>, kind: AgentKind, bin: &Path) -> Option
     command.extend(argv.iter().map(|a| a.to_string()));
     let argv = crate::launcher::wrap_login_shell(&crate::launcher::login_shell(), marked(command));
     let mut cmd = crate::agent_probe::base_command(&argv, None, prelude.path());
-    cmd.process_group(0);
+    crate::agent_probe::own_tree(&mut cmd);
     let mut child = cmd.spawn().ok()?;
-    let pid = nix::unistd::Pid::from_raw(child.id()? as i32);
+    // Dropping it never kills: only the deadline below does, while the
+    // leader is unreaped.
+    let tree = chimaera_core::proc::ProcessTree::adopt(child.id()?).ok()?;
     let stdout = child.stdout.take()?;
     let stderr = child.stderr.take()?;
     let work = async {
@@ -294,7 +299,7 @@ async fn run_probe(state: &Arc<AppState>, kind: AgentKind, bin: &Path) -> Option
         Ok(None) => None,
         Err(_) => {
             // The leader is unreaped: the group id is still its own.
-            let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
+            tree.kill();
             let _ = child.wait().await;
             None
         }
@@ -382,6 +387,7 @@ async fn probe_and_store(state: &Arc<AppState>, kind: AgentKind, bin: &Path) -> 
 }
 
 /// A verdict as if just probed — tests plant what a CLI would have said.
+#[cfg_attr(not(unix), allow(dead_code))]
 #[cfg(test)]
 pub(crate) fn preset_verdict(
     state: &AppState,
@@ -474,7 +480,7 @@ pub(crate) struct Progress {
 /// One of the login's pipes. A pipe is ordered, so it splits cleanly at its
 /// own [`CLI_START`]; across the two pipes nothing is ordered, which is why
 /// each is split on its own.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct Pipe {
     /// Before the marker: the login shell's words — never searched for a
     /// page; kept to explain a failure before the CLI ran.
@@ -482,6 +488,16 @@ struct Pipe {
     /// After the marker: the CLI's words, the only text a page or code is
     /// read from. `None` until the marker arrives.
     cli: Option<Vec<u8>>,
+}
+impl Default for Pipe {
+    /// Windows runs the CLI with no shell in front of it ([`marked`]), so its
+    /// pipes are the CLI's from the first byte.
+    fn default() -> Self {
+        Pipe {
+            shell: Vec::new(),
+            cli: cfg!(windows).then(Vec::new),
+        }
+    }
 }
 impl operation::Progress for Progress {
     fn id(&self) -> &str {
@@ -874,8 +890,8 @@ async fn run_login(
     let prelude = crate::agent_probe::ProbePrelude::write(state, Some(&workspace)).await;
     let mut env = crate::api::session_env(state, &id, "dark", prelude.path());
     if no_browser {
-        match no_browser_dir().await {
-            Ok(dir) => env = with_path_prefix(env, &dir),
+        match no_browser_env(env).await {
+            Ok(quiet) => env = quiet,
             Err(err) => {
                 return (
                     Phase::Failed,
@@ -934,6 +950,7 @@ async fn run_login(
 /// stderr, then execs it: each pipe splits into the login shell's part and
 /// the CLI's. The marker is printed in two halves so it never appears whole
 /// in an argv a tracing shell (`set -x`) echoes ahead of the real one.
+#[cfg(unix)]
 fn marked(argv: Vec<String>) -> Vec<String> {
     let (head, tail) = CLI_START.split_at(CLI_START.len() / 2);
     let mut cmd = vec![
@@ -948,19 +965,57 @@ fn marked(argv: Vec<String>) -> Vec<String> {
     cmd
 }
 
-/// A folder whose `open` and `xdg-open` do nothing, for a login that would
-/// open a browser itself (the app opens the page). Under the runtime dir;
-/// rewritten when missing.
+/// Windows runs the CLI without a login shell around it, so everything on
+/// its pipes is the CLI's own: no marker to print or to look for.
+#[cfg(windows)]
+fn marked(argv: Vec<String>) -> Vec<String> {
+    argv
+}
+
+/// `env` for a login that would open a browser itself (the app opens the
+/// page). Unix: a folder whose `open` and `xdg-open` do nothing goes first
+/// on PATH. Windows opens a browser through the shell, not a program on
+/// PATH, so the most that can be done is `BROWSER` naming a no-op script:
+/// a CLI that honors it stays quiet, one that doesn't opens the system
+/// browser as well.
+async fn no_browser_env(env: Vec<(String, String)>) -> std::io::Result<Vec<(String, String)>> {
+    let dir = no_browser_dir().await?;
+    #[cfg(unix)]
+    {
+        Ok(with_path_prefix(env, &dir))
+    }
+    #[cfg(windows)]
+    {
+        let mut env = env;
+        env.retain(|(k, _)| !k.eq_ignore_ascii_case("BROWSER"));
+        env.push((
+            "BROWSER".into(),
+            dir.join("no-browser.cmd").display().to_string(),
+        ));
+        Ok(env)
+    }
+}
+
+/// The folder of [`no_browser_env`]'s do-nothing programs. Under the runtime
+/// dir; rewritten when missing.
 async fn no_browser_dir() -> std::io::Result<PathBuf> {
     let dir = chimaera_core::runtime_dir().join("no-browser");
     tokio::task::spawn_blocking(move || {
-        use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir_all(&dir)?;
+        #[cfg(unix)]
         for name in ["open", "xdg-open"] {
+            use std::os::unix::fs::PermissionsExt;
             let path = dir.join(name);
             if !path.exists() {
                 std::fs::write(&path, "#!/bin/sh\nexit 0\n")?;
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+            }
+        }
+        #[cfg(windows)]
+        {
+            let path = dir.join("no-browser.cmd");
+            if !path.exists() {
+                std::fs::write(&path, "@exit /b 0\r\n")?;
             }
         }
         Ok(dir)
@@ -969,15 +1024,22 @@ async fn no_browser_dir() -> std::io::Result<PathBuf> {
     .map_err(|_| std::io::Error::other("the no-browser folder could not be prepared"))?
 }
 
+/// `PATH`'s separator, for a prefix put before a whole PATH value as is.
+const PATH_SEPARATOR: char = if cfg!(windows) { ';' } else { ':' };
+
 /// `dir` first on the environment's PATH (the session PATH, else the
 /// daemon's).
+#[cfg_attr(windows, allow(dead_code))]
 fn with_path_prefix(mut env: Vec<(String, String)>, dir: &Path) -> Vec<(String, String)> {
     let prefix = dir.display().to_string();
     if let Some(entry) = env.iter_mut().find(|(k, _)| k == "PATH") {
-        entry.1 = format!("{prefix}:{}", entry.1);
+        entry.1 = format!("{prefix}{PATH_SEPARATOR}{}", entry.1);
     } else {
         let inherited = std::env::var("PATH").unwrap_or_default();
-        env.push(("PATH".into(), format!("{prefix}:{inherited}")));
+        env.push((
+            "PATH".into(),
+            format!("{prefix}{PATH_SEPARATOR}{inherited}"),
+        ));
     }
     env
 }
@@ -1184,6 +1246,27 @@ mod tests {
         }
     }
 
+    /// Windows runs the CLI with no shell in front of it: every byte on its
+    /// pipes is the CLI's, so the page and code are read from the first line.
+    #[cfg(windows)]
+    #[test]
+    fn windows_reads_the_cli_from_its_first_byte() {
+        use operation::{Progress as _, Stream};
+        let mut p = progress(AgentKind::Codex);
+        p.on_output(
+            Stream::Stderr,
+            b"1. Open this link\r\n   https://auth.openai.com/codex/device\r\n\r\n2. Enter this code\r\n   WXYZ-12345\r\n",
+        );
+        assert_eq!(
+            p.url.as_deref(),
+            Some("https://auth.openai.com/codex/device")
+        );
+        assert_eq!(p.code.as_deref(), Some("WXYZ-12345"));
+        assert_eq!(cli_part("{\"loggedIn\": true}"), "{\"loggedIn\": true}");
+    }
+
+    // The login shell's marker exists on Unix only (Windows runs the CLI bare).
+    #[cfg(unix)]
     #[test]
     fn each_pipe_is_read_from_its_own_marker_so_the_login_shell_never_supplies_the_page() {
         use operation::{Progress as _, Stream};
@@ -1226,6 +1309,8 @@ mod tests {
         assert!(failure_tail(&p.failure_text()).contains("No such file"));
     }
 
+    // The login shell's marker exists on Unix only (Windows runs the CLI bare).
+    #[cfg(unix)]
     #[test]
     fn a_page_the_table_doesn_t_know_is_shown_as_the_cli_s_output_never_guessed() {
         use operation::{Progress as _, Stream};
@@ -1252,6 +1337,8 @@ mod tests {
         assert!(p.url.is_some());
     }
 
+    // The login shell's marker exists on Unix only (Windows runs the CLI bare).
+    #[cfg(unix)]
     #[test]
     fn a_status_answer_is_read_from_the_cli_s_part_only() {
         let banner = "Welcome. You are logged in to the cluster.\n{\"motd\": 1}\n";
@@ -1449,7 +1536,7 @@ mod tests {
             vec![("PATH".into(), "/usr/bin".into())],
             Path::new("/x/no-browser"),
         );
-        assert_eq!(env[0].1, "/x/no-browser:/usr/bin");
+        assert_eq!(env[0].1, format!("/x/no-browser{PATH_SEPARATOR}/usr/bin"));
         assert_eq!(with_path_prefix(vec![], Path::new("/x"))[0].0, "PATH");
     }
 
@@ -1461,6 +1548,8 @@ mod tests {
         assert!(failure_tail(&"x".repeat(1000)).chars().count() <= 301);
     }
 
+    // The login stand-ins are shell scripts.
+    #[cfg(unix)]
     fn state() -> Arc<AppState> {
         let root =
             std::env::temp_dir().join(format!("chimaera-auth-{}", chimaera_core::generate_token()));
@@ -1473,6 +1562,7 @@ mod tests {
             root.join("config"),
         ))
     }
+    #[cfg(unix)]
     fn request(id: &str) -> Request {
         Request {
             workspace_id: "test".into(),
@@ -1481,6 +1571,7 @@ mod tests {
             theme: None,
         }
     }
+    #[cfg(unix)]
     fn script(body: &str, stdin: bool) -> Launch {
         Launch::Browser {
             argv: vec!["/bin/bash".into(), "-c".into(), body.into()],
@@ -1490,6 +1581,7 @@ mod tests {
             no_browser: false,
         }
     }
+    #[cfg(unix)]
     async fn wait_for(
         state: &AppState,
         kind: AgentKind,
@@ -1516,6 +1608,7 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_browser_login_shows_its_page_and_code_takes_a_pasted_code_and_never_claims_success_itself(
     ) {
@@ -1608,6 +1701,7 @@ mod tests {
         assert!(String::from_utf8_lossy(&op.snapshot().cli).contains("got PASTED-1"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_failed_login_carries_a_short_tail_and_cancel_stops_a_waiting_one() {
         let state = state();

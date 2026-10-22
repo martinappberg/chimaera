@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { extractFileRefs, FILE_REF_MAX_BYTES, findFileRef, parseFileRef, type FileRef } from "./fileRef";
+import {
+  extractFileRefs,
+  FILE_REF_MAX_BYTES,
+  findFileRef,
+  parseFileRef,
+  resolveBases,
+  type FileRef,
+} from "./fileRef";
 import fixture from "./fileRefs.fixture.json";
 
 interface Expected {
@@ -94,5 +101,20 @@ describe("length ceiling", () => {
     const long = `${`${seg}/`.repeat(6)}x.md`;
     expect(new TextEncoder().encode(long).length).toBeGreaterThan(FILE_REF_MAX_BYTES);
     expect(parseFileRef(long)).toBeNull();
+  });
+});
+
+describe("resolveBases", () => {
+  it("needs one base for an absolute path, on either host", () => {
+    const ctx = { cwd: "/w/sub", spawnCwd: "/w", root: "/w", workspaceId: "ws" };
+    expect(resolveBases(ctx, "/abs/x.rs")).toEqual(["/w/sub"]);
+    expect(resolveBases(ctx, "~/x.rs")).toEqual(["/w/sub"]);
+    expect(resolveBases(ctx, "./x.rs")).toEqual(["/w/sub", "/w"]);
+    expect(resolveBases(ctx, "x.rs")).toEqual(["/w/sub", "/w"]);
+    const win = { cwd: "C:/w/sub", spawnCwd: "C:/w", root: "C:/w", workspaceId: "ws" };
+    expect(resolveBases(win, "C:/abs/x.rs")).toEqual(["C:/w/sub"]);
+    expect(resolveBases(win, "./x.rs")).toEqual(["C:/w/sub", "C:/w"]);
+    expect(resolveBases(win, "x.rs")).toEqual(["C:/w/sub", "C:/w"]);
+    expect(resolveBases({ cwd: null, root: "//srv/share/w", workspaceId: null }, "x.rs")).toEqual(["//srv/share/w"]);
   });
 });

@@ -37,6 +37,7 @@
   import { isoDay, providerLabels, shortStatusNote } from "./overview";
   import { knowledgeLookup } from "./store";
   import TidyList from "./TidyList.svelte";
+  import { isAbsolute, joinPath } from "../shared/paths";
 
   interface Props {
     wsId?: string | null;
@@ -202,7 +203,7 @@
   }
 
   function abs(p: string): string {
-    return p.startsWith("/") || p.startsWith("~") || wsRoot === null ? p : `${wsRoot}/${p}`;
+    return isAbsolute(p) || p.startsWith("~") || wsRoot === null ? p : joinPath(wsRoot, p);
   }
 
   function openFile(path: string, line: number, end: number): void {

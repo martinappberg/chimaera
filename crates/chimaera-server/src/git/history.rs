@@ -190,7 +190,7 @@ pub(crate) async fn log(State(state): State<Arc<AppState>>, Query(q): Query<LogQ
             || out.stderr.contains("unknown revision")
         {
             return Json(json!({
-                "toplevel": repo.toplevel.to_string_lossy(),
+                "toplevel": chimaera_core::paths::wire_path(&repo.toplevel),
                 "commits": [],
                 "has_more": false,
                 "unborn": true,
@@ -216,7 +216,7 @@ pub(crate) async fn log(State(state): State<Arc<AppState>>, Query(q): Query<LogQ
         })
         .collect();
     Json(json!({
-        "toplevel": repo.toplevel.to_string_lossy(),
+        "toplevel": chimaera_core::paths::wire_path(&repo.toplevel),
         "path": rel,
         "commits": items,
         "has_more": has_more,
@@ -365,9 +365,9 @@ fn files_json(repo: &RepoInfo, files: &[ChangedFile]) -> Vec<serde_json::Value> 
         .iter()
         .map(|f| {
             json!({
-                "path": repo.toplevel.join(&f.rel).to_string_lossy(),
+                "path": chimaera_core::paths::wire_path(&repo.toplevel.join(&f.rel)),
                 "rel": f.rel,
-                "orig": f.orig_rel.as_ref().map(|o| repo.toplevel.join(o).to_string_lossy().into_owned()),
+                "orig": f.orig_rel.as_ref().map(|o| chimaera_core::paths::wire_path(&repo.toplevel.join(o))),
                 "orig_rel": f.orig_rel,
                 "status": f.status.to_string(),
                 "added": f.added,
@@ -448,7 +448,7 @@ pub(crate) async fn show(
         Err(err) => return bad_request(&err.to_string()),
     };
     Json(json!({
-        "toplevel": repo.toplevel.to_string_lossy(),
+        "toplevel": chimaera_core::paths::wire_path(&repo.toplevel),
         "sha": full,
         "parents": parents,
         "author": author,
@@ -596,7 +596,7 @@ pub(crate) async fn compare(
         }
     }
     Json(json!({
-        "toplevel": top.to_string_lossy(),
+        "toplevel": chimaera_core::paths::wire_path(top),
         "base": base_label,
         "merge_base": merge_base,
         "diff_from": from,

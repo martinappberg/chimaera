@@ -17,6 +17,47 @@ use super::include::{copy_included, IncludeReport};
 use super::parse::RepoInfo;
 use super::service::{configured_git, run_git, run_git_within, MAX_STATUS_OUTPUT};
 
+/// A branch name as a Windows directory path: git allows names the Windows
+/// filesystem refuses (`aux`, `con.txt`, `a:b`, a trailing dot), so each
+/// `/`-separated component is made creatable. Applied only on Windows, where
+/// the folder never needs to read back as the branch name (git records the
+/// worktree's branch itself).
+fn windows_safe_dir(branch: &str) -> String {
+    const RESERVED: [&str; 4] = ["CON", "PRN", "AUX", "NUL"];
+    let is_reserved = |stem: &str| {
+        let upper = stem.trim_end().to_ascii_uppercase();
+        RESERVED.contains(&upper.as_str())
+            || (upper.len() == 4
+                && (upper.starts_with("COM") || upper.starts_with("LPT"))
+                && matches!(upper.as_bytes()[3], b'1'..=b'9'))
+    };
+    branch
+        .split('/')
+        .map(|part| {
+            let mut part: String = part
+                .chars()
+                .map(|c| {
+                    if c.is_control() || "<>:\"|?*".contains(c) {
+                        '-'
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            while part.ends_with('.') || part.ends_with(' ') {
+                part.pop();
+                part.push('-');
+            }
+            // The device name applies to the stem: `aux.txt` is as reserved as `aux`.
+            if is_reserved(part.split('.').next().unwrap_or("")) {
+                part.insert(0, '_');
+            }
+            part
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// A stable directory name for a repo, shared by all of its worktrees:
 /// `<repo-dir-name>-<hash of the common git dir>`. The hash disambiguates two
 /// checkouts that happen to share a basename; the name keeps it human.
@@ -167,7 +208,12 @@ async fn prepare_path(
     // minted here), so it carries no `..` component; assert containment
     // anyway — a path escape here would let a later `remove` delete outside
     // the managed root.
-    let path = state.worktrees_root.join(repo_key(repo)).join(branch);
+    let leaf = if cfg!(windows) {
+        windows_safe_dir(branch)
+    } else {
+        branch.to_string()
+    };
+    let path = state.worktrees_root.join(repo_key(repo)).join(leaf);
     if !path.starts_with(&state.worktrees_root) {
         return Err(refuse(
             StatusCode::BAD_REQUEST,
@@ -195,7 +241,8 @@ async fn prepare_path(
                 format!("failed to create {}: {err}", parent.display()),
             )
         })?;
-        let real = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+        let real =
+            chimaera_core::paths::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
         Ok(real.join(leaf))
     })
     .await
@@ -523,7 +570,7 @@ pub(crate) async fn discard_session_worktree(
     else {
         return;
     };
-    let path = created.path.to_string_lossy().into_owned();
+    let path = chimaera_core::paths::wire_path(&created.path);
     let procs = &state.git.procs;
     match run_git(
         &git.path,
@@ -649,6 +696,23 @@ pub(crate) async fn forget_missing_managed_workspaces(state: &Arc<AppState>) {
 
 #[cfg(test)]
 mod tests {
+    use super::windows_safe_dir;
+
+    #[test]
+    fn windows_dir_names_avoid_reserved_devices_and_bad_characters() {
+        assert_eq!(windows_safe_dir("feature/login"), "feature/login");
+        assert_eq!(windows_safe_dir("aux"), "_aux");
+        assert_eq!(windows_safe_dir("Con.txt"), "_Con.txt");
+        assert_eq!(windows_safe_dir("fix/com1"), "fix/_com1");
+        assert_eq!(windows_safe_dir("lpt9.x.y"), "_lpt9.x.y");
+        assert_eq!(windows_safe_dir("com0"), "com0");
+        assert_eq!(windows_safe_dir("auxiliary"), "auxiliary");
+        assert_eq!(windows_safe_dir("a:b|c?d*e\"f<g>"), "a-b-c-d-e-f-g-");
+        assert_eq!(windows_safe_dir("x\u{1}y"), "x-y");
+        assert_eq!(windows_safe_dir("name."), "name-");
+        assert_eq!(windows_safe_dir("dir./leaf "), "dir-/leaf-");
+    }
+
     #[test]
     fn session_worktree_suffix_is_six_hex_digits() {
         for _ in 0..64 {
@@ -721,7 +785,7 @@ pub(crate) async fn create_worktree(
     .await
     {
         Ok(created) => Json(json!({
-            "worktree": {"path": created.path.to_string_lossy(), "branch": created.branch},
+            "worktree": {"path": chimaera_core::paths::wire_path(&created.path), "branch": created.branch},
             "workspace": null,
             "included": created.included.json(),
         }))
@@ -825,8 +889,8 @@ pub(crate) async fn remove_worktree(
         let root = state.worktrees_root.clone();
         match tokio::task::spawn_blocking(move || {
             (
-                std::fs::canonicalize(&raw).ok(),
-                std::fs::canonicalize(&root).unwrap_or(root),
+                chimaera_core::paths::canonicalize(&raw).ok(),
+                chimaera_core::paths::canonicalize(&root).unwrap_or(root),
             )
         })
         .await
@@ -992,7 +1056,7 @@ pub(crate) async fn allowed_session_cwd(
         return Err("cwd must be an absolute path".to_string());
     }
     let canonical = tokio::task::spawn_blocking(move || {
-        std::fs::canonicalize(&requested)
+        chimaera_core::paths::canonicalize(&requested)
             .ok()
             .filter(|p| p.is_dir())
     })

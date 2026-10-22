@@ -30,17 +30,33 @@
 //! redirected stdio, the new session, the environment, and the pid all survive
 //! it, so the re-exec'd daemon lands fully detached and connect can still stop
 //! it by the pid in its manifest.
+//!
+//! Windows has no fork, SIGHUP or sessions: `detach` there starts a fresh
+//! `chimaera serve` as a detached process (no console, its own process group,
+//! so the launching console's Ctrl-C and close never reach it) and exits. The
+//! stdio policy is the same: a redirect to a file is kept, anything else
+//! becomes `NUL`. Nothing launches a Windows daemon this way today (`connect`
+//! targets POSIX hosts, the app spawns its own); it is for a user starting one
+//! by hand.
 
+#[cfg(unix)]
 use std::ffi::CString;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::io::{AsFd, AsRawFd};
 
 use anyhow::Context;
+#[cfg(unix)]
 use nix::fcntl::OFlag;
+#[cfg(unix)]
 use nix::sys::signal::{signal, SigHandler, Signal};
+#[cfg(unix)]
 use nix::sys::stat::{fstat, Mode, SFlag};
+#[cfg(unix)]
 use nix::unistd::{close, dup2_stderr, dup2_stdin, dup2_stdout, execv, fork, setsid, ForkResult};
 
+#[cfg(unix)]
 fn is_regular_file(fd: impl AsFd) -> bool {
     matches!(fstat(fd), Ok(st) if SFlag::from_bits_truncate(st.st_mode) & SFlag::S_IFMT == SFlag::S_IFREG)
 }
@@ -52,6 +68,7 @@ fn is_regular_file(fd: impl AsFd) -> bool {
 /// runtime spawns its workers — so the `fork` clones a quiescent process and the
 /// child touches nothing an async-signal-unsafe path (allocation included) would
 /// need.
+#[cfg(unix)]
 pub fn detach() -> anyhow::Result<()> {
     // Prepare EVERYTHING the child needs here, in the parent, before the fork:
     // the child may not allocate (an inherited allocator lock could deadlock it),
@@ -140,5 +157,63 @@ pub fn detach() -> anyhow::Result<()> {
             let errno = execv(&exe_c, &argv).expect_err("execv returns only on failure");
             Err(anyhow::Error::new(errno).context("re-exec the detached daemon"))
         }
+    }
+}
+
+/// Start a detached `chimaera serve` (without `--daemonize`) and exit. The
+/// child inherits the environment and every other argument verbatim.
+#[cfg(windows)]
+pub fn detach() -> anyhow::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use std::process::{Command, Stdio};
+
+    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+
+    let exe = std::env::current_exe().context("locate own executable to start")?;
+    let args: Vec<_> = std::env::args_os()
+        .skip(1)
+        .filter(|arg| arg != "--daemonize")
+        .collect();
+    let (stdout, stderr) = (
+        kept_if_file(std::io::stdout()),
+        kept_if_file(std::io::stderr()),
+    );
+    // CreateProcess hands the child every inheritable handle this process
+    // holds, not only the three it is given: a launcher's pipe would stay
+    // open for the daemon's lifetime and its reader would never see EOF.
+    // Ours are about to close with this process anyway.
+    for handle in [
+        std::io::stdin().as_raw_handle(),
+        std::io::stdout().as_raw_handle(),
+        std::io::stderr().as_raw_handle(),
+    ] {
+        // SAFETY: the process's own std handles; clearing the flag only
+        // changes what a later CreateProcess inherits. A failure (a null
+        // handle) leaves nothing to inherit.
+        unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+    }
+    let mut cmd = Command::new(exe);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr);
+    chimaera_core::proc::spawn_detached(&mut cmd).context("start the detached daemon")?;
+    std::process::exit(0);
+}
+
+/// The handle itself when it is a disk file (a caller's log redirect), else
+/// `NUL`: a console or a pipe dies with the launcher, and a daemon that keeps
+/// writing its logs into one fails every write after that.
+#[cfg(windows)]
+fn kept_if_file(stdio: impl std::os::windows::io::AsHandle) -> std::process::Stdio {
+    use windows_sys::Win32::Storage::FileSystem::{GetFileType, FILE_TYPE_DISK};
+
+    let handle = stdio.as_handle();
+    // SAFETY: a borrowed, open handle; GetFileType only queries it.
+    let is_file = unsafe { GetFileType(std::os::windows::io::AsRawHandle::as_raw_handle(&handle)) }
+        == FILE_TYPE_DISK;
+    match is_file.then(|| handle.try_clone_to_owned()) {
+        Some(Ok(owned)) => std::process::Stdio::from(owned),
+        _ => std::process::Stdio::null(),
     }
 }

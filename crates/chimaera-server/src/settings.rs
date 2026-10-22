@@ -134,7 +134,7 @@ impl SettingsStore {
     /// Replace the whole map and persist (pretty-printed, atomic rename).
     /// Blocking, under the caller's lock: the route goes through
     /// [`put_settings`] instead.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn put(&mut self, map: Map) -> anyhow::Result<()> {
         let body = encode(&map).map_err(|err| match err {
             WriteError::TooLarge => anyhow::anyhow!("settings exceed {MAX_SETTINGS_BYTES} bytes"),

@@ -6,7 +6,8 @@
    * no recursive components, trivial scrolling.
    */
   import { tick, untrack } from "svelte";
-  import { basename, dirLabel, dirname, fsDownload, fsList, type FsEntry } from "../previews/files";
+  import { dirLabel, fsDownload, fsList, type FsEntry } from "../previews/files";
+  import { basename, dirname, isRoot, isUnder, joinPath, relativeTo, trimSlash } from "../shared/paths";
   import { getSetting } from "../settings/store.svelte";
   import {
     gitIndex,
@@ -416,7 +417,7 @@
   }
 
   // --- file drop target ---------------------------------------------------
-  const rootPath = $derived(root.length > 1 && root.endsWith("/") ? root.slice(0, -1) : root);
+  const rootPath = $derived(trimSlash(root));
   const dropIsRoot = $derived(dropDir !== null && (dropDir === root || dropDir === rootPath));
   /** The targeted dir row and its visible subtree (start, end] — the folder's
    *  extent washes so "into this folder" reads as a region, not a line. */
@@ -539,8 +540,8 @@
     let dir = dirname(path);
     while (true) {
       dirs.add(dir);
-      if (dir === r || dir === "/") break;
-      if (r !== "/" && !dir.startsWith(`${r}/`)) break;
+      if (dir === r || isRoot(dir)) break;
+      if (!isUnder(dir, r)) break;
       dir = dirname(dir);
     }
   }
@@ -644,16 +645,16 @@
 
   async function doReveal(path: string): Promise<void> {
     const r = rootPath;
-    if (path !== r && !path.startsWith(`${r}/`)) return;
+    const rel = relativeTo(path, r);
+    if (rel === null) return;
     closeFilter();
-    const rel = path === r ? "" : path.slice(r.length + 1);
-    const parts = rel === "" ? [] : rel.split("/");
+    const parts = rel === "." ? [] : rel.split("/");
     // Expand every ancestor; the target itself expands too when it is a dir
     // (its row exists either way — the parent listing decides its kind).
     const chain: string[] = [];
     let cur = r;
     for (const part of parts) {
-      cur = `${cur}/${part}`;
+      cur = joinPath(cur, part);
       chain.push(cur);
     }
     for (const d of [r, ...chain.slice(0, -1)]) {
@@ -768,14 +769,16 @@
    *  unfocused ghost input. */
   const inline = new InlineRename<TreeEdit>({
     check(cur, name) {
-      const invalid = validateEntryName(name, { allowSlashes: cur.mode === "create" });
+      const invalid = validateEntryName(name, {
+        allowSlashes: cur.mode === "create",
+        dir: cur.mode === "create" ? cur.parent : dirname(cur.path),
+      });
       if (invalid !== null) return { invalid };
       return cur.mode === "rename" && name === cur.name ? "unchanged" : "submit";
     },
     async submit(cur, name, close) {
       if (cur.mode === "create") {
-        const base = cur.parent === "/" ? "" : cur.parent;
-        const created = await fsCreateOp(`${base}/${name}`, cur.kind);
+        const created = await fsCreateOp(joinPath(cur.parent, name), cur.kind);
         close();
         // doReveal refreshes every ancestor listing (nested a/b/c names just
         // work), expands the chain, scrolls + flashes the new row.
@@ -784,7 +787,7 @@
         if (cur.kind === "file") onOpenPinned(created);
       } else {
         const parent = dirname(cur.path);
-        await fsRenameOp(cur.path, `${parent === "/" ? "" : parent}/${name}`);
+        await fsRenameOp(cur.path, joinPath(parent, name));
         // the fsEpoch bump re-lists; App rewrites open tabs
       }
     },

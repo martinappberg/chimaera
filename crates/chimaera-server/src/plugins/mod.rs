@@ -1008,9 +1008,14 @@ pub(crate) mod test_catalog {
     /// `plugins/dist-test/<dir>` on disk: what a test installs by path (the
     /// first-party releases the build script downloads there, the fixture).
     pub(crate) fn dist_test_dir(dir: &str) -> PathBuf {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../plugins/dist-test")
-            .join(dir);
+        // A cross-compiled Windows test binary carries the build host's
+        // drive-less manifest dir; installs take only absolute paths.
+        let path = std::path::absolute(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../plugins/dist-test")
+                .join(dir),
+        )
+        .unwrap();
         assert!(
             path.join("plugin.wasm").is_file(),
             "{} — run scripts/build-plugins.sh",
@@ -1173,7 +1178,7 @@ pub(crate) fn manifest_json(state: &AppState, m: &Manifest) -> Value {
     v["verified"] = json!(o.verified);
     v["sha256_wasm"] = json!(&*m.wasm.sha256);
     if let Some(path) = &o.path {
-        v["path"] = json!(path);
+        v["path"] = json!(chimaera_core::paths::wire_path(path));
     }
     if let Some(repo) = &o.release {
         v["repo"] = json!(repo);
@@ -1184,7 +1189,7 @@ pub(crate) fn manifest_json(state: &AppState, m: &Manifest) -> Value {
         }
     }
     if let Some(dir) = &o.local_path {
-        v["local_path"] = json!(dir);
+        v["local_path"] = json!(chimaera_core::paths::wire_path(dir));
     }
     if let Some(previous) = &o.previous {
         v["previous"] = json!(previous);
@@ -1372,7 +1377,7 @@ pub(crate) async fn workspace_plugins(
     Json(json!({
         "schema": 1,
         "workspace_id": id,
-        "root": workspace.root,
+        "root": chimaera_core::paths::wire_path(&workspace.root),
         "plugins": plugins,
         "policy": trust::policy(&state).json(),
     }))
@@ -1604,6 +1609,20 @@ pub(crate) async fn install_requirement(
     }
     if !cli_safe(&req.id) || !cli_safe(&req.marketplace) {
         return bad_request("manifest requirement is not CLI-safe");
+    }
+    // The install runs `install-agent.sh` under bash; a Windows host has no
+    // POSIX shell to run it, so the user gets the agent's own commands.
+    if cfg!(windows) {
+        let agent = kind.as_str();
+        let verb = if kind == crate::agents::AgentKind::Codex {
+            "add"
+        } else {
+            "install"
+        };
+        return bad_request(format!(
+            "Installing agent plugins from Chimaera isn't supported on Windows yet. In a terminal, run `{agent} plugin marketplace add {}`, then `{agent} plugin {verb} {}`.",
+            req.marketplace, req.id
+        ));
     }
     let det = crate::launcher::detect(&state, kind, false).await;
     let bin = match det.path {

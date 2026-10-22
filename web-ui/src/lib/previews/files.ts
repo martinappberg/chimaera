@@ -14,6 +14,7 @@
 
 import { api, ApiError } from "../net/api";
 import { EXT_GLYPH, GLYPHS, NAME_GLYPH, type Glyph } from "../shared/icons";
+import * as paths from "../shared/paths";
 
 export interface FsEntry {
   name: string;
@@ -832,14 +833,14 @@ export async function fsProbe(path: string): Promise<"ok" | "dead" | "unknown"> 
 // --- pure path/display helpers ----------------------------------------------
 
 export function basename(path: string): string {
-  const trimmed = path.endsWith("/") ? path.slice(0, -1) : path;
-  const i = trimmed.lastIndexOf("/");
-  return i >= 0 ? trimmed.slice(i + 1) : trimmed;
+  return paths.basename(path);
 }
 
-/** A directory as a drop-destination label: `src/`, and `/` for the root
- *  (never `//`). One helper so every "upload into …" chip agrees. */
+/** A directory as a drop-destination label: `src/`, and the root itself
+ *  (`/`, `C:/`) for a root (never `//`). One helper so every "upload into …"
+ *  chip agrees. */
 export function dirLabel(path: string): string {
+  if (paths.isRoot(path)) return paths.rootOf(path);
   const name = basename(path);
   return name === "" ? "/" : `${name}/`;
 }
@@ -855,15 +856,28 @@ export function midTruncate(s: string, max: number): string {
   return `${s.slice(0, head)}…${s.slice(s.length - tail)}`;
 }
 
-/** Name of the containing directory ("/" for root-level paths). */
+/** A drive or UNC root: the daemon runs on Windows. */
+function foreignRoot(path: string): string {
+  const root = paths.rootOf(path);
+  return root === "/" ? "" : root;
+}
+
+/** Name of the containing directory ("/" for root-level paths; the drive or
+ *  share root, e.g. `C:/`, for a root-level path on a Windows host). */
 export function parentName(path: string): string {
+  if (foreignRoot(path) !== "") {
+    const parent = paths.dirname(path);
+    return paths.isRoot(parent) ? paths.rootOf(parent) : paths.basename(parent);
+  }
   const i = path.lastIndexOf("/");
   if (i <= 0) return "/";
   return basename(path.slice(0, i));
 }
 
-/** Absolute path of the containing directory ("/" at the top). */
+/** Absolute path of the containing directory ("/" at the top; a root's
+ *  parent is the root itself). */
 export function dirname(path: string): string {
+  if (foreignRoot(path) !== "") return paths.dirname(path);
   const trimmed = path.endsWith("/") ? path.slice(0, -1) : path;
   const i = trimmed.lastIndexOf("/");
   return i > 0 ? trimmed.slice(0, i) : "/";
@@ -871,7 +885,7 @@ export function dirname(path: string): string {
 
 /** Join a directory and a leaf into an absolute path. */
 export function joinPath(dir: string, leaf: string): string {
-  return dir.endsWith("/") ? `${dir}${leaf}` : `${dir}/${leaf}`;
+  return dir === "" ? `/${leaf}` : paths.joinPath(dir, leaf);
 }
 
 /**
@@ -892,16 +906,31 @@ export function safeDecodeUri(s: string): string {
 }
 
 export function resolveDocPath(docPath: string, rel: string): string {
-  const i = docPath.lastIndexOf("/");
-  const base = i <= 0 ? "" : docPath.slice(0, i);
-  const parts = (rel.startsWith("/") ? rel : `${base}/${rel}`).split("/");
+  // The result keeps the document's root: `C:/a/b.md` + `../x.png` →
+  // `C:/x.png`, and a root-absolute `/x.png` lands on the same drive. Only a
+  // Windows document honors a drive-absolute `rel`; on a Unix host `C:/x` is
+  // an ordinary relative name.
+  const docRoot = paths.rootOf(docPath);
+  let root = docRoot === "" ? "/" : docRoot;
+  let rest: string;
+  const relRoot = paths.rootOf(rel);
+  if (foreignRoot(docPath) !== "" && relRoot !== "" && relRoot !== "/") {
+    root = relRoot;
+    rest = rel.slice(relRoot.length);
+  } else if (rel.startsWith("/")) {
+    rest = rel;
+  } else {
+    const i = docPath.lastIndexOf("/");
+    const base = i <= 0 ? "" : docPath.slice(0, i);
+    rest = `${base.slice(Math.min(docRoot.length, base.length))}/${rel}`;
+  }
   const out: string[] = [];
-  for (const seg of parts) {
+  for (const seg of rest.split("/")) {
     if (seg === "" || seg === ".") continue;
     if (seg === "..") out.pop();
     else out.push(seg);
   }
-  return `/${out.join("/")}`;
+  return `${root}${out.join("/")}`;
 }
 
 export function extension(path: string): string {

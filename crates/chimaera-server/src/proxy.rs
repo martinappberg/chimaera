@@ -133,6 +133,12 @@ impl ProxyStore {
     }
 }
 
+/// The null known_hosts for a relay hop, in the platform ssh's own spelling.
+#[cfg(unix)]
+const NULL_KNOWN_HOSTS: &str = "UserKnownHostsFile=/dev/null";
+#[cfg(windows)]
+const NULL_KNOWN_HOSTS: &str = "UserKnownHostsFile=NUL";
+
 /// SIGKILL + reap a relay child off the caller's path.
 fn kill_relay(mut child: tokio::process::Child) {
     let _ = child.start_kill();
@@ -749,7 +755,10 @@ async fn start_relay(host: &str, port: u16) -> Result<(tokio::process::Child, u1
             .map_err(|e| format!("no local port for the relay: {e}"))?
             .port()
     };
-    let mut child = tokio::process::Command::new("ssh")
+    let mut ssh = tokio::process::Command::new("ssh");
+    #[cfg(windows)]
+    ssh.creation_flags(chimaera_core::CREATE_NO_WINDOW);
+    let mut child = ssh
         .args([
             "-o",
             "BatchMode=yes",
@@ -764,7 +773,7 @@ async fn start_relay(host: &str, port: u16) -> Result<(tokio::process::Child, u1
             "-o",
             "StrictHostKeyChecking=no",
             "-o",
-            "UserKnownHostsFile=/dev/null",
+            NULL_KNOWN_HOSTS,
             "-o",
             "ConnectTimeout=10",
             "-o",

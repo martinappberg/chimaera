@@ -1943,6 +1943,7 @@ fn ask_user(state: &Arc<AppState>, ws: &str, req: WakeRequest) {
 
 /// Use up a workspace's unattended wakes (tests drive the limit without
 /// twenty real wakes).
+#[cfg_attr(not(unix), allow(dead_code))]
 #[cfg(test)]
 pub(crate) fn use_unattended_wakes_for_tests(state: &AppState, ws: &str) {
     crate::lock(&state.comms.inner)
@@ -1951,6 +1952,7 @@ pub(crate) fn use_unattended_wakes_for_tests(state: &AppState, ws: &str) {
 }
 
 /// How many unattended wakes a workspace's agents have used.
+#[cfg_attr(not(unix), allow(dead_code))]
 #[cfg(test)]
 pub(crate) fn unattended_wakes_for_tests(state: &AppState, ws: &str) -> usize {
     crate::lock(&state.comms.inner)

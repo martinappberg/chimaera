@@ -432,12 +432,16 @@ async fn settings_getters_answer_from_the_cache_while_the_read_is_stalled() {
         lock(&state.settings).git_path().as_deref(),
         Some("/opt/git-old/bin/git")
     );
-    let session = format!("settings-stalled-{}", std::process::id());
-    let prelude = crate::environment::materialize_prelude(&state, &session, "w-1", None, None)
-        .expect("the cached host prelude");
-    let text = std::fs::read_to_string(&prelude).unwrap();
-    crate::environment::remove_prelude_file(&session);
-    assert!(text.contains("ml cached-host"), "{text}");
+    // Preludes are POSIX shell: a Windows spawn never gets one.
+    #[cfg(unix)]
+    {
+        let session = format!("settings-stalled-{}", std::process::id());
+        let prelude = crate::environment::materialize_prelude(&state, &session, "w-1", None, None)
+            .expect("the cached host prelude");
+        let text = std::fs::read_to_string(&prelude).unwrap();
+        crate::environment::remove_prelude_file(&session);
+        assert!(text.contains("ml cached-host"), "{text}");
+    }
     let (status, _) = request(&state, Method::GET, "/api/v1/health", None).await;
     assert_eq!(status, StatusCode::OK);
     assert!(!parked.is_finished(), "the stalled read let go early");

@@ -1,6 +1,6 @@
 //! One command vocabulary shared by the Tauri build-time permission generator
 //! and the runtime daemon-window capability. `generate_handler!` remains the
-//! compiler-checked dispatch side; wizard grants remain static and local-only.
+//! compiler-checked dispatch side.
 
 pub const DAEMON_UI_COMMANDS: &[&str] = &[
     "list_hosts",
@@ -62,17 +62,6 @@ pub const DAEMON_UI_COMMANDS: &[&str] = &[
     "answer_askpass",
     "list_askpass",
     "cache_appearance",
-];
-
-// The application crate consumes only the daemon list at runtime; this list is
-// consumed by the separately compiled build script.
-#[allow(dead_code)]
-pub const WSL_SETUP_COMMANDS: &[&str] = &[
-    "wsl_status",
-    "wsl_install",
-    "wsl_update",
-    "wsl_install_distro",
-    "wsl_setup_daemon",
 ];
 
 /// Who may invoke a daemon-window command. Every daemon page holds the same

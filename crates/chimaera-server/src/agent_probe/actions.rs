@@ -15,6 +15,7 @@ pub(crate) struct Action {
     pub(crate) target: Option<String>,
 }
 
+#[cfg(unix)]
 const SCRIPT: &str = r#"completion=$1
 trust=$2
 shift 2
@@ -40,6 +41,105 @@ if [ "$trust" = grok-install ]; then
 fi
 "$@"
 "#;
+
+/// [`SCRIPT`] for Windows PowerShell 5.1 and later. Fixed text: the
+/// completion file, the trust mode and the command (a JSON array) arrive in
+/// the environment, never as source.
+#[cfg(windows)]
+const SCRIPT_PS: &str = r#"$cmd = $env:CHIMAERA_ACTION_ARGV | ConvertFrom-Json
+$cmd = @($cmd)
+$result = 0
+$run = $true
+if ($env:CHIMAERA_ACTION_TRUST -eq 'grok-install') {
+    Write-Output 'Grok plugins can run hooks, tools, and connections on this machine.'
+    $answer = Read-Host ('Install and trust ' + $cmd[-1] + '? [y/N]')
+    if ($answer -cmatch '^(y|Y|yes|YES)$') { $cmd += '--trust' } else { Write-Output 'Installation cancelled.'; $run = $false }
+}
+if ($run) {
+    $rest = @()
+    if ($cmd.Count -gt 1) { $rest = $cmd[1..($cmd.Count - 1)] }
+    try {
+        & $cmd[0] @rest
+        $result = $LASTEXITCODE
+        if ($null -eq $result) { $result = 0 }
+    } catch {
+        Write-Output $_.Exception.Message
+        $result = 1
+    }
+}
+Write-Output ''
+if ($result -eq 0) {
+    Write-Output 'Finished. Return to Extensions to check the result.'
+    Write-Output 'Start a new agent session to load changed extensions.'
+} else {
+    Write-Output ('The agent command failed (exit ' + $result + '). Review its message above.')
+}
+Set-Content -NoNewline -Path $env:CHIMAERA_ACTION_DONE -Value '1'
+if (-not [Console]::IsInputRedirected) { Write-Output ''; [void](Read-Host 'Press Enter to close') }
+exit $result
+"#;
+
+/// The PTY command that runs `bin args` as the action, and the environment
+/// it reads. Unix: [`SCRIPT`] in bash, through the login shell.
+#[cfg(unix)]
+fn action_command(
+    completion: &Path,
+    trust: &str,
+    bin: &Path,
+    args: Vec<String>,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let mut argv = vec![
+        "/bin/bash".into(),
+        "-c".into(),
+        SCRIPT.into(),
+        "chimaera-extension-action".into(),
+        completion.display().to_string(),
+        trust.to_string(),
+        bin.display().to_string(),
+    ];
+    argv.extend(args);
+    (
+        crate::launcher::wrap_login_shell(&crate::launcher::login_shell(), argv),
+        Vec::new(),
+    )
+}
+
+/// Windows: [`SCRIPT_PS`], passed encoded so no quoting rule touches it.
+#[cfg(windows)]
+fn action_command(
+    completion: &Path,
+    trust: &str,
+    bin: &Path,
+    args: Vec<String>,
+) -> (Vec<String>, Vec<(String, String)>) {
+    use base64::Engine as _;
+    let utf16: Vec<u8> = SCRIPT_PS
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let mut command = vec![bin.display().to_string()];
+    command.extend(args);
+    let argv = vec![
+        "powershell.exe".to_string(),
+        "-NoProfile".to_string(),
+        "-ExecutionPolicy".to_string(),
+        "Bypass".to_string(),
+        "-EncodedCommand".to_string(),
+        base64::engine::general_purpose::STANDARD.encode(utf16),
+    ];
+    let env = vec![
+        (
+            "CHIMAERA_ACTION_DONE".to_string(),
+            completion.display().to_string(),
+        ),
+        ("CHIMAERA_ACTION_TRUST".to_string(), trust.to_string()),
+        (
+            "CHIMAERA_ACTION_ARGV".to_string(),
+            serde_json::to_string(&command).unwrap_or_default(),
+        ),
+    ];
+    (argv, env)
+}
 
 pub(crate) async fn run(
     State(state): State<Arc<AppState>>,
@@ -104,31 +204,21 @@ pub(crate) async fn run(
     let Ok(Ok((completion, prelude))) = prepared else {
         return crate::plugins::bad_request("Couldn't prepare extension management.");
     };
-    let env = crate::api::session_env(&state, &sid, "dark", prelude.as_deref());
+    let mut env = crate::api::session_env(&state, &sid, "dark", prelude.as_deref());
+    let trust = if kind == AgentKind::Grok && body.action == "install_plugin" {
+        "grok-install"
+    } else {
+        "native"
+    };
+    let (command, action_env) = action_command(&completion, trust, &bin, args);
+    env.extend(action_env);
     let env_remove = crate::api::spawn_env_remove(&env);
-    let mut argv = vec![
-        "/bin/bash".into(),
-        "-c".into(),
-        SCRIPT.into(),
-        "chimaera-extension-action".into(),
-        completion.display().to_string(),
-        if kind == AgentKind::Grok && body.action == "install_plugin" {
-            "grok-install".into()
-        } else {
-            "native".into()
-        },
-        bin.display().to_string(),
-    ];
-    argv.extend(args);
     let result = state.sessions.spawn(chimaera_pty::SpawnOpts {
         cwd: workspace.root,
         name: Some(format!("{} extensions", body.agent)),
         cols: 100,
         rows: 28,
-        command: Some(crate::launcher::wrap_login_shell(
-            &crate::launcher::login_shell(),
-            argv,
-        )),
+        command: Some(command),
         id: Some(sid.clone()),
         env,
         env_remove,
@@ -169,7 +259,8 @@ pub(crate) async fn run(
     }
 }
 
-#[cfg(test)]
+// The trust prompt is the bash script's.
+#[cfg(all(test, unix))]
 mod tests {
     use super::SCRIPT;
     use std::io::Write;

@@ -95,7 +95,7 @@ pub(crate) async fn create_workspace(
     // Validate off the reactor; the error strings are unchanged.
     let input = body.root.clone();
     let validated = tokio::task::spawn_blocking(move || {
-        let root = std::fs::canonicalize(PathBuf::from(&input))
+        let root = chimaera_core::paths::canonicalize(&PathBuf::from(&input))
             .map_err(|err| format!("{input}: {err}"))?;
         if !root.is_dir() {
             return Err(format!("{} is not a directory", root.display()));

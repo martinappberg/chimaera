@@ -13,6 +13,7 @@
 //! and run off the reactor under the shared filesystem limiter.
 
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -196,7 +197,7 @@ fn write_atomic_if(
     unchanged: impl FnOnce() -> anyhow::Result<bool>,
 ) -> anyhow::Result<bool> {
     let target = match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => std::fs::canonicalize(path)
+        Ok(meta) if meta.file_type().is_symlink() => chimaera_core::paths::canonicalize(path)
             .with_context(|| format!("{} is a dangling symlink", path.display()))?,
         _ => path.to_path_buf(),
     };
@@ -208,6 +209,9 @@ fn write_atomic_if(
         .with_context(|| format!("{} has no file name", target.display()))?
         .to_string_lossy()
         .into_owned();
+    // Windows has no mode bits to carry over: the new file takes its
+    // folder's inherited ACL, as the replaced one did.
+    #[cfg(unix)]
     let mode = std::fs::metadata(&target)
         .map(|m| m.permissions().mode() & 0o7777)
         .unwrap_or(0o644);
@@ -220,13 +224,15 @@ fn write_atomic_if(
         std::process::id()
     ));
     let result = (|| -> anyhow::Result<bool> {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(mode)
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(mode);
+        let mut file = options
             .open(&tmp)
             .with_context(|| format!("failed to create {}", tmp.display()))?;
         // The open's mode passed through the umask; restore the exact bits.
+        #[cfg(unix)]
         let _ = file.set_permissions(std::fs::Permissions::from_mode(mode));
         file.write_all(contents.as_bytes())
             .and_then(|()| file.sync_all())
@@ -345,7 +351,7 @@ pub(crate) async fn status(
             };
             targets.push(json!({
                 "target": "agents_md",
-                "path": path,
+                "path": chimaera_core::paths::wire_path(&path),
                 "state": state,
                 "text": agents_block(),
             }));
@@ -356,7 +362,7 @@ pub(crate) async fn status(
         };
         targets.push(json!({
             "target": "claude_skill",
-            "path": skill,
+            "path": chimaera_core::paths::wire_path(&skill),
             "state": state,
             "text": skill_text(),
         }));
@@ -401,6 +407,7 @@ pub(crate) async fn install(
             install_agents_md(&path)?
         };
         tracing::info!(target = %target, path = %path.display(), changed, "agent docs installed");
+        let path = chimaera_core::paths::wire_path(&path);
         Ok(json!({"target": target, "path": path, "changed": changed, "created": created}))
     })
     .await;

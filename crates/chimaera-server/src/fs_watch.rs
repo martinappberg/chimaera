@@ -331,20 +331,11 @@ fn bounded_paths(
         }
         *total_bytes = next_total;
         out.push(WatchPath {
-            disk: expand_tilde(&wire),
+            disk: chimaera_core::paths::expand_tilde(&wire),
             wire,
         });
     }
     out
-}
-
-fn expand_tilde(raw: &str) -> PathBuf {
-    if let Some(rest) = raw.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return Path::new(&home).join(rest);
-        }
-    }
-    PathBuf::from(raw)
 }
 
 fn observe(

@@ -842,7 +842,7 @@ pub(crate) fn spawn_jobs_task(state: Arc<AppState>) {
     {
         return;
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = chimaera_core::paths::home_dir();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(JOBS_TICK).await;
@@ -888,7 +888,7 @@ fn session_kind(state: &AppState, sid: &str) -> (Option<String>, &'static str) {
 
 fn relative_to(root: Option<&Path>, path: &str) -> String {
     root.and_then(|r| Path::new(path).strip_prefix(r).ok())
-        .map(|p| p.to_string_lossy().into_owned())
+        .map(chimaera_core::paths::wire_path)
         .unwrap_or_else(|| path.to_string())
 }
 

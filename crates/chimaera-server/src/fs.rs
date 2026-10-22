@@ -23,6 +23,8 @@ use flate2::read::{GzDecoder, MultiGzDecoder};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use chimaera_core::paths::wire_path;
+
 use crate::AppState;
 
 mod row_index;
@@ -96,30 +98,28 @@ const MAX_TICKETS: usize = 4096;
 /// requests remain asynchronous, so terminals/chat/health stay responsive.
 pub(crate) static FILESYSTEM_WORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
 
-/// The daemon user's home directory (`$HOME`).
+/// The daemon user's home directory (`$HOME`; Windows: the profile folder).
 fn home_dir() -> anyhow::Result<PathBuf> {
-    match std::env::var_os("HOME") {
-        Some(home) if !home.is_empty() => Ok(PathBuf::from(home)),
-        _ => anyhow::bail!("HOME is not set"),
-    }
+    chimaera_core::paths::home_dir().context("HOME is not set")
 }
 
 /// Expand a leading `~` to the user's home directory; other paths pass through.
 pub(crate) fn expand_tilde(raw: &str) -> anyhow::Result<PathBuf> {
-    if raw == "~" {
-        return home_dir();
+    let tilde = raw == "~" || raw.starts_with("~/") || (cfg!(windows) && raw.starts_with("~\\"));
+    if !tilde {
+        return Ok(PathBuf::from(raw));
     }
-    if let Some(rest) = raw.strip_prefix("~/") {
-        return Ok(home_dir()?.join(rest));
-    }
-    Ok(PathBuf::from(raw))
+    Ok(chimaera_core::paths::expand_tilde_with(
+        raw,
+        Some(&home_dir()?),
+    ))
 }
 
 /// Expand `~` and canonicalize; the error carries the pre-canonical path so
 /// "$path: No such file or directory" reads naturally.
 fn canonical(raw: &str) -> anyhow::Result<PathBuf> {
     let expanded = expand_tilde(raw)?;
-    std::fs::canonicalize(&expanded).with_context(|| expanded.display().to_string())
+    chimaera_core::paths::canonicalize(&expanded).with_context(|| expanded.display().to_string())
 }
 
 /// Resolve `raw` WITHOUT following a final symlink: `~` expanded, the parent
@@ -137,7 +137,8 @@ fn canonical_parent_join(raw: &str) -> anyhow::Result<PathBuf> {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => anyhow::bail!("{} has no parent directory", expanded.display()),
     };
-    let parent = std::fs::canonicalize(parent).with_context(|| parent.display().to_string())?;
+    let parent =
+        chimaera_core::paths::canonicalize(parent).with_context(|| parent.display().to_string())?;
     Ok(parent.join(name))
 }
 
@@ -155,15 +156,22 @@ pub(crate) fn canonical_file(raw: &str) -> anyhow::Result<PathBuf> {
 /// but a FIFO swapped in after that check would park a plain `open` until a
 /// writer shows up — holding a blocking worker and whatever limiter permit
 /// the caller took — and a device (`/dev/zero`) would stream without end.
-/// `O_NONBLOCK` changes nothing for a regular file's reads.
+/// `O_NONBLOCK` changes nothing for a regular file's reads. Windows has no
+/// FIFO in the filesystem namespace and refuses to open a directory as a
+/// file, so a plain open plus the same check covers it.
 pub(crate) fn open_regular(path: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
-    use rustix::fs::{Mode, OFlags};
-    let fd = rustix::fs::open(
-        path,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
-        Mode::empty(),
-    )?;
-    let file = std::fs::File::from(fd);
+    #[cfg(unix)]
+    let file = {
+        use rustix::fs::{Mode, OFlags};
+        let fd = rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )?;
+        std::fs::File::from(fd)
+    };
+    #[cfg(windows)]
+    let file = std::fs::File::open(path)?;
     let meta = file.metadata()?;
     if !meta.is_file() {
         return Err(std::io::Error::new(
@@ -241,6 +249,13 @@ pub(crate) fn mtime_token(meta: &std::fs::Metadata) -> String {
         hasher.update(meta.ctime().to_le_bytes());
         hasher.update(meta.ctime_nsec().to_le_bytes());
     }
+    // No stable file id or change time in std on Windows; creation time
+    // still tells a file replaced by rename from one rewritten in place.
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        hasher.update(meta.creation_time().to_le_bytes());
+    }
     let digest = hasher.finalize();
     let mut head = [0u8; 8];
     head.copy_from_slice(&digest[..8]);
@@ -280,7 +295,7 @@ pub(crate) fn bad_request(err: &anyhow::Error) -> Response {
 /// GET /api/v1/fs/home
 pub(crate) async fn home() -> Response {
     match home_dir() {
-        Ok(path) => Json(json!({"path": path.to_string_lossy()})).into_response(),
+        Ok(path) => Json(json!({"path": wire_path(&path)})).into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": err.to_string()})),
@@ -386,11 +401,42 @@ fn entry_is_dir(entry: &std::fs::DirEntry) -> bool {
     }
 }
 
+/// Whether a listing leaves this entry out unless asked for hidden ones: a
+/// dotted name, and on Windows also what Explorer hides (the hidden
+/// attribute: AppData, the legacy junctions in a home folder that only
+/// answer "access denied", desktop.ini).
+fn is_hidden(name: &str, entry: &std::fs::DirEntry) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        /// `FILE_ATTRIBUTE_HIDDEN` (winnt.h).
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+        // The directory scan already carries the attributes: no extra call.
+        if entry
+            .metadata()
+            .is_ok_and(|m| m.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0)
+        {
+            return true;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = entry;
+    name.starts_with('.')
+}
+
 /// Canonicalize `raw` (after tilde expansion) and list its subdirectories:
-/// directories and symlinks resolving to directories only, dotted names
-/// excluded unless `hidden`, sorted case-insensitively by name, capped at
-/// [`MAX_DIR_ENTRIES`].
+/// directories and symlinks resolving to directories only, hidden ones
+/// ([`is_hidden`]) excluded unless `hidden`, sorted case-insensitively by
+/// name, capped at [`MAX_DIR_ENTRIES`].
 fn list_dirs(raw: &str, hidden: bool) -> anyhow::Result<serde_json::Value> {
+    #[cfg(windows)]
+    if raw == "/" {
+        let dirs: Vec<DirEntry> = drive_roots()
+            .into_iter()
+            .map(|(name, path)| DirEntry { name, path })
+            .collect();
+        return Ok(json!({"path": "/", "parent": null, "dirs": dirs, "truncated": false}));
+    }
     let path = canonical(raw)?;
     if !path.is_dir() {
         anyhow::bail!("{} is not a directory", path.display());
@@ -404,7 +450,7 @@ fn list_dirs(raw: &str, hidden: bool) -> anyhow::Result<serde_json::Value> {
         // Unreadable entries are skipped silently.
         let Ok(entry) = entry else { continue };
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !hidden && name.starts_with('.') {
+        if !hidden && is_hidden(&name, &entry) {
             continue;
         }
         if !entry_is_dir(&entry) {
@@ -412,7 +458,7 @@ fn list_dirs(raw: &str, hidden: bool) -> anyhow::Result<serde_json::Value> {
         }
         dirs.push(DirEntry {
             name,
-            path: entry.path().to_string_lossy().into_owned(),
+            path: wire_path(&entry.path()),
         });
         if dirs.len() > MAX_DIR_ENTRIES {
             dirs.pop();
@@ -428,11 +474,41 @@ fn list_dirs(raw: &str, hidden: bool) -> anyhow::Result<serde_json::Value> {
     });
 
     Ok(json!({
-        "path": path.to_string_lossy(),
-        "parent": path.parent().map(|p| p.to_string_lossy()),
+        "path": wire_path(&path),
+        "parent": wire_parent(&path),
         "dirs": dirs,
         "truncated": truncated,
     }))
+}
+
+/// The wire form of `path`'s parent. On Windows a drive root's parent is
+/// `/`, the listing of every drive (see [`drive_roots`]).
+fn wire_parent(path: &Path) -> Option<String> {
+    #[cfg(windows)]
+    if path.parent().is_none()
+        && matches!(
+            path.components().next(),
+            Some(std::path::Component::Prefix(p))
+                if matches!(p.kind(), std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_))
+        )
+    {
+        return Some("/".to_string());
+    }
+    path.parent().map(wire_path)
+}
+
+/// Windows' top level: the drives that exist and answer now (an empty
+/// card reader is in the drive mask but not readable), as `("C:", "C:/")`.
+#[cfg(windows)]
+fn drive_roots() -> Vec<(String, String)> {
+    // SAFETY: no arguments; returns a bitmask of drive letters.
+    let mask = unsafe { windows_sys::Win32::Storage::FileSystem::GetLogicalDrives() };
+    (0..26u8)
+        .filter(|i| mask & (1 << i) != 0)
+        .map(|i| char::from(b'A' + i))
+        .filter(|letter| std::fs::metadata(format!("{letter}:\\")).is_ok_and(|m| m.is_dir()))
+        .map(|letter| (format!("{letter}:"), format!("{letter}:/")))
+        .collect()
 }
 
 /// One entry in a `fs/list` listing.
@@ -486,7 +562,7 @@ pub(crate) async fn list(
 }
 
 /// List all entries of a directory: dirs first then files, each group sorted
-/// case-insensitively; dot entries excluded unless `hidden`; unreadable
+/// case-insensitively; hidden entries ([`is_hidden`]) excluded unless `hidden`; unreadable
 /// entries (including broken symlinks) skipped; capped at [`MAX_DIR_ENTRIES`].
 /// Unlike `list_dirs` this needs each entry's size + mtime, so it stats — the
 /// cap is what bounds that on a huge directory.
@@ -495,6 +571,23 @@ fn list_entries(
     hidden: bool,
     saw_git: &mut Option<PathBuf>,
 ) -> anyhow::Result<serde_json::Value> {
+    #[cfg(windows)]
+    if raw == "/" {
+        let entries: Vec<FsEntry> = drive_roots()
+            .into_iter()
+            .map(|(name, path)| FsEntry {
+                name,
+                path,
+                kind: "dir",
+                size: 0,
+                mtime: 0,
+                symlink: false,
+                target: None,
+                broken: false,
+            })
+            .collect();
+        return Ok(json!({"path": "/", "parent": null, "entries": entries, "truncated": false}));
+    }
     let path = canonical(raw)?;
     if !path.is_dir() {
         anyhow::bail!("{} is not a directory", path.display());
@@ -510,7 +603,7 @@ fn list_entries(
         if name == ".git" {
             *saw_git = Some(path.clone());
         }
-        if !hidden && name.starts_with('.') {
+        if !hidden && is_hidden(&name, &entry) {
             continue;
         }
         let entry_path = entry.path();
@@ -519,7 +612,7 @@ fn list_entries(
         let is_link = entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(false);
         let target = is_link.then(|| {
             std::fs::read_link(&entry_path)
-                .map(|t| t.to_string_lossy().into_owned())
+                .map(|t| wire_path(&t))
                 .unwrap_or_default()
         });
         // metadata() follows symlinks. A dangling symlink stats as an error:
@@ -534,7 +627,7 @@ fn list_entries(
                     .map_or(0, |d| d.as_secs());
                 entries.push(FsEntry {
                     name,
-                    path: entry_path.to_string_lossy().into_owned(),
+                    path: wire_path(&entry_path),
                     kind: "file",
                     size: 0,
                     mtime,
@@ -557,7 +650,7 @@ fn list_entries(
             .map_or(0, |d| d.as_secs());
         entries.push(FsEntry {
             name,
-            path: entry_path.to_string_lossy().into_owned(),
+            path: wire_path(&entry_path),
             kind: if meta.is_dir() { "dir" } else { "file" },
             size: meta.len(),
             mtime,
@@ -579,8 +672,8 @@ fn list_entries(
     });
 
     Ok(json!({
-        "path": path.to_string_lossy(),
-        "parent": path.parent().map(|p| p.to_string_lossy()),
+        "path": wire_path(&path),
+        "parent": wire_parent(&path),
         "entries": entries,
         "truncated": truncated,
     }))
@@ -1073,12 +1166,14 @@ impl Drop for TempFile {
     }
 }
 
-/// Longest file name most filesystems accept (NAME_MAX).
+/// Longest file name most filesystems accept (NAME_MAX; on Windows the
+/// limit is 255 UTF-16 units).
 const MAX_NAME_BYTES: usize = 255;
 
 /// The hidden temp sibling's name: `.{name}.{8 random}.tmp`, with `name`
 /// shortened (at a UTF-8 boundary when it is UTF-8) so the whole stays within
 /// [`MAX_NAME_BYTES`] — a 250-byte file name must still be saveable.
+#[cfg(unix)]
 fn temp_name(name: &std::ffi::OsStr) -> std::ffi::OsString {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     let nonce = &chimaera_core::generate_token()[..8];
@@ -1098,10 +1193,29 @@ fn temp_name(name: &std::ffi::OsStr) -> std::ffi::OsString {
     std::ffi::OsString::from_vec(out)
 }
 
+/// [`temp_name`] in UTF-16 units, Windows' name limit. A name that isn't
+/// valid Unicode keeps a lossy prefix: the temp is only ever renamed.
+#[cfg(windows)]
+fn temp_name(name: &std::ffi::OsStr) -> std::ffi::OsString {
+    let nonce = &chimaera_core::generate_token()[..8];
+    let budget = MAX_NAME_BYTES - (".".len() + ".".len() + nonce.len() + ".tmp".len());
+    let mut kept = String::new();
+    let mut units = 0;
+    for c in name.to_string_lossy().chars() {
+        units += c.len_utf16();
+        if units > budget {
+            break;
+        }
+        kept.push(c);
+    }
+    format!(".{kept}.{nonce}.tmp").into()
+}
+
 /// Give the temp file the target's owner and group where the kernel allows.
 /// A non-root daemon can never give a file away, but may move it to any group
 /// it belongs to — the shared project directory case — so a refused full
 /// `fchown` retries with the group alone. Failures are expected and ignored.
+#[cfg(unix)]
 fn carry_owner(file: &std::fs::File, target: &std::fs::Metadata) {
     use std::os::unix::fs::MetadataExt;
     let Ok(now) = file.metadata() else { return };
@@ -1136,9 +1250,12 @@ fn sync_dir(dir: &Path) {
 ///
 /// A target with other hard links is rewritten in place instead (see
 /// [`write_in_place`]).
+///
+/// Windows: no owner, mode or hard-link handling (std exposes no link count
+/// there, and the temp inherits the folder's ACL); the rename replaces the
+/// target, and fails while another program holds it open without delete
+/// sharing.
 fn write_file(raw: &str, bytes: &[u8], pre: Precondition<'_>) -> anyhow::Result<WriteOutcome> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-
     let expanded = expand_tilde(raw)?;
     let body_hash = sha256_hex(bytes);
     let (target, existing) = match std::fs::metadata(&expanded) {
@@ -1149,8 +1266,8 @@ fn write_file(raw: &str, bytes: &[u8], pre: Precondition<'_>) -> anyhow::Result<
             anyhow::bail!("{} is not a regular file", expanded.display());
         }
         Ok(meta) => {
-            let path =
-                std::fs::canonicalize(&expanded).with_context(|| expanded.display().to_string())?;
+            let path = chimaera_core::paths::canonicalize(&expanded)
+                .with_context(|| expanded.display().to_string())?;
             (path, Some(meta))
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -1169,8 +1286,8 @@ fn write_file(raw: &str, bytes: &[u8], pre: Precondition<'_>) -> anyhow::Result<
                 Some(p) if !p.as_os_str().is_empty() => p,
                 _ => anyhow::bail!("{} has no parent directory", expanded.display()),
             };
-            let parent =
-                std::fs::canonicalize(parent).with_context(|| parent.display().to_string())?;
+            let parent = chimaera_core::paths::canonicalize(parent)
+                .with_context(|| parent.display().to_string())?;
             if !parent.is_dir() {
                 anyhow::bail!("{} is not a directory", parent.display());
             }
@@ -1187,8 +1304,20 @@ fn write_file(raw: &str, bytes: &[u8], pre: Precondition<'_>) -> anyhow::Result<
     if let Err(outcome) = judge(pre, version_for(pre, &target)?, &body_hash) {
         return Ok(outcome);
     }
+    // Windows won't rename over a read-only file; say so before writing.
+    #[cfg(windows)]
+    if existing
+        .as_ref()
+        .is_some_and(|meta| meta.permissions().readonly())
+    {
+        anyhow::bail!("{} is read-only", target.display());
+    }
 
-    if existing.as_ref().is_some_and(|meta| meta.nlink() > 1) {
+    #[cfg(unix)]
+    if existing.as_ref().is_some_and(|meta| {
+        use std::os::unix::fs::MetadataExt;
+        meta.nlink() > 1
+    }) {
         return write_in_place(&target, bytes, pre, body_hash);
     }
 
@@ -1199,16 +1328,21 @@ fn write_file(raw: &str, bytes: &[u8], pre: Precondition<'_>) -> anyhow::Result<
         .file_name()
         .with_context(|| format!("{} has no file name", target.display()))?;
     let tmp = parent.join(temp_name(name));
-    let mode = existing
-        .as_ref()
-        .map_or(0o666, |meta| meta.permissions().mode() & 0o7777);
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mode = existing
+            .as_ref()
+            .map_or(0o666, |meta| meta.permissions().mode() & 0o7777);
+        options.mode(mode);
+    }
+    let mut file = options
         .open(&tmp)
         .with_context(|| format!("failed to create {}", tmp.display()))?;
     let mut guard = TempFile(Some(tmp.clone()));
+    #[cfg(unix)]
     if let Some(meta) = &existing {
         // Owner first: a successful chown clears setuid/setgid bits, which
         // the exact chmod below then restores. The open's mode was filtered by
@@ -1253,6 +1387,7 @@ fn write_file(raw: &str, bytes: &[u8], pre: Precondition<'_>) -> anyhow::Result<
 /// I/O error mid-write leaves one. Bytes are written before the truncate so
 /// the file is never transiently empty. The precondition is judged on the
 /// same descriptor right before writing.
+#[cfg(unix)]
 fn write_in_place(
     target: &Path,
     bytes: &[u8],
@@ -1395,6 +1530,7 @@ mod write_tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn temp_names_fit_name_max_without_splitting_characters() {
         use std::os::unix::ffi::OsStrExt;
@@ -1411,6 +1547,116 @@ mod write_tests {
         let name = temp_name(std::ffi::OsStr::new(&long));
         assert!(name.as_bytes().len() <= MAX_NAME_BYTES);
         assert!(name.to_str().is_some(), "split a character: {name:?}");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    fn temp(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-fs-win-{label}-{}-{}",
+            std::process::id(),
+            &chimaera_core::generate_token()[..8]
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn open_regular_refuses_a_directory() {
+        let dir = temp("regular");
+        std::fs::write(dir.join("f.txt"), b"x").unwrap();
+        assert!(open_regular(&dir).is_err());
+        let (_, meta) = open_regular(&dir.join("f.txt")).unwrap();
+        assert!(meta.is_file());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn listings_answer_wire_paths() {
+        // Canonical: the temp folder may be spelled with 8.3 short names.
+        let dir = chimaera_core::paths::canonicalize(&temp("wire")).unwrap();
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("f.txt"), b"x").unwrap();
+        let raw = dir.to_string_lossy().replace('/', "\\");
+        for body in [
+            list_dirs(&raw, false).unwrap(),
+            list_entries(&raw, false, &mut None).unwrap(),
+        ] {
+            let text = body.to_string();
+            assert!(!text.contains("\\\\"), "a backslash on the wire: {text}");
+            assert!(
+                !text.contains("//?/"),
+                "a verbatim prefix on the wire: {text}"
+            );
+            let path = body["path"].as_str().unwrap();
+            assert!(
+                path.as_bytes()[0].is_ascii_uppercase() && &path[1..3] == ":/",
+                "{path}"
+            );
+            assert_eq!(body["parent"], json!(wire_path(dir.parent().unwrap())));
+        }
+        let listed = list_entries(&raw, false, &mut None).unwrap();
+        let sub = listed["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == "sub")
+            .unwrap();
+        assert_eq!(sub["path"], json!(format!("{}/sub", wire_path(&dir))));
+        assert_eq!(sub["kind"], "dir");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn slash_lists_the_drives_and_a_drive_root_goes_up_to_it() {
+        let top = list_dirs("/", false).unwrap();
+        assert_eq!(top["path"], "/");
+        assert!(top["parent"].is_null());
+        let dirs = top["dirs"].as_array().unwrap();
+        assert!(
+            dirs.iter().any(|d| d["name"] == "C:" && d["path"] == "C:/"),
+            "{top}"
+        );
+        let files = list_entries("/", false, &mut None).unwrap();
+        assert!(files["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["path"] == "C:/" && e["kind"] == "dir"));
+        for raw in ["C:/", "c:\\"] {
+            let root = list_dirs(raw, false).unwrap();
+            assert_eq!(root["path"], "C:/", "{raw}");
+            assert_eq!(root["parent"], "/", "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_save_replaces_the_file_and_leaves_no_temp() {
+        let dir = temp("save");
+        let file = dir.join("notes.md");
+        std::fs::write(&file, b"old").unwrap();
+        let raw = wire_path(&file);
+        write_file(&raw, b"new", Precondition::None).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"new");
+        write_file(
+            &wire_path(&dir.join("fresh.md")),
+            b"made",
+            Precondition::None,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(dir.join("fresh.md")).unwrap(), b"made");
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        let long = "é".repeat(250);
+        let name = temp_name(std::ffi::OsStr::new(&long));
+        assert!(name.to_str().unwrap().encode_utf16().count() <= MAX_NAME_BYTES);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
 
@@ -3632,13 +3878,13 @@ fn suffix_candidate(candidate: &str) -> Option<&str> {
 /// Canonicalize (resolving symlinks and `..`, and proving existence) and
 /// classify; anything unresolvable is `None`, never an error.
 fn resolve_entry(path: &Path) -> Option<(PathBuf, &'static str)> {
-    let resolved = std::fs::canonicalize(path).ok()?;
+    let resolved = chimaera_core::paths::canonicalize(path).ok()?;
     let kind = if resolved.is_dir() { "dir" } else { "file" };
     Some((resolved, kind))
 }
 
 fn entry_json(path: &Path, kind: &str) -> serde_json::Value {
-    json!({"path": path.to_string_lossy(), "kind": kind})
+    json!({"path": wire_path(path), "kind": kind})
 }
 
 /// The direct rungs of the ladder: an absolute or `~` candidate as-is; else
@@ -3868,12 +4114,12 @@ pub(crate) async fn mkdir(Json(body): Json<MkdirRequest>) -> Response {
             .with_context(|| format!("{}: failed to create directory", expanded.display()))?;
         // Canonicalize what we just made so the caller opens the resolved path
         // (symlinks/`..` collapsed), matching create_workspace's own view.
-        let path =
-            std::fs::canonicalize(&expanded).with_context(|| expanded.display().to_string())?;
+        let path = chimaera_core::paths::canonicalize(&expanded)
+            .with_context(|| expanded.display().to_string())?;
         if !path.is_dir() {
             anyhow::bail!("{} is not a directory", path.display());
         }
-        Ok(json!({ "path": path.to_string_lossy() }))
+        Ok(json!({ "path": wire_path(&path) }))
     };
     match tokio::task::spawn_blocking(work).await {
         Ok(Ok(body)) => Json(body).into_response(),
@@ -3988,11 +4234,9 @@ pub(crate) async fn create(
                 }
             },
         }
-        let path =
-            std::fs::canonicalize(&expanded).with_context(|| expanded.display().to_string())?;
-        Ok(MutateOutcome::Done(
-            json!({ "path": path.to_string_lossy() }),
-        ))
+        let path = chimaera_core::paths::canonicalize(&expanded)
+            .with_context(|| expanded.display().to_string())?;
+        Ok(MutateOutcome::Done(json!({ "path": wire_path(&path) })))
     };
     run_mutation(&state, work, &[&raw]).await
 }
@@ -4025,8 +4269,9 @@ pub(crate) async fn rename(
             // canonicalize sees through case-insensitive filesystems: when the
             // "existing" target is the source itself, this is a case-only
             // rename (foo.txt -> Foo.txt) and must proceed.
-            let same = std::fs::canonicalize(&to)
-                .is_ok_and(|resolved| std::fs::canonicalize(&from).is_ok_and(|f| f == resolved));
+            let same = chimaera_core::paths::canonicalize(&to).is_ok_and(|resolved| {
+                chimaera_core::paths::canonicalize(&from).is_ok_and(|f| f == resolved)
+            });
             if !same {
                 return Ok(MutateOutcome::Conflict(format!(
                     "{} already exists",
@@ -4053,7 +4298,7 @@ pub(crate) async fn rename(
         }
         // Return the parent-resolved path as-is: canonicalizing now would
         // resolve a renamed symlink to its target.
-        Ok(MutateOutcome::Done(json!({ "path": to.to_string_lossy() })))
+        Ok(MutateOutcome::Done(json!({ "path": wire_path(&to) })))
     };
     run_mutation(&state, work, &[&raw_from, &raw_to]).await
 }
@@ -4075,8 +4320,9 @@ pub(crate) async fn delete(
     let raw = body.path.clone();
     let work = move || -> anyhow::Result<MutateOutcome> {
         let target = canonical_parent_join(&body.path)?;
-        let home = home_dir()
-            .and_then(|h| std::fs::canonicalize(&h).with_context(|| h.display().to_string()));
+        let home = home_dir().and_then(|h| {
+            chimaera_core::paths::canonicalize(&h).with_context(|| h.display().to_string())
+        });
         if home.is_ok_and(|h| h == target) {
             anyhow::bail!("refusing to delete your home directory");
         }
@@ -4159,9 +4405,21 @@ fn copy_recursive(src: &Path, dst: &Path, entries: &mut usize) -> anyhow::Result
         let meta = std::fs::symlink_metadata(&from)
             .with_context(|| format!("{}: cannot read", from.display()))?;
         if meta.file_type().is_symlink() {
-            let link = std::fs::read_link(&from)?;
-            std::os::unix::fs::symlink(&link, &to)
-                .with_context(|| format!("{}: failed to recreate symlink", to.display()))?;
+            #[cfg(unix)]
+            {
+                let link = std::fs::read_link(&from)?;
+                std::os::unix::fs::symlink(&link, &to)
+                    .with_context(|| format!("{}: failed to recreate symlink", to.display()))?;
+            }
+            // A junction is recreated as one (no privileges needed); a
+            // symbolic link is left out, since making one needs Developer
+            // Mode or an administrator.
+            #[cfg(windows)]
+            if junction::exists(&from).unwrap_or(false) {
+                let target = junction::get_target(&from)?;
+                junction::create(&target, &to)
+                    .with_context(|| format!("{}: failed to recreate junction", to.display()))?;
+            }
         } else if meta.is_dir() {
             std::fs::create_dir(&to)
                 .with_context(|| format!("{}: failed to create directory", to.display()))?;
@@ -4215,8 +4473,9 @@ pub(crate) async fn copy(
         // Guard against copying a directory into its own subtree (the canonical
         // source vs the canonical destination PARENT — `to` itself doesn't
         // exist yet).
-        if let (Ok(src_c), Some(parent)) = (std::fs::canonicalize(&from), to.parent()) {
-            if let Ok(dst_parent_c) = std::fs::canonicalize(parent) {
+        if let (Ok(src_c), Some(parent)) = (chimaera_core::paths::canonicalize(&from), to.parent())
+        {
+            if let Ok(dst_parent_c) = chimaera_core::paths::canonicalize(parent) {
                 if is_within(&dst_parent_c, &src_c) {
                     anyhow::bail!("cannot copy a directory into itself");
                 }
@@ -4239,7 +4498,7 @@ pub(crate) async fn copy(
             let _ = std::fs::remove_dir_all(&to).or_else(|_| std::fs::remove_file(&to));
             return Err(err);
         }
-        Ok(MutateOutcome::Done(json!({ "path": to.to_string_lossy() })))
+        Ok(MutateOutcome::Done(json!({ "path": wire_path(&to) })))
     };
     run_mutation(&state, work, &[&raw_from, &raw_to]).await
 }
@@ -4265,22 +4524,25 @@ pub(crate) async fn move_(
         if std::fs::symlink_metadata(&from).is_err() {
             anyhow::bail!("{}: No such file or directory", from.display());
         }
-        let home = home_dir()
-            .and_then(|h| std::fs::canonicalize(&h).with_context(|| h.display().to_string()));
-        if home.is_ok_and(|h| std::fs::canonicalize(&from).is_ok_and(|f| f == h)) {
+        let home = home_dir().and_then(|h| {
+            chimaera_core::paths::canonicalize(&h).with_context(|| h.display().to_string())
+        });
+        if home.is_ok_and(|h| chimaera_core::paths::canonicalize(&from).is_ok_and(|f| f == h)) {
             anyhow::bail!("refusing to move your home directory");
         }
         let to = canonical_parent_join(&body.to)?;
-        if let (Ok(src_c), Some(parent)) = (std::fs::canonicalize(&from), to.parent()) {
-            if let Ok(dst_parent_c) = std::fs::canonicalize(parent) {
+        if let (Ok(src_c), Some(parent)) = (chimaera_core::paths::canonicalize(&from), to.parent())
+        {
+            if let Ok(dst_parent_c) = chimaera_core::paths::canonicalize(parent) {
                 if is_within(&dst_parent_c, &src_c) {
                     anyhow::bail!("cannot move a directory into itself");
                 }
             }
         }
         if std::fs::symlink_metadata(&to).is_ok() {
-            let same = std::fs::canonicalize(&to)
-                .is_ok_and(|resolved| std::fs::canonicalize(&from).is_ok_and(|f| f == resolved));
+            let same = chimaera_core::paths::canonicalize(&to).is_ok_and(|resolved| {
+                chimaera_core::paths::canonicalize(&from).is_ok_and(|f| f == resolved)
+            });
             if !same {
                 return Ok(MutateOutcome::Conflict(format!(
                     "{} already exists",
@@ -4318,7 +4580,7 @@ pub(crate) async fn move_(
                 )));
             }
         }
-        Ok(MutateOutcome::Done(json!({ "path": to.to_string_lossy() })))
+        Ok(MutateOutcome::Done(json!({ "path": wire_path(&to) })))
     };
     run_mutation(&state, work, &[&raw_from, &raw_to]).await
 }
@@ -4756,22 +5018,9 @@ fn asset_relative(rest: &str) -> Option<PathBuf> {
 /// Open `relative` beneath `dir` without following any symlink, as a
 /// regular file (O_NONBLOCK: a planted FIFO must not park the worker).
 fn open_asset(dir: &Path, relative: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
-    let root = std::fs::File::from(rustix::fs::open(
-        dir,
-        rustix::fs::OFlags::RDONLY
-            | rustix::fs::OFlags::DIRECTORY
-            | rustix::fs::OFlags::NOFOLLOW
-            | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::empty(),
-    )?);
-    let file = crate::download::open_beneath(
-        &root,
-        relative,
-        rustix::fs::OFlags::RDONLY
-            | rustix::fs::OFlags::NOFOLLOW
-            | rustix::fs::OFlags::CLOEXEC
-            | rustix::fs::OFlags::NONBLOCK,
-    )?;
+    use crate::download::Beneath;
+    let root = crate::download::open_nofollow(dir, Beneath::Dir)?;
+    let file = crate::download::open_beneath(&root, relative, Beneath::Any)?;
     let meta = file.metadata()?;
     if !meta.is_file() {
         return Err(std::io::Error::new(

@@ -23,6 +23,7 @@
     type SkillGroup,
   } from "./skillsModel";
   import { agentName, type AgentId, type Skill, type SkillsReport } from "./store";
+  import { isAbsolute, isUnder, joinPath } from "../shared/paths";
 
   interface Props {
     report: SkillsReport | null;
@@ -67,17 +68,17 @@
   }
 
   function abs(p: string): string {
-    return p.startsWith("/") || p.startsWith("~") || wsRoot === null ? p : `${wsRoot}/${p}`;
+    return isAbsolute(p) || p.startsWith("~") || wsRoot === null ? p : joinPath(wsRoot, p);
   }
   function skillFile(s: Skill): string | null {
     const p = Object.values(s.paths).find(Boolean) ?? null;
     if (p === null) return null;
-    return p.endsWith("SKILL.md") ? p : `${p.replace(/\/$/, "")}/SKILL.md`;
+    return p.endsWith("SKILL.md") ? p : joinPath(p, "SKILL.md");
   }
   /** `path` is the skill's own file or dir, or lies inside that dir — a
    *  sibling that merely shares a prefix ("pdf" vs "pdf-tools") is not. */
   function within(path: string, skillPath: string): boolean {
-    return path === skillPath || path.startsWith(skillPath.endsWith("/") ? skillPath : `${skillPath}/`);
+    return isUnder(path, skillPath);
   }
   function errorsFor(s: Skill): string[] {
     if (report === null) return [];

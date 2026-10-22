@@ -6,6 +6,17 @@ use super::support::*;
 #[tokio::test]
 async fn exec_sentinel_round_trip_on_plain_shell() {
     let state = test_state();
+    // Windows: PowerShell without its integration.
+    #[cfg(unix)]
+    let (shell, command) = (
+        vec!["/bin/bash", "--noprofile", "--norc"],
+        "echo sentinel-ran && false",
+    );
+    #[cfg(windows)]
+    let (shell, command) = (
+        vec!["powershell.exe", "-NoLogo", "-NoProfile"],
+        "echo sentinel-ran; cmd /c exit 1",
+    );
     let info = state
         .sessions
         .spawn(chimaera_pty::SpawnOpts {
@@ -13,11 +24,7 @@ async fn exec_sentinel_round_trip_on_plain_shell() {
             name: None,
             cols: 80,
             rows: 24,
-            command: Some(vec![
-                "/bin/bash".to_string(),
-                "--noprofile".to_string(),
-                "--norc".to_string(),
-            ]),
+            command: Some(shell.iter().map(|a| a.to_string()).collect()),
             id: None,
             env: Vec::new(),
             env_remove: Vec::new(),
@@ -25,12 +32,27 @@ async fn exec_sentinel_round_trip_on_plain_shell() {
         })
         .expect("spawn plain bash");
     let id = info.id;
+    // The sentinel's marks must show within the exec's start window, which
+    // a PowerShell still starting (seconds, more under emulation) outlasts:
+    // type once it drew its prompt.
+    #[cfg(windows)]
+    {
+        let deadline = tokio::time::Instant::now() + SHELL_WAIT;
+        while !state
+            .sessions
+            .screen_text(&id, 50)
+            .is_some_and(|screen| screen.contains("PS "))
+        {
+            assert!(tokio::time::Instant::now() < deadline, "no prompt");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
 
     let (status, out) = request(
         &state,
         Method::POST,
         &format!("/api/v1/sessions/{id}/exec"),
-        Some(serde_json::json!({"command": "echo sentinel-ran && false"})),
+        Some(serde_json::json!({"command": command})),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{out}");
@@ -49,6 +71,7 @@ async fn exec_sentinel_round_trip_on_plain_shell() {
     state.sessions.kill(&id).ok();
 }
 
+#[cfg(unix)]
 /// The author decision in action: an exec against a busy integrated
 /// shell QUEUES until the prompt returns, then runs in integrated mode.
 #[tokio::test]
@@ -100,6 +123,7 @@ async fn exec_queues_behind_running_command() {
     state.sessions.kill(&id).ok();
 }
 
+#[cfg(unix)]
 /// With a short queue timeout and no remote-forwarding foreground, a
 /// busy shell is a 409 — never typed into.
 #[tokio::test]
@@ -137,6 +161,7 @@ async fn exec_busy_is_409_without_sentinel_permission() {
     state.sessions.kill(&id).ok();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn exec_into_agent_session_is_409_and_journal_endpoint_reads() {
     let state = test_state();

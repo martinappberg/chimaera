@@ -52,6 +52,7 @@ fn validate_dimensions(cols: u16, rows: u16) -> anyhow::Result<()> {
 pub struct SessionInfo {
     pub id: SessionId,
     pub name: String,
+    #[cfg_attr(windows, serde(serialize_with = "serialize_wire_path"))]
     pub cwd: PathBuf,
     pub cols: u16,
     pub rows: u16,
@@ -74,6 +75,16 @@ pub struct SessionInfo {
     pub last_output_at: u64,
 }
 
+/// Paths reach the UI in the daemon's wire form (forward slashes, no
+/// verbatim prefix); on Unix that is the plain path, so only Windows needs it.
+#[cfg(windows)]
+fn serialize_wire_path<S: serde::Serializer>(
+    path: &std::path::Path,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&chimaera_core::paths::wire_path(path))
+}
+
 /// Options for spawning a new session.
 #[derive(Clone, Debug)]
 pub struct SpawnOpts {
@@ -81,8 +92,8 @@ pub struct SpawnOpts {
     pub name: Option<String>,
     pub cols: u16,
     pub rows: u16,
-    /// `None` spawns the user's shell (`$SHELL`, else `/bin/bash`) as an
-    /// interactive shell.
+    /// `None` spawns the user's shell (`$SHELL`, else `/bin/bash`; on
+    /// Windows [`chimaera_core::login_shell`]) as an interactive shell.
     pub command: Option<Vec<String>>,
     /// Caller-chosen session id (must be unused). `None` generates one. This
     /// lets callers embed the id in the command/environment before spawning.
@@ -287,7 +298,14 @@ impl SessionManager {
     /// session; a busy integrated shell queues up to `opts.queue_timeout`.
     pub async fn exec(&self, id: &str, opts: ExecOptions) -> Result<ExecOutcome, ExecError> {
         let session = self.session(id).ok_or(ExecError::SessionGone)?;
-        exec::exec(session.marks(), session.input(), session.exec_lock(), opts).await
+        exec::exec(
+            session.marks(),
+            session.input(),
+            session.exec_lock(),
+            session.shell(),
+            opts,
+        )
+        .await
     }
 
     /// Signal the session's child to terminate (SIGHUP); the wait thread

@@ -70,24 +70,42 @@ pub(crate) fn fork_context_path(session_id: &str) -> PathBuf {
     agents_runtime_dir().join(format!("{session_id}-fork-context.txt"))
 }
 
+/// Set `path`'s Unix mode (owner-only for anything embedding a secret). On
+/// Windows there are no mode bits: the runtime dir sits in the user's
+/// profile, whose inherited ACL already grants only that user.
+fn set_mode(path: &std::path::Path, mode: u32) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("failed to chmod {}", path.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+        Ok(())
+    }
+}
+
 pub(crate) fn write_fork_context(session_id: &str, context: &str) -> anyhow::Result<PathBuf> {
     use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let path = fork_context_path(session_id);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("failed to create {}", dir.display()))?;
     }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
         .open(&path)
         .with_context(|| format!("failed to open {}", path.display()))?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("failed to chmod {}", path.display()))?;
+    set_mode(&path, 0o600)?;
     file.write_all(context.as_bytes())
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(path)
@@ -123,7 +141,8 @@ const HOOK_EVENTS: [&str; 10] = [
 /// [`write_settings`]). Lives next to the settings file that references it,
 /// so the two are scrubbed and regenerated together.
 pub(crate) fn statusline_script_path(session_id: &str) -> PathBuf {
-    agents_runtime_dir().join(format!("{session_id}-statusline.sh"))
+    let ext = if cfg!(windows) { "ps1" } else { "sh" };
+    agents_runtime_dir().join(format!("{session_id}-statusline.{ext}"))
 }
 
 /// Path to a session's statusline auth-header file (mode 0600): it holds the
@@ -168,8 +187,6 @@ pub(crate) fn write_settings(
     mastermind: Option<crate::workspaces::MastermindMode>,
     plugin_tools: &[String],
 ) -> anyhow::Result<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-
     let url = format!("http://127.0.0.1:{port}/api/v1/agent-events/{session_id}?key={key}");
     let hook = json!({ "type": "http", "url": url, "timeout": 10 });
     let mut hooks = serde_json::Map::new();
@@ -214,9 +231,8 @@ pub(crate) fn write_settings(
     settings["permissions"] = json!({ "allow": allow });
     if let Some(passthrough) = statusline_passthrough(user_statusline) {
         let script = write_statusline_script(session_id, key, port, passthrough.as_deref())?;
-        // claude runs statusLine commands through a shell: quote the path so
-        // whitespace in a user-set state home can't split the command.
-        settings["statusLine"] = json!({ "type": "command", "command": sh_quote(&script) });
+        settings["statusLine"] =
+            json!({ "type": "command", "command": statusline_command(&script) });
         // Mirror the user's padding so their statusline spacing is unchanged.
         if let Some(padding) = user_statusline.and_then(|s| s.get("padding")) {
             settings["statusLine"]["padding"] = padding.clone();
@@ -230,9 +246,23 @@ pub(crate) fn write_settings(
     }
     std::fs::write(&path, serde_json::to_vec_pretty(&settings)?)
         .with_context(|| format!("failed to write {}", path.display()))?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("failed to chmod {}", path.display()))?;
+    set_mode(&path, 0o600)?;
     Ok(path)
+}
+
+/// The settings `statusLine.command` running the wrapper. Unix: the script
+/// path, shell-quoted (claude runs it through a shell, and a user-set state
+/// home may carry whitespace). Windows: Windows PowerShell running the
+/// `.ps1` — present on every Windows, and the same string parses in
+/// PowerShell, `cmd.exe` and Git Bash, whichever claude uses.
+fn statusline_command(script: &str) -> String {
+    if cfg!(windows) {
+        format!(
+            "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{script}\""
+        )
+    } else {
+        sh_quote(script)
+    }
 }
 
 /// Whether/how to wrap the user's statusline: `Some(passthrough_command)` =
@@ -257,6 +287,10 @@ fn statusline_passthrough(user: Option<&serde_json::Value>) -> Option<Option<Str
         None | Some("") => Some(None),
         // A multi-line command can't be embedded on the wrapper's pipe line.
         Some(cmd) if cmd.contains('\n') || cmd.contains('\r') => None,
+        // Windows: which shell claude runs the user's command through (Git
+        // Bash or PowerShell) isn't knowable here, so it is not re-run from
+        // the wrapper; theirs applies untouched.
+        Some(_) if cfg!(windows) => None,
         Some(cmd) => Some(Some(cmd.to_string())),
     }
 }
@@ -278,8 +312,6 @@ fn write_statusline_script(
     port: u16,
     passthrough: Option<&str>,
 ) -> anyhow::Result<String> {
-    use std::os::unix::fs::PermissionsExt;
-
     // The URL is SECRET-FREE: the key would otherwise ride the curl argv, and
     // /proc/<pid>/cmdline is world-readable on the shared login nodes — any
     // other user could scrape the session id + key and reach this session's
@@ -295,15 +327,78 @@ fn write_statusline_script(
     }
     std::fs::write(&hdr_path, format!("Authorization: Bearer {key}\n"))
         .with_context(|| format!("failed to write {}", hdr_path.display()))?;
-    std::fs::set_permissions(&hdr_path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("failed to chmod {}", hdr_path.display()))?;
+    set_mode(&hdr_path, 0o600)?;
     let stamp = statusline_script_path(session_id).with_extension("stamp");
+    #[cfg(windows)]
+    let script = {
+        let _ = passthrough;
+        statusline_powershell(&url, &hdr_path, &stamp)
+    };
+    #[cfg(not(windows))]
+    let script = statusline_sh(&url, &hdr_path, &stamp, passthrough);
+    let path = statusline_script_path(session_id);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+    }
+    std::fs::write(&path, script).with_context(|| format!("failed to write {}", path.display()))?;
+    set_mode(&path, 0o700)?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// The Windows wrapper (Windows PowerShell 5.1, present on every Windows):
+/// the same throttled POST as the sh one, authenticated from the same header
+/// file. It runs in the foreground — a PowerShell process can't leave a
+/// request behind — so the request is bounded to 2 s against the loopback
+/// daemon. No passthrough: see `statusline_passthrough`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn statusline_powershell(url: &str, hdr_path: &std::path::Path, stamp: &std::path::Path) -> String {
+    let ps = |s: &str| format!("'{}'", s.replace('\'', "''"));
+    let url = ps(url);
+    let hdr = ps(&hdr_path.to_string_lossy());
+    let stamp = ps(&stamp.to_string_lossy());
+    format!(
+        // ASCII only: Windows PowerShell reads a BOM-less script in the
+        // ANSI code page.
+        "# generated by chimaera - do not edit (rewritten on session spawn)\r\n\
+         # Sends claude's statusline JSON to the chimaera daemon (usage telemetry\r\n\
+         # for the dashboard, at most one POST per 2s).\r\n\
+         $ErrorActionPreference = 'SilentlyContinue'\r\n\
+         try {{ [Console]::InputEncoding = [System.Text.Encoding]::UTF8 }} catch {{ }}\r\n\
+         $payload = [Console]::In.ReadToEnd()\r\n\
+         $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()\r\n\
+         [long]$last = 0\r\n\
+         if (Test-Path -LiteralPath {stamp}) {{\r\n\
+         \x20 $raw = Get-Content -LiteralPath {stamp} -Raw\r\n\
+         \x20 if (-not [long]::TryParse(\"$raw\".Trim(), [ref]$last)) {{ $last = 0 }}\r\n\
+         }}\r\n\
+         if (($now - $last) -ge 2) {{\r\n\
+         \x20 Set-Content -LiteralPath {stamp} -Value \"$now\" -NoNewline\r\n\
+         \x20 try {{\r\n\
+         \x20   $line = (Get-Content -LiteralPath {hdr} -Raw).Trim()\r\n\
+         \x20   $auth = $line.Substring($line.IndexOf(':') + 1).Trim()\r\n\
+         \x20   $body = [System.Text.Encoding]::UTF8.GetBytes($payload)\r\n\
+         \x20   Invoke-WebRequest -Uri {url} -Method Post -UseBasicParsing -TimeoutSec 2 \
+         -Headers @{{ Authorization = $auth }} -ContentType 'application/json' -Body $body | Out-Null\r\n\
+         \x20 }} catch {{ }}\r\n\
+         }}\r\n"
+    )
+}
+
+/// The POSIX wrapper (see [`write_statusline_script`]).
+#[cfg_attr(windows, allow(dead_code))]
+fn statusline_sh(
+    url: &str,
+    hdr_path: &std::path::Path,
+    stamp: &std::path::Path,
+    passthrough: Option<&str>,
+) -> String {
     // The runtime dir usually has a safe charset, but a user-set
     // CHIMAERA_HOME (or a dev build's home dir) can carry spaces or quotes —
     // embed it shell-quoted so the script never breaks on its own path.
     // The URL is generated hex/digits; quoted anyway for uniformity.
     let stamp = sh_quote(&stamp.to_string_lossy());
-    let url_q = sh_quote(&url);
+    let url_q = sh_quote(url);
     let hdr_q = sh_quote(&hdr_path.to_string_lossy());
     // The POST is throttled to one per 2s via an epoch stamp file: claude
     // repaints the statusline continuously while streaming, and an
@@ -338,15 +433,7 @@ fn write_statusline_script(
         // treats EOF-without-newline as failure and renders nothing.
         script.push_str(&format!("printf '%s\\n' \"$input\" | {cmd}\n"));
     }
-    let path = statusline_script_path(session_id);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("failed to create {}", dir.display()))?;
-    }
-    std::fs::write(&path, script).with_context(|| format!("failed to write {}", path.display()))?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("failed to chmod {}", path.display()))?;
-    Ok(path.to_string_lossy().into_owned())
+    script
 }
 
 /// The per-session MCP endpoint URL with key-in-URL auth — for the claude
@@ -368,8 +455,6 @@ pub(crate) fn mcp_url_bare(session_id: &str, port: u16) -> String {
 /// linked-terminal tools (`--mcp-config`; merges with the user's own MCP
 /// servers). Mode 0600 — the URL embeds the session secret.
 pub(crate) fn write_mcp_config(session_id: &str, key: &str, port: u16) -> anyhow::Result<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-
     let url = mcp_url(session_id, key, port);
     let config = json!({
         "mcpServers": { "chimaera": { "type": "http", "url": url } }
@@ -381,8 +466,7 @@ pub(crate) fn write_mcp_config(session_id: &str, key: &str, port: u16) -> anyhow
     }
     std::fs::write(&path, serde_json::to_vec_pretty(&config)?)
         .with_context(|| format!("failed to write {}", path.display()))?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("failed to chmod {}", path.display()))?;
+    set_mode(&path, 0o600)?;
     Ok(path)
 }
 
@@ -1054,9 +1138,12 @@ mod tests {
                 "mcp__chimaera__update_plan",
             ])
         );
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(statusline_script_path(&sid)).ok();
     }
@@ -1179,6 +1266,7 @@ mod tests {
     /// background. With no user statusline the wrapper prints nothing; a
     /// user command is piped the same stdin (their TUI looks unchanged); an
     /// un-embeddable user statusLine suppresses injection entirely.
+    #[cfg(unix)]
     #[test]
     fn settings_statusline_wrapper_preserves_user_statusline() {
         use std::os::unix::fs::PermissionsExt;
@@ -1278,6 +1366,134 @@ mod tests {
             assert!(value.get("statusLine").is_none(), "{user}");
             assert!(!statusline_script_path(&sid).exists());
             std::fs::remove_file(&path).ok();
+        }
+    }
+
+    /// The Windows wrapper keeps the sh one's contract: secret-free URL, the
+    /// key read from the header file, a 2 s stamp throttle, and nothing but
+    /// ASCII (Windows PowerShell reads a BOM-less script in the ANSI code
+    /// page).
+    #[test]
+    fn powershell_statusline_wrapper_is_secret_free_and_throttled() {
+        let url = "http://127.0.0.1:43999/api/v1/agent-events/s-1?event=statusline";
+        let script = statusline_powershell(
+            url,
+            std::path::Path::new(r"C:\Users\o'brien\s-1-statusline.hdr"),
+            std::path::Path::new(r"C:\Users\o'brien\s-1-statusline.stamp"),
+        );
+        assert!(script.is_ascii(), "{script}");
+        assert!(script.contains(&format!("-Uri '{url}'")), "{script}");
+        assert!(
+            script.contains(r"-LiteralPath 'C:\Users\o''brien\s-1-statusline.hdr'"),
+            "{script}"
+        );
+        assert!(script.contains("-ge 2"), "{script}");
+        assert!(script.contains("-TimeoutSec 2"), "{script}");
+        assert!(!script.contains("?key="), "{script}");
+        assert_eq!(
+            statusline_command(r"C:\state\s-1-statusline.ps1"),
+            if cfg!(windows) {
+                r#"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:\state\s-1-statusline.ps1""#.to_string()
+            } else {
+                r"'C:\state\s-1-statusline.ps1'".to_string()
+            }
+        );
+    }
+
+    /// Live on Windows: the exact `statusLine` command, run the way a shell
+    /// would run it, POSTs claude's JSON to the daemon with the session key
+    /// from the header file, prints nothing, and throttles a second repaint.
+    #[cfg(windows)]
+    #[test]
+    fn powershell_statusline_wrapper_posts_to_the_daemon() {
+        use std::io::{Read, Write};
+        use std::os::windows::process::CommandExt;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            conn.set_read_timeout(Some(Duration::from_secs(20)))
+                .unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = conn.read(&mut chunk).unwrap();
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf).to_string();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let len = text[..end]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= end + 4 + len || n == 0 {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            String::from_utf8_lossy(&buf).to_string()
+        });
+
+        let sid = fresh_session_id();
+        let key = fresh_agent_key();
+        let path = write_settings(&sid, &key, port, None, None, None, &[]).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let command = value["statusLine"]["command"].as_str().unwrap().to_string();
+        let run = || {
+            let mut child = std::process::Command::new("cmd.exe")
+                .raw_arg(format!("/d /s /c \"{command}\""))
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(r#"{"model":{"id":"opus"},"cwd":"C:\\proj"}"#.as_bytes())
+                .unwrap();
+            child.wait_with_output().unwrap()
+        };
+        let out = run();
+        assert!(out.status.success(), "{out:?}");
+        assert!(out.stdout.is_empty(), "{out:?}");
+        let request = server.join().unwrap();
+        assert!(
+            request.starts_with(&format!(
+                "POST /api/v1/agent-events/{sid}?event=statusline "
+            )),
+            "{request}"
+        );
+        assert!(request.contains(&format!("Bearer {key}")), "{request}");
+        assert!(
+            request.ends_with(r#"{"model":{"id":"opus"},"cwd":"C:\\proj"}"#),
+            "{request}"
+        );
+        // Within 2 s: throttled, no second request (the listener is gone, so
+        // a POST would fail — silently — either way; the run must stay quiet).
+        let again = run();
+        assert!(
+            again.status.success() && again.stdout.is_empty(),
+            "{again:?}"
+        );
+        for p in [
+            path,
+            statusline_script_path(&sid),
+            statusline_header_path(&sid),
+            statusline_script_path(&sid).with_extension("stamp"),
+        ] {
+            std::fs::remove_file(p).ok();
         }
     }
 }

@@ -6,7 +6,8 @@
 //!   `$XDG_CACHE_HOME/chimaera`, survives restarts, never night-scrubbed).
 //! - The plugin addresses it as `output:<path>`: every path is relative,
 //!   walked from the folder's own descriptor with `O_NOFOLLOW` on each
-//!   component (a program the plugin runs could leave a link there), so
+//!   component (a program the plugin runs could leave a link there; on
+//!   Windows a cap-std walk that refuses junctions and symlinks alike), so
 //!   nothing it names leaves the folder.
 //! - Reads start at an offset and stop at 8 MiB a call (a large log
 //!   streams); the plugin's own writes are ≤ 8 MiB a file, written to a
@@ -32,6 +33,7 @@ use std::time::{Duration, Instant, SystemTime};
 use axum::extract::{Path as AxPath, State};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+#[cfg(unix)]
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use serde_json::json;
 
@@ -101,9 +103,10 @@ fn open_root(dir: &Path) -> Result<File, String> {
     builder
         .create(dir)
         .map_err(|e| format!("the output folder: {e}"))?;
-    File::open(dir).map_err(|e| format!("the output folder: {e}"))
+    crate::download::open_dir_path(dir).map_err(|e| format!("the output folder: {e}"))
 }
 
+#[cfg(unix)]
 fn dir_flags() -> OFlags {
     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
 }
@@ -111,12 +114,8 @@ fn dir_flags() -> OFlags {
 /// Bytes of `rel` from `offset`, at most `cap` (blocking).
 pub(crate) fn read(dir: &Path, rel: &Path, offset: u64, cap: usize) -> Result<Vec<u8>, String> {
     let root = open_root(dir)?;
-    let mut file = crate::download::open_beneath(
-        &root,
-        rel,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-    )
-    .map_err(|e| io(rel, e))?;
+    let mut file = crate::download::open_beneath(&root, rel, crate::download::Beneath::Any)
+        .map_err(|e| io(rel, e))?;
     let meta = file.metadata().map_err(|e| io(rel, e))?;
     if !meta.is_file() {
         return Err(io(rel, "not a regular file"));
@@ -131,13 +130,15 @@ pub(crate) fn read(dir: &Path, rel: &Path, offset: u64, cap: usize) -> Result<Ve
 }
 
 /// A folder's entries, at most `cap`, sorted (blocking).
+#[cfg(unix)]
 pub(crate) fn list(
     dir: &Path,
     rel: &Path,
     cap: usize,
 ) -> Result<Vec<super::runtime::wit::Entry>, String> {
     let root = open_root(dir)?;
-    let folder = crate::download::open_beneath(&root, rel, dir_flags()).map_err(|e| io(rel, e))?;
+    let folder = crate::download::open_beneath(&root, rel, crate::download::Beneath::Dir)
+        .map_err(|e| io(rel, e))?;
     let entries = rustix::fs::Dir::read_from(&folder).map_err(|e| io(rel, e))?;
     let mut out = Vec::new();
     for entry in entries {
@@ -168,10 +169,11 @@ pub(crate) fn list(
 /// Keep the `keep` newest entries of folder `rel` (by modification time)
 /// and remove the rest, never following a link (blocking). A folder that
 /// isn't there yet is fine.
+#[cfg(unix)]
 pub(crate) fn prune_oldest(dir: &Path, rel: &Path, keep: usize) -> Result<(), String> {
     use std::os::unix::ffi::OsStrExt;
     let root = open_root(dir)?;
-    let folder = match crate::download::open_beneath(&root, rel, dir_flags()) {
+    let folder = match crate::download::open_beneath(&root, rel, crate::download::Beneath::Dir) {
         Ok(folder) => folder,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(io(rel, e)),
@@ -205,11 +207,13 @@ pub(crate) fn prune_oldest(dir: &Path, rel: &Path, keep: usize) -> Result<(), St
 /// The parent folder of `rel` beneath `root`, made on the way (never
 /// through a link, private: the output folder's), and `rel`'s last
 /// component.
+#[cfg(unix)]
 fn parent_of(root: &File, rel: &Path) -> Result<(File, std::ffi::OsString), String> {
     parent_made(root, rel, 0o700)
 }
 
 /// `parent_of`, making missing folders with `mode` (the umask applies).
+#[cfg(unix)]
 fn parent_made(
     root: &File,
     rel: &Path,
@@ -241,6 +245,7 @@ fn parent_made(
 
 /// Make folder `rel` (and those on its path) beneath the output folder,
 /// never through a link (blocking).
+#[cfg(unix)]
 pub(crate) fn make_dir(dir: &Path, rel: &Path) -> Result<(), String> {
     let root = open_root(dir)?;
     if rel.as_os_str().is_empty() {
@@ -259,6 +264,7 @@ pub(crate) fn make_dir(dir: &Path, rel: &Path) -> Result<(), String> {
 
 /// Create (or truncate) file `rel` for writing, never through a link
 /// (blocking): a job's log.
+#[cfg(unix)]
 pub(crate) fn create_file(dir: &Path, rel: &Path) -> Result<File, String> {
     let root = open_root(dir)?;
     let (parent, name) = parent_of(&root, rel)?;
@@ -288,6 +294,7 @@ pub(crate) fn fits(rel: &Path, len: usize) -> Result<(), String> {
 
 /// Write `bytes` to `rel` (a temporary name, then a rename: a reader never
 /// sees half a file) (blocking).
+#[cfg(unix)]
 pub(crate) fn write(dir: &Path, rel: &Path, bytes: &[u8]) -> Result<(), String> {
     fits(rel, bytes.len())?;
     let root = open_root(dir)?;
@@ -322,6 +329,7 @@ pub(crate) fn write(dir: &Path, rel: &Path, bytes: &[u8]) -> Result<(), String> 
 /// Copy output file `rel` to `dst_rel` beneath the workspace root `dst`
 /// (**Save to workspace**, the user's click): never through a link on
 /// either side, never over an existing file unless `replace`; its bytes.
+#[cfg(unix)]
 pub(crate) fn copy_out(
     dir: &Path,
     rel: &Path,
@@ -330,12 +338,8 @@ pub(crate) fn copy_out(
     replace: bool,
 ) -> Result<u64, String> {
     let root = open_root(dir)?;
-    let mut src = crate::download::open_beneath(
-        &root,
-        rel,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-    )
-    .map_err(|e| io(rel, e))?;
+    let mut src = crate::download::open_beneath(&root, rel, crate::download::Beneath::Any)
+        .map_err(|e| io(rel, e))?;
     if !src.metadata().map_err(|e| io(rel, e))?.is_file() {
         return Err(io(rel, "not a regular file"));
     }
@@ -385,9 +389,8 @@ pub(crate) fn copy_out(
 
 /// Whether any component of `rel` is hidden (starts with a dot).
 fn hidden(rel: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
     rel.components()
-        .any(|c| c.as_os_str().as_bytes().first() == Some(&b'.'))
+        .any(|c| c.as_os_str().as_encoded_bytes().first() == Some(&b'.'))
 }
 
 /// Remove `rel`, a file or a whole folder, never following a link
@@ -397,6 +400,8 @@ pub(crate) fn remove(dir: &Path, rel: &Path) -> Result<(), String> {
         return Ok(());
     }
     let root = open_root(dir)?;
+    #[cfg(windows)]
+    let root = crate::download::cap_dir(&root).map_err(|e| io(rel, e))?;
     if rel.as_os_str().is_empty() {
         let mut left = WALK_MAX;
         return empty_folder(&root, &mut left).map_err(|e| io(rel, e));
@@ -405,6 +410,7 @@ pub(crate) fn remove(dir: &Path, rel: &Path) -> Result<(), String> {
     remove_entry(&parent, &name, &mut WALK_MAX.clone()).map_err(|e| io(rel, e))
 }
 
+#[cfg(unix)]
 fn remove_entry(parent: &File, name: &std::ffi::OsStr, left: &mut usize) -> std::io::Result<()> {
     let st = match rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(st) => st,
@@ -426,6 +432,7 @@ fn remove_entry(parent: &File, name: &std::ffi::OsStr, left: &mut usize) -> std:
     Ok(())
 }
 
+#[cfg(unix)]
 fn empty_folder(dir: &File, left: &mut usize) -> std::io::Result<()> {
     let names: Vec<std::ffi::OsString> = rustix::fs::Dir::read_from(dir)?
         .filter_map(Result::ok)
@@ -441,6 +448,275 @@ fn empty_folder(dir: &File, left: &mut usize) -> std::io::Result<()> {
     }
     Ok(())
 }
+
+/// The Windows twins of the descriptor-relative functions above: the same
+/// contracts on cap-std directories, whose every open is beneath the folder
+/// and refuses a junction or symlink (`open_dir_nofollow`,
+/// `FollowSymlinks::No`). Modes are not set: files inherit the folder's
+/// ACL, which is the user's own under the profile.
+#[cfg(windows)]
+mod win {
+    use super::*;
+    use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+    use cap_std::fs::{Dir, OpenOptions};
+    use std::ffi::{OsStr, OsString};
+
+    fn entry(
+        name: OsString,
+        ty: Option<cap_std::fs::FileType>,
+    ) -> super::super::runtime::wit::Entry {
+        super::super::runtime::wit::Entry {
+            name: name.to_string_lossy().into_owned(),
+            is_dir: ty.is_some_and(|t| t.is_dir()),
+            is_symlink: ty.is_some_and(|t| t.is_symlink()),
+        }
+    }
+
+    pub(crate) fn list(
+        dir: &Path,
+        rel: &Path,
+        cap: usize,
+    ) -> Result<Vec<super::super::runtime::wit::Entry>, String> {
+        let root = open_root(dir)?;
+        let folder = crate::download::open_beneath(&root, rel, crate::download::Beneath::Dir)
+            .and_then(|f| crate::download::cap_dir(&f))
+            .map_err(|e| io(rel, e))?;
+        let mut out = Vec::new();
+        for e in folder.entries().map_err(|e| io(rel, e))? {
+            if out.len() >= cap.min(LIST_MAX) {
+                break;
+            }
+            let e = e.map_err(|e| io(rel, e))?;
+            out.push(entry(e.file_name(), e.file_type().ok()));
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    pub(crate) fn prune_oldest(dir: &Path, rel: &Path, keep: usize) -> Result<(), String> {
+        let root = open_root(dir)?;
+        let folder = match crate::download::open_beneath(&root, rel, crate::download::Beneath::Dir)
+        {
+            Ok(folder) => crate::download::cap_dir(&folder).map_err(|e| io(rel, e))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(io(rel, e)),
+        };
+        let mut entries = Vec::new();
+        for e in folder.entries().map_err(|e| io(rel, e))? {
+            if entries.len() >= LIST_MAX {
+                break;
+            }
+            let e = e.map_err(|e| io(rel, e))?;
+            let name = e.file_name();
+            // `symlink_metadata`: a link's own time, never its target's.
+            if let Ok(mtime) = folder.symlink_metadata(&name).and_then(|m| m.modified()) {
+                entries.push((mtime.into_std(), name));
+            }
+        }
+        if entries.len() <= keep {
+            return Ok(());
+        }
+        entries.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
+        let mut left = WALK_MAX;
+        for (_, name) in entries.into_iter().skip(keep) {
+            remove_entry(&folder, &name, &mut left).map_err(|e| io(rel, e))?;
+        }
+        Ok(())
+    }
+
+    /// The parent folder of `rel` beneath `root`, made on the way (never
+    /// through a link), and `rel`'s last component.
+    pub(super) fn parent_of(root: &Dir, rel: &Path) -> Result<(Dir, OsString), String> {
+        let mut parts: Vec<&OsStr> = rel
+            .components()
+            .map(|c| match c {
+                Component::Normal(n) => Ok(n),
+                _ => Err(io(rel, "not a plain relative path")),
+            })
+            .collect::<Result<_, _>>()?;
+        let name = parts
+            .pop()
+            .ok_or_else(|| io(rel, "names the folder itself"))?
+            .to_os_string();
+        let mut dir = root.try_clone().map_err(|e| io(rel, e))?;
+        for part in parts {
+            match dir.create_dir(part) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(io(rel, e)),
+            }
+            dir = dir.open_dir_nofollow(part).map_err(|e| io(rel, e))?;
+        }
+        Ok((dir, name))
+    }
+
+    fn root_dir(dir: &Path) -> Result<Dir, String> {
+        crate::download::cap_dir(&open_root(dir)?).map_err(|e| format!("the output folder: {e}"))
+    }
+
+    pub(crate) fn make_dir(dir: &Path, rel: &Path) -> Result<(), String> {
+        let root = root_dir(dir)?;
+        if rel.as_os_str().is_empty() {
+            return Ok(());
+        }
+        let (parent, name) = parent_of(&root, rel)?;
+        match parent.create_dir(&name) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(io(rel, e)),
+        }
+        // It must be a folder, not a link someone left there.
+        parent
+            .open_dir_nofollow(&name)
+            .map(drop)
+            .map_err(|e| io(rel, e))
+    }
+
+    fn create_options(new: bool) -> OpenOptions {
+        let mut options = OpenOptions::new();
+        options.write(true).follow(FollowSymlinks::No);
+        if new {
+            options.create_new(true);
+        } else {
+            options.create(true).truncate(true);
+        }
+        options
+    }
+
+    pub(crate) fn create_file(dir: &Path, rel: &Path) -> Result<File, String> {
+        let root = root_dir(dir)?;
+        let (parent, name) = parent_of(&root, rel)?;
+        parent
+            .open_with(&name, &create_options(false))
+            .map(cap_std::fs::File::into_std)
+            .map_err(|e| io(rel, e))
+    }
+
+    /// Write `bytes` beside `name` under a temporary name and rename it into
+    /// place; `shown` names the target in errors.
+    fn write_renamed(
+        parent: &Dir,
+        name: &OsStr,
+        from: &mut dyn Read,
+        shown: &dyn Fn(&dyn std::fmt::Display) -> String,
+    ) -> Result<u64, String> {
+        let tmp = format!(
+            ".{}.{}.tmp",
+            name.to_string_lossy(),
+            &chimaera_core::generate_token()[..8]
+        );
+        let mut file = parent
+            .open_with(&tmp, &create_options(true))
+            .map(cap_std::fs::File::into_std)
+            .map_err(|e| shown(&e))?;
+        let written = std::io::copy(from, &mut file).and_then(|n| {
+            file.flush()?;
+            Ok(n)
+        });
+        drop(file);
+        let n = match written {
+            Ok(n) => n,
+            Err(err) => {
+                let _ = parent.remove_file(&tmp);
+                return Err(shown(&err));
+            }
+        };
+        // A folder where the file goes is refused by the rename; a link
+        // there is replaced or refused, never written through.
+        parent.rename(&tmp, parent, name).map_err(|e| {
+            let _ = parent.remove_file(&tmp);
+            shown(&e)
+        })?;
+        Ok(n)
+    }
+
+    pub(crate) fn write(dir: &Path, rel: &Path, bytes: &[u8]) -> Result<(), String> {
+        fits(rel, bytes.len())?;
+        let root = root_dir(dir)?;
+        let (parent, name) = parent_of(&root, rel)?;
+        write_renamed(
+            &parent,
+            &name,
+            &mut &bytes[..],
+            &|e: &dyn std::fmt::Display| io(rel, e),
+        )
+        .map(drop)
+    }
+
+    pub(crate) fn copy_out(
+        dir: &Path,
+        rel: &Path,
+        dst: &Path,
+        dst_rel: &Path,
+        replace: bool,
+    ) -> Result<u64, String> {
+        let root = open_root(dir)?;
+        let mut src = crate::download::open_beneath(&root, rel, crate::download::Beneath::Any)
+            .map_err(|e| io(rel, e))?;
+        if !src.metadata().map_err(|e| io(rel, e))?.is_file() {
+            return Err(io(rel, "not a regular file"));
+        }
+        let dst_root = crate::download::open_dir_path(dst)
+            .and_then(|f| crate::download::cap_dir(&f))
+            .map_err(|e| format!("the workspace root: {e}"))?;
+        let (parent, name) = parent_of(&dst_root, dst_rel)?;
+        let shown = |e: &dyn std::fmt::Display| format!("{}: {e}", dst_rel.display());
+        match parent.symlink_metadata(&name) {
+            Ok(meta) if !meta.is_file() || meta.file_type().is_symlink() => {
+                return Err(shown(&"something other than a file is there"))
+            }
+            Ok(_) if !replace => return Err(format!("{} already exists", dst_rel.display())),
+            _ => {}
+        }
+        write_renamed(&parent, &name, &mut (&mut src).take(QUOTA), &shown)
+    }
+
+    pub(super) fn remove_entry(
+        parent: &Dir,
+        name: &OsStr,
+        left: &mut usize,
+    ) -> std::io::Result<()> {
+        let meta = match parent.symlink_metadata(name) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        if meta.file_type().is_symlink() {
+            // The link itself (a junction is a directory entry), never what
+            // it points at.
+            return parent.remove_file_or_symlink(name);
+        }
+        if meta.is_dir() {
+            let dir = parent.open_dir_nofollow(name)?;
+            empty_folder(&dir, left)?;
+            drop(dir);
+            parent.remove_dir(name)
+        } else {
+            parent.remove_file(name)
+        }
+    }
+
+    pub(super) fn empty_folder(dir: &Dir, left: &mut usize) -> std::io::Result<()> {
+        let names: Vec<OsString> = dir
+            .entries()?
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .collect();
+        for name in names {
+            if *left == 0 {
+                return Err(std::io::Error::other("too many entries to remove"));
+            }
+            *left -= 1;
+            remove_entry(dir, &name, left)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+pub(crate) use win::{copy_out, create_file, list, make_dir, prune_oldest, write};
+#[cfg(windows)]
+use win::{empty_folder, parent_of, remove_entry};
 
 /// Bytes under `dir`, walking at most `WALK_MAX` entries, never through a
 /// link (blocking); also each top-level entry of each workspace folder, for
@@ -688,7 +964,7 @@ pub(crate) async fn folder_route(
     if let Ok(Err(err)) = made {
         return super::bad_request(err);
     }
-    Json(json!({"root": dir.display().to_string()})).into_response()
+    Json(json!({"root": chimaera_core::paths::wire_path(&dir)})).into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -738,7 +1014,7 @@ pub(crate) async fn save_route(
     };
     match copied {
         Ok(Ok(bytes)) => {
-            let target = target.display().to_string();
+            let target = chimaera_core::paths::wire_path(&target);
             crate::git::mark_path_dirty(&state, &target).await;
             Json(json!({"path": target, "bytes": bytes})).into_response()
         }
@@ -761,6 +1037,7 @@ mod tests {
         dir
     }
 
+    #[cfg(unix)]
     #[test]
     fn pruning_keeps_the_newest_and_never_follows_a_link() {
         let dir = temp("prune");
@@ -800,6 +1077,7 @@ mod tests {
         assert!(!hidden(Path::new("thesis/main.pdf")));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_plugin_stays_in_its_folder() {
         let dir = temp("output");
@@ -822,6 +1100,7 @@ mod tests {
         assert!(write(&dir, Path::new("big"), &vec![0; WRITE_MAX + 1]).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_quota_evicts_the_oldest_first() {
         let root = temp("quota");
@@ -842,6 +1121,71 @@ mod tests {
         assert_eq!(Usage::enforce(&root, "p", 1000), 600);
         assert!(!ws.join("old").exists());
         assert!(ws.join("new").exists());
+    }
+
+    /// Windows: a junction someone left in the folder is never read,
+    /// listed into, written or removed through, and pruning removes the
+    /// junction itself, never what it points at.
+    #[cfg(windows)]
+    #[test]
+    fn a_plugin_stays_in_its_folder_past_a_junction() {
+        let dir = temp("output-win");
+        let outside = temp("output-win-outside");
+        std::fs::write(outside.join("secret.txt"), b"secret").unwrap();
+        write(&dir, Path::new("a/b.txt"), b"hello").unwrap();
+        assert_eq!(read(&dir, Path::new("a/b.txt"), 1, 3).unwrap(), b"ell");
+        write(&dir, Path::new("a/b.txt"), b"again").unwrap();
+        assert_eq!(read(&dir, Path::new("a/b.txt"), 0, 10).unwrap(), b"again");
+        junction::create(&outside, dir.join("out")).unwrap();
+        assert!(read(&dir, Path::new("out/secret.txt"), 0, 10).is_err());
+        assert!(read(&dir, Path::new("out"), 0, 10).is_err());
+        assert!(list(&dir, Path::new("out"), 10).is_err());
+        assert!(write(&dir, Path::new("out/x"), b"x").is_err());
+        assert!(create_file(&dir, Path::new("out/log")).is_err());
+        assert!(create_file(&dir, Path::new("out")).is_err());
+        assert!(make_dir(&dir, Path::new("out/sub")).is_err());
+        assert!(make_dir(&dir, Path::new("out")).is_err());
+        let listed = list(&dir, Path::new(""), 10).unwrap();
+        let out = listed.iter().find(|e| e.name == "out").unwrap();
+        assert!(out.is_symlink && !out.is_dir);
+        // Save to workspace: never through a junction on the far side.
+        let ws = temp("output-win-ws");
+        junction::create(&outside, ws.join("docs")).unwrap();
+        assert!(copy_out(
+            &dir,
+            Path::new("a/b.txt"),
+            &ws,
+            Path::new("docs/b.txt"),
+            true
+        )
+        .is_err());
+        assert_eq!(
+            copy_out(
+                &dir,
+                Path::new("a/b.txt"),
+                &ws,
+                Path::new("saved/b.txt"),
+                false
+            )
+            .unwrap(),
+            5
+        );
+        assert!(copy_out(
+            &dir,
+            Path::new("a/b.txt"),
+            &ws,
+            Path::new("saved/b.txt"),
+            false
+        )
+        .is_err());
+        remove(&dir, Path::new("out")).unwrap();
+        assert!(!dir.join("out").exists());
+        junction::create(&outside, dir.join("jobs-link")).unwrap();
+        prune_oldest(&dir, Path::new(""), 0).unwrap();
+        remove(&dir, Path::new("")).unwrap();
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        assert!(outside.join("secret.txt").exists());
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1);
     }
 
     #[test]

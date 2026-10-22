@@ -16,6 +16,7 @@
 
 import { viewKindFor } from "../previews/files";
 import { isMissing, splitTarget, type TargetResult } from "../shared/embed/embed";
+import { isAbsolute } from "../shared/paths";
 
 /** What a turn's file is FOR: a `visual` is looked at (a figure, a
  *  rendered report, a PDF, a clip), a `document` is opened (a markdown
@@ -73,16 +74,20 @@ export function isArtifactPath(path: string): boolean {
   return artifactShape(path) !== null;
 }
 
+/** A drive-rooted path (`C:/…`, a Windows host): its colon is no scheme. */
+const DRIVE = /^[A-Za-z]:\//;
+
 /** A URL (`https://…`, `file:`) or a protocol-relative `//host` — never a
  *  local path. */
 function isUrlLike(token: string): boolean {
-  return /^[a-z][a-z0-9+.-]*:/i.test(token) || token.startsWith("//");
+  return (/^[a-z][a-z0-9+.-]*:/i.test(token) && !DRIVE.test(token)) || token.startsWith("//");
 }
 
 /** A whitespace/quote/bracket-delimited token. */
 const TOKEN = /[^\s"'`<>()[\]{}|,;=]+/g;
-/** Characters a path token may hold (letters and digits of any script). */
-const PATHLIKE = /^[\p{L}\p{N}_./~@+%-]+$/u;
+/** Characters a path token may hold (letters and digits of any script),
+ *  after an optional drive. */
+const PATHLIKE = /^(?:[A-Za-z]:\/)?[\p{L}\p{N}_./~@+%-]+$/u;
 /** Bytes of one text scanned: a command's head, an output's head and tail. */
 const HEAD_BYTES = 4096;
 const TAIL_BYTES = 4096;
@@ -105,7 +110,9 @@ export function artifactMentions(texts: readonly string[], cap = 24): string[] {
   for (const text of texts) {
     for (const m of scanned(text).matchAll(TOKEN)) {
       // Trailing sentence punctuation and markdown emphasis come off.
-      const t = m[0].replace(/^[*_]+/, "").replace(/[.:!?*_]+$/, "");
+      // A Windows shell prints `C:\out\plot.png`; the daemon speaks `C:/…`.
+      const raw = m[0].replace(/^[*_]+/, "").replace(/[.:!?*_]+$/, "");
+      const t = /^[A-Za-z]:\\/.test(raw) ? raw.replace(/\\/g, "/") : raw;
       if (t.length < 3 || seen.has(t) || !PATHLIKE.test(t)) continue;
       if (isUrlLike(t)) continue;
       if (!isArtifactPath(t) || (t.startsWith(".") && !t.startsWith("./") && !t.startsWith("../"))) continue;
@@ -157,7 +164,7 @@ function hopless(path: string): string {
  */
 export function namesFile(name: string, path: string): boolean {
   if (name === path) return true;
-  if (name.startsWith("/")) return false;
+  if (isAbsolute(name)) return false;
   const rel = hopless(name);
   return rel !== "" && (hopless(path) === rel || path.endsWith(`/${rel}`));
 }

@@ -48,6 +48,7 @@ A chat session's truth spans several `AppState` locks; keep them coherent ([→]
 
 ## Invariants / gotchas
 
+- **Windows is a native host.** A path the daemon sends to the UI goes through `chimaera_core::paths::wire_path` (`C:/x`; unchanged on Unix), a spawned tree through `chimaera_core::proc` (a Job Object on Windows), a `HOME` read through `paths::home_dir`. Unix-only code is `cfg(unix)` with a Windows arm, never a silent no-op ([native app](../../docs/features/native-app.md)).
 - **Extension reports whitelist fields; never turn an unknown slash command into a discovery prompt** ([→](REFERENCE.md#native-extension-adapters)).
 - **Connector reports carry names and statuses only; sign-in is a bounded in-memory job, never a terminal session** ([→](REFERENCE.md#connector-inventory)).
 - **Agent-plugin installs pass metadata as arguments, never spliced into shell source; the exit trap, not the terminal title, reports the outcome** ([→](REFERENCE.md#agent-plugin-installs)).

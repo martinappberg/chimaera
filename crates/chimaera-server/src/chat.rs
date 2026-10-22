@@ -1000,7 +1000,7 @@ pub(crate) fn chat_session_json(
     json!({
         "id": info.id,
         "name": info.agent,
-        "cwd": info.cwd,
+        "cwd": chimaera_core::paths::wire_path(&info.cwd),
         "cols": 0,
         "rows": 0,
         "created_at": info.created_at_ms / 1000,
@@ -1012,7 +1012,7 @@ pub(crate) fn chat_session_json(
         // the pin and stops deriving a name over it).
         "renamed": agent.is_some_and(|a| a.custom_title.is_some()),
         "phase": "unknown",
-        "cwd_current": info.cwd,
+        "cwd_current": chimaera_core::paths::wire_path(&info.cwd),
         "exec_stage": null,
         "workspace_id": workspace_id,
         "kind": "agent",

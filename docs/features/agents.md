@@ -361,6 +361,14 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
 - **Where it lives.** `launcher.rs` (`list_agents`, `detect`, `resolve_bin`, `models`,
   `is_outdated`, `claude_resumables`); upstream latest-release probes in `agent_updates.rs`.
   Routes `GET /api/v1/agents`, `GET /api/v1/agents/claude/sessions`.
+- **On Windows** there is no login shell: agents are found through PATH + PATHEXT and the vendors'
+  install folders (Claude Code `%USERPROFILE%\.local\bin\claude.exe` and npm shims, Codex npm
+  `codex.cmd` launched as node + script, Cursor CLI `%LOCALAPPDATA%\cursor-agent`, Grok Build
+  `%USERPROFILE%\.grok\bin\grok.exe`, Antigravity `%LOCALAPPDATA%\agy\bin\agy.exe`, unverified).
+  Chimaera-managed runtime installs are not offered; the install action shows the vendor's
+  PowerShell command. Agent-plugin installs from Extensions are unavailable; Claude's statusline
+  wrapper is a PowerShell script (a user's own `statusLine` is not passed through); Claude MCP
+  connector sign-in through a PTY is unsupported (use `/mcp` in a Claude session).
 - **Key behaviors.** Detection runs the registered agents' login shells + version probes concurrently (serial would
   visibly stall the popover), with a 6s timeout and a 64 KiB output cap. A runnable
   `agents.<id>.path` wins, followed by the interactive login shell's choice. Only a completed

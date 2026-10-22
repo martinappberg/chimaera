@@ -3,7 +3,8 @@
 //! what both routes do the same way: the progress record every window polls,
 //! start-or-join under one lock, generation-scoped cancel, a capped output
 //! buffer, and the process loop (its own process group; select on exit,
-//! cancel and deadline; SIGTERM, a grace, then SIGKILL the whole group). What
+//! cancel and deadline; SIGTERM, a grace, then SIGKILL the whole group; on
+//! Windows a Job Object stands in for the group and gets no SIGTERM). What
 //! differs — the wire payload, the words, how a clean exit becomes a verdict —
 //! stays in the module that owns the route, behind the [`Progress`] trait.
 use std::{
@@ -131,8 +132,12 @@ impl<P: Progress> Operation<P> {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .process_group(0);
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        run.command.process_group(0);
+        #[cfg(windows)]
+        run.command
+            .creation_flags(chimaera_core::proc::TREE_CREATION_FLAGS);
         let mut child = match run.command.spawn() {
             Ok(child) => child,
             Err(err) => return Exit::SpawnFailed(err),
@@ -140,7 +145,12 @@ impl<P: Progress> Operation<P> {
         let Some(pid) = child.id() else {
             return Exit::SpawnFailed(io::Error::other("the process ended before it started"));
         };
-        let group = Group(nix::unistd::Pid::from_raw(pid as i32));
+        let group = match chimaera_core::proc::ProcessTree::adopt(pid) {
+            Ok(tree) => Group(Some(tree)),
+            // A tree the engine can't stop is not run: kill_on_drop ends
+            // the leader as `child` drops.
+            Err(err) => return Exit::SpawnFailed(err),
+        };
         let stdout = child.stdout.take().expect("piped");
         let stderr = child.stderr.take().expect("piped");
         let mut stdin = child.stdin.take();
@@ -203,7 +213,7 @@ impl<P: Progress> Operation<P> {
             Some(result) => {
                 // The leader is reaped: never signal a possibly recycled
                 // group id.
-                std::mem::forget(group);
+                group.release();
                 if let OutputEnd::Grace(grace) = run.output {
                     settle_reads(&mut reads, grace).await;
                 }
@@ -214,7 +224,11 @@ impl<P: Progress> Operation<P> {
                 // SIGTERM first so EXIT traps can clean up, the pipes a moment
                 // to land the rest, then the whole group goes. Wait AFTER the
                 // kill so the group id cannot be recycled in between.
-                let _ = nix::sys::signal::killpg(group.0, nix::sys::signal::Signal::SIGTERM);
+                // Windows has no SIGTERM: a closed stdin is the only notice
+                // before the grace runs out and the job is killed.
+                group.terminate();
+                #[cfg(windows)]
+                drop(stdin.take());
                 settle_reads(&mut reads, TERM_GRACE).await;
                 drop(group);
                 let code = child.wait().await.ok().and_then(|s| s.code());
@@ -452,12 +466,26 @@ pub(crate) fn command(
     cmd
 }
 
-/// The process group, killed outright when dropped. Forget it once the
-/// leader is reaped — its id may be someone else's by then.
-struct Group(nix::unistd::Pid);
+/// The process group (Windows: the Job Object), killed outright when
+/// dropped. Release it once the leader is reaped — its id may be someone
+/// else's by then.
+struct Group(Option<chimaera_core::proc::ProcessTree>);
+impl Group {
+    fn terminate(&self) {
+        if let Some(tree) = &self.0 {
+            tree.terminate();
+        }
+    }
+    /// Let go without killing: a dropped tree never signals anything.
+    fn release(mut self) {
+        self.0 = None;
+    }
+}
 impl Drop for Group {
     fn drop(&mut self) {
-        let _ = nix::sys::signal::killpg(self.0, nix::sys::signal::Signal::SIGKILL);
+        if let Some(tree) = &self.0 {
+            tree.kill();
+        }
     }
 }
 

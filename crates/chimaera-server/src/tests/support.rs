@@ -13,13 +13,34 @@ pub(super) use tower::ServiceExt;
 pub(super) fn test_dir(label: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+    // The pid alone repeats: Windows reuses pids at once, and a test run
+    // one per process would find an earlier process's leftovers.
+    static RUN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let run = RUN.get_or_init(|| chimaera_core::generate_token()[..6].to_string());
     let dir = std::env::temp_dir().join(format!(
-        "chimaera-server-test-{}-{label}-{}",
+        "chimaera-server-test-{}-{run}-{label}-{}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+/// `path` canonicalized the way the daemon does it: no `\\?\` prefix on
+/// Windows; exactly `std::fs::canonicalize` on Unix.
+pub(super) fn canonical(path: &std::path::Path) -> PathBuf {
+    chimaera_core::paths::canonicalize(path).unwrap()
+}
+
+/// `path` in the form the daemon sends it to the UI: forward slashes and an
+/// upper-case drive on Windows (`C:/…`); the lossy string itself on Unix.
+pub(super) fn wire(path: &std::path::Path) -> String {
+    chimaera_core::paths::wire_path(path)
+}
+
+/// The user's home folder as the daemon finds it (`$HOME` on Unix).
+pub(super) fn home() -> PathBuf {
+    chimaera_core::paths::home_dir().expect("home directory")
 }
 
 /// Test state with its workspace registry persisted under a temp dir
@@ -115,7 +136,12 @@ pub(super) async fn request(
     (status, json)
 }
 
-/// Next frame from a tungstenite client stream, with a 10s timeout.
+/// How long a test waits on a fresh shell to answer: Windows PowerShell
+/// takes seconds to start, far longer on an emulated or loaded runner.
+pub(super) const SHELL_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(if cfg!(windows) { 60 } else { 10 });
+
+/// Next frame from a tungstenite client stream, within [`SHELL_WAIT`].
 pub(super) async fn next_ws_frame<S>(socket: &mut S) -> tokio_tungstenite::tungstenite::Message
 where
     S: futures::Stream<
@@ -126,7 +152,7 @@ where
         > + Unpin,
 {
     use futures::StreamExt;
-    tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
+    tokio::time::timeout(SHELL_WAIT, socket.next())
         .await
         .expect("ws frame timeout")
         .expect("ws stream ended")
@@ -145,7 +171,39 @@ pub(super) fn inject_agent(state: &Arc<AppState>, key: &str) -> String {
 /// whenever the shell gets there, so a test reading the name must not have
 /// a shell underneath.
 pub(super) fn inject_silent_agent(state: &Arc<AppState>, key: &str) -> String {
-    inject_agent_running(state, key, Some(vec!["sleep".into(), "600".into()]))
+    #[cfg(unix)]
+    let command = vec!["sleep".into(), "600".into()];
+    // A Windows console is always titled, with its program's path until the
+    // program sets one. Titled `claude`, an agent's own name, it reads as
+    // untitled, the way `sleep` leaves a Unix terminal.
+    #[cfg(windows)]
+    let command = vec![
+        "powershell.exe".into(),
+        "-NoLogo".into(),
+        "-NoProfile".into(),
+        "-NonInteractive".into(),
+        "-Command".into(),
+        "$Host.UI.RawUI.WindowTitle = 'claude'; Start-Sleep -Seconds 600".into(),
+    ];
+    inject_agent_running(state, key, Some(command))
+}
+
+/// Wait until a silent agent's terminal reads as untitled: at once on Unix;
+/// on Windows once its PowerShell (seconds to start) titled itself.
+pub(super) async fn silent_agent_settled(state: &Arc<AppState>, id: &str) {
+    #[cfg(windows)]
+    {
+        let deadline = tokio::time::Instant::now() + SHELL_WAIT;
+        while state.sessions.get(id).and_then(|i| i.title).as_deref() != Some("claude") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the silent agent never titled itself"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+    #[cfg(unix)]
+    let _ = (state, id);
 }
 
 fn inject_agent_running(state: &Arc<AppState>, key: &str, command: Option<Vec<String>>) -> String {
@@ -168,6 +226,20 @@ fn inject_agent_running(state: &Arc<AppState>, key: &str, command: Option<Vec<St
         agents::AgentRecord::new(key.to_string(), agents::AgentKind::Claude),
     );
     info.id
+}
+
+/// A real program that exits at once whatever its arguments: a stand-in
+/// agent binary that still runs the whole spawn path.
+pub(super) fn quick_exit_bin() -> PathBuf {
+    #[cfg(unix)]
+    {
+        PathBuf::from("/bin/echo")
+    }
+    #[cfg(windows)]
+    {
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+        PathBuf::from(root).join(r"System32\whoami.exe")
+    }
 }
 
 /// Preset the launcher's detection cache for one agent, so tests never
@@ -306,12 +378,27 @@ pub(super) async fn post_hook(
 
 /// Spawn a real bash (no rc files, so no OSC titles interfere) at `root`,
 /// map it to `workspace_id`, and start the naming watcher — the shell
-/// equivalent of `inject_agent`.
+/// equivalent of `inject_agent`. On Windows: the default PowerShell with
+/// its integration, whose OSC 7 is the only way the daemon learns a
+/// Windows shell's cwd.
 pub(super) fn inject_shell(
     state: &Arc<AppState>,
     root: &std::path::Path,
     workspace_id: &str,
 ) -> String {
+    #[cfg(unix)]
+    let command = vec![
+        "/bin/bash".to_string(),
+        "--noprofile".to_string(),
+        "--norc".to_string(),
+    ];
+    #[cfg(windows)]
+    let command = chimaera_core::shellint::shell_launch_for(
+        &chimaera_core::login_shell(),
+        &test_dir("shell-base"),
+    )
+    .expect("launch")
+    .argv;
     let info = state
         .sessions
         .spawn(chimaera_pty::SpawnOpts {
@@ -319,11 +406,7 @@ pub(super) fn inject_shell(
             name: None,
             cols: 80,
             rows: 24,
-            command: Some(vec![
-                "/bin/bash".to_string(),
-                "--noprofile".to_string(),
-                "--norc".to_string(),
-            ]),
+            command: Some(command),
             id: None,
             env: Vec::new(),
             env_remove: Vec::new(),
@@ -334,6 +417,42 @@ pub(super) fn inject_shell(
     naming::spawn_shell_watch(state.clone(), info.id.clone());
     info.id
 }
+
+/// Wait until an `inject_shell` shell drew its first prompt. Windows only:
+/// until then ConPTY holds the session's output for a cursor reply that an
+/// attached client owes (the headless terminal answers only while none is
+/// attached), and only the PowerShell there reports its prompt.
+pub(super) async fn shell_ready(state: &Arc<AppState>, id: &str) {
+    #[cfg(windows)]
+    {
+        let marks = state.sessions.marks(id).expect("marks");
+        let deadline = tokio::time::Instant::now() + SHELL_WAIT;
+        while marks.phase() != chimaera_pty::ShellPhase::Ready {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "shell never reached ready"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+    #[cfg(unix)]
+    let _ = (state, id);
+}
+
+/// What an idle `inject_shell` shell is named: its program.
+pub(super) fn shell_name() -> String {
+    #[cfg(unix)]
+    {
+        "bash".to_string()
+    }
+    #[cfg(windows)]
+    {
+        crate::naming::default_shell_name()
+    }
+}
+
+/// The key that submits a typed line: a ConPTY reads Enter as CR.
+pub(super) const ENTER: &str = if cfg!(windows) { "\r" } else { "\n" };
 
 /// Poll GET /api/v1/sessions until the session's display_name matches.
 pub(super) async fn wait_display_name(state: &Arc<AppState>, id: &str, expected: &str) {
@@ -354,7 +473,7 @@ pub(super) async fn wait_display_name(state: &Arc<AppState>, id: &str, expected:
 
 /// Poll GET /api/v1/sessions until the session's cwd_current matches.
 pub(super) async fn wait_cwd_current(state: &Arc<AppState>, id: &str, expected: &std::path::Path) {
-    let expected = serde_json::json!(expected);
+    let expected = serde_json::json!(wire(expected));
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         let entry = session_entry(state, id).await;
@@ -370,6 +489,7 @@ pub(super) async fn wait_cwd_current(state: &Arc<AppState>, id: &str, expected: 
     }
 }
 
+#[cfg(unix)]
 /// Spawn an integrated bash with a hermetic HOME and wait for `ready`.
 pub(super) async fn spawn_integrated_bash(state: &Arc<AppState>, label: &str) -> String {
     let base = test_dir(&format!("{label}-base"));
@@ -403,6 +523,7 @@ pub(super) async fn spawn_integrated_bash(state: &Arc<AppState>, label: &str) ->
     info.id
 }
 
+#[cfg(unix)]
 /// Write a minimal fake `claude` chat binary: answers the stream-json
 /// initialize handshake (the driver hardcodes request_id "init") and then
 /// stays alive swallowing stdin, so spawn-path route tests run hermetically.

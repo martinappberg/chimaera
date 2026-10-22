@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+chimaera-core.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 tokio.workspace = true
@@ -14,8 +15,13 @@ bytes.workspace = true
 rand.workspace = true
 portable-pty.workspace = true
 alacritty_terminal.workspace = true
-nix.workspace = true
 
 [dev-dependencies]
 chimaera-wire-fixtures.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys.workspace = true

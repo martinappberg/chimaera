@@ -29,6 +29,9 @@ describe("terminal mentions", () => {
     expect(terminalLabel(shells[1], shells)).toBe("bash · b");
     const sameDirectory = shells.map((t) => ({ ...t, cwd: "/work" }));
     expect(terminalLabel(sameDirectory[0], sameDirectory)).toBe("bash · 1234abcd");
+    const windows = shells.slice(0, 2).map((t, i) => ({ ...t, cwd: i === 0 ? "C:/Users/me/a" : "D:/" }));
+    expect(terminalLabel(windows[0], windows)).toBe("bash · a");
+    expect(terminalLabel(windows[1], windows)).toBe("bash · D:");
   });
   it("uses distinct readable chips while send, save and copy retain exact IDs", () => {
     const tokens = new Map<string, string>();
