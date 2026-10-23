@@ -521,6 +521,43 @@ async fn always_has_no_caps_and_loosening_the_policy_releases_requests() {
     state.sessions.kill(&a).ok();
 }
 
+/// A request that lands after a looser policy's sweep (a send decided under
+/// the old one) is let go at once instead of waiting for the user.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_landing_after_the_sweep_is_released() {
+    let state = test_state();
+    let ws = make_workspace(&state, "comms-late").await;
+    let a = tui(&state, &ws, "ka");
+    let (c, _) = chat(&state, &ws, "comms-late-1").await;
+    let (_, text) = send(
+        &state,
+        &a,
+        "ka",
+        serde_json::json!({"to": c, "text": "late-request"}),
+    )
+    .await;
+    assert!(text.contains("the user was asked"), "{text}");
+    // The policy moves without a sweep, as if the sweep ran first.
+    {
+        let mut settings = lock(&state.settings);
+        let mut map = settings.map_cached().clone();
+        map.insert(
+            "agents.communication.wakes".into(),
+            serde_json::json!("always"),
+        );
+        settings.put(map).unwrap();
+    }
+    crate::comms::reask_for_tests(&state, &ws);
+    journal_has(&state, &c, "late-request").await;
+    assert!(comms(&state, &ws).await["wake_requests"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    state.chat.kill(&c);
+    state.sessions.kill(&a).ok();
+}
+
 /// Inside the per-pair gap a fresh message is not stranded: it wakes its
 /// idle reader once the gap has passed — and another sender's message to
 /// the same reader isn't held by it.

@@ -12,17 +12,9 @@
    * chevron beside Wake wakes it "from now on" (`loosenChoices`), as the
    * idle agent's own wake bar does.
    */
-  import Chevron from "../shared/Chevron.svelte";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
-  import { contextMenu } from "../shared/contextMenu.svelte";
-  import {
-    dismissWakeFailure,
-    loosenChoices,
-    wake,
-    wakeAsk,
-    wakeFromNowOn,
-    type WakeRequest,
-  } from "../workspace/comms.svelte";
+  import WakeSplitButton from "../workspace/WakeSplitButton.svelte";
+  import { dismissWakeFailure, wake, wakeAsk, wakeFromNowOn, type WakeRequest } from "../workspace/comms.svelte";
 
   interface Props {
     request: WakeRequest;
@@ -47,31 +39,18 @@
   let busy = $state<"wake" | "leave" | null>(null);
   let error = $state<string | null>(null);
 
-  async function answer(yes: boolean, policy?: "auto" | "always"): Promise<void> {
+  async function answer(yes: boolean, policy?: "auto" | "always", wid = request.id): Promise<void> {
     if (busy !== null) return;
     busy = yes ? "wake" : "leave";
     error = null;
     try {
-      if (policy !== undefined) await wakeFromNowOn(request.id, policy);
-      else await wake(request.id, yes);
+      if (policy !== undefined) await wakeFromNowOn(wid, policy);
+      else await wake(wid, yes);
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {
       busy = null;
     }
-  }
-
-  function openChoices(e: MouseEvent): void {
-    const r = (e.currentTarget as Element).getBoundingClientRect();
-    contextMenu.openAtPoint(
-      r.left,
-      r.bottom,
-      loosenChoices(request.reason).map((c) => ({
-        label: c.label,
-        detail: c.detail,
-        onSelect: () => void answer(true, c.policy),
-      })),
-    );
   }
 </script>
 
@@ -109,23 +88,15 @@
     </div>
   {:else}
     <div class="actions">
-      <span class="split">
-        <button
-          class="btn primary"
-          disabled={busy !== null}
-          title="deliver {to}'s waiting messages now — one turn, billed to your account"
-          onclick={() => answer(true)}
-        >
-          {busy === "wake" ? (cont ? "continuing…" : "waking…") : cont ? "Continue" : "Wake"}
-        </button><button
-          class="btn primary more"
-          disabled={busy !== null}
-          aria-haspopup="menu"
-          aria-label={cont ? "Continue from now on" : "Wake from now on"}
-          title={cont ? "continue, and stop asking" : "wake, and stop asking every time"}
-          onclick={openChoices}><Chevron open size={9} /></button
-        >
-      </span>
+      <WakeSplitButton
+        {request}
+        label={busy === "wake" ? (cont ? "continuing…" : "waking…") : cont ? "Continue" : "Wake"}
+        title="deliver {to}'s waiting messages now — one turn, billed to your account"
+        disabled={busy !== null}
+        pill
+        onWake={() => void answer(true)}
+        onPick={(wid, policy) => void answer(true, policy, wid)}
+      />
       <button
         class="btn"
         disabled={busy !== null}
@@ -227,36 +198,9 @@
   .btn:hover:not(:disabled) {
     border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
   }
-  .btn.primary {
-    font-weight: 500;
-    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
-    background: color-mix(in srgb, var(--accent) 14%, transparent);
-  }
-  .btn.primary:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--accent) 24%, transparent);
-  }
   .btn:disabled {
     opacity: 0.55;
     cursor: default;
-  }
-  /* Wake and its "from now on" chevron read as one pill. */
-  .split {
-    display: inline-flex;
-  }
-  .split > .btn:first-child {
-    border-top-right-radius: 0;
-    border-bottom-right-radius: 0;
-  }
-  .split > .more {
-    display: inline-flex;
-    align-items: center;
-    padding: 2px 7px 2px 5px;
-    border-left-width: 0;
-    border-top-left-radius: 0;
-    border-bottom-left-radius: 0;
-  }
-  .more :global(.chev) {
-    color: inherit;
   }
   .err {
     font-size: var(--text-xs);

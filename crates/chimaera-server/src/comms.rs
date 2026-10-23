@@ -1963,6 +1963,7 @@ fn defer_wake(state: &Arc<AppState>, ws: &str, sid: &str, after: Duration) {
 /// behind it, and one Continue lets them all go on (`post_wake`).
 fn ask_user(state: &Arc<AppState>, ws: &str, req: WakeRequest) {
     let announce = req.clone();
+    let to_sid = req.to_sid.clone();
     let fresh = {
         let mut st = crate::lock(&state.comms.inner);
         let asked = req.reason == "unattended"
@@ -1972,10 +1973,53 @@ fn ask_user(state: &Arc<AppState>, ws: &str, req: WakeRequest) {
                 .is_some_and(|list| list.iter().any(|r| r.reason == "unattended"));
         st.request(ws, req) && !asked
     };
+    // A send decided under the old policy can land its request just after a
+    // looser policy's sweep (`policy_changed`): the policy is read after the
+    // insert, so either the sweep sees the request or this sees the policy.
+    // Whichever removes it releases it.
+    let policy = wake_policy(state);
+    let late = {
+        let mut st = crate::lock(&state.comms.inner);
+        let list = st.requests.entry(ws.to_string()).or_default();
+        match list
+            .iter()
+            .position(|r| r.to_sid == to_sid && lets_go(policy, r.reason))
+        {
+            Some(pos) => {
+                let req = list.remove(pos);
+                bump(&mut st, ws);
+                Some(req)
+            }
+            None => None,
+        }
+    };
+    if let Some(req) = late {
+        state.changes.notify_waiters();
+        tokio::spawn(release_held(
+            state.clone(),
+            ws.to_string(),
+            vec![req],
+            LOOSENED_WHY,
+        ));
+        return;
+    }
     if fresh {
         crate::notices::push_wake_notice(state, &announce);
     }
     state.changes.notify_waiters();
+}
+
+/// Ask again about `ws`'s first waiting request, as a send decided under an
+/// older policy would (tests drive the request-after-sweep race).
+#[cfg(test)]
+pub(crate) fn reask_for_tests(state: &Arc<AppState>, ws: &str) {
+    let req = crate::lock(&state.comms.inner)
+        .requests
+        .get(ws)
+        .and_then(|l| l.first().cloned());
+    if let Some(req) = req {
+        ask_user(state, ws, req);
+    }
 }
 
 /// Use up a workspace's unattended wakes (tests drive the limit without
@@ -2654,12 +2698,19 @@ pub(crate) async fn post_wake(
 /// "Within limits" / "Always"): the requests it no longer asks about go,
 /// and their agents wake under it. Ask → Within limits lets go of the
 /// plain asks (a limit's Continue still asks); Always lets go of every one.
-pub(crate) fn policy_changed(state: &Arc<AppState>, before: WakePolicy, after: WakePolicy) {
-    let lets_go = |reason: &str| match after {
+/// Whether `policy` no longer asks about a request held for `reason`.
+fn lets_go(policy: WakePolicy, reason: &str) -> bool {
+    match policy {
         WakePolicy::Always => true,
         WakePolicy::Auto => reason == "ask",
         WakePolicy::Never | WakePolicy::Ask => false,
-    };
+    }
+}
+
+const LOOSENED_WHY: &str =
+    "[chimaera delivered these because the user now lets agents in this workspace wake each other]";
+
+pub(crate) fn policy_changed(state: &Arc<AppState>, before: WakePolicy, after: WakePolicy) {
     if before == after || !enabled(state) {
         return;
     }
@@ -2669,7 +2720,7 @@ pub(crate) fn policy_changed(state: &Arc<AppState>, before: WakePolicy, after: W
         for (ws, list) in st.requests.iter_mut() {
             let (go, keep): (Vec<_>, Vec<_>) = std::mem::take(list)
                 .into_iter()
-                .partition(|r| lets_go(r.reason));
+                .partition(|r| lets_go(after, r.reason));
             *list = keep;
             if !go.is_empty() {
                 out.push((ws.clone(), go));
@@ -2685,9 +2736,7 @@ pub(crate) fn policy_changed(state: &Arc<AppState>, before: WakePolicy, after: W
     }
     state.changes.notify_waiters();
     for (ws, held) in released {
-        let why = "[chimaera delivered these because the user now lets agents in this \
-                   workspace wake each other]";
-        tokio::spawn(release_held(state.clone(), ws, held, why));
+        tokio::spawn(release_held(state.clone(), ws, held, LOOSENED_WHY));
     }
 }
 

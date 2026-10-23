@@ -14,17 +14,9 @@
    * A refused answer stays as the bar with the daemon's words until
    * dismissed. The message is an agent's words: plain text, one line.
    */
-  import Chevron from "../shared/Chevron.svelte";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
-  import { contextMenu } from "../shared/contextMenu.svelte";
-  import {
-    dismissWakeFailure,
-    loosenChoices,
-    wake,
-    wakeAsk,
-    wakeFromNowOn,
-    type WakeRequest,
-  } from "../workspace/comms.svelte";
+  import WakeSplitButton from "../workspace/WakeSplitButton.svelte";
+  import { dismissWakeFailure, wake, wakeAsk, wakeFromNowOn, type WakeRequest } from "../workspace/comms.svelte";
 
   interface Props {
     request: WakeRequest | null;
@@ -54,24 +46,6 @@
       busy = null;
     }
   }
-
-  function openChoices(e: MouseEvent): void {
-    if (request === null) return;
-    // The pick answers the request the menu was opened for, even if the bar
-    // has moved on to the next one meanwhile.
-    const wid = request.id;
-    const r = (e.currentTarget as Element).getBoundingClientRect();
-    contextMenu.openAtPoint(
-      r.right,
-      r.bottom,
-      loosenChoices(request.reason).map((c) => ({
-        label: c.label,
-        detail: c.detail,
-        onSelect: () => void answer(true, c.policy, wid),
-      })),
-      { alignRight: true },
-    );
-  }
 </script>
 
 {#if failure !== null && request === null}
@@ -96,22 +70,15 @@
         title="keep it in the inbox — it reads it when it next works"
         onclick={() => void answer(false)}>{busy === "leave" ? "Leaving…" : "Leave"}</button
       >
-      <span class="split">
-        <button
-          class="opt primary"
-          disabled={busy !== null}
-          title="deliver it now — a turn billed to your account"
-          onclick={() => void answer(true)}
-          >{busy === "wake" ? (ask.cont ? "Continuing…" : "Waking…") : ask.cont ? "Continue" : "Wake"}</button
-        ><button
-          class="opt primary more"
-          disabled={busy !== null}
-          aria-haspopup="menu"
-          aria-label={ask.cont ? "Continue from now on" : "Wake from now on"}
-          title={ask.cont ? "continue, and stop asking" : "wake, and stop asking every time"}
-          onclick={openChoices}><Chevron open size={9} /></button
-        >
-      </span>
+      <WakeSplitButton
+        {request}
+        label={busy === "wake" ? (ask.cont ? "Continuing…" : "Waking…") : ask.cont ? "Continue" : "Wake"}
+        title="deliver it now — a turn billed to your account"
+        disabled={busy !== null}
+        alignRight
+        onWake={() => void answer(true)}
+        onPick={(wid, policy) => void answer(true, policy, wid)}
+      />
     </span>
   </div>
 {/if}
@@ -166,24 +133,5 @@
     display: inline-flex;
     align-items: center;
     gap: 6px;
-  }
-  /* Wake and its "from now on" chevron read as one control. */
-  .split {
-    display: inline-flex;
-  }
-  .split > .opt:first-child {
-    border-top-right-radius: 0;
-    border-bottom-right-radius: 0;
-  }
-  .split > .more {
-    display: inline-flex;
-    align-items: center;
-    padding: 3px 5px;
-    border-left-width: 0;
-    border-top-left-radius: 0;
-    border-bottom-left-radius: 0;
-  }
-  .more :global(.chev) {
-    color: inherit;
   }
 </style>
