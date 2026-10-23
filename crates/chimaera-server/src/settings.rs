@@ -195,7 +195,7 @@ impl SettingsStore {
     }
 
     /// Daemon-consumed key: what a new Claude session's `--settings` file
-    /// says about auto-compact (PROTOCOL.md Pass 49). On (the default) writes
+    /// says about auto-compact (PROTOCOL.md Pass 50). On (the default) writes
     /// nothing, so the user's own Claude Code settings stay in charge (their
     /// default is on); Off writes `autoCompactEnabled: false` into the
     /// per-session file, which outranks user and project settings and never

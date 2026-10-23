@@ -286,7 +286,7 @@ const DEFS = {
   },
 
   // Claude Code's own switch, set per session through the generated
-  // --settings file (crates/chimaera-agent/protocol/passes.md, Pass 49).
+  // --settings file (crates/chimaera-agent/protocol/passes.md, Pass 50).
   "agents.autoCompact": {
     title: "Auto-Compact",
     category: "Agents",

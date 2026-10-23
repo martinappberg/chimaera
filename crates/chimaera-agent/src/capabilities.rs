@@ -79,7 +79,7 @@ mod tests {
         assert!(claude.commands.iter().any(|c| c == "set_thinking"));
         assert!(!codex.commands.iter().any(|c| c == "set_thinking"));
         assert!(codex.commands.iter().any(|c| c == "compact"));
-        // Codex has no auto-compact switch (PROTOCOL.md Pass 49).
+        // Codex has no auto-compact switch (PROTOCOL.md Pass 50).
         assert!(claude.commands.iter().any(|c| c == "set_auto_compact"));
         assert!(!codex.commands.iter().any(|c| c == "set_auto_compact"));
         assert!(claude.custom_model && codex.custom_model);

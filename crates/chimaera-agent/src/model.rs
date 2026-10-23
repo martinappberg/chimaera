@@ -421,7 +421,7 @@ pub enum AgentEvent {
     /// Whether the agent compacts on its own when the context fills, read
     /// back from the agent (claude get_settings `effective.autoCompactEnabled`,
     /// absent = the CLI's default, on). Latest-wins; emitted only by agents
-    /// that can switch it per session (codex cannot, PROTOCOL.md Pass 49).
+    /// that can switch it per session (codex cannot, PROTOCOL.md Pass 50).
     AutoCompact {
         enabled: bool,
         /// This read-back follows the user's own SetAutoCompact; only a pick

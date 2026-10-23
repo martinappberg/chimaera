@@ -148,7 +148,7 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   when you asked. Reconnect/replay restores an active compaction instead of falling back to a
   generic working spinner; turn abort, failure, or driver exit always settles it. Neither CLI hands
   off to a new session when it compacts: the summary replaces history in the same conversation
-  (PROTOCOL.md Pass 49). With Claude's auto-compact off, a full context ends the turn with "Prompt is
+  (PROTOCOL.md Pass 50). With Claude's auto-compact off, a full context ends the turn with "Prompt is
   too long" and the notice "context limit reached · /compact to continue".
   The slash popover triggers after any whitespace boundary, so prose such as
   `please use /skill` remains fully editable while the matching command menu opens. A mid-draft

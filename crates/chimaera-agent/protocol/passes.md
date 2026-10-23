@@ -1428,7 +1428,7 @@ Installed Codex 0.158.0; `TESTED_CODEX_VERSION` remains 0.162.1. Generated the i
 
 - Isolated preview resource check after verification: ~28 MiB RSS, 0.0% CPU at idle. Preview ownership: this verification run owns the isolated daemon on port 52328 and the component gallery on port 57924.
 
-## Pass 49 — 2026-10-23: auto-compact (claude 2.1.302, codex 0.158.0 / 0.162.1 source)
+## Pass 50 — 2026-10-23: auto-compact (claude 2.1.302, codex 0.158.0 / 0.162.1 source)
 
 Issue #347: give Chimaera an auto-compact setting that behaves the way each CLI does. Sources: the installed claude 2.1.302 bundle (strings), the official settings docs (`code.claude.com/docs/en/settings`, `settings-reference`), free control-channel probes against a throwaway `HOME`, and billed haiku probes (five short runs, under $0.02 in total) with the real `HOME` (`~/.claude/settings.json` hash checked before and after: unchanged). Codex: the installed 0.158.0 `app-server generate-ts` schema and the `rust-v0.158.0` / `rust-v0.162.1` sources (`core/src/session/context_window.rs`, `protocol/src/openai_models.rs`, `core/src/compact.rs`), no billed codex turn.
 
@@ -1458,7 +1458,7 @@ Issue #347: give Chimaera an auto-compact setting that behaves the way each CLI 
 - A `blocking_limit` result adds the notice "context limit reached · /compact to continue".
 - The remote-message gate also skips `isSynthetic` user frames (the compaction summary).
 
-### Gate (Pass 49)
+### Gate (Pass 50)
 
 - Hermetic: `claude.rs` `success_status_waits_for_the_boundary_that_carries_the_trigger`, `a_success_without_a_boundary_completes_at_the_turn_end`, `manual_boundary_is_tagged_manual`, `auto_compact_applies_to_the_flag_layer_and_reads_back`, `auto_compact_read_back_defaults_on_and_dedupes`, `blocking_limit_says_how_to_continue`; `codex.rs` `compaction_trigger_follows_the_turn_that_ran_it`; `journal.rs` `index_keeps_a_conversations_auto_compact_pick`; `tests/manager.rs` `auto_compact_carries_through_the_handshake_and_picks_read_back` (fake-claude reads its `--settings` file and answers the flag); the wire fixtures.
 - Live: `claude_auto_compact_is_a_session_flag` (new, no billing) and `claude_manual_compaction_emits_status_lifecycle` (now also asserts `trigger:"manual"`) passed against 2.1.302. The full `just chat-smoke` was not run for this pass; `TESTED_CLAUDE_VERSION` stays 2.1.300.

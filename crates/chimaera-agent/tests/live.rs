@@ -211,7 +211,7 @@ async fn claude_manual_compaction_emits_status_lifecycle() {
     assert!(saw_start, "manual compaction announces status=compacting");
     assert!(saw_result, "manual compaction settles with compact_result");
     // The boundary names who asked; the transcript's line depends on it
-    // (PROTOCOL.md Pass 49).
+    // (PROTOCOL.md Pass 50).
     assert_eq!(boundary_trigger, json!("manual"));
 
     chat.shutdown(Duration::from_secs(5))
@@ -1265,7 +1265,7 @@ async fn driver_rapid_queued_sends_settle_idle() {
     manager.kill("rapid");
 }
 
-/// Auto-compact is a session flag (PROTOCOL.md Pass 49): the launcher's
+/// Auto-compact is a session flag (PROTOCOL.md Pass 50): the launcher's
 /// `--settings` file turns it off, `apply_flag_settings` switches it, and
 /// get_settings' merged `effective` view reads it back. Control channel only:
 /// no turn, no billing.

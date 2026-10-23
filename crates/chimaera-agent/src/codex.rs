@@ -6097,7 +6097,7 @@ impl CodexMapper {
             // codex has no rewind_files-style file restore to answer with.
             // No auto-compact switch either: codex always compacts at 90% of
             // the window, and its token-limit config can only lower that
-            // (PROTOCOL.md Pass 49). The capability is not advertised.
+            // (PROTOCOL.md Pass 50). The capability is not advertised.
             AgentCommand::SetThinking { .. }
             | AgentCommand::SetUltracode { .. }
             | AgentCommand::SetAutoCompact { .. }

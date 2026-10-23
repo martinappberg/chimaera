@@ -183,7 +183,7 @@ pub(crate) fn write_settings(
         settings["theme"] = json!(theme);
     }
     // `agents.autoCompact` off: the flag layer outranks the user's and the
-    // project's settings for this session only (claude 2.1.302, Pass 49).
+    // project's settings for this session only (claude 2.1.302, Pass 50).
     if let Some(enabled) = auto_compact {
         settings["autoCompactEnabled"] = json!(enabled);
     }

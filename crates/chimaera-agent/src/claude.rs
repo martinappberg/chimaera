@@ -4392,7 +4392,7 @@ impl ClaudeMapper {
             }
             // Auto-compact rides the same session-scoped flag layer (live
             // 2.1.302: get_settings reads it back from flagSettings, and no
-            // settings file is written; PROTOCOL.md Pass 49).
+            // settings file is written; PROTOCOL.md Pass 50).
             AgentCommand::SetAutoCompact { enabled } => {
                 let id = self.ctl_id();
                 self.pending_controls.insert(
