@@ -549,6 +549,7 @@ async fn spawn_chat_ui(
                 .await;
         let settings_theme = (!theme_set).then_some(theme);
         let plugin_tools = crate::plugins::spawn_allow(state, &workspace.id).await;
+        let auto_compact = crate::lock(&state.settings).claude_auto_compact();
         match crate::agents::write_settings(
             &id,
             &key,
@@ -557,7 +558,7 @@ async fn spawn_chat_ui(
             user_statusline.as_ref(),
             None,
             &plugin_tools,
-            crate::lock(&state.settings).claude_auto_compact(),
+            auto_compact,
         ) {
             Ok(path) => Some(path),
             Err(err) => return internal(err),

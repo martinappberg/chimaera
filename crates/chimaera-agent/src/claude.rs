@@ -1321,14 +1321,12 @@ impl ClaudeMapper {
     /// One get_settings round-trip → EffortState. Issued at spawn and after
     /// every apply_flag_settings, so the chips always show the CLI's truth.
     fn request_settings(&mut self, step: &mut DriverStep) {
-        self.request_settings_after(false, step);
+        self.request_settings_after(false, false, step);
     }
 
-    fn request_settings_after(&mut self, chosen: bool, step: &mut DriverStep) {
-        self.request_settings_with(chosen, false, step);
-    }
-
-    fn request_settings_with(
+    /// `chosen` / `auto_compact_chosen`: the read follows the user's own
+    /// effort-or-ultracode / auto-compact apply (at most one is true).
+    fn request_settings_after(
         &mut self,
         chosen: bool,
         auto_compact_chosen: bool,
@@ -1361,11 +1359,12 @@ impl ClaudeMapper {
         self.compaction_awaiting_boundary = false;
     }
 
-    /// A result/watchdog abort can be the only terminal signal when the CLI
-    /// never emits compact_result. Keep completed=true until the next turn so
-    /// a late compact_boundary still dedupes, while active never leaks. A
-    /// success still waiting for its boundary completes here, unannotated.
-    fn settle_compaction_at_turn_end(&mut self, step: &mut DriverStep) {
+    /// A success status whose boundary never came completes unannotated once
+    /// something else proves the compaction over: the model's output resumes,
+    /// another compaction starts, or the turn ends. Hooks and a repeated
+    /// `system/init` sit between a manual success and its boundary (live
+    /// 2.1.302), so only those signals settle it.
+    fn settle_awaited_compaction(&mut self, step: &mut DriverStep) {
         if std::mem::take(&mut self.compaction_awaiting_boundary) {
             self.compaction_completed = true;
             step.events.push(AgentEvent::ContextCompaction {
@@ -1374,6 +1373,14 @@ impl ClaudeMapper {
                 trigger: None,
             });
         }
+    }
+
+    /// A result/watchdog abort can be the only terminal signal when the CLI
+    /// never emits compact_result. Keep completed=true until the next turn so
+    /// a late compact_boundary still dedupes, while active never leaks. A
+    /// success still waiting for its boundary completes here, unannotated.
+    fn settle_compaction_at_turn_end(&mut self, step: &mut DriverStep) {
+        self.settle_awaited_compaction(step);
         if self.compaction_active {
             self.compaction_active = false;
             self.compaction_completed = true;
@@ -1462,8 +1469,14 @@ impl ClaudeMapper {
         }
         match frame["type"].as_str() {
             Some("system") => self.on_system(frame, &mut step),
-            Some("stream_event") => self.on_stream_event(&frame["event"], &mut step),
-            Some("assistant") => self.on_assistant(frame, &mut step),
+            Some("stream_event") => {
+                self.settle_awaited_compaction(&mut step);
+                self.on_stream_event(&frame["event"], &mut step)
+            }
+            Some("assistant") => {
+                self.settle_awaited_compaction(&mut step);
+                self.on_assistant(frame, &mut step)
+            }
             Some("user") => self.on_user_frame(frame, &mut step),
             Some("control_request") => self.on_control_request(frame, &mut step),
             Some("control_cancel_request") => {
@@ -1812,6 +1825,7 @@ impl ClaudeMapper {
             Some("status") => {
                 if frame["status"] == "compacting" {
                     if !self.compaction_active {
+                        self.settle_awaited_compaction(step);
                         self.ensure_turn(step);
                         self.compaction_active = true;
                         self.compaction_completed = false;
@@ -1835,8 +1849,8 @@ impl ClaudeMapper {
                     } else if result == "success" && self.compaction_active {
                         // The boundary follows with the trigger and the token
                         // count (live 2.1.302: status success, then the
-                        // boundary); the turn end completes it if it never
-                        // comes.
+                        // boundary); `settle_awaited_compaction` completes it
+                        // if it never comes.
                         self.compaction_active = false;
                         self.compaction_awaiting_boundary = true;
                     }
@@ -2508,7 +2522,8 @@ impl ClaudeMapper {
         }
         if frame["isSynthetic"] == json!(true) {
             // The CLI's own words to the model — a Stop hook's "not yet"
-            // (live 2.1.300: `/goal`'s failed check), never a message.
+            // (live 2.1.300: `/goal`'s failed check) or the compaction
+            // summary (2.1.302) — never a message.
             if let Some(text) = frame["message"]["content"]
                 .as_array()
                 .and_then(|blocks| blocks.iter().find_map(|b| b["text"].as_str()))
@@ -2546,7 +2561,6 @@ impl ClaudeMapper {
         if frame["isReplay"] == json!(true)
             || frame["isMeta"] == json!(true)
             || frame["isCompactSummary"] == json!(true)
-            || frame["isSynthetic"] == json!(true)
             || !frame["parent_tool_use_id"].is_null()
         {
             return;
@@ -3764,11 +3778,7 @@ impl ClaudeMapper {
                 // The apply is fire-and-ack; the truth comes from re-reading —
                 // and that read is the pick (it feeds the prefs) when the
                 // apply was.
-                if auto_compact {
-                    self.request_settings_with(false, chosen, step);
-                } else {
-                    self.request_settings_after(chosen, step);
-                }
+                self.request_settings_after(chosen && !auto_compact, chosen && auto_compact, step);
             }
         }
     }
@@ -10201,6 +10211,32 @@ pub(crate) mod tests {
             pre_tokens: None,
             trigger: None,
         }));
+    }
+
+    /// An auto compaction mid-turn whose boundary never comes must not read
+    /// "compacting" for the rest of the turn: the model's next output ends it.
+    #[test]
+    fn a_success_without_a_boundary_completes_when_output_resumes() {
+        let mut m = mapper();
+        m.on_frame(&json!({ "type": "system", "subtype": "status", "status": "compacting" }));
+        m.on_frame(&json!({
+            "type": "system", "subtype": "status", "status": null,
+            "compact_result": "success",
+        }));
+        let resumed = m.on_frame(&json!({
+            "type": "stream_event",
+            "event": { "type": "message_start", "message": { "id": "msg-1" } },
+        }));
+        assert!(resumed.events.contains(&AgentEvent::ContextCompaction {
+            phase: CompactionPhase::Completed,
+            pre_tokens: None,
+            trigger: None,
+        }));
+        let end = m.on_frame(&json!({ "type": "result", "is_error": false }));
+        assert!(!end
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ContextCompaction { .. })));
     }
 
     #[test]

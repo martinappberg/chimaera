@@ -1211,6 +1211,7 @@ async fn resolve_respawn_inputs(
                     .await;
             let settings_theme = (!theme_set).then_some(theme);
             let plugin_tools = crate::plugins::spawn_allow(state, workspace_id).await;
+            let auto_compact = crate::lock(&state.settings).claude_auto_compact();
             let settings = crate::agents::write_settings(
                 id,
                 &key,
@@ -1219,7 +1220,7 @@ async fn resolve_respawn_inputs(
                 user_statusline.as_ref(),
                 mastermind,
                 &plugin_tools,
-                crate::lock(&state.settings).claude_auto_compact(),
+                auto_compact,
             )
             .map_err(|err| err.to_string())?;
             let mcp = crate::agents::write_mcp_config(id, &key, state.port)
@@ -3275,6 +3276,7 @@ pub(crate) async fn spawn_fresh_chat_at(
                 .await;
         let settings_theme = (!theme_set).then_some(spec.theme.as_str());
         let plugin_tools = crate::plugins::spawn_allow(state, &workspace.id).await;
+        let auto_compact = crate::lock(&state.settings).claude_auto_compact();
         let s = crate::agents::write_settings(
             &id,
             &key,
@@ -3283,7 +3285,7 @@ pub(crate) async fn spawn_fresh_chat_at(
             user_statusline.as_ref(),
             spec.mastermind,
             &plugin_tools,
-            crate::lock(&state.settings).claude_auto_compact(),
+            auto_compact,
         )
         .map_err(ChatSpawnFailure::Internal)?;
         let m = crate::agents::write_mcp_config(&id, &key, state.port)
@@ -3850,6 +3852,7 @@ pub(crate) async fn resurrect_chat(
             crate::runtimes::claude_settings_gates(&state.claude_settings_path, &root).await;
         let settings_theme = (!theme_set).then_some(entry.theme.as_str());
         let plugin_tools = crate::plugins::spawn_allow(state, &workspace.id).await;
+        let auto_compact = crate::lock(&state.settings).claude_auto_compact();
         let s = crate::agents::write_settings(
             &entry.id,
             &key,
@@ -3858,7 +3861,7 @@ pub(crate) async fn resurrect_chat(
             user_statusline.as_ref(),
             mastermind_mode,
             &plugin_tools,
-            crate::lock(&state.settings).claude_auto_compact(),
+            auto_compact,
         )?;
         let m = crate::agents::write_mcp_config(&entry.id, &key, state.port)?;
         (Some(s), Some(m))

@@ -168,6 +168,7 @@ pub(crate) async fn spawn_session(
                 let plugin_tools = crate::plugins::spawn_allow(state, &workspace.id).await;
                 // PTY TUI spawns are never the Mastermind (a chat-only role);
                 // only active plugins' tools may ride a permissions block.
+                let auto_compact = crate::lock(&state.settings).claude_auto_compact();
                 match crate::agents::write_settings(
                     &id,
                     &key,
@@ -176,7 +177,7 @@ pub(crate) async fn spawn_session(
                     user_statusline.as_ref(),
                     None,
                     &plugin_tools,
-                    crate::lock(&state.settings).claude_auto_compact(),
+                    auto_compact,
                 ) {
                     Ok(path) => Some(path),
                     Err(err) => {
