@@ -55,6 +55,14 @@ fn emit(value: Value) {
     stdout.flush().expect("stdout flush");
 }
 
+/// The JSON file a `--settings <path>` argument names (the launcher passes
+/// one per session), wherever it sits in argv.
+fn flag_settings() -> Option<Value> {
+    let args: Vec<String> = std::env::args().collect();
+    let path = args.windows(2).find(|w| w[0] == "--settings")?[1].clone();
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "normal".into());
     match mode.as_str() {
@@ -79,6 +87,13 @@ fn main() {
     // Session-scoped flag state, so an apply_flag_settings shows up in the
     // next get_settings read-back like the real CLI's.
     let mut ultracode = false;
+    // Auto-compact as the real CLI resolves it (2.1.302): the `--settings`
+    // flag layer's `autoCompactEnabled`, else the default (on); an
+    // apply_flag_settings changes it for the session. Read back in
+    // get_settings' merged `effective` view.
+    let mut auto_compact = flag_settings()
+        .and_then(|s| s["autoCompactEnabled"].as_bool())
+        .unwrap_or(true);
     // Loop mode: set by "Stop the loop." so a pending wake never fires.
     let loop_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -352,12 +367,18 @@ fn main() {
                 "response": {
                     "subtype": "success",
                     "request_id": frame["request_id"],
-                    "response": { "applied": { "ultracode": ultracode } },
+                    "response": {
+                        "applied": { "ultracode": ultracode },
+                        "effective": { "autoCompactEnabled": auto_compact },
+                    },
                 },
             }));
         } else if frame["type"] == "control_request" {
             if let Some(on) = frame["request"]["settings"]["ultracode"].as_bool() {
                 ultracode = on;
+            }
+            if let Some(on) = frame["request"]["settings"]["autoCompactEnabled"].as_bool() {
+                auto_compact = on;
             }
             // set_permission_mode / set_model / apply_flag_settings / …:
             // acknowledge.

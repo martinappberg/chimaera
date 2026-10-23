@@ -159,6 +159,7 @@ pub(crate) fn statusline_header_path(session_id: &str) -> PathBuf {
 /// `None` (every non-mastermind session) writes no permissions block. A
 /// running claude never re-reads this file, so a mode change re-creates the
 /// session (the PUT mastermind route) rather than editing in place.
+#[allow(clippy::too_many_arguments)] // one arg per optional key, like the argv builders
 pub(crate) fn write_settings(
     session_id: &str,
     key: &str,
@@ -167,6 +168,7 @@ pub(crate) fn write_settings(
     user_statusline: Option<&serde_json::Value>,
     mastermind: Option<crate::workspaces::MastermindMode>,
     plugin_tools: &[String],
+    auto_compact: Option<bool>,
 ) -> anyhow::Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -179,6 +181,11 @@ pub(crate) fn write_settings(
     let mut settings = json!({ "hooks": hooks });
     if let Some(theme) = theme {
         settings["theme"] = json!(theme);
+    }
+    // `agents.autoCompact` off: the flag layer outranks the user's and the
+    // project's settings for this session only (claude 2.1.302, Pass 49).
+    if let Some(enabled) = auto_compact {
+        settings["autoCompactEnabled"] = json!(enabled);
     }
     // Every session pre-allows the prompt-free tools (`notify`, the
     // read-only document tools); a Mastermind adds its tier's gate on top.
@@ -1024,10 +1031,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn auto_compact_off_rides_the_session_settings_file() {
+        let sid = fresh_session_id();
+        let key = fresh_agent_key();
+        let path = write_settings(&sid, &key, 43999, None, None, None, &[], Some(false)).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["autoCompactEnabled"], json!(false));
+        // The hooks ride along untouched.
+        assert_eq!(value["hooks"]["Stop"][0]["hooks"][0]["type"], "http");
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(statusline_script_path(&sid)).ok();
+    }
+
+    #[test]
     fn settings_file_embeds_hook_url() {
         let sid = fresh_session_id();
         let key = fresh_agent_key();
-        let path = write_settings(&sid, &key, 43999, None, None, None, &[]).unwrap();
+        let path = write_settings(&sid, &key, 43999, None, None, None, &[], None).unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&contents).unwrap();
         let url = format!("http://127.0.0.1:43999/api/v1/agent-events/{sid}?key={key}");
@@ -1041,6 +1062,8 @@ mod tests {
         // No theme requested: the settings stay hooks-only (a user with an
         // explicit theme choice is never overridden).
         assert!(value.get("theme").is_none());
+        // Auto-compact at its default leaves the user's own setting in charge.
+        assert!(value.get("autoCompactEnabled").is_none());
         // Not a mastermind: only the prompt-free tools (`notify`, the
         // read-only document tools, `open_browser`) are pre-allowed — every
         // other tool (the terminal tools included) still prompts.
@@ -1068,7 +1091,7 @@ mod tests {
     fn settings_file_merges_theme_next_to_hooks() {
         let sid = fresh_session_id();
         let key = fresh_agent_key();
-        let path = write_settings(&sid, &key, 43999, Some("light"), None, None, &[]).unwrap();
+        let path = write_settings(&sid, &key, 43999, Some("light"), None, None, &[], None).unwrap();
         let value: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(value["theme"], "light");
@@ -1101,6 +1124,7 @@ mod tests {
             None,
             Some(MastermindMode::Ask),
             &[],
+            None,
         )
         .unwrap();
         let value: serde_json::Value =
@@ -1138,6 +1162,7 @@ mod tests {
             None,
             Some(MastermindMode::Ask),
             &extras,
+            None,
         )
         .unwrap();
         let value: serde_json::Value =
@@ -1165,6 +1190,7 @@ mod tests {
             None,
             Some(MastermindMode::Auto),
             &[],
+            None,
         )
         .unwrap();
         let value: serde_json::Value =
@@ -1186,7 +1212,7 @@ mod tests {
         // (a) No user statusline: wrapper injected, prints nothing itself.
         let sid = fresh_session_id();
         let key = fresh_agent_key();
-        let path = write_settings(&sid, &key, 43999, None, None, None, &[]).unwrap();
+        let path = write_settings(&sid, &key, 43999, None, None, None, &[], None).unwrap();
         let value: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let script_path = statusline_script_path(&sid);
@@ -1242,7 +1268,7 @@ mod tests {
         // (b) A user statusline command: piped the same stdin, padding kept.
         let sid = fresh_session_id();
         let user = json!({"type": "command", "command": "my-status --flag", "padding": 0});
-        let path = write_settings(&sid, &key, 43999, None, Some(&user), None, &[]).unwrap();
+        let path = write_settings(&sid, &key, 43999, None, Some(&user), None, &[], None).unwrap();
         let value: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(value["statusLine"]["padding"], 0);
@@ -1272,7 +1298,8 @@ mod tests {
             json!({"type": "widget"}),
         ] {
             let sid = fresh_session_id();
-            let path = write_settings(&sid, &key, 43999, None, Some(&user), None, &[]).unwrap();
+            let path =
+                write_settings(&sid, &key, 43999, None, Some(&user), None, &[], None).unwrap();
             let value: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
             assert!(value.get("statusLine").is_none(), "{user}");

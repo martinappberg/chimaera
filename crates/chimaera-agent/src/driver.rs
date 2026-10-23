@@ -88,6 +88,11 @@ pub struct SpawnSpec {
     /// header pick but not recorded as one (a resurrected session had it on
     /// when the daemon restarted). Codex has no ultracode and ignores it.
     pub initial_ultracode: bool,
+    /// The conversation's own auto-compact pick, applied after the
+    /// handshake like a header pick but not recorded again (claude's
+    /// session flag layer; the launcher's settings file carries the global
+    /// setting). `None` = the spawn's settings decide. Codex ignores it.
+    pub initial_auto_compact: Option<bool>,
     /// The binary's `--version` line as the server probed it (`None` when
     /// the probe failed). Neither wire protocol offers a reliable version
     /// handshake (see PROTOCOL.md), so the server-side probe is the source:
@@ -195,6 +200,7 @@ impl SpawnSpec {
             initial_effort: None,
             initial_mode: None,
             initial_ultracode: false,
+            initial_auto_compact: None,
             agent_version: None,
             rollback_turns: None,
             fork_at: None,

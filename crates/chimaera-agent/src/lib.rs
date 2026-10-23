@@ -785,6 +785,7 @@ struct IndexUpdate {
     model: Option<String>,
     effort: Option<Option<String>>,
     mode: Option<String>,
+    auto_compact: Option<bool>,
 }
 
 /// One per-agent preference write queued by `absorb` for the blocking lane.
@@ -1193,6 +1194,21 @@ impl ChatManager {
                         });
                     }
                 }
+                // A per-chat auto-compact pick belongs to the conversation
+                // alone: a reopen applies it over the daemon's setting. The
+                // read-backs that follow a spawn are not picks.
+                AgentEvent::AutoCompact {
+                    enabled,
+                    chosen: true,
+                } => {
+                    if let Some(native) = &info.native_session_id {
+                        index_to_record = Some(IndexUpdate {
+                            native: native.clone(),
+                            auto_compact: Some(*enabled),
+                            ..Default::default()
+                        });
+                    }
+                }
                 // The model in effect is the conversation's own (any reason);
                 // only a user's pick (no reason) is a preference — a safety
                 // reroute or a credits fallback (reason present) is not.
@@ -1275,6 +1291,10 @@ impl ChatManager {
                     index.record(&native, &session_id);
                 }
                 if let Some(update) = index_to_record {
+                    if let Some(enabled) = update.auto_compact {
+                        index.record_auto_compact(&update.native, &session_id, enabled);
+                        return;
+                    }
                     index.record_settings(&update.native, &session_id, |s| {
                         if let Some(model) = update.model {
                             s.model = Some(model);

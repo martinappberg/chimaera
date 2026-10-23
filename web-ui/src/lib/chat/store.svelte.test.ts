@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { SeqEvent } from "./chatWs";
-import { ChatStore } from "./store.svelte";
+import { ChatStore, compactionNotice } from "./store.svelte";
 import { toolSpanMs } from "./toolLabels";
 
 /** Build a numbered event stream (seq assigned in order) and fold it through a
@@ -160,6 +160,27 @@ describe("ChatStore context compaction", () => {
       { type: "turn_aborted", turn_id: "compact-2", reason: "interrupted", interrupted: true },
     ]);
     expect(missingTerminalItem.compacting).toBe(false);
+  });
+
+  it("names the agent's own compaction and keeps a requested one plain", () => {
+    const texts = (trigger: string | undefined) =>
+      fold([
+        { type: "context_compaction", phase: "started" },
+        { type: "context_compaction", phase: "completed", pre_tokens: 27_506, trigger },
+      ]).blocks.flatMap((b) => (b.kind === "notice" ? [b.text] : []));
+    expect(texts("auto")).toEqual([`context auto-compacted · ${(27_506).toLocaleString()} tokens summarized`]);
+    expect(texts("manual")).toEqual([`context compacted · ${(27_506).toLocaleString()} tokens summarized`]);
+    expect(compactionNotice(undefined, "auto")).toBe("context auto-compacted");
+    expect(compactionNotice(undefined, undefined)).toBe("context compacted");
+  });
+
+  it("folds the auto-compact read-back latest-wins", () => {
+    const store = fold([
+      { type: "auto_compact", enabled: true },
+      { type: "auto_compact", enabled: false, chosen: true },
+    ]);
+    expect(store.autoCompact).toBe(false);
+    expect(fold([]).autoCompact).toBeNull();
   });
 });
 

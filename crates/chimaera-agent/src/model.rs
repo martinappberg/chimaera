@@ -418,6 +418,17 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         chosen: bool,
     },
+    /// Whether the agent compacts on its own when the context fills, read
+    /// back from the agent (claude get_settings `effective.autoCompactEnabled`,
+    /// absent = the CLI's default, on). Latest-wins; emitted only by agents
+    /// that can switch it per session (codex cannot, PROTOCOL.md Pass 49).
+    AutoCompact {
+        enabled: bool,
+        /// This read-back follows the user's own SetAutoCompact; only a pick
+        /// is remembered for the conversation. Additive: absent = false.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        chosen: bool,
+    },
     TurnCompleted {
         turn_id: String,
         usage: Usage,
@@ -451,6 +462,12 @@ pub enum AgentEvent {
         /// Claude's compact_boundary reports how much context was summarized.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pre_tokens: Option<u64>,
+        /// What started it, where the wire says: claude's compact_boundary
+        /// `trigger`, codex's requesting turn (a `thread/compact/start` turn
+        /// is manual, any other compaction is the agent's own). Additive:
+        /// absent = unknown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trigger: Option<CompactionTrigger>,
     },
     /// Account usage windows (claude get_usage; rendered by the /usage panel).
     UsageReport {
@@ -1085,6 +1102,12 @@ pub enum AgentCommand {
     SetUltracode {
         enabled: bool,
     },
+    /// Session auto-compact toggle (claude apply_flag_settings
+    /// {autoCompactEnabled}: the session's flag layer, never a settings
+    /// file). Codex has no switch and does not advertise it.
+    SetAutoCompact {
+        enabled: bool,
+    },
     /// Answer a QuestionRequest: question id → chosen labels (free text
     /// rides as a label).
     Answer {
@@ -1415,6 +1438,7 @@ impl AgentCommand {
             Self::Interrupt
             | Self::SetThinking { .. }
             | Self::SetUltracode { .. }
+            | Self::SetAutoCompact { .. }
             | Self::GetUsage
             | Self::Compact
             | Self::GetMcp
@@ -1567,6 +1591,15 @@ pub enum CompactionPhase {
     Started,
     Completed,
     Failed,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionTrigger {
+    /// The agent compacted on its own as the context filled.
+    Auto,
+    /// The user asked (/compact, the usage meter's Compact).
+    Manual,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

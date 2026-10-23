@@ -557,6 +557,7 @@ async fn spawn_chat_ui(
             user_statusline.as_ref(),
             None,
             &plugin_tools,
+            crate::lock(&state.settings).claude_auto_compact(),
         ) {
             Ok(path) => Some(path),
             Err(err) => return internal(err),

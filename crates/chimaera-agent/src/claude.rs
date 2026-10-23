@@ -36,13 +36,14 @@ use crate::elicitation::{Elicitation, ElicitationAction, ELICITATION_PENDING};
 use crate::model::{
     cap_head_tail, cap_output, clip_command, fmt_elapsed_secs, fmt_tokens, truncate_label,
     AgentCommand, AgentEvent, BackgroundTask, BackgroundTaskClose, ChunkKind, Coalescer,
-    CompactionPhase, ContentBlock, ModeInfo, PermissionOption, PermissionOptionKind, PlanEntry,
-    PlanStatus, SlashCommand, ToolContent, ToolKind, ToolStatus, Usage, UsageWindow,
-    UserMessageState, WorkflowAgent, BG_LABEL_MAX, BG_PATH_MAX, BG_TASKS_CAP, COMMAND_ID_MAX,
-    DIFF_FILE_BUDGET, DIFF_TURN_BUDGET, PLAN_BLOCKED_CAP, PLAN_DESC_MAX, PLAN_LABEL_MAX,
-    PLAN_TASKS_CAP, SLASH_COMMANDS_CAP, SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX, STATUS_DETAIL_MAX,
-    SUBAGENT_RESULT_MAX, TOOL_SUMMARY_IDS_CAP, TOOL_SUMMARY_MAX, UNHANDLED_REQUESTS_CAP,
-    UNHANDLED_REQUEST_NAME_MAX, WF_AGENTS_CAP, WF_AGENTS_SET_BUDGET, WF_AGENT_LABEL_MAX,
+    CompactionPhase, CompactionTrigger, ContentBlock, ModeInfo, PermissionOption,
+    PermissionOptionKind, PlanEntry, PlanStatus, SlashCommand, ToolContent, ToolKind, ToolStatus,
+    Usage, UsageWindow, UserMessageState, WorkflowAgent, BG_LABEL_MAX, BG_PATH_MAX, BG_TASKS_CAP,
+    COMMAND_ID_MAX, DIFF_FILE_BUDGET, DIFF_TURN_BUDGET, PLAN_BLOCKED_CAP, PLAN_DESC_MAX,
+    PLAN_LABEL_MAX, PLAN_TASKS_CAP, SLASH_COMMANDS_CAP, SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX,
+    STATUS_DETAIL_MAX, SUBAGENT_RESULT_MAX, TOOL_SUMMARY_IDS_CAP, TOOL_SUMMARY_MAX,
+    UNHANDLED_REQUESTS_CAP, UNHANDLED_REQUEST_NAME_MAX, WF_AGENTS_CAP, WF_AGENTS_SET_BUDGET,
+    WF_AGENT_LABEL_MAX,
 };
 use crate::model::{RemoteControlSnapshot, RemoteControlState};
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
@@ -542,6 +543,11 @@ impl Driver for ClaudeDriver {
         if spec.initial_ultracode {
             initial.push(mapper.on_command(AgentCommand::SetUltracode { enabled: true }));
         }
+        // The conversation's own auto-compact pick (a reopened chat), over
+        // the per-session settings file the launcher wrote.
+        if let Some(enabled) = spec.initial_auto_compact {
+            initial.push(mapper.on_command(AgentCommand::SetAutoCompact { enabled }));
+        }
         mapper.bootstrapping = false;
         // Remote Control at start — the embedder's standing choice, honored
         // only where the CLI offers the bridge. It rides the ordinary command
@@ -689,12 +695,17 @@ enum PendingControl {
     /// spawn bootstrap.
     Settings {
         chosen: bool,
+        /// The read follows the user's own auto-compact pick (remembered
+        /// for the conversation), not an effort/ultracode one.
+        auto_compact_chosen: bool,
     },
     /// apply_flag_settings acknowledged → re-read the truth. `chosen` = the
     /// apply was the user's own pick (fed to the prefs), not the handshake
-    /// replaying the spawn's remembered effort.
+    /// replaying the spawn's remembered effort; `auto_compact` = it was the
+    /// auto-compact flag, whose pick must not count as an effort pick.
     ApplyFlags {
         chosen: bool,
+        auto_compact: bool,
     },
     /// mcp_status round-trip (the /mcp panel).
     McpStatus,
@@ -990,6 +1001,13 @@ struct ClaudeMapper {
     /// signals into one normalized start + one terminal event.
     compaction_active: bool,
     compaction_completed: bool,
+    /// `compact_result: "success"` landed and its `compact_boundary` (which
+    /// carries the trigger and the token count) has not: 2.1.302 sends the
+    /// boundary right AFTER the status, so the status alone must not
+    /// complete the lifecycle. A turn end without a boundary completes it.
+    compaction_awaiting_boundary: bool,
+    /// The last auto-compact read-back journaled (latest-wins dedupe).
+    auto_compact: Option<bool>,
     /// Remote Control offer flags from the initialize response (see
     /// `AgentEvent::Init`): whether the bridge can be offered at all here, and
     /// whether the user's/org's default says auto-on.
@@ -1156,6 +1174,8 @@ impl ClaudeMapper {
             activity_line: None,
             compaction_active: false,
             compaction_completed: false,
+            compaction_awaiting_boundary: false,
+            auto_compact: None,
             remote_control_available,
             remote_control_auto_enable,
             remote_control: None,
@@ -1305,9 +1325,23 @@ impl ClaudeMapper {
     }
 
     fn request_settings_after(&mut self, chosen: bool, step: &mut DriverStep) {
+        self.request_settings_with(chosen, false, step);
+    }
+
+    fn request_settings_with(
+        &mut self,
+        chosen: bool,
+        auto_compact_chosen: bool,
+        step: &mut DriverStep,
+    ) {
         let id = self.ctl_id();
-        self.pending_controls
-            .insert(id.clone(), PendingControl::Settings { chosen });
+        self.pending_controls.insert(
+            id.clone(),
+            PendingControl::Settings {
+                chosen,
+                auto_compact_chosen,
+            },
+        );
         step.outbound.push(control_request_frame(
             &id,
             json!({ "subtype": "get_settings" }),
@@ -1324,12 +1358,22 @@ impl ClaudeMapper {
     fn reset_compaction_for_new_turn(&mut self) {
         self.compaction_active = false;
         self.compaction_completed = false;
+        self.compaction_awaiting_boundary = false;
     }
 
     /// A result/watchdog abort can be the only terminal signal when the CLI
     /// never emits compact_result. Keep completed=true until the next turn so
-    /// a late compact_boundary still dedupes, while active never leaks.
-    fn settle_compaction_at_turn_end(&mut self) {
+    /// a late compact_boundary still dedupes, while active never leaks. A
+    /// success still waiting for its boundary completes here, unannotated.
+    fn settle_compaction_at_turn_end(&mut self, step: &mut DriverStep) {
+        if std::mem::take(&mut self.compaction_awaiting_boundary) {
+            self.compaction_completed = true;
+            step.events.push(AgentEvent::ContextCompaction {
+                phase: CompactionPhase::Completed,
+                pre_tokens: None,
+                trigger: None,
+            });
+        }
         if self.compaction_active {
             self.compaction_active = false;
             self.compaction_completed = true;
@@ -1774,26 +1818,27 @@ impl ClaudeMapper {
                         step.events.push(AgentEvent::ContextCompaction {
                             phase: CompactionPhase::Started,
                             pre_tokens: None,
+                            trigger: None,
                         });
                     }
                 } else if let Some(result) = frame["compact_result"].as_str() {
                     if result == "failed" && self.compaction_active {
+                        // An auto attempt can fail and the turn carry on
+                        // (live 2.1.302: `compact_error: "too_few_groups"`).
                         self.compaction_active = false;
                         self.compaction_completed = true;
                         step.events.push(AgentEvent::ContextCompaction {
                             phase: CompactionPhase::Failed,
                             pre_tokens: None,
+                            trigger: None,
                         });
                     } else if result == "success" && self.compaction_active {
-                        // Fallback for a future build that omits/reorders the
-                        // richer compact_boundary. Today's wire lands the
-                        // boundary first, so its pre_tokens win.
+                        // The boundary follows with the trigger and the token
+                        // count (live 2.1.302: status success, then the
+                        // boundary); the turn end completes it if it never
+                        // comes.
                         self.compaction_active = false;
-                        self.compaction_completed = true;
-                        step.events.push(AgentEvent::ContextCompaction {
-                            phase: CompactionPhase::Completed,
-                            pre_tokens: None,
-                        });
+                        self.compaction_awaiting_boundary = true;
                     }
                 }
                 if let Some(mode) = frame["permissionMode"].as_str() {
@@ -1807,13 +1852,21 @@ impl ClaudeMapper {
                 }
             }
             Some("compact_boundary") => {
-                let pre = frame["compact_metadata"]["pre_tokens"].as_u64();
+                let metadata = &frame["compact_metadata"];
+                let pre = metadata["pre_tokens"].as_u64();
+                let trigger = match metadata["trigger"].as_str() {
+                    Some("auto") => Some(CompactionTrigger::Auto),
+                    Some("manual") => Some(CompactionTrigger::Manual),
+                    _ => None,
+                };
                 self.compaction_active = false;
+                self.compaction_awaiting_boundary = false;
                 if !self.compaction_completed {
                     self.compaction_completed = true;
                     step.events.push(AgentEvent::ContextCompaction {
                         phase: CompactionPhase::Completed,
                         pre_tokens: pre,
+                        trigger,
                     });
                 }
             }
@@ -2493,6 +2546,7 @@ impl ClaudeMapper {
         if frame["isReplay"] == json!(true)
             || frame["isMeta"] == json!(true)
             || frame["isCompactSummary"] == json!(true)
+            || frame["isSynthetic"] == json!(true)
             || !frame["parent_tool_use_id"].is_null()
         {
             return;
@@ -3636,13 +3690,32 @@ impl ClaudeMapper {
                     }
                 }
             }
-            PendingControl::Settings { chosen } => {
+            PendingControl::Settings {
+                chosen,
+                auto_compact_chosen,
+            } => {
                 let applied = &payload["applied"];
                 step.events.push(AgentEvent::EffortState {
                     effort: applied["effort"].as_str().map(String::from),
                     ultracode: applied["ultracode"] == json!(true),
                     chosen,
                 });
+                // The merged settings say whether the CLI compacts on its
+                // own (absent = its default, on). A CLI without the merged
+                // view reports nothing, so no switch is offered for it.
+                if let Some(effective) = payload["effective"].as_object() {
+                    let enabled = effective
+                        .get("autoCompactEnabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true);
+                    if auto_compact_chosen || self.auto_compact != Some(enabled) {
+                        self.auto_compact = Some(enabled);
+                        step.events.push(AgentEvent::AutoCompact {
+                            enabled,
+                            chosen: auto_compact_chosen,
+                        });
+                    }
+                }
             }
             PendingControl::Background { for_message: true } => {
                 // The daemon moved a foreground subagent aside so a message
@@ -3684,11 +3757,18 @@ impl ClaudeMapper {
                     }
                 }
             }
-            PendingControl::ApplyFlags { chosen } => {
+            PendingControl::ApplyFlags {
+                chosen,
+                auto_compact,
+            } => {
                 // The apply is fire-and-ack; the truth comes from re-reading —
                 // and that read is the pick (it feeds the prefs) when the
                 // apply was.
-                self.request_settings_after(chosen, step);
+                if auto_compact {
+                    self.request_settings_with(false, chosen, step);
+                } else {
+                    self.request_settings_after(chosen, step);
+                }
             }
         }
     }
@@ -3769,7 +3849,7 @@ impl ClaudeMapper {
         // Consumed at EVERY result so a late interrupt can never relabel the
         // next turn's error.
         let interrupted = std::mem::take(&mut self.interrupt_requested);
-        self.settle_compaction_at_turn_end();
+        self.settle_compaction_at_turn_end(step);
         self.tool_kinds.clear();
         self.streamed.clear();
         // Task maps live per turn (the extension wipes its map on result) —
@@ -3812,6 +3892,14 @@ impl ClaudeMapper {
                         .to_string(),
                     interrupted,
                 });
+                // A full context with auto-compact off ends the turn before
+                // any request ("Prompt is too long", live 2.1.302). Say how
+                // to go on, as the TUI's "Context limit reached" line does.
+                if frame["terminal_reason"] == "blocking_limit" {
+                    step.events.push(AgentEvent::Notice {
+                        text: "context limit reached · /compact to continue".into(),
+                    });
+                }
                 self.refresh_context_usage(step);
             }
         } else if was_active {
@@ -4271,6 +4359,7 @@ impl ClaudeMapper {
                     id.clone(),
                     PendingControl::ApplyFlags {
                         chosen: !self.bootstrapping,
+                        auto_compact: false,
                     },
                 );
                 step.outbound.push(control_request_frame(
@@ -4290,6 +4379,7 @@ impl ClaudeMapper {
                     id.clone(),
                     PendingControl::ApplyFlags {
                         chosen: !self.bootstrapping,
+                        auto_compact: false,
                     },
                 );
                 step.outbound.push(control_request_frame(
@@ -4297,6 +4387,26 @@ impl ClaudeMapper {
                     json!({
                         "subtype": "apply_flag_settings",
                         "settings": { "ultracode": enabled },
+                    }),
+                ));
+            }
+            // Auto-compact rides the same session-scoped flag layer (live
+            // 2.1.302: get_settings reads it back from flagSettings, and no
+            // settings file is written; PROTOCOL.md Pass 49).
+            AgentCommand::SetAutoCompact { enabled } => {
+                let id = self.ctl_id();
+                self.pending_controls.insert(
+                    id.clone(),
+                    PendingControl::ApplyFlags {
+                        chosen: !self.bootstrapping,
+                        auto_compact: true,
+                    },
+                );
+                step.outbound.push(control_request_frame(
+                    &id,
+                    json!({
+                        "subtype": "apply_flag_settings",
+                        "settings": { "autoCompactEnabled": enabled },
                     }),
                 ));
             }
@@ -4765,7 +4875,7 @@ impl ClaudeMapper {
         let turn_id = self.turn_id();
         self.turn_active = false;
         self.turn_starting = false;
-        self.settle_compaction_at_turn_end();
+        self.settle_compaction_at_turn_end(&mut step);
         self.interrupt_requested = false;
         // Same per-turn cleanup a real result performs — the interrupted
         // subagents settle neutrally instead of turning a deliberate Stop red.
@@ -10038,8 +10148,169 @@ pub(crate) mod tests {
             AgentEvent::ContextCompaction {
                 phase: CompactionPhase::Completed,
                 pre_tokens: Some(42000),
+                ..
             }
         ));
+    }
+
+    /// Live 2.1.302 order: the success status lands BEFORE the boundary, and
+    /// only the boundary says who started it and how much it summarized.
+    #[test]
+    fn success_status_waits_for_the_boundary_that_carries_the_trigger() {
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "type": "system", "subtype": "status", "status": "compacting",
+            "compact_output_chars": 0,
+        }));
+        let success = m.on_frame(&json!({
+            "type": "system", "subtype": "status", "status": null,
+            "compact_result": "success",
+        }));
+        assert!(success.events.is_empty(), "{:?}", success.events);
+        let boundary = m.on_frame(&json!({
+            "type": "system", "subtype": "compact_boundary",
+            "compact_metadata": { "trigger": "auto", "pre_tokens": 27506,
+                "post_tokens": 2499, "duration_ms": 4650 },
+        }));
+        assert_eq!(
+            boundary.events,
+            vec![AgentEvent::ContextCompaction {
+                phase: CompactionPhase::Completed,
+                pre_tokens: Some(27506),
+                trigger: Some(CompactionTrigger::Auto),
+            }]
+        );
+        let end = m.on_frame(&json!({ "type": "result", "is_error": false }));
+        assert!(!end
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ContextCompaction { .. })));
+    }
+
+    #[test]
+    fn a_success_without_a_boundary_completes_at_the_turn_end() {
+        let mut m = mapper();
+        m.on_frame(&json!({ "type": "system", "subtype": "status", "status": "compacting" }));
+        m.on_frame(&json!({
+            "type": "system", "subtype": "status", "status": null,
+            "compact_result": "success",
+        }));
+        let end = m.on_frame(&json!({ "type": "result", "is_error": false }));
+        assert!(end.events.contains(&AgentEvent::ContextCompaction {
+            phase: CompactionPhase::Completed,
+            pre_tokens: None,
+            trigger: None,
+        }));
+    }
+
+    #[test]
+    fn manual_boundary_is_tagged_manual() {
+        let mut m = mapper();
+        m.on_frame(&json!({ "type": "system", "subtype": "status", "status": "compacting" }));
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "compact_boundary",
+            "compact_metadata": { "trigger": "manual", "pre_tokens": 27477 },
+        }));
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::ContextCompaction {
+                trigger: Some(CompactionTrigger::Manual),
+                ..
+            }
+        ));
+    }
+
+    /// The per-chat switch rides the session flag layer and reads back from
+    /// get_settings `effective` (live 2.1.302); only the read that follows
+    /// the user's own apply is a pick, and it is not an effort pick.
+    #[test]
+    fn auto_compact_applies_to_the_flag_layer_and_reads_back() {
+        let mut m = mapper();
+        let apply = m.on_command(AgentCommand::SetAutoCompact { enabled: false });
+        assert_eq!(
+            apply.outbound[0]["request"]["subtype"],
+            "apply_flag_settings"
+        );
+        assert_eq!(
+            apply.outbound[0]["request"]["settings"],
+            json!({ "autoCompactEnabled": false })
+        );
+        let ack = m.on_frame(&json!({"type":"control_response", "response": {
+            "subtype":"success", "request_id":apply.outbound[0]["request_id"]
+        }}));
+        assert_eq!(ack.outbound[0]["request"]["subtype"], "get_settings");
+        let read = m.on_frame(&json!({"type":"control_response", "response": {
+            "subtype":"success", "request_id":ack.outbound[0]["request_id"], "response":{
+                "applied":{"effort":"medium","ultracode":false},
+                "effective":{"autoCompactEnabled":false},
+                "sources":[{"source":"flagSettings","settings":{"autoCompactEnabled":false}}]
+            }
+        }}));
+        assert_eq!(
+            read.events,
+            vec![
+                AgentEvent::EffortState {
+                    effort: Some("medium".into()),
+                    ultracode: false,
+                    chosen: false,
+                },
+                AgentEvent::AutoCompact {
+                    enabled: false,
+                    chosen: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn auto_compact_read_back_defaults_on_and_dedupes() {
+        let mut m = mapper();
+        let read = |m: &mut ClaudeMapper, response: Value| {
+            let mut step = DriverStep::default();
+            m.request_settings(&mut step);
+            m.on_frame(&json!({"type":"control_response", "response": {
+                "subtype":"success", "request_id":step.outbound[0]["request_id"],
+                "response": response,
+            }}))
+        };
+        // Absent key in the merged view = the CLI's default (on).
+        let first = read(&mut m, json!({"applied":{}, "effective":{}}));
+        assert!(first.events.contains(&AgentEvent::AutoCompact {
+            enabled: true,
+            chosen: false,
+        }));
+        let again = read(&mut m, json!({"applied":{}, "effective":{}}));
+        assert!(!again
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::AutoCompact { .. })));
+        // A CLI without the merged view offers no switch at all.
+        let mut old = mapper();
+        let legacy = read(&mut old, json!({"applied":{}}));
+        assert!(!legacy
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::AutoCompact { .. })));
+    }
+
+    /// Auto-compact off and a full window: the CLI ends the turn without a
+    /// request (live 2.1.302, `terminal_reason: "blocking_limit"`).
+    #[test]
+    fn blocking_limit_says_how_to_continue() {
+        let mut m = mapper();
+        m.turn_active = true;
+        let step = m.on_frame(&json!({
+            "type": "result", "subtype": "success", "is_error": true,
+            "result": "Prompt is too long", "terminal_reason": "blocking_limit",
+        }));
+        assert!(step.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::TurnAborted { reason, .. } if reason == "Prompt is too long"
+        )));
+        assert!(step.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Notice { text } if text.contains("/compact")
+        )));
     }
 
     #[test]

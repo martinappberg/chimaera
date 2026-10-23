@@ -54,6 +54,9 @@
     /** Free the context window (the usage popover's Compact); offered only
      *  while the agent is idle. */
     onCompact?: () => void;
+    /** This chat's auto-compact (null: the agent has no per-chat switch). */
+    autoCompact?: boolean | null;
+    onSetAutoCompact?: (enabled: boolean) => void;
     /** Agent settings, where the account's limits are read live. */
     onOpenSettings?: () => void;
     /** Sign in to the agent here — offered in every state the chat can be
@@ -73,6 +76,8 @@
     visible = true,
     menu = $bindable(),
     onCompact,
+    autoCompact = null,
+    onSetAutoCompact,
     onOpenSettings,
     onSignIn,
     accountLimits = [],
@@ -350,6 +355,8 @@
     onToggle={() => (menu = menu === "usage" ? null : "usage")}
     onClose={() => (menu = null)}
     {onCompact}
+    {autoCompact}
+    {onSetAutoCompact}
     {onOpenSettings}
   />
   </div>

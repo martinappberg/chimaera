@@ -568,6 +568,16 @@ function decisionLine(title: string, label: string): string {
   return `${first}${first.length < trimmed.length ? " …" : ""} — ${label}`;
 }
 
+/** The transcript line a finished compaction leaves. The agent's own
+ *  compaction says so (both CLIs call it auto-compact); one the user asked
+ *  for, or one whose trigger the wire didn't name, reads plain. */
+export function compactionNotice(preTokens: unknown, trigger: unknown): string {
+  const what = trigger === "auto" ? "context auto-compacted" : "context compacted";
+  return typeof preTokens === "number"
+    ? `${what} · ${preTokens.toLocaleString()} tokens summarized`
+    : what;
+}
+
 /** Fold a wire `remote_control` event or an Init's `remote_control` snapshot
  *  (same field names) into the store's shape; off/absent = null. */
 function foldRemoteControl(raw: unknown): RemoteControlInfo | null {
@@ -690,6 +700,10 @@ export class ChatStore {
   /** Applied effort/ultracode truth (claude get_settings read-back). */
   effort = $state<string | null>(null);
   ultracode = $state(false);
+  /** Whether the agent compacts on its own (claude get_settings
+   *  `effective.autoCompactEnabled`); null = the agent doesn't say, so no
+   *  per-chat switch is offered. */
+  autoCompact = $state<boolean | null>(null);
   /** Latest rewind_files answer; the view gates dialogs on its own intent
    *  flag so replayed reports never reopen UI. */
   rewind = $state<RewindReport | null>(null);
@@ -1705,6 +1719,9 @@ export class ChatStore {
         this.effort = (ev.effort as string) ?? null;
         this.ultracode = ev.ultracode === true;
         break;
+      case "auto_compact":
+        this.autoCompact = ev.enabled === true;
+        break;
       case "context_usage": {
         this.contextPct = ev.percentage as number;
         this.contextTokens = {
@@ -1727,13 +1744,7 @@ export class ChatStore {
         } else {
           this.compacting = false;
           if (phase === "completed") {
-            const pre = ev.pre_tokens as number | undefined;
-            this.notice(
-              pre !== undefined
-                ? `context compacted · ${pre.toLocaleString()} tokens summarized`
-                : "context compacted",
-              "info",
-            );
+            this.notice(compactionNotice(ev.pre_tokens, ev.trigger), "info");
           }
           // The agent's normal turn output owns failure details. The lifecycle
           // event only settles progress, avoiding a duplicate Claude message.
@@ -1918,6 +1929,7 @@ export class ChatStore {
           this.modelCatalogReceived = false;
           this.effort = null;
           this.ultracode = false;
+          this.autoCompact = null;
           this.contextPct = null;
           this.contextTokens = null;
           this.rateLimit = null;

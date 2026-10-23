@@ -2714,6 +2714,48 @@ async fn remote_control_at_start_enables_after_the_handshake() {
     assert!(fx2.manager.kill("s-rcu"));
 }
 
+/// A reopened conversation's own auto-compact pick comes back through the
+/// handshake (the session flag layer), reads back as the CLI's truth, and is
+/// not a new pick; a pick made in the chat is.
+#[tokio::test]
+async fn auto_compact_carries_through_the_handshake_and_picks_read_back() {
+    let fx = fixture();
+    let mut s = spec("s-autocompact", &fx.cwd, "normal");
+    s.initial_auto_compact = Some(false);
+    fx.manager.spawn(&ClaudeAdapter, s).expect("spawn");
+    let att = fx.manager.attach("s-autocompact", 0).expect("attach");
+    let mut seen: Vec<Arc<SeqEvent>> = att.replay.clone();
+    let mut rx = att.live;
+    wait_for(&mut rx, &mut seen, "carried auto-compact off", |ev| {
+        matches!(
+            ev,
+            AgentEvent::AutoCompact {
+                enabled: false,
+                chosen: false,
+            }
+        )
+    })
+    .await;
+    fx.manager
+        .command(
+            "s-autocompact",
+            AgentCommand::SetAutoCompact { enabled: true },
+        )
+        .await
+        .expect("command");
+    wait_for(&mut rx, &mut seen, "picked auto-compact on", |ev| {
+        matches!(
+            ev,
+            AgentEvent::AutoCompact {
+                enabled: true,
+                chosen: true,
+            }
+        )
+    })
+    .await;
+    assert!(fx.manager.kill("s-autocompact"));
+}
+
 /// What a daemon restart would cut off is readable off the live session
 /// (the ledger snapshots it): the bridge, ultracode, background work, a
 /// running turn. The resurrection side round-trips too — ultracode comes

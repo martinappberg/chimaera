@@ -1844,6 +1844,16 @@
     return setUltracode(!store.ultracode);
   }
 
+  /** This chat's auto-compact, beside its context window: offered only
+   *  where the agent can switch it per session and has said where it
+   *  stands (Claude's flag layer; Codex has no switch). */
+  const autoCompactShown = $derived(
+    !readOnly && supports("set_auto_compact") && store.autoCompact !== null ? store.autoCompact : null,
+  );
+  function setAutoCompact(enabled: boolean): void {
+    sendCommand({ type: "set_auto_compact", enabled }, "auto-compact change not sent");
+  }
+
   /** Where this chat's relative references resolve: App's context for the
    *  session (live cwd, spawn cwd, workspace root — the terminal's answer
    *  too), else what the session row itself knows. */
@@ -2941,6 +2951,8 @@
     onInterrupt={interrupt}
     onSetRemoteControl={setRemoteControl}
     onCompact={canCompact ? compactNow : undefined}
+    autoCompact={autoCompactShown}
+    onSetAutoCompact={setAutoCompact}
     onOpenSettings={readOnly ? undefined : openAgentSettings}
     onSignIn={readOnly || !catalogAgent?.signIn ? undefined : () => (signInRequested = true)}
     accountLimits={accountUsage?.rows}

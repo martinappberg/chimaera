@@ -1219,6 +1219,7 @@ async fn resolve_respawn_inputs(
                 user_statusline.as_ref(),
                 mastermind,
                 &plugin_tools,
+                crate::lock(&state.settings).claude_auto_compact(),
             )
             .map_err(|err| err.to_string())?;
             let mcp = crate::agents::write_mcp_config(id, &key, state.port)
@@ -3282,6 +3283,7 @@ pub(crate) async fn spawn_fresh_chat_at(
             user_statusline.as_ref(),
             spec.mastermind,
             &plugin_tools,
+            crate::lock(&state.settings).claude_auto_compact(),
         )
         .map_err(ChatSpawnFailure::Internal)?;
         let m = crate::agents::write_mcp_config(&id, &key, state.port)
@@ -3693,6 +3695,14 @@ pub(crate) async fn spawn_chat_session(
     if recipe.kind == AgentKind::Claude && recipe.carry_ultracode {
         spec.initial_ultracode = true;
     }
+    // The conversation's own auto-compact pick (from its usage meter) comes
+    // back with it, over the daemon's setting the settings file carries.
+    if recipe.kind == AgentKind::Claude {
+        spec.initial_auto_compact = recipe
+            .resume
+            .as_deref()
+            .and_then(|native| state.chat.index().auto_compact(native));
+    }
     if recipe.kind == AgentKind::Claude && remote_control {
         // The bare name (the driver spells `chimaera · <name>`): the session's
         // display name as the rail shows it, or the workspace directory, plus
@@ -3848,6 +3858,7 @@ pub(crate) async fn resurrect_chat(
             user_statusline.as_ref(),
             mastermind_mode,
             &plugin_tools,
+            crate::lock(&state.settings).claude_auto_compact(),
         )?;
         let m = crate::agents::write_mcp_config(&entry.id, &key, state.port)?;
         (Some(s), Some(m))

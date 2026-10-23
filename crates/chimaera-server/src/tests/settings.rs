@@ -94,6 +94,29 @@ async fn codex_steering_setting_preserves_native_defaults_and_rejects_unknown_ov
     }
 }
 
+/// On (the default) writes nothing, so the user's own Claude Code settings
+/// decide; only an explicit Off reaches the per-session settings file.
+#[tokio::test]
+async fn auto_compact_setting_only_overrides_when_off() {
+    let state = test_state();
+    assert_eq!(lock(&state.settings).claude_auto_compact(), None);
+    for (value, expected) in [
+        (serde_json::json!(false), Some(false)),
+        (serde_json::json!(true), None),
+        (serde_json::json!("off"), None),
+    ] {
+        let (status, _) = request(
+            &state,
+            Method::PUT,
+            "/api/v1/settings",
+            Some(serde_json::json!({"agents.autoCompact": value})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(lock(&state.settings).claude_auto_compact(), expected);
+    }
+}
+
 #[tokio::test]
 async fn new_chat_model_setting_opts_out_only_for_agent_defaults() {
     let state = test_state();

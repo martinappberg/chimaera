@@ -181,6 +181,7 @@ async fn claude_manual_compaction_emits_status_lifecycle() {
     chat.send_user_text("/compact").await.expect("send compact");
     let mut saw_start = false;
     let mut saw_result = false;
+    let mut boundary_trigger = Value::Null;
     loop {
         let frame = chat
             .recv(TURN)
@@ -199,12 +200,19 @@ async fn claude_manual_compaction_emits_status_lifecycle() {
                 }
             }
         }
+        if frame["type"] == "system" && frame["subtype"] == "compact_boundary" {
+            boundary_trigger = frame["compact_metadata"]["trigger"].clone();
+            assert!(frame["compact_metadata"]["pre_tokens"].is_u64());
+        }
         if frame["type"] == "result" {
             break;
         }
     }
     assert!(saw_start, "manual compaction announces status=compacting");
     assert!(saw_result, "manual compaction settles with compact_result");
+    // The boundary names who asked; the transcript's line depends on it
+    // (PROTOCOL.md Pass 49).
+    assert_eq!(boundary_trigger, json!("manual"));
 
     chat.shutdown(Duration::from_secs(5))
         .await
@@ -1255,6 +1263,57 @@ async fn driver_rapid_queued_sends_settle_idle() {
     }
 
     manager.kill("rapid");
+}
+
+/// Auto-compact is a session flag (PROTOCOL.md Pass 49): the launcher's
+/// `--settings` file turns it off, `apply_flag_settings` switches it, and
+/// get_settings' merged `effective` view reads it back. Control channel only:
+/// no turn, no billing.
+#[tokio::test]
+#[ignore = "live: spawns real claude, needs auth"]
+async fn claude_auto_compact_is_a_session_flag() {
+    let dir = tmpdir();
+    let settings = dir.path().join("session-settings.json");
+    let file = "{\"autoCompactEnabled\": false}";
+    std::fs::write(&settings, file).expect("write settings");
+    let mut chat = spawn_claude(
+        dir.path(),
+        &["--settings".into(), settings.to_string_lossy().into_owned()],
+    );
+    chat.initialize(HANDSHAKE).await.expect("initialize");
+    let read = |v: &Value| v["effective"]["autoCompactEnabled"].clone();
+    let id = chat
+        .send_control(json!({ "subtype": "get_settings" }))
+        .await
+        .expect("get_settings");
+    assert_eq!(
+        read(&await_control_response(&mut chat, &id).await),
+        json!(false)
+    );
+    let id = chat
+        .send_control(json!({
+            "subtype": "apply_flag_settings",
+            "settings": { "autoCompactEnabled": true },
+        }))
+        .await
+        .expect("apply");
+    await_control_response(&mut chat, &id).await;
+    let id = chat
+        .send_control(json!({ "subtype": "get_settings" }))
+        .await
+        .expect("get_settings");
+    assert_eq!(
+        read(&await_control_response(&mut chat, &id).await),
+        json!(true)
+    );
+    // The flag layer is the session's: the file it started from is untouched.
+    assert_eq!(
+        std::fs::read_to_string(&settings).expect("read settings"),
+        file
+    );
+    chat.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
 }
 
 /// Wait for a specific control_response and return its inner response value.

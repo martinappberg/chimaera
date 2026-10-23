@@ -25,7 +25,10 @@ on the remote host. Chimaera adds workspace integration through session-scoped
 settings, hooks, and MCP tools. Chat controls select the model and permissions
 for the current session; see [chat mode](chat-mode.md) for provider behavior and
 custom model selection. Settings → Chat → New Chat Model can follow the runtime's
-configured model instead of Chimaera's last-used choice. A CLI's identity does not
+configured model instead of Chimaera's last-used choice. Settings → Agents →
+Auto-Compact turns Claude Code's own auto-compaction off for the Claude sessions
+Chimaera starts, through each session's generated settings file and never your own;
+Codex has no off switch. A CLI's identity does not
 establish its upstream provider; launcher subtitles describe installation provenance.
 
 Claude Code 2.1.277+ reads `AGENTS.md` as a fallback when `CLAUDE.md` is absent.

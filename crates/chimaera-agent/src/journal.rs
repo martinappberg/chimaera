@@ -598,6 +598,10 @@ struct IndexEntry {
     model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mode: Option<String>,
+    /// The user's own per-chat auto-compact pick (claude's session flag);
+    /// absent = the daemon's setting decides. Only picks are recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auto_compact: Option<bool>,
 }
 
 /// What a native conversation last ran with. A reopened chat starts from
@@ -643,6 +647,7 @@ impl JournalIndex {
             effort: previous.and_then(|e| e.effort.clone()),
             model: previous.and_then(|e| e.model.clone()),
             mode: previous.and_then(|e| e.mode.clone()),
+            auto_compact: previous.and_then(|e| e.auto_compact),
         };
         apply(&mut entry);
         entries.retain(|e| e.native_id != native_id);
@@ -697,6 +702,26 @@ impl JournalIndex {
                 mode: e.mode.clone(),
             })
             .unwrap_or_default()
+    }
+
+    /// Remember the user's own auto-compact pick for this conversation.
+    /// Blocking fs — call from a blocking worker.
+    pub fn record_auto_compact(&self, native_id: &str, session_id: &str, enabled: bool) {
+        self.upsert(native_id, session_id, |entry| {
+            entry.auto_compact = Some(enabled);
+        });
+    }
+
+    /// The conversation's own auto-compact pick (`None`: never picked, or
+    /// an unknown id).
+    pub fn auto_compact(&self, native_id: &str) -> Option<bool> {
+        self.entries
+            .lock()
+            .expect("index lock")
+            .iter()
+            .rev()
+            .find(|e| e.native_id == native_id)
+            .and_then(|e| e.auto_compact)
     }
 
     pub fn lookup(&self, native_id: &str) -> Option<String> {
@@ -1484,6 +1509,24 @@ mod tests {
         }
         let entries = index.entries.lock().unwrap();
         assert!(entries.len() <= INDEX_MAX_ENTRIES);
+    }
+
+    /// A per-chat auto-compact pick survives the other settings' writes, a
+    /// resume re-key and a reload; an unknown conversation has none.
+    #[test]
+    fn index_keeps_a_conversations_auto_compact_pick() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = JournalIndex::load(dir.path());
+        assert_eq!(index.auto_compact("native-a"), None);
+        index.record("native-a", "s-1");
+        index.record_auto_compact("native-a", "s-1", false);
+        index.record_effort("native-a", "s-1", Some("high".into()));
+        index.record("native-a", "s-2");
+        assert_eq!(index.auto_compact("native-a"), Some(false));
+        assert_eq!(index.effort("native-a").as_deref(), Some("high"));
+        let reloaded = JournalIndex::load(dir.path());
+        assert_eq!(reloaded.auto_compact("native-a"), Some(false));
+        assert_eq!(reloaded.auto_compact("native-b"), None);
     }
 
     /// A reopened conversation comes back with its own model/effort/mode: the

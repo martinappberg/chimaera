@@ -54,7 +54,8 @@ section (`requestSettingsSection`) — or at one setting's row, given its id.
 
 **Agents holds schema rows too.** The Agents category renders the bespoke
 `AgentsSettings` panel (its `agents.<id>.path` rows are presented there, not
-generically), then **Agent communication** — `agents.communication.enabled`,
+generically), then **Context** — `agents.autoCompact` (Claude's auto-compact for new
+sessions; daemon-read, Off only) — then **Agent communication** — `agents.communication.enabled`,
 `agents.communication.wakes` and `agents.communication.freeSubagents` — as ordinary
 `SettingRow`s under their own subheading (`SettingsView`, every
 `agents.communication.*` row). The schema has no "show only when" yet, so the
