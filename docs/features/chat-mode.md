@@ -421,16 +421,23 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   and the Errored rail state are reserved for genuine failures.
   If Codex has not confirmed receipt of the opening message when stopped, a brief
   notice asks you to resend it. Saying only “Keep going” cannot recover missing input.
-- **A Stop that ends more than the turn asks once.** Claude's Stop also kills its subagents
-  (foreground and background) and its workflows; it leaves background commands, Monitor watches
-  and the schedule running (PROTOCOL.md Pass 49). When the running turn has any of the first
-  kind, the first Esc or Stop press shows one line above the stop control, "Also stops 2
-  subagents · Esc again to stop" ("Click again" after a click), and turns the Stop buttons
-  amber. A second Esc anywhere in the chat, or a second click on Stop or the line, stops. Any
-  other key, a press elsewhere, five seconds, the turn ending, or the named work finishing
-  withdraws it. Esc still closes an open picker or menu first. With nothing else to end, as in
-  every Codex and ACP chat (a Codex Stop leaves spawned agents and background terminals running),
-  the first press stops at once. A polite live region announces the line.
+- **Anything that would end subagents or workflows asks once, whatever control started it.**
+  Claude's Stop also kills its subagents (foreground and background) and its workflows; it
+  leaves background commands, Monitor watches and the schedule running (PROTOCOL.md Pass 49).
+  Esc, either Stop, Clear goal (Claude clears a running goal by stopping the turn first) and a
+  waiting message's Send now each count only what that action ends: a Stop or Clear goal counts
+  every live subagent and workflow; Send now (`interrupt {send_now}`) counts only the foreground
+  subagent the turn waits on, since it spares background agents and workflows (Pass 44). When
+  the count is non-zero, the first press shows one line above the control that was pressed
+  ("Also stops 2 subagents · Click again to stop"; "Click again to clear", "Click again to
+  send") and gives that control the amber tone. The hint names the real gesture: "Esc again"
+  after Esc, "Press again" after Enter or Space on a button, "Click again" after a click; the
+  polite live region says the same. The second press of that control, a click on the line, or
+  Esc anywhere in the chat does it. Any other key, a press elsewhere, five seconds, the turn
+  ending, the named work finishing or the message being read withdraws it. Esc still closes an
+  open picker or menu first. With nothing else to end the first press acts at once, as in every
+  Codex and ACP chat: a Codex Stop or Send now (`turn/interrupt`) leaves spawned agents and
+  background terminals running, and Codex's Clear goal interrupts nothing.
   `web-ui/src/lib/chat/stopConfirm.ts` decides what counts.
 - **Rendering.** Streamed prose reveals word-by-word on a ~75ms ticker (respects
   `prefers-reduced-motion`). Markdown and Codex's common LaTeX delimiters (`$…$`, `$$…$$`,

@@ -3,6 +3,8 @@
   import CountdownRing from "../shared/CountdownRing.svelte";
   import GoalGlyph from "../shared/GoalGlyph.svelte";
   import Chevron from "../shared/Chevron.svelte";
+  import StopNote from "./StopNote.svelte";
+  import { clickVia } from "./stopConfirm";
   import { liveClock } from "../shared/liveClock.svelte";
   import {
     compactCount,
@@ -44,7 +46,12 @@
     onCancelJob?: (id: string) => void;
     onGoalPause?: () => void;
     onGoalResume?: () => void;
-    onGoalClear?: () => void;
+    /** Clear the goal, pressed by keyboard or pointer (the host may ask
+     *  first: claude clears a running goal by stopping the turn). */
+    onGoalClear?: (via: "key" | "pointer") => void;
+    /** A Clear waiting for its second press: what else it ends, and the
+     *  hint. Shown above the Clear that was pressed. */
+    goalConfirm?: { text: string; how: string } | null;
   }
   let {
     wakeup,
@@ -59,7 +66,16 @@
     onGoalPause,
     onGoalResume,
     onGoalClear,
+    goalConfirm = null,
   }: Props = $props();
+
+  /** Which Clear asked (the row's hover action or the detail's link): its
+   *  note sits above that one. */
+  let clearFrom = $state<"row" | "detail">("row");
+  function clearGoal(from: "row" | "detail", e: MouseEvent) {
+    clearFrom = from;
+    onGoalClear?.(clickVia(e));
+  }
 
   type Row =
     | { key: "wakeup"; kind: "wakeup"; at: number; from: number; text: string; wakeup: ScheduledWakeup }
@@ -157,6 +173,8 @@
   /** Inside the folded strip the line above already reads the goal, so its
    *  part opens straight to the detail. */
   const goalInline = $derived(part === "goal" && embedded);
+  const rowAsks = $derived(goalConfirm !== null && clearFrom === "row" && !goalInline);
+  const detailAsks = $derived(goalConfirm !== null && (clearFrom === "detail" || goalInline));
 
   function toggle(key: string) {
     opened = opened === key ? null : key;
@@ -226,7 +244,10 @@
 <div class="ahead" class:pinned-card={!embedded} class:visible class:embedded>
   {#if showGoal && goal !== null}
     {#if !goalInline}
-    <div class="row">
+    <div class="row goal-row" class:armed={rowAsks}>
+      {#if rowAsks && goalConfirm !== null}
+        <StopNote text={goalConfirm.text} how={goalConfirm.how} control="goal" onConfirm={() => onGoalClear?.("pointer")} />
+      {/if}
       <button type="button" class="main" aria-expanded={opened === "goal"} onclick={() => toggle("goal")}>
         <span class="glyph"><GoalGlyph tone={goalTone} /></span>
         <span class="kind">Goal</span>
@@ -246,7 +267,14 @@
               <button type="button" class="act" onclick={onGoalResume} title="/goal resume">Resume</button>
             {/if}
             {#if onGoalClear !== undefined}
-              <button type="button" class="act stop" onclick={onGoalClear} title="/goal clear">Clear</button>
+              <button
+                type="button"
+                class="act stop"
+                class:armed={rowAsks}
+                data-stop-control="goal"
+                onclick={(e) => clearGoal("row", e)}
+                title="/goal clear">Clear</button
+              >
             {/if}
           </span>
         {/if}
@@ -268,7 +296,20 @@
           <span class="k"></span><span class="v links">
             {#if goal.status === "active" && onGoalPause !== undefined}<button type="button" class="link" onclick={onGoalPause}>Pause</button>{/if}
             {#if goal.status !== "active" && onGoalResume !== undefined}<button type="button" class="link" onclick={onGoalResume}>Resume</button>{/if}
-            {#if onGoalClear !== undefined}<button type="button" class="link" onclick={onGoalClear}>Clear the goal</button>{/if}
+            {#if onGoalClear !== undefined}<span class="clear-anchor"
+                >{#if detailAsks && goalConfirm !== null}<StopNote
+                    text={goalConfirm.text}
+                    how={goalConfirm.how}
+                    control="goal"
+                    onConfirm={() => onGoalClear?.("pointer")}
+                  />{/if}<button
+                  type="button"
+                  class="link"
+                  class:armed={detailAsks}
+                  data-stop-control="goal"
+                  onclick={(e) => clearGoal("detail", e)}>Clear the goal</button
+                ></span
+              >{/if}
           </span>
         {/if}
       </div>
@@ -424,6 +465,33 @@
   .act.stop:hover,
   .act.stop:focus-visible {
     color: var(--err);
+  }
+  /* A Clear waiting for its second press: the note above names what else
+     it stops; the Clear stays shown (hover or not) in the warning tone. */
+  .goal-row {
+    position: relative;
+    --stop-note-max: 100%;
+  }
+  .row.armed .acts {
+    visibility: visible;
+  }
+  .row.armed .meta:has(~ .acts) {
+    visibility: hidden;
+  }
+  .act.armed,
+  .act.armed:hover,
+  .act.armed:focus-visible {
+    color: var(--warn);
+    background: color-mix(in srgb, var(--warn) 12%, transparent);
+  }
+  .clear-anchor {
+    position: relative;
+    --stop-note-right: auto;
+    --stop-note-left: 0;
+  }
+  .link.armed {
+    color: var(--warn);
+    text-decoration-color: color-mix(in srgb, var(--warn) 50%, transparent);
   }
   .stopping .text {
     text-decoration: line-through;

@@ -53,7 +53,20 @@
   import FinishedFold from "./FinishedFold.svelte";
   import { effortScale } from "./effortScale";
   import { backgroundKind } from "./backgroundKinds";
-  import { STOP_CONFIRM_MS, agentRowName, armedKey, stopReach, stopReachText } from "./stopConfirm";
+  import {
+    STOP_CONFIRM_MS,
+    actionReach,
+    actionVerb,
+    agentRowName,
+    armedKey,
+    clickVia,
+    confirmHint,
+    pressStep,
+    type ActionContext,
+    type ConfirmControl,
+    type ConfirmVia,
+  } from "./stopConfirm";
+  import StopNote from "./StopNote.svelte";
   import AgentsTray from "./AgentsTray.svelte";
   import BackgroundTray from "./BackgroundTray.svelte";
   import AheadCard from "./AheadCard.svelte";
@@ -1610,59 +1623,98 @@
     sendCommand({ type: "answer", request_id: requestId, answers }, "answer not sent");
   }
 
-  /** What a Stop would end besides the turn (claude's subagents and
-   *  workflows; see stopConfirm.ts for what survives), or null. */
-  const stopReachLabel = $derived(
-    readOnly ? null : stopReachText(stopReach(store.activeAgents, store.backgroundTasks)),
-  );
-  /** A Stop waiting for its second press, and how the first came: the hint
-   *  names the same gesture. */
-  let stopArmed = $state<"key" | "pointer" | null>(null);
-  const stopConfirm = $derived(
-    stopArmed !== null && stopReachLabel !== null ? { text: stopReachLabel, via: stopArmed } : null,
-  );
+  /** Every action that interrupts the turn asks once when it would also end
+   *  subagents or workflows, whatever control started it (stopConfirm.ts:
+   *  `actionReach` counts only what that action ends). Each control carries
+   *  its key as `data-stop-control`. */
+  let armed = $state<{ control: ConfirmControl; via: ConfirmVia } | null>(null);
+  // A closure: `agentBusy` and `goalClearStops` are declared further down.
+  const actionContext = $derived.by<ActionContext>(() => ({
+    agents: store.activeAgents,
+    lanes: store.backgroundTasks,
+    busy: agentBusy,
+    running: store.running,
+    goalClearStops,
+    queued: store.pendingSends.filter((s) => s.state === "queued").map((s) => s.id),
+  }));
+  /** The armed question as each surface draws it; null when nothing waits
+   *  or its cause is gone. */
+  const armedConfirm = $derived.by(() => {
+    if (armed === null || readOnly) return null;
+    const text = actionReach(armed.control, actionContext);
+    if (text === null) return null;
+    const hint = confirmHint(actionVerb(armed.control), armed.via);
+    return { control: armed.control, text, how: hint.how, spoken: `${text}. ${hint.spoken}` };
+  });
+  const confirmFor = (control: ConfirmControl) =>
+    armedConfirm !== null && armedConfirm.control === control ? armedConfirm : null;
+  const stopConfirm = $derived(confirmFor("stop"));
+  const goalConfirm = $derived(confirmFor("goal"));
 
-  /** Esc or a Stop button. When the interrupt would also end subagents or
-   *  workflows, the first press only asks (inline, by the composer); the
-   *  second stops. Otherwise it stops at once, as it always has. */
-  function interrupt(via: "key" | "pointer" = "pointer") {
-    if (stopArmed === null && stopReachLabel !== null && agentBusy) {
-      stopArmed = via;
-      return;
-    }
-    stopArmed = null;
+  /** A press of an asking control: the first press only asks (inline, above
+   *  that control) when its action would end more than the turn; the second
+   *  press of the same control, or Esc, does it. */
+  function press(control: ConfirmControl, via: ConfirmVia, act: () => void) {
+    const reach = readOnly ? null : actionReach(control, actionContext);
+    const step = pressStep(armed?.control ?? null, control, reach);
+    armed = step === "arm" ? { control, via } : null;
+    if (step === "act") act();
+  }
+  /** Run whatever action is waiting (Esc, from anywhere in this chat). */
+  function confirmArmed() {
+    const control = armed?.control;
+    armed = null;
+    if (control === "stop") sendInterrupt();
+    else if (control === "goal") clearClaudeGoalNow();
+    else if (control?.startsWith("send:")) deliverQueuedNow(control.slice("send:".length));
+  }
+  function sendInterrupt() {
     sendCommand({ type: "interrupt" }, "stop not sent");
   }
+
+  /** Esc or a Stop button. With another action waiting, Esc (the composer's
+   *  own included) confirms that one. */
+  function interrupt(via: ConfirmVia = "pointer") {
+    if (armed !== null && armed.control !== "stop" && via === "esc") {
+      confirmArmed();
+      return;
+    }
+    press("stop", via, sendInterrupt);
+  }
   // The question lapses with its cause: the turn ended on its own, the work
-  // it named finished, or the chat was hidden.
+  // it named finished, the message was read, or the chat was hidden.
   $effect(() => {
-    if (!agentBusy || stopReachLabel === null || !visible) untrack(() => (stopArmed = null));
+    if (armed !== null && (armedConfirm === null || !visible)) untrack(() => (armed = null));
   });
   // While armed: Esc anywhere in this chat confirms (focus may sit in the
-  // transcript or on the header's Stop); any other key, a press outside the
-  // stop controls, or the timeout lets it go. Bubble phase, so a popover,
-  // menu or card that handles Esc first keeps winning.
+  // transcript or on the control that asked); any other key, a press outside
+  // that control and its note, or the timeout lets it go. Bubble phase, so a
+  // popover, menu or card that handles Esc first keeps winning.
   $effect(() => {
-    if (stopArmed === null) return;
+    if (armed === null) return;
+    const control = armed.control;
     const root = chatEl;
-    const timer = setTimeout(() => (stopArmed = null), STOP_CONFIRM_MS);
+    const timer = setTimeout(() => (armed = null), STOP_CONFIRM_MS);
+    const pressedControl = (t: EventTarget | null) =>
+      t instanceof Element ? (t.closest("[data-stop-control]")?.getAttribute("data-stop-control") ?? null) : null;
     const onKey = (e: KeyboardEvent) => {
-      if (stopArmed === null) return;
+      if (armed === null) return;
       // WebKit leaves focus on <body> after a click on a button, so a key
       // with no focused element counts as the chat's (the user just pressed
-      // Stop here); focus elsewhere in the app dismisses.
+      // a control here); focus elsewhere in the app dismisses.
       const unfocused = e.target === document.body || e.target === document.documentElement;
       const inChat = unfocused || (root !== null && e.target instanceof Node && root.contains(e.target));
-      const onStop = e.target instanceof Element && e.target.closest("[data-stop-control]") !== null;
-      const act = armedKey(e, inChat, onStop);
+      const act = armedKey(e, inChat, pressedControl(e.target) === control);
       if (act === "confirm") {
         e.preventDefault();
-        interrupt("key");
-      } else if (act === "dismiss") stopArmed = null;
+        confirmArmed();
+      } else if (act === "hold") e.preventDefault();
+      else if (act === "dismiss") armed = null;
     };
+    // A press on another asking control lets this one go; its own click
+    // then asks afresh.
     const onDown = (e: PointerEvent) => {
-      if (e.target instanceof Element && e.target.closest("[data-stop-control]") !== null) return;
-      stopArmed = null;
+      if (pressedControl(e.target) !== control) armed = null;
     };
     window.addEventListener("keydown", onKey);
     window.addEventListener("pointerdown", onDown, true);
@@ -1693,8 +1745,13 @@
   /** Stop the running turn so this waiting message — and every other one
    *  still waiting — is read right away. The bubble stays until the daemon
    *  resolves it `sent`, so a disconnect or a no-op never lies about delivery. */
-  function sendQueuedNow(id: string) {
+  function deliverQueuedNow(id: string) {
     sendCommand({ type: "send_now", id }, "couldn't send now");
+  }
+  /** Send now stops the foreground subagent the turn waits on, so it asks
+   *  first when there is one (stopConfirm.ts `sendNowReach`). */
+  function sendQueuedNow(id: string, via: "key" | "pointer") {
+    press(`send:${id}`, via, () => deliverQueuedNow(id));
   }
 
   /** Dialog-only slash commands get native UI here instead of the CLI's
@@ -2536,13 +2593,17 @@
    *  until the goal is met, so a queued `/goal clear` would never be read.
    *  Stop the turn first (the goal survives an interrupt), then clear it. */
   let clearGoalAfterStop = $state(false);
-  function clearClaudeGoal() {
+  function clearClaudeGoalNow() {
     if (!store.running) {
       askAgent("/goal clear");
       return;
     }
     // An interrupt drops what is queued behind it: send once the turn ends.
     if (sendCommand({ type: "interrupt" }, "stop not sent")) clearGoalAfterStop = true;
+  }
+  /** The interrupt is a Stop, so it asks first like one. */
+  function clearClaudeGoal(via: "key" | "pointer" = "pointer") {
+    press("goal", via, clearClaudeGoalNow);
   }
   $effect(() => {
     if (clearGoalAfterStop && !store.running) {
@@ -2552,11 +2613,14 @@
       });
     }
   });
+  /** Claude's Clear goal is a Stop while the turn runs (codex's own
+   *  `clear_goal` lets the turn finish). */
+  const goalClearStops = $derived(!readOnly && !supports("clear_goal") && canAskClaude);
   const goalClear = $derived(
     readOnly
       ? undefined
       : supports("clear_goal")
-        ? () => sendCommand({ type: "clear_goal" }, "goal change not sent")
+        ? (_via: "key" | "pointer") => sendCommand({ type: "clear_goal" }, "goal change not sent")
         : canAskClaude
           ? clearClaudeGoal
           : undefined,
@@ -2998,7 +3062,7 @@
     onPickEffort={pickEffort}
     onToggleUltracode={toggleUltracode}
     onToggleThinking={toggleThinking}
-    onInterrupt={() => interrupt("pointer")}
+    onInterrupt={interrupt}
     stopArmed={stopConfirm !== null}
     onSetRemoteControl={setRemoteControl}
     onCompact={canCompact ? compactNow : undefined}
@@ -3535,6 +3599,7 @@
       >
         {#each pinnedSends as send (send.id)}
           {@const pictureOnly = send.text.length === 0 && send.attachmentPaths.length > 0}
+          {@const sendConfirm = confirmFor(`send:${send.id}`)}
           {#if isAgentOrigin(send.origin)}
             <!-- Another agent's message steered in (Codex): it waits for the
                  agent's next step like a queued send; one that misses its
@@ -3558,7 +3623,15 @@
             {#if send.attachmentPaths.length > 0 && !pictureOnly}
               {@render sentImages(send.attachmentPaths)}
             {/if}
-            <div class="bubble-row">
+            <div class="bubble-row" class:asks={sendConfirm !== null}>
+              {#if sendConfirm !== null}
+                <StopNote
+                  text={sendConfirm.text}
+                  how={sendConfirm.how}
+                  control={sendConfirm.control}
+                  onConfirm={() => sendQueuedNow(send.id, "pointer")}
+                />
+              {/if}
               {#if pictureOnly}
                 {@render sentImages(send.attachmentPaths)}
               {:else}
@@ -3573,11 +3646,13 @@
               {#if send.state === "queued" && store.running}
                 <button
                   class="send-now-btn"
+                  class:armed={sendConfirm !== null}
+                  data-stop-control="send:{send.id}"
                   title={waiting > 1
                     ? "stop the current turn and send the waiting messages now"
                     : "stop the current turn and send this now"}
                   aria-label="send now (stops the current turn)"
-                  onclick={() => sendQueuedNow(send.id)}
+                  onclick={(e) => sendQueuedNow(send.id, clickVia(e))}
                 >Send now</button>
               {/if}
               <button
@@ -3667,6 +3742,7 @@
       onGoalPause={goalPause}
       onGoalResume={goalResume}
       onGoalClear={goalClear}
+      {goalConfirm}
     />
   {/snippet}
 
@@ -3777,6 +3853,11 @@
   {#if agentKind === "claude" && store.exited === null && !readOnly}
     <ModsWorkbench transport={socket.nativeUi} host={chatEl} onDockWidth={(width) => (modDockWidth = width)} {visible} {focused} running={agentBusy} hasSurvey={store.questions.length > 0 || store.elicitations.length > 0} composer={composerApi} canEdit={!composerDisabled && store.pending.length === 0 && store.questions.length === 0 && store.elicitations.length === 0 && rewindIntent === null && forkIntent === null} canFocus={focused && !composerEngaged && !agentBusy && store.pending.length === 0 && store.questions.length === 0 && store.elicitations.length === 0 && rewindIntent === null && forkIntent === null} />
   {/if}
+
+  <!-- The question an interrupting action asks (Esc or Stop, Clear goal,
+       Send now), announced politely in the same words as its note. Mounted
+       throughout, so it is read when it appears. -->
+  <span class="sr-only" role="status" aria-live="polite">{armedConfirm?.spoken ?? ""}</span>
 
   {#if !readOnly}
   {#snippet branchContext()}
@@ -4098,6 +4179,19 @@
   .send-now-btn:focus-visible {
     color: var(--accent);
     background: color-mix(in srgb, var(--accent) 9%, transparent);
+  }
+  /* Waiting for its second press: the note above names the subagent it
+     would stop, and the button takes the warning tone. */
+  .send-now-btn.armed,
+  .send-now-btn.armed:hover,
+  .send-now-btn.armed:focus-visible {
+    color: var(--warn);
+    background: color-mix(in srgb, var(--warn) 12%, transparent);
+  }
+  /* The note's right edge is the row's (Send now and ✕ end it); it runs
+     left over the transcript, never squeezed to a short bubble's width. */
+  .bubble-row.asks {
+    position: relative;
   }
   .delivery {
     color: var(--muted);

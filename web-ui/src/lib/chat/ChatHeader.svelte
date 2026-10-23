@@ -18,6 +18,7 @@
   import type { ModelChoice } from "./modelPicker";
   import ModelPicker from "./ModelPicker.svelte";
   import UsageMeter from "./UsageMeter.svelte";
+  import { clickVia } from "./stopConfirm";
   import type { UsageRow } from "../shared/usage";
 
   interface Props {
@@ -47,7 +48,8 @@
     onPickEffort: (id: string) => void;
     onToggleUltracode: () => void;
     onToggleThinking: () => void;
-    onInterrupt: () => void;
+    /** The Stop, pressed by keyboard or pointer (the hint names which). */
+    onInterrupt: (via: "key" | "pointer") => void;
     /** A Stop is waiting for its second press (the composer says why). */
     stopArmed?: boolean;
     /** Turn the agent's Remote Control bridge on/off (claude: the
@@ -342,7 +344,7 @@
   <span class="spacer"></span>
   <div class="session-status">
   {#if store.running || store.compacting}
-    <button class="stop" class:armed={stopArmed} data-stop-control onclick={() => onInterrupt()} aria-label="Stop" title="interrupt the agent (Esc)"><span class="stop-mark" aria-hidden="true"></span><span class="stop-label">Stop</span></button>
+    <button class="stop" class:armed={stopArmed} data-stop-control="stop" onclick={(e) => onInterrupt(clickVia(e))} aria-label="Stop" title="interrupt the agent (Esc)"><span class="stop-mark" aria-hidden="true"></span><span class="stop-label">Stop</span></button>
   {/if}
   <UsageMeter
     contextPct={store.contextPct}

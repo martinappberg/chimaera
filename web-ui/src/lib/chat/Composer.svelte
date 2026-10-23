@@ -29,6 +29,8 @@
   import { Dictation, dictationParts, hostCanDictate, joinParts } from "./voice.svelte";
   import { CaptureError, listMicrophones } from "./voiceCapture";
   import VoiceMeter from "./VoiceMeter.svelte";
+  import StopNote from "./StopNote.svelte";
+  import { clickVia, type ConfirmVia } from "./stopConfirm";
   import { uploadChips } from "./uploadChips";
   import {
     collapseUploadMentions,
@@ -78,12 +80,13 @@
      *  after-this-turn chord sent it — hold it until the running turn ends
      *  rather than have the agent read it at its next step. */
     onSubmit(text: string, images: ImageAttachment[], afterTurn?: boolean): boolean;
-    /** Esc ("key") or the Stop button ("pointer"). The host decides whether
-     *  this stops or first asks (`stopConfirm`). */
-    onInterrupt(via: "key" | "pointer"): void;
-    /** A Stop waiting for its second press: what else it ends, and how the
-     *  first press came (the hint names the same gesture). */
-    stopConfirm?: { text: string; via: "key" | "pointer" } | null;
+    /** Esc, or the Stop button pressed by keyboard or pointer. The host
+     *  decides whether this stops or first asks (`stopConfirm`); with
+     *  another action waiting for its second press, Esc confirms that one. */
+    onInterrupt(via: ConfirmVia): void;
+    /** A Stop waiting for its second press: what else it ends, and the
+     *  hint in the words of the first press's gesture. */
+    stopConfirm?: { text: string; how: string } | null;
     /** Shift+Tab: advance to the next permission mode (agent-TUI parity). */
     onCycleMode(): void;
     /** Intercept a dialog-only slash command with native UI. True = handled. */
@@ -969,7 +972,7 @@
       e.preventDefault();
       // A held Esc auto-repeats: the repeat must not answer the question
       // its own first press just asked.
-      if (!e.repeat) onInterrupt("key");
+      if (!e.repeat) onInterrupt("esc");
     }
   }
 
@@ -992,26 +995,14 @@
 <div class="composer" class:visible>
   <!-- A Stop that would also end subagents or workflows asks once, here by
        the stop control: a press outside, any other key, or the timeout lets
-       it go (ChatView owns the state). The live region stays mounted so the
-       question is announced when it appears. -->
-  <span class="sr-only" role="status" aria-live="polite"
-    >{stopConfirm === null
-      ? ""
-      : `${stopConfirm.text}. ${stopConfirm.via === "key" ? "Press Escape" : "Press Stop"} again to stop.`}</span
-  >
+       it go (ChatView owns the state and the polite announcement). -->
   {#if stopConfirm !== null}
-    <button
-      type="button"
-      class="overlay-surface stop-note"
-      data-stop-control
-      tabindex="-1"
-      onmousedown={(e) => e.preventDefault()}
-      onclick={() => onInterrupt("pointer")}
-    >
-      <span class="stop-note-mark" aria-hidden="true"></span>
-      <span class="stop-note-what">{stopConfirm.text}</span>
-      <span class="stop-note-how">{stopConfirm.via === "key" ? "Esc again to stop" : "Click again to stop"}</span>
-    </button>
+    <StopNote
+      text={stopConfirm.text}
+      how={stopConfirm.how}
+      control="stop"
+      onConfirm={() => onInterrupt("pointer")}
+    />
   {/if}
   {#if popover === "slash"}
     <div class="overlay-surface pop" id="{uid}-pop" role="listbox" aria-label="slash commands">
@@ -1251,11 +1242,11 @@
         <button
           class="action stop"
           class:armed={stopConfirm !== null}
-          data-stop-control
+          data-stop-control="stop"
           aria-label="interrupt the agent"
           title="interrupt the agent (Esc)"
           onmousedown={(e) => e.preventDefault()}
-          onclick={() => onInterrupt("pointer")}
+          onclick={(e) => onInterrupt(clickVia(e))}
         >
           <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
             <rect x="4" y="4" width="8" height="8" rx="1.5" fill="currentColor" />
@@ -1390,6 +1381,9 @@
     flex: none;
     border-top: 1px solid var(--edge);
     padding: 8px 10px;
+    /* The stop note's edge is the input's edge (the side padding). */
+    --stop-note-right: var(--composer-pad-x, 10px);
+    --stop-note-max: calc(100% - 2 * var(--composer-pad-x, 10px));
   }
   /* .overlay-surface / .overlay-row (surface + button reset + hover) live in
      app.css; .pop and .pop-row add only this popover's position and layout. */
@@ -1688,54 +1682,8 @@
   .stop.armed::after {
     box-shadow: 0 0 0 4px color-mix(in srgb, var(--warn) 14%, transparent);
   }
-  /* The one-line question above the stop control, right-aligned with it.
-     An overlay (like the slash popover), so it never moves the composer. */
-  .stop-note {
-    bottom: 100%;
-    /* The composer's side padding: the note's edge is the input's edge. */
-    right: var(--composer-pad-x, 10px);
-    max-width: calc(100% - 2 * var(--composer-pad-x, 10px));
-    margin-bottom: 6px;
-    z-index: 11;
-    box-sizing: border-box;
-    display: inline-flex;
-    align-items: center;
-    gap: 7px;
-    padding: 5px 10px;
-    font: inherit;
-    font-size: var(--text-sm);
-    line-height: 1.35;
-    color: var(--fg);
-    white-space: nowrap;
-    cursor: pointer;
-    animation: rise 0.14s ease-out;
-  }
-  .stop-note:hover {
-    background: color-mix(in srgb, var(--fg) 5%, var(--overlay-bg));
-  }
-  .stop-note-mark {
-    flex: none;
-    width: 7px;
-    height: 7px;
-    border-radius: 1.5px;
-    background: var(--warn);
-  }
-  .stop-note-what {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .stop-note-how {
-    flex: none;
-    color: var(--muted);
-  }
-  .stop-note-how::before {
-    content: "·";
-    margin-right: 7px;
-  }
   @media (prefers-reduced-motion: reduce) {
-    .stop::after,
-    .stop-note {
+    .stop::after {
       animation: none;
     }
   }
