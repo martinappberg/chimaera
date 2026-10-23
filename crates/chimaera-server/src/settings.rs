@@ -467,10 +467,18 @@ pub(crate) async fn put_settings(State(state): State<Arc<AppState>>, body: Bytes
                 .into_response();
         }
     };
-    let gate = crate::lock(&state.settings).gate.clone();
+    let (gate, wakes_before) = {
+        let store = crate::lock(&state.settings);
+        (store.gate.clone(), crate::comms::policy_in(&store.map))
+    };
+    let wakes_after = crate::comms::policy_in(&map);
     let job_state = state.clone();
     match gate.run(move || put_job(&job_state, map)).await {
-        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Ok(())) => {
+            // A looser wake policy lets go of the requests it no longer asks.
+            crate::comms::policy_changed(&state, wakes_before, wakes_after);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(Err(WriteError::TooLarge)) => too_large(),
         Ok(Err(WriteError::Failed(err))) | Err(err) => {
             tracing::error!(%err, "failed to persist settings");

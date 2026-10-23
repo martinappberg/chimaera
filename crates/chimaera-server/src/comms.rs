@@ -126,11 +126,15 @@ const READ_BYTES_MAX: usize = 16 * 1024;
 const AWAITING_MAX: usize = 64;
 
 /// What may start a turn in an idle agent (`agents.communication.wakes`).
+/// `Auto` is "Within limits" (the caps below, then the user is asked);
+/// `Always` wakes on every message with no caps — the posting rate limit
+/// is all that bounds it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WakePolicy {
     Never,
     Ask,
     Auto,
+    Always,
 }
 
 impl WakePolicy {
@@ -139,6 +143,16 @@ impl WakePolicy {
             WakePolicy::Never => "never",
             WakePolicy::Ask => "ask",
             WakePolicy::Auto => "auto",
+            WakePolicy::Always => "always",
+        }
+    }
+
+    fn from_setting(value: Option<&str>) -> Self {
+        match value {
+            Some("never") => WakePolicy::Never,
+            Some("auto") => WakePolicy::Auto,
+            Some("always") => WakePolicy::Always,
+            _ => WakePolicy::Ask,
         }
     }
 }
@@ -153,18 +167,15 @@ pub(crate) fn enabled(state: &AppState) -> bool {
         .unwrap_or(true)
 }
 
-/// Default `auto` (the maintainer's call, 2026-10-15): a message an agent
-/// sends to an idle peer should arrive; the caps bound the cost.
+/// Default `ask` (the maintainer's call, 2026-10-23, #344, reversing
+/// 2026-10-15's `auto`): the request shows in the idle agent's own chat,
+/// whose bar also switches the policy to Within limits or Always.
 pub(crate) fn wake_policy(state: &AppState) -> WakePolicy {
-    match crate::lock(&state.settings)
-        .map_cached()
-        .get(WAKES_KEY)
-        .and_then(Value::as_str)
-    {
-        Some("never") => WakePolicy::Never,
-        Some("ask") => WakePolicy::Ask,
-        _ => WakePolicy::Auto,
-    }
+    policy_in(crate::lock(&state.settings).map_cached())
+}
+
+pub(crate) fn policy_in(map: &serde_json::Map<String, Value>) -> WakePolicy {
+    WakePolicy::from_setting(map.get(WAKES_KEY).and_then(Value::as_str))
 }
 
 /// Whether a message may move a waiting claude chat's foreground subagent to
@@ -465,19 +476,26 @@ impl CommsState {
                 return Err(Capped::Gap(WAKE_GAP.saturating_sub(t.elapsed())));
             }
         }
-        let used = self.unattended.entry(ws.to_string()).or_insert(0);
-        if *used >= UNATTENDED_WAKES_MAX {
+        if self.unattended.get(ws).copied().unwrap_or(0) >= UNATTENDED_WAKES_MAX {
             return Err(Capped::Unattended);
         }
-        *used += 1;
+        self.record_wake(sender, reader, ws, thread);
+        Ok(())
+    }
+
+    /// Count a wake with no cap checked (the Always policy), so
+    /// [`Self::release_wake`] undoes either kind alike and a switch back to
+    /// Within limits starts from what the agents really did.
+    fn record_wake(&mut self, sender: &str, reader: &str, ws: &str, thread: Option<(String, u64)>) {
+        *self.unattended.entry(ws.to_string()).or_insert(0) += 1;
         // The gap is a fresh message's: a reply neither checks nor sets it.
         match thread {
             Some(key) => self.count_thread_wake(key),
             None => {
-                self.woke_at.insert(pair, Instant::now());
+                self.woke_at
+                    .insert((sender.to_string(), reader.to_string()), Instant::now());
             }
         }
-        Ok(())
     }
 
     fn count_thread_wake(&mut self, key: (String, u64)) {
@@ -785,7 +803,7 @@ impl Reader {
                 WakePolicy::Ask => {
                     "a message asks the user to wake it (a reply it asked for wakes it)"
                 }
-                WakePolicy::Auto => "a message wakes it",
+                WakePolicy::Auto | WakePolicy::Always => "a message wakes it",
             },
         }
     }
@@ -1178,6 +1196,14 @@ fn decide_idle(
     }
     if policy == WakePolicy::Ask && !reply_wake {
         return Plan::Request("ask");
+    }
+    if policy == WakePolicy::Always {
+        st.record_wake(sender, &reader.sid, ws, thread);
+        return Plan::Wake(if reply_wake {
+            "it answers a question you asked"
+        } else {
+            "the user lets agents in this workspace wake each other"
+        });
     }
     match st.claim_wake(sender, &reader.sid, ws, thread) {
         Ok(()) if reply_wake => Plan::Wake("it answers a question you asked"),
@@ -2247,7 +2273,9 @@ pub(crate) fn instructions(sid: &str, mastermind_here: bool, is_mastermind: bool
          nothing, so try it before asking). message_agent sends one of them (by id, \
          \"mastermind\", or \"everyone\") a short message: a finding it needs, a blocker, a \
          heads-up like \"I'm changing the loader API\", or a question (set expect_reply to get \
-         the answer back) — not progress chatter. These are chimaera's tools: agent tools your harness has of its \
+         the answer back) — not progress chatter. A message can wake an idle agent, a turn \
+         billed to the user, so send no thanks or acknowledgements and answer a reply only \
+         when something is still open. These are chimaera's tools: agent tools your harness has of its \
          own (ListAgents, SendMessage, subagents) reach other sessions on this machine or \
          your own helpers, never this workspace's agents. Before \
          starting work that could overlap \
@@ -2582,7 +2610,9 @@ pub(crate) async fn post_wake(
     // held agents (already taken out of the list) nor half-finish a send's
     // claim, and the click answers once its own agent has the message.
     if !held.is_empty() {
-        tokio::spawn(release_held(state.clone(), id.clone(), held));
+        let why = "[chimaera delivered these because the user let the agents in this workspace \
+                   keep going]";
+        tokio::spawn(release_held(state.clone(), id.clone(), held, why));
     }
     let why = "[chimaera delivered these because the user approved waking you for messages from \
                other agents in this workspace]";
@@ -2609,25 +2639,69 @@ pub(crate) async fn post_wake(
     }
 }
 
-/// After the user's Continue past the unattended limit: wake every other
-/// agent the limit held back. Each is an agent wake like any other — it
-/// counts against the new round and keeps the pair's gap and the
-/// conversation's limit.
-async fn release_held(state: Arc<AppState>, ws: String, held: Vec<WakeRequest>) {
+/// The user loosened the wake policy (Settings, or the wake bar's
+/// "Within limits" / "Always"): the requests it no longer asks about go,
+/// and their agents wake under it. Ask → Within limits lets go of the
+/// plain asks (a limit's Continue still asks); Always lets go of every one.
+pub(crate) fn policy_changed(state: &Arc<AppState>, before: WakePolicy, after: WakePolicy) {
+    let lets_go = |reason: &str| match after {
+        WakePolicy::Always => true,
+        WakePolicy::Auto => reason == "ask",
+        WakePolicy::Never | WakePolicy::Ask => false,
+    };
+    if before == after || !enabled(state) {
+        return;
+    }
+    let released: Vec<(String, Vec<WakeRequest>)> = {
+        let mut st = crate::lock(&state.comms.inner);
+        let mut out = Vec::new();
+        for (ws, list) in st.requests.iter_mut() {
+            let (go, keep): (Vec<_>, Vec<_>) = std::mem::take(list)
+                .into_iter()
+                .partition(|r| lets_go(r.reason));
+            *list = keep;
+            if !go.is_empty() {
+                out.push((ws.clone(), go));
+            }
+        }
+        for (ws, _) in &out {
+            bump(&mut st, ws);
+        }
+        out
+    };
+    if released.is_empty() {
+        return;
+    }
+    state.changes.notify_waiters();
+    for (ws, held) in released {
+        let why = "[chimaera delivered these because the user now lets agents in this \
+                   workspace wake each other]";
+        tokio::spawn(release_held(state.clone(), ws, held, why));
+    }
+}
+
+/// Wake agents whose requests the user let go: every other agent the
+/// unattended limit held back after a Continue, or every request a looser
+/// wake policy no longer asks about. Each is an agent wake like any other —
+/// within limits it counts against the round and keeps the pair's gap and
+/// the conversation's limit; under Always it is only counted.
+async fn release_held(state: Arc<AppState>, ws: String, held: Vec<WakeRequest>, why: &'static str) {
     for other in held {
         let Some(target) = reader(&state, &other.to_sid).filter(|r| r.alive && r.chat) else {
             continue;
         };
-        let claim = crate::lock(&state.comms.inner).claim_wake(
-            &other.from_sid,
-            &target.sid,
-            &ws,
-            other.thread.clone(),
-        );
+        let always = wake_policy(&state) == WakePolicy::Always;
+        let claim = {
+            let mut st = crate::lock(&state.comms.inner);
+            if always {
+                st.record_wake(&other.from_sid, &target.sid, &ws, other.thread.clone());
+                Ok(())
+            } else {
+                st.claim_wake(&other.from_sid, &target.sid, &ws, other.thread.clone())
+            }
+        };
         match claim {
             Ok(()) => {
-                let why = "[chimaera delivered these because the user let the agents in this \
-                           workspace keep going]";
                 match deliver_all(
                     &state,
                     &target,
@@ -2668,7 +2742,14 @@ async fn release_held(state: Arc<AppState>, ws: String, held: Vec<WakeRequest>) 
                     ..other
                 },
             ),
-            Err(Capped::Unattended) => ask_user(&state, &ws, other),
+            Err(Capped::Unattended) => ask_user(
+                &state,
+                &ws,
+                WakeRequest {
+                    reason: "unattended",
+                    ..other
+                },
+            ),
         }
     }
     state.changes.notify_waiters();
