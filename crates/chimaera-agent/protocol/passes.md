@@ -1427,3 +1427,44 @@ Installed Codex 0.158.0; `TESTED_CODEX_VERSION` remains 0.162.1. Generated the i
 - Final `RUST_TEST_THREADS=1 just check` passed with normal host access: formatting, both workspace clippy checks, all daemon and plugin workspace tests (including all 1,004 server tests), and unchanged wire fixtures. Earlier concurrent runs intermittently timed out in existing Slurm subprocess tests; those passed in the serial run. The installer completion-watcher test timed out in earlier restricted runs, then passed both alone with normal host access and in the final full gate. No production timeout or installer code changed.
 
 - Isolated preview resource check after verification: ~28 MiB RSS, 0.0% CPU at idle. Preview ownership: this verification run owns the isolated daemon on port 52328 and the component gallery on port 57924.
+
+## Pass 49 (2026-10-23 — live probes claude 2.1.302 + codex 0.162.1): Stop ends subagents and workflows, not commands. ADOPTED (UI only).
+
+Issue #343 asked for a confirmation before Esc or Stop also ends background work. A confirmation that names work the Stop leaves running, or misses work it ends, is worse than none, so each kind was probed.
+
+**Method.** Claude: a raw client with the driver's stream-json flags (`--model haiku`, `--dangerously-skip-permissions`, every `CLAUDE*` variable scrubbed) asked for, in one turn, a `run_in_background` Bash (`sleep 301`), a Monitor, a background Agent whose own Bash ran `perl -e 'sleep 303'`, a `CronCreate` job, a `ScheduleWakeup`, and then a foreground `perl -e 'sleep 120'`. The client sent a plain `interrupt` five seconds after the foreground command's `task_started`, logged every frame, checked `ps` for the marker sleeps, and then asked for `CronList` in a second turn. Two more runs used the same steps: a Workflow (one agent running `perl -e 'sleep 307'`) beside the foreground command, and one Agent call with no `run_in_background`. Codex: the real `codex app-server` with an isolated `CODEX_HOME` whose model provider is a local scripted Responses server (no billing). The parent ran `perl -e 'sleep 305'` with `yield_time_ms: 500` (a background terminal), spawned one agent with `multi_agent_v1.spawn_agent` (the child ran `perl -e 'sleep 12'`, and `sleep 306` in a second run), then ran `perl -e 'sleep 120'`. The client sent the driver's `turn/interrupt` and called `thread/backgroundTerminals/list` before and after it.
+
+### Claude 2.1.302
+
+| Running at the Stop | After the plain `interrupt` |
+|---|---|
+| foreground Bash | stopped (`task_notification {status: "stopped"}`, the "doesn't want to proceed" result) |
+| background Agent (`local_agent`) and its own Bash | **killed**: `task_updated {status: "killed"}`, `task_notification {status: "stopped"}`, the lane leaves `background_tasks_changed`, all before the receipt `{still_queued: []}` |
+| Workflow (`local_workflow`) and its agent's Bash | **killed** the same way; `background_tasks_changed {tasks: []}`; no marker process left |
+| `run_in_background` Bash | **kept running**: still in the set, `sleep 301` alive after a second turn; it stopped only when stdin closed and the process exited |
+| Monitor | **kept running**, the same way |
+| `CronCreate` job, `ScheduleWakeup` | **kept**: the next turn's `CronList` listed the job and the wakeup (as a one-shot job) |
+
+- In `-p` an Agent call without `run_in_background` launched as a background agent (`is_backgrounded: true`, "Async agent launched"), and the turn ended (as Pass 42 noted). A plain `interrupt` sent after that, with no turn running, still killed the agent.
+- The Bash tool now refuses a standalone foreground `sleep N` ("Blocked: standalone sleep N. …"); probes use `perl -e 'sleep N'`.
+- The CLI's schema says Send now "ends no background task, subscription or other thing outside the running turn that a Stop ends". The probes show that a Stop does not end background commands, Monitor watches or the schedule.
+
+### Codex 0.162.1
+
+- `turn/interrupt` → `{}`, then the parent's `turn/completed {status: "interrupted"}` at once. The child's turn ran on: its command finished on schedule 10 s later, it asked the model again, and its `turn/completed {completed}` arrived. `thread/backgroundTerminals/list` listed the parent's `sleep 305` and its interrupted `sleep 120` both before and after the interrupt, and `ps` agreed. Everything ended when the app-server's stdin closed.
+- With `features.multi_agent` the spawn arrived as `collabAgentToolCall {tool: "spawnAgent"}` `item/started` / `item/completed`, with no `subAgentActivity` marker, so the driver drew no Agent row for the child. Not pursued here.
+- Chimaera's Stop also pauses an active goal before it interrupts (Pass 47). The goal stays and can be resumed.
+
+### ACP
+
+No subagent or background surface (Pass 42; Pass 44): a Stop ends only the turn.
+
+### ADOPTED
+
+- `web-ui/src/lib/chat/stopConfirm.ts`: what a Stop would end besides the turn. It counts live, non-`crossTurn` subagent rows plus non-ambient `local_agent` lanes (a foreground agent moved to the background is counted once), and `local_workflow` lanes. It never counts `local_bash` (commands and Monitor watches), the schedule, or Codex's process-owned (`crossTurn`) agent rows. `remote_agent` stays out until probed. The rules follow the event shapes, not the agent's brand.
+- Esc in the composer, the composer's Stop and the header's Stop: when that count is non-zero, the first press shows one line above the stop control ("Also stops 2 subagents · Esc again to stop") and gives the Stop buttons the warning tone. A second Esc anywhere in the chat, or a second click, stops. Any other key, a press outside the stop controls, five seconds, the turn ending, or the named work finishing withdraws the line. Popovers, menus and cards that handle Esc first keep it. With nothing else to end, the first press stops, as before. No wire change.
+
+### Gate (Pass 49)
+
+- Hermetic: `stopConfirm.test.ts` (which lanes and rows count, the dedupe, the key rules).
+- Live UI, isolated daemon, headless Chrome: a stand-in `claude` replayed the recorded 2.1.302 frames (background agent + command + Monitor; workflow; a turn held on a foreground subagent; commands only). Esc, Esc stopped the first three. The commands-only scene stopped at the first Esc. The real Codex app-server with the scripted provider stopped at the first Esc. Driver code is unchanged, so `just chat-smoke` was not run.

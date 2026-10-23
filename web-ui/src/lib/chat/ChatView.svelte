@@ -53,6 +53,7 @@
   import FinishedFold from "./FinishedFold.svelte";
   import { effortScale } from "./effortScale";
   import { backgroundKind } from "./backgroundKinds";
+  import { STOP_CONFIRM_MS, armedKey, stopReach, stopReachText } from "./stopConfirm";
   import AgentsTray from "./AgentsTray.svelte";
   import BackgroundTray from "./BackgroundTray.svelte";
   import AheadCard from "./AheadCard.svelte";
@@ -1609,9 +1610,63 @@
     sendCommand({ type: "answer", request_id: requestId, answers }, "answer not sent");
   }
 
-  function interrupt() {
+  /** What a Stop would end besides the turn (claude's subagents and
+   *  workflows; see stopConfirm.ts for what survives), or null. */
+  const stopReachLabel = $derived(
+    readOnly ? null : stopReachText(stopReach(store.activeAgents, store.backgroundTasks)),
+  );
+  /** A Stop waiting for its second press, and how the first came: the hint
+   *  names the same gesture. */
+  let stopArmed = $state<"key" | "pointer" | null>(null);
+  const stopConfirm = $derived(
+    stopArmed !== null && stopReachLabel !== null ? { text: stopReachLabel, via: stopArmed } : null,
+  );
+
+  /** Esc or a Stop button. When the interrupt would also end subagents or
+   *  workflows, the first press only asks (inline, by the composer); the
+   *  second stops. Otherwise it stops at once, as it always has. */
+  function interrupt(via: "key" | "pointer" = "pointer") {
+    if (stopArmed === null && stopReachLabel !== null && agentBusy) {
+      stopArmed = via;
+      return;
+    }
+    stopArmed = null;
     sendCommand({ type: "interrupt" }, "stop not sent");
   }
+  // The question lapses with its cause: the turn ended on its own, the work
+  // it named finished, or the chat was hidden.
+  $effect(() => {
+    if (!agentBusy || stopReachLabel === null || !visible) untrack(() => (stopArmed = null));
+  });
+  // While armed: Esc anywhere in this chat confirms (focus may sit in the
+  // transcript or on the header's Stop); any other key, a press outside the
+  // stop controls, or the timeout lets it go. Bubble phase, so a popover,
+  // menu or card that handles Esc first keeps winning.
+  $effect(() => {
+    if (stopArmed === null) return;
+    const root = chatEl;
+    const timer = setTimeout(() => (stopArmed = null), STOP_CONFIRM_MS);
+    const onKey = (e: KeyboardEvent) => {
+      if (stopArmed === null) return;
+      const inChat = root !== null && e.target instanceof Node && root.contains(e.target);
+      const act = armedKey(e, inChat);
+      if (act === "confirm") {
+        e.preventDefault();
+        interrupt("key");
+      } else if (act === "dismiss") stopArmed = null;
+    };
+    const onDown = (e: PointerEvent) => {
+      if (e.target instanceof Element && e.target.closest("[data-stop-control]") !== null) return;
+      stopArmed = null;
+    };
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("pointerdown", onDown, true);
+    return () => {
+      clearTimeout(timer);
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("pointerdown", onDown, true);
+    };
+  });
 
   // Stop/background ride the same never-lose-a-click contract as decide():
   // a send into a closed socket says why nothing happened.
@@ -2938,7 +2993,8 @@
     onPickEffort={pickEffort}
     onToggleUltracode={toggleUltracode}
     onToggleThinking={toggleThinking}
-    onInterrupt={interrupt}
+    onInterrupt={() => interrupt("pointer")}
+    stopArmed={stopConfirm !== null}
     onSetRemoteControl={setRemoteControl}
     onCompact={canCompact ? compactNow : undefined}
     onOpenSettings={readOnly ? undefined : openAgentSettings}
@@ -3748,6 +3804,7 @@
     {voiceTerms}
     onDraftState={(active) => (composerEngaged = active)}
     onInterrupt={interrupt}
+    {stopConfirm}
     onCycleMode={cycleMode}
     {onSlash}
   />
@@ -3853,8 +3910,9 @@
     margin-left: auto;
     margin-right: auto;
     box-sizing: border-box;
-    padding-left: 18px;
-    padding-right: 18px;
+    --composer-pad-x: 18px;
+    padding-left: var(--composer-pad-x);
+    padding-right: var(--composer-pad-x);
   }
   /* No full-width rule under a centered column — the input's own border
      is the boundary (the Claude Desktop treatment). */

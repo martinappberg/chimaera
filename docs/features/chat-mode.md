@@ -421,6 +421,17 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   and the Errored rail state are reserved for genuine failures.
   If Codex has not confirmed receipt of the opening message when stopped, a brief
   notice asks you to resend it. Saying only “Keep going” cannot recover missing input.
+- **A Stop that ends more than the turn asks once.** Claude's Stop also kills its subagents
+  (foreground and background) and its workflows; it leaves background commands, Monitor watches
+  and the schedule running (PROTOCOL.md Pass 49). When the running turn has any of the first
+  kind, the first Esc or Stop press shows one line above the stop control, "Also stops 2
+  subagents · Esc again to stop" ("Click again" after a click), and turns the Stop buttons
+  amber. A second Esc anywhere in the chat, or a second click on Stop or the line, stops. Any
+  other key, a press elsewhere, five seconds, the turn ending, or the named work finishing
+  withdraws it. Esc still closes an open picker or menu first. With nothing else to end, as in
+  every Codex and ACP chat (a Codex Stop leaves spawned agents and background terminals running),
+  the first press stops at once. A polite live region announces the line.
+  `web-ui/src/lib/chat/stopConfirm.ts` decides what counts.
 - **Rendering.** Streamed prose reveals word-by-word on a ~75ms ticker (respects
   `prefers-reduced-motion`). Markdown and Codex's common LaTeX delimiters (`$…$`, `$$…$$`,
   `\(…\)`, `\[…\]`) render through **marked + KaTeX MathML → DOMPurify**; math is excluded from
