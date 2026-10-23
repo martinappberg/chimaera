@@ -42,12 +42,12 @@
   const ask = $derived(wakeAsk(request?.reason ?? "ask"));
   const oneLine = $derived((request?.text ?? "").replace(/\s+/g, " ").trim());
 
-  async function answer(yes: boolean, policy?: "auto" | "always"): Promise<void> {
-    if (request === null || busy !== null) return;
+  async function answer(yes: boolean, policy?: "auto" | "always", wid = request?.id): Promise<void> {
+    if (wid === undefined || busy !== null) return;
     busy = yes ? "wake" : "leave";
     try {
-      if (policy !== undefined) await wakeFromNowOn(request.id, policy);
-      else await wake(request.id, yes);
+      if (policy !== undefined) await wakeFromNowOn(wid, policy);
+      else await wake(wid, yes);
     } catch {
       // The store keeps the refusal; `failure` shows it.
     } finally {
@@ -57,6 +57,9 @@
 
   function openChoices(e: MouseEvent): void {
     if (request === null) return;
+    // The pick answers the request the menu was opened for, even if the bar
+    // has moved on to the next one meanwhile.
+    const wid = request.id;
     const r = (e.currentTarget as Element).getBoundingClientRect();
     contextMenu.openAtPoint(
       r.right,
@@ -64,7 +67,7 @@
       loosenChoices(request.reason).map((c) => ({
         label: c.label,
         detail: c.detail,
-        onSelect: () => void answer(true, c.policy),
+        onSelect: () => void answer(true, c.policy, wid),
       })),
       { alignRight: true },
     );

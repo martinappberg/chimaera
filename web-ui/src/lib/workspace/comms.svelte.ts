@@ -352,16 +352,24 @@ export function loosenChoices(reason: string): { policy: "auto" | "always"; labe
 }
 
 /**
- * Wake this request's agent and loosen the wake policy from now on. The
- * daemon lets go of every request the new policy no longer asks about,
- * this one included, so the wake that follows may find it already gone
- * (a 404, which `wake` treats as settled).
+ * Wake this request's agent, then loosen the wake policy from now on. The
+ * wake goes first so it is the user's own (it starts the workspace's round
+ * over and is never held by a cap); the setting then makes the daemon let
+ * go of every other request the new policy no longer asks about. The
+ * policy changes even when this wake was refused, since the user asked
+ * for it from now on.
  */
 export async function wakeFromNowOn(wid: string, policy: "auto" | "always"): Promise<void> {
+  let refused: unknown = null;
+  try {
+    await wake(wid, true);
+  } catch (e) {
+    refused = e;
+  }
   setSetting("agents.communication.wakes", policy);
   if (!(await flushSettings())) throw new Error(settingsSaveRejection() || "couldn't save the setting");
   commsStore.wakes = policy;
-  await wake(wid, true);
+  if (refused !== null) throw refused;
 }
 
 /** Put away a refused answer's card. */

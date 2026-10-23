@@ -483,6 +483,23 @@ impl CommsState {
         Ok(())
     }
 
+    /// [`Self::claim_wake`] under `policy`: Always checks no cap and only
+    /// counts the wake.
+    fn claim_wake_under(
+        &mut self,
+        policy: WakePolicy,
+        sender: &str,
+        reader: &str,
+        ws: &str,
+        thread: Option<(String, u64)>,
+    ) -> Result<(), Capped> {
+        if policy == WakePolicy::Always {
+            self.record_wake(sender, reader, ws, thread);
+            return Ok(());
+        }
+        self.claim_wake(sender, reader, ws, thread)
+    }
+
     /// Count a wake with no cap checked (the Always policy), so
     /// [`Self::release_wake`] undoes either kind alike and a switch back to
     /// Within limits starts from what the agents really did.
@@ -492,6 +509,8 @@ impl CommsState {
         match thread {
             Some(key) => self.count_thread_wake(key),
             None => {
+                // Pruned here too: under Always `claim_wake` never runs.
+                self.woke_at.retain(|_, t| t.elapsed() < WAKE_GAP);
                 self.woke_at
                     .insert((sender.to_string(), reader.to_string()), Instant::now());
             }
@@ -1197,15 +1216,7 @@ fn decide_idle(
     if policy == WakePolicy::Ask && !reply_wake {
         return Plan::Request("ask");
     }
-    if policy == WakePolicy::Always {
-        st.record_wake(sender, &reader.sid, ws, thread);
-        return Plan::Wake(if reply_wake {
-            "it answers a question you asked"
-        } else {
-            "the user lets agents in this workspace wake each other"
-        });
-    }
-    match st.claim_wake(sender, &reader.sid, ws, thread) {
+    match st.claim_wake_under(policy, sender, &reader.sid, ws, thread) {
         Ok(()) if reply_wake => Plan::Wake("it answers a question you asked"),
         Ok(()) => Plan::Wake("the user lets agents in this workspace wake each other"),
         Err(Capped::Gap(after)) => Plan::Later(after),
@@ -2690,16 +2701,14 @@ async fn release_held(state: Arc<AppState>, ws: String, held: Vec<WakeRequest>, 
         let Some(target) = reader(&state, &other.to_sid).filter(|r| r.alive && r.chat) else {
             continue;
         };
-        let always = wake_policy(&state) == WakePolicy::Always;
-        let claim = {
-            let mut st = crate::lock(&state.comms.inner);
-            if always {
-                st.record_wake(&other.from_sid, &target.sid, &ws, other.thread.clone());
-                Ok(())
-            } else {
-                st.claim_wake(&other.from_sid, &target.sid, &ws, other.thread.clone())
-            }
-        };
+        let policy = wake_policy(&state);
+        let claim = crate::lock(&state.comms.inner).claim_wake_under(
+            policy,
+            &other.from_sid,
+            &target.sid,
+            &ws,
+            other.thread.clone(),
+        );
         match claim {
             Ok(()) => {
                 match deliver_all(
