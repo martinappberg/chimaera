@@ -65,6 +65,12 @@ describe("armedKey", () => {
     expect(armedKey(key("Escape"), false)).toBe("dismiss");
   });
 
+  it("leaves Enter or Space on a focused Stop to that Stop's own click", () => {
+    expect(armedKey(key("Enter"), true, true)).toBe("ignore");
+    expect(armedKey(key(" "), true, true)).toBe("ignore");
+    expect(armedKey(key("a"), true, true)).toBe("dismiss");
+  });
+
   it("ignores a bare modifier", () => {
     for (const k of ["Shift", "Control", "Alt", "Meta"]) expect(armedKey(key(k), true)).toBe("ignore");
   });

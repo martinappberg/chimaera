@@ -967,7 +967,9 @@
       submit();
     } else if (e.key === "Escape" && running) {
       e.preventDefault();
-      onInterrupt("key");
+      // A held Esc auto-repeats: the repeat must not answer the question
+      // its own first press just asked.
+      if (!e.repeat) onInterrupt("key");
     }
   }
 

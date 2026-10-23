@@ -53,7 +53,7 @@
   import FinishedFold from "./FinishedFold.svelte";
   import { effortScale } from "./effortScale";
   import { backgroundKind } from "./backgroundKinds";
-  import { STOP_CONFIRM_MS, armedKey, stopReach, stopReachText } from "./stopConfirm";
+  import { STOP_CONFIRM_MS, agentRowName, armedKey, stopReach, stopReachText } from "./stopConfirm";
   import AgentsTray from "./AgentsTray.svelte";
   import BackgroundTray from "./BackgroundTray.svelte";
   import AheadCard from "./AheadCard.svelte";
@@ -1648,8 +1648,13 @@
     const timer = setTimeout(() => (stopArmed = null), STOP_CONFIRM_MS);
     const onKey = (e: KeyboardEvent) => {
       if (stopArmed === null) return;
-      const inChat = root !== null && e.target instanceof Node && root.contains(e.target);
-      const act = armedKey(e, inChat);
+      // WebKit leaves focus on <body> after a click on a button, so a key
+      // with no focused element counts as the chat's (the user just pressed
+      // Stop here); focus elsewhere in the app dismisses.
+      const unfocused = e.target === document.body || e.target === document.documentElement;
+      const inChat = unfocused || (root !== null && e.target instanceof Node && root.contains(e.target));
+      const onStop = e.target instanceof Element && e.target.closest("[data-stop-control]") !== null;
+      const act = armedKey(e, inChat, onStop);
       if (act === "confirm") {
         e.preventDefault();
         interrupt("key");
@@ -2366,7 +2371,7 @@
   const runningTasks = $derived.by(() => {
     // A foreground agent moved to the background (Ctrl-B) is still its live
     // row AND now an agent lane — count it once.
-    const rows = new Set(store.activeAgents.map((a) => a.title.replace(/^(Agent|Task): /, "")));
+    const rows = new Set(store.activeAgents.map((a) => agentRowName(a.title)));
     const lanes = store.backgroundTasks.filter(
       (t) => !t.ambient && !(backgroundKind(t) === "agent" && rows.has(t.description)),
     );

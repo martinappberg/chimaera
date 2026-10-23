@@ -44,6 +44,13 @@ export const STOP_CONFIRM_MS = 5000;
 
 const LIVE = new Set(["pending", "in_progress"]);
 
+/** A subagent row's name without its tool prefix: what its background lane
+ *  calls it once the agent moves there (ChatView's running-task count shares
+ *  this, so both dedupe the same way). */
+export function agentRowName(title: string): string {
+  return title.replace(/^(Agent|Task): /, "");
+}
+
 /** What a Stop would end besides the turn itself. */
 export function stopReach(
   agents: readonly StopAgentRow[],
@@ -52,7 +59,7 @@ export function stopReach(
   const rows = agents.filter((a) => LIVE.has(a.status) && !a.crossTurn);
   // A foreground agent moved to the background (Ctrl-B) is still its live
   // row AND now an agent lane: count it once (as ChatView's runningTasks).
-  const names = new Set(rows.map((a) => a.title.replace(/^(Agent|Task): /, "")));
+  const names = new Set(rows.map((a) => agentRowName(a.title)));
   let subagents = rows.length;
   let workflows = 0;
   for (const lane of lanes) {
@@ -79,14 +86,18 @@ export function stopReachText(reach: StopReach): string | null {
 /** While a Stop waits for its second press, what a key does. A key some
  *  surface already handled (the composer's own Esc, a card's Esc, a menu's)
  *  is left alone; Esc elsewhere in this chat confirms; a bare modifier does
- *  nothing; any other key, or Esc in another pane, lets the stop go. */
+ *  nothing; any other key, or Esc in another pane, lets the stop go.
+ *  Enter or Space on a focused Stop control is that control's own click (it
+ *  confirms), so dismissing on its keydown would re-arm instead. */
 export function armedKey(
   e: { key: string; defaultPrevented: boolean },
   inChat: boolean,
+  onStopControl = false,
 ): "confirm" | "dismiss" | "ignore" {
   if (e.key === "Shift" || e.key === "Control" || e.key === "Alt" || e.key === "Meta") {
     return "ignore";
   }
+  if (onStopControl && (e.key === "Enter" || e.key === " ")) return "ignore";
   if (e.key === "Escape") {
     if (e.defaultPrevented) return "ignore";
     return inChat ? "confirm" : "dismiss";
