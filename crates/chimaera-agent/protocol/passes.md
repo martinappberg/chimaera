@@ -1428,7 +1428,6 @@ Installed Codex 0.158.0; `TESTED_CODEX_VERSION` remains 0.162.1. Generated the i
 
 - Isolated preview resource check after verification: ~28 MiB RSS, 0.0% CPU at idle. Preview ownership: this verification run owns the isolated daemon on port 52328 and the component gallery on port 57924.
 
-
 ## Pass 52 (2026-10-23 — live probes claude 2.1.310): drift pass 2.1.300 → 2.1.310, and the changelogs. Pin moved; nothing new adopted.
 
 Claude Code 2.1.310 (npm latest) against the 2.1.300 pin, plus the official changelogs for 2.1.301–2.1.310 and Codex 0.163.0–0.164.0. The codex pin is not part of this pass.
@@ -1452,7 +1451,7 @@ Claude Code 2.1.310 (npm latest) against the 2.1.300 pin, plus the official chan
   - `assistant` thinking frames: `thinking_display`, `thinking_duration_ms`;
   - `result`: `model_usage_since_last_result`;
   - `system/thinking_tokens`: `user_message_uuid`.
-- The `read_file` control documents `anchor` (`as_written`, gated by `read_file_as_written_v1`).
+- The `read_file` control documents `anchor` (`as_written`, gated by `read_file_as_written_v1`, a capability token new in the 2.1.310 binary that the probed `-p` init did not list).
 - Subtype literals went from 157 to 161, all of them cloud-session and feedback controls. `sdk-tools.d.ts` changed one description line: `Agent.effort` is ignored for `subagent_type: "fork"`. `--help` changed wording only.
 
 ### Changelog review (2.1.301–2.1.310)
@@ -1469,13 +1468,13 @@ These entries matter to a host that drives the CLI structurally. TUI, VS Code, c
 | 2.1.304 | Model switches, messages and interrupts no longer wait behind a context-usage check in SDK sessions. | Benefits (the per-turn `get_context_usage`). | Ignore. |
 | 2.1.304 | A warning on Pro and Max before resuming an inactive conversation that would use a noticeable share of the 5-hour limit. | Unknown whether `-p` asks (a dialog kind would need declaring). | Adopt later. Probe a cold resume. |
 | 2.1.307 | `setModel()` waits up to 15 s for the API to confirm a model. | No client timeout on `set_model`; the chip re-reads `get_settings`. | Ignore. |
-| 2.1.307 | An HTTP MCP call whose connection closed mid-call is retried only for read-only or idempotent tools. | Chimaera's MCP tools carry no annotations, so none is retried. | Adopt later: `readOnlyHint` on `list_terminals`, `read_terminal`, `workspace_status`, `list_changed_files`, `read_timeline`, `document_guide`, `check_document`. |
+| 2.1.307 | An HTTP MCP call whose connection closed mid-call is retried only for read-only or idempotent tools. | Chimaera's MCP tools carry no annotations, so none is retried. | Adopt later: `readOnlyHint` on `list_terminals`, `read_terminal`, `workspace_status`, `list_changed_files`, `read_timeline`, `workspace_agents`, `read_agent`, `read_messages`, `document_guide`, `check_document`. |
 | 2.1.307 | A background command stopped by a connected app is no longer "stopped by the user"; the notice names its output file. | The close text is passed through verbatim. | Ignore. |
 | 2.1.309 | `sed -i` is now a plain Bash command, so `rewind_files` no longer restores it. | The rewind dialog shows what the dry run reports. | Ignore. Recorded in Checkpoints. |
 | 2.1.309 | A disabled MCP server is no longer reconnected by a later permission prompt in print and SDK sessions. | Benefits `mcp_toggle`. | Ignore. |
 | 2.1.310 | An MCP call that times out on an unanswered elicitation in `-p` tells Claude no answer came. | Chimaera answers every elicitation. | Ignore. |
 | 2.1.310 | Lower memory in `-p` during compaction of very large transcripts. | Benefits. | Ignore. |
-| binary | `lifecycle_wakeup_source_v1`: `wakeup_source` / `scheduled_for` on a scheduler fire's `started`. | `autonomy.rs` infers the cause from what is due (2-minute window). | **Adopt now** (small): prefer the CLI's word when present, so a wakeup is never confused with a job that falls due at the same moment; keep the inference for older CLIs. |
+| binary | `lifecycle_wakeup_source_v1`: `wakeup_source` / `scheduled_for` on a scheduler fire's `started`. | `autonomy.rs` infers the cause from what is due (fires up to 30 s early; 120 s for a one-shot job). | **Adopt now** (small): prefer the CLI's word when present, so a wakeup is never confused with a job that falls due at the same moment; keep the inference for older CLIs. |
 | binary | `interrupt_requeue_taken_v1` / `requeue_if_interrupted_within_ms`. | Stop treats a `started` message as read. | Adopt later. It would save a prompt typed just before a Stop. |
 | binary | `interrupt {for_user_message_uuids}` (`@internal`): a Stop names the messages whose turn it is for. | A plain `interrupt`. | Adopt later. A Stop that lands after its turn ended could otherwise cut the next one; probe first. |
 | binary | `read_file {anchor: as_written}`. | Chimaera resolves reply paths itself. | Adopt later, for remote hosts where a reply's path is relative to an earlier cwd. |
