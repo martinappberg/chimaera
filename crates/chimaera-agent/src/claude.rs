@@ -681,8 +681,9 @@ enum PendingControl {
     /// get_context_usage round-trip. `meter`: the turn-end refresh feeding
     /// the context meter; without it, the auto-compact check that follows a
     /// settings read and wants only `isAutoCompactEnabled`. `setting`: the
-    /// flag-layer auto-compact when it was asked, so a reply that crossed a
-    /// switch never blames the environment. `picked`: the user's
+    /// flag-layer auto-compact when it was asked (`None` while an apply was
+    /// still unread), so a reply that crossed a switch never blames the
+    /// environment. `picked`: the user's
     /// auto-compact pick the check settles.
     ContextUsage {
         meter: bool,
@@ -703,6 +704,9 @@ enum PendingControl {
         /// The user's auto-compact pick this read settles (remembered for
         /// the conversation); never an effort/ultracode pick too.
         picked: Option<bool>,
+        /// `auto_compact_applies` when asked: the read reflects every
+        /// auto-compact apply sent before it.
+        applies: u64,
     },
     /// apply_flag_settings acknowledged → re-read the truth. `chosen` = the
     /// apply was the user's own effort/ultracode pick (fed to the prefs),
@@ -1014,6 +1018,11 @@ struct ClaudeMapper {
     /// The flag-layer auto-compact (`get_settings` `effective`); `None`
     /// until read, and for a CLI without the merged view (no switch then).
     auto_compact_setting: Option<bool>,
+    /// Auto-compact applies sent, and how many of them the cached setting
+    /// reflects. While they differ the CLI may already run with a value
+    /// the cache does not show, so no answer may blame the environment.
+    auto_compact_applies: u64,
+    auto_compact_read: u64,
     /// What holds auto-compact off from the environment: `None` = not
     /// known yet, `Some(None)` = nothing, `Some(Some(var))` = that variable.
     /// Fixed for the process's life, so learned once.
@@ -1197,6 +1206,8 @@ impl ClaudeMapper {
             compaction_completed: false,
             compaction_awaiting_boundary: false,
             auto_compact_setting: None,
+            auto_compact_applies: 0,
+            auto_compact_read: 0,
             auto_compact_env: None,
             compact_offered,
             auto_compact: None,
@@ -1357,8 +1368,14 @@ impl ClaudeMapper {
         step: &mut DriverStep,
     ) {
         let id = self.ctl_id();
-        self.pending_controls
-            .insert(id.clone(), PendingControl::Settings { chosen, picked });
+        self.pending_controls.insert(
+            id.clone(),
+            PendingControl::Settings {
+                chosen,
+                picked,
+                applies: self.auto_compact_applies,
+            },
+        );
         step.outbound.push(control_request_frame(
             &id,
             json!({ "subtype": "get_settings" }),
@@ -1452,7 +1469,12 @@ impl ClaudeMapper {
             id.clone(),
             PendingControl::ContextUsage {
                 meter,
-                setting: self.auto_compact_setting,
+                // Unknown while an apply is unread: the CLI answers with it.
+                setting: if self.auto_compact_read == self.auto_compact_applies {
+                    self.auto_compact_setting
+                } else {
+                    None
+                },
                 picked,
             },
         );
@@ -1491,12 +1513,17 @@ impl ClaudeMapper {
     /// Fold one `get_context_usage` answer's `isAutoCompactEnabled` (the
     /// CLI's own resolution: the setting, unless `DISABLE_AUTO_COMPACT` or
     /// `DISABLE_COMPACT` is set). Off while the setting reads on, both when
-    /// asked and now, can only be the environment. A CLI that does not say
-    /// leaves the setting in charge.
+    /// asked (no apply unread) and now, can only be the environment, and
+    /// only an unknown one is learned. A CLI that does not say leaves the
+    /// setting in charge.
     fn learn_auto_compact_env(&mut self, reported: Option<bool>, asked_with: Option<bool>) {
         match reported {
             Some(true) => self.auto_compact_env = Some(None),
-            Some(false) if asked_with == Some(true) && self.auto_compact_setting == Some(true) => {
+            Some(false)
+                if self.auto_compact_env.is_none()
+                    && asked_with == Some(true)
+                    && self.auto_compact_setting == Some(true) =>
+            {
                 self.auto_compact_env = Some(Some(if self.compact_offered {
                     "DISABLE_AUTO_COMPACT"
                 } else {
@@ -3811,7 +3838,11 @@ impl ClaudeMapper {
                     }
                 }
             }
-            PendingControl::Settings { chosen, picked } => {
+            PendingControl::Settings {
+                chosen,
+                picked,
+                applies,
+            } => {
                 let applied = &payload["applied"];
                 step.events.push(AgentEvent::EffortState {
                     effort: applied["effort"].as_str().map(String::from),
@@ -3822,6 +3853,7 @@ impl ClaudeMapper {
                 // own (absent = its default, on). A CLI without the merged
                 // view reports nothing, so no switch is offered for it.
                 if let Some(effective) = payload["effective"].as_object() {
+                    self.auto_compact_read = self.auto_compact_read.max(applies);
                     self.auto_compact_setting = Some(
                         effective
                             .get("autoCompactEnabled")
@@ -4504,6 +4536,7 @@ impl ClaudeMapper {
             // 2.1.302: get_settings reads it back from flagSettings, and no
             // settings file is written; PROTOCOL.md Pass 50).
             AgentCommand::SetAutoCompact { enabled } => {
+                self.auto_compact_applies += 1;
                 let id = self.ctl_id();
                 self.pending_controls.insert(
                     id.clone(),
@@ -10587,6 +10620,49 @@ pub(crate) mod tests {
         );
         let stale = answer(&mut m, &check, json!({"isAutoCompactEnabled": false}));
         assert!(auto_compact_events(&stale).is_empty(), "{:?}", stale.events);
+    }
+
+    /// Switched on, then off before the on read-back landed: the check that
+    /// read asks is answered with the off already applied, which is the
+    /// switch, not the environment.
+    #[test]
+    fn a_check_behind_an_unread_switch_never_blames_the_environment() {
+        let mut m = mapper();
+        let mut settings = DriverStep::default();
+        m.request_settings(&mut settings);
+        answer(
+            &mut m,
+            &settings,
+            json!({"applied":{}, "effective":{"autoCompactEnabled":false}}),
+        );
+        let on = m.on_command(AgentCommand::SetAutoCompact { enabled: true });
+        let on_ack = answer(&mut m, &on, Value::Null);
+        let off = m.on_command(AgentCommand::SetAutoCompact { enabled: false });
+        let on_read = answer(
+            &mut m,
+            &on_ack,
+            json!({"applied":{}, "effective":{"autoCompactEnabled":true}}),
+        );
+        assert_eq!(
+            on_read.outbound[0]["request"]["subtype"],
+            "get_context_usage"
+        );
+        let off_ack = answer(&mut m, &off, Value::Null);
+        let check = answer(&mut m, &on_read, json!({"isAutoCompactEnabled": false}));
+        assert!(auto_compact_events(&check).is_empty(), "{:?}", check.events);
+        let off_read = answer(
+            &mut m,
+            &off_ack,
+            json!({"applied":{}, "effective":{"autoCompactEnabled":false}}),
+        );
+        assert_eq!(
+            auto_compact_events(&off_read),
+            vec![&AgentEvent::AutoCompact {
+                enabled: false,
+                disabled_by: None,
+                picked: Some(false),
+            }]
+        );
     }
 
     /// A refused check leaves the setting in charge, with no error row.

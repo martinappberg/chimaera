@@ -2249,8 +2249,8 @@
    *  running tools → working (between steps). */
   const agentBusy = $derived(store.running || store.compacting);
   /** The usage popover's Compact: the same path as typing `/compact` (Codex's
-   *  native command, else Claude's own slash command), offered while idle. */
-  /** `DISABLE_COMPACT` switches /compact off along with auto-compact. */
+   *  native command, else Claude's own slash command), offered while idle;
+   *  `DISABLE_COMPACT` switches /compact off along with auto-compact. */
   const canCompact = $derived(
     !readOnly &&
       !agentBusy &&
