@@ -1436,7 +1436,9 @@ impl ClaudeMapper {
             // wakeup, a job, a monitor event): the CLI counts every turn
             // started since a client message's turn as that turn, so a Stop
             // naming those messages stops this one, and one landing after
-            // it ended still spares a next turn a message of ours opened.
+            // it ended still spares a next turn a message of ours opened
+            // (live 2.1.310: `turn: "stopped"` for a wakeup turn after A;
+            // `turn: "spared"` for B, dequeued as the Stop naming A landed).
             self.turn_starting = false;
             self.reset_compaction_for_new_turn();
             self.turn_n += 1;
