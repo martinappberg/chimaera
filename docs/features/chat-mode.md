@@ -432,8 +432,10 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   ("Also stops 2 subagents · Click again to stop"; "Click again to clear", "Click again to
   send") and gives that control the amber tone. The hint names the real gesture: "Esc again"
   after Esc, "Press again" after Enter or Space on a button, "Click again" after a click; the
-  polite live region says the same. The second press of that control, a click on the line, or
-  Esc anywhere in the chat does it. Any other key, a press elsewhere, five seconds, the turn
+  polite live region says the same. The second press of that control or a click on the line does
+  it, and for a Stop so does Esc anywhere in the chat; Esc cancels an armed Clear goal or Send
+  now (Esc is the stop key, never a yes to another question). A press on the other Clear moves
+  the question there. Any other key, a press elsewhere, five seconds, the turn
   ending, the named work finishing or the message being read withdraws it. Esc still closes an
   open picker or menu first. With nothing else to end the first press acts at once, as in every
   Codex and ACP chat: a Codex Stop or Send now (`turn/interrupt`) leaves spawned agents and

@@ -76,6 +76,9 @@ describe("armedKey", () => {
     expect(armedKey(key("a"), true)).toBe("dismiss");
     expect(armedKey(key("Enter"), true)).toBe("dismiss");
     expect(armedKey(key("Escape"), false)).toBe("dismiss");
+    // Esc confirms only a Stop; an armed Clear goal or Send now is cancelled.
+    expect(armedKey(key("Escape"), true, false, false)).toBe("dismiss");
+    expect(armedKey(key("Escape"), true, true, false)).toBe("dismiss");
   });
 
   it("leaves Enter or Space on a focused Stop to that Stop's own click", () => {
@@ -89,6 +92,8 @@ describe("armedKey", () => {
     expect(armedKey(held("Enter"), true, true)).toBe("hold");
     expect(armedKey(held(" "), true, true)).toBe("hold");
     expect(armedKey(held("Escape"), true)).toBe("hold");
+    // Another pane's held Esc is that pane's, never swallowed here.
+    expect(armedKey(held("Escape"), false)).toBe("dismiss");
     // The composer's own held Esc stays the composer's.
     expect(armedKey({ key: "Escape", defaultPrevented: true, repeat: true }, true)).toBe("ignore");
   });

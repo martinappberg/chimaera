@@ -1627,7 +1627,7 @@
    *  subagents or workflows, whatever control started it (stopConfirm.ts:
    *  `actionReach` counts only what that action ends). Each control carries
    *  its key as `data-stop-control`. */
-  let armed = $state<{ control: ConfirmControl; via: ConfirmVia } | null>(null);
+  let armed = $state.raw<{ control: ConfirmControl; via: ConfirmVia; act: () => void } | null>(null);
   // A closure: `agentBusy` and `goalClearStops` are declared further down.
   const actionContext = $derived.by<ActionContext>(() => ({
     agents: store.activeAgents,
@@ -1657,26 +1657,25 @@
   function press(control: ConfirmControl, via: ConfirmVia, act: () => void) {
     const reach = readOnly ? null : actionReach(control, actionContext);
     const step = pressStep(armed?.control ?? null, control, reach);
-    armed = step === "arm" ? { control, via } : null;
+    armed = step === "arm" ? { control, via, act } : null;
     if (step === "act") act();
   }
   /** Run whatever action is waiting (Esc, from anywhere in this chat). */
   function confirmArmed() {
-    const control = armed?.control;
+    const act = armed?.act;
     armed = null;
-    if (control === "stop") sendInterrupt();
-    else if (control === "goal") clearClaudeGoalNow();
-    else if (control?.startsWith("send:")) deliverQueuedNow(control.slice("send:".length));
+    act?.();
   }
   function sendInterrupt() {
     sendCommand({ type: "interrupt" }, "stop not sent");
   }
 
-  /** Esc or a Stop button. With another action waiting, Esc (the composer's
-   *  own included) confirms that one. */
+  /** Esc or a Stop button. With another action waiting (Clear goal, Send
+   *  now), Esc — the composer's own included — cancels that one: Esc is
+   *  the stop key, never a yes to a different question. */
   function interrupt(via: ConfirmVia = "pointer") {
     if (armed !== null && armed.control !== "stop" && via === "esc") {
-      confirmArmed();
+      armed = null;
       return;
     }
     press("stop", via, sendInterrupt);
@@ -1686,8 +1685,9 @@
   $effect(() => {
     if (armed !== null && (armedConfirm === null || !visible)) untrack(() => (armed = null));
   });
-  // While armed: Esc anywhere in this chat confirms (focus may sit in the
-  // transcript or on the control that asked); any other key, a press outside
+  // While armed: Esc anywhere in this chat confirms a Stop (focus may sit
+  // in the transcript or on the control that asked) and cancels any other
+  // action; any other key, a press outside
   // that control and its note, or the timeout lets it go. Bubble phase, so a
   // popover, menu or card that handles Esc first keeps winning.
   $effect(() => {
@@ -1704,7 +1704,7 @@
       // a control here); focus elsewhere in the app dismisses.
       const unfocused = e.target === document.body || e.target === document.documentElement;
       const inChat = unfocused || (root !== null && e.target instanceof Node && root.contains(e.target));
-      const act = armedKey(e, inChat, pressedControl(e.target) === control);
+      const act = armedKey(e, inChat, pressedControl(e.target) === control, control === "stop");
       if (act === "confirm") {
         e.preventDefault();
         confirmArmed();
@@ -4192,6 +4192,8 @@
      left over the transcript, never squeezed to a short bubble's width. */
   .bubble-row.asks {
     position: relative;
+    /* The bubble may be narrower than its note: cap by the column instead. */
+    --stop-note-max: min(30rem, 90vw);
   }
   .delivery {
     color: var(--muted);

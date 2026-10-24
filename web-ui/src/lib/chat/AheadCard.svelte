@@ -73,6 +73,13 @@
    *  note sits above that one. */
   let clearFrom = $state<"row" | "detail">("row");
   function clearGoal(from: "row" | "detail", e: MouseEvent) {
+    // Both Clears share the "goal" question; a press on the one that did
+    // not ask moves the question there instead of answering it, so nothing
+    // acts from a control that never showed it.
+    if (goalConfirm !== null && clearFrom !== from && !goalInline) {
+      clearFrom = from;
+      return;
+    }
     clearFrom = from;
     onGoalClear?.(clickVia(e));
   }
@@ -488,6 +495,7 @@
     position: relative;
     --stop-note-right: auto;
     --stop-note-left: 0;
+    --stop-note-max: min(26rem, 80vw);
   }
   .link.armed {
     color: var(--warn);

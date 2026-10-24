@@ -53,12 +53,18 @@ export function agentRowName(title: string): string {
   return title.replace(/^(Agent|Task): /, "");
 }
 
+/** The live subagent rows an interrupt of this turn ends (never a
+ *  process-owned, `crossTurn` row). */
+function turnRows(agents: readonly StopAgentRow[]): readonly StopAgentRow[] {
+  return agents.filter((a) => LIVE.has(a.status) && !a.crossTurn);
+}
+
 /** What a Stop would end besides the turn itself. */
 export function stopReach(
   agents: readonly StopAgentRow[],
   lanes: readonly StopLane[],
 ): StopReach {
-  const rows = agents.filter((a) => LIVE.has(a.status) && !a.crossTurn);
+  const rows = turnRows(agents);
   // A foreground agent moved to the background (Ctrl-B) is still its live
   // row AND now an agent lane: count it once (as ChatView's runningTasks).
   const names = new Set(rows.map((a) => agentRowName(a.title)));
@@ -92,9 +98,7 @@ export function sendNowReach(
   const moved = new Set(
     lanes.filter((l) => !l.ambient && l.taskType === "local_agent").map((l) => l.description),
   );
-  const subagents = agents.filter(
-    (a) => LIVE.has(a.status) && !a.crossTurn && !moved.has(agentRowName(a.title)),
-  ).length;
+  const subagents = turnRows(agents).filter((a) => !moved.has(agentRowName(a.title))).length;
   return { subagents, workflows: 0 };
 }
 
@@ -186,6 +190,9 @@ export function armedKey(
   e: { key: string; defaultPrevented: boolean; repeat?: boolean },
   inChat: boolean,
   onArmedControl = false,
+  /** Esc is the stop key, so it confirms an armed Stop; for any other
+   *  armed action (Clear goal, Send now) Esc is cancel. */
+  escConfirms = true,
 ): "confirm" | "dismiss" | "ignore" | "hold" {
   if (e.key === "Shift" || e.key === "Control" || e.key === "Alt" || e.key === "Meta") {
     return "ignore";
@@ -193,8 +200,9 @@ export function armedKey(
   if (onArmedControl && (e.key === "Enter" || e.key === " ")) return e.repeat ? "hold" : "ignore";
   if (e.key === "Escape") {
     if (e.defaultPrevented) return "ignore";
-    if (e.repeat) return "hold";
-    return inChat ? "confirm" : "dismiss";
+    // Another pane's held Esc is its own: never swallowed from here.
+    if (!inChat || !escConfirms) return "dismiss";
+    return e.repeat ? "hold" : "confirm";
   }
   return "dismiss";
 }
