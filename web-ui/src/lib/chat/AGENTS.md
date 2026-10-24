@@ -28,7 +28,7 @@ daemon  ──WS /ws/chat/{id}──▶  chatWs.ts (ChatSocket)
 | `Markdown`, `streamSegments.ts`, `revealLedger.ts`, `tables.ts`, `markedExtensions.ts`, `MathText`, `math.ts` | Sanitized prose and math, streamed. |
 | `ChatHeader`, `ModelPicker`, `EffortPopover`, `capabilities.ts` | Header controls from capabilities. |
 | `Composer`, `composer.ts`, `composerHeight.ts`, `composerBus.ts`, `drafts.ts` | Input, slash completion, inserts, drafts; one context row for branch/worktree, linked terminals and notices, only when populated; terminal completion opens through `@term`, with no permanent launcher. |
-| `stopConfirm.ts` + `StopNote.svelte` | Esc / Stop / Clear goal / Send now ask once ("Also stops 2 subagents · Esc again to stop") when that action also ends subagents or workflows, the line above the control pressed and worded by the real gesture; otherwise they act at once. |
+| `stopConfirm.ts` + `StopNote.svelte` | Esc / Stop / Clear goal ask once ("Also stops 2 subagents · Esc again to stop") when that action also ends subagents or workflows, the line above the control pressed and worded by the real gesture; otherwise they act at once. |
 | `uploadTokens.ts`, `uploadChips.ts`, `ComposerMentions`, `terminalMentions.ts` | Atomic mention tokens in the draft. |
 | `voice*.ts`, `VoiceMeter` | Voice dictation. |
 | `images.ts`, `AttachmentStrip`, `ImagePreview` | Image attachments and tiles. |

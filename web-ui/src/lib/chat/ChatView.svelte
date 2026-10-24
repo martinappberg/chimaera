@@ -59,14 +59,12 @@
     actionVerb,
     agentRowName,
     armedKey,
-    clickVia,
     confirmHint,
     pressStep,
     type ActionContext,
     type ConfirmControl,
     type ConfirmVia,
   } from "./stopConfirm";
-  import StopNote from "./StopNote.svelte";
   import AgentsTray from "./AgentsTray.svelte";
   import BackgroundTray from "./BackgroundTray.svelte";
   import AheadCard from "./AheadCard.svelte";
@@ -1635,7 +1633,6 @@
     busy: agentBusy,
     running: store.running,
     goalClearStops,
-    queued: store.pendingSends.filter((s) => s.state === "queued").map((s) => s.id),
   }));
   /** The armed question as each surface draws it; null when nothing waits
    *  or its cause is gone. */
@@ -1670,9 +1667,9 @@
     sendCommand({ type: "interrupt" }, "stop not sent");
   }
 
-  /** Esc or a Stop button. With another action waiting (Clear goal, Send
-   *  now), Esc — the composer's own included — cancels that one: Esc is
-   *  the stop key, never a yes to a different question. */
+  /** Esc or a Stop button. With Clear goal waiting, Esc — the composer's
+   *  own included — cancels it: Esc is the stop key, never a yes to a
+   *  different question. */
   function interrupt(via: ConfirmVia = "pointer") {
     if (armed !== null && armed.control !== "stop" && via === "esc") {
       armed = null;
@@ -1747,11 +1744,6 @@
    *  resolves it `sent`, so a disconnect or a no-op never lies about delivery. */
   function deliverQueuedNow(id: string) {
     sendCommand({ type: "send_now", id }, "couldn't send now");
-  }
-  /** Send now stops the foreground subagent the turn waits on, so it asks
-   *  first when there is one (stopConfirm.ts `sendNowReach`). */
-  function sendQueuedNow(id: string, via: "key" | "pointer") {
-    press(`send:${id}`, via, () => deliverQueuedNow(id));
   }
 
   /** Dialog-only slash commands get native UI here instead of the CLI's
@@ -3599,7 +3591,6 @@
       >
         {#each pinnedSends as send (send.id)}
           {@const pictureOnly = send.text.length === 0 && send.attachmentPaths.length > 0}
-          {@const sendConfirm = confirmFor(`send:${send.id}`)}
           {#if isAgentOrigin(send.origin)}
             <!-- Another agent's message steered in (Codex): it waits for the
                  agent's next step like a queued send; one that misses its
@@ -3623,15 +3614,7 @@
             {#if send.attachmentPaths.length > 0 && !pictureOnly}
               {@render sentImages(send.attachmentPaths)}
             {/if}
-            <div class="bubble-row" class:asks={sendConfirm !== null}>
-              {#if sendConfirm !== null}
-                <StopNote
-                  text={sendConfirm.text}
-                  how={sendConfirm.how}
-                  control={sendConfirm.control}
-                  onConfirm={() => sendQueuedNow(send.id, "pointer")}
-                />
-              {/if}
+            <div class="bubble-row">
               {#if pictureOnly}
                 {@render sentImages(send.attachmentPaths)}
               {:else}
@@ -3646,13 +3629,11 @@
               {#if send.state === "queued" && store.running}
                 <button
                   class="send-now-btn"
-                  class:armed={sendConfirm !== null}
-                  data-stop-control="send:{send.id}"
                   title={waiting > 1
                     ? "stop the current turn and send the waiting messages now"
                     : "stop the current turn and send this now"}
                   aria-label="send now (stops the current turn)"
-                  onclick={(e) => sendQueuedNow(send.id, clickVia(e))}
+                  onclick={() => deliverQueuedNow(send.id)}
                 >Send now</button>
               {/if}
               <button
@@ -3854,8 +3835,8 @@
     <ModsWorkbench transport={socket.nativeUi} host={chatEl} onDockWidth={(width) => (modDockWidth = width)} {visible} {focused} running={agentBusy} hasSurvey={store.questions.length > 0 || store.elicitations.length > 0} composer={composerApi} canEdit={!composerDisabled && store.pending.length === 0 && store.questions.length === 0 && store.elicitations.length === 0 && rewindIntent === null && forkIntent === null} canFocus={focused && !composerEngaged && !agentBusy && store.pending.length === 0 && store.questions.length === 0 && store.elicitations.length === 0 && rewindIntent === null && forkIntent === null} />
   {/if}
 
-  <!-- The question an interrupting action asks (Esc or Stop, Clear goal,
-       Send now), announced politely in the same words as its note. Mounted
+  <!-- The question an interrupting action asks (Esc or Stop, Clear goal),
+       announced politely in the same words as its note. Mounted
        throughout, so it is read when it appears. -->
   <span class="sr-only" role="status" aria-live="polite">{armedConfirm?.spoken ?? ""}</span>
 
@@ -4179,21 +4160,6 @@
   .send-now-btn:focus-visible {
     color: var(--accent);
     background: color-mix(in srgb, var(--accent) 9%, transparent);
-  }
-  /* Waiting for its second press: the note above names the subagent it
-     would stop, and the button takes the warning tone. */
-  .send-now-btn.armed,
-  .send-now-btn.armed:hover,
-  .send-now-btn.armed:focus-visible {
-    color: var(--warn);
-    background: color-mix(in srgb, var(--warn) 12%, transparent);
-  }
-  /* The note's right edge is the row's (Send now and ✕ end it); it runs
-     left over the transcript, never squeezed to a short bubble's width. */
-  .bubble-row.asks {
-    position: relative;
-    /* The bubble may be narrower than its note: cap by the column instead. */
-    --stop-note-max: min(30rem, 90vw);
   }
   .delivery {
     color: var(--muted);

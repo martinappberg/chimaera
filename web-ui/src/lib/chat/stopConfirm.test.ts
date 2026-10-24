@@ -6,7 +6,6 @@ import {
   clickVia,
   confirmHint,
   pressStep,
-  sendNowReach,
   stopReach,
   stopReachText,
   type ActionContext,
@@ -103,29 +102,6 @@ describe("armedKey", () => {
   });
 });
 
-describe("sendNowReach", () => {
-  const sendText = (agents: StopAgentRow[], lanes: StopLane[]) => stopReachText(sendNowReach(agents, lanes));
-
-  it("names the foreground subagent the turn waits on", () => {
-    // claude: interrupt {send_now} stops it (Pass 44).
-    expect(sendText([row("Agent: audit the loader")], [])).toBe("Also stops 1 subagent");
-  });
-
-  it("never names background work, which a claude Send now spares", () => {
-    expect(sendText([], [lane("local_agent", "bg"), lane("local_workflow", "wf"), lane("local_bash", "npm test")])).toBeNull();
-    // A foreground agent moved to the background is still its live row.
-    expect(sendText([row("Agent: audit")], [lane("local_agent", "audit")])).toBeNull();
-    expect(sendText([row("Agent: audit"), row("Task: other")], [lane("local_agent", "audit")])).toBe(
-      "Also stops 1 subagent",
-    );
-  });
-
-  it("never names codex's process-owned agents or settled rows", () => {
-    expect(sendText([row("Agent: agent_a", { crossTurn: true })], [])).toBeNull();
-    expect(sendText([row("Agent: done", { status: "completed" })], [])).toBeNull();
-  });
-});
-
 describe("actionReach", () => {
   const ctx = (over: Partial<ActionContext> = {}): ActionContext => ({
     agents: [],
@@ -133,7 +109,6 @@ describe("actionReach", () => {
     busy: true,
     running: true,
     goalClearStops: true,
-    queued: [],
     ...over,
   });
   const fg = [row("Agent: audit")];
@@ -154,35 +129,22 @@ describe("actionReach", () => {
     // codex's clear_goal lets the turn finish.
     expect(actionReach("goal", ctx({ agents: fg, goalClearStops: false }))).toBeNull();
   });
-
-  it("asks for Send now only for what Send now ends", () => {
-    const queued = ["m1"];
-    expect(actionReach("send:m1", ctx({ agents: fg, queued }))).toBe("Also stops 1 subagent");
-    // Background agents and workflows survive a Send now.
-    expect(actionReach("send:m1", ctx({ lanes: [...bg, lane("local_workflow", "wf")], queued }))).toBeNull();
-    // codex: turn/interrupt ends no spawned agent.
-    expect(actionReach("send:m1", ctx({ agents: [row("Agent: a", { crossTurn: true })], queued }))).toBeNull();
-    // Already read, or no turn to interrupt: nothing to ask.
-    expect(actionReach("send:m1", ctx({ agents: fg, queued: ["m2"] }))).toBeNull();
-    expect(actionReach("send:m1", ctx({ agents: fg, queued, running: false }))).toBeNull();
-  });
 });
 
 describe("pressStep", () => {
   it("asks on the first press and acts on the second press of the same control", () => {
     expect(pressStep(null, "stop", "Also stops 1 subagent")).toBe("arm");
     expect(pressStep("stop", "stop", "Also stops 1 subagent")).toBe("act");
-    expect(pressStep("send:m1", "send:m1", "Also stops 1 subagent")).toBe("act");
+    expect(pressStep("goal", "goal", "Also stops 1 subagent")).toBe("act");
   });
 
   it("acts at once when nothing else would end", () => {
     expect(pressStep(null, "goal", null)).toBe("act");
-    expect(pressStep(null, "send:m1", null)).toBe("act");
   });
 
   it("asks afresh when another control was waiting", () => {
-    expect(pressStep("stop", "send:m1", "Also stops 1 subagent")).toBe("arm");
-    expect(pressStep("send:m1", "send:m2", "Also stops 1 subagent")).toBe("arm");
+    expect(pressStep("stop", "goal", "Also stops 1 subagent")).toBe("arm");
+    expect(pressStep("goal", "stop", "Also stops 1 subagent")).toBe("arm");
   });
 });
 
@@ -201,7 +163,6 @@ describe("the hint names the real gesture", () => {
   it("ends with the action's own verb", () => {
     expect(actionVerb("stop")).toBe("stop");
     expect(actionVerb("goal")).toBe("clear");
-    expect(actionVerb("send:m1")).toBe("send");
-    expect(confirmHint(actionVerb("send:m1"), "pointer").how).toBe("Click again to send");
+    expect(actionVerb("stop")).toBe("stop");
   });
 });

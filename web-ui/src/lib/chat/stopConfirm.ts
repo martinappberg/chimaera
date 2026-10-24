@@ -82,26 +82,6 @@ function count(n: number, word: string): string {
   return `${n} ${word}${n === 1 ? "" : "s"}`;
 }
 
-/** What a Send now would end besides the turn: only the foreground
- *  subagents the turn waits on. Claude's `interrupt {send_now}` "ends no
- *  background task … outside the running turn that a Stop ends" (its schema;
- *  2026-10-05), and stops the foreground subagent (Pass 44), so background
- *  agents, a foreground agent already moved to the background and workflows
- *  go on. Codex's Send now is `turn/interrupt`, which ends no spawned agent
- *  (Pass 49): its rows are `crossTurn`, so nothing counts. A claude CLI
- *  older than `interrupt_send_now_v1` (2.1.289) gets a plain Stop instead;
- *  the tested CLIs all advertise it. */
-export function sendNowReach(
-  agents: readonly StopAgentRow[],
-  lanes: readonly StopLane[],
-): StopReach {
-  const moved = new Set(
-    lanes.filter((l) => !l.ambient && l.taskType === "local_agent").map((l) => l.description),
-  );
-  const subagents = turnRows(agents).filter((a) => !moved.has(agentRowName(a.title))).length;
-  return { subagents, workflows: 0 };
-}
-
 /** "Also stops 2 subagents", "Also stops 1 subagent and 1 workflow"; null
  *  when the Stop ends only the turn (it then stops at once, as before). */
 export function stopReachText(reach: StopReach): string | null {
@@ -112,8 +92,10 @@ export function stopReachText(reach: StopReach): string | null {
 }
 
 /** The controls that ask, by their `data-stop-control` key: "stop" (Esc
- *  and both Stops), "goal" (Clear goal) and `send:<id>` (a waiting
- *  message's Send now). */
+ *  and both Stops) and "goal" (Clear goal). Send now never asks: it ends
+ *  only the step the turn is on (a command or the foreground subagent it
+ *  waits on — the step the user pressed it to cut off), and Claude's
+ *  `interrupt {send_now}` spares background agents and workflows. */
 export type ConfirmControl = string;
 
 /** What the view knows when a control is pressed. */
@@ -127,8 +109,6 @@ export interface ActionContext {
   /** Clear goal stops the turn first (claude's goal is a Stop hook; codex's
    *  `clear_goal` lets the turn finish and stops nothing). */
   goalClearStops: boolean;
-  /** Ids of the messages still waiting for the agent. */
-  queued: readonly string[];
 }
 
 /** What the control's action would end besides the turn, as the note words
@@ -138,10 +118,6 @@ export function actionReach(control: ConfirmControl, ctx: ActionContext): string
   // Idle, Clear goal is only the `/goal clear` message.
   if (control === "goal") {
     return ctx.running && ctx.goalClearStops ? stopReachText(stopReach(ctx.agents, ctx.lanes)) : null;
-  }
-  if (control.startsWith("send:")) {
-    const waiting = ctx.running && ctx.queued.includes(control.slice("send:".length));
-    return waiting ? stopReachText(sendNowReach(ctx.agents, ctx.lanes)) : null;
   }
   return null;
 }
@@ -158,7 +134,7 @@ export function pressStep(
 
 /** The verb the hint ends with. */
 export function actionVerb(control: ConfirmControl): string {
-  return control === "goal" ? "clear" : control === "stop" ? "stop" : "send";
+  return control === "goal" ? "clear" : "stop";
 }
 
 /** How a first press came: Esc, a keyboard press on a button (Enter or

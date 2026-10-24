@@ -424,19 +424,18 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
 - **Anything that would end subagents or workflows asks once, whatever control started it.**
   Claude's Stop also kills its subagents (foreground and background) and its workflows; it
   leaves background commands, Monitor watches and the schedule running (PROTOCOL.md Pass 49).
-  Esc, either Stop, Clear goal (Claude clears a running goal by stopping the turn first) and a
-  waiting message's Send now each count only what that action ends: a Stop or Clear goal counts
-  every live subagent and workflow; Send now (`interrupt {send_now}`) counts only the foreground
-  subagent the turn waits on, since it spares background agents and workflows (Pass 44). When
+  Esc, either Stop and Clear goal (Claude clears a running goal by stopping the turn first)
+  count every live subagent and workflow. A waiting message's Send now never asks: it ends only
+  the step the turn is on, a command or the foreground subagent it waits on, which is what it is
+  pressed for, and `interrupt {send_now}` spares background agents and workflows (Pass 44). When
   the count is non-zero, the first press shows one line above the control that was pressed
-  ("Also stops 2 subagents · Click again to stop"; "Click again to clear", "Click again to
-  send") and gives that control the amber tone. The hint names the real gesture: "Esc again"
+  ("Also stops 2 subagents · Click again to stop"; "Click again to clear") and gives that control the amber tone. The hint names the real gesture: "Esc again"
   after Esc, "Press again" after Enter or Space on a button, "Click again" after a click; the
   polite live region says the same. The second press of that control or a click on the line does
-  it, and for a Stop so does Esc anywhere in the chat; Esc cancels an armed Clear goal or Send
-  now (Esc is the stop key, never a yes to another question). A press on the other Clear moves
+  it, and for a Stop so does Esc anywhere in the chat; Esc cancels an armed Clear goal (Esc is
+  the stop key, never a yes to another question). A press on the other Clear moves
   the question there. Any other key, a press elsewhere, five seconds, the turn
-  ending, the named work finishing or the message being read withdraws it. Esc still closes an
+  ending or the named work finishing withdraws it. Esc still closes an
   open picker or menu first. With nothing else to end the first press acts at once, as in every
   Codex and ACP chat: a Codex Stop or Send now (`turn/interrupt`) leaves spawned agents and
   background terminals running, and Codex's Clear goal interrupts nothing.
