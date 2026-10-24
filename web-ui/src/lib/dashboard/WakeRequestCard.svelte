@@ -8,10 +8,13 @@
    * limit asks the same question in the words of a conversation that has
    * been going back and forth. The message is an agent's words: plain text,
    * one clamped line. An answer the daemon refused stays as this card with
-   * its words and a Dismiss (the request itself is gone either way).
+   * its words and a Dismiss (the request itself is gone either way). The
+   * chevron beside Wake wakes it "from now on" (`loosenChoices`), as the
+   * idle agent's own wake bar does.
    */
   import SessionGlyph from "../shared/SessionGlyph.svelte";
-  import { dismissWakeFailure, wake, wakeAsk, type WakeRequest } from "../workspace/comms.svelte";
+  import WakeSplitButton from "../workspace/WakeSplitButton.svelte";
+  import { dismissWakeFailure, wake, wakeAsk, wakeFromNowOn, type WakeRequest } from "../workspace/comms.svelte";
 
   interface Props {
     request: WakeRequest;
@@ -36,12 +39,13 @@
   let busy = $state<"wake" | "leave" | null>(null);
   let error = $state<string | null>(null);
 
-  async function answer(yes: boolean): Promise<void> {
+  async function answer(yes: boolean, policy?: "auto" | "always", wid = request.id): Promise<void> {
     if (busy !== null) return;
     busy = yes ? "wake" : "leave";
     error = null;
     try {
-      await wake(request.id, yes);
+      if (policy !== undefined) await wakeFromNowOn(wid, policy);
+      else await wake(wid, yes);
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {
@@ -84,14 +88,15 @@
     </div>
   {:else}
     <div class="actions">
-      <button
-        class="btn primary"
-        disabled={busy !== null}
+      <WakeSplitButton
+        {request}
+        label={busy === "wake" ? (cont ? "continuing…" : "waking…") : cont ? "Continue" : "Wake"}
         title="deliver {to}'s waiting messages now — one turn, billed to your account"
-        onclick={() => answer(true)}
-      >
-        {busy === "wake" ? (cont ? "continuing…" : "waking…") : cont ? "Continue" : "Wake"}
-      </button>
+        disabled={busy !== null}
+        pill
+        onWake={() => void answer(true)}
+        onPick={(wid, policy) => void answer(true, policy, wid)}
+      />
       <button
         class="btn"
         disabled={busy !== null}
@@ -192,14 +197,6 @@
   }
   .btn:hover:not(:disabled) {
     border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
-  }
-  .btn.primary {
-    font-weight: 500;
-    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
-    background: color-mix(in srgb, var(--accent) 14%, transparent);
-  }
-  .btn.primary:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--accent) 24%, transparent);
   }
   .btn:disabled {
     opacity: 0.55;

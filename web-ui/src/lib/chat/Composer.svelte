@@ -29,6 +29,8 @@
   import { Dictation, dictationParts, hostCanDictate, joinParts } from "./voice.svelte";
   import { CaptureError, listMicrophones } from "./voiceCapture";
   import VoiceMeter from "./VoiceMeter.svelte";
+  import StopNote from "./StopNote.svelte";
+  import { clickVia, type ConfirmVia } from "./stopConfirm";
   import { uploadChips } from "./uploadChips";
   import {
     collapseUploadMentions,
@@ -78,7 +80,13 @@
      *  after-this-turn chord sent it — hold it until the running turn ends
      *  rather than have the agent read it at its next step. */
     onSubmit(text: string, images: ImageAttachment[], afterTurn?: boolean): boolean;
-    onInterrupt(): void;
+    /** Esc, or the Stop button pressed by keyboard or pointer. The host
+     *  decides whether this stops or first asks (`stopConfirm`); with
+     *  another action waiting for its second press, Esc confirms that one. */
+    onInterrupt(via: ConfirmVia): void;
+    /** A Stop waiting for its second press: what else it ends, and the
+     *  hint in the words of the first press's gesture. */
+    stopConfirm?: { text: string; how: string } | null;
     /** Shift+Tab: advance to the next permission mode (agent-TUI parity). */
     onCycleMode(): void;
     /** Intercept a dialog-only slash command with native UI. True = handled. */
@@ -109,6 +117,7 @@
     visible = true,
     onSubmit,
     onInterrupt,
+    stopConfirm = null,
     onCycleMode,
     onSlash,
     onDraftState,
@@ -961,7 +970,9 @@
       submit();
     } else if (e.key === "Escape" && running) {
       e.preventDefault();
-      onInterrupt();
+      // A held Esc auto-repeats: the repeat must not answer the question
+      // its own first press just asked.
+      if (!e.repeat) onInterrupt("esc");
     }
   }
 
@@ -982,6 +993,17 @@
 </script>
 
 <div class="composer" class:visible>
+  <!-- A Stop that would also end subagents or workflows asks once, here by
+       the stop control: a press outside, any other key, or the timeout lets
+       it go (ChatView owns the state and the polite announcement). -->
+  {#if stopConfirm !== null}
+    <StopNote
+      text={stopConfirm.text}
+      how={stopConfirm.how}
+      control="stop"
+      onConfirm={() => onInterrupt("pointer")}
+    />
+  {/if}
   {#if popover === "slash"}
     <div class="overlay-surface pop" id="{uid}-pop" role="listbox" aria-label="slash commands">
       {#each slashMatches as choice, i (choice.key)}
@@ -1219,10 +1241,12 @@
       {#if running}
         <button
           class="action stop"
+          class:armed={stopConfirm !== null}
+          data-stop-control="stop"
           aria-label="interrupt the agent"
           title="interrupt the agent (Esc)"
           onmousedown={(e) => e.preventDefault()}
-          onclick={onInterrupt}
+          onclick={(e) => onInterrupt(clickVia(e))}
         >
           <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
             <rect x="4" y="4" width="8" height="8" rx="1.5" fill="currentColor" />
@@ -1357,6 +1381,9 @@
     flex: none;
     border-top: 1px solid var(--edge);
     padding: 8px 10px;
+    /* The stop note's edge is the input's edge (the side padding). */
+    --stop-note-right: var(--composer-pad-x, 10px);
+    --stop-note-max: calc(100% - 2 * var(--composer-pad-x, 10px));
   }
   /* .overlay-surface / .overlay-row (surface + button reset + hover) live in
      app.css; .pop and .pop-row add only this popover's position and layout. */
@@ -1640,6 +1667,20 @@
     50% {
       opacity: 1;
     }
+  }
+  /* Waiting for the second press: the stop takes the warning tone, so the
+     button the note points at is the one that confirms. */
+  .stop.armed {
+    color: var(--warn);
+    background: color-mix(in srgb, var(--warn) 14%, transparent);
+    border-color: color-mix(in srgb, var(--warn) 60%, var(--edge));
+  }
+  .stop.armed:hover {
+    background: color-mix(in srgb, var(--warn) 22%, transparent);
+    border-color: var(--warn);
+  }
+  .stop.armed::after {
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--warn) 14%, transparent);
   }
   @media (prefers-reduced-motion: reduce) {
     .stop::after {

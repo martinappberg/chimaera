@@ -3,6 +3,7 @@
  * (docs/design/agent-communication-plan.md §12):
  *   GET  /workspaces/{id}/comms                {enabled, wakes, unread, wake_requests}
  *   POST /workspaces/{id}/comms/wakes/{wid}    {wake}     answer a wake request
+ *   (a looser `agents.communication.wakes` PUT lets go of requests itself)
  *   POST /workspaces/{id}/comms/deliver        {session}  hand an inbox over
  *
  * The timeline discipline: state is pulled, never pushed. `/ws/events`
@@ -15,9 +16,11 @@
  * same counts.
  */
 import { api, ApiError } from "../net/api";
+import { flushSettings, setSetting, settingsSaveRejection } from "../settings/store.svelte";
 import { dotState, dotTitle, type Session } from "./sessions";
 
-export type WakePolicy = "never" | "ask" | "auto";
+/** "auto" is Within limits; "always" wakes with no caps. */
+export type WakePolicy = "never" | "ask" | "auto" | "always";
 
 /** A message that would start a turn in an idle agent, waiting on the user:
  *  the "Ask me" policy, a thread that hit its hop limit, or a workspace whose
@@ -82,7 +85,7 @@ export function parseComms(raw: unknown): CommsSnapshot {
       created_ms: num(o.created_ms),
     });
   }
-  const wakes = r.wakes === "never" || r.wakes === "ask" ? r.wakes : "auto";
+  const wakes = r.wakes === "never" || r.wakes === "auto" || r.wakes === "always" ? r.wakes : "ask";
   return { enabled: r.enabled !== false, wakes, unread, wake_requests: wakeRequests };
 }
 
@@ -125,7 +128,7 @@ class CommsStore {
   available = $state<boolean | null>(null);
   /** The daemon's view of the setting (the settings store is the live one). */
   enabled = $state(true);
-  wakes = $state<WakePolicy>("auto");
+  wakes = $state<WakePolicy>("ask");
   unread = $state<Record<string, number>>({});
   wakeRequests = $state<WakeRequest[]>([]);
   /** Answers the daemon refused (the agent is gone, the setting went off).
@@ -326,6 +329,47 @@ export async function wake(wid: string, wake: boolean): Promise<void> {
   }
   void pull();
   if (failure !== null) throw failure;
+}
+
+/** A wake request's "from now on" picks, by its reason: under Ask me the
+ *  policy can loosen to Within limits or Always; past a limit only Always
+ *  is looser. The wake bar and the Needs-you card share them. */
+export function loosenChoices(reason: string): { policy: "auto" | "always"; label: string; detail: string }[] {
+  const always = {
+    policy: "always" as const,
+    label: wakeAsk(reason).cont ? "Always continue" : "Always wake",
+    detail: "From now on every message wakes its agent, with no limits",
+  };
+  if (wakeAsk(reason).cont) return [always];
+  return [
+    {
+      policy: "auto",
+      label: "Wake within limits",
+      detail: "From now on agents wake each other without asking, up to 20 times",
+    },
+    always,
+  ];
+}
+
+/**
+ * Wake this request's agent, then loosen the wake policy from now on. The
+ * wake goes first so it is the user's own (it starts the workspace's round
+ * over and is never held by a cap); the setting then makes the daemon let
+ * go of every other request the new policy no longer asks about. The
+ * policy changes even when this wake was refused, since the user asked
+ * for it from now on.
+ */
+export async function wakeFromNowOn(wid: string, policy: "auto" | "always"): Promise<void> {
+  let refused: unknown = null;
+  try {
+    await wake(wid, true);
+  } catch (e) {
+    refused = e;
+  }
+  setSetting("agents.communication.wakes", policy);
+  if (!(await flushSettings())) throw new Error(settingsSaveRejection() || "couldn't save the setting");
+  commsStore.wakes = policy;
+  if (refused !== null) throw refused;
 }
 
 /** Put away a refused answer's card. */
