@@ -937,7 +937,7 @@ async fn claude_next_priority_send_is_read_mid_turn() {
                     .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_use"));
                 if tool {
                     queued = Some(
-                        chat.send_queued_text("Also include the word BANANA.", "next")
+                        chat.send_queued_text("Also include the word BANANA.", "next", false)
                             .await
                             .expect("queued send"),
                     );
@@ -1161,6 +1161,317 @@ async fn claude_send_now_spares_background_agents() {
     assert!(read, "the waiting message was read");
     assert!(!agent_ended, "send now left the background agent running");
 
+    chat.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
+/// `interrupt_requeue_taken_v1` (PROTOCOL.md Pass 53): B waits with
+/// `requeue_if_interrupted_within_ms` while A's foreground sleep runs, is
+/// taken at the step after it, and a Stop sent the instant B starts crosses
+/// that intake. The CLI puts B back (`queued` again; the receipt's
+/// `put_back`), the stopped turn's result leaves it out, and B runs as a turn
+/// of its own.
+#[tokio::test]
+#[ignore = "live: spawns real claude, needs auth, bills two tiny turns"]
+async fn claude_stop_puts_back_a_just_taken_message() {
+    let dir = tmpdir();
+    let mut chat = spawn_claude(dir.path(), &[]);
+    chat.initialize(HANDSHAKE).await.expect("initialize");
+    let a = chat
+        .send_user_text_with_uuid(
+            "Run this exact Bash command in the foreground: sleep 6 && echo done. \
+             Then reply with just: finished",
+        )
+        .await
+        .expect("send A");
+    let mut capable = false;
+    let mut b: Option<String> = None;
+    let mut ctl: Option<String> = None;
+    let mut receipt = Value::Null;
+    let mut b_started = 0;
+    let mut b_requeued = false;
+    let mut stopped_read = Value::Null;
+    let b_reply = loop {
+        let frame = chat
+            .recv(TURN)
+            .await
+            .expect("recv")
+            .expect("claude exited before B ran");
+        let subtype = frame["subtype"].as_str().unwrap_or_default();
+        let is_b = |f: &Value| f["command_uuid"].as_str() == b.as_deref();
+        match frame["type"].as_str() {
+            Some("control_request") if frame["request"]["subtype"] == "can_use_tool" => {
+                let input = frame["request"]["input"].clone();
+                chat.respond_permission(
+                    &frame["request_id"],
+                    PermissionDecision::Allow {
+                        updated_input: input,
+                    },
+                )
+                .await
+                .expect("respond allow");
+            }
+            Some("system") if subtype == "init" => {
+                capable |= frame["capabilities"]
+                    .as_array()
+                    .is_some_and(|caps| caps.iter().any(|c| c == "interrupt_requeue_taken_v1"));
+            }
+            Some("assistant") if b.is_none() => {
+                let tool = frame["message"]["content"]
+                    .as_array()
+                    .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_use"));
+                if tool {
+                    b = Some(
+                        chat.send_queued_text("Reply with exactly: SECOND", "next", true)
+                            .await
+                            .expect("queue B"),
+                    );
+                }
+            }
+            Some("command_lifecycle") if is_b(&frame) => match frame["state"].as_str() {
+                Some("started") => {
+                    b_started += 1;
+                    if b_started == 1 {
+                        ctl = Some(
+                            chat.send_control(json!({
+                                "subtype": "interrupt",
+                                "for_user_message_uuids": [a],
+                            }))
+                            .await
+                            .expect("stop"),
+                        );
+                    }
+                }
+                Some("queued") if b_started == 1 => b_requeued = true,
+                _ => {}
+            },
+            Some("control_response")
+                if ctl.is_some() && frame["response"]["request_id"].as_str() == ctl.as_deref() =>
+            {
+                receipt = frame["response"]["response"].clone();
+            }
+            Some("result") if b_started == 1 && stopped_read.is_null() => {
+                stopped_read = frame["user_message_uuids"].clone();
+            }
+            Some("result") if b_started >= 2 => {
+                break frame["result"].as_str().unwrap_or_default().to_string();
+            }
+            _ => {}
+        }
+    };
+    eprintln!(
+        "LIVE requeue: receipt={receipt}, requeued={b_requeued}, stopped turn read {stopped_read}, \
+         B's own turn said {b_reply:?}"
+    );
+    let b = b.expect("B was queued");
+    assert!(capable, "init advertises interrupt_requeue_taken_v1");
+    assert_eq!(receipt["put_back"], json!([b]), "{receipt}");
+    assert_eq!(receipt["turn"], "stopped", "{receipt}");
+    assert!(b_requeued, "B reported queued again after its start");
+    assert!(
+        !stopped_read
+            .as_array()
+            .is_some_and(|ids| ids.iter().any(|id| *id == json!(b))),
+        "the stopped turn does not count B as read: {stopped_read}"
+    );
+    assert!(
+        b_reply.contains("SECOND"),
+        "B ran as its own turn: {b_reply:?}"
+    );
+    chat.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
+/// A turn the CLI opens itself belongs to the client turn before it
+/// (PROTOCOL.md Pass 53): A arms a wakeup; while its fire W1 streams, B is
+/// queued `later`; a Stop naming A sent the instant W1 ends lands as B is
+/// dequeued and spares B. B arms a second wakeup, and a Stop naming B while
+/// that fire W2 streams stops W2. This is why the driver keeps the client
+/// turn's uuids across a self-opened turn and resets them when ours opens one.
+#[tokio::test]
+#[ignore = "live: spawns real claude, needs auth, bills four tiny turns and waits ~4 min"]
+async fn claude_stop_naming_the_client_turn_reaches_its_wakeup_and_spares_the_next() {
+    const ARM: &str =
+        "Load the ScheduleWakeup tool with ToolSearch (query: select:ScheduleWakeup), \
+        then call ScheduleWakeup with delaySeconds 60, reason \"smoke tick\", prompt \"Count from \
+        1 to 150, one number per line, then say: end\". Then reply with just: armed";
+    let dir = tmpdir();
+    let mut chat = spawn_claude(dir.path(), &[]);
+    chat.initialize(HANDSHAKE).await.expect("initialize");
+    let a = chat.send_user_text_with_uuid(ARM).await.expect("send A");
+    run_turn_to_result(&mut chat).await;
+
+    let mut b: Option<String> = None;
+    let mut fires = 0;
+    let mut ctl: Option<String> = None;
+    let mut receipts: Vec<Value> = Vec::new();
+    let mut results: Vec<Value> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(420);
+    while results.len() < 3 {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let frame = chat
+            .recv(left)
+            .await
+            .expect("recv")
+            .expect("claude exited before both wakeups ran");
+        match frame["type"].as_str() {
+            Some("control_request") if frame["request"]["subtype"] == "can_use_tool" => {
+                let input = frame["request"]["input"].clone();
+                chat.respond_permission(
+                    &frame["request_id"],
+                    PermissionDecision::Allow {
+                        updated_input: input,
+                    },
+                )
+                .await
+                .expect("respond allow");
+            }
+            Some("command_lifecycle")
+                if frame["state"] == "started" && frame["wakeup_source"] == "loop_wakeup" =>
+            {
+                fires += 1;
+            }
+            Some("stream_event")
+                if frame["event"]["type"] == "content_block_delta" && b.is_none() && fires == 1 =>
+            {
+                b = Some(
+                    chat.send_queued_text(ARM, "later", false)
+                        .await
+                        .expect("queue B"),
+                );
+            }
+            Some("stream_event")
+                if frame["event"]["type"] == "content_block_delta"
+                    && fires == 2
+                    && ctl.is_none() =>
+            {
+                ctl = Some(
+                    chat.send_control(json!({"subtype": "interrupt",
+                        "for_user_message_uuids": [b.clone().expect("B")]}))
+                        .await
+                        .expect("stop for B"),
+                );
+            }
+            Some("control_response")
+                if ctl.is_some() && frame["response"]["request_id"].as_str() == ctl.as_deref() =>
+            {
+                receipts.push(frame["response"]["response"].clone());
+                ctl = Some(String::new());
+            }
+            Some("result") => {
+                results.push(frame.clone());
+                if results.len() == 1 {
+                    // W1 ended: B is about to be dequeued. A Stop for A now.
+                    ctl = Some(
+                        chat.send_control(json!({"subtype": "interrupt",
+                            "for_user_message_uuids": [a]}))
+                            .await
+                            .expect("stop for A"),
+                    );
+                } else if results.len() == 2 {
+                    // A stopped B never arms W2: fail here, not at the
+                    // deadline, and never drop the Stop-for-A receipt.
+                    assert_eq!(receipts.len(), 1, "Stop for A answered: {receipts:?}");
+                    assert_eq!(receipts[0]["turn"], "spared", "a late Stop for A spares B");
+                    assert_eq!(frame["is_error"], json!(false), "B ran on: {frame}");
+                    ctl = None;
+                }
+            }
+            _ => {}
+        }
+    }
+    let summary: Vec<Value> = results
+        .iter()
+        .map(|r| json!([r["subtype"], r["terminal_reason"]]))
+        .collect();
+    eprintln!("LIVE stop for the client turn: receipts={receipts:?}, results={summary:?}");
+    // W1 completed, B (spared) completed, W2 stopped.
+    assert_eq!(receipts.len(), 2, "{receipts:?}");
+    assert_eq!(
+        receipts[1]["turn"], "stopped",
+        "a Stop for B reaches its wakeup turn"
+    );
+    assert_eq!(
+        results[2]["is_error"],
+        json!(true),
+        "W2 was stopped: {}",
+        results[2]
+    );
+    chat.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
+/// `interrupt {for_user_message_uuids}` (2.1.310, PROTOCOL.md Pass 53): a
+/// Stop that names a turn that already ended answers `turn: "spared"` and
+/// leaves the running turn alone; one that names the running turn stops it.
+#[tokio::test]
+#[ignore = "live: spawns real claude, needs auth, bills three tiny turns"]
+async fn claude_stop_for_an_ended_turn_spares_the_next() {
+    let dir = tmpdir();
+    let mut chat = spawn_claude(dir.path(), &[]);
+    chat.initialize(HANDSHAKE).await.expect("initialize");
+    let a = chat
+        .send_user_text_with_uuid("Reply with just: alpha")
+        .await
+        .expect("send A");
+    run_turn_to_result(&mut chat).await;
+    // The first Stop names A (over); the second names its own turn.
+    for (text, names_a, expect) in [
+        (
+            "Count from 1 to 40, one number per line, then say: end",
+            true,
+            "spared",
+        ),
+        (
+            "Count from 1 to 60, one number per line, then say: end",
+            false,
+            "stopped",
+        ),
+    ] {
+        let c = chat.send_user_text_with_uuid(text).await.expect("send");
+        let names = if names_a { a.clone() } else { c.clone() };
+        let mut ctl: Option<String> = None;
+        let mut receipt = Value::Null;
+        let result = loop {
+            let frame = chat
+                .recv(TURN)
+                .await
+                .expect("recv")
+                .expect("claude exited mid-turn");
+            match frame["type"].as_str() {
+                Some("stream_event") if ctl.is_none() => {
+                    ctl = Some(
+                        chat.send_control(json!({
+                            "subtype": "interrupt",
+                            "for_user_message_uuids": [names],
+                        }))
+                        .await
+                        .expect("stop"),
+                    );
+                }
+                Some("control_response")
+                    if frame["response"]["request_id"].as_str() == ctl.as_deref() =>
+                {
+                    receipt = frame["response"]["response"].clone();
+                }
+                Some("result") => break frame,
+                _ => {}
+            }
+        };
+        eprintln!(
+            "LIVE stop for {expect}: receipt={receipt}, result={}",
+            result["subtype"]
+        );
+        assert_eq!(receipt["turn"], expect, "{receipt}");
+        assert_eq!(
+            result["is_error"],
+            json!(expect == "stopped"),
+            "a spared turn ran on: {result}"
+        );
+    }
     chat.shutdown(Duration::from_secs(5))
         .await
         .expect("shutdown");
@@ -2819,7 +3130,7 @@ async fn claude_background_tasks_frees_a_parent_waiting_on_a_subagent() {
             {
                 let call = agent_call.clone().expect("the Agent call came first");
                 message = Some(
-                    chat.send_queued_text("Reply with exactly: KIWI", "next")
+                    chat.send_queued_text("Reply with exactly: KIWI", "next", false)
                         .await
                         .expect("queue a message"),
                 );
@@ -3162,6 +3473,102 @@ async fn claude_wakeup_fires_as_a_named_turn() {
         "the wakeup is spent"
     );
     manager.kill("s-wake");
+}
+
+/// The driver end of `interrupt_requeue_taken_v1` (PROTOCOL.md Pass 53): B
+/// waits while A's foreground sleep runs; the Stop goes out the moment the
+/// sleep's result lands, which is when the CLI takes B in. B must not read as
+/// sent with the stopped turn: it stays queued, then opens its own turn.
+#[tokio::test]
+#[ignore = "live: spawns real claude, needs auth, bills two tiny turns"]
+async fn driver_stop_keeps_a_just_taken_message_queued() {
+    use chimaera_agent::model::{PermissionOptionKind, ToolStatus};
+    let dir = tmpdir();
+    let manager = claude_manager(&dir, "s-requeue");
+    let mut rx = manager.attach("s-requeue", 0).expect("attach").live;
+    send(
+        &manager,
+        "s-requeue",
+        "Run this exact Bash command in the foreground: sleep 6 && echo done. \
+         Then reply with just: finished",
+    )
+    .await;
+    let mut queued_b = false;
+    let mut b: Option<String> = None;
+    let mut stopped = false;
+    let mut sent_before_abort = false;
+    let mut aborted = false;
+    let mut b_sent = false;
+    let mut reply = String::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    loop {
+        let entry = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .expect("timed out")
+            .expect("broadcast closed");
+        match &entry.ev {
+            AgentEvent::PermissionRequest {
+                request_id,
+                options,
+                ..
+            } => {
+                let allow = options
+                    .iter()
+                    .find(|o| o.kind == PermissionOptionKind::AllowOnce)
+                    .expect("allow once");
+                manager
+                    .command(
+                        "s-requeue",
+                        AgentCommand::Permission {
+                            request_id: request_id.clone(),
+                            option_id: allow.id.clone(),
+                            destination: None,
+                            feedback: None,
+                        },
+                    )
+                    .await
+                    .expect("allow");
+            }
+            AgentEvent::ToolCall { .. } if !queued_b => {
+                queued_b = true;
+                send(&manager, "s-requeue", "Reply with exactly: SECOND").await;
+            }
+            AgentEvent::UserMessage {
+                id: Some(id),
+                queued: true,
+                ..
+            } => b = Some(id.clone()),
+            AgentEvent::ToolCallUpdate {
+                status: ToolStatus::Completed,
+                ..
+            } if !stopped => {
+                stopped = true;
+                manager
+                    .command("s-requeue", AgentCommand::Interrupt)
+                    .await
+                    .expect("stop");
+            }
+            AgentEvent::UserMessageUpdate {
+                id,
+                state: UserMessageState::Sent,
+            } if Some(id) == b.as_ref() => {
+                b_sent = true;
+                sent_before_abort |= !aborted;
+            }
+            AgentEvent::TurnAborted { .. } => aborted = true,
+            AgentEvent::MessageChunk { text, .. } if b_sent => reply.push_str(text),
+            AgentEvent::TurnCompleted { .. } if b_sent => break,
+            _ => {}
+        }
+    }
+    eprintln!(
+        "LIVE driver requeue: aborted={aborted}, B sent before the abort={sent_before_abort}, \
+         B's turn said {reply:?}"
+    );
+    assert!(aborted, "the Stop ended A's turn");
+    assert!(!sent_before_abort, "B never read with the stopped turn");
+    assert!(reply.contains("SECOND"), "B ran as its own turn: {reply:?}");
+    manager.kill("s-requeue");
 }
 
 /// `/goal` on the live wire: the CLI's own reply sets the goal (a synthetic

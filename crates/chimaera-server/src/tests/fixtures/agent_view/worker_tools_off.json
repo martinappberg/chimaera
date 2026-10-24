@@ -1,6 +1,9 @@
 {
   "tools": [
     {
+      "annotations": {
+        "readOnlyHint": true
+      },
       "description": "List the terminal sessions linked to this agent: name, id, working directory, shell state (ready/running), and the most recent command. Linked terminals are the only ones reachable.",
       "inputSchema": {
         "additionalProperties": false,
@@ -40,6 +43,9 @@
       "name": "run_in_terminal"
     },
     {
+      "annotations": {
+        "readOnlyHint": true
+      },
       "description": "Read a linked terminal's recent activity: the command journal (commands, outputs, exit codes) by default, or the visible screen text with screen=true (for TUIs, boot output, or shells without integration marks).",
       "inputSchema": {
         "additionalProperties": false,
@@ -65,6 +71,9 @@
       "name": "read_terminal"
     },
     {
+      "annotations": {
+        "readOnlyHint": true
+      },
       "description": "The full guide to writing documents the user reads in Chimaera: the portable markdown dialect (it also renders on GitHub and in Obsidian), links and embeds with fragments, frontmatter, and how to reference files in replies. Read it before writing a report, README or notes.",
       "inputSchema": {
         "additionalProperties": false,
@@ -74,6 +83,9 @@
       "name": "document_guide"
     },
     {
+      "annotations": {
+        "readOnlyHint": true
+      },
       "description": "Check a markdown document before handing it over: broken relative links and embeds, missing heading anchors and line ranges, dangling footnotes, absolute local paths, images without alt text or over 10 MB, and syntax GitHub shows as literal text (wikilinks, MDX, ::: blocks, MyST directives, unsupported alert types). Returns each issue with its line and a fix.",
       "inputSchema": {
         "additionalProperties": false,

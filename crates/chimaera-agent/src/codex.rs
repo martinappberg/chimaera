@@ -753,6 +753,13 @@ fn summary_configured(result: &Value) -> bool {
 /// Build the thread-open request separately from I/O so the launch recipe's
 /// create-time model/effort contract stays hermetically testable.
 fn thread_open_request(spec: &SpawnSpec, id: u64, effort: Option<&str>) -> Value {
+    // `excludeTurns` on resume and fork: nothing reads the opened thread's
+    // `turns` (the handshake takes its id, model and effort), but by default
+    // the answer carries the whole history as one line, which a long thread
+    // can push past the ndjson line cap. `excludeTurns` is in the app-server
+    // protocol since at least 0.144.2, and its params never deny unknown
+    // fields; 0.158.0 and 0.164.0 answer it with `turns: []` and no
+    // deprecation notice (Pass 54).
     let mut open = match (&spec.pinned_native_id, &spec.fork_at) {
         (Some(thread_id), Some(last_turn_id)) => json!({
             "id": id, "method": "thread/fork",
@@ -761,11 +768,12 @@ fn thread_open_request(spec: &SpawnSpec, id: u64, effort: Option<&str>) -> Value
                 "lastTurnId": last_turn_id,
                 "cwd": spec.cwd,
                 "ephemeral": false,
+                "excludeTurns": true,
             },
         }),
         (Some(thread_id), None) => json!({
             "id": id, "method": "thread/resume",
-            "params": { "threadId": thread_id, "cwd": spec.cwd },
+            "params": { "threadId": thread_id, "cwd": spec.cwd, "excludeTurns": true },
         }),
         (None, _) => json!({
             "id": id, "method": "thread/start",
@@ -1117,6 +1125,60 @@ const COLLAB_TOKEN_STEP: u64 = 256;
 /// The parent turn's live output counter (`TurnTokens`) journals a new value
 /// only after a move this large — same order as the collab throttle above.
 const TURN_TOKENS_STEP: u64 = 256;
+
+/// Items whose `item/started` or `item/completed` in the current turn
+/// proves an opening message reached the model: its reply, reasoning, plan
+/// and tool calls, plus a child's marker and a recorded tool output (the
+/// turn is past the pre-prompt hooks). An ALLOWLIST on purpose, the opposite default of `NON_RESPONSE_ITEMS`: an
+/// item kind a later Codex adds must not count as delivery, or a Stop
+/// before the prompt reached history would lose the "please resend" notice.
+const DELIVERY_PROOF_ITEMS: &[&str] = &[
+    "agentMessage",
+    "reasoning",
+    "plan",
+    "commandExecution",
+    "mcpToolCall",
+    "webSearch",
+    "fileChange",
+    "imageGeneration",
+    "imageView",
+    "dynamicToolCall",
+    "collabAgentToolCall",
+    "sleep",
+    "subAgentActivity",
+    "functionCallOutput",
+];
+
+/// Item kinds that are not part of a model response. Each was seen to land
+/// after a steer was read without the model answering it, or belongs to
+/// earlier work: the user's own input, a Stop hook's continuation prompt, a
+/// compaction, a tool output codex records at a turn's end, and the review
+/// markers. Every other kind, a later Codex's new ones included, counts as
+/// a response: an unknown kind fails toward "answered" (no extra billed
+/// turn) rather than toward an input-less turn the user never asked for.
+const NON_RESPONSE_ITEMS: &[&str] = &[
+    "userMessage",
+    "hookPrompt",
+    "contextCompaction",
+    "functionCallOutput",
+    "enteredReviewMode",
+    "exitedReviewMode",
+];
+
+/// This item belongs to a model response: its reply, reasoning, plan or a
+/// tool call, a v2 collaboration call (a `subAgentActivity` other than a
+/// child's `completed` marker, which v2 reports with no
+/// `collabAgentToolCall`), or a kind not in `NON_RESPONSE_ITEMS`. Its
+/// `item/started` answers a steer the turn read (`note_steer_answered`).
+/// Delivery confirmation does not use it: it has its own allowlist,
+/// `DELIVERY_PROOF_ITEMS`, so an unknown kind confirms nothing there.
+fn is_model_response_item(item: &Value) -> bool {
+    match item["type"].as_str() {
+        None => false,
+        Some("subAgentActivity") => item["kind"] != "completed",
+        Some(kind) => !NON_RESPONSE_ITEMS.contains(&kind),
+    }
+}
 
 struct CollabAgent {
     /// The subagent's thread id — the key every foreign frame carries.
@@ -1605,6 +1667,18 @@ struct CodexMapper {
     /// dropped or cancelled, or on the user's Send now (their own delivery);
     /// teardown clears it.
     agent_steers: HashSet<String>,
+    /// A user steer's `userMessage` item landed on the running turn and no
+    /// model step on that turn has followed it yet. Codex records a steer it
+    /// accepted while the turn was finishing (after its last pending-input
+    /// check) straight into history, echoes it, and ends the turn without a
+    /// model request (live 0.164.0, PROTOCOL.md Pass 54). Per turn.
+    read_unanswered: bool,
+    /// The turn that just completed read a steer it never answered. The
+    /// message is already in history, so resending it would put it there
+    /// twice: the next turn opens with no input instead (`turn/start
+    /// {input: []}` samples the model on the history as it stands), unless
+    /// queued input opens that turn anyway.
+    answer_owed: bool,
     /// Interrupt watchdog: ticks remaining before we synthesize the abort the
     /// app-server never sent. Armed on `Interrupt`, counted down in `tick`,
     /// disarmed when a turn ends (`reset_turn_state`) or a fresh turn opens.
@@ -1779,6 +1853,8 @@ impl CodexMapper {
             read_before_answer: HashSet::new(),
             feedback_steers: HashSet::new(),
             agent_steers: HashSet::new(),
+            read_unanswered: false,
+            answer_owed: false,
             interrupt_grace: None,
             idle_flush_grace: None,
             coalescer: Coalescer::new(),
@@ -2156,6 +2232,7 @@ impl CodexMapper {
         {
             self.unread_opening_message = None;
         }
+        self.note_steer_answered(method, frame);
 
         match method {
             "hook/started" | "hook/completed" => {
@@ -2218,6 +2295,8 @@ impl CodexMapper {
                     .to_string();
                 self.turn_active = true;
                 self.turn_pending = false;
+                // A turn the server opened itself reads the history too.
+                self.answer_owed = false;
                 self.compaction_active = false;
                 self.compaction_completed = false;
                 // Fresh turn, fresh prose: no item-boundary break is owed yet.
@@ -2717,9 +2796,16 @@ impl CodexMapper {
                                 .unwrap_or_else(|| "turn failed".into()),
                             interrupted: false,
                         }),
-                        _ => step
-                            .events
-                            .push(AgentEvent::TurnCompleted { turn_id, usage }),
+                        _ => {
+                            // The turn read a steer as it finished and never
+                            // answered it (Pass 54). A goal's server-started
+                            // continuation would answer it on its own.
+                            if self.read_unanswered && !self.goal_drives_turns() {
+                                self.answer_owed = true;
+                            }
+                            step.events
+                                .push(AgentEvent::TurnCompleted { turn_id, usage })
+                        }
                     }
                     // No usage read here: codex sends the rolling
                     // account/rateLimits/updated during every turn (live
@@ -2912,6 +2998,7 @@ impl CodexMapper {
     fn reset_turn_state(&mut self) {
         self.unread_opening_message = None;
         self.opening_turn_owned = false;
+        self.read_unanswered = false;
         self.startup_hooks.clear();
         self.streamed.clear();
         self.out_streamed.clear();
@@ -3418,27 +3505,13 @@ impl CodexMapper {
             self.unread_opening_message = None;
         }
         // Older servers may omit clientId on the user echo; actual model
-        // activity also proves we passed the pre-prompt hook barrier.
+        // activity also proves we passed the pre-prompt hook barrier. Only
+        // known kinds count (`DELIVERY_PROOF_ITEMS`): an unknown one must
+        // leave the message unconfirmed.
         if current_turn
-            && matches!(
-                item["type"].as_str(),
-                Some(
-                    "reasoning"
-                        | "agentMessage"
-                        | "commandExecution"
-                        | "mcpToolCall"
-                        | "webSearch"
-                        | "fileChange"
-                        | "imageGeneration"
-                        | "imageView"
-                        | "dynamicToolCall"
-                        | "collabAgentToolCall"
-                        | "subAgentActivity"
-                        | "functionCallOutput"
-                        | "plan"
-                        | "sleep"
-                )
-            )
+            && item["type"]
+                .as_str()
+                .is_some_and(|t| DELIVERY_PROOF_ITEMS.contains(&t))
         {
             self.unread_opening_message = None;
         }
@@ -4802,6 +4875,61 @@ impl CodexMapper {
         }
     }
 
+    /// Track whether the running turn answered the last user steer it read
+    /// (`read_unanswered`). A user steer's echo opens the window; a new model
+    /// response on the same turn after it closes it (see the arms). Hooks are
+    /// not model steps: a Stop hook follows an answer, a prompt hook precedes
+    /// the echo, and pre/post-model-request hooks also wrap a request whose
+    /// output a newer steer superseded. A message the daemon sent for an
+    /// agent (`agent_steers`) and decline feedback never owe a turn.
+    fn note_steer_answered(&mut self, method: &str, frame: &Value) {
+        let params = &frame["params"];
+        if !self.turn_active
+            || self.turn_pending
+            || params["turnId"].as_str() != Some(self.turn_id.as_str())
+        {
+            return;
+        }
+        let item = &params["item"];
+        match method {
+            "item/started" | "item/completed" if item["type"] == "userMessage" => {
+                if method == "item/started" {
+                    if let Some(id) = item["clientId"].as_str() {
+                        let user_steer = !self.agent_steers.contains(id)
+                            && !self.feedback_steers.contains(id)
+                            && (self.steer_pending_for(id)
+                                || self.unread_steers.values().any(|s| s.client_msg_id == id));
+                        if user_steer {
+                            self.read_unanswered = true;
+                        }
+                    }
+                }
+            }
+            // Only a NEW model response answers it: an item the response
+            // opens, or its streamed text, reasoning or plan. Captured
+            // (0.164.0, Pass 54): an answered steer's echo is followed by
+            // the reply's `item/started` before its token update; a leftover
+            // echo by nothing but the read state, idle status and turn end.
+            // Never a step: a completion or output of an earlier item (a
+            // background command finishing), a token-usage update (it trails
+            // the request it counts), or an `item/started` of a kind in
+            // `NON_RESPONSE_ITEMS` or a child's finish marker. Any other
+            // `item/started`, an unknown kind included, is a response.
+            "item/started" => {
+                if is_model_response_item(item) {
+                    self.read_unanswered = false;
+                }
+            }
+            "item/agentMessage/delta"
+            | "item/reasoning/textDelta"
+            | "item/reasoning/summaryTextDelta"
+            | "item/reasoning/summaryPartAdded"
+            | "item/plan/delta"
+            | "turn/plan/updated" => self.read_unanswered = false,
+            _ => {}
+        }
+    }
+
     /// A `userMessage` item: codex took a user input into the conversation.
     /// For a steer this is the moment the agent READ it — at its next step,
     /// several together (live 0.157.1: two steers sent during a `sleep` both
@@ -4936,6 +5064,9 @@ impl CodexMapper {
             }
         }
         let Some(queued) = self.queued_sends.pop_front() else {
+            if self.answer_owed {
+                self.emit_answer_turn(step);
+            }
             return;
         };
         self.redrive_as_fresh_turn(queued.input, queued.client_msg_id, step);
@@ -5619,13 +5750,31 @@ impl CodexMapper {
     /// instead of racing a second turn/start into the same window.
     fn emit_turn_start(&mut self, input: Value, client_msg_id: String, step: &mut DriverStep) {
         self.unread_opening_message = Some(client_msg_id.clone());
+        self.open_turn(input, Some(client_msg_id), step);
+    }
+
+    /// Open the turn a steer read at its turn's end is owed (Pass 54): no
+    /// input and no user message of its own, so no checkpoint and no
+    /// delivery to confirm — the model answers the history as it stands.
+    /// Codex 0.158.0 and 0.164.0 both accept an empty `input`.
+    fn emit_answer_turn(&mut self, step: &mut DriverStep) {
+        self.unread_opening_message = None;
+        self.open_turn(json!([]), None, step);
+    }
+
+    fn open_turn(&mut self, input: Value, client_msg_id: Option<String>, step: &mut DriverStep) {
+        // Any turn the driver opens reads the whole history, a steer left
+        // unanswered at the last turn's end included.
+        self.answer_owed = false;
         self.opening_turn_owned = true;
         let id = self.rpc_id();
         let mut params = json!({
             "threadId": self.thread_id,
-            "clientUserMessageId": client_msg_id,
             "input": input,
         });
+        if let Some(client_msg_id) = client_msg_id {
+            params["clientUserMessageId"] = json!(client_msg_id);
+        }
         if let Some(model) = &self.pending_model {
             params["model"] = json!(model);
         }
@@ -5980,6 +6129,9 @@ impl CodexMapper {
                 if self.goal_active() {
                     self.goal_set(GoalAction::Pause, json!({ "status": "paused" }), &mut step);
                 }
+                // Stop opens nothing: not even the turn an unanswered steer
+                // was owed.
+                self.answer_owed = false;
                 self.interrupt(&mut step);
             }
             AgentCommand::SetModel { model_id } => {
@@ -7329,6 +7481,9 @@ mod tests {
             "contextCompaction",
             "enteredReviewMode",
             "exitedReviewMode",
+            // An item kind a later Codex adds proves nothing about delivery
+            // (`DELIVERY_PROOF_ITEMS` is an allowlist), unlike a steer's answer.
+            "futureResponsePart",
         ] {
             let mut m = mapper();
             active_turn(&mut m);
@@ -7925,6 +8080,462 @@ mod tests {
             .collect();
         assert_eq!(checkpoints, vec![ids[0].clone()]);
         assert!(m.unread_steers.is_empty() && m.deferred_steer_redrives.is_empty());
+    }
+
+    /// The frames codex 0.164.0 sent around a steer that landed as its turn
+    /// finished (hermetic probe, Pass 54), on `thr-1` / `turn-A`.
+    fn finishing_frames(client_id: &str) -> Vec<Value> {
+        vec![
+            json!({"method": "hook/completed", "params": {"threadId": "thr-1", "turnId": "turn-A",
+                "run": {"id": "stop:0:/home/u/.codex/config.toml", "eventName": "stop",
+                    "handlerType": "command", "executionMode": "sync", "scope": "turn",
+                    "source": "user", "status": "completed", "entries": []}}}),
+            json!({"method": "item/started", "params": {"item": {"type": "userMessage",
+                "id": "01a16b75-eb96", "clientId": client_id,
+                "content": [{"type": "text", "text": "STEER S", "text_elements": []}]},
+                "threadId": "thr-1", "turnId": "turn-A", "startedAtMs": 1792804252567u64}}),
+            json!({"method": "item/completed", "params": {"item": {"type": "userMessage",
+                "id": "01a16b75-eb96", "clientId": client_id,
+                "content": [{"type": "text", "text": "STEER S", "text_elements": []}]},
+                "threadId": "thr-1", "turnId": "turn-A", "completedAtMs": 1792804252567u64}}),
+            json!({"method": "thread/readState/changed", "params": {"threadId": "thr-1",
+                "readState": {"firstUnread": {"type": "turn", "turnId": "turn-A"},
+                    "revision": "7808930b-c402-4ff6-a4a5-41c95b5b61ea"}}}),
+            json!({"method": "thread/status/changed", "params": {"threadId": "thr-1",
+                "status": {"type": "idle"}}}),
+        ]
+    }
+
+    fn turn_a_completed() -> Value {
+        json!({"method": "turn/completed", "params": {"threadId": "thr-1", "turn": {
+            "id": "turn-A", "rootTurnId": "turn-A",
+            "items": [{"type": "agentMessage", "id": "msg_40", "text": "ANSWER 40 to: FIRST prompt",
+                "phase": null, "memoryCitation": null, "delivery": null, "questions": null}],
+            "itemsView": "summary", "status": "completed", "error": null,
+            "startedAt": 1792804251u64, "completedAt": 1792804252u64, "durationMs": 1073}}})
+    }
+
+    fn steer_text(m: &mut CodexMapper, text: &str) -> (String, u64) {
+        let step = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: text.into() }],
+        });
+        let AgentEvent::UserMessage { id: Some(id), .. } = &step.events[0] else {
+            panic!("expected UserMessage, got {:?}", step.events);
+        };
+        assert_eq!(step.outbound[0]["method"], "turn/steer");
+        (id.clone(), step.outbound[0]["id"].as_u64().unwrap())
+    }
+
+    /// Codex 0.164.0 accepted a steer after its turn's last pending-input
+    /// check, recorded it at the turn's end (the `userMessage` echo) and
+    /// completed the turn with no model request for it. The bubble resolves
+    /// `sent` at the echo; the next turn opens with NO input, so the model
+    /// answers the message from history instead of reading it twice.
+    #[test]
+    fn a_steer_read_as_its_turn_finishes_opens_an_inputless_turn() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let (id, rpc) = steer_text(&mut m, "STEER S");
+        let frames = finishing_frames(&id);
+        let mut order = vec![frames[0].clone()];
+        order.push(json!({ "id": rpc, "result": { "turnId": "turn-A" } }));
+        order.extend(frames[1..].iter().cloned());
+        let mut events = Vec::new();
+        for f in &order {
+            let step = m.on_frame(f);
+            assert!(
+                step.outbound.is_empty(),
+                "nothing opens before the turn ends: {:?}",
+                step.outbound
+            );
+            events.extend(step.events);
+        }
+        let step = m.on_frame(&turn_a_completed());
+        events.extend(step.events);
+        let outbound = step.outbound;
+        let sent: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::UserMessageUpdate { .. }))
+            .collect();
+        assert_eq!(
+            sent,
+            vec![&AgentEvent::UserMessageUpdate {
+                id: id.clone(),
+                state: UserMessageState::Sent,
+            }]
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Checkpoint { .. })),
+            "the owed turn is no rewind boundary: {events:?}"
+        );
+        assert_eq!(outbound.len(), 1, "{outbound:?}");
+        assert_eq!(outbound[0]["method"], "turn/start");
+        assert_eq!(outbound[0]["params"]["input"], json!([]));
+        assert!(outbound[0]["params"].get("clientUserMessageId").is_none());
+        assert!(m.turn_pending && !m.answer_owed);
+        assert!(m.unread_steers.is_empty() && m.deferred_steer_redrives.is_empty());
+        // The owed turn is ours: its activity is the reply, and an interrupt
+        // before it asks nobody to resend anything.
+        let rpc = outbound[0]["id"].as_u64().unwrap();
+        m.on_frame(&json!({ "id": rpc, "result": { "turn": { "id": "turn-B" } } }));
+        let step = m.on_frame(&json!({"method": "turn/started",
+            "params": {"threadId": "thr-1", "turn": {"id": "turn-B"}}}));
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnCause { .. })),
+            "{:?}",
+            step.events
+        );
+        assert!(m.unread_opening_message.is_none());
+    }
+
+    /// The ordinary case: the turn reads the steer and answers it before it
+    /// ends (live 0.164.0: a steer during the Stop hook is answered in the
+    /// same turn). Nothing is owed.
+    #[test]
+    fn a_steer_answered_in_its_turn_owes_no_turn() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let (id, rpc) = steer_text(&mut m, "STEER S");
+        m.on_frame(&json!({ "id": rpc, "result": { "turnId": "turn-A" } }));
+        let frames = finishing_frames(&id);
+        m.on_frame(&frames[1]);
+        m.on_frame(&frames[2]);
+        for f in [
+            json!({"method": "item/started", "params": {"item": {"type": "agentMessage",
+                "id": "msg_41", "text": "", "phase": null}, "threadId": "thr-1", "turnId": "turn-A"}}),
+            json!({"method": "item/completed", "params": {"item": {"type": "agentMessage",
+                "id": "msg_41", "text": "ANSWER 41 to: STEER S", "phase": null},
+                "threadId": "thr-1", "turnId": "turn-A"}}),
+            json!({"method": "thread/tokenUsage/updated", "params": {"threadId": "thr-1",
+                "turnId": "turn-A", "tokenUsage": {
+                    "total": {"totalTokens": 240, "inputTokens": 200, "cachedInputTokens": 0,
+                        "outputTokens": 40, "reasoningOutputTokens": 0},
+                    "last": {"totalTokens": 120, "inputTokens": 100, "cachedInputTokens": 0,
+                        "outputTokens": 20, "reasoningOutputTokens": 0},
+                    "modelContextWindow": 272000}}}),
+        ] {
+            m.on_frame(&f);
+        }
+        let step = m.on_frame(&turn_a_completed());
+        assert!(
+            !step.outbound.iter().any(|o| o["method"] == "turn/start"),
+            "{:?}",
+            step.outbound
+        );
+        assert!(!m.answer_owed);
+    }
+
+    fn model_hook(event: &str, completed: bool) -> Value {
+        let id = match event {
+            "preModelRequest" => "pre-model-request:0:/home/u/.codex/config.toml",
+            "postModelRequest" => "post-model-request:0:/home/u/.codex/config.toml",
+            "userPromptSubmit" => "user-prompt-submit:0:/home/u/.codex/config.toml",
+            _ => "stop:0:/home/u/.codex/config.toml",
+        };
+        json!({"method": if completed { "hook/completed" } else { "hook/started" },
+            "params": {"threadId": "thr-1", "turnId": "turn-A", "run": {"id": id,
+                "eventName": event, "handlerType": "command", "executionMode": "sync",
+                "scope": "turn", "source": "user",
+                "status": if completed { "completed" } else { "running" }, "entries": []}}})
+    }
+
+    fn token_usage(total: u64) -> Value {
+        json!({"method": "thread/tokenUsage/updated", "params": {"threadId": "thr-1",
+            "turnId": "turn-A", "tokenUsage": {
+                "total": {"totalTokens": total, "inputTokens": total - 40, "cachedInputTokens": 0,
+                    "outputTokens": 40, "reasoningOutputTokens": 0},
+                "last": {"totalTokens": 120, "inputTokens": 100, "cachedInputTokens": 0,
+                    "outputTokens": 20, "reasoningOutputTokens": 0},
+                "modelContextWindow": 258400}}})
+    }
+
+    /// Frames that follow a leftover echo but belong to earlier work — the
+    /// previous request's token update, an earlier command finishing in the
+    /// background with its last output, a child agent's finish marker, a
+    /// recorded tool output — are no model step: the steer is still owed
+    /// its turn. (Captured, the leftover echo is followed only by the read
+    /// state, idle status and turn end; these are the frames that could
+    /// still land in between.)
+    #[test]
+    fn frames_of_earlier_work_after_a_leftover_echo_keep_the_turn_owed() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let (id, rpc) = steer_text(&mut m, "STEER S");
+        m.on_frame(&json!({ "id": rpc, "result": { "turnId": "turn-A" } }));
+        let frames = finishing_frames(&id);
+        m.on_frame(&frames[1]);
+        m.on_frame(&frames[2]);
+        for f in [
+            token_usage(240),
+            json!({"method": "item/commandExecution/outputDelta", "params": {"threadId": "thr-1",
+                "turnId": "turn-A", "itemId": "call_bg", "delta": "done\n"}}),
+            json!({"method": "item/completed", "params": {"threadId": "thr-1", "turnId": "turn-A",
+                "item": {"type": "commandExecution", "id": "call_bg", "command": "sleep 2",
+                    "cwd": "/work", "status": "completed", "commandActions": [],
+                    "aggregatedOutput": "done\n", "exitCode": 0, "durationMs": 2000}}}),
+            json!({"method": "item/started", "params": {"threadId": "thr-1", "turnId": "turn-A",
+                "item": {"type": "subAgentActivity", "id": "subagent-completed-1",
+                    "kind": "completed", "agentThreadId": "thr-child",
+                    "agentPath": "/root/helper"}}}),
+            json!({"method": "item/started", "params": {"threadId": "thr-1", "turnId": "turn-A",
+                "item": {"type": "functionCallOutput", "id": "call_bg", "name": "exec_command",
+                    "output": "done"}}}),
+        ] {
+            m.on_frame(&f);
+        }
+        for f in &frames[3..] {
+            m.on_frame(f);
+        }
+        let step = m.on_frame(&turn_a_completed());
+        let starts: Vec<_> = step
+            .outbound
+            .iter()
+            .filter(|o| o["method"] == "turn/start")
+            .collect();
+        assert_eq!(starts.len(), 1, "{:?}", step.outbound);
+        assert_eq!(starts[0]["params"]["input"], json!([]));
+    }
+
+    /// An item kind this driver has never seen (a later Codex's) counts as
+    /// the model answering: the failure mode is the old one (a steer left
+    /// unanswered), never an input-less turn nobody asked for. The known
+    /// non-response kinds still leave the turn owed.
+    #[test]
+    fn an_unknown_item_after_a_steer_echo_counts_as_its_answer() {
+        for (kind, owed) in [
+            ("futureResponsePart", false),
+            ("hookPrompt", true),
+            ("contextCompaction", true),
+            ("enteredReviewMode", true),
+            ("exitedReviewMode", true),
+        ] {
+            let mut m = mapper();
+            active_turn(&mut m);
+            let (id, rpc) = steer_text(&mut m, "STEER S");
+            m.on_frame(&json!({ "id": rpc, "result": { "turnId": "turn-A" } }));
+            let frames = finishing_frames(&id);
+            m.on_frame(&frames[1]);
+            m.on_frame(&frames[2]);
+            m.on_frame(
+                &json!({"method": "item/started", "params": {"threadId": "thr-1",
+                "turnId": "turn-A", "item": {"type": kind, "id": "item-x"}}}),
+            );
+            for f in &frames[3..] {
+                m.on_frame(f);
+            }
+            let step = m.on_frame(&turn_a_completed());
+            let opened = step.outbound.iter().any(|o| o["method"] == "turn/start");
+            assert_eq!(opened, owed, "{kind}: {:?}", step.outbound);
+        }
+    }
+
+    /// Captured (0.164.0, Stop and model-request hooks configured): steer A
+    /// is read, its model request runs between the pre/post hooks but its
+    /// output is superseded by steer B, read next; the reply to B opens with
+    /// `item/started`, then its token update and the Stop hook. Both were
+    /// answered: nothing is owed.
+    #[test]
+    fn a_superseded_request_then_an_answered_steer_owes_no_turn() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let (a, rpc_a) = steer_text(&mut m, "STEER A during the Stop hook");
+        m.on_frame(&json!({ "id": rpc_a, "result": { "turnId": "turn-A" } }));
+        let (b, rpc_b) = steer_text(&mut m, "STEER B during finish");
+        m.on_frame(&json!({ "id": rpc_b, "result": { "turnId": "turn-A" } }));
+        let echo_a = finishing_frames(&a);
+        let echo_b = finishing_frames(&b);
+        let mut order = vec![
+            model_hook("stop", true),
+            model_hook("userPromptSubmit", false),
+            model_hook("userPromptSubmit", true),
+            echo_a[1].clone(),
+            echo_a[2].clone(),
+            model_hook("preModelRequest", false),
+            model_hook("preModelRequest", true),
+            model_hook("postModelRequest", false),
+            model_hook("postModelRequest", true),
+            model_hook("userPromptSubmit", false),
+            model_hook("userPromptSubmit", true),
+            echo_b[1].clone(),
+            echo_b[2].clone(),
+            model_hook("preModelRequest", false),
+            model_hook("preModelRequest", true),
+            json!({"method": "item/started", "params": {"threadId": "thr-1", "turnId": "turn-A",
+                "item": {"type": "agentMessage", "id": "msg_3", "text": "", "phase": null}}}),
+            json!({"method": "item/completed", "params": {"threadId": "thr-1", "turnId": "turn-A",
+                "item": {"type": "agentMessage", "id": "msg_3",
+                    "text": "ANSWER 3 to: STEER B during finish", "phase": null}}}),
+            model_hook("postModelRequest", false),
+            model_hook("postModelRequest", true),
+            token_usage(360),
+            model_hook("stop", false),
+            model_hook("stop", true),
+        ];
+        order.extend(echo_b[3..].iter().cloned());
+        for f in &order {
+            m.on_frame(f);
+        }
+        let step = m.on_frame(&turn_a_completed());
+        assert!(
+            !step.outbound.iter().any(|o| o["method"] == "turn/start"),
+            "{:?}",
+            step.outbound
+        );
+        assert!(!m.answer_owed);
+    }
+
+    /// A v2 spawn after the echo is the model's own answer (v2 reports
+    /// `spawn_agent` only as a `subAgentActivity {started}` marker): nothing
+    /// is owed. A child's `completed` marker is not (the test above).
+    #[test]
+    fn a_steer_answered_by_a_spawn_owes_no_turn() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let (id, rpc) = steer_text(&mut m, "STEER S");
+        m.on_frame(&json!({ "id": rpc, "result": { "turnId": "turn-A" } }));
+        let frames = finishing_frames(&id);
+        m.on_frame(&frames[1]);
+        m.on_frame(&frames[2]);
+        m.on_frame(
+            &json!({"method": "item/started", "params": {"threadId": "thr-1",
+            "turnId": "turn-A", "item": {"type": "subAgentActivity", "id": "sa-1",
+                "kind": "started", "agentThreadId": "thr-child", "agentPath": "/root/helper"}}}),
+        );
+        for f in &frames[3..] {
+            m.on_frame(f);
+        }
+        let step = m.on_frame(&turn_a_completed());
+        assert!(
+            !step.outbound.iter().any(|o| o["method"] == "turn/start"),
+            "{:?}",
+            step.outbound
+        );
+        assert!(!m.answer_owed);
+    }
+
+    /// Queued input opens the next turn anyway, and that turn reads the
+    /// unanswered steer from history: one turn, the queued message's.
+    #[test]
+    fn queued_input_takes_the_turn_an_unanswered_steer_was_owed() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let (id, rpc) = steer_text(&mut m, "STEER S");
+        let step = m.on_command(AgentCommand::SendAfterTurn {
+            blocks: vec![ContentBlock::Text {
+                text: "after".into(),
+            }],
+        });
+        let AgentEvent::UserMessage {
+            id: Some(after), ..
+        } = &step.events[0]
+        else {
+            panic!("expected UserMessage, got {:?}", step.events);
+        };
+        let after = after.clone();
+        m.on_frame(&json!({ "id": rpc, "result": { "turnId": "turn-A" } }));
+        for f in &finishing_frames(&id)[1..] {
+            m.on_frame(f);
+        }
+        let step = m.on_frame(&turn_a_completed());
+        let starts: Vec<_> = step
+            .outbound
+            .iter()
+            .filter(|o| o["method"] == "turn/start")
+            .collect();
+        assert_eq!(starts.len(), 1, "{:?}", step.outbound);
+        assert_eq!(starts[0]["params"]["clientUserMessageId"], json!(after));
+        assert!(!m.answer_owed);
+    }
+
+    /// An agent message read at the turn's end owes nothing: a
+    /// `SendIfRunning` never opens a turn. Neither does a Stop.
+    #[test]
+    fn an_agent_message_or_a_stop_never_opens_the_owed_turn() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let step = m.on_command(agent_send("agent-1", "heads-up"));
+        let rpc = step.outbound[0]["id"].as_u64().unwrap();
+        m.on_frame(&json!({ "id": rpc, "result": { "turnId": "turn-A" } }));
+        for f in &finishing_frames("agent-1")[1..] {
+            m.on_frame(f);
+        }
+        let step = m.on_frame(&turn_a_completed());
+        assert!(step.outbound.is_empty(), "{:?}", step.outbound);
+
+        let mut m = mapper();
+        active_turn(&mut m);
+        let (id, rpc) = steer_text(&mut m, "STEER S");
+        m.on_frame(&json!({ "id": rpc, "result": { "turnId": "turn-A" } }));
+        for f in &finishing_frames(&id)[1..] {
+            m.on_frame(f);
+        }
+        m.on_command(AgentCommand::Interrupt);
+        let step = m.on_frame(
+            &json!({"method": "turn/completed", "params": {"threadId": "thr-1",
+            "turn": {"id": "turn-A", "status": "interrupted"}}}),
+        );
+        assert!(
+            !step.outbound.iter().any(|o| o["method"] == "turn/start"),
+            "{:?}",
+            step.outbound
+        );
+    }
+
+    /// Codex 0.164.0 refuses a steer once its turn is finishing ("no active
+    /// turn to steer", no `data`); live the refusal came both before and
+    /// after `turn/completed`. Either way the message opens the next turn
+    /// exactly once, as that turn's input.
+    #[test]
+    fn a_steer_refused_by_a_finishing_turn_opens_the_next_turn_once() {
+        for refusal_first in [true, false] {
+            let mut m = mapper();
+            active_turn(&mut m);
+            let (id, rpc) = steer_text(&mut m, "STEER S");
+            let refusal = json!({
+                "error": { "code": -32600, "message": "no active turn to steer" }, "id": rpc,
+            });
+            let mut outbound = Vec::new();
+            let mut events = Vec::new();
+            let order = if refusal_first {
+                vec![refusal.clone(), turn_a_completed()]
+            } else {
+                vec![turn_a_completed(), refusal.clone()]
+            };
+            for f in &finishing_frames(&id)[3..] {
+                m.on_frame(f);
+            }
+            for f in &order {
+                let step = m.on_frame(f);
+                outbound.extend(step.outbound);
+                events.extend(step.events);
+            }
+            let starts: Vec<_> = outbound
+                .iter()
+                .filter(|o| o["method"] == "turn/start")
+                .collect();
+            assert_eq!(starts.len(), 1, "{refusal_first}: {outbound:?}");
+            assert_eq!(starts[0]["params"]["clientUserMessageId"], json!(id));
+            assert_eq!(
+                starts[0]["params"]["input"],
+                json!([{ "type": "text", "text": "STEER S" }])
+            );
+            assert!(events.contains(&AgentEvent::UserMessageUpdate {
+                id: id.clone(),
+                state: UserMessageState::Sent,
+            }));
+            assert!(!events.iter().any(|e| matches!(
+                e,
+                AgentEvent::UserMessageUpdate {
+                    state: UserMessageState::Dropped,
+                    ..
+                }
+            )));
+        }
     }
 
     /// Send now on a steered message interrupts the turn; on a message held
@@ -9652,6 +10263,7 @@ mod tests {
         assert_eq!(start["params"]["sandbox"], "workspace-write");
         assert_eq!(start["params"]["approvalPolicy"], "on-request");
         assert_eq!(start["params"]["approvalsReviewer"], "auto_review");
+        assert!(start["params"].get("excludeTurns").is_none());
 
         spec.pinned_native_id = Some("thread-old".into());
         let resume = thread_open_request(&spec, 8, spec.initial_effort.as_deref());
@@ -9660,6 +10272,8 @@ mod tests {
         assert_eq!(resume["params"]["model"], "gpt-test");
         assert_eq!(resume["params"]["effort"], "xhigh");
         assert_eq!(resume["params"]["approvalsReviewer"], "auto_review");
+        // The history stays out of the open answer (Pass 54).
+        assert_eq!(resume["params"]["excludeTurns"], true);
 
         spec.fork_at = Some("turn-7".into());
         let fork = thread_open_request(&spec, 9, spec.initial_effort.as_deref());
@@ -9670,6 +10284,7 @@ mod tests {
         assert_eq!(fork["params"]["model"], "gpt-test");
         assert_eq!(fork["params"]["effort"], "xhigh");
         assert_eq!(fork["params"]["approvalsReviewer"], "auto_review");
+        assert_eq!(fork["params"]["excludeTurns"], true);
 
         spec.portable_context = Some("quiet imported transcript".into());
         let contextual = thread_open_request(&spec, 10, spec.initial_effort.as_deref());
@@ -10953,6 +11568,117 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// 0.164.0 schema: `ImageGenerationItem` is `{…} & ({fileId} | {result})`
+    /// — `result` is no longer always there. The row never read it: a
+    /// file-id image with a saved path opens it, one with neither still
+    /// completes, and a `failure` (usage limit) item fails its row.
+    #[test]
+    fn an_image_item_without_result_still_draws_its_row() {
+        let mut m = mapper();
+        let started = json!({"method": "item/started", "params": {"threadId": "thr-1",
+            "turnId": "turn-A", "item": {"type": "imageGeneration", "id": "ig_1",
+            "status": "inProgress", "revisedPrompt": null, "failure": null}}});
+        let step = m.on_frame(&started);
+        assert!(matches!(
+            &step.events[..],
+            [AgentEvent::ToolCall {
+                status: ToolStatus::InProgress,
+                ..
+            }]
+        ));
+        let step = m.on_frame(
+            &json!({"method": "item/completed", "params": {"threadId": "thr-1",
+            "turnId": "turn-A", "item": {"type": "imageGeneration", "id": "ig_1",
+            "status": "completed", "revisedPrompt": "a red dot", "transparentBackground": false,
+            "failure": null, "fileId": "file_abc", "savedPath": "/tmp/out/ig_1.png",
+            "inputImages": []}}}),
+        );
+        assert!(
+            matches!(
+                &step.events[..],
+                [
+                    AgentEvent::ToolCall { locations, .. },
+                    AgentEvent::ToolCallUpdate { status: ToolStatus::Completed, .. },
+                ] if locations == &vec!["/tmp/out/ig_1.png".to_string()]
+            ),
+            "{:?}",
+            step.events
+        );
+
+        let mut m = mapper();
+        m.on_frame(&started);
+        let step = m.on_frame(
+            &json!({"method": "item/completed", "params": {"threadId": "thr-1",
+            "turnId": "turn-A", "item": {"type": "imageGeneration", "id": "ig_1",
+            "status": "completed", "revisedPrompt": null, "failure": null, "fileId": "file_abc"}}}),
+        );
+        assert!(
+            matches!(
+                &step.events[..],
+                [
+                    AgentEvent::ToolCall { locations, .. },
+                    AgentEvent::ToolCallUpdate { status: ToolStatus::Completed, content: None, .. },
+                ] if locations.is_empty()
+            ),
+            "{:?}",
+            step.events
+        );
+
+        let mut m = mapper();
+        m.on_frame(&started);
+        let step = m.on_frame(
+            &json!({"method": "item/completed", "params": {"threadId": "thr-1",
+            "turnId": "turn-A", "item": {"type": "imageGeneration", "id": "ig_1",
+            "status": "failed", "revisedPrompt": null, "fileId": "",
+            "failure": {"type": "usageLimitExceeded", "limitId": "images", "resetsAt": null}}}}),
+        );
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ToolCallUpdate {
+                    status: ToolStatus::Failed,
+                    ..
+                }
+            )),
+            "{:?}",
+            step.events
+        );
+    }
+
+    /// 0.164.0 adds `preModelRequest` / `postModelRequest` hooks, which run
+    /// synchronously on the parent turn around every model request (live,
+    /// hermetic probe, Pass 54). They are not startup hooks: no row, no
+    /// startup phase, nothing held for a completion.
+    #[test]
+    fn model_request_hooks_are_not_startup_hooks() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        for event in ["preModelRequest", "postModelRequest"] {
+            let kebab = if event == "preModelRequest" {
+                "pre-model-request"
+            } else {
+                "post-model-request"
+            };
+            for (method, status) in [("hook/started", "running"), ("hook/completed", "completed")] {
+                let step = m.on_frame(&json!({"method": method, "params": {"threadId": "thr-1",
+                    "turnId": "turn-A", "run": {
+                        "id": format!("{kebab}:0:/home/u/.codex/config.toml"),
+                        "eventName": event, "handlerType": "command", "executionMode": "sync",
+                        "scope": "turn", "sourcePath": "/home/u/.codex/config.toml",
+                        "source": "user", "displayOrder": 0, "status": status,
+                        "statusMessage": null, "startedAt": 1792803964u64, "completedAt": null,
+                        "durationMs": null, "entries": []}}}));
+                assert!(
+                    step.events.is_empty(),
+                    "{event} {method}: {:?}",
+                    step.events
+                );
+                assert!(step.outbound.is_empty());
+            }
+        }
+        assert!(m.startup_hooks.is_empty());
     }
 
     #[test]

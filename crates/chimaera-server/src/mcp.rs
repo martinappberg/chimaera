@@ -610,8 +610,58 @@ fn tool_defs(plan_tool: bool, comms_on: bool, mastermind: bool, plugin_tools: Ve
     if mastermind {
         tools.extend(mastermind_tool_defs());
     }
+    for tool in &mut tools {
+        if let Some(annotations) = tool["name"].as_str().and_then(tool_annotations) {
+            tool["annotations"] = annotations;
+        }
+    }
+    // A plugin's tools carry what its manifest says; core never annotates them.
     tools.extend(plugin_tools);
     Value::Array(tools)
+}
+
+/// Core tools that change nothing: they only read the workspace, the
+/// daemon's journals or fixed text. Claude Code (2.1.307+) retries an HTTP
+/// MCP call cut off by a closed connection only when the tool says it is
+/// read-only or idempotent; it also lets plan mode call a read-only tool and
+/// may run read-only calls side by side. `read_messages` is not here: it
+/// settles what it shows (see [`tool_annotations`]).
+pub(crate) const READ_ONLY_TOOLS: [&str; 9] = [
+    "list_terminals",
+    "read_terminal",
+    "document_guide",
+    "check_document",
+    "workspace_status",
+    "list_changed_files",
+    "read_timeline",
+    "workspace_agents",
+    "read_agent",
+];
+
+/// MCP `annotations` for a core tool (MCP 2025-03-26 `ToolAnnotations`),
+/// `None` for a tool whose defaults (may write, not idempotent) are the truth.
+fn tool_annotations(name: &str) -> Option<Value> {
+    if READ_ONLY_TOOLS.contains(&name) {
+        return Some(json!({ "readOnlyHint": true }));
+    }
+    match name {
+        // A level-set of the chat's plan card: a repeat with the same steps
+        // draws the same card, so a retry after a dropped connection is safe.
+        "update_plan" => Some(json!({
+            "readOnlyHint": false,
+            "destructiveHint": false,
+            "idempotentHint": true,
+        })),
+        // It settles every message it shows. A retry of a call whose answer
+        // was lost would read "No messages waiting" while the batch the
+        // agent never saw is already settled, so it must never be retried.
+        "read_messages" => Some(json!({
+            "readOnlyHint": false,
+            "destructiveHint": false,
+            "idempotentHint": false,
+        })),
+        _ => None,
+    }
 }
 
 /// Plugin manifests cannot claim a core name, including tools gated by role.

@@ -92,14 +92,21 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   faded **pending stack at the scrollable transcript tail**, captioned "next step" or "after this
   turn", until the agent actually reads it (claude: the CLI's `command_lifecycle started`; codex:
   the steered message's `userMessage` item — not the RPC ack). Then it leaves the stack and enters
-  the transcript right there, solid — mid-turn if that is where it was read. Each waiting bubble
+  the transcript right there, solid — mid-turn if that is where it was read. A Codex steer read
+  just as its turn finishes (recorded, but no model step after it) is answered in an input-less
+  follow-up turn, so it never sits read and unanswered (Pass 54). Each waiting bubble
   has **Send now** (stops the current turn, unless Claude can take the message into it by moving what the turn waits on to the background; every waiting message is then read at once — claude
   keeps its queue through the interrupt, and Chimaera re-sends the steers Codex drops; Claude's
   background agents keep running, because Chimaera sends the CLI's own send-now rather than its
   Stop, which ends them for good) and **✕**
   (pulls it back — Claude `cancel_async_message`, an ACP or Codex next-turn queue item
   removed locally; a Codex steer can't be withdrawn and says so).
-  Stop never drops the queue. A genuinely undeliverable entry stays marked **"not delivered"**
+  Stop never drops the queue. On Claude Code 2.1.310+ that holds across the race too: a waiting
+  message the agent took in just as you pressed Stop stays in the stack and runs as a turn of its
+  own (the CLI puts it back); it shows as read only once Claude's reply to it begins. A Stop also
+  names the turn it was meant for, so one that lands after that turn ended leaves the next one
+  running (PROTOCOL.md Pass 53).
+  A genuinely undeliverable entry stays marked **"not delivered"**
   (text kept readable/copyable, never auto-dumped into a draft you may have started); ✕ dismisses
   it. This is driven by the single `pendingSends` reducer and journaled via `user_message`
   `id`/`queued`/`after_turn` + `user_message_update`, so replay rebuilds the same order and delivery

@@ -17,6 +17,11 @@
 //! `plan_tool_for`) are pinned in `tests/mcp.rs`, not in these fixtures.
 //! Re-blessed 2026-10-23 (#344): the comms paragraph asks agents not to send
 //! thanks or acknowledgements, since the Always wake policy has no caps.
+//! Re-blessed 2026-10-23: the tool list carries MCP `annotations`
+//! (`readOnlyHint` on the read-only tools, explicit non-idempotent ones on
+//! `read_messages`), so Claude Code 2.1.307+ retries a read-only call cut off
+//! by a closed connection and never a `read_messages` (PROTOCOL.md Pass 53).
+//! Only `worker_tools*.json` change; the instructions and settings do not.
 
 use super::support::*;
 use crate::{lock, AppState};

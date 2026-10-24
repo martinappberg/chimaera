@@ -72,7 +72,55 @@ async fn mcp_handshake_auth_and_tool_listing() {
         ]
     );
 
+    // MCP annotations: the read-only tools say so (claude 2.1.307+ retries a
+    // call cut off by a closed connection only for read-only or idempotent
+    // tools); read_messages settles what it shows, so it must never be
+    // retried; a command run in a terminal carries the defaults.
+    let annotations = |name: &str| {
+        out["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == name)
+            .map(|t| t["annotations"].clone())
+            .unwrap()
+    };
+    for name in [
+        "list_terminals",
+        "read_terminal",
+        "document_guide",
+        "check_document",
+        "workspace_agents",
+        "read_agent",
+    ] {
+        assert_eq!(
+            annotations(name),
+            serde_json::json!({"readOnlyHint": true}),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        annotations("read_messages"),
+        serde_json::json!({"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false})
+    );
+    for name in ["run_in_terminal", "notify", "open_browser", "message_agent"] {
+        assert!(annotations(name).is_null(), "{name}");
+    }
+
     state.sessions.kill(&id).ok();
+}
+
+/// Every tool an ask-mode Mastermind may call unprompted is read-only, save
+/// read_messages (it settles the messages it shows).
+#[test]
+fn the_mastermind_read_tools_are_annotated_read_only() {
+    for name in crate::mcp::MASTERMIND_READ_TOOLS {
+        assert_eq!(
+            crate::mcp::READ_ONLY_TOOLS.contains(&name),
+            name != "read_messages",
+            "{name}"
+        );
+    }
 }
 
 /// The full agent-side story over MCP: unlinked -> helpful error;
