@@ -3749,10 +3749,9 @@ impl CodexMapper {
                         },
                         content: None,
                     });
-                    // An interrupted call (the parent turn stopped mid-call)
-                    // never reached its agents: nothing to fold.
-                    if !failed && item["status"] != "interrupted" {
-                        self.on_collab_call_completed(item, step);
+                    if !failed {
+                        let interrupted = item["status"] == "interrupted";
+                        self.on_collab_call_completed(item, interrupted, step);
                     }
                 }
             }
@@ -4155,10 +4154,17 @@ impl CodexMapper {
     /// keeps a failed row of its own so the attempt stays visible; an
     /// interrupted one that names its thread still opens the row, since the
     /// child may be running (an invisible subagent is worse than a spurious
-    /// one).
+    /// one), unless the call's own `agentsStates` reports that child gone: a
+    /// row nothing will close would read as running work until teardown.
     fn on_collab_spawn(&mut self, item: &Value, id: String, step: &mut DriverStep) {
         let failed = matches!(item["status"].as_str(), Some("failed" | "declined"));
-        let threads = collab_receivers(item);
+        let mut threads = collab_receivers(item);
+        threads.retain(|thread| {
+            !matches!(
+                item["agentsStates"][thread.as_str()]["status"].as_str(),
+                Some("notFound" | "shutdown")
+            )
+        });
         if failed || threads.is_empty() {
             if let Some(flushed) = self.coalescer.flush() {
                 step.events.push(flushed);
@@ -4209,20 +4215,23 @@ impl CodexMapper {
     /// known to be running — the rule of v2's "completed" marker, because
     /// the verdict can land just before the child's own turn end (live,
     /// gpt-5.6-luna). A receiver this process never saw spawn is parked, so
-    /// its own next turn opens a row.
-    fn on_collab_call_completed(&mut self, item: &Value, step: &mut DriverStep) {
+    /// its own next turn opens a row. An `interrupted` call (the parent turn
+    /// stopped mid-call) may or may not have reached its agents: it closes
+    /// and notes nothing, but still parks an unseen receiver, which draws
+    /// nothing unless that agent's own turn starts.
+    fn on_collab_call_completed(&mut self, item: &Value, interrupted: bool, step: &mut DriverStep) {
         let tool = item["tool"].as_str().unwrap_or_default();
         for thread in collab_receivers(item) {
             match tool {
-                "closeAgent" => {
+                "closeAgent" if !interrupted => {
                     self.collab_agent_close(&thread, StintEnd::Stopped, "closed", step);
                 }
                 "sendInput" | "resumeAgent" | "sendMessage" | "followupTask" => {
                     match self.collab_agent_mut(&thread).map(|agent| agent.open) {
-                        Some(true) => {
+                        Some(true) if !interrupted => {
                             self.collab_agent_note(&thread, "Follow-up input", step);
                         }
-                        Some(false) => {}
+                        Some(_) => {}
                         None => {
                             self.collab_agent_park(&thread, "subagent");
                             if let Some(agent) = self.collab_agent_mut(&thread) {
@@ -4234,6 +4243,9 @@ impl CodexMapper {
                 }
                 _ => {}
             }
+        }
+        if interrupted {
+            return;
         }
         let Some(states) = item["agentsStates"].as_object() else {
             return;
@@ -13091,6 +13103,49 @@ mod tests {
             e,
             AgentEvent::ToolCallUpdate { id, .. } if *id == row
         )));
+    }
+
+    /// An interrupted input call may still have reached an agent this
+    /// process never saw spawn: it is parked (no row) and read, so its own
+    /// turn still opens one. An interrupted spawn whose call reports the
+    /// child gone opens no row that nothing would close.
+    #[test]
+    fn interrupted_v1_input_parks_an_unseen_agent_and_a_gone_spawn_opens_nothing() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let step = m.on_frame(&v1_call(
+            "item/completed",
+            "call_in_i",
+            "sendInput",
+            "interrupted",
+            json!({ "receiverThreadIds": [V1_CHILD], "prompt": "and now 43" }),
+        ));
+        assert_eq!(thread_reads(&step).len(), 1);
+        let step = m.on_frame(&foreign(
+            "turn/started",
+            V1_CHILD,
+            json!({ "turn": { "id": "t-9" } }),
+        ));
+        assert!(step.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolCall { id, kind: ToolKind::Agent, .. }
+                if id.starts_with(&format!("agent:{V1_CHILD}@"))
+        )));
+
+        let mut m = mapper();
+        active_turn(&mut m);
+        let mut spawn = v1_spawn("interrupted", json!([V1_CHILD]));
+        spawn["params"]["item"]["agentsStates"] =
+            json!({ V1_CHILD: { "status": "notFound", "message": null } });
+        let step = m.on_frame(&spawn);
+        assert!(!step.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolCall {
+                kind: ToolKind::Agent,
+                ..
+            }
+        )));
+        assert!(m.collab_agents.is_empty());
     }
 
     /// v1 input to an agent this process never saw spawn (a thread resumed
