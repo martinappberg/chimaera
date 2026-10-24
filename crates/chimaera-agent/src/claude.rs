@@ -68,16 +68,39 @@ fn autocompact_pct(value: &Value) -> Option<f64> {
     let pct = match value {
         Value::Number(n) => n.as_f64()?,
         Value::String(text) => {
-            // `parseFloat` takes the longest numeric prefix, exponent
-            // included ("8e1" is 80). Rust's extra spellings (`inf`, `nan`)
-            // land outside (0, 100] either way.
-            let text = text.trim_start();
-            let cap = text.char_indices().nth(32).map_or(text.len(), |(i, _)| i);
-            let text = &text[..cap];
-            (1..=text.len())
-                .rev()
-                .filter(|&end| text.is_char_boundary(end))
-                .find_map(|end| text[..end].parse::<f64>().ok())?
+            // `parseFloat`: skip JS whitespace (BOM yes, NEL no), then take
+            // the longest decimal prefix, exponent included ("8e1" is 80).
+            // Its one other spelling, `Infinity`, is outside (0, 100].
+            let text = text.trim_start_matches(|c: char| {
+                (c.is_whitespace() && c != '\u{85}') || c == '\u{feff}'
+            });
+            let bytes = text.as_bytes();
+            let digits = |from: usize| {
+                bytes.get(from..).map_or(0, |rest| {
+                    rest.iter().take_while(|b| b.is_ascii_digit()).count()
+                })
+            };
+            let mut end = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
+            let int = digits(end);
+            end += int;
+            let mut frac = 0;
+            if bytes.get(end) == Some(&b'.') {
+                frac = digits(end + 1);
+                if int + frac > 0 {
+                    end += 1 + frac;
+                }
+            }
+            if int + frac == 0 {
+                return None;
+            }
+            if matches!(bytes.get(end), Some(b'e' | b'E')) {
+                let exp = end + 1 + usize::from(matches!(bytes.get(end + 1), Some(b'+' | b'-')));
+                let exp_digits = digits(exp);
+                if exp_digits > 0 {
+                    end = exp + exp_digits;
+                }
+            }
+            text[..end].parse::<f64>().ok()?
         }
         _ => return None,
     };
@@ -10539,6 +10562,14 @@ pub(crate) mod tests {
         assert_eq!(autocompact_pct(&json!("75e")), Some(75.0));
         assert_eq!(autocompact_pct(&json!("1.5.2")), Some(1.5));
         assert_eq!(autocompact_pct(&json!("inf")), None);
+        assert_eq!(autocompact_pct(&json!("5.")), Some(5.0));
+        assert_eq!(autocompact_pct(&json!(".5x")), Some(0.5));
+        assert_eq!(autocompact_pct(&json!("8e+1%")), Some(80.0));
+        assert_eq!(autocompact_pct(&json!("\u{feff}80")), Some(80.0));
+        assert_eq!(autocompact_pct(&json!("\u{85}80")), None);
+        // No length cap: a long spelling still reads as the CLI reads it.
+        let padded = format!("{}80", "0".repeat(40));
+        assert_eq!(autocompact_pct(&json!(padded)), Some(80.0));
         assert_eq!(autocompact_pct(&json!(42)), Some(42.0));
         assert_eq!(autocompact_pct(&json!("100")), Some(100.0));
         assert_eq!(autocompact_pct(&json!("0")), None);

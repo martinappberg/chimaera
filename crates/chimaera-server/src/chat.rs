@@ -1204,23 +1204,34 @@ async fn resolve_respawn_inputs(
     let (settings, mcp_config) = if kind == AgentKind::Claude {
         let settings_path = crate::agents::settings_path(id);
         let mcp_path = crate::agents::mcp_config_path(id);
-        if settings_path.exists() && mcp_path.exists() {
-            // The file is the one this session started with; a toggle in
-            // the chat since then lives only in the conversation's record,
-            // and the threshold is read as it is now.
-            let compaction = crate::agents::Compaction {
-                enabled: resume.and_then(|native| conversation_auto_compact(state, native)),
-                at: crate::lock(&state.settings).auto_compact_at(),
-            };
-            // Every Claude respawn now reads (and may rewrite) the file: off
-            // the reactor.
-            let refresh_path = settings_path.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::agents::refresh_settings_compaction(&refresh_path, compaction)
-            })
-            .await
-            .map_err(|err| err.to_string())?
-            .map_err(|err| err.to_string())?;
+        // A reused file is the one this session started with; a toggle in
+        // the chat since then lives only in the conversation's record, and
+        // the threshold is read as it is now.
+        let compaction = crate::agents::Compaction {
+            enabled: resume.and_then(|native| conversation_auto_compact(state, native)),
+            at: crate::lock(&state.settings).auto_compact_at(),
+        };
+        // The presence checks and the refresh (a read, maybe a rewrite) are
+        // blocking fs: one trip off the reactor.
+        let (probe_settings, probe_mcp) = (settings_path.clone(), mcp_path.clone());
+        // A file the refresh can't use (cut short by a full disk, say) is
+        // regenerated like a scrubbed one: refusing would fail every later
+        // rewind and view switch of the session with no way out.
+        let reused = tokio::task::spawn_blocking(move || {
+            if !(probe_settings.exists() && probe_mcp.exists()) {
+                return false;
+            }
+            match crate::agents::refresh_settings_compaction(&probe_settings, compaction) {
+                Ok(()) => true,
+                Err(err) => {
+                    tracing::warn!(%err, path = %probe_settings.display(), "settings file unusable; regenerating");
+                    false
+                }
+            }
+        })
+        .await
+        .map_err(|err| err.to_string())?;
+        if reused {
             (Some(settings_path), Some(mcp_path))
         } else {
             // Runtime state is explicitly reconstructible: macOS and Linux
@@ -2146,13 +2157,30 @@ pub(crate) async fn rewind_session(
                 .map(|content| compacted_since_anchor(&content, &anchor))
         })
         .await;
-        if matches!(compacted, Ok(Ok(true))) {
-            return err(
-                StatusCode::CONFLICT,
-                "the conversation was compacted after this message, so Claude can no longer \
-                 rewind it there; fork from the message instead"
-                    .to_string(),
-            );
+        match compacted {
+            Ok(Ok(false)) => {}
+            Ok(Ok(true)) => {
+                return err(
+                    StatusCode::CONFLICT,
+                    "the conversation was compacted after this message, so Claude can no longer \
+                     rewind it there; fork from the message instead"
+                        .to_string(),
+                );
+            }
+            // Unchecked is refused too: a rewind past a compaction kills the
+            // chat after its journal is cut, which is what this check guards.
+            Ok(Err(e)) => {
+                return err(
+                    StatusCode::CONFLICT,
+                    format!("couldn't read this chat's history to check the rewind point: {e}"),
+                );
+            }
+            Err(_) => {
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "the rewind check didn't finish".to_string(),
+                );
+            }
         }
     }
 
