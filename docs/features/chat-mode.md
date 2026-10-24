@@ -99,7 +99,12 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   Stop, which ends them for good) and **✕**
   (pulls it back — Claude `cancel_async_message`, an ACP or Codex next-turn queue item
   removed locally; a Codex steer can't be withdrawn and says so).
-  Stop never drops the queue. A genuinely undeliverable entry stays marked **"not delivered"**
+  Stop never drops the queue. On Claude Code 2.1.310+ that holds across the race too: a waiting
+  message the agent took in just as you pressed Stop stays in the stack and runs as a turn of its
+  own (the CLI puts it back); it shows as read only once Claude's reply to it begins. A Stop also
+  names the turn it was meant for, so one that lands after that turn ended leaves the next one
+  running (PROTOCOL.md Pass 53).
+  A genuinely undeliverable entry stays marked **"not delivered"**
   (text kept readable/copyable, never auto-dumped into a draft you may have started); ✕ dismisses
   it. This is driven by the single `pendingSends` reducer and journaled via `user_message`
   `id`/`queued`/`after_turn` + `user_message_update`, so replay rebuilds the same order and delivery
