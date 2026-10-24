@@ -64,7 +64,7 @@ describe("armedKey", () => {
     expect(armedKey(key("a"), true)).toBe("dismiss");
     expect(armedKey(key("Enter"), true)).toBe("dismiss");
     expect(armedKey(key("Escape"), false)).toBe("dismiss");
-    // Esc confirms only a Stop; an armed Clear goal or Send now is cancelled.
+    // Esc confirms only a Stop; an armed Clear goal is cancelled.
     expect(armedKey(key("Escape"), true, false, false)).toBe("dismiss");
     expect(armedKey(key("Escape"), true, true, false)).toBe("dismiss");
   });
@@ -149,6 +149,6 @@ describe("the hint names the real gesture", () => {
   it("ends with the action's own verb", () => {
     expect(actionVerb("stop")).toBe("stop");
     expect(actionVerb("goal")).toBe("clear");
-    expect(actionVerb("stop")).toBe("stop");
+    expect(confirmHint(actionVerb("goal"), "pointer").how).toBe("Click again to clear");
   });
 });

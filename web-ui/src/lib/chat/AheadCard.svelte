@@ -52,6 +52,9 @@
     /** A Clear waiting for its second press: what else it ends, and the
      *  hint. Shown above the Clear that was pressed. */
     goalConfirm?: { text: string; how: string } | null;
+    /** The question moved to the other Clear: the host asks afresh from
+     *  there (the hint's gesture and the timeout follow the new press). */
+    onGoalAskMoved?: (via: "key" | "pointer") => void;
   }
   let {
     wakeup,
@@ -67,6 +70,7 @@
     onGoalResume,
     onGoalClear,
     goalConfirm = null,
+    onGoalAskMoved,
   }: Props = $props();
 
   /** Which Clear asked (the row's hover action or the detail's link): its
@@ -78,6 +82,7 @@
     // acts from a control that never showed it.
     if (goalConfirm !== null && clearFrom !== from && !goalInline) {
       clearFrom = from;
+      onGoalAskMoved?.(clickVia(e));
       return;
     }
     clearFrom = from;
@@ -491,11 +496,14 @@
     color: var(--warn);
     background: color-mix(in srgb, var(--warn) 12%, transparent);
   }
-  .clear-anchor {
+  /* The detail's note hangs from its actions cell (the card's value
+     column), not the link: capped by the card, never the window, so a
+     narrow pane can't push it past its edge. */
+  .detail .links:has(.clear-anchor) {
     position: relative;
     --stop-note-right: auto;
     --stop-note-left: 0;
-    --stop-note-max: min(26rem, 80vw);
+    --stop-note-max: 100%;
   }
   .link.armed {
     color: var(--warn);

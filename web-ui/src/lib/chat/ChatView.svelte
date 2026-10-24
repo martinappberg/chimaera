@@ -1656,7 +1656,13 @@
     armed = step === "arm" ? { control, via, act } : null;
     if (step === "act") act();
   }
-  /** Run whatever action is waiting (Esc, from anywhere in this chat). */
+  /** The goal question moved to the other Clear: a fresh object, so the
+   *  hint names this press's gesture and the timeout starts over. */
+  function reaskGoal(via: ConfirmVia) {
+    if (armed?.control === "goal") armed = { ...armed, via };
+  }
+  /** Run whatever action is waiting (Esc on an armed Stop, from anywhere in
+   *  this chat). */
   function confirmArmed() {
     const act = armed?.act;
     armed = null;
@@ -1677,7 +1683,7 @@
     press("stop", via, sendInterrupt);
   }
   // The question lapses with its cause: the turn ended on its own, the work
-  // it named finished, the message was read, or the chat was hidden.
+  // it named finished, or the chat was hidden.
   $effect(() => {
     if (armed !== null && (armedConfirm === null || !visible)) untrack(() => (armed = null));
   });
@@ -3723,6 +3729,7 @@
       onGoalResume={goalResume}
       onGoalClear={goalClear}
       {goalConfirm}
+      onGoalAskMoved={reaskGoal}
     />
   {/snippet}
 

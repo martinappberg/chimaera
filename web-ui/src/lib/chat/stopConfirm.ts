@@ -145,7 +145,7 @@ export function armedKey(
   inChat: boolean,
   onArmedControl = false,
   /** Esc is the stop key, so it confirms an armed Stop; for any other
-   *  armed action (Clear goal, Send now) Esc is cancel. */
+   *  armed action (Clear goal) Esc is cancel. */
   escConfirms = true,
 ): "confirm" | "dismiss" | "ignore" | "hold" {
   if (e.key === "Shift" || e.key === "Control" || e.key === "Alt" || e.key === "Meta") {
