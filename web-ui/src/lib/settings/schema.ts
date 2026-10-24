@@ -88,8 +88,9 @@ export type SettingsMap = {
   "appearance.interfaceFontFamily": string;
   "agents.defaultView": "chat" | "terminal";
   "agents.communication.enabled": boolean;
-  "agents.communication.wakes": "never" | "ask" | "auto";
+  "agents.communication.wakes": "never" | "ask" | "auto" | "always";
   "agents.communication.freeSubagents": boolean;
+  "agents.autoCompact": "agent" | "on" | "off";
   "dashboard.landing": "auto" | "never";
   "dashboard.cardDensity": "auto" | "comfortable" | "compact";
   "dashboard.roster": "line" | "cards";
@@ -261,13 +262,14 @@ const DEFS = {
     title: "Agents may wake each other",
     category: "Agents",
     description:
-      "Whether another agent's message may start a turn in an idle agent — a turn billed to your account. Automatically wakes it — up to 20 wakes in a workspace since you last stepped in (a prompt in one of its chats or Claude terminals, a Wake, a hand-over) and 4 rounds of one back-and-forth; past those you're asked once. Ask me asks every time, in the agent's chat and in Needs you; a reply to a question it asked still wakes it. Never keeps messages in its inbox until it looks or you hand them over. Terminal agents are never woken.",
+      "Whether another agent's message may start a turn in an idle agent — a turn billed to your account. Ask me asks every time, in the agent's chat and in Needs you; a reply to a question it asked still wakes it. Within limits wakes it on its own, up to 20 wakes in a workspace since you last stepped in (a prompt in one of its chats or Claude terminals, a Wake, a hand-over) and 4 rounds of one back-and-forth; past those you're asked once. Always wakes it every time, with no limits. Never keeps messages in its inbox until it looks or you hand them over. Terminal agents are never woken.",
     type: "enum",
-    default: "auto",
+    default: "ask",
     options: [
       { value: "never", label: "Never" },
       { value: "ask", label: "Ask me" },
-      { value: "auto", label: "Automatically" },
+      { value: "auto", label: "Within limits" },
+      { value: "always", label: "Always" },
     ],
     scope: "daemon",
   },
@@ -282,6 +284,24 @@ const DEFS = {
     default: false,
     scope: "daemon",
     note: "Claude chats. Codex reads a message while it waits on its subagents either way.",
+  },
+
+  // Claude Code's own switch, set per session through the generated
+  // --settings file (crates/chimaera-agent/protocol/passes.md, Pass 50).
+  "agents.autoCompact": {
+    title: "Auto-Compact (Claude)",
+    category: "Agents",
+    description:
+      "Whether Claude Code summarizes a long conversation on its own when the context fills. Agent default follows your Claude Code settings. Off: it waits for /compact or Compact under a chat's usage meter, and a full context stops the turn.",
+    type: "enum",
+    default: "agent",
+    options: [
+      { value: "agent", label: "Agent default" },
+      { value: "on", label: "On" },
+      { value: "off", label: "Off" },
+    ],
+    scope: "daemon",
+    note: "Claude sessions started after the change. A chat's own switch, under its usage meter, wins for that conversation.",
   },
 
   // --- Dashboard ---------------------------------------------------------------

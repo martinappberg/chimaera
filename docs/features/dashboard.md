@@ -61,7 +61,8 @@ workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
 - **Wake requests** ([agent-communication.md](agent-communication.md#wakes-and-wake-requests)).
   When a message to an idle chat agent needs the user's OK (the **Ask me** wake policy, or
   agents that kept waking each other since the user last stepped in), Needs you adds a card — "analyst
-  wants to wake reviewer" with the message — offering **Wake** / **Leave in inbox**; a
+  wants to wake reviewer" with the message — offering **Wake** (its chevron wakes it "from
+  now on": Within limits or Always, as the agent's own wake bar does) / **Leave in inbox**; a
   conversation past its wake limit asks "… have been going back and forth — let them
   continue?" (**Continue**). From the comms store (`workspace/comms.svelte.ts`, over
   `GET /workspaces/{id}/comms` and the `comms` epoch frame), counted in "needs you"; a refused

@@ -18,6 +18,7 @@
   import type { ModelChoice } from "./modelPicker";
   import ModelPicker from "./ModelPicker.svelte";
   import UsageMeter from "./UsageMeter.svelte";
+  import { clickVia } from "./stopConfirm";
   import type { UsageRow } from "../shared/usage";
 
   interface Props {
@@ -47,13 +48,21 @@
     onPickEffort: (id: string) => void;
     onToggleUltracode: () => void;
     onToggleThinking: () => void;
-    onInterrupt: () => void;
+    /** The Stop, pressed by keyboard or pointer (the hint names which). */
+    onInterrupt: (via: "key" | "pointer") => void;
+    /** A Stop is waiting for its second press (the composer says why). */
+    stopArmed?: boolean;
     /** Turn the agent's Remote Control bridge on/off (claude: the
      *  `remote_control` control; codex answers with a pointer to its daemon). */
     onSetRemoteControl: (enabled: boolean) => void;
     /** Free the context window (the usage popover's Compact); offered only
      *  while the agent is idle. */
     onCompact?: () => void;
+    /** This chat's auto-compact (null: the agent has no per-chat switch). */
+    autoCompact?: boolean | null;
+    /** The environment variable holding it off, when one does. */
+    autoCompactDisabledBy?: string | null;
+    onSetAutoCompact?: (enabled: boolean) => void;
     /** Agent settings, where the account's limits are read live. */
     onOpenSettings?: () => void;
     /** Sign in to the agent here — offered in every state the chat can be
@@ -73,6 +82,9 @@
     visible = true,
     menu = $bindable(),
     onCompact,
+    autoCompact = null,
+    autoCompactDisabledBy = null,
+    onSetAutoCompact,
     onOpenSettings,
     onSignIn,
     accountLimits = [],
@@ -96,6 +108,7 @@
     onToggleUltracode,
     onToggleThinking,
     onInterrupt,
+    stopArmed = false,
     onSetRemoteControl,
   }: Props = $props();
 
@@ -339,7 +352,7 @@
   <span class="spacer"></span>
   <div class="session-status">
   {#if store.running || store.compacting}
-    <button class="stop" onclick={onInterrupt} aria-label="Stop" title="interrupt the agent (Esc)"><span class="stop-mark" aria-hidden="true"></span><span class="stop-label">Stop</span></button>
+    <button class="stop" class:armed={stopArmed} data-stop-control="stop" onclick={(e) => onInterrupt(clickVia(e))} aria-label="Stop" title="interrupt the agent (Esc)"><span class="stop-mark" aria-hidden="true"></span><span class="stop-label">Stop</span></button>
   {/if}
   <UsageMeter
     contextPct={store.contextPct}
@@ -350,6 +363,9 @@
     onToggle={() => (menu = menu === "usage" ? null : "usage")}
     onClose={() => (menu = null)}
     {onCompact}
+    {autoCompact}
+    {autoCompactDisabledBy}
+    {onSetAutoCompact}
     {onOpenSettings}
   />
   </div>
@@ -609,5 +625,11 @@
   .stop-mark { width: 6px; height: 6px; border-radius: 1px; background: currentColor; }
   .stop:hover {
     background: var(--row-hover);
+  }
+  /* Waiting for the second press: the composer's note says what else stops. */
+  .stop.armed {
+    color: var(--warn);
+    border-color: color-mix(in srgb, var(--warn) 55%, var(--edge));
+    background: color-mix(in srgb, var(--warn) 10%, var(--term-bg));
   }
 </style>

@@ -15,7 +15,7 @@ Orientation for coding agents. This crate is the daemon: every HTTP route, every
 | `claude_store.rs`, `goal_outcome.rs` | Where a Claude transcript lives; how a `/goal` ended. |
 | `operation.rs`, `agent_setup.rs`, `agent_auth.rs` | Per-agent bounded jobs: installs, sign-in. |
 | `launcher.rs` | argv assembly, binary detection and resolution, role prompts. |
-| `agent_state.rs`, `agents.rs`, `spawn.rs` | Pure agent state; hook ingest and writers; PTY spawn. |
+| `agent_state.rs`, `agents.rs`, `spawn.rs` | Pure agent state; hook ingest and writers (the per-session Claude `--settings` file also carries `autoCompactEnabled`: the reopened conversation's pick, else `agents.autoCompact` On/Off, via `chat::claude_auto_compact`; `set_settings_auto_compact` rewrites it in a reused file); PTY spawn. |
 | `git/` | Read-only git: repositories, session tracker, diffs, history. |
 | `fs.rs`, `embed.rs`, `notebook.rs` | Filesystem service and previews; link targets; notebook pages. |
 | `fs_watch.rs`, `doc_check.rs`, `drafts.rs`, `agent_docs.rs` | Disk monitor; dialect checker; draft mirror; "teach agents" docs. |

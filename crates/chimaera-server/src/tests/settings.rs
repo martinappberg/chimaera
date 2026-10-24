@@ -94,6 +94,35 @@ async fn codex_steering_setting_preserves_native_defaults_and_rejects_unknown_ov
     }
 }
 
+/// Agent default (absent, unknown, or a stray boolean) writes nothing, so
+/// the user's own Claude Code settings decide; On and Off write their value.
+#[tokio::test]
+async fn auto_compact_setting_writes_only_an_explicit_choice() {
+    let state = test_state();
+    assert_eq!(lock(&state.settings).claude_auto_compact(), None);
+    for (value, expected) in [
+        (serde_json::json!("off"), Some(false)),
+        (serde_json::json!("on"), Some(true)),
+        (serde_json::json!("agent"), None),
+        (serde_json::json!(false), None),
+        (serde_json::json!("sometimes"), None),
+    ] {
+        let (status, _) = request(
+            &state,
+            Method::PUT,
+            "/api/v1/settings",
+            Some(serde_json::json!({"agents.autoCompact": value})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            lock(&state.settings).claude_auto_compact(),
+            expected,
+            "{value}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn new_chat_model_setting_opts_out_only_for_agent_defaults() {
     let state = test_state();

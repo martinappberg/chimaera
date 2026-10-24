@@ -11,7 +11,7 @@
 
 use chimaera_agent::journal::SeqEvent;
 use chimaera_agent::model::{
-    AgentCommand, AgentEvent, CompactionPhase, ContentBlock, PermissionOption,
+    AgentCommand, AgentEvent, CompactionPhase, CompactionTrigger, ContentBlock, PermissionOption,
     PermissionOptionKind, Question, RemoteControlSnapshot, RemoteControlState, ToolKind,
     ToolStatus, UserMessageState,
 };
@@ -75,6 +75,7 @@ fn agent_event_wire_shapes() {
         serde_json::to_value(AgentEvent::ContextCompaction {
             phase: CompactionPhase::Started,
             pre_tokens: None,
+            trigger: None,
         })
         .unwrap(),
         json!({ "type": "context_compaction", "phase": "started" })
@@ -83,12 +84,36 @@ fn agent_event_wire_shapes() {
         serde_json::to_value(AgentEvent::ContextCompaction {
             phase: CompactionPhase::Completed,
             pre_tokens: Some(168_000),
+            trigger: Some(CompactionTrigger::Auto),
         })
         .unwrap(),
         json!({
             "type": "context_compaction",
             "phase": "completed",
             "pre_tokens": 168_000,
+            "trigger": "auto",
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(AgentEvent::AutoCompact {
+            enabled: false,
+            disabled_by: None,
+            picked: Some(false),
+        })
+        .unwrap(),
+        json!({ "type": "auto_compact", "enabled": false, "picked": false })
+    );
+    assert_eq!(
+        serde_json::to_value(AgentEvent::AutoCompact {
+            enabled: false,
+            disabled_by: Some("DISABLE_AUTO_COMPACT".into()),
+            picked: None,
+        })
+        .unwrap(),
+        json!({
+            "type": "auto_compact",
+            "enabled": false,
+            "disabled_by": "DISABLE_AUTO_COMPACT",
         })
     );
 }
@@ -856,6 +881,10 @@ fn loop_and_goal_wire_shapes_are_additive() {
         (AgentCommand::PauseGoal, json!({ "type": "pause_goal" })),
         (AgentCommand::ResumeGoal, json!({ "type": "resume_goal" })),
         (AgentCommand::ClearGoal, json!({ "type": "clear_goal" })),
+        (
+            AgentCommand::SetAutoCompact { enabled: false },
+            json!({ "type": "set_auto_compact", "enabled": false }),
+        ),
     ] {
         assert_eq!(serde_json::to_value(&cmd).unwrap(), wire);
         assert_eq!(serde_json::from_value::<AgentCommand>(wire).unwrap(), cmd);
@@ -1356,6 +1385,25 @@ fn chat_events_fixture() {
             AgentEvent::ContextCompaction {
                 phase: CompactionPhase::Completed,
                 pre_tokens: Some(168_000),
+                trigger: Some(CompactionTrigger::Auto),
+            },
+        ),
+        (
+            "auto_compact",
+            "the user turned auto-compact off for this chat",
+            AgentEvent::AutoCompact {
+                enabled: false,
+                disabled_by: None,
+                picked: Some(false),
+            },
+        ),
+        (
+            "auto_compact_held_off",
+            "the agent's environment holds auto-compact off",
+            AgentEvent::AutoCompact {
+                enabled: false,
+                disabled_by: Some("DISABLE_AUTO_COMPACT".into()),
+                picked: None,
             },
         ),
         (
@@ -1733,6 +1781,7 @@ fn chat_events_fixture() {
             AgentEvent::QuestionResolved { .. } => "question_resolved",
             AgentEvent::ModeChanged { .. } => "mode_changed",
             AgentEvent::EffortState { .. } => "effort_state",
+            AgentEvent::AutoCompact { .. } => "auto_compact",
             AgentEvent::TurnCompleted { .. } => "turn_completed",
             AgentEvent::TurnAborted { .. } => "turn_aborted",
             AgentEvent::ContextUsage { .. } => "context_usage",
@@ -1798,7 +1847,7 @@ fn chat_events_fixture() {
         .collect();
     assert_eq!(
         covered.len(),
-        57,
+        58,
         "every AgentEvent variant has at least one case"
     );
     pin(

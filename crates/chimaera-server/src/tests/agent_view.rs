@@ -15,6 +15,8 @@
 //! pre-allow `mcp__chimaera__update_plan`. The worker here is a terminal
 //! session, so the plan paragraph and tool a Claude CHAT gets (`mcp.rs`
 //! `plan_tool_for`) are pinned in `tests/mcp.rs`, not in these fixtures.
+//! Re-blessed 2026-10-23 (#344): the comms paragraph asks agents not to send
+//! thanks or acknowledgements, since the Always wake policy has no caps.
 //! Re-blessed 2026-10-23: the tool list carries MCP `annotations`
 //! (`readOnlyHint` on the read-only tools, explicit non-idempotent ones on
 //! `read_messages`), so Claude Code 2.1.307+ retries a read-only call cut off
@@ -147,9 +149,17 @@ async fn worker_mcp_view_is_unchanged() {
 
 #[test]
 fn worker_generated_settings_and_codex_argv_are_unchanged() {
-    let path =
-        crate::agents::write_settings("s-agentview", "KEY", 4242, Some("dark"), None, None, &[])
-            .expect("write settings");
+    let path = crate::agents::write_settings(
+        "s-agentview",
+        "KEY",
+        4242,
+        Some("dark"),
+        None,
+        None,
+        &[],
+        None,
+    )
+    .expect("write settings");
     let body = std::fs::read_to_string(&path).unwrap();
     // Normalize the per-host bits (the runtime dir) so the fixture is portable.
     let runtime = chimaera_core::runtime_dir();
