@@ -161,7 +161,7 @@
    *  block under the bespoke binaries panel. */
   const isCommsDef = (d: SettingDef) => d.id.startsWith("agents.communication.");
   /** Agent-wide session behavior: a titled block of its own. */
-  const isContextDef = (d: SettingDef) => d.id === "agents.autoCompact";
+  const isContextDef = (d: SettingDef) => d.id === "agents.autoCompact" || d.id === "agents.autoCompactAt";
 
   // A section asked for from elsewhere (Quick Open "Usage", the dashboard's
   // cost line): clear any search that hides it, then scroll there once shown.

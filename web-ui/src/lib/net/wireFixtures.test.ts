@@ -181,6 +181,14 @@ describe("chat-events: every AgentEvent variant through the chat socket and the 
     expect(store.backgroundTasks.map((t) => t.id)).toEqual(["bg-1", "bg-2"]);
     expect(store.jobs.map((j) => j.id)).toEqual(["f2143f41"]);
   });
+
+  it("reads where the agent compacts off the context meter frame", () => {
+    const usage = cases.find((c) => (c.frame.ev as { type?: string }).type === "context_usage")!;
+    const store = new ChatStore();
+    store.apply(usage.frame as unknown as SeqEvent);
+    expect(store.contextTokens).toEqual({ total: 84_000, max: 200_000 });
+    expect(store.contextCompactAt).toBe(160_000);
+  });
 });
 
 describe("chat-socket: /ws/chat frames through ChatSocket", () => {

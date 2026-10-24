@@ -1372,11 +1372,12 @@ fn chat_events_fixture() {
         ),
         (
             "context_usage",
-            "context window fill",
+            "context window fill, with the threshold the agent compacts at",
             AgentEvent::ContextUsage {
                 total_tokens: 84_000,
                 max_tokens: 200_000,
                 percentage: 42.0,
+                auto_compact_at: Some(160_000),
             },
         ),
         (

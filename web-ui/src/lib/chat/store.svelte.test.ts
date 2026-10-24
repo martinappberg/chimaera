@@ -174,6 +174,19 @@ describe("ChatStore context compaction", () => {
     expect(compactionNotice(undefined, undefined)).toBe("context compacted");
   });
 
+  it("keeps where the agent compacts, only while it says so", () => {
+    const set = fold([
+      { type: "context_usage", percentage: 3, total_tokens: 32_052, max_tokens: 1_000_000, auto_compact_at: 784_000 },
+    ]);
+    expect(set.contextCompactAt).toBe(784_000);
+    const dropped = fold([
+      { type: "context_usage", percentage: 3, total_tokens: 32_052, max_tokens: 1_000_000, auto_compact_at: 784_000 },
+      { type: "context_usage", percentage: 4, total_tokens: 41_533, max_tokens: 1_000_000 },
+    ]);
+    expect(dropped.contextCompactAt).toBeNull();
+    expect(fold([]).contextCompactAt).toBeNull();
+  });
+
   it("marks checkpoints from before the latest compaction", () => {
     const store = fold([
       { type: "user_message", text: "one", id: "u1" },

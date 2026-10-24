@@ -683,6 +683,10 @@ export class ChatStore {
    *  turn; codex tokenUsage vs modelContextWindow). */
   contextPct = $state<number | null>(null);
   contextTokens = $state<{ total: number; max: number } | null>(null);
+  /** Where on that window the agent compacts on its own, in tokens, when it
+   *  applies a threshold someone set (claude's percentage override, codex's
+   *  post-turn percentage); null at its own default or when it doesn't say. */
+  contextCompactAt = $state<number | null>(null);
   /** Journal seq of the latest completed compaction (0: none). Claude can't
    *  resume at a message from before it, so a rewind there is limited. */
   lastCompactionSeq = $state(0);
@@ -1742,6 +1746,8 @@ export class ChatStore {
           total: (ev.total_tokens as number) ?? 0,
           max: (ev.max_tokens as number) ?? 0,
         };
+        this.contextCompactAt =
+          typeof ev.auto_compact_at === "number" && ev.auto_compact_at > 0 ? ev.auto_compact_at : null;
         break;
       }
       case "context_compaction": {
@@ -1948,6 +1954,7 @@ export class ChatStore {
           this.autoCompactDisabledBy = null;
           this.contextPct = null;
           this.contextTokens = null;
+          this.contextCompactAt = null;
           this.rateLimit = null;
           this.rewind = null;
           this.mcpServers = null;

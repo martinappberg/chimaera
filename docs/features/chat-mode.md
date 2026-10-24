@@ -150,6 +150,12 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   off to a new session when it compacts: the summary replaces history in the same conversation
   (PROTOCOL.md Pass 50). With Claude's auto-compact off, a full context ends the turn with "Prompt is
   too long" and the notice "context limit reached · /compact to continue".
+  With Settings → Agents → Auto-Compact At set, the usage popover marks the threshold the CLI
+  really applies on the Context bar and says "Auto-compact at N%" (Claude's is read from its
+  own context report and merged settings, so 80% reads 78% on a 1M window; Codex's is checked as
+  a turn ends); nothing extra at an agent's default or with auto-compact off. A Claude rewind to
+  a message from before a compaction keeps only "restore files" (the CLI can't resume there); a
+  fork from there goes portable (PROTOCOL.md Pass 55).
   The slash popover triggers after any whitespace boundary, so prose such as
   `please use /skill` remains fully editable while the matching command menu opens. A mid-draft
   pick completes the token in place; only a whole-draft slash takes the command path. Native

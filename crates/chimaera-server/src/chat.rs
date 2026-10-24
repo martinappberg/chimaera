@@ -903,7 +903,7 @@ async fn switch_to_pty(
     } else {
         None
     };
-    let argv = crate::launcher::build_agent_resume_command(
+    let mut argv = crate::launcher::build_agent_resume_command(
         recipe.kind,
         &bin,
         recipe.settings.as_deref(),
@@ -914,6 +914,10 @@ async fn switch_to_pty(
         codex_theme,
         fork_context_file.as_deref(),
     );
+    if recipe.kind == AgentKind::Codex {
+        let at = crate::lock(&state.settings).auto_compact_at();
+        crate::launcher::push_codex_compact_at(&mut argv, at);
+    }
     // A view-switch respawn is a real spawn too — same prelude as the chat
     // process it replaces (the recipe carries the launch scope).
     let startup = crate::environment::job_startup().await;
@@ -1202,13 +1206,14 @@ async fn resolve_respawn_inputs(
         let mcp_path = crate::agents::mcp_config_path(id);
         if settings_path.exists() && mcp_path.exists() {
             // The file is the one this session started with; a toggle in
-            // the chat since then lives only in the conversation's record.
-            if let Some(enabled) =
-                resume.and_then(|native| conversation_auto_compact(state, native))
-            {
-                crate::agents::set_settings_auto_compact(&settings_path, enabled)
-                    .map_err(|err| err.to_string())?;
-            }
+            // the chat since then lives only in the conversation's record,
+            // and the threshold is read as it is now.
+            let compaction = crate::agents::Compaction {
+                enabled: resume.and_then(|native| conversation_auto_compact(state, native)),
+                at: crate::lock(&state.settings).auto_compact_at(),
+            };
+            crate::agents::refresh_settings_compaction(&settings_path, compaction)
+                .map_err(|err| err.to_string())?;
             (Some(settings_path), Some(mcp_path))
         } else {
             // Runtime state is explicitly reconstructible: macOS and Linux
@@ -1226,7 +1231,6 @@ async fn resolve_respawn_inputs(
                     .await;
             let settings_theme = (!theme_set).then_some(theme);
             let plugin_tools = crate::plugins::spawn_allow(state, workspace_id).await;
-            let auto_compact = claude_auto_compact(state, resume);
             let settings = crate::agents::write_settings(
                 id,
                 &key,
@@ -1235,7 +1239,7 @@ async fn resolve_respawn_inputs(
                 user_statusline.as_ref(),
                 mastermind,
                 &plugin_tools,
-                auto_compact,
+                claude_compaction(state, resume),
             )
             .map_err(|err| err.to_string())?;
             let mcp = crate::agents::write_mcp_config(id, &key, state.port)
@@ -3381,12 +3385,11 @@ pub(crate) async fn spawn_fresh_chat_at(
         let settings_theme = (!theme_set).then_some(spec.theme.as_str());
         let plugin_tools = crate::plugins::spawn_allow(state, &workspace.id).await;
         // A branch starts from its parent's pick.
-        let auto_compact = inherited_auto_compact.or_else(|| {
-            claude_auto_compact(
-                state,
-                native_fork.as_ref().map(|(source, _)| source.as_str()),
-            )
-        });
+        let mut compaction = claude_compaction(
+            state,
+            native_fork.as_ref().map(|(source, _)| source.as_str()),
+        );
+        compaction.enabled = inherited_auto_compact.or(compaction.enabled);
         let s = crate::agents::write_settings(
             &id,
             &key,
@@ -3395,7 +3398,7 @@ pub(crate) async fn spawn_fresh_chat_at(
             user_statusline.as_ref(),
             spec.mastermind,
             &plugin_tools,
-            auto_compact,
+            compaction,
         )
         .map_err(ChatSpawnFailure::Internal)?;
         let m = crate::agents::write_mcp_config(&id, &key, state.port)
@@ -3564,6 +3567,19 @@ pub(crate) fn claude_auto_compact(state: &AppState, resume: Option<&str>) -> Opt
     resume
         .and_then(|native| conversation_auto_compact(state, native))
         .or_else(|| crate::lock(&state.settings).claude_auto_compact())
+}
+
+/// Everything a Claude session's generated `--settings` file says about
+/// compaction: [`claude_auto_compact`] and the daemon's threshold
+/// (`agents.autoCompactAt`, which has no per-conversation pick).
+pub(crate) fn claude_compaction(
+    state: &AppState,
+    resume: Option<&str>,
+) -> crate::agents::Compaction {
+    crate::agents::Compaction {
+        enabled: claude_auto_compact(state, resume),
+        at: crate::lock(&state.settings).auto_compact_at(),
+    }
 }
 
 /// The conversation's own auto-compact pick (in-memory index read).
@@ -3833,6 +3849,11 @@ pub(crate) async fn spawn_chat_session(
     if recipe.kind == AgentKind::Claude {
         spec.conversation_auto_compact = conversation_auto_compact;
     }
+    // Codex takes the threshold at the thread open, so each reopen (resume,
+    // rewind, fork, resurrection) re-applies the setting as it is now.
+    if recipe.kind == AgentKind::Codex {
+        spec.auto_compact_at = crate::lock(&state.settings).auto_compact_at();
+    }
     if recipe.kind == AgentKind::Claude && remote_control {
         // The bare name (the driver spells `chimaera · <name>`): the session's
         // display name as the rail shows it, or the workspace directory, plus
@@ -3980,7 +4001,6 @@ pub(crate) async fn resurrect_chat(
             crate::runtimes::claude_settings_gates(&state.claude_settings_path, &root).await;
         let settings_theme = (!theme_set).then_some(entry.theme.as_str());
         let plugin_tools = crate::plugins::spawn_allow(state, &workspace.id).await;
-        let auto_compact = claude_auto_compact(state, agent.resume.as_deref());
         let s = crate::agents::write_settings(
             &entry.id,
             &key,
@@ -3989,7 +4009,7 @@ pub(crate) async fn resurrect_chat(
             user_statusline.as_ref(),
             mastermind_mode,
             &plugin_tools,
-            auto_compact,
+            claude_compaction(state, agent.resume.as_deref()),
         )?;
         let m = crate::agents::write_mcp_config(&entry.id, &key, state.port)?;
         (Some(s), Some(m))

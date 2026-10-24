@@ -167,8 +167,9 @@ pub(crate) async fn spawn_session(
                 let settings_theme = (!theme_set).then_some(spec.theme.as_str());
                 let plugin_tools = crate::plugins::spawn_allow(state, &workspace.id).await;
                 // A resumed conversation's own auto-compact pick (its chat
-                // view's switch), else the daemon's setting.
-                let auto_compact = crate::chat::claude_auto_compact(state, resume.as_deref());
+                // view's switch), else the daemon's setting; the threshold
+                // is the daemon's.
+                let compaction = crate::chat::claude_compaction(state, resume.as_deref());
                 // PTY TUI spawns are never the Mastermind (a chat-only role);
                 // only active plugins' tools may ride a permissions block.
                 match crate::agents::write_settings(
@@ -179,7 +180,7 @@ pub(crate) async fn spawn_session(
                     user_statusline.as_ref(),
                     None,
                     &plugin_tools,
-                    auto_compact,
+                    compaction,
                 ) {
                     Ok(path) => Some(path),
                     Err(err) => {
@@ -246,6 +247,10 @@ pub(crate) async fn spawn_session(
             if let Some(mcp) = &mcp_config {
                 argv.push("--mcp-config".to_string());
                 argv.push(mcp.to_string_lossy().into_owned());
+            }
+            if agent_kind == AgentKind::Codex {
+                let at = crate::lock(&state.settings).auto_compact_at();
+                crate::launcher::push_codex_compact_at(&mut argv, at);
             }
             if !codex_plugin_tools.is_empty() {
                 // Pre-approved: the prompt-free tools every session gets

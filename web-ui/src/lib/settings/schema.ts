@@ -91,6 +91,7 @@ export type SettingsMap = {
   "agents.communication.wakes": "never" | "ask" | "auto";
   "agents.communication.freeSubagents": boolean;
   "agents.autoCompact": "agent" | "on" | "off";
+  "agents.autoCompactAt": "agent" | "50" | "55" | "60" | "65" | "70" | "75" | "80" | "85" | "90";
   "dashboard.landing": "auto" | "never";
   "dashboard.cardDensity": "auto" | "comfortable" | "compact";
   "dashboard.roster": "line" | "cards";
@@ -301,6 +302,33 @@ const DEFS = {
     ],
     scope: "daemon",
     note: "Claude sessions started after the change. A chat's own switch, under its usage meter, wins for that conversation.",
+  },
+  // Each CLI's own percentage, set per session (Pass 55): Claude's
+  // CLAUDE_AUTOCOMPACT_PCT_OVERRIDE in the generated --settings env, Codex's
+  // model_post_turn_compact_threshold_percent on the thread. 50–90 in 5s:
+  // below half the window compaction churns (each one costs a request and
+  // detail), and past 90 both CLIs' own limits come first.
+  "agents.autoCompactAt": {
+    title: "Auto-Compact At",
+    category: "Agents",
+    description:
+      "How full the context window gets before the agent summarizes the conversation on its own. Agent default keeps each agent's own point, near the end of the window.",
+    type: "enum",
+    default: "agent",
+    options: [
+      { value: "agent", label: "Agent default" },
+      { value: "50", label: "50%" },
+      { value: "55", label: "55%" },
+      { value: "60", label: "60%" },
+      { value: "65", label: "65%" },
+      { value: "70", label: "70%" },
+      { value: "75", label: "75%" },
+      { value: "80", label: "80%" },
+      { value: "85", label: "85%" },
+      { value: "90", label: "90%" },
+    ],
+    scope: "daemon",
+    note: "Claude and Codex sessions started or resumed after the change. Claude counts it against the window less its reply reserve; Codex checks it as a turn ends.",
   },
 
   // --- Dashboard ---------------------------------------------------------------

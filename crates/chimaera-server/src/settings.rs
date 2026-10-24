@@ -210,6 +210,23 @@ impl SettingsStore {
         }
     }
 
+    /// Daemon-consumed key: the percentage of the window at which a new
+    /// Claude or Codex session compacts on its own (PROTOCOL.md Pass 55).
+    /// Agent default (absent, or anything but a multiple of 5 from 50 to 90,
+    /// as the UI offers) sets nothing. Claude gets it as the generated
+    /// `--settings` file's `env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`, Codex as
+    /// the thread's `model_post_turn_compact_threshold_percent` (`-c` for a
+    /// TUI); neither touches the user's own config.
+    pub(crate) fn auto_compact_at(&self) -> Option<u8> {
+        let value = self.map.get("agents.autoCompactAt")?;
+        let percent = match value {
+            serde_json::Value::String(text) => text.parse::<u8>().ok()?,
+            serde_json::Value::Number(n) => u8::try_from(n.as_u64()?).ok()?,
+            _ => return None,
+        };
+        ((50..=90).contains(&percent) && percent % 5 == 0).then_some(percent)
+    }
+
     /// Daemon-consumed key: when a restart cut a chat's work off (a running
     /// turn, background commands / monitors / workflows), send the resumed
     /// agent one message saying what stopped (see `chat::resurrect_chat`).

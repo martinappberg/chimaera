@@ -123,6 +123,35 @@ async fn auto_compact_setting_writes_only_an_explicit_choice() {
     }
 }
 
+/// `agents.autoCompactAt`: Agent default unless a 50–90% step of 5 (the
+/// choices the UI offers); a hand-written number reads the same.
+#[tokio::test]
+async fn auto_compact_at_setting_takes_only_the_offered_steps() {
+    let state = test_state();
+    assert_eq!(lock(&state.settings).auto_compact_at(), None);
+    for (value, expected) in [
+        (serde_json::json!("80"), Some(80)),
+        (serde_json::json!("50"), Some(50)),
+        (serde_json::json!("90"), Some(90)),
+        (serde_json::json!(75), Some(75)),
+        (serde_json::json!("agent"), None),
+        (serde_json::json!("95"), None),
+        (serde_json::json!("45"), None),
+        (serde_json::json!("82"), None),
+        (serde_json::json!(true), None),
+    ] {
+        let (status, _) = request(
+            &state,
+            Method::PUT,
+            "/api/v1/settings",
+            Some(serde_json::json!({"agents.autoCompactAt": value})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(lock(&state.settings).auto_compact_at(), expected, "{value}");
+    }
+}
+
 #[tokio::test]
 async fn new_chat_model_setting_opts_out_only_for_agent_defaults() {
     let state = test_state();

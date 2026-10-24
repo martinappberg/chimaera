@@ -32,6 +32,13 @@
      *  cannot be turned on here. */
     autoCompactDisabledBy?: string | null;
     onSetAutoCompact?: (enabled: boolean) => void;
+    /** Where the agent compacts on its own, in tokens of the context window,
+     *  when it applies a threshold someone set; null at its own default. */
+    compactAt?: number | null;
+    /** Whose threshold it is, for the one-line explanation on hover. */
+    agentName?: string;
+    /** Codex checks its threshold when a turn's answer lands. */
+    compactsAfterTurn?: boolean;
     onOpenSettings?: () => void;
   }
 
@@ -47,6 +54,9 @@
     autoCompact = null,
     autoCompactDisabledBy = null,
     onSetAutoCompact,
+    compactAt = null,
+    agentName = "The agent",
+    compactsAfterTurn = false,
     onOpenSettings,
   }: Props = $props();
 
@@ -67,8 +77,26 @@
       .filter((part) => part !== null)
       .join(" · "),
   );
+  /** The threshold as a point on the context bar: only while the agent
+   *  compacts on its own (a chat switched off, or held off by the
+   *  environment, draws none). */
+  const compactAtPct = $derived.by(() => {
+    if (compactAt === null || contextTokens === null || contextTokens.max <= 0) return null;
+    if (autoCompact === false || autoCompactDisabledBy !== null) return null;
+    const pct = (compactAt / contextTokens.max) * 100;
+    return pct > 0 && pct < 100 ? pct : null;
+  });
   const contextRow = $derived<UsageRow[]>(
-    contextPct === null ? [] : [{ label: "context", utilization: contextPct, resetsAt: null }],
+    contextPct === null
+      ? []
+      : [{ label: "context", utilization: contextPct, resetsAt: null, mark: compactAtPct }],
+  );
+  const compactAtTitle = $derived(
+    compactAtPct === null || compactAt === null
+      ? ""
+      : `${agentName} summarizes the conversation once it reaches ${formatTokenCount(compactAt, true)} tokens` +
+          (compactsAfterTurn ? ", when a turn ends past it" : "") +
+          ".",
   );
   let now = $state(Date.now());
   $effect(() => {
@@ -111,8 +139,14 @@
             {/if}
           </div>
           {#if autoCompact !== null && onSetAutoCompact}
-            <div class="auto-line" title="Summarize the conversation on its own when the context window fills. Off: it waits for Compact, and a full window stops the turn.">
-              <span>Auto-compact</span>
+            <div
+              class="auto-line"
+              title={compactAtTitle ||
+                "Summarize the conversation on its own when the context window fills. Off: it waits for Compact, and a full window stops the turn."}
+            >
+              <span
+                >Auto-compact{#if compactAtPct !== null}<span class="at">{` at ${Math.round(compactAtPct)}%`}</span>{/if}</span
+              >
               <Switch
                 on={autoCompact && !autoCompactDisabledBy}
                 disabled={!!autoCompactDisabledBy}
@@ -123,6 +157,10 @@
             {#if autoCompactDisabledBy}
               <p class="held">set off by <code>{autoCompactDisabledBy}</code></p>
             {/if}
+          {:else if compactAtPct !== null}
+            <div class="auto-line" title={compactAtTitle}>
+              <span>Auto-compact<span class="at">{` at ${Math.round(compactAtPct)}%`}</span></span>
+            </div>
           {/if}
         {/if}
         {#if limits.length > 0}
@@ -263,6 +301,9 @@
     margin-top: -2px;
     font-size: var(--text-xs);
     color: var(--muted);
+  }
+  .auto-line .at {
+    font-variant-numeric: tabular-nums;
   }
   .held {
     margin: -4px 0 0;

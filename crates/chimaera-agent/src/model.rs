@@ -458,6 +458,15 @@ pub enum AgentEvent {
         total_tokens: u64,
         max_tokens: u64,
         percentage: f64,
+        /// Where on this window the agent compacts on its own, in tokens,
+        /// only while it applies a threshold someone set (PROTOCOL.md Pass
+        /// 55): claude's `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` from its merged
+        /// settings, against the threshold it reports; codex's
+        /// `model_post_turn_compact_threshold_percent` from the thread open.
+        /// Absent at an agent's own default, with auto-compact off, and on
+        /// every pre-upgrade journal line.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auto_compact_at: Option<u64>,
     },
     /// The agent is summarizing its conversation to reclaim context. This is
     /// a real, sometimes-long lifecycle rather than a transcript notice:

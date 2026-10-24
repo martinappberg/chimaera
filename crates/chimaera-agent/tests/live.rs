@@ -1316,6 +1316,63 @@ async fn claude_auto_compact_is_a_session_flag() {
         .expect("shutdown");
 }
 
+/// The threshold's inputs (PROTOCOL.md Pass 55): a `--settings` file's
+/// `env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` reads back in `get_settings`
+/// `effective.env`, and `get_context_usage` reports an enforced source and
+/// the unlowered `autoCompactThreshold` (the window less 33k) the driver
+/// lowers by it. Control channel only: no turn, no billing.
+#[tokio::test]
+#[ignore = "live: spawns real claude, needs auth"]
+async fn claude_auto_compact_threshold_inputs_are_reported() {
+    let dir = tmpdir();
+    let settings = dir.path().join("session-settings.json");
+    std::fs::write(
+        &settings,
+        "{\"env\": {\"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE\": \"80\"}}",
+    )
+    .expect("write settings");
+    let mut chat = spawn_claude(
+        dir.path(),
+        &["--settings".into(), settings.to_string_lossy().into_owned()],
+    );
+    chat.initialize(HANDSHAKE).await.expect("initialize");
+    let id = chat
+        .send_control(json!({ "subtype": "get_settings" }))
+        .await
+        .expect("get_settings");
+    let read = await_control_response(&mut chat, &id).await;
+    assert_eq!(
+        read["effective"]["env"]["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"],
+        json!("80"),
+        "{read}"
+    );
+    let id = chat
+        .send_control(json!({ "subtype": "get_context_usage" }))
+        .await
+        .expect("get_context_usage");
+    let answer = await_control_response(&mut chat, &id).await;
+    let usage = if answer.get("usage").is_some() {
+        &answer["usage"]
+    } else {
+        &answer
+    };
+    assert_eq!(usage["isAutoCompactEnabled"], json!(true), "{usage}");
+    let source = usage["autocompactSource"]
+        .as_str()
+        .expect("autocompactSource");
+    assert_ne!(source, "auto", "{usage}");
+    let threshold = usage["autoCompactThreshold"]
+        .as_u64()
+        .expect("autoCompactThreshold");
+    let max = usage["rawMaxTokens"].as_u64().expect("rawMaxTokens");
+    // The percentage is not in the report: the threshold stays the window
+    // less the output and summary reserves.
+    assert!(threshold < max && threshold + 40_000 > max, "{usage}");
+    chat.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
 /// What the switch shows comes from the CLI (PROTOCOL.md Pass 50): the
 /// flag-layer setting, held off by `DISABLE_AUTO_COMPACT`, which only
 /// get_context_usage's `isAutoCompactEnabled` reports. The driver names the
