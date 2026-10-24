@@ -9,53 +9,42 @@ import {
   stopReach,
   stopReachText,
   type ActionContext,
-  type StopAgentRow,
   type StopLane,
 } from "./stopConfirm";
 
-function row(title: string, over: Partial<StopAgentRow> = {}): StopAgentRow {
-  return { title, status: "in_progress", crossTurn: false, ...over };
-}
 function lane(taskType: string, description: string, over: Partial<StopLane> = {}): StopLane {
   return { taskType, description, ambient: false, ...over };
 }
-const text = (agents: StopAgentRow[], lanes: StopLane[]) => stopReachText(stopReach(agents, lanes));
+const text = (lanes: StopLane[]) => stopReachText(stopReach(lanes));
 
 describe("stopReach", () => {
   it("stops at once when only the turn would end", () => {
-    expect(text([], [])).toBeNull();
+    expect(text([])).toBeNull();
   });
 
-  it("names a foreground subagent the turn waits on", () => {
-    expect(text([row("Agent: audit the loader")], [])).toBe("Also stops 1 subagent");
+  it("never names the step the turn is on", () => {
+    // A foreground subagent the turn waits on is no lane until it is moved
+    // to the background (Pass 44): stopping it is what Stop is for.
+    expect(text([lane("local_bash", "npm test")])).toBeNull();
   });
 
   it("names background agents and workflows, which a claude Stop kills", () => {
-    expect(
-      text([], [lane("local_agent", "bg probe"), lane("local_agent", "second"), lane("local_workflow", "probe")]),
-    ).toBe("Also stops 2 subagents and 1 workflow");
-    expect(text([], [lane("local_workflow", "a"), lane("local_workflow", "b")])).toBe("Also stops 2 workflows");
+    expect(text([lane("local_agent", "bg probe"), lane("local_agent", "second"), lane("local_workflow", "probe")])).toBe(
+      "Also stops 2 subagents and 1 workflow",
+    );
+    expect(text([lane("local_workflow", "a"), lane("local_workflow", "b")])).toBe("Also stops 2 workflows");
+    // A foreground agent moved to the background is a background agent now.
+    expect(text([lane("local_agent", "audit")])).toBe("Also stops 1 subagent");
   });
 
   it("never names work a Stop leaves running", () => {
     // claude: run_in_background commands and Monitor watches ride local_bash
     // and survive the interrupt; remote agents are unprobed.
-    expect(text([], [lane("local_bash", "npm test"), lane("local_bash", "watch log"), lane("remote_agent", "r")])).toBeNull();
-    // codex: collab agents are process-owned and outlive turn/interrupt.
-    expect(text([row("Agent: agent_a", { crossTurn: true })], [])).toBeNull();
+    expect(text([lane("local_bash", "npm test"), lane("local_bash", "watch log"), lane("remote_agent", "r")])).toBeNull();
   });
 
-  it("skips settled rows and housekeeping lanes", () => {
-    expect(text([row("Agent: done", { status: "completed" }), row("Agent: x", { status: "failed" })], [])).toBeNull();
-    expect(text([], [lane("local_agent", "tidy", { ambient: true })])).toBeNull();
-    expect(text([row("Agent: queued", { status: "pending" })], [])).toBe("Also stops 1 subagent");
-  });
-
-  it("counts a foreground agent moved to the background once", () => {
-    expect(text([row("Agent: audit")], [lane("local_agent", "audit")])).toBe("Also stops 1 subagent");
-    expect(text([row("Task: audit")], [lane("local_agent", "audit"), lane("local_agent", "other")])).toBe(
-      "Also stops 2 subagents",
-    );
+  it("skips housekeeping lanes", () => {
+    expect(text([lane("local_agent", "tidy", { ambient: true })])).toBeNull();
   });
 });
 
@@ -104,18 +93,15 @@ describe("armedKey", () => {
 
 describe("actionReach", () => {
   const ctx = (over: Partial<ActionContext> = {}): ActionContext => ({
-    agents: [],
     lanes: [],
     busy: true,
     running: true,
     goalClearStops: true,
     ...over,
   });
-  const fg = [row("Agent: audit")];
   const bg = [lane("local_agent", "bg probe")];
 
   it("asks for a Stop only while something runs", () => {
-    expect(actionReach("stop", ctx({ agents: fg }))).toBe("Also stops 1 subagent");
     expect(actionReach("stop", ctx({ lanes: bg }))).toBe("Also stops 1 subagent");
     expect(actionReach("stop", ctx({ lanes: bg, busy: false, running: false }))).toBeNull();
     expect(actionReach("stop", ctx())).toBeNull();
@@ -123,11 +109,11 @@ describe("actionReach", () => {
 
   it("asks for claude's Clear goal as for a Stop, since it stops the turn first", () => {
     expect(actionReach("goal", ctx({ lanes: [lane("local_workflow", "wf")] }))).toBe("Also stops 1 workflow");
-    expect(actionReach("goal", ctx({ agents: fg, lanes: bg }))).toBe("Also stops 2 subagents");
+    expect(actionReach("goal", ctx({ lanes: [...bg, lane("local_agent", "two")] }))).toBe("Also stops 2 subagents");
     // Idle, it is only the /goal clear message.
     expect(actionReach("goal", ctx({ lanes: bg, running: false }))).toBeNull();
     // codex's clear_goal lets the turn finish.
-    expect(actionReach("goal", ctx({ agents: fg, goalClearStops: false }))).toBeNull();
+    expect(actionReach("goal", ctx({ lanes: bg, goalClearStops: false }))).toBeNull();
   });
 });
 

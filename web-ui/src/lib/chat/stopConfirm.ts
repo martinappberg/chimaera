@@ -1,31 +1,25 @@
 /**
  * Whether an action that interrupts the turn needs a second press: it ends
- * more than the turn, and the user should hear what before it goes. The
- * rule is the action's, not the control's: Esc, either Stop, Clear goal
- * (claude, while the turn runs) and Send now all ask the same way.
+ * work OUTSIDE the step the turn is on, and the user should hear what before
+ * it goes. Esc, either Stop and Clear goal (claude, while the turn runs) ask
+ * the same way; Send now never does (it ends only the current step, and
+ * claude's `interrupt {send_now}` spares background work).
  *
- * Only what the interrupt is known to end counts (live, issue #343;
- * crates/chimaera-agent/protocol/passes.md Pass 49):
- *   - claude: a live subagent row of this turn and a background `local_agent`
- *     lane are killed, and so is a `local_workflow` with its agents. A
- *     `run_in_background` command, a Monitor watch, a cron job and a wakeup
- *     survive, so they are never named.
+ * The current step itself — a running command, or the foreground subagent
+ * the turn waits on — is what a Stop is pressed to end, so it is never
+ * named. Only background work the interrupt is known to kill counts (live,
+ * issue #343; crates/chimaera-agent/protocol/passes.md Pass 49):
+ *   - claude: a background `local_agent` lane (a foreground agent shows up
+ *     as one only once moved to the background, Pass 44) and a
+ *     `local_workflow` with its agents are killed. A `run_in_background`
+ *     command, a Monitor watch, a cron job and a wakeup survive, so they
+ *     are never named.
  *   - codex: `turn/interrupt` ends neither a spawned agent nor a background
- *     terminal. Its agent rows are `crossTurn` (process-owned) and it sends
- *     no background lanes, so nothing counts.
+ *     terminal, and it sends no background lanes, so nothing counts.
  *   - ACP: no subagent or background surface.
- * Keyed on the event shapes, never on the agent's brand: a process-owned row
- * outlives the turn by definition, and the lane names are the agent's own.
- * `remote_agent` lanes are left out until a probe says what a Stop does to
- * them.
+ * Keyed on the lane shapes, never on the agent's brand. `remote_agent` lanes
+ * are left out until a probe says what a Stop does to them.
  */
-
-/** The fields of a subagent tool row this reads (`ChatStore.activeAgents`). */
-export interface StopAgentRow {
-  title: string;
-  status: string;
-  crossTurn: boolean;
-}
 
 /** The fields of a background lane this reads (`ChatStore.backgroundTasks`). */
 export interface StopLane {
@@ -44,35 +38,20 @@ export interface StopReach {
  *  turns a later, unrelated Esc into a stop. */
 export const STOP_CONFIRM_MS = 5000;
 
-const LIVE = new Set(["pending", "in_progress"]);
-
 /** A subagent row's name without its tool prefix: what its background lane
- *  calls it once the agent moves there (ChatView's running-task count shares
- *  this, so both dedupe the same way). */
+ *  calls it once the agent moves there (ChatView's running-task count
+ *  dedupes rows and lanes by it). */
 export function agentRowName(title: string): string {
   return title.replace(/^(Agent|Task): /, "");
 }
 
-/** The live subagent rows an interrupt of this turn ends (never a
- *  process-owned, `crossTurn` row). */
-function turnRows(agents: readonly StopAgentRow[]): readonly StopAgentRow[] {
-  return agents.filter((a) => LIVE.has(a.status) && !a.crossTurn);
-}
-
-/** What a Stop would end besides the turn itself. */
-export function stopReach(
-  agents: readonly StopAgentRow[],
-  lanes: readonly StopLane[],
-): StopReach {
-  const rows = turnRows(agents);
-  // A foreground agent moved to the background (Ctrl-B) is still its live
-  // row AND now an agent lane: count it once (as ChatView's runningTasks).
-  const names = new Set(rows.map((a) => agentRowName(a.title)));
-  let subagents = rows.length;
+/** The background work a Stop would end besides the turn itself. */
+export function stopReach(lanes: readonly StopLane[]): StopReach {
+  let subagents = 0;
   let workflows = 0;
   for (const lane of lanes) {
     if (lane.ambient) continue;
-    if (lane.taskType === "local_agent" && !names.has(lane.description)) subagents++;
+    if (lane.taskType === "local_agent") subagents++;
     else if (lane.taskType === "local_workflow") workflows++;
   }
   return { subagents, workflows };
@@ -100,7 +79,6 @@ export type ConfirmControl = string;
 
 /** What the view knows when a control is pressed. */
 export interface ActionContext {
-  agents: readonly StopAgentRow[];
   lanes: readonly StopLane[];
   /** A turn or a compaction is running (a Stop has something to stop). */
   busy: boolean;
@@ -114,10 +92,10 @@ export interface ActionContext {
 /** What the control's action would end besides the turn, as the note words
  *  it; null when it ends only the turn (it then acts at once). */
 export function actionReach(control: ConfirmControl, ctx: ActionContext): string | null {
-  if (control === "stop") return ctx.busy ? stopReachText(stopReach(ctx.agents, ctx.lanes)) : null;
+  if (control === "stop") return ctx.busy ? stopReachText(stopReach(ctx.lanes)) : null;
   // Idle, Clear goal is only the `/goal clear` message.
   if (control === "goal") {
-    return ctx.running && ctx.goalClearStops ? stopReachText(stopReach(ctx.agents, ctx.lanes)) : null;
+    return ctx.running && ctx.goalClearStops ? stopReachText(stopReach(ctx.lanes)) : null;
   }
   return null;
 }

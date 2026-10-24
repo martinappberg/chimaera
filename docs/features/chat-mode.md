@@ -421,11 +421,12 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   and the Errored rail state are reserved for genuine failures.
   If Codex has not confirmed receipt of the opening message when stopped, a brief
   notice asks you to resend it. Saying only “Keep going” cannot recover missing input.
-- **Anything that would end subagents or workflows asks once, whatever control started it.**
-  Claude's Stop also kills its subagents (foreground and background) and its workflows; it
-  leaves background commands, Monitor watches and the schedule running (PROTOCOL.md Pass 49).
-  Esc, either Stop and Clear goal (Claude clears a running goal by stopping the turn first)
-  count every live subagent and workflow. A waiting message's Send now never asks: it ends only
+- **Anything that would end background subagents or workflows asks once, whatever control
+  started it.** Claude's Stop also kills its background agents and its workflows; it leaves
+  background commands, Monitor watches and the schedule running (PROTOCOL.md Pass 49). The step
+  the turn is on — a running command, or the foreground subagent it waits on — is what a Stop
+  is pressed to end, so it is never named. Esc, either Stop and Clear goal (Claude clears a
+  running goal by stopping the turn first) count every live background agent and workflow. A waiting message's Send now never asks: it ends only
   the step the turn is on, a command or the foreground subagent it waits on, which is what it is
   pressed for, and `interrupt {send_now}` spares background agents and workflows (Pass 44). When
   the count is non-zero, the first press shows one line above the control that was pressed

@@ -1622,13 +1622,12 @@
   }
 
   /** Every action that interrupts the turn asks once when it would also end
-   *  subagents or workflows, whatever control started it (stopConfirm.ts:
+   *  background subagents or workflows, whatever control started it (stopConfirm.ts:
    *  `actionReach` counts only what that action ends). Each control carries
    *  its key as `data-stop-control`. */
   let armed = $state.raw<{ control: ConfirmControl; via: ConfirmVia; act: () => void } | null>(null);
   // A closure: `agentBusy` and `goalClearStops` are declared further down.
   const actionContext = $derived.by<ActionContext>(() => ({
-    agents: store.activeAgents,
     lanes: store.backgroundTasks,
     busy: agentBusy,
     running: store.running,
