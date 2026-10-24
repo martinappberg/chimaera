@@ -3712,7 +3712,7 @@ impl CodexMapper {
             // opens the agent's row rather than a row of its own.
             Some("collabAgentToolCall") if item["tool"] == "spawnAgent" => {
                 if completed {
-                    self.on_collab_spawn(item, step);
+                    self.on_collab_spawn(item, id, step);
                 }
             }
             // A collab tool call the model made (multi-agent). On the v2
@@ -3749,7 +3749,9 @@ impl CodexMapper {
                         },
                         content: None,
                     });
-                    if !failed {
+                    // An interrupted call (the parent turn stopped mid-call)
+                    // never reached its agents: nothing to fold.
+                    if !failed && item["status"] != "interrupted" {
                         self.on_collab_call_completed(item, step);
                     }
                 }
@@ -4150,15 +4152,14 @@ impl CodexMapper {
     /// `reasoningEffort` the resolved values, `prompt` its task. The row opens
     /// titled by the prompt's first line and takes the child's nickname when
     /// its metadata read answers. A spawn that failed, or names no thread,
-    /// keeps a failed row of its own so the attempt stays visible.
-    fn on_collab_spawn(&mut self, item: &Value, step: &mut DriverStep) {
-        let failed = matches!(
-            item["status"].as_str(),
-            Some("failed" | "declined" | "interrupted")
-        );
+    /// keeps a failed row of its own so the attempt stays visible; an
+    /// interrupted one that names its thread still opens the row, since the
+    /// child may be running (an invisible subagent is worse than a spurious
+    /// one).
+    fn on_collab_spawn(&mut self, item: &Value, id: String, step: &mut DriverStep) {
+        let failed = matches!(item["status"].as_str(), Some("failed" | "declined"));
         let threads = collab_receivers(item);
         if failed || threads.is_empty() {
-            let id = item["id"].as_str().unwrap_or_default().to_string();
             if let Some(flushed) = self.coalescer.flush() {
                 step.events.push(flushed);
             }
@@ -13063,6 +13064,33 @@ mod tests {
             ] if title.starts_with("Spawn agent: Reply with exactly")
         ));
         assert!(m.collab_agents.is_empty());
+    }
+
+    /// The parent turn stopped mid-call: an interrupted spawn that names its
+    /// thread still opens the row (the child may run), and an interrupted
+    /// `closeAgent` never reached its agent, so the row stays open.
+    #[test]
+    fn interrupted_v1_calls_neither_hide_nor_close_an_agent() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let row = format!("agent:{V1_CHILD}");
+        let step = m.on_frame(&v1_spawn("interrupted", json!([V1_CHILD])));
+        assert!(step.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolCall { id, kind: ToolKind::Agent, .. } if *id == row
+        )));
+        let step = m.on_frame(&v1_call(
+            "item/completed",
+            "call_close_i",
+            "closeAgent",
+            "interrupted",
+            json!({ "receiverThreadIds": [V1_CHILD] }),
+        ));
+        assert!(finished(&step.events).is_empty(), "{:?}", step.events);
+        assert!(!step.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolCallUpdate { id, .. } if *id == row
+        )));
     }
 
     /// v1 input to an agent this process never saw spawn (a thread resumed
