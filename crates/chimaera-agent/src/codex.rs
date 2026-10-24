@@ -1126,6 +1126,24 @@ const COLLAB_TOKEN_STEP: u64 = 256;
 /// only after a move this large — same order as the collab throttle above.
 const TURN_TOKENS_STEP: u64 = 256;
 
+/// Items a model response opens: its reply, reasoning, plan and tool calls.
+/// Their `item/started` proves the model is working on the current input
+/// (delivery of an opening message, the answer to a steer).
+const MODEL_RESPONSE_ITEMS: &[&str] = &[
+    "agentMessage",
+    "reasoning",
+    "plan",
+    "commandExecution",
+    "mcpToolCall",
+    "webSearch",
+    "fileChange",
+    "imageGeneration",
+    "imageView",
+    "dynamicToolCall",
+    "collabAgentToolCall",
+    "sleep",
+];
+
 struct CollabAgent {
     /// The subagent's thread id — the key every foreign frame carries.
     thread_id: String,
@@ -3435,25 +3453,10 @@ impl CodexMapper {
         // Older servers may omit clientId on the user echo; actual model
         // activity also proves we passed the pre-prompt hook barrier.
         if current_turn
-            && matches!(
-                item["type"].as_str(),
-                Some(
-                    "reasoning"
-                        | "agentMessage"
-                        | "commandExecution"
-                        | "mcpToolCall"
-                        | "webSearch"
-                        | "fileChange"
-                        | "imageGeneration"
-                        | "imageView"
-                        | "dynamicToolCall"
-                        | "collabAgentToolCall"
-                        | "subAgentActivity"
-                        | "functionCallOutput"
-                        | "plan"
-                        | "sleep"
-                )
-            )
+            && item["type"].as_str().is_some_and(|t| {
+                MODEL_RESPONSE_ITEMS.contains(&t)
+                    || matches!(t, "subAgentActivity" | "functionCallOutput")
+            })
         {
             self.unread_opening_message = None;
         }
@@ -4852,26 +4855,18 @@ impl CodexMapper {
             // echo by nothing but the read state, idle status and turn end.
             // Never a step: a completion or output of an earlier item (a
             // background command finishing), a token-usage update (it trails
-            // the request it counts), a child's `subAgentActivity` marker, a
-            // recorded tool output, a hook prompt or a compaction.
+            // the request it counts), a child's finish marker, a recorded
+            // tool output, a hook prompt or a compaction. A v2
+            // `subAgentActivity` other than `completed` is the model's own
+            // collaboration call (spawn, message, interrupt), which v2
+            // reports with no `collabAgentToolCall`.
             "item/started" => {
-                if matches!(
-                    item["type"].as_str(),
-                    Some(
-                        "agentMessage"
-                            | "reasoning"
-                            | "plan"
-                            | "commandExecution"
-                            | "mcpToolCall"
-                            | "webSearch"
-                            | "fileChange"
-                            | "imageGeneration"
-                            | "imageView"
-                            | "dynamicToolCall"
-                            | "collabAgentToolCall"
-                            | "sleep"
-                    )
-                ) {
+                let response = match item["type"].as_str() {
+                    Some("subAgentActivity") => item["kind"] != "completed",
+                    Some(t) => MODEL_RESPONSE_ITEMS.contains(&t),
+                    None => false,
+                };
+                if response {
                     self.read_unanswered = false;
                 }
             }
@@ -8293,6 +8288,35 @@ mod tests {
         ];
         order.extend(echo_b[3..].iter().cloned());
         for f in &order {
+            m.on_frame(f);
+        }
+        let step = m.on_frame(&turn_a_completed());
+        assert!(
+            !step.outbound.iter().any(|o| o["method"] == "turn/start"),
+            "{:?}",
+            step.outbound
+        );
+        assert!(!m.answer_owed);
+    }
+
+    /// A v2 spawn after the echo is the model's own answer (v2 reports
+    /// `spawn_agent` only as a `subAgentActivity {started}` marker): nothing
+    /// is owed. A child's `completed` marker is not (the test above).
+    #[test]
+    fn a_steer_answered_by_a_spawn_owes_no_turn() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let (id, rpc) = steer_text(&mut m, "STEER S");
+        m.on_frame(&json!({ "id": rpc, "result": { "turnId": "turn-A" } }));
+        let frames = finishing_frames(&id);
+        m.on_frame(&frames[1]);
+        m.on_frame(&frames[2]);
+        m.on_frame(
+            &json!({"method": "item/started", "params": {"threadId": "thr-1",
+            "turnId": "turn-A", "item": {"type": "subAgentActivity", "id": "sa-1",
+                "kind": "started", "agentThreadId": "thr-child", "agentPath": "/root/helper"}}}),
+        );
+        for f in &frames[3..] {
             m.on_frame(f);
         }
         let step = m.on_frame(&turn_a_completed());

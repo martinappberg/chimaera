@@ -1432,12 +1432,11 @@ impl ClaudeMapper {
     /// phantom turn with no start event.
     fn ensure_turn(&mut self, step: &mut DriverStep) {
         if !self.turn_active {
-            // No message of ours opened it (a wakeup, a job, a monitor
-            // event): the last turn's messages are not this turn's, and a
-            // Stop naming them would be `spared`, stopping nothing.
-            if !self.turn_starting {
-                self.turn_messages.clear();
-            }
+            // `turn_messages` is kept when the CLI opens a turn by itself (a
+            // wakeup, a job, a monitor event): the CLI counts every turn
+            // started since a client message's turn as that turn, so a Stop
+            // naming those messages stops this one, and one landing after
+            // it ended still spares a next turn a message of ours opened.
             self.turn_starting = false;
             self.reset_compaction_for_new_turn();
             self.turn_n += 1;
@@ -7015,12 +7014,14 @@ pub(crate) mod tests {
         assert!(!m.interrupt_requested);
     }
 
-    /// A turn the CLI opens by itself (a wakeup, a job) holds no message of
-    /// ours: a Stop there must not name the previous turn's, which the CLI
-    /// would answer `spared`, stopping nothing.
+    /// A turn the CLI opens by itself (a wakeup, a job) is, to the CLI, part
+    /// of the last client message's turn ("the latest one dequeued for a
+    /// client's message, with every turn started since"): a Stop there names
+    /// that message, which stops it, and still spares a next turn of ours if
+    /// it lands late.
     #[test]
-    fn a_stop_in_a_self_opened_turn_names_no_old_messages() {
-        let (mut m, _a) = requeue_mapper_mid_turn();
+    fn a_stop_in_a_self_opened_turn_names_the_last_client_turn() {
+        let (mut m, a) = requeue_mapper_mid_turn();
         m.on_frame(&result_frame());
         assert!(!m.turn_active);
         m.on_frame(&lifecycle("cli-wake-1", "started"));
@@ -7028,8 +7029,8 @@ pub(crate) mod tests {
         assert!(m.turn_active);
         let step = m.on_command(AgentCommand::Interrupt);
         assert_eq!(
-            step.outbound[0]["request"],
-            json!({ "subtype": "interrupt" })
+            step.outbound[0]["request"]["for_user_message_uuids"],
+            json!([a])
         );
     }
 
