@@ -682,12 +682,13 @@ enum PendingControl {
     /// the context meter; without it, the auto-compact check that follows a
     /// settings read and wants only `isAutoCompactEnabled`. `setting`: the
     /// flag-layer auto-compact when it was asked (`None` while an apply was
-    /// still unread), so a reply that crossed a switch never blames the
-    /// environment. `picked`: the user's
-    /// auto-compact pick the check settles.
+    /// still unread) and `applies` the auto-compact applies sent by then, so
+    /// a reply that crossed a switch on either side never blames the
+    /// environment. `picked`: the user's auto-compact pick the check settles.
     ContextUsage {
         meter: bool,
         setting: Option<bool>,
+        applies: u64,
         picked: Option<bool>,
     },
     GetUsage,
@@ -1475,6 +1476,7 @@ impl ClaudeMapper {
                 } else {
                     None
                 },
+                applies: self.auto_compact_applies,
                 picked,
             },
         );
@@ -3593,11 +3595,12 @@ impl ClaudeMapper {
             if let PendingControl::ContextUsage {
                 meter: false,
                 setting,
+                applies,
                 picked,
             } = pending
             {
                 self.auto_compact_env.get_or_insert(None);
-                if setting == self.auto_compact_setting {
+                if applies == self.auto_compact_applies && setting == self.auto_compact_setting {
                     self.emit_auto_compact(picked, step);
                 }
                 return;
@@ -3644,6 +3647,17 @@ impl ClaudeMapper {
                     });
                 }
                 return;
+            }
+            // A refused switch applied nothing, and its read-back never comes:
+            // re-read, or every later check waits on it as unread.
+            if matches!(
+                pending,
+                PendingControl::ApplyFlags {
+                    auto_compact: Some(_),
+                    ..
+                }
+            ) {
+                self.request_settings(step);
             }
             // A refused send-now stopped nothing: a later genuine error must
             // not read as the user's stop (unless a Stop is also in flight).
@@ -3738,6 +3752,7 @@ impl ClaudeMapper {
             PendingControl::ContextUsage {
                 meter,
                 setting,
+                applies,
                 picked,
             } => {
                 let usage = if payload.get("usage").is_some() {
@@ -3745,6 +3760,9 @@ impl ClaudeMapper {
                 } else {
                     payload
                 };
+                // A switch sent after the question may already be in the
+                // answer, before its read-back moves the cached setting.
+                let setting = setting.filter(|_| applies == self.auto_compact_applies);
                 let known = self.auto_compact_env;
                 self.learn_auto_compact_env(usage["isAutoCompactEnabled"].as_bool(), setting);
                 // A check a later switch overtook settles nothing: that
@@ -10661,6 +10679,57 @@ pub(crate) mod tests {
                 enabled: false,
                 disabled_by: None,
                 picked: Some(false),
+            }]
+        );
+    }
+
+    /// Switched off while the on check was out: the CLI can answer with the
+    /// off applied before its read-back lands, which is the switch, not the
+    /// environment.
+    #[test]
+    fn a_switch_after_the_check_never_blames_the_environment() {
+        let mut m = mapper();
+        let mut settings = DriverStep::default();
+        m.request_settings(&mut settings);
+        let read = answer(&mut m, &settings, json!({"applied":{}, "effective":{}}));
+        assert_eq!(read.outbound[0]["request"]["subtype"], "get_context_usage");
+        let off = m.on_command(AgentCommand::SetAutoCompact { enabled: false });
+        let off_ack = answer(&mut m, &off, Value::Null);
+        let check = answer(&mut m, &read, json!({"isAutoCompactEnabled": false}));
+        assert!(auto_compact_events(&check).is_empty(), "{:?}", check.events);
+        let off_read = answer(
+            &mut m,
+            &off_ack,
+            json!({"applied":{}, "effective":{"autoCompactEnabled":false}}),
+        );
+        assert_eq!(
+            auto_compact_events(&off_read),
+            vec![&AgentEvent::AutoCompact {
+                enabled: false,
+                disabled_by: None,
+                picked: Some(false),
+            }]
+        );
+    }
+
+    /// A refused switch is re-read, so the checks after it are not left
+    /// waiting on a read-back that never comes.
+    #[test]
+    fn a_refused_switch_is_re_read() {
+        let mut m = mapper();
+        let on = m.on_command(AgentCommand::SetAutoCompact { enabled: true });
+        let refused = m.on_frame(&json!({"type":"control_response", "response": {
+            "subtype":"error", "request_id":on.outbound[0]["request_id"], "error":"nope",
+        }}));
+        assert_eq!(refused.outbound[0]["request"]["subtype"], "get_settings");
+        let read = answer(&mut m, &refused, json!({"applied":{}, "effective":{}}));
+        let check = answer(&mut m, &read, json!({"isAutoCompactEnabled": false}));
+        assert_eq!(
+            auto_compact_events(&check),
+            vec![&AgentEvent::AutoCompact {
+                enabled: false,
+                disabled_by: Some("DISABLE_AUTO_COMPACT".into()),
+                picked: None,
             }]
         );
     }
