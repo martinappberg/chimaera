@@ -1212,8 +1212,15 @@ async fn resolve_respawn_inputs(
                 enabled: resume.and_then(|native| conversation_auto_compact(state, native)),
                 at: crate::lock(&state.settings).auto_compact_at(),
             };
-            crate::agents::refresh_settings_compaction(&settings_path, compaction)
-                .map_err(|err| err.to_string())?;
+            // Every Claude respawn now reads (and may rewrite) the file: off
+            // the reactor.
+            let refresh_path = settings_path.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::agents::refresh_settings_compaction(&refresh_path, compaction)
+            })
+            .await
+            .map_err(|err| err.to_string())?
+            .map_err(|err| err.to_string())?;
             (Some(settings_path), Some(mcp_path))
         } else {
             // Runtime state is explicitly reconstructible: macOS and Linux
@@ -1266,6 +1273,49 @@ pub(crate) struct DroppedTurns {
     pub(crate) first_turn_id: Option<String>,
 }
 
+/// A completed compaction: Claude reloads only the conversation after its
+/// latest compaction boundary, so an anchor from before one is no longer in
+/// the chain it resumes: `--resume-session-at` with it exits at once ("No
+/// message found with message.uuid of: …", 2.1.310, PROTOCOL.md Pass 55).
+/// Codex reverts across one fine.
+fn is_completed_compaction(ev: &AgentEvent) -> bool {
+    matches!(
+        ev,
+        AgentEvent::ContextCompaction {
+            phase: chimaera_agent::model::CompactionPhase::Completed,
+            ..
+        }
+    )
+}
+
+/// Whether a completed compaction was journaled after `seq`.
+fn compacted_after(entries: &[Arc<SeqEvent>], seq: u64) -> bool {
+    entries
+        .iter()
+        .any(|entry| entry.seq > seq && is_completed_compaction(&entry.ev))
+}
+
+/// Whether the conversation was compacted after the checkpoint whose
+/// preceding uuid is `resume_at` (a Claude rewind's anchor): the line scan
+/// [`find_fork_cut`] makes, so the refusal is decided before any stop.
+fn compacted_since_anchor(content: &str, resume_at: &str) -> bool {
+    let mut past_anchor = false;
+    for line in content.lines() {
+        let Ok(entry) = serde_json::from_str::<SeqEvent>(line) else {
+            continue;
+        };
+        match &entry.ev {
+            AgentEvent::Checkpoint {
+                preceding_uuid: Some(preceding),
+                ..
+            } if preceding == resume_at => past_anchor = true,
+            ev if past_anchor && is_completed_compaction(ev) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 type ForkCut = (usize, DroppedTurns, Vec<(usize, String)>);
 
 /// Locate the rewind cut for `resume_at` in a journal's content: the line
@@ -1283,48 +1333,6 @@ type ForkCut = (usize, DroppedTurns, Vec<(usize, String)>);
 /// truncation replaces each in-place with a Cancelled tombstone (same seq),
 /// preserving the completed previous turn without replaying a phantom queue.
 /// `None` = no anchor match.
-/// A completed compaction journaled after `seq`. Claude reloads only the
-/// conversation after its latest compaction boundary, so an anchor from
-/// before one is no longer in the chain it resumes: `--resume-session-at`
-/// with it exits at once ("No message found with message.uuid of: …",
-/// 2.1.310, PROTOCOL.md Pass 55). Codex reverts across one fine.
-fn compacted_after(entries: &[Arc<SeqEvent>], seq: u64) -> bool {
-    entries.iter().any(|entry| {
-        entry.seq > seq
-            && matches!(
-                entry.ev,
-                AgentEvent::ContextCompaction {
-                    phase: chimaera_agent::model::CompactionPhase::Completed,
-                    ..
-                }
-            )
-    })
-}
-
-/// Whether the conversation was compacted after the checkpoint whose
-/// preceding uuid is `resume_at` (a Claude rewind's anchor): the line scan
-/// [`find_fork_cut`] makes, so the refusal is decided before any stop.
-fn compacted_since_anchor(content: &str, resume_at: &str) -> bool {
-    let mut past_anchor = false;
-    for line in content.lines() {
-        let Ok(entry) = serde_json::from_str::<SeqEvent>(line) else {
-            continue;
-        };
-        match &entry.ev {
-            AgentEvent::Checkpoint {
-                preceding_uuid: Some(preceding),
-                ..
-            } if preceding == resume_at => past_anchor = true,
-            AgentEvent::ContextCompaction {
-                phase: chimaera_agent::model::CompactionPhase::Completed,
-                ..
-            } if past_anchor => return true,
-            _ => {}
-        }
-    }
-    false
-}
-
 fn find_fork_cut(content: &str, resume_at: &str) -> Option<ForkCut> {
     let lines: Vec<&str> = content.lines().collect();
     // The checkpoint's own echo, right before it (a fresh send) — matched by
@@ -2126,6 +2134,28 @@ pub(crate) async fn rewind_session(
         );
     };
 
+    let jpath = state.chat.journal_dir().join(format!("{id}.jsonl"));
+    // Claude cannot resume at a message from before its latest compaction:
+    // refuse while the session is still alive (the respawn would exit at
+    // once, after the journal was already cut) and before the respawn inputs
+    // rewrite anything. A fork from there still works, from the transcript.
+    if record.kind == AgentKind::Claude {
+        let (scan_path, anchor) = (jpath.clone(), body.resume_at.clone());
+        let compacted = tokio::task::spawn_blocking(move || {
+            std::fs::read_to_string(&scan_path)
+                .map(|content| compacted_since_anchor(&content, &anchor))
+        })
+        .await;
+        if matches!(compacted, Ok(Ok(true))) {
+            return err(
+                StatusCode::CONFLICT,
+                "the conversation was compacted after this message, so Claude can no longer \
+                 rewind it there; fork from the message instead"
+                    .to_string(),
+            );
+        }
+    }
+
     // Resolve every respawn precondition BEFORE the kill (same discipline as
     // the view switch): a post-kill failure would strand the session. Only
     // claude needs the per-session settings/mcp files.
@@ -2147,7 +2177,6 @@ pub(crate) async fn rewind_session(
         Ok(inputs) => inputs,
         Err(msg) => return err(StatusCode::CONFLICT, msg),
     };
-    let jpath = state.chat.journal_dir().join(format!("{id}.jsonl"));
     // Codex rolls back by TURN COUNT derived from the journal: without an
     // anchor match there is no count, so refuse HERE, with the driver still
     // alive. (Claude can proceed anchor-less — its fork is keyed by uuid and
@@ -2163,26 +2192,6 @@ pub(crate) async fn rewind_session(
             return err(
                 StatusCode::CONFLICT,
                 "no checkpoint anchor for this message in the session journal".to_string(),
-            );
-        }
-    }
-    // Claude cannot resume at a message from before its latest compaction:
-    // refuse while the session is still alive (the respawn would exit at
-    // once, after the journal was already cut). A fork from there still
-    // works, from the transcript.
-    if record.kind == AgentKind::Claude {
-        let (scan_path, anchor) = (jpath.clone(), body.resume_at.clone());
-        let compacted = tokio::task::spawn_blocking(move || {
-            std::fs::read_to_string(&scan_path)
-                .map(|content| compacted_since_anchor(&content, &anchor))
-        })
-        .await;
-        if matches!(compacted, Ok(Ok(true))) {
-            return err(
-                StatusCode::CONFLICT,
-                "the conversation was compacted after this message, so Claude can no longer \
-                 rewind it there; fork from the message instead"
-                    .to_string(),
             );
         }
     }

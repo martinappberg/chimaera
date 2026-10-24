@@ -135,6 +135,16 @@ pub(crate) fn statusline_header_path(session_id: &str) -> PathBuf {
     agents_runtime_dir().join(format!("{session_id}-statusline.hdr"))
 }
 
+/// What a Claude session's generated `--settings` file says about
+/// compaction (`chat::claude_compaction`): `enabled` is the conversation's
+/// pick, else `agents.autoCompact` On/Off; `at` is `agents.autoCompactAt`.
+/// `None` in either leaves the user's own Claude Code settings in charge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Compaction {
+    pub(crate) enabled: Option<bool>,
+    pub(crate) at: Option<u8>,
+}
+
 /// Write the per-agent Claude Code settings file (hooks -> daemon ingest URL)
 /// into the chimaera runtime dir, mode 0600 (it embeds the session secret).
 ///
@@ -159,16 +169,6 @@ pub(crate) fn statusline_header_path(session_id: &str) -> PathBuf {
 /// `None` (every non-mastermind session) writes no permissions block. A
 /// running claude never re-reads this file, so a mode change re-creates the
 /// session (the PUT mastermind route) rather than editing in place.
-/// What a Claude session's generated `--settings` file says about
-/// compaction (`chat::claude_compaction`): `enabled` is the conversation's
-/// pick, else `agents.autoCompact` On/Off; `at` is `agents.autoCompactAt`.
-/// `None` in either leaves the user's own Claude Code settings in charge.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Compaction {
-    pub(crate) enabled: Option<bool>,
-    pub(crate) at: Option<u8>,
-}
-
 #[allow(clippy::too_many_arguments)] // one arg per optional key, like the argv builders
 pub(crate) fn write_settings(
     session_id: &str,

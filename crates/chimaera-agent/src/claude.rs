@@ -68,14 +68,16 @@ fn autocompact_pct(value: &Value) -> Option<f64> {
     let pct = match value {
         Value::Number(n) => n.as_f64()?,
         Value::String(text) => {
+            // `parseFloat` takes the longest numeric prefix, exponent
+            // included ("8e1" is 80). Rust's extra spellings (`inf`, `nan`)
+            // land outside (0, 100] either way.
             let text = text.trim_start();
-            let end = text
-                .char_indices()
-                .find(|&(i, c)| {
-                    !(c.is_ascii_digit() || c == '.' || (i == 0 && (c == '-' || c == '+')))
-                })
-                .map_or(text.len(), |(i, _)| i);
-            text[..end].parse::<f64>().ok()?
+            let cap = text.char_indices().nth(32).map_or(text.len(), |(i, _)| i);
+            let text = &text[..cap];
+            (1..=text.len())
+                .rev()
+                .filter(|&end| text.is_char_boundary(end))
+                .find_map(|end| text[..end].parse::<f64>().ok())?
         }
         _ => return None,
     };
@@ -10533,6 +10535,10 @@ pub(crate) mod tests {
         assert_eq!(autocompact_pct(&json!("80")), Some(80.0));
         assert_eq!(autocompact_pct(&json!(" 7.5")), Some(7.5));
         assert_eq!(autocompact_pct(&json!("80%")), Some(80.0));
+        assert_eq!(autocompact_pct(&json!("8e1")), Some(80.0));
+        assert_eq!(autocompact_pct(&json!("75e")), Some(75.0));
+        assert_eq!(autocompact_pct(&json!("1.5.2")), Some(1.5));
+        assert_eq!(autocompact_pct(&json!("inf")), None);
         assert_eq!(autocompact_pct(&json!(42)), Some(42.0));
         assert_eq!(autocompact_pct(&json!("100")), Some(100.0));
         assert_eq!(autocompact_pct(&json!("0")), None);
