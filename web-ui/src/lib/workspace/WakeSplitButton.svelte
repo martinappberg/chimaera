@@ -82,6 +82,10 @@
     font-weight: 500;
     padding: 2px 10px;
   }
+  /* Dimmed like the card's other buttons while busy. */
+  .pill > .opt:disabled {
+    opacity: 0.55;
+  }
   .pill > .opt:first-child {
     border-radius: 999px 0 0 999px;
   }

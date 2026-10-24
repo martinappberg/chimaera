@@ -1976,22 +1976,22 @@ fn ask_user(state: &Arc<AppState>, ws: &str, req: WakeRequest) {
     // A send decided under the old policy can land its request just after a
     // looser policy's sweep (`policy_changed`): the policy is read after the
     // insert, so either the sweep sees the request or this sees the policy.
-    // Whichever removes it releases it.
+    // Whichever removes it releases it. Like the sweep, nothing goes while
+    // agent communication is off.
     let policy = wake_policy(state);
-    let late = {
+    let late = if enabled(state) {
         let mut st = crate::lock(&state.comms.inner);
         let list = st.requests.entry(ws.to_string()).or_default();
-        match list
+        let req = list
             .iter()
             .position(|r| r.to_sid == to_sid && lets_go(policy, r.reason))
-        {
-            Some(pos) => {
-                let req = list.remove(pos);
-                bump(&mut st, ws);
-                Some(req)
-            }
-            None => None,
+            .map(|pos| list.remove(pos));
+        if req.is_some() {
+            bump(&mut st, ws);
         }
+        req
+    } else {
+        None
     };
     if let Some(req) = late {
         state.changes.notify_waiters();
@@ -2009,14 +2009,15 @@ fn ask_user(state: &Arc<AppState>, ws: &str, req: WakeRequest) {
     state.changes.notify_waiters();
 }
 
-/// Ask again about `ws`'s first waiting request, as a send decided under an
-/// older policy would (tests drive the request-after-sweep race).
+/// Take `ws`'s first waiting request out and ask about it again, as a send
+/// decided under an older policy lands its request after the sweep (tests
+/// drive that race).
 #[cfg(test)]
 pub(crate) fn reask_for_tests(state: &Arc<AppState>, ws: &str) {
     let req = crate::lock(&state.comms.inner)
         .requests
-        .get(ws)
-        .and_then(|l| l.first().cloned());
+        .get_mut(ws)
+        .and_then(|l| (!l.is_empty()).then(|| l.remove(0)));
     if let Some(req) = req {
         ask_user(state, ws, req);
     }
@@ -2694,10 +2695,6 @@ pub(crate) async fn post_wake(
     }
 }
 
-/// The user loosened the wake policy (Settings, or the wake bar's
-/// "Within limits" / "Always"): the requests it no longer asks about go,
-/// and their agents wake under it. Ask → Within limits lets go of the
-/// plain asks (a limit's Continue still asks); Always lets go of every one.
 /// Whether `policy` no longer asks about a request held for `reason`.
 fn lets_go(policy: WakePolicy, reason: &str) -> bool {
     match policy {
@@ -2710,6 +2707,10 @@ fn lets_go(policy: WakePolicy, reason: &str) -> bool {
 const LOOSENED_WHY: &str =
     "[chimaera delivered these because the user now lets agents in this workspace wake each other]";
 
+/// The user loosened the wake policy (Settings, or the wake bar's
+/// "Within limits" / "Always"): the requests it no longer asks about go,
+/// and their agents wake under it. Ask → Within limits lets go of the
+/// plain asks (a limit's Continue still asks); Always lets go of every one.
 pub(crate) fn policy_changed(state: &Arc<AppState>, before: WakePolicy, after: WakePolicy) {
     if before == after || !enabled(state) {
         return;
