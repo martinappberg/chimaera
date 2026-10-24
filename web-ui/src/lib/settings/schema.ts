@@ -293,7 +293,7 @@ const DEFS = {
     title: "Auto-Compact (Claude)",
     category: "Agents",
     description:
-      "Whether Claude Code summarizes a long conversation on its own when the context fills. Agent default follows your Claude Code settings. Off: it waits for /compact or Compact under a chat's usage meter, and a full context stops the turn.",
+      "Whether Claude Code summarizes a long conversation on its own.",
     type: "enum",
     default: "agent",
     options: [
@@ -302,7 +302,7 @@ const DEFS = {
       { value: "off", label: "Off" },
     ],
     scope: "daemon",
-    note: "Claude sessions started after the change. A chat's own switch, under its usage meter, wins for that conversation.",
+    note: "Applies to sessions started after the change.",
   },
   // Each CLI's own percentage, set per session (Pass 55): Claude's
   // CLAUDE_AUTOCOMPACT_PCT_OVERRIDE in the generated --settings env, Codex's
@@ -313,7 +313,7 @@ const DEFS = {
     title: "Auto-Compact At",
     category: "Agents",
     description:
-      "How full the context window gets before the agent summarizes the conversation on its own. Agent default keeps each agent's own point, near the end of the window.",
+      "How full the context gets before the agent summarizes it.",
     type: "enum",
     default: "agent",
     options: [
@@ -329,7 +329,7 @@ const DEFS = {
       { value: "90", label: "90%" },
     ],
     scope: "daemon",
-    note: "Claude and Codex sessions started or resumed after the change. Claude counts it against the window less its reply reserve; Codex checks it as a turn ends.",
+    note: "Applies to sessions started or resumed after the change.",
   },
 
   // --- Dashboard ---------------------------------------------------------------
