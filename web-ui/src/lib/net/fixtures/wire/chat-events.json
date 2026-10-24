@@ -685,6 +685,7 @@
     {
       "frame": {
         "ev": {
+          "auto_compact_at": 160000,
           "max_tokens": 200000,
           "percentage": 42.0,
           "total_tokens": 84000,
@@ -694,7 +695,7 @@
         "ts": 1700000000034
       },
       "name": "context_usage",
-      "note": "context window fill"
+      "note": "context window fill, with the threshold the agent compacts at"
     },
     {
       "frame": {

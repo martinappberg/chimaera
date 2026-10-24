@@ -320,6 +320,7 @@ impl Driver for CodexDriver {
         if hs.summary_configured {
             mapper.reasoning_summary = None;
         }
+        mapper.compact_threshold = hs.compact_threshold;
         // A status announced during the handshake (a paired daemon that is
         // already connected) would otherwise never reach the relay.
         if let Some(frame) = hs.remote_control_status {
@@ -382,6 +383,52 @@ struct CodexHandshake {
     /// The user's config names a `model_reasoning_summary`, so turns must
     /// not override it (see `CodexMapper::reasoning_summary`).
     summary_configured: bool,
+    /// Where the opened thread compacts on its own, when a percentage set it.
+    compact_threshold: Option<CompactThreshold>,
+}
+
+/// A thread's `model_post_turn_compact_threshold_percent` (Chimaera's, else
+/// the user's config) and the user's own `model_auto_compact_token_limit`,
+/// which can only bring compaction earlier (Pass 55).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CompactThreshold {
+    percent: u8,
+    user_limit: Option<u64>,
+}
+
+impl CompactThreshold {
+    /// The token count, on the meter's window (`modelContextWindow`, the
+    /// usable window the percentage is taken of), where a turn that ends at
+    /// or past it is compacted: `active × 100 >= window × percent`.
+    fn tokens(self, window: u64) -> u64 {
+        let at = (window * u64::from(self.percent)).div_ceil(100);
+        self.user_limit.map_or(at, |limit| at.min(limit))
+    }
+}
+
+/// The thread's threshold from Chimaera's setting and the user's merged
+/// config (`config/read`). A user limit charged only after the opening
+/// prefix (`model_auto_compact_token_limit_scope = "body_after_prefix"`)
+/// has no place on the meter, so no threshold is shown then.
+fn compact_threshold(chosen: Option<u8>, config: Option<&Value>) -> Option<CompactThreshold> {
+    let config = config.map(|c| &c["config"]);
+    let percent = chosen.or_else(|| {
+        config?["model_post_turn_compact_threshold_percent"]
+            .as_u64()
+            .and_then(|p| u8::try_from(p).ok())
+    })?;
+    if percent == 0 || percent > 100 {
+        return None;
+    }
+    if config
+        .is_some_and(|c| c["model_auto_compact_token_limit_scope"] == json!("body_after_prefix"))
+    {
+        return None;
+    }
+    Some(CompactThreshold {
+        percent,
+        user_limit: config.and_then(|c| c["model_auto_compact_token_limit"].as_u64()),
+    })
 }
 
 #[derive(Default)]
@@ -679,6 +726,7 @@ async fn codex_handshake(
         remote_control_status: side.remote_control_status,
         server_requests: side.server_requests,
         summary_configured,
+        compact_threshold: compact_threshold(spec.auto_compact_at, config.as_ref()),
     })
 }
 
@@ -783,6 +831,13 @@ fn thread_open_request(spec: &SpawnSpec, id: u64, effort: Option<&str>) -> Value
     // Native planning defaults to disabled. Set it on the thread itself:
     // app-server launch flags alone did not expose the tool (Pass 48).
     open["params"]["config"] = json!({"tools.update_plan.enabled": true});
+    // The daemon's auto-compact threshold: Codex's own percentage of the
+    // usable window, checked when a turn's final answer lands (a turn that
+    // fills the window still compacts at Codex's 90% limit). Thread config,
+    // so it holds for this process and is re-sent on every reopen (Pass 55).
+    if let Some(percent) = spec.auto_compact_at {
+        open["params"]["config"]["model_post_turn_compact_threshold_percent"] = json!(percent);
+    }
     // The launcher's model selection is thread configuration, not argv, for
     // app-server. Passing it while opening the thread avoids the old seam
     // where a Codex chat silently fell back to the user's default until they
@@ -1598,6 +1653,10 @@ struct CodexMapper {
     /// live: 0 of 3 unset turns vs 3 of 3 with "auto", the value Codex
     /// Desktop sends. `None` when the user's config names its own mode.
     reasoning_summary: Option<&'static str>,
+    /// The post-turn compaction threshold this thread runs with, for the
+    /// context meter (Pass 55); `None` when nothing set one or the user's
+    /// own limit is counted in a way the meter cannot place.
+    compact_threshold: Option<CompactThreshold>,
     /// Composer agent mode (read-only/auto/full-access/plan): the wire
     /// fields ride each turn/start once settings/update proves unsupported.
     current_mode: String,
@@ -1833,6 +1892,7 @@ impl CodexMapper {
             // The handshake queues this exact state immediately after Init.
             reported_effort: Some(effort),
             reasoning_summary: Some("auto"),
+            compact_threshold: None,
             // Chimaera's chat default: the same workspace/on-request tuple,
             // with Codex's reviewer assessing approvals before they surface.
             current_mode: "auto-review".to_string(),
@@ -2506,6 +2566,7 @@ impl CodexMapper {
                             total_tokens: in_window,
                             max_tokens: max,
                             percentage: in_window as f64 / max as f64 * 100.0,
+                            auto_compact_at: self.compact_threshold.map(|t| t.tokens(max)),
                         });
                     }
                 }
@@ -11117,13 +11178,113 @@ mod tests {
                 total_tokens,
                 max_tokens,
                 percentage,
+                auto_compact_at,
             } => {
                 assert_eq!(*total_tokens, 30_000);
                 assert_eq!(*max_tokens, 300_000);
                 assert!((percentage - 10.0).abs() < 0.01);
+                // Nothing set a threshold: none is drawn.
+                assert_eq!(*auto_compact_at, None);
             }
             other => panic!("expected ContextUsage, got {other:?}"),
         }
+    }
+
+    /// The daemon's threshold opens every thread (start, resume, fork) as
+    /// Codex's own post-turn percentage, beside the plan tool's config.
+    #[test]
+    fn auto_compact_at_rides_every_thread_open() {
+        let mut spec = SpawnSpec::new("s", vec![], std::path::PathBuf::from("/w"));
+        let fresh = thread_open_request(&spec, 2, None);
+        assert!(fresh["params"]["config"]
+            .get("model_post_turn_compact_threshold_percent")
+            .is_none());
+        spec.auto_compact_at = Some(80);
+        for (pinned, fork_at, method) in [
+            (None, None, "thread/start"),
+            (Some("th"), None, "thread/resume"),
+            (Some("th"), Some("turn"), "thread/fork"),
+        ] {
+            spec.pinned_native_id = pinned.map(String::from);
+            spec.fork_at = fork_at.map(String::from);
+            let open = thread_open_request(&spec, 2, None);
+            assert_eq!(open["method"], method);
+            assert_eq!(
+                open["params"]["config"]["model_post_turn_compact_threshold_percent"],
+                json!(80)
+            );
+            assert_eq!(
+                open["params"]["config"]["tools.update_plan.enabled"],
+                json!(true)
+            );
+        }
+    }
+
+    /// Where the meter draws the threshold: the percentage of the usable
+    /// window (`modelContextWindow`), rounded up like Codex's own check,
+    /// never past the user's earlier token limit; the user's own percentage
+    /// counts when Chimaera sets none; a prefix-scoped limit hides it.
+    #[test]
+    fn compact_threshold_follows_the_thread_config() {
+        let config = |c: Value| json!({ "config": c });
+        assert_eq!(compact_threshold(None, None), None);
+        assert_eq!(compact_threshold(None, Some(&config(json!({})))), None);
+        let chosen = compact_threshold(Some(80), None).unwrap();
+        assert_eq!(chosen.tokens(258_400), 206_720);
+        assert_eq!(chosen.tokens(258_401), 206_721);
+        let own = compact_threshold(
+            None,
+            Some(&config(
+                json!({ "model_post_turn_compact_threshold_percent": 60 }),
+            )),
+        )
+        .unwrap();
+        assert_eq!(own.tokens(100_000), 60_000);
+        let limited = compact_threshold(
+            Some(80),
+            Some(&config(
+                json!({ "model_auto_compact_token_limit": 150_000 }),
+            )),
+        )
+        .unwrap();
+        assert_eq!(limited.tokens(258_400), 150_000);
+        assert_eq!(
+            compact_threshold(
+                Some(80),
+                Some(&config(json!({
+                    "model_auto_compact_token_limit": 150_000,
+                    "model_auto_compact_token_limit_scope": "body_after_prefix",
+                }))),
+            ),
+            None
+        );
+        assert_eq!(
+            compact_threshold(
+                None,
+                Some(&config(
+                    json!({ "model_post_turn_compact_threshold_percent": 0 })
+                ))
+            ),
+            None
+        );
+
+        let mut m = mapper();
+        m.compact_threshold = Some(chosen);
+        let step = m.on_frame(&json!({
+            "method": "thread/tokenUsage/updated",
+            "params": { "tokenUsage": {
+                "total": { "totalTokens": 19_039 },
+                "last": { "totalTokens": 19_039 },
+                "modelContextWindow": 258_400,
+            }},
+        }));
+        assert!(matches!(
+            step.events.as_slice(),
+            [AgentEvent::ContextUsage {
+                auto_compact_at: Some(206_720),
+                ..
+            }]
+        ));
     }
 
     #[test]

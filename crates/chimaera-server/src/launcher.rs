@@ -1211,6 +1211,18 @@ pub(crate) fn build_agent_command(
     cmd
 }
 
+/// A Codex TUI's auto-compact threshold (`agents.autoCompactAt`): the same
+/// `model_post_turn_compact_threshold_percent` a chat thread opens with, as a
+/// launch-scoped `-c` override (PROTOCOL.md Pass 55). Nothing at Agent default.
+pub(crate) fn push_codex_compact_at(argv: &mut Vec<String>, at: Option<u8>) {
+    if let Some(percent) = at {
+        argv.push("-c".to_string());
+        argv.push(format!(
+            "model_post_turn_compact_threshold_percent={percent}"
+        ));
+    }
+}
+
 /// Argv to resume a chat session as an *interactive* PTY TUI — the degrade
 /// (failed handshake) and toggle-to-terminal paths. Claude reuses
 /// [`build_agent_command`] (settings/model/`--resume`) and appends the
@@ -1857,6 +1869,24 @@ mod detection_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Codex TUI gets the threshold as a launch-scoped `-c`, and nothing
+    /// at Agent default.
+    #[test]
+    fn codex_tui_takes_the_compaction_threshold_as_config() {
+        let mut argv = vec!["codex".to_string()];
+        push_codex_compact_at(&mut argv, None);
+        assert_eq!(argv, ["codex"]);
+        push_codex_compact_at(&mut argv, Some(75));
+        assert_eq!(
+            argv,
+            [
+                "codex",
+                "-c",
+                "model_post_turn_compact_threshold_percent=75"
+            ]
+        );
+    }
 
     /// The IDE launcher masquerading as `agy` must be refused on every
     /// platform: via the macOS bundle path AND via the launcher binary's

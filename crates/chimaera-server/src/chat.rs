@@ -903,7 +903,7 @@ async fn switch_to_pty(
     } else {
         None
     };
-    let argv = crate::launcher::build_agent_resume_command(
+    let mut argv = crate::launcher::build_agent_resume_command(
         recipe.kind,
         &bin,
         recipe.settings.as_deref(),
@@ -914,6 +914,10 @@ async fn switch_to_pty(
         codex_theme,
         fork_context_file.as_deref(),
     );
+    if recipe.kind == AgentKind::Codex {
+        let at = crate::lock(&state.settings).auto_compact_at();
+        crate::launcher::push_codex_compact_at(&mut argv, at);
+    }
     // A view-switch respawn is a real spawn too — same prelude as the chat
     // process it replaces (the recipe carries the launch scope).
     let startup = crate::environment::job_startup().await;
@@ -1200,15 +1204,34 @@ async fn resolve_respawn_inputs(
     let (settings, mcp_config) = if kind == AgentKind::Claude {
         let settings_path = crate::agents::settings_path(id);
         let mcp_path = crate::agents::mcp_config_path(id);
-        if settings_path.exists() && mcp_path.exists() {
-            // The file is the one this session started with; a toggle in
-            // the chat since then lives only in the conversation's record.
-            if let Some(enabled) =
-                resume.and_then(|native| conversation_auto_compact(state, native))
-            {
-                crate::agents::set_settings_auto_compact(&settings_path, enabled)
-                    .map_err(|err| err.to_string())?;
+        // A reused file is the one this session started with; a toggle in
+        // the chat since then lives only in the conversation's record, and
+        // the threshold is read as it is now.
+        let compaction = crate::agents::Compaction {
+            enabled: resume.and_then(|native| conversation_auto_compact(state, native)),
+            at: crate::lock(&state.settings).auto_compact_at(),
+        };
+        // The presence checks and the refresh (a read, maybe a rewrite) are
+        // blocking fs: one trip off the reactor.
+        let (probe_settings, probe_mcp) = (settings_path.clone(), mcp_path.clone());
+        // A file the refresh can't use (cut short by a full disk, say) is
+        // regenerated like a scrubbed one: refusing would fail every later
+        // rewind and view switch of the session with no way out.
+        let reused = tokio::task::spawn_blocking(move || {
+            if !(probe_settings.exists() && probe_mcp.exists()) {
+                return false;
             }
+            match crate::agents::refresh_settings_compaction(&probe_settings, compaction) {
+                Ok(()) => true,
+                Err(err) => {
+                    tracing::warn!(%err, path = %probe_settings.display(), "settings file unusable; regenerating");
+                    false
+                }
+            }
+        })
+        .await
+        .map_err(|err| err.to_string())?;
+        if reused {
             (Some(settings_path), Some(mcp_path))
         } else {
             // Runtime state is explicitly reconstructible: macOS and Linux
@@ -1226,7 +1249,6 @@ async fn resolve_respawn_inputs(
                     .await;
             let settings_theme = (!theme_set).then_some(theme);
             let plugin_tools = crate::plugins::spawn_allow(state, workspace_id).await;
-            let auto_compact = claude_auto_compact(state, resume);
             let settings = crate::agents::write_settings(
                 id,
                 &key,
@@ -1235,7 +1257,7 @@ async fn resolve_respawn_inputs(
                 user_statusline.as_ref(),
                 mastermind,
                 &plugin_tools,
-                auto_compact,
+                claude_compaction(state, resume),
             )
             .map_err(|err| err.to_string())?;
             let mcp = crate::agents::write_mcp_config(id, &key, state.port)
@@ -1260,6 +1282,49 @@ async fn resolve_respawn_inputs(
 pub(crate) struct DroppedTurns {
     pub(crate) count: u32,
     pub(crate) first_turn_id: Option<String>,
+}
+
+/// A completed compaction: Claude reloads only the conversation after its
+/// latest compaction boundary, so an anchor from before one is no longer in
+/// the chain it resumes: `--resume-session-at` with it exits at once ("No
+/// message found with message.uuid of: …", 2.1.310, PROTOCOL.md Pass 55).
+/// Codex reverts across one fine.
+fn is_completed_compaction(ev: &AgentEvent) -> bool {
+    matches!(
+        ev,
+        AgentEvent::ContextCompaction {
+            phase: chimaera_agent::model::CompactionPhase::Completed,
+            ..
+        }
+    )
+}
+
+/// Whether a completed compaction was journaled after `seq`.
+fn compacted_after(entries: &[Arc<SeqEvent>], seq: u64) -> bool {
+    entries
+        .iter()
+        .any(|entry| entry.seq > seq && is_completed_compaction(&entry.ev))
+}
+
+/// Whether the conversation was compacted after the checkpoint whose
+/// preceding uuid is `resume_at` (a Claude rewind's anchor): the line scan
+/// [`find_fork_cut`] makes, so the refusal is decided before any stop.
+fn compacted_since_anchor(content: &str, resume_at: &str) -> bool {
+    let mut past_anchor = false;
+    for line in content.lines() {
+        let Ok(entry) = serde_json::from_str::<SeqEvent>(line) else {
+            continue;
+        };
+        match &entry.ev {
+            AgentEvent::Checkpoint {
+                preceding_uuid: Some(preceding),
+                ..
+            } if preceding == resume_at => past_anchor = true,
+            ev if past_anchor && is_completed_compaction(ev) => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 type ForkCut = (usize, DroppedTurns, Vec<(usize, String)>);
@@ -2080,6 +2145,45 @@ pub(crate) async fn rewind_session(
         );
     };
 
+    let jpath = state.chat.journal_dir().join(format!("{id}.jsonl"));
+    // Claude cannot resume at a message from before its latest compaction:
+    // refuse while the session is still alive (the respawn would exit at
+    // once, after the journal was already cut) and before the respawn inputs
+    // rewrite anything. A fork from there still works, from the transcript.
+    if record.kind == AgentKind::Claude {
+        let (scan_path, anchor) = (jpath.clone(), body.resume_at.clone());
+        let compacted = tokio::task::spawn_blocking(move || {
+            std::fs::read_to_string(&scan_path)
+                .map(|content| compacted_since_anchor(&content, &anchor))
+        })
+        .await;
+        match compacted {
+            Ok(Ok(false)) => {}
+            Ok(Ok(true)) => {
+                return err(
+                    StatusCode::CONFLICT,
+                    "the conversation was compacted after this message, so Claude can no longer \
+                     rewind it there; fork from the message instead"
+                        .to_string(),
+                );
+            }
+            // Unchecked is refused too: a rewind past a compaction kills the
+            // chat after its journal is cut, which is what this check guards.
+            Ok(Err(e)) => {
+                return err(
+                    StatusCode::CONFLICT,
+                    format!("couldn't read this chat's history to check the rewind point: {e}"),
+                );
+            }
+            Err(_) => {
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "the rewind check didn't finish".to_string(),
+                );
+            }
+        }
+    }
+
     // Resolve every respawn precondition BEFORE the kill (same discipline as
     // the view switch): a post-kill failure would strand the session. Only
     // claude needs the per-session settings/mcp files.
@@ -2101,7 +2205,6 @@ pub(crate) async fn rewind_session(
         Ok(inputs) => inputs,
         Err(msg) => return err(StatusCode::CONFLICT, msg),
     };
-    let jpath = state.chat.journal_dir().join(format!("{id}.jsonl"));
     // Codex rolls back by TURN COUNT derived from the journal: without an
     // anchor match there is no count, so refuse HERE, with the driver still
     // alive. (Claude can proceed anchor-less — its fork is keyed by uuid and
@@ -2803,6 +2906,15 @@ fn native_fork_point(
     match kind {
         AgentKind::Claude => {
             if let Some(selected) = before_user_id {
+                let checkpoint_seq = entries.iter().find_map(|entry| match &entry.ev {
+                    AgentEvent::Checkpoint {
+                        user_message_id, ..
+                    } if user_message_id == selected && entry.seq > through_seq => Some(entry.seq),
+                    _ => None,
+                });
+                if checkpoint_seq.is_none_or(|seq| compacted_after(entries, seq)) {
+                    return false;
+                }
                 // Editing a user message branches immediately BEFORE it. The
                 // selected checkpoint authenticates the preceding native UUID
                 // even though that UUID can belong to an assistant message and
@@ -2840,6 +2952,9 @@ fn native_fork_point(
                         })
                 });
                 return checkpoint && clean_cut;
+            }
+            if compacted_after(entries, through_seq) {
+                return false;
             }
             let checkpoint = entries.iter().any(|entry| {
                 entry.seq > portable_floor
@@ -3307,12 +3422,11 @@ pub(crate) async fn spawn_fresh_chat_at(
         let settings_theme = (!theme_set).then_some(spec.theme.as_str());
         let plugin_tools = crate::plugins::spawn_allow(state, &workspace.id).await;
         // A branch starts from its parent's pick.
-        let auto_compact = inherited_auto_compact.or_else(|| {
-            claude_auto_compact(
-                state,
-                native_fork.as_ref().map(|(source, _)| source.as_str()),
-            )
-        });
+        let mut compaction = claude_compaction(
+            state,
+            native_fork.as_ref().map(|(source, _)| source.as_str()),
+        );
+        compaction.enabled = inherited_auto_compact.or(compaction.enabled);
         let s = crate::agents::write_settings(
             &id,
             &key,
@@ -3321,7 +3435,7 @@ pub(crate) async fn spawn_fresh_chat_at(
             user_statusline.as_ref(),
             spec.mastermind,
             &plugin_tools,
-            auto_compact,
+            compaction,
         )
         .map_err(ChatSpawnFailure::Internal)?;
         let m = crate::agents::write_mcp_config(&id, &key, state.port)
@@ -3490,6 +3604,19 @@ pub(crate) fn claude_auto_compact(state: &AppState, resume: Option<&str>) -> Opt
     resume
         .and_then(|native| conversation_auto_compact(state, native))
         .or_else(|| crate::lock(&state.settings).claude_auto_compact())
+}
+
+/// Everything a Claude session's generated `--settings` file says about
+/// compaction: [`claude_auto_compact`] and the daemon's threshold
+/// (`agents.autoCompactAt`, which has no per-conversation pick).
+pub(crate) fn claude_compaction(
+    state: &AppState,
+    resume: Option<&str>,
+) -> crate::agents::Compaction {
+    crate::agents::Compaction {
+        enabled: claude_auto_compact(state, resume),
+        at: crate::lock(&state.settings).auto_compact_at(),
+    }
 }
 
 /// The conversation's own auto-compact pick (in-memory index read).
@@ -3759,6 +3886,11 @@ pub(crate) async fn spawn_chat_session(
     if recipe.kind == AgentKind::Claude {
         spec.conversation_auto_compact = conversation_auto_compact;
     }
+    // Codex takes the threshold at the thread open, so each reopen (resume,
+    // rewind, fork, resurrection) re-applies the setting as it is now.
+    if recipe.kind == AgentKind::Codex {
+        spec.auto_compact_at = crate::lock(&state.settings).auto_compact_at();
+    }
     if recipe.kind == AgentKind::Claude && remote_control {
         // The bare name (the driver spells `chimaera · <name>`): the session's
         // display name as the rail shows it, or the workspace directory, plus
@@ -3906,7 +4038,6 @@ pub(crate) async fn resurrect_chat(
             crate::runtimes::claude_settings_gates(&state.claude_settings_path, &root).await;
         let settings_theme = (!theme_set).then_some(entry.theme.as_str());
         let plugin_tools = crate::plugins::spawn_allow(state, &workspace.id).await;
-        let auto_compact = claude_auto_compact(state, agent.resume.as_deref());
         let s = crate::agents::write_settings(
             &entry.id,
             &key,
@@ -3915,7 +4046,7 @@ pub(crate) async fn resurrect_chat(
             user_statusline.as_ref(),
             mastermind_mode,
             &plugin_tools,
-            auto_compact,
+            claude_compaction(state, agent.resume.as_deref()),
         )?;
         let m = crate::agents::write_mcp_config(&entry.id, &key, state.port)?;
         (Some(s), Some(m))
@@ -4665,6 +4796,87 @@ mod tests {
         for line in jsonl.lines() {
             let _: serde_json::Value = serde_json::from_str(line).unwrap();
         }
+    }
+
+    /// Claude reloads only what follows its latest compaction (2.1.310: a
+    /// `--resume-session-at` before the boundary exits at once). A rewind to
+    /// a checkpoint before a completed compaction is refused up front, and a
+    /// native fork from there falls back to the portable handoff; a
+    /// checkpoint after it, and a failed compaction, change nothing.
+    #[test]
+    fn claude_anchors_before_a_compaction_are_not_native() {
+        use chimaera_agent::model::CompactionPhase;
+        let user = |id: &str| AgentEvent::UserMessage {
+            text: "q".into(),
+            attachments: 0,
+            attachment_paths: Vec::new(),
+            id: Some(id.into()),
+            queued: false,
+            after_turn: false,
+            origin: None,
+        };
+        let checkpoint = |id: &str, preceding: &str| AgentEvent::Checkpoint {
+            user_message_id: id.into(),
+            preceding_uuid: Some(preceding.into()),
+        };
+        let compaction = |phase| AgentEvent::ContextCompaction {
+            phase,
+            pre_tokens: Some(45_244),
+            trigger: None,
+        };
+        let entries = vec![
+            seq_event(1, user("u1")),
+            seq_event(2, checkpoint("u1", "a0")),
+            seq_event(3, compaction(CompactionPhase::Started)),
+            seq_event(4, compaction(CompactionPhase::Failed)),
+            seq_event(5, user("u2")),
+            seq_event(6, checkpoint("u2", "a1")),
+            seq_event(7, compaction(CompactionPhase::Started)),
+            seq_event(8, compaction(CompactionPhase::Completed)),
+            seq_event(9, user("u3")),
+            seq_event(10, checkpoint("u3", "a2")),
+        ];
+        let journal: String = entries
+            .iter()
+            .map(|e| serde_json::to_string(e.as_ref()).unwrap() + "\n")
+            .collect();
+        assert!(compacted_since_anchor(&journal, "a0"));
+        assert!(compacted_since_anchor(&journal, "a1"));
+        assert!(!compacted_since_anchor(&journal, "a2"));
+        assert!(!compacted_since_anchor(&journal, "missing"));
+        // The failed attempt after u1 alone would not have cut it off.
+        assert!(!compacted_after(&entries[..5], 2));
+        assert!(compacted_after(&entries, 6));
+        assert!(!compacted_after(&entries, 8));
+        // Forks: the agent branch through a checkpoint, and an edit of u2.
+        assert!(!native_fork_point(
+            &entries,
+            6,
+            AgentKind::Claude,
+            "u2",
+            None
+        ));
+        assert!(native_fork_point(
+            &entries,
+            10,
+            AgentKind::Claude,
+            "u3",
+            None
+        ));
+        assert!(!native_fork_point(
+            &entries,
+            4,
+            AgentKind::Claude,
+            "a1",
+            Some("u2")
+        ));
+        assert!(native_fork_point(
+            &entries,
+            8,
+            AgentKind::Claude,
+            "a2",
+            Some("u3")
+        ));
     }
 
     #[test]

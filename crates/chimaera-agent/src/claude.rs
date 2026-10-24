@@ -52,6 +52,79 @@ use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 /// Claude part of chat-smoke 21/21 + chat-mods-smoke; PROTOCOL.md Pass 52).
 pub const TESTED_CLAUDE_VERSION: &str = "2.1.310";
 
+/// The environment variable that lowers Claude Code's auto-compact
+/// threshold to a percentage of its window (PROTOCOL.md Pass 55). Chimaera
+/// writes it into a session's generated `--settings` `env`.
+pub const AUTOCOMPACT_PCT_VAR: &str = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE";
+
+/// The token reserve between the window less its output reserve and the
+/// threshold `get_context_usage` reports (`autoCompactThreshold` is that
+/// window minus 13,000; 2.1.310 bundle, Pass 55).
+const AUTOCOMPACT_SUMMARY_RESERVE: u64 = 13_000;
+
+/// The CLI's reading of an `env` value (`parseFloat`; used only when above
+/// 0 and at most 100). A JSON number is taken as written.
+fn autocompact_pct(value: &Value) -> Option<f64> {
+    let pct = match value {
+        Value::Number(n) => n.as_f64()?,
+        Value::String(text) => {
+            // `parseFloat`: skip JS whitespace (BOM yes, NEL no), then take
+            // the longest decimal prefix, exponent included ("8e1" is 80).
+            // Its one other spelling, `Infinity`, is outside (0, 100].
+            let text = text.trim_start_matches(|c: char| {
+                (c.is_whitespace() && c != '\u{85}') || c == '\u{feff}'
+            });
+            let bytes = text.as_bytes();
+            let digits = |from: usize| {
+                bytes.get(from..).map_or(0, |rest| {
+                    rest.iter().take_while(|b| b.is_ascii_digit()).count()
+                })
+            };
+            let mut end = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
+            let int = digits(end);
+            end += int;
+            let mut frac = 0;
+            if bytes.get(end) == Some(&b'.') {
+                frac = digits(end + 1);
+                if int + frac > 0 {
+                    end += 1 + frac;
+                }
+            }
+            if int + frac == 0 {
+                return None;
+            }
+            if matches!(bytes.get(end), Some(b'e' | b'E')) {
+                let exp = end + 1 + usize::from(matches!(bytes.get(end + 1), Some(b'+' | b'-')));
+                let exp_digits = digits(exp);
+                if exp_digits > 0 {
+                    end = exp + exp_digits;
+                }
+            }
+            text[..end].parse::<f64>().ok()?
+        }
+        _ => return None,
+    };
+    (pct > 0.0 && pct <= 100.0).then_some(pct)
+}
+
+/// Where a percentage override makes the CLI compact, from its own
+/// `get_context_usage`: `min(floor(window × pct / 100), threshold)`, the
+/// window being the reported threshold plus the summary reserve. Nothing
+/// while the CLI compacts only on "prompt is too long" (`autocompactSource`
+/// `auto`, where the percentage is ignored; a CLI that names no source is
+/// not assumed to compact early) or not at all.
+fn autocompact_at(usage: &Value, pct: f64) -> Option<u64> {
+    let enforced = usage["autocompactSource"]
+        .as_str()
+        .is_some_and(|source| source != "auto");
+    if usage["isAutoCompactEnabled"] != json!(true) || !enforced {
+        return None;
+    }
+    let threshold = usage["autoCompactThreshold"].as_u64()?;
+    let window = threshold + AUTOCOMPACT_SUMMARY_RESERVE;
+    Some((((window as f64) * pct / 100.0).floor() as u64).min(threshold))
+}
+
 /// Arguments for a structured chat session, before server-side extras
 /// (`--settings`, `--mcp-config`, `--session-id`) and login-shell wrapping.
 pub fn chat_args(model: Option<&str>, resume: Option<&str>) -> Vec<String> {
@@ -1066,6 +1139,11 @@ struct ClaudeMapper {
     /// The flag-layer auto-compact (`get_settings` `effective`); `None`
     /// until read, and for a CLI without the merged view (no switch then).
     auto_compact_setting: Option<bool>,
+    /// `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` as the merged settings' `env`
+    /// carries it (the CLI copies that into its process environment, over
+    /// an inherited value, and reads it at every check; Pass 55). `None`
+    /// when no settings layer sets a usable one.
+    auto_compact_pct: Option<f64>,
     /// Auto-compact applies sent, and how many of them the cached setting
     /// reflects. While they differ the CLI may already run with a value
     /// the cache does not show, so no answer may blame the environment.
@@ -1272,6 +1350,7 @@ impl ClaudeMapper {
             compaction_completed: false,
             compaction_awaiting_boundary: false,
             auto_compact_setting: None,
+            auto_compact_pct: None,
             auto_compact_applies: 0,
             auto_compact_read: 0,
             auto_compact_env: None,
@@ -3891,6 +3970,9 @@ impl ClaudeMapper {
                         percentage: usage["percentage"]
                             .as_f64()
                             .unwrap_or_else(|| total as f64 / max.max(1) as f64 * 100.0),
+                        auto_compact_at: self
+                            .auto_compact_pct
+                            .and_then(|pct| autocompact_at(usage, pct)),
                     });
                 }
             }
@@ -3977,6 +4059,10 @@ impl ClaudeMapper {
                 // own (absent = its default, on). A CLI without the merged
                 // view reports nothing, so no switch is offered for it.
                 if let Some(effective) = payload["effective"].as_object() {
+                    self.auto_compact_pct = effective
+                        .get("env")
+                        .and_then(|env| env.get(AUTOCOMPACT_PCT_VAR))
+                        .and_then(autocompact_pct);
                     self.auto_compact_read = self.auto_compact_read.max(applies);
                     self.auto_compact_setting = Some(
                         effective
@@ -11035,6 +11121,96 @@ pub(crate) mod tests {
                 },
             ]
         );
+    }
+
+    /// `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` as the CLI reads it (`parseFloat`,
+    /// then used only above 0 and at most 100).
+    #[test]
+    fn autocompact_pct_reads_like_the_cli() {
+        assert_eq!(autocompact_pct(&json!("80")), Some(80.0));
+        assert_eq!(autocompact_pct(&json!(" 7.5")), Some(7.5));
+        assert_eq!(autocompact_pct(&json!("80%")), Some(80.0));
+        assert_eq!(autocompact_pct(&json!("8e1")), Some(80.0));
+        assert_eq!(autocompact_pct(&json!("75e")), Some(75.0));
+        assert_eq!(autocompact_pct(&json!("1.5.2")), Some(1.5));
+        assert_eq!(autocompact_pct(&json!("inf")), None);
+        assert_eq!(autocompact_pct(&json!("5.")), Some(5.0));
+        assert_eq!(autocompact_pct(&json!(".5x")), Some(0.5));
+        assert_eq!(autocompact_pct(&json!("8e+1%")), Some(80.0));
+        assert_eq!(autocompact_pct(&json!("\u{feff}80")), Some(80.0));
+        assert_eq!(autocompact_pct(&json!("\u{85}80")), None);
+        // No length cap: a long spelling still reads as the CLI reads it.
+        let padded = format!("{}80", "0".repeat(40));
+        assert_eq!(autocompact_pct(&json!(padded)), Some(80.0));
+        assert_eq!(autocompact_pct(&json!(42)), Some(42.0));
+        assert_eq!(autocompact_pct(&json!("100")), Some(100.0));
+        assert_eq!(autocompact_pct(&json!("0")), None);
+        assert_eq!(autocompact_pct(&json!("150")), None);
+        assert_eq!(autocompact_pct(&json!("-5")), None);
+        assert_eq!(autocompact_pct(&json!("abc")), None);
+        assert_eq!(autocompact_pct(&json!(true)), None);
+    }
+
+    /// The merged settings' threshold lands on the turn-end meter where the
+    /// CLI compacts: `min(floor((threshold + 13k) × pct / 100), threshold)`
+    /// from its own `get_context_usage` (live 2.1.310: 967,000 reported for
+    /// a 1M window; 80% compacts at 784,000). Nothing at the CLI's default,
+    /// while it compacts only on "prompt is too long", or with it off.
+    #[test]
+    fn auto_compact_at_follows_the_merged_settings_env() {
+        fn meter(m: &mut ClaudeMapper, usage: Value) -> Option<Option<u64>> {
+            let mut step = DriverStep::default();
+            m.refresh_context_usage(&mut step);
+            let answered = answer(m, &step, usage);
+            answered.events.iter().find_map(|e| match e {
+                AgentEvent::ContextUsage {
+                    auto_compact_at, ..
+                } => Some(*auto_compact_at),
+                _ => None,
+            })
+        }
+        let usage = |source: &str, enabled: bool| {
+            json!({
+                "totalTokens": 32_052, "rawMaxTokens": 1_000_000, "percentage": 3,
+                "autoCompactThreshold": 967_000, "autocompactSource": source,
+                "isAutoCompactEnabled": enabled,
+            })
+        };
+        let mut m = mapper();
+        assert_eq!(meter(&mut m, usage("model-default", true)), Some(None));
+        let mut settings = DriverStep::default();
+        m.request_settings(&mut settings);
+        answer(
+            &mut m,
+            &settings,
+            json!({"applied":{}, "effective":{"env":{"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE":"80"}}}),
+        );
+        assert_eq!(
+            meter(&mut m, usage("model-default", true)),
+            Some(Some(784_000))
+        );
+        // A window from settings (`autoCompactWindow` 800k: threshold 767k).
+        let mut small = usage("settings", true);
+        small["autoCompactThreshold"] = json!(767_000);
+        assert_eq!(meter(&mut m, small), Some(Some(624_000)));
+        // Above the CLI's own threshold the percentage changes nothing.
+        let mut m99 = mapper();
+        let mut settings = DriverStep::default();
+        m99.request_settings(&mut settings);
+        answer(
+            &mut m99,
+            &settings,
+            json!({"applied":{}, "effective":{"env":{"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE":"99.5"}}}),
+        );
+        assert_eq!(
+            meter(&mut m99, usage("model-default", true)),
+            Some(Some(967_000))
+        );
+        assert_eq!(meter(&mut m, usage("auto", true)), Some(None));
+        assert_eq!(meter(&mut m, usage("model-default", false)), Some(None));
+        let mut unnamed = usage("model-default", true);
+        unnamed.as_object_mut().unwrap().remove("autocompactSource");
+        assert_eq!(meter(&mut m, unnamed), Some(None));
     }
 
     /// A setting that reads on is confirmed with get_context_usage before

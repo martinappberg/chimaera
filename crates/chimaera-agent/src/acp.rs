@@ -334,6 +334,7 @@ fn context_usage(used: &Value, size: &Value) -> Option<AgentEvent> {
         total_tokens: used,
         max_tokens: size,
         percentage: (used as f64 / size as f64 * 100.0).clamp(0.0, 100.0),
+        auto_compact_at: None,
     })
 }
 
@@ -1757,7 +1758,7 @@ mod tests {
             "sessionUpdate":"usage_update","used":53000,"size":200000,"cost":{"amount":0.4,"currency":"USD"}}}}));
         assert!(matches!(
             &step.events[..],
-            [AgentEvent::ContextUsage { total_tokens: 53000, max_tokens: 200000, percentage }] if (*percentage - 26.5).abs() < 0.01
+            [AgentEvent::ContextUsage { total_tokens: 53000, max_tokens: 200000, percentage, auto_compact_at: None }] if (*percentage - 26.5).abs() < 0.01
         ));
         // A report without a size says nothing.
         let step = m.on_frame(

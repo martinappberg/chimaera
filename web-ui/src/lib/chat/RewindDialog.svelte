@@ -18,6 +18,9 @@
       /** Asked from a reply ("rewind to here"): the anchor is the next
        *  message you sent, and the reply itself stays. */
       fromReply?: boolean;
+      /** Claude compacted the conversation after this point: only files can
+       *  rewind here (it resumes only what follows its latest compaction). */
+      compacted?: boolean;
     };
     /** The dry-run/apply report for this intent, once it lands (claude). */
     report: RewindReport | null;
@@ -82,9 +85,14 @@
           {/each}
         </ul>
       {/if}
+      {#if intent.compacted === true && intent.preceding !== null}
+        <div class="dialog-note">
+          the conversation was compacted since, so it can't rewind here — fork from this message to branch it
+        </div>
+      {/if}
       <div class="dialog-actions">
         <button class="opt primary" onclick={() => onConfirm(false)}>restore files</button>
-        {#if intent.preceding !== null}
+        {#if intent.preceding !== null && intent.compacted !== true}
           <button
             class="opt primary"
             title="also truncate the conversation here (forks to a new native session)"

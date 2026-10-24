@@ -12,6 +12,9 @@ export interface UsageRow {
   /** Epoch seconds (the streamed events, Codex) or an ISO timestamp
    *  (Claude's `get_usage`); null when unknown. */
   resetsAt: string | null;
+  /** 0-100: a point on the bar worth marking (the context row's
+   *  auto-compact threshold); absent on every limit window. */
+  mark?: number | null;
 }
 
 /** The wire's `{label, utilization, resets_at?}` windows. Labels are unique

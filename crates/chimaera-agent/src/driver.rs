@@ -94,6 +94,12 @@ pub struct SpawnSpec {
     /// records it under the native id the spawn reports, which is how a
     /// fork or rewind branch inherits its parent's pick. `None` = no pick.
     pub conversation_auto_compact: Option<bool>,
+    /// The daemon's auto-compact threshold (`agents.autoCompactAt`), a
+    /// percentage of the agent's usable window. Codex opens the thread with
+    /// it as `model_post_turn_compact_threshold_percent` (start, resume and
+    /// fork alike; the thread keeps it for its process). Claude ignores this
+    /// copy: the server writes it into the generated `--settings` `env`.
+    pub auto_compact_at: Option<u8>,
     /// The binary's `--version` line as the server probed it (`None` when
     /// the probe failed). Neither wire protocol offers a reliable version
     /// handshake (see PROTOCOL.md), so the server-side probe is the source:
@@ -202,6 +208,7 @@ impl SpawnSpec {
             initial_mode: None,
             initial_ultracode: false,
             conversation_auto_compact: None,
+            auto_compact_at: None,
             agent_version: None,
             rollback_turns: None,
             fork_at: None,

@@ -366,6 +366,9 @@
     {autoCompact}
     {autoCompactDisabledBy}
     {onSetAutoCompact}
+    compactAt={store.contextCompactAt}
+    agentName={agentKind === "codex" ? "Codex" : agentKind === "claude" ? "Claude" : "The agent"}
+    compactsAfterTurn={agentKind === "codex"}
     {onOpenSettings}
   />
   </div>

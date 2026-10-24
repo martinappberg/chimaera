@@ -157,7 +157,7 @@ fn worker_generated_settings_and_codex_argv_are_unchanged() {
         None,
         None,
         &[],
-        None,
+        crate::agents::Compaction::default(),
     )
     .expect("write settings");
     let body = std::fs::read_to_string(&path).unwrap();

@@ -29,7 +29,9 @@ configured model instead of Chimaera's last-used choice. Settings → Agents →
 Auto-Compact (Claude) sets Claude Code's own auto-compaction for the Claude sessions
 Chimaera starts: Agent default follows your Claude Code settings, On and Off go into each
 session's generated settings file and never your own. A chat's own switch wins for its
-conversation; Codex has no off switch. A CLI's identity does not
+conversation; Codex has no off switch. Auto-Compact At sets how full the window gets
+before Claude and Codex compact on their own (Agent default, or 50–90%), from each session's
+next start or resume; a chat's usage popover marks where it compacts. A CLI's identity does not
 establish its upstream provider; launcher subtitles describe installation provenance.
 
 Claude Code 2.1.277+ reads `AGENTS.md` as a fallback when `CLAUDE.md` is absent.

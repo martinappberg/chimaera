@@ -2173,6 +2173,7 @@
     fork: boolean;
     stage: "dry" | "confirm" | "applying";
     fromReply?: boolean;
+    compacted?: boolean;
   }>(null);
   const rewindReport = $derived(
     rewindIntent !== null && store.rewind?.userMessageId === rewindIntent.id
@@ -2180,12 +2181,22 @@
       : null,
   );
 
-  function askRewind(checkpoint: { id: string; preceding: string | null }, fromReply = false) {
+  function askRewind(checkpoint: CheckpointRef, fromReply = false) {
     store.rewind = null;
     if (conversationOnlyRewind) {
       rewindIntent = { id: checkpoint.id, preceding: checkpoint.preceding, fork: true, stage: "confirm", fromReply };
     } else {
-      rewindIntent = { id: checkpoint.id, preceding: checkpoint.preceding, fork: false, stage: "dry", fromReply };
+      // Claude resumes only what follows its latest compaction: a checkpoint
+      // from before one can still restore files, not the conversation.
+      const compacted = checkpoint.seq !== undefined && checkpoint.seq < store.lastCompactionSeq;
+      rewindIntent = {
+        id: checkpoint.id,
+        preceding: checkpoint.preceding,
+        fork: false,
+        stage: "dry",
+        fromReply,
+        compacted,
+      };
       if (
         !sendCommand(
           { type: "rewind", user_message_id: checkpoint.id, dry_run: true },

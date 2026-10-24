@@ -26,7 +26,11 @@
     <div class="row">
       <span class="label">{usageTitle(row.label)}</span>
       <span class="bar" aria-hidden="true"
-        ><span class="fill {level}" style:width="{Math.min(100, Math.max(0, row.utilization))}%"></span></span
+        ><span class="fill {level}" style:width="{Math.min(100, Math.max(0, row.utilization))}%"></span
+        >{#if row.mark != null && row.mark > 0 && row.mark < 100}<span
+            class="mark"
+            style:left="{row.mark}%"
+          ></span>{/if}</span
       >
       <span class="pct {level}">{Math.floor(row.utilization)}%</span>
       {#if resets !== null}<span class="resets">resets {resets}</span>{/if}
@@ -60,10 +64,23 @@
     text-overflow: ellipsis;
   }
   .bar {
+    position: relative;
     height: 4px;
     border-radius: 2px;
     background: color-mix(in srgb, var(--fg) 9%, transparent);
-    overflow: hidden;
+  }
+  /* A notch where the bar's own meaning changes (the context row: where the
+     agent compacts). Stands a hair proud of the track so it reads at 4px,
+     in the bar's ink rather than a new colour. */
+  .mark {
+    position: absolute;
+    top: -2px;
+    bottom: -2px;
+    width: 2px;
+    margin-left: -1px;
+    border-radius: 1px;
+    background: color-mix(in srgb, var(--fg) 42%, transparent);
+    pointer-events: none;
   }
   .fill {
     display: block;
