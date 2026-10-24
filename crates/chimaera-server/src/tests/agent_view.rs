@@ -15,6 +15,8 @@
 //! pre-allow `mcp__chimaera__update_plan`. The worker here is a terminal
 //! session, so the plan paragraph and tool a Claude CHAT gets (`mcp.rs`
 //! `plan_tool_for`) are pinned in `tests/mcp.rs`, not in these fixtures.
+//! Re-blessed 2026-10-23 (#344): the comms paragraph asks agents not to send
+//! thanks or acknowledgements, since the Always wake policy has no caps.
 
 use super::support::*;
 use crate::{lock, AppState};

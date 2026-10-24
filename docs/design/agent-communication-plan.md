@@ -201,15 +201,19 @@ with a new `agent` origin so its transcript shows who sent it (the `worker`
 origin's chip, generalized). It bills the user, so it's policy-gated:
 
 - **Wake policy**, the second row of the setting (§7); the default is
-  **Ask me** (*as built since 2026-10-15:* **Automatically**, the old
-  *Within limits* — a request asked out of sight left a peer's message
-  unread; a request now also shows in the idle agent's own chat):
+  **Ask me** (*as built:* **Automatically** from 2026-10-15 — a request
+  asked out of sight left a peer's message unread; a request now also shows
+  in the idle agent's own chat — and **Ask me** again from 2026-10-23, #344,
+  beside a fourth mode, *Always*, with no caps, and a "from now on" choice
+  on the wake bar):
   - *Never* — mail only. The user wakes an agent with **Deliver** on the
     message (the existing route, generalized).
   - *Ask me* — a wake request lands in the dashboard's Needs-you queue:
     "loader refactor wants to wake fix CI: '…'" · **Wake** · **Leave in
     inbox**. The attention queue is already the product's wedge.
   - *Within limits* — wakes happen on their own, inside the caps below.
+  - *Always* (*added 2026-10-23*) — every message wakes its reader; none of
+    the caps below apply, only the posting rate limit.
 - **Reply wakes.** `message_agent {expect_reply:true}` opens a thread. A
   reply to it (`reply_to`) wakes the asker if it has gone idle, because it
   asked; still inside the caps. Under *Ask me* a reply wake needs no
@@ -401,7 +405,8 @@ Settled by the maintainer, 2026-09-30:
   and `tell_mastermind`.
 
 - **Wakes**: mail by default, phone by policy, and the policy defaults to
-  **Ask me** (§5) — changed 2026-10-15 to **Automatically** by the maintainer.
+  **Ask me** (§5) — changed 2026-10-15 to **Automatically** by the maintainer,
+  and back to **Ask me** on 2026-10-23 (#344), with **Always** added.
 - **No per-workspace override** in v1; the switch is global (§7).
 - **Peers read each other** with `read_agent`, within the workspace.
 - **No cross-workspace** visibility in v1 (P3 at the earliest).
