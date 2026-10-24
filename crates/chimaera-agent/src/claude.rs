@@ -1037,6 +1037,10 @@ struct ClaudeMapper {
     /// signals into one normalized start + one terminal event.
     compaction_active: bool,
     compaction_completed: bool,
+    /// A `compact_result: success` status came before its `compact_boundary`
+    /// (live 2.1.310 auto-compaction: 4 ms apart), so the completion waits a
+    /// frame for the boundary's token counts.
+    compaction_success_pending: bool,
     /// Remote Control offer flags from the initialize response (see
     /// `AgentEvent::Init`): whether the bridge can be offered at all here, and
     /// whether the user's/org's default says auto-on.
@@ -1221,6 +1225,7 @@ impl ClaudeMapper {
             activity_line: None,
             compaction_active: false,
             compaction_completed: false,
+            compaction_success_pending: false,
             remote_control_available,
             remote_control_auto_enable,
             remote_control: None,
@@ -1394,6 +1399,19 @@ impl ClaudeMapper {
     fn reset_compaction_for_new_turn(&mut self) {
         self.compaction_active = false;
         self.compaction_completed = false;
+        self.compaction_success_pending = false;
+    }
+
+    /// A compaction that reported success with no `compact_boundary` after
+    /// it: complete it without counts before anything else is said.
+    fn finish_pending_compaction(&mut self, step: &mut DriverStep) {
+        if std::mem::take(&mut self.compaction_success_pending) && !self.compaction_completed {
+            self.compaction_completed = true;
+            step.events.push(AgentEvent::ContextCompaction {
+                phase: CompactionPhase::Completed,
+                pre_tokens: None,
+            });
+        }
     }
 
     /// A result/watchdog abort can be the only terminal signal when the CLI
@@ -1490,6 +1508,12 @@ impl ClaudeMapper {
         // The model's reply began (or the turn ended without a Stop pending):
         // a taken message can no longer be put back, so it reads as read
         // before anything the reply says.
+        if matches!(
+            frame["type"].as_str(),
+            Some("stream_event" | "assistant" | "user" | "result")
+        ) {
+            self.finish_pending_compaction(&mut step);
+        }
         match frame["type"].as_str() {
             Some("stream_event" | "assistant") => self.release_taken(&mut step),
             Some("result") if !self.stop_in_flight() => self.release_taken(&mut step),
@@ -1879,15 +1903,13 @@ impl ClaudeMapper {
                             pre_tokens: None,
                         });
                     } else if result == "success" && self.compaction_active {
-                        // Fallback for a future build that omits/reorders the
-                        // richer compact_boundary. Today's wire lands the
-                        // boundary first, so its pre_tokens win.
+                        // Manual `/compact` lands the richer compact_boundary
+                        // first; a 2.1.310 auto-compaction lands it 4 ms after
+                        // this status. Wait for it, so its pre_tokens win; the
+                        // next content frame completes it without (a build
+                        // that never sends the boundary).
                         self.compaction_active = false;
-                        self.compaction_completed = true;
-                        step.events.push(AgentEvent::ContextCompaction {
-                            phase: CompactionPhase::Completed,
-                            pre_tokens: None,
-                        });
+                        self.compaction_success_pending = true;
                     }
                 }
                 if let Some(mode) = frame["permissionMode"].as_str() {
@@ -1903,6 +1925,7 @@ impl ClaudeMapper {
             Some("compact_boundary") => {
                 let pre = frame["compact_metadata"]["pre_tokens"].as_u64();
                 self.compaction_active = false;
+                self.compaction_success_pending = false;
                 if !self.compaction_completed {
                     self.compaction_completed = true;
                     step.events.push(AgentEvent::ContextCompaction {
@@ -5054,6 +5077,7 @@ impl ClaudeMapper {
             return step;
         }
         self.end_thinking_block(false, &mut step);
+        self.finish_pending_compaction(&mut step);
         self.release_taken(&mut step);
         if let Some(flushed) = self.coalescer.flush() {
             step.events.push(flushed);
@@ -10438,6 +10462,97 @@ pub(crate) mod tests {
                 ..
             }
         ));
+    }
+
+    /// Live 2.1.310 (Pass 53): `set_model claude-haiku-4-5` (200k) on a
+    /// 368k-token Haiku 5.5 (1M) conversation. The ack comes with a replayed
+    /// `/model` stdout frame; the next message's turn compacts first, with the
+    /// previous model (`modelUsage` billed the summary to claude-haiku-5-5),
+    /// then answers on the new one. One turn, with the compaction in it.
+    #[test]
+    fn a_switch_to_a_smaller_window_compacts_inside_the_next_turn() {
+        let mut m = mapper();
+        m.on_frame(
+            &json!({"type": "system", "subtype": "init", "session_id": "native-1",
+            "model": "claude-haiku-5-5", "capabilities": ["msg_lifecycle_v1"]}),
+        );
+        let step = m.on_command(AgentCommand::SetModel {
+            model_id: "claude-haiku-4-5".into(),
+        });
+        let ctl = step.outbound[0]["request_id"].clone();
+        let mut events = Vec::new();
+        events.extend(m.on_frame(&json!({"type": "user", "message": {"role": "user",
+            "content": "<local-command-stdout>Set model to `claude-haiku-4-5`</local-command-stdout>"},
+            "parent_tool_use_id": null, "uuid": "e496eb9c", "isReplay": true})).events);
+        events.extend(
+            m.on_frame(&json!({"type": "control_response", "response": {
+            "subtype": "success", "request_id": ctl,
+            "response": {"model": "claude-haiku-4-5"}}}))
+                .events,
+        );
+        let (ours, step) = send_text(&mut m, "Reply with just: ok", false);
+        events.extend(step.events);
+        for frame in [
+            lifecycle(&ours, "queued"),
+            lifecycle(&ours, "started"),
+            json!({"type": "system", "subtype": "init", "session_id": "native-1",
+                "model": "claude-haiku-4-5", "capabilities": ["msg_lifecycle_v1"]}),
+            json!({"type": "system", "subtype": "status", "status": "requesting",
+                "user_message_uuids": [ours]}),
+            json!({"type": "system", "subtype": "status", "status": "compacting",
+                "compact_output_chars": 0}),
+            json!({"type": "system", "subtype": "status", "status": null,
+                "compact_result": "success"}),
+            json!({"type": "system", "subtype": "compact_boundary", "compact_metadata": {
+                "trigger": "auto", "pre_tokens": 368181, "post_tokens": 3537}}),
+            json!({"type": "user", "parent_tool_use_id": null, "isSynthetic": true,
+                "uuid": "u-summary", "message": {"role": "user", "content": [{"type": "text",
+                "text": "This session is being continued from a previous conversation that \
+                    ran out of context. The summary below covers the earlier portion of the \
+                    conversation.\n\nSummary:\n1. Primary Request and Intent: ..."}]}}),
+            text_frame("msg_011CgLDB", "claude-haiku-4-5-20251001", "ok"),
+            result_frame(),
+            lifecycle(&ours, "completed"),
+        ] {
+            events.extend(m.on_frame(&frame).events);
+        }
+        let kinds: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::TurnStarted { .. } => Some("turn"),
+                AgentEvent::ContextCompaction {
+                    phase: CompactionPhase::Started,
+                    ..
+                } => Some("compacting"),
+                AgentEvent::ContextCompaction {
+                    phase: CompactionPhase::Completed,
+                    ..
+                } => Some("compacted"),
+                AgentEvent::ModelSwitched { reason: None, .. } => Some("switched"),
+                AgentEvent::UserMessage { .. } => Some("user"),
+                AgentEvent::TurnCompleted { .. } => Some("done"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "switched",
+                "user",
+                "turn",
+                "compacting",
+                "compacted",
+                "done"
+            ],
+            "{events:?}"
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ContextCompaction {
+                pre_tokens: Some(368181),
+                ..
+            }
+        )));
     }
 
     #[test]
