@@ -1594,6 +1594,8 @@ This pass follows up the Codex part of Pass 52's changelog table. The pin stays 
 - **Resume.** The driver keeps every value it sends at thread open. `sandbox` / `approvalPolicy` / `approvalsReviewer` stay explicit. The header's starting mode must be known, and the conversation's remembered mode, the user's pick in Chimaera, then replays only when it differs. So that pick wins over one made in another Codex client. The effort replay already runs only when the index differs from the restored value. `summary: "auto"` rides every `turn/start` (Pass 31), so the restored summary never applies. Chimaera sends no `serviceTier` (Fast not adopted, Pass 30) and no `personality`. A Fast tier picked in another Codex client therefore now carries into a Chimaera resume, with no indicator in Chimaera.
 - **Not adopted.** `thread/readState/*` is the Codex app's unread marker. Chimaera has no "the user has seen this chat" signal to drive it, and nothing in Chimaera would read it. `feedback/save`, `thread/sample` / `thread/sample/cancel` and the prediction forks have no product use.
 
+- **Delivery keeps its own allowlist (third review):** sharing the steer-answer denylist made an unknown item kind confirm an opening message, which would silence the "please resend" notice after an early Stop. Delivery confirmation uses `DELIVERY_PROOF_ITEMS` (an allowlist) again; the steer answer keeps the denylist. `model_work_confirms_opening_input_but_pre_prompt_items_do_not` pins an unknown kind as unconfirmed.
+
 ### Gate (Pass 54)
 
 - `cargo test -p chimaera-agent`: every hermetic target passed (lib 423, manager 40, wire contract 19). `cargo clippy -p chimaera-agent --all-targets -- -D warnings` was clean.

@@ -1126,6 +1126,29 @@ const COLLAB_TOKEN_STEP: u64 = 256;
 /// only after a move this large — same order as the collab throttle above.
 const TURN_TOKENS_STEP: u64 = 256;
 
+/// Items whose `item/started` proves an opening message reached the model:
+/// its reply, reasoning, plan and tool calls, plus a child's marker and a
+/// recorded tool output (the turn is past the pre-prompt hooks). An
+/// ALLOWLIST on purpose, the opposite default of `NON_RESPONSE_ITEMS`: an
+/// item kind a later Codex adds must not count as delivery, or a Stop
+/// before the prompt reached history would lose the "please resend" notice.
+const DELIVERY_PROOF_ITEMS: &[&str] = &[
+    "agentMessage",
+    "reasoning",
+    "plan",
+    "commandExecution",
+    "mcpToolCall",
+    "webSearch",
+    "fileChange",
+    "imageGeneration",
+    "imageView",
+    "dynamicToolCall",
+    "collabAgentToolCall",
+    "sleep",
+    "subAgentActivity",
+    "functionCallOutput",
+];
+
 /// Item kinds that are not part of a model response. Each was seen to land
 /// after a steer was read without the model answering it, or belongs to
 /// earlier work: the user's own input, a Stop hook's continuation prompt, a
@@ -3463,16 +3486,13 @@ impl CodexMapper {
             self.unread_opening_message = None;
         }
         // Older servers may omit clientId on the user echo; actual model
-        // activity also proves we passed the pre-prompt hook barrier.
-        // Deliberately wider than a steer's answer: a child's `completed`
-        // marker and a recorded tool output are not an answer (they can be
-        // earlier work), but they do prove the turn is past the barrier.
+        // activity also proves we passed the pre-prompt hook barrier. Only
+        // known kinds count (`DELIVERY_PROOF_ITEMS`): an unknown one must
+        // leave the message unconfirmed.
         if current_turn
-            && (is_model_response_item(item)
-                || matches!(
-                    item["type"].as_str(),
-                    Some("subAgentActivity" | "functionCallOutput")
-                ))
+            && item["type"]
+                .as_str()
+                .is_some_and(|t| DELIVERY_PROOF_ITEMS.contains(&t))
         {
             self.unread_opening_message = None;
         }
@@ -7436,6 +7456,9 @@ mod tests {
             "contextCompaction",
             "enteredReviewMode",
             "exitedReviewMode",
+            // An item kind a later Codex adds proves nothing about delivery
+            // (`DELIVERY_PROOF_ITEMS` is an allowlist), unlike a steer's answer.
+            "futureResponsePart",
         ] {
             let mut m = mapper();
             active_turn(&mut m);
@@ -8264,6 +8287,7 @@ mod tests {
             ("hookPrompt", true),
             ("contextCompaction", true),
             ("enteredReviewMode", true),
+            ("exitedReviewMode", true),
         ] {
             let mut m = mapper();
             active_turn(&mut m);

@@ -1363,6 +1363,11 @@ async fn claude_stop_naming_the_client_turn_reaches_its_wakeup_and_spares_the_ne
                             .expect("stop for A"),
                     );
                 } else if results.len() == 2 {
+                    // A stopped B never arms W2: fail here, not at the
+                    // deadline, and never drop the Stop-for-A receipt.
+                    assert_eq!(receipts.len(), 1, "Stop for A answered: {receipts:?}");
+                    assert_eq!(receipts[0]["turn"], "spared", "a late Stop for A spares B");
+                    assert_eq!(frame["is_error"], json!(false), "B ran on: {frame}");
                     ctl = None;
                 }
             }
@@ -1376,13 +1381,6 @@ async fn claude_stop_naming_the_client_turn_reaches_its_wakeup_and_spares_the_ne
     eprintln!("LIVE stop for the client turn: receipts={receipts:?}, results={summary:?}");
     // W1 completed, B (spared) completed, W2 stopped.
     assert_eq!(receipts.len(), 2, "{receipts:?}");
-    assert_eq!(receipts[0]["turn"], "spared", "a late Stop for A spares B");
-    assert_eq!(
-        results[1]["is_error"],
-        json!(false),
-        "B ran on: {}",
-        results[1]
-    );
     assert_eq!(
         receipts[1]["turn"], "stopped",
         "a Stop for B reaches its wakeup turn"
