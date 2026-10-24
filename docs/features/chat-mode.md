@@ -92,7 +92,9 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   faded **pending stack at the scrollable transcript tail**, captioned "next step" or "after this
   turn", until the agent actually reads it (claude: the CLI's `command_lifecycle started`; codex:
   the steered message's `userMessage` item — not the RPC ack). Then it leaves the stack and enters
-  the transcript right there, solid — mid-turn if that is where it was read. Each waiting bubble
+  the transcript right there, solid — mid-turn if that is where it was read. A Codex steer read
+  just as its turn finishes (recorded, but no model step after it) is answered in an input-less
+  follow-up turn, so it never sits read and unanswered (Pass 54). Each waiting bubble
   has **Send now** (stops the current turn, unless Claude can take the message into it by moving what the turn waits on to the background; every waiting message is then read at once — claude
   keeps its queue through the interrupt, and Chimaera re-sends the steers Codex drops; Claude's
   background agents keep running, because Chimaera sends the CLI's own send-now rather than its
