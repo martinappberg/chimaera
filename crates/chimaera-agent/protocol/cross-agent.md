@@ -157,9 +157,10 @@ The latest full results, per gate. Earlier results are in [passes.md](passes.md)
 | Gate | Result | Versions | Date |
 |---|---|---|---|
 | `just chat-smoke` | 31/31 | claude 2.1.300, codex 0.162.1 | 2026-10-14 (Pass 44) |
-| `just chat-mods-smoke` | 1/1 | claude 2.1.300 | 2026-10-14 (Pass 43) |
+| `just chat-mods-smoke` | 1/1 | claude 2.1.310 | 2026-10-23 (Pass 52) |
 | `just chat-smoke-acp` | passed | grok 1.0.46, agy-acp 1.2.1, cursor-agent 2026.10.14-941492e | 2026-10-15 (Pass 45) |
 
+- Pass 52 ran the Claude half of `just chat-smoke` (21/21) on claude 2.1.310 and moved the Claude pin there; the codex half stays at its own pin.
 - Pass 46 ran the codex half of `just chat-smoke` and Pass 47 added three live cases (`claude_wakeup_fires_as_a_named_turn`, `claude_goal_sets_and_clears`, `codex_goal_sets_pauses_and_clears`) on the same pins.
 - A full `just chat-smoke` repeats the complete approval, queue, background task, fork, rollback, compaction and driver lifecycle suite, not only an echo prompt (2026-10-01).
 - Live suites bill turns. An account weekly limit (`api_error_status: 429`, `is_error: true`, zero model usage) is an environment gate, not wire drift; re-run the gate after the reset before advancing a pin (2026-10-03; Pass 24).

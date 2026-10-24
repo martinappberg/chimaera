@@ -8,12 +8,12 @@ Sources: **live** = probed against the real CLI at the version named; **official
 
 | Provider | Driver | Pin (current value) | Live gate | Reference | Latest pass |
 |---|---|---|---|---|---|
-| Claude Code stream-json | `src/claude.rs` | `TESTED_CLAUDE_VERSION` = 2.1.300 | `just chat-smoke` | [claude-code.md](protocol/claude-code.md) | Pass 50 |
+| Claude Code stream-json | `src/claude.rs` | `TESTED_CLAUDE_VERSION` = 2.1.310 | `just chat-smoke` | [claude-code.md](protocol/claude-code.md) | Pass 52 |
 | Codex app-server | `src/codex.rs` | `TESTED_CODEX_VERSION` = 0.164.0 | `just chat-smoke` | [codex.md](protocol/codex.md) | Pass 51 |
 | ACP: Grok Build | `src/acp.rs` | `TESTED_GROK_VERSION` = 1.0.46 | `just chat-smoke-acp` | [acp.md](protocol/acp.md) | Pass 46 addendum |
 | ACP: Google Antigravity | `src/acp.rs` | `TESTED_AGY_VERSION` = 1.2.1 | `just chat-smoke-acp` | [acp.md](protocol/acp.md) | Pass 46 addendum |
 | ACP: Cursor CLI | `src/acp.rs` | `TESTED_CURSOR_VERSION` = 2026.10.14-941492e | `just chat-smoke-acp` | [acp.md](protocol/acp.md) | Pass 46 addendum |
-| Claude Mods native UI | `src/native_ui.rs` | `TESTED_CLAUDE_VERSION` | `just chat-mods-smoke` | [mods.md](protocol/mods.md) | Pass 43 |
+| Claude Mods native UI | `src/native_ui.rs` | `TESTED_CLAUDE_VERSION` | `just chat-mods-smoke` | [mods.md](protocol/mods.md) | Pass 52 |
 
 The shared rules are in [cross-agent.md](protocol/cross-agent.md). The live gates bill turns, except `chat-mods-smoke`.
 

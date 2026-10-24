@@ -48,9 +48,9 @@ use crate::model::{
 use crate::model::{RemoteControlSnapshot, RemoteControlState};
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 
-/// CLI version these frame shapes were verified against (2026-10-14,
-/// full chat-smoke 29/29 + chat-mods-smoke; PROTOCOL.md Pass 43).
-pub const TESTED_CLAUDE_VERSION: &str = "2.1.300";
+/// CLI version these frame shapes were verified against (2026-10-23, the
+/// Claude part of chat-smoke 21/21 + chat-mods-smoke; PROTOCOL.md Pass 52).
+pub const TESTED_CLAUDE_VERSION: &str = "2.1.310";
 
 /// Arguments for a structured chat session, before server-side extras
 /// (`--settings`, `--mcp-config`, `--session-id`) and login-shell wrapping.
