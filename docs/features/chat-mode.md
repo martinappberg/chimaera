@@ -661,7 +661,9 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   `@name`, which is the same identity `TaskStop` accepts.
 - **Codex subagents (collab / multi-agent), same surface.** Codex 0.144.x delegation renders the
   identical way: each spawned agent is an "Agent: {name}" row (name = the model's own
-  `agentPath` name) whose progress line folds the agent's live activity in Claude's spelling
+  `agentPath` name; on the multi-agent v1 runtime — gpt-5.6-luna and any model without catalog
+  metadata — the nickname Codex gave the child, the row opening under the task's first line until
+  that nickname is read; PROTOCOL.md Pass 51) whose progress line folds the agent's live activity in Claude's spelling
   ("Thinking", a command, "Writing", or the newest reasoning-summary section title · N tools ·
   12.3k tokens), so the tray works unchanged. A subagent is a real thread multiplexed onto
   the same connection — the driver scopes every frame by `threadId`, hides the agent's transcript
