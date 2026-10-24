@@ -8,12 +8,15 @@
    * that went back and forth, or agents that kept waking each other while
    * the user was away — one Continue lets every held agent go on); **Leave**
    * keeps them in the inbox (the agent reads them when it next works, or
-   * with the user's next prompt).
+   * with the user's next prompt). The chevron beside Wake offers the same
+   * wake "from now on": Within limits or Always under Ask me, Always past
+   * a limit (`loosenChoices`), which also lets other held agents go.
    * A refused answer stays as the bar with the daemon's words until
    * dismissed. The message is an agent's words: plain text, one line.
    */
   import SessionGlyph from "../shared/SessionGlyph.svelte";
-  import { dismissWakeFailure, wake, wakeAsk, type WakeRequest } from "../workspace/comms.svelte";
+  import WakeSplitButton from "../workspace/WakeSplitButton.svelte";
+  import { dismissWakeFailure, wake, wakeAsk, wakeFromNowOn, type WakeRequest } from "../workspace/comms.svelte";
 
   interface Props {
     request: WakeRequest | null;
@@ -31,11 +34,12 @@
   const ask = $derived(wakeAsk(request?.reason ?? "ask"));
   const oneLine = $derived((request?.text ?? "").replace(/\s+/g, " ").trim());
 
-  async function answer(yes: boolean): Promise<void> {
-    if (request === null || busy !== null) return;
+  async function answer(yes: boolean, policy?: "auto" | "always", wid = request?.id): Promise<void> {
+    if (wid === undefined || busy !== null) return;
     busy = yes ? "wake" : "leave";
     try {
-      await wake(request.id, yes);
+      if (policy !== undefined) await wakeFromNowOn(wid, policy);
+      else await wake(wid, yes);
     } catch {
       // The store keeps the refusal; `failure` shows it.
     } finally {
@@ -66,13 +70,15 @@
         title="keep it in the inbox — it reads it when it next works"
         onclick={() => void answer(false)}>{busy === "leave" ? "Leaving…" : "Leave"}</button
       >
-      <button
-        class="opt primary"
-        disabled={busy !== null}
+      <WakeSplitButton
+        {request}
+        label={busy === "wake" ? (ask.cont ? "Continuing…" : "Waking…") : ask.cont ? "Continue" : "Wake"}
         title="deliver it now — a turn billed to your account"
-        onclick={() => void answer(true)}
-        >{busy === "wake" ? (ask.cont ? "Continuing…" : "Waking…") : ask.cont ? "Continue" : "Wake"}</button
-      >
+        disabled={busy !== null}
+        alignRight
+        onWake={() => void answer(true)}
+        onPick={(wid, policy) => void answer(true, policy, wid)}
+      />
     </span>
   </div>
 {/if}

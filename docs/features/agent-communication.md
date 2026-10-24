@@ -125,12 +125,16 @@ is not moved to the background: its result may be what the next step needs.
 ## Wakes and wake requests
 
 - **What & when.** A message to an idle chat agent may start a turn — billed — only as
-  Settings → Agents → **Agents may wake each other** says: **Automatically** (default: it
-  wakes, inside the caps), **Ask me** (a wake request, every time), **Never** (it waits for the
-  agent's next turn or the user's hand-over).
+  Settings → Agents → **Agents may wake each other** says: **Ask me** (default: a wake
+  request, every time), **Within limits** (it wakes, inside the caps; stored `auto`), **Always**
+  (it wakes on every message, with no caps; the 10-posts-a-minute limit still holds), **Never**
+  (it waits for the agent's next turn or the user's hand-over).
 - **How it's used.** A wake request shows where the user looks: a bar above the idle agent's
   own composer — the sender, the message on one line, **Leave** · **Wake** (**Continue** past a
-  limit; `WakeRequestBar`)
+  limit; `WakeRequestBar`) with a chevron beside it that wakes it "from now on": **Wake within
+  limits** or **Always wake** under Ask me, **Always continue** past a limit (`loosenChoices`;
+  it sets the policy, and a looser policy lets go of every request it no longer asks about, so
+  the other held agents wake too)
   — an attention-colored glyph on its rail row, tab and focus-strip chip ("analyst sent a
   message — wake it?"), a "Message waiting" notification (`notifications.needsYou`; a click
   opens the agent), and a card in the dashboard's Needs you ("analyst wants to wake reviewer:
@@ -179,7 +183,9 @@ is not moved to the background: its result may be what the next step needs.
 
 - **What & when.** Settings → Agents → **Agents can see and message each other**
   (`agents.communication.enabled`, default on), **Agents may wake each other**
-  (`agents.communication.wakes`: `never` · `ask` · `auto`, default `auto`) and **Messages may
+  (`agents.communication.wakes`: `never` · `ask` · `auto` (Within limits) · `always`, default
+  `ask`; a PUT that loosens it releases the requests it no longer asks about,
+  `comms::policy_changed`) and **Messages may
   move a waiting subagent to the background** (`agents.communication.freeSubagents`, default
   off; Claude chats — see Delivery).
 - **Key behaviors.** Off: new sessions get none of the four tools, no paragraph and no
@@ -202,7 +208,7 @@ woke it; the switch off in Settings refused a running agent's `message_agent` at
 emptied its tool list to the base six, and the Mastermind panel showed its off banner.
 Later the same day: asked in plain words, a sonnet chat and an opus chat each put a question
 to the codex chat through `workspace_agents` / `read_agent` / `message_agent` and were woken
-by its answers; two haiku chats in a counting relay under **Within limits** (now **Automatically**)
+by its answers; two haiku chats in a counting relay under **Within limits**
 woke each other four times (a reply within the 3 minutes included), the fifth asked the user,
 **Continue** gave four more; a codex **terminal** read its inbox with `read_messages` when
 prompted and answered with `message_agent`, pre-approved, which woke the asker; a codex chat,
@@ -247,6 +253,13 @@ _Captured 2026-09-29/30 from the maintainer, in the design conversation that pro
   hour) gave way to a budget of about 20 agent wakes since the user last stepped in (a prompt
   to any agent in the workspace, or answering a wake request), asked once past it, with
   Continue refilling it — after the maintainer asked whether 10 an hour "really make[s] sense".
+- **Ask me again, with Always one click away (2026-10-23, #344).** Agents still didn't seem
+  to reach each other on their own, so the maintainer asked for four modes, "Never — do not
+  ever, Ask — ask first (the continue), Always — just let it do this", with Within limits
+  kept between them: **Ask me** is the default again ("I think it should be"), Always "should
+  have no caps", and the first Wake or Continue offers Within limits or Always — "a very easy
+  not too distracting option". Agents are told not to send thanks or acknowledgements, as a
+  brief instruction not to spam each other.
 - **How settled it is (intended vs provisional):** the calls above are the maintainer's.
   The mechanics — the carriers, the caps, the tool names, the header format — are how it
   works now.
