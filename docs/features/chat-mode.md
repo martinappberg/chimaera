@@ -661,7 +661,9 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   `@name`, which is the same identity `TaskStop` accepts.
 - **Codex subagents (collab / multi-agent), same surface.** Codex 0.144.x delegation renders the
   identical way: each spawned agent is an "Agent: {name}" row (name = the model's own
-  `agentPath` name) whose progress line folds the agent's live activity in Claude's spelling
+  `agentPath` name; on the multi-agent v1 runtime — gpt-5.6-luna and any model without catalog
+  metadata — the nickname Codex gave the child, the row opening under the task's first line until
+  that nickname is read; PROTOCOL.md Pass 51) whose progress line folds the agent's live activity in Claude's spelling
   ("Thinking", a command, "Writing", or the newest reasoning-summary section title · N tools ·
   12.3k tokens), so the tray works unchanged. A subagent is a real thread multiplexed onto
   the same connection — the driver scopes every frame by `threadId`, hides the agent's transcript
@@ -941,7 +943,8 @@ intact rather than bypassing them.
 Settings → Chat → **Codex Steering Timing** controls new and resumed structured
 Codex processes. **Agent default** leaves the user's native configuration alone;
 **Next step** disables `features.instant_interrupt`; **Immediate (experimental)**
-enables it (Codex 0.159.0+). Immediate steering can interrupt a model response or
+enables it (Codex 0.159.0+). Codex 0.163.0 turned the flag on by default, so Agent default
+is immediate there unless the user's config turns it off (Pass 51). Immediate steering can interrupt a model response or
 code-mode call to read a steer, including one delivered by another agent. It does
 not promote messages queued for a later turn. Changing the setting does not
 restart a running chat. The daemon reads
