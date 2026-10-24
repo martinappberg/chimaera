@@ -245,9 +245,9 @@ impl ScheduleTracker {
     }
 
     /// A turn the CLI started by itself (no message of ours opened it). When
-    /// the CLI named the fire, that is the truth: a wakeup is spent only if
-    /// it is the one that was set for `scheduled_for` (a newer one armed
-    /// while the fire waited stays pending), a job fire advances the job
+    /// the CLI named the fire, that is the truth: a wakeup is spent if it is
+    /// the one that was set for `scheduled_for` or older (replaced unseen; a
+    /// newer one armed while the fire waited stays pending), a job fire advances the job
     /// that is due and never touches the wakeup, and no source means no
     /// scheduler fire at all. An older CLI says nothing, so the earliest
     /// item that is due is taken for what fired. A recurring job moves to
@@ -258,19 +258,22 @@ impl ScheduleTracker {
             FireSource::Unsaid => return self.guess_fire(now_ms),
             FireSource::NotScheduled => return None,
             FireSource::Wakeup { scheduled_for } => {
-                let ours = self
-                    .wakeup
-                    .as_ref()
-                    .is_some_and(|w| scheduled_for.is_none_or(|at| at == w.at_ms));
-                match ours.then(|| self.wakeup.take()).flatten() {
-                    Some(wakeup) => Fired {
+                let at_ms = self.wakeup.as_ref().map(|w| w.at_ms);
+                // Claude holds one wakeup: a fire set for a later time than
+                // the one tracked here means that one was replaced unseen,
+                // so it is gone either way.
+                let spent = at_ms.is_some_and(|w| scheduled_for.is_none_or(|at| w <= at));
+                let ours = at_ms.is_some_and(|w| scheduled_for.is_none_or(|at| w == at));
+                match spent.then(|| self.wakeup.take()).flatten() {
+                    Some(wakeup) if ours => Fired {
                         kind: "wakeup",
                         detail: wakeup.reason,
                         schedule: None,
                     },
-                    // An older wakeup, or one Claude armed with no frame (its
-                    // `/loop` keepalive): still a wakeup, of no known reason.
-                    None => Fired {
+                    // An older wakeup, one replaced unseen, or one Claude
+                    // armed with no frame (its `/loop` keepalive): still a
+                    // wakeup, of no known reason.
+                    _ => Fired {
                         kind: "wakeup",
                         detail: String::new(),
                         schedule: None,
@@ -415,7 +418,7 @@ impl Job {
 }
 
 /// Epoch ms from a JSON number (Claude sends `nextFireAt` as a float).
-fn as_ms(value: &Value) -> Option<u64> {
+pub(crate) fn as_ms(value: &Value) -> Option<u64> {
     let ms = value.as_f64()?;
     (ms.is_finite() && ms > 0.0).then_some(ms as u64)
 }
@@ -716,6 +719,15 @@ mod tests {
         let (fired, _) = t.on_cli_turn(SET_FOR, FireSource::Job).expect("fired");
         assert_eq!((fired.kind, fired.detail.as_str()), ("job", ""));
         assert!(!t.is_empty(), "the wakeup is untouched");
+
+        // A fire set for a later time than the tracked wakeup: Claude
+        // replaced that one unseen, so it no longer waits.
+        let later = FireSource::Wakeup {
+            scheduled_for: Some(SET_FOR + 60_000),
+        };
+        let (fired, _) = t.on_cli_turn(SET_FOR + 60_200, later).expect("fired");
+        assert_eq!((fired.kind, fired.detail.as_str()), ("wakeup", ""));
+        assert!(t.is_empty(), "the replaced wakeup is gone");
     }
 
     #[test]

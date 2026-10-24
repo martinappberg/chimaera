@@ -753,6 +753,13 @@ fn summary_configured(result: &Value) -> bool {
 /// Build the thread-open request separately from I/O so the launch recipe's
 /// create-time model/effort contract stays hermetically testable.
 fn thread_open_request(spec: &SpawnSpec, id: u64, effort: Option<&str>) -> Value {
+    // `excludeTurns` on resume and fork: nothing reads the opened thread's
+    // `turns` (the handshake takes its id, model and effort), but by default
+    // the answer carries the whole history as one line, which a long thread
+    // can push past the ndjson line cap. `excludeTurns` is in the app-server
+    // protocol since at least 0.144.2, and its params never deny unknown
+    // fields; 0.158.0 and 0.164.0 answer it with `turns: []` and no
+    // deprecation notice (Pass 54).
     let mut open = match (&spec.pinned_native_id, &spec.fork_at) {
         (Some(thread_id), Some(last_turn_id)) => json!({
             "id": id, "method": "thread/fork",
@@ -764,13 +771,6 @@ fn thread_open_request(spec: &SpawnSpec, id: u64, effort: Option<&str>) -> Value
                 "excludeTurns": true,
             },
         }),
-        // Nothing reads the opened thread's `turns` (the handshake takes its
-        // id, model and effort), but by default the answer carries the whole
-        // history as one line, which a long thread can push past the ndjson
-        // line cap. `excludeTurns` is in the app-server protocol since at
-        // least 0.144.2, and its params never deny unknown fields; 0.158.0
-        // and 0.164.0 answer it with `turns: []` and no deprecation notice
-        // (Pass 54).
         (Some(thread_id), None) => json!({
             "id": id, "method": "thread/resume",
             "params": { "threadId": thread_id, "cwd": spec.cwd, "excludeTurns": true },

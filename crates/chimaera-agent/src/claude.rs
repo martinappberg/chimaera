@@ -1432,6 +1432,12 @@ impl ClaudeMapper {
     /// phantom turn with no start event.
     fn ensure_turn(&mut self, step: &mut DriverStep) {
         if !self.turn_active {
+            // No message of ours opened it (a wakeup, a job, a monitor
+            // event): the last turn's messages are not this turn's, and a
+            // Stop naming them would be `spared`, stopping nothing.
+            if !self.turn_starting {
+                self.turn_messages.clear();
+            }
             self.turn_starting = false;
             self.reset_compaction_for_new_turn();
             self.turn_n += 1;
@@ -1508,15 +1514,18 @@ impl ClaudeMapper {
         // The model's reply began (or the turn ended without a Stop pending):
         // a taken message can no longer be put back, so it reads as read
         // before anything the reply says.
-        if matches!(
-            frame["type"].as_str(),
-            Some("stream_event" | "assistant" | "user" | "result")
-        ) {
-            self.finish_pending_compaction(&mut step);
-        }
         match frame["type"].as_str() {
-            Some("stream_event" | "assistant") => self.release_taken(&mut step),
-            Some("result") if !self.stop_in_flight() => self.release_taken(&mut step),
+            Some("stream_event" | "assistant") => {
+                self.finish_pending_compaction(&mut step);
+                self.release_taken(&mut step);
+            }
+            Some("result") => {
+                self.finish_pending_compaction(&mut step);
+                if !self.stop_in_flight() {
+                    self.release_taken(&mut step);
+                }
+            }
+            Some("user") => self.finish_pending_compaction(&mut step),
             _ => {}
         }
         match frame["type"].as_str() {
@@ -3879,6 +3888,7 @@ impl ClaudeMapper {
             for id in consumed.iter().filter_map(Value::as_str) {
                 if let Some(pos) = self.awaiting_read.iter().position(|q| q == id) {
                     let id = self.awaiting_read.remove(pos).expect("position exists");
+                    self.requeue_armed.remove(&id);
                     step.events.push(AgentEvent::UserMessageUpdate {
                         id,
                         state: UserMessageState::Sent,
@@ -4039,10 +4049,7 @@ impl ClaudeMapper {
         }
         match frame["wakeup_source"].as_str() {
             Some("loop_wakeup") => FireSource::Wakeup {
-                scheduled_for: frame["scheduled_for"]
-                    .as_f64()
-                    .filter(|ms| ms.is_finite() && *ms > 0.0)
-                    .map(|ms| ms as u64),
+                scheduled_for: crate::autonomy::as_ms(&frame["scheduled_for"]),
             },
             Some("schedule_wakeup") => FireSource::Job,
             // A word this build does not know is still a scheduler fire of
@@ -4957,13 +4964,11 @@ impl ClaudeMapper {
                 option_id: "expired".into(),
             });
         }
-        // The turn had taken it in: it was read.
-        if let Some(t) = self.taken.take() {
-            events.push(AgentEvent::UserMessageUpdate {
-                id: t.id,
-                state: UserMessageState::Sent,
-            });
-        }
+        // The turn had taken it in: it was read (an opener with its rewind
+        // boundary, as at any other release).
+        let mut taken = DriverStep::default();
+        self.release_taken(&mut taken);
+        events.extend(taken.events);
         // A hard kill mid-queue must not strand a waiting message as "queued"
         // forever on replay — drop what the agent never read: the CLI's queue
         // died with it, and a held message was never even written.
@@ -7008,6 +7013,24 @@ pub(crate) mod tests {
         );
         assert!(m.interrupt_grace.is_none());
         assert!(!m.interrupt_requested);
+    }
+
+    /// A turn the CLI opens by itself (a wakeup, a job) holds no message of
+    /// ours: a Stop there must not name the previous turn's, which the CLI
+    /// would answer `spared`, stopping nothing.
+    #[test]
+    fn a_stop_in_a_self_opened_turn_names_no_old_messages() {
+        let (mut m, _a) = requeue_mapper_mid_turn();
+        m.on_frame(&result_frame());
+        assert!(!m.turn_active);
+        m.on_frame(&lifecycle("cli-wake-1", "started"));
+        m.on_frame(&text_frame("msg-w", "claude-sonnet-5-5", "tick"));
+        assert!(m.turn_active);
+        let step = m.on_command(AgentCommand::Interrupt);
+        assert_eq!(
+            step.outbound[0]["request"],
+            json!({ "subtype": "interrupt" })
+        );
     }
 
     /// An older CLI: no field on the frame, a plain Stop, read at `started`.
