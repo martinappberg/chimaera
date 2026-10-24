@@ -5328,7 +5328,6 @@ impl ClaudeMapper {
             return step;
         }
         self.end_thinking_block(false, &mut step);
-        self.settle_awaited_compaction(&mut step);
         self.release_taken(&mut step);
         if let Some(flushed) = self.coalescer.flush() {
             step.events.push(flushed);

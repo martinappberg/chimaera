@@ -1355,7 +1355,7 @@ async fn claude_stop_naming_the_client_turn_reaches_its_wakeup_and_spares_the_ne
                 );
             }
             Some("control_response")
-                if frame["response"]["request_id"].as_str() == ctl.as_deref() =>
+                if ctl.is_some() && frame["response"]["request_id"].as_str() == ctl.as_deref() =>
             {
                 receipts.push(frame["response"]["response"].clone());
                 ctl = Some(String::new());

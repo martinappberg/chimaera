@@ -1126,10 +1126,10 @@ const COLLAB_TOKEN_STEP: u64 = 256;
 /// only after a move this large — same order as the collab throttle above.
 const TURN_TOKENS_STEP: u64 = 256;
 
-/// Items whose `item/started` proves an opening message reached the model:
-/// its reply, reasoning, plan and tool calls, plus a child's marker and a
-/// recorded tool output (the turn is past the pre-prompt hooks). An
-/// ALLOWLIST on purpose, the opposite default of `NON_RESPONSE_ITEMS`: an
+/// Items whose `item/started` or `item/completed` in the current turn
+/// proves an opening message reached the model: its reply, reasoning, plan
+/// and tool calls, plus a child's marker and a recorded tool output (the
+/// turn is past the pre-prompt hooks). An ALLOWLIST on purpose, the opposite default of `NON_RESPONSE_ITEMS`: an
 /// item kind a later Codex adds must not count as delivery, or a Stop
 /// before the prompt reached history would lose the "please resend" notice.
 const DELIVERY_PROOF_ITEMS: &[&str] = &[
@@ -1169,8 +1169,9 @@ const NON_RESPONSE_ITEMS: &[&str] = &[
 /// tool call, a v2 collaboration call (a `subAgentActivity` other than a
 /// child's `completed` marker, which v2 reports with no
 /// `collabAgentToolCall`), or a kind not in `NON_RESPONSE_ITEMS`. Its
-/// `item/started` answers a steer the turn read (`note_steer_answered`);
-/// delivery confirmation counts it too, plus the two kinds noted there.
+/// `item/started` answers a steer the turn read (`note_steer_answered`).
+/// Delivery confirmation does not use it: it has its own allowlist,
+/// `DELIVERY_PROOF_ITEMS`, so an unknown kind confirms nothing there.
 fn is_model_response_item(item: &Value) -> bool {
     match item["type"].as_str() {
         None => false,
