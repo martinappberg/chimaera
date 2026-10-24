@@ -1126,23 +1126,35 @@ const COLLAB_TOKEN_STEP: u64 = 256;
 /// only after a move this large — same order as the collab throttle above.
 const TURN_TOKENS_STEP: u64 = 256;
 
-/// Items a model response opens: its reply, reasoning, plan and tool calls.
-/// Their `item/started` proves the model is working on the current input
-/// (delivery of an opening message, the answer to a steer).
-const MODEL_RESPONSE_ITEMS: &[&str] = &[
-    "agentMessage",
-    "reasoning",
-    "plan",
-    "commandExecution",
-    "mcpToolCall",
-    "webSearch",
-    "fileChange",
-    "imageGeneration",
-    "imageView",
-    "dynamicToolCall",
-    "collabAgentToolCall",
-    "sleep",
+/// Item kinds that are not part of a model response. Each was seen to land
+/// after a steer was read without the model answering it, or belongs to
+/// earlier work: the user's own input, a Stop hook's continuation prompt, a
+/// compaction, a tool output codex records at a turn's end, and the review
+/// markers. Every other kind, a later Codex's new ones included, counts as
+/// a response: an unknown kind fails toward "answered" (no extra billed
+/// turn) rather than toward an input-less turn the user never asked for.
+const NON_RESPONSE_ITEMS: &[&str] = &[
+    "userMessage",
+    "hookPrompt",
+    "contextCompaction",
+    "functionCallOutput",
+    "enteredReviewMode",
+    "exitedReviewMode",
 ];
+
+/// This item belongs to a model response: its reply, reasoning, plan or a
+/// tool call, a v2 collaboration call (a `subAgentActivity` other than a
+/// child's `completed` marker, which v2 reports with no
+/// `collabAgentToolCall`), or a kind not in `NON_RESPONSE_ITEMS`. Its
+/// `item/started` answers a steer the turn read (`note_steer_answered`);
+/// delivery confirmation counts it too, plus the two kinds noted there.
+fn is_model_response_item(item: &Value) -> bool {
+    match item["type"].as_str() {
+        None => false,
+        Some("subAgentActivity") => item["kind"] != "completed",
+        Some(kind) => !NON_RESPONSE_ITEMS.contains(&kind),
+    }
+}
 
 struct CollabAgent {
     /// The subagent's thread id — the key every foreign frame carries.
@@ -3452,11 +3464,15 @@ impl CodexMapper {
         }
         // Older servers may omit clientId on the user echo; actual model
         // activity also proves we passed the pre-prompt hook barrier.
+        // Deliberately wider than a steer's answer: a child's `completed`
+        // marker and a recorded tool output are not an answer (they can be
+        // earlier work), but they do prove the turn is past the barrier.
         if current_turn
-            && item["type"].as_str().is_some_and(|t| {
-                MODEL_RESPONSE_ITEMS.contains(&t)
-                    || matches!(t, "subAgentActivity" | "functionCallOutput")
-            })
+            && (is_model_response_item(item)
+                || matches!(
+                    item["type"].as_str(),
+                    Some("subAgentActivity" | "functionCallOutput")
+                ))
         {
             self.unread_opening_message = None;
         }
@@ -4855,18 +4871,11 @@ impl CodexMapper {
             // echo by nothing but the read state, idle status and turn end.
             // Never a step: a completion or output of an earlier item (a
             // background command finishing), a token-usage update (it trails
-            // the request it counts), a child's finish marker, a recorded
-            // tool output, a hook prompt or a compaction. A v2
-            // `subAgentActivity` other than `completed` is the model's own
-            // collaboration call (spawn, message, interrupt), which v2
-            // reports with no `collabAgentToolCall`.
+            // the request it counts), or an `item/started` of a kind in
+            // `NON_RESPONSE_ITEMS` or a child's finish marker. Any other
+            // `item/started`, an unknown kind included, is a response.
             "item/started" => {
-                let response = match item["type"].as_str() {
-                    Some("subAgentActivity") => item["kind"] != "completed",
-                    Some(t) => MODEL_RESPONSE_ITEMS.contains(&t),
-                    None => false,
-                };
-                if response {
+                if is_model_response_item(item) {
                     self.read_unanswered = false;
                 }
             }
@@ -8242,6 +8251,38 @@ mod tests {
             .collect();
         assert_eq!(starts.len(), 1, "{:?}", step.outbound);
         assert_eq!(starts[0]["params"]["input"], json!([]));
+    }
+
+    /// An item kind this driver has never seen (a later Codex's) counts as
+    /// the model answering: the failure mode is the old one (a steer left
+    /// unanswered), never an input-less turn nobody asked for. The known
+    /// non-response kinds still leave the turn owed.
+    #[test]
+    fn an_unknown_item_after_a_steer_echo_counts_as_its_answer() {
+        for (kind, owed) in [
+            ("futureResponsePart", false),
+            ("hookPrompt", true),
+            ("contextCompaction", true),
+            ("enteredReviewMode", true),
+        ] {
+            let mut m = mapper();
+            active_turn(&mut m);
+            let (id, rpc) = steer_text(&mut m, "STEER S");
+            m.on_frame(&json!({ "id": rpc, "result": { "turnId": "turn-A" } }));
+            let frames = finishing_frames(&id);
+            m.on_frame(&frames[1]);
+            m.on_frame(&frames[2]);
+            m.on_frame(
+                &json!({"method": "item/started", "params": {"threadId": "thr-1",
+                "turnId": "turn-A", "item": {"type": kind, "id": "item-x"}}}),
+            );
+            for f in &frames[3..] {
+                m.on_frame(f);
+            }
+            let step = m.on_frame(&turn_a_completed());
+            let opened = step.outbound.iter().any(|o| o["method"] == "turn/start");
+            assert_eq!(opened, owed, "{kind}: {:?}", step.outbound);
+        }
     }
 
     /// Captured (0.164.0, Stop and model-request hooks configured): steer A
