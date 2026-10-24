@@ -1528,7 +1528,7 @@ The release notes and PR text were read, and the stable TypeScript schemas diffe
 - `just chat-mods-smoke` passed 1/1.
 - `TESTED_CLAUDE_VERSION` moved 2.1.300 → 2.1.310. No driver mapping changed.
 
-## Pass 54 (2026-10-23 — hermetic app-server probes codex 0.158.0 / 0.164.0, live probes codex 0.164.0, an old-glibc cluster host): the Codex 0.163–0.164 follow-ups from Pass 52. One mapping ADOPTED; the rest settled.
+## Pass 54 (2026-10-23 — hermetic app-server probes codex 0.158.0 / 0.164.0, live probes codex 0.164.0, an old-glibc cluster host): the Codex 0.163–0.164 follow-ups from Pass 52. Two mappings ADOPTED; the rest settled.
 
 This pass follows up the Codex part of Pass 52's changelog table. The pin stays `TESTED_CODEX_VERSION = "0.164.0"`.
 
@@ -1545,13 +1545,13 @@ This pass follows up the Codex part of Pass 52's changelog table. The pin stays 
 ### ADOPTED
 
 - A user steer whose echo is the last thing its turn did is owed an answer. "Last" means no non-user item, delta, plan or token-usage update on that turn after the echo. When that turn completes, the next turn opens with `turn/start {input: []}`: no bubble, no checkpoint, no delivery to confirm. Queued input that opens the next turn anyway takes its place. A Stop, an agent message (`SendIfRunning` never opens a turn), decline feedback, an interrupted or failed turn, and an active goal owe nothing (`read_unanswered` → `answer_owed`).
+- `thread/resume` and `thread/fork` send `excludeTurns: true`. Without it the open answer carries the whole history as one line, which a long thread can push toward the 8 MiB ndjson cap, plus a full-history-hydration `deprecationNotice`. Nothing reads those turns: the handshake takes only the thread id, model and effort, and the subagent replay reads its own `thread/read`. Hermetic on 0.158.0 and 0.164.0: resume and fork both answered `turns: []` with no notice (2017 vs 3101 bytes for a two-turn resume). A `thread/revert`, a `thread/inject_items` and a turn after the open all worked, and the next model request carried the full history. `exclude_turns` is in the protocol source at rust-v0.144.2, rust-v0.153.0 and rust-v0.164.0, with no `deny_unknown_fields`, so no version gate is needed. Test: `thread_open_carries_the_create_time_model_and_resumed_effort` (resume and fork carry it, start does not).
 - Hermetic tests from the captured frames: `a_steer_read_as_its_turn_finishes_opens_an_inputless_turn`, `a_steer_answered_in_its_turn_owes_no_turn`, `queued_input_takes_the_turn_an_unanswered_steer_was_owed`, `an_agent_message_or_a_stop_never_opens_the_owed_turn`, `a_steer_refused_by_a_finishing_turn_opens_the_next_turn_once` (refusal before and after `turn/completed`), `an_image_item_without_result_still_draws_its_row` (the 0.164.0 `fileId` shape, neither path nor result, a `failure`), and `model_request_hooks_are_not_startup_hooks` (the captured pre/post frames).
 
 ### Settled, nothing changed
 
 - **Resume.** The driver keeps every value it sends at thread open. `sandbox` / `approvalPolicy` / `approvalsReviewer` stay explicit. The header's starting mode must be known, and the conversation's remembered mode, the user's pick in Chimaera, then replays only when it differs. So that pick wins over one made in another Codex client. The effort replay already runs only when the index differs from the restored value. `summary: "auto"` rides every `turn/start` (Pass 31), so the restored summary never applies. Chimaera sends no `serviceTier` (Fast not adopted, Pass 30) and no `personality`. A Fast tier picked in another Codex client therefore now carries into a Chimaera resume, with no indicator in Chimaera.
 - **Not adopted.** `thread/readState/*` is the Codex app's unread marker. Chimaera has no "the user has seen this chat" signal to drive it, and nothing in Chimaera would read it. `feedback/save`, `thread/sample` / `thread/sample/cancel` and the prediction forks have no product use.
-- A follow-up, not taken here: the resume response carries the whole `thread.turns` history unless `excludeTurns: true` (in the 0.158.0–0.164.0 schemas), and the driver never reads it. A long thread's resume line can approach the 8 MiB ndjson cap.
 
 ### Gate (Pass 54)
 

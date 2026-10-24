@@ -761,11 +761,19 @@ fn thread_open_request(spec: &SpawnSpec, id: u64, effort: Option<&str>) -> Value
                 "lastTurnId": last_turn_id,
                 "cwd": spec.cwd,
                 "ephemeral": false,
+                "excludeTurns": true,
             },
         }),
+        // Nothing reads the opened thread's `turns` (the handshake takes its
+        // id, model and effort), but by default the answer carries the whole
+        // history as one line, which a long thread can push past the ndjson
+        // line cap. `excludeTurns` is in the app-server protocol since at
+        // least 0.144.2, and its params never deny unknown fields; 0.158.0
+        // and 0.164.0 answer it with `turns: []` and no deprecation notice
+        // (Pass 54).
         (Some(thread_id), None) => json!({
             "id": id, "method": "thread/resume",
-            "params": { "threadId": thread_id, "cwd": spec.cwd },
+            "params": { "threadId": thread_id, "cwd": spec.cwd, "excludeTurns": true },
         }),
         (None, _) => json!({
             "id": id, "method": "thread/start",
@@ -9981,6 +9989,7 @@ mod tests {
         assert_eq!(start["params"]["sandbox"], "workspace-write");
         assert_eq!(start["params"]["approvalPolicy"], "on-request");
         assert_eq!(start["params"]["approvalsReviewer"], "auto_review");
+        assert!(start["params"].get("excludeTurns").is_none());
 
         spec.pinned_native_id = Some("thread-old".into());
         let resume = thread_open_request(&spec, 8, spec.initial_effort.as_deref());
@@ -9989,6 +9998,8 @@ mod tests {
         assert_eq!(resume["params"]["model"], "gpt-test");
         assert_eq!(resume["params"]["effort"], "xhigh");
         assert_eq!(resume["params"]["approvalsReviewer"], "auto_review");
+        // The history stays out of the open answer (Pass 54).
+        assert_eq!(resume["params"]["excludeTurns"], true);
 
         spec.fork_at = Some("turn-7".into());
         let fork = thread_open_request(&spec, 9, spec.initial_effort.as_deref());
@@ -9999,6 +10010,7 @@ mod tests {
         assert_eq!(fork["params"]["model"], "gpt-test");
         assert_eq!(fork["params"]["effort"], "xhigh");
         assert_eq!(fork["params"]["approvalsReviewer"], "auto_review");
+        assert_eq!(fork["params"]["excludeTurns"], true);
 
         spec.portable_context = Some("quiet imported transcript".into());
         let contextual = thread_open_request(&spec, 10, spec.initial_effort.as_deref());
