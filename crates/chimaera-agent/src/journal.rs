@@ -598,6 +598,11 @@ struct IndexEntry {
     model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mode: Option<String>,
+    /// The user's own per-chat auto-compact pick (claude's session flag);
+    /// absent = the daemon's setting decides. Only picks are recorded, and
+    /// a fork or rewind branch inherits its parent's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auto_compact: Option<bool>,
 }
 
 /// What a native conversation last ran with. A reopened chat starts from
@@ -608,6 +613,10 @@ pub struct ConversationSettings {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub mode: Option<String>,
+    /// The user's own auto-compact pick (claude), which the server writes
+    /// into a reopened session's generated `--settings` file. `None` = the
+    /// daemon's `agents.autoCompact` decides.
+    pub auto_compact: Option<bool>,
 }
 
 const INDEX_MAX_ENTRIES: usize = 200;
@@ -643,6 +652,7 @@ impl JournalIndex {
             effort: previous.and_then(|e| e.effort.clone()),
             model: previous.and_then(|e| e.model.clone()),
             mode: previous.and_then(|e| e.mode.clone()),
+            auto_compact: previous.and_then(|e| e.auto_compact),
         };
         apply(&mut entry);
         entries.retain(|e| e.native_id != native_id);
@@ -672,6 +682,7 @@ impl JournalIndex {
                 model: entry.model.take(),
                 effort: entry.effort.take(),
                 mode: entry.mode.take(),
+                auto_compact: entry.auto_compact,
             };
             apply(&mut settings);
             let bounded = |value: Option<String>| {
@@ -680,6 +691,7 @@ impl JournalIndex {
             entry.model = bounded(settings.model).filter(|m| crate::model::is_real_model(m));
             entry.effort = bounded(settings.effort);
             entry.mode = bounded(settings.mode);
+            entry.auto_compact = settings.auto_compact;
         });
     }
 
@@ -695,6 +707,7 @@ impl JournalIndex {
                 model: e.model.clone().filter(|m| crate::model::is_real_model(m)),
                 effort: e.effort.clone(),
                 mode: e.mode.clone(),
+                auto_compact: e.auto_compact,
             })
             .unwrap_or_default()
     }
@@ -1486,6 +1499,24 @@ mod tests {
         assert!(entries.len() <= INDEX_MAX_ENTRIES);
     }
 
+    /// A per-chat auto-compact pick survives the other settings' writes, a
+    /// resume re-key and a reload; an unknown conversation has none.
+    #[test]
+    fn index_keeps_a_conversations_auto_compact_pick() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = JournalIndex::load(dir.path());
+        assert_eq!(index.settings("native-a").auto_compact, None);
+        index.record("native-a", "s-1");
+        index.record_settings("native-a", "s-1", |s| s.auto_compact = Some(false));
+        index.record_effort("native-a", "s-1", Some("high".into()));
+        index.record("native-a", "s-2");
+        assert_eq!(index.settings("native-a").auto_compact, Some(false));
+        assert_eq!(index.effort("native-a").as_deref(), Some("high"));
+        let reloaded = JournalIndex::load(dir.path());
+        assert_eq!(reloaded.settings("native-a").auto_compact, Some(false));
+        assert_eq!(reloaded.settings("native-b").auto_compact, None);
+    }
+
     /// A reopened conversation comes back with its own model/effort/mode: the
     /// row carries all three, each write keeps the others, the Init re-key
     /// keeps them too, and an over-long value is dropped rather than stored.
@@ -1505,6 +1536,7 @@ mod tests {
                 model: Some("sonnet".into()),
                 effort: Some("high".into()),
                 mode: Some("acceptEdits".into()),
+                auto_compact: None,
             }
         );
         assert_eq!(index.lookup("native-a").as_deref(), Some("s-2"));

@@ -294,6 +294,8 @@ pub(crate) mod samples {
                 objective: "all tests pass".to_string(),
                 status: "active".to_string(),
             }),
+            // Never serialized: a rich row proves it stays off the wire.
+            conversation_auto_compact: rich.then_some(false),
         }
     }
 }

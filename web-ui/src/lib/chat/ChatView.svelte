@@ -1958,6 +1958,16 @@
     return setUltracode(!store.ultracode);
   }
 
+  /** This chat's auto-compact, beside its context window: offered only
+   *  where the agent can switch it per session and has said where it
+   *  stands (Claude's flag layer; Codex has no switch). */
+  const autoCompactShown = $derived(
+    !readOnly && supports("set_auto_compact") && store.autoCompact !== null ? store.autoCompact : null,
+  );
+  function setAutoCompact(enabled: boolean): void {
+    sendCommand({ type: "set_auto_compact", enabled }, "auto-compact change not sent");
+  }
+
   /** Where this chat's relative references resolve: App's context for the
    *  session (live cwd, spawn cwd, workspace root — the terminal's answer
    *  too), else what the session row itself knows. */
@@ -2353,9 +2363,14 @@
    *  running tools → working (between steps). */
   const agentBusy = $derived(store.running || store.compacting);
   /** The usage popover's Compact: the same path as typing `/compact` (Codex's
-   *  native command, else Claude's own slash command), offered while idle. */
+   *  native command, else Claude's own slash command), offered while idle;
+   *  `DISABLE_COMPACT` switches /compact off along with auto-compact. */
   const canCompact = $derived(
-    !readOnly && !agentBusy && store.contextPct !== null && (agentKind === "claude" || supports("compact")),
+    !readOnly &&
+      !agentBusy &&
+      store.contextPct !== null &&
+      (agentKind === "claude" || supports("compact")) &&
+      store.autoCompactDisabledBy !== "DISABLE_COMPACT",
   );
   function compactNow(): void {
     menu = null;
@@ -3063,6 +3078,9 @@
     stopArmed={stopConfirm !== null}
     onSetRemoteControl={setRemoteControl}
     onCompact={canCompact ? compactNow : undefined}
+    autoCompact={autoCompactShown}
+    autoCompactDisabledBy={store.autoCompactDisabledBy}
+    onSetAutoCompact={setAutoCompact}
     onOpenSettings={readOnly ? undefined : openAgentSettings}
     onSignIn={readOnly || !catalogAgent?.signIn ? undefined : () => (signInRequested = true)}
     accountLimits={accountUsage?.rows}

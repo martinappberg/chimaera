@@ -90,6 +90,7 @@ export type SettingsMap = {
   "agents.communication.enabled": boolean;
   "agents.communication.wakes": "never" | "ask" | "auto" | "always";
   "agents.communication.freeSubagents": boolean;
+  "agents.autoCompact": "agent" | "on" | "off";
   "dashboard.landing": "auto" | "never";
   "dashboard.cardDensity": "auto" | "comfortable" | "compact";
   "dashboard.roster": "line" | "cards";
@@ -283,6 +284,24 @@ const DEFS = {
     default: false,
     scope: "daemon",
     note: "Claude chats. Codex reads a message while it waits on its subagents either way.",
+  },
+
+  // Claude Code's own switch, set per session through the generated
+  // --settings file (crates/chimaera-agent/protocol/passes.md, Pass 50).
+  "agents.autoCompact": {
+    title: "Auto-Compact (Claude)",
+    category: "Agents",
+    description:
+      "Whether Claude Code summarizes a long conversation on its own when the context fills. Agent default follows your Claude Code settings. Off: it waits for /compact or Compact under a chat's usage meter, and a full context stops the turn.",
+    type: "enum",
+    default: "agent",
+    options: [
+      { value: "agent", label: "Agent default" },
+      { value: "on", label: "On" },
+      { value: "off", label: "Off" },
+    ],
+    scope: "daemon",
+    note: "Claude sessions started after the change. A chat's own switch, under its usage meter, wins for that conversation.",
   },
 
   // --- Dashboard ---------------------------------------------------------------

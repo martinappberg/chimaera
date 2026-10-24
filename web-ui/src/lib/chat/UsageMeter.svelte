@@ -1,6 +1,7 @@
 <script lang="ts">
   import { toolbarPopover } from "../shared/toolbarPopover";
   import UsageBars from "../shared/UsageBars.svelte";
+  import Switch from "../shared/Switch.svelte";
   import { formatTokenCount } from "../shared/format";
   import { usageHeadline, usageTitle, type UsageRow } from "../shared/usage";
 
@@ -24,6 +25,13 @@
     onClose: () => void;
     /** Offered while the agent is idle. */
     onCompact?: () => void;
+    /** Whether this chat compacts on its own; null where the agent has no
+     *  per-chat switch (Codex always does near a full window). */
+    autoCompact?: boolean | null;
+    /** The environment variable holding it off: the switch reads Off and
+     *  cannot be turned on here. */
+    autoCompactDisabledBy?: string | null;
+    onSetAutoCompact?: (enabled: boolean) => void;
     onOpenSettings?: () => void;
   }
 
@@ -36,6 +44,9 @@
     onToggle,
     onClose,
     onCompact,
+    autoCompact = null,
+    autoCompactDisabledBy = null,
+    onSetAutoCompact,
     onOpenSettings,
   }: Props = $props();
 
@@ -99,6 +110,20 @@
               <button class="link" onclick={onCompact} title="Summarize the conversation so far to free the context window">Compact</button>
             {/if}
           </div>
+          {#if autoCompact !== null && onSetAutoCompact}
+            <div class="auto-line" title="Summarize the conversation on its own when the context window fills. Off: it waits for Compact, and a full window stops the turn.">
+              <span>Auto-compact</span>
+              <Switch
+                on={autoCompact && !autoCompactDisabledBy}
+                disabled={!!autoCompactDisabledBy}
+                label="Auto-compact this chat"
+                onToggle={onSetAutoCompact}
+              />
+            </div>
+            {#if autoCompactDisabledBy}
+              <p class="held">set off by <code>{autoCompactDisabledBy}</code></p>
+            {/if}
+          {/if}
         {/if}
         {#if limits.length > 0}
           {#if contextRow.length > 0}<hr />{/if}
@@ -229,6 +254,25 @@
   .context-line .link:hover,
   .context-line .link:focus-visible {
     background: var(--hover-tint);
+  }
+  .auto-line {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-top: -2px;
+    font-size: var(--text-xs);
+    color: var(--muted);
+  }
+  .held {
+    margin: -4px 0 0;
+    font-size: var(--text-xs);
+    color: var(--muted);
+    overflow-wrap: anywhere;
+  }
+  .held code {
+    font-family: var(--mono);
+    font-size: inherit;
   }
   hr {
     width: 100%;

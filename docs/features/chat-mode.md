@@ -143,9 +143,13 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   agent normalize to one journaled lifecycle: while history is being summarized the live status
   reads **"compacting context"** with an indeterminate progress track (no invented percentage),
   the dashboard carries the same now-line, and completion becomes a quiet transcript notice
-  (including Claude's pre-summary token count when reported). Reconnect/replay restores an active
-  compaction instead of falling back to a generic working spinner; turn abort, failure, or driver
-  exit always settles it.
+  (including Claude's pre-summary token count when reported) that says whose it was: "context
+  auto-compacted · N tokens summarized" when the agent compacted on its own, "context compacted · …"
+  when you asked. Reconnect/replay restores an active compaction instead of falling back to a
+  generic working spinner; turn abort, failure, or driver exit always settles it. Neither CLI hands
+  off to a new session when it compacts: the summary replaces history in the same conversation
+  (PROTOCOL.md Pass 50). With Claude's auto-compact off, a full context ends the turn with "Prompt is
+  too long" and the notice "context limit reached · /compact to continue".
   The slash popover triggers after any whitespace boundary, so prose such as
   `please use /skill` remains fully editable while the matching command menu opens. A mid-draft
   pick completes the token in place; only a whole-draft slash takes the command path. Native
@@ -311,7 +315,13 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   reading, with no number. Once a reading reaches 80% it says which and how full ("weekly 86%",
   "context 84%") in the warn colour; a limit the agent reports as spent reads "weekly limit reached"
   in the error colour. A click opens the detail: the context window (tokens used of the window, and
-  **Compact** while the agent is idle — the same path as typing `/compact`), then every plan window
+  **Compact** while the agent is idle — the same path as typing `/compact` — and, in a Claude chat,
+  an **Auto-compact** switch for this chat: Claude's session flag, showing what the CLI reports.
+  The pick is remembered for the conversation and goes into the generated settings file whenever it
+  starts again (reopen, view switch to the terminal and back, rewind, restart), so it never shows the
+  default first; a fork or rewind branch starts with its parent's. When the agent's environment sets
+  `DISABLE_AUTO_COMPACT` or `DISABLE_COMPACT`, the switch reads Off, is disabled, and says
+  "set off by DISABLE_AUTO_COMPACT". Codex has no such switch), then every plan window
   this chat knows, each with when it resets ("in 1h 40m", "Thu 09:00"), and **All limits** →
   Settings → Agents. Claude reports both plan windows on every request (`unifiedWindows`), Codex its
   primary/secondary windows during each turn, Grok its weekly credit window after each turn; an
