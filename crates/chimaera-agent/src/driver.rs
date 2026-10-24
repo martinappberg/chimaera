@@ -88,6 +88,12 @@ pub struct SpawnSpec {
     /// header pick but not recorded as one (a resurrected session had it on
     /// when the daemon restarted). Codex has no ultracode and ignores it.
     pub initial_ultracode: bool,
+    /// The auto-compact pick of the conversation this spawn reopens (a
+    /// resume, rewind or fork of it). The server already wrote it into the
+    /// generated `--settings` file, so no driver applies it; the manager
+    /// records it under the native id the spawn reports, which is how a
+    /// fork or rewind branch inherits its parent's pick. `None` = no pick.
+    pub conversation_auto_compact: Option<bool>,
     /// The binary's `--version` line as the server probed it (`None` when
     /// the probe failed). Neither wire protocol offers a reliable version
     /// handshake (see PROTOCOL.md), so the server-side probe is the source:
@@ -195,6 +201,7 @@ impl SpawnSpec {
             initial_effort: None,
             initial_mode: None,
             initial_ultracode: false,
+            conversation_auto_compact: None,
             agent_version: None,
             rollback_turns: None,
             fork_at: None,

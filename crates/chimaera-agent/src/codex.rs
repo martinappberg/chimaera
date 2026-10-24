@@ -232,8 +232,8 @@ use crate::driver::{
 };
 use crate::model::{
     cap_output, clip_command, fmt_elapsed_secs, fmt_tokens, truncate_label, AgentCommand,
-    AgentEvent, ChunkKind, Coalescer, CompactionPhase, ContentBlock, GoalEnd, GoalState,
-    PermissionOption, PermissionOptionKind, RemoteControlSnapshot, RemoteControlState,
+    AgentEvent, ChunkKind, Coalescer, CompactionPhase, CompactionTrigger, ContentBlock, GoalEnd,
+    GoalState, PermissionOption, PermissionOptionKind, RemoteControlSnapshot, RemoteControlState,
     SlashCommand, ToolContent, ToolKind, ToolStatus, Usage, UserMessageState, BG_LABEL_MAX,
     GOAL_TEXT_MAX, SKILL_PATH_MAX, SLASH_COMMANDS_CAP, SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX,
     SUBAGENT_RESULT_MAX, UNHANDLED_REQUESTS_CAP, UNHANDLED_REQUEST_NAME_MAX,
@@ -1713,6 +1713,10 @@ struct CodexMapper {
     /// A `thread/compact/start` was sent: the server-started turn it opens
     /// is a compaction, not a goal continuation.
     compact_requested: bool,
+    /// The running turn is the one a `thread/compact/start` opened: its
+    /// compaction is the user's; any other is codex's own (the item carries
+    /// no trigger, schema 0.158.0).
+    compact_turn: bool,
     next_id: u64,
 }
 
@@ -1810,6 +1814,7 @@ impl CodexMapper {
             goal_emitted_ms: 0,
             goal_seen: false,
             compact_requested: false,
+            compact_turn: false,
             // The handshake minted 0..next_id (init, config read, thread
             // open, optional rollback, model/list, skills/list) and hands
             // over the next id.
@@ -2004,6 +2009,17 @@ impl CodexMapper {
         self.goal
             .as_ref()
             .is_some_and(|goal| goal.status == "active")
+    }
+
+    /// Who started the compaction now running: the turn our
+    /// `thread/compact/start` opened is the user's, any other (pre-turn,
+    /// mid-turn, post-turn at the window's 90%) codex's own.
+    fn compaction_trigger(&self) -> CompactionTrigger {
+        if self.compact_turn {
+            CompactionTrigger::Manual
+        } else {
+            CompactionTrigger::Auto
+        }
     }
 
     /// The goal runs, or a set that makes it run is in flight: the server
@@ -2218,8 +2234,8 @@ impl CodexMapper {
                 // continuing toward it (live 0.162.1: back to back, no
                 // userMessage item) — or the turn a set/resume opens. The
                 // turn a requested compaction opens is neither.
-                if !ours && !std::mem::take(&mut self.compact_requested) && self.goal_drives_turns()
-                {
+                self.compact_turn = !ours && std::mem::take(&mut self.compact_requested);
+                if !ours && !self.compact_turn && self.goal_drives_turns() {
                     step.events.push(AgentEvent::TurnCause {
                         turn_id: self.turn_id.clone(),
                         kind: "goal".into(),
@@ -2617,6 +2633,7 @@ impl CodexMapper {
                     step.events.push(AgentEvent::ContextCompaction {
                         phase: CompactionPhase::Completed,
                         pre_tokens: None,
+                        trigger: Some(self.compaction_trigger()),
                     });
                 }
             }
@@ -2912,6 +2929,7 @@ impl CodexMapper {
             self.compaction_active = false;
             self.compaction_completed = true;
         }
+        self.compact_turn = false;
         // Defensive: a turn that ends without ever emitting turn/started must
         // not leave the start-window flag stuck true.
         self.turn_pending = false;
@@ -3858,6 +3876,7 @@ impl CodexMapper {
                         step.events.push(AgentEvent::ContextCompaction {
                             phase: CompactionPhase::Completed,
                             pre_tokens: None,
+                            trigger: Some(self.compaction_trigger()),
                         });
                     }
                 } else if !self.compaction_active {
@@ -3866,6 +3885,7 @@ impl CodexMapper {
                     step.events.push(AgentEvent::ContextCompaction {
                         phase: CompactionPhase::Started,
                         pre_tokens: None,
+                        trigger: Some(self.compaction_trigger()),
                     });
                 }
             }
@@ -6275,8 +6295,12 @@ impl CodexMapper {
             // command here: the conversation rewind is the server's respawn
             // recipe (thread/resume + thread/rollback at handshake), and
             // codex has no rewind_files-style file restore to answer with.
+            // No auto-compact switch either: codex always compacts at 90% of
+            // the window, and its token-limit config can only lower that
+            // (PROTOCOL.md Pass 50). The capability is not advertised.
             AgentCommand::SetThinking { .. }
             | AgentCommand::SetUltracode { .. }
+            | AgentCommand::SetAutoCompact { .. }
             | AgentCommand::BackgroundTool { .. }
             | AgentCommand::StopTask { .. }
             | AgentCommand::Rewind { .. }
@@ -10798,6 +10822,52 @@ mod tests {
             "params": { "threadId": "thr-1" },
         }));
         assert!(deprecated.events.is_empty());
+    }
+
+    /// The item carries no trigger: the turn our thread/compact/start opened
+    /// is the user's compaction, one inside any other turn is codex's own.
+    #[test]
+    fn compaction_trigger_follows_the_turn_that_ran_it() {
+        let item = |m: &mut CodexMapper, method: &str| {
+            m.on_frame(&json!({
+                "method": method,
+                "params": { "threadId": "thr-1",
+                    "item": { "type": "contextCompaction", "id": "c" } },
+            }))
+        };
+        let mut m = mapper();
+        let ask = m.on_command(AgentCommand::Compact);
+        let id = ask.outbound[0]["id"].as_u64().unwrap();
+        m.on_frame(&json!({ "id": id, "result": {} }));
+        m.on_frame(&json!({
+            "method": "turn/started",
+            "params": { "threadId": "thr-1", "turn": { "id": "compact-turn" } },
+        }));
+        let started = item(&mut m, "item/started");
+        assert!(matches!(
+            &started.events[0],
+            AgentEvent::ContextCompaction {
+                trigger: Some(CompactionTrigger::Manual),
+                ..
+            }
+        ));
+        m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "threadId": "thr-1", "turn": { "id": "compact-turn", "status": "completed" } },
+        }));
+        m.on_frame(&json!({
+            "method": "turn/started",
+            "params": { "threadId": "thr-1", "turn": { "id": "work-turn" } },
+        }));
+        let auto = item(&mut m, "item/completed");
+        assert!(matches!(
+            &auto.events[0],
+            AgentEvent::ContextCompaction {
+                phase: CompactionPhase::Completed,
+                trigger: Some(CompactionTrigger::Auto),
+                ..
+            }
+        ));
     }
 
     #[test]
