@@ -1316,6 +1316,57 @@ async fn claude_auto_compact_is_a_session_flag() {
         .expect("shutdown");
 }
 
+/// What the switch shows comes from the CLI (PROTOCOL.md Pass 50): the
+/// flag-layer setting, held off by `DISABLE_AUTO_COMPACT`, which only
+/// get_context_usage's `isAutoCompactEnabled` reports. The driver names the
+/// variable and journals nothing that reads On first. No turn, no billing.
+#[tokio::test]
+#[ignore = "live: spawns real claude, needs auth, no turn"]
+async fn driver_auto_compact_names_the_environment_holding_it_off() {
+    use std::sync::Arc;
+
+    for (env, expected) in [
+        (None, (true, None)),
+        (
+            Some("DISABLE_AUTO_COMPACT"),
+            (false, Some("DISABLE_AUTO_COMPACT".to_string())),
+        ),
+    ] {
+        let dir = tmpdir();
+        let manager = Arc::new(ChatManager::new(
+            dir.path().join("chat"),
+            Box::new(|_, _| {}),
+            Box::new(|_, _| {}),
+        ));
+        let mut argv = vec!["claude".to_string()];
+        argv.extend(chat_args(Some(CLAUDE_TEST_MODEL), None));
+        let mut spec = SpawnSpec::new("s-autocompact", argv, dir.path().to_path_buf());
+        if let Some(var) = env {
+            spec.env.push((var.to_string(), "1".to_string()));
+        }
+        manager.spawn(&ClaudeAdapter, spec).expect("spawn driver");
+        let mut rx = manager.attach("s-autocompact", 0).expect("attach").live;
+        let deadline = tokio::time::Instant::now() + HANDSHAKE;
+        let seen = loop {
+            let entry = tokio::time::timeout_at(deadline, rx.recv())
+                .await
+                .expect("no auto-compact read-back")
+                .expect("broadcast closed");
+            if let AgentEvent::AutoCompact {
+                enabled,
+                disabled_by,
+                picked,
+            } = &entry.ev
+            {
+                assert_eq!(*picked, None, "a spawn read is not a pick");
+                break (*enabled, disabled_by.clone());
+            }
+        };
+        assert_eq!(seen, expected, "env {env:?}");
+        manager.kill("s-autocompact");
+    }
+}
+
 /// Wait for a specific control_response and return its inner response value.
 async fn await_control_response(chat: &mut ClaudeChat, ctl_id: &str) -> Value {
     loop {

@@ -295,6 +295,13 @@ pub struct ChatInfo {
     /// rows and cards with no warm store. `None` without one. Additive.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub goal: Option<GoalBrief>,
+    /// The conversation's own auto-compact pick: the reopened parent's at
+    /// spawn (`SpawnSpec::conversation_auto_compact`), then the user's
+    /// latest. Recorded under each native id the session reports, so a
+    /// fork or rewind branch inherits it. Daemon-internal, never on the
+    /// wire.
+    #[serde(skip)]
+    pub conversation_auto_compact: Option<bool>,
 }
 
 /// [`ChatInfo::next_wake`].
@@ -972,6 +979,7 @@ impl ChatManager {
             background_running: 0,
             next_wake: None,
             goal: None,
+            conversation_auto_compact: spec.conversation_auto_compact,
         };
         let session = Arc::new(ChatSession {
             unused_startup: AtomicBool::new(journal.last_seq() == 0),
@@ -1156,10 +1164,13 @@ impl ChatManager {
                         // The process's opening model/mode are what a reopen
                         // of THIS native conversation must come back with
                         // (fold_session_metadata already copied them in).
+                        // So does its auto-compact pick: a fork or rewind
+                        // branch reports a new id and keeps the parent's.
                         index_to_record = Some(IndexUpdate {
                             native: native_session_id.clone(),
                             model: info.model.clone(),
                             mode: info.current_mode.clone(),
+                            auto_compact: info.conversation_auto_compact,
                             ..Default::default()
                         });
                     }
@@ -1195,16 +1206,18 @@ impl ChatManager {
                     }
                 }
                 // A per-chat auto-compact pick belongs to the conversation
-                // alone: a reopen applies it over the daemon's setting. The
-                // read-backs that follow a spawn are not picks.
+                // alone: a reopen writes it into the spawn's settings file,
+                // over the daemon's setting. What the user picked is kept,
+                // not what the CLI reports (an environment can hold it off).
                 AgentEvent::AutoCompact {
-                    enabled,
-                    chosen: true,
+                    picked: Some(picked),
+                    ..
                 } => {
+                    info.conversation_auto_compact = Some(*picked);
                     if let Some(native) = &info.native_session_id {
                         index_to_record = Some(IndexUpdate {
                             native: native.clone(),
-                            auto_compact: Some(*enabled),
+                            auto_compact: Some(*picked),
                             ..Default::default()
                         });
                     }
@@ -1291,10 +1304,6 @@ impl ChatManager {
                     index.record(&native, &session_id);
                 }
                 if let Some(update) = index_to_record {
-                    if let Some(enabled) = update.auto_compact {
-                        index.record_auto_compact(&update.native, &session_id, enabled);
-                        return;
-                    }
                     index.record_settings(&update.native, &session_id, |s| {
                         if let Some(model) = update.model {
                             s.model = Some(model);
@@ -1304,6 +1313,9 @@ impl ChatManager {
                         }
                         if let Some(mode) = update.mode {
                             s.mode = Some(mode);
+                        }
+                        if let Some(picked) = update.auto_compact {
+                            s.auto_compact = Some(picked);
                         }
                     });
                 }
@@ -1635,6 +1647,7 @@ mod tests {
             background_running: 0,
             next_wake: None,
             goal: None,
+            conversation_auto_compact: None,
         }
     }
 

@@ -105,6 +105,11 @@ pub(crate) struct ChatRecipe {
     /// survives a daemon restart instead of resetting to "now". `None` on a
     /// fresh create / view-switch / rewind — the spawn stamps now.
     pub(crate) created_at_ms: Option<u64>,
+    /// The auto-compact pick a Claude branch inherits from its source chat
+    /// (a fork, native or portable). The conversation's own record wins once
+    /// it has one; this covers a branch with no native parent to read it
+    /// from. `None` everywhere else.
+    pub(crate) auto_compact: Option<bool>,
 }
 
 /// Whether a chat spawn turns claude's Remote Control bridge on after the
@@ -1182,6 +1187,7 @@ async fn stop_for_respawn(
 /// must abort with the session still alive: killing first and failing after
 /// would leave it in neither registry and the watcher would retire a live
 /// session. (`settings`/`mcp_config` are `None` when the file is absent.)
+#[allow(clippy::too_many_arguments)] // one per respawn input, like the spawn helpers
 async fn resolve_respawn_inputs(
     state: &Arc<AppState>,
     id: &str,
@@ -1189,11 +1195,20 @@ async fn resolve_respawn_inputs(
     workspace_root: &std::path::Path,
     workspace_id: &str,
     theme: &str,
+    resume: Option<&str>,
 ) -> Result<(Option<PathBuf>, Option<PathBuf>, PathBuf, Option<String>), String> {
     let (settings, mcp_config) = if kind == AgentKind::Claude {
         let settings_path = crate::agents::settings_path(id);
         let mcp_path = crate::agents::mcp_config_path(id);
         if settings_path.exists() && mcp_path.exists() {
+            // The file is the one this session started with; a toggle in
+            // the chat since then lives only in the conversation's record.
+            if let Some(enabled) =
+                resume.and_then(|native| conversation_auto_compact(state, native))
+            {
+                crate::agents::set_settings_auto_compact(&settings_path, enabled)
+                    .map_err(|err| err.to_string())?;
+            }
             (Some(settings_path), Some(mcp_path))
         } else {
             // Runtime state is explicitly reconstructible: macOS and Linux
@@ -1211,7 +1226,7 @@ async fn resolve_respawn_inputs(
                     .await;
             let settings_theme = (!theme_set).then_some(theme);
             let plugin_tools = crate::plugins::spawn_allow(state, workspace_id).await;
-            let auto_compact = crate::lock(&state.settings).claude_auto_compact();
+            let auto_compact = claude_auto_compact(state, resume);
             let settings = crate::agents::write_settings(
                 id,
                 &key,
@@ -1779,6 +1794,7 @@ async fn perform_switch(
         &workspace_root,
         &workspace_id,
         &theme,
+        resume.as_deref(),
     )
     .await?;
 
@@ -1812,6 +1828,7 @@ async fn perform_switch(
         // A view switch respawns in place; age isn't preserved across it
         // today (the ledger path is what fixes resurrection).
         created_at_ms: None,
+        auto_compact: None,
     };
 
     // Stop the current process and wait for its slot to free.
@@ -1954,6 +1971,7 @@ fn control_only_switch_journal(path: &std::path::Path) -> bool {
             | AgentEvent::Init { .. }
             | AgentEvent::ModeChanged { .. }
             | AgentEvent::EffortState { .. }
+            | AgentEvent::AutoCompact { .. }
             | AgentEvent::ContextUsage { .. }
             | AgentEvent::UsageReport { .. }
             | AgentEvent::RateLimit { .. }
@@ -2076,6 +2094,7 @@ pub(crate) async fn rewind_session(
         &workspace_root,
         &workspace_id,
         &theme,
+        Some(&native),
     )
     .await
     {
@@ -2206,6 +2225,7 @@ pub(crate) async fn rewind_session(
             prelude: launch_prelude,
             portable_context,
             created_at_ms: None,
+            auto_compact: None,
         };
         spawn_chat_session(&state, id.clone(), recipe, None)
             .await
@@ -2675,6 +2695,7 @@ fn build_fork_bootstrap(
         events,
         portable_context,
         native,
+        auto_compact: None,
     })
 }
 
@@ -3007,7 +3028,7 @@ pub(crate) async fn fork_session(
     let inherited_context = crate::lock(&state.chat_recipes)
         .get(&id)
         .and_then(|recipe| recipe.portable_context.clone());
-    let bootstrap = match build_fork_bootstrap(
+    let mut bootstrap = match build_fork_bootstrap(
         &entries,
         through_seq,
         source_record.kind,
@@ -3018,6 +3039,11 @@ pub(crate) async fn fork_session(
         Ok(bootstrap) => bootstrap,
         Err(message) => return err(StatusCode::CONFLICT, message),
     };
+    // The source's live pick (its spawn's, or the user's since), so even a
+    // portable Claude-to-Claude branch starts as its parent was.
+    if target == AgentKind::Claude && source_record.kind == AgentKind::Claude {
+        bootstrap.auto_compact = source_info.conversation_auto_compact;
+    }
     let source_name = source_record.display_name(None);
     match spawn_fresh_chat(
         &state,
@@ -3188,6 +3214,9 @@ pub(crate) struct ForkBootstrap {
     /// Native source handle + exact native boundary (Claude message uuid or
     /// Codex completed turn id).
     native: Option<(String, String)>,
+    /// The source chat's auto-compact pick, for a Claude destination: a
+    /// branch starts as its parent was (Pass 50).
+    auto_compact: Option<bool>,
 }
 
 /// Why a fresh chat spawn could not happen (mirrors `spawn::SpawnFailure`).
@@ -3253,6 +3282,7 @@ pub(crate) async fn spawn_fresh_chat_at(
     let is_fork = fork.is_some();
     let native_fork = fork.as_ref().and_then(|fork| fork.native.clone());
     let portable_context = fork.as_ref().and_then(|fork| fork.portable_context.clone());
+    let inherited_auto_compact = fork.as_ref().and_then(|fork| fork.auto_compact);
     let id = spec.id.unwrap_or_else(crate::agents::fresh_session_id);
     // Take the path AND its probed version from one detection so the chat
     // driver's version notice reflects the binary it actually spawns.
@@ -3276,7 +3306,13 @@ pub(crate) async fn spawn_fresh_chat_at(
                 .await;
         let settings_theme = (!theme_set).then_some(spec.theme.as_str());
         let plugin_tools = crate::plugins::spawn_allow(state, &workspace.id).await;
-        let auto_compact = crate::lock(&state.settings).claude_auto_compact();
+        // A branch starts from its parent's pick.
+        let auto_compact = inherited_auto_compact.or_else(|| {
+            claude_auto_compact(
+                state,
+                native_fork.as_ref().map(|(source, _)| source.as_str()),
+            )
+        });
         let s = crate::agents::write_settings(
             &id,
             &key,
@@ -3350,6 +3386,7 @@ pub(crate) async fn spawn_fresh_chat_at(
         portable_context,
         // Fresh create — the spawn stamps now.
         created_at_ms: None,
+        auto_compact: inherited_auto_compact,
     };
     // A fork's target journal must exist before `ChatManager::spawn` opens it;
     // seeding afterward would race the live writer and violate seq ownership.
@@ -3439,7 +3476,25 @@ fn resolve_start_settings(
             .find(|m| chimaera_agent::model::is_real_model(m)),
         effort: recovered_effort.or(own.effort).or(remembered_effort),
         mode: own.mode.or(prefs.mode.clone()),
+        auto_compact: own.auto_compact,
     }
+}
+
+/// What a Claude session's generated `--settings` file says about
+/// auto-compact: the pick of the conversation it reopens (`resume`: a
+/// resume, view switch, rewind, fork or resurrection of it), else
+/// `agents.autoCompact` (`None` = Agent default, nothing written). Written
+/// into the file rather than applied after the handshake, so a reopened
+/// chat never shows the default first and its terminal view gets the same.
+pub(crate) fn claude_auto_compact(state: &AppState, resume: Option<&str>) -> Option<bool> {
+    resume
+        .and_then(|native| conversation_auto_compact(state, native))
+        .or_else(|| crate::lock(&state.settings).claude_auto_compact())
+}
+
+/// The conversation's own auto-compact pick (in-memory index read).
+fn conversation_auto_compact(state: &AppState, native: &str) -> Option<bool> {
+    state.chat.index().settings(native).auto_compact
 }
 
 pub(crate) async fn spawn_chat_session(
@@ -3502,6 +3557,7 @@ pub(crate) async fn spawn_chat_session(
     let model = start.model;
     let initial_effort = start.effort;
     let initial_mode = start.mode;
+    let conversation_auto_compact = start.auto_compact.or(recipe.auto_compact);
     // Legacy recovery and the prune can yield while a concurrent retire
     // removes the shared identity. From here through ChatManager::spawn there
     // are no awaits, so this closes that race without resurrecting an
@@ -3697,13 +3753,11 @@ pub(crate) async fn spawn_chat_session(
     if recipe.kind == AgentKind::Claude && recipe.carry_ultracode {
         spec.initial_ultracode = true;
     }
-    // The conversation's own auto-compact pick (from its usage meter) comes
-    // back with it, over the daemon's setting the settings file carries.
+    // The reopened conversation's auto-compact pick is already in the
+    // settings file (`claude_auto_compact`); the manager records it under
+    // the native id this spawn reports, so a fork or rewind keeps it.
     if recipe.kind == AgentKind::Claude {
-        spec.initial_auto_compact = recipe
-            .resume
-            .as_deref()
-            .and_then(|native| state.chat.index().auto_compact(native));
+        spec.conversation_auto_compact = conversation_auto_compact;
     }
     if recipe.kind == AgentKind::Claude && remote_control {
         // The bare name (the driver spells `chimaera · <name>`): the session's
@@ -3852,7 +3906,7 @@ pub(crate) async fn resurrect_chat(
             crate::runtimes::claude_settings_gates(&state.claude_settings_path, &root).await;
         let settings_theme = (!theme_set).then_some(entry.theme.as_str());
         let plugin_tools = crate::plugins::spawn_allow(state, &workspace.id).await;
-        let auto_compact = crate::lock(&state.settings).claude_auto_compact();
+        let auto_compact = claude_auto_compact(state, agent.resume.as_deref());
         let s = crate::agents::write_settings(
             &entry.id,
             &key,
@@ -3974,6 +4028,7 @@ pub(crate) async fn resurrect_chat(
         // Keep the original age across the restart (0 = an older ledger with
         // no stamp → let the spawn stamp now, as before).
         created_at_ms: (entry.created_at > 0).then(|| entry.created_at * 1000),
+        auto_compact: None,
     };
     // A stop that landed meanwhile: the entry stays in the ledger for the
     // next boot, and no process starts that the stop would not end.
@@ -4340,6 +4395,7 @@ mod tests {
             background_running,
             next_wake: None,
             goal: None,
+            conversation_auto_compact: None,
         }
     }
 
@@ -5221,6 +5277,7 @@ mod tests {
                 model: Some("opus".into()),
                 effort: Some("xhigh".into()),
                 mode: Some("acceptEdits".into()),
+                auto_compact: None,
             }
         );
         // A reopened chat keeps what it ran with, even when the prefs moved on.
@@ -5228,6 +5285,7 @@ mod tests {
             model: Some("sonnet".into()),
             effort: Some("high".into()),
             mode: Some("plan".into()),
+            auto_compact: Some(false),
         };
         assert_eq!(
             resolve_start_settings(None, own.clone(), None, &prefs, true),
@@ -5258,6 +5316,7 @@ mod tests {
             model: None,
             effort: Some("medium".into()),
             mode: None,
+            auto_compact: None,
         };
         assert_eq!(
             resolve_start_settings(None, partial, None, &prefs, true),
@@ -5265,6 +5324,7 @@ mod tests {
                 model: Some("opus".into()),
                 effort: Some("medium".into()),
                 mode: Some("acceptEdits".into()),
+                auto_compact: None,
             }
         );
         // The launch-time model and codex's journal-recovered effort win.
@@ -5280,6 +5340,7 @@ mod tests {
                 model: Some("haiku".into()),
                 effort: Some("low".into()),
                 mode: Some("acceptEdits".into()),
+                auto_compact: None,
             }
         );
     }
@@ -5298,13 +5359,15 @@ mod tests {
             ConversationSettings {
                 model: None,
                 effort: None,
-                mode: prefs.mode.clone()
+                mode: prefs.mode.clone(),
+                auto_compact: None,
             },
         );
         let own = ConversationSettings {
             model: Some("conversation/model".into()),
             effort: Some("low".into()),
             mode: Some("auto".into()),
+            auto_compact: None,
         };
         assert_eq!(
             resolve_start_settings(None, own.clone(), None, &prefs, false),
@@ -5322,6 +5385,7 @@ mod tests {
                 model: Some("explicit/model:latest".into()),
                 effort: Some("medium".into()),
                 mode: Some("auto".into()),
+                auto_compact: None,
             },
         );
         assert_eq!(
@@ -5335,7 +5399,8 @@ mod tests {
             ConversationSettings {
                 model: Some("explicit/model".into()),
                 effort: None,
-                mode: prefs.mode.clone()
+                mode: prefs.mode.clone(),
+                auto_compact: None,
             },
         );
         // The preference remains available if the user later chooses Remember.
@@ -5628,6 +5693,7 @@ mod tests {
             mastermind: None,
             portable_context: None,
             created_at_ms: None,
+            auto_compact: None,
         };
 
         seed_view_switch_history(&state, target_id, &recipe).await;

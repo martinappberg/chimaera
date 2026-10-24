@@ -94,16 +94,18 @@ async fn codex_steering_setting_preserves_native_defaults_and_rejects_unknown_ov
     }
 }
 
-/// On (the default) writes nothing, so the user's own Claude Code settings
-/// decide; only an explicit Off reaches the per-session settings file.
+/// Agent default (absent, unknown, or a stray boolean) writes nothing, so
+/// the user's own Claude Code settings decide; On and Off write their value.
 #[tokio::test]
-async fn auto_compact_setting_only_overrides_when_off() {
+async fn auto_compact_setting_writes_only_an_explicit_choice() {
     let state = test_state();
     assert_eq!(lock(&state.settings).claude_auto_compact(), None);
     for (value, expected) in [
-        (serde_json::json!(false), Some(false)),
-        (serde_json::json!(true), None),
-        (serde_json::json!("off"), None),
+        (serde_json::json!("off"), Some(false)),
+        (serde_json::json!("on"), Some(true)),
+        (serde_json::json!("agent"), None),
+        (serde_json::json!(false), None),
+        (serde_json::json!("sometimes"), None),
     ] {
         let (status, _) = request(
             &state,
@@ -113,7 +115,11 @@ async fn auto_compact_setting_only_overrides_when_off() {
         )
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
-        assert_eq!(lock(&state.settings).claude_auto_compact(), expected);
+        assert_eq!(
+            lock(&state.settings).claude_auto_compact(),
+            expected,
+            "{value}"
+        );
     }
 }
 

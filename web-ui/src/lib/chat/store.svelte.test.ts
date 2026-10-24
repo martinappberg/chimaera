@@ -177,10 +177,22 @@ describe("ChatStore context compaction", () => {
   it("folds the auto-compact read-back latest-wins", () => {
     const store = fold([
       { type: "auto_compact", enabled: true },
-      { type: "auto_compact", enabled: false, chosen: true },
+      { type: "auto_compact", enabled: false, picked: false },
     ]);
     expect(store.autoCompact).toBe(false);
+    expect(store.autoCompactDisabledBy).toBeNull();
     expect(fold([]).autoCompact).toBeNull();
+  });
+
+  it("keeps the environment variable that holds auto-compact off", () => {
+    const held = fold([{ type: "auto_compact", enabled: false, disabled_by: "DISABLE_AUTO_COMPACT" }]);
+    expect(held.autoCompact).toBe(false);
+    expect(held.autoCompactDisabledBy).toBe("DISABLE_AUTO_COMPACT");
+    const freed = fold([
+      { type: "auto_compact", enabled: false, disabled_by: "DISABLE_COMPACT" },
+      { type: "auto_compact", enabled: true },
+    ]);
+    expect(freed.autoCompactDisabledBy).toBeNull();
   });
 });
 

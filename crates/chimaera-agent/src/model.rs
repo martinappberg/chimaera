@@ -418,16 +418,24 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         chosen: bool,
     },
-    /// Whether the agent compacts on its own when the context fills, read
-    /// back from the agent (claude get_settings `effective.autoCompactEnabled`,
-    /// absent = the CLI's default, on). Latest-wins; emitted only by agents
-    /// that can switch it per session (codex cannot, PROTOCOL.md Pass 50).
+    /// Whether the agent compacts on its own when the context fills, as the
+    /// agent reports it (claude: get_settings `effective.autoCompactEnabled`,
+    /// absent = the CLI's default, on; get_context_usage
+    /// `isAutoCompactEnabled` adds the environment overrides). Latest-wins;
+    /// emitted only by agents that can switch it per session (codex cannot,
+    /// PROTOCOL.md Pass 50).
     AutoCompact {
         enabled: bool,
-        /// This read-back follows the user's own SetAutoCompact; only a pick
-        /// is remembered for the conversation. Additive: absent = false.
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        chosen: bool,
+        /// The environment variable that holds it off whatever the setting
+        /// says (`DISABLE_AUTO_COMPACT`, `DISABLE_COMPACT`); no switch can
+        /// turn it on. Additive: absent = nothing in the way.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disabled_by: Option<String>,
+        /// What the user picked, when this read-back settles their own
+        /// SetAutoCompact: remembered for the conversation, even where the
+        /// environment keeps `enabled` false. Additive: absent = no pick.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        picked: Option<bool>,
     },
     TurnCompleted {
         turn_id: String,
@@ -1102,9 +1110,11 @@ pub enum AgentCommand {
     SetUltracode {
         enabled: bool,
     },
-    /// Session auto-compact toggle (claude apply_flag_settings
-    /// {autoCompactEnabled}: the session's flag layer, never a settings
-    /// file). Codex has no switch and does not advertise it.
+    /// Session auto-compact toggle, always the user's pick (claude
+    /// apply_flag_settings {autoCompactEnabled}: the session's flag layer,
+    /// never a settings file; a reopen carries the pick in the generated
+    /// `--settings` file instead). Codex has no switch and does not
+    /// advertise it.
     SetAutoCompact {
         enabled: bool,
     },

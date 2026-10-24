@@ -182,8 +182,10 @@ pub(crate) fn write_settings(
     if let Some(theme) = theme {
         settings["theme"] = json!(theme);
     }
-    // `agents.autoCompact` off: the flag layer outranks the user's and the
-    // project's settings for this session only (claude 2.1.302, Pass 50).
+    // The conversation's pick, else `agents.autoCompact` On/Off
+    // (`chat::claude_auto_compact`): the flag layer outranks the user's and
+    // the project's settings for this session only (claude 2.1.302, Pass 50).
+    // `None` (Agent default) leaves the user's own setting in charge.
     if let Some(enabled) = auto_compact {
         settings["autoCompactEnabled"] = json!(enabled);
     }
@@ -240,6 +242,33 @@ pub(crate) fn write_settings(
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("failed to chmod {}", path.display()))?;
     Ok(path)
+}
+
+/// Set `autoCompactEnabled` in a session's existing generated settings file
+/// (a respawn that reuses it: a view switch or rewind carries the
+/// conversation's latest pick, which a live toggle changed only in the
+/// running process). Everything else in the file is kept as written.
+pub(crate) fn set_settings_auto_compact(
+    path: &std::path::Path,
+    enabled: bool,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let body = std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut settings: serde_json::Value = serde_json::from_slice(&body)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let object = settings
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("{} is not a JSON object", path.display()))?;
+    if object.get("autoCompactEnabled") == Some(&json!(enabled)) {
+        return Ok(());
+    }
+    object.insert("autoCompactEnabled".into(), json!(enabled));
+    std::fs::write(path, serde_json::to_vec_pretty(&settings)?)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to chmod {}", path.display()))?;
+    Ok(())
 }
 
 /// Whether/how to wrap the user's statusline: `Some(passthrough_command)` =
@@ -1031,15 +1060,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn auto_compact_off_rides_the_session_settings_file() {
+    fn auto_compact_rides_the_session_settings_file() {
         let sid = fresh_session_id();
         let key = fresh_agent_key();
         let path = write_settings(&sid, &key, 43999, None, None, None, &[], Some(false)).unwrap();
-        let value: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(value["autoCompactEnabled"], json!(false));
+        let read = || -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
+        };
+        assert_eq!(read()["autoCompactEnabled"], json!(false));
         // The hooks ride along untouched.
-        assert_eq!(value["hooks"]["Stop"][0]["hooks"][0]["type"], "http");
+        assert_eq!(read()["hooks"]["Stop"][0]["hooks"][0]["type"], "http");
+        // A respawn that reuses the file carries a newer pick, nothing else.
+        let before = read();
+        set_settings_auto_compact(&path, true).unwrap();
+        let after = read();
+        assert_eq!(after["autoCompactEnabled"], json!(true));
+        assert_eq!(after["hooks"], before["hooks"]);
+        assert_eq!(after["permissions"], before["permissions"]);
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(statusline_script_path(&sid)).ok();
     }

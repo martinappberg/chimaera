@@ -2250,8 +2250,13 @@
   const agentBusy = $derived(store.running || store.compacting);
   /** The usage popover's Compact: the same path as typing `/compact` (Codex's
    *  native command, else Claude's own slash command), offered while idle. */
+  /** `DISABLE_COMPACT` switches /compact off along with auto-compact. */
   const canCompact = $derived(
-    !readOnly && !agentBusy && store.contextPct !== null && (agentKind === "claude" || supports("compact")),
+    !readOnly &&
+      !agentBusy &&
+      store.contextPct !== null &&
+      (agentKind === "claude" || supports("compact")) &&
+      store.autoCompactDisabledBy !== "DISABLE_COMPACT",
   );
   function compactNow(): void {
     menu = null;
@@ -2952,6 +2957,7 @@
     onSetRemoteControl={setRemoteControl}
     onCompact={canCompact ? compactNow : undefined}
     autoCompact={autoCompactShown}
+    autoCompactDisabledBy={store.autoCompactDisabledBy}
     onSetAutoCompact={setAutoCompact}
     onOpenSettings={readOnly ? undefined : openAgentSettings}
     onSignIn={readOnly || !catalogAgent?.signIn ? undefined : () => (signInRequested = true)}

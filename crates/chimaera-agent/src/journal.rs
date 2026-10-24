@@ -599,7 +599,8 @@ struct IndexEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mode: Option<String>,
     /// The user's own per-chat auto-compact pick (claude's session flag);
-    /// absent = the daemon's setting decides. Only picks are recorded.
+    /// absent = the daemon's setting decides. Only picks are recorded, and
+    /// a fork or rewind branch inherits its parent's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     auto_compact: Option<bool>,
 }
@@ -612,6 +613,10 @@ pub struct ConversationSettings {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub mode: Option<String>,
+    /// The user's own auto-compact pick (claude), which the server writes
+    /// into a reopened session's generated `--settings` file. `None` = the
+    /// daemon's `agents.autoCompact` decides.
+    pub auto_compact: Option<bool>,
 }
 
 const INDEX_MAX_ENTRIES: usize = 200;
@@ -677,6 +682,7 @@ impl JournalIndex {
                 model: entry.model.take(),
                 effort: entry.effort.take(),
                 mode: entry.mode.take(),
+                auto_compact: entry.auto_compact,
             };
             apply(&mut settings);
             let bounded = |value: Option<String>| {
@@ -685,6 +691,7 @@ impl JournalIndex {
             entry.model = bounded(settings.model).filter(|m| crate::model::is_real_model(m));
             entry.effort = bounded(settings.effort);
             entry.mode = bounded(settings.mode);
+            entry.auto_compact = settings.auto_compact;
         });
     }
 
@@ -700,28 +707,9 @@ impl JournalIndex {
                 model: e.model.clone().filter(|m| crate::model::is_real_model(m)),
                 effort: e.effort.clone(),
                 mode: e.mode.clone(),
+                auto_compact: e.auto_compact,
             })
             .unwrap_or_default()
-    }
-
-    /// Remember the user's own auto-compact pick for this conversation.
-    /// Blocking fs — call from a blocking worker.
-    pub fn record_auto_compact(&self, native_id: &str, session_id: &str, enabled: bool) {
-        self.upsert(native_id, session_id, |entry| {
-            entry.auto_compact = Some(enabled);
-        });
-    }
-
-    /// The conversation's own auto-compact pick (`None`: never picked, or
-    /// an unknown id).
-    pub fn auto_compact(&self, native_id: &str) -> Option<bool> {
-        self.entries
-            .lock()
-            .expect("index lock")
-            .iter()
-            .rev()
-            .find(|e| e.native_id == native_id)
-            .and_then(|e| e.auto_compact)
     }
 
     pub fn lookup(&self, native_id: &str) -> Option<String> {
@@ -1517,16 +1505,16 @@ mod tests {
     fn index_keeps_a_conversations_auto_compact_pick() {
         let dir = tempfile::tempdir().unwrap();
         let index = JournalIndex::load(dir.path());
-        assert_eq!(index.auto_compact("native-a"), None);
+        assert_eq!(index.settings("native-a").auto_compact, None);
         index.record("native-a", "s-1");
-        index.record_auto_compact("native-a", "s-1", false);
+        index.record_settings("native-a", "s-1", |s| s.auto_compact = Some(false));
         index.record_effort("native-a", "s-1", Some("high".into()));
         index.record("native-a", "s-2");
-        assert_eq!(index.auto_compact("native-a"), Some(false));
+        assert_eq!(index.settings("native-a").auto_compact, Some(false));
         assert_eq!(index.effort("native-a").as_deref(), Some("high"));
         let reloaded = JournalIndex::load(dir.path());
-        assert_eq!(reloaded.auto_compact("native-a"), Some(false));
-        assert_eq!(reloaded.auto_compact("native-b"), None);
+        assert_eq!(reloaded.settings("native-a").auto_compact, Some(false));
+        assert_eq!(reloaded.settings("native-b").auto_compact, None);
     }
 
     /// A reopened conversation comes back with its own model/effort/mode: the
@@ -1548,6 +1536,7 @@ mod tests {
                 model: Some("sonnet".into()),
                 effort: Some("high".into()),
                 mode: Some("acceptEdits".into()),
+                auto_compact: None,
             }
         );
         assert_eq!(index.lookup("native-a").as_deref(), Some("s-2"));

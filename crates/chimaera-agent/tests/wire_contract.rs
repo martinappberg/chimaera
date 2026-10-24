@@ -97,10 +97,24 @@ fn agent_event_wire_shapes() {
     assert_eq!(
         serde_json::to_value(AgentEvent::AutoCompact {
             enabled: false,
-            chosen: true,
+            disabled_by: None,
+            picked: Some(false),
         })
         .unwrap(),
-        json!({ "type": "auto_compact", "enabled": false, "chosen": true })
+        json!({ "type": "auto_compact", "enabled": false, "picked": false })
+    );
+    assert_eq!(
+        serde_json::to_value(AgentEvent::AutoCompact {
+            enabled: false,
+            disabled_by: Some("DISABLE_AUTO_COMPACT".into()),
+            picked: None,
+        })
+        .unwrap(),
+        json!({
+            "type": "auto_compact",
+            "enabled": false,
+            "disabled_by": "DISABLE_AUTO_COMPACT",
+        })
     );
 }
 
@@ -1379,7 +1393,17 @@ fn chat_events_fixture() {
             "the user turned auto-compact off for this chat",
             AgentEvent::AutoCompact {
                 enabled: false,
-                chosen: true,
+                disabled_by: None,
+                picked: Some(false),
+            },
+        ),
+        (
+            "auto_compact_held_off",
+            "the agent's environment holds auto-compact off",
+            AgentEvent::AutoCompact {
+                enabled: false,
+                disabled_by: Some("DISABLE_AUTO_COMPACT".into()),
+                picked: None,
             },
         ),
         (

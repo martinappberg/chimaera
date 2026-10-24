@@ -700,10 +700,13 @@ export class ChatStore {
   /** Applied effort/ultracode truth (claude get_settings read-back). */
   effort = $state<string | null>(null);
   ultracode = $state(false);
-  /** Whether the agent compacts on its own (claude get_settings
-   *  `effective.autoCompactEnabled`); null = the agent doesn't say, so no
-   *  per-chat switch is offered. */
+  /** Whether the agent compacts on its own, as it reports it (claude: the
+   *  session's setting, held off by the environment); null = the agent
+   *  doesn't say, so no per-chat switch is offered. */
   autoCompact = $state<boolean | null>(null);
+  /** The environment variable holding auto-compact off (no switch can turn
+   *  it on), e.g. `DISABLE_AUTO_COMPACT`; null when nothing is in the way. */
+  autoCompactDisabledBy = $state<string | null>(null);
   /** Latest rewind_files answer; the view gates dialogs on its own intent
    *  flag so replayed reports never reopen UI. */
   rewind = $state<RewindReport | null>(null);
@@ -1721,6 +1724,7 @@ export class ChatStore {
         break;
       case "auto_compact":
         this.autoCompact = ev.enabled === true;
+        this.autoCompactDisabledBy = typeof ev.disabled_by === "string" ? ev.disabled_by : null;
         break;
       case "context_usage": {
         this.contextPct = ev.percentage as number;
@@ -1930,6 +1934,7 @@ export class ChatStore {
           this.effort = null;
           this.ultracode = false;
           this.autoCompact = null;
+          this.autoCompactDisabledBy = null;
           this.contextPct = null;
           this.contextTokens = null;
           this.rateLimit = null;

@@ -543,11 +543,6 @@ impl Driver for ClaudeDriver {
         if spec.initial_ultracode {
             initial.push(mapper.on_command(AgentCommand::SetUltracode { enabled: true }));
         }
-        // The conversation's own auto-compact pick (a reopened chat), over
-        // the per-session settings file the launcher wrote.
-        if let Some(enabled) = spec.initial_auto_compact {
-            initial.push(mapper.on_command(AgentCommand::SetAutoCompact { enabled }));
-        }
         mapper.bootstrapping = false;
         // Remote Control at start — the embedder's standing choice, honored
         // only where the CLI offers the bridge. It rides the ordinary command
@@ -683,7 +678,17 @@ enum PendingControl {
     SetModel(String),
     Interrupt,
     SetThinking,
-    ContextUsage,
+    /// get_context_usage round-trip. `meter`: the turn-end refresh feeding
+    /// the context meter; without it, the auto-compact check that follows a
+    /// settings read and wants only `isAutoCompactEnabled`. `setting`: the
+    /// flag-layer auto-compact when it was asked, so a reply that crossed a
+    /// switch never blames the environment. `picked`: the user's
+    /// auto-compact pick the check settles.
+    ContextUsage {
+        meter: bool,
+        setting: Option<bool>,
+        picked: Option<bool>,
+    },
     GetUsage,
     /// rewind_files round-trip; `dry_run` shapes the RewindResult.
     Rewind {
@@ -695,17 +700,17 @@ enum PendingControl {
     /// spawn bootstrap.
     Settings {
         chosen: bool,
-        /// The read follows the user's own auto-compact pick (remembered
-        /// for the conversation), not an effort/ultracode one.
-        auto_compact_chosen: bool,
+        /// The user's auto-compact pick this read settles (remembered for
+        /// the conversation); never an effort/ultracode pick too.
+        picked: Option<bool>,
     },
     /// apply_flag_settings acknowledged → re-read the truth. `chosen` = the
-    /// apply was the user's own pick (fed to the prefs), not the handshake
-    /// replaying the spawn's remembered effort; `auto_compact` = it was the
-    /// auto-compact flag, whose pick must not count as an effort pick.
+    /// apply was the user's own effort/ultracode pick (fed to the prefs),
+    /// not the handshake replaying the spawn's remembered effort;
+    /// `auto_compact` = the user's auto-compact pick it carried.
     ApplyFlags {
         chosen: bool,
-        auto_compact: bool,
+        auto_compact: Option<bool>,
     },
     /// mcp_status round-trip (the /mcp panel).
     McpStatus,
@@ -1006,8 +1011,19 @@ struct ClaudeMapper {
     /// boundary right AFTER the status, so the status alone must not
     /// complete the lifecycle. A turn end without a boundary completes it.
     compaction_awaiting_boundary: bool,
-    /// The last auto-compact read-back journaled (latest-wins dedupe).
-    auto_compact: Option<bool>,
+    /// The flag-layer auto-compact (`get_settings` `effective`); `None`
+    /// until read, and for a CLI without the merged view (no switch then).
+    auto_compact_setting: Option<bool>,
+    /// What holds auto-compact off from the environment: `None` = not
+    /// known yet, `Some(None)` = nothing, `Some(Some(var))` = that variable.
+    /// Fixed for the process's life, so learned once.
+    auto_compact_env: Option<Option<&'static str>>,
+    /// `/compact` is in the initialize catalog. `DISABLE_COMPACT` removes
+    /// it, so its absence names that variable as the one holding
+    /// auto-compact off (else `DISABLE_AUTO_COMPACT`).
+    compact_offered: bool,
+    /// The last auto-compact state journaled (latest-wins dedupe).
+    auto_compact: Option<(bool, Option<&'static str>)>,
     /// Remote Control offer flags from the initialize response (see
     /// `AgentEvent::Init`): whether the bridge can be offered at all here, and
     /// whether the user's/org's default says auto-on.
@@ -1038,6 +1054,11 @@ impl ClaudeMapper {
         agent_version: Option<String>,
         commands_catalog: &Value,
     ) -> Self {
+        // Read before the catalog is capped: a long skill list must not
+        // push `/compact` out of the check.
+        let compact_offered = commands_catalog["commands"]
+            .as_array()
+            .is_none_or(|cmds| cmds.iter().any(|c| c["name"] == "compact"));
         let mut seen_commands = HashSet::new();
         let slash_commands = commands_catalog["commands"]
             .as_array()
@@ -1175,6 +1196,9 @@ impl ClaudeMapper {
             compaction_active: false,
             compaction_completed: false,
             compaction_awaiting_boundary: false,
+            auto_compact_setting: None,
+            auto_compact_env: None,
+            compact_offered,
             auto_compact: None,
             remote_control_available,
             remote_control_auto_enable,
@@ -1321,25 +1345,20 @@ impl ClaudeMapper {
     /// One get_settings round-trip → EffortState. Issued at spawn and after
     /// every apply_flag_settings, so the chips always show the CLI's truth.
     fn request_settings(&mut self, step: &mut DriverStep) {
-        self.request_settings_after(false, false, step);
+        self.request_settings_after(false, None, step);
     }
 
-    /// `chosen` / `auto_compact_chosen`: the read follows the user's own
-    /// effort-or-ultracode / auto-compact apply (at most one is true).
+    /// `chosen`: the read follows the user's own effort-or-ultracode apply;
+    /// `picked`: their auto-compact one (never both).
     fn request_settings_after(
         &mut self,
         chosen: bool,
-        auto_compact_chosen: bool,
+        picked: Option<bool>,
         step: &mut DriverStep,
     ) {
         let id = self.ctl_id();
-        self.pending_controls.insert(
-            id.clone(),
-            PendingControl::Settings {
-                chosen,
-                auto_compact_chosen,
-            },
-        );
+        self.pending_controls
+            .insert(id.clone(), PendingControl::Settings { chosen, picked });
         step.outbound.push(control_request_frame(
             &id,
             json!({ "subtype": "get_settings" }),
@@ -1424,13 +1443,71 @@ impl ClaudeMapper {
     /// extension's cadence, kept honest for aborts too (an interrupted turn
     /// still consumed context). Only issued for a turn that was actually open.
     fn refresh_context_usage(&mut self, step: &mut DriverStep) {
+        self.request_context_usage(true, None, step);
+    }
+
+    fn request_context_usage(&mut self, meter: bool, picked: Option<bool>, step: &mut DriverStep) {
         let id = self.ctl_id();
-        self.pending_controls
-            .insert(id.clone(), PendingControl::ContextUsage);
+        self.pending_controls.insert(
+            id.clone(),
+            PendingControl::ContextUsage {
+                meter,
+                setting: self.auto_compact_setting,
+                picked,
+            },
+        );
         step.outbound.push(control_request_frame(
             &id,
             json!({ "subtype": "get_context_usage" }),
         ));
+    }
+
+    /// Journal where auto-compact stands: the flag-layer setting, held off
+    /// by the environment when a variable says so. A setting that reads on
+    /// while the environment is still unknown asks the CLI first
+    /// (`get_context_usage`), so the switch never shows On and then flips
+    /// to held off. `picked` settles the user's own switch and is always
+    /// journaled; anything else only when the state moved.
+    fn emit_auto_compact(&mut self, picked: Option<bool>, step: &mut DriverStep) {
+        let Some(setting) = self.auto_compact_setting else {
+            return;
+        };
+        if setting && self.auto_compact_env.is_none() {
+            self.request_context_usage(false, picked, step);
+            return;
+        }
+        let blocker = self.auto_compact_env.flatten();
+        let state = (setting && blocker.is_none(), blocker);
+        if picked.is_some() || self.auto_compact != Some(state) {
+            self.auto_compact = Some(state);
+            step.events.push(AgentEvent::AutoCompact {
+                enabled: state.0,
+                disabled_by: blocker.map(String::from),
+                picked,
+            });
+        }
+    }
+
+    /// Fold one `get_context_usage` answer's `isAutoCompactEnabled` (the
+    /// CLI's own resolution: the setting, unless `DISABLE_AUTO_COMPACT` or
+    /// `DISABLE_COMPACT` is set). Off while the setting reads on, both when
+    /// asked and now, can only be the environment. A CLI that does not say
+    /// leaves the setting in charge.
+    fn learn_auto_compact_env(&mut self, reported: Option<bool>, asked_with: Option<bool>) {
+        match reported {
+            Some(true) => self.auto_compact_env = Some(None),
+            Some(false) if asked_with == Some(true) && self.auto_compact_setting == Some(true) => {
+                self.auto_compact_env = Some(Some(if self.compact_offered {
+                    "DISABLE_AUTO_COMPACT"
+                } else {
+                    "DISABLE_COMPACT"
+                }));
+            }
+            Some(false) => {}
+            None => {
+                self.auto_compact_env.get_or_insert(None);
+            }
+        }
     }
 
     fn flush(&mut self) -> Option<AgentEvent> {
@@ -3484,6 +3561,20 @@ impl ClaudeMapper {
             return;
         };
         if frame["response"]["subtype"] != "success" {
+            // The auto-compact check is the driver's own question: a refusal
+            // leaves the setting in charge, silently.
+            if let PendingControl::ContextUsage {
+                meter: false,
+                setting,
+                picked,
+            } = pending
+            {
+                self.auto_compact_env.get_or_insert(None);
+                if setting == self.auto_compact_setting {
+                    self.emit_auto_compact(picked, step);
+                }
+                return;
+            }
             // A failed rewind must resolve the client's confirm flow, not
             // just leave an error notice.
             if let PendingControl::Rewind {
@@ -3617,12 +3708,28 @@ impl ClaudeMapper {
                 }
                 _ => {}
             },
-            PendingControl::ContextUsage => {
+            PendingControl::ContextUsage {
+                meter,
+                setting,
+                picked,
+            } => {
                 let usage = if payload.get("usage").is_some() {
                     &payload["usage"]
                 } else {
                     payload
                 };
+                let known = self.auto_compact_env;
+                self.learn_auto_compact_env(usage["isAutoCompactEnabled"].as_bool(), setting);
+                // A check a later switch overtook settles nothing: that
+                // switch's own read journals it (and its pick).
+                let current = setting == self.auto_compact_setting;
+                if (!meter && current) || self.auto_compact_env != known {
+                    let picked = if meter || !current { None } else { picked };
+                    self.emit_auto_compact(picked, step);
+                }
+                if !meter {
+                    return;
+                }
                 if let (Some(total), Some(max)) = (
                     usage["totalTokens"].as_u64(),
                     usage["rawMaxTokens"].as_u64(),
@@ -3704,10 +3811,7 @@ impl ClaudeMapper {
                     }
                 }
             }
-            PendingControl::Settings {
-                chosen,
-                auto_compact_chosen,
-            } => {
+            PendingControl::Settings { chosen, picked } => {
                 let applied = &payload["applied"];
                 step.events.push(AgentEvent::EffortState {
                     effort: applied["effort"].as_str().map(String::from),
@@ -3718,17 +3822,13 @@ impl ClaudeMapper {
                 // own (absent = its default, on). A CLI without the merged
                 // view reports nothing, so no switch is offered for it.
                 if let Some(effective) = payload["effective"].as_object() {
-                    let enabled = effective
-                        .get("autoCompactEnabled")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(true);
-                    if auto_compact_chosen || self.auto_compact != Some(enabled) {
-                        self.auto_compact = Some(enabled);
-                        step.events.push(AgentEvent::AutoCompact {
-                            enabled,
-                            chosen: auto_compact_chosen,
-                        });
-                    }
+                    self.auto_compact_setting = Some(
+                        effective
+                            .get("autoCompactEnabled")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(true),
+                    );
+                    self.emit_auto_compact(picked, step);
                 }
             }
             PendingControl::Background { for_message: true } => {
@@ -3778,7 +3878,7 @@ impl ClaudeMapper {
                 // The apply is fire-and-ack; the truth comes from re-reading —
                 // and that read is the pick (it feeds the prefs) when the
                 // apply was.
-                self.request_settings_after(chosen && !auto_compact, chosen && auto_compact, step);
+                self.request_settings_after(chosen, auto_compact, step);
             }
         }
     }
@@ -4369,7 +4469,7 @@ impl ClaudeMapper {
                     id.clone(),
                     PendingControl::ApplyFlags {
                         chosen: !self.bootstrapping,
-                        auto_compact: false,
+                        auto_compact: None,
                     },
                 );
                 step.outbound.push(control_request_frame(
@@ -4389,7 +4489,7 @@ impl ClaudeMapper {
                     id.clone(),
                     PendingControl::ApplyFlags {
                         chosen: !self.bootstrapping,
-                        auto_compact: false,
+                        auto_compact: None,
                     },
                 );
                 step.outbound.push(control_request_frame(
@@ -4408,8 +4508,8 @@ impl ClaudeMapper {
                 self.pending_controls.insert(
                     id.clone(),
                     PendingControl::ApplyFlags {
-                        chosen: !self.bootstrapping,
-                        auto_compact: true,
+                        chosen: false,
+                        auto_compact: Some(enabled),
                     },
                 );
                 step.outbound.push(control_request_frame(
@@ -10256,9 +10356,24 @@ pub(crate) mod tests {
         ));
     }
 
+    /// Answer the control request `request` sent (its first outbound frame).
+    fn answer(m: &mut ClaudeMapper, request: &DriverStep, response: Value) -> DriverStep {
+        m.on_frame(&json!({"type":"control_response", "response": {
+            "subtype":"success", "request_id":request.outbound[0]["request_id"],
+            "response": response,
+        }}))
+    }
+
+    fn auto_compact_events(step: &DriverStep) -> Vec<&AgentEvent> {
+        step.events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::AutoCompact { .. }))
+            .collect()
+    }
+
     /// The per-chat switch rides the session flag layer and reads back from
-    /// get_settings `effective` (live 2.1.302); only the read that follows
-    /// the user's own apply is a pick, and it is not an effort pick.
+    /// get_settings `effective` (live 2.1.302); the read that follows the
+    /// user's own apply carries their pick, and it is not an effort pick.
     #[test]
     fn auto_compact_applies_to_the_flag_layer_and_reads_back() {
         let mut m = mapper();
@@ -10271,17 +10386,17 @@ pub(crate) mod tests {
             apply.outbound[0]["request"]["settings"],
             json!({ "autoCompactEnabled": false })
         );
-        let ack = m.on_frame(&json!({"type":"control_response", "response": {
-            "subtype":"success", "request_id":apply.outbound[0]["request_id"]
-        }}));
+        let ack = answer(&mut m, &apply, Value::Null);
         assert_eq!(ack.outbound[0]["request"]["subtype"], "get_settings");
-        let read = m.on_frame(&json!({"type":"control_response", "response": {
-            "subtype":"success", "request_id":ack.outbound[0]["request_id"], "response":{
+        let read = answer(
+            &mut m,
+            &ack,
+            json!({
                 "applied":{"effort":"medium","ultracode":false},
                 "effective":{"autoCompactEnabled":false},
                 "sources":[{"source":"flagSettings","settings":{"autoCompactEnabled":false}}]
-            }
-        }}));
+            }),
+        );
         assert_eq!(
             read.events,
             vec![
@@ -10292,41 +10407,206 @@ pub(crate) mod tests {
                 },
                 AgentEvent::AutoCompact {
                     enabled: false,
-                    chosen: true,
+                    disabled_by: None,
+                    picked: Some(false),
                 },
             ]
         );
     }
 
+    /// A setting that reads on is confirmed with get_context_usage before
+    /// anything is journaled (no On that then flips); the answer is learned
+    /// once, later reads dedupe, and a CLI without the merged view offers
+    /// no switch at all.
     #[test]
-    fn auto_compact_read_back_defaults_on_and_dedupes() {
+    fn auto_compact_on_waits_for_the_cli_then_dedupes() {
         let mut m = mapper();
-        let read = |m: &mut ClaudeMapper, response: Value| {
-            let mut step = DriverStep::default();
-            m.request_settings(&mut step);
-            m.on_frame(&json!({"type":"control_response", "response": {
-                "subtype":"success", "request_id":step.outbound[0]["request_id"],
-                "response": response,
-            }}))
-        };
+        let mut settings = DriverStep::default();
+        m.request_settings(&mut settings);
         // Absent key in the merged view = the CLI's default (on).
-        let first = read(&mut m, json!({"applied":{}, "effective":{}}));
-        assert!(first.events.contains(&AgentEvent::AutoCompact {
-            enabled: true,
-            chosen: false,
-        }));
-        let again = read(&mut m, json!({"applied":{}, "effective":{}}));
-        assert!(!again
-            .events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::AutoCompact { .. })));
-        // A CLI without the merged view offers no switch at all.
+        let read = answer(&mut m, &settings, json!({"applied":{}, "effective":{}}));
+        assert!(auto_compact_events(&read).is_empty());
+        assert_eq!(read.outbound[0]["request"]["subtype"], "get_context_usage");
+        let check = answer(
+            &mut m,
+            &read,
+            json!({"totalTokens": 1, "rawMaxTokens": 10, "isAutoCompactEnabled": true}),
+        );
+        assert_eq!(
+            check.events,
+            vec![AgentEvent::AutoCompact {
+                enabled: true,
+                disabled_by: None,
+                picked: None,
+            }],
+            "the check feeds no context meter"
+        );
+        let mut again = DriverStep::default();
+        m.request_settings(&mut again);
+        let again = answer(&mut m, &again, json!({"applied":{}, "effective":{}}));
+        assert!(again.outbound.is_empty(), "the environment is learned once");
+        assert!(auto_compact_events(&again).is_empty());
+
         let mut old = mapper();
-        let legacy = read(&mut old, json!({"applied":{}}));
-        assert!(!legacy
+        let mut legacy = DriverStep::default();
+        old.request_settings(&mut legacy);
+        let legacy = answer(&mut old, &legacy, json!({"applied":{}}));
+        assert!(legacy.outbound.is_empty());
+        assert!(auto_compact_events(&legacy).is_empty());
+    }
+
+    /// `DISABLE_AUTO_COMPACT` / `DISABLE_COMPACT` hold it off whatever the
+    /// setting says, and only get_context_usage says so (live 2.1.302):
+    /// `isAutoCompactEnabled: false` while the flag layer reads on. Without
+    /// `/compact` in the catalog the variable is `DISABLE_COMPACT`.
+    #[test]
+    fn the_environment_holding_auto_compact_off_is_named() {
+        for (catalog, var) in [
+            (
+                json!({ "commands": [{ "name": "compact" }] }),
+                "DISABLE_AUTO_COMPACT",
+            ),
+            (
+                json!({ "commands": [{ "name": "review" }] }),
+                "DISABLE_COMPACT",
+            ),
+        ] {
+            let mut m = ClaudeMapper::new(Some("native-1".into()), None, &catalog);
+            let mut settings = DriverStep::default();
+            m.request_settings(&mut settings);
+            let read = answer(&mut m, &settings, json!({"applied":{}, "effective":{}}));
+            let check = answer(&mut m, &read, json!({"isAutoCompactEnabled": false}));
+            assert_eq!(
+                check.events,
+                vec![AgentEvent::AutoCompact {
+                    enabled: false,
+                    disabled_by: Some(var.into()),
+                    picked: None,
+                }]
+            );
+            // A pick still settles (and is remembered), held off all the same.
+            let apply = m.on_command(AgentCommand::SetAutoCompact { enabled: true });
+            let ack = answer(&mut m, &apply, Value::Null);
+            let read = answer(
+                &mut m,
+                &ack,
+                json!({"applied":{}, "effective":{"autoCompactEnabled":true}}),
+            );
+            assert_eq!(
+                auto_compact_events(&read),
+                vec![&AgentEvent::AutoCompact {
+                    enabled: false,
+                    disabled_by: Some(var.into()),
+                    picked: Some(true),
+                }]
+            );
+        }
+    }
+
+    /// Off at spawn says nothing about the environment; switching it on
+    /// asks, and a turn-end meter read that was asked while it was off
+    /// never blames the environment.
+    #[test]
+    fn auto_compact_off_learns_the_environment_when_switched_on() {
+        let mut m = mapper();
+        let mut settings = DriverStep::default();
+        m.request_settings(&mut settings);
+        let read = answer(
+            &mut m,
+            &settings,
+            json!({"applied":{}, "effective":{"autoCompactEnabled":false}}),
+        );
+        assert_eq!(
+            auto_compact_events(&read),
+            vec![&AgentEvent::AutoCompact {
+                enabled: false,
+                disabled_by: None,
+                picked: None,
+            }]
+        );
+        assert!(read.outbound.is_empty());
+        // A meter refresh asked while off; it lands after the switch on.
+        let mut meter = DriverStep::default();
+        m.refresh_context_usage(&mut meter);
+        let apply = m.on_command(AgentCommand::SetAutoCompact { enabled: true });
+        let ack = answer(&mut m, &apply, Value::Null);
+        let read = answer(
+            &mut m,
+            &ack,
+            json!({"applied":{}, "effective":{"autoCompactEnabled":true}}),
+        );
+        assert!(auto_compact_events(&read).is_empty());
+        let stale = answer(
+            &mut m,
+            &meter,
+            json!({"totalTokens": 5, "rawMaxTokens": 10, "isAutoCompactEnabled": false}),
+        );
+        assert!(auto_compact_events(&stale).is_empty());
+        assert!(stale
             .events
             .iter()
-            .any(|e| matches!(e, AgentEvent::AutoCompact { .. })));
+            .any(|e| matches!(e, AgentEvent::ContextUsage { .. })));
+        let check = answer(&mut m, &read, json!({"isAutoCompactEnabled": true}));
+        assert_eq!(
+            check.events,
+            vec![AgentEvent::AutoCompact {
+                enabled: true,
+                disabled_by: None,
+                picked: Some(true),
+            }]
+        );
+    }
+
+    /// Switched on, then off before the CLI answered the check: the stale
+    /// answer settles nothing, so the conversation keeps the last pick.
+    #[test]
+    fn an_overtaken_auto_compact_check_keeps_the_last_pick() {
+        let mut m = mapper();
+        let on = m.on_command(AgentCommand::SetAutoCompact { enabled: true });
+        let ack = answer(&mut m, &on, Value::Null);
+        let check = answer(
+            &mut m,
+            &ack,
+            json!({"applied":{}, "effective":{"autoCompactEnabled":true}}),
+        );
+        assert_eq!(check.outbound[0]["request"]["subtype"], "get_context_usage");
+        let off = m.on_command(AgentCommand::SetAutoCompact { enabled: false });
+        let ack = answer(&mut m, &off, Value::Null);
+        let read = answer(
+            &mut m,
+            &ack,
+            json!({"applied":{}, "effective":{"autoCompactEnabled":false}}),
+        );
+        assert_eq!(
+            auto_compact_events(&read),
+            vec![&AgentEvent::AutoCompact {
+                enabled: false,
+                disabled_by: None,
+                picked: Some(false),
+            }]
+        );
+        let stale = answer(&mut m, &check, json!({"isAutoCompactEnabled": false}));
+        assert!(auto_compact_events(&stale).is_empty(), "{:?}", stale.events);
+    }
+
+    /// A refused check leaves the setting in charge, with no error row.
+    #[test]
+    fn a_refused_auto_compact_check_is_silent() {
+        let mut m = mapper();
+        let mut settings = DriverStep::default();
+        m.request_settings(&mut settings);
+        let read = answer(&mut m, &settings, json!({"applied":{}, "effective":{}}));
+        let refused = m.on_frame(&json!({"type":"control_response", "response": {
+            "subtype":"error", "request_id":read.outbound[0]["request_id"], "error":"nope",
+        }}));
+        assert_eq!(
+            refused.events,
+            vec![AgentEvent::AutoCompact {
+                enabled: true,
+                disabled_by: None,
+                picked: None,
+            }]
+        );
     }
 
     /// Auto-compact off and a full window: the CLI ends the turn without a

@@ -56,6 +56,8 @@
     onCompact?: () => void;
     /** This chat's auto-compact (null: the agent has no per-chat switch). */
     autoCompact?: boolean | null;
+    /** The environment variable holding it off, when one does. */
+    autoCompactDisabledBy?: string | null;
     onSetAutoCompact?: (enabled: boolean) => void;
     /** Agent settings, where the account's limits are read live. */
     onOpenSettings?: () => void;
@@ -77,6 +79,7 @@
     menu = $bindable(),
     onCompact,
     autoCompact = null,
+    autoCompactDisabledBy = null,
     onSetAutoCompact,
     onOpenSettings,
     onSignIn,
@@ -356,6 +359,7 @@
     onClose={() => (menu = null)}
     {onCompact}
     {autoCompact}
+    {autoCompactDisabledBy}
     {onSetAutoCompact}
     {onOpenSettings}
   />

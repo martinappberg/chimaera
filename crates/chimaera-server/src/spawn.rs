@@ -166,9 +166,11 @@ pub(crate) async fn spawn_session(
                 .await;
                 let settings_theme = (!theme_set).then_some(spec.theme.as_str());
                 let plugin_tools = crate::plugins::spawn_allow(state, &workspace.id).await;
+                // A resumed conversation's own auto-compact pick (its chat
+                // view's switch), else the daemon's setting.
+                let auto_compact = crate::chat::claude_auto_compact(state, resume.as_deref());
                 // PTY TUI spawns are never the Mastermind (a chat-only role);
                 // only active plugins' tools may ride a permissions block.
-                let auto_compact = crate::lock(&state.settings).claude_auto_compact();
                 match crate::agents::write_settings(
                     &id,
                     &key,

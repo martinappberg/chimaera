@@ -2714,28 +2714,62 @@ async fn remote_control_at_start_enables_after_the_handshake() {
     assert!(fx2.manager.kill("s-rcu"));
 }
 
-/// A reopened conversation's own auto-compact pick comes back through the
-/// handshake (the session flag layer), reads back as the CLI's truth, and is
-/// not a new pick; a pick made in the chat is.
+/// A reopened conversation's auto-compact pick rides the generated
+/// `--settings` file (the server writes it; the driver applies nothing), so
+/// the first read-back already shows it and is not a pick. The native id the
+/// spawn reports inherits it (a fork's or rewind's new id), and a pick made
+/// in the chat is what the conversation keeps.
 #[tokio::test]
-async fn auto_compact_carries_through_the_handshake_and_picks_read_back() {
+async fn auto_compact_pick_rides_the_settings_file_and_follows_the_native_id() {
     let fx = fixture();
+    let settings = fx.cwd.join("session-settings.json");
+    std::fs::write(&settings, r#"{"autoCompactEnabled": false}"#).expect("settings");
     let mut s = spec("s-autocompact", &fx.cwd, "normal");
-    s.initial_auto_compact = Some(false);
+    s.argv
+        .extend(["--settings".to_string(), settings.display().to_string()]);
+    s.conversation_auto_compact = Some(false);
     fx.manager.spawn(&ClaudeAdapter, s).expect("spawn");
     let att = fx.manager.attach("s-autocompact", 0).expect("attach");
     let mut seen: Vec<Arc<SeqEvent>> = att.replay.clone();
     let mut rx = att.live;
-    wait_for(&mut rx, &mut seen, "carried auto-compact off", |ev| {
+    wait_for(&mut rx, &mut seen, "the file's auto-compact off", |ev| {
         matches!(
             ev,
             AgentEvent::AutoCompact {
                 enabled: false,
-                chosen: false,
+                picked: None,
+                ..
             }
         )
     })
     .await;
+    assert!(
+        !seen
+            .iter()
+            .any(|e| matches!(e.ev, AgentEvent::AutoCompact { enabled: true, .. })),
+        "no On before the carried Off: {seen:#?}"
+    );
+    fx.manager
+        .command(
+            "s-autocompact",
+            AgentCommand::Send {
+                blocks: vec![ContentBlock::Text { text: "hi".into() }],
+            },
+        )
+        .await
+        .expect("send");
+    wait_for(&mut rx, &mut seen, "Init with the native id", |ev| {
+        matches!(ev, AgentEvent::Init { native_session_id, .. } if !native_session_id.is_empty())
+    })
+    .await;
+    let deadline = std::time::Instant::now() + WAIT;
+    while fx.manager.index().settings("fake-native-1").auto_compact != Some(false) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the carried pick never landed under the reported native id"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     fx.manager
         .command(
             "s-autocompact",
@@ -2748,11 +2782,20 @@ async fn auto_compact_carries_through_the_handshake_and_picks_read_back() {
             ev,
             AgentEvent::AutoCompact {
                 enabled: true,
-                chosen: true,
+                picked: Some(true),
+                ..
             }
         )
     })
     .await;
+    let deadline = std::time::Instant::now() + WAIT;
+    while fx.manager.index().settings("fake-native-1").auto_compact != Some(true) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pick never landed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert!(fx.manager.kill("s-autocompact"));
 }
 

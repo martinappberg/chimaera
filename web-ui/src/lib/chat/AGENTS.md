@@ -39,7 +39,7 @@ daemon  ──WS /ws/chat/{id}──▶  chatWs.ts (ChatSocket)
 | `AgentMessageCards`, `agentMessages.ts`, `WakeRequestBar` | Other agents' messages and wake requests. |
 | `PermissionCard`, `QuestionCard`, `PlanApprovalCard`, `Elicitation*` | Answers to the agent. |
 | `RewindDialog`, `ForkDialog`, `AgentMessageMeta` | Rewind, fork, message actions. |
-| `McpPanel`, `UsagePanel`, `UsageMeter` | `/mcp`, `/usage` and the usage meter (its popover also holds a Claude chat's Auto-compact switch: `store.autoCompact` from the `auto_compact` read-back, `set_auto_compact` capability). |
+| `McpPanel`, `UsagePanel`, `UsageMeter` | `/mcp`, `/usage` and the usage meter (its popover also holds a Claude chat's Auto-compact switch: `store.autoCompact` from the `auto_compact` read-back, `set_auto_compact` capability; `store.autoCompactDisabledBy` disables it, reading Off, "set off by <var>"). |
 | `ArtifactGallery`, `artifacts.ts`, `embeds.ts`, `FileChip`, `ProseChip`, `hoverTargets.ts` | Embeds, written files, hover previews. |
 | `paths.ts`, `UserText` | Path links; the user-message bubble. |
 | `ChatFind`, `chatFind.ts`, `quoteSelection.ts` | Find in chat; quote a selection. |

@@ -713,8 +713,8 @@
     {
       "frame": {
         "ev": {
-          "chosen": true,
           "enabled": false,
+          "picked": false,
           "type": "auto_compact"
         },
         "seq": 37,
@@ -722,6 +722,19 @@
       },
       "name": "auto_compact",
       "note": "the user turned auto-compact off for this chat"
+    },
+    {
+      "frame": {
+        "ev": {
+          "disabled_by": "DISABLE_AUTO_COMPACT",
+          "enabled": false,
+          "type": "auto_compact"
+        },
+        "seq": 38,
+        "ts": 1700000000037
+      },
+      "name": "auto_compact_held_off",
+      "note": "the agent's environment holds auto-compact off"
     },
     {
       "frame": {
@@ -735,8 +748,8 @@
             }
           ]
         },
-        "seq": 38,
-        "ts": 1700000000037
+        "seq": 39,
+        "ts": 1700000000038
       },
       "name": "usage_report",
       "note": "account usage windows (get_usage)"
@@ -756,8 +769,8 @@
             }
           ]
         },
-        "seq": 39,
-        "ts": 1700000000038
+        "seq": 40,
+        "ts": 1700000000039
       },
       "name": "rate_limit",
       "note": "a streamed rate-limit event that hit the limit"
@@ -771,8 +784,8 @@
           "to": "claude-sonnet-5-5",
           "type": "model_switched"
         },
-        "seq": 40,
-        "ts": 1700000000039
+        "seq": 41,
+        "ts": 1700000000040
       },
       "name": "model_switched",
       "note": "the runtime switched models mid-session"
@@ -782,8 +795,8 @@
         "ev": {
           "type": "messages_superseded"
         },
-        "seq": 41,
-        "ts": 1700000000040
+        "seq": 42,
+        "ts": 1700000000041
       },
       "name": "messages_superseded",
       "note": "the native transcript replaced the shown messages"
@@ -795,8 +808,8 @@
           "type": "thought_retracted",
           "utf16_len": 12
         },
-        "seq": 42,
-        "ts": 1700000000041
+        "seq": 43,
+        "ts": 1700000000042
       },
       "name": "thought_retracted",
       "note": "the tail of a thinking run was withdrawn"
@@ -807,8 +820,8 @@
           "title": "Wire fixtures",
           "type": "session_title"
         },
-        "seq": 43,
-        "ts": 1700000000042
+        "seq": 44,
+        "ts": 1700000000043
       },
       "name": "session_title",
       "note": "the agent named the conversation"
@@ -820,8 +833,8 @@
           "type": "checkpoint",
           "user_message_id": "u1"
         },
-        "seq": 44,
-        "ts": 1700000000043
+        "seq": 45,
+        "ts": 1700000000044
       },
       "name": "checkpoint",
       "note": "a rewind checkpoint for a user message"
@@ -837,8 +850,8 @@
           "type": "rewind_result",
           "user_message_id": "u1"
         },
-        "seq": 45,
-        "ts": 1700000000044
+        "seq": 46,
+        "ts": 1700000000045
       },
       "name": "rewind_result",
       "note": "a rewind dry run answered"
@@ -860,8 +873,8 @@
           ],
           "type": "mcp_servers"
         },
-        "seq": 46,
-        "ts": 1700000000045
+        "seq": 47,
+        "ts": 1700000000046
       },
       "name": "mcp_servers",
       "note": "the MCP inventory"
@@ -872,8 +885,8 @@
           "text": "Context compacted",
           "type": "notice"
         },
-        "seq": 47,
-        "ts": 1700000000046
+        "seq": 48,
+        "ts": 1700000000047
       },
       "name": "notice",
       "note": "a one-line notice"
@@ -884,8 +897,8 @@
           "text": "Run the tests",
           "type": "prompt_suggestion"
         },
-        "seq": 48,
-        "ts": 1700000000047
+        "seq": 49,
+        "ts": 1700000000048
       },
       "name": "prompt_suggestion",
       "note": "a suggested next prompt"
@@ -895,8 +908,8 @@
         "ev": {
           "type": "truncated"
         },
-        "seq": 49,
-        "ts": 1700000000048
+        "seq": 50,
+        "ts": 1700000000049
       },
       "name": "truncated",
       "note": "journal history was trimmed"
@@ -907,8 +920,8 @@
           "to": "term",
           "type": "mode_switch"
         },
-        "seq": 50,
-        "ts": 1700000000049
+        "seq": 51,
+        "ts": 1700000000050
       },
       "name": "mode_switch",
       "note": "the session moved to a terminal"
@@ -921,8 +934,8 @@
           "source_seq": 118,
           "type": "forked"
         },
-        "seq": 51,
-        "ts": 1700000000050
+        "seq": 52,
+        "ts": 1700000000051
       },
       "name": "forked",
       "note": "this journal was forked from another session"
@@ -935,8 +948,8 @@
           "sign_in": true,
           "type": "error"
         },
-        "seq": 52,
-        "ts": 1700000000051
+        "seq": 53,
+        "ts": 1700000000052
       },
       "name": "error_sign_in",
       "note": "a fatal error asking the user to sign in"
@@ -947,8 +960,8 @@
           "status": 0,
           "type": "exited"
         },
-        "seq": 53,
-        "ts": 1700000000052
+        "seq": 54,
+        "ts": 1700000000053
       },
       "name": "exited",
       "note": "the driver process ended"
@@ -958,8 +971,8 @@
         "ev": {
           "type": "exited"
         },
-        "seq": 54,
-        "ts": 1700000000053
+        "seq": 55,
+        "ts": 1700000000054
       },
       "name": "exited_unknown_status",
       "note": "the driver process ended without a status"
@@ -971,8 +984,8 @@
           "state": "sent",
           "type": "user_message_update"
         },
-        "seq": 55,
-        "ts": 1700000000054
+        "seq": 56,
+        "ts": 1700000000055
       },
       "name": "user_message_update",
       "note": "a queued message was read"
@@ -1021,8 +1034,8 @@
           ],
           "type": "background_tasks"
         },
-        "seq": 56,
-        "ts": 1700000000055
+        "seq": 57,
+        "ts": 1700000000056
       },
       "name": "background_tasks",
       "note": "the background level-set: a workflow with agents, a monitor, a close"
@@ -1035,8 +1048,8 @@
           "needs_action": true,
           "type": "session_status"
         },
-        "seq": 57,
-        "ts": 1700000000056
+        "seq": 58,
+        "ts": 1700000000057
       },
       "name": "session_status",
       "note": "the agent's post-turn status line"
@@ -1049,8 +1062,8 @@
           "state": "error",
           "type": "remote_control"
         },
-        "seq": 58,
-        "ts": 1700000000057
+        "seq": 59,
+        "ts": 1700000000058
       },
       "name": "remote_control",
       "note": "the Remote Control bridge failed"
@@ -1065,8 +1078,8 @@
           ],
           "type": "tool_summary"
         },
-        "seq": 59,
-        "ts": 1700000000058
+        "seq": 60,
+        "ts": 1700000000059
       },
       "name": "tool_summary",
       "note": "a summary line over a batch of tools"
@@ -1081,8 +1094,8 @@
           "status": "completed",
           "type": "subagent_finished"
         },
-        "seq": 60,
-        "ts": 1700000000059
+        "seq": 61,
+        "ts": 1700000000060
       },
       "name": "subagent_finished",
       "note": "a subagent's closing words"
@@ -1096,8 +1109,8 @@
           "model": "claude-sonnet-5-5",
           "type": "subagent_info"
         },
-        "seq": 61,
-        "ts": 1700000000060
+        "seq": 62,
+        "ts": 1700000000061
       },
       "name": "subagent_info",
       "note": "a subagent's identity once known"
@@ -1108,8 +1121,8 @@
           "output": 1240,
           "type": "turn_tokens"
         },
-        "seq": 62,
-        "ts": 1700000000061
+        "seq": 63,
+        "ts": 1700000000062
       },
       "name": "turn_tokens",
       "note": "output tokens so far this turn"
@@ -1120,8 +1133,8 @@
           "detail": "Counting files",
           "type": "activity_line"
         },
-        "seq": 63,
-        "ts": 1700000000062
+        "seq": 64,
+        "ts": 1700000000063
       },
       "name": "activity_line",
       "note": "what the agent says it is doing"
@@ -1137,8 +1150,8 @@
           "text": "Tests are green.",
           "type": "agent_message"
         },
-        "seq": 64,
-        "ts": 1700000000063
+        "seq": 65,
+        "ts": 1700000000064
       },
       "name": "agent_message",
       "note": "a message from another agent, a reply to an earlier one"
@@ -1165,8 +1178,8 @@
             "scheduled_at_ms": 1700000000000
           }
         },
-        "seq": 65,
-        "ts": 1700000000064
+        "seq": 66,
+        "ts": 1700000000065
       },
       "name": "schedule",
       "note": "the loop level-set: a wakeup and a job"
@@ -1184,8 +1197,8 @@
           },
           "type": "goal"
         },
-        "seq": 66,
-        "ts": 1700000000065
+        "seq": 67,
+        "ts": 1700000000066
       },
       "name": "goal",
       "note": "a goal as it stands (codex, with a budget)"
@@ -1202,8 +1215,8 @@
           },
           "type": "goal"
         },
-        "seq": 67,
-        "ts": 1700000000066
+        "seq": 68,
+        "ts": 1700000000067
       },
       "name": "goal_ended",
       "note": "a goal ended (claude, achieved after three checks)"
@@ -1217,8 +1230,8 @@
           "turn_id": "t2",
           "type": "turn_cause"
         },
-        "seq": 68,
-        "ts": 1700000000067
+        "seq": 69,
+        "ts": 1700000000068
       },
       "name": "turn_cause",
       "note": "what resumed the agent on its own"

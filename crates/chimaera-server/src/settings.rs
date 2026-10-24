@@ -194,19 +194,20 @@ impl SettingsStore {
         }
     }
 
-    /// Daemon-consumed key: what a new Claude session's `--settings` file
-    /// says about auto-compact (PROTOCOL.md Pass 50). On (the default) writes
-    /// nothing, so the user's own Claude Code settings stay in charge (their
-    /// default is on); Off writes `autoCompactEnabled: false` into the
-    /// per-session file, which outranks user and project settings and never
-    /// touches them. Codex has no switch.
+    /// Daemon-consumed key: what a new Claude session's generated
+    /// `--settings` file says about auto-compact (PROTOCOL.md Pass 50).
+    /// Agent default (absent, or anything but "on"/"off" — a stray boolean
+    /// included, as the UI reads it) writes nothing, so the user's own Claude
+    /// Code settings decide; On/Off write `autoCompactEnabled`, which
+    /// outranks user and project settings for that session only and never
+    /// touches them. A conversation's own pick wins over it
+    /// (`chat::claude_auto_compact`). Codex has no switch.
     pub(crate) fn claude_auto_compact(&self) -> Option<bool> {
-        let on = self
-            .map
-            .get("agents.autoCompact")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-        (!on).then_some(false)
+        match self.map.get("agents.autoCompact").and_then(|v| v.as_str()) {
+            Some("on") => Some(true),
+            Some("off") => Some(false),
+            _ => None,
+        }
     }
 
     /// Daemon-consumed key: when a restart cut a chat's work off (a running

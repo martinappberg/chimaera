@@ -28,6 +28,9 @@
     /** Whether this chat compacts on its own; null where the agent has no
      *  per-chat switch (Codex always does near a full window). */
     autoCompact?: boolean | null;
+    /** The environment variable holding it off: the switch reads Off and
+     *  cannot be turned on here. */
+    autoCompactDisabledBy?: string | null;
     onSetAutoCompact?: (enabled: boolean) => void;
     onOpenSettings?: () => void;
   }
@@ -42,6 +45,7 @@
     onClose,
     onCompact,
     autoCompact = null,
+    autoCompactDisabledBy = null,
     onSetAutoCompact,
     onOpenSettings,
   }: Props = $props();
@@ -109,8 +113,16 @@
           {#if autoCompact !== null && onSetAutoCompact}
             <div class="auto-line" title="Summarize the conversation on its own when the context window fills. Off: it waits for Compact, and a full window stops the turn.">
               <span>Auto-compact</span>
-              <Switch on={autoCompact} label="Auto-compact this chat" onToggle={onSetAutoCompact} />
+              <Switch
+                on={autoCompact && !autoCompactDisabledBy}
+                disabled={!!autoCompactDisabledBy}
+                label="Auto-compact this chat"
+                onToggle={onSetAutoCompact}
+              />
             </div>
+            {#if autoCompactDisabledBy}
+              <p class="held">set off by <code>{autoCompactDisabledBy}</code></p>
+            {/if}
           {/if}
         {/if}
         {#if limits.length > 0}
@@ -251,6 +263,16 @@
     margin-top: -2px;
     font-size: var(--text-xs);
     color: var(--muted);
+  }
+  .held {
+    margin: -4px 0 0;
+    font-size: var(--text-xs);
+    color: var(--muted);
+    overflow-wrap: anywhere;
+  }
+  .held code {
+    font-family: var(--mono);
+    font-size: inherit;
   }
   hr {
     width: 100%;

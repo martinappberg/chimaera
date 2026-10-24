@@ -373,6 +373,22 @@ fn main() {
                     },
                 },
             }));
+        } else if frame["type"] == "control_request"
+            && frame["request"]["subtype"] == "get_context_usage"
+        {
+            // The CLI's own resolution: the setting, unless the environment
+            // holds it off (2.1.302 reads both variables).
+            let held_off = ["DISABLE_AUTO_COMPACT", "DISABLE_COMPACT"]
+                .iter()
+                .any(|var| std::env::var(var).is_ok_and(|v| !v.is_empty() && v != "0"));
+            emit(json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": frame["request_id"],
+                    "response": { "isAutoCompactEnabled": auto_compact && !held_off },
+                },
+            }));
         } else if frame["type"] == "control_request" {
             if let Some(on) = frame["request"]["settings"]["ultracode"].as_bool() {
                 ultracode = on;
