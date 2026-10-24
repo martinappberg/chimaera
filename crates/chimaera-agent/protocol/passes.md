@@ -1427,3 +1427,71 @@ Installed Codex 0.158.0; `TESTED_CODEX_VERSION` remains 0.162.1. Generated the i
 - Final `RUST_TEST_THREADS=1 just check` passed with normal host access: formatting, both workspace clippy checks, all daemon and plugin workspace tests (including all 1,004 server tests), and unchanged wire fixtures. Earlier concurrent runs intermittently timed out in existing Slurm subprocess tests; those passed in the serial run. The installer completion-watcher test timed out in earlier restricted runs, then passed both alone with normal host access and in the final full gate. No production timeout or installer code changed.
 
 - Isolated preview resource check after verification: ~28 MiB RSS, 0.0% CPU at idle. Preview ownership: this verification run owns the isolated daemon on port 52328 and the component gallery on port 57924.
+
+
+## Pass 52 (2026-10-23 — live probes claude 2.1.310): drift pass 2.1.300 → 2.1.310, and the changelogs. Pin moved; nothing new adopted.
+
+Claude Code 2.1.310 (npm latest) against the 2.1.300 pin, plus the official changelogs for 2.1.301–2.1.310 and Codex 0.163.0–0.164.0. The codex pin is not part of this pass.
+
+**Method.** Both CLIs were installed into throwaway npm prefixes (`/tmp/claude-300`, `/tmp/claude-latest`); the user's own `claude` (2.1.302) was not touched. `~/.claude/settings.json` hashed the same before and after. `~/.claude.json` changed only in cache and usage-count keys (`cachedGrowthBookFeatures`, `skillUsage`, …), which every running claude writes. The probes:
+
+- a no-turn `initialize` against each version (`-p` stream-json, `--strict-mcp-config`, `--settings '{"disableAllHooks":true}'`, `CLAUDE*` scrubbed);
+- one billed haiku turn on each (Bash `echo hi`, then `ok`), with every frame logged and the key sets diffed by frame kind;
+- two `/loop` runs on 2.1.310, one per minute (`CronCreate`, three fires) and one self-paced (`ScheduleWakeup`; haiku chose 1200 s, so it never fired inside the probe);
+- `--help` and the bundled `sdk-tools.d.ts` diffed;
+- the binary's zod literal sets diffed: subtypes, types and capability tokens.
+
+### Findings
+
+- **No drift in anything the driver maps.** The `initialize` response keys and the 80-command catalog are identical. The `system/init`, `result`, `assistant`, `stream_event` and `command_lifecycle` shapes are additive only, and no subtype was removed.
+- `system/init.capabilities` adds three tokens: `interrupt_requeue_taken_v1`, `lifecycle_wakeup_source_v1` and `mcp_call_result_not_for_model_v1`, for 13 in all. The `initialize` response's own list adds `mcp_call_result_not_for_model_v1`. See [claude-code.md › Handshake](claude-code.md#handshake-and-initialize).
+- **`lifecycle_wakeup_source_v1`.** A scheduler fire's `command_lifecycle started` carries `wakeup_source` (`loop_wakeup` with `scheduled_for`, or `schedule_wakeup`). Live: every fire of a `/loop 1m` job carried `"schedule_wakeup"`. The `loop_wakeup` / `scheduled_for` pair comes from the schema only. See [claude-code.md › Loops and goals](claude-code.md#loops-and-goals).
+- **`interrupt_requeue_taken_v1`.** `requeue_if_interrupted_within_ms` on a stdin `user` frame lets a Stop that crosses a just-read prompt put that prompt back in the queue; the receipt lists it under `put_back`. Schema only. See [claude-code.md › Mid-turn messages](claude-code.md#mid-turn-messages-queue-send-now-cancel).
+- New `@internal` fields:
+  - `system/init`: `original_cwd`, `additional_directories`, `user_message_uuids`;
+  - `assistant` thinking frames: `thinking_display`, `thinking_duration_ms`;
+  - `result`: `model_usage_since_last_result`;
+  - `system/thinking_tokens`: `user_message_uuid`.
+- The `read_file` control documents `anchor` (`as_written`, gated by `read_file_as_written_v1`).
+- Subtype literals went from 157 to 161, all of them cloud-session and feedback controls. `sdk-tools.d.ts` changed one description line: `Agent.effort` is ignored for `subagent_type: "fork"`. `--help` changed wording only.
+
+### Changelog review (2.1.301–2.1.310)
+
+These entries matter to a host that drives the CLI structurally. TUI, VS Code, cloud, Slack, Code Review and provider-only entries were skipped.
+
+| Version | Change | Chimaera today | Recommendation |
+|---|---|---|---|
+| 2.1.302 | Fork subagents (`subagent_type: "fork"`) are on by default under `-p` and the SDK. A subagent's own Agent calls run in the foreground there. | Ordinary Agent rows and task lanes; nothing keys on the type. | Ignore. The wire is unchanged. |
+| 2.1.302 | Desktop and VS Code always run the main thread's subagents in the background; `-p` still lets Claude choose. | Follows whatever `-p` does. | Adopt later, if chat should match the desktop (the env `CLAUDE_AUTO_BACKGROUND_TASKS` changes every lifetime, Pass 44). |
+| 2.1.302 | An `Idle compaction` setting; idle compaction notices say how to turn it off. | Not probed under `-p`. A compaction while idle would open an implicit turn (`ensure_turn`). | Adopt later. Probe whether `-p` ever compacts while idle. |
+| 2.1.301 | Switching to a model with a smaller context first summarizes with the previous model. | `set_model` is fire-and-forget; a summary would stream as a turn. | Adopt later. Probe a Fable[1m] → Haiku switch on a long chat. |
+| 2.1.301 | A tool call cut off by a mid-turn message during its permission check is no longer reported as rejected by the user. | Benefits; `control_cancel_request` → cancelled is unchanged. | Ignore. |
+| 2.1.304 | Model switches, messages and interrupts no longer wait behind a context-usage check in SDK sessions. | Benefits (the per-turn `get_context_usage`). | Ignore. |
+| 2.1.304 | A warning on Pro and Max before resuming an inactive conversation that would use a noticeable share of the 5-hour limit. | Unknown whether `-p` asks (a dialog kind would need declaring). | Adopt later. Probe a cold resume. |
+| 2.1.307 | `setModel()` waits up to 15 s for the API to confirm a model. | No client timeout on `set_model`; the chip re-reads `get_settings`. | Ignore. |
+| 2.1.307 | An HTTP MCP call whose connection closed mid-call is retried only for read-only or idempotent tools. | Chimaera's MCP tools carry no annotations, so none is retried. | Adopt later: `readOnlyHint` on `list_terminals`, `read_terminal`, `workspace_status`, `list_changed_files`, `read_timeline`, `document_guide`, `check_document`. |
+| 2.1.307 | A background command stopped by a connected app is no longer "stopped by the user"; the notice names its output file. | The close text is passed through verbatim. | Ignore. |
+| 2.1.309 | `sed -i` is now a plain Bash command, so `rewind_files` no longer restores it. | The rewind dialog shows what the dry run reports. | Ignore. Recorded in Checkpoints. |
+| 2.1.309 | A disabled MCP server is no longer reconnected by a later permission prompt in print and SDK sessions. | Benefits `mcp_toggle`. | Ignore. |
+| 2.1.310 | An MCP call that times out on an unanswered elicitation in `-p` tells Claude no answer came. | Chimaera answers every elicitation. | Ignore. |
+| 2.1.310 | Lower memory in `-p` during compaction of very large transcripts. | Benefits. | Ignore. |
+| binary | `lifecycle_wakeup_source_v1`: `wakeup_source` / `scheduled_for` on a scheduler fire's `started`. | `autonomy.rs` infers the cause from what is due (2-minute window). | **Adopt now** (small): prefer the CLI's word when present, so a wakeup is never confused with a job that falls due at the same moment; keep the inference for older CLIs. |
+| binary | `interrupt_requeue_taken_v1` / `requeue_if_interrupted_within_ms`. | Stop treats a `started` message as read. | Adopt later. It would save a prompt typed just before a Stop. |
+| binary | `interrupt {for_user_message_uuids}` (`@internal`): a Stop names the messages whose turn it is for. | A plain `interrupt`. | Adopt later. A Stop that lands after its turn ended could otherwise cut the next one; probe first. |
+| binary | `read_file {anchor: as_written}`. | Chimaera resolves reply paths itself. | Adopt later, for remote hosts where a reply's path is relative to an earlier cwd. |
+
+### Codex changelog (0.163.0, 0.164.0; no 0.162.x or 0.163.x patch releases)
+
+The release notes and PR text were read, and the stable TypeScript schemas diffed between rust-v0.162.1 and rust-v0.164.0. Nothing was removed or renamed. The server-request union is byte-identical. The only new methods are `feedback/save` and `thread/readState/changed`. The re-pin belongs to the 0.164.0 branch; for it:
+
+- 0.163.0 turns `instant_interrupt` on by default (#51812). [codex.md](codex.md) and the setting's description still say the default is "the next step".
+- 0.163.0 refuses a steer into a finishing turn (#53452). Re-probe its wording.
+- `ImageGenerationItem.result` became optional (#54398). The driver never reads it.
+- Resume now restores the thread's own permissions, network approvals, service tier, reasoning summary and personality.
+- The post-compaction accuracy `warning` is gone (#55355).
+
+### Gate (Pass 52)
+
+- The Claude part of `just chat-smoke` (`--skip codex`, `CLAUDE*` scrubbed, `/tmp/claude-latest/node_modules/.bin` first on PATH) passed 21/21 on claude 2.1.310: the handshake, echo, manual compaction, allow-then-deny, plan approval, feedback deny, background lanes, foreground Bash, hooks, rewind/title/MCP, mid-turn queue, `next` read mid-turn, `cancel_async_message` (un-queues), send now (receipt `stopped`, background agent spared), background-for-a-message, wakeup, goal, rapid queued sends, the end-to-end driver stack, initial ultracode, and Stop ending detached background work.
+- `just chat-mods-smoke` passed 1/1.
+- `TESTED_CLAUDE_VERSION` moved 2.1.300 → 2.1.310. No driver mapping changed.

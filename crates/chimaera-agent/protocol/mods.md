@@ -41,3 +41,4 @@ Recorded at claude 2.1.289 (2026-10-04).
 
 - 2.1.300 adds the Mods control `ui_prompt_autocomplete` (`prompt.autocomplete` hooks answer a surface's composer), and the hooks `prompt.change` (12 sites) and `$.ui.view` (7). None is adopted. `chat-mods-smoke` (control, module, reattach) passed (Pass 43, claude 2.1.300).
 - `system/init` advertises `ui_surface_v1` at 2.1.289 (2026-10-05).
+- 2.1.310 adds no Mods control (the `ui_*` subtype set is the same as 2.1.300). Its changelogs since 2.1.300 add mod-side features only: `decider: "person"` and `e.isReadOnly` on `tool.check` (2.1.304), `rows` on `Input` (2.1.301), `settings.read` layers (2.1.304). `chat-mods-smoke` passed (Pass 52, claude 2.1.310).
