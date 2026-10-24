@@ -4816,11 +4816,11 @@ impl CodexMapper {
     }
 
     /// Track whether the running turn answered the last user steer it read
-    /// (`read_unanswered`). A user steer's echo opens the window; any model
-    /// step on the same turn after it — an item other than a user message,
-    /// a delta, a token-usage update (one per model request), a plan update
-    /// — closes it. Hooks are not model steps: a Stop hook follows an answer,
-    /// a prompt hook precedes the echo. A message the daemon sent for an
+    /// (`read_unanswered`). A user steer's echo opens the window; a new model
+    /// response on the same turn after it closes it (see the arms). Hooks are
+    /// not model steps: a Stop hook follows an answer, a prompt hook precedes
+    /// the echo, and pre/post-model-request hooks also wrap a request whose
+    /// output a newer steer superseded. A message the daemon sent for an
     /// agent (`agent_steers`) and decline feedback never owe a turn.
     fn note_steer_answered(&mut self, method: &str, frame: &Value) {
         let params = &frame["params"];
@@ -4845,8 +4845,42 @@ impl CodexMapper {
                     }
                 }
             }
-            "thread/tokenUsage/updated" | "turn/plan/updated" => self.read_unanswered = false,
-            m if m.starts_with("item/") => self.read_unanswered = false,
+            // Only a NEW model response answers it: an item the response
+            // opens, or its streamed text, reasoning or plan. Captured
+            // (0.164.0, Pass 54): an answered steer's echo is followed by
+            // the reply's `item/started` before its token update; a leftover
+            // echo by nothing but the read state, idle status and turn end.
+            // Never a step: a completion or output of an earlier item (a
+            // background command finishing), a token-usage update (it trails
+            // the request it counts), a child's `subAgentActivity` marker, a
+            // recorded tool output, a hook prompt or a compaction.
+            "item/started" => {
+                if matches!(
+                    item["type"].as_str(),
+                    Some(
+                        "agentMessage"
+                            | "reasoning"
+                            | "plan"
+                            | "commandExecution"
+                            | "mcpToolCall"
+                            | "webSearch"
+                            | "fileChange"
+                            | "imageGeneration"
+                            | "imageView"
+                            | "dynamicToolCall"
+                            | "collabAgentToolCall"
+                            | "sleep"
+                    )
+                ) {
+                    self.read_unanswered = false;
+                }
+            }
+            "item/agentMessage/delta"
+            | "item/reasoning/textDelta"
+            | "item/reasoning/summaryTextDelta"
+            | "item/reasoning/summaryPartAdded"
+            | "item/plan/delta"
+            | "turn/plan/updated" => self.read_unanswered = false,
             _ => {}
         }
     }
@@ -8134,6 +8168,132 @@ mod tests {
                     "modelContextWindow": 272000}}}),
         ] {
             m.on_frame(&f);
+        }
+        let step = m.on_frame(&turn_a_completed());
+        assert!(
+            !step.outbound.iter().any(|o| o["method"] == "turn/start"),
+            "{:?}",
+            step.outbound
+        );
+        assert!(!m.answer_owed);
+    }
+
+    fn model_hook(event: &str, completed: bool) -> Value {
+        let id = match event {
+            "preModelRequest" => "pre-model-request:0:/home/u/.codex/config.toml",
+            "postModelRequest" => "post-model-request:0:/home/u/.codex/config.toml",
+            "userPromptSubmit" => "user-prompt-submit:0:/home/u/.codex/config.toml",
+            _ => "stop:0:/home/u/.codex/config.toml",
+        };
+        json!({"method": if completed { "hook/completed" } else { "hook/started" },
+            "params": {"threadId": "thr-1", "turnId": "turn-A", "run": {"id": id,
+                "eventName": event, "handlerType": "command", "executionMode": "sync",
+                "scope": "turn", "source": "user",
+                "status": if completed { "completed" } else { "running" }, "entries": []}}})
+    }
+
+    fn token_usage(total: u64) -> Value {
+        json!({"method": "thread/tokenUsage/updated", "params": {"threadId": "thr-1",
+            "turnId": "turn-A", "tokenUsage": {
+                "total": {"totalTokens": total, "inputTokens": total - 40, "cachedInputTokens": 0,
+                    "outputTokens": 40, "reasoningOutputTokens": 0},
+                "last": {"totalTokens": 120, "inputTokens": 100, "cachedInputTokens": 0,
+                    "outputTokens": 20, "reasoningOutputTokens": 0},
+                "modelContextWindow": 258400}}})
+    }
+
+    /// Frames that follow a leftover echo but belong to earlier work — the
+    /// previous request's token update, an earlier command finishing in the
+    /// background with its last output, a child agent's finish marker, a
+    /// recorded tool output — are no model step: the steer is still owed
+    /// its turn. (Captured, the leftover echo is followed only by the read
+    /// state, idle status and turn end; these are the frames that could
+    /// still land in between.)
+    #[test]
+    fn frames_of_earlier_work_after_a_leftover_echo_keep_the_turn_owed() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let (id, rpc) = steer_text(&mut m, "STEER S");
+        m.on_frame(&json!({ "id": rpc, "result": { "turnId": "turn-A" } }));
+        let frames = finishing_frames(&id);
+        m.on_frame(&frames[1]);
+        m.on_frame(&frames[2]);
+        for f in [
+            token_usage(240),
+            json!({"method": "item/commandExecution/outputDelta", "params": {"threadId": "thr-1",
+                "turnId": "turn-A", "itemId": "call_bg", "delta": "done\n"}}),
+            json!({"method": "item/completed", "params": {"threadId": "thr-1", "turnId": "turn-A",
+                "item": {"type": "commandExecution", "id": "call_bg", "command": "sleep 2",
+                    "cwd": "/work", "status": "completed", "commandActions": [],
+                    "aggregatedOutput": "done\n", "exitCode": 0, "durationMs": 2000}}}),
+            json!({"method": "item/started", "params": {"threadId": "thr-1", "turnId": "turn-A",
+                "item": {"type": "subAgentActivity", "id": "subagent-completed-1",
+                    "kind": "completed", "agentThreadId": "thr-child",
+                    "agentPath": "/root/helper"}}}),
+            json!({"method": "item/started", "params": {"threadId": "thr-1", "turnId": "turn-A",
+                "item": {"type": "functionCallOutput", "id": "call_bg", "name": "exec_command",
+                    "output": "done"}}}),
+        ] {
+            m.on_frame(&f);
+        }
+        for f in &frames[3..] {
+            m.on_frame(f);
+        }
+        let step = m.on_frame(&turn_a_completed());
+        let starts: Vec<_> = step
+            .outbound
+            .iter()
+            .filter(|o| o["method"] == "turn/start")
+            .collect();
+        assert_eq!(starts.len(), 1, "{:?}", step.outbound);
+        assert_eq!(starts[0]["params"]["input"], json!([]));
+    }
+
+    /// Captured (0.164.0, Stop and model-request hooks configured): steer A
+    /// is read, its model request runs between the pre/post hooks but its
+    /// output is superseded by steer B, read next; the reply to B opens with
+    /// `item/started`, then its token update and the Stop hook. Both were
+    /// answered: nothing is owed.
+    #[test]
+    fn a_superseded_request_then_an_answered_steer_owes_no_turn() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let (a, rpc_a) = steer_text(&mut m, "STEER A during the Stop hook");
+        m.on_frame(&json!({ "id": rpc_a, "result": { "turnId": "turn-A" } }));
+        let (b, rpc_b) = steer_text(&mut m, "STEER B during finish");
+        m.on_frame(&json!({ "id": rpc_b, "result": { "turnId": "turn-A" } }));
+        let echo_a = finishing_frames(&a);
+        let echo_b = finishing_frames(&b);
+        let mut order = vec![
+            model_hook("stop", true),
+            model_hook("userPromptSubmit", false),
+            model_hook("userPromptSubmit", true),
+            echo_a[1].clone(),
+            echo_a[2].clone(),
+            model_hook("preModelRequest", false),
+            model_hook("preModelRequest", true),
+            model_hook("postModelRequest", false),
+            model_hook("postModelRequest", true),
+            model_hook("userPromptSubmit", false),
+            model_hook("userPromptSubmit", true),
+            echo_b[1].clone(),
+            echo_b[2].clone(),
+            model_hook("preModelRequest", false),
+            model_hook("preModelRequest", true),
+            json!({"method": "item/started", "params": {"threadId": "thr-1", "turnId": "turn-A",
+                "item": {"type": "agentMessage", "id": "msg_3", "text": "", "phase": null}}}),
+            json!({"method": "item/completed", "params": {"threadId": "thr-1", "turnId": "turn-A",
+                "item": {"type": "agentMessage", "id": "msg_3",
+                    "text": "ANSWER 3 to: STEER B during finish", "phase": null}}}),
+            model_hook("postModelRequest", false),
+            model_hook("postModelRequest", true),
+            token_usage(360),
+            model_hook("stop", false),
+            model_hook("stop", true),
+        ];
+        order.extend(echo_b[3..].iter().cloned());
+        for f in &order {
+            m.on_frame(f);
         }
         let step = m.on_frame(&turn_a_completed());
         assert!(
