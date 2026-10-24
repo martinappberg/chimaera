@@ -48,9 +48,9 @@ use crate::model::{
 use crate::model::{RemoteControlSnapshot, RemoteControlState};
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 
-/// CLI version these frame shapes were verified against (2026-10-14,
-/// full chat-smoke 29/29 + chat-mods-smoke; PROTOCOL.md Pass 43).
-pub const TESTED_CLAUDE_VERSION: &str = "2.1.300";
+/// CLI version these frame shapes were verified against (2026-10-23, the
+/// Claude part of chat-smoke 21/21 + chat-mods-smoke; PROTOCOL.md Pass 52).
+pub const TESTED_CLAUDE_VERSION: &str = "2.1.310";
 
 /// The environment variable that lowers Claude Code's auto-compact
 /// threshold to a percentage of its window (PROTOCOL.md Pass 55). Chimaera
@@ -194,10 +194,24 @@ fn user_message_frame(uuid: &str, content: Value) -> Value {
 /// for the turn to end. Only written to a CLI that advertises
 /// [`MSG_LIFECYCLE_CAPABILITY`], whose `command_lifecycle` frames report
 /// when it was read.
-fn queued_message_frame(uuid: &str, content: Value, priority: &str) -> Value {
+fn queued_message_frame(uuid: &str, content: Value, priority: &str, requeue: bool) -> Value {
     let mut frame = user_message_frame(uuid, content);
     frame["priority"] = json!(priority);
+    if requeue {
+        frame["requeue_if_interrupted_within_ms"] = json!(REQUEUE_WINDOW_MS);
+    }
     frame
+}
+
+/// A waiting message the CLI has just taken in, which a Stop can still put
+/// back ([`REQUEUE_CAPABILITY`]). It shows as read only once that can no
+/// longer happen: the model's reply began, the window passed, or the Stop's
+/// receipt left it with the stopped turn.
+struct Taken {
+    id: String,
+    /// It opens the next turn (taken while idle), so it is a rewind boundary.
+    opener: bool,
+    deadline: std::time::Instant,
 }
 
 /// `system/init` capability: the CLI reports each queued message's fate on
@@ -210,6 +224,32 @@ const MSG_LIFECYCLE_CAPABILITY: &str = "msg_lifecycle_v1";
 /// which also kills every background agent and marks it "stopped by the
 /// user" — the CLI then refuses to resume it.
 const SEND_NOW_CAPABILITY: &str = "interrupt_send_now_v1";
+
+/// The `system/init` capability of a CLI (2.1.310) that takes
+/// `requeue_if_interrupted_within_ms` on a stdin `user` frame: a Stop that
+/// crosses a turn just taking that prompt in puts it back in the queue
+/// (`queued` again, and the receipt's `put_back`) instead of losing it with
+/// the stopped turn. The same build reads `interrupt {for_user_message_uuids}`.
+const REQUEUE_CAPABILITY: &str = "interrupt_requeue_taken_v1";
+
+/// How long after a turn takes a waiting message in that a Stop still means
+/// "stop what was running", not "stop this message": the bubble said
+/// "queued" until the `started` frame crossed the wire, and the Stop was
+/// already on its way. One human reaction time (~0.3 s) plus the frame's trip
+/// to the window and the Stop's trip back over a slow SSH link (≤ 0.5 s
+/// each way), with margin. Longer would put back a prompt the user had seen
+/// being read and meant to stop. The CLI also ends the window the moment the
+/// model's reply begins, and the driver shows the message as read then.
+const REQUEUE_WINDOW_MS: u64 = 2_000;
+
+/// `interrupt.for_user_message_uuids` takes one to eight uuids.
+const STOP_FOR_MESSAGES_MAX: usize = 8;
+
+/// The `system/init` capability of a CLI (2.1.310) whose `command_lifecycle
+/// started` for a scheduler fire names it: `wakeup_source: "loop_wakeup"`
+/// (a ScheduleWakeup, with `scheduled_for`) or `"schedule_wakeup"` (any other
+/// scheduled task, a CronCreate job among them).
+const WAKEUP_SOURCE_CAPABILITY: &str = "lifecycle_wakeup_source_v1";
 
 fn control_request_frame(id: &str, request: Value) -> Value {
     json!({
@@ -459,14 +499,21 @@ impl ClaudeChat {
     }
 
     /// A mid-turn message for the CLI's own queue, with the driver's exact
-    /// frame (`priority` `"next"` or `"later"`); returns its uuid.
-    pub async fn send_queued_text(&mut self, text: &str, priority: &str) -> Result<String> {
+    /// frame (`priority` `"next"` or `"later"`; `requeue` adds
+    /// `requeue_if_interrupted_within_ms`); returns its uuid.
+    pub async fn send_queued_text(
+        &mut self,
+        text: &str,
+        priority: &str,
+        requeue: bool,
+    ) -> Result<String> {
         let uuid = crate::model::fresh_uuid();
         self.io
             .send(&queued_message_frame(
                 &uuid,
                 json!([{ "type": "text", "text": text }]),
                 priority,
+                requeue,
             ))
             .await?;
         Ok(uuid)
@@ -1130,9 +1177,27 @@ struct ClaudeMapper {
     /// The `/goal` the CLI checks each time the agent stops.
     goal: crate::autonomy::GoalTracker,
     /// A `command_lifecycle` started a command nobody here sent: the CLI is
-    /// opening a turn by itself (a wakeup, a job, a monitor event). Consumed
-    /// when that turn opens.
-    cli_turn: bool,
+    /// opening a turn by itself (a wakeup, a job, a monitor event), and what
+    /// the frame said fired it. Consumed when that turn opens.
+    cli_turn: Option<crate::autonomy::FireSource>,
+    /// Whether the latest `system/init` advertised [`REQUEUE_CAPABILITY`].
+    requeue_capable: bool,
+    /// Waiting messages written with `requeue_if_interrupted_within_ms`
+    /// (a subset of `awaiting_read`; one put back leaves, as the CLI puts a
+    /// message back at most once).
+    requeue_armed: HashSet<String>,
+    /// The last waiting message the CLI took in since the model last spoke,
+    /// while a Stop can still put it back. Only the last can be (the CLI's
+    /// rule), so a newer one releases it.
+    taken: Option<Taken>,
+    /// The client messages the current turn took in, its opener first
+    /// (`interrupt.for_user_message_uuids`: a Stop names its own turn, so one
+    /// that lands after that turn ended spares the next).
+    turn_messages: Vec<String>,
+    /// Whether the latest `system/init` advertised
+    /// [`WAKEUP_SOURCE_CAPABILITY`]: then a self-opened turn's `started`
+    /// names its scheduler fire, and one that names none was not a fire.
+    wakeup_source_capable: bool,
     next_ctl: u64,
 }
 
@@ -1297,7 +1362,12 @@ impl ClaudeMapper {
             minted_uuids: VecDeque::new(),
             schedule: Default::default(),
             goal: Default::default(),
-            cli_turn: false,
+            cli_turn: None,
+            wakeup_source_capable: false,
+            requeue_capable: false,
+            requeue_armed: HashSet::new(),
+            taken: None,
+            turn_messages: Vec::new(),
             next_ctl: 0,
         }
     }
@@ -1511,6 +1581,13 @@ impl ClaudeMapper {
     /// phantom turn with no start event.
     fn ensure_turn(&mut self, step: &mut DriverStep) {
         if !self.turn_active {
+            // `turn_messages` is kept when the CLI opens a turn by itself (a
+            // wakeup, a job, a monitor event): the CLI counts every turn
+            // started since a client message's turn as that turn, so a Stop
+            // naming those messages stops this one, and one landing after
+            // it ended still spares a next turn a message of ours opened
+            // (live 2.1.310: `turn: "stopped"` for a wakeup turn after A;
+            // `turn: "spared"` for B, dequeued as the Stop naming A landed).
             self.turn_starting = false;
             self.reset_compaction_for_new_turn();
             self.turn_n += 1;
@@ -1522,8 +1599,9 @@ impl ClaudeMapper {
             step.events.push(AgentEvent::TurnStarted {
                 turn_id: self.turn_id(),
             });
-            if std::mem::take(&mut self.cli_turn) {
-                if let Some((fired, schedule)) = self.schedule.on_cli_turn(crate::now_ms()) {
+            if let Some(source) = self.cli_turn.take() {
+                if let Some((fired, schedule)) = self.schedule.on_cli_turn(crate::now_ms(), source)
+                {
                     step.events.push(AgentEvent::TurnCause {
                         turn_id: self.turn_id(),
                         kind: fired.kind.into(),
@@ -1652,6 +1730,14 @@ impl ClaudeMapper {
             }
             return step;
         }
+        // The model's reply began (or the turn ended without a Stop pending):
+        // a taken message can no longer be put back, so it reads as read
+        // before anything the reply says.
+        match frame["type"].as_str() {
+            Some("stream_event" | "assistant") => self.release_taken(&mut step),
+            Some("result") if !self.stop_in_flight() => self.release_taken(&mut step),
+            _ => {}
+        }
         match frame["type"].as_str() {
             Some("system") => self.on_system(frame, &mut step),
             Some("stream_event") => {
@@ -1754,6 +1840,8 @@ impl ClaudeMapper {
                 let native = advertises(MSG_LIFECYCLE_CAPABILITY);
                 self.native_queue = Some(native);
                 self.send_now_capable = advertises(SEND_NOW_CAPABILITY);
+                self.wakeup_source_capable = advertises(WAKEUP_SOURCE_CAPABILITY);
+                self.requeue_capable = advertises(REQUEUE_CAPABILITY);
                 if native {
                     // Sent before this first init could say which kind of CLI
                     // this is: the CLI's own queue takes them from here.
@@ -2008,6 +2096,19 @@ impl ClaudeMapper {
             // assistant frame, so it must also open the turn boundary (manual
             // /compact otherwise looked idle until it finished).
             Some("status") => {
+                // The window runs from the request that carries the taken
+                // prompt (its uuid is listed, live 2.1.310).
+                if frame["status"] == "requesting" {
+                    if let Some(t) = self.taken.as_mut() {
+                        let carried = frame["user_message_uuids"]
+                            .as_array()
+                            .is_some_and(|ids| ids.iter().any(|u| u == t.id.as_str()));
+                        if carried {
+                            t.deadline = std::time::Instant::now()
+                                + Duration::from_millis(REQUEUE_WINDOW_MS);
+                        }
+                    }
+                }
                 if frame["status"] == "compacting" {
                     if !self.compaction_active {
                         self.settle_awaited_compaction(step);
@@ -3805,7 +3906,8 @@ impl ClaudeMapper {
                 // Read the native result instead of retaining the old chip.
                 self.request_settings(step);
             }
-            PendingControl::Interrupt | PendingControl::SetThinking => {}
+            PendingControl::Interrupt => self.on_stop_receipt(payload, step),
+            PendingControl::SetThinking => {}
             // Live 2.1.289: the receipt lands before the stopped turn's
             // result. `stopped` promises that result, so the watchdog covers
             // a CLI that never sends it. `delivering` keeps the turn (what it
@@ -3813,21 +3915,25 @@ impl ClaudeMapper {
             // on its way in) and may still end it for the message later —
             // the user's doing either way, so the flag stays. Only
             // `nothing_waiting` did nothing at all.
-            PendingControl::SendNow => match payload["send_now"].as_str() {
-                // The flag is consumed at every result: once it is gone the
-                // stopped turn has ended, and the open one is the next.
-                Some("stopped")
-                    if self.interrupt_requested && (self.turn_active || self.turn_starting) =>
-                {
-                    self.interrupt_grace = Some(INTERRUPT_GRACE_TICKS);
+            PendingControl::SendNow => {
+                self.on_stop_receipt(payload, step);
+                match payload["send_now"].as_str() {
+                    // The flag is consumed at every result: once it is gone
+                    // the stopped turn has ended, and the open one is the next.
+                    Some("stopped")
+                        if self.interrupt_requested && (self.turn_active || self.turn_starting) =>
+                    {
+                        self.interrupt_grace = Some(INTERRUPT_GRACE_TICKS);
+                    }
+                    // A Stop pressed while this request was in flight armed
+                    // the watchdog and owns the flag: its abort is still the
+                    // user's.
+                    Some("nothing_waiting") if self.interrupt_grace.is_none() => {
+                        self.interrupt_requested = false;
+                    }
+                    _ => {}
                 }
-                // A Stop pressed while this request was in flight armed the
-                // watchdog and owns the flag: its abort is still the user's.
-                Some("nothing_waiting") if self.interrupt_grace.is_none() => {
-                    self.interrupt_requested = false;
-                }
-                _ => {}
-            },
+            }
             PendingControl::ContextUsage {
                 meter,
                 setting,
@@ -3997,14 +4103,25 @@ impl ClaudeMapper {
             // comes first resolves it). `false`: the agent already took it,
             // and its `started` frame resolves it `sent`.
             PendingControl::CancelQueued(id) => {
+                let taken = self.taken.as_ref().is_some_and(|t| t.id == id);
                 if payload["cancelled"] == json!(true) {
                     if let Some(pos) = self.awaiting_read.iter().position(|q| *q == id) {
                         self.awaiting_read.remove(pos);
+                        self.requeue_armed.remove(&id);
+                        step.events.push(AgentEvent::UserMessageUpdate {
+                            id,
+                            state: UserMessageState::Cancelled,
+                        });
+                    } else if taken {
+                        self.taken = None;
                         step.events.push(AgentEvent::UserMessageUpdate {
                             id,
                             state: UserMessageState::Cancelled,
                         });
                     }
+                } else if taken {
+                    // The turn has it; the CLI will not put it back now.
+                    self.release_taken(step);
                 }
             }
             PendingControl::ApplyFlags {
@@ -4059,7 +4176,7 @@ impl ClaudeMapper {
         self.prose_blocks.clear();
         // The turn is over: a CLI command that never opened one is not the
         // next turn's cause, and a schedule call cut off never answers.
-        self.cli_turn = false;
+        self.cli_turn = None;
         self.schedule.end_turn();
         if let Some(flushed) = self.coalescer.flush() {
             step.events.push(flushed);
@@ -4072,6 +4189,7 @@ impl ClaudeMapper {
             for id in consumed.iter().filter_map(Value::as_str) {
                 if let Some(pos) = self.awaiting_read.iter().position(|q| q == id) {
                     let id = self.awaiting_read.remove(pos).expect("position exists");
+                    self.requeue_armed.remove(&id);
                     step.events.push(AgentEvent::UserMessageUpdate {
                         id,
                         state: UserMessageState::Sent,
@@ -4217,9 +4335,36 @@ impl ClaudeMapper {
     fn hand_held_to_cli(&mut self, step: &mut DriverStep) {
         for (id, content, after_turn) in std::mem::take(&mut self.queued_sends) {
             let priority = if after_turn { "later" } else { "next" };
-            step.outbound
-                .push(queued_message_frame(&id, content, priority));
+            step.outbound.push(queued_message_frame(
+                &id,
+                content,
+                priority,
+                self.requeue_capable,
+            ));
+            if self.requeue_capable {
+                self.requeue_armed.insert(id.clone());
+            }
             self.awaiting_read.push_back(id);
+        }
+    }
+
+    /// What a self-opened turn's `started` frame says fired it. Live 2.1.310:
+    /// `loop_wakeup` + `scheduled_for` (= the ScheduleWakeup result's
+    /// `scheduledFor`) for a wakeup, `schedule_wakeup` for a CronCreate job.
+    fn fire_source(&self, frame: &Value) -> crate::autonomy::FireSource {
+        use crate::autonomy::FireSource;
+        if !self.wakeup_source_capable {
+            return FireSource::Unsaid;
+        }
+        match frame["wakeup_source"].as_str() {
+            Some("loop_wakeup") => FireSource::Wakeup {
+                scheduled_for: crate::autonomy::as_ms(&frame["scheduled_for"]),
+            },
+            Some("schedule_wakeup") => FireSource::Job,
+            // A word this build does not know is still a scheduler fire of
+            // some kind: guess, as for an older CLI.
+            Some(_) => FireSource::Unsaid,
+            None => FireSource::NotScheduled,
         }
     }
 
@@ -4229,11 +4374,31 @@ impl ClaudeMapper {
     /// turn (several waiting messages start together, as one turn). Frames
     /// for messages that never waited here (fresh sends, the CLI's own
     /// commands) are ignored, as is a `cancelled` after `started`: that
-    /// message was read before its turn was cut, and a stop never re-sends.
+    /// message was read before its turn was cut. A message written with
+    /// `requeue_if_interrupted_within_ms` is held as [`Taken`] at `started`
+    /// until a Stop can no longer put it back (2.1.310).
     fn on_command_lifecycle(&mut self, frame: &Value, step: &mut DriverStep) {
         let Some(id) = frame["command_uuid"].as_str() else {
             return;
         };
+        if self.taken.as_ref().is_some_and(|t| t.id == id) {
+            match frame["state"].as_str() {
+                // Live 2.1.310: a Stop that crossed its intake reports it
+                // `queued` a second time, just before the receipt's put_back.
+                Some("queued") => self.put_back(id),
+                Some("completed" | "cancelled") => self.release_taken(step),
+                Some("discarded" | "refused") => {
+                    if let Some(t) = self.taken.take() {
+                        step.events.push(AgentEvent::UserMessageUpdate {
+                            id: t.id,
+                            state: UserMessageState::Dropped,
+                        });
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         let Some(pos) = self.awaiting_read.iter().position(|q| q == id) else {
             // A command nobody here sent, starting while idle: the CLI is
             // opening a turn by itself (live 2.1.300: a fired wakeup or job
@@ -4243,7 +4408,7 @@ impl ClaudeMapper {
                 && !self.turn_active
                 && !self.minted_uuids.iter().any(|u| u == id)
             {
-                self.cli_turn = true;
+                self.cli_turn = Some(self.fire_source(frame));
             }
             return;
         };
@@ -4268,26 +4433,126 @@ impl ClaudeMapper {
             _ => return,
         };
         let id = self.awaiting_read.remove(pos).expect("position exists");
-        if state == UserMessageState::Sent {
-            // What the agent wrote before this step lands above the bubble.
-            self.flush_prose(step);
-            if !self.turn_active {
-                // Our message opens this turn, whatever the CLI started too.
-                self.cli_turn = false;
-                // It opens the next turn, so it is a rewind boundary, anchored
-                // after everything the finished turn wrote. A message folded
-                // into a running turn is not one (the same rule as a steered
-                // codex message).
-                self.turn_starting = true;
-                let preceding = self.last_msg_uuid.replace(id.clone());
-                step.events.push(AgentEvent::Checkpoint {
-                    user_message_id: id.clone(),
-                    preceding_uuid: preceding,
-                });
-            }
+        if state != UserMessageState::Sent {
+            self.requeue_armed.remove(&id);
+            step.events
+                .push(AgentEvent::UserMessageUpdate { id, state });
+            return;
         }
-        step.events
-            .push(AgentEvent::UserMessageUpdate { id, state });
+        let opener = !self.turn_active;
+        if opener {
+            // Our message opens this turn, whatever the CLI started too.
+            self.cli_turn = None;
+            self.turn_starting = true;
+            self.turn_messages.clear();
+        }
+        self.note_turn_message(&id);
+        if self.requeue_armed.remove(&id) {
+            // Only the last prompt taken since the model spoke can be put
+            // back: an earlier one stays with the turn, so it is read now.
+            self.release_taken(step);
+            self.taken = Some(Taken {
+                id,
+                opener,
+                deadline: std::time::Instant::now() + Duration::from_millis(REQUEUE_WINDOW_MS),
+            });
+            return;
+        }
+        self.mark_read(id, opener, step);
+    }
+
+    /// A waiting message the agent has read: it leaves the pending stack and
+    /// enters the transcript here. One that opens the next turn is a rewind
+    /// boundary, anchored after everything the finished turn wrote; one
+    /// folded into a running turn is not (the same rule as a steered codex
+    /// message).
+    fn mark_read(&mut self, id: String, opener: bool, step: &mut DriverStep) {
+        // What the agent wrote before this step lands above the bubble.
+        self.flush_prose(step);
+        if opener {
+            let preceding = self.last_msg_uuid.replace(id.clone());
+            step.events.push(AgentEvent::Checkpoint {
+                user_message_id: id.clone(),
+                preceding_uuid: preceding,
+            });
+        }
+        step.events.push(AgentEvent::UserMessageUpdate {
+            id,
+            state: UserMessageState::Sent,
+        });
+    }
+
+    /// The taken message can no longer be put back: show it read.
+    fn release_taken(&mut self, step: &mut DriverStep) {
+        if let Some(t) = self.taken.take() {
+            self.mark_read(t.id, t.opener, step);
+        }
+    }
+
+    /// A Stop put a taken message back in the CLI's queue: it waits again
+    /// (it never showed as read) and runs as a turn of its own. The CLI puts
+    /// a message back at most once, so its next `started` reads it at once.
+    fn put_back(&mut self, id: &str) {
+        if self.taken.as_ref().is_some_and(|t| t.id == id) {
+            self.taken = None;
+        } else if self.awaiting_read.iter().any(|q| q == id)
+            || !self.minted_uuids.iter().any(|u| u == id)
+        {
+            return;
+        }
+        // (A message already shown read — the window outran the driver's
+        // clock — still waits in the CLI; tracking its next `started` keeps
+        // its turn ours instead of a self-opened one.)
+        self.requeue_armed.remove(id);
+        self.turn_messages.retain(|m| m != id);
+        self.awaiting_read.push_front(id.to_string());
+    }
+
+    /// Remember a client message the current turn took in, for a Stop that
+    /// names its turn: the opener always, then the latest folds.
+    fn note_turn_message(&mut self, id: &str) {
+        if self.turn_messages.iter().any(|m| m == id) {
+            return;
+        }
+        if self.turn_messages.len() >= STOP_FOR_MESSAGES_MAX {
+            self.turn_messages.remove(1);
+        }
+        self.turn_messages.push(id.to_string());
+    }
+
+    /// A Stop's receipt (`interrupt`, or a send-now that stopped the turn):
+    /// what it put back waits again; a taken message it left with the
+    /// stopped turn was read. `turn: "spared"` (2.1.310, for a Stop that
+    /// named a turn that had already ended) stopped nothing.
+    fn on_stop_receipt(&mut self, payload: &Value, step: &mut DriverStep) {
+        for id in payload["put_back"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .take(STOP_FOR_MESSAGES_MAX)
+        {
+            self.put_back(id);
+        }
+        if payload["turn"] == "spared" {
+            // Its own turn ended before it landed; the running one is the
+            // next message's, which the user did not stop.
+            self.interrupt_grace = None;
+            self.interrupt_requested = false;
+            return;
+        }
+        let stopped = payload.get("send_now").is_none() || payload["send_now"] == "stopped";
+        if stopped && payload["turn"] != "idle" {
+            self.release_taken(step);
+        }
+    }
+
+    /// A Stop is on its way: its receipt says whether the taken message
+    /// stays with the stopped turn or goes back to the queue.
+    fn stop_in_flight(&self) -> bool {
+        self.pending_controls
+            .values()
+            .any(|p| matches!(p, PendingControl::Interrupt | PendingControl::SendNow))
     }
 
     fn send_blocks(&mut self, blocks: Vec<ContentBlock>, after_turn: bool, step: &mut DriverStep) {
@@ -4341,9 +4606,20 @@ impl ClaudeMapper {
                 // The official clients' behavior: the CLI reads it at the
                 // agent's next step (`"next"`), or after the turn when asked
                 // (`"later"`), and reports when on `command_lifecycle`.
+                // A waiting message is the one a Stop can cross: armed, the
+                // CLI puts it back instead of losing it (REQUEUE_CAPABILITY).
+                // A send that opens a turn is not: its bubble reads as sent,
+                // so a Stop right after it means "stop this".
                 let priority = if after_turn { "later" } else { "next" };
-                step.outbound
-                    .push(queued_message_frame(&uuid, json!(content), priority));
+                step.outbound.push(queued_message_frame(
+                    &uuid,
+                    json!(content),
+                    priority,
+                    self.requeue_capable,
+                ));
+                if self.requeue_capable {
+                    self.requeue_armed.insert(uuid.clone());
+                }
                 self.awaiting_read.push_back(uuid.clone());
             } else {
                 // No per-message signal from this CLI (yet): HOLD it until the
@@ -4363,7 +4639,8 @@ impl ClaudeMapper {
             // quiet stop, nor let its armed watchdog abort it.
             self.interrupt_requested = false;
             self.interrupt_grace = None;
-            self.cli_turn = false;
+            self.cli_turn = None;
+            self.turn_messages = vec![uuid.clone()];
             self.reset_compaction_for_new_turn();
             self.turn_n += 1;
             self.turn_active = true;
@@ -4844,7 +5121,11 @@ impl ClaudeMapper {
             // live and replay alike; for one already `sent` the reducer no-ops —
             // the message is visibly in the transcript, its own answer.
             AgentCommand::CancelQueued { id } => {
-                if self.awaiting_read.contains(&id) {
+                // A taken message still reads "queued": only the CLI knows
+                // whether a racing Stop put it back, so it is asked too.
+                if self.awaiting_read.contains(&id)
+                    || self.taken.as_ref().is_some_and(|t| t.id == id)
+                {
                     let ctl = self.ctl_id();
                     self.pending_controls
                         .insert(ctl.clone(), PendingControl::CancelQueued(id.clone()));
@@ -4953,10 +5234,15 @@ impl ClaudeMapper {
         let id = self.ctl_id();
         self.pending_controls
             .insert(id.clone(), PendingControl::Interrupt);
-        step.outbound.push(control_request_frame(
-            &id,
-            json!({ "subtype": "interrupt" }),
-        ));
+        let mut request = json!({ "subtype": "interrupt" });
+        // A Stop names its own turn (2.1.310), so one that lands after that
+        // turn ended spares the next instead of cutting it. With nothing to
+        // name (a turn the CLI opened before any message of ours), a plain
+        // Stop stops whatever runs.
+        if self.requeue_capable && !self.turn_messages.is_empty() {
+            request["for_user_message_uuids"] = json!(self.turn_messages);
+        }
+        step.outbound.push(control_request_frame(&id, request));
     }
 
     /// The CLI's send-now: `interrupt {send_now, message_uuid}`. The abort it
@@ -5010,6 +5296,11 @@ impl ClaudeMapper {
                 option_id: "expired".into(),
             });
         }
+        // The turn had taken it in: it was read (an opener with its rewind
+        // boundary, as at any other release).
+        let mut taken = DriverStep::default();
+        self.release_taken(&mut taken);
+        events.extend(taken.events);
         // A hard kill mid-queue must not strand a waiting message as "queued"
         // forever on replay — drop what the agent never read: the CLI's queue
         // died with it, and a held message was never even written.
@@ -5077,6 +5368,13 @@ impl ClaudeMapper {
     /// result, so there is no coalesced surplus for a timer to reconcile.
     fn tick(&mut self) -> DriverStep {
         let mut step = self.interrupt_watchdog();
+        if self
+            .taken
+            .as_ref()
+            .is_some_and(|t| std::time::Instant::now() >= t.deadline)
+        {
+            self.release_taken(&mut step);
+        }
         self.native_ui.tick(&mut step);
         // A thinking block still streaming past the hold is reasoning —
         // narration arrives whole, signature included, in one burst.
@@ -5116,6 +5414,7 @@ impl ClaudeMapper {
             return step;
         }
         self.end_thinking_block(false, &mut step);
+        self.release_taken(&mut step);
         if let Some(flushed) = self.coalescer.flush() {
             step.events.push(flushed);
         }
@@ -6917,6 +7216,188 @@ pub(crate) mod tests {
             step.outbound[0]["request"],
             json!({ "subtype": "interrupt" })
         );
+    }
+
+    /// A mid-turn mapper on a 2.1.310 CLI (`interrupt_requeue_taken_v1`).
+    fn requeue_mapper_mid_turn() -> (ClaudeMapper, String) {
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "type": "system", "subtype": "init", "session_id": "native-1",
+            "capabilities": ["interrupt_receipt_v1", "msg_lifecycle_v1",
+                "interrupt_send_now_v1", "interrupt_requeue_taken_v1"],
+        }));
+        let (a, _) = send_text(&mut m, "A", false);
+        (m, a)
+    }
+
+    fn sent(step: &DriverStep, id: &str) -> bool {
+        step.events.iter().any(|e| {
+            matches!(e, AgentEvent::UserMessageUpdate { id: i, state: UserMessageState::Sent }
+                if i == id)
+        })
+    }
+
+    /// Live 2.1.310: B waited while A's `sleep 6` ran and was taken at the
+    /// step after it; a Stop sent the instant B started crossed that intake.
+    /// The CLI put B back (`queued` again, then the receipt's `put_back`),
+    /// stopped A's turn and ran B as a turn of its own. B never shows as read
+    /// with the stopped turn: it stays queued until it opens its own.
+    #[test]
+    fn a_stop_that_crosses_a_just_taken_message_puts_it_back() {
+        let (mut m, a) = requeue_mapper_mid_turn();
+        let (b, step) = send_text(&mut m, "B", false);
+        let frame = step.outbound.iter().find(|f| f["type"] == "user").unwrap();
+        assert_eq!(frame["priority"], "next");
+        assert_eq!(frame["requeue_if_interrupted_within_ms"], 2000);
+
+        assert!(
+            m.on_frame(&lifecycle(&b, "started")).events.is_empty(),
+            "not yet read"
+        );
+        let step = m.on_command(AgentCommand::Interrupt);
+        assert_eq!(
+            step.outbound[0]["request"],
+            json!({ "subtype": "interrupt", "for_user_message_uuids": [a, b] })
+        );
+        let ctl = step.outbound[0]["request_id"].clone();
+        let mut seen = Vec::new();
+        for frame in [
+            json!({"type": "system", "subtype": "status", "status": "requesting",
+                "user_message_uuids": [a, b]}),
+            lifecycle(&b, "queued"),
+            json!({"type": "control_response", "response": {"subtype": "success",
+                "request_id": ctl, "response": {"still_queued": [b], "put_back": [b],
+                "turn": "stopped"}}}),
+            json!({"type": "user", "uuid": "u-int", "parent_tool_use_id": null,
+                "message": {"role": "user", "content": [
+                    {"type": "text", "text": "[Request interrupted by user]"}]}}),
+            json!({"type": "result", "subtype": "error_during_execution", "is_error": true,
+                "user_message_uuids": [a], "terminal_reason": "aborted_streaming"}),
+            lifecycle(&a, "cancelled"),
+        ] {
+            seen.extend(m.on_frame(&frame).events);
+        }
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, AgentEvent::UserMessageUpdate { id, .. } if *id == b)),
+            "{seen:?}"
+        );
+        assert!(seen.iter().any(|e| matches!(
+            e,
+            AgentEvent::TurnAborted {
+                interrupted: true,
+                ..
+            }
+        )));
+        // Its own turn: read at once (the CLI puts a message back only once),
+        // as the rewind boundary that turn opens.
+        let step = m.on_frame(&lifecycle(&b, "started"));
+        assert!(sent(&step, &b));
+        assert!(step.events.iter().any(|e| matches!(e,
+            AgentEvent::Checkpoint { user_message_id, .. } if *user_message_id == b)));
+    }
+
+    /// A taken message reads as read the moment the model's reply begins (or
+    /// the window passes), before anything that reply says.
+    #[test]
+    fn a_taken_message_reads_as_read_once_it_can_no_longer_be_put_back() {
+        let (mut m, _a) = requeue_mapper_mid_turn();
+        let (b, _) = send_text(&mut m, "B", false);
+        m.on_frame(&lifecycle(&b, "started"));
+        let step = m.on_frame(&json!({"type": "stream_event",
+            "event": {"type": "message_start", "message": {"id": "msg-2"}}}));
+        assert!(sent(&step, &b));
+
+        let (c, _) = send_text(&mut m, "C", false);
+        m.on_frame(&lifecycle(&c, "started"));
+        assert!(m.tick().events.is_empty(), "inside the window");
+        m.taken.as_mut().unwrap().deadline = std::time::Instant::now();
+        assert!(sent(&m.tick(), &c));
+
+        // A Stop whose receipt left it with the stopped turn: read then.
+        let (d, _) = send_text(&mut m, "D", false);
+        m.on_frame(&lifecycle(&d, "started"));
+        let ctl = m.on_command(AgentCommand::Interrupt).outbound[0]["request_id"].clone();
+        let step = m.on_frame(&json!({"type": "control_response", "response": {
+            "subtype": "success", "request_id": ctl,
+            "response": {"still_queued": [], "turn": "stopped"}}}));
+        assert!(sent(&step, &d));
+    }
+
+    /// Live 2.1.310: a Stop naming a turn that already ended answered
+    /// `{still_queued: [], turn: "spared"}` and the next turn ran on. Nothing
+    /// was stopped, so the watchdog must not abort that turn.
+    #[test]
+    fn a_stop_for_a_turn_that_already_ended_stops_nothing() {
+        let (mut m, a) = requeue_mapper_mid_turn();
+        let step = m.on_command(AgentCommand::Interrupt);
+        assert_eq!(
+            step.outbound[0]["request"]["for_user_message_uuids"],
+            json!([a])
+        );
+        assert!(m.interrupt_grace.is_some());
+        let ctl = step.outbound[0]["request_id"].clone();
+        m.on_frame(
+            &json!({"type": "control_response", "response": {"subtype": "success",
+            "request_id": ctl, "response": {"still_queued": [], "turn": "spared"}}}),
+        );
+        assert!(m.interrupt_grace.is_none());
+        assert!(!m.interrupt_requested);
+    }
+
+    /// A turn the CLI opens by itself (a wakeup, a job) is, to the CLI, part
+    /// of the last client message's turn ("the latest one dequeued for a
+    /// client's message, with every turn started since"): a Stop there names
+    /// that message, which stops it, and still spares a next turn of ours if
+    /// it lands late.
+    #[test]
+    fn a_stop_in_a_self_opened_turn_names_the_last_client_turn() {
+        let (mut m, a) = requeue_mapper_mid_turn();
+        m.on_frame(&result_frame());
+        assert!(!m.turn_active);
+        m.on_frame(&lifecycle("cli-wake-1", "started"));
+        m.on_frame(&text_frame("msg-w", "claude-sonnet-5-5", "tick"));
+        assert!(m.turn_active);
+        let step = m.on_command(AgentCommand::Interrupt);
+        assert_eq!(
+            step.outbound[0]["request"]["for_user_message_uuids"],
+            json!([a])
+        );
+    }
+
+    /// An older CLI: no field on the frame, a plain Stop, read at `started`.
+    #[test]
+    fn a_cli_without_requeue_keeps_the_plain_frames() {
+        let mut m = native_mapper_mid_turn();
+        let (b, step) = send_text(&mut m, "B", false);
+        let frame = step.outbound.iter().find(|f| f["type"] == "user").unwrap();
+        assert!(frame.get("requeue_if_interrupted_within_ms").is_none());
+        assert!(sent(&m.on_frame(&lifecycle(&b, "started")), &b));
+        let step = m.on_command(AgentCommand::Interrupt);
+        assert_eq!(
+            step.outbound[0]["request"],
+            json!({ "subtype": "interrupt" })
+        );
+    }
+
+    /// The ✕ on a taken message asks the CLI: `cancelled: false` means the
+    /// turn has it, so it reads as read.
+    #[test]
+    fn cancelling_a_taken_message_asks_the_cli() {
+        let (mut m, _a) = requeue_mapper_mid_turn();
+        let (b, _) = send_text(&mut m, "B", false);
+        m.on_frame(&lifecycle(&b, "started"));
+        let step = m.on_command(AgentCommand::CancelQueued { id: b.clone() });
+        assert_eq!(
+            step.outbound[0]["request"]["subtype"],
+            "cancel_async_message"
+        );
+        assert!(step.events.is_empty(), "no tombstone while the CLI decides");
+        let ctl = step.outbound[0]["request_id"].clone();
+        let step = m.on_frame(&json!({"type": "control_response", "response": {
+            "subtype": "success", "request_id": ctl, "response": {"cancelled": false}}}));
+        assert!(sent(&step, &b));
     }
 
     /// The turn a send-now aborts takes its foreground agents with it, not a
@@ -10339,6 +10820,97 @@ pub(crate) mod tests {
         ));
     }
 
+    /// Live 2.1.310 (Pass 53): `set_model claude-haiku-4-5` (200k) on a
+    /// 368k-token Haiku 5.5 (1M) conversation. The ack comes with a replayed
+    /// `/model` stdout frame; the next message's turn compacts first, with the
+    /// previous model (`modelUsage` billed the summary to claude-haiku-5-5),
+    /// then answers on the new one. One turn, with the compaction in it.
+    #[test]
+    fn a_switch_to_a_smaller_window_compacts_inside_the_next_turn() {
+        let mut m = mapper();
+        m.on_frame(
+            &json!({"type": "system", "subtype": "init", "session_id": "native-1",
+            "model": "claude-haiku-5-5", "capabilities": ["msg_lifecycle_v1"]}),
+        );
+        let step = m.on_command(AgentCommand::SetModel {
+            model_id: "claude-haiku-4-5".into(),
+        });
+        let ctl = step.outbound[0]["request_id"].clone();
+        let mut events = Vec::new();
+        events.extend(m.on_frame(&json!({"type": "user", "message": {"role": "user",
+            "content": "<local-command-stdout>Set model to `claude-haiku-4-5`</local-command-stdout>"},
+            "parent_tool_use_id": null, "uuid": "e496eb9c", "isReplay": true})).events);
+        events.extend(
+            m.on_frame(&json!({"type": "control_response", "response": {
+            "subtype": "success", "request_id": ctl,
+            "response": {"model": "claude-haiku-4-5"}}}))
+                .events,
+        );
+        let (ours, step) = send_text(&mut m, "Reply with just: ok", false);
+        events.extend(step.events);
+        for frame in [
+            lifecycle(&ours, "queued"),
+            lifecycle(&ours, "started"),
+            json!({"type": "system", "subtype": "init", "session_id": "native-1",
+                "model": "claude-haiku-4-5", "capabilities": ["msg_lifecycle_v1"]}),
+            json!({"type": "system", "subtype": "status", "status": "requesting",
+                "user_message_uuids": [ours]}),
+            json!({"type": "system", "subtype": "status", "status": "compacting",
+                "compact_output_chars": 0}),
+            json!({"type": "system", "subtype": "status", "status": null,
+                "compact_result": "success"}),
+            json!({"type": "system", "subtype": "compact_boundary", "compact_metadata": {
+                "trigger": "auto", "pre_tokens": 368181, "post_tokens": 3537}}),
+            json!({"type": "user", "parent_tool_use_id": null, "isSynthetic": true,
+                "uuid": "u-summary", "message": {"role": "user", "content": [{"type": "text",
+                "text": "This session is being continued from a previous conversation that \
+                    ran out of context. The summary below covers the earlier portion of the \
+                    conversation.\n\nSummary:\n1. Primary Request and Intent: ..."}]}}),
+            text_frame("msg_011CgLDB", "claude-haiku-4-5-20251001", "ok"),
+            result_frame(),
+            lifecycle(&ours, "completed"),
+        ] {
+            events.extend(m.on_frame(&frame).events);
+        }
+        let kinds: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::TurnStarted { .. } => Some("turn"),
+                AgentEvent::ContextCompaction {
+                    phase: CompactionPhase::Started,
+                    ..
+                } => Some("compacting"),
+                AgentEvent::ContextCompaction {
+                    phase: CompactionPhase::Completed,
+                    ..
+                } => Some("compacted"),
+                AgentEvent::ModelSwitched { reason: None, .. } => Some("switched"),
+                AgentEvent::UserMessage { .. } => Some("user"),
+                AgentEvent::TurnCompleted { .. } => Some("done"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "switched",
+                "user",
+                "turn",
+                "compacting",
+                "compacted",
+                "done"
+            ],
+            "{events:?}"
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ContextCompaction {
+                pre_tokens: Some(368181),
+                ..
+            }
+        )));
+    }
+
     #[test]
     fn interrupted_compaction_does_not_suppress_the_next_lifecycle() {
         let mut m = mapper();
@@ -11967,7 +12539,7 @@ pub(crate) mod tests {
         let mut m = mapper();
         let (ours, _) = send_text(&mut m, "hi", false);
         assert!(m.on_frame(&lifecycle(&ours, "started")).events.is_empty());
-        assert!(!m.cli_turn, "our own send");
+        assert!(m.cli_turn.is_none(), "our own send");
         m.on_frame(&result_frame());
         m.on_frame(&lifecycle("cli-x", "started"));
         let step = m.on_frame(&text_frame("msg-x", "claude-sonnet-5-5", "woke"));
@@ -11976,6 +12548,51 @@ pub(crate) mod tests {
             .events
             .iter()
             .any(|e| matches!(e, AgentEvent::TurnCause { .. })));
+    }
+
+    /// Live 2.1.310 (`lifecycle_wakeup_source_v1`): the fire's own `started`
+    /// says what fired. A started frame with no source on such a CLI is not
+    /// a scheduler fire, even with the wakeup due (a monitor event): nothing
+    /// is spent and the turn gets no cause. The `loop_wakeup` frame then
+    /// names the wakeup it was set for.
+    #[test]
+    fn a_cli_that_names_its_fires_is_believed() {
+        let mut m = mapper();
+        m.on_frame(
+            &json!({"type": "system", "subtype": "init", "session_id": "native-1",
+            "capabilities": ["msg_lifecycle_v1", "lifecycle_wakeup_source_v1"]}),
+        );
+        send_text(&mut m, "/loop say tock", false);
+        m.on_frame(&tool_use_frame(
+            "tu-w",
+            "ScheduleWakeup",
+            json!({"delaySeconds": 60, "reason": "probe tick", "prompt": "Reply with just: tock"}),
+        ));
+        let at = crate::now_ms() + 10_000;
+        m.on_frame(&tool_result_frame(
+            "tu-w",
+            json!({"scheduledFor": at, "clampedDelaySeconds": 60, "wasClamped": false}),
+        ));
+        m.on_frame(&result_frame());
+
+        m.on_frame(&lifecycle("cli-monitor", "started"));
+        let step = m.on_frame(&text_frame("msg-m", "claude-sonnet-5-5", "a monitor line"));
+        assert!(!step.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::TurnCause { .. } | AgentEvent::Schedule { .. }
+        )));
+        assert!(!m.schedule.is_empty(), "the wakeup still waits");
+        m.on_frame(&result_frame());
+
+        let fire = json!({"type": "command_lifecycle", "command_uuid": "8aaad282",
+            "state": "started", "wakeup_source": "loop_wakeup", "scheduled_for": at,
+            "uuid": "5c863634", "session_id": "native-1"});
+        assert!(m.on_frame(&fire).events.is_empty());
+        let step = m.on_frame(&text_frame("msg-t", "claude-sonnet-5-5", "tock"));
+        assert!(step.events.iter().any(|e| matches!(e,
+            AgentEvent::TurnCause { kind, detail: Some(d), .. }
+            if kind == "wakeup" && d == "probe tick")));
+        assert!(m.schedule.is_empty(), "spent");
     }
 
     /// Live 2.1.300 `/goal`: the reply is a synthetic frame naming the local

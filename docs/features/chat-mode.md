@@ -92,14 +92,21 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   faded **pending stack at the scrollable transcript tail**, captioned "next step" or "after this
   turn", until the agent actually reads it (claude: the CLI's `command_lifecycle started`; codex:
   the steered message's `userMessage` item — not the RPC ack). Then it leaves the stack and enters
-  the transcript right there, solid — mid-turn if that is where it was read. Each waiting bubble
+  the transcript right there, solid — mid-turn if that is where it was read. A Codex steer read
+  just as its turn finishes (recorded, but no model step after it) is answered in an input-less
+  follow-up turn, so it never sits read and unanswered (Pass 54). Each waiting bubble
   has **Send now** (stops the current turn, unless Claude can take the message into it by moving what the turn waits on to the background; every waiting message is then read at once — claude
   keeps its queue through the interrupt, and Chimaera re-sends the steers Codex drops; Claude's
   background agents keep running, because Chimaera sends the CLI's own send-now rather than its
   Stop, which ends them for good) and **✕**
   (pulls it back — Claude `cancel_async_message`, an ACP or Codex next-turn queue item
   removed locally; a Codex steer can't be withdrawn and says so).
-  Stop never drops the queue. A genuinely undeliverable entry stays marked **"not delivered"**
+  Stop never drops the queue. On Claude Code 2.1.310+ that holds across the race too: a waiting
+  message the agent took in just as you pressed Stop stays in the stack and runs as a turn of its
+  own (the CLI puts it back); it shows as read only once Claude's reply to it begins. A Stop also
+  names the turn it was meant for, so one that lands after that turn ended leaves the next one
+  running (PROTOCOL.md Pass 53).
+  A genuinely undeliverable entry stays marked **"not delivered"**
   (text kept readable/copyable, never auto-dumped into a draft you may have started); ✕ dismisses
   it. This is driven by the single `pendingSends` reducer and journaled via `user_message`
   `id`/`queued`/`after_turn` + `user_message_update`, so replay rebuilds the same order and delivery
@@ -697,7 +704,9 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   `@name`, which is the same identity `TaskStop` accepts.
 - **Codex subagents (collab / multi-agent), same surface.** Codex 0.144.x delegation renders the
   identical way: each spawned agent is an "Agent: {name}" row (name = the model's own
-  `agentPath` name) whose progress line folds the agent's live activity in Claude's spelling
+  `agentPath` name; on the multi-agent v1 runtime — gpt-5.6-luna and any model without catalog
+  metadata — the nickname Codex gave the child, the row opening under the task's first line until
+  that nickname is read; PROTOCOL.md Pass 51) whose progress line folds the agent's live activity in Claude's spelling
   ("Thinking", a command, "Writing", or the newest reasoning-summary section title · N tools ·
   12.3k tokens), so the tray works unchanged. A subagent is a real thread multiplexed onto
   the same connection — the driver scopes every frame by `threadId`, hides the agent's transcript
@@ -977,7 +986,8 @@ intact rather than bypassing them.
 Settings → Chat → **Codex Steering Timing** controls new and resumed structured
 Codex processes. **Agent default** leaves the user's native configuration alone;
 **Next step** disables `features.instant_interrupt`; **Immediate (experimental)**
-enables it (Codex 0.159.0+). Immediate steering can interrupt a model response or
+enables it (Codex 0.159.0+). Codex 0.163.0 turned the flag on by default, so Agent default
+is immediate there unless the user's config turns it off (Pass 51). Immediate steering can interrupt a model response or
 code-mode call to read a steer, including one delivered by another agent. It does
 not promote messages queued for a later turn. Changing the setting does not
 restart a running chat. The daemon reads
