@@ -174,6 +174,21 @@ describe("ChatStore context compaction", () => {
     expect(compactionNotice(undefined, undefined)).toBe("context compacted");
   });
 
+  it("marks checkpoints from before the latest compaction", () => {
+    const store = fold([
+      { type: "user_message", text: "one", id: "u1" },
+      { type: "checkpoint", user_message_id: "u1", preceding_uuid: "a0" },
+      { type: "context_compaction", phase: "started" },
+      { type: "context_compaction", phase: "completed", pre_tokens: 45_244, trigger: "auto" },
+      { type: "user_message", text: "two", id: "u2" },
+      { type: "checkpoint", user_message_id: "u2", preceding_uuid: "a1" },
+    ]);
+    expect(store.lastCompactionSeq).toBe(4);
+    const seqs = store.blocks.flatMap((b) => (b.kind === "user" && b.checkpoint ? [b.checkpoint.seq] : []));
+    expect(seqs).toEqual([2, 6]);
+    expect(fold([{ type: "context_compaction", phase: "failed" }]).lastCompactionSeq).toBe(0);
+  });
+
   it("folds the auto-compact read-back latest-wins", () => {
     const store = fold([
       { type: "auto_compact", enabled: true },

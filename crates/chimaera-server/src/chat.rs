@@ -1279,6 +1279,48 @@ type ForkCut = (usize, DroppedTurns, Vec<(usize, String)>);
 /// truncation replaces each in-place with a Cancelled tombstone (same seq),
 /// preserving the completed previous turn without replaying a phantom queue.
 /// `None` = no anchor match.
+/// A completed compaction journaled after `seq`. Claude reloads only the
+/// conversation after its latest compaction boundary, so an anchor from
+/// before one is no longer in the chain it resumes: `--resume-session-at`
+/// with it exits at once ("No message found with message.uuid of: …",
+/// 2.1.310, PROTOCOL.md Pass 55). Codex reverts across one fine.
+fn compacted_after(entries: &[Arc<SeqEvent>], seq: u64) -> bool {
+    entries.iter().any(|entry| {
+        entry.seq > seq
+            && matches!(
+                entry.ev,
+                AgentEvent::ContextCompaction {
+                    phase: chimaera_agent::model::CompactionPhase::Completed,
+                    ..
+                }
+            )
+    })
+}
+
+/// Whether the conversation was compacted after the checkpoint whose
+/// preceding uuid is `resume_at` (a Claude rewind's anchor): the line scan
+/// [`find_fork_cut`] makes, so the refusal is decided before any stop.
+fn compacted_since_anchor(content: &str, resume_at: &str) -> bool {
+    let mut past_anchor = false;
+    for line in content.lines() {
+        let Ok(entry) = serde_json::from_str::<SeqEvent>(line) else {
+            continue;
+        };
+        match &entry.ev {
+            AgentEvent::Checkpoint {
+                preceding_uuid: Some(preceding),
+                ..
+            } if preceding == resume_at => past_anchor = true,
+            AgentEvent::ContextCompaction {
+                phase: chimaera_agent::model::CompactionPhase::Completed,
+                ..
+            } if past_anchor => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 fn find_fork_cut(content: &str, resume_at: &str) -> Option<ForkCut> {
     let lines: Vec<&str> = content.lines().collect();
     // The checkpoint's own echo, right before it (a fresh send) — matched by
@@ -2120,6 +2162,26 @@ pub(crate) async fn rewind_session(
             );
         }
     }
+    // Claude cannot resume at a message from before its latest compaction:
+    // refuse while the session is still alive (the respawn would exit at
+    // once, after the journal was already cut). A fork from there still
+    // works, from the transcript.
+    if record.kind == AgentKind::Claude {
+        let (scan_path, anchor) = (jpath.clone(), body.resume_at.clone());
+        let compacted = tokio::task::spawn_blocking(move || {
+            std::fs::read_to_string(&scan_path)
+                .map(|content| compacted_since_anchor(&content, &anchor))
+        })
+        .await;
+        if matches!(compacted, Ok(Ok(true))) {
+            return err(
+                StatusCode::CONFLICT,
+                "the conversation was compacted after this message, so Claude can no longer \
+                 rewind it there; fork from the message instead"
+                    .to_string(),
+            );
+        }
+    }
 
     let result = async {
         // Stop the driver (a dead-but-registered ProtocolError entry is dropped
@@ -2803,6 +2865,15 @@ fn native_fork_point(
     match kind {
         AgentKind::Claude => {
             if let Some(selected) = before_user_id {
+                let checkpoint_seq = entries.iter().find_map(|entry| match &entry.ev {
+                    AgentEvent::Checkpoint {
+                        user_message_id, ..
+                    } if user_message_id == selected && entry.seq > through_seq => Some(entry.seq),
+                    _ => None,
+                });
+                if checkpoint_seq.is_none_or(|seq| compacted_after(entries, seq)) {
+                    return false;
+                }
                 // Editing a user message branches immediately BEFORE it. The
                 // selected checkpoint authenticates the preceding native UUID
                 // even though that UUID can belong to an assistant message and
@@ -2840,6 +2911,9 @@ fn native_fork_point(
                         })
                 });
                 return checkpoint && clean_cut;
+            }
+            if compacted_after(entries, through_seq) {
+                return false;
             }
             let checkpoint = entries.iter().any(|entry| {
                 entry.seq > portable_floor
@@ -4665,6 +4739,87 @@ mod tests {
         for line in jsonl.lines() {
             let _: serde_json::Value = serde_json::from_str(line).unwrap();
         }
+    }
+
+    /// Claude reloads only what follows its latest compaction (2.1.310: a
+    /// `--resume-session-at` before the boundary exits at once). A rewind to
+    /// a checkpoint before a completed compaction is refused up front, and a
+    /// native fork from there falls back to the portable handoff; a
+    /// checkpoint after it, and a failed compaction, change nothing.
+    #[test]
+    fn claude_anchors_before_a_compaction_are_not_native() {
+        use chimaera_agent::model::CompactionPhase;
+        let user = |id: &str| AgentEvent::UserMessage {
+            text: "q".into(),
+            attachments: 0,
+            attachment_paths: Vec::new(),
+            id: Some(id.into()),
+            queued: false,
+            after_turn: false,
+            origin: None,
+        };
+        let checkpoint = |id: &str, preceding: &str| AgentEvent::Checkpoint {
+            user_message_id: id.into(),
+            preceding_uuid: Some(preceding.into()),
+        };
+        let compaction = |phase| AgentEvent::ContextCompaction {
+            phase,
+            pre_tokens: Some(45_244),
+            trigger: None,
+        };
+        let entries = vec![
+            seq_event(1, user("u1")),
+            seq_event(2, checkpoint("u1", "a0")),
+            seq_event(3, compaction(CompactionPhase::Started)),
+            seq_event(4, compaction(CompactionPhase::Failed)),
+            seq_event(5, user("u2")),
+            seq_event(6, checkpoint("u2", "a1")),
+            seq_event(7, compaction(CompactionPhase::Started)),
+            seq_event(8, compaction(CompactionPhase::Completed)),
+            seq_event(9, user("u3")),
+            seq_event(10, checkpoint("u3", "a2")),
+        ];
+        let journal: String = entries
+            .iter()
+            .map(|e| serde_json::to_string(e.as_ref()).unwrap() + "\n")
+            .collect();
+        assert!(compacted_since_anchor(&journal, "a0"));
+        assert!(compacted_since_anchor(&journal, "a1"));
+        assert!(!compacted_since_anchor(&journal, "a2"));
+        assert!(!compacted_since_anchor(&journal, "missing"));
+        // The failed attempt after u1 alone would not have cut it off.
+        assert!(!compacted_after(&entries[..5], 2));
+        assert!(compacted_after(&entries, 6));
+        assert!(!compacted_after(&entries, 8));
+        // Forks: the agent branch through a checkpoint, and an edit of u2.
+        assert!(!native_fork_point(
+            &entries,
+            6,
+            AgentKind::Claude,
+            "u2",
+            None
+        ));
+        assert!(native_fork_point(
+            &entries,
+            10,
+            AgentKind::Claude,
+            "u3",
+            None
+        ));
+        assert!(!native_fork_point(
+            &entries,
+            4,
+            AgentKind::Claude,
+            "a1",
+            Some("u2")
+        ));
+        assert!(native_fork_point(
+            &entries,
+            8,
+            AgentKind::Claude,
+            "a2",
+            Some("u3")
+        ));
     }
 
     #[test]
