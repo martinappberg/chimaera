@@ -2435,6 +2435,156 @@ async fn driver_codex_instant_steering_reads_during_a_response() {
     );
 }
 
+/// Every Codex spawn draws its Agent row, on both multi-agent runtimes
+/// (PROTOCOL.md Pass 51). The model's catalog metadata picks the runtime:
+/// gpt-5.6-luna is v1 (the spawn is a `collabAgentToolCall {tool:
+/// "spawnAgent"}`, no `subAgentActivity` marker), gpt-5.6-sol is v2 (the
+/// marker). Through the real driver each must open a cross-turn Agent row
+/// with its thread handle and model, close it on the child's answer with one
+/// finish line, and serve the child's conversation to the subagent view.
+#[tokio::test]
+#[ignore = "live: spawns real codex, needs auth, bills two small multi-agent turns"]
+async fn driver_codex_spawned_agents_draw_rows_on_both_runtimes() {
+    use chimaera_agent::codex::{CodexAdapter, COLLAB_WAIT_TITLE};
+    use chimaera_agent::model::{ToolKind, ToolStatus};
+    use std::sync::Arc;
+
+    for (model, runtime) in [("gpt-5.6-luna", "v1"), ("gpt-5.6-sol", "v2")] {
+        let dir = tmpdir();
+        let manager = Arc::new(ChatManager::new(
+            dir.path().join("chat"),
+            Box::new(|_, _| {}),
+            Box::new(|_, _| {}),
+        ));
+        let id = format!("s-codex-spawn-{runtime}");
+        let mut spec = SpawnSpec::new(
+            &id,
+            vec!["codex".into(), "app-server".into()],
+            dir.path().to_path_buf(),
+        );
+        spec.initial_model = Some(model.into());
+        manager.spawn(&CodexAdapter, spec).expect("spawn driver");
+        let mut rx = manager.attach(&id, 0).expect("attach").live;
+        manager
+            .command(
+                &id,
+                AgentCommand::Send {
+                    blocks: vec![ContentBlock::Text {
+                        text: "Use your spawn_agent tool now: delegate to exactly one sub-agent \
+                               (this is required). Its task: reply with exactly the number 42 \
+                               and nothing else. Wait for it, then reply with its answer."
+                            .into(),
+                    }],
+                },
+            )
+            .await
+            .expect("send");
+
+        let deadline = tokio::time::Instant::now() + TURN;
+        let mut row: Option<String> = None;
+        let mut handle: Option<String> = None;
+        let mut served: Option<String> = None;
+        let mut closed = false;
+        let mut finish: Option<(String, Option<String>)> = None;
+        let mut waited = false;
+        let mut parent_done = false;
+        while !(parent_done && closed && finish.is_some()) {
+            let entry = tokio::time::timeout_at(deadline, rx.recv())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "{runtime}: timed out (row={row:?} closed={closed} \
+                         finish={finish:?} parent_done={parent_done})"
+                    )
+                })
+                .expect("broadcast closed");
+            match &entry.ev {
+                AgentEvent::ToolCall {
+                    id: call,
+                    kind: ToolKind::Agent,
+                    cross_turn,
+                    title,
+                    ..
+                } => {
+                    assert!(*cross_turn, "{runtime}: agent rows are cross-turn");
+                    assert!(call.starts_with("agent:"), "{runtime}: row id {call}");
+                    eprintln!("{runtime}: agent row {call} {title:?}");
+                    row.get_or_insert_with(|| call.clone());
+                }
+                AgentEvent::ToolCall { title, .. } if title == COLLAB_WAIT_TITLE => waited = true,
+                AgentEvent::SubagentInfo {
+                    id: call,
+                    agent_id,
+                    model,
+                    ..
+                } if Some(call) == row.as_ref() => {
+                    if agent_id.is_some() {
+                        handle = agent_id.clone();
+                    }
+                    if model.is_some() {
+                        served = model.clone();
+                    }
+                }
+                AgentEvent::ToolCallUpdate {
+                    id: call,
+                    status: ToolStatus::Completed,
+                    ..
+                } if Some(call) == row.as_ref() => closed = true,
+                AgentEvent::ToolCallUpdate {
+                    id: call,
+                    status: ToolStatus::Failed,
+                    content,
+                } if Some(call) == row.as_ref() => {
+                    panic!("{runtime}: the agent row failed: {content:?}")
+                }
+                AgentEvent::SubagentFinished {
+                    id: call,
+                    label,
+                    status,
+                    result,
+                    ..
+                } if call.as_ref() == row.as_ref() => {
+                    assert_eq!(status, "completed", "{runtime}: finish status");
+                    assert!(finish.is_none(), "{runtime}: one finish line per stint");
+                    finish = Some((label.clone(), result.clone()));
+                }
+                AgentEvent::TurnCompleted { .. } => parent_done = true,
+                AgentEvent::TurnAborted { reason, .. } => {
+                    panic!("{runtime}: turn aborted: {reason}")
+                }
+                AgentEvent::Error { .. } | AgentEvent::Notice { .. } => {
+                    eprintln!("{runtime}: diagnostic {:?}", entry.ev);
+                }
+                _ => {}
+            }
+        }
+        let (label, result) = finish.expect("finish line");
+        eprintln!(
+            "{runtime}: row={row:?} label={label:?} result={result:?} model={served:?} \
+             waited={waited}"
+        );
+        assert!(
+            result.as_deref().is_some_and(|r| r.contains("42")),
+            "{runtime}: the finish line quotes the child's answer: {result:?}"
+        );
+        assert!(served.is_some(), "{runtime}: the row names its model");
+        let handle = handle.expect("the row carries the child's thread handle");
+        let transcript = manager
+            .subagent_transcript(&id, &handle, false)
+            .await
+            .expect("the subagent view reads the child");
+        assert!(
+            transcript.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::MessageChunk { text, .. } if text.contains("42")
+            )),
+            "{runtime}: the child's answer replays in its view: {:?}",
+            transcript.events
+        );
+        manager.kill(&id);
+    }
+}
+
 /// Ultracode at spawn (a resurrected session had it on): the handshake
 /// applies it and the read-back says so, WITHOUT counting as the user's pick
 /// (it must not become a remembered preference). Bills nothing — no turn.
