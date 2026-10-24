@@ -1212,6 +1212,14 @@ fn tool_result_with(id: &str, content: &str, result: Value) {
     );
 }
 
+/// `loop` mode's `system/init`: 2.1.310 names each scheduler fire on its
+/// `started` frame and says so with `lifecycle_wakeup_source_v1`.
+fn loop_init() -> Value {
+    json!({ "type": "system", "subtype": "init", "session_id": "fake-native-1",
+        "model": "fake-model", "permissionMode": "default", "slash_commands": ["compact"],
+        "capabilities": ["lifecycle_wakeup_source_v1"] })
+}
+
 fn loop_result() {
     emit(
         json!({ "type": "result", "subtype": "success", "is_error": false,
@@ -1219,7 +1227,10 @@ fn loop_result() {
     );
 }
 
-fn schedule_wakeup(msg: &str, id: &str, reason: &str, delay_ms: u64) {
+/// Arms the wakeup; returns its `scheduledFor`, which the fire's `started`
+/// frame repeats as `scheduled_for` (2.1.310).
+fn schedule_wakeup(msg: &str, id: &str, reason: &str, delay_ms: u64) -> u64 {
+    let at = now_ms() + delay_ms;
     tool_use(
         msg,
         id,
@@ -1233,10 +1244,11 @@ fn schedule_wakeup(msg: &str, id: &str, reason: &str, delay_ms: u64) {
         id,
         "Next wakeup scheduled.",
         json!({
-            "scheduledFor": now_ms() + delay_ms, "clampedDelaySeconds": delay_ms / 1000,
+            "scheduledFor": at, "clampedDelaySeconds": delay_ms / 1000,
             "wasClamped": false,
         }),
     );
+    at
 }
 
 /// One `loop`-mode turn, chosen by the message: a goal command, the stop
@@ -1249,10 +1261,7 @@ fn run_loop_turn(frame: &Value, stop: &std::sync::Arc<std::sync::atomic::AtomicB
         .or_else(|| frame["message"]["content"].as_str())
         .unwrap_or_default()
         .to_string();
-    emit(
-        json!({ "type": "system", "subtype": "init", "session_id": "fake-native-1",
-        "model": "fake-model", "permissionMode": "default", "slash_commands": ["compact"] }),
-    );
+    emit(loop_init());
     let synthetic = |text: String, args: &str| {
         emit(json!({ "type": "assistant", "parent_tool_use_id": null,
             "message": { "id": format!("syn-{}", now_ms()), "model": "<synthetic>",
@@ -1325,7 +1334,7 @@ fn run_loop_turn(frame: &Value, stop: &std::sync::Arc<std::sync::atomic::AtomicB
         "ml-1",
         "Staging is still rolling out (3 of 5 pods). I'll check again shortly.",
     );
-    schedule_wakeup(
+    let mut set_for = schedule_wakeup(
         "ml-1",
         "tu-w0",
         "Checking whether the staging deploy finished",
@@ -1355,11 +1364,11 @@ fn run_loop_turn(frame: &Value, stop: &std::sync::Arc<std::sync::atomic::AtomicB
                 return;
             }
             let uuid = format!("fake-wake-{tick}");
-            emit(json!({ "type": "command_lifecycle", "command_uuid": uuid, "state": "started" }));
             emit(
-                json!({ "type": "system", "subtype": "init", "session_id": "fake-native-1",
-                "model": "fake-model", "permissionMode": "default", "slash_commands": ["compact"] }),
+                json!({ "type": "command_lifecycle", "command_uuid": uuid, "state": "started",
+                "wakeup_source": "loop_wakeup", "scheduled_for": set_for }),
             );
+            emit(loop_init());
             let msg = format!("mt-{tick}");
             stream(json!({ "type": "message_start", "message": { "id": msg } }));
             tool_use(
@@ -1378,7 +1387,7 @@ fn run_loop_turn(frame: &Value, stop: &std::sync::Arc<std::sync::atomic::AtomicB
                     &msg,
                     &format!("Tick {tick}: 4 of 5 pods updated. Checking again shortly."),
                 );
-                schedule_wakeup(
+                set_for = schedule_wakeup(
                     &msg,
                     &format!("tu-w{tick}"),
                     "Checking whether the staging deploy finished",
