@@ -943,7 +943,8 @@ intact rather than bypassing them.
 Settings → Chat → **Codex Steering Timing** controls new and resumed structured
 Codex processes. **Agent default** leaves the user's native configuration alone;
 **Next step** disables `features.instant_interrupt`; **Immediate (experimental)**
-enables it (Codex 0.159.0+). Immediate steering can interrupt a model response or
+enables it (Codex 0.159.0+). Codex 0.163.0 turned the flag on by default, so Agent default
+is immediate there unless the user's config turns it off (Pass 51). Immediate steering can interrupt a model response or
 code-mode call to read a steer, including one delivered by another agent. It does
 not promote messages queued for a later turn. Changing the setting does not
 restart a running chat. The daemon reads

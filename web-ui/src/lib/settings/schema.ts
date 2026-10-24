@@ -821,7 +821,7 @@ const DEFS = {
   "chat.codexSteering": {
     title: "Codex Steering Timing",
     category: "Chat",
-    description: "When Codex reads messages steered into an active turn, including messages from another agent. Agent default uses your Codex configuration (normally the next step). Immediate lets Codex interrupt its current model response or code-mode call. Messages queued for the next turn still wait.",
+    description: "When Codex reads messages steered into an active turn, including messages from another agent. Agent default uses your Codex configuration: since Codex 0.163.0 that is immediate, before it the next step. Immediate lets Codex interrupt its current model response or code-mode call. Messages queued for the next turn still wait.",
     type: "enum",
     default: "agent",
     options: [
