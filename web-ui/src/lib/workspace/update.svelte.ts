@@ -20,7 +20,12 @@
  */
 
 import { api, type JobContext } from "../net/api";
-import { appUpdateStatus, isNativeShell, type AppUpdateStatus } from "../net/native";
+import {
+  appUpdateStatus,
+  clusterContinueJob,
+  isNativeShell,
+  type AppUpdateStatus,
+} from "../net/native";
 
 /** The daemon's release knowledge (GET /api/v1/update, the `update` frame). */
 export interface UpdateStatus {
@@ -87,6 +92,9 @@ export const updateState = $state({
   /** The ssh scope this window reaches its daemon through (null = local);
    *  set once by App, read by the Settings panel's update actions. */
   scope: null as string | null,
+  /** Set once by App in a cluster job window, whose daemon only a new job
+   *  can update (see `continueInNewJob`). */
+  job: null as JobContext | null,
   /** Bumped on snooze/skip so the derived offer re-evaluates. */
   dismissedAt: 0,
   /**
@@ -331,6 +339,20 @@ function currentAnswer(): UpdateAnswer {
     return { kind: "failed", error: daemon.error ?? "the check did not finish" };
   }
   return { kind: "current", version: daemon.current };
+}
+
+/**
+ * Update a cluster job window's daemon: continue its workspace in a new job,
+ * which deploys this app's build (a running job keeps the binary it started
+ * with, and its tunnel key is no ssh host a reconnect could reach). Throws
+ * the scheduler's own words on a refusal.
+ */
+export async function continueInNewJob(alias: string, job: JobContext): Promise<void> {
+  const result = await clusterContinueJob(
+    alias,
+    job.cws !== null ? { workspaceId: job.cws } : { jobId: job.jobId },
+  );
+  if (result.kind === "refused") throw new Error(result.message);
 }
 
 /** The toast's content right now: an offer, an explicit check's answer, or null. */

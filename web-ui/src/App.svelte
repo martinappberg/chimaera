@@ -1128,6 +1128,7 @@
   // key is no host a reconnect could reach.
   const updateNotice = $derived(currentNotice(isRemoteWindow ? hostAlias : null, jobCtx));
   updateState.scope = scopeAlias;
+  updateState.job = jobCtx;
 
   // The 5s sessions + links poll, only while /ws/events is down.
   conn.pollWhileEventsDown({

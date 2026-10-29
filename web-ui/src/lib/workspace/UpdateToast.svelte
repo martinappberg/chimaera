@@ -21,12 +21,13 @@
   import type { UpdateNotice } from "./update.svelte";
   import {
     checkForUpdates,
+    continueInNewJob,
     dismissAnswer,
     snoozeUpdate,
     skipUpdateVersion,
   } from "./update.svelte";
   import { isRemoteHost } from "../net/api";
-  import { beginUpdate, clusterContinueJob, connectHost, updateLocalDaemon } from "../net/native";
+  import { beginUpdate, connectHost, updateLocalDaemon } from "../net/native";
   import { openInSystemBrowser } from "../shared/urlOpen";
 
   let { notice }: { notice: UpdateNotice } = $props();
@@ -141,16 +142,10 @@
         case "daemon-remote":
           await connectHost(notice.alias, true);
           break;
-        case "daemon-job": {
-          const { job } = notice;
-          const result = await clusterContinueJob(
-            notice.alias,
-            job.cws !== null ? { workspaceId: job.cws } : { jobId: job.jobId },
-          );
-          if (result.kind === "refused") error = result.message;
-          else queued = true;
+        case "daemon-job":
+          await continueInNewJob(notice.alias, notice.job);
+          queued = true;
           break;
-        }
         case "failed":
           await checkForUpdates(true);
           break;
@@ -192,7 +187,13 @@
   <div class="actions">
     {#if action !== null}
       <button class="primary" disabled={busy} onclick={() => void run()}>
-        {busy ? (notice.kind === "failed" ? "checking…" : "updating…") : action}
+        {busy
+          ? notice.kind === "failed"
+            ? "checking…"
+            : notice.kind === "daemon-job"
+              ? "queueing…"
+              : "updating…"
+          : action}
       </button>
     {/if}
     {#if releaseUrl !== null}
