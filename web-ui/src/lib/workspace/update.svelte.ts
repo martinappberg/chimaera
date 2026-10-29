@@ -19,7 +19,7 @@
  * origin, so dismissing once quiets every window there.
  */
 
-import { api } from "../net/api";
+import { api, type JobContext } from "../net/api";
 import { appUpdateStatus, isNativeShell, type AppUpdateStatus } from "../net/native";
 
 /** The daemon's release knowledge (GET /api/v1/update, the `update` frame). */
@@ -48,6 +48,11 @@ export type UpdateOffer =
   | { kind: "daemon-local" }
   /** Native, remote window: the host's daemon is older than the app build. */
   | { kind: "daemon-remote"; alias: string }
+  /** Native, cluster job window: the job's daemon is older than the app
+   *  build. Its tunnel key is no ssh host, so a reconnect can't replace it;
+   *  a job runs the binary it started with, so a new job (which deploys this
+   *  build) takes the workspace over. `alias` is the cluster's ssh alias. */
+  | { kind: "daemon-job"; alias: string; job: JobContext }
   /** Browser: a newer release exists; applying happens elsewhere. */
   | { kind: "release"; version: string; url: string | null };
 
@@ -257,10 +262,15 @@ export function skipUpdateVersion(version: string): void {
 
 /**
  * The one offer worth making right now, or null. `hostAlias` is the ssh
- * alias this window reaches its daemon through (null = the local daemon).
- * `asked` bypasses snooze/skip: an explicit check shows what it found.
+ * alias this window reaches its daemon through (null = the local daemon);
+ * `job` is set in a cluster job window. `asked` bypasses snooze/skip: an
+ * explicit check shows what it found.
  */
-export function currentOffer(hostAlias: string | null, asked = false): UpdateOffer | null {
+export function currentOffer(
+  hostAlias: string | null,
+  asked = false,
+  job: JobContext | null = null,
+): UpdateOffer | null {
   // Touch the dismissal marker so runes re-derive after snooze/skip.
   void updateState.dismissedAt;
   if (!asked && Date.now() < snoozedUntil()) return null;
@@ -277,8 +287,9 @@ export function currentOffer(hostAlias: string | null, asked = false): UpdateOff
     };
   }
   if (native && updateState.buildSkew) {
-    return hostAlias === null
-      ? { kind: "daemon-local" }
+    if (hostAlias === null) return { kind: "daemon-local" };
+    return job !== null
+      ? { kind: "daemon-job", alias: hostAlias, job }
       : { kind: "daemon-remote", alias: hostAlias };
   }
   if (!native && updateState.daemon?.available && updateState.daemon.latest !== null) {
@@ -323,10 +334,13 @@ function currentAnswer(): UpdateAnswer {
 }
 
 /** The toast's content right now: an offer, an explicit check's answer, or null. */
-export function currentNotice(hostAlias: string | null): UpdateNotice | null {
+export function currentNotice(
+  hostAlias: string | null,
+  job: JobContext | null = null,
+): UpdateNotice | null {
   const asked = updateState.asked;
   if (asked === "checking") return { kind: "checking" };
-  const offer = currentOffer(hostAlias, asked === "answered");
+  const offer = currentOffer(hostAlias, asked === "answered", job);
   if (offer !== null) return offer;
   return asked === "answered" ? currentAnswer() : null;
 }

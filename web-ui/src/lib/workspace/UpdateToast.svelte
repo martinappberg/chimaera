@@ -2,7 +2,8 @@
   The update toast: one small, dismissible card, bottom-right, shown when
   `currentNotice` has something worth saying. One primary action per offer
   kind — the full app+daemon chain (native), a daemon-only restart (skew),
-  or a pointer at the release (browser windows, which cannot apply updates
+  a new job for a cluster job window (its daemon is the job's), or a
+  pointer at the release (browser windows, which cannot apply updates
   themselves). The copy states consequences plainly: layouts and sessions
   come back (ledger + handoff + window registry), running terminal programs
   restart. "later" snoozes until tomorrow; "skip" mutes that version.
@@ -25,7 +26,7 @@
     skipUpdateVersion,
   } from "./update.svelte";
   import { isRemoteHost } from "../net/api";
-  import { beginUpdate, connectHost, updateLocalDaemon } from "../net/native";
+  import { beginUpdate, clusterContinueJob, connectHost, updateLocalDaemon } from "../net/native";
   import { openInSystemBrowser } from "../shared/urlOpen";
 
   let { notice }: { notice: UpdateNotice } = $props();
@@ -36,6 +37,9 @@
   let busy = $state(false);
   let error = $state<string | null>(null);
   let hovered = $state(false);
+  /** A job window's new job is in the queue: nothing left to click — the
+   *  window moves over when it starts. */
+  let queued = $state(false);
 
   const isAnswer = $derived(
     notice.kind === "checking" ||
@@ -59,6 +63,8 @@
         return "daemon is older than this app";
       case "daemon-remote":
         return `daemon on ${notice.alias} is outdated`;
+      case "daemon-job":
+        return `daemon in job ${notice.job.jobId} is outdated`;
       case "checking":
         return "Checking for updates…";
       case "current":
@@ -78,6 +84,10 @@
         return "Restart the daemon into this app's build. Layouts and sessions come back; running terminal programs restart.";
       case "daemon-remote":
         return "Reconnect and update it. Layouts and sessions there come back; running terminal programs restart.";
+      case "daemon-job":
+        return queued
+          ? "The new job is queued. This window moves to it when it starts."
+          : "Continue in a new job, which runs this app's build. Chats come back there; running terminal programs restart.";
       case "release":
         return "Update from the chimaera app, or rerun chimaera connect from your machine.";
       case "checking":
@@ -102,6 +112,8 @@
         return "update daemon";
       case "daemon-remote":
         return `update ${notice.alias}`;
+      case "daemon-job":
+        return queued ? null : "continue in a new job";
       case "failed":
         return "try again";
       default:
@@ -129,6 +141,16 @@
         case "daemon-remote":
           await connectHost(notice.alias, true);
           break;
+        case "daemon-job": {
+          const { job } = notice;
+          const result = await clusterContinueJob(
+            notice.alias,
+            job.cws !== null ? { workspaceId: job.cws } : { jobId: job.jobId },
+          );
+          if (result.kind === "refused") error = result.message;
+          else queued = true;
+          break;
+        }
         case "failed":
           await checkForUpdates(true);
           break;
@@ -262,9 +284,12 @@
   }
 
   .title {
+    min-width: 0;
     font-size: var(--text-sm);
     font-weight: 600;
     color: var(--fg);
+    /* A host alias can be one unbroken user@host token. */
+    overflow-wrap: anywhere;
   }
 
   .body {
@@ -289,6 +314,8 @@
   }
 
   .primary {
+    min-width: 0;
+    overflow-wrap: anywhere;
     padding: 4px 12px;
     border-radius: 6px;
     border: 1px solid var(--accent);
