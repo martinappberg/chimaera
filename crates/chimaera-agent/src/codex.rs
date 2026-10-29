@@ -5145,20 +5145,17 @@ impl CodexMapper {
         // a model choice or a sibling steer holds the user's own input. Held
         // behind those gates it stayed "next step" on an idle chat (and out
         // of the reader's inbox) until the user's next send.
-        let missed: Vec<u64> = self
-            .deferred_steer_redrives
-            .iter()
-            .filter(|(_, send)| self.agent_steers.contains(&send.client_msg_id))
-            .map(|(order, _)| *order)
-            .collect();
-        for order in missed {
-            if let Some(send) = self.deferred_steer_redrives.remove(&order) {
-                self.agent_steers.remove(&send.client_msg_id);
-                step.events.push(AgentEvent::UserMessageUpdate {
-                    id: send.client_msg_id,
-                    state: UserMessageState::Dropped,
-                });
-            }
+        let (missed, kept): (BTreeMap<u64, QueuedSend>, BTreeMap<u64, QueuedSend>) =
+            std::mem::take(&mut self.deferred_steer_redrives)
+                .into_iter()
+                .partition(|(_, send)| self.agent_steers.contains(&send.client_msg_id));
+        self.deferred_steer_redrives = kept;
+        for send in missed.into_values() {
+            self.agent_steers.remove(&send.client_msg_id);
+            step.events.push(AgentEvent::UserMessageUpdate {
+                id: send.client_msg_id,
+                state: UserMessageState::Dropped,
+            });
         }
         if self.turn_active
             || self.turn_pending
@@ -5921,6 +5918,10 @@ impl CodexMapper {
     /// (`opening_turn_owned = false`); an interrupted end without that echo
     /// asks for a resend.
     fn adopt_running_turn(&mut self, live: String, step: &mut DriverStep) {
+        // A refusal can name the turn whose `turn/started` already landed
+        // (the server opened one in our start window): its TurnStarted is
+        // out, and a second would only reset the activity line.
+        let announced = self.turn_active && self.turn_id == live;
         self.turn_id = live;
         self.turn_active = true;
         self.turn_pending = false;
@@ -5930,9 +5931,11 @@ impl CodexMapper {
         // not mark a boundary onto its first text.
         self.last_msg_item = None;
         self.last_thought_item = None;
-        step.events.push(AgentEvent::TurnStarted {
-            turn_id: self.turn_id.clone(),
-        });
+        if !announced {
+            step.events.push(AgentEvent::TurnStarted {
+                turn_id: self.turn_id.clone(),
+            });
+        }
         self.flush_requested_steers(step);
     }
 
