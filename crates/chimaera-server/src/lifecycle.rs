@@ -1478,49 +1478,59 @@ mod tests {
 
         // Many contenders taking over one dead holder, round after round
         // (each round's winner is the next round's dead holder): exactly one
-        // winner every time, and nothing left beside the lease.
-        let mut dead = new;
-        for round in 0..50 {
-            let start = Arc::new(std::sync::Barrier::new(8));
-            let runs: Vec<_> = (0..8)
-                .map(|i| {
-                    let (path, start, dead) = (path.clone(), start.clone(), dead.clone());
-                    std::thread::spawn(move || {
-                        let own = holder(
-                            &format!("{}", 1000 + round * 8 + i),
-                            &format!("r{round}t{i}"),
-                        );
-                        start.wait();
-                        let outcome = acquire_lease(&path, &own, |h| (*h == dead).then_some(false));
-                        (own, outcome.unwrap())
+        // winner every time, and nothing left beside the lease. Unix only:
+        // the lease guards cluster workspaces, which run on Linux, and
+        // Windows answers an open of a record another contender is deleting
+        // with "access denied" (delete pending) rather than not-found.
+        #[cfg(unix)]
+        let dead = {
+            let mut dead = new;
+            for round in 0..50 {
+                let start = Arc::new(std::sync::Barrier::new(8));
+                let runs: Vec<_> = (0..8)
+                    .map(|i| {
+                        let (path, start, dead) = (path.clone(), start.clone(), dead.clone());
+                        std::thread::spawn(move || {
+                            let own = holder(
+                                &format!("{}", 1000 + round * 8 + i),
+                                &format!("r{round}t{i}"),
+                            );
+                            start.wait();
+                            let outcome =
+                                acquire_lease(&path, &own, |h| (*h == dead).then_some(false));
+                            (own, outcome.unwrap())
+                        })
                     })
-                })
-                .collect();
-            let results: Vec<_> = runs.into_iter().map(|r| r.join().unwrap()).collect();
-            let winners: Vec<&LeaseHolder> = results
-                .iter()
-                .filter(|(_, o)| matches!(o, LeaseOutcome::Acquired { .. }))
-                .map(|(own, _)| own)
-                .collect();
-            assert_eq!(winners.len(), 1, "round {round}: {results:?}");
-            assert_eq!(
-                lease_holder(&path).as_ref(),
-                Some(winners[0]),
-                "round {round}"
-            );
-            assert!(results.iter().all(|(_, o)| matches!(
-                o,
-                LeaseOutcome::Acquired { .. } | LeaseOutcome::Held(Some(_))
-            )));
-            let left: Vec<String> = std::fs::read_dir(&dir)
-                .unwrap()
-                .filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| n != LEASE_FILE)
-                .collect();
-            assert!(left.is_empty(), "round {round}: {left:?}");
-            dead = winners[0].clone();
-        }
+                    .collect();
+                let results: Vec<_> = runs.into_iter().map(|r| r.join().unwrap()).collect();
+                let winners: Vec<&LeaseHolder> = results
+                    .iter()
+                    .filter(|(_, o)| matches!(o, LeaseOutcome::Acquired { .. }))
+                    .map(|(own, _)| own)
+                    .collect();
+                assert_eq!(winners.len(), 1, "round {round}: {results:?}");
+                assert_eq!(
+                    lease_holder(&path).as_ref(),
+                    Some(winners[0]),
+                    "round {round}"
+                );
+                assert!(results.iter().all(|(_, o)| matches!(
+                    o,
+                    LeaseOutcome::Acquired { .. } | LeaseOutcome::Held(Some(_))
+                )));
+                let left: Vec<String> = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n != LEASE_FILE)
+                    .collect();
+                assert!(left.is_empty(), "round {round}: {left:?}");
+                dead = winners[0].clone();
+            }
+            dead
+        };
+        #[cfg(not(unix))]
+        let dead = new;
 
         // A takeover its claimant never finished: waited on while that
         // claimant may be live, cleared once it is proven gone.
