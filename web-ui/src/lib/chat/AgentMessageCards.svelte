@@ -111,11 +111,11 @@
   {/if}
   {#if state !== null}
     <div class="delivery" class:dropped={state === "dropped"}>
-      <span>{state === "dropped" ? "not delivered — it's in their inbox" : "next step"}</span>
+      <span>{state === "dropped" ? "not delivered — still in this agent's inbox" : "next step"}</span>
       {#if state === "dropped" && onDismiss !== undefined}
         <button
           class="dismiss"
-          title="dismiss (the message stays in the agent's inbox)"
+          title="dismiss (the message stays in this agent's inbox)"
           aria-label="dismiss undelivered message"
           onclick={onDismiss}>✕</button
         >

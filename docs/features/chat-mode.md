@@ -106,6 +106,9 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   own (the CLI puts it back); it shows as read only once Claude's reply to it begins. A Stop also
   names the turn it was meant for, so one that lands after that turn ended leaves the next one
   running (PROTOCOL.md Pass 53).
+  On Codex, a Stop the app-server is slow to honor still ends the turn on screen (a watchdog),
+  and if that turn was in fact still running, the next send joins it: the chat shows it running
+  again and later sends steer into it instead of waiting as "next step" (PROTOCOL.md Pass 56).
   A genuinely undeliverable entry stays marked **"not delivered"**
   (text kept readable/copyable, never auto-dumped into a draft you may have started); ✕ dismisses
   it. This is driven by the single `pendingSends` reducer and journaled via `user_message`

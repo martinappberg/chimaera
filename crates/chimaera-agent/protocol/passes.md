@@ -1715,3 +1715,40 @@ Issue #347 follow-up: let the user set at what percentage each CLI compacts, usi
 - Live, new: `claude_auto_compact_threshold_inputs_are_reported` (raw control channel, free: the settings `env` reads back, the source is enforced, the reported threshold is unlowered).
 - Live on an isolated daemon (claude 2.1.310 haiku with `CLAUDE_CODE_AUTO_COMPACT_WINDOW=100000` from the host prelude, so 50% is 40,000 tokens; codex 0.164.0 luna through a test-only wrapper adding `-c model_context_window=40000`, so 50% is 19,000): the settings file carried `"50"`; the meter reported `auto_compact_at: 40000`; turn 3 compacted (`trigger:"auto"`, 48,310 tokens summarized) and the meter dropped to 37,149; the native id stayed. Rewinds to checkpoints before the compaction answered 409 with the chat still running; a fork from there started as a portable branch; a rewind after it forked natively and the branch's new id was followed. After `agents.autoCompactAt` moved to 70 and the daemon restarted, the resurrected chat resumed the rewound branch's id, its file said `"70"` and the meter `56000`; a reopen from Recents the same; a terminal-view switch rewrote the reused file to the then-current `"50"`; Agent default removed the `env` and the meter's threshold. Codex: the meter reported 19,000 of 38,000, a turn ending at 54% compacted in-turn (`trigger:"auto"`), a rewind across that compaction kept the thread id with one note in history, the resumed thread compacted again at 54%, and its terminal view ran `codex resume <id> … -c model_post_turn_compact_threshold_percent=50`. Screenshots of the Settings rows and the popover in light and dark.
 - Full `just chat-smoke`, 2026-10-23, claude 2.1.310 and codex-cli 0.164.0 first on `PATH` (`~/.chimaera/shims` removed, `CLAUDE*` scrubbed): 38 passed, 0 failed, 592 s, the new `claude_auto_compact_threshold_inputs_are_reported` included. `~/.claude/settings.json` and `~/.codex/config.toml` hashes unchanged across the run. `TESTED_CLAUDE_VERSION` / `TESTED_CODEX_VERSION` stay where they are: a drift pass moves the pins.
+
+## Pass 56 — 2026-10-29: a turn/start that meets a running turn (hermetic app-server probe, codex 0.158.0)
+
+Reported: a Codex chat stopped during a flaky network stretch (auto review timed out, "Reconnecting… 5/5", the WebSocket-to-HTTPS fallback). The next message rendered delivered and got no reply; the one after it sat as a dashed "next step" while the chat looked idle, forever. In another chat a waking agent message did the same, and later turned red "not delivered — it's in their inbox" on the reader's own chat.
+
+**Method.** The user's codex-cli 0.158.0 `app-server` on an isolated `CODEX_HOME` against a scripted local Responses server (a request whose last user text contains a marker holds its stream open, another delays its answer), driven by a JSON-RPC client. Not billed. 0.164.0, the pin, was not on this machine.
+
+### Findings
+
+- **`turn/start` during a running turn joins it.** Sent 3 s into a turn whose model request never answers, `turn/start {input, clientUserMessageId}` was answered at once with `{turn: {id: <the running turn>, status: "inProgress", items: []}}`, and no `turn/started` followed. Sent 1.5 s into a turn whose request answers after 4 s, the same; the running turn then echoed the joined input (`userMessage`, our `clientId`, the running `turnId`) after its first answer, answered it in a second model request inside the same turn, and completed once. So a joined input is read like a steer.
+- **A fresh turn's answer precedes its start.** The `turn/start` answer (with the new turn's id) arrived 1–20 ms before `turn/started`, on every fresh turn in the probes.
+- **An interrupt of a stalled request ends the turn at once.** `turn/interrupt` 3 s into a stalled request: `{}`, `thread/status/changed {idle}` and `turn/completed {status: "interrupted"}` within 10 ms; a `turn/start` sent right after the interrupt opened a fresh turn, and the model request carried the `<turn_aborted>` marker before the new input. The slow Stop in the report (codex retrying a dropped connection) could not be reproduced against a local server.
+
+### The mechanism
+
+The interrupt watchdog closes a turn when Codex has not answered a Stop within 1.5 s, while Codex's turn can live on. The driver, idle, opened the next send with `turn/start`; Codex joined it into the old turn, and the driver waited in `turn_pending` for a `turn/started` that never comes. Nothing cleared that state but the old turn's own end: the chat showed idle (no `TurnStarted`), every later send was held as a start-window send ("next step"), the idle flush was gated off by `turn_pending`, and the daemon, seeing an idle chat, woke it with agent messages that queued the same way.
+
+Separately, an agent message (`SendIfRunning`) that missed its turn was settled `Dropped` only inside `start_next_queued`, after its gates: a pending or refused model choice, or an unanswered sibling steer, kept it "next step" on an idle chat (and out of the reader's inbox) until the user's next send.
+
+### ADOPTED
+
+- A `turn/start` answer that names the turn the driver last saw start adopts it (`adopt_running_turn`): `TurnStarted` for it, `turn_pending` cleared, start-window Steer clicks flushed, and the opening input confirmed only by its exact echo (`opening_turn_owned = false`). The TurnStart-refusal adoption path (`expected active turn id`) now emits `TurnStarted` the same way. An answer naming any other turn arms `start_ack`; if its `turn/started` has not come within `START_ACK_GRACE_TICKS` (3 s), that turn is adopted. A `turn/started` for a turn already adopted is ignored.
+- A joined opening input echoed as its completed turn ends, with no model response after it, is owed an input-less turn like a steer (Pass 54).
+- `start_next_queued` settles missed agent messages `Dropped` before its gates.
+- The dropped agent-message card reads "not delivered — still in this agent's inbox" (it was "it's in their inbox", wrong on the reader's own chat).
+- Hermetic tests: `a_start_joined_into_the_turn_the_watchdog_closed_adopts_that_turn`, `a_joined_opening_echo_confirms_it_and_an_unanswered_one_is_owed`, `an_accepted_start_that_never_starts_is_adopted_after_the_grace`, `a_start_answered_before_its_turn_started_opens_one_turn`, `an_agent_message_that_missed_its_turn_drops_whatever_holds_the_queue`.
+
+### Not changed
+
+- A collab child thread keeps its row after the parent turn ends, watchdog or not: children are process-scoped and finish on their own (Pass 16), so "N subagents working" after a Stop is not by itself wrong.
+- An agent message delivered as a wake (`Send`, the "chimaera delivered this while you were idle" caption) is settled read when the driver takes it; if the driver later drops it (the interrupt watchdog or teardown), the card's "still in this agent's inbox" is not true for it. Rare after this pass, since a wake now finds the chat running whenever the driver is.
+- A `turn/steer` that Codex never answers still holds the next-run FIFO (`steer_in_flight`); Codex answered every steer at once in all probes.
+
+### Gate (Pass 56)
+
+- `cargo test -p chimaera-agent`: lib 454, manager 41, wire contract 19 passed. `cargo clippy -p chimaera-agent --all-targets -- -D warnings` clean. Web UI `check` and `test` (2914) passed.
+- The Codex part of `just chat-smoke` has NOT been run for this change yet.
