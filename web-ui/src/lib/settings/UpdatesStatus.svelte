@@ -28,7 +28,7 @@
   import {
     applyAppStatus,
     checkForUpdates,
-    continueInNewJob,
+    updateInJob,
     updateState,
   } from "../workspace/update.svelte";
   import { agentUpdateStatus } from "./agentStatus";
@@ -182,7 +182,10 @@
             ? { label: "restart daemon", run: updateLocalDaemon }
             : job !== null
               ? // A job window's scope is its tunnel key, no ssh host.
-                { label: "continue in a new job", run: () => continueInNewJob(where, job) }
+                {
+                  label: job.cws !== null ? "update in this job" : "continue in a new job",
+                  run: () => updateInJob(where, scope, job).then(() => {}),
+                }
               : { label: `update ${where}`, run: () => connectHost(scope, true) },
       };
     }
