@@ -1751,7 +1751,7 @@ Separately, an agent message (`SendIfRunning`) that missed its turn was settled 
 ### Gate (Pass 56)
 
 - `cargo test -p chimaera-agent`: lib 454, manager 41, wire contract 19 passed. `cargo clippy -p chimaera-agent --all-targets -- -D warnings` clean. Web UI `check` and `test` (2914) passed.
-- The Codex part of `just chat-smoke` has NOT been run for this change yet.
+- The Codex part of `just chat-smoke`, 2026-10-29, codex-cli 0.164.0: 14 of 15 passed, every driver test included. The one failure, `codex_collab_subagent_surface`, was a stale raw-wire order assertion, unrelated to this change (Pass 58).
 
 ## Pass 57 — 2026-10-29: a Claude waiting message that never resolves (claude 2.1.310 binary read, hermetic)
 
@@ -1779,3 +1779,21 @@ Reported: in Claude chats a waiting bubble ("next step" or "after this turn") so
 
 - Hermetic: `tests/manager.rs` `spawn_settles_waiting_sends_a_dead_process_stranded` (failed before the change: the stranded id got no update), `journal.rs` `reopening_remembers_unsettled_waiting_messages`.
 - `just chat-smoke` not run: no driver wire behavior changed.
+
+## Pass 58 — 2026-10-29: a subagent's finish marker now precedes its turn end (codex 0.164.0)
+
+Found by the Codex `just chat-smoke` run for the stuck "next step" fix: `codex_collab_subagent_surface` failed three runs in a row on its frame-order assertion, with codex-cli 0.164.0 (npm) and the CLI's default model `gpt-6.1-sol`. One billed run with a temporary frame dump captured the order.
+
+### Codex
+
+- At a child's finish the parent's `subAgentActivity {completed}` marker (`item/started`, then `item/completed`) now arrives right after the child's final `agentMessage` and BEFORE the child's own `turn/completed`. Then the child's `turn/completed`, the parent's `collabAgentToolCall` (`wait`) `item/completed`, the parent's final answer, its Stop hook, and the parent's `turn/completed`. Pass 43 (0.162.1) had the child's turn end between the marker's two frames, so a test keyed on the marker's `item/completed` saw the turn end first.
+
+### Adopted
+
+- No driver change: a `completed` marker while the agent's turn is known to run is already a no-op, and the turn end closes the row with one `SubagentFinished` quoting the final answer.
+- `tests/live.rs` `codex_collab_subagent_surface` accepts either order and asserts that the marker arrives at all.
+
+### Gate (Pass 58)
+
+- Hermetic, new: `codex.rs` `completed_marker_before_the_agent_turn_end_leaves_the_close_to_it` (the 0.164.0 order: one finish line, closed on the turn end, no new stint).
+- Live: `codex_collab_subagent_surface` passes on codex-cli 0.164.0 with the relaxed assertion; `driver_codex_spawned_agents_draw_rows_on_both_runtimes` passed in the same day's Codex smoke.
