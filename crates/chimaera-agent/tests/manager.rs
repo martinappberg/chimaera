@@ -435,6 +435,119 @@ async fn spawn_neutralizes_stale_background_set_in_reused_journal() {
     );
 }
 
+/// A message still waiting when the daemon died hard (no teardown to drop
+/// it) lived in that process's queue: the respawned driver never minted its
+/// id, so nothing it does can settle it, and its bubble would read "next
+/// step" forever on an idle chat. The new process settles it "not
+/// delivered" before any event of its own; a message already settled stays
+/// as it was.
+#[tokio::test]
+async fn spawn_settles_waiting_sends_a_dead_process_stranded() {
+    let fx = fixture();
+    let echo = |id: &str| AgentEvent::UserMessage {
+        text: format!("message {id}"),
+        attachments: 0,
+        attachment_paths: Vec::new(),
+        id: Some(id.into()),
+        queued: true,
+        after_turn: false,
+        origin: None,
+    };
+    fx.manager
+        .seed_journal(
+            "s-stranded",
+            &[
+                AgentEvent::TurnStarted {
+                    turn_id: "t1".into(),
+                },
+                echo("read-before"),
+                echo("stranded"),
+                AgentEvent::UserMessageUpdate {
+                    id: "read-before".into(),
+                    state: UserMessageState::Sent,
+                },
+            ],
+        )
+        .expect("seed crash-tailed journal");
+
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-stranded", &fx.cwd, "normal"))
+        .expect("respawn");
+    // Off the runtime: a cursor the ring cannot serve reads the file behind
+    // a blocking writer barrier (see the respawn test below).
+    let attach = |from: u64| {
+        let manager = Arc::clone(&fx.manager);
+        tokio::task::spawn_blocking(move || manager.attach("s-stranded", from))
+    };
+    let att = attach(0).await.expect("attach task").expect("attach");
+    let mut seen = att.replay.clone();
+    let mut rx = att.live;
+    if !seen.iter().any(|e| matches!(e.ev, AgentEvent::Init { .. })) {
+        wait_for(&mut rx, &mut seen, "Init", |ev| {
+            matches!(ev, AgentEvent::Init { .. })
+        })
+        .await;
+    }
+    let seen = dedup_by_seq(&seen);
+    let updates: Vec<(&str, UserMessageState, u64)> = seen
+        .iter()
+        .filter_map(|e| match &e.ev {
+            AgentEvent::UserMessageUpdate { id, state } => Some((id.as_str(), *state, e.seq)),
+            _ => None,
+        })
+        .collect();
+    let init = seen
+        .iter()
+        .find(|e| matches!(e.ev, AgentEvent::Init { .. }))
+        .expect("init")
+        .seq;
+    let settled: Vec<_> = updates
+        .iter()
+        .filter(|(id, ..)| *id == "stranded")
+        .collect();
+    assert_eq!(settled.len(), 1, "{updates:?}");
+    assert_eq!(settled[0].1, UserMessageState::Dropped);
+    assert!(settled[0].2 < init, "settled before the new driver speaks");
+    assert_eq!(
+        updates
+            .iter()
+            .filter(|(id, ..)| *id == "read-before")
+            .count(),
+        1,
+        "a message already read is left alone: {updates:?}"
+    );
+
+    // Its own respawn finds nothing left to settle.
+    assert!(fx.manager.kill("s-stranded"));
+    let mut seen_live = Vec::new();
+    let exited = wait_for(&mut rx, &mut seen_live, "exit", |ev| {
+        matches!(ev, AgentEvent::Exited { .. })
+    })
+    .await;
+    fx.manager.remove("s-stranded");
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-stranded", &fx.cwd, "normal"))
+        .expect("second respawn");
+    let att = attach(exited.seq)
+        .await
+        .expect("attach task")
+        .expect("attach");
+    let mut seen = att.replay.clone();
+    let mut rx = att.live;
+    if !seen.iter().any(|e| matches!(e.ev, AgentEvent::Init { .. })) {
+        wait_for(&mut rx, &mut seen, "second Init", |ev| {
+            matches!(ev, AgentEvent::Init { .. })
+        })
+        .await;
+    }
+    assert!(
+        !seen
+            .iter()
+            .any(|e| matches!(e.ev, AgentEvent::UserMessageUpdate { .. })),
+        "{seen:#?}"
+    );
+}
+
 /// A daemon-authored event (`annotate`) takes its seq on the pump like any
 /// driver event: journaled, broadcast, and replayed on reconnect. A dead
 /// session refuses it.

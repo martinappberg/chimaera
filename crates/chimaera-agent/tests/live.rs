@@ -1910,6 +1910,7 @@ async fn codex_collab_subagent_surface() {
     let mut agent_thread = String::new();
     let mut saw_foreign_frame = false;
     let mut saw_foreign_turn_end = false;
+    let mut saw_completed_marker = false;
     let mut child_last_phase = Value::Null;
     loop {
         let frame = chat
@@ -1930,15 +1931,14 @@ async fn codex_collab_subagent_surface() {
                     assert_ne!(agent_thread, thread_id, "a subagent is its own thread");
                     assert!(item["agentPath"].is_string(), "agentPath names the agent");
                 }
-                // The finish marker (0.153+) trails the agent thread's own
-                // turn end — the driver closes the row (and journals its
-                // one SubagentFinished) on that turn end and treats the
-                // marker as a no-op, so the order is load-bearing.
+                // The finish marker (0.153+) and the agent thread's own turn
+                // end come in either order: through 0.162.1 the turn end
+                // landed before the marker's `item/completed`, 0.164.0 sends
+                // both marker frames first (Pass 43; Pass 58). The driver closes
+                // the row on whichever names the finish while no turn of the
+                // agent's is known to be running, so neither order matters.
                 if item["kind"] == "completed" {
-                    assert!(
-                        saw_foreign_turn_end,
-                        "the completed marker arrived before the subagent's turn end"
-                    );
+                    saw_completed_marker = true;
                 }
             }
             // The subagent's own transcript multiplexes onto this connection.
@@ -1978,6 +1978,10 @@ async fn codex_collab_subagent_surface() {
     assert!(
         saw_foreign_turn_end,
         "the subagent's own turn/completed arrived (threadId-scoped)"
+    );
+    assert!(
+        saw_completed_marker,
+        "the parent thread carried the subagent's finish marker"
     );
     assert_ne!(
         child_last_phase,

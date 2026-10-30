@@ -169,6 +169,11 @@ Nothing site-specific is ever coded.
   person starts every job. An attached job can't continue (the app holds it); its window
   says when it ends without offering to (job-host sets `CHIMAERA_JOB_ATTACHED` on its
   workspaces' chimaeras, and their `/compute` `self` block carries `attached`).
+- **Update in this job.** A job window whose chimaera is older than the app updates in
+  place: the app installs its build on the cluster, closes and reopens the workspace in
+  the same job (job-host starts each workspace from the binary's path); its windows
+  re-home onto it. The job keeps running; chats come back, running terminal programs restart
+  ([native-app](native-app.md)).
 - **Notifications** (native app, even when looking elsewhere; windows never open by
   themselves): ready, an hour left, ten minutes left (only for a job longer than the mark,
   worded with the time actually left; the watcher wakes at those marks), stopped, and

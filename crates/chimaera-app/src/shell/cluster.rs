@@ -1427,13 +1427,16 @@ async fn open_ws_window(
         c.last_ws.insert(wid.to_string(), endpoint.job.clone());
         c.opened_at.insert(wid.to_string(), Instant::now());
     }
+    // The token rides only to this key's own windows (Home gets the public
+    // copy): a workspace reopened in place has a new one, and its window
+    // re-homes onto it.
     emit_host_status(
         app,
         HostStatus {
             alias: key,
             status: "connected",
             local_port: Some(local_port),
-            token: None,
+            token: Some(endpoint.token.clone()),
             error: None,
             reason: None,
             build: None,
@@ -1603,6 +1606,119 @@ pub(super) async fn cluster_move(
     absorb(&app, &alias, &ov).await;
     let _ = app.emit("cluster-changed", json!({ "alias": alias }));
     Ok(())
+}
+
+/// Update a job window's chimaera in place, reached through `connect_host`
+/// with the window's tunnel key: this build onto the cluster, then the
+/// workspace closed and reopened in the same job. job-host starts each
+/// workspace from the binary's path, so the reopen runs this build; the job
+/// keeps running. Its windows re-home themselves: the `connected` that
+/// `open_ws_window` sends them carries the new chimaera's token, and the page
+/// navigates through its own gate (unsaved edits, the build reload). Returns
+/// the new forward's local port.
+pub(super) async fn update_job_workspace(
+    app: &AppHandle,
+    alias: &str,
+    key: &str,
+) -> Result<u16, String> {
+    ensure_cluster(app, alias).await?;
+    tracing::info!("ipc: update {key} in its job");
+    let shell = app.state::<Shell>();
+    // One at a time per window key: a second update (another of its windows)
+    // or the window's own reconnect mid-restart would close or race the
+    // reopen; theirs say "hold on" and the `connected` below heals them.
+    if !lock(&shell.compute_connecting).insert(key.to_string()) {
+        return Err("it's already updating or reconnecting — hold on".into());
+    }
+    let restarted = restart_in_job(app, alias, key).await;
+    lock(&shell.compute_connecting).remove(key);
+    let (wid, endpoint, name) = restarted?;
+    // The old forward reaches a chimaera that exited.
+    let stale = shell.compute_tunnels.lock().await.remove(key);
+    if let Some(t) = stale {
+        t.close().await;
+    }
+    open_ws_window(app, alias, &wid, &endpoint, &name).await?;
+    let _ = app.emit("cluster-changed", json!({ "alias": alias }));
+    let port = shell
+        .compute_tunnels
+        .lock()
+        .await
+        .get(key)
+        .map(|t| t.local_port)
+        .ok_or_else(|| format!("{name} disconnected while reopening"))?;
+    Ok(port)
+}
+
+/// Close and reopen the workspace behind `key` in its job, on this build:
+/// its id, its new endpoint and its name.
+async fn restart_in_job(
+    app: &AppHandle,
+    alias: &str,
+    key: &str,
+) -> Result<(String, cluster::Endpoint, String), String> {
+    let ov = live_overview(app, alias).await?;
+    absorb(app, alias, &ov).await;
+    let (wid, old) = ov
+        .endpoints
+        .iter()
+        .find(|(wid, e)| ws_key(alias, &e.slurm_job_id, wid) == key)
+        .map(|(wid, e)| (wid.clone(), e.clone()))
+        .ok_or("this workspace isn't open in a running job any more")?;
+    let name = ov
+        .workspaces
+        .iter()
+        .find(|w| w.id == wid)
+        .map_or_else(|| "workspace".to_string(), |w| w.name.clone());
+    let shell = app.state::<Shell>();
+    // Asked for, so checked again: another app or a CLI deploy may have
+    // replaced the cluster's binary since this run's check. Before anything
+    // closes, so a failed install leaves it running as it was.
+    if let Some(c) = lock(&shell.clusters).get_mut(alias) {
+        c.binary_ok = false;
+    }
+    ensure_binary(app, alias).await?;
+    // Taken as opening while it restarts: a cluster read in between must not
+    // tell its window it closed (that latches the page as ended).
+    lock(&shell.clusters)
+        .entry(alias.to_string())
+        .or_default()
+        .opened_at
+        .insert(wid.clone(), Instant::now());
+    let reopened = async {
+        let (port, token) = host_port(app, alias, &old.job).await?;
+        cluster::host_close(port, &token, &wid).await.map_err(err)?;
+        // An open while job-host still holds the slot is refused as closing.
+        let started = Instant::now();
+        while cluster::host_status(port, &token)
+            .await
+            .map_err(err)?
+            .workspaces
+            .iter()
+            .any(|w| w.id == wid && w.state == HostedState::Closing)
+        {
+            if started.elapsed() > Duration::from_secs(60) {
+                return Err(format!("{name} is taking too long to close"));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        open_in_job(app, alias, &old.job, &wid).await
+    }
+    .await;
+    match reopened {
+        Ok(endpoint) => Ok((wid, endpoint, name)),
+        Err(e) => {
+            // Its window learns where it stands from a fresh look.
+            if let Some(c) = lock(&shell.clusters).get_mut(alias) {
+                c.opened_at.remove(&wid);
+            }
+            if let Ok(ov) = live_overview(app, alias).await {
+                absorb(app, alias, &ov).await;
+            }
+            let _ = app.emit("cluster-changed", json!({ "alias": alias }));
+            Err(e)
+        }
+    }
 }
 
 /// Open a workspace when a job that is still waiting starts: added to that

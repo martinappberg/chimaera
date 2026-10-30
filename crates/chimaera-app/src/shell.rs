@@ -310,6 +310,17 @@ impl WindowScope {
         }
     }
 
+    /// A compute window's login host (its `alias` is then the per-job tunnel
+    /// key). From the typed scope `new_compute` recorded, never parsed.
+    pub(crate) fn compute_login(&self) -> Option<&str> {
+        match &self.askpass_scope {
+            AskpassScope::Host(login) if self.alias.as_deref() != Some(login.as_str()) => {
+                Some(login)
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn allows_askpass(&self, prompt_alias: Option<&str>) -> bool {
         askpass_scope_matches(&self.askpass_scope, prompt_alias)
     }
@@ -1627,5 +1638,15 @@ mod origin_tests {
         assert!(compute.allows_askpass(Some("cluster")));
         assert!(!compute.allows_askpass(Some("cluster#job123")));
         assert_eq!(compute.appearance_alias(), Some("cluster"));
+
+        // Only a compute scope routes an update to its job: a lookalike
+        // ordinary alias, a remote home and a local window never do.
+        assert_eq!(compute.compute_login(), Some("cluster"));
+        assert_eq!(colliding_remote.compute_login(), None);
+        assert_eq!(remote_home.compute_login(), None);
+        assert_eq!(
+            WindowScope::new(None, None, "local".into()).compute_login(),
+            None
+        );
     }
 }

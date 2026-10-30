@@ -307,6 +307,26 @@ pub(super) fn state_for(
     }
 }
 
+impl HostState {
+    /// A job window's key after its in-place update (no hosts.json entry).
+    pub(super) fn compute(alias: String, local_port: u16) -> Self {
+        HostState {
+            alias,
+            status: "connected",
+            local_port: Some(local_port),
+            last_connected_at: None,
+            error: None,
+            outdated: false,
+            remote_build: None,
+            live_sessions: None,
+            node: None,
+            cluster: None,
+            not_cluster: false,
+            cluster_setup_complete: false,
+        }
+    }
+}
+
 /// Publish the current endpoint identity alongside a successful connect
 /// reply. Every success path uses this, including healthy-tunnel reuse and
 /// joined flights: a caller may still hold an old daemon token even though

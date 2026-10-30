@@ -4,12 +4,16 @@ const mocks = vi.hoisted(() => ({
   api: vi.fn(),
   native: false,
   appUpdateStatus: vi.fn(),
+  connectHost: vi.fn(),
+  clusterContinueJob: vi.fn(),
 }));
 
 vi.mock("../net/api", () => ({ api: mocks.api }));
 vi.mock("../net/native", () => ({
   isNativeShell: () => mocks.native,
   appUpdateStatus: mocks.appUpdateStatus,
+  connectHost: mocks.connectHost,
+  clusterContinueJob: mocks.clusterContinueJob,
 }));
 
 type Store = typeof import("./update.svelte");
@@ -150,6 +154,38 @@ describe("update awareness", () => {
     });
     await store.checkForUpdates(true);
     expect(store.currentNotice(null)).toEqual({ kind: "app", version: "0.43.0", url: null });
+  });
+
+  it("a job window's stale daemon is offered a new job, never its tunnel key as a host", async () => {
+    mocks.native = true;
+    const store = await load();
+    store.updateState.buildSkew = true;
+    expect(store.currentNotice("cluster")).toEqual({ kind: "daemon-remote", alias: "cluster" });
+    const job = { jobId: "4242", node: null, cws: "w-1" };
+    expect(store.currentNotice("cluster", job)).toEqual({
+      kind: "daemon-job",
+      alias: "cluster",
+      job,
+    });
+    expect(store.currentNotice(null, job)).toEqual({ kind: "daemon-local" });
+  });
+
+  it("a job window updates in its job through its tunnel key; an older window continues in a new one", async () => {
+    const store = await load();
+    mocks.connectHost.mockReset().mockResolvedValue({});
+    mocks.clusterContinueJob.mockReset().mockResolvedValue({ kind: "started" });
+    const key = "cluster#job4242~w-1";
+    await expect(
+      store.updateInJob("cluster", key, { jobId: "4242", node: null, cws: "w-1" }),
+    ).resolves.toBe(false);
+    expect(mocks.connectHost).toHaveBeenCalledWith(key, true);
+    expect(mocks.clusterContinueJob).not.toHaveBeenCalled();
+
+    await expect(
+      store.updateInJob("cluster", "cluster#job4242", { jobId: "4242", node: null, cws: null }),
+    ).resolves.toBe(true);
+    expect(mocks.clusterContinueJob).toHaveBeenCalledWith("cluster", { jobId: "4242" });
+    expect(mocks.connectHost).toHaveBeenCalledTimes(1);
   });
 
   it("the app answers without waiting on a slow daemon check", async () => {
