@@ -53,6 +53,7 @@ async fn handshake_failure_for_every_provider(submit: bool) {
                 mastermind: None,
                 portable_context: None,
                 created_at_ms: None,
+                auto_compact: None,
             },
         );
         let mut spec = chimaera_agent::driver::SpawnSpec::new(id.clone(), swallow_stdin(), dir);
@@ -176,6 +177,7 @@ async fn only_cursor_chat_spawns_disable_the_browser_login() {
             mastermind: None,
             portable_context: None,
             created_at_ms: None,
+            auto_compact: None,
         };
         chat::spawn_chat_session(&state, id.clone(), recipe, None)
             .await
@@ -279,6 +281,7 @@ async fn resumed_handshake_failure_keeps_chat_for_every_provider() {
                 mastermind: None,
                 portable_context: None,
                 created_at_ms: None,
+                auto_compact: None,
             },
         );
         let mut spec =

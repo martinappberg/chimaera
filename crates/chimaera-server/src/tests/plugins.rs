@@ -724,8 +724,17 @@ async fn first_party_plugins_are_available_until_installed() {
 #[tokio::test]
 async fn worker_settings_pre_allow_only_active_plugin_tools() {
     let tools = vec!["knowledge_search".to_string(), "knowledge_get".to_string()];
-    let path =
-        crate::agents::write_settings("s-plugin-allow", "K", 1, None, None, None, &tools).unwrap();
+    let path = crate::agents::write_settings(
+        "s-plugin-allow",
+        "K",
+        1,
+        None,
+        None,
+        None,
+        &tools,
+        crate::agents::Compaction::default(),
+    )
+    .unwrap();
     let value: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(

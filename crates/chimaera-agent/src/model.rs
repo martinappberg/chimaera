@@ -418,6 +418,25 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         chosen: bool,
     },
+    /// Whether the agent compacts on its own when the context fills, as the
+    /// agent reports it (claude: get_settings `effective.autoCompactEnabled`,
+    /// absent = the CLI's default, on; get_context_usage
+    /// `isAutoCompactEnabled` adds the environment overrides). Latest-wins;
+    /// emitted only by agents that can switch it per session (codex cannot,
+    /// PROTOCOL.md Pass 50).
+    AutoCompact {
+        enabled: bool,
+        /// The environment variable that holds it off whatever the setting
+        /// says (`DISABLE_AUTO_COMPACT`, `DISABLE_COMPACT`); no switch can
+        /// turn it on. Additive: absent = nothing in the way.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disabled_by: Option<String>,
+        /// What the user picked, when this read-back settles their own
+        /// SetAutoCompact: remembered for the conversation, even where the
+        /// environment keeps `enabled` false. Additive: absent = no pick.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        picked: Option<bool>,
+    },
     TurnCompleted {
         turn_id: String,
         usage: Usage,
@@ -439,6 +458,15 @@ pub enum AgentEvent {
         total_tokens: u64,
         max_tokens: u64,
         percentage: f64,
+        /// Where on this window the agent compacts on its own, in tokens,
+        /// only while it applies a threshold someone set (PROTOCOL.md Pass
+        /// 55): claude's `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` from its merged
+        /// settings, against the threshold it reports; codex's
+        /// `model_post_turn_compact_threshold_percent` from the thread open.
+        /// Absent at an agent's own default, with auto-compact off, and on
+        /// every pre-upgrade journal line.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auto_compact_at: Option<u64>,
     },
     /// The agent is summarizing its conversation to reclaim context. This is
     /// a real, sometimes-long lifecycle rather than a transcript notice:
@@ -451,6 +479,12 @@ pub enum AgentEvent {
         /// Claude's compact_boundary reports how much context was summarized.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pre_tokens: Option<u64>,
+        /// What started it, where the wire says: claude's compact_boundary
+        /// `trigger`, codex's requesting turn (a `thread/compact/start` turn
+        /// is manual, any other compaction is the agent's own). Additive:
+        /// absent = unknown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trigger: Option<CompactionTrigger>,
     },
     /// Account usage windows (claude get_usage; rendered by the /usage panel).
     UsageReport {
@@ -1085,6 +1119,14 @@ pub enum AgentCommand {
     SetUltracode {
         enabled: bool,
     },
+    /// Session auto-compact toggle, always the user's pick (claude
+    /// apply_flag_settings {autoCompactEnabled}: the session's flag layer,
+    /// never a settings file; a reopen carries the pick in the generated
+    /// `--settings` file instead). Codex has no switch and does not
+    /// advertise it.
+    SetAutoCompact {
+        enabled: bool,
+    },
     /// Answer a QuestionRequest: question id → chosen labels (free text
     /// rides as a label).
     Answer {
@@ -1415,6 +1457,7 @@ impl AgentCommand {
             Self::Interrupt
             | Self::SetThinking { .. }
             | Self::SetUltracode { .. }
+            | Self::SetAutoCompact { .. }
             | Self::GetUsage
             | Self::Compact
             | Self::GetMcp
@@ -1567,6 +1610,15 @@ pub enum CompactionPhase {
     Started,
     Completed,
     Failed,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionTrigger {
+    /// The agent compacted on its own as the context filled.
+    Auto,
+    /// The user asked (/compact, the usage meter's Compact).
+    Manual,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

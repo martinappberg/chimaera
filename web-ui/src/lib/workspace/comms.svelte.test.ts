@@ -5,6 +5,7 @@ import {
   commsStore,
   deliver,
   dismissWakeFailure,
+  loosenChoices,
   onCommsNudge,
   onCommsReconnect,
   parseComms,
@@ -45,10 +46,23 @@ describe("parseComms", () => {
     ]);
   });
 
-  it("defaults to on, Automatically, and nothing waiting", () => {
-    expect(parseComms(null)).toEqual({ enabled: true, wakes: "auto", unread: {}, wake_requests: [] });
-    expect(parseComms({ enabled: false, wakes: "sometimes" })).toMatchObject({ enabled: false, wakes: "auto" });
-    expect(parseComms({ wakes: "ask" }).wakes).toBe("ask");
+  it("defaults to on, Ask me, and nothing waiting", () => {
+    expect(parseComms(null)).toEqual({ enabled: true, wakes: "ask", unread: {}, wake_requests: [] });
+    expect(parseComms({ enabled: false, wakes: "sometimes" })).toMatchObject({ enabled: false, wakes: "ask" });
+    expect(parseComms({ wakes: "auto" }).wakes).toBe("auto");
+    expect(parseComms({ wakes: "always" }).wakes).toBe("always");
+  });
+});
+
+describe("loosenChoices", () => {
+  it("offers Within limits and Always under Ask me, only Always past a limit", () => {
+    expect(loosenChoices("ask").map((c) => [c.policy, c.label])).toEqual([
+      ["auto", "Wake within limits"],
+      ["always", "Always wake"],
+    ]);
+    for (const reason of ["hop_limit", "unattended"]) {
+      expect(loosenChoices(reason).map((c) => [c.policy, c.label])).toEqual([["always", "Always continue"]]);
+    }
   });
 });
 

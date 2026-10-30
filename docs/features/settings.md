@@ -31,7 +31,12 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
   frame re-read the file, and a PUT installs at once; the daemon's own readers use the cache
   and never touch the disk. A change bumps a content generation that `/ws/events` diffs against. Daemon-consumed keys include
   `git.path`, `agents.*.path`, `agents.communication.*`, `notifications.*`,
-  `daemon.scrollbackLines`, `daemon.restoreSessions`, `chat.remoteControlAtStart`,
+  `daemon.scrollbackLines`, `daemon.restoreSessions`, `agents.autoCompact` (Agent default, the
+  default, writes nothing, leaving the user's own Claude Code settings in charge; On / Off write
+  `autoCompactEnabled` into each new Claude session's generated `--settings` file; a conversation's own
+  pick wins over it), `agents.autoCompactAt` (Agent default writes nothing; 50–90% in 5s goes
+  into a new or resumed Claude session's `--settings` `env` as `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`
+  and a Codex thread's `model_post_turn_compact_threshold_percent`), `chat.remoteControlAtStart`,
   `chat.toolSummaries`, `chat.codexSteering`, `chat.resumeAfterRestart`, `update.autoCheck` and
   `quickOpen.ignoreDirs`; unknown keys are opaque and preserved verbatim (forward-compat — a newer
   UI's keys survive an older daemon). A corrupt/oversized/non-object file degrades to an empty map with

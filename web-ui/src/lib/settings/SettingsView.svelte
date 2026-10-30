@@ -160,6 +160,8 @@
   /** The Agents section's own schema rows: agent communication, a titled
    *  block under the bespoke binaries panel. */
   const isCommsDef = (d: SettingDef) => d.id.startsWith("agents.communication.");
+  /** Agent-wide session behavior: a titled block of its own. */
+  const isContextDef = (d: SettingDef) => d.id === "agents.autoCompact" || d.id === "agents.autoCompactAt";
 
   // A section asked for from elsewhere (Quick Open "Usage", the dashboard's
   // cost line): clear any search that hides it, then scroll there once shown.
@@ -304,14 +306,22 @@
           {#if group.category === "Agents"}
             <!-- Bespoke panel: fuses live daemon detection with the
                  agents.<id>.path settings and an uninstall action. It renders
-                 its own <h2>, so its generic rows are skipped here. Agent
-                 communication's two rows follow as ordinary schema rows. -->
+                 its own <h2>, so its generic rows are skipped here. Context
+                 (auto-compact) and agent communication's rows follow as
+                 ordinary schema rows. -->
             {@const comms = group.defs.filter(isCommsDef)}
+            {@const context = group.defs.filter(isContextDef)}
             <section data-section={group.category}>
-              {#if q === "" || group.defs.some((d) => !isCommsDef(d))}
+              {#if q === "" || group.defs.some((d) => !isCommsDef(d) && !isContextDef(d))}
                 <AgentsSettings visible={tabVisible} />
               {:else}
                 <h2 class="cat">{group.category}</h2>
+              {/if}
+              {#if context.length > 0}
+                <h3 class="subcat">Context</h3>
+                {#each context as def (def.id)}
+                  <SettingRow {def} />
+                {/each}
               {/if}
               {#if comms.length > 0}
                 <h3 class="subcat">Agent communication</h3>

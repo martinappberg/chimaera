@@ -55,6 +55,14 @@ fn emit(value: Value) {
     stdout.flush().expect("stdout flush");
 }
 
+/// The JSON file a `--settings <path>` argument names (the launcher passes
+/// one per session), wherever it sits in argv.
+fn flag_settings() -> Option<Value> {
+    let args: Vec<String> = std::env::args().collect();
+    let path = args.windows(2).find(|w| w[0] == "--settings")?[1].clone();
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "normal".into());
     match mode.as_str() {
@@ -79,6 +87,13 @@ fn main() {
     // Session-scoped flag state, so an apply_flag_settings shows up in the
     // next get_settings read-back like the real CLI's.
     let mut ultracode = false;
+    // Auto-compact as the real CLI resolves it (2.1.302): the `--settings`
+    // flag layer's `autoCompactEnabled`, else the default (on); an
+    // apply_flag_settings changes it for the session. Read back in
+    // get_settings' merged `effective` view.
+    let mut auto_compact = flag_settings()
+        .and_then(|s| s["autoCompactEnabled"].as_bool())
+        .unwrap_or(true);
     // Loop mode: set by "Stop the loop." so a pending wake never fires.
     let loop_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -352,12 +367,34 @@ fn main() {
                 "response": {
                     "subtype": "success",
                     "request_id": frame["request_id"],
-                    "response": { "applied": { "ultracode": ultracode } },
+                    "response": {
+                        "applied": { "ultracode": ultracode },
+                        "effective": { "autoCompactEnabled": auto_compact },
+                    },
+                },
+            }));
+        } else if frame["type"] == "control_request"
+            && frame["request"]["subtype"] == "get_context_usage"
+        {
+            // The CLI's own resolution: the setting, unless the environment
+            // holds it off (2.1.302 reads both variables).
+            let held_off = ["DISABLE_AUTO_COMPACT", "DISABLE_COMPACT"]
+                .iter()
+                .any(|var| std::env::var(var).is_ok_and(|v| !v.is_empty() && v != "0"));
+            emit(json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": frame["request_id"],
+                    "response": { "isAutoCompactEnabled": auto_compact && !held_off },
                 },
             }));
         } else if frame["type"] == "control_request" {
             if let Some(on) = frame["request"]["settings"]["ultracode"].as_bool() {
                 ultracode = on;
+            }
+            if let Some(on) = frame["request"]["settings"]["autoCompactEnabled"].as_bool() {
+                auto_compact = on;
             }
             // set_permission_mode / set_model / apply_flag_settings / …:
             // acknowledge.
@@ -1212,6 +1249,14 @@ fn tool_result_with(id: &str, content: &str, result: Value) {
     );
 }
 
+/// `loop` mode's `system/init`: 2.1.310 names each scheduler fire on its
+/// `started` frame and says so with `lifecycle_wakeup_source_v1`.
+fn loop_init() -> Value {
+    json!({ "type": "system", "subtype": "init", "session_id": "fake-native-1",
+        "model": "fake-model", "permissionMode": "default", "slash_commands": ["compact"],
+        "capabilities": ["lifecycle_wakeup_source_v1"] })
+}
+
 fn loop_result() {
     emit(
         json!({ "type": "result", "subtype": "success", "is_error": false,
@@ -1219,7 +1264,10 @@ fn loop_result() {
     );
 }
 
-fn schedule_wakeup(msg: &str, id: &str, reason: &str, delay_ms: u64) {
+/// Arms the wakeup; returns its `scheduledFor`, which the fire's `started`
+/// frame repeats as `scheduled_for` (2.1.310).
+fn schedule_wakeup(msg: &str, id: &str, reason: &str, delay_ms: u64) -> u64 {
+    let at = now_ms() + delay_ms;
     tool_use(
         msg,
         id,
@@ -1233,10 +1281,11 @@ fn schedule_wakeup(msg: &str, id: &str, reason: &str, delay_ms: u64) {
         id,
         "Next wakeup scheduled.",
         json!({
-            "scheduledFor": now_ms() + delay_ms, "clampedDelaySeconds": delay_ms / 1000,
+            "scheduledFor": at, "clampedDelaySeconds": delay_ms / 1000,
             "wasClamped": false,
         }),
     );
+    at
 }
 
 /// One `loop`-mode turn, chosen by the message: a goal command, the stop
@@ -1249,10 +1298,7 @@ fn run_loop_turn(frame: &Value, stop: &std::sync::Arc<std::sync::atomic::AtomicB
         .or_else(|| frame["message"]["content"].as_str())
         .unwrap_or_default()
         .to_string();
-    emit(
-        json!({ "type": "system", "subtype": "init", "session_id": "fake-native-1",
-        "model": "fake-model", "permissionMode": "default", "slash_commands": ["compact"] }),
-    );
+    emit(loop_init());
     let synthetic = |text: String, args: &str| {
         emit(json!({ "type": "assistant", "parent_tool_use_id": null,
             "message": { "id": format!("syn-{}", now_ms()), "model": "<synthetic>",
@@ -1325,7 +1371,7 @@ fn run_loop_turn(frame: &Value, stop: &std::sync::Arc<std::sync::atomic::AtomicB
         "ml-1",
         "Staging is still rolling out (3 of 5 pods). I'll check again shortly.",
     );
-    schedule_wakeup(
+    let mut set_for = schedule_wakeup(
         "ml-1",
         "tu-w0",
         "Checking whether the staging deploy finished",
@@ -1355,11 +1401,11 @@ fn run_loop_turn(frame: &Value, stop: &std::sync::Arc<std::sync::atomic::AtomicB
                 return;
             }
             let uuid = format!("fake-wake-{tick}");
-            emit(json!({ "type": "command_lifecycle", "command_uuid": uuid, "state": "started" }));
             emit(
-                json!({ "type": "system", "subtype": "init", "session_id": "fake-native-1",
-                "model": "fake-model", "permissionMode": "default", "slash_commands": ["compact"] }),
+                json!({ "type": "command_lifecycle", "command_uuid": uuid, "state": "started",
+                "wakeup_source": "loop_wakeup", "scheduled_for": set_for }),
             );
+            emit(loop_init());
             let msg = format!("mt-{tick}");
             stream(json!({ "type": "message_start", "message": { "id": msg } }));
             tool_use(
@@ -1378,7 +1424,7 @@ fn run_loop_turn(frame: &Value, stop: &std::sync::Arc<std::sync::atomic::AtomicB
                     &msg,
                     &format!("Tick {tick}: 4 of 5 pods updated. Checking again shortly."),
                 );
-                schedule_wakeup(
+                set_for = schedule_wakeup(
                     &msg,
                     &format!("tu-w{tick}"),
                     "Checking whether the staging deploy finished",

@@ -549,6 +549,7 @@ async fn spawn_chat_ui(
                 .await;
         let settings_theme = (!theme_set).then_some(theme);
         let plugin_tools = crate::plugins::spawn_allow(state, &workspace.id).await;
+        let compaction = crate::chat::claude_compaction(state, body.resume.as_deref());
         match crate::agents::write_settings(
             &id,
             &key,
@@ -557,6 +558,7 @@ async fn spawn_chat_ui(
             user_statusline.as_ref(),
             None,
             &plugin_tools,
+            compaction,
         ) {
             Ok(path) => Some(path),
             Err(err) => return internal(err),
@@ -628,6 +630,7 @@ async fn spawn_chat_ui(
         portable_context: None,
         // A fresh session id resuming an old conversation — "now" is correct.
         created_at_ms: None,
+        auto_compact: None,
     };
 
     // A resumed recent replays no history over the wire — seed the new journal

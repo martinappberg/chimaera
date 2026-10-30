@@ -88,8 +88,10 @@ export type SettingsMap = {
   "appearance.interfaceFontFamily": string;
   "agents.defaultView": "chat" | "terminal";
   "agents.communication.enabled": boolean;
-  "agents.communication.wakes": "never" | "ask" | "auto";
+  "agents.communication.wakes": "never" | "ask" | "auto" | "always";
   "agents.communication.freeSubagents": boolean;
+  "agents.autoCompact": "agent" | "on" | "off";
+  "agents.autoCompactAt": "agent" | "50" | "55" | "60" | "65" | "70" | "75" | "80" | "85" | "90";
   "dashboard.landing": "auto" | "never";
   "dashboard.cardDensity": "auto" | "comfortable" | "compact";
   "dashboard.roster": "line" | "cards";
@@ -261,13 +263,14 @@ const DEFS = {
     title: "Agents may wake each other",
     category: "Agents",
     description:
-      "Whether another agent's message may start a turn in an idle agent — a turn billed to your account. Automatically wakes it — up to 20 wakes in a workspace since you last stepped in (a prompt in one of its chats or Claude terminals, a Wake, a hand-over) and 4 rounds of one back-and-forth; past those you're asked once. Ask me asks every time, in the agent's chat and in Needs you; a reply to a question it asked still wakes it. Never keeps messages in its inbox until it looks or you hand them over. Terminal agents are never woken.",
+      "Whether another agent's message may start a turn in an idle agent — a turn billed to your account. Ask me asks every time, in the agent's chat and in Needs you; a reply to a question it asked still wakes it. Within limits wakes it on its own, up to 20 wakes in a workspace since you last stepped in (a prompt in one of its chats or Claude terminals, a Wake, a hand-over) and 4 rounds of one back-and-forth; past those you're asked once. Always wakes it every time, with no limits. Never keeps messages in its inbox until it looks or you hand them over. Terminal agents are never woken.",
     type: "enum",
-    default: "auto",
+    default: "ask",
     options: [
       { value: "never", label: "Never" },
       { value: "ask", label: "Ask me" },
-      { value: "auto", label: "Automatically" },
+      { value: "auto", label: "Within limits" },
+      { value: "always", label: "Always" },
     ],
     scope: "daemon",
   },
@@ -282,6 +285,51 @@ const DEFS = {
     default: false,
     scope: "daemon",
     note: "Claude chats. Codex reads a message while it waits on its subagents either way.",
+  },
+
+  // Claude Code's own switch, set per session through the generated
+  // --settings file (crates/chimaera-agent/protocol/passes.md, Pass 50).
+  "agents.autoCompact": {
+    title: "Auto-Compact (Claude)",
+    category: "Agents",
+    description:
+      "Whether Claude Code summarizes a long conversation on its own.",
+    type: "enum",
+    default: "agent",
+    options: [
+      { value: "agent", label: "Agent default" },
+      { value: "on", label: "On" },
+      { value: "off", label: "Off" },
+    ],
+    scope: "daemon",
+    note: "Applies to sessions started after the change.",
+  },
+  // Each CLI's own percentage, set per session (Pass 55): Claude's
+  // CLAUDE_AUTOCOMPACT_PCT_OVERRIDE in the generated --settings env, Codex's
+  // model_post_turn_compact_threshold_percent on the thread. 50–90 in 5s:
+  // below half the window compaction churns (each one costs a request and
+  // detail), and past 90 both CLIs' own limits come first.
+  "agents.autoCompactAt": {
+    title: "Auto-Compact At",
+    category: "Agents",
+    description:
+      "How full the context gets before the agent summarizes it.",
+    type: "enum",
+    default: "agent",
+    options: [
+      { value: "agent", label: "Agent default" },
+      { value: "50", label: "50%" },
+      { value: "55", label: "55%" },
+      { value: "60", label: "60%" },
+      { value: "65", label: "65%" },
+      { value: "70", label: "70%" },
+      { value: "75", label: "75%" },
+      { value: "80", label: "80%" },
+      { value: "85", label: "85%" },
+      { value: "90", label: "90%" },
+    ],
+    scope: "daemon",
+    note: "Applies to sessions started or resumed after the change.",
   },
 
   // --- Dashboard ---------------------------------------------------------------
@@ -821,7 +869,7 @@ const DEFS = {
   "chat.codexSteering": {
     title: "Codex Steering Timing",
     category: "Chat",
-    description: "When Codex reads messages steered into an active turn, including messages from another agent. Agent default uses your Codex configuration (normally the next step). Immediate lets Codex interrupt its current model response or code-mode call. Messages queued for the next turn still wait.",
+    description: "When Codex reads messages steered into an active turn, including messages from another agent. Agent default uses your Codex configuration: since Codex 0.163.0 that is immediate, before it the next step. Immediate lets Codex interrupt its current model response or code-mode call. Messages queued for the next turn still wait.",
     type: "enum",
     default: "agent",
     options: [

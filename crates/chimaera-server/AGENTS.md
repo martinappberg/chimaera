@@ -15,7 +15,7 @@ Orientation for coding agents. This crate is the daemon: every HTTP route, every
 | `claude_store.rs`, `goal_outcome.rs` | Where a Claude transcript lives; how a `/goal` ended. |
 | `operation.rs`, `agent_setup.rs`, `agent_auth.rs` | Per-agent bounded jobs: installs, sign-in. |
 | `launcher.rs` | argv assembly, binary detection and resolution, role prompts. |
-| `agent_state.rs`, `agents.rs`, `spawn.rs` | Pure agent state; hook ingest and writers; PTY spawn. |
+| `agent_state.rs`, `agents.rs`, `spawn.rs` | Pure agent state; hook ingest and writers (the per-session Claude `--settings` file also carries `autoCompactEnabled`: the reopened conversation's pick, else `agents.autoCompact` On/Off, and `env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` from `agents.autoCompactAt`, via `chat::claude_compaction` → `agents::Compaction`; `refresh_settings_compaction` brings a reused file up to date); PTY spawn (a Codex TUI gets the threshold as `-c model_post_turn_compact_threshold_percent`, `launcher::push_codex_compact_at`). |
 | `git/` | Read-only git: repositories, session tracker, diffs, history. |
 | `fs.rs`, `embed.rs`, `notebook.rs` | Filesystem service and previews; link targets; notebook pages. |
 | `fs_watch.rs`, `doc_check.rs`, `drafts.rs`, `agent_docs.rs` | Disk monitor; dialect checker; draft mirror; "teach agents" docs. |
@@ -28,7 +28,7 @@ Orientation for coding agents. This crate is the daemon: every HTTP route, every
 | `subagents.rs`, `recents_archive.rs`, `knowledge.rs` | A subagent's transcript; archived Recents; the Knowledge snapshot. |
 | `plugins/` | The plugin host: lock, catalog, trust, runtime, platform, jobs. |
 | `agent_probe.rs` + `agent_probe/` | Ask agents: plugins, skills, connections, extensions, usage. |
-| `comms.rs`, `mcp.rs` | Agent communication; the per-session MCP endpoint and tiers. Chat instructions require a final task-tool update before replying; no user refresh action or inferred completion. |
+| `comms.rs`, `mcp.rs` | Agent communication; the per-session MCP endpoint and tiers. Chat instructions require a final task-tool update before replying; no user refresh action or inferred completion. Core tool `annotations` come from `mcp::tool_annotations` (`READ_ONLY_TOOLS` get `readOnlyHint`; `read_messages` is never idempotent, it settles what it shows); a new read-only tool belongs on that list (PROTOCOL.md Pass 53). |
 | `workspaces`, `links`, `settings`, `quickopen`, `recents`, `naming`, `view_state` | Roots, linked terminals, settings, palette, Recents, view-state. |
 
 Cross-module topics: [status feed](REFERENCE.md#the-status-feed-v02), [Mastermind](REFERENCE.md#the-mastermind--the-coordinator-inside-agent-communication), [Codex MCP injection](REFERENCE.md#codex-mcp-injection), [chat-mode seam](REFERENCE.md#chatrs--the-chat-mode-seam), [agent integration](REFERENCE.md#agent-integration-and-view-persistence).

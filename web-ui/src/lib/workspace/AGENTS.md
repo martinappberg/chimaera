@@ -15,7 +15,7 @@ Orientation for coding agents. This area owns the workbench's domain data and th
 | Home and hosts | `HomeScreen.svelte`, `HomeNavigation.svelte`, `HomeActions.svelte` (row menu), `FolderPicker.svelte`, `RemoteSettingsDialog.svelte`, `ReauthOverlay.svelte` (blocking re-auth), `AskpassModal.svelte` + `askpassScope.ts` (in-app SSH prompts) |
 | Clusters and compute | `cluster.ts` (pure words and launch spec), `clusterRow.ts` (the home row's subset), `clusterStore.svelte.ts`, `ClusterPage.svelte`, `ClusterStartSheet.svelte`, `ClusterFolderPicker.svelte`, `ClusterSettingDialog.svelte`, `JobClusterHome.svelte`, `JobWindowNotices.svelte`, `compute.ts` (`/api/v1/compute` store), `ComputeBanner.svelte`, `ComputeStrip.svelte` |
 | Timeline, Knowledge, history | `timeline.svelte.ts` + `timelineModel.ts` (pure), `TimelineView.svelte`, `TimelineRow.svelte` (shared row anatomy), `knowledge.ts`, `history.ts` (history, edits, activity, CSV) |
-| Comms, notices, updates | `comms.svelte.ts` (agent communication), `notices.ts` (browser notifications), `update.svelte.ts` + `UpdateToast.svelte` |
+| Comms, notices, updates | `comms.svelte.ts` (agent communication), `WakeSplitButton.svelte` (a wake request's Wake/Continue + its "from now on" chevron, shared by the chat's wake bar and the Needs-you card), `notices.ts` (browser notifications), `update.svelte.ts` + `UpdateToast.svelte` |
 
 Tests: `*.test.ts` beside the modules.
 

@@ -82,7 +82,7 @@ export function parseSchedule(ev: Record<string, unknown>): {
     jobs.push({
       id,
       cron: str(j.cron, 256),
-      schedule: str(j.schedule, 500),
+      schedule: scheduleWords(str(j.schedule, 500), str(j.cron, 256)),
       prompt: str(j.prompt, 500),
       recurring: j.recurring === true,
       nextAtMs: num(j.next_at_ms),
@@ -243,4 +243,61 @@ export function jobPeriodMs(cron: string): number {
   if (fixed(min) && step(hour) > 0) return step(hour) * 3_600_000;
   if (fixed(min) && fixed(hour)) return 86_400_000;
   return 600_000;
+}
+
+const DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/** A cron field as plain numbers: `7`, `7,37`, `1-5`; null for anything else. */
+function cronNumbers(field: string, max: number): number[] | null {
+  const out: number[] = [];
+  for (const part of field.split(",")) {
+    const range = /^(\d+)(?:-(\d+))?$/.exec(part);
+    if (!range) return null;
+    const lo = Number(range[1]);
+    const hi = range[2] === undefined ? lo : Number(range[2]);
+    if (hi < lo || hi > max) return null;
+    for (let n = lo; n <= hi; n++) out.push(n);
+  }
+  return out;
+}
+
+const joinAnd = (xs: string[]) => (xs.length < 2 ? (xs[0] ?? "") : `${xs.slice(0, -1).join(", ")} and ${xs[xs.length - 1]}`);
+
+/** A cron in words ("Every hour at :07 and :37") for the shapes agents
+ *  actually schedule; "" for the rest, which the card shows as the raw cron. */
+export function cronWords(cron: string): string {
+  const f = cron.trim().split(/\s+/);
+  if (f.length !== 5) return "";
+  const [min, hour, dom, mon, dow] = f;
+  if (dom !== "*" || mon !== "*") return "";
+  let when = "";
+  if (dow !== "*") {
+    const days = cronNumbers(dow.replace(/7/g, "0"), 6);
+    if (!days) return "";
+    const set = [...new Set(days)];
+    when = set.join() === "1,2,3,4,5" ? " on weekdays" : ` on ${joinAnd(set.map((d) => DOW[d]))}`;
+  }
+  const step = (x: string) => Number(/^\*\/(\d+)$/.exec(x)?.[1] ?? NaN);
+  const every = (n: number, unit: string) => (n === 1 ? `Every ${unit}` : `Every ${n} ${unit}s`);
+  if (min === "*" && hour === "*") return `Every minute${when}`;
+  if (hour === "*" && step(min) > 0) return `${every(step(min), "minute")}${when}`;
+  const mins = cronNumbers(min, 59);
+  if (!mins) return "";
+  if (hour === "*") return `Every hour at ${joinAnd(mins.map((m) => `:${String(m).padStart(2, "0")}`))}${when}`;
+  if (step(hour) > 0 && mins.length === 1) {
+    return `${every(step(hour), "hour")} at :${String(mins[0]).padStart(2, "0")}${when}`;
+  }
+  const hours = cronNumbers(hour, 23);
+  if (!hours) return "";
+  const times = hours.flatMap((h) =>
+    mins.map((m) => `${h % 12 === 0 ? 12 : h % 12}:${String(m).padStart(2, "0")} ${h < 12 ? "AM" : "PM"}`),
+  );
+  return `${when === "" ? "Every day at" : "At"} ${joinAnd(times)}${when}`;
+}
+
+/** The agent's own phrasing, unless it only echoed the cron back (it does
+ *  for lists like `7,37`); then ours. */
+export function scheduleWords(schedule: string, cron: string): string {
+  if (schedule.trim() !== "" && schedule.trim() !== cron.trim()) return schedule;
+  return cronWords(cron) || schedule;
 }

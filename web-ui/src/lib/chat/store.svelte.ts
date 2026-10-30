@@ -214,6 +214,8 @@ export interface CheckpointRef {
   id: string;
   /** The message preceding it — the conversation-fork resume point. */
   preceding: string | null;
+  /** The checkpoint's journal seq (compared with `lastCompactionSeq`). */
+  seq?: number;
 }
 
 /** A user message the agent has NOT consumed yet — shown in the scrollable
@@ -568,6 +570,16 @@ function decisionLine(title: string, label: string): string {
   return `${first}${first.length < trimmed.length ? " …" : ""} — ${label}`;
 }
 
+/** The transcript line a finished compaction leaves. The agent's own
+ *  compaction says so (both CLIs call it auto-compact); one the user asked
+ *  for, or one whose trigger the wire didn't name, reads plain. */
+export function compactionNotice(preTokens: unknown, trigger: unknown): string {
+  const what = trigger === "auto" ? "context auto-compacted" : "context compacted";
+  return typeof preTokens === "number"
+    ? `${what} · ${preTokens.toLocaleString()} tokens summarized`
+    : what;
+}
+
 /** Fold a wire `remote_control` event or an Init's `remote_control` snapshot
  *  (same field names) into the store's shape; off/absent = null. */
 function foldRemoteControl(raw: unknown): RemoteControlInfo | null {
@@ -671,6 +683,13 @@ export class ChatStore {
    *  turn; codex tokenUsage vs modelContextWindow). */
   contextPct = $state<number | null>(null);
   contextTokens = $state<{ total: number; max: number } | null>(null);
+  /** Where on that window the agent compacts on its own, in tokens, when it
+   *  applies a threshold someone set (claude's percentage override, codex's
+   *  post-turn percentage); null at its own default or when it doesn't say. */
+  contextCompactAt = $state<number | null>(null);
+  /** Journal seq of the latest completed compaction (0: none). Claude can't
+   *  resume at a message from before it, so a rewind there is limited. */
+  lastCompactionSeq = $state(0);
   /** Streamed account rate-limit telemetry (header chip). */
   rateLimit = $state<RateLimitInfo | null>(null);
   /** Agent's own model catalog (claude initialize.models / codex
@@ -690,6 +709,13 @@ export class ChatStore {
   /** Applied effort/ultracode truth (claude get_settings read-back). */
   effort = $state<string | null>(null);
   ultracode = $state(false);
+  /** Whether the agent compacts on its own, as it reports it (claude: the
+   *  session's setting, held off by the environment); null = the agent
+   *  doesn't say, so no per-chat switch is offered. */
+  autoCompact = $state<boolean | null>(null);
+  /** The environment variable holding auto-compact off (no switch can turn
+   *  it on), e.g. `DISABLE_AUTO_COMPACT`; null when nothing is in the way. */
+  autoCompactDisabledBy = $state<string | null>(null);
   /** Latest rewind_files answer; the view gates dialogs on its own intent
    *  flag so replayed reports never reopen UI. */
   rewind = $state<RewindReport | null>(null);
@@ -953,6 +979,7 @@ export class ChatStore {
     this.epoch += 1;
     this.structuralVersion += 1;
     this.lastSeq = 0;
+    this.lastCompactionSeq = 0;
     this.initialized = false;
     this.startupDetail = null;
     this.capabilities = null;
@@ -1307,7 +1334,11 @@ export class ChatStore {
         // id). A queued send is still in the pending stack at this point, so
         // check there first; the anchor rides along when it promotes to a block.
         const umid = ev.user_message_id as string;
-        const cp: CheckpointRef = { id: umid, preceding: (ev.preceding_uuid as string) ?? null };
+        const cp: CheckpointRef = {
+          id: umid,
+          preceding: (ev.preceding_uuid as string) ?? null,
+          seq: entry.seq,
+        };
         const p = this.pendingSends.find((s) => s.id === umid);
         if (p !== undefined) {
           // Still queued: nothing rendered changes yet (the anchor rides
@@ -1705,12 +1736,18 @@ export class ChatStore {
         this.effort = (ev.effort as string) ?? null;
         this.ultracode = ev.ultracode === true;
         break;
+      case "auto_compact":
+        this.autoCompact = ev.enabled === true;
+        this.autoCompactDisabledBy = typeof ev.disabled_by === "string" ? ev.disabled_by : null;
+        break;
       case "context_usage": {
         this.contextPct = ev.percentage as number;
         this.contextTokens = {
           total: (ev.total_tokens as number) ?? 0,
           max: (ev.max_tokens as number) ?? 0,
         };
+        this.contextCompactAt =
+          typeof ev.auto_compact_at === "number" && ev.auto_compact_at > 0 ? ev.auto_compact_at : null;
         break;
       }
       case "context_compaction": {
@@ -1727,13 +1764,8 @@ export class ChatStore {
         } else {
           this.compacting = false;
           if (phase === "completed") {
-            const pre = ev.pre_tokens as number | undefined;
-            this.notice(
-              pre !== undefined
-                ? `context compacted · ${pre.toLocaleString()} tokens summarized`
-                : "context compacted",
-              "info",
-            );
+            this.lastCompactionSeq = entry.seq;
+            this.notice(compactionNotice(ev.pre_tokens, ev.trigger), "info");
           }
           // The agent's normal turn output owns failure details. The lifecycle
           // event only settles progress, avoiding a duplicate Claude message.
@@ -1918,8 +1950,11 @@ export class ChatStore {
           this.modelCatalogReceived = false;
           this.effort = null;
           this.ultracode = false;
+          this.autoCompact = null;
+          this.autoCompactDisabledBy = null;
           this.contextPct = null;
           this.contextTokens = null;
+          this.contextCompactAt = null;
           this.rateLimit = null;
           this.rewind = null;
           this.mcpServers = null;

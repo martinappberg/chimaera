@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { SeqEvent } from "./chatWs";
-import { ChatStore } from "./store.svelte";
+import { ChatStore, compactionNotice } from "./store.svelte";
 import { toolSpanMs } from "./toolLabels";
 
 /** Build a numbered event stream (seq assigned in order) and fold it through a
@@ -160,6 +160,67 @@ describe("ChatStore context compaction", () => {
       { type: "turn_aborted", turn_id: "compact-2", reason: "interrupted", interrupted: true },
     ]);
     expect(missingTerminalItem.compacting).toBe(false);
+  });
+
+  it("names the agent's own compaction and keeps a requested one plain", () => {
+    const texts = (trigger: string | undefined) =>
+      fold([
+        { type: "context_compaction", phase: "started" },
+        { type: "context_compaction", phase: "completed", pre_tokens: 27_506, trigger },
+      ]).blocks.flatMap((b) => (b.kind === "notice" ? [b.text] : []));
+    expect(texts("auto")).toEqual([`context auto-compacted · ${(27_506).toLocaleString()} tokens summarized`]);
+    expect(texts("manual")).toEqual([`context compacted · ${(27_506).toLocaleString()} tokens summarized`]);
+    expect(compactionNotice(undefined, "auto")).toBe("context auto-compacted");
+    expect(compactionNotice(undefined, undefined)).toBe("context compacted");
+  });
+
+  it("keeps where the agent compacts, only while it says so", () => {
+    const set = fold([
+      { type: "context_usage", percentage: 3, total_tokens: 32_052, max_tokens: 1_000_000, auto_compact_at: 784_000 },
+    ]);
+    expect(set.contextCompactAt).toBe(784_000);
+    const dropped = fold([
+      { type: "context_usage", percentage: 3, total_tokens: 32_052, max_tokens: 1_000_000, auto_compact_at: 784_000 },
+      { type: "context_usage", percentage: 4, total_tokens: 41_533, max_tokens: 1_000_000 },
+    ]);
+    expect(dropped.contextCompactAt).toBeNull();
+    expect(fold([]).contextCompactAt).toBeNull();
+  });
+
+  it("marks checkpoints from before the latest compaction", () => {
+    const store = fold([
+      { type: "user_message", text: "one", id: "u1" },
+      { type: "checkpoint", user_message_id: "u1", preceding_uuid: "a0" },
+      { type: "context_compaction", phase: "started" },
+      { type: "context_compaction", phase: "completed", pre_tokens: 45_244, trigger: "auto" },
+      { type: "user_message", text: "two", id: "u2" },
+      { type: "checkpoint", user_message_id: "u2", preceding_uuid: "a1" },
+    ]);
+    expect(store.lastCompactionSeq).toBe(4);
+    const seqs = store.blocks.flatMap((b) => (b.kind === "user" && b.checkpoint ? [b.checkpoint.seq] : []));
+    expect(seqs).toEqual([2, 6]);
+    expect(fold([{ type: "context_compaction", phase: "failed" }]).lastCompactionSeq).toBe(0);
+  });
+
+  it("folds the auto-compact read-back latest-wins", () => {
+    const store = fold([
+      { type: "auto_compact", enabled: true },
+      { type: "auto_compact", enabled: false, picked: false },
+    ]);
+    expect(store.autoCompact).toBe(false);
+    expect(store.autoCompactDisabledBy).toBeNull();
+    expect(fold([]).autoCompact).toBeNull();
+  });
+
+  it("keeps the environment variable that holds auto-compact off", () => {
+    const held = fold([{ type: "auto_compact", enabled: false, disabled_by: "DISABLE_AUTO_COMPACT" }]);
+    expect(held.autoCompact).toBe(false);
+    expect(held.autoCompactDisabledBy).toBe("DISABLE_AUTO_COMPACT");
+    const freed = fold([
+      { type: "auto_compact", enabled: false, disabled_by: "DISABLE_COMPACT" },
+      { type: "auto_compact", enabled: true },
+    ]);
+    expect(freed.autoCompactDisabledBy).toBeNull();
   });
 });
 

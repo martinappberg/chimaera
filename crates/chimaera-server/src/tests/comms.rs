@@ -1,6 +1,6 @@
 //! Agent communication end to end (plan: docs/design/agent-communication-plan.md):
 //! messages on the Timeline, carried to claude on its next hook exactly
-//! once, broadcasts, the wake policy for idle chats (ask / never / auto,
+//! once, broadcasts, the wake policy for idle chats (ask / never / auto / always,
 //! and a reply the reader asked for), the user's hand-over and wake
 //! answers, the chat journal annotation, and the switch.
 
@@ -347,14 +347,14 @@ async fn broadcasts_reach_everyone_but_never_wake() {
 #[cfg(unix)]
 /// An idle chat and the wake policy: "ask" puts a request in Needs you (and
 /// announces it) and the user's Wake delivers; "never" leaves it for the
-/// user's hand-over; "auto" (the default) wakes at once.
+/// user's hand-over; "auto" wakes at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_wake_policy_decides_what_an_idle_chat_gets() {
     let state = test_state();
     let ws = make_workspace(&state, "comms-wake").await;
     let a = tui(&state, &ws, "ka");
     let (c, _) = chat(&state, &ws, "comms-wake-fake").await;
-    assert_eq!(comms(&state, &ws).await["wakes"], "auto", "the default");
+    assert_eq!(comms(&state, &ws).await["wakes"], "ask", "the default");
 
     // Ask.
     set_comms(&state, true, "ask").await;
@@ -448,6 +448,118 @@ async fn the_wake_policy_decides_what_an_idle_chat_gets() {
     .await;
     assert!(text.contains("started a turn"), "{text}");
     journal_has(&state, &c, "figures are in figs/").await;
+
+    state.chat.kill(&c);
+    state.sessions.kill(&a).ok();
+}
+
+#[cfg(unix)]
+/// Always wakes past every cap, and loosening the policy lets go of the
+/// requests it no longer asks about: Within limits the plain asks, Always
+/// every one — their agents wake under the new policy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn always_has_no_caps_and_loosening_the_policy_releases_requests() {
+    let state = test_state();
+    let ws = make_workspace(&state, "comms-always").await;
+    let a = tui(&state, &ws, "ka");
+    let (c1, _) = chat(&state, &ws, "comms-always-1").await;
+    let (c2, _) = chat(&state, &ws, "comms-always-2").await;
+
+    // The default asks.
+    let (_, text) = send(
+        &state,
+        &a,
+        "ka",
+        serde_json::json!({"to": c1, "text": "ask-first"}),
+    )
+    .await;
+    assert!(text.contains("the user was asked"), "{text}");
+    assert_eq!(
+        comms(&state, &ws).await["wake_requests"][0]["reason"],
+        "ask"
+    );
+
+    // Within limits: the ask goes, and c1 wakes.
+    set_comms(&state, true, "auto").await;
+    journal_has(&state, &c1, "ask-first").await;
+    let body = comms(&state, &ws).await;
+    assert!(
+        body["wake_requests"].as_array().unwrap().is_empty(),
+        "{body}"
+    );
+
+    // Past the unattended limit Within limits asks; Always lets it go.
+    crate::comms::use_unattended_wakes_for_tests(&state, &ws);
+    let (_, text) = send(
+        &state,
+        &a,
+        "ka",
+        serde_json::json!({"to": c2, "text": "held-by-limit"}),
+    )
+    .await;
+    assert!(text.contains("keep going"), "{text}");
+    assert_eq!(
+        comms(&state, &ws).await["wake_requests"][0]["reason"],
+        "unattended"
+    );
+    set_comms(&state, true, "always").await;
+    assert_eq!(comms(&state, &ws).await["wakes"], "always");
+    journal_has(&state, &c2, "held-by-limit").await;
+    assert!(comms(&state, &ws).await["wake_requests"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    // Always: no gap, no round — the same pair again at once.
+    lock(&state.agents).get_mut(&c2).unwrap().state = agent_state::AgentState::Finished;
+    let (_, text) = send(
+        &state,
+        &a,
+        "ka",
+        serde_json::json!({"to": c2, "text": "no-cap-again"}),
+    )
+    .await;
+    assert!(text.contains("started a turn"), "{text}");
+    journal_has(&state, &c2, "no-cap-again").await;
+
+    state.chat.kill(&c1);
+    state.chat.kill(&c2);
+    state.sessions.kill(&a).ok();
+}
+
+#[cfg(unix)]
+/// A request that lands after a looser policy's sweep (a send decided under
+/// the old one) is let go at once instead of waiting for the user.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_landing_after_the_sweep_is_released() {
+    let state = test_state();
+    let ws = make_workspace(&state, "comms-late").await;
+    let a = tui(&state, &ws, "ka");
+    let (c, _) = chat(&state, &ws, "comms-late-1").await;
+    let (_, text) = send(
+        &state,
+        &a,
+        "ka",
+        serde_json::json!({"to": c, "text": "late-request"}),
+    )
+    .await;
+    assert!(text.contains("the user was asked"), "{text}");
+    // The policy moves without a sweep, as if the sweep ran first.
+    {
+        let mut settings = lock(&state.settings);
+        let mut map = settings.map_cached().clone();
+        map.insert(
+            "agents.communication.wakes".into(),
+            serde_json::json!("always"),
+        );
+        settings.put(map).unwrap();
+    }
+    crate::comms::reask_for_tests(&state, &ws);
+    journal_has(&state, &c, "late-request").await;
+    assert!(comms(&state, &ws).await["wake_requests"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 
     state.chat.kill(&c);
     state.sessions.kill(&a).ok();

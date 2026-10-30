@@ -194,6 +194,39 @@ impl SettingsStore {
         }
     }
 
+    /// Daemon-consumed key: what a new Claude session's generated
+    /// `--settings` file says about auto-compact (PROTOCOL.md Pass 50).
+    /// Agent default (absent, or anything but "on"/"off" — a stray boolean
+    /// included, as the UI reads it) writes nothing, so the user's own Claude
+    /// Code settings decide; On/Off write `autoCompactEnabled`, which
+    /// outranks user and project settings for that session only and never
+    /// touches them. A conversation's own pick wins over it
+    /// (`chat::claude_auto_compact`). Codex has no switch.
+    pub(crate) fn claude_auto_compact(&self) -> Option<bool> {
+        match self.map.get("agents.autoCompact").and_then(|v| v.as_str()) {
+            Some("on") => Some(true),
+            Some("off") => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Daemon-consumed key: the percentage of the window at which a new
+    /// Claude or Codex session compacts on its own (PROTOCOL.md Pass 55).
+    /// Agent default (absent, or anything but a multiple of 5 from 50 to 90,
+    /// as the UI offers) sets nothing. Claude gets it as the generated
+    /// `--settings` file's `env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`, Codex as
+    /// the thread's `model_post_turn_compact_threshold_percent` (`-c` for a
+    /// TUI); neither touches the user's own config.
+    pub(crate) fn auto_compact_at(&self) -> Option<u8> {
+        let value = self.map.get("agents.autoCompactAt")?;
+        let percent = match value {
+            serde_json::Value::String(text) => text.parse::<u8>().ok()?,
+            serde_json::Value::Number(n) => u8::try_from(n.as_u64()?).ok()?,
+            _ => return None,
+        };
+        ((50..=90).contains(&percent) && percent % 5 == 0).then_some(percent)
+    }
+
     /// Daemon-consumed key: when a restart cut a chat's work off (a running
     /// turn, background commands / monitors / workflows), send the resumed
     /// agent one message saying what stopped (see `chat::resurrect_chat`).
@@ -306,7 +339,7 @@ fn encode(map: &Map) -> Result<Vec<u8>, WriteError> {
 /// The quick-open clear and the `/ws/events` wake happen HERE, not in the
 /// awaiting handler: a handler dropped mid-job (a closed window) must not
 /// lose them once the change is installed.
-fn refresh_job(state: &AppState) -> bool {
+fn refresh_job(state: &Arc<AppState>) -> bool {
     let (path, recorded, hook) = {
         let store = crate::lock(&state.settings);
         (store.path.clone(), store.mtime, store.before_read.clone())
@@ -315,16 +348,19 @@ fn refresh_job(state: &AppState) -> bool {
     if !matches!(disk, Disk::Loaded(..)) {
         return false;
     }
-    let (changed, ignore_changed) = {
+    let (changed, ignore_changed, wakes_before, wakes_after) = {
         let mut store = crate::lock(&state.settings);
         if store.mtime != recorded {
             return false;
         }
         let ignore_before = store.map.get("quickOpen.ignoreDirs").cloned();
+        let wakes_before = crate::comms::policy_in(&store.map);
         let changed = store.install(disk);
         (
             changed,
             ignore_before != store.map.get("quickOpen.ignoreDirs").cloned(),
+            wakes_before,
+            crate::comms::policy_in(&store.map),
         )
     };
     if ignore_changed {
@@ -332,6 +368,8 @@ fn refresh_job(state: &AppState) -> bool {
         // list must not be served for its freshness window.
         crate::lock(&state.quickopen).clear();
     }
+    // A hand-edit that loosens the wake policy lets go of requests too.
+    crate::comms::policy_changed(state, wakes_before, wakes_after);
     if changed {
         state.changes.notify_waiters();
     }
@@ -400,15 +438,16 @@ pub(crate) async fn get_settings(State(state): State<Arc<AppState>>) -> Response
 /// the file is written. A hand-edit is folded in first so the diff is
 /// against what was really on disk, and `before` is taken BEFORE the write,
 /// from the cache only this gate installs into.
-fn put_job(state: &AppState, map: Map) -> Result<(), WriteError> {
+fn put_job(state: &Arc<AppState>, map: Map) -> Result<(), WriteError> {
     refresh_job(state);
     let body = encode(&map)?;
-    let (path, before, ignore_before, after_write) = {
+    let (path, before, ignore_before, wakes_before, after_write) = {
         let store = crate::lock(&state.settings);
         (
             store.path.clone(),
             agent_path_snapshot(&store.map),
             store.map.get("quickOpen.ignoreDirs").cloned(),
+            crate::comms::policy_in(&store.map),
             store.after_write.clone(),
         )
     };
@@ -417,6 +456,7 @@ fn put_job(state: &AppState, map: Map) -> Result<(), WriteError> {
     crate::persist::run_hook(after_write.as_ref());
     let agent_paths_changed = before != agent_path_snapshot(&map);
     let ignore_dirs_changed = ignore_before.as_ref() != map.get("quickOpen.ignoreDirs");
+    let wakes_after = crate::comms::policy_in(&map);
     crate::lock(&state.settings).install(Disk::Loaded(map, mtime));
     // The settings mutex is released: regenerate_shims re-locks it.
     if agent_paths_changed {
@@ -431,6 +471,8 @@ fn put_job(state: &AppState, map: Map) -> Result<(), WriteError> {
         // an index built under the old ignore list must not outlive the edit.
         crate::lock(&state.quickopen).clear();
     }
+    // A looser wake policy lets go of the requests it no longer asks about.
+    crate::comms::policy_changed(state, wakes_before, wakes_after);
     // Wake /ws/events subscribers so every window converges live.
     state.changes.notify_waiters();
     Ok(())

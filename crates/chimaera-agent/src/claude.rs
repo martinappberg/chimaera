@@ -36,20 +36,94 @@ use crate::elicitation::{Elicitation, ElicitationAction, ELICITATION_PENDING};
 use crate::model::{
     cap_head_tail, cap_output, clip_command, fmt_elapsed_secs, fmt_tokens, truncate_label,
     AgentCommand, AgentEvent, BackgroundTask, BackgroundTaskClose, ChunkKind, Coalescer,
-    CompactionPhase, ContentBlock, ModeInfo, PermissionOption, PermissionOptionKind, PlanEntry,
-    PlanStatus, SlashCommand, ToolContent, ToolKind, ToolStatus, Usage, UsageWindow,
-    UserMessageState, WorkflowAgent, BG_LABEL_MAX, BG_PATH_MAX, BG_TASKS_CAP, COMMAND_ID_MAX,
-    DIFF_FILE_BUDGET, DIFF_TURN_BUDGET, PLAN_BLOCKED_CAP, PLAN_DESC_MAX, PLAN_LABEL_MAX,
-    PLAN_TASKS_CAP, SLASH_COMMANDS_CAP, SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX, STATUS_DETAIL_MAX,
-    SUBAGENT_RESULT_MAX, TOOL_SUMMARY_IDS_CAP, TOOL_SUMMARY_MAX, UNHANDLED_REQUESTS_CAP,
-    UNHANDLED_REQUEST_NAME_MAX, WF_AGENTS_CAP, WF_AGENTS_SET_BUDGET, WF_AGENT_LABEL_MAX,
+    CompactionPhase, CompactionTrigger, ContentBlock, ModeInfo, PermissionOption,
+    PermissionOptionKind, PlanEntry, PlanStatus, SlashCommand, ToolContent, ToolKind, ToolStatus,
+    Usage, UsageWindow, UserMessageState, WorkflowAgent, BG_LABEL_MAX, BG_PATH_MAX, BG_TASKS_CAP,
+    COMMAND_ID_MAX, DIFF_FILE_BUDGET, DIFF_TURN_BUDGET, PLAN_BLOCKED_CAP, PLAN_DESC_MAX,
+    PLAN_LABEL_MAX, PLAN_TASKS_CAP, SLASH_COMMANDS_CAP, SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX,
+    STATUS_DETAIL_MAX, SUBAGENT_RESULT_MAX, TOOL_SUMMARY_IDS_CAP, TOOL_SUMMARY_MAX,
+    UNHANDLED_REQUESTS_CAP, UNHANDLED_REQUEST_NAME_MAX, WF_AGENTS_CAP, WF_AGENTS_SET_BUDGET,
+    WF_AGENT_LABEL_MAX,
 };
 use crate::model::{RemoteControlSnapshot, RemoteControlState};
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 
-/// CLI version these frame shapes were verified against (2026-10-14,
-/// full chat-smoke 29/29 + chat-mods-smoke; PROTOCOL.md Pass 43).
-pub const TESTED_CLAUDE_VERSION: &str = "2.1.300";
+/// CLI version these frame shapes were verified against (2026-10-23, the
+/// Claude part of chat-smoke 21/21 + chat-mods-smoke; PROTOCOL.md Pass 52).
+pub const TESTED_CLAUDE_VERSION: &str = "2.1.310";
+
+/// The environment variable that lowers Claude Code's auto-compact
+/// threshold to a percentage of its window (PROTOCOL.md Pass 55). Chimaera
+/// writes it into a session's generated `--settings` `env`.
+pub const AUTOCOMPACT_PCT_VAR: &str = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE";
+
+/// The token reserve between the window less its output reserve and the
+/// threshold `get_context_usage` reports (`autoCompactThreshold` is that
+/// window minus 13,000; 2.1.310 bundle, Pass 55).
+const AUTOCOMPACT_SUMMARY_RESERVE: u64 = 13_000;
+
+/// The CLI's reading of an `env` value (`parseFloat`; used only when above
+/// 0 and at most 100). A JSON number is taken as written.
+fn autocompact_pct(value: &Value) -> Option<f64> {
+    let pct = match value {
+        Value::Number(n) => n.as_f64()?,
+        Value::String(text) => {
+            // `parseFloat`: skip JS whitespace (BOM yes, NEL no), then take
+            // the longest decimal prefix, exponent included ("8e1" is 80).
+            // Its one other spelling, `Infinity`, is outside (0, 100].
+            let text = text.trim_start_matches(|c: char| {
+                (c.is_whitespace() && c != '\u{85}') || c == '\u{feff}'
+            });
+            let bytes = text.as_bytes();
+            let digits = |from: usize| {
+                bytes.get(from..).map_or(0, |rest| {
+                    rest.iter().take_while(|b| b.is_ascii_digit()).count()
+                })
+            };
+            let mut end = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
+            let int = digits(end);
+            end += int;
+            let mut frac = 0;
+            if bytes.get(end) == Some(&b'.') {
+                frac = digits(end + 1);
+                if int + frac > 0 {
+                    end += 1 + frac;
+                }
+            }
+            if int + frac == 0 {
+                return None;
+            }
+            if matches!(bytes.get(end), Some(b'e' | b'E')) {
+                let exp = end + 1 + usize::from(matches!(bytes.get(end + 1), Some(b'+' | b'-')));
+                let exp_digits = digits(exp);
+                if exp_digits > 0 {
+                    end = exp + exp_digits;
+                }
+            }
+            text[..end].parse::<f64>().ok()?
+        }
+        _ => return None,
+    };
+    (pct > 0.0 && pct <= 100.0).then_some(pct)
+}
+
+/// Where a percentage override makes the CLI compact, from its own
+/// `get_context_usage`: `min(floor(window × pct / 100), threshold)`, the
+/// window being the reported threshold plus the summary reserve. Nothing
+/// while the CLI compacts only on "prompt is too long" (`autocompactSource`
+/// `auto`, where the percentage is ignored; a CLI that names no source is
+/// not assumed to compact early) or not at all.
+fn autocompact_at(usage: &Value, pct: f64) -> Option<u64> {
+    let enforced = usage["autocompactSource"]
+        .as_str()
+        .is_some_and(|source| source != "auto");
+    if usage["isAutoCompactEnabled"] != json!(true) || !enforced {
+        return None;
+    }
+    let threshold = usage["autoCompactThreshold"].as_u64()?;
+    let window = threshold + AUTOCOMPACT_SUMMARY_RESERVE;
+    Some((((window as f64) * pct / 100.0).floor() as u64).min(threshold))
+}
 
 /// Arguments for a structured chat session, before server-side extras
 /// (`--settings`, `--mcp-config`, `--session-id`) and login-shell wrapping.
@@ -120,10 +194,24 @@ fn user_message_frame(uuid: &str, content: Value) -> Value {
 /// for the turn to end. Only written to a CLI that advertises
 /// [`MSG_LIFECYCLE_CAPABILITY`], whose `command_lifecycle` frames report
 /// when it was read.
-fn queued_message_frame(uuid: &str, content: Value, priority: &str) -> Value {
+fn queued_message_frame(uuid: &str, content: Value, priority: &str, requeue: bool) -> Value {
     let mut frame = user_message_frame(uuid, content);
     frame["priority"] = json!(priority);
+    if requeue {
+        frame["requeue_if_interrupted_within_ms"] = json!(REQUEUE_WINDOW_MS);
+    }
     frame
+}
+
+/// A waiting message the CLI has just taken in, which a Stop can still put
+/// back ([`REQUEUE_CAPABILITY`]). It shows as read only once that can no
+/// longer happen: the model's reply began, the window passed, or the Stop's
+/// receipt left it with the stopped turn.
+struct Taken {
+    id: String,
+    /// It opens the next turn (taken while idle), so it is a rewind boundary.
+    opener: bool,
+    deadline: std::time::Instant,
 }
 
 /// `system/init` capability: the CLI reports each queued message's fate on
@@ -136,6 +224,32 @@ const MSG_LIFECYCLE_CAPABILITY: &str = "msg_lifecycle_v1";
 /// which also kills every background agent and marks it "stopped by the
 /// user" — the CLI then refuses to resume it.
 const SEND_NOW_CAPABILITY: &str = "interrupt_send_now_v1";
+
+/// The `system/init` capability of a CLI (2.1.310) that takes
+/// `requeue_if_interrupted_within_ms` on a stdin `user` frame: a Stop that
+/// crosses a turn just taking that prompt in puts it back in the queue
+/// (`queued` again, and the receipt's `put_back`) instead of losing it with
+/// the stopped turn. The same build reads `interrupt {for_user_message_uuids}`.
+const REQUEUE_CAPABILITY: &str = "interrupt_requeue_taken_v1";
+
+/// How long after a turn takes a waiting message in that a Stop still means
+/// "stop what was running", not "stop this message": the bubble said
+/// "queued" until the `started` frame crossed the wire, and the Stop was
+/// already on its way. One human reaction time (~0.3 s) plus the frame's trip
+/// to the window and the Stop's trip back over a slow SSH link (≤ 0.5 s
+/// each way), with margin. Longer would put back a prompt the user had seen
+/// being read and meant to stop. The CLI also ends the window the moment the
+/// model's reply begins, and the driver shows the message as read then.
+const REQUEUE_WINDOW_MS: u64 = 2_000;
+
+/// `interrupt.for_user_message_uuids` takes one to eight uuids.
+const STOP_FOR_MESSAGES_MAX: usize = 8;
+
+/// The `system/init` capability of a CLI (2.1.310) whose `command_lifecycle
+/// started` for a scheduler fire names it: `wakeup_source: "loop_wakeup"`
+/// (a ScheduleWakeup, with `scheduled_for`) or `"schedule_wakeup"` (any other
+/// scheduled task, a CronCreate job among them).
+const WAKEUP_SOURCE_CAPABILITY: &str = "lifecycle_wakeup_source_v1";
 
 fn control_request_frame(id: &str, request: Value) -> Value {
     json!({
@@ -385,14 +499,21 @@ impl ClaudeChat {
     }
 
     /// A mid-turn message for the CLI's own queue, with the driver's exact
-    /// frame (`priority` `"next"` or `"later"`); returns its uuid.
-    pub async fn send_queued_text(&mut self, text: &str, priority: &str) -> Result<String> {
+    /// frame (`priority` `"next"` or `"later"`; `requeue` adds
+    /// `requeue_if_interrupted_within_ms`); returns its uuid.
+    pub async fn send_queued_text(
+        &mut self,
+        text: &str,
+        priority: &str,
+        requeue: bool,
+    ) -> Result<String> {
         let uuid = crate::model::fresh_uuid();
         self.io
             .send(&queued_message_frame(
                 &uuid,
                 json!([{ "type": "text", "text": text }]),
                 priority,
+                requeue,
             ))
             .await?;
         Ok(uuid)
@@ -677,7 +798,19 @@ enum PendingControl {
     SetModel(String),
     Interrupt,
     SetThinking,
-    ContextUsage,
+    /// get_context_usage round-trip. `meter`: the turn-end refresh feeding
+    /// the context meter; without it, the auto-compact check that follows a
+    /// settings read and wants only `isAutoCompactEnabled`. `setting`: the
+    /// flag-layer auto-compact when it was asked (`None` while an apply was
+    /// still unread) and `applies` the auto-compact applies sent by then, so
+    /// a reply that crossed a switch on either side never blames the
+    /// environment. `picked`: the user's auto-compact pick the check settles.
+    ContextUsage {
+        meter: bool,
+        setting: Option<bool>,
+        applies: u64,
+        picked: Option<bool>,
+    },
     GetUsage,
     /// rewind_files round-trip; `dry_run` shapes the RewindResult.
     Rewind {
@@ -689,12 +822,20 @@ enum PendingControl {
     /// spawn bootstrap.
     Settings {
         chosen: bool,
+        /// The user's auto-compact pick this read settles (remembered for
+        /// the conversation); never an effort/ultracode pick too.
+        picked: Option<bool>,
+        /// `auto_compact_applies` when asked: the read reflects every
+        /// auto-compact apply sent before it.
+        applies: u64,
     },
     /// apply_flag_settings acknowledged → re-read the truth. `chosen` = the
-    /// apply was the user's own pick (fed to the prefs), not the handshake
-    /// replaying the spawn's remembered effort.
+    /// apply was the user's own effort/ultracode pick (fed to the prefs),
+    /// not the handshake replaying the spawn's remembered effort;
+    /// `auto_compact` = the user's auto-compact pick it carried.
     ApplyFlags {
         chosen: bool,
+        auto_compact: Option<bool>,
     },
     /// mcp_status round-trip (the /mcp panel).
     McpStatus,
@@ -990,6 +1131,34 @@ struct ClaudeMapper {
     /// signals into one normalized start + one terminal event.
     compaction_active: bool,
     compaction_completed: bool,
+    /// `compact_result: "success"` landed and its `compact_boundary` (which
+    /// carries the trigger and the token count) has not: 2.1.302 sends the
+    /// boundary right AFTER the status, so the status alone must not
+    /// complete the lifecycle. A turn end without a boundary completes it.
+    compaction_awaiting_boundary: bool,
+    /// The flag-layer auto-compact (`get_settings` `effective`); `None`
+    /// until read, and for a CLI without the merged view (no switch then).
+    auto_compact_setting: Option<bool>,
+    /// `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` as the merged settings' `env`
+    /// carries it (the CLI copies that into its process environment, over
+    /// an inherited value, and reads it at every check; Pass 55). `None`
+    /// when no settings layer sets a usable one.
+    auto_compact_pct: Option<f64>,
+    /// Auto-compact applies sent, and how many of them the cached setting
+    /// reflects. While they differ the CLI may already run with a value
+    /// the cache does not show, so no answer may blame the environment.
+    auto_compact_applies: u64,
+    auto_compact_read: u64,
+    /// What holds auto-compact off from the environment: `None` = not
+    /// known yet, `Some(None)` = nothing, `Some(Some(var))` = that variable.
+    /// Fixed for the process's life, so learned once.
+    auto_compact_env: Option<Option<&'static str>>,
+    /// `/compact` is in the initialize catalog. `DISABLE_COMPACT` removes
+    /// it, so its absence names that variable as the one holding
+    /// auto-compact off (else `DISABLE_AUTO_COMPACT`).
+    compact_offered: bool,
+    /// The last auto-compact state journaled (latest-wins dedupe).
+    auto_compact: Option<(bool, Option<&'static str>)>,
     /// Remote Control offer flags from the initialize response (see
     /// `AgentEvent::Init`): whether the bridge can be offered at all here, and
     /// whether the user's/org's default says auto-on.
@@ -1008,9 +1177,27 @@ struct ClaudeMapper {
     /// The `/goal` the CLI checks each time the agent stops.
     goal: crate::autonomy::GoalTracker,
     /// A `command_lifecycle` started a command nobody here sent: the CLI is
-    /// opening a turn by itself (a wakeup, a job, a monitor event). Consumed
-    /// when that turn opens.
-    cli_turn: bool,
+    /// opening a turn by itself (a wakeup, a job, a monitor event), and what
+    /// the frame said fired it. Consumed when that turn opens.
+    cli_turn: Option<crate::autonomy::FireSource>,
+    /// Whether the latest `system/init` advertised [`REQUEUE_CAPABILITY`].
+    requeue_capable: bool,
+    /// Waiting messages written with `requeue_if_interrupted_within_ms`
+    /// (a subset of `awaiting_read`; one put back leaves, as the CLI puts a
+    /// message back at most once).
+    requeue_armed: HashSet<String>,
+    /// The last waiting message the CLI took in since the model last spoke,
+    /// while a Stop can still put it back. Only the last can be (the CLI's
+    /// rule), so a newer one releases it.
+    taken: Option<Taken>,
+    /// The client messages the current turn took in, its opener first
+    /// (`interrupt.for_user_message_uuids`: a Stop names its own turn, so one
+    /// that lands after that turn ended spares the next).
+    turn_messages: Vec<String>,
+    /// Whether the latest `system/init` advertised
+    /// [`WAKEUP_SOURCE_CAPABILITY`]: then a self-opened turn's `started`
+    /// names its scheduler fire, and one that names none was not a fire.
+    wakeup_source_capable: bool,
     next_ctl: u64,
 }
 
@@ -1020,6 +1207,11 @@ impl ClaudeMapper {
         agent_version: Option<String>,
         commands_catalog: &Value,
     ) -> Self {
+        // Read before the catalog is capped: a long skill list must not
+        // push `/compact` out of the check.
+        let compact_offered = commands_catalog["commands"]
+            .as_array()
+            .is_none_or(|cmds| cmds.iter().any(|c| c["name"] == "compact"));
         let mut seen_commands = HashSet::new();
         let slash_commands = commands_catalog["commands"]
             .as_array()
@@ -1156,13 +1348,26 @@ impl ClaudeMapper {
             activity_line: None,
             compaction_active: false,
             compaction_completed: false,
+            compaction_awaiting_boundary: false,
+            auto_compact_setting: None,
+            auto_compact_pct: None,
+            auto_compact_applies: 0,
+            auto_compact_read: 0,
+            auto_compact_env: None,
+            compact_offered,
+            auto_compact: None,
             remote_control_available,
             remote_control_auto_enable,
             remote_control: None,
             minted_uuids: VecDeque::new(),
             schedule: Default::default(),
             goal: Default::default(),
-            cli_turn: false,
+            cli_turn: None,
+            wakeup_source_capable: false,
+            requeue_capable: false,
+            requeue_armed: HashSet::new(),
+            taken: None,
+            turn_messages: Vec::new(),
             next_ctl: 0,
         }
     }
@@ -1301,13 +1506,26 @@ impl ClaudeMapper {
     /// One get_settings round-trip → EffortState. Issued at spawn and after
     /// every apply_flag_settings, so the chips always show the CLI's truth.
     fn request_settings(&mut self, step: &mut DriverStep) {
-        self.request_settings_after(false, step);
+        self.request_settings_after(false, None, step);
     }
 
-    fn request_settings_after(&mut self, chosen: bool, step: &mut DriverStep) {
+    /// `chosen`: the read follows the user's own effort-or-ultracode apply;
+    /// `picked`: their auto-compact one (never both).
+    fn request_settings_after(
+        &mut self,
+        chosen: bool,
+        picked: Option<bool>,
+        step: &mut DriverStep,
+    ) {
         let id = self.ctl_id();
-        self.pending_controls
-            .insert(id.clone(), PendingControl::Settings { chosen });
+        self.pending_controls.insert(
+            id.clone(),
+            PendingControl::Settings {
+                chosen,
+                picked,
+                applies: self.auto_compact_applies,
+            },
+        );
         step.outbound.push(control_request_frame(
             &id,
             json!({ "subtype": "get_settings" }),
@@ -1324,12 +1542,31 @@ impl ClaudeMapper {
     fn reset_compaction_for_new_turn(&mut self) {
         self.compaction_active = false;
         self.compaction_completed = false;
+        self.compaction_awaiting_boundary = false;
+    }
+
+    /// A success status whose boundary never came completes unannotated once
+    /// something else proves the compaction over: the model's output resumes,
+    /// another compaction starts, or the turn ends. Hooks and a repeated
+    /// `system/init` sit between a manual success and its boundary (live
+    /// 2.1.302), so only those signals settle it.
+    fn settle_awaited_compaction(&mut self, step: &mut DriverStep) {
+        if std::mem::take(&mut self.compaction_awaiting_boundary) {
+            self.compaction_completed = true;
+            step.events.push(AgentEvent::ContextCompaction {
+                phase: CompactionPhase::Completed,
+                pre_tokens: None,
+                trigger: None,
+            });
+        }
     }
 
     /// A result/watchdog abort can be the only terminal signal when the CLI
     /// never emits compact_result. Keep completed=true until the next turn so
-    /// a late compact_boundary still dedupes, while active never leaks.
-    fn settle_compaction_at_turn_end(&mut self) {
+    /// a late compact_boundary still dedupes, while active never leaks. A
+    /// success still waiting for its boundary completes here, unannotated.
+    fn settle_compaction_at_turn_end(&mut self, step: &mut DriverStep) {
+        self.settle_awaited_compaction(step);
         if self.compaction_active {
             self.compaction_active = false;
             self.compaction_completed = true;
@@ -1344,6 +1581,13 @@ impl ClaudeMapper {
     /// phantom turn with no start event.
     fn ensure_turn(&mut self, step: &mut DriverStep) {
         if !self.turn_active {
+            // `turn_messages` is kept when the CLI opens a turn by itself (a
+            // wakeup, a job, a monitor event): the CLI counts every turn
+            // started since a client message's turn as that turn, so a Stop
+            // naming those messages stops this one, and one landing after
+            // it ended still spares a next turn a message of ours opened
+            // (live 2.1.310: `turn: "stopped"` for a wakeup turn after A;
+            // `turn: "spared"` for B, dequeued as the Stop naming A landed).
             self.turn_starting = false;
             self.reset_compaction_for_new_turn();
             self.turn_n += 1;
@@ -1355,8 +1599,9 @@ impl ClaudeMapper {
             step.events.push(AgentEvent::TurnStarted {
                 turn_id: self.turn_id(),
             });
-            if std::mem::take(&mut self.cli_turn) {
-                if let Some((fired, schedule)) = self.schedule.on_cli_turn(crate::now_ms()) {
+            if let Some(source) = self.cli_turn.take() {
+                if let Some((fired, schedule)) = self.schedule.on_cli_turn(crate::now_ms(), source)
+                {
                     step.events.push(AgentEvent::TurnCause {
                         turn_id: self.turn_id(),
                         kind: fired.kind.into(),
@@ -1373,13 +1618,82 @@ impl ClaudeMapper {
     /// extension's cadence, kept honest for aborts too (an interrupted turn
     /// still consumed context). Only issued for a turn that was actually open.
     fn refresh_context_usage(&mut self, step: &mut DriverStep) {
+        self.request_context_usage(true, None, step);
+    }
+
+    fn request_context_usage(&mut self, meter: bool, picked: Option<bool>, step: &mut DriverStep) {
         let id = self.ctl_id();
-        self.pending_controls
-            .insert(id.clone(), PendingControl::ContextUsage);
+        self.pending_controls.insert(
+            id.clone(),
+            PendingControl::ContextUsage {
+                meter,
+                // Unknown while an apply is unread: the CLI answers with it.
+                setting: if self.auto_compact_read == self.auto_compact_applies {
+                    self.auto_compact_setting
+                } else {
+                    None
+                },
+                applies: self.auto_compact_applies,
+                picked,
+            },
+        );
         step.outbound.push(control_request_frame(
             &id,
             json!({ "subtype": "get_context_usage" }),
         ));
+    }
+
+    /// Journal where auto-compact stands: the flag-layer setting, held off
+    /// by the environment when a variable says so. A setting that reads on
+    /// while the environment is still unknown asks the CLI first
+    /// (`get_context_usage`), so the switch never shows On and then flips
+    /// to held off. `picked` settles the user's own switch and is always
+    /// journaled; anything else only when the state moved.
+    fn emit_auto_compact(&mut self, picked: Option<bool>, step: &mut DriverStep) {
+        let Some(setting) = self.auto_compact_setting else {
+            return;
+        };
+        if setting && self.auto_compact_env.is_none() {
+            self.request_context_usage(false, picked, step);
+            return;
+        }
+        let blocker = self.auto_compact_env.flatten();
+        let state = (setting && blocker.is_none(), blocker);
+        if picked.is_some() || self.auto_compact != Some(state) {
+            self.auto_compact = Some(state);
+            step.events.push(AgentEvent::AutoCompact {
+                enabled: state.0,
+                disabled_by: blocker.map(String::from),
+                picked,
+            });
+        }
+    }
+
+    /// Fold one `get_context_usage` answer's `isAutoCompactEnabled` (the
+    /// CLI's own resolution: the setting, unless `DISABLE_AUTO_COMPACT` or
+    /// `DISABLE_COMPACT` is set). Off while the setting reads on, both when
+    /// asked (no apply unread) and now, can only be the environment, and
+    /// only an unknown one is learned. A CLI that does not say leaves the
+    /// setting in charge.
+    fn learn_auto_compact_env(&mut self, reported: Option<bool>, asked_with: Option<bool>) {
+        match reported {
+            Some(true) => self.auto_compact_env = Some(None),
+            Some(false)
+                if self.auto_compact_env.is_none()
+                    && asked_with == Some(true)
+                    && self.auto_compact_setting == Some(true) =>
+            {
+                self.auto_compact_env = Some(Some(if self.compact_offered {
+                    "DISABLE_AUTO_COMPACT"
+                } else {
+                    "DISABLE_COMPACT"
+                }));
+            }
+            Some(false) => {}
+            None => {
+                self.auto_compact_env.get_or_insert(None);
+            }
+        }
     }
 
     fn flush(&mut self) -> Option<AgentEvent> {
@@ -1416,10 +1730,24 @@ impl ClaudeMapper {
             }
             return step;
         }
+        // The model's reply began (or the turn ended without a Stop pending):
+        // a taken message can no longer be put back, so it reads as read
+        // before anything the reply says.
+        match frame["type"].as_str() {
+            Some("stream_event" | "assistant") => self.release_taken(&mut step),
+            Some("result") if !self.stop_in_flight() => self.release_taken(&mut step),
+            _ => {}
+        }
         match frame["type"].as_str() {
             Some("system") => self.on_system(frame, &mut step),
-            Some("stream_event") => self.on_stream_event(&frame["event"], &mut step),
-            Some("assistant") => self.on_assistant(frame, &mut step),
+            Some("stream_event") => {
+                self.settle_awaited_compaction(&mut step);
+                self.on_stream_event(&frame["event"], &mut step)
+            }
+            Some("assistant") => {
+                self.settle_awaited_compaction(&mut step);
+                self.on_assistant(frame, &mut step)
+            }
             Some("user") => self.on_user_frame(frame, &mut step),
             Some("control_request") => self.on_control_request(frame, &mut step),
             Some("control_cancel_request") => {
@@ -1512,6 +1840,8 @@ impl ClaudeMapper {
                 let native = advertises(MSG_LIFECYCLE_CAPABILITY);
                 self.native_queue = Some(native);
                 self.send_now_capable = advertises(SEND_NOW_CAPABILITY);
+                self.wakeup_source_capable = advertises(WAKEUP_SOURCE_CAPABILITY);
+                self.requeue_capable = advertises(REQUEUE_CAPABILITY);
                 if native {
                     // Sent before this first init could say which kind of CLI
                     // this is: the CLI's own queue takes them from here.
@@ -1766,34 +2096,49 @@ impl ClaudeMapper {
             // assistant frame, so it must also open the turn boundary (manual
             // /compact otherwise looked idle until it finished).
             Some("status") => {
+                // The window runs from the request that carries the taken
+                // prompt (its uuid is listed, live 2.1.310).
+                if frame["status"] == "requesting" {
+                    if let Some(t) = self.taken.as_mut() {
+                        let carried = frame["user_message_uuids"]
+                            .as_array()
+                            .is_some_and(|ids| ids.iter().any(|u| u == t.id.as_str()));
+                        if carried {
+                            t.deadline = std::time::Instant::now()
+                                + Duration::from_millis(REQUEUE_WINDOW_MS);
+                        }
+                    }
+                }
                 if frame["status"] == "compacting" {
                     if !self.compaction_active {
+                        self.settle_awaited_compaction(step);
                         self.ensure_turn(step);
                         self.compaction_active = true;
                         self.compaction_completed = false;
                         step.events.push(AgentEvent::ContextCompaction {
                             phase: CompactionPhase::Started,
                             pre_tokens: None,
+                            trigger: None,
                         });
                     }
                 } else if let Some(result) = frame["compact_result"].as_str() {
                     if result == "failed" && self.compaction_active {
+                        // An auto attempt can fail and the turn carry on
+                        // (live 2.1.302: `compact_error: "too_few_groups"`).
                         self.compaction_active = false;
                         self.compaction_completed = true;
                         step.events.push(AgentEvent::ContextCompaction {
                             phase: CompactionPhase::Failed,
                             pre_tokens: None,
+                            trigger: None,
                         });
                     } else if result == "success" && self.compaction_active {
-                        // Fallback for a future build that omits/reorders the
-                        // richer compact_boundary. Today's wire lands the
-                        // boundary first, so its pre_tokens win.
+                        // The boundary follows with the trigger and the token
+                        // count (live 2.1.302: status success, then the
+                        // boundary); `settle_awaited_compaction` completes it
+                        // if it never comes.
                         self.compaction_active = false;
-                        self.compaction_completed = true;
-                        step.events.push(AgentEvent::ContextCompaction {
-                            phase: CompactionPhase::Completed,
-                            pre_tokens: None,
-                        });
+                        self.compaction_awaiting_boundary = true;
                     }
                 }
                 if let Some(mode) = frame["permissionMode"].as_str() {
@@ -1807,13 +2152,21 @@ impl ClaudeMapper {
                 }
             }
             Some("compact_boundary") => {
-                let pre = frame["compact_metadata"]["pre_tokens"].as_u64();
+                let metadata = &frame["compact_metadata"];
+                let pre = metadata["pre_tokens"].as_u64();
+                let trigger = match metadata["trigger"].as_str() {
+                    Some("auto") => Some(CompactionTrigger::Auto),
+                    Some("manual") => Some(CompactionTrigger::Manual),
+                    _ => None,
+                };
                 self.compaction_active = false;
+                self.compaction_awaiting_boundary = false;
                 if !self.compaction_completed {
                     self.compaction_completed = true;
                     step.events.push(AgentEvent::ContextCompaction {
                         phase: CompactionPhase::Completed,
                         pre_tokens: pre,
+                        trigger,
                     });
                 }
             }
@@ -2455,7 +2808,8 @@ impl ClaudeMapper {
         }
         if frame["isSynthetic"] == json!(true) {
             // The CLI's own words to the model — a Stop hook's "not yet"
-            // (live 2.1.300: `/goal`'s failed check), never a message.
+            // (live 2.1.300: `/goal`'s failed check) or the compaction
+            // summary (2.1.302) — never a message.
             if let Some(text) = frame["message"]["content"]
                 .as_array()
                 .and_then(|blocks| blocks.iter().find_map(|b| b["text"].as_str()))
@@ -3416,6 +3770,21 @@ impl ClaudeMapper {
             return;
         };
         if frame["response"]["subtype"] != "success" {
+            // The auto-compact check is the driver's own question: a refusal
+            // leaves the setting in charge, silently.
+            if let PendingControl::ContextUsage {
+                meter: false,
+                setting,
+                applies,
+                picked,
+            } = pending
+            {
+                self.auto_compact_env.get_or_insert(None);
+                if applies == self.auto_compact_applies && setting == self.auto_compact_setting {
+                    self.emit_auto_compact(picked, step);
+                }
+                return;
+            }
             // A failed rewind must resolve the client's confirm flow, not
             // just leave an error notice.
             if let PendingControl::Rewind {
@@ -3458,6 +3827,17 @@ impl ClaudeMapper {
                     });
                 }
                 return;
+            }
+            // A refused switch applied nothing, and its read-back never comes:
+            // re-read, or every later check waits on it as unread.
+            if matches!(
+                pending,
+                PendingControl::ApplyFlags {
+                    auto_compact: Some(_),
+                    ..
+                }
+            ) {
+                self.request_settings(step);
             }
             // A refused send-now stopped nothing: a later genuine error must
             // not read as the user's stop (unless a Stop is also in flight).
@@ -3526,7 +3906,8 @@ impl ClaudeMapper {
                 // Read the native result instead of retaining the old chip.
                 self.request_settings(step);
             }
-            PendingControl::Interrupt | PendingControl::SetThinking => {}
+            PendingControl::Interrupt => self.on_stop_receipt(payload, step),
+            PendingControl::SetThinking => {}
             // Live 2.1.289: the receipt lands before the stopped turn's
             // result. `stopped` promises that result, so the watchdog covers
             // a CLI that never sends it. `delivering` keeps the turn (what it
@@ -3534,27 +3915,51 @@ impl ClaudeMapper {
             // on its way in) and may still end it for the message later —
             // the user's doing either way, so the flag stays. Only
             // `nothing_waiting` did nothing at all.
-            PendingControl::SendNow => match payload["send_now"].as_str() {
-                // The flag is consumed at every result: once it is gone the
-                // stopped turn has ended, and the open one is the next.
-                Some("stopped")
-                    if self.interrupt_requested && (self.turn_active || self.turn_starting) =>
-                {
-                    self.interrupt_grace = Some(INTERRUPT_GRACE_TICKS);
+            PendingControl::SendNow => {
+                self.on_stop_receipt(payload, step);
+                match payload["send_now"].as_str() {
+                    // The flag is consumed at every result: once it is gone
+                    // the stopped turn has ended, and the open one is the next.
+                    Some("stopped")
+                        if self.interrupt_requested && (self.turn_active || self.turn_starting) =>
+                    {
+                        self.interrupt_grace = Some(INTERRUPT_GRACE_TICKS);
+                    }
+                    // A Stop pressed while this request was in flight armed
+                    // the watchdog and owns the flag: its abort is still the
+                    // user's.
+                    Some("nothing_waiting") if self.interrupt_grace.is_none() => {
+                        self.interrupt_requested = false;
+                    }
+                    _ => {}
                 }
-                // A Stop pressed while this request was in flight armed the
-                // watchdog and owns the flag: its abort is still the user's.
-                Some("nothing_waiting") if self.interrupt_grace.is_none() => {
-                    self.interrupt_requested = false;
-                }
-                _ => {}
-            },
-            PendingControl::ContextUsage => {
+            }
+            PendingControl::ContextUsage {
+                meter,
+                setting,
+                applies,
+                picked,
+            } => {
                 let usage = if payload.get("usage").is_some() {
                     &payload["usage"]
                 } else {
                     payload
                 };
+                // A switch sent after the question may already be in the
+                // answer, before its read-back moves the cached setting.
+                let setting = setting.filter(|_| applies == self.auto_compact_applies);
+                let known = self.auto_compact_env;
+                self.learn_auto_compact_env(usage["isAutoCompactEnabled"].as_bool(), setting);
+                // A check a later switch overtook settles nothing: that
+                // switch's own read journals it (and its pick).
+                let current = setting == self.auto_compact_setting;
+                if (!meter && current) || self.auto_compact_env != known {
+                    let picked = if meter || !current { None } else { picked };
+                    self.emit_auto_compact(picked, step);
+                }
+                if !meter {
+                    return;
+                }
                 if let (Some(total), Some(max)) = (
                     usage["totalTokens"].as_u64(),
                     usage["rawMaxTokens"].as_u64(),
@@ -3565,6 +3970,9 @@ impl ClaudeMapper {
                         percentage: usage["percentage"]
                             .as_f64()
                             .unwrap_or_else(|| total as f64 / max.max(1) as f64 * 100.0),
+                        auto_compact_at: self
+                            .auto_compact_pct
+                            .and_then(|pct| autocompact_at(usage, pct)),
                     });
                 }
             }
@@ -3636,13 +4044,34 @@ impl ClaudeMapper {
                     }
                 }
             }
-            PendingControl::Settings { chosen } => {
+            PendingControl::Settings {
+                chosen,
+                picked,
+                applies,
+            } => {
                 let applied = &payload["applied"];
                 step.events.push(AgentEvent::EffortState {
                     effort: applied["effort"].as_str().map(String::from),
                     ultracode: applied["ultracode"] == json!(true),
                     chosen,
                 });
+                // The merged settings say whether the CLI compacts on its
+                // own (absent = its default, on). A CLI without the merged
+                // view reports nothing, so no switch is offered for it.
+                if let Some(effective) = payload["effective"].as_object() {
+                    self.auto_compact_pct = effective
+                        .get("env")
+                        .and_then(|env| env.get(AUTOCOMPACT_PCT_VAR))
+                        .and_then(autocompact_pct);
+                    self.auto_compact_read = self.auto_compact_read.max(applies);
+                    self.auto_compact_setting = Some(
+                        effective
+                            .get("autoCompactEnabled")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(true),
+                    );
+                    self.emit_auto_compact(picked, step);
+                }
             }
             PendingControl::Background { for_message: true } => {
                 // The daemon moved a foreground subagent aside so a message
@@ -3674,21 +4103,35 @@ impl ClaudeMapper {
             // comes first resolves it). `false`: the agent already took it,
             // and its `started` frame resolves it `sent`.
             PendingControl::CancelQueued(id) => {
+                let taken = self.taken.as_ref().is_some_and(|t| t.id == id);
                 if payload["cancelled"] == json!(true) {
                     if let Some(pos) = self.awaiting_read.iter().position(|q| *q == id) {
                         self.awaiting_read.remove(pos);
+                        self.requeue_armed.remove(&id);
+                        step.events.push(AgentEvent::UserMessageUpdate {
+                            id,
+                            state: UserMessageState::Cancelled,
+                        });
+                    } else if taken {
+                        self.taken = None;
                         step.events.push(AgentEvent::UserMessageUpdate {
                             id,
                             state: UserMessageState::Cancelled,
                         });
                     }
+                } else if taken {
+                    // The turn has it; the CLI will not put it back now.
+                    self.release_taken(step);
                 }
             }
-            PendingControl::ApplyFlags { chosen } => {
+            PendingControl::ApplyFlags {
+                chosen,
+                auto_compact,
+            } => {
                 // The apply is fire-and-ack; the truth comes from re-reading —
                 // and that read is the pick (it feeds the prefs) when the
                 // apply was.
-                self.request_settings_after(chosen, step);
+                self.request_settings_after(chosen, auto_compact, step);
             }
         }
     }
@@ -3733,7 +4176,7 @@ impl ClaudeMapper {
         self.prose_blocks.clear();
         // The turn is over: a CLI command that never opened one is not the
         // next turn's cause, and a schedule call cut off never answers.
-        self.cli_turn = false;
+        self.cli_turn = None;
         self.schedule.end_turn();
         if let Some(flushed) = self.coalescer.flush() {
             step.events.push(flushed);
@@ -3746,6 +4189,7 @@ impl ClaudeMapper {
             for id in consumed.iter().filter_map(Value::as_str) {
                 if let Some(pos) = self.awaiting_read.iter().position(|q| q == id) {
                     let id = self.awaiting_read.remove(pos).expect("position exists");
+                    self.requeue_armed.remove(&id);
                     step.events.push(AgentEvent::UserMessageUpdate {
                         id,
                         state: UserMessageState::Sent,
@@ -3769,7 +4213,7 @@ impl ClaudeMapper {
         // Consumed at EVERY result so a late interrupt can never relabel the
         // next turn's error.
         let interrupted = std::mem::take(&mut self.interrupt_requested);
-        self.settle_compaction_at_turn_end();
+        self.settle_compaction_at_turn_end(step);
         self.tool_kinds.clear();
         self.streamed.clear();
         // Task maps live per turn (the extension wipes its map on result) —
@@ -3812,6 +4256,14 @@ impl ClaudeMapper {
                         .to_string(),
                     interrupted,
                 });
+                // A full context with auto-compact off ends the turn before
+                // any request ("Prompt is too long", live 2.1.302). Say how
+                // to go on, as the TUI's "Context limit reached" line does.
+                if frame["terminal_reason"] == "blocking_limit" {
+                    step.events.push(AgentEvent::Notice {
+                        text: "context limit reached · /compact to continue".into(),
+                    });
+                }
                 self.refresh_context_usage(step);
             }
         } else if was_active {
@@ -3883,9 +4335,36 @@ impl ClaudeMapper {
     fn hand_held_to_cli(&mut self, step: &mut DriverStep) {
         for (id, content, after_turn) in std::mem::take(&mut self.queued_sends) {
             let priority = if after_turn { "later" } else { "next" };
-            step.outbound
-                .push(queued_message_frame(&id, content, priority));
+            step.outbound.push(queued_message_frame(
+                &id,
+                content,
+                priority,
+                self.requeue_capable,
+            ));
+            if self.requeue_capable {
+                self.requeue_armed.insert(id.clone());
+            }
             self.awaiting_read.push_back(id);
+        }
+    }
+
+    /// What a self-opened turn's `started` frame says fired it. Live 2.1.310:
+    /// `loop_wakeup` + `scheduled_for` (= the ScheduleWakeup result's
+    /// `scheduledFor`) for a wakeup, `schedule_wakeup` for a CronCreate job.
+    fn fire_source(&self, frame: &Value) -> crate::autonomy::FireSource {
+        use crate::autonomy::FireSource;
+        if !self.wakeup_source_capable {
+            return FireSource::Unsaid;
+        }
+        match frame["wakeup_source"].as_str() {
+            Some("loop_wakeup") => FireSource::Wakeup {
+                scheduled_for: crate::autonomy::as_ms(&frame["scheduled_for"]),
+            },
+            Some("schedule_wakeup") => FireSource::Job,
+            // A word this build does not know is still a scheduler fire of
+            // some kind: guess, as for an older CLI.
+            Some(_) => FireSource::Unsaid,
+            None => FireSource::NotScheduled,
         }
     }
 
@@ -3895,11 +4374,31 @@ impl ClaudeMapper {
     /// turn (several waiting messages start together, as one turn). Frames
     /// for messages that never waited here (fresh sends, the CLI's own
     /// commands) are ignored, as is a `cancelled` after `started`: that
-    /// message was read before its turn was cut, and a stop never re-sends.
+    /// message was read before its turn was cut. A message written with
+    /// `requeue_if_interrupted_within_ms` is held as [`Taken`] at `started`
+    /// until a Stop can no longer put it back (2.1.310).
     fn on_command_lifecycle(&mut self, frame: &Value, step: &mut DriverStep) {
         let Some(id) = frame["command_uuid"].as_str() else {
             return;
         };
+        if self.taken.as_ref().is_some_and(|t| t.id == id) {
+            match frame["state"].as_str() {
+                // Live 2.1.310: a Stop that crossed its intake reports it
+                // `queued` a second time, just before the receipt's put_back.
+                Some("queued") => self.put_back(id),
+                Some("completed" | "cancelled") => self.release_taken(step),
+                Some("discarded" | "refused") => {
+                    if let Some(t) = self.taken.take() {
+                        step.events.push(AgentEvent::UserMessageUpdate {
+                            id: t.id,
+                            state: UserMessageState::Dropped,
+                        });
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         let Some(pos) = self.awaiting_read.iter().position(|q| q == id) else {
             // A command nobody here sent, starting while idle: the CLI is
             // opening a turn by itself (live 2.1.300: a fired wakeup or job
@@ -3909,7 +4408,7 @@ impl ClaudeMapper {
                 && !self.turn_active
                 && !self.minted_uuids.iter().any(|u| u == id)
             {
-                self.cli_turn = true;
+                self.cli_turn = Some(self.fire_source(frame));
             }
             return;
         };
@@ -3934,26 +4433,126 @@ impl ClaudeMapper {
             _ => return,
         };
         let id = self.awaiting_read.remove(pos).expect("position exists");
-        if state == UserMessageState::Sent {
-            // What the agent wrote before this step lands above the bubble.
-            self.flush_prose(step);
-            if !self.turn_active {
-                // Our message opens this turn, whatever the CLI started too.
-                self.cli_turn = false;
-                // It opens the next turn, so it is a rewind boundary, anchored
-                // after everything the finished turn wrote. A message folded
-                // into a running turn is not one (the same rule as a steered
-                // codex message).
-                self.turn_starting = true;
-                let preceding = self.last_msg_uuid.replace(id.clone());
-                step.events.push(AgentEvent::Checkpoint {
-                    user_message_id: id.clone(),
-                    preceding_uuid: preceding,
-                });
-            }
+        if state != UserMessageState::Sent {
+            self.requeue_armed.remove(&id);
+            step.events
+                .push(AgentEvent::UserMessageUpdate { id, state });
+            return;
         }
-        step.events
-            .push(AgentEvent::UserMessageUpdate { id, state });
+        let opener = !self.turn_active;
+        if opener {
+            // Our message opens this turn, whatever the CLI started too.
+            self.cli_turn = None;
+            self.turn_starting = true;
+            self.turn_messages.clear();
+        }
+        self.note_turn_message(&id);
+        if self.requeue_armed.remove(&id) {
+            // Only the last prompt taken since the model spoke can be put
+            // back: an earlier one stays with the turn, so it is read now.
+            self.release_taken(step);
+            self.taken = Some(Taken {
+                id,
+                opener,
+                deadline: std::time::Instant::now() + Duration::from_millis(REQUEUE_WINDOW_MS),
+            });
+            return;
+        }
+        self.mark_read(id, opener, step);
+    }
+
+    /// A waiting message the agent has read: it leaves the pending stack and
+    /// enters the transcript here. One that opens the next turn is a rewind
+    /// boundary, anchored after everything the finished turn wrote; one
+    /// folded into a running turn is not (the same rule as a steered codex
+    /// message).
+    fn mark_read(&mut self, id: String, opener: bool, step: &mut DriverStep) {
+        // What the agent wrote before this step lands above the bubble.
+        self.flush_prose(step);
+        if opener {
+            let preceding = self.last_msg_uuid.replace(id.clone());
+            step.events.push(AgentEvent::Checkpoint {
+                user_message_id: id.clone(),
+                preceding_uuid: preceding,
+            });
+        }
+        step.events.push(AgentEvent::UserMessageUpdate {
+            id,
+            state: UserMessageState::Sent,
+        });
+    }
+
+    /// The taken message can no longer be put back: show it read.
+    fn release_taken(&mut self, step: &mut DriverStep) {
+        if let Some(t) = self.taken.take() {
+            self.mark_read(t.id, t.opener, step);
+        }
+    }
+
+    /// A Stop put a taken message back in the CLI's queue: it waits again
+    /// (it never showed as read) and runs as a turn of its own. The CLI puts
+    /// a message back at most once, so its next `started` reads it at once.
+    fn put_back(&mut self, id: &str) {
+        if self.taken.as_ref().is_some_and(|t| t.id == id) {
+            self.taken = None;
+        } else if self.awaiting_read.iter().any(|q| q == id)
+            || !self.minted_uuids.iter().any(|u| u == id)
+        {
+            return;
+        }
+        // (A message already shown read — the window outran the driver's
+        // clock — still waits in the CLI; tracking its next `started` keeps
+        // its turn ours instead of a self-opened one.)
+        self.requeue_armed.remove(id);
+        self.turn_messages.retain(|m| m != id);
+        self.awaiting_read.push_front(id.to_string());
+    }
+
+    /// Remember a client message the current turn took in, for a Stop that
+    /// names its turn: the opener always, then the latest folds.
+    fn note_turn_message(&mut self, id: &str) {
+        if self.turn_messages.iter().any(|m| m == id) {
+            return;
+        }
+        if self.turn_messages.len() >= STOP_FOR_MESSAGES_MAX {
+            self.turn_messages.remove(1);
+        }
+        self.turn_messages.push(id.to_string());
+    }
+
+    /// A Stop's receipt (`interrupt`, or a send-now that stopped the turn):
+    /// what it put back waits again; a taken message it left with the
+    /// stopped turn was read. `turn: "spared"` (2.1.310, for a Stop that
+    /// named a turn that had already ended) stopped nothing.
+    fn on_stop_receipt(&mut self, payload: &Value, step: &mut DriverStep) {
+        for id in payload["put_back"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .take(STOP_FOR_MESSAGES_MAX)
+        {
+            self.put_back(id);
+        }
+        if payload["turn"] == "spared" {
+            // Its own turn ended before it landed; the running one is the
+            // next message's, which the user did not stop.
+            self.interrupt_grace = None;
+            self.interrupt_requested = false;
+            return;
+        }
+        let stopped = payload.get("send_now").is_none() || payload["send_now"] == "stopped";
+        if stopped && payload["turn"] != "idle" {
+            self.release_taken(step);
+        }
+    }
+
+    /// A Stop is on its way: its receipt says whether the taken message
+    /// stays with the stopped turn or goes back to the queue.
+    fn stop_in_flight(&self) -> bool {
+        self.pending_controls
+            .values()
+            .any(|p| matches!(p, PendingControl::Interrupt | PendingControl::SendNow))
     }
 
     fn send_blocks(&mut self, blocks: Vec<ContentBlock>, after_turn: bool, step: &mut DriverStep) {
@@ -4007,9 +4606,20 @@ impl ClaudeMapper {
                 // The official clients' behavior: the CLI reads it at the
                 // agent's next step (`"next"`), or after the turn when asked
                 // (`"later"`), and reports when on `command_lifecycle`.
+                // A waiting message is the one a Stop can cross: armed, the
+                // CLI puts it back instead of losing it (REQUEUE_CAPABILITY).
+                // A send that opens a turn is not: its bubble reads as sent,
+                // so a Stop right after it means "stop this".
                 let priority = if after_turn { "later" } else { "next" };
-                step.outbound
-                    .push(queued_message_frame(&uuid, json!(content), priority));
+                step.outbound.push(queued_message_frame(
+                    &uuid,
+                    json!(content),
+                    priority,
+                    self.requeue_capable,
+                ));
+                if self.requeue_capable {
+                    self.requeue_armed.insert(uuid.clone());
+                }
                 self.awaiting_read.push_back(uuid.clone());
             } else {
                 // No per-message signal from this CLI (yet): HOLD it until the
@@ -4029,7 +4639,8 @@ impl ClaudeMapper {
             // quiet stop, nor let its armed watchdog abort it.
             self.interrupt_requested = false;
             self.interrupt_grace = None;
-            self.cli_turn = false;
+            self.cli_turn = None;
+            self.turn_messages = vec![uuid.clone()];
             self.reset_compaction_for_new_turn();
             self.turn_n += 1;
             self.turn_active = true;
@@ -4271,6 +4882,7 @@ impl ClaudeMapper {
                     id.clone(),
                     PendingControl::ApplyFlags {
                         chosen: !self.bootstrapping,
+                        auto_compact: None,
                     },
                 );
                 step.outbound.push(control_request_frame(
@@ -4290,6 +4902,7 @@ impl ClaudeMapper {
                     id.clone(),
                     PendingControl::ApplyFlags {
                         chosen: !self.bootstrapping,
+                        auto_compact: None,
                     },
                 );
                 step.outbound.push(control_request_frame(
@@ -4297,6 +4910,27 @@ impl ClaudeMapper {
                     json!({
                         "subtype": "apply_flag_settings",
                         "settings": { "ultracode": enabled },
+                    }),
+                ));
+            }
+            // Auto-compact rides the same session-scoped flag layer (live
+            // 2.1.302: get_settings reads it back from flagSettings, and no
+            // settings file is written; PROTOCOL.md Pass 50).
+            AgentCommand::SetAutoCompact { enabled } => {
+                self.auto_compact_applies += 1;
+                let id = self.ctl_id();
+                self.pending_controls.insert(
+                    id.clone(),
+                    PendingControl::ApplyFlags {
+                        chosen: false,
+                        auto_compact: Some(enabled),
+                    },
+                );
+                step.outbound.push(control_request_frame(
+                    &id,
+                    json!({
+                        "subtype": "apply_flag_settings",
+                        "settings": { "autoCompactEnabled": enabled },
                     }),
                 ));
             }
@@ -4487,7 +5121,11 @@ impl ClaudeMapper {
             // live and replay alike; for one already `sent` the reducer no-ops —
             // the message is visibly in the transcript, its own answer.
             AgentCommand::CancelQueued { id } => {
-                if self.awaiting_read.contains(&id) {
+                // A taken message still reads "queued": only the CLI knows
+                // whether a racing Stop put it back, so it is asked too.
+                if self.awaiting_read.contains(&id)
+                    || self.taken.as_ref().is_some_and(|t| t.id == id)
+                {
                     let ctl = self.ctl_id();
                     self.pending_controls
                         .insert(ctl.clone(), PendingControl::CancelQueued(id.clone()));
@@ -4596,10 +5234,15 @@ impl ClaudeMapper {
         let id = self.ctl_id();
         self.pending_controls
             .insert(id.clone(), PendingControl::Interrupt);
-        step.outbound.push(control_request_frame(
-            &id,
-            json!({ "subtype": "interrupt" }),
-        ));
+        let mut request = json!({ "subtype": "interrupt" });
+        // A Stop names its own turn (2.1.310), so one that lands after that
+        // turn ended spares the next instead of cutting it. With nothing to
+        // name (a turn the CLI opened before any message of ours), a plain
+        // Stop stops whatever runs.
+        if self.requeue_capable && !self.turn_messages.is_empty() {
+            request["for_user_message_uuids"] = json!(self.turn_messages);
+        }
+        step.outbound.push(control_request_frame(&id, request));
     }
 
     /// The CLI's send-now: `interrupt {send_now, message_uuid}`. The abort it
@@ -4653,6 +5296,11 @@ impl ClaudeMapper {
                 option_id: "expired".into(),
             });
         }
+        // The turn had taken it in: it was read (an opener with its rewind
+        // boundary, as at any other release).
+        let mut taken = DriverStep::default();
+        self.release_taken(&mut taken);
+        events.extend(taken.events);
         // A hard kill mid-queue must not strand a waiting message as "queued"
         // forever on replay — drop what the agent never read: the CLI's queue
         // died with it, and a held message was never even written.
@@ -4720,6 +5368,13 @@ impl ClaudeMapper {
     /// result, so there is no coalesced surplus for a timer to reconcile.
     fn tick(&mut self) -> DriverStep {
         let mut step = self.interrupt_watchdog();
+        if self
+            .taken
+            .as_ref()
+            .is_some_and(|t| std::time::Instant::now() >= t.deadline)
+        {
+            self.release_taken(&mut step);
+        }
         self.native_ui.tick(&mut step);
         // A thinking block still streaming past the hold is reasoning —
         // narration arrives whole, signature included, in one burst.
@@ -4759,13 +5414,14 @@ impl ClaudeMapper {
             return step;
         }
         self.end_thinking_block(false, &mut step);
+        self.release_taken(&mut step);
         if let Some(flushed) = self.coalescer.flush() {
             step.events.push(flushed);
         }
         let turn_id = self.turn_id();
         self.turn_active = false;
         self.turn_starting = false;
-        self.settle_compaction_at_turn_end();
+        self.settle_compaction_at_turn_end(&mut step);
         self.interrupt_requested = false;
         // Same per-turn cleanup a real result performs — the interrupted
         // subagents settle neutrally instead of turning a deliberate Stop red.
@@ -6560,6 +7216,188 @@ pub(crate) mod tests {
             step.outbound[0]["request"],
             json!({ "subtype": "interrupt" })
         );
+    }
+
+    /// A mid-turn mapper on a 2.1.310 CLI (`interrupt_requeue_taken_v1`).
+    fn requeue_mapper_mid_turn() -> (ClaudeMapper, String) {
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "type": "system", "subtype": "init", "session_id": "native-1",
+            "capabilities": ["interrupt_receipt_v1", "msg_lifecycle_v1",
+                "interrupt_send_now_v1", "interrupt_requeue_taken_v1"],
+        }));
+        let (a, _) = send_text(&mut m, "A", false);
+        (m, a)
+    }
+
+    fn sent(step: &DriverStep, id: &str) -> bool {
+        step.events.iter().any(|e| {
+            matches!(e, AgentEvent::UserMessageUpdate { id: i, state: UserMessageState::Sent }
+                if i == id)
+        })
+    }
+
+    /// Live 2.1.310: B waited while A's `sleep 6` ran and was taken at the
+    /// step after it; a Stop sent the instant B started crossed that intake.
+    /// The CLI put B back (`queued` again, then the receipt's `put_back`),
+    /// stopped A's turn and ran B as a turn of its own. B never shows as read
+    /// with the stopped turn: it stays queued until it opens its own.
+    #[test]
+    fn a_stop_that_crosses_a_just_taken_message_puts_it_back() {
+        let (mut m, a) = requeue_mapper_mid_turn();
+        let (b, step) = send_text(&mut m, "B", false);
+        let frame = step.outbound.iter().find(|f| f["type"] == "user").unwrap();
+        assert_eq!(frame["priority"], "next");
+        assert_eq!(frame["requeue_if_interrupted_within_ms"], 2000);
+
+        assert!(
+            m.on_frame(&lifecycle(&b, "started")).events.is_empty(),
+            "not yet read"
+        );
+        let step = m.on_command(AgentCommand::Interrupt);
+        assert_eq!(
+            step.outbound[0]["request"],
+            json!({ "subtype": "interrupt", "for_user_message_uuids": [a, b] })
+        );
+        let ctl = step.outbound[0]["request_id"].clone();
+        let mut seen = Vec::new();
+        for frame in [
+            json!({"type": "system", "subtype": "status", "status": "requesting",
+                "user_message_uuids": [a, b]}),
+            lifecycle(&b, "queued"),
+            json!({"type": "control_response", "response": {"subtype": "success",
+                "request_id": ctl, "response": {"still_queued": [b], "put_back": [b],
+                "turn": "stopped"}}}),
+            json!({"type": "user", "uuid": "u-int", "parent_tool_use_id": null,
+                "message": {"role": "user", "content": [
+                    {"type": "text", "text": "[Request interrupted by user]"}]}}),
+            json!({"type": "result", "subtype": "error_during_execution", "is_error": true,
+                "user_message_uuids": [a], "terminal_reason": "aborted_streaming"}),
+            lifecycle(&a, "cancelled"),
+        ] {
+            seen.extend(m.on_frame(&frame).events);
+        }
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, AgentEvent::UserMessageUpdate { id, .. } if *id == b)),
+            "{seen:?}"
+        );
+        assert!(seen.iter().any(|e| matches!(
+            e,
+            AgentEvent::TurnAborted {
+                interrupted: true,
+                ..
+            }
+        )));
+        // Its own turn: read at once (the CLI puts a message back only once),
+        // as the rewind boundary that turn opens.
+        let step = m.on_frame(&lifecycle(&b, "started"));
+        assert!(sent(&step, &b));
+        assert!(step.events.iter().any(|e| matches!(e,
+            AgentEvent::Checkpoint { user_message_id, .. } if *user_message_id == b)));
+    }
+
+    /// A taken message reads as read the moment the model's reply begins (or
+    /// the window passes), before anything that reply says.
+    #[test]
+    fn a_taken_message_reads_as_read_once_it_can_no_longer_be_put_back() {
+        let (mut m, _a) = requeue_mapper_mid_turn();
+        let (b, _) = send_text(&mut m, "B", false);
+        m.on_frame(&lifecycle(&b, "started"));
+        let step = m.on_frame(&json!({"type": "stream_event",
+            "event": {"type": "message_start", "message": {"id": "msg-2"}}}));
+        assert!(sent(&step, &b));
+
+        let (c, _) = send_text(&mut m, "C", false);
+        m.on_frame(&lifecycle(&c, "started"));
+        assert!(m.tick().events.is_empty(), "inside the window");
+        m.taken.as_mut().unwrap().deadline = std::time::Instant::now();
+        assert!(sent(&m.tick(), &c));
+
+        // A Stop whose receipt left it with the stopped turn: read then.
+        let (d, _) = send_text(&mut m, "D", false);
+        m.on_frame(&lifecycle(&d, "started"));
+        let ctl = m.on_command(AgentCommand::Interrupt).outbound[0]["request_id"].clone();
+        let step = m.on_frame(&json!({"type": "control_response", "response": {
+            "subtype": "success", "request_id": ctl,
+            "response": {"still_queued": [], "turn": "stopped"}}}));
+        assert!(sent(&step, &d));
+    }
+
+    /// Live 2.1.310: a Stop naming a turn that already ended answered
+    /// `{still_queued: [], turn: "spared"}` and the next turn ran on. Nothing
+    /// was stopped, so the watchdog must not abort that turn.
+    #[test]
+    fn a_stop_for_a_turn_that_already_ended_stops_nothing() {
+        let (mut m, a) = requeue_mapper_mid_turn();
+        let step = m.on_command(AgentCommand::Interrupt);
+        assert_eq!(
+            step.outbound[0]["request"]["for_user_message_uuids"],
+            json!([a])
+        );
+        assert!(m.interrupt_grace.is_some());
+        let ctl = step.outbound[0]["request_id"].clone();
+        m.on_frame(
+            &json!({"type": "control_response", "response": {"subtype": "success",
+            "request_id": ctl, "response": {"still_queued": [], "turn": "spared"}}}),
+        );
+        assert!(m.interrupt_grace.is_none());
+        assert!(!m.interrupt_requested);
+    }
+
+    /// A turn the CLI opens by itself (a wakeup, a job) is, to the CLI, part
+    /// of the last client message's turn ("the latest one dequeued for a
+    /// client's message, with every turn started since"): a Stop there names
+    /// that message, which stops it, and still spares a next turn of ours if
+    /// it lands late.
+    #[test]
+    fn a_stop_in_a_self_opened_turn_names_the_last_client_turn() {
+        let (mut m, a) = requeue_mapper_mid_turn();
+        m.on_frame(&result_frame());
+        assert!(!m.turn_active);
+        m.on_frame(&lifecycle("cli-wake-1", "started"));
+        m.on_frame(&text_frame("msg-w", "claude-sonnet-5-5", "tick"));
+        assert!(m.turn_active);
+        let step = m.on_command(AgentCommand::Interrupt);
+        assert_eq!(
+            step.outbound[0]["request"]["for_user_message_uuids"],
+            json!([a])
+        );
+    }
+
+    /// An older CLI: no field on the frame, a plain Stop, read at `started`.
+    #[test]
+    fn a_cli_without_requeue_keeps_the_plain_frames() {
+        let mut m = native_mapper_mid_turn();
+        let (b, step) = send_text(&mut m, "B", false);
+        let frame = step.outbound.iter().find(|f| f["type"] == "user").unwrap();
+        assert!(frame.get("requeue_if_interrupted_within_ms").is_none());
+        assert!(sent(&m.on_frame(&lifecycle(&b, "started")), &b));
+        let step = m.on_command(AgentCommand::Interrupt);
+        assert_eq!(
+            step.outbound[0]["request"],
+            json!({ "subtype": "interrupt" })
+        );
+    }
+
+    /// The ✕ on a taken message asks the CLI: `cancelled: false` means the
+    /// turn has it, so it reads as read.
+    #[test]
+    fn cancelling_a_taken_message_asks_the_cli() {
+        let (mut m, _a) = requeue_mapper_mid_turn();
+        let (b, _) = send_text(&mut m, "B", false);
+        m.on_frame(&lifecycle(&b, "started"));
+        let step = m.on_command(AgentCommand::CancelQueued { id: b.clone() });
+        assert_eq!(
+            step.outbound[0]["request"]["subtype"],
+            "cancel_async_message"
+        );
+        assert!(step.events.is_empty(), "no tombstone while the CLI decides");
+        let ctl = step.outbound[0]["request_id"].clone();
+        let step = m.on_frame(&json!({"type": "control_response", "response": {
+            "subtype": "success", "request_id": ctl, "response": {"cancelled": false}}}));
+        assert!(sent(&step, &b));
     }
 
     /// The turn a send-now aborts takes its foreground agents with it, not a
@@ -9982,6 +10820,97 @@ pub(crate) mod tests {
         ));
     }
 
+    /// Live 2.1.310 (Pass 53): `set_model claude-haiku-4-5` (200k) on a
+    /// 368k-token Haiku 5.5 (1M) conversation. The ack comes with a replayed
+    /// `/model` stdout frame; the next message's turn compacts first, with the
+    /// previous model (`modelUsage` billed the summary to claude-haiku-5-5),
+    /// then answers on the new one. One turn, with the compaction in it.
+    #[test]
+    fn a_switch_to_a_smaller_window_compacts_inside_the_next_turn() {
+        let mut m = mapper();
+        m.on_frame(
+            &json!({"type": "system", "subtype": "init", "session_id": "native-1",
+            "model": "claude-haiku-5-5", "capabilities": ["msg_lifecycle_v1"]}),
+        );
+        let step = m.on_command(AgentCommand::SetModel {
+            model_id: "claude-haiku-4-5".into(),
+        });
+        let ctl = step.outbound[0]["request_id"].clone();
+        let mut events = Vec::new();
+        events.extend(m.on_frame(&json!({"type": "user", "message": {"role": "user",
+            "content": "<local-command-stdout>Set model to `claude-haiku-4-5`</local-command-stdout>"},
+            "parent_tool_use_id": null, "uuid": "e496eb9c", "isReplay": true})).events);
+        events.extend(
+            m.on_frame(&json!({"type": "control_response", "response": {
+            "subtype": "success", "request_id": ctl,
+            "response": {"model": "claude-haiku-4-5"}}}))
+                .events,
+        );
+        let (ours, step) = send_text(&mut m, "Reply with just: ok", false);
+        events.extend(step.events);
+        for frame in [
+            lifecycle(&ours, "queued"),
+            lifecycle(&ours, "started"),
+            json!({"type": "system", "subtype": "init", "session_id": "native-1",
+                "model": "claude-haiku-4-5", "capabilities": ["msg_lifecycle_v1"]}),
+            json!({"type": "system", "subtype": "status", "status": "requesting",
+                "user_message_uuids": [ours]}),
+            json!({"type": "system", "subtype": "status", "status": "compacting",
+                "compact_output_chars": 0}),
+            json!({"type": "system", "subtype": "status", "status": null,
+                "compact_result": "success"}),
+            json!({"type": "system", "subtype": "compact_boundary", "compact_metadata": {
+                "trigger": "auto", "pre_tokens": 368181, "post_tokens": 3537}}),
+            json!({"type": "user", "parent_tool_use_id": null, "isSynthetic": true,
+                "uuid": "u-summary", "message": {"role": "user", "content": [{"type": "text",
+                "text": "This session is being continued from a previous conversation that \
+                    ran out of context. The summary below covers the earlier portion of the \
+                    conversation.\n\nSummary:\n1. Primary Request and Intent: ..."}]}}),
+            text_frame("msg_011CgLDB", "claude-haiku-4-5-20251001", "ok"),
+            result_frame(),
+            lifecycle(&ours, "completed"),
+        ] {
+            events.extend(m.on_frame(&frame).events);
+        }
+        let kinds: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::TurnStarted { .. } => Some("turn"),
+                AgentEvent::ContextCompaction {
+                    phase: CompactionPhase::Started,
+                    ..
+                } => Some("compacting"),
+                AgentEvent::ContextCompaction {
+                    phase: CompactionPhase::Completed,
+                    ..
+                } => Some("compacted"),
+                AgentEvent::ModelSwitched { reason: None, .. } => Some("switched"),
+                AgentEvent::UserMessage { .. } => Some("user"),
+                AgentEvent::TurnCompleted { .. } => Some("done"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "switched",
+                "user",
+                "turn",
+                "compacting",
+                "compacted",
+                "done"
+            ],
+            "{events:?}"
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ContextCompaction {
+                pre_tokens: Some(368181),
+                ..
+            }
+        )));
+    }
+
     #[test]
     fn interrupted_compaction_does_not_suppress_the_next_lifecycle() {
         let mut m = mapper();
@@ -10038,8 +10967,559 @@ pub(crate) mod tests {
             AgentEvent::ContextCompaction {
                 phase: CompactionPhase::Completed,
                 pre_tokens: Some(42000),
+                ..
             }
         ));
+    }
+
+    /// Live 2.1.302 order: the success status lands BEFORE the boundary, and
+    /// only the boundary says who started it and how much it summarized.
+    #[test]
+    fn success_status_waits_for_the_boundary_that_carries_the_trigger() {
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "type": "system", "subtype": "status", "status": "compacting",
+            "compact_output_chars": 0,
+        }));
+        let success = m.on_frame(&json!({
+            "type": "system", "subtype": "status", "status": null,
+            "compact_result": "success",
+        }));
+        assert!(success.events.is_empty(), "{:?}", success.events);
+        let boundary = m.on_frame(&json!({
+            "type": "system", "subtype": "compact_boundary",
+            "compact_metadata": { "trigger": "auto", "pre_tokens": 27506,
+                "post_tokens": 2499, "duration_ms": 4650 },
+        }));
+        assert_eq!(
+            boundary.events,
+            vec![AgentEvent::ContextCompaction {
+                phase: CompactionPhase::Completed,
+                pre_tokens: Some(27506),
+                trigger: Some(CompactionTrigger::Auto),
+            }]
+        );
+        let end = m.on_frame(&json!({ "type": "result", "is_error": false }));
+        assert!(!end
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ContextCompaction { .. })));
+    }
+
+    #[test]
+    fn a_success_without_a_boundary_completes_at_the_turn_end() {
+        let mut m = mapper();
+        m.on_frame(&json!({ "type": "system", "subtype": "status", "status": "compacting" }));
+        m.on_frame(&json!({
+            "type": "system", "subtype": "status", "status": null,
+            "compact_result": "success",
+        }));
+        let end = m.on_frame(&json!({ "type": "result", "is_error": false }));
+        assert!(end.events.contains(&AgentEvent::ContextCompaction {
+            phase: CompactionPhase::Completed,
+            pre_tokens: None,
+            trigger: None,
+        }));
+    }
+
+    /// An auto compaction mid-turn whose boundary never comes must not read
+    /// "compacting" for the rest of the turn: the model's next output ends it.
+    #[test]
+    fn a_success_without_a_boundary_completes_when_output_resumes() {
+        let mut m = mapper();
+        m.on_frame(&json!({ "type": "system", "subtype": "status", "status": "compacting" }));
+        m.on_frame(&json!({
+            "type": "system", "subtype": "status", "status": null,
+            "compact_result": "success",
+        }));
+        let resumed = m.on_frame(&json!({
+            "type": "stream_event",
+            "event": { "type": "message_start", "message": { "id": "msg-1" } },
+        }));
+        assert!(resumed.events.contains(&AgentEvent::ContextCompaction {
+            phase: CompactionPhase::Completed,
+            pre_tokens: None,
+            trigger: None,
+        }));
+        let end = m.on_frame(&json!({ "type": "result", "is_error": false }));
+        assert!(!end
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ContextCompaction { .. })));
+    }
+
+    #[test]
+    fn manual_boundary_is_tagged_manual() {
+        let mut m = mapper();
+        m.on_frame(&json!({ "type": "system", "subtype": "status", "status": "compacting" }));
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "compact_boundary",
+            "compact_metadata": { "trigger": "manual", "pre_tokens": 27477 },
+        }));
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::ContextCompaction {
+                trigger: Some(CompactionTrigger::Manual),
+                ..
+            }
+        ));
+    }
+
+    /// Answer the control request `request` sent (its first outbound frame).
+    fn answer(m: &mut ClaudeMapper, request: &DriverStep, response: Value) -> DriverStep {
+        m.on_frame(&json!({"type":"control_response", "response": {
+            "subtype":"success", "request_id":request.outbound[0]["request_id"],
+            "response": response,
+        }}))
+    }
+
+    fn auto_compact_events(step: &DriverStep) -> Vec<&AgentEvent> {
+        step.events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::AutoCompact { .. }))
+            .collect()
+    }
+
+    /// The per-chat switch rides the session flag layer and reads back from
+    /// get_settings `effective` (live 2.1.302); the read that follows the
+    /// user's own apply carries their pick, and it is not an effort pick.
+    #[test]
+    fn auto_compact_applies_to_the_flag_layer_and_reads_back() {
+        let mut m = mapper();
+        let apply = m.on_command(AgentCommand::SetAutoCompact { enabled: false });
+        assert_eq!(
+            apply.outbound[0]["request"]["subtype"],
+            "apply_flag_settings"
+        );
+        assert_eq!(
+            apply.outbound[0]["request"]["settings"],
+            json!({ "autoCompactEnabled": false })
+        );
+        let ack = answer(&mut m, &apply, Value::Null);
+        assert_eq!(ack.outbound[0]["request"]["subtype"], "get_settings");
+        let read = answer(
+            &mut m,
+            &ack,
+            json!({
+                "applied":{"effort":"medium","ultracode":false},
+                "effective":{"autoCompactEnabled":false},
+                "sources":[{"source":"flagSettings","settings":{"autoCompactEnabled":false}}]
+            }),
+        );
+        assert_eq!(
+            read.events,
+            vec![
+                AgentEvent::EffortState {
+                    effort: Some("medium".into()),
+                    ultracode: false,
+                    chosen: false,
+                },
+                AgentEvent::AutoCompact {
+                    enabled: false,
+                    disabled_by: None,
+                    picked: Some(false),
+                },
+            ]
+        );
+    }
+
+    /// `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` as the CLI reads it (`parseFloat`,
+    /// then used only above 0 and at most 100).
+    #[test]
+    fn autocompact_pct_reads_like_the_cli() {
+        assert_eq!(autocompact_pct(&json!("80")), Some(80.0));
+        assert_eq!(autocompact_pct(&json!(" 7.5")), Some(7.5));
+        assert_eq!(autocompact_pct(&json!("80%")), Some(80.0));
+        assert_eq!(autocompact_pct(&json!("8e1")), Some(80.0));
+        assert_eq!(autocompact_pct(&json!("75e")), Some(75.0));
+        assert_eq!(autocompact_pct(&json!("1.5.2")), Some(1.5));
+        assert_eq!(autocompact_pct(&json!("inf")), None);
+        assert_eq!(autocompact_pct(&json!("5.")), Some(5.0));
+        assert_eq!(autocompact_pct(&json!(".5x")), Some(0.5));
+        assert_eq!(autocompact_pct(&json!("8e+1%")), Some(80.0));
+        assert_eq!(autocompact_pct(&json!("\u{feff}80")), Some(80.0));
+        assert_eq!(autocompact_pct(&json!("\u{85}80")), None);
+        // No length cap: a long spelling still reads as the CLI reads it.
+        let padded = format!("{}80", "0".repeat(40));
+        assert_eq!(autocompact_pct(&json!(padded)), Some(80.0));
+        assert_eq!(autocompact_pct(&json!(42)), Some(42.0));
+        assert_eq!(autocompact_pct(&json!("100")), Some(100.0));
+        assert_eq!(autocompact_pct(&json!("0")), None);
+        assert_eq!(autocompact_pct(&json!("150")), None);
+        assert_eq!(autocompact_pct(&json!("-5")), None);
+        assert_eq!(autocompact_pct(&json!("abc")), None);
+        assert_eq!(autocompact_pct(&json!(true)), None);
+    }
+
+    /// The merged settings' threshold lands on the turn-end meter where the
+    /// CLI compacts: `min(floor((threshold + 13k) × pct / 100), threshold)`
+    /// from its own `get_context_usage` (live 2.1.310: 967,000 reported for
+    /// a 1M window; 80% compacts at 784,000). Nothing at the CLI's default,
+    /// while it compacts only on "prompt is too long", or with it off.
+    #[test]
+    fn auto_compact_at_follows_the_merged_settings_env() {
+        fn meter(m: &mut ClaudeMapper, usage: Value) -> Option<Option<u64>> {
+            let mut step = DriverStep::default();
+            m.refresh_context_usage(&mut step);
+            let answered = answer(m, &step, usage);
+            answered.events.iter().find_map(|e| match e {
+                AgentEvent::ContextUsage {
+                    auto_compact_at, ..
+                } => Some(*auto_compact_at),
+                _ => None,
+            })
+        }
+        let usage = |source: &str, enabled: bool| {
+            json!({
+                "totalTokens": 32_052, "rawMaxTokens": 1_000_000, "percentage": 3,
+                "autoCompactThreshold": 967_000, "autocompactSource": source,
+                "isAutoCompactEnabled": enabled,
+            })
+        };
+        let mut m = mapper();
+        assert_eq!(meter(&mut m, usage("model-default", true)), Some(None));
+        let mut settings = DriverStep::default();
+        m.request_settings(&mut settings);
+        answer(
+            &mut m,
+            &settings,
+            json!({"applied":{}, "effective":{"env":{"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE":"80"}}}),
+        );
+        assert_eq!(
+            meter(&mut m, usage("model-default", true)),
+            Some(Some(784_000))
+        );
+        // A window from settings (`autoCompactWindow` 800k: threshold 767k).
+        let mut small = usage("settings", true);
+        small["autoCompactThreshold"] = json!(767_000);
+        assert_eq!(meter(&mut m, small), Some(Some(624_000)));
+        // Above the CLI's own threshold the percentage changes nothing.
+        let mut m99 = mapper();
+        let mut settings = DriverStep::default();
+        m99.request_settings(&mut settings);
+        answer(
+            &mut m99,
+            &settings,
+            json!({"applied":{}, "effective":{"env":{"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE":"99.5"}}}),
+        );
+        assert_eq!(
+            meter(&mut m99, usage("model-default", true)),
+            Some(Some(967_000))
+        );
+        assert_eq!(meter(&mut m, usage("auto", true)), Some(None));
+        assert_eq!(meter(&mut m, usage("model-default", false)), Some(None));
+        let mut unnamed = usage("model-default", true);
+        unnamed.as_object_mut().unwrap().remove("autocompactSource");
+        assert_eq!(meter(&mut m, unnamed), Some(None));
+    }
+
+    /// A setting that reads on is confirmed with get_context_usage before
+    /// anything is journaled (no On that then flips); the answer is learned
+    /// once, later reads dedupe, and a CLI without the merged view offers
+    /// no switch at all.
+    #[test]
+    fn auto_compact_on_waits_for_the_cli_then_dedupes() {
+        let mut m = mapper();
+        let mut settings = DriverStep::default();
+        m.request_settings(&mut settings);
+        // Absent key in the merged view = the CLI's default (on).
+        let read = answer(&mut m, &settings, json!({"applied":{}, "effective":{}}));
+        assert!(auto_compact_events(&read).is_empty());
+        assert_eq!(read.outbound[0]["request"]["subtype"], "get_context_usage");
+        let check = answer(
+            &mut m,
+            &read,
+            json!({"totalTokens": 1, "rawMaxTokens": 10, "isAutoCompactEnabled": true}),
+        );
+        assert_eq!(
+            check.events,
+            vec![AgentEvent::AutoCompact {
+                enabled: true,
+                disabled_by: None,
+                picked: None,
+            }],
+            "the check feeds no context meter"
+        );
+        let mut again = DriverStep::default();
+        m.request_settings(&mut again);
+        let again = answer(&mut m, &again, json!({"applied":{}, "effective":{}}));
+        assert!(again.outbound.is_empty(), "the environment is learned once");
+        assert!(auto_compact_events(&again).is_empty());
+
+        let mut old = mapper();
+        let mut legacy = DriverStep::default();
+        old.request_settings(&mut legacy);
+        let legacy = answer(&mut old, &legacy, json!({"applied":{}}));
+        assert!(legacy.outbound.is_empty());
+        assert!(auto_compact_events(&legacy).is_empty());
+    }
+
+    /// `DISABLE_AUTO_COMPACT` / `DISABLE_COMPACT` hold it off whatever the
+    /// setting says, and only get_context_usage says so (live 2.1.302):
+    /// `isAutoCompactEnabled: false` while the flag layer reads on. Without
+    /// `/compact` in the catalog the variable is `DISABLE_COMPACT`.
+    #[test]
+    fn the_environment_holding_auto_compact_off_is_named() {
+        for (catalog, var) in [
+            (
+                json!({ "commands": [{ "name": "compact" }] }),
+                "DISABLE_AUTO_COMPACT",
+            ),
+            (
+                json!({ "commands": [{ "name": "review" }] }),
+                "DISABLE_COMPACT",
+            ),
+        ] {
+            let mut m = ClaudeMapper::new(Some("native-1".into()), None, &catalog);
+            let mut settings = DriverStep::default();
+            m.request_settings(&mut settings);
+            let read = answer(&mut m, &settings, json!({"applied":{}, "effective":{}}));
+            let check = answer(&mut m, &read, json!({"isAutoCompactEnabled": false}));
+            assert_eq!(
+                check.events,
+                vec![AgentEvent::AutoCompact {
+                    enabled: false,
+                    disabled_by: Some(var.into()),
+                    picked: None,
+                }]
+            );
+            // A pick still settles (and is remembered), held off all the same.
+            let apply = m.on_command(AgentCommand::SetAutoCompact { enabled: true });
+            let ack = answer(&mut m, &apply, Value::Null);
+            let read = answer(
+                &mut m,
+                &ack,
+                json!({"applied":{}, "effective":{"autoCompactEnabled":true}}),
+            );
+            assert_eq!(
+                auto_compact_events(&read),
+                vec![&AgentEvent::AutoCompact {
+                    enabled: false,
+                    disabled_by: Some(var.into()),
+                    picked: Some(true),
+                }]
+            );
+        }
+    }
+
+    /// Off at spawn says nothing about the environment; switching it on
+    /// asks, and a turn-end meter read that was asked while it was off
+    /// never blames the environment.
+    #[test]
+    fn auto_compact_off_learns_the_environment_when_switched_on() {
+        let mut m = mapper();
+        let mut settings = DriverStep::default();
+        m.request_settings(&mut settings);
+        let read = answer(
+            &mut m,
+            &settings,
+            json!({"applied":{}, "effective":{"autoCompactEnabled":false}}),
+        );
+        assert_eq!(
+            auto_compact_events(&read),
+            vec![&AgentEvent::AutoCompact {
+                enabled: false,
+                disabled_by: None,
+                picked: None,
+            }]
+        );
+        assert!(read.outbound.is_empty());
+        // A meter refresh asked while off; it lands after the switch on.
+        let mut meter = DriverStep::default();
+        m.refresh_context_usage(&mut meter);
+        let apply = m.on_command(AgentCommand::SetAutoCompact { enabled: true });
+        let ack = answer(&mut m, &apply, Value::Null);
+        let read = answer(
+            &mut m,
+            &ack,
+            json!({"applied":{}, "effective":{"autoCompactEnabled":true}}),
+        );
+        assert!(auto_compact_events(&read).is_empty());
+        let stale = answer(
+            &mut m,
+            &meter,
+            json!({"totalTokens": 5, "rawMaxTokens": 10, "isAutoCompactEnabled": false}),
+        );
+        assert!(auto_compact_events(&stale).is_empty());
+        assert!(stale
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ContextUsage { .. })));
+        let check = answer(&mut m, &read, json!({"isAutoCompactEnabled": true}));
+        assert_eq!(
+            check.events,
+            vec![AgentEvent::AutoCompact {
+                enabled: true,
+                disabled_by: None,
+                picked: Some(true),
+            }]
+        );
+    }
+
+    /// Switched on, then off before the CLI answered the check: the stale
+    /// answer settles nothing, so the conversation keeps the last pick.
+    #[test]
+    fn an_overtaken_auto_compact_check_keeps_the_last_pick() {
+        let mut m = mapper();
+        let on = m.on_command(AgentCommand::SetAutoCompact { enabled: true });
+        let ack = answer(&mut m, &on, Value::Null);
+        let check = answer(
+            &mut m,
+            &ack,
+            json!({"applied":{}, "effective":{"autoCompactEnabled":true}}),
+        );
+        assert_eq!(check.outbound[0]["request"]["subtype"], "get_context_usage");
+        let off = m.on_command(AgentCommand::SetAutoCompact { enabled: false });
+        let ack = answer(&mut m, &off, Value::Null);
+        let read = answer(
+            &mut m,
+            &ack,
+            json!({"applied":{}, "effective":{"autoCompactEnabled":false}}),
+        );
+        assert_eq!(
+            auto_compact_events(&read),
+            vec![&AgentEvent::AutoCompact {
+                enabled: false,
+                disabled_by: None,
+                picked: Some(false),
+            }]
+        );
+        let stale = answer(&mut m, &check, json!({"isAutoCompactEnabled": false}));
+        assert!(auto_compact_events(&stale).is_empty(), "{:?}", stale.events);
+    }
+
+    /// Switched on, then off before the on read-back landed: the check that
+    /// read asks is answered with the off already applied, which is the
+    /// switch, not the environment.
+    #[test]
+    fn a_check_behind_an_unread_switch_never_blames_the_environment() {
+        let mut m = mapper();
+        let mut settings = DriverStep::default();
+        m.request_settings(&mut settings);
+        answer(
+            &mut m,
+            &settings,
+            json!({"applied":{}, "effective":{"autoCompactEnabled":false}}),
+        );
+        let on = m.on_command(AgentCommand::SetAutoCompact { enabled: true });
+        let on_ack = answer(&mut m, &on, Value::Null);
+        let off = m.on_command(AgentCommand::SetAutoCompact { enabled: false });
+        let on_read = answer(
+            &mut m,
+            &on_ack,
+            json!({"applied":{}, "effective":{"autoCompactEnabled":true}}),
+        );
+        assert_eq!(
+            on_read.outbound[0]["request"]["subtype"],
+            "get_context_usage"
+        );
+        let off_ack = answer(&mut m, &off, Value::Null);
+        let check = answer(&mut m, &on_read, json!({"isAutoCompactEnabled": false}));
+        assert!(auto_compact_events(&check).is_empty(), "{:?}", check.events);
+        let off_read = answer(
+            &mut m,
+            &off_ack,
+            json!({"applied":{}, "effective":{"autoCompactEnabled":false}}),
+        );
+        assert_eq!(
+            auto_compact_events(&off_read),
+            vec![&AgentEvent::AutoCompact {
+                enabled: false,
+                disabled_by: None,
+                picked: Some(false),
+            }]
+        );
+    }
+
+    /// Switched off while the on check was out: the CLI can answer with the
+    /// off applied before its read-back lands, which is the switch, not the
+    /// environment.
+    #[test]
+    fn a_switch_after_the_check_never_blames_the_environment() {
+        let mut m = mapper();
+        let mut settings = DriverStep::default();
+        m.request_settings(&mut settings);
+        let read = answer(&mut m, &settings, json!({"applied":{}, "effective":{}}));
+        assert_eq!(read.outbound[0]["request"]["subtype"], "get_context_usage");
+        let off = m.on_command(AgentCommand::SetAutoCompact { enabled: false });
+        let off_ack = answer(&mut m, &off, Value::Null);
+        let check = answer(&mut m, &read, json!({"isAutoCompactEnabled": false}));
+        assert!(auto_compact_events(&check).is_empty(), "{:?}", check.events);
+        let off_read = answer(
+            &mut m,
+            &off_ack,
+            json!({"applied":{}, "effective":{"autoCompactEnabled":false}}),
+        );
+        assert_eq!(
+            auto_compact_events(&off_read),
+            vec![&AgentEvent::AutoCompact {
+                enabled: false,
+                disabled_by: None,
+                picked: Some(false),
+            }]
+        );
+    }
+
+    /// A refused switch is re-read, so the checks after it are not left
+    /// waiting on a read-back that never comes.
+    #[test]
+    fn a_refused_switch_is_re_read() {
+        let mut m = mapper();
+        let on = m.on_command(AgentCommand::SetAutoCompact { enabled: true });
+        let refused = m.on_frame(&json!({"type":"control_response", "response": {
+            "subtype":"error", "request_id":on.outbound[0]["request_id"], "error":"nope",
+        }}));
+        assert_eq!(refused.outbound[0]["request"]["subtype"], "get_settings");
+        let read = answer(&mut m, &refused, json!({"applied":{}, "effective":{}}));
+        let check = answer(&mut m, &read, json!({"isAutoCompactEnabled": false}));
+        assert_eq!(
+            auto_compact_events(&check),
+            vec![&AgentEvent::AutoCompact {
+                enabled: false,
+                disabled_by: Some("DISABLE_AUTO_COMPACT".into()),
+                picked: None,
+            }]
+        );
+    }
+
+    /// A refused check leaves the setting in charge, with no error row.
+    #[test]
+    fn a_refused_auto_compact_check_is_silent() {
+        let mut m = mapper();
+        let mut settings = DriverStep::default();
+        m.request_settings(&mut settings);
+        let read = answer(&mut m, &settings, json!({"applied":{}, "effective":{}}));
+        let refused = m.on_frame(&json!({"type":"control_response", "response": {
+            "subtype":"error", "request_id":read.outbound[0]["request_id"], "error":"nope",
+        }}));
+        assert_eq!(
+            refused.events,
+            vec![AgentEvent::AutoCompact {
+                enabled: true,
+                disabled_by: None,
+                picked: None,
+            }]
+        );
+    }
+
+    /// Auto-compact off and a full window: the CLI ends the turn without a
+    /// request (live 2.1.302, `terminal_reason: "blocking_limit"`).
+    #[test]
+    fn blocking_limit_says_how_to_continue() {
+        let mut m = mapper();
+        m.turn_active = true;
+        let step = m.on_frame(&json!({
+            "type": "result", "subtype": "success", "is_error": true,
+            "result": "Prompt is too long", "terminal_reason": "blocking_limit",
+        }));
+        assert!(step.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::TurnAborted { reason, .. } if reason == "Prompt is too long"
+        )));
+        assert!(step.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Notice { text } if text.contains("/compact")
+        )));
     }
 
     #[test]
@@ -11059,7 +12539,7 @@ pub(crate) mod tests {
         let mut m = mapper();
         let (ours, _) = send_text(&mut m, "hi", false);
         assert!(m.on_frame(&lifecycle(&ours, "started")).events.is_empty());
-        assert!(!m.cli_turn, "our own send");
+        assert!(m.cli_turn.is_none(), "our own send");
         m.on_frame(&result_frame());
         m.on_frame(&lifecycle("cli-x", "started"));
         let step = m.on_frame(&text_frame("msg-x", "claude-sonnet-5-5", "woke"));
@@ -11068,6 +12548,51 @@ pub(crate) mod tests {
             .events
             .iter()
             .any(|e| matches!(e, AgentEvent::TurnCause { .. })));
+    }
+
+    /// Live 2.1.310 (`lifecycle_wakeup_source_v1`): the fire's own `started`
+    /// says what fired. A started frame with no source on such a CLI is not
+    /// a scheduler fire, even with the wakeup due (a monitor event): nothing
+    /// is spent and the turn gets no cause. The `loop_wakeup` frame then
+    /// names the wakeup it was set for.
+    #[test]
+    fn a_cli_that_names_its_fires_is_believed() {
+        let mut m = mapper();
+        m.on_frame(
+            &json!({"type": "system", "subtype": "init", "session_id": "native-1",
+            "capabilities": ["msg_lifecycle_v1", "lifecycle_wakeup_source_v1"]}),
+        );
+        send_text(&mut m, "/loop say tock", false);
+        m.on_frame(&tool_use_frame(
+            "tu-w",
+            "ScheduleWakeup",
+            json!({"delaySeconds": 60, "reason": "probe tick", "prompt": "Reply with just: tock"}),
+        ));
+        let at = crate::now_ms() + 10_000;
+        m.on_frame(&tool_result_frame(
+            "tu-w",
+            json!({"scheduledFor": at, "clampedDelaySeconds": 60, "wasClamped": false}),
+        ));
+        m.on_frame(&result_frame());
+
+        m.on_frame(&lifecycle("cli-monitor", "started"));
+        let step = m.on_frame(&text_frame("msg-m", "claude-sonnet-5-5", "a monitor line"));
+        assert!(!step.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::TurnCause { .. } | AgentEvent::Schedule { .. }
+        )));
+        assert!(!m.schedule.is_empty(), "the wakeup still waits");
+        m.on_frame(&result_frame());
+
+        let fire = json!({"type": "command_lifecycle", "command_uuid": "8aaad282",
+            "state": "started", "wakeup_source": "loop_wakeup", "scheduled_for": at,
+            "uuid": "5c863634", "session_id": "native-1"});
+        assert!(m.on_frame(&fire).events.is_empty());
+        let step = m.on_frame(&text_frame("msg-t", "claude-sonnet-5-5", "tock"));
+        assert!(step.events.iter().any(|e| matches!(e,
+            AgentEvent::TurnCause { kind, detail: Some(d), .. }
+            if kind == "wakeup" && d == "probe tick")));
+        assert!(m.schedule.is_empty(), "spent");
     }
 
     /// Live 2.1.300 `/goal`: the reply is a synthetic frame naming the local

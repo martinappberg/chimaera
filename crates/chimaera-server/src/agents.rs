@@ -154,6 +154,16 @@ pub(crate) fn statusline_header_path(session_id: &str) -> PathBuf {
     agents_runtime_dir().join(format!("{session_id}-statusline.hdr"))
 }
 
+/// What a Claude session's generated `--settings` file says about
+/// compaction (`chat::claude_compaction`): `enabled` is the conversation's
+/// pick, else `agents.autoCompact` On/Off; `at` is `agents.autoCompactAt`.
+/// `None` in either leaves the user's own Claude Code settings in charge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Compaction {
+    pub(crate) enabled: Option<bool>,
+    pub(crate) at: Option<u8>,
+}
+
 /// Write the per-agent Claude Code settings file (hooks -> daemon ingest URL)
 /// into the chimaera runtime dir, mode 0600 (it embeds the session secret).
 ///
@@ -178,6 +188,7 @@ pub(crate) fn statusline_header_path(session_id: &str) -> PathBuf {
 /// `None` (every non-mastermind session) writes no permissions block. A
 /// running claude never re-reads this file, so a mode change re-creates the
 /// session (the PUT mastermind route) rather than editing in place.
+#[allow(clippy::too_many_arguments)] // one arg per optional key, like the argv builders
 pub(crate) fn write_settings(
     session_id: &str,
     key: &str,
@@ -186,6 +197,7 @@ pub(crate) fn write_settings(
     user_statusline: Option<&serde_json::Value>,
     mastermind: Option<crate::workspaces::MastermindMode>,
     plugin_tools: &[String],
+    compaction: Compaction,
 ) -> anyhow::Result<PathBuf> {
     let url = format!("http://127.0.0.1:{port}/api/v1/agent-events/{session_id}?key={key}");
     let hook = json!({ "type": "http", "url": url, "timeout": 10 });
@@ -196,6 +208,20 @@ pub(crate) fn write_settings(
     let mut settings = json!({ "hooks": hooks });
     if let Some(theme) = theme {
         settings["theme"] = json!(theme);
+    }
+    // The conversation's pick, else `agents.autoCompact` On/Off
+    // (`chat::claude_auto_compact`): the flag layer outranks the user's and
+    // the project's settings for this session only (claude 2.1.302, Pass 50).
+    // `None` (Agent default) leaves the user's own setting in charge.
+    if let Some(enabled) = compaction.enabled {
+        settings["autoCompactEnabled"] = json!(enabled);
+    }
+    // The threshold rides the flag layer's `env`, which the CLI copies into
+    // its process environment over an inherited value and the user's and
+    // project's `env` (2.1.310, Pass 55), for this session only.
+    if let Some(percent) = compaction.at {
+        settings["env"] =
+            json!({ chimaera_agent::claude::AUTOCOMPACT_PCT_VAR: percent.to_string() });
     }
     // Every session pre-allows the prompt-free tools (`notify`, the
     // read-only document tools); a Mastermind adds its tier's gate on top.
@@ -263,6 +289,51 @@ fn statusline_command(script: &str) -> String {
     } else {
         sh_quote(script)
     }
+}
+
+/// Bring a session's existing generated settings file up to date for a
+/// respawn that reuses it (a view switch or rewind): `enabled`, when set, is
+/// the conversation's latest pick, which a live toggle changed only in the
+/// running process; the threshold follows `agents.autoCompactAt` as it is
+/// now, written or removed, since a respawn is the session's next start.
+/// Everything else in the file is kept as written.
+pub(crate) fn refresh_settings_compaction(
+    path: &std::path::Path,
+    compaction: Compaction,
+) -> anyhow::Result<()> {
+    let body = std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut settings: serde_json::Value = serde_json::from_slice(&body)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let object = settings
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("{} is not a JSON object", path.display()))?;
+    let before = object.clone();
+    if let Some(enabled) = compaction.enabled {
+        object.insert("autoCompactEnabled".into(), json!(enabled));
+    }
+    let var = chimaera_agent::claude::AUTOCOMPACT_PCT_VAR;
+    match compaction.at {
+        Some(percent) => {
+            let env = object.entry("env").or_insert_with(|| json!({}));
+            if let Some(env) = env.as_object_mut() {
+                env.insert(var.into(), json!(percent.to_string()));
+            }
+        }
+        None => {
+            if let Some(env) = object.get_mut("env").and_then(|env| env.as_object_mut()) {
+                env.remove(var);
+                if env.is_empty() {
+                    object.remove("env");
+                }
+            }
+        }
+    }
+    if *object == before {
+        return Ok(());
+    }
+    std::fs::write(path, serde_json::to_vec_pretty(&settings)?)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    set_mode(path, 0o600)
 }
 
 /// Whether/how to wrap the user's statusline: `Some(passthrough_command)` =
@@ -1108,10 +1179,73 @@ mod tests {
     use super::*;
 
     #[test]
+    fn auto_compact_rides_the_session_settings_file() {
+        let sid = fresh_session_id();
+        let key = fresh_agent_key();
+        let path = write_settings(
+            &sid,
+            &key,
+            43999,
+            None,
+            None,
+            None,
+            &[],
+            Compaction {
+                enabled: Some(false),
+                at: Some(70),
+            },
+        )
+        .unwrap();
+        let read = || -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
+        };
+        assert_eq!(read()["autoCompactEnabled"], json!(false));
+        assert_eq!(
+            read()["env"]["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"],
+            json!("70")
+        );
+        // The hooks ride along untouched.
+        assert_eq!(read()["hooks"]["Stop"][0]["hooks"][0]["type"], "http");
+        // A respawn that reuses the file carries a newer pick, nothing else.
+        let before = read();
+        refresh_settings_compaction(
+            &path,
+            Compaction {
+                enabled: Some(true),
+                at: Some(85),
+            },
+        )
+        .unwrap();
+        let after = read();
+        assert_eq!(after["autoCompactEnabled"], json!(true));
+        assert_eq!(after["env"]["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], json!("85"));
+        assert_eq!(after["hooks"], before["hooks"]);
+        assert_eq!(after["permissions"], before["permissions"]);
+        // No pick keeps the session's own switch; Agent default drops the
+        // threshold, and the `env` it leaves empty.
+        refresh_settings_compaction(&path, Compaction::default()).unwrap();
+        let cleared = read();
+        assert_eq!(cleared["autoCompactEnabled"], json!(true));
+        assert!(cleared.get("env").is_none());
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(statusline_script_path(&sid)).ok();
+    }
+
+    #[test]
     fn settings_file_embeds_hook_url() {
         let sid = fresh_session_id();
         let key = fresh_agent_key();
-        let path = write_settings(&sid, &key, 43999, None, None, None, &[]).unwrap();
+        let path = write_settings(
+            &sid,
+            &key,
+            43999,
+            None,
+            None,
+            None,
+            &[],
+            Compaction::default(),
+        )
+        .unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&contents).unwrap();
         let url = format!("http://127.0.0.1:43999/api/v1/agent-events/{sid}?key={key}");
@@ -1125,6 +1259,9 @@ mod tests {
         // No theme requested: the settings stay hooks-only (a user with an
         // explicit theme choice is never overridden).
         assert!(value.get("theme").is_none());
+        // Auto-compact at its default leaves the user's own setting in charge.
+        assert!(value.get("autoCompactEnabled").is_none());
+        assert!(value.get("env").is_none());
         // Not a mastermind: only the prompt-free tools (`notify`, the
         // read-only document tools, `open_browser`) are pre-allowed — every
         // other tool (the terminal tools included) still prompts.
@@ -1155,7 +1292,17 @@ mod tests {
     fn settings_file_merges_theme_next_to_hooks() {
         let sid = fresh_session_id();
         let key = fresh_agent_key();
-        let path = write_settings(&sid, &key, 43999, Some("light"), None, None, &[]).unwrap();
+        let path = write_settings(
+            &sid,
+            &key,
+            43999,
+            Some("light"),
+            None,
+            None,
+            &[],
+            Compaction::default(),
+        )
+        .unwrap();
         let value: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(value["theme"], "light");
@@ -1188,6 +1335,7 @@ mod tests {
             None,
             Some(MastermindMode::Ask),
             &[],
+            Compaction::default(),
         )
         .unwrap();
         let value: serde_json::Value =
@@ -1225,6 +1373,7 @@ mod tests {
             None,
             Some(MastermindMode::Ask),
             &extras,
+            Compaction::default(),
         )
         .unwrap();
         let value: serde_json::Value =
@@ -1252,6 +1401,7 @@ mod tests {
             None,
             Some(MastermindMode::Auto),
             &[],
+            Compaction::default(),
         )
         .unwrap();
         let value: serde_json::Value =
@@ -1274,7 +1424,17 @@ mod tests {
         // (a) No user statusline: wrapper injected, prints nothing itself.
         let sid = fresh_session_id();
         let key = fresh_agent_key();
-        let path = write_settings(&sid, &key, 43999, None, None, None, &[]).unwrap();
+        let path = write_settings(
+            &sid,
+            &key,
+            43999,
+            None,
+            None,
+            None,
+            &[],
+            Compaction::default(),
+        )
+        .unwrap();
         let value: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let script_path = statusline_script_path(&sid);
@@ -1330,7 +1490,17 @@ mod tests {
         // (b) A user statusline command: piped the same stdin, padding kept.
         let sid = fresh_session_id();
         let user = json!({"type": "command", "command": "my-status --flag", "padding": 0});
-        let path = write_settings(&sid, &key, 43999, None, Some(&user), None, &[]).unwrap();
+        let path = write_settings(
+            &sid,
+            &key,
+            43999,
+            None,
+            Some(&user),
+            None,
+            &[],
+            Compaction::default(),
+        )
+        .unwrap();
         let value: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(value["statusLine"]["padding"], 0);
@@ -1360,7 +1530,17 @@ mod tests {
             json!({"type": "widget"}),
         ] {
             let sid = fresh_session_id();
-            let path = write_settings(&sid, &key, 43999, None, Some(&user), None, &[]).unwrap();
+            let path = write_settings(
+                &sid,
+                &key,
+                43999,
+                None,
+                Some(&user),
+                None,
+                &[],
+                Compaction::default(),
+            )
+            .unwrap();
             let value: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
             assert!(value.get("statusLine").is_none(), "{user}");
@@ -1445,7 +1625,17 @@ mod tests {
 
         let sid = fresh_session_id();
         let key = fresh_agent_key();
-        let path = write_settings(&sid, &key, port, None, None, None, &[]).unwrap();
+        let path = write_settings(
+            &sid,
+            &key,
+            port,
+            None,
+            None,
+            None,
+            &[],
+            Compaction::default(),
+        )
+        .unwrap();
         let value: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let command = value["statusLine"]["command"].as_str().unwrap().to_string();
