@@ -1124,8 +1124,11 @@
 
   /** The one update worth offering in this window right now — or, after an
    *  explicit check, its answer. */
-  const updateNotice = $derived(currentNotice(scopeAlias));
+  // The bare ssh alias, not `scopeAlias`: a job window's composite tunnel
+  // key is no host a reconnect could reach.
+  const updateNotice = $derived(currentNotice(isRemoteWindow ? hostAlias : null, jobCtx));
   updateState.scope = scopeAlias;
+  updateState.job = jobCtx;
 
   // The 5s sessions + links poll, only while /ws/events is down.
   conn.pollWhileEventsDown({
