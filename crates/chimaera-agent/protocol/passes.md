@@ -1715,3 +1715,21 @@ Issue #347 follow-up: let the user set at what percentage each CLI compacts, usi
 - Live, new: `claude_auto_compact_threshold_inputs_are_reported` (raw control channel, free: the settings `env` reads back, the source is enforced, the reported threshold is unlowered).
 - Live on an isolated daemon (claude 2.1.310 haiku with `CLAUDE_CODE_AUTO_COMPACT_WINDOW=100000` from the host prelude, so 50% is 40,000 tokens; codex 0.164.0 luna through a test-only wrapper adding `-c model_context_window=40000`, so 50% is 19,000): the settings file carried `"50"`; the meter reported `auto_compact_at: 40000`; turn 3 compacted (`trigger:"auto"`, 48,310 tokens summarized) and the meter dropped to 37,149; the native id stayed. Rewinds to checkpoints before the compaction answered 409 with the chat still running; a fork from there started as a portable branch; a rewind after it forked natively and the branch's new id was followed. After `agents.autoCompactAt` moved to 70 and the daemon restarted, the resurrected chat resumed the rewound branch's id, its file said `"70"` and the meter `56000`; a reopen from Recents the same; a terminal-view switch rewrote the reused file to the then-current `"50"`; Agent default removed the `env` and the meter's threshold. Codex: the meter reported 19,000 of 38,000, a turn ending at 54% compacted in-turn (`trigger:"auto"`), a rewind across that compaction kept the thread id with one note in history, the resumed thread compacted again at 54%, and its terminal view ran `codex resume <id> … -c model_post_turn_compact_threshold_percent=50`. Screenshots of the Settings rows and the popover in light and dark.
 - Full `just chat-smoke`, 2026-10-23, claude 2.1.310 and codex-cli 0.164.0 first on `PATH` (`~/.chimaera/shims` removed, `CLAUDE*` scrubbed): 38 passed, 0 failed, 592 s, the new `claude_auto_compact_threshold_inputs_are_reported` included. `~/.claude/settings.json` and `~/.codex/config.toml` hashes unchanged across the run. `TESTED_CLAUDE_VERSION` / `TESTED_CODEX_VERSION` stay where they are: a drift pass moves the pins.
+
+## Pass 58 — 2026-10-29: a subagent's finish marker now precedes its turn end (codex 0.164.0)
+
+Found by the Codex `just chat-smoke` run for the stuck "next step" fix: `codex_collab_subagent_surface` failed three runs in a row on its frame-order assertion, with codex-cli 0.164.0 (npm) and the CLI's default model `gpt-6.1-sol`. One billed run with a temporary frame dump captured the order.
+
+### Codex
+
+- At a child's finish the parent's `subAgentActivity {completed}` marker (`item/started`, then `item/completed`) now arrives right after the child's final `agentMessage` and BEFORE the child's own `turn/completed`. Then the child's `turn/completed`, the parent's `collabAgentToolCall` (`wait`) `item/completed`, the parent's final answer, its Stop hook, and the parent's `turn/completed`. Pass 43 (0.162.1) had the child's turn end between the marker's two frames, so a test keyed on the marker's `item/completed` saw the turn end first.
+
+### Adopted
+
+- No driver change: a `completed` marker while the agent's turn is known to run is already a no-op, and the turn end closes the row with one `SubagentFinished` quoting the final answer.
+- `tests/live.rs` `codex_collab_subagent_surface` accepts either order and asserts that the marker arrives at all.
+
+### Gate (Pass 58)
+
+- Hermetic, new: `codex.rs` `completed_marker_before_the_agent_turn_end_leaves_the_close_to_it` (the 0.164.0 order: one finish line, closed on the turn end, no new stint).
+- Live: `codex_collab_subagent_surface` passes on codex-cli 0.164.0 with the relaxed assertion; `driver_codex_spawned_agents_draw_rows_on_both_runtimes` passed in the same day's Codex smoke.

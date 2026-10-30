@@ -13098,6 +13098,48 @@ mod tests {
         assert!(!m.collab_agents[0].open);
     }
 
+    /// The 0.164.0 order (Pass 58): the child's final answer, THEN the
+    /// parent's `completed` marker, then the child's own turn end. The
+    /// marker lands while the agent's turn runs, so it is ignored; the turn
+    /// end closes the row with one finish line quoting the answer.
+    #[test]
+    fn completed_marker_before_the_agent_turn_end_leaves_the_close_to_it() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        m.on_frame(&sub_agent_activity("started", "sub-1"));
+        m.on_frame(&foreign(
+            "turn/started",
+            "sub-1",
+            json!({ "turn": { "id": "t-s1" } }),
+        ));
+        m.on_frame(&foreign(
+            "item/completed",
+            "sub-1",
+            json!({ "item": { "type": "agentMessage", "id": "m1",
+                              "phase": "final_answer", "text": "42" } }),
+        ));
+        let step = m.on_frame(&sub_agent_activity("completed", "sub-1"));
+        assert_eq!(step.events, vec![], "the running turn owns the close");
+        assert!(m.collab_agents[0].open);
+        let step = m.on_frame(&foreign(
+            "turn/completed",
+            "sub-1",
+            json!({ "turn": { "id": "t-s1", "status": "completed" } }),
+        ));
+        assert_eq!(
+            finished(&step.events),
+            vec![&AgentEvent::SubagentFinished {
+                id: Some("agent:sub-1".into()),
+                label: "agent_a".into(),
+                status: "completed".into(),
+                result: Some("42".into()),
+                stats: None,
+            }]
+        );
+        assert!(!m.collab_agents[0].open);
+        assert_eq!(m.collab_agents[0].stint, 1);
+    }
+
     /// The marker still closes a row whose thread never reported a running
     /// turn (its frames never reached this connection), and is ignored while
     /// the agent's own turn is known to run.
