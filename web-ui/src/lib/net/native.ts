@@ -778,8 +778,10 @@ export interface HostStatusEvent {
   /** Local end of the tunnel (may change across a reconnect). */
   local_port: number | null;
   /** New daemon token, on the window's own host's "connected" only — lets a
-   *  window re-home if the remote daemon restarted. Absent on every other
-   *  status, on compute keys, and on the copy local windows (Home) get. */
+   *  window re-home if the remote daemon restarted (a job workspace's own
+   *  windows get it too: an update reopens it with a new one). Absent on
+   *  every other status, on the health monitor's compute "connected", and on
+   *  the copy local windows (Home) get. */
   token?: string;
   /** The connect failure, on "error" only — so a home screen that merely
    *  observed the attempt (startup restore) can surface it instead of

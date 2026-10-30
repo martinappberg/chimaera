@@ -114,10 +114,10 @@ export function hostStatusAction(e: HostStatusEvent, ctx: HostStatusContext): Ho
       return { kind: "stranded", message: clusterStrandedMessage(ctx.hostAlias) };
     case "connected": {
       const port = e.local_port;
-      // Compute-status events carry no token (compute tokens stay in the
-      // shell's Rust side); a rebuilt job tunnel lands on the SAME daemon,
-      // so this window's own token still holds — carry it across the origin
-      // move ourselves.
+      // A job workspace opened or reopened carries its chimaera's token (an
+      // update reopens it with a new one); a tokenless compute "connected"
+      // is a rebuilt tunnel to the SAME daemon, so this window's own token
+      // still holds — carry it across the origin move ourselves.
       const token = e.token ?? (ctx.isJobWindow ? ctx.token : null);
       const portMoved = port !== null && String(port) !== ctx.port;
       // A login window's tunnel on a new port always brings its token; a

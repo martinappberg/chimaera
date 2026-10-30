@@ -246,7 +246,12 @@ pub(super) fn open_compute_window(
     record: &WindowRecord,
     scope_alias: &str,
 ) -> tauri::Result<()> {
-    let url = compute_window_url(app, url, &record.id, record.alias.as_deref());
+    let mut url = format!("{url}&win={}", urlencoding::encode(&record.id));
+    let appearance = lock(&app.state::<Shell>().appearance).get(record.alias.as_deref());
+    if let Some(appearance) = appearance {
+        url.push_str("&appearance=");
+        url.push_str(&urlencoding::encode(&appearance.json()));
+    }
     let login_alias = record
         .alias
         .clone()
@@ -258,23 +263,6 @@ pub(super) fn open_compute_window(
         record.id.clone(),
     );
     open_shell_window(app, &url, title, record, scope)
-}
-
-/// A compute window's URL: the tunnel's own plus its window id and the login
-/// host's first-paint palette.
-pub(super) fn compute_window_url(
-    app: &AppHandle,
-    url: &str,
-    win_id: &str,
-    login_alias: Option<&str>,
-) -> String {
-    let mut url = format!("{url}&win={}", urlencoding::encode(win_id));
-    let appearance = lock(&app.state::<Shell>().appearance).get(login_alias);
-    if let Some(appearance) = appearance {
-        url.push_str("&appearance=");
-        url.push_str(&urlencoding::encode(&appearance.json()));
-    }
-    url
 }
 
 pub(super) fn open_shell_window(

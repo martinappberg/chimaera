@@ -171,8 +171,8 @@ Nothing site-specific is ever coded.
   workspaces' chimaeras, and their `/compute` `self` block carries `attached`).
 - **Update in this job.** A job window whose chimaera is older than the app updates in
   place: the app installs its build on the cluster, closes and reopens the workspace in
-  the same job (job-host starts each workspace from the binary's path), and points the
-  window at it. The job keeps running; chats come back, running terminal programs restart
+  the same job (job-host starts each workspace from the binary's path); its windows
+  re-home onto it. The job keeps running; chats come back, running terminal programs restart
   ([native-app](native-app.md)).
 - **Notifications** (native app, even when looking elsewhere; windows never open by
   themselves): ready, an hour left, ten minutes left (only for a job longer than the mark,

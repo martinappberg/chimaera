@@ -42,6 +42,9 @@
   /** A job window's new job is in the queue: nothing left to click — the
    *  window moves over when it starts. */
   let queued = $state(false);
+  /** A job window's workspace reopened on this build: the window re-homes
+   *  onto it by itself; a second click would restart it again. */
+  let restarted = $state(false);
   /** A job window from an older build (no workspace id) can't update in its
    *  job; it continues in a new one. */
   const newJob = $derived(notice.kind === "daemon-job" && notice.job.cws === null);
@@ -91,6 +94,7 @@
         return "Reconnect and update it. Layouts and sessions there come back; running terminal programs restart.";
       case "daemon-job":
         if (queued) return "The new job is queued. This window moves to it when it starts.";
+        if (restarted) return "Updated. This window reloads into it.";
         return newJob
           ? "Continue in a new job, which runs this app's build. Chats come back there; running terminal programs restart."
           : "Update it in this job. Chats come back; running terminal programs restart.";
@@ -119,7 +123,7 @@
       case "daemon-remote":
         return `update ${notice.alias}`;
       case "daemon-job":
-        if (queued) return null;
+        if (queued || restarted) return null;
         return newJob ? "continue in a new job" : "update in this job";
       case "failed":
         return "try again";
@@ -150,6 +154,7 @@
           break;
         case "daemon-job":
           queued = await updateInJob(notice.alias, updateState.scope, notice.job);
+          restarted = !queued;
           break;
         case "failed":
           await checkForUpdates(true);

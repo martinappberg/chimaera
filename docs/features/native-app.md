@@ -218,7 +218,9 @@ app-build` (never the root `cargo`).
   ssh host, so skew there offers **update in this job**. The shell recognizes a job window from its
   typed scope (`connect_host` with that key; `cluster::update_job_workspace`): it installs this build on
   the cluster, closes and reopens the workspace in the same job (job-host starts each workspace from the
-  binary's path), and points the window at the new forward. The job keeps running. That shell path is
+  binary's path), and sends the workspace's windows a `connected` carrying the new chimaera's token, so
+  each re-homes itself through its own navigation gate (unsaved edits are kept). One update runs per
+  window key; the window's own reconnect meanwhile says "hold on". The job keeps running. That shell path is
   what makes the fix reach the windows that need it: an outdated job's window runs that job's older UI,
   whose toast sends the same `connect_host(key, true)`. A window from a build without workspace-keyed
   jobs (no `cws`) continues in a new job instead (`cluster_continue_job`).
