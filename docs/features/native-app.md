@@ -215,9 +215,13 @@ app-build` (never the root `cargo`).
   self-apply). Body copy states the consequence plainly (layouts/tabs/sessions come back; running terminal
   programs restart). "later" snoozes ~20h; "skip this version" mutes it — both origin-wide in localStorage.
 - **A cluster job window's daemon is the job's.** Its tunnel key (`<alias>#job<id>~<workspace>`) is no
-  ssh host and a running job keeps the binary it started with, so skew there offers **continue in a new
-  job** (`cluster_continue_job`, which deploys this build) instead of a reconnect; the window moves over
-  when the new job starts.
+  ssh host, so skew there offers **update in this job**. The shell recognizes a job window from its
+  typed scope (`connect_host` with that key; `cluster::update_job_workspace`): it installs this build on
+  the cluster, closes and reopens the workspace in the same job (job-host starts each workspace from the
+  binary's path), and points the window at the new forward. The job keeps running. That shell path is
+  what makes the fix reach the windows that need it: an outdated job's window runs that job's older UI,
+  whose toast sends the same `connect_host(key, true)`. A window from a build without workspace-keyed
+  jobs (no `cws`) continues in a new job instead (`cluster_continue_job`).
 - **An explicit check always answers** (`checkForUpdates(true)`: the menu item, the home screen's version
   stamp): "Checking for updates…", then the offer (snooze/skip don't hide what you asked for), "You're up
   to date" (fades after ~6s unless hovered), "Development build", or "Couldn't check for updates" with the

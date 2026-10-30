@@ -23,6 +23,7 @@ import { api, type JobContext } from "../net/api";
 import {
   appUpdateStatus,
   clusterContinueJob,
+  connectHost,
   isNativeShell,
   type AppUpdateStatus,
 } from "../net/native";
@@ -92,8 +93,8 @@ export const updateState = $state({
   /** The ssh scope this window reaches its daemon through (null = local);
    *  set once by App, read by the Settings panel's update actions. */
   scope: null as string | null,
-  /** Set once by App in a cluster job window, whose daemon only a new job
-   *  can update (see `continueInNewJob`). */
+  /** Set once by App in a cluster job window, whose daemon updates in its
+   *  job (see `updateInJob`). */
   job: null as JobContext | null,
   /** Bumped on snooze/skip so the derived offer re-evaluates. */
   dismissedAt: 0,
@@ -342,17 +343,26 @@ function currentAnswer(): UpdateAnswer {
 }
 
 /**
- * Update a cluster job window's daemon: continue its workspace in a new job,
- * which deploys this app's build (a running job keeps the binary it started
- * with, and its tunnel key is no ssh host a reconnect could reach). Throws
- * the scheduler's own words on a refusal.
+ * Update a cluster job window's daemon in its job: the shell installs this
+ * app's build on the cluster, closes and reopens the workspace there (job-host
+ * starts it from the installed binary) and reloads the window; the job keeps
+ * running. `scope` is the window's tunnel key. A window from a build that
+ * predates workspace-keyed jobs (no `cws`) can only continue in a new job,
+ * which deploys this build too. Resolves `true` when that new job is queued;
+ * throws the shell's or scheduler's own words on a refusal.
  */
-export async function continueInNewJob(alias: string, job: JobContext): Promise<void> {
-  const result = await clusterContinueJob(
-    alias,
-    job.cws !== null ? { workspaceId: job.cws } : { jobId: job.jobId },
-  );
+export async function updateInJob(
+  alias: string,
+  scope: string | null,
+  job: JobContext,
+): Promise<boolean> {
+  if (job.cws !== null && scope !== null) {
+    await connectHost(scope, true);
+    return false;
+  }
+  const result = await clusterContinueJob(alias, { jobId: job.jobId });
   if (result.kind === "refused") throw new Error(result.message);
+  return true;
 }
 
 /** The toast's content right now: an offer, an explicit check's answer, or null. */

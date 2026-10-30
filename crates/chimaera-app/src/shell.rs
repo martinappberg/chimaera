@@ -310,6 +310,17 @@ impl WindowScope {
         }
     }
 
+    /// A compute window's login host (its `alias` is then the per-job tunnel
+    /// key). From the typed scope `new_compute` recorded, never parsed.
+    pub(crate) fn compute_login(&self) -> Option<&str> {
+        match &self.askpass_scope {
+            AskpassScope::Host(login) if self.alias.as_deref() != Some(login.as_str()) => {
+                Some(login)
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn allows_askpass(&self, prompt_alias: Option<&str>) -> bool {
         askpass_scope_matches(&self.askpass_scope, prompt_alias)
     }
