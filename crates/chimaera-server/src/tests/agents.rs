@@ -2419,3 +2419,125 @@ async fn real_claude_agent_session() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 }
+
+/// Writes `name` in `dir`, last changed `days` ago.
+fn runtime_file(dir: &std::path::Path, name: &str, days: u64) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, "x").unwrap();
+    age_file(&path, days * 24 * 60 * 60);
+    path
+}
+
+/// The sweep's name table covers every file the runtime paths make.
+#[test]
+fn every_runtime_file_names_its_session() {
+    let sid = agents::fresh_session_id();
+    let script = agents::statusline_script_path(&sid);
+    for path in [
+        agents::settings_path(&sid),
+        agents::mcp_config_path(&sid),
+        agents::fork_context_path(&sid),
+        agents::statusline_header_path(&sid),
+        script.with_extension("stamp"),
+        script,
+    ] {
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert_eq!(
+            agents::runtime_file_session(name),
+            Some(sid.as_str()),
+            "{name}"
+        );
+    }
+    assert_eq!(agents::runtime_file_session("notes.txt"), None);
+    assert_eq!(agents::runtime_file_session("-settings.json"), None);
+}
+
+/// A session's runtime files go as one set, once all of them are stale;
+/// nothing else in the folder is touched.
+#[test]
+fn stale_runtime_files_go_by_session() {
+    let dir = test_dir("runtime-sweep");
+    let max_age = agents::STALE_RUNTIME_FILE_AGE;
+    let stale = [
+        "s-old-settings.json",
+        "s-old-mcp.json",
+        "s-old-statusline.ps1",
+        "s-old-statusline.hdr",
+        "s-old-statusline.stamp",
+    ]
+    .map(|name| runtime_file(&dir, name, 4));
+    // A refreshed settings file keeps its session's older statusline: a
+    // respawn would reuse the settings and find no script.
+    let refreshed = [
+        runtime_file(&dir, "s-live-settings.json", 0),
+        runtime_file(&dir, "s-live-statusline.sh", 4),
+        runtime_file(&dir, "s-live-statusline.hdr", 4),
+    ];
+    let foreign = runtime_file(&dir, "notes.txt", 4);
+    let folder = dir.join("s-dir-settings.json");
+    std::fs::create_dir(&folder).unwrap();
+
+    let now = std::time::SystemTime::now();
+    assert_eq!(
+        agents::sweep_stale_runtime_files(&dir, max_age, now),
+        stale.len()
+    );
+    assert!(stale.iter().all(|path| !path.exists()));
+    assert!(refreshed.iter().all(|path| path.exists()));
+
+    // Days later that set is stale too; the others still stay.
+    let later = now + max_age * 2;
+    assert_eq!(
+        agents::sweep_stale_runtime_files(&dir, max_age, later),
+        refreshed.len()
+    );
+    assert!(refreshed.iter().all(|path| !path.exists()));
+    assert!(foreign.exists());
+    assert!(folder.is_dir());
+    assert_eq!(
+        agents::sweep_stale_runtime_files(&dir.join("absent"), max_age, later),
+        0
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The daemon sweeps at start only where no OS scrub does it: on Windows.
+/// On Unix the runtime dir stays the OS's to clear.
+#[tokio::test]
+async fn startup_sweep_runs_on_windows_only() {
+    let sid = agents::fresh_session_id();
+    let path = agents::settings_path(&sid);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "{}").unwrap();
+    age_file(&path, agents::STALE_RUNTIME_FILE_AGE.as_secs() + 3600);
+    agents::sweep_runtime_files_at_start().await;
+    assert_eq!(path.exists(), cfg!(unix));
+    std::fs::remove_file(&path).ok();
+}
+
+/// A file another process holds open without delete sharing can't be
+/// removed on Windows: the sweep takes the rest of its set and leaves that
+/// one for the next start.
+#[cfg(windows)]
+#[test]
+fn a_held_runtime_file_waits_for_the_next_sweep() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let dir = test_dir("runtime-sweep-held");
+    let max_age = agents::STALE_RUNTIME_FILE_AGE;
+    let settings = runtime_file(&dir, "s-held-settings.json", 4);
+    let script = runtime_file(&dir, "s-held-statusline.ps1", 4);
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&script)
+        .unwrap();
+    let now = std::time::SystemTime::now();
+    assert_eq!(agents::sweep_stale_runtime_files(&dir, max_age, now), 1);
+    assert!(!settings.exists());
+    assert!(script.exists());
+    drop(held);
+    assert_eq!(agents::sweep_stale_runtime_files(&dir, max_age, now), 1);
+    assert!(!script.exists());
+    std::fs::remove_dir_all(&dir).ok();
+}
