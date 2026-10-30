@@ -22,7 +22,7 @@
 //! every agent probe shares; only answers are cached, so a sign-in or a
 //! network blip is asked again on the next look.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -33,7 +33,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 
 use super::{
-    base_command, bin_of, read_rpc_line, wrapped, CodexRpc, GroupKill, ProbePrelude, GATE,
+    base_command, bin_of, own_tree, read_rpc_line, wrapped, CodexRpc, GroupKill, ProbePrelude, GATE,
 };
 use crate::agents::AgentKind;
 use crate::AppState;
@@ -94,10 +94,9 @@ async fn read(state: &Arc<AppState>, kind: AgentKind, agent: &str, refresh: bool
             return hit;
         }
     }
-    let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else {
+    let Some(home) = chimaera_core::paths::home_dir().filter(|h| !h.as_os_str().is_empty()) else {
         return failed("HOME is not set".to_string());
     };
-    let home = PathBuf::from(home);
     let generation = state.probes.generation.load(Ordering::Relaxed);
     let prelude = ProbePrelude::write(state, None).await;
     let answer = match kind {
@@ -140,14 +139,12 @@ async fn claude_usage(
         ],
     );
     let mut cmd = base_command(&argv, Some(home), prelude);
-    cmd.stdin(Stdio::piped())
-        .stderr(Stdio::null())
-        .process_group(0);
+    own_tree(cmd.stdin(Stdio::piped()).stderr(Stdio::null()));
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("could not start claude: {e}"))?;
     // Dropped before the leader is reaped (PID reuse), like `CodexRpc`.
-    let group = GroupKill(child.id().map(|pid| nix::unistd::Pid::from_raw(pid as i32)));
+    let group = GroupKill::of(&child);
     let mut stdin = child.stdin.take().ok_or("no stdin")?;
     let mut stdout = BufReader::new(child.stdout.take().ok_or("no stdout")?);
     let exchange = async {
@@ -233,13 +230,11 @@ async fn grok_usage(
 ) -> Result<(Vec<UsageWindow>, bool), String> {
     let argv = wrapped(bin, &["agent", "--no-leader", "stdio"]);
     let mut cmd = base_command(&argv, Some(home), prelude);
-    cmd.stdin(Stdio::piped())
-        .stderr(Stdio::null())
-        .process_group(0);
+    own_tree(cmd.stdin(Stdio::piped()).stderr(Stdio::null()));
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("could not start grok: {e}"))?;
-    let group = GroupKill(child.id().map(|pid| nix::unistd::Pid::from_raw(pid as i32)));
+    let group = GroupKill::of(&child);
     let mut stdin = child.stdin.take().ok_or("no stdin")?;
     let mut stdout = BufReader::new(child.stdout.take().ok_or("no stdout")?);
     let exchange = async {
@@ -312,12 +307,12 @@ async fn agy_usage(
 ) -> Result<(Vec<UsageWindow>, bool), String> {
     let argv = wrapped(bin, &["-p", "/usage", "--output-format", "json"]);
     let mut cmd = base_command(&argv, Some(home), prelude);
-    cmd.stderr(Stdio::null()).process_group(0);
+    own_tree(cmd.stderr(Stdio::null()));
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("could not start agy: {e}"))?;
     // The whole group, not just the login shell, dies with a stalled read.
-    let group = GroupKill(child.id().map(|pid| nix::unistd::Pid::from_raw(pid as i32)));
+    let group = GroupKill::of(&child);
     let mut stdout = child.stdout.take().ok_or("no stdout")?;
     let read = async {
         let mut out = Vec::new();

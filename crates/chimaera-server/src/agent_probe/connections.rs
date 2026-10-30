@@ -265,9 +265,9 @@ pub(super) async fn run_cli(
     prelude: Option<&Path>,
 ) -> Result<String, ()> {
     let mut cmd = base_command(&wrapped(bin, args), Some(root), prelude);
-    cmd.stderr(Stdio::null()).process_group(0);
+    own_tree(cmd.stderr(Stdio::null()));
     let mut child = cmd.spawn().map_err(|_| ())?;
-    let group = GroupKill(child.id().map(|pid| nix::unistd::Pid::from_raw(pid as i32)));
+    let group = GroupKill::of(&child);
     let stdout = child.stdout.take().ok_or(())?;
     let work = async {
         let mut out = Vec::new();

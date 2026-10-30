@@ -37,7 +37,7 @@ pub use restore::open_ui_window;
 
 /// Permissions exposed to a daemon-served workbench window. These grants are
 /// installed at runtime for one volatile window label and one exact loopback
-/// origin; the only static capability is the shell-local WSL wizard.
+/// origin; the app has no static capability.
 ///
 /// Exactly what the web UI and Tauri's injected drag-region script call —
 /// never `core:default`: remote hosts' pages hold these grants too, and the
@@ -759,12 +759,7 @@ pub(crate) fn finish_quit(app: &AppHandle) {
 /// - no window at all (a repeated launch racing startup; closing the last
 ///   Home window quits the app) → open Home.
 pub(crate) fn activate_app(app: &AppHandle, dock_click: bool) {
-    let windows: Vec<_> = app
-        .webview_windows()
-        .into_values()
-        // The WSL wizard is its own flow; never count or raise it here.
-        .filter(|w| !w.label().starts_with("wsl-setup"))
-        .collect();
+    let windows: Vec<_> = app.webview_windows().into_values().collect();
     let on_screen = |w: &tauri::WebviewWindow| {
         w.is_visible().unwrap_or(false) && !w.is_minimized().unwrap_or(false)
     };
@@ -1025,9 +1020,8 @@ pub(crate) fn show_local_home(
 
 /// Whether focus belongs to a managed daemon window (Home or a workspace).
 /// Drives the menu's Settings item. Reads the scope map (populated by
-/// `open_ui_window` and `report_window_scope`); false before startup, for the
-/// WSL wizard, which cannot show the daemon-served Settings surface, and for a
-/// login-node terminal window (`cluster_open_terminal`): daemon-served, but a
+/// `open_ui_window` and `report_window_scope`); false before startup, and for
+/// a login-node terminal window (`cluster_open_terminal`): daemon-served, but a
 /// bare terminal page with no settings surface and no `menu` listener.
 pub(crate) fn focused_daemon_open(app: &AppHandle) -> bool {
     let Some(focused) = app
@@ -1050,69 +1044,11 @@ pub(crate) fn focused_daemon_open(app: &AppHandle) -> bool {
     }
 }
 
-/// Startup completion is a real three-state gate, NOT `try_state::<Shell>()`:
-/// the wizard's finishing command must be excluded while another invocation
-/// is mid-flight (provisioning runs minutes, and a webview reload re-enables
-/// its button), and a finish that failed AFTER manage(Shell) must stay
-/// retryable — Shell existing does not mean startup completed.
-pub(crate) enum StartupClaim {
-    Claimed,
-    InFlight,
-    Done,
-}
-
-static STARTUP_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-static STARTUP_DONE: AtomicBool = AtomicBool::new(false);
-
-pub(crate) fn claim_startup() -> StartupClaim {
-    if STARTUP_DONE.load(Ordering::SeqCst) {
-        return StartupClaim::Done;
-    }
-    if STARTUP_IN_FLIGHT
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok()
-    {
-        StartupClaim::Claimed
-    } else {
-        StartupClaim::InFlight
-    }
-}
-
-pub(crate) fn release_startup(success: bool) {
-    if success {
-        STARTUP_DONE.store(true, Ordering::SeqCst);
-    }
-    STARTUP_IN_FLIGHT.store(false, Ordering::SeqCst);
-}
-
-/// Post-completion self-heal: if startup finished but no real (non-wizard)
-/// window survived — a partial finish, or every window closed while a stale
-/// wizard lingered — open the home window so retiring the wizard can never
-/// leave the app window-less (last-window-closed would exit it).
-pub(crate) fn recover_windows(handle: &tauri::AppHandle) {
-    if handle.try_state::<Shell>().is_none() {
-        return;
-    }
-    let has_real = handle
-        .webview_windows()
-        .keys()
-        .any(|l| !l.starts_with("wsl-setup"));
-    if has_real {
-        return;
-    }
-    if let Err(e) = show_local_home(handle, None) {
-        tracing::error!("could not recover a home window: {e}");
-    }
-}
-
 /// Complete startup once a local daemon exists: manage `Shell` (BEFORE any
 /// window opens, so each registers its scope), reopen the persisted window
-/// set or the home window, and start the monitors. Two callers: `setup()` on
-/// the normal path, and the WSL wizard's finishing command on a Windows
-/// first run — where setup() deliberately returned early with no daemon.
-/// Re-entrant for the retry-after-partial-failure case: an already-managed
-/// Shell keeps its state (monitors are NOT spawned twice); only the daemon
-/// handle is refreshed and the windows re-attempted.
+/// set or the home window, and start the monitors. Re-entrant: an
+/// already-managed Shell keeps its state (monitors are NOT spawned twice);
+/// only the daemon handle is refreshed and the windows re-attempted.
 pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> tauri::Result<()> {
     let (port, token) = (local.port, local.token.clone());
     let fresh = handle.try_state::<Shell>().is_none();
@@ -1174,22 +1110,6 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
     // Seed the Settings item's enabled state for the windows just opened, in
     // case a restored workspace window doesn't emit an early Focused event.
     crate::menu::sync_settings_enabled(handle);
-    Ok(())
-}
-
-/// The WSL first-run wizard window: shell-local assets (`setup.html`), not
-/// the daemon origin — on a fresh Windows machine no daemon exists to serve
-/// the UI yet.
-fn open_setup_window(handle: &tauri::AppHandle) -> tauri::Result<()> {
-    tauri::WebviewWindowBuilder::new(
-        handle,
-        "wsl-setup",
-        tauri::WebviewUrl::App("setup.html".into()),
-    )
-    .title("chimaera setup")
-    .inner_size(780.0, 640.0)
-    .min_inner_size(600.0, 520.0)
-    .build()?;
     Ok(())
 }
 
@@ -1291,11 +1211,6 @@ pub fn run() {
             commands::request_notification_permission,
             commands::open_notification_settings,
             commands::test_notification,
-            commands::wsl_status,
-            commands::wsl_install,
-            commands::wsl_update,
-            commands::wsl_install_distro,
-            commands::wsl_setup_daemon,
         ])
         .on_window_event(|window, event| {
             let Some(shell) = window.try_state::<Shell>() else {
@@ -1437,21 +1352,6 @@ pub fn run() {
             let mut local =
                 match tauri::async_runtime::block_on(crate::daemon::ensure_local_daemon()) {
                     Ok(local) => local,
-                    // Windows: anything that needs provisioning — no WSL, no
-                    // distro, no (current) daemon — goes through the wizard,
-                    // which shows the work; startup itself never downloads or
-                    // installs invisibly. Its finishing command
-                    // (wsl_setup_daemon) completes the startup this skips.
-                    Err(e) if e.downcast_ref::<crate::wsl::WslNotReady>().is_some() => {
-                        tracing::info!("WSL daemon not adoptable — opening the setup wizard");
-                        // Any pending update intent is moot on this path: the
-                        // wizard's ensure replaces an old-build daemon anyway,
-                        // and a stale intent must not fire on a LATER launch
-                        // detached from the click that authorized it.
-                        crate::update::clear_intent();
-                        open_setup_window(&handle)?;
-                        return Ok(());
-                    }
                     Err(e) => {
                         tracing::error!("{e:#}");
                         return Err(std::io::Error::other(format!("{e:#}")).into());
@@ -1481,19 +1381,13 @@ pub fn run() {
                     }
                 }
             }
-            // Uncontended here (no windows exist yet), but the gate must
-            // still be claimed so a stale wizard invocation later reads
-            // "done" instead of racing a second startup.
-            let _ = claim_startup();
             // A login-node terminal a crash left without a window ends here
             // (off the startup path: two loopback calls at most).
             {
                 let (port, token) = (local.port, local.token.clone());
                 std::thread::spawn(move || cluster::sweep_terminals(port, token));
             }
-            let finished = finish_startup(&handle, local);
-            release_startup(finished.is_ok());
-            finished?;
+            finish_startup(&handle, local)?;
             Ok(())
         })
         .build(tauri::generate_context!())

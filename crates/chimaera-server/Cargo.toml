@@ -6,6 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+cap-std.workspace = true
+cap-fs-ext.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -20,8 +22,6 @@ tracing.workspace = true
 rust-embed.workspace = true
 mime_guess.workspace = true
 hostname.workspace = true
-rustix.workspace = true
-nix = { workspace = true, features = ["term", "signal"] }
 chimaera-agent.workspace = true
 chimaera-core.workspace = true
 chimaera-pty.workspace = true
@@ -101,3 +101,11 @@ chimaera-wire-fixtures.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tokio-tungstenite = "0.30"
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+nix = { workspace = true, features = ["term", "signal"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+junction.workspace = true

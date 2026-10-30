@@ -64,6 +64,7 @@
   import type { Extension } from "@codemirror/state";
   import type { EditorView } from "@codemirror/view";
   import {
+    basename,
     EDIT_MAX_BYTES,
     fsFile,
     lastRawTicketUrl,
@@ -192,7 +193,7 @@
   // the reading body AND the live editor, so the two views read identically.
   const bodyFont = $derived(fontSize ?? getSetting("editor.markdownFontSize"));
   /** The reading pane's accessible name: the file, not a generic word. */
-  const fileLabel = $derived(path.split("/").filter(Boolean).pop() ?? path);
+  const fileLabel = $derived(basename(path) || path);
   const bodyLineHeight = $derived(getSetting("editor.markdownLineHeight"));
 
   type Mode = MdMode;

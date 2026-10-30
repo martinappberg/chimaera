@@ -125,9 +125,12 @@ impl JsonlChild {
         // Its own process group: the executable can be a launcher (npm's
         // codex entry is a node script around the native binary), and
         // killing only the direct child would strand that native process,
-        // still running and still holding the stdout pipe open.
+        // still running and still holding the stdout pipe open. Windows: a
+        // Job Object adopted right after spawn plays the group's part.
         #[cfg(unix)]
         cmd.process_group(0);
+        #[cfg(windows)]
+        cmd.creation_flags(chimaera_core::proc::TREE_CREATION_FLAGS);
         cmd.args(args)
             .current_dir(cwd)
             .stdin(Stdio::piped())
@@ -147,6 +150,18 @@ impl JsonlChild {
         let mut child = cmd
             .spawn()
             .with_context(|| format!("failed to spawn {bin}"))?;
+        // Without the job only the direct child is killable (kill_on_drop);
+        // a session still runs, so a failed adopt is logged, not fatal.
+        #[cfg(windows)]
+        let tree = child
+            .id()
+            .and_then(|pid| match chimaera_core::proc::ProcessTree::adopt(pid) {
+                Ok(tree) => Some(tree),
+                Err(err) => {
+                    tracing::warn!(%err, bin, "agent process tree not adopted");
+                    None
+                }
+            });
 
         let stdin = child.stdin.take().context("child stdin unavailable")?;
         let stdout = child.stdout.take().context("child stdout unavailable")?;
@@ -181,6 +196,8 @@ impl JsonlChild {
             },
             guard: ChildGuard {
                 child,
+                #[cfg(windows)]
+                tree,
                 stderr_tail,
                 stderr_task,
             },
@@ -276,6 +293,10 @@ const STDERR_SETTLE: Duration = Duration::from_secs(1);
 /// Owns the child for lifecycle: bounded shutdown, kill, stderr diagnostics.
 pub struct ChildGuard {
     child: Child,
+    /// The child's Job Object. Unlike a process group it is addressed by
+    /// handle, not pid, so it stays valid after the leader is reaped.
+    #[cfg(windows)]
+    tree: Option<chimaera_core::proc::ProcessTree>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
     stderr_task: tokio::task::JoinHandle<()>,
 }
@@ -290,12 +311,13 @@ impl ChildGuard {
     /// exits 0 either way. Live-probed claude 2.1.281 / codex 0.156.1
     /// (PROTOCOL.md Pass 32). A no-op once the child has been reaped (tokio
     /// clears the pid then, so a recycled pid is never signalled).
+    ///
+    /// Windows has no SIGTERM for a console-less child, so this does nothing
+    /// there: the closed stdin and the shutdown grace are the only notice,
+    /// and the grace ends in a kill of the whole job.
     pub fn terminate(&self) {
         if let Some(pid) = self.child.id() {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGTERM,
-            );
+            chimaera_core::proc::terminate_pid(pid);
         }
     }
 
@@ -316,6 +338,10 @@ impl ChildGuard {
     /// helper left in the group does not outlive the session. The leader's
     /// exit is observed without reaping it (`exited_unreaped`), so its pid,
     /// and with it the group id, cannot be recycled before the group kill.
+    ///
+    /// On Windows the job is killed at the same point: when the leader has
+    /// exited or the grace has run out. The job handle, not a pid, names the
+    /// tree, so reaping the leader first is safe there.
     pub async fn shutdown_with_stderr(mut self, grace: Duration) -> (Option<i32>, String) {
         let deadline = Instant::now() + grace;
         #[cfg(unix)]
@@ -330,8 +356,14 @@ impl ChildGuard {
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         let status = match tokio::time::timeout(remaining, self.child.wait()).await {
-            Ok(Ok(status)) => status.code(),
+            Ok(Ok(status)) => {
+                #[cfg(windows)]
+                self.kill_tree();
+                status.code()
+            }
             _ => {
+                #[cfg(windows)]
+                self.kill_tree();
                 self.child.start_kill().ok();
                 self.child.wait().await.ok().and_then(|s| s.code())
             }
@@ -344,6 +376,14 @@ impl ChildGuard {
     pub fn stderr_tail(&self) -> String {
         let tail = self.stderr_tail.lock().expect("stderr tail lock");
         tail.iter().cloned().collect::<Vec<_>>().join("\n")
+    }
+
+    /// Kill the job once; later calls (the drop after a shutdown) are no-ops.
+    #[cfg(windows)]
+    fn kill_tree(&mut self) {
+        if let Some(tree) = self.tree.take() {
+            tree.kill();
+        }
     }
 }
 
@@ -362,6 +402,8 @@ impl Drop for ChildGuard {
                 nix::sys::signal::Signal::SIGKILL,
             );
         }
+        #[cfg(windows)]
+        self.kill_tree();
     }
 }
 
@@ -609,5 +651,101 @@ wait "$native"
             assert!(Instant::now() < deadline, "the background sleep survived");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use chimaera_core::proc::pid_alive;
+
+    /// A leader that starts a long-lived grandchild, reports both pids as one
+    /// JSON line, then waits on stdin like an agent. The grandchild's ping
+    /// output shares stdout; non-JSON lines are skipped by the stream.
+    fn spawn_leader_with_grandchild() -> JsonlChild {
+        let script = "$g = Start-Process -PassThru -NoNewWindow -FilePath ping.exe \
+                      -ArgumentList '-n','120','127.0.0.1'; \
+                      [Console]::Out.WriteLine('{\"leader\":' + $PID + ',\"grandchild\":' + $g.Id + '}'); \
+                      [Console]::Out.Flush(); [Console]::In.ReadToEnd() | Out-Null; Start-Sleep 120";
+        JsonlChild::spawn(
+            "powershell.exe",
+            &[
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                script.into(),
+            ],
+            &std::env::temp_dir(),
+            &[],
+            &[],
+        )
+        .expect("spawn powershell")
+    }
+
+    async fn pids(stream: &mut JsonlStream) -> (u32, u32) {
+        let frame = tokio::time::timeout(Duration::from_secs(60), stream.next())
+            .await
+            .expect("leader reported in time")
+            .expect("read")
+            .expect("a frame before EOF");
+        let pid = |key: &str| u32::try_from(frame[key].as_u64().expect(key)).expect(key);
+        (pid("leader"), pid("grandchild"))
+    }
+
+    async fn gone(pid: u32) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pid_alive(pid) {
+            if Instant::now() > deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        true
+    }
+
+    #[tokio::test]
+    async fn shutdown_ends_the_leader_and_its_grandchild() {
+        let (sink, mut stream, guard) = spawn_leader_with_grandchild().split();
+        let (leader, grandchild) = pids(&mut stream).await;
+        assert!(pid_alive(grandchild));
+        guard.terminate();
+        drop(sink);
+        // The leader outlives its closed stdin (it sleeps), so the grace
+        // runs out and the job kill ends both.
+        guard.shutdown(Duration::from_millis(500)).await;
+        assert!(gone(leader).await, "leader survived shutdown");
+        assert!(gone(grandchild).await, "grandchild survived shutdown");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_guard_ends_the_tree() {
+        let (_sink, mut stream, guard) = spawn_leader_with_grandchild().split();
+        let (leader, grandchild) = pids(&mut stream).await;
+        drop(guard);
+        assert!(gone(leader).await, "leader survived the drop");
+        assert!(gone(grandchild).await, "grandchild survived the drop");
+    }
+
+    #[tokio::test]
+    async fn an_exited_leader_still_has_its_grandchild_ended() {
+        let child = JsonlChild::spawn(
+            "cmd.exe",
+            &[
+                "/C".into(),
+                "start /B ping -n 120 127.0.0.1 >NUL & exit 3".into(),
+            ],
+            &std::env::temp_dir(),
+            &[],
+            &[],
+        )
+        .expect("spawn cmd");
+        let (_sink, _stream, guard) = child.split();
+        let started = Instant::now();
+        assert_eq!(guard.shutdown(Duration::from_secs(10)).await, Some(3));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }

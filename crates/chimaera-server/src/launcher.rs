@@ -22,6 +22,11 @@
 //! claude installer's `~/.local/bin` PATH line lives in the interactive-only
 //! `.zshrc` — a login-only `-lc` (or a GUI launch with no usable `$SHELL`)
 //! misses both, so a plain `which` from the daemon's environment is not enough.
+//!
+//! Windows has no login shell to ask: the daemon's own PATH (with `PATHEXT`)
+//! and the vendors' Windows install folders are the search, nothing is
+//! wrapped at spawn, and an npm `.cmd` shim is launched as the program it
+//! runs ([`wrap_login_shell`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -156,6 +161,9 @@ pub(crate) fn extension_action(
 /// Install command for a missing agent — pre-typed (never executed) into a
 /// fresh terminal session; the user reviews and presses Enter.
 pub(crate) fn install_command(kind: AgentKind) -> &'static str {
+    if cfg!(windows) {
+        return windows_install_command(kind);
+    }
     match kind {
         // The official installer script (claude.ai/install.sh), not npm:
         // it needs no node on the host, which matters on HPC login nodes.
@@ -167,6 +175,19 @@ pub(crate) fn install_command(kind: AgentKind) -> &'static str {
         AgentKind::Gemini => "npm install -g @google/gemini-cli",
         AgentKind::Grok => "curl -fsSL https://x.ai/cli/install.sh | bash",
         AgentKind::Cursor => "curl https://cursor.com/install -fsS | bash",
+    }
+}
+
+/// Each vendor's official native-Windows install command, for a PowerShell
+/// prompt (the Windows login shell). The managed installs are POSIX-only.
+pub(crate) fn windows_install_command(kind: AgentKind) -> &'static str {
+    match kind {
+        AgentKind::Claude => "irm https://claude.ai/install.ps1 | iex",
+        AgentKind::Codex => "npm install -g @openai/codex",
+        AgentKind::Antigravity => "irm https://antigravity.google/cli/install.ps1 | iex",
+        AgentKind::Gemini => "npm install -g @google/gemini-cli",
+        AgentKind::Grok => "irm https://x.ai/cli/install.ps1 | iex",
+        AgentKind::Cursor => "irm 'https://cursor.com/install?win32=true' | iex",
     }
 }
 
@@ -510,28 +531,98 @@ pub(crate) fn managed_fallback(bin: &str, managed_bin: &Path) -> Option<PathBuf>
 /// Whether `path` is a regular executable file (symlinks followed — a
 /// versioned `~/.local/bin/claude` symlink counts). One stat: cheap enough
 /// for spawn-time re-validation (the degrade path checks its recipe bin).
+/// On Windows an executable is a file whose extension is in `PATHEXT`.
 pub(crate) fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+    chimaera_core::paths::is_executable(path)
 }
 
 /// The mtime of `path` when it is a regular executable (symlinks followed) —
 /// the cache-validation stamp. `None` = missing, not executable, or the fs
 /// reports no mtime.
 fn exec_mtime(path: &Path) -> Option<std::time::SystemTime> {
-    use std::os::unix::fs::PermissionsExt;
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
+    if !is_executable(path) {
         return None;
     }
-    meta.modified().ok()
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+/// `path` as a runnable file: itself on Unix; on Windows, also `path` plus
+/// each `PATHEXT` extension in order (`claude` → `claude.exe`), the way
+/// `cmd.exe` resolves a bare name.
+fn runnable(path: PathBuf) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        chimaera_core::paths::find_on_path(&path.to_string_lossy(), None)
+    }
+    #[cfg(not(windows))]
+    {
+        is_executable(&path).then_some(path)
+    }
 }
 
 /// Concrete installer locations, used only after a completed login-shell
 /// probe and the inherited PATH both miss. Do not scan version-manager
 /// directories: an installed version is not necessarily the user's selection.
+#[cfg(windows)]
+fn well_known_agent_paths(bin: &str, home: Option<&Path>) -> Vec<PathBuf> {
+    let env_dir = |name| {
+        std::env::var_os(name)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    well_known_windows_paths(
+        bin,
+        home,
+        env_dir("LOCALAPPDATA").as_deref(),
+        env_dir("APPDATA").as_deref(),
+    )
+}
+
+/// The Windows installers' targets, extensionless (resolution adds
+/// `PATHEXT`): each vendor's PowerShell installer puts its directory on the
+/// user PATH, but a daemon started before the install (or by a parent with
+/// an older environment) doesn't see that. Claude's native installer and
+/// `~/bin` mirror Unix; Grok's `install.ps1` uses `~/.grok/bin`; Antigravity
+/// `%LOCALAPPDATA%\agy\bin`; Cursor's `%LOCALAPPDATA%\cursor-agent`; npm
+/// global shims (`codex.cmd`) `%APPDATA%\npm`; WinGet's portable links last.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn well_known_windows_paths(
+    bin: &str,
+    home: Option<&Path>,
+    local_app_data: Option<&Path>,
+    app_data: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(home) = home {
+        out.push(home.join(".local").join("bin").join(bin));
+        out.push(home.join("bin").join(bin));
+        if bin == "grok" {
+            out.push(home.join(".grok").join("bin").join(bin));
+        }
+    }
+    if let Some(local) = local_app_data {
+        match bin {
+            "agy" => out.push(local.join("agy").join("bin").join(bin)),
+            "cursor-agent" => out.push(local.join("cursor-agent").join(bin)),
+            _ => {}
+        }
+    }
+    if let Some(roaming) = app_data {
+        out.push(roaming.join("npm").join(bin));
+    }
+    if let Some(local) = local_app_data {
+        out.push(
+            local
+                .join("Microsoft")
+                .join("WinGet")
+                .join("Links")
+                .join(bin),
+        );
+    }
+    out
+}
+
+#[cfg(not(windows))]
 fn well_known_agent_paths(bin: &str, home: Option<&Path>) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Some(home) = home {
@@ -555,6 +646,7 @@ const SHELL_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
 /// The budget for a check someone is waiting on ([`verify`]): a loaded host
 /// can take longer than a spawn's budget to start an interactive zsh.
 const SHELL_PROBE_PATIENT: Duration = Duration::from_secs(30);
+#[cfg(unix)]
 const SHELL_PROBE_OUTPUT_CAP: u64 = 64 * 1024;
 
 /// A login shell that couldn't answer `command -v`: `reason` for the logs,
@@ -586,8 +678,10 @@ impl From<&str> for ShellProbeError {
 
 /// Kill rc children as well as the shell on timeout or cancellation. The
 /// guard drops before the child is reaped, while its process-group id is owned.
+#[cfg(unix)]
 struct ShellProbeGroup(Option<nix::unistd::Pid>);
 
+#[cfg(unix)]
 impl Drop for ShellProbeGroup {
     fn drop(&mut self) {
         if let Some(group) = self.0 {
@@ -616,10 +710,38 @@ async fn probe_login_shell(
 /// a path (that bin's error alone); the whole shell failing is the outer one.
 type ShellAnswers = Result<Vec<Result<Option<PathBuf>, ShellProbeError>>, ShellProbeError>;
 
+/// Windows has no login shell to ask: the daemon's own environment (PATH
+/// from the registry, through its parent) is the agents' environment, so
+/// each bin is looked up on that PATH with `PATHEXT`, the way a fresh
+/// PowerShell would find it. Never an error: a miss is a completed answer.
+#[cfg(windows)]
+async fn probe_login_shell_all(_shell: &str, bins: &[&str], _timeout: Duration) -> ShellAnswers {
+    let bins: Vec<String> = bins.iter().map(|b| b.to_string()).collect();
+    tokio::task::spawn_blocking(move || {
+        let path = std::env::var_os("PATH");
+        bins.iter()
+            .map(|bin| {
+                Ok(path.as_deref().and_then(|p| {
+                    chimaera_core::paths::find_on_path(bin, Some(p))
+                        .filter(|found| found.is_absolute())
+                }))
+            })
+            .collect()
+    })
+    .await
+    .map_err(|e| {
+        ShellProbeError::new(
+            format!("PATH lookup failed: {e}"),
+            "Chimaera couldn't search your PATH.".into(),
+        )
+    })
+}
+
 /// `command -v` for each of `bins` in ONE interactive login shell. Nonce
 /// markers separate the answers from each other and from startup/logout
 /// banners, and prove startup reached our command. A completed empty answer
 /// is the ONLY shell result that permits fallback.
+#[cfg(unix)]
 async fn probe_login_shell_all(shell: &str, bins: &[&str], timeout: Duration) -> ShellAnswers {
     use tokio::io::AsyncReadExt;
     let nonce = chimaera_core::generate_token();
@@ -752,7 +874,9 @@ async fn probe_login_shell_all(shell: &str, bins: &[&str], timeout: Duration) ->
 /// a patient check's 30 s; it runs as its own task, so a caller that goes
 /// away can't strand it; and it ends with its shell — answers are never kept
 /// past it (`agent_bins` / `agent_misses` are the cache).
+/// Unused on Windows, where detection asks no shell (see [`resolve_bin`]).
 #[derive(Default)]
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) struct ShellProbes {
     flights: std::sync::Mutex<HashMap<FlightKey, (Arc<AtomicBool>, Flight)>>,
 }
@@ -762,6 +886,7 @@ type FlightKey = (String, Duration);
 type Flight = futures::future::Shared<futures::future::BoxFuture<'static, Arc<ShellAnswers>>>;
 
 impl ShellProbes {
+    #[cfg_attr(windows, allow(dead_code))]
     async fn answer(
         &self,
         shell: &str,
@@ -821,7 +946,7 @@ struct BinarySearch {
 
 impl BinarySearch {
     fn current(kind: AgentKind) -> Self {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = chimaera_core::paths::home_dir();
         Self {
             shell: login_shell(),
             path: std::env::var_os("PATH"),
@@ -841,6 +966,14 @@ async fn resolve_bin(
     shell_budget: Duration,
 ) -> Result<PathBuf, Unresolved> {
     let search = BinarySearch::current(kind);
+    // Windows: no login shell — the inherited PATH and the installers'
+    // directories below are the whole search (a completed empty answer).
+    #[cfg(windows)]
+    let probe = {
+        let _ = (probes, shell_budget);
+        std::future::ready(Ok(None))
+    };
+    #[cfg(not(windows))]
     let probe = probes.answer(&search.shell, kind, shell_budget);
     resolve_with_search(kind, managed_bin, explicit, &search, probe).await
 }
@@ -892,7 +1025,8 @@ async fn resolve_with_search(
                 .map(|dir| ("inherited PATH", dir.join(kind.path_bin())));
             let known = well_known.into_iter().map(|path| ("well-known location", path));
             for (source, path) in inherited.chain(known) {
-                if is_executable(&path) && !(kind == AgentKind::Antigravity && agy_is_ide_shim(&path)) {
+                let Some(path) = runnable(path) else { continue };
+                if !(kind == AgentKind::Antigravity && agy_is_ide_shim(&path)) {
                     return Ok(resolved_binary(kind, source, path));
                 }
             }
@@ -912,6 +1046,17 @@ fn resolved_binary(kind: AgentKind, source: &str, path: PathBuf) -> PathBuf {
 /// attempt (GET /agents only exposes the `installed` boolean).
 fn not_found(kind: AgentKind, shell: &str) -> String {
     let bin = kind.path_bin();
+    if cfg!(windows) {
+        let _ = shell;
+        return format!(
+            "{bin} not found on the PATH, in well-known install locations, or as a \
+             chimaera-managed install; install {name} (`{cmd}`, see {url}), then restart \
+             chimaera if the installer changed your PATH",
+            name = kind.product_name(),
+            cmd = install_command(kind),
+            url = docs_url(kind),
+        );
+    }
     format!(
         "{bin} not found via `{shell} -ilc 'command -v {bin}'`, the inherited PATH, well-known install \
          locations, or a chimaera-managed install; install {name} (`{cmd}`, see {url}) \
@@ -934,6 +1079,12 @@ fn agy_is_ide_shim(path: &Path) -> bool {
         .components()
         .any(|c| c.as_os_str().to_string_lossy() == "Antigravity.app")
         || target.file_name().is_some_and(|f| f == "antigravity")
+        // Windows: the IDE's launcher carries a PATHEXT extension
+        // (`antigravity.cmd`).
+        || (cfg!(windows)
+            && target
+                .file_stem()
+                .is_some_and(|f| f.eq_ignore_ascii_case("antigravity")))
 }
 
 /// Version-probe budget: node-backed CLIs take ~1s to boot; anything past
@@ -942,11 +1093,14 @@ const VERSION_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// First non-empty line of `<bin> --version`, or `None` on any failure.
 pub(crate) async fn probe_version(bin: &Path) -> Option<String> {
-    let output = tokio::process::Command::new(bin)
-        .arg("--version")
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.arg("--version")
         .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output();
+        .kill_on_drop(true);
+    // A console child of a windowless daemon would flash a console window.
+    #[cfg(windows)]
+    cmd.creation_flags(chimaera_core::CREATE_NO_WINDOW);
+    let output = cmd.output();
     let out = tokio::time::timeout(VERSION_TIMEOUT, output)
         .await
         .ok()?
@@ -1135,7 +1289,7 @@ fn resolution_fields(row: &mut serde_json::Map<String, serde_json::Value>, d: &A
         row.insert("unchecked".into(), json!(why));
     }
     if let Ok(path) = &d.path {
-        row.insert("path".into(), json!(path));
+        row.insert("path".into(), json!(chimaera_core::paths::wire_path(path)));
     }
     if let Some(version) = &d.version {
         row.insert("version".into(), json!(version));
@@ -1556,6 +1710,19 @@ fn toml_basic_string(s: &str) -> String {
 /// `bash -c` never sees; the exec chain still leaves the agent as the
 /// PTY's direct child. No bash on the host → the prelude is skipped,
 /// never a failed launch.
+///
+/// Windows has no login shell to source (the daemon's environment is the
+/// agents'), so nothing is wrapped; the one rewrite is an npm `.cmd` shim
+/// (`%APPDATA%\npm\codex.cmd`) replaced by the program it starts
+/// ([`unwrap_npm_shim`]). A `.cmd` runs under `cmd.exe`, which re-parses
+/// every argument: std refuses one with a newline, and `"`, `%`, `&` in a
+/// `-c key="…"` override or a prompt don't survive its quoting.
+#[cfg(windows)]
+pub(crate) fn wrap_login_shell(_shell: &str, argv: Vec<String>) -> Vec<String> {
+    unwrap_npm_shim(argv)
+}
+
+#[cfg(not(windows))]
 pub(crate) fn wrap_login_shell(shell: &str, argv: Vec<String>) -> Vec<String> {
     let script = if shell.rsplit('/').next() == Some("fish") {
         // fish has no `$0`/`$@`; -c puts trailing args in $argv instead.
@@ -1576,6 +1743,107 @@ exec $argv"#
     let mut cmd = vec![shell.to_string(), "-lc".to_string(), script];
     cmd.extend(argv);
     cmd
+}
+
+/// `argv` with an npm `cmd-shim` launcher in `argv[0]` replaced by what the
+/// shim itself would run: `node <script>` (the shim's own `node.exe` beside
+/// it, else `node` on PATH) or the native executable it points at. Anything
+/// else — an `.exe`, a `.cmd` that isn't npm's, a shim whose target is gone —
+/// is returned untouched.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn unwrap_npm_shim(mut argv: Vec<String>) -> Vec<String> {
+    let Some(first) = argv.first() else {
+        return argv;
+    };
+    let shim = Path::new(first);
+    let is_batch = shim
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"));
+    let Some(dir) = shim.parent().filter(|_| is_batch) else {
+        return argv;
+    };
+    // Shims are a few hundred bytes; anything larger is not one.
+    let text = match std::fs::metadata(shim) {
+        Ok(meta) if meta.len() <= 16 * 1024 => std::fs::read_to_string(shim).ok(),
+        _ => None,
+    };
+    let Some(target) = text.and_then(|t| parse_cmd_shim(&t, dir)) else {
+        return argv;
+    };
+    let prefix = match target {
+        ShimTarget::Node(script) if script.is_file() => {
+            let local = dir.join("node.exe");
+            let node = if local.is_file() {
+                Some(local)
+            } else {
+                chimaera_core::paths::find_on_path("node", None)
+            };
+            match node {
+                Some(node) => vec![node, script],
+                None => return argv,
+            }
+        }
+        ShimTarget::Direct(exe)
+            if exe.is_file()
+                && exe
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("exe")) =>
+        {
+            vec![exe]
+        }
+        _ => return argv,
+    };
+    let prefix: Vec<String> = prefix
+        .into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    argv.splice(..1, prefix);
+    argv
+}
+
+/// What an npm `cmd-shim` runs.
+#[derive(Debug, PartialEq)]
+enum ShimTarget {
+    /// `node <script>`.
+    Node(PathBuf),
+    /// A native executable started directly.
+    Direct(PathBuf),
+}
+
+/// Read an npm `cmd-shim` (`dir` is the shim's folder, its `%dp0%`). The
+/// launch line is the last one that forwards `%*`, ending in the quoted
+/// target: `"%_prog%"  "%dp0%\node_modules\…\cli.js" %*` (node, today's
+/// shim), `node  "%~dp0\…\cli.js" %*` (older shims) or `"%dp0%\…\x.exe"
+/// %*` (a native bin). Any other shape — shebang arguments, a different
+/// interpreter — is not read, so the shim runs as written.
+fn parse_cmd_shim(text: &str, dir: &Path) -> Option<ShimTarget> {
+    let line = text.lines().rev().find(|l| l.contains("%*"))?;
+    let before = line[..line.find("%*")?].trim_end();
+    let quoted = before.strip_suffix('"')?;
+    let open = quoted.rfind('"')?;
+    let inner = &quoted[open + 1..];
+    let relative = inner
+        .strip_prefix("%dp0%")
+        .or_else(|| inner.strip_prefix("%~dp0"))?;
+    let mut target = dir.to_path_buf();
+    for part in relative.split(['\\', '/']).filter(|p| !p.is_empty()) {
+        target.push(part);
+    }
+    let rest = quoted[..open].trim_end();
+    let rest = rest.trim_start_matches('@');
+    let node = rest.ends_with("\"%_prog%\"")
+        || rest.ends_with("\"%~dp0\\node.exe\"")
+        || rest == "node"
+        || rest.ends_with(" node");
+    if node {
+        Some(ShimTarget::Node(target))
+    } else if rest.is_empty() {
+        Some(ShimTarget::Direct(target))
+    } else {
+        None
+    }
 }
 
 /// The user's login shell. `$SHELL` when a terminal set it; otherwise the
@@ -1827,22 +2095,28 @@ pub(crate) async fn chat_executable(
             is_executable(&path),
             "Antigravity chat executable is not runnable"
         );
-        return Ok(tokio::fs::canonicalize(path).await?);
+        return canonical(path).await;
     }
     if let Some(path) = managed_fallback(
         "agy-acp",
         &crate::runtimes::managed_bin_for(state, "agy-acp"),
     ) {
-        return Ok(tokio::fs::canonicalize(path).await?);
+        return canonical(path).await;
     }
     if let Some(path) = resolve_via_login_shell(&login_shell(), "agy_acp_server.par")
         .await
         .map_err(anyhow::Error::msg)?
         .filter(|p| is_executable(p))
     {
-        return Ok(tokio::fs::canonicalize(path).await?);
+        return canonical(path).await;
     }
     anyhow::bail!("Antigravity chat isn't set up yet. Choose ‘set up chat’ beside Antigravity in the new-agent menu.")
+}
+
+/// The canonical form of an executable to spawn — without Windows' `\\?\`
+/// prefix, which some programs read back from their own argv[0].
+async fn canonical(path: PathBuf) -> anyhow::Result<PathBuf> {
+    Ok(tokio::task::spawn_blocking(move || chimaera_core::paths::canonicalize(&path)).await??)
 }
 
 pub(crate) fn build_acp_chat_command(kind: AgentKind, bin: &Path) -> Vec<String> {
@@ -1862,7 +2136,7 @@ pub(crate) fn build_acp_chat_command(kind: AgentKind, bin: &Path) -> Vec<String>
     argv
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "launcher_detection_tests.rs"]
 mod detection_tests;
 
@@ -1915,6 +2189,7 @@ mod tests {
         assert!(extension_action(AgentKind::Gemini, "manage_plugins", None).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn agy_shim_detection_spans_platforms() {
         let dir = std::env::temp_dir().join(format!("chimaera-agy-shim-{}", std::process::id()));
@@ -2228,6 +2503,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn wrap_login_shell_passes_argv_untouched() {
         // sh-family: `$0`/`$@` carry the argv — nothing is interpolated
@@ -2484,6 +2760,7 @@ mod tests {
     /// The well-known fallback covers the official installers' targets — most
     /// importantly `~/.local/bin`, where `claude.ai/install.sh` lands and
     /// which macOS zsh keeps on PATH only via the interactive-only `.zshrc`.
+    #[cfg(not(windows))]
     #[test]
     fn well_known_paths_cover_installer_targets() {
         let home = PathBuf::from("/home/u");
@@ -2521,6 +2798,7 @@ mod tests {
     /// invalidates the entry. `mtime: None` (stat failed at detection, or a
     /// test preset) is trusted as before — never a fall-through to the real
     /// login shell.
+    #[cfg(unix)]
     #[test]
     fn cache_hits_are_validated_against_the_binary_on_disk() {
         use std::os::unix::fs::PermissionsExt;
@@ -2586,6 +2864,7 @@ mod tests {
 
     /// `is_executable` follows symlinks (a versioned `~/.local/bin/claude`
     /// symlink is the real install shape) and rejects non-exec / missing.
+    #[cfg(unix)]
     #[test]
     fn is_executable_follows_symlinks_and_checks_mode() {
         use std::os::unix::fs::PermissionsExt;
@@ -2774,8 +3053,264 @@ mod tests {
         assert!(safe_arg("opus[1m]"));
         assert!(safe_arg("claude-fable-5-1[1m]"));
         assert!(!safe_arg("opus[1m];rm"));
-        assert!(install_command(AgentKind::Claude).starts_with("curl "));
+        if cfg!(windows) {
+            assert!(install_command(AgentKind::Claude).starts_with("irm "));
+        } else {
+            assert!(install_command(AgentKind::Claude).starts_with("curl "));
+        }
         assert!(install_command(AgentKind::Codex).contains("npm install -g @openai/codex"));
         assert!(install_command(AgentKind::Gemini).contains("npm install -g @google/gemini-cli"));
+    }
+
+    /// Claude Code names a project folder by replacing every
+    /// non-alphanumeric character of the cwd with `-`; on Windows that turns
+    /// the drive colon and each separator into dashes, from either spelling
+    /// of the path (native `\` or the wire's `/`).
+    #[test]
+    fn encode_cwd_matches_claude_on_windows_paths() {
+        assert_eq!(
+            encode_cwd(Path::new(r"C:\Users\me\proj")),
+            "C--Users-me-proj"
+        );
+        assert_eq!(
+            encode_cwd(Path::new("C:/Users/me/proj")),
+            "C--Users-me-proj"
+        );
+        assert_eq!(
+            encode_cwd(Path::new(r"D:\work\my_proj.v2\.claude\worktrees\x")),
+            "D--work-my-proj-v2--claude-worktrees-x"
+        );
+    }
+
+    /// Every native-Windows installer target is searched, user installs
+    /// before npm's shims and WinGet's links, and only for its own agent.
+    #[test]
+    fn windows_well_known_paths_cover_vendor_installers() {
+        let home = PathBuf::from("home");
+        let local = PathBuf::from("local");
+        let roaming = PathBuf::from("roaming");
+        let paths = |bin| well_known_windows_paths(bin, Some(&home), Some(&local), Some(&roaming));
+        let claude = paths("claude");
+        assert_eq!(claude[0], home.join(".local").join("bin").join("claude"));
+        assert!(claude.contains(&roaming.join("npm").join("claude")));
+        assert!(claude.contains(
+            &local
+                .join("Microsoft")
+                .join("WinGet")
+                .join("Links")
+                .join("claude")
+        ));
+        assert!(paths("grok").contains(&home.join(".grok").join("bin").join("grok")));
+        assert!(paths("agy").contains(&local.join("agy").join("bin").join("agy")));
+        assert!(paths("cursor-agent").contains(&local.join("cursor-agent").join("cursor-agent")));
+        assert!(!claude.iter().any(|p| p.starts_with(local.join("agy"))));
+        let codex = paths("codex");
+        let at = |p: &PathBuf| codex.iter().position(|c| c == p).unwrap();
+        assert!(
+            at(&home.join(".local").join("bin").join("codex"))
+                < at(&roaming.join("npm").join("codex"))
+        );
+        // No profile and no AppData: nothing to guess at.
+        assert!(well_known_windows_paths("claude", None, None, None).is_empty());
+    }
+
+    /// The three shapes npm's `cmd-shim` writes, CRLF line ends included,
+    /// and the shapes that must be left to run as written.
+    #[test]
+    fn npm_cmd_shims_are_read_for_their_target() {
+        let dir = Path::new("npm");
+        let script = dir
+            .join("node_modules")
+            .join("@openai")
+            .join("codex")
+            .join("bin")
+            .join("codex.js");
+        let today = "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\r\nIF EXIST \"%dp0%\\node.exe\" (\r\n  SET \"_prog=%dp0%\\node.exe\"\r\n) ELSE (\r\n  SET \"_prog=node\"\r\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\"  \"%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js\" %*\r\n";
+        assert_eq!(
+            parse_cmd_shim(today, dir),
+            Some(ShimTarget::Node(script.clone()))
+        );
+        let older = "@IF EXIST \"%~dp0\\node.exe\" (\n  \"%~dp0\\node.exe\"  \"%~dp0\\node_modules\\@openai\\codex\\bin\\codex.js\" %*\n) ELSE (\n  @SETLOCAL\n  @SET PATHEXT=%PATHEXT:;.JS;=;%\n  node  \"%~dp0\\node_modules\\@openai\\codex\\bin\\codex.js\" %*\n)\n";
+        assert_eq!(parse_cmd_shim(older, dir), Some(ShimTarget::Node(script)));
+        let native = "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\"%dp0%\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe\"   %*\r\n";
+        assert_eq!(
+            parse_cmd_shim(native, dir),
+            Some(ShimTarget::Direct(
+                dir.join("node_modules")
+                    .join("@anthropic-ai")
+                    .join("claude-code")
+                    .join("bin")
+                    .join("claude.exe")
+            ))
+        );
+        // Shebang arguments, another interpreter, a non-shim batch file.
+        for other in [
+            "\"%_prog%\" --no-warnings \"%dp0%\\x.js\" %*",
+            "python \"%dp0%\\x.py\" %*",
+            "@echo off\r\ncall \"C:\\tools\\agent.cmd\" %*\r\n",
+            "@echo off\r\necho hi\r\n",
+        ] {
+            assert_eq!(parse_cmd_shim(other, dir), None, "{other}");
+        }
+        // Not a batch file: untouched without a read.
+        let argv = vec!["/usr/bin/claude".to_string(), "--x".to_string()];
+        assert_eq!(unwrap_npm_shim(argv.clone()), argv);
+    }
+
+    /// On disk: a node shim becomes `node <script> args…` with the args
+    /// verbatim (newlines and quotes included), a native shim its `.exe`,
+    /// and a shim whose target is missing stays as it was.
+    #[test]
+    fn npm_shims_unwrap_to_their_program() {
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-npm-shim-{}-{}",
+            std::process::id(),
+            &chimaera_core::generate_token()[..8]
+        ));
+        let pkg = dir.join("node_modules").join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(dir.join("node.exe"), "").unwrap();
+        std::fs::write(pkg.join("cli.js"), "").unwrap();
+        std::fs::write(pkg.join("tool.exe"), "").unwrap();
+        let node_shim = dir.join("agent.cmd");
+        std::fs::write(
+            &node_shim,
+            "@ECHO off\r\n\"%_prog%\"  \"%dp0%\\node_modules\\pkg\\cli.js\" %*\r\n",
+        )
+        .unwrap();
+        let native_shim = dir.join("tool.CMD");
+        std::fs::write(
+            &native_shim,
+            "\"%dp0%\\node_modules\\pkg\\tool.exe\"   %*\r\n",
+        )
+        .unwrap();
+        let broken = dir.join("gone.cmd");
+        std::fs::write(&broken, "\"%dp0%\\node_modules\\pkg\\gone.js\" %*\r\n").unwrap();
+
+        let prompt = "line one\n\nline \"two\" 100% & more".to_string();
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+        assert_eq!(
+            unwrap_npm_shim(vec![s(&node_shim), "app-server".into(), prompt.clone()]),
+            vec![
+                s(&dir.join("node.exe")),
+                s(&pkg.join("cli.js")),
+                "app-server".into(),
+                prompt
+            ]
+        );
+        assert_eq!(
+            unwrap_npm_shim(vec![s(&native_shim), "--version".into()]),
+            vec![s(&pkg.join("tool.exe")), "--version".into()]
+        );
+        assert_eq!(unwrap_npm_shim(vec![s(&broken)]), vec![s(&broken)]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Windows detection: an `agent.exe` and an npm `agent.cmd` on a custom
+    /// PATH are found through `PATHEXT` (`.exe` before `.cmd`, as `cmd.exe`
+    /// orders them), the well-known directories are searched the same way,
+    /// and nothing extensionless counts as a program.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_detection_resolves_pathext_programs() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-win-detect-{}",
+            &chimaera_core::generate_token()[..8]
+        ));
+        let exe_dir = root.join("exe");
+        let cmd_dir = root.join("npm");
+        let known = root.join("known");
+        for d in [&exe_dir, &cmd_dir, &known] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(exe_dir.join("codex.exe"), "").unwrap();
+        std::fs::write(cmd_dir.join("codex.cmd"), "@echo off\r\n").unwrap();
+        std::fs::write(cmd_dir.join("codex"), "#!/bin/sh\n").unwrap();
+        std::fs::write(known.join("codex.cmd"), "@echo off\r\n").unwrap();
+        let search = |path: &[&Path], known: Vec<PathBuf>| BinarySearch {
+            shell: "powershell.exe".into(),
+            path: Some(std::env::join_paths(path).unwrap()),
+            well_known: known,
+        };
+        let managed = root.join("managed");
+        let resolve = |search: BinarySearch| {
+            let managed = &managed;
+            async move {
+                resolve_with_search(
+                    AgentKind::Codex,
+                    managed,
+                    None,
+                    &search,
+                    std::future::ready(Ok(None)),
+                )
+                .await
+            }
+        };
+        // `PATHEXT` spells extensions in upper case; Windows paths compare
+        // case-insensitively.
+        let same = |a: &Path, b: &Path| {
+            a.to_string_lossy()
+                .eq_ignore_ascii_case(&b.to_string_lossy())
+        };
+        // PATH order first; the npm dir's extensionless sh shim is skipped.
+        let got = resolve(search(&[&cmd_dir, &exe_dir], vec![]))
+            .await
+            .unwrap();
+        assert!(same(&got, &cmd_dir.join("codex.cmd")), "{got:?}");
+        let got = resolve(search(&[&exe_dir, &cmd_dir], vec![]))
+            .await
+            .unwrap();
+        assert!(same(&got, &exe_dir.join("codex.exe")), "{got:?}");
+        // Same folder, both kinds: `.exe` wins.
+        std::fs::write(cmd_dir.join("codex.exe"), "").unwrap();
+        let got = resolve(search(&[&cmd_dir], vec![])).await.unwrap();
+        assert!(same(&got, &cmd_dir.join("codex.exe")), "{got:?}");
+        // Nothing on PATH: a well-known installer directory.
+        let got = resolve(search(&[], vec![known.join("codex")]))
+            .await
+            .unwrap();
+        assert!(same(&got, &known.join("codex.cmd")), "{got:?}");
+        let miss = resolve(search(&[], vec![])).await.unwrap_err();
+        assert!(
+            miss.reason.contains("not found on the PATH"),
+            "{}",
+            miss.reason
+        );
+        assert!(miss.unchecked.is_none());
+        // The PATH lookup that stands in for the login shell.
+        assert!(!is_executable(&cmd_dir.join("codex")));
+        assert!(is_executable(&cmd_dir.join("codex.cmd")));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The probe that stands in for the login shell on Windows answers every
+    /// bin at once from the daemon's PATH, and a miss is a completed answer.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_probe_reads_the_daemon_path() {
+        let answers = probe_login_shell_all(
+            "powershell.exe",
+            &["cmd", "no-such-agent-x"],
+            SHELL_PROBE_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        let cmd = answers[0]
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .expect("cmd.exe on PATH");
+        assert!(cmd
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .ends_with("cmd.exe"));
+        assert!(matches!(answers[1], Ok(None)));
+        // No wrapping on Windows; an exe passes through untouched.
+        let argv = vec![
+            cmd.to_string_lossy().into_owned(),
+            "/c".into(),
+            "a\nb".into(),
+        ];
+        assert_eq!(wrap_login_shell("powershell.exe", argv.clone()), argv);
     }
 }

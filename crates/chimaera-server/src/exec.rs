@@ -36,9 +36,7 @@ pub(crate) async fn run_exec(
     timeout_ms: Option<u64>,
     queue_timeout_ms: Option<u64>,
 ) -> Result<chimaera_pty::ExecOutcome, chimaera_pty::ExecError> {
-    let allow_sentinel_over_running = state
-        .sessions
-        .foreground_pid(id)
+    let allow_sentinel_over_running = crate::naming::foreground_pid(state, id)
         .and_then(crate::naming::comm_name)
         .is_some_and(|comm| SENTINEL_FOREGROUNDS.contains(&comm.as_str()));
 

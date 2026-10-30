@@ -37,6 +37,7 @@ Tests: `*.test.ts` beside the modules.
 
 ## Invariants / gotchas
 
+- **Daemon paths may have a drive or UNC root** (a Windows daemon sends `C:/x`). Path logic goes through `shared/paths.ts`; the folder picker shows **This PC** above a drive root (`fs/dirs?path=/` lists the drives there) and checks names against Windows rules under a drive root. Cluster paths stay POSIX.
 - **Git, Timeline, and Knowledge are pulled, never pushed.** `/ws/events` carries only a small epoch nudge. Each store mirrors only the active workspace (`git.ts`, `timeline.svelte.ts`, `knowledge.ts` headers).
 - **Store modules own their `visibilitychange` listener** when the return needs an immediate refetch (`compute.ts`, `comms.svelte.ts`, `timeline.svelte.ts`, `knowledge.ts`). See the rule bullet on recurring work.
 - **Compute asks at most once a minute.** That is the scheduler-politeness floor (`compute.ts` header).

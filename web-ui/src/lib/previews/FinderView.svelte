@@ -40,6 +40,16 @@
     pasteInto,
   } from "../workspace/fileClipboard.svelte";
   import { validateEntryName } from "../shared/fsNames";
+  import {
+    ancestors,
+    isAbsolute,
+    isRoot,
+    isUnder,
+    joinPath,
+    relativeTo,
+    rootOf,
+    trimSlash,
+  } from "../shared/paths";
   import { InlineRename, renameFocus } from "../shared/inlineRename.svelte";
   import { resizeKeydown, startResizeDrag } from "../shared/resizeDrag";
   import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
@@ -177,13 +187,11 @@
    *  right of column `afterIndex` until its listing settles (macOS Finder). */
   let pendingCol = $state<{ afterIndex: number; seq: number } | null>(null);
 
-  const wsNorm = $derived(
-    wsRoot !== null && wsRoot.length > 1 && wsRoot.endsWith("/") ? wsRoot.slice(0, -1) : wsRoot,
-  );
+  const wsNorm = $derived(wsRoot !== null ? trimSlash(wsRoot) : null);
   const outsideWs = $derived(location !== "" && !withinWs(location));
 
   function withinWs(p: string): boolean {
-    return wsNorm !== null && (wsNorm === "/" || p === wsNorm || p.startsWith(`${wsNorm}/`));
+    return wsNorm !== null && (wsNorm === "/" || isUnder(p, wsNorm));
   }
 
   /** Leftmost column for a location: the workspace root when the path is under
@@ -195,28 +203,26 @@
   /** The dir chain [anchor … dir] (both canonical, dir at/under anchor). */
   function ancestorChain(anchor: string, dir: string): string[] {
     if (dir === anchor) return [anchor];
-    const prefix = anchor === "/" ? "/" : `${anchor}/`;
-    if (!dir.startsWith(prefix)) return [dir];
-    const parts = dir.slice(prefix.length).split("/").filter(Boolean);
+    const rel = relativeTo(dir, anchor);
+    if (rel === null) return [dir];
+    if (rel === ".") return [anchor];
     const chain = [anchor];
-    let acc = anchor === "/" ? "" : anchor;
-    for (const part of parts) {
-      acc = `${acc}/${part}`;
+    let acc = anchor;
+    for (const part of rel.split("/").filter(Boolean)) {
+      acc = joinPath(acc, part);
       chain.push(acc);
     }
     return chain;
   }
 
-  /** Breadcrumb segments — always the full absolute path from "/". */
-  const crumbs = $derived.by(() => {
-    const out = [{ name: "/", path: "/" }];
-    let acc = "";
-    for (const part of location.split("/").filter(Boolean)) {
-      acc += `/${part}`;
-      out.push({ name: part, path: acc });
-    }
-    return out;
-  });
+  /** Breadcrumb segments — always the full absolute path from its root (`/`,
+   *  or `C:` / `//srv/share` on a Windows host). */
+  const crumbs = $derived.by(() =>
+    ancestors(isAbsolute(location) ? location : `/${location}`).map((path) => ({
+      name: isRoot(path) ? (path === "/" ? "/" : path.slice(0, -1)) : basename(path),
+      path,
+    })),
+  );
 
   $effect(() => {
     if (location === "" || crumbsEl === null) return;
@@ -450,21 +456,21 @@
    *  rename replacing an entry row). */
   const inline = new InlineRename<FinderEdit>({
     check(cur, name) {
-      const invalid = validateEntryName(name, { allowSlashes: cur.mode === "create" });
+      const invalid = validateEntryName(name, {
+        allowSlashes: cur.mode === "create",
+        dir: cur.mode === "create" ? cur.dir : dirname(cur.path),
+      });
       if (invalid !== null) return { invalid };
       return cur.mode === "rename" && name === cur.name ? "unchanged" : "submit";
     },
     async submit(cur, name, close) {
       if (cur.mode === "create") {
-        const base = cur.dir === "/" ? "" : cur.dir;
-        const created = await fsCreateOp(`${base}/${name}`, cur.kind);
+        const created = await fsCreateOp(joinPath(cur.dir, name), cur.kind);
         close();
         if (cur.kind === "file") onOpenFile(created, false);
         // The fsEpoch rebuild below refreshes the columns.
       } else {
-        const i = cur.path.lastIndexOf("/");
-        const parent = i > 0 ? cur.path.slice(0, i) : "";
-        await fsRenameOp(cur.path, `${parent}/${name}`);
+        await fsRenameOp(cur.path, joinPath(dirname(cur.path), name));
       }
     },
     errorText: (e) => message(e),
@@ -677,11 +683,10 @@
       lastEpoch = epoch;
       if (epoch === 0 || location === "") return;
       let target = location;
-      if (m?.kind === "rename" && (location === m.from || location.startsWith(`${m.from}/`))) {
+      if (m?.kind === "rename" && isUnder(location, m.from)) {
         target = m.to + location.slice(m.from.length);
-      } else if (m?.kind === "delete" && (location === m.path || location.startsWith(`${m.path}/`))) {
-        const i = m.path.lastIndexOf("/");
-        target = i > 0 ? m.path.slice(0, i) : "/";
+      } else if (m?.kind === "delete" && isUnder(location, m.path)) {
+        target = dirname(m.path);
       }
       if (target !== location) {
         void navigateTo(target);
@@ -709,10 +714,7 @@
       lastDiskSeq = change.seq;
       let target = location;
       for (const removed of change.removedDirs) {
-        if (target === removed || target.startsWith(`${removed}/`)) {
-          const i = removed.lastIndexOf("/");
-          target = i > 0 ? removed.slice(0, i) : "/";
-        }
+        if (isUnder(target, removed)) target = dirname(removed);
       }
       if (target !== location) {
         void navigateTo(target);
@@ -754,7 +756,7 @@
 <div class="finder">
   <div class="bar">
     <button class="act icon-act" aria-label="go to parent folder" title="Go to parent folder"
-      disabled={location === "" || location === "/"}
+      disabled={location === "" || isRoot(location)}
       onclick={() => void navigateTo(dirname(location))}>
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <path d="m6 11 6-6 6 6M12 5v14" />
@@ -980,7 +982,7 @@
 
   <div class="status" role="status">
     {#if dropDir !== null}
-      <span class="transfer-status" title={dropDir}>{dropAction} into {basename(dropDir) || "/"}</span>
+      <span class="transfer-status" title={dropDir}>{dropAction} into {basename(dropDir) || rootOf(dropDir) || "/"}</span>
       {#if dropAction === "move"}<span class="gesture-hint">{isMac ? "Option" : "Alt"} to copy</span>{/if}
     {:else if activeColumn !== undefined}
       <span class="item-count" title={activeColumn.dir}>{activeColumn.entries.length}{activeColumn.truncated ? "+" : ""} {activeColumn.entries.length === 1 ? "item" : "items"}</span>

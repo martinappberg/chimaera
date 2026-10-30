@@ -197,7 +197,14 @@ swap() {{ # swap <agent> <version>
 /// phase-1 managed install exists (gemini needs a node runtime). The daemon
 /// composes this itself — never from the client — and every script ends by
 /// printing the installed version through the swapped symlink.
+///
+/// None on Windows: the scripts are POSIX (curl, tar, `uname`, symlinks);
+/// a Windows host runs the user's own install, and the launcher offers each
+/// vendor's PowerShell installer instead (`launcher::install_command`).
 pub(crate) fn install_script(kind: AgentKind, managed_root: &Path) -> Option<String> {
+    if cfg!(windows) {
+        return None;
+    }
     let prelude = script_prelude(managed_root);
     let body = match kind {
         AgentKind::Claude => format!(
@@ -468,16 +475,22 @@ pub(crate) async fn install_agent(
             .into_response();
     };
     let Some(script) = install_script(kind, &state.managed_root) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!(
+        let error = if cfg!(windows) && kind != AgentKind::Gemini {
+            format!(
+                "Chimaera can't install {} on Windows. Install it yourself from PowerShell \
+                 with `{}`, then check again.",
+                kind.product_name(),
+                crate::launcher::install_command(kind),
+            )
+        } else {
+            format!(
                 "Chimaera no longer installs {}. Choose Antigravity for new Google conversations, \
                  or manage your existing installation with `{}`",
                 kind.product_name(),
                 crate::launcher::install_command(kind),
-            )})),
-        )
-            .into_response();
+            )
+        };
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response();
     };
     match start_install(&state, kind, &workspace, "install", script).await {
         Ok(session_id) => Json(json!({"session_id": session_id})).into_response(),
@@ -1051,7 +1064,15 @@ pub(crate) fn explicit_agent_paths(state: &AppState) -> HashMap<AgentKind, Strin
 /// check re-detects its agent), because a dropped hit is re-probed through the
 /// login shell — on a slow host, every installed agent would read "couldn't
 /// check" after any one install.
+///
+/// Not on Windows: the shims are `#!/bin/sh` programs, and a Windows host
+/// has no managed install for them to fall back to. An explicit path setting
+/// still reaches spawns through detection; a typed `claude` in a terminal
+/// runs unthemed.
 pub(crate) fn regenerate_shims(state: &AppState) {
+    if cfg!(windows) {
+        return;
+    }
     let explicit = explicit_agent_paths(state);
     if let Err(err) = write_shims_for(
         &state.shims_dir,
@@ -1072,6 +1093,7 @@ pub(crate) fn regenerate_shims(state: &AppState) {
 /// `agents.<kind>.path`. Otherwise the shim is REMOVED (or never created), so
 /// typing `<bin>` resolves through the user's own PATH exactly like a plain
 /// terminal — chimaera never shadows an install it doesn't own and then fails.
+#[cfg_attr(not(unix), allow(dead_code))]
 #[cfg(test)]
 pub(crate) fn write_shims(
     shim_dir: &Path,
@@ -1135,14 +1157,18 @@ fn remove_if_exists(path: &Path) -> anyhow::Result<()> {
 /// failures. Permissions land on the tmp, so the target never transitions
 /// through a wrong mode.
 fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
     std::fs::write(&tmp, contents).with_context(|| format!("failed to write {}", tmp.display()))?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
-        .with_context(|| format!("failed to chmod {}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("failed to chmod {}", tmp.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
     std::fs::rename(&tmp, path)
         .with_context(|| format!("failed to move {} into place", tmp.display()))?;
     Ok(())
@@ -1259,7 +1285,8 @@ exec "$real" "$@"
     }
 }
 
-#[cfg(test)]
+/// The managed installs and shims are POSIX programs these tests run.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -2177,5 +2204,36 @@ esac
         ));
         assert!(!is_managed(Path::new("/usr/local/bin/codex"), &root));
         assert!(!is_managed(Path::new("/home/u/.local/bin/claude"), &root));
+    }
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+
+    /// A Windows host has no managed install: the catalog row says so and
+    /// the install route answers with the vendor's own Windows command.
+    #[test]
+    fn managed_installs_are_posix_only() {
+        let root = Path::new("managed");
+        for kind in [
+            AgentKind::Claude,
+            AgentKind::Codex,
+            AgentKind::Antigravity,
+            AgentKind::Grok,
+            AgentKind::Cursor,
+        ] {
+            assert_eq!(
+                install_script(kind, root).is_some(),
+                !cfg!(windows),
+                "{kind:?}"
+            );
+        }
+        if cfg!(windows) {
+            assert_eq!(
+                crate::launcher::install_command(AgentKind::Grok),
+                "irm https://x.ai/cli/install.ps1 | iex"
+            );
+        }
     }
 }

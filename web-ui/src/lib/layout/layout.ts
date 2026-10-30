@@ -11,6 +11,7 @@
  */
 
 import type { DiffMode } from "../workspace/git";
+import { dirname, isUnder } from "../shared/paths";
 
 export type SplitDir = "row" | "col";
 export type FocusDir = "left" | "right" | "up" | "down";
@@ -1389,17 +1390,6 @@ export function pruneFiles(l: Layout, dead: ReadonlySet<string>): Layout {
   return pruneTabs(l, (t) => t.surface !== "file" || !dead.has(t.path));
 }
 
-/** True when `p` is `prefix` itself or lies under it. */
-function underPath(p: string, prefix: string): boolean {
-  return p === prefix || p.startsWith(`${prefix}/`);
-}
-
-/** Containing directory of an absolute path ("/" at the top). */
-function parentPath(p: string): string {
-  const i = p.lastIndexOf("/");
-  return i > 0 ? p.slice(0, i) : "/";
-}
-
 /**
  * Rewrite every path-keyed tab after an fs rename: file and diff tabs at or
  * under `from` follow to `to` (prefix-aware — a dir rename carries its open
@@ -1408,7 +1398,7 @@ function parentPath(p: string): string {
  * by tabKey (first in walk order wins), panes emptied by the dedupe collapse.
  */
 export function rewriteTabPaths(l: Layout, from: string, to: string): Layout {
-  const move = (p: string): string => (underPath(p, from) ? to + p.slice(from.length) : p);
+  const move = (p: string): string => (isUnder(p, from) ? to + p.slice(from.length) : p);
   const mapTab = (t: Tab): Tab => {
     if (t.surface !== "file" && t.surface !== "diff" && t.surface !== "finder") return t;
     const p = move(t.path);
@@ -1472,13 +1462,13 @@ export function pruneDeletedPath(
   path: string,
   preserveDirtyFiles?: ReadonlySet<string>,
 ): Layout {
-  const parent = parentPath(path);
+  const parent = dirname(path);
   const retarget = (node: LayoutNode): LayoutNode => {
     if (node.type === "pane") {
       const tabs = node.tabs.map((t) => {
-        if (t.surface === "finder" && underPath(t.path, path)) return { ...t, path: parent };
+        if (t.surface === "finder" && isUnder(t.path, path)) return { ...t, path: parent };
         if (t.surface !== "file" || t.fileTrail === undefined) return t;
-        const keep = (p: string) => !underPath(p, path) || preserveDirtyFiles?.has(p) === true;
+        const keep = (p: string) => !isUnder(p, path) || preserveDirtyFiles?.has(p) === true;
         const paths = t.fileTrail.paths.filter(keep);
         if (paths.length === t.fileTrail.paths.length) return t;
         const index = Math.max(0, Math.min(paths.length - 1, t.fileTrail.paths.slice(0, t.fileTrail.index + 1).filter(keep).length - 1));
@@ -1496,7 +1486,7 @@ export function pruneDeletedPath(
     retargeted,
     (t) =>
       (t.surface !== "file" && t.surface !== "diff") ||
-      !underPath(t.path, path) ||
+      !isUnder(t.path, path) ||
       (t.surface === "file" && preserveDirtyFiles?.has(t.path) === true),
   );
 }

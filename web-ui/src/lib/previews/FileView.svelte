@@ -15,6 +15,7 @@
    */
   import { untrack, type Component, type Snippet } from "svelte";
   import { looksBinary, midTruncate, viewKindFor, type FileChunk } from "./files";
+  import { isUnder, trimSlash } from "../shared/paths";
   import { retain, release, type FileEntry } from "./fileStore.svelte";
   import { isMarpFrontmatter, isMarpSource } from "./marp";
   import ImageView from "./ImageView.svelte";
@@ -51,10 +52,10 @@
   // A file OUTSIDE the workspace shows its full path so its origin is
   // unambiguous — an in-workspace file's location is implied by the workspace
   // and the FILES tree, so it stays clean.
-  const wsNorm = $derived(
-    wsRoot !== null && wsRoot.length > 1 && wsRoot.endsWith("/") ? wsRoot.slice(0, -1) : wsRoot,
+  const wsNorm = $derived(wsRoot !== null ? trimSlash(wsRoot) : null);
+  const external = $derived(
+    wsNorm !== null && path !== wsNorm && (wsNorm === "/" || !isUnder(path, wsNorm)),
   );
-  const external = $derived(wsNorm !== null && path !== wsNorm && !path.startsWith(`${wsNorm}/`));
 
   // --- per-tab overrides -----------------------------------------------------------
 

@@ -339,7 +339,7 @@ impl Caps {
         let shells: Vec<&str> = programs
             .iter()
             .copied()
-            .filter(|p| super::platform::SHELLS.contains(p))
+            .filter(|p| super::platform::is_shell(p))
             .collect();
         for shell in &shells {
             lines.push(Line {

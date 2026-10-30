@@ -13,9 +13,12 @@ tracing.workspace = true
 rand.workspace = true
 dirs.workspace = true
 hostname.workspace = true
+dunce.workspace = true
 
-# Unix-only: uid/passwd lookups and the signal-0 liveness probe. The Windows
-# build of the app workspace never touches processes by pid directly (the WSL
-# shell probes liveness inside the distro), so core must compile without nix.
+# Unix: uid/passwd lookups, process-group signals and the signal-0 liveness
+# probe (`proc`). Windows does the same through job objects (`windows-sys`).
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["user"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

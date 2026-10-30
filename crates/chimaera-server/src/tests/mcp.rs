@@ -123,6 +123,7 @@ fn the_mastermind_read_tools_are_annotated_read_only() {
     }
 }
 
+#[cfg(unix)]
 /// The full agent-side story over MCP: unlinked -> helpful error;
 /// linked -> list, exec (by display name), and journal read all work
 /// and stay scoped.
@@ -223,6 +224,7 @@ async fn mcp_tools_scoped_to_links_and_exec_round_trip() {
     state.sessions.kill(&other).ok();
 }
 
+#[cfg(unix)]
 /// `update_plan` draws the plan card: a chat session's call journals one
 /// `plan` level-set (1-based ids, the three statuses), a malformed call is
 /// refused with the reason, and a terminal session (no chat journal) is told

@@ -34,10 +34,17 @@ pub(crate) struct MastermindCfg {
     pub(crate) agent: String,
 }
 
+/// Serializes a path in the wire form: the UI and `workspaces.json` carry
+/// `C:/x`, never `C:\x` or a `\\?\` prefix (identical to the default on Unix).
+fn serialize_wire_path<S: serde::Serializer>(path: &Path, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&chimaera_core::paths::wire_path(path))
+}
+
 /// A registered workspace: a canonicalized directory the user opened.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Workspace {
     pub(crate) id: String,
+    #[serde(serialize_with = "serialize_wire_path")]
     pub(crate) root: PathBuf,
     pub(crate) name: String,
     /// Unix seconds of the last open/activity; 0 for pre-upgrade records.
@@ -604,7 +611,7 @@ pub(crate) fn seed_cluster_workspace(state: &crate::AppState) {
             // Every registered root is canonical (fs routes compare against
             // it); a path that can't be resolved yet is kept as given.
             let given = PathBuf::from(&seed.path);
-            let root = std::fs::canonicalize(&given).unwrap_or(given);
+            let root = chimaera_core::paths::canonicalize(&given).unwrap_or(given);
             match crate::lock(&state.workspaces).seed(&seed.id, &seed.name, root) {
                 Ok(true) => {
                     tracing::info!(id = %seed.id, "registered this job's cluster workspace")
@@ -649,7 +656,7 @@ fn read_seed(path: &Path) -> anyhow::Result<chimaera_core::cluster::WorkspaceSee
 fn workspace_name(root: &Path) -> String {
     root.file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| root.display().to_string())
+        .unwrap_or_else(|| chimaera_core::paths::wire_path(root))
 }
 
 fn unix_now() -> u64 {
@@ -766,9 +773,17 @@ mod tests {
         let dir = test_dir("seed-file");
         let file = dir.join("workspace.json");
         let write = |v: &str| std::fs::write(&file, v).unwrap();
-        write(r#"{"id":"w-0000abcd","name":"x","path":"/data/x"}"#);
+        #[cfg(unix)]
+        let abs = "/data/x";
+        #[cfg(windows)]
+        let abs = "C:/data/x";
+        write(&format!(
+            r#"{{"id":"w-0000abcd","name":"x","path":"{abs}"}}"#
+        ));
         assert_eq!(read_seed(&file).unwrap().id, "w-0000abcd");
-        write(r#"{"id":"w-../../x","name":"x","path":"/data/x"}"#);
+        write(&format!(
+            r#"{{"id":"w-../../x","name":"x","path":"{abs}"}}"#
+        ));
         assert!(read_seed(&file).is_err());
         write(r#"{"id":"w-0000abcd","name":"x","path":"data/x"}"#);
         assert!(read_seed(&file).is_err());

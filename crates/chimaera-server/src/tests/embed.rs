@@ -6,10 +6,7 @@ use super::support::*;
 use crate::AppState;
 
 fn canon(path: &std::path::Path) -> String {
-    std::fs::canonicalize(path)
-        .unwrap()
-        .to_string_lossy()
-        .into_owned()
+    wire(&canonical(path))
 }
 
 fn png(w: u32, h: u32) -> Vec<u8> {
@@ -280,6 +277,7 @@ async fn raw_is_cacheable_and_revalidates_to_304() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn raw_asset_serves_a_reports_folder_and_nothing_outside_it() {
     use std::os::unix::fs::symlink;
@@ -482,6 +480,7 @@ async fn raw_sandboxes_markup_and_every_report_asset() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+#[cfg(unix)]
 /// A frame addresses its page by the canonical name the ticket mint answers:
 /// an HTML report opened through a symlink, or under a hidden name, loads
 /// itself and its assets; hidden names stay refused for every OTHER file.
@@ -605,7 +604,12 @@ async fn raw_assets_revalidate_every_load() {
 async fn escaped_filesystem_paths_resolve_to_the_file_they_name() {
     let state = test_state();
     let root = test_dir("embed-raw-paths");
-    for dir in ["run#2", "50%", "50%25", "why?", "sp ace "] {
+    // Windows forbids `?` in a name and drops a trailing space.
+    #[cfg(unix)]
+    let dirs = ["run#2", "50%", "50%25", "why?", "sp ace "];
+    #[cfg(windows)]
+    let dirs = ["run#2", "50%", "50%25", "sp ace"];
+    for dir in dirs {
         std::fs::create_dir_all(root.join(dir)).unwrap();
         std::fs::write(root.join(dir).join("plot.png"), png(2, 2)).unwrap();
     }
@@ -623,14 +627,16 @@ async fn escaped_filesystem_paths_resolve_to_the_file_they_name() {
         }
         out
     };
-    let paths: Vec<String> = ["run#2", "50%", "50%25", "why?", "sp ace "]
+    let paths: Vec<String> = dirs
         .iter()
         .map(|dir| format!("{base}/{dir}/plot.png"))
         .collect();
     let targets: Vec<String> = paths.iter().map(|p| escape(p)).collect();
+    // The filesystem root: `/`, or the drive's (`C:/`).
+    let fs_root = if cfg!(windows) { &base[..3] } else { "/" };
     let results = resolve(
         &state,
-        serde_json::json!({"base": "/", "targets": targets.clone()}),
+        serde_json::json!({"base": fs_root, "targets": targets.clone()}),
     )
     .await;
     for (path, target) in paths.iter().zip(&targets) {
@@ -642,7 +648,7 @@ async fn escaped_filesystem_paths_resolve_to_the_file_they_name() {
     // fragment, `50%25` decodes to `50%`, `why?` starts a query.
     let raw = resolve(
         &state,
-        serde_json::json!({"base": "/", "targets": [
+        serde_json::json!({"base": fs_root, "targets": [
             format!("{base}/run#2/plot.png"),
             format!("{base}/50%25/plot.png"),
         ]}),
@@ -658,6 +664,7 @@ async fn escaped_filesystem_paths_resolve_to_the_file_they_name() {
 
 /// A FIFO swapped in at a ticketed path since the mint must answer 404 at
 /// once, never park a blocking thread in `open` waiting for a writer.
+#[cfg(unix)] // FIFOs and `mkfifo` exist only on Unix.
 #[tokio::test]
 async fn raw_never_blocks_on_a_fifo_at_the_ticketed_path() {
     let state = test_state();

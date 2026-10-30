@@ -17,6 +17,10 @@ import {
 } from "./paths";
 
 describe("codeSpanRefs", () => {
+  it("reads a Windows host's drive paths", () => {
+    expect(codeSpanRefs("C:/proj/src/x.rs:12")).toEqual({ whole: { path: "C:/proj/src/x.rs", line: 12 }, parts: [] });
+    expect(codeSpanRefs("C:\\proj\\x.rs").whole).toBeNull();
+  });
   it("offers the whole span when it is a reference", () => {
     expect(codeSpanRefs("src/x.rs:12")).toEqual({ whole: { path: "src/x.rs", line: 12 }, parts: [] });
     expect(codeSpanRefs("Screenshot (1).png").whole).toEqual({ path: "Screenshot (1).png" });
@@ -367,6 +371,8 @@ describe("mentionChipLabel", () => {
     );
     expect(mentionChipLabel("@src/lib/", "src/lib/", "lib")).toBe("lib/");
     expect(mentionChipLabel("@src/a.ts#L3-L9", "src/a.ts", "a.ts")).toBe("a.ts#L3-L9");
+    expect(mentionChipLabel("@C:/proj/src/a.ts#L3", "C:/proj/src/a.ts", "a.ts")).toBe("a.ts#L3");
+    expect(mentionChipLabel("@C:/proj/src/", "C:/proj/src/", "src")).toBe("src/");
     expect(mentionChipLabel('@"my dir/a b.ts#L3"', "my dir/a b.ts", "a b.ts")).toBe("a b.ts#L3");
     // A name two files share, widened by the caller.
     expect(mentionChipLabel("@docs/README.md", "docs/README.md", "docs/README.md")).toBe("docs/README.md");

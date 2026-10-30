@@ -197,6 +197,10 @@ async fn session_kind_defaults_to_shell_and_round_trips() {
 /// PTY; the install spawn path shares `session_env` with POST
 /// /sessions, and a user shell's rc can stall for a minute on this
 /// machine, so the deterministic command is the honest probe).
+// Unix-only: it checks the `:` PATH form and drives a managed-install
+// session, which Windows doesn't offer; `windows_spawn_path_lists_with_semicolons`
+// covers the Windows PATH form.
+#[cfg(unix)]
 #[tokio::test]
 async fn session_env_reaches_spawned_session() {
     let state = test_state();
@@ -351,4 +355,20 @@ async fn session_spawn_size_is_honored_and_clamped() {
     assert_eq!(session["cols"], 80);
     assert_eq!(session["rows"], 24);
     state.sessions.kill(session["id"].as_str().unwrap()).ok();
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_spawn_path_lists_with_semicolons() {
+    assert_eq!(
+        api::spawn_path(r"C:\s", r"C:\Windows\System32;C:\bin"),
+        r"C:\s;C:\Windows\System32;C:\bin"
+    );
+    let fallback = api::spawn_path(r"C:\s", "");
+    assert!(fallback.starts_with(r"C:\s;"), "{fallback}");
+    assert!(
+        fallback.to_ascii_lowercase().contains(r"\system32"),
+        "{fallback}"
+    );
+    assert!(!fallback.ends_with(';'), "{fallback}");
 }

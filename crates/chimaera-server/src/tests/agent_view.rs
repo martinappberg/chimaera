@@ -163,6 +163,22 @@ fn worker_generated_settings_and_codex_argv_are_unchanged() {
     let body = std::fs::read_to_string(&path).unwrap();
     // Normalize the per-host bits (the runtime dir) so the fixture is portable.
     let runtime = chimaera_core::runtime_dir();
+    // Windows wraps the statusline in a PowerShell script (the POSIX one
+    // can't run there): pinned here exactly, then compared as the fixture's.
+    #[cfg(windows)]
+    let body = {
+        let script = runtime.join("agents").join("s-agentview-statusline.ps1");
+        let command = format!(
+            "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{}\"",
+            script.display()
+        );
+        let command = serde_json::to_string(&command).unwrap();
+        assert!(body.contains(&command), "{body}");
+        body.replace(
+            &command,
+            r#""'<RUNTIME>/agents/s-agentview-statusline.sh'""#,
+        )
+    };
     let body = body.replace(&runtime.to_string_lossy().to_string(), "<RUNTIME>");
     check("worker_settings.json", &body);
     let _ = std::fs::remove_file(path);

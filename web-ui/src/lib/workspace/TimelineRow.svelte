@@ -31,6 +31,7 @@
   import { resolveReference } from "../shared/references";
   import { knowledgeLookup } from "../knowledge/store";
   import { providerLabels, statusWord, toneOf } from "../knowledge/overview";
+  import { isAbsolute, joinPath } from "../shared/paths";
 
   interface Props {
     group: TimelineGroup;
@@ -95,7 +96,7 @@
 
   /** Absolute path for a workspace-relative evidence path. */
   function abs(p: string): string {
-    return p.startsWith("/") || wsRoot === null ? p : `${wsRoot}/${p}`;
+    return isAbsolute(p) || wsRoot === null ? p : joinPath(wsRoot, p);
   }
   function base(p: string): string {
     const i = p.lastIndexOf("/");

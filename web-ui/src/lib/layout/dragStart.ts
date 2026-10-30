@@ -11,7 +11,7 @@
  */
 
 import { isMac } from "../shared/keys";
-import { basename } from "../previews/files";
+import { basename, isRoot } from "../shared/paths";
 import { transferBlock, transferInto, type FileSource } from "../workspace/fileTransfer";
 import type { CrossWindow } from "./crossWindowController";
 import { folderTargetAt, startDrag, type DropSpot } from "./dnd";
@@ -79,7 +79,7 @@ export function createDragStart(host: DragStartHost): DragStart {
    */
   function describeSpot(spot: DropSpot): string | null {
     if (spot.kind === "fileOp") {
-      const folder = spot.dir === "/" ? "/" : `${basename(spot.dir)}/`;
+      const folder = isRoot(spot.dir) ? spot.dir : `${basename(spot.dir)}/`;
       const modifier = spot.operation === "move" ? ` · ${isMac ? "Option" : "Alt"} to copy` : "";
       return spot.blocked ?? `${spot.operation} into ${folder}${modifier}`;
     }

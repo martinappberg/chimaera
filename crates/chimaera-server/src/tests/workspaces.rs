@@ -41,10 +41,7 @@ async fn workspaces_post_get_round_trip() {
         ws["name"].as_str().unwrap(),
         root.file_name().unwrap().to_str().unwrap()
     );
-    assert_eq!(
-        ws["root"].as_str().unwrap(),
-        std::fs::canonicalize(&root).unwrap().to_str().unwrap()
-    );
+    assert_eq!(ws["root"].as_str().unwrap(), wire(&canonical(&root)));
 
     // POST again with the same root is idempotent.
     let (status, again) = request(
@@ -190,6 +187,7 @@ fn workspace_store_oversized_file_loads_empty_and_is_replaced() {
     assert_eq!(workspaces::WorkspaceStore::load(path).list().len(), 1);
 }
 
+#[cfg(unix)]
 /// Unreadable: every save refuses ([`workspaces::Held`]) and takes its
 /// change back, so a boot that couldn't read the list never replaces it;
 /// once the file reads, the next save merges it with this daemon's list.

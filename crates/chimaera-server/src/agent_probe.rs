@@ -54,6 +54,7 @@ const DETAILS_TIMEOUT: Duration = Duration::from_secs(45);
 /// as positional arguments, never as shell source. Each marker starts its
 /// own line (the leading newline) and carries the probe's random nonce, so
 /// no text a plugin ships can open, close or re-attribute a section.
+#[cfg(unix)]
 const DETAILS_SCRIPT: &str = r#"nonce=$1 bin=$2
 shift 2
 i=0
@@ -244,19 +245,40 @@ async fn run_bounded(
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
-/// Kills a batch's whole process group when dropped: the shell AND the
-/// call it has in flight, which `kill_on_drop` (the shell alone) misses — a
-/// `claude` hung on a stalled NFS read would outlive the probe on a shared
-/// login node. Dropped before the shell is reaped, so the group id can't
-/// have been reused.
-struct GroupKill(Option<nix::unistd::Pid>);
+/// Kills a batch's whole process group (Windows: its Job Object) when
+/// dropped: the shell AND the call it has in flight, which `kill_on_drop`
+/// (the shell alone) misses — a `claude` hung on a stalled NFS read would
+/// outlive the probe on a shared login node. Dropped before the shell is
+/// reaped, so the group id can't have been reused.
+pub(crate) struct GroupKill(Option<chimaera_core::proc::ProcessTree>);
+
+impl GroupKill {
+    /// The tree of `child`, spawned from a command given [`own_tree`].
+    pub(crate) fn of(child: &tokio::process::Child) -> Self {
+        Self(
+            child
+                .id()
+                .and_then(|pid| chimaera_core::proc::ProcessTree::adopt(pid).ok()),
+        )
+    }
+}
 
 impl Drop for GroupKill {
     fn drop(&mut self) {
-        if let Some(group) = self.0 {
-            let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
+        if let Some(tree) = &self.0 {
+            tree.kill();
         }
     }
+}
+
+/// Make `cmd`'s child lead its own kill tree: a process group on Unix, the
+/// creation flags a Job Object needs on Windows ([`GroupKill::of`]).
+pub(crate) fn own_tree(cmd: &mut tokio::process::Command) -> &mut tokio::process::Command {
+    #[cfg(unix)]
+    cmd.process_group(0);
+    #[cfg(windows)]
+    cmd.creation_flags(chimaera_core::proc::TREE_CREATION_FLAGS);
+    cmd
 }
 
 /// Run a batch under one overall deadline and return the stdout that
@@ -264,13 +286,14 @@ impl Drop for GroupKill {
 /// trusts only sections whose end marker made it in. Once reading stops
 /// (the shell would block on a full pipe past the cap), or if the probe is
 /// abandoned, the batch's process group is killed.
+#[cfg(unix)]
 async fn run_until(argv: &[String], prelude: Option<&Path>, limit: Duration) -> String {
     let mut cmd = base_command(argv, None, prelude);
     // Each call's failure is in its end marker's status; nothing reads stderr.
     cmd.stderr(Stdio::null());
     // Its own group: the login shell execs into the batch shell, whose
     // children are the calls (see `GroupKill`).
-    cmd.process_group(0);
+    own_tree(&mut cmd);
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
@@ -279,7 +302,7 @@ async fn run_until(argv: &[String], prelude: Option<&Path>, limit: Duration) -> 
         }
     };
     // Declared after `child`, so on an abandoned probe it drops first.
-    let group = GroupKill(child.id().map(|pid| nix::unistd::Pid::from_raw(pid as i32)));
+    let group = GroupKill::of(&child);
     let Some(mut stdout) = child.stdout.take() else {
         return String::new();
     };
@@ -317,13 +340,11 @@ impl CodexRpc {
     async fn open(bin: &Path, cwd: &Path, prelude: Option<&Path>) -> Result<Self, String> {
         let argv = wrapped(bin, &["app-server"]);
         let mut cmd = base_command(&argv, Some(cwd), prelude);
-        cmd.stdin(Stdio::piped())
-            .stderr(Stdio::null())
-            .process_group(0);
+        own_tree(cmd.stdin(Stdio::piped()).stderr(Stdio::null()));
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("could not start codex app-server: {e}"))?;
-        let group = GroupKill(child.id().map(|pid| nix::unistd::Pid::from_raw(pid as i32)));
+        let group = GroupKill::of(&child);
         let stdin = child.stdin.take().ok_or("no stdin")?;
         let stdout = child.stdout.take().ok_or("no stdout")?;
         let mut rpc = CodexRpc {
@@ -472,6 +493,7 @@ fn parse_claude_details(text: &str) -> (Option<u64>, Option<u64>, Option<u64>) {
 /// sections that carry this probe's nonce on both markers and ended with
 /// status 0 count; anything else (the login profile's chatter, a forged
 /// marker, a section cut off by the deadline) is None or plain text.
+#[cfg(any(unix, test))]
 fn split_details(out: &str, nonce: &str, count: usize) -> Vec<Option<String>> {
     let start = format!("\u{1e}{nonce} start ");
     let end = format!("\u{1e}{nonce} end ");
@@ -507,19 +529,39 @@ async fn claude_details(bin: &Path, ids: &[&str], prelude: Option<&Path>) -> Vec
     if ids.is_empty() {
         return Vec::new();
     }
-    let nonce = chimaera_core::generate_token();
-    let mut argv = vec![
-        "/bin/bash".to_string(),
-        "-c".to_string(),
-        DETAILS_SCRIPT.to_string(),
-        "chimaera-probe".to_string(),
-        nonce.clone(),
-        bin.to_string_lossy().into_owned(),
-    ];
-    argv.extend(ids.iter().map(|id| id.to_string()));
-    let argv = crate::launcher::wrap_login_shell(&crate::launcher::login_shell(), argv);
-    let out = run_until(&argv, prelude, DETAILS_TIMEOUT).await;
-    split_details(&out, &nonce, ids.len())
+    #[cfg(windows)]
+    {
+        // No POSIX shell to batch them in: one call after another, under
+        // the same overall deadline.
+        let deadline = Instant::now() + DETAILS_TIMEOUT;
+        let mut sections = Vec::with_capacity(ids.len());
+        for id in ids {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let argv = wrapped(bin, &["plugin", "details", id]);
+            let text = tokio::time::timeout(left, run_bounded(&argv, None, prelude))
+                .await
+                .ok()
+                .and_then(Result::ok);
+            sections.push(text);
+        }
+        sections
+    }
+    #[cfg(unix)]
+    {
+        let nonce = chimaera_core::generate_token();
+        let mut argv = vec![
+            "/bin/bash".to_string(),
+            "-c".to_string(),
+            DETAILS_SCRIPT.to_string(),
+            "chimaera-probe".to_string(),
+            nonce.clone(),
+            bin.to_string_lossy().into_owned(),
+        ];
+        argv.extend(ids.iter().map(|id| id.to_string()));
+        let argv = crate::launcher::wrap_login_shell(&crate::launcher::login_shell(), argv);
+        let out = run_until(&argv, prelude, DETAILS_TIMEOUT).await;
+        split_details(&out, &nonce, ids.len())
+    }
 }
 
 async fn claude_state(state: &Arc<AppState>) -> Value {
@@ -1104,7 +1146,7 @@ pub(crate) async fn skills(
         extensions::inventory(&state, &id, &root, AgentKind::Antigravity),
         extensions::inventory(&state, &id, &root, AgentKind::Grok),
     );
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = chimaera_core::paths::home_dir();
     let plugin_dirs: Vec<(String, PathBuf)> = claude
         .get("plugins")
         .and_then(Value::as_array)
@@ -1263,8 +1305,8 @@ pub(crate) async fn skills(
                 "source": if row.source.is_empty() { "system" } else { row.source },
                 "plugin": row.plugin,
                 "paths": {
-                    "claude": row.claude.as_ref().and_then(|c| c.2.clone()),
-                    "codex": row.codex.as_ref().and_then(|c| c.2.clone()),
+                    "claude": row.claude.as_ref().and_then(|c| c.2.as_deref()).map(chimaera_core::paths::wire_path),
+                    "codex": row.codex.as_ref().and_then(|c| c.2.as_deref()).map(chimaera_core::paths::wire_path),
                 },
                 "agents": {
                     "claude": side(&row.claude, '/', claude_available, "claude"),
@@ -1371,6 +1413,7 @@ mod tests {
         assert_eq!(split_details(&crossed, n, 2), vec![None, None]);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_batch_past_its_deadline_keeps_the_finished_sections() {
         use std::os::unix::fs::PermissionsExt;

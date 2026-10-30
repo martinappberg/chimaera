@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Manager, State};
 
 use super::connect::{do_connect, state_for, with_hosts, HostState};
 use super::restore::open_ui_window;
@@ -162,17 +162,6 @@ pub(super) async fn connect_host(
     update_daemon: Option<bool>,
 ) -> Result<HostState, String> {
     super::require_target(&app, window.label(), Some(&alias))?;
-    // On Windows ssh MUST run inside the WSL distro (Win32-OpenSSH has no
-    // ControlMaster). If the transport never got wired, fail with the real
-    // reason instead of letting host ssh produce baffling per-host errors.
-    #[cfg(windows)]
-    if !chimaera_remote::wsl_transport_ready() {
-        return Err(
-            "remote hosts need the WSL2 daemon running (its distro carries ssh); \
-             restart chimaera or finish WSL setup first"
-                .to_string(),
-        );
-    }
     let update_daemon = update_daemon.unwrap_or(false);
     // A job window's key is no ssh host. Every build's update toast sends it
     // here (an outdated job's window runs that job's older UI), so the update
@@ -317,17 +306,26 @@ pub(super) async fn update_local_daemon(
     let fresh = crate::daemon::update_local_daemon()
         .await
         .map_err(|e| e.message)?;
+    adopt_local_daemon(&app, &state, fresh)
+}
+
+/// Point the shell and every local window at a (re)started local daemon.
+fn adopt_local_daemon(
+    app: &AppHandle,
+    state: &Shell,
+    fresh: crate::daemon::LocalDaemon,
+) -> Result<(), String> {
     let moved = LocalDaemonMoved {
         port: fresh.port,
         token: fresh.token.clone(),
         build: fresh.build.clone(),
     };
-    authorize_scope_origin(&app, None, fresh.port)
+    authorize_scope_origin(app, None, fresh.port)
         .map_err(|e| format!("could not authorize the updated daemon origin: {e}"))?;
     *lock(&state.local) = fresh;
     let targets = super::local_event_targets(&lock(&state.windows));
     for label in targets {
-        if let Err(error) = super::deliver_to(&app, &label, "local-daemon-updated", &moved) {
+        if let Err(error) = super::deliver_to(app, &label, "local-daemon-updated", &moved) {
             tracing::warn!(%error, window = label, "could not deliver local-daemon-updated");
         }
     }
@@ -1316,12 +1314,11 @@ pub(super) fn write_clipboard(app: AppHandle, text: String) -> Result<(), String
 /// A daemon-served page names the path, and remote hosts' pages hold the same
 /// command grants — so the callers first `require_local` (a local window's
 /// paths are this machine's; a remote page's would name whatever happens to
-/// sit at that path here). On Windows the local daemon lives inside WSL2, so
-/// its paths are not host paths either.
+/// sit at that path here). Windows pages name paths in wire form
+/// (`C:/x/y`); the shell hands the OS its native backslash form.
 fn local_file_path(path: &str) -> Result<std::path::PathBuf, String> {
-    if cfg!(windows) {
-        return Err("not available on Windows".to_string());
-    }
+    #[cfg(windows)]
+    let path = &path.replace('/', "\\");
     existing_absolute_path(path)
 }
 
@@ -1358,6 +1355,11 @@ pub(super) async fn copy_file_to_clipboard(
             *slot = Some(arboard::Clipboard::new().map_err(|e| e.to_string())?);
         }
         let clipboard = slot.as_mut().expect("just filled");
+        // arboard's Windows file list joins whatever the clipboard holds, so
+        // a paste into a text field would still give the text copied before.
+        // Explorer's Copy replaces it.
+        #[cfg(windows)]
+        clipboard.clear().map_err(|e| e.to_string())?;
         clipboard
             .set()
             .file_list(&[path])
@@ -1368,8 +1370,9 @@ pub(super) async fn copy_file_to_clipboard(
 }
 
 /// Show a file or folder in the platform's file manager, selected in its
-/// parent folder (macOS Finder; a Linux file manager that speaks the
-/// freedesktop `FileManager1` interface, else the parent folder just opens).
+/// parent folder (macOS Finder; Windows Explorer; a Linux file manager that
+/// speaks the freedesktop `FileManager1` interface, else the parent folder
+/// just opens).
 #[tauri::command]
 pub(super) async fn reveal_in_file_manager(
     webview: tauri::WebviewWindow,
@@ -1397,7 +1400,29 @@ fn reveal(path: &std::path::Path) -> Result<(), String> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Explorer's `/select,` switch takes the rest of its argument verbatim, so
+/// the path is passed raw (quoted by hand, never through the CRT escaping
+/// `Command::arg` applies). Explorer exits 1 even when it shows the file, so
+/// its status says nothing; spawning it is the whole result.
+#[cfg(windows)]
+fn reveal(path: &std::path::Path) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new("explorer.exe")
+        .raw_arg(explorer_select_arg(path))
+        .spawn()
+        .map(drop)
+        .map_err(|e| e.to_string())
+}
+
+/// `/select,"C:\x\y"`: the page hands over the wire form (`C:/x/y`), and
+/// Explorer only resolves backslashes.
+#[cfg(any(windows, test))]
+fn explorer_select_arg(path: &std::path::Path) -> String {
+    let native = path.to_string_lossy().replace('/', "\\");
+    format!("/select,\"{native}\"")
+}
+
+#[cfg(all(not(target_os = "macos"), not(windows)))]
 fn reveal(path: &std::path::Path) -> Result<(), String> {
     let shown = tauri::Url::from_file_path(path).is_ok_and(|url| {
         std::process::Command::new("dbus-send")
@@ -1493,8 +1518,15 @@ pub(super) async fn begin_update(
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "no update available".to_string())?;
+    // Windows installs only after the download, from a stopped daemon (below).
+    #[cfg(not(windows))]
     update
         .download_and_install(|_downloaded, _total| {}, || {})
+        .await
+        .map_err(|e| e.to_string())?;
+    #[cfg(windows)]
+    let bytes = update
+        .download(|_downloaded, _total| {}, || {})
         .await
         .map_err(|e| e.to_string())?;
     // Edits made during the download: the restart would drop them. The new
@@ -1508,99 +1540,54 @@ pub(super) async fn begin_update(
     // Consent for the new process to replace the local daemon, written only
     // now that the relaunch is certain.
     crate::update::write_intent().map_err(|e| format!("{e:#}"))?;
-    tracing::info!("app update {} installed; relaunching", update.version);
-    app.restart();
+    #[cfg(windows)]
+    return install_from_stopped_daemon(&app, &update, bytes).await;
+    #[cfg(not(windows))]
+    {
+        tracing::info!("app update {} installed; relaunching", update.version);
+        app.restart();
+    }
 }
 
-// --- WSL setup (the Windows first-run wizard; clean errors elsewhere) -----
-
-/// Detection report for the wizard: registry facts plus the async WSL
-/// version gate (never blocks on wsl.exe when the package is absent).
-#[tauri::command]
-pub(super) async fn wsl_status() -> Result<crate::wsl::WslReport, String> {
-    tracing::debug!("ipc: wsl_status");
-    Ok(crate::wsl::full_report().await)
-}
-
-/// One-time WSL enablement (UAC prompt; a reboot usually follows).
-#[tauri::command]
-pub(super) async fn wsl_install() -> Result<(), String> {
-    tracing::info!("ipc: wsl_install");
-    crate::wsl::launch_wsl_install()
+/// Windows: the daemon runs this same executable, and a running image cannot
+/// be replaced, so it stops (gracefully, sessions handed off) before the
+/// installer starts. The updater then exits this process and the installer
+/// relaunches the app, whose startup brings up the new daemon. An install
+/// that fails to start brings the old daemon back.
+#[cfg(windows)]
+async fn install_from_stopped_daemon(
+    app: &AppHandle,
+    update: &tauri_plugin_updater::Update,
+    bytes: Vec<u8>,
+) -> Result<(), String> {
+    crate::daemon::stop_for_install()
         .await
-        .map_err(|e| format!("{e:#}"))
-}
-
-/// `wsl --update` for the needs-update wizard state (pre-2.1.1 WSL breaks
-/// daemonized processes after sleep/resume).
-#[tauri::command]
-pub(super) async fn wsl_update() -> Result<(), String> {
-    tracing::info!("ipc: wsl_update");
-    crate::wsl::launch_wsl_update()
-        .await
-        .map_err(|e| format!("{e:#}"))
-}
-
-/// Kick off the Ubuntu distro install; the wizard polls `wsl_status` until
-/// the distro registers (the image download runs minutes).
-#[tauri::command]
-pub(super) async fn wsl_install_distro() -> Result<(), String> {
-    tracing::info!("ipc: wsl_install_distro");
-    crate::wsl::launch_distro_install()
-        .await
-        .map_err(|e| format!("{e:#}"))
-}
-
-/// Provision + start + adopt the daemon in `distro` (None = persisted/
-/// default), then complete the startup the wizard interrupted and close the
-/// wizard window. Emits `wsl-setup` phase events for the wizard's progress
-/// line. Concurrency and retries are governed by the shell's startup gate —
-/// `try_state::<Shell>()` alone can neither exclude a concurrent invocation
-/// (minutes-long await) nor distinguish "done" from "failed after manage".
-#[tauri::command]
-pub(super) async fn wsl_setup_daemon(app: AppHandle, distro: Option<String>) -> Result<(), String> {
-    tracing::info!("ipc: wsl_setup_daemon ({distro:?})");
-    let claimed = match super::claim_startup() {
-        super::StartupClaim::Claimed => true,
-        super::StartupClaim::InFlight => {
-            return Err("setup is already running".to_string());
-        }
-        // Startup already finished — recover any missing home window (a
-        // partial finish can leave Shell managed with zero real windows),
-        // then just retire the wizard below.
-        super::StartupClaim::Done => {
-            super::recover_windows(&app);
-            false
-        }
+        .map_err(|e| format!("the update needs the local daemon stopped: {e:#}"))?;
+    tracing::info!("installing app update {}", update.version);
+    let failed = match update.install(bytes) {
+        Ok(()) => app.restart(),
+        Err(e) => e.to_string(),
     };
-    if claimed {
-        let progress = {
-            let app = app.clone();
-            move |phase: &str| {
-                let _ = app.emit("wsl-setup", phase.to_string());
-            }
-        };
-        let result = async {
-            let local = crate::wsl::ensure_daemon(distro, false, &progress)
-                .await
-                .map_err(|e| format!("{e:#}"))?;
-            super::finish_startup(&app, local).map_err(|e| format!("{e:#}"))
-        }
-        .await;
-        super::release_startup(result.is_ok());
-        result?;
-    }
-    for (label, w) in app.webview_windows() {
-        if label.starts_with("wsl-setup") {
-            let _ = w.close();
-        }
-    }
-    Ok(())
+    tracing::error!("app update did not install: {failed}");
+    crate::update::clear_intent();
+    let back = crate::daemon::ensure_local_daemon()
+        .await
+        .map_err(|e| format!("the update did not install ({failed}), and the local daemon could not be restarted ({e:#}); quit and reopen chimaera"))?;
+    adopt_local_daemon(app, &app.state::<Shell>(), back)?;
+    Err(format!("the update did not install: {failed}"))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{existing_absolute_path, report_can_reclaim_local_home};
+    use super::{existing_absolute_path, explorer_select_arg, report_can_reclaim_local_home};
+
+    #[test]
+    fn explorer_selects_the_native_form_of_a_wire_path() {
+        assert_eq!(
+            explorer_select_arg(std::path::Path::new("C:/Users/me/a b.txt")),
+            r#"/select,"C:\Users\me\a b.txt""#
+        );
+    }
 
     #[test]
     fn a_file_handed_to_the_os_must_be_an_existing_absolute_path() {

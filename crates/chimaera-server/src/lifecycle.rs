@@ -571,8 +571,8 @@ fn pid_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn pid_alive(_pid: u32) -> bool {
-    true
+fn pid_alive(pid: u32) -> bool {
+    chimaera_core::proc::pid_alive(pid)
 }
 
 /// What is provable about `holder` without the scheduler: `Some(false)` for
@@ -1004,8 +1004,29 @@ async fn rebind(port: u16, routable: bool) -> Option<TcpListener> {
     None
 }
 
+/// POST /api/v1/stop — stop the daemon the way SIGTERM does: no session is
+/// ended, so the graceful path's final ledger flush and restart handoff
+/// carry them to the next start. The in-band stop for hosts without SIGTERM
+/// (Windows); `POST /shutdown` is the one that ends every session first.
+/// The signal trips just after the reply leaves, so the caller reads it
+/// before the listener closes.
+pub(crate) async fn stop(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    tracing::info!("in-band stop requested; sessions carry over to the next start");
+    tokio::spawn(async move {
+        tokio::time::sleep(STOP_REPLY_GRACE).await;
+        state.shutdown.notify_one();
+    });
+    axum::Json(serde_json::json!({ "stopping": true })).into_response()
+}
+
+/// How long `stop` lets its reply flush before the graceful drain begins.
+const STOP_REPLY_GRACE: Duration = Duration::from_millis(200);
+
 /// Resolve when SIGINT (ctrl-c) or SIGTERM is received, or when an in-band
-/// `POST /shutdown` signals `state.shutdown`.
+/// `POST /shutdown` or `POST /stop` signals `state.shutdown`.
 async fn shutdown_signal(state: Arc<AppState>) {
     let ctrl_c = async {
         if let Err(err) = tokio::signal::ctrl_c().await {
@@ -1046,6 +1067,112 @@ async fn shutdown_signal(state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `POST /stop` answers, trips the graceful-shutdown signal, and ends
+    /// no session: the graceful path hands them to the next start.
+    #[tokio::test]
+    async fn stop_route_signals_shutdown_and_keeps_sessions() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-stop-route-{}-{}",
+            std::process::id(),
+            chimaera_core::generate_token()
+        ));
+        let state = Arc::new(AppState::new(
+            "test-token".into(),
+            "testhost".into(),
+            4242,
+            0,
+            dir.join("data"),
+            dir.join("data/config"),
+        ));
+        let cwd = dir.join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let session = state
+            .sessions
+            .spawn(chimaera_pty::SpawnOpts {
+                cwd,
+                name: None,
+                cols: 80,
+                rows: 24,
+                command: if cfg!(windows) {
+                    None
+                } else {
+                    Some(vec!["sleep".into(), "600".into()])
+                },
+                id: None,
+                env: Vec::new(),
+                env_remove: Vec::new(),
+                scrollback: None,
+            })
+            .expect("spawn session");
+
+        let res = app(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/v1/stop")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer test-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body, serde_json::json!({ "stopping": true }));
+
+        tokio::time::timeout(Duration::from_secs(5), state.shutdown.notified())
+            .await
+            .expect("the stop route trips the graceful shutdown");
+        let info = state
+            .sessions
+            .get(&session.id)
+            .expect("session still registered");
+        assert!(info.alive, "the stop route must end no session");
+
+        state.sessions.kill_all();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Unauthenticated, the stop route is refused like every `/api/v1` route.
+    #[tokio::test]
+    async fn stop_route_requires_the_bearer_token() {
+        use tower::ServiceExt;
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-stop-auth-{}-{}",
+            std::process::id(),
+            chimaera_core::generate_token()
+        ));
+        let state = Arc::new(AppState::new(
+            "test-token".into(),
+            "testhost".into(),
+            4242,
+            0,
+            dir.join("data"),
+            dir.join("data/config"),
+        ));
+        let res = app(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/v1/stop")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), state.shutdown.notified())
+                .await
+                .is_err(),
+            "a refused stop must not signal shutdown"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// When the handoff port stays busy through `rebind`, the fallback must
     /// bind an OS-assigned port and report `reused=false` — NOT retry the busy
@@ -1179,6 +1306,9 @@ mod tests {
 
     /// A previous job that is still live is waited out — squeue asked at
     /// most once per floor — and taken over once Slurm says it ended.
+    // The stand-in squeue is a /bin/sh script, and these need its answers
+    // (unanswered, the wait holds by design).
+    #[cfg(unix)]
     #[tokio::test]
     async fn lease_wait_holds_until_the_previous_job_ends() {
         let dir = lease_dir("ends");
@@ -1240,11 +1370,9 @@ mod tests {
 
     /// The arguments every holder question carries: this user's jobs only,
     /// with the name that proves the job one of ours.
+    #[cfg(unix)]
     fn own_asks(job: &str) -> String {
-        #[cfg(unix)]
         let user = format!("-u {} ", nix::unistd::Uid::effective().as_raw());
-        #[cfg(not(unix))]
-        let user = String::new();
         format!("-h {user}-j {job} -o %T|%j")
     }
 
@@ -1350,49 +1478,59 @@ mod tests {
 
         // Many contenders taking over one dead holder, round after round
         // (each round's winner is the next round's dead holder): exactly one
-        // winner every time, and nothing left beside the lease.
-        let mut dead = new;
-        for round in 0..50 {
-            let start = Arc::new(std::sync::Barrier::new(8));
-            let runs: Vec<_> = (0..8)
-                .map(|i| {
-                    let (path, start, dead) = (path.clone(), start.clone(), dead.clone());
-                    std::thread::spawn(move || {
-                        let own = holder(
-                            &format!("{}", 1000 + round * 8 + i),
-                            &format!("r{round}t{i}"),
-                        );
-                        start.wait();
-                        let outcome = acquire_lease(&path, &own, |h| (*h == dead).then_some(false));
-                        (own, outcome.unwrap())
+        // winner every time, and nothing left beside the lease. Unix only:
+        // the lease guards cluster workspaces, which run on Linux, and
+        // Windows answers an open of a record another contender is deleting
+        // with "access denied" (delete pending) rather than not-found.
+        #[cfg(unix)]
+        let dead = {
+            let mut dead = new;
+            for round in 0..50 {
+                let start = Arc::new(std::sync::Barrier::new(8));
+                let runs: Vec<_> = (0..8)
+                    .map(|i| {
+                        let (path, start, dead) = (path.clone(), start.clone(), dead.clone());
+                        std::thread::spawn(move || {
+                            let own = holder(
+                                &format!("{}", 1000 + round * 8 + i),
+                                &format!("r{round}t{i}"),
+                            );
+                            start.wait();
+                            let outcome =
+                                acquire_lease(&path, &own, |h| (*h == dead).then_some(false));
+                            (own, outcome.unwrap())
+                        })
                     })
-                })
-                .collect();
-            let results: Vec<_> = runs.into_iter().map(|r| r.join().unwrap()).collect();
-            let winners: Vec<&LeaseHolder> = results
-                .iter()
-                .filter(|(_, o)| matches!(o, LeaseOutcome::Acquired { .. }))
-                .map(|(own, _)| own)
-                .collect();
-            assert_eq!(winners.len(), 1, "round {round}: {results:?}");
-            assert_eq!(
-                lease_holder(&path).as_ref(),
-                Some(winners[0]),
-                "round {round}"
-            );
-            assert!(results.iter().all(|(_, o)| matches!(
-                o,
-                LeaseOutcome::Acquired { .. } | LeaseOutcome::Held(Some(_))
-            )));
-            let left: Vec<String> = std::fs::read_dir(&dir)
-                .unwrap()
-                .filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| n != LEASE_FILE)
-                .collect();
-            assert!(left.is_empty(), "round {round}: {left:?}");
-            dead = winners[0].clone();
-        }
+                    .collect();
+                let results: Vec<_> = runs.into_iter().map(|r| r.join().unwrap()).collect();
+                let winners: Vec<&LeaseHolder> = results
+                    .iter()
+                    .filter(|(_, o)| matches!(o, LeaseOutcome::Acquired { .. }))
+                    .map(|(own, _)| own)
+                    .collect();
+                assert_eq!(winners.len(), 1, "round {round}: {results:?}");
+                assert_eq!(
+                    lease_holder(&path).as_ref(),
+                    Some(winners[0]),
+                    "round {round}"
+                );
+                assert!(results.iter().all(|(_, o)| matches!(
+                    o,
+                    LeaseOutcome::Acquired { .. } | LeaseOutcome::Held(Some(_))
+                )));
+                let left: Vec<String> = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n != LEASE_FILE)
+                    .collect();
+                assert!(left.is_empty(), "round {round}: {left:?}");
+                dead = winners[0].clone();
+            }
+            dead
+        };
+        #[cfg(not(unix))]
+        let dead = new;
 
         // A takeover its claimant never finished: waited on while that
         // claimant may be live, cleared once it is proven gone.
@@ -1444,6 +1582,9 @@ mod tests {
 
     /// The async wait: a live holder is waited out (asked about at most once
     /// per floor, as this user's chimaera job), then taken over.
+    // The stand-in squeue is a /bin/sh script, and these need its answers
+    // (unanswered, the wait holds by design).
+    #[cfg(unix)]
     #[tokio::test]
     async fn lease_acquire_wait_takes_over_once_slurm_says_the_holder_ended() {
         let dir = lease_dir("acquire-wait");

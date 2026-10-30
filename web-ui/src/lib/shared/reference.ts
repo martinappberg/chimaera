@@ -15,6 +15,7 @@
  */
 
 import { writable } from "svelte/store";
+import { isRoot, relativeTo, rootOf, trimSlash } from "./paths";
 
 // --- selection + target coordination -----------------------------------------
 
@@ -162,8 +163,7 @@ export function composeCommitReference(
   const title = subject.length > 72 ? `${subject.slice(0, 71)}…` : subject;
   let where = "";
   if (sel.repo !== null) {
-    const rel =
-      root !== null && sel.repo.startsWith(`${root}/`) ? sel.repo.slice(root.length + 1) : sel.repo;
+    const rel = root !== null && root !== "/" ? (relativeTo(sel.repo, root) ?? sel.repo) : sel.repo;
     if (rel !== "" && sel.repo !== root) where = ` in ${rel}`;
   }
   return title !== "" ? `commit ${short} ("${title}")${where} ` : `commit ${short}${where} `;
@@ -192,18 +192,18 @@ export function truncateSelection(text: string, max = SELECTION_MAX): string {
   return `${cutAt(flat, max).trimEnd()}…`;
 }
 
-/** Root without its trailing slash ("/" stays "/"). */
-function normRoot(root: string): string {
-  return root.length > 1 && root.endsWith("/") ? root.slice(0, -1) : root;
-}
-
 /**
  * `path` relative to the workspace `root` when under it, else the absolute
  * path unchanged (agents can resolve either).
  */
 export function workspaceRelative(path: string, root: string): string {
-  const r = normRoot(root);
+  const r = trimSlash(root);
   if (r === "/") return path.startsWith("/") ? path.slice(1) : path;
+  if (isRoot(r)) {
+    const rr = rootOf(r);
+    if (path === r) return ".";
+    return path.startsWith(rr) ? path.slice(rr.length) || "." : path;
+  }
   if (path === r) return ".";
   return path.startsWith(`${r}/`) ? path.slice(r.length + 1) : path;
 }
@@ -227,6 +227,20 @@ const SHELL_SAFE = /^[A-Za-z0-9_./-]+$/;
 export function shellEscapePath(path: string): string {
   if (path.length > 0 && SHELL_SAFE.test(path)) return path;
   return `'${path.replace(/'/g, "'\\''")}'`;
+}
+
+/** Characters safe to hand PowerShell without quoting (a native path). */
+const POWERSHELL_SAFE = /^[A-Za-z0-9_.\\:-]+$/;
+
+/**
+ * A wire path (`C:/a b/x.txt`) as PowerShell takes it: native backslashes,
+ * bare when safe, else single-quoted with an embedded `'` doubled
+ * (`'C:\a b\it''s.txt'`) — PowerShell's verbatim string, nothing expands.
+ */
+export function powershellEscapePath(path: string): string {
+  const native = path.replace(/\//g, "\\");
+  if (native.length > 0 && POWERSHELL_SAFE.test(native)) return native;
+  return `'${native.replace(/'/g, "''")}'`;
 }
 
 /**
@@ -413,10 +427,15 @@ export function composeProvenanceSuffix(
 
 /**
  * A shell-ready path for a plain terminal (drag-to-reference): escaped,
- * relative to the session's current cwd when under it, else absolute.
+ * relative to the session's current cwd when under it, else absolute. A
+ * session on a Windows host (its cwd has a drive or UNC root) runs
+ * PowerShell, so the path is quoted its way, in native form.
  */
 export function composeShellPathReference(path: string, cwd: string): string {
-  return `${shellEscapePath(relativeToCwd(path, cwd))} `;
+  const rel = relativeToCwd(path, cwd);
+  const root = rootOf(cwd);
+  const windows = root !== "" && root !== "/";
+  return `${windows ? powershellEscapePath(rel) : shellEscapePath(rel)} `;
 }
 
 // --- dev-only self-checks ---------------------------------------------------

@@ -287,6 +287,7 @@ impl Cron {
 
 /// The host's local wall clock at `epoch_secs`, by the C library's zone
 /// rules (`TZ`, else the system zone) — the rules the agent's process uses.
+#[cfg(unix)]
 pub fn local_tm(epoch_secs: i64) -> Option<LocalTm> {
     #[allow(
         clippy::useless_conversion,
@@ -310,6 +311,55 @@ pub fn local_tm(epoch_secs: i64) -> Option<LocalTm> {
         weekday: u8::try_from(tm.tm_wday).ok()?,
     };
     local.valid().then_some(local)
+}
+
+/// The host's local wall clock at `epoch_secs`, by the system time zone's
+/// rules for that date (Windows keeps per-year DST rules; `TZ` is a C-runtime
+/// convention the agents' runtimes do not follow there).
+#[cfg(windows)]
+pub fn local_tm(epoch_secs: i64) -> Option<LocalTm> {
+    use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows_sys::Win32::System::Time::{
+        FileTimeToSystemTime, GetDynamicTimeZoneInformation, SystemTimeToTzSpecificLocalTimeEx,
+        DYNAMIC_TIME_ZONE_INFORMATION,
+    };
+    /// Seconds from 1601-01-01 (the FILETIME epoch) to 1970-01-01.
+    const EPOCH_DELTA_SECS: i64 = 11_644_473_600;
+    /// TIME_ZONE_ID_INVALID (timezoneapi.h).
+    const TIME_ZONE_ID_INVALID: u32 = u32::MAX;
+
+    let ticks = u64::try_from(epoch_secs.checked_add(EPOCH_DELTA_SECS)?)
+        .ok()?
+        .checked_mul(10_000_000)?;
+    let filetime = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    // SAFETY: plain-data out-parameters, zero-initialised and filled by the
+    // calls below; every call's failure is checked before a field is read.
+    unsafe {
+        let mut utc: SYSTEMTIME = std::mem::zeroed();
+        if FileTimeToSystemTime(&filetime, &mut utc) == 0 {
+            return None;
+        }
+        let mut zone: DYNAMIC_TIME_ZONE_INFORMATION = std::mem::zeroed();
+        if GetDynamicTimeZoneInformation(&mut zone) == TIME_ZONE_ID_INVALID {
+            return None;
+        }
+        let mut local: SYSTEMTIME = std::mem::zeroed();
+        if SystemTimeToTzSpecificLocalTimeEx(&zone, &utc, &mut local) == 0 {
+            return None;
+        }
+        let tm = LocalTm {
+            year: i32::from(local.wYear),
+            month: u8::try_from(local.wMonth).ok()?,
+            day: u8::try_from(local.wDay).ok()?,
+            hour: u8::try_from(local.wHour).ok()?,
+            minute: u8::try_from(local.wMinute).ok()?,
+            weekday: u8::try_from(local.wDayOfWeek).ok()?,
+        };
+        tm.valid().then_some(tm)
+    }
 }
 
 /// Days since 1970-01-01 of a proleptic Gregorian date (Hinnant's

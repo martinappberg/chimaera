@@ -248,10 +248,21 @@ impl Drop for EnqueueReservation<'_> {
     }
 }
 
+/// The wire form of a path (`chimaera_core::paths::wire_path`): forward
+/// slashes and no `\\?\` prefix on Windows; Unix serializes as before.
+#[cfg(windows)]
+fn serialize_wire_path<S: serde::Serializer>(
+    path: &std::path::Path,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&chimaera_core::paths::wire_path(path))
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ChatInfo {
     pub id: String,
     pub agent: String,
+    #[cfg_attr(windows, serde(serialize_with = "serialize_wire_path"))]
     pub cwd: PathBuf,
     pub created_at_ms: u64,
     pub alive: bool,
@@ -832,6 +843,38 @@ pub struct ChatManager {
     journals: Mutex<HashMap<String, Weak<Journal>>>,
 }
 
+/// Agents on Windows name files natively (`C:\\x\\y`); the wire carries
+/// one path form (`chimaera_core::paths::wire_path`). Every path an event
+/// hands the UI goes through here before it is journaled.
+#[cfg(windows)]
+fn wire_paths(ev: &mut AgentEvent) {
+    use chimaera_core::paths::wire_path_windows as wire;
+    match ev {
+        AgentEvent::ToolCall { locations, .. } => {
+            for location in locations.iter_mut() {
+                *location = wire(location);
+            }
+        }
+        AgentEvent::ToolCallUpdate {
+            content: Some(model::ToolContent::Diff { path, .. }),
+            ..
+        } => *path = wire(path),
+        AgentEvent::RewindResult { files_changed, .. } => {
+            for file in files_changed.iter_mut() {
+                *file = wire(file);
+            }
+        }
+        AgentEvent::BackgroundTasks { closed, .. } => {
+            for close in closed.iter_mut() {
+                if let Some(file) = close.output_file.as_mut() {
+                    *file = wire(file);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 impl ChatManager {
     pub fn new(journal_dir: PathBuf, on_event: EventHook, on_exit: ExitHook) -> Self {
         Self {
@@ -1098,6 +1141,8 @@ impl ChatManager {
         {
             *sign_in = model::sign_in_failure(message);
         }
+        #[cfg(windows)]
+        wire_paths(&mut ev);
         session
             .command_budget
             .lock()

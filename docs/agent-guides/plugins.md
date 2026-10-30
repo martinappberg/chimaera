@@ -955,12 +955,12 @@ version = "2026.09"
 programs = ["latexmk", "pdflatex"]   # each also a [[programs]] entry
 home = "https://github.com/rstudio/tinytex-releases"
 
-[[tools.artifacts]]        # one per platform: linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64
+[[tools.artifacts]]        # one per platform: linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64 windows-x86_64 windows-aarch64
 platform = "linux-x86_64"
 url = "https://github.com/…/releases/download/v2026.09/TinyTeX-1.tar.xz"  # https, a fixed release
 sha256 = "…"               # required; checked while it streams
 size = 159_000_000         # the download stops past it (and past 2 GiB)
-unpack = "tar.xz"          # tar | tar.gz | tar.xz | zip | none (the file is the program, named after the tool's first program)
+unpack = "tar.xz"          # tar | tar.gz | tar.xz | zip | none (the file is the program, named after the tool's first program; `.exe` added on Windows)
 bin = "TinyTeX/bin/x86_64-linux"     # where its programs are, inside the folder
 
 [[tools.setup]]            # run once after unpacking, as jobs; this tool's programs only

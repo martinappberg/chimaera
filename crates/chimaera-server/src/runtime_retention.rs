@@ -372,7 +372,8 @@ fn untracked_daemon(root: &Path) -> anyhow::Result<bool> {
     Ok(false)
 }
 
-#[cfg(test)]
+/// Managed installs activate through symlinks, which only Unix hosts get.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};

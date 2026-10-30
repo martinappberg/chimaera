@@ -29,6 +29,7 @@ fn tui(state: &Arc<AppState>, ws: &str, key: &str) -> String {
     sid
 }
 
+#[cfg(unix)]
 /// A scripted claude chat session in `ws` (idle: the fake never starts a
 /// turn) and its MCP/hook key.
 async fn chat(state: &Arc<AppState>, ws: &str, label: &str) -> (String, String) {
@@ -89,6 +90,7 @@ async fn comms(state: &Arc<AppState>, ws: &str) -> serde_json::Value {
 }
 
 /// Poll a chat session's journal until it holds `needle`.
+#[cfg(unix)]
 async fn journal_has(state: &Arc<AppState>, sid: &str, needle: &str) -> String {
     let journal = state.chat.journal_dir().join(format!("{sid}.jsonl"));
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -105,6 +107,7 @@ async fn journal_has(state: &Arc<AppState>, sid: &str, needle: &str) -> String {
     }
 }
 
+#[cfg(unix)]
 fn journal(state: &Arc<AppState>, sid: &str) -> String {
     std::fs::read_to_string(state.chat.journal_dir().join(format!("{sid}.jsonl")))
         .unwrap_or_default()
@@ -303,6 +306,7 @@ async fn workspace_agents_and_addressing() {
     }
 }
 
+#[cfg(unix)]
 /// "everyone" reaches every other agent's carrier, never the sender, and
 /// never wakes an idle chat — even with wakes on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -340,6 +344,7 @@ async fn broadcasts_reach_everyone_but_never_wake() {
     }
 }
 
+#[cfg(unix)]
 /// An idle chat and the wake policy: "ask" puts a request in Needs you (and
 /// announces it) and the user's Wake delivers; "never" leaves it for the
 /// user's hand-over; "auto" wakes at once.
@@ -448,6 +453,7 @@ async fn the_wake_policy_decides_what_an_idle_chat_gets() {
     state.sessions.kill(&a).ok();
 }
 
+#[cfg(unix)]
 /// Always wakes past every cap, and loosening the policy lets go of the
 /// requests it no longer asks about: Within limits the plain asks, Always
 /// every one — their agents wake under the new policy.
@@ -521,6 +527,7 @@ async fn always_has_no_caps_and_loosening_the_policy_releases_requests() {
     state.sessions.kill(&a).ok();
 }
 
+#[cfg(unix)]
 /// A request that lands after a looser policy's sweep (a send decided under
 /// the old one) is let go at once instead of waiting for the user.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -558,6 +565,7 @@ async fn a_request_landing_after_the_sweep_is_released() {
     state.sessions.kill(&a).ok();
 }
 
+#[cfg(unix)]
 /// Inside the per-pair gap a fresh message is not stranded: it wakes its
 /// idle reader once the gap has passed — and another sender's message to
 /// the same reader isn't held by it.
@@ -623,6 +631,7 @@ async fn a_wake_inside_the_gap_comes_when_it_passes() {
     }
 }
 
+#[cfg(unix)]
 /// Agents get a round of wakes between two of the user's own actions in a
 /// workspace. Past it the user is asked once — one notification however
 /// many agents wait — and one Continue lets every held agent go on; a
@@ -748,6 +757,7 @@ async fn past_the_unattended_limit_the_user_is_asked_once_and_continue_lets_all_
     state.sessions.kill(&a).ok();
 }
 
+#[cfg(unix)]
 /// A reply to a question the reader asked (`expect_reply`) wakes it even
 /// when the policy asks first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -831,6 +841,7 @@ async fn a_reply_the_asker_wanted_wakes_it_without_asking() {
     state.sessions.kill(&b).ok();
 }
 
+#[cfg(unix)]
 /// A working claude chat hears a message on its next hook — and its
 /// transcript shows it (a journaled `agent_message`). A turn that ends
 /// with a message still unread meets the wake policy then.
@@ -1017,6 +1028,7 @@ async fn a_settle_wakes_a_sender_waiting_for_the_read() {
     }
 }
 
+#[cfg(unix)]
 /// ACP chats cannot be steered mid-turn. Their direct messages must still meet
 /// the wake policy at turn end, without being lost or asking more than once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1120,6 +1132,7 @@ async fn switched_off_nothing_moves() {
     }
 }
 
+#[cfg(unix)]
 /// Only a message that reached a working chat and went unread meets the
 /// wake policy at its turn end — once. A broadcast never wakes it, and a
 /// message the user left in the inbox isn't asked about again.

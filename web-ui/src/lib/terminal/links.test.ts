@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { bareLinkable, extractCandidates, wrappedRefs, wrappedTokens } from "./links";
+import {
+  bareLinkable,
+  extractCandidates,
+  nativeToWire,
+  windowsHost,
+  wrappedRefs,
+  wrappedTokens,
+} from "./links";
 
 const raws = (s: string) => extractCandidates(s).map((c) => c.raw);
 const bareRaws = (s: string) => extractCandidates(s, true).map((c) => c.raw);
@@ -109,5 +116,41 @@ describe("hard-wrapped paths", () => {
 
   it("drops a join that is not a path", () => {
     expect(wrappedRefs(pad(["1.2.3", "4.5"], 5))).toEqual([]);
+  });
+});
+
+describe("Windows shells", () => {
+  const winRaws = (s: string) => extractCandidates(s, false, true).map((c) => c.raw);
+
+  it("knows a Windows host by its directories' root", () => {
+    expect(windowsHost({ cwd: "C:/Users/me/proj", root: "C:/Users/me/proj", workspaceId: null })).toBe(true);
+    expect(windowsHost({ cwd: null, spawnCwd: null, root: "//srv/share/proj", workspaceId: null })).toBe(true);
+    expect(windowsHost({ cwd: "/home/u", root: "/home/u", workspaceId: null })).toBe(false);
+    expect(windowsHost({ cwd: null, root: null, workspaceId: null })).toBe(false);
+  });
+
+  it("converts native paths index for index", () => {
+    const line = "  --> c:\\Users\\me\\proj\\src\\a.rs:12:5";
+    const wire = nativeToWire(line);
+    expect(wire).toBe("  --> C:/Users/me/proj/src/a.rs:12:5");
+    expect(wire.length).toBe(line.length);
+    expect(nativeToWire("no separators")).toBe("no separators");
+  });
+
+  it("links PowerShell's native paths in wire form", () => {
+    const [c] = extractCandidates("error at C:\\Users\\me\\proj\\src\\a.rs:12 here", false, true);
+    expect(c.raw).toBe("C:/Users/me/proj/src/a.rs");
+    expect(c.line).toBe(12);
+    expect(c.start).toBe("error at ".length);
+    expect(c.length).toBe("C:\\Users\\me\\proj\\src\\a.rs:12".length);
+    expect(winRaws("see .\\src\\a.rs and ..\\up\\b.txt")).toEqual(["./src/a.rs", "../up/b.txt"]);
+    expect(winRaws("  --> src\\main.rs:2:5")).toEqual(["src/main.rs"]);
+    expect(winRaws("Directory: C:\\Users\\me")).toEqual(["C:/Users/me"]);
+    expect(winRaws("wrote C:/Users/me/out.png")).toEqual(["C:/Users/me/out.png"]);
+  });
+
+  it("leaves a Unix host's backslashes alone", () => {
+    expect(raws("C:\\Users\\me\\x.txt and .\\src\\a.rs")).toEqual([]);
+    expect(raws("printf 'a\\nb' > out/x.txt")).toEqual(["out/x.txt"]);
   });
 });

@@ -190,7 +190,8 @@
   import { setChatLinkContext } from "./lib/chat/paths";
   import type { UrlTarget } from "./lib/terminal/urlLinks";
   import { setUrlPaneOpener, urlMenuEntries } from "./lib/shared/urlOpen";
-  import { basename, fileTabTitles, fsProbe, viewKindFor } from "./lib/previews/files";
+  import { fileTabTitles, fsProbe, viewKindFor } from "./lib/previews/files";
+  import { basename, relativeTo } from "./lib/shared/paths";
   import {
     CLOSE_SAVE_DEADLINE_MS,
     dirtyFiles,
@@ -863,7 +864,7 @@
               ? $gitStatus
               : ($gitRepoStatuses.get(repo.path) ?? null);
           if (status !== null && status.repo) {
-            const name = repo.path.split("/").filter(Boolean).pop() ?? repo.path;
+            const name = basename(repo.path) || repo.path;
             return { status, label: repo.kind === "root" ? null : name, path: repo.path };
           }
         }
@@ -2878,10 +2879,11 @@
     if (openRequest === null || !layoutReady || workspace === null) return;
     const path = openRequest;
     openRequest = null;
-    const root = workspace.root.replace(/\/+$/, "");
     // Inside this workspace only (the shell copies peeks into the folder it
-    // opened this window on); a `..` segment can't climb back out.
-    if (!path.startsWith(`${root}/`) || path.split("/").includes("..")) return;
+    // opened this window on); a `..` segment (either separator, for a Windows
+    // daemon) can't climb back out.
+    const rel = relativeTo(path, workspace.root);
+    if (rel === null || rel === "." || rel.split(/[\\/]/).includes("..")) return;
     void fsProbe(path).then((found) => {
       if (found === "ok") untrack(() => openFilePath(path));
     });

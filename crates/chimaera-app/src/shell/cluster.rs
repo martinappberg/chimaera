@@ -1959,7 +1959,7 @@ fn terminals_workspace(port: u16, token: &str) -> Result<String, String> {
         token,
         "POST",
         "/api/v1/workspaces",
-        json!({ "root": dir.to_string_lossy(), "hidden": true }),
+        json!({ "root": chimaera_core::paths::wire_path(&dir), "hidden": true }),
     )?;
     v.get("id")
         .and_then(|i| i.as_str())
@@ -2090,6 +2090,12 @@ pub(crate) fn end_attached_jobs(app: &AppHandle) {
                 nix::unistd::Pid::from_raw(pid),
                 nix::sys::signal::Signal::SIGTERM,
             );
+        }
+        // No signal reaches a console-less child on Windows; ending ssh
+        // still hangs up the remote session.
+        #[cfg(windows)]
+        if let Some(pid) = a.pid {
+            chimaera_core::proc::kill_pid(pid);
         }
         let _ = a.stop.send(());
     }

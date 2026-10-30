@@ -13715,6 +13715,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn command_item(actions: Value) -> Value {
         json!({
             "type": "commandExecution", "id": "cmd-1",
@@ -13725,6 +13726,8 @@ mod tests {
 
     /// Live 0.156.1 `commandActions` shapes: read paths absolute, search
     /// path as typed, listFiles path null for a bare `ls`.
+    // Its POSIX paths are absolute only on Unix (a Windows agent reports `C:\\…`).
+    #[cfg(unix)]
     #[test]
     fn exploration_commands_render_as_read_and_search_rows() {
         let row = |actions: Value| {

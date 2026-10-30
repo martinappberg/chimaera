@@ -350,7 +350,9 @@ export function classifyHref(href: string): DocHref {
       const u = new URL(h);
       if (u.hostname !== "" && u.hostname !== "localhost") return { kind: "none" };
       const fragment = u.hash.length > 1 ? u.hash.slice(1) : null;
-      return { kind: "path", path: safeDecode(u.pathname), fragment };
+      // `file:///C:/x` names the drive path `C:/x` (the daemon's wire form).
+      const path = safeDecode(u.pathname);
+      return { kind: "path", path: /^\/[A-Za-z]:\//.test(path) ? path.slice(1) : path, fragment };
     } catch {
       return { kind: "none" };
     }

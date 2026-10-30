@@ -1,7 +1,8 @@
 //! Shared types and helpers for the chimaera daemon and CLI.
 
 pub mod cluster;
-#[cfg(unix)]
+pub mod paths;
+pub mod proc;
 pub mod shellint;
 pub mod slurm;
 
@@ -279,6 +280,19 @@ pub fn login_shell() -> String {
     })
 }
 
+/// The user's interactive shell on Windows: PowerShell 7 (`pwsh.exe`) when it
+/// is on `PATH`, else Windows PowerShell, else `%COMSPEC%` (cmd.exe).
+#[cfg(windows)]
+pub fn login_shell() -> String {
+    if let Some(pwsh) = paths::find_on_path("pwsh.exe", None) {
+        return pwsh.to_string_lossy().into_owned();
+    }
+    if let Some(ps) = paths::find_on_path("powershell.exe", None) {
+        return ps.to_string_lossy().into_owned();
+    }
+    std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())
+}
+
 /// Pure core of [`login_shell`] (env + passwd threaded in for testability).
 /// `$SHELL` wins when it names an existing shell that isn't the launchd-
 /// minimal `/bin/sh`; otherwise the passwd shell; otherwise `/bin/sh`.
@@ -441,14 +455,22 @@ impl Manifest {
         this_node().is_none_or(|node| same_node(&node, &self.hostname))
     }
 
-    /// Whether the recorded pid is alive (signal 0 probe). Unix-only by
-    /// design: on Windows the pid in a manifest belongs to a process inside
-    /// WSL, so liveness must be probed in the distro, never on the host.
-    /// Meaningless for a manifest another node wrote — check
-    /// [`Manifest::written_here`] first.
-    #[cfg(unix)]
+    /// Whether the recorded pid is a live process of ours. Unix: a signal-0
+    /// probe, where EPERM (a recycled pid now owned by another user) reads
+    /// as dead — on a shared login node a stale manifest must not look like
+    /// a running daemon. Windows: [`proc::pid_alive`]. Meaningless for a
+    /// manifest another node wrote — check [`Manifest::written_here`] first.
     pub fn is_alive(&self) -> bool {
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(self.pid as i32), None).is_ok()
+        #[cfg(unix)]
+        {
+            i32::try_from(self.pid).is_ok_and(|pid| {
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            proc::pid_alive(self.pid)
+        }
     }
 }
 

@@ -300,7 +300,7 @@ async fn spawn_requested(
             let remembered = crate::lock(&state.recents).cwd_of(&workspace.id, id);
             match remembered {
                 Some(dir) => {
-                    let raw = dir.to_string_lossy().into_owned();
+                    let raw = chimaera_core::paths::wire_path(&dir);
                     crate::git::allowed_session_cwd(state, &workspace, &raw)
                         .await
                         .ok()

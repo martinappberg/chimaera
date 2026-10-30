@@ -38,6 +38,7 @@
   } from "./history";
   import SessionEdits from "./SessionEdits.svelte";
   import { openGitView } from "./git";
+  import { isAbsolute, joinPath } from "../shared/paths";
 
   interface Props {
     dash: DashCtx;
@@ -226,7 +227,7 @@
 
   /** Record paths are workspace-relative; the edit record's are absolute. */
   function abs(p: string): string {
-    return wsRoot !== null && !p.startsWith("/") ? `${wsRoot}/${p}` : p;
+    return wsRoot !== null && !isAbsolute(p) ? joinPath(wsRoot, p) : p;
   }
 
   function clock(ms: number): string {
