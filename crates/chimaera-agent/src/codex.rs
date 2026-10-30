@@ -45,6 +45,12 @@ pub const TESTED_CODEX_VERSION: &str = "0.164.0";
 /// PROTOCOL.md Pass 44).
 pub const COLLAB_WAIT_TITLE: &str = "waiting for subagents";
 
+/// Ticks (~3 s) an accepted `turn/start` waits for its `turn/started` before
+/// the driver adopts the turn the answer named (`start_ack`). A fresh turn's
+/// start lands within milliseconds of the answer (hermetic 0.158.0); the
+/// grace only bounds a start that never comes.
+const START_ACK_GRACE_TICKS: u32 = (3000 / crate::model::COALESCE_INTERVAL_MS) as u32;
+
 /// The `initialize` request both the probe client and the driver handshake
 /// send. Declares `experimentalApi` so `thread/settings/update` is available
 /// (live: -32600 "requires experimentalApi capability" without it).
@@ -1749,6 +1755,14 @@ struct CodexMapper {
     /// stranded. Symmetric to claude's idle-flush; see
     /// `IDLE_FLUSH_GRACE_TICKS`.
     idle_flush_grace: Option<u32>,
+    /// The turn our accepted `turn/start` named, and the ticks left for its
+    /// `turn/started` to land. Codex answers a start that meets a running
+    /// turn by joining the input into it: the answer names that turn and no
+    /// `turn/started` follows (hermetic 0.158.0, PROTOCOL.md Pass 56). An id
+    /// the driver already knows is adopted at once; any other is adopted
+    /// when the grace runs out, so the start window always closes. Cleared
+    /// by `turn/started` and every turn end.
+    start_ack: Option<(String, u32)>,
     coalescer: Coalescer,
     /// agentMessage item ids that streamed deltas (skip their completed text).
     streamed: HashSet<String>,
@@ -1917,6 +1931,7 @@ impl CodexMapper {
             answer_owed: false,
             interrupt_grace: None,
             idle_flush_grace: None,
+            start_ack: None,
             coalescer: Coalescer::new(),
             streamed: HashSet::new(),
             last_msg_item: None,
@@ -2346,13 +2361,19 @@ impl CodexMapper {
                 }
             }
             "turn/started" => {
+                let started = frame["params"]["turn"]["id"].as_str().unwrap_or_default();
+                // A late start for the turn a `turn/start` answer already
+                // adopted (`adopt_running_turn`) is the same turn: its
+                // TurnStarted is out, so a second one would only reset the
+                // activity line.
+                if self.turn_active && !started.is_empty() && started == self.turn_id {
+                    return step;
+                }
+                self.start_ack = None;
                 // Our `turn/start` is in flight or opened this turn; anything
                 // else the server started on its own.
                 let ours = self.turn_pending || self.opening_turn_owned;
-                self.turn_id = frame["params"]["turn"]["id"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string();
+                self.turn_id = started.to_string();
                 self.turn_active = true;
                 self.turn_pending = false;
                 // A turn the server opened itself reads the history too.
@@ -3081,6 +3102,7 @@ impl CodexMapper {
         // Defensive: a turn that ends without ever emitting turn/started must
         // not leave the start-window flag stuck true.
         self.turn_pending = false;
+        self.start_ack = None;
         // Codex drops a steer it accepted but never read when its turn ends.
         // The message still delivers — it opens the next turn, with any other
         // left over — the same as a queued message after a stop.
@@ -3115,13 +3137,7 @@ impl CodexMapper {
                 // turn and service only explicit start-window Steer requests
                 // rather than erroring; ordinary follow-ups remain queued.
                 if let Some(live) = parse_expected_turn_id(msg) {
-                    self.turn_id = live;
-                    self.turn_active = true;
-                    // An adopted turn is fresh prose: the previous turn's
-                    // item ids must not mark a boundary onto its first text.
-                    self.last_msg_item = None;
-                    self.last_thought_item = None;
-                    self.flush_requested_steers(step);
+                    self.adopt_running_turn(live, step);
                 } else {
                     step.events.push(AgentEvent::Error {
                         message: format!("turn/start failed: {}", err["message"]),
@@ -3409,9 +3425,28 @@ impl CodexMapper {
                 // releases it when the driver is idle.
                 self.start_next_queued(step);
             }
+            // A start that met a running turn joined its input into that
+            // turn: the answer names the running turn and no `turn/started`
+            // follows (hermetic 0.158.0, Pass 56). The driver is idle then
+            // only because the interrupt watchdog closed a turn codex kept
+            // running; left alone, `turn_pending` would never clear, and
+            // every later send would wait as "next step" behind a start that
+            // never comes while the chat looks idle. A known id is that
+            // turn: adopt it now. Any other id gets the start grace
+            // (`start_ack_watchdog`).
+            (PendingRpc::TurnStart, None) => {
+                let acked = frame["result"]["turn"]["id"].as_str().unwrap_or_default();
+                if self.turn_pending && !self.turn_active && !acked.is_empty() {
+                    if acked == self.turn_id {
+                        self.adopt_running_turn(acked.to_string(), step);
+                    } else {
+                        self.start_ack = Some((acked.to_string(), START_ACK_GRACE_TICKS));
+                    }
+                }
+            }
             // Compact's ack is an empty result; the compaction turn's
             // contextCompaction item carries the visible notice.
-            (PendingRpc::TurnStart | PendingRpc::Interrupt | PendingRpc::Compact, None) => {}
+            (PendingRpc::Interrupt | PendingRpc::Compact, None) => {}
             (PendingRpc::SubagentMeta { thread }, None) => {
                 self.on_subagent_meta(&thread, &frame["result"]["thread"], step);
             }
@@ -4956,9 +4991,15 @@ impl CodexMapper {
             "item/started" | "item/completed" if item["type"] == "userMessage" => {
                 if method == "item/started" {
                     if let Some(id) = item["clientId"].as_str() {
+                        // An opening input that joined an adopted turn
+                        // (`adopt_running_turn`) is read like a steer, so
+                        // it can be left unanswered like one.
+                        let joined_opening = !self.opening_turn_owned
+                            && self.unread_opening_message.as_deref() == Some(id);
                         let user_steer = !self.agent_steers.contains(id)
                             && !self.feedback_steers.contains(id)
                             && (self.steer_pending_for(id)
+                                || joined_opening
                                 || self.unread_steers.values().any(|s| s.client_msg_id == id));
                         if user_steer {
                             self.read_unanswered = true;
@@ -5099,6 +5140,23 @@ impl CodexMapper {
     /// one request without ever issuing concurrent `turn/start`s. Turn-end
     /// callers run this AFTER `reset_turn_state`, which clears `turn_pending`.
     fn start_next_queued(&mut self, step: &mut DriverStep) {
+        // An agent message that missed its turn never opens one, so nothing
+        // below gates it: it settles the moment its turn is over, even while
+        // a model choice or a sibling steer holds the user's own input. Held
+        // behind those gates it stayed "next step" on an idle chat (and out
+        // of the reader's inbox) until the user's next send.
+        let (missed, kept): (BTreeMap<u64, QueuedSend>, BTreeMap<u64, QueuedSend>) =
+            std::mem::take(&mut self.deferred_steer_redrives)
+                .into_iter()
+                .partition(|(_, send)| self.agent_steers.contains(&send.client_msg_id));
+        self.deferred_steer_redrives = kept;
+        for send in missed.into_values() {
+            self.agent_steers.remove(&send.client_msg_id);
+            step.events.push(AgentEvent::UserMessageUpdate {
+                id: send.client_msg_id,
+                state: UserMessageState::Dropped,
+            });
+        }
         if self.turn_active
             || self.turn_pending
             || self.pending_model_update.is_some()
@@ -5108,21 +5166,11 @@ impl CodexMapper {
             return;
         }
         if !self.deferred_steer_redrives.is_empty() {
-            let (missed, batch): (Vec<QueuedSend>, Vec<QueuedSend>) =
-                std::mem::take(&mut self.deferred_steer_redrives)
-                    .into_values()
-                    .partition(|send| self.agent_steers.contains(&send.client_msg_id));
-            for send in missed {
-                self.agent_steers.remove(&send.client_msg_id);
-                step.events.push(AgentEvent::UserMessageUpdate {
-                    id: send.client_msg_id,
-                    state: UserMessageState::Dropped,
-                });
-            }
-            if !batch.is_empty() {
-                self.redrive_batch(batch, step);
-                return;
-            }
+            let batch: Vec<QueuedSend> = std::mem::take(&mut self.deferred_steer_redrives)
+                .into_values()
+                .collect();
+            self.redrive_batch(batch, step);
+            return;
         }
         let Some(queued) = self.queued_sends.pop_front() else {
             if self.answer_owed {
@@ -5859,6 +5907,55 @@ impl CodexMapper {
         step.outbound.push(json!({
             "id": id, "method": "turn/start", "params": params,
         }));
+    }
+
+    /// Our `turn/start` landed in a turn that was already running (its
+    /// answer or refusal names it). The driver runs it as the current turn,
+    /// and says so: a chat the user sees idle while the driver steers every
+    /// send into a hidden turn leaves each one waiting as "next step" with
+    /// no Stop to reach it. The opening input joined that turn the way a
+    /// steer does, so only its exact echo confirms it
+    /// (`opening_turn_owned = false`); an interrupted end without that echo
+    /// asks for a resend.
+    fn adopt_running_turn(&mut self, live: String, step: &mut DriverStep) {
+        // A refusal can name the turn whose `turn/started` already landed
+        // (the server opened one in our start window): its TurnStarted is
+        // out, and a second would only reset the activity line.
+        let announced = self.turn_active && self.turn_id == live;
+        self.turn_id = live;
+        self.turn_active = true;
+        self.turn_pending = false;
+        self.opening_turn_owned = false;
+        self.start_ack = None;
+        // An adopted turn is fresh prose: the previous turn's item ids must
+        // not mark a boundary onto its first text.
+        self.last_msg_item = None;
+        self.last_thought_item = None;
+        if !announced {
+            step.events.push(AgentEvent::TurnStarted {
+                turn_id: self.turn_id.clone(),
+            });
+        }
+        self.flush_requested_steers(step);
+    }
+
+    /// The start grace (see `start_ack`): an accepted `turn/start` whose
+    /// `turn/started` never came adopts the turn its answer named, so the
+    /// start window cannot hold waiting input forever.
+    fn start_ack_watchdog(&mut self) -> DriverStep {
+        let mut step = DriverStep::default();
+        if !self.turn_pending || self.turn_active {
+            self.start_ack = None;
+            return step;
+        }
+        match self.start_ack.take() {
+            Some((turn, remaining)) if remaining > 1 => {
+                self.start_ack = Some((turn, remaining - 1));
+            }
+            Some((turn, _)) => self.adopt_running_turn(turn, &mut step),
+            None => {}
+        }
+        step
     }
 
     /// A Steer click may arrive after `turn/start` but before `turn/started`.
@@ -6756,6 +6853,9 @@ impl Mapper for CodexMapper {
         let watchdog = self.interrupt_watchdog();
         step.events.extend(watchdog.events);
         step.outbound.extend(watchdog.outbound);
+        let started = self.start_ack_watchdog();
+        step.events.extend(started.events);
+        step.outbound.extend(started.outbound);
         let flush = self.idle_flush();
         step.events.extend(flush.events);
         step.outbound.extend(flush.outbound);
@@ -15103,6 +15203,233 @@ mod tests {
             let step = m.on_frame(&sleep("item/started", item));
             assert!(matches!(&step.events[0],
                 AgentEvent::ToolCall { title: t, .. } if t == title));
+        }
+    }
+
+    fn send_text(m: &mut CodexMapper, text: &str) -> DriverStep {
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: text.into() }],
+        })
+    }
+
+    fn user_message_id(step: &DriverStep) -> (String, bool) {
+        match &step.events[0] {
+            AgentEvent::UserMessage {
+                id: Some(id),
+                queued,
+                ..
+            } => (id.clone(), *queued),
+            other => panic!("expected UserMessage, got {other:?}"),
+        }
+    }
+
+    /// Close turn-A the way the interrupt watchdog does when codex is slow to
+    /// honor a Stop (a flaky network): the driver goes idle while codex's
+    /// turn lives on.
+    fn watchdog_closes_turn_a(m: &mut CodexMapper) {
+        active_turn(m);
+        m.on_command(AgentCommand::Interrupt);
+        let mut aborted = false;
+        for _ in 0..INTERRUPT_GRACE_TICKS {
+            aborted |= m
+                .tick()
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnAborted { .. }));
+        }
+        assert!(aborted && !m.turn_active, "the watchdog closed turn-A");
+    }
+
+    /// Hermetic 0.158.0 (Pass 56): a `turn/start` that meets a running turn
+    /// is answered with THAT turn's id, no `turn/started` follows, and the
+    /// input is read at the turn's next step. After a watchdog-closed turn
+    /// the driver used to sit in `turn_pending` forever: the chat looked
+    /// idle, the opening message was never answered, and every later send
+    /// waited as "next step" (the reported stuck chat). The answer now
+    /// adopts the running turn, says so, and later sends steer into it.
+    #[test]
+    fn a_start_joined_into_the_turn_the_watchdog_closed_adopts_that_turn() {
+        let mut m = mapper();
+        watchdog_closes_turn_a(&mut m);
+
+        let step = send_text(&mut m, "Where were we?");
+        let (opening, queued) = user_message_id(&step);
+        assert!(!queued, "idle: the send opens a turn");
+        let rpc = step
+            .outbound
+            .iter()
+            .find(|o| o["method"] == "turn/start")
+            .expect("turn/start")["id"]
+            .clone();
+        let step = m.on_frame(&json!({"id": rpc, "result": {"turn": {
+            "id": "turn-A", "items": [], "status": "inProgress",
+        }}}));
+        assert!(
+            step.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnStarted { turn_id } if turn_id == "turn-A")),
+            "the chat shows the adopted turn running: {:?}",
+            step.events
+        );
+        assert!(m.turn_active && !m.turn_pending && !m.opening_turn_owned);
+
+        // The next send steers into the live turn instead of queueing
+        // behind a start that never comes.
+        let step = send_text(&mut m, "Status?");
+        let (status, queued) = user_message_id(&step);
+        assert!(queued);
+        assert_eq!(step.outbound[0]["method"], "turn/steer");
+        assert_eq!(step.outbound[0]["params"]["expectedTurnId"], "turn-A");
+        let steer = step.outbound[0]["id"].as_u64().unwrap();
+        m.on_frame(&json!({"id": steer, "result": {"turnId": "turn-A"}}));
+        assert!(m.queued_sends.is_empty());
+
+        // A second Stop that codex honors ends it for real: the unread steer
+        // opens the next turn, and the opening input that joined the
+        // interrupted turn unread asks for a resend.
+        m.on_command(AgentCommand::Interrupt);
+        let end = m.on_frame(&json!({"method": "turn/completed", "params": {
+            "threadId": "thr-1", "turn": {"id": "turn-A", "status": "interrupted"},
+        }}));
+        assert!(
+            end.events.iter().any(|e| matches!(e,
+            AgentEvent::Notice { text } if text == "Message may not have arrived. Please resend."))
+        );
+        assert!(end.events.iter().any(|e| matches!(e,
+            AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if *id == status)));
+        let start = end
+            .outbound
+            .iter()
+            .find(|o| o["method"] == "turn/start")
+            .expect("the unread steer opens the next turn");
+        assert_eq!(start["params"]["clientUserMessageId"], json!(status));
+        assert_ne!(opening, status);
+    }
+
+    /// The joined opening input is read like a steer: its echo confirms it,
+    /// and a turn that read it at its end without answering owes a turn.
+    #[test]
+    fn a_joined_opening_echo_confirms_it_and_an_unanswered_one_is_owed() {
+        let mut m = mapper();
+        watchdog_closes_turn_a(&mut m);
+        let step = send_text(&mut m, "Where were we?");
+        let (opening, _) = user_message_id(&step);
+        let rpc = step.outbound[0]["id"].clone();
+        m.on_frame(&json!({"id": rpc, "result": {"turn": {"id": "turn-A"}}}));
+
+        // Old work on the adopted turn does not confirm it.
+        m.on_frame(&json!({"method": "item/agentMessage/delta", "params": {
+            "threadId": "thr-1", "turnId": "turn-A", "itemId": "old", "delta": "old work",
+        }}));
+        assert_eq!(m.unread_opening_message.as_deref(), Some(opening.as_str()));
+        for f in &finishing_frames(&opening)[1..] {
+            m.on_frame(f);
+        }
+        assert!(m.unread_opening_message.is_none(), "its echo confirms it");
+        let end = m.on_frame(&turn_a_completed());
+        let start = end
+            .outbound
+            .iter()
+            .find(|o| o["method"] == "turn/start")
+            .expect("the unanswered message is owed a turn");
+        assert_eq!(start["params"]["input"], json!([]));
+    }
+
+    /// A `turn/start` answer that names a turn the driver never saw, with no
+    /// `turn/started` after it, cannot hold the start window forever: the
+    /// grace adopts the named turn and releases a send waiting to steer.
+    #[test]
+    fn an_accepted_start_that_never_starts_is_adopted_after_the_grace() {
+        let mut m = mapper();
+        let step = send_text(&mut m, "first");
+        let rpc = step.outbound[0]["id"].clone();
+        m.on_frame(&json!({"id": rpc, "result": {"turn": {"id": "turn-X"}}}));
+        assert!(m.turn_pending);
+        let step = send_text(&mut m, "second");
+        let (second, queued) = user_message_id(&step);
+        assert!(queued && step.outbound.is_empty(), "start window: held");
+
+        for _ in 0..(START_ACK_GRACE_TICKS - 1) {
+            let step = m.tick();
+            assert!(step.events.is_empty() && step.outbound.is_empty());
+        }
+        let step = m.tick();
+        assert!(step
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnStarted { turn_id } if turn_id == "turn-X")));
+        assert!(m.turn_active && !m.turn_pending);
+        let steer = step
+            .outbound
+            .iter()
+            .find(|o| o["method"] == "turn/steer")
+            .expect("the held send steers once the turn is known");
+        assert_eq!(steer["params"]["clientUserMessageId"], json!(second));
+        assert_eq!(steer["params"]["expectedTurnId"], "turn-X");
+
+        // A late start for the same turn is not a second turn.
+        let late = m.on_frame(&json!({"method": "turn/started", "params": {
+            "threadId": "thr-1", "turn": {"id": "turn-X"},
+        }}));
+        assert!(late.events.is_empty(), "{:?}", late.events);
+    }
+
+    /// The ordinary order — the answer, then `turn/started` milliseconds
+    /// later (hermetic 0.158.0) — opens exactly one turn and arms nothing.
+    #[test]
+    fn a_start_answered_before_its_turn_started_opens_one_turn() {
+        let mut m = mapper();
+        let step = send_text(&mut m, "first");
+        let rpc = step.outbound[0]["id"].clone();
+        m.on_frame(&json!({"id": rpc, "result": {"turn": {"id": "turn-B"}}}));
+        let step = m.on_frame(&json!({"method": "turn/started", "params": {
+            "threadId": "thr-1", "turn": {"id": "turn-B"},
+        }}));
+        assert_eq!(
+            step.events
+                .iter()
+                .filter(|e| matches!(e, AgentEvent::TurnStarted { .. }))
+                .count(),
+            1
+        );
+        assert!(m.start_ack.is_none() && m.opening_turn_owned);
+        for _ in 0..(START_ACK_GRACE_TICKS + 1) {
+            assert!(m.tick().events.is_empty());
+        }
+    }
+
+    /// An agent message that missed its turn settles `Dropped` (back in the
+    /// reader's inbox) at that turn's end, even while a held model choice or
+    /// an unanswered sibling steer keeps the user's own input waiting. It
+    /// used to wait behind those gates as "next step" on an idle chat.
+    #[test]
+    fn an_agent_message_that_missed_its_turn_drops_whatever_holds_the_queue() {
+        for hold in ["model_change_failed", "sibling_steer"] {
+            let mut m = mapper();
+            active_turn(&mut m);
+            let step = m.on_command(agent_send("agent-1", "heads-up"));
+            let rpc = step.outbound[0]["id"].as_u64().unwrap();
+            m.on_frame(&json!({ "id": rpc, "result": { "turnId": "turn-A" } }));
+            if hold == "model_change_failed" {
+                m.model_change_failed = true;
+            } else {
+                steer_text(&mut m, "user steer");
+            }
+            let end = m.on_frame(&json!({"method": "turn/completed", "params": {
+                "threadId": "thr-1", "turn": {"id": "turn-A", "status": "interrupted"},
+            }}));
+            assert!(
+                end.events.iter().any(|e| matches!(e,
+                    AgentEvent::UserMessageUpdate { id, state: UserMessageState::Dropped }
+                        if id == "agent-1")),
+                "{hold}: {:?}",
+                end.events
+            );
+            assert!(m.agent_steers.is_empty(), "{hold}");
+            assert!(
+                !end.outbound.iter().any(|o| o["method"] == "turn/start"),
+                "{hold}: an agent message never opens a turn"
+            );
         }
     }
 }

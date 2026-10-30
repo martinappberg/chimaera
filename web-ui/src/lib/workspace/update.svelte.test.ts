@@ -152,6 +152,20 @@ describe("update awareness", () => {
     expect(store.currentNotice(null)).toEqual({ kind: "app", version: "0.43.0", url: null });
   });
 
+  it("a job window's stale daemon is offered a new job, never its tunnel key as a host", async () => {
+    mocks.native = true;
+    const store = await load();
+    store.updateState.buildSkew = true;
+    expect(store.currentNotice("cluster")).toEqual({ kind: "daemon-remote", alias: "cluster" });
+    const job = { jobId: "4242", node: null, cws: "w-1" };
+    expect(store.currentNotice("cluster", job)).toEqual({
+      kind: "daemon-job",
+      alias: "cluster",
+      job,
+    });
+    expect(store.currentNotice(null, job)).toEqual({ kind: "daemon-local" });
+  });
+
   it("the app answers without waiting on a slow daemon check", async () => {
     mocks.native = true;
     const store = await load();

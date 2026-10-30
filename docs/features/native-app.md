@@ -214,6 +214,10 @@ app-build` (never the root `cargo`).
   here (full app+daemon chain > daemon-only restart > "a release exists" notice — a browser window can't
   self-apply). Body copy states the consequence plainly (layouts/tabs/sessions come back; running terminal
   programs restart). "later" snoozes ~20h; "skip this version" mutes it — both origin-wide in localStorage.
+- **A cluster job window's daemon is the job's.** Its tunnel key (`<alias>#job<id>~<workspace>`) is no
+  ssh host and a running job keeps the binary it started with, so skew there offers **continue in a new
+  job** (`cluster_continue_job`, which deploys this build) instead of a reconnect; the window moves over
+  when the new job starts.
 - **An explicit check always answers** (`checkForUpdates(true)`: the menu item, the home screen's version
   stamp): "Checking for updates…", then the offer (snooze/skip don't hide what you asked for), "You're up
   to date" (fades after ~6s unless hovered), "Development build", or "Couldn't check for updates" with the
