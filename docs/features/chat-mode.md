@@ -109,6 +109,9 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   On Codex, a Stop the app-server is slow to honor still ends the turn on screen (a watchdog),
   and if that turn was in fact still running, the next send joins it: the chat shows it running
   again and later sends steer into it instead of waiting as "next step" (PROTOCOL.md Pass 56).
+  A message still waiting when the daemon died hard (a crash, a kill, a job's time limit) lived
+  only in that process's queue: the chat's next start marks it "not delivered" instead of leaving
+  a bubble no new process can read or Send now.
   A genuinely undeliverable entry stays marked **"not delivered"**
   (text kept readable/copyable, never auto-dumped into a draft you may have started); ✕ dismisses
   it. This is driven by the single `pendingSends` reducer and journaled via `user_message`

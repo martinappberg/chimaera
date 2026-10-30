@@ -116,6 +116,39 @@ pub struct Journal {
 pub struct Reopened {
     pub goal: Option<crate::model::GoalState>,
     pub jobs: Vec<crate::model::ScheduledJob>,
+    /// Waiting user messages (a `queued` echo) no `UserMessageUpdate` has
+    /// settled yet, oldest first. A driver's teardown settles its own, so
+    /// any left when a new process starts were stranded by a process that
+    /// died without one (a hard daemon stop). The newest
+    /// [`WAITING_CAP`] are kept: one process never holds more.
+    pub waiting: VecDeque<String>,
+}
+
+/// Bound on [`Reopened::waiting`]: the manager refuses a send past this many
+/// undelivered ones, so a single process never strands more.
+pub const WAITING_CAP: usize = crate::RETAINED_SENDS_MAX;
+
+impl Reopened {
+    fn fold(&mut self, ev: &AgentEvent) {
+        match ev {
+            AgentEvent::Goal { goal, .. } => self.goal = goal.clone(),
+            AgentEvent::Schedule { jobs, .. } => self.jobs = jobs.clone(),
+            AgentEvent::UserMessage {
+                id: Some(id),
+                queued: true,
+                ..
+            } => {
+                if !self.waiting.contains(id) {
+                    if self.waiting.len() >= WAITING_CAP {
+                        self.waiting.pop_front();
+                    }
+                    self.waiting.push_back(id.clone());
+                }
+            }
+            AgentEvent::UserMessageUpdate { id, .. } => self.waiting.retain(|w| w != id),
+            _ => {}
+        }
+    }
 }
 
 impl Journal {
@@ -160,11 +193,7 @@ impl Journal {
                     if let Ok(entry) = serde_json::from_slice::<SeqEvent>(&bytes[line_start..i]) {
                         last_seq = last_seq.max(entry.seq);
                         good_end = (i + 1) as u64;
-                        match entry.ev {
-                            AgentEvent::Goal { goal, .. } => reopened.goal = goal,
-                            AgentEvent::Schedule { jobs, .. } => reopened.jobs = jobs,
-                            _ => {}
-                        }
+                        reopened.fold(&entry.ev);
                     }
                     line_start = i + 1;
                 }
@@ -264,11 +293,7 @@ impl Journal {
             );
             // The entry as journaled (an oversized Schedule became an Error
             // marker above, and the file will say so too).
-            match &entry.ev {
-                AgentEvent::Goal { goal, .. } => state.latest.goal = goal.clone(),
-                AgentEvent::Schedule { jobs, .. } => state.latest.jobs = jobs.clone(),
-                _ => {}
-            }
+            state.latest.fold(&entry.ev);
 
             let line_len = line.len();
             state.ring.push_back((Arc::clone(&entry), line_len));
@@ -1126,6 +1151,45 @@ mod tests {
         assert_eq!(reopened.reopened().goal.as_ref().unwrap().objective, "new");
         assert_eq!(reopened.reopened().jobs.len(), 1);
         assert_eq!(reopened.reopened().jobs[0].id, "b");
+    }
+
+    /// A reopened journal knows which waiting messages nothing settled, in
+    /// send order, and an update appended later settles one.
+    #[tokio::test]
+    async fn reopening_remembers_unsettled_waiting_messages() {
+        let echo = |id: &str, queued: bool| AgentEvent::UserMessage {
+            text: id.into(),
+            attachments: 0,
+            attachment_paths: Vec::new(),
+            id: Some(id.into()),
+            queued,
+            after_turn: false,
+            origin: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let journal = Journal::open(dir.path(), "s-wait").unwrap();
+            journal.append(echo("fresh", false)).await;
+            journal.append(echo("a", true)).await;
+            journal.append(echo("b", true)).await;
+            journal.append(echo("c", true)).await;
+            journal
+                .append(AgentEvent::UserMessageUpdate {
+                    id: "b".into(),
+                    state: crate::model::UserMessageState::Sent,
+                })
+                .await;
+            journal.sync_async().await;
+        }
+        let reopened = Journal::open(dir.path(), "s-wait").unwrap();
+        assert_eq!(reopened.reopened().waiting, ["a", "c"]);
+        reopened
+            .append(AgentEvent::UserMessageUpdate {
+                id: "a".into(),
+                state: crate::model::UserMessageState::Dropped,
+            })
+            .await;
+        assert_eq!(reopened.reopened().waiting, ["c"]);
     }
 
     /// The live journal answers `reopened()` from memory the moment an
