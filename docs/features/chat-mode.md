@@ -106,6 +106,9 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   own (the CLI puts it back); it shows as read only once Claude's reply to it begins. A Stop also
   names the turn it was meant for, so one that lands after that turn ended leaves the next one
   running (PROTOCOL.md Pass 53).
+  A message still waiting when the daemon died hard (a crash, a kill, a job's time limit) lived
+  only in that process's queue: the chat's next start marks it "not delivered" instead of leaving
+  a bubble no new process can read or Send now.
   A genuinely undeliverable entry stays marked **"not delivered"**
   (text kept readable/copyable, never auto-dumped into a draft you may have started); ✕ dismisses
   it. This is driven by the single `pendingSends` reducer and journaled via `user_message`
