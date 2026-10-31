@@ -174,7 +174,8 @@ pub fn cache_dir() -> PathBuf {
 
 /// Per-user runtime directory: `$XDG_RUNTIME_DIR/chimaera` if set, else
 /// `/tmp/chimaera-$UID` (`$CHIMAERA_HOME/run` when isolated; on Windows
-/// `%LOCALAPPDATA%\chimaera\run` — already per-user, no /tmp analogue).
+/// `%LOCALAPPDATA%\chimaera\run` — already per-user, no /tmp analogue, and
+/// no OS scrub: the daemon clears its stale agent files there at start).
 /// Created with mode 0700 on demand where the platform has modes.
 pub fn runtime_dir() -> PathBuf {
     let dir = match (env_dir(cluster::ENV_RUNTIME_DIR), state_home()) {

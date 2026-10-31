@@ -252,6 +252,9 @@ app-build` (never the root `cargo`).
   aliases and keys resolve against the Windows `~/.ssh`.
 - **Paths.** The daemon speaks forward-slash paths on the wire (`C:/Users/me/proj`, UNC as
   `//server/share/`); the folder picker's root lists the drives ("This PC").
+- **Runtime dir.** `%LOCALAPPDATA%\chimaera\run` has no OS scrub like Unix's `/tmp`, so each
+  daemon start removes the per-session agent files (settings, MCP config, statusline) that sat
+  untouched for 3 days. It runs before restore, so a restored session writes any it lacks.
 - **Not on Windows yet.** Chimaera-managed agent runtime installs (the action shows the vendor's
   PowerShell command), agent-plugin installs from Extensions, environment preludes (POSIX
   snippets), the Claude MCP connector sign-in through a PTY (use `/mcp` in a Claude session), a
