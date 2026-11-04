@@ -1346,3 +1346,18 @@ _Intent pending — drafted from the maintainer's request, 2026-09-26; questionn
   pasted into terminal agents, table fragments counting rows the RFC 7111 way (so they differ by
   one from the grid's row numbers), and the chip-only affordance (no context menu) have not been confirmed
   with the maintainer — capture via **capture-feature-intent** when available.
+
+### HTML in a web view of its own, and marking HTML — why it exists
+_Captured 2026-11-04 (the maintainer, in the session that built it)._
+
+- **Problem it solves:** a large HTML report opened on a remote made the whole window
+  unresponsive — "I cannot use that window"; the page "works but takes a LONG ass time to look
+  at", and going back to chat was barely usable too. Separately: "be able to mark things in HTML
+  like we do for PDFs". The ask was to "fix this properly once and for all", to make sure it
+  works on remotes too, and to run all HTML this way rather than above a size threshold
+  ("considering some people do web dev"). The browser fallback "still needs to be there".
+- **How settled it is:** "Can change" — the whole implementation is provisional (pane views,
+  the bridge, the pill, the area tool, the wording). Only the why above is settled.
+- **Do not change (or: open to change):** nothing is frozen; the area is open to improvement.
+- **Left open:** native pane views on Linux/Windows (they keep the iframe for now), and the agent
+  browser's pane engine (#273) building on pane views.

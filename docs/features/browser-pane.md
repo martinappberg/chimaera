@@ -302,3 +302,9 @@ _Captured 2026-10-04 (from the maintainer, in the session that built it)._
 - **Silent, by decision:** he chose no permission prompt ("I'd rather it be silent") and
   confirmed "Silent everywhere" after being shown the shared-host risk recorded under
   Key constraints. Do not add a prompt, or a per-host exception, without asking.
+
+### In a web view of its own (the macOS app)
+_Captured 2026-11-04 (the maintainer)._ The why and its grade live with the HTML preview's entry in
+[files and previews](files-and-previews.md#html-in-a-web-view-of-its-own-and-marking-html--why-it-exists):
+all HTML and web apps run this way in the app, including web-dev pages; the implementation is
+provisional ("Can change") and nothing in it is frozen.
