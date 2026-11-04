@@ -45,7 +45,12 @@
   let lastInput = 0;
   const INPUT_FRESH_MS = 1500;
   const noteInput = (e) => {
-    if (e.isTrusted) lastInput = Date.now();
+    if (!e.isTrusted) return;
+    lastInput = Date.now();
+    // A selection the user finished (a drag released, a shift+arrow let
+    // go) is reported now: a slow drag's last selectionchange can fall
+    // outside INPUT_FRESH_MS, and nothing changes after the release.
+    if (e.type === "pointerup" || e.type === "keyup") scheduleSelection();
   };
   addEventListener("pointerdown", (e) => e.isTrusted && post({ kind: "focus" }), true);
   addEventListener("focus", (e) => e.isTrusted && post({ kind: "focus" }));
@@ -156,10 +161,11 @@
       rect: selRect,
     });
   };
-  document.addEventListener("selectionchange", () => {
+  function scheduleSelection() {
     if (selTimer !== 0) clearTimeout(selTimer);
     selTimer = setTimeout(reportSelection, 120);
-  });
+  }
+  document.addEventListener("selectionchange", scheduleSelection);
   // The pill follows its selection when the page scrolls.
   addEventListener(
     "scroll",

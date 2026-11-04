@@ -13,9 +13,9 @@
  * window.
  *
  * Trust: unlike the native view's isolated-world bridge, a framed page's own
- * scripts share the bridge's world and can post anything it can. So a
- * selection is taken only while the user is in the frame (it holds this
- * document's focus), a reference too and at most once a second, and a
+ * scripts share the bridge's world and can post anything it can. So focus
+ * and a selection are taken only while the user is in the frame (it holds
+ * this document's focus), a reference too and at most once a second, and a
  * relayed key is honoured only as the reference chord, never replayed as a
  * workbench chord. A forged reference can at worst fill an agent's input,
  * never send it. There is no snapshot, text-under-a-rect or history here.
@@ -72,7 +72,9 @@ export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
     if (ev === null) return;
     switch (ev.kind) {
       case "focus":
-        params.onFocus?.();
+        // Only when the user is in the frame: a page could otherwise post
+        // `focus` on a timer and keep pulling focus to its pane.
+        if (userInFrame()) params.onFocus?.();
         break;
       case "key":
         if (isChord(ev, REFERENCE_CHORD)) reference();

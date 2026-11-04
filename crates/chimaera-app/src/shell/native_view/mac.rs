@@ -58,8 +58,6 @@ const MESSAGE_MAX: usize = 256 * 1024;
 
 static APP: OnceLock<AppHandle> = OnceLock::new();
 
-/// A link the user clicked lets that URL out to their browser this long.
-const LINK_FRESH: Duration = Duration::from_millis(1500);
 /// A view whose own process dies this many times within `CRASH_WINDOW` is
 /// left down (and the page told) instead of reloaded again: a page over
 /// WebKit's per-process limit would otherwise crash, re-download and crash.
@@ -207,19 +205,9 @@ fn clicked(label: &str, url: &tauri::Url) -> bool {
             return false;
         };
         match pane.link.take() {
-            Some((href, at)) => at.elapsed() < LINK_FRESH && same_link(&href, url),
+            Some((href, at)) => super::link_lets_out(&href, at, Instant::now(), url),
             None => false,
         }
-    })
-}
-
-/// The clicked href and the navigated URL name the same resource.
-fn same_link(href: &str, url: &tauri::Url) -> bool {
-    href.parse::<tauri::Url>().is_ok_and(|mut h| {
-        let mut u = url.clone();
-        h.set_fragment(None);
-        u.set_fragment(None);
-        h == u
     })
 }
 

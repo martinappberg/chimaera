@@ -32,6 +32,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use tauri::webview::PageLoadEvent;
@@ -181,6 +182,26 @@ fn main_frame_policy(app: &AppHandle, label: &str, url: &tauri::Url) -> Policy {
     decide(&asked, daemon_navigation_allowed(app, &owner, url), url)
 }
 
+/// A link the user clicked lets that URL out to their browser this long.
+const LINK_FRESH: Duration = Duration::from_millis(1500);
+
+/// Whether a navigation to `url` may go to the user's browser: it is the
+/// link the user clicked at `at` (a trusted click the bridge reported), the
+/// same URL bar the fragment, and recent. A script's `a.click()` is a link
+/// activation to WebKit too, so this — not `navigationType` — is the gate.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn link_lets_out(href: &str, at: Instant, now: Instant, url: &tauri::Url) -> bool {
+    if now.saturating_duration_since(at) >= LINK_FRESH {
+        return false;
+    }
+    href.parse::<tauri::Url>().is_ok_and(|mut h| {
+        let mut u = url.clone();
+        h.set_fragment(None);
+        u.set_fragment(None);
+        h == u
+    })
+}
+
 /// A link out of a view: the user's real browser for web URLs (validated
 /// the same way as every other rendered link), nothing for the rest.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -239,7 +260,21 @@ pub(super) fn native_view_show(
     let navigate = previous.is_some_and(|v| v.url != parsed.as_str());
     #[cfg(target_os = "macos")]
     {
-        mac::show(&app, &webview, label, parsed, navigate, rect, hidden)
+        let shown = mac::show(
+            &app,
+            &webview,
+            label.clone(),
+            parsed,
+            navigate,
+            rect,
+            hidden,
+        );
+        if shown.is_err() {
+            // Never made (the owner is going): no record of a view that
+            // doesn't exist.
+            lock(&views.views).remove(&label);
+        }
+        shown
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -413,7 +448,52 @@ pub(super) fn owner_page_load(app: &AppHandle, owner: &str, event: PageLoadEvent
 
 #[cfg(test)]
 mod tests {
-    use super::{child_label, decide, proxy_base, valid_id, view_path_allowed, Policy};
+    use std::time::{Duration, Instant};
+
+    use super::{
+        child_label, decide, link_lets_out, proxy_base, valid_id, view_path_allowed, Policy,
+    };
+
+    #[test]
+    fn only_the_link_the_user_clicked_goes_out() {
+        let url = |s: &str| -> tauri::Url { s.parse().unwrap() };
+        let at = Instant::now();
+        let soon = at + Duration::from_millis(200);
+        let target = url("https://example.com/a?b=1");
+        assert!(link_lets_out(
+            "https://example.com/a?b=1",
+            at,
+            soon,
+            &target
+        ));
+        // The fragment doesn't make it another place.
+        assert!(link_lets_out(
+            "https://example.com/a?b=1#x",
+            at,
+            soon,
+            &target
+        ));
+        // Anything else — another URL, a stale click, garbage — stays in.
+        assert!(!link_lets_out(
+            "https://example.com/a?b=2",
+            at,
+            soon,
+            &target
+        ));
+        assert!(!link_lets_out(
+            "https://evil.example/a?b=1",
+            at,
+            soon,
+            &target
+        ));
+        assert!(!link_lets_out(
+            "https://example.com/a?b=1",
+            at,
+            at + Duration::from_secs(2),
+            &target
+        ));
+        assert!(!link_lets_out("not a url", at, soon, &target));
+    }
 
     #[test]
     fn ids_are_label_safe() {

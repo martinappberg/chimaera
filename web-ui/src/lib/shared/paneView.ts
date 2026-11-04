@@ -278,8 +278,10 @@ class OverlayWatch {
   private dirty = true;
   private found: Element[] = [];
   private readonly observer: MutationObserver;
+  private watching = false;
 
-  /** `onChange` runs when the change may have moved an overlay. */
+  /** `onChange` runs when the change may have moved an overlay. Observes
+   *  only while `watch(true)`: a parked view has nothing to keep clear. */
   constructor(
     private readonly host: Element,
     onChange: () => void,
@@ -290,7 +292,18 @@ class OverlayWatch {
         onChange();
       }
     });
-    this.observer.observe(document.body, { childList: true, subtree: true });
+  }
+
+  watch(on: boolean): void {
+    if (on === this.watching) return;
+    this.watching = on;
+    if (on) {
+      // Whatever came and went while unwatched is re-collected.
+      this.dirty = true;
+      this.observer.observe(document.body, { childList: true, subtree: true });
+    } else {
+      this.observer.disconnect();
+    }
   }
 
   /** Whether a batch of DOM changes added or removed an overlay: streaming
@@ -530,6 +543,12 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
   };
   function burst(): void {
     if (destroyed) return;
+    // A parked view has no rect to follow: one pass hides it (or keeps it
+    // hidden), and the document's transitions and resizes cost it nothing.
+    if (!params.shown) {
+      void sync();
+      return;
+    }
     still = 0;
     if (frame === 0) frame = requestAnimationFrame(tick);
   }
@@ -545,6 +564,7 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
   let safety: ReturnType<typeof setInterval> | null = null;
   const armSafety = (): void => {
     const want = params.shown && !destroyed && !failed;
+    overlays.watch(want);
     if (want && safety === null) {
       safety = setInterval(() => {
         if (document.visibilityState !== "visible") return;
