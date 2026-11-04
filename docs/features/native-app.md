@@ -48,6 +48,19 @@ app-build` (never the root `cargo`).
   copy to local windows and Home), `local-daemon-updated` only to local windows, and askpass prompts
   only to the windows allowed to answer them. A test fails on any broadcast of those events, and
   another pins Tauri's internal dispatch names to the locked Tauri version.
+- **The grants follow the window's own web view, not the window.** A daemon window's
+  capability names its web view's label (`authorize_daemon_origin`; for every daemon window
+  the two labels are the same). Tauri hands a window-scoped capability to every web view in
+  that window, so this keeps any future Tauri web view in a window from inheriting the grants.
+  Defence in depth: pane views are plain WKWebViews with no IPC.
+- **Pane views** (macOS): an HTML preview or browser pane is a `WKWebView` the shell owns,
+  laid over the pane — its own web process, so a heavy page can't freeze the window
+  ([files and previews](files-and-previews.md#rendered-previews), [browser pane](browser-pane.md#the-pane-ui)).
+  It is a plain subview, never a Tauri web view: it has no IPC, and Tauri's window lookups
+  (`get_webview_window`, which `deliver_to` uses) keep finding the window — a Tauri child web
+  view would make Tauri stop counting it as a webview window. It loads only its window's daemon
+  origin under `/raw/` or `/proxy/`; a clicked link elsewhere goes to the real browser
+  (`shell/native_view.rs`).
 - **The askpass wiring stays the app's own.** The local daemon is spawned without the app's
   `SSH_ASKPASS*` / `CHIMAERA_ASKPASS_*` variables (and a daemon that inherited them from an older
   app strips them from its sessions), so a terminal's `ssh` prompts on its tty and no agent can
