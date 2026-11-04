@@ -409,7 +409,13 @@
   {:else if tab.surface === "file"}
     {@const FileView = views.file}
     {#if FileView !== undefined}
-      <FileView path={tab.path} {wsRoot} fontSize={node.fontSize} visible={active} />
+      <FileView
+        path={tab.path}
+        {wsRoot}
+        fontSize={node.fontSize}
+        visible={active}
+        onFocusRequest={() => ctrl.focusPane(node.id)}
+      />
     {:else if viewErrors.file}
       {@render loadFailure("file", "file view")}
     {:else}

@@ -9,6 +9,13 @@
    * demand and re-minted whenever it expires, so daemon restarts heal
    * invisibly. The chrome stays quiet: back/reload/external + an address
    * field, with honest overlay states instead of raw browser error pages.
+   *
+   * In the app the page is not an iframe but a web view of its own laid over
+   * the stage (`shared/paneView.ts`): its own web process, so a heavy app
+   * can't freeze the window. Its location, title and focus arrive as events
+   * instead of same-origin reads, history goes through the shell, and a
+   * text selection in it can be referenced in an agent. The iframe stays the
+   * browser's path and the fallback for an app build without pane views.
    */
   import { onDestroy, untrack } from "svelte";
   import { get } from "svelte/store";
@@ -19,6 +26,18 @@
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import { agentHue } from "../workspace/agentLinks";
   import type { BrowserOpener } from "./agentOpen";
+  import { PaneViewControl, paneView, paneViewsPossible } from "../shared/paneView";
+  import { referencePill } from "../shared/paneViewBridge";
+  import {
+    activeSelection,
+    clearSelection,
+    referenceTarget,
+    requestReference,
+    setSelection,
+    type FileSelection,
+  } from "../shared/reference";
+  import { PINNED } from "../shared/keys";
+  import { inAppPath, onRootForm, pageAddress } from "./frameLocation";
   import {
     ConfirmRequired,
     isLoopbackHost,
@@ -89,6 +108,16 @@
 
   let draft = $state<string | null>(null);
   let addressEl = $state<HTMLInputElement | null>(null);
+
+  /** The page shows in a native pane view; false after the shell declined. */
+  let native = $state(paneViewsPossible());
+  /** The native view has yet to show `iframeSrc`'s page. */
+  let viewLoading = $state(true);
+  /** The native view's page process died for good (until a reload). */
+  let viewCrashed = $state(false);
+  const control = new PaneViewControl();
+  /** The native view's page sits on a root-form (rescued) path. */
+  let viewRootForm = false;
 
   // --- the compute-node hunt --------------------------------------------------
   //
@@ -214,6 +243,8 @@
       base = null;
       proxyId = null;
       iframeSrc = null;
+      pageSel = null;
+      unpublish();
       // `moved` is intentionally NOT reset here — an auto-move sets it right
       // before it re-points, and this reset runs as a consequence of that
       // very re-point; clearing it would erase the note we just set.
@@ -301,34 +332,49 @@
     try {
       const win = el.contentWindow;
       if (win === null) return null; // cross-origin: leave the address as-is
-      // The iframe's initial about:blank document (before the first load
-      // commits) has pathname "blank": recording it would re-point the tab.
-      if (win.location.protocol === "about:") return null;
-      // Include the hash so livePath matches a target path that carried one
-      // (a hash-router route) — otherwise the external-navigation effect above
-      // would see a spurious mismatch and re-load on every settle.
-      const raw = `${win.location.pathname}${win.location.search}${win.location.hash}`;
-      // Prefixed navigations carry /proxy/{id}; rescued (absolute-path) ones
-      // land on root-form paths. Both name the same app location. A /proxy/
-      // path under a DIFFERENT id is the previous target's iframe still on
-      // screen mid-retarget — never record it as this target's location.
-      if (raw.startsWith("/proxy/") && !raw.startsWith(b)) return null;
-      const inApp = raw.startsWith(b) ? raw.slice(b.length) || "/" : raw;
-      if (inApp !== livePath) {
-        livePath = inApp;
-        if (inApp !== path) onNavigate(inApp);
-      }
+      // Not this app's page (about:blank before the first load commits, or
+      // the previous target's page mid-retarget): never record it.
+      const inApp = inAppPath(win.location, b);
+      if (inApp === null) return null;
       // Keep the tab label honest too: a same-document route change can swap
       // the title, and re-reading it here (idempotent — setBrowserTitle
       // short-circuits an unchanged value) also heals any transient clear.
-      const title = win.document.title.trim();
-      setBrowserTitle(tabId, title.length > 0 ? title : null);
+      notePage(inApp, win.document.title);
       return win;
     } catch {
       // The app navigated somewhere cross-origin; the address keeps the last
       // known in-app location.
       return null;
     }
+  }
+
+  /** Record the page's in-app location (persisted onto the tab) and title. */
+  function notePage(inApp: string, title: string): void {
+    if (inApp !== livePath) {
+      livePath = inApp;
+      if (inApp !== path) onNavigate(inApp);
+    }
+    const t = title.trim();
+    setBrowserTitle(tabId, t.length > 0 ? t : null);
+  }
+
+  /** The native view loaded a page, or its title or same-document URL
+   *  changed: the same bookkeeping the iframe's reads do. */
+  function onViewPage(page: { url: string; title: string }): void {
+    viewCrashed = false;
+    const b = base;
+    if (b === null) return;
+    let u: URL;
+    try {
+      u = new URL(page.url, location.href);
+    } catch {
+      return;
+    }
+    if (u.origin !== location.origin) return;
+    const inApp = inAppPath(u, b);
+    if (inApp === null) return;
+    viewRootForm = onRootForm(u, b);
+    notePage(inApp, page.title);
   }
 
   function readIframeState(): void {
@@ -362,8 +408,9 @@
   // catch-up read when either returns (the effect re-runs; the read is a bare
   // same-origin property access, no I/O). untrack: syncLocation reads AND
   // writes `livePath` — tracking it would loop the effect.
+  // A native view reports its own location changes (onViewPage): no poll.
   $effect(() => {
-    if (!visible || !$pageVisible || phase.kind !== "ready") return;
+    if (native || !visible || !$pageVisible || phase.kind !== "ready") return;
     untrack(() => syncLocation());
     const t = setInterval(syncLocation, 5000);
     return () => clearInterval(t);
@@ -382,11 +429,79 @@
   onDestroy(() => {
     titleObserver?.disconnect();
     setBrowserTitle(tabId, null);
+    unpublish();
+  });
+
+  // --- pointing at part of the page (context bridge; native view only) -------
+  //
+  // A text selection in the page goes to an agent like a file selection,
+  // its "file" the app's own address (`@http://localhost:8888/lab (§ Intro)
+  // "…"`): the bridge has no kind for a web page, and an agent reads a URL
+  // for what it is. Offered by the pill the shell draws in the page.
+
+  const selOwner = {};
+  let published: FileSelection | null = null;
+  /** The page's text selection as last reported: re-offered by its pill
+   *  after a newer selection elsewhere took the bridge. */
+  let pageSel: { text: string; context: string | null } | null = null;
+
+  function unpublish(): void {
+    if (published === null) return;
+    published = null;
+    clearSelection(selOwner);
+  }
+
+  function publishPageSelection(): void {
+    const s = pageSel;
+    if (s === null || host === "") return;
+    const sel: FileSelection = {
+      kind: "file",
+      path: pageAddress(host, port, livePath ?? path),
+      startLine: null,
+      endLine: null,
+      text: s.text,
+      ...(s.context !== null ? { context: `§ ${s.context}` } : {}),
+      label: "selection",
+    };
+    published = sel;
+    setSelection(selOwner, sel);
+  }
+
+  function onViewSelection(sel: { text: string; context: string | null }): void {
+    if (sel.text.trim() === "") {
+      pageSel = null;
+      unpublish();
+      return;
+    }
+    pageSel = { text: sel.text, context: sel.context };
+    publishPageSelection();
+  }
+
+  /** The in-page pill: reference the page's own selection, even when a
+   *  newer one elsewhere had taken the bridge since. */
+  function onViewReference(): void {
+    if (pageSel !== null && published === null) publishPageSelection();
+    requestReference();
+  }
+
+  // A newer selection elsewhere (another view, a terminal) replaces this one.
+  $effect(() => {
+    const a = $activeSelection;
+    if (published !== null && a !== published) published = null;
+  });
+
+  // The in-page pill wears the shared chip's words and follows the target.
+  $effect(() => {
+    control.setChip(referencePill($referenceTarget, undefined, PINNED.reference));
   });
 
   // --- chrome actions ---------------------------------------------------------
 
   function back(): void {
+    if (native) {
+      control.nav("back");
+      return;
+    }
     try {
       iframeEl?.contentWindow?.history.back();
     } catch {
@@ -395,6 +510,10 @@
   }
 
   function forward(): void {
+    if (native) {
+      control.nav("forward");
+      return;
+    }
     try {
       iframeEl?.contentWindow?.history.forward();
     } catch {
@@ -405,6 +524,16 @@
   function reload(): void {
     if (phase.kind === "unreachable" || phase.kind === "blank") {
       void connect();
+      return;
+    }
+    if (native) {
+      viewCrashed = false;
+      // A page on a rescued root-form path can't be reloaded as it is (a
+      // top-level document there is the workbench's, never the app's):
+      // load the same app location under the proxy prefix instead.
+      const prefixed = base !== null && livePath !== null ? `${base}${livePath}` : null;
+      if (viewRootForm && prefixed !== null && prefixed !== iframeSrc) iframeSrc = prefixed;
+      else control.nav("reload");
       return;
     }
     try {
@@ -585,7 +714,43 @@
         <button class="action" onclick={() => void connect()}>retry now</button>
       </div>
     {/if}
-    {#if iframeSrc !== null && (phase.kind === "ready" || phase.kind === "connecting")}
+    {#if iframeSrc !== null && (phase.kind === "ready" || phase.kind === "connecting") && native}
+      <!-- The loading state sits INSIDE the placeholder: paneView treats a
+           positioned status element elsewhere over it as an overlay. -->
+      <div
+        class="frame native-slot"
+        class:hidden={phase.kind !== "ready"}
+        use:paneView={{
+          url: iframeSrc,
+          shown: visible && phase.kind === "ready",
+          onFallback: () => (native = false),
+          onLoading: (l) => {
+            viewLoading = l;
+            // A load under way means the page is no longer the crashed one.
+            if (l) viewCrashed = false;
+          },
+          onCrashed: () => (viewCrashed = true),
+          onFocus: onFocusRequest,
+          onSelection: onViewSelection,
+          onReference: onViewReference,
+          onPage: onViewPage,
+          control,
+        }}
+      >
+        {#if viewCrashed}
+          <div class="state">
+            <div class="state-title">This page stopped responding</div>
+            <button
+              class="action"
+              onclick={() => {
+                viewCrashed = false;
+                control.nav("reload");
+              }}>Reload</button
+            >
+          </div>
+        {:else if viewLoading && phase.kind === "ready"}<Spinner />{/if}
+      </div>
+    {:else if iframeSrc !== null && (phase.kind === "ready" || phase.kind === "connecting")}
       <iframe
         class="frame"
         class:hidden={phase.kind !== "ready"}

@@ -362,6 +362,143 @@ export async function openExternal(url: string): Promise<boolean> {
   }
 }
 
+/** A pane's rectangle in CSS px of this window (the window's points). */
+export interface ViewRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * Show a page (`/raw/…` or `/proxy/…` on this daemon) in a web view of its
+ * own laid over `rect` — its own web process, so a heavy page can't freeze
+ * this window (`crates/chimaera-app/src/shell/native_view.rs`). Creates the
+ * view on first call; a later call with the same `id` moves it and navigates
+ * only if `url` changed. `hidden` creates or navigates it without showing
+ * it (a page still loading; `nativeViewPlace` shows it). False outside the
+ * app, or from an app build without pane views — the caller falls back to
+ * an iframe.
+ */
+export async function nativeViewShow(id: string, url: string, rect: ViewRect, hidden: boolean): Promise<boolean> {
+  const t = tauri();
+  if (t === null) return false;
+  try {
+    await t.core.invoke<void>("native_view_show", { id, url, rect, hidden });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Move a pane view (`rect`), or hide it (`null`). */
+export async function nativeViewPlace(id: string, rect: ViewRect | null): Promise<void> {
+  const t = tauri();
+  if (t === null) return;
+  try {
+    await t.core.invoke<void>("native_view_place", { id, rect });
+  } catch {
+    /* gone with its window or an older app build: nothing to move */
+  }
+}
+
+/** Close a pane view. */
+export async function nativeViewClose(id: string): Promise<void> {
+  const t = tauri();
+  if (t === null) return;
+  try {
+    await t.core.invoke<void>("native_view_close", { id });
+  } catch {
+    /* already gone */
+  }
+}
+
+/** A pane view's visible viewport as rendered: a PNG (base64) and the
+ *  viewport's size in CSS px (the PNG is usually denser). */
+export interface NativeViewSnapshot {
+  png: string;
+  width: number;
+  height: number;
+}
+
+/** Capture a pane view's viewport. Take it while the view is shown; null
+ *  outside the app, from an older build, or when the view is gone. */
+export async function nativeViewSnapshot(id: string): Promise<NativeViewSnapshot | null> {
+  const t = tauri();
+  if (t === null) return null;
+  try {
+    return await t.core.invoke<NativeViewSnapshot>("native_view_snapshot", { id });
+  } catch {
+    return null;
+  }
+}
+
+/** The "reference in agent" pill the shell draws in a pane view next to its
+ *  page's text selection (shown only while a selection exists). */
+export interface NativeViewChip {
+  text: string;
+  title: string;
+  enabled: boolean;
+}
+
+/** Set (or with `null` remove) a pane view's in-page reference pill. */
+export async function nativeViewChip(id: string, chip: NativeViewChip | null): Promise<void> {
+  const t = tauri();
+  if (t === null) return;
+  try {
+    await t.core.invoke<void>("native_view_chip", { id, chip });
+  } catch {
+    /* gone, or an app build without the pill: the chord still references */
+  }
+}
+
+/** What lies under a rect of a pane view's viewport, and where the page was
+ *  scrolled when it was read (document CSS px). `text` is capped by the
+ *  shell. */
+export interface NativeViewRegion {
+  text: string;
+  scrollX: number;
+  scrollY: number;
+  title: string;
+}
+
+/** Read the text under `rect` (CSS px of the view's viewport). */
+export async function nativeViewRegion(id: string, rect: ViewRect): Promise<NativeViewRegion | null> {
+  const t = tauri();
+  if (t === null) return null;
+  try {
+    return await t.core.invoke<NativeViewRegion>("native_view_region", { id, rect });
+  } catch {
+    return null;
+  }
+}
+
+export type NativeViewNav = "back" | "forward" | "reload" | "stop";
+
+/** Drive a pane view's own history. */
+export async function nativeViewNav(id: string, action: NativeViewNav): Promise<void> {
+  const t = tauri();
+  if (t === null) return;
+  try {
+    await t.core.invoke<void>("native_view_nav", { id, action });
+  } catch {
+    /* gone with its window or an older app build */
+  }
+}
+
+/**
+ * What a pane view reports about its page (`native-view`, delivered to the
+ * owning window's web view only). Shapes in `shared/paneViewBridge.ts`,
+ * which decodes them; this stays the untyped wire.
+ */
+export function listenNativeView(handler: (payload: unknown) => void): Promise<() => void> {
+  const t = tauri();
+  if (t === null) return Promise.resolve(() => {});
+  return t.webviewWindow
+    .getCurrentWebviewWindow()
+    .listen<unknown>("native-view", (e) => handler(e.payload));
+}
+
 /**
  * A newer signed app build exists (the shell's periodic updater check).
  * Broadcast to every window; presentation and snoozing are the UI's job.
