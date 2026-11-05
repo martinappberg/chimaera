@@ -1500,6 +1500,16 @@ _Captured 2026-11-04 (the maintainer, in the session that built it)._
 - **Left open:** native pane views on Linux/Windows (they keep the iframe for now), and the agent
   browser's pane engine (#273) building on pane views.
 
+### Zooming an HTML page — why it exists
+_Intent pending — drafted from the maintainer's request, 2026-11-05; questionnaire not yet run._
+
+- **Problem it solves (from the request).** "Is it possible to zoom in on HTML with the normal
+  controls? Does not need to add anything extra for this, just like how it would be on a webpage
+  normally." Alongside it, the maintainer noted ⌘+/⌘− "not working correctly before" (the
+  position-matched chords on a non-US layout) and that the dashboard may not need ⌘0 anymore.
+- **Pending.** Which parts are a promise rather than "for now" — capture via
+  **capture-feature-intent**.
+
 ### Code files in every common format, and a language picker — why it exists
 _Captured 2026-11-04 (the maintainer, in the session that built it)._
 
