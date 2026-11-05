@@ -138,6 +138,46 @@ describe("DeckEditsCore", () => {
     expect(readText(core.text(S1), "2")).toEqual(["b"]);
   });
 
+  it("saved edits never conflict with a later outside change (save, then PowerPoint)", async () => {
+    const core = new DeckEditsCore(reader({ [S1]: slide(box("2", 0, "a"), box("3", 50, "b")) }), "h0");
+    await core.ensure(S1);
+    // Five separate moves (five undo steps), then a save.
+    for (let x = 1; x <= 5; x++) core.push(move("2", x - 1, x));
+    const parts = core.pendingSave();
+    core.markSaved(parts, "h1");
+    // PowerPoint opens the saved file, changes something else, saves.
+    const ppt = parts[0]!.text.replace(">b<", ">from PowerPoint<");
+    const r = await core.rebase(reader({ [S1]: ppt }), "h2");
+    expect(r.conflicts).toHaveLength(0);
+    expect(core.dirty).toBe(false);
+    expect(readText(core.text(S1), "3")).toEqual(["from PowerPoint"]);
+  });
+
+  it("a saved edit undone before an outside change comes back as its inverse", async () => {
+    const core = new DeckEditsCore(reader({ [S1]: slide(box("2", 0, "a"), box("3", 50, "b")) }), "h0");
+    await core.ensure(S1);
+    core.push(move("2", 0, 5));
+    const parts = core.pendingSave();
+    core.markSaved(parts, "h1");
+    core.undo();
+    expect(core.unsavedOps()).toEqual([move("2", 5, 0)]);
+    const other = parts[0]!.text.replace(">b<", ">c<");
+    const r = await core.rebase(reader({ [S1]: other }), "h2");
+    expect(r.conflicts).toHaveLength(0);
+    expect(readXfrm(core.text(S1), "2")?.x).toBe(0);
+    expect(core.dirty).toBe(true);
+  });
+
+  it("only unsaved edits are journaled", async () => {
+    const core = new DeckEditsCore(reader({ [S1]: slide(box("2", 0, "a")) }), "h0");
+    await core.ensure(S1);
+    core.push(move("2", 0, 5));
+    core.markSaved(core.pendingSave(), "h1");
+    expect(core.unsavedOps()).toEqual([]);
+    core.push(move("2", 5, 7));
+    expect(core.unsavedOps()).toEqual([move("2", 5, 7)]);
+  });
+
   it("an edit that changes nothing is no undo step and keeps redo", async () => {
     const core = new DeckEditsCore(reader({ [S1]: slide(box("2", 0, "a")) }), "h0");
     await core.ensure(S1);

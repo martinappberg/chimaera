@@ -91,6 +91,25 @@ function shapeExists(xml: string, id: string): boolean {
   }
 }
 
+/**
+ * The operation that undoes `op` (it put `from` back). A move of a shape that
+ * had no transform of its own can't be undone that way (the file model has no
+ * "inherit again"), nor a delete (shapes aren't re-added): those keep `op`'s
+ * `to` as their target so they don't fit, and are held for the person.
+ */
+function inverse(op: DeckOp): DeckOp {
+  switch (op.kind) {
+    case "xfrm":
+      return op.from === null ? op : { ...op, from: op.to, to: op.from };
+    case "text":
+      return { ...op, from: op.to, to: op.from };
+    case "order":
+      return { ...op, from: op.to, to: op.from };
+    case "delete":
+      return op;
+  }
+}
+
 /** `op` with its `from` read from `base` (what it now replaces). */
 function rebased(op: DeckOp, base: string): DeckOp {
   switch (op.kind) {
@@ -137,6 +156,9 @@ export class DeckEditsCore {
   private held: DeckOp[] = [];
   /** Gesture id of the last operation, for coalescing a drag or typing. */
   private lastGesture: string | null = null;
+  /** The history as it stood at the last save (or attach): what the file on
+   *  disk already holds. Only what differs from it is unsaved. */
+  private savedOps: DeckOp[] = [];
 
   constructor(
     private read: PartReader,
@@ -260,6 +282,21 @@ export class DeckEditsCore {
     for (const p of parts) this.saved.set(p.name, p.text);
     this.diskHash = hash;
     this.lastGesture = null;
+    this.savedOps = [...this.ops];
+  }
+
+  /**
+   * The edits the file on disk doesn't hold yet, as operations over it: a
+   * saved edit since undone comes back as its inverse (most recent first),
+   * then every edit made since the save. This — never the saved part of the
+   * history — is what a rebase replays and what the journal keeps: a saved
+   * edit is in the file, so it can't conflict with a later change to it.
+   */
+  unsavedOps(): DeckOp[] {
+    let k = 0;
+    while (k < this.ops.length && k < this.savedOps.length && this.ops[k] === this.savedOps[k]) k++;
+    const undone = this.savedOps.slice(k).reverse().map(inverse);
+    return [...undone, ...this.ops.slice(k)];
   }
 
   /**
@@ -280,14 +317,16 @@ export class DeckEditsCore {
         // The part is gone (a slide deleted): its operations can't fit.
       }
     }
+    const all = [...this.unsavedOps(), ...this.held];
     this.origin = next;
     this.saved.clear();
     this.current.clear();
     this.diskHash = hash;
     this.lastGesture = null;
     this.redoStack = [];
-    const all = [...this.ops, ...this.held];
+    // The new file is the new start: undo goes back to it, not past it.
     this.ops = [];
+    this.savedOps = [];
     this.held = [];
     for (const op of all) this.replant(op);
     return { conflicts: [...this.held] };

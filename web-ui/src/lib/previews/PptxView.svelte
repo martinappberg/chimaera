@@ -555,15 +555,22 @@
     showPart(edits.redo()?.part);
   }
 
-  /** "slide 3 (move), slide 5 (text)": where each held edit is. */
-  const conflictList = $derived(
-    edits.conflicts
-      .map((c) => {
-        const i = deck?.presentation.slides.findIndex((sl) => sl.slidePath === c.part) ?? -1;
-        return i >= 0 ? `slide ${i + 1} (${c.label})` : c.label;
-      })
-      .join(", "),
-  );
+  /** "slide 1: 2 moves, text; slide 3: move": where the held edits are,
+   *  grouped by slide and kind. */
+  const conflictList = $derived.by(() => {
+    const bySlide = new Map<string, Map<string, number>>();
+    for (const c of edits.conflicts) {
+      const i = deck?.presentation.slides.findIndex((sl) => sl.slidePath === c.part) ?? -1;
+      const where = i >= 0 ? `slide ${i + 1}` : "the slide list";
+      const kinds = bySlide.get(where) ?? new Map<string, number>();
+      kinds.set(c.label, (kinds.get(c.label) ?? 0) + 1);
+      bySlide.set(where, kinds);
+    }
+    const plural = (label: string, n: number) => (n === 1 ? label : `${n} ${label === "text" ? "text edits" : `${label}s`}`);
+    return [...bySlide]
+      .map(([where, kinds]) => `${where}: ${[...kinds].map(([l, n]) => plural(l, n)).join(", ")}`)
+      .join("; ");
+  });
 
   // --- slide order (thumbnail drag, edit mode) ---------------------------------------
 

@@ -318,7 +318,9 @@ export class DeckEdits {
       await drafts.clear(key, { writer: drafts.WRITER, ...(restored !== null ? { text: restored } : {}) }).catch(() => {});
       return;
     }
-    const body: JournalBody = { v: 1, ops: [...c.history, ...c.conflicts] };
+    // Only what the file doesn't hold yet: replaying saved edits onto the
+    // saved file would read as conflicts with themselves.
+    const body: JournalBody = { v: 1, ops: [...c.unsavedOps(), ...c.conflicts] };
     const r = await drafts
       .journal({
         path: key,
