@@ -919,13 +919,25 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   the bar says so, and counts shapes that couldn't be drawn. Refused past 100 MB. A reveal's
   plain line (`deck.pptx:3`, a deck check's problem on slide 3) lands on that slide.
 - **Editing a deck.** The bar's **edit** turns the stage into an editor (`PptxEditLayer.svelte`):
-  click a shape to select it, drag it (snapping to the slide's edges and centre and to other
-  shapes, with guides; Shift keeps one axis, Alt turns snapping off), resize it from its handles
-  (pictures keep their aspect unless Shift; tables and rotated shapes move only), nudge it with the
-  arrows (Shift: 10 px), Delete it, Tab through shapes, and double-click or Enter to edit its text
-  in a box under the shape — Enter is a new paragraph, Shift+Enter a line break, and the slide
-  redraws as you type. Drag a thumbnail to reorder slides. ⌘Z / ⇧⌘Z undo and redo (one step per
-  drag or typing burst), ⌘S saves, Esc leaves. Layout and master shapes aren't selectable.
+  click a shape to select it (the grey around the slide deselects), drag it (snapping to the
+  slide's edges and centre and to other shapes, with guides and a position readout in points;
+  Shift keeps one axis, Alt turns snapping off, Esc puts it back), resize it from its handles
+  (pictures keep their aspect unless Shift; resized edges snap too; tables and rotated shapes move
+  only), nudge it with the arrows (Shift: 10 px; nudges within a second are one undo step), Delete
+  it, Tab through shapes and out. Text is edited **where it is drawn**: double-click puts the caret
+  at the click, a click on the selected shape does too, Enter selects all of it, and just typing
+  on a selected text shape replaces it, as in PowerPoint. You type into the renderer's own text
+  body in the slide's real fonts (bullet markers kept out of the text); Enter is a new paragraph
+  (its bullet shows at once), Shift+Enter a line break, paste is plain text, formatting
+  shortcuts are off, and Esc, a click elsewhere or focus leaving commits it; the slide redraws
+  then. A shape whose drawn text doesn't read back as its XML gets a box editor under it instead,
+  and that one redraws as you type. Empty text placeholders show dashed; a table, chart or group
+  says where to edit it. A drag previews by moving the drawn shape and commits once on release.
+  Drag a thumbnail to reorder slides (the strip scrolls at its ends). ⌘Z / ⇧⌘Z undo and redo
+  anywhere in the viewer and show the slide they changed, ⌘S saves (also mid-typing), Esc steps
+  back: text, selection, edit mode. While editing, slide-show keys (Backspace, Space, Enter, F) do
+  nothing to the deck; edit mode and the area tool exclude each other, and the slide's @ hides.
+  Layout and master shapes aren't selectable, nor is a shape whose id repeats on its slide.
   Edits are operations over the package's parts (`pptxEdits.ts`), applied as text splices to the
   part's own XML (`pptxXml.ts`): a move rewrites only the `<a:off>` values, a resize only
   `<a:ext>`, a text edit only the `<a:t>` text the change falls in (a new paragraph copies its
@@ -937,10 +949,13 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   sibling and renames it over the deck, or answers 409. The history lives in
   `pptxEditStore.svelte.ts`, not the view: closing the tab keeps it (the tab's unsaved dot, the
   close and quit prompts offer Save), it is journaled through the drafts journal under
-  `<path>#pptx-edits`, and our own save coming back from disk changes nothing. Any other change on
-  disk — an agent's python-pptx rewrite, PowerPoint — rebases the edits: each one replays over the
-  new file, and one whose shape changed or vanished there waits in a banner (**keep mine** /
-  **use theirs**); nothing is overwritten or dropped silently. While PowerPoint has the deck open
+  `<path>#pptx-edits` (reopening the deck after a crash or reload brings the edits back at once,
+  with the unsaved dot), and our own save coming back from disk is not re-read. Any other change
+  on disk — an agent's python-pptx rewrite, PowerPoint — waits while you are mid-typing or
+  mid-drag, then rebases the edits: each one replays over the new file, and one whose shape
+  changed or vanished there waits in a banner naming its slide (**keep mine** / **use theirs**;
+  a kept edit becomes an edit of the new file); nothing is overwritten or dropped silently. A
+  refused save (409) rechecks the disk at once. While PowerPoint has the deck open
   (its `~$` owner file sits beside it) the bar says so, because PowerPoint's next save replaces
   the file without checking.
 - **The same deck in PowerPoint.** In the app, **PowerPoint** in the bar opens the deck in
