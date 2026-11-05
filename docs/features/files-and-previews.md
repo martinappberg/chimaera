@@ -1397,3 +1397,17 @@ _Captured 2026-11-04 (the maintainer, in the session that built it)._
 - **Do not change (or: open to change):** nothing is frozen; the area is open to improvement.
 - **Left open:** native pane views on Linux/Windows (they keep the iframe for now), and the agent
   browser's pane engine (#273) building on pane views.
+
+### Code files in every common format, and a language picker — why it exists
+_Captured 2026-11-04 (the maintainer, in the session that built it)._
+
+- **Problem it solves:** code files are "not as big of a deal and not something people should
+  use a lot, but sometimes you want to go into the code and understand what it does", and
+  research files ("rust files, snakemake files etc.") are "quite common". The ask was to keep it
+  "simple still and useful but that all of these work", with the file-name mapping made
+  exhaustive.
+- **How settled it is:** the why is settled; the language tables, the dialect choices and the
+  picker are additions, free to change if improved.
+- **Deliberately left out:** "we skip all real Linters" — "If something is out of scope it should
+  be an extension". Core reads and highlights; checking code is not core.
+- **Do not change (or: open to change):** nothing is frozen; the area is open to improvement.

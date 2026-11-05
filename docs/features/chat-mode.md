@@ -1321,3 +1321,12 @@ _Captured 2026-10-15 (from the maintainer, in-session, while the chat-UX batch w
 _Intent pending — not yet captured from the maintainer (shipped 2026-10-15, autonomous session)._
 
 - Derived context, not intent: the 2026-10-14 batch's cross-runtime review found the ACP chats getting less silently — every pre-allowed chimaera tool still raised a permission card there, and Cursor's to-do list was discarded. Both were held back until the frames were captured live (the repo's rule: agent wire formats are pinned, never guessed; PROTOCOL.md Pass 45). Decisions made without the maintainer and open: the driver answers only an offered allow-once (never a standing allow-always in the agent), a cancelled Cursor to-do leaves the card rather than drawing a fourth state, and an agent's own plan-tool rows are hidden as Claude's TodoWrite is. Run **capture-feature-intent** with the maintainer to replace this stub.
+
+### Running a shell block from chat — why it exists
+_Captured 2026-11-04 (the maintainer, in the session that built it)._
+
+- **Problem it solves:** when an agent gives "terminal commands it would want you to run", "one
+  should be able to do this in chat", not by copying them into a terminal by hand.
+- **How settled it is:** the why is settled; which fences qualify, which terminal it picks and how
+  the text is typed are additions, free to change if improved.
+- **Do not change (or: open to change):** open to change; nothing about the Run behavior is frozen.
