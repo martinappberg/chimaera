@@ -50,6 +50,10 @@ arboard = { version = "3.6", default-features = false }
 # has nowhere else to go. Same crate the CLI uses to open the UI.
 open = "5"
 ureq = { version = "3", features = ["json"] }
+# The "open in PowerPoint" round trip's content hashes (the daemon's
+# `X-Content-Hash`/`expect_hash` are SHA-256); already in the tree through
+# chimaera-remote, same version.
+sha2 = "0.11"
 urlencoding = "2"
 
 chimaera-core = { path = "../chimaera-core" }

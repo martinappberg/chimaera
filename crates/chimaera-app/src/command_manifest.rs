@@ -59,6 +59,9 @@ pub const DAEMON_UI_COMMANDS: &[&str] = &[
     "copy_file_to_clipboard",
     "reveal_in_file_manager",
     "open_external",
+    "office_open",
+    "office_trip",
+    "office_trip_resolve",
     "native_view_show",
     "native_view_place",
     "native_view_close",
@@ -162,6 +165,13 @@ pub const COMMAND_AUTHORITY: &[(&str, Authority)] = &[
     ("copy_file_to_clipboard", Authority::LocalOnly),
     ("reveal_in_file_manager", Authority::LocalOnly),
     ("open_external", Authority::AnyWindow),
+    // The host is the caller's own scope, never an argument: a page acts
+    // only on its own host's files (a local window's are this machine's,
+    // the `reveal_in_file_manager` hand-off). `require_target` on that alias
+    // still refuses a window mid-navigation, whose old document still runs.
+    ("office_open", Authority::OwnHost),
+    ("office_trip", Authority::OwnHost),
+    ("office_trip_resolve", Authority::OwnHost),
     ("native_view_show", Authority::AnyWindow),
     ("native_view_place", Authority::AnyWindow),
     ("native_view_close", Authority::AnyWindow),

@@ -53,6 +53,12 @@ app-build` (never the root `cargo`).
   the two labels are the same). Tauri hands a window-scoped capability to every web view in
   that window, so this keeps any future Tauri web view in a window from inheriting the grants.
   Defence in depth: pane views are plain WKWebViews with no IPC.
+- **A deck in PowerPoint** (`shell/office.rs`): `office_open` takes the host from the calling
+  window's own scope, never an argument. A local window's deck opens in Microsoft PowerPoint (or
+  the default app); a remote window's deck (macro-free types only) goes on a round trip — a
+  working copy under the data dir, each PowerPoint save uploaded with the host's hash as its
+  precondition, a conflict held for the person, and the trip ending once PowerPoint closes the
+  deck with everything sent ([files and previews](files-and-previews.md)).
 - **Pane views** (macOS): an HTML preview or browser pane is a `WKWebView` the shell owns,
   laid over the pane — its own web process, so a heavy page can't freeze the window
   ([files and previews](files-and-previews.md#rendered-previews), [browser pane](browser-pane.md#the-pane-ui)).

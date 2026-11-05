@@ -27,6 +27,7 @@ mod connect;
 mod drag;
 mod native_view;
 pub(crate) mod notices;
+mod office;
 #[cfg(target_os = "macos")]
 mod print_frame;
 mod restore;
@@ -1157,6 +1158,8 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
         // Before any window opens: the watchers start polling right away,
         // and a window's first scope report may already owe it a focus.
         notices::start(handle);
+        // Resumes the persisted PowerPoint round trips.
+        office::start(handle);
     }
     // Reopen last session's windows. Restore itself registers a home surface
     // before launching any remote ssh that may need askpass, and also covers
@@ -1285,6 +1288,9 @@ pub fn run() {
             commands::copy_file_to_clipboard,
             commands::reveal_in_file_manager,
             commands::open_external,
+            office::office_open,
+            office::office_trip,
+            office::office_trip_resolve,
             native_view::native_view_show,
             native_view::native_view_place,
             native_view::native_view_close,

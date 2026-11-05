@@ -17,11 +17,19 @@
    * the tool the shape under the pointer, with the shapes' names and text
    * (`pptxRefs.ts`). `#slide=N&xywh=…` reveals that slide with the box
    * outlined.
+   *
+   * Edit mode (the bar's edit, `PptxEditLayer.svelte`): move, resize and
+   * delete shapes, edit their text, drag thumbnails to reorder slides. The
+   * edits live in `pptxEditStore.svelte.ts` (undo, unsaved state, journal,
+   * the hash-checked save that rewrites only the touched parts); a slide an
+   * edit touched is redrawn from its patched XML, so the stage and strip
+   * always show the renderer's real output. "PowerPoint" opens the deck in
+   * the real app through the native shell (a round trip for a remote host).
    */
   import { untrack } from "svelte";
-  import type { SlideHandle } from "@aiden0z/pptx-renderer";
-  import { renderSlide } from "@aiden0z/pptx-renderer";
-  import { basename, fsDownload } from "./files";
+  import type { SlideData, SlideHandle } from "@aiden0z/pptx-renderer";
+  import { materializeSlideNodes, renderSlide } from "@aiden0z/pptx-renderer";
+  import { basename, dirname, fsDownload, fsList } from "./files";
   import { onDiskVersion, ownedObjectUrls, paneVisibility, useFileEntry } from "./viewLifecycle.svelte";
   import { fetchRawBytes, TooLargeError } from "./rawBytes";
   import { loadDeck, loadNotes, type Deck } from "./pptxDeck";
@@ -35,6 +43,18 @@
   import { activeSelection, clearSelection, setSelection, type FileSelection } from "../shared/reference";
   import { dragRegion, screenToPage, type Point, type Region } from "./imageRegion";
   import { areaReference, itemAt, PX_TO_PT, slideItems, slideReference, snapBox, type SlideItem } from "./pptxRefs";
+  import PptxEditLayer from "./PptxEditLayer.svelte";
+  import { deckEdits } from "./pptxEditStore.svelte";
+  import { sha256Hex } from "./pptxPackage";
+  import { slideOrder } from "./pptxXml";
+  import {
+    canOpenInOffice,
+    listenOfficeTrip,
+    officeTrip,
+    openInOffice,
+    resolveOfficeTrip,
+    type OfficeTrip,
+  } from "../net/native";
 
   interface Props {
     path: string;
@@ -104,11 +124,47 @@
     () => slot,
   );
   onDiskVersion(() => file.current, () => onScreen.pane, {
-    load: readDeck,
-    apply: ({ d, bytes }, still) => {
+    // This window's own save: the stage already shows exactly what it wrote
+    // (the edited slides were redrawn from it), so there's nothing to read —
+    // re-reading would refetch the whole deck and redraw every slide.
+    load: async (signal) => {
+      const m = untrack(() => file.current?.mtime ?? null);
+      if (untrack(() => deck !== null && edits.ready) && file.current?.isOwnWrite(m) === true) return null;
+      return readDeck(signal);
+    },
+    apply: (got, still) => {
+      if (got === null) return;
+      // Mid-typing or mid-drag the drawn slide is being edited: take the new
+      // version when that ends (the history rebases onto it then).
+      if (holding) {
+        heldVersion = { got, still };
+        return;
+      }
+      applyVersion(got, still);
+    },
+    fail: (e) => {
+      tooLarge = e instanceof TooLargeError;
+      error = e instanceof Error ? e.message : "the deck could not be opened";
+    },
+    whileHidden: "defer",
+  });
+
+  /** A disk version that landed while the slide was held. */
+  let heldVersion: { got: { d: Deck; bytes: ArrayBuffer }; still: () => boolean } | null = null;
+  $effect(() => {
+    if (holding) return;
+    const h = heldVersion;
+    heldVersion = null;
+    if (h !== null && h.still()) untrack(() => applyVersion(h.got, h.still));
+  });
+
+  function applyVersion({ d, bytes }: { d: Deck; bytes: ArrayBuffer }, still: () => boolean): void {
       disposeAll();
       revokeMedia();
       clearPick();
+      lastBytes = bytes;
+      drawn.clear();
+      relTargets = null;
       deck = d;
       deckGen += 1;
       error = null;
@@ -124,13 +180,17 @@
         },
         () => {},
       );
-    },
-    fail: (e) => {
-      tooLarge = e instanceof TooLargeError;
-      error = e instanceof Error ? e.message : "the deck could not be opened";
-    },
-    whileHidden: "defer",
-  });
+      // A history (this view's, or one a closed view left unsaved) follows
+      // every version on disk: our own save is recognized, anything else is
+      // rebased, and the touched slides are drawn edited. Unsaved edits a
+      // crash or reload left in the journal come back at once, not at the
+      // next press of edit (the unsaved dot and the note show they're there).
+      if (edits.ready || editMode) void attachEdits(bytes, still);
+      else
+        void edits.hasJournal().then((has) => {
+          if (has && still() && !disposed) void attachEdits(bytes, still);
+        });
+  }
 
   $effect(() => () => disposeAll());
 
@@ -226,8 +286,10 @@
   $effect(() => {
     void $revealRequest;
     const req = takeReveal(path);
-    if (req?.slide === undefined) return;
-    const i = req.slide - 1;
+    // A plain line (a check's problem on "slide N", `deck.pptx:3`) is a slide.
+    const slideNo = req?.slide ?? req?.line;
+    if (req === null || slideNo === undefined || !(slideNo >= 1)) return;
+    const i = slideNo - 1;
     untrack(() => {
       revealed = req.region === undefined ? null : { slide: i, region: req.region };
       // The followed box replaces a pick, even on the slide already shown.
@@ -243,6 +305,452 @@
     if (next !== current) clearPick();
     current = next;
   }
+
+
+  // --- editing ---------------------------------------------------------------------
+
+  const PRES_PART = "ppt/presentation.xml";
+  const PRES_RELS = "ppt/_rels/presentation.xml.rels";
+
+  const edits = $derived(deckEdits(path));
+  $effect(() => {
+    const e = edits;
+    e.retainView();
+    // A refused save rechecks the disk now rather than waiting for the watcher.
+    e.onConflict = () => void file.current?.revalidate();
+    return () => {
+      e.onConflict = null;
+      e.releaseView();
+    };
+  });
+
+  let editMode = $state(false);
+  let selectedShape = $state<string | null>(null);
+  let texting = $state(false);
+  /** The layer is editing the drawn slide (typing in place, mid-drag): don't
+   *  redraw it under the caret or the pointer. */
+  let holding = $state(false);
+  /** A short note from the layer ("edit tables in PowerPoint"). */
+  let layerNotice = $state<string | null>(null);
+  /** Bumped when a slide was redrawn from edited XML (the layer re-reads it). */
+  let slideGen = $state(0);
+  let editLayer = $state<{ key(e: KeyboardEvent): boolean | "typing" } | null>(null);
+  /** The version on screen, for a history's first attach. */
+  let lastBytes: ArrayBuffer | null = null;
+  /** The XML each part's slide was last drawn from, where that isn't disk. */
+  const drawn = new Map<string, string>();
+  /** `presentation.xml`'s relationship ids → slide parts (slide order). */
+  let relTargets: Map<string, string> | null = null;
+  /** PowerPoint has this deck open here (its `~$` owner file sits beside it). */
+  let lockedBy = $state(false);
+  let disposed = false;
+  $effect(() => () => (disposed = true));
+
+  async function attachEdits(bytes: ArrayBuffer, still: () => boolean): Promise<void> {
+    const hash = await sha256Hex(bytes);
+    if (!still() || disposed) return;
+    await edits.attach(bytes, hash);
+    if (!still() || disposed) return;
+    await loadOrderParts();
+    if (!still() || disposed) return;
+    syncEdited();
+  }
+
+  /** The slide list and its relationships, read once per version. */
+  async function loadOrderParts(): Promise<void> {
+    if (relTargets !== null || !edits.ready) return;
+    const [rels] = await Promise.all([edits.ensure(PRES_RELS), edits.ensure(PRES_PART)]);
+    if (rels === null) return;
+    const doc = new DOMParser().parseFromString(rels, "application/xml");
+    const map = new Map<string, string>();
+    for (const r of Array.from(doc.getElementsByTagNameNS("*", "Relationship"))) {
+      const id = r.getAttribute("Id");
+      const target = r.getAttribute("Target");
+      if (id === null || target === null || r.getAttribute("TargetMode") === "External") continue;
+      const base = target.startsWith("/") ? [] : ["ppt"];
+      for (const seg of target.replace(/^\//, "").split("/")) {
+        if (seg === "..") base.pop();
+        else if (seg !== "." && seg !== "") base.push(seg);
+      }
+      map.set(id, base.join("/"));
+    }
+    relTargets = map;
+  }
+
+  /** Redraw every slide whose edited XML differs from what it shows, and
+   *  follow an edited slide order. */
+  function syncEdited(): void {
+    const d = deck;
+    if (d === null || !edits.ready) return;
+    applyOrder(d);
+    const now = deck;
+    if (now === null) return;
+    for (const [i, slide] of now.presentation.slides.entries()) {
+      // The stage's slide is being edited in its own DOM (typing, a drag):
+      // it is redrawn when that ends (the thumbnail follows then too).
+      if (holding && i === current) continue;
+      const text = edits.partText(slide.slidePath);
+      if (text === null) continue;
+      const was = drawn.get(slide.slidePath) ?? edits.diskText(slide.slidePath);
+      if (text === was) continue;
+      replaceSlide(i, text);
+      drawn.set(slide.slidePath, text);
+    }
+  }
+
+  $effect(() => {
+    void edits.version;
+    void holding;
+    untrack(syncEdited);
+  });
+
+  /** Put the deck's slides in the edited order, the current slide kept. */
+  function applyOrder(d: Deck): void {
+    const xml = edits.partText(PRES_PART);
+    const targets = relTargets;
+    if (xml === null || targets === null) return;
+    let order: string[];
+    try {
+      order = slideOrder(xml).map((r) => targets.get(r) ?? "");
+    } catch {
+      return;
+    }
+    const now = d.presentation.slides.map((sl) => sl.slidePath);
+    if (order.length !== now.length || order.every((p, k) => p === now[k])) return;
+    if (new Set(order).size !== order.length || order.some((p) => !now.includes(p))) return;
+    const keep = now[current];
+    const perm = order.map((p) => now.indexOf(p));
+    const slides = perm.map((k) => d.presentation.slides[k]!);
+    slides.forEach((sl, k) => (sl.index = k));
+    d.presentation.slides.splice(0, slides.length, ...slides);
+    const notesSkipped = new Set<number>();
+    for (const k of d.notesSkipped) notesSkipped.add(perm.indexOf(k));
+    disposeAll();
+    itemsMemo = null;
+    deck = { ...d, notes: perm.map((k) => d.notes[k] ?? ""), notesSkipped };
+    deckGen += 1;
+    current = Math.max(0, keep === undefined ? current : order.indexOf(keep));
+  }
+
+  /** Draw slide `i` from `xml`: a fresh lazy slide in the presentation, its
+   *  stage render swapped in place (new one up before the old goes, so the
+   *  stage never blinks) and its thumbnail re-mounted. */
+  function replaceSlide(i: number, xml: string): void {
+    const d = deck;
+    const old = d?.presentation.slides[i];
+    if (d === null || old === undefined) return;
+    const fresh: SlideData = {
+      index: old.index,
+      nodes: [],
+      layoutIndex: old.layoutIndex,
+      rels: old.rels,
+      slidePath: old.slidePath,
+      showMasterSp: true,
+      sourceXml: xml,
+      nodesMaterialized: false,
+    };
+    d.presentation.slides[i] = fresh;
+    try {
+      materializeSlideNodes(d.presentation, fresh);
+    } catch {
+      nodeErrors += 1;
+    }
+    itemsMemo = null;
+    const th = thumbHandles.get(i);
+    if (th !== undefined) {
+      // The old picture stays until the new one replaces it (syncThumbs'
+      // replaceChildren), so the strip never blinks empty.
+      th.dispose();
+      thumbHandles.delete(i);
+    }
+    const st = stageHandles.get(i);
+    if (st !== undefined) {
+      stageHandles.delete(i);
+      const el = slot;
+      if (el !== null && i === current) {
+        const made = stageHandle(i, el);
+        if (made !== null) made.element.style.visibility = "visible";
+      }
+      st.dispose();
+      st.element.remove();
+    }
+    slideGen += 1;
+  }
+
+  /** The current slide in edit mode: laid out (its shapes known) and its
+   *  part loaded, so the first gesture applies at once. */
+  const editSlide = $derived.by(() => {
+    void slideGen;
+    void deckGen;
+    return deck?.presentation.slides[current];
+  });
+
+  $effect(() => {
+    // Also once the history attaches: entering edit mode starts the attach,
+    // and the slide's part can only load after it.
+    if (!editMode || !edits.ready) return;
+    const i = current;
+    void deckGen;
+    const d = untrack(() => deck);
+    const slide = d?.presentation.slides[i];
+    if (d === null || slide === undefined) return;
+    untrack(() => (selectedShape = null));
+    try {
+      materializeSlideNodes(d.presentation, slide);
+    } catch {
+      // Drawn as far as it goes; the layer shows what parsed.
+    }
+    void edits.ensure(slide.slidePath).then(() => {
+      if (!disposed) slideGen += 1;
+    });
+  });
+
+  async function toggleEdit(): Promise<void> {
+    if (editMode) {
+      editMode = false;
+      selectedShape = null;
+      stageEl?.focus({ preventScroll: true });
+      return;
+    }
+    if (areaMode) toggleArea();
+    clearPick();
+    revealed = null;
+    editMode = true;
+    stageEl?.focus({ preventScroll: true });
+    void checkLock();
+    const bytes = lastBytes;
+    if (bytes !== null) await attachEdits(bytes, () => lastBytes === bytes);
+  }
+
+  async function checkLock(): Promise<void> {
+    try {
+      const listing = await fsList(dirname(path), true);
+      lockedBy = listing.entries.some((e) => e.name === `~$${basename(path)}`);
+    } catch {
+      lockedBy = false;
+    }
+  }
+
+  async function saveEdits(): Promise<void> {
+    await edits.save();
+  }
+
+  function resolveConflicts(choice: "mine" | "theirs"): void {
+    edits.resolve(choice);
+    stageEl?.focus({ preventScroll: true });
+  }
+
+  /** Show the slide an undone or redone edit was on (the slide list stays). */
+  function showPart(part: string | undefined): void {
+    if (part === undefined || part === PRES_PART) return;
+    const i = deck?.presentation.slides.findIndex((sl) => sl.slidePath === part) ?? -1;
+    if (i >= 0 && i !== current) go(i);
+  }
+
+  function undoEdit(): void {
+    showPart(edits.undo()?.part);
+  }
+
+  function redoEdit(): void {
+    showPart(edits.redo()?.part);
+  }
+
+  /** "slide 1: 2 moves, text; slide 3: move": where the held edits are,
+   *  grouped by slide and kind. */
+  const conflictList = $derived.by(() => {
+    const bySlide = new Map<string, Map<string, number>>();
+    for (const c of edits.conflicts) {
+      const i = deck?.presentation.slides.findIndex((sl) => sl.slidePath === c.part) ?? -1;
+      const where = i >= 0 ? `slide ${i + 1}` : "the slide list";
+      const kinds = bySlide.get(where) ?? new Map<string, number>();
+      kinds.set(c.label, (kinds.get(c.label) ?? 0) + 1);
+      bySlide.set(where, kinds);
+    }
+    const plural = (label: string, n: number) => (n === 1 ? label : `${n} ${label === "text" ? "text edits" : `${label}s`}`);
+    return [...bySlide]
+      .map(([where, kinds]) => `${where}: ${[...kinds].map(([l, n]) => plural(l, n)).join(", ")}`)
+      .join("; ");
+  });
+
+  // --- slide order (thumbnail drag, edit mode) ---------------------------------------
+
+  /** A thumbnail being dragged: `dx` is how far it moved within the strip,
+   *  counting the strip's own scrolling since the press. */
+  let thumbDrag = $state.raw<{
+    from: number;
+    pointer: number;
+    startX: number;
+    startScroll: number;
+    clientX: number;
+    dx: number;
+    moved: boolean;
+  } | null>(null);
+  let thumbScrollRaf = 0;
+  let swallowClick = false;
+  /** Where the dragged slide lands: its index once moved (the others'
+   *  centres it has passed). */
+  const dropAt = $derived.by(() => {
+    const t = thumbDrag;
+    if (t === null || !t.moved) return null;
+    const span = thumbW + THUMB_GAP;
+    const centre = t.from * span + thumbW / 2 + t.dx;
+    let n = 0;
+    for (let k = 0; k < count; k++) if (k !== t.from && k * span + thumbW / 2 < centre) n++;
+    return n;
+  });
+  /** The insertion mark's x in the strip, between the thumbnails it lands between. */
+  const dropMarkX = $derived.by(() => {
+    const t = thumbDrag;
+    const to = dropAt;
+    if (t === null || to === null || to === t.from) return null;
+    const span = thumbW + THUMB_GAP;
+    return (to < t.from ? to : to + 1) * span - THUMB_GAP / 2;
+  });
+
+  function onThumbDown(e: PointerEvent, i: number): void {
+    if (!editMode || e.button !== 0 || !edits.ready || relTargets === null) return;
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    thumbDrag = {
+      from: i,
+      pointer: e.pointerId,
+      startX: e.clientX,
+      startScroll: stripEl?.scrollLeft ?? 0,
+      clientX: e.clientX,
+      dx: 0,
+      moved: false,
+    };
+  }
+
+  function onThumbMove(e: PointerEvent): void {
+    const t = thumbDrag;
+    if (t === null || e.pointerId !== t.pointer) return;
+    const dx = e.clientX - t.startX + ((stripEl?.scrollLeft ?? 0) - t.startScroll);
+    if (!t.moved && Math.abs(dx) < 5) return;
+    thumbDrag = { ...t, clientX: e.clientX, dx, moved: true };
+    if (thumbScrollRaf === 0) thumbScrollRaf = requestAnimationFrame(autoScrollStrip);
+  }
+
+  /** Near either end of the strip a dragged thumbnail scrolls it, so a slide
+   *  can travel the length of a long deck. */
+  function autoScrollStrip(): void {
+    thumbScrollRaf = 0;
+    const t = thumbDrag;
+    const strip = stripEl;
+    if (t === null || !t.moved || strip === null) return;
+    const r = strip.getBoundingClientRect();
+    const edge = 40;
+    const v = t.clientX < r.left + edge ? -(r.left + edge - t.clientX) : t.clientX > r.right - edge ? t.clientX - (r.right - edge) : 0;
+    if (v === 0) return;
+    const before = strip.scrollLeft;
+    strip.scrollLeft = before + Math.max(-24, Math.min(24, v / 2));
+    const moved = strip.scrollLeft - before;
+    if (moved !== 0) thumbDrag = { ...t, dx: t.dx + moved };
+    thumbScrollRaf = requestAnimationFrame(autoScrollStrip);
+  }
+
+  $effect(() => () => {
+    if (thumbScrollRaf !== 0) cancelAnimationFrame(thumbScrollRaf);
+  });
+
+  function onThumbUp(e: PointerEvent): void {
+    const t = thumbDrag;
+    if (t === null || e.pointerId !== t.pointer) return;
+    const el = e.currentTarget as HTMLElement;
+    if (el.hasPointerCapture(e.pointerId)) el.releasePointerCapture(e.pointerId);
+    const to = dropAt;
+    thumbDrag = null;
+    if (!t.moved || to === null) return;
+    swallowClick = true;
+    const xml = edits.partText(PRES_PART);
+    if (xml === null || to === t.from) return;
+    const from = slideOrder(xml);
+    const next = [...from];
+    const [moved] = next.splice(t.from, 1);
+    next.splice(to, 0, moved!);
+    // applyOrder keeps whichever slide is current, the dragged one included.
+    edits.edit({ kind: "order", part: PRES_PART, from, to: next });
+  }
+
+  function onThumbCancel(e: PointerEvent): void {
+    if (thumbDrag !== null && e.pointerId === thumbDrag.pointer) thumbDrag = null;
+  }
+
+  // --- the same file in PowerPoint ---------------------------------------------------
+
+  const officeOk = $derived(canOpenInOffice(path));
+  let trip = $state.raw<OfficeTrip | null>(null);
+  let officeBusy = $state(false);
+  let officeError = $state<string | null>(null);
+  /** Where PowerPoint's saves go after "save mine as a copy". */
+  let officeNote = $state<string | null>(null);
+  let officeApp = $state("PowerPoint");
+
+  $effect(() => {
+    if (!officeOk) return;
+    const p = path;
+    let stop: (() => void) | null = null;
+    let gone = false;
+    void officeTrip(p).then((t) => {
+      if (!gone) trip = t;
+    });
+    void listenOfficeTrip((t) => {
+      // A trip ends on its own once PowerPoint closes the deck, all sent.
+      if (t.path === p) trip = t.state === "done" ? null : t;
+    }).then((un) => {
+      if (gone) un();
+      else stop = un;
+    });
+    return () => {
+      gone = true;
+      stop?.();
+    };
+  });
+
+  async function openOffice(): Promise<void> {
+    officeError = null;
+    // PowerPoint opens what is on disk: unsaved edits here go first.
+    if (edits.dirty) {
+      const ok = await edits.save();
+      if (!ok) {
+        officeError = edits.conflicts.length > 0 ? "decide the conflicting edits first" : "save your edits first";
+        return;
+      }
+    }
+    officeBusy = true;
+    try {
+      const r = await openInOffice(path);
+      officeApp = r.app;
+      if (r.trip !== null) trip = r.trip;
+    } catch (e) {
+      officeError = e instanceof Error ? e.message : "PowerPoint couldn't open it";
+    } finally {
+      officeBusy = false;
+    }
+  }
+
+  async function settleTrip(choice: "overwrite" | "copy" | "theirs" | "done"): Promise<void> {
+    officeError = null;
+    try {
+      stageEl?.focus({ preventScroll: true });
+      const copy = await resolveOfficeTrip(path, choice);
+      // After "copy" the trip follows the copy: this deck has none left.
+      if (choice === "done" || choice === "copy") trip = null;
+      if (choice === "copy" && copy !== null) officeNote = `PowerPoint now saves to ${basename(copy)}`;
+    } catch (e) {
+      officeError = e instanceof Error ? e.message : "that didn't work";
+    }
+  }
+
+  const tripLabel = $derived.by(() => {
+    const t = trip;
+    if (t === null) return null;
+    if (t.state === "uploading") return "uploading…";
+    if (t.state === "error") return "upload failed";
+    if (t.state === "conflict") return null;
+    if (t.uploaded_ms === null) return `in ${officeApp}`;
+    const at = new Date(t.uploaded_ms);
+    return `in ${officeApp} · saved ${at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+  });
 
   let stageW = $state(0);
   let stageH = $state(0);
@@ -297,7 +805,7 @@
   }
 
   function onBoxPointerDown(e: PointerEvent): void {
-    if (e.button !== 0 || deck === null || presenting || !(areaMode || e.shiftKey)) return;
+    if (e.button !== 0 || deck === null || presenting || editMode || !(areaMode || e.shiftKey)) return;
     const at = slidePoint(e);
     if (at === null) return;
     e.preventDefault();
@@ -355,7 +863,7 @@
    *  shape's jump or web link (the renderer's listeners, on the target)
    *  must not run. The slide's @ is a button of its own. */
   function onBoxClickCapture(e: MouseEvent): void {
-    if (!(areaMode || e.shiftKey)) return;
+    if (!(areaMode || e.shiftKey || editMode)) return;
     if ((e.target as Element | null)?.closest?.(".slide-ref") != null) return;
     e.preventDefault();
     e.stopPropagation();
@@ -372,6 +880,11 @@
   }
 
   function toggleArea(): void {
+    // Pointing and editing both take the slide's pointer: one at a time.
+    if (!areaMode && editMode) {
+      editMode = false;
+      selectedShape = null;
+    }
     areaMode = !areaMode;
     if (!areaMode) clearPick();
     stageEl?.focus({ preventScroll: true });
@@ -458,6 +971,7 @@
   $effect(() => {
     void thumbRange;
     void deckGen;
+    void slideGen;
     if (!showThumbs || stripEl === null) return;
     // After the stage: thumbnails never hold up the slide being read.
     let t = setTimeout(function pump() {
@@ -498,6 +1012,28 @@
   // --- keys, present -------------------------------------------------------------
 
   function onKey(e: KeyboardEvent): void {
+    if (editMode && !presenting && deck !== null && !texting) {
+      const mod = (e.metaKey || e.ctrlKey) && !e.altKey;
+      if (!mod && !e.altKey) {
+        const took = editLayer?.key(e) ?? false;
+        if (took === "typing") return;
+        if (took) {
+          e.preventDefault();
+          return;
+        }
+        // Editing, these keys are not the slide show's: no paging back on a
+        // stray Backspace, no full screen on a typed f.
+        if (["Backspace", "Delete", " ", "Enter", "f", "F5"].includes(e.key)) {
+          e.preventDefault();
+          return;
+        }
+      }
+      if (!mod && e.key === "Escape") {
+        e.preventDefault();
+        void toggleEdit();
+        return;
+      }
+    }
     if (e.metaKey || e.ctrlKey || e.altKey) return;
     // Enter and Space on a control inside the stage (the slide's @, a
     // slide link) activate it; they page the deck only from the stage.
@@ -540,6 +1076,25 @@
     e.preventDefault();
   }
 
+  /** ⌘S, ⌘Z and ⇧⌘Z / ⌘Y anywhere in the viewer (the stage, the strip after
+   *  a drag, the bar's buttons), not only on the stage. A text field keeps
+   *  its own undo. */
+  function onViewKey(e: KeyboardEvent): void {
+    if (!(e.metaKey || e.ctrlKey) || e.altKey || deck === null || presenting || texting) return;
+    if (!(editMode || edits.dirty)) return;
+    const t = e.target as HTMLElement | null;
+    if (t !== null && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+    const k = e.key.toLowerCase();
+    if (k === "s") {
+      e.preventDefault();
+      void saveEdits();
+    } else if (k === "z" || k === "y") {
+      e.preventDefault();
+      if (k === "y" || e.shiftKey) redoEdit();
+      else undoEdit();
+    }
+  }
+
   async function togglePresent(): Promise<void> {
     const el = stageEl;
     if (el === null) return;
@@ -567,7 +1122,7 @@
 
   /** Web links inside a slide open through the app, never in this page. */
   function onStageClick(e: MouseEvent): void {
-    if (areaMode || e.shiftKey) {
+    if (areaMode || e.shiftKey || editMode) {
       e.preventDefault();
       return;
     }
@@ -595,7 +1150,8 @@
   const hiddenSlide = $derived(deck?.presentation.slides[current]?.hidden === true);
 </script>
 
-<div class="pptx-view">
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div class="pptx-view" onkeydown={onViewKey}>
   <div class="slides-bar">
     {#if deck !== null}
       <button class="bbtn icon" onclick={() => go(current - 1)} disabled={current === 0} title="previous slide (←)" aria-label="previous slide">
@@ -620,7 +1176,41 @@
       </span>
     {/if}
     {#if downloadError !== null}<span class="bar-err">{downloadError}</span>{/if}
+    {#if officeError !== null}<span class="bar-err">{officeError}</span>{/if}
+    {#if officeNote !== null}<span class="status" role="status">{officeNote}</span>{/if}
     <span class="spacer"></span>
+    {#if deck !== null && (editMode || edits.dirty || edits.saving)}
+      <span class="edit-tools" role="group" aria-label="editing">
+        {#if edits.blocked !== null}
+          <span class="bar-err" title={edits.blocked}>can't edit: {edits.blocked}</span>
+        {:else if !edits.ready}
+          <span class="status">getting ready…</span>
+        {:else}
+          {#if edits.error !== null}<span class="bar-err" title={edits.error}>{edits.error}</span>{/if}
+          {#if layerNotice !== null}<span class="status" role="status">{layerNotice}</span>{/if}
+          {#if lockedBy}
+            <span class="status warn" title="PowerPoint has this deck open: its next save there replaces what is saved here">open in PowerPoint</span>
+          {/if}
+          {#if edits.unjournaled && edits.dirty}
+            <span class="status warn" title="your edits couldn't be backed up in this window's journal — save to keep them">not backed up</span>
+          {/if}
+          {#if edits.saving}
+            <span class="status">saving…</span>
+          {:else if edits.note !== null}
+            <span class="status ok" role="status">{edits.note}</span>
+          {:else if edits.dirty}
+            <span class="status"><span class="dot" aria-hidden="true"></span>unsaved</span>
+          {/if}
+          <button class="bbtn icon" onclick={undoEdit} disabled={!edits.canUndo} title="undo (⌘Z)" aria-label="undo">
+            <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M5.5 4 2.5 7l3 3M3 7h6.5a4 4 0 0 1 0 8H8" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" /></svg>
+          </button>
+          <button class="bbtn icon" onclick={redoEdit} disabled={!edits.canRedo} title="redo (⇧⌘Z)" aria-label="redo">
+            <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M10.5 4l3 3-3 3M13 7H6.5a4 4 0 0 0 0 8H8" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" /></svg>
+          </button>
+          <button class="bbtn save" class:primed={edits.dirty} onclick={() => void saveEdits()} disabled={!edits.dirty || edits.saving} title="save (⌘S)">save</button>
+        {/if}
+      </span>
+    {/if}
     {#if deck !== null}
       {#if hasNotes}
         <button class="bbtn" class:on={showNotes} onclick={() => (showNotes = !showNotes)} title="show or hide the speaker notes">notes</button>
@@ -647,11 +1237,64 @@
         >
       </button>
       <button class="bbtn" onclick={() => void togglePresent()} title="present full screen (F)">present</button>
+      <button
+        class="bbtn"
+        class:on={editMode}
+        onclick={() => void toggleEdit()}
+        aria-pressed={editMode}
+        title={editMode ? "stop editing (Esc)" : "edit: move, resize and retype shapes, drag thumbnails to reorder"}>edit</button
+      >
     {/if}
-    {#if remote}
+    {#if officeOk}
+      {#if tripLabel !== null}<span class="status" title="saves in PowerPoint are uploaded to {basename(path)} on this host">{tripLabel}</span>{/if}
+      <button
+        class="bbtn"
+        onclick={() => void openOffice()}
+        disabled={officeBusy}
+        title={remote
+          ? `open in PowerPoint: a copy on this Mac, every save there uploaded back${edits.dirty ? " (your edits here are saved first)" : ""}`
+          : `open ${basename(path)} in PowerPoint${edits.dirty ? " (your edits here are saved first)" : ""}`}
+        >{officeBusy ? "opening…" : "PowerPoint"}</button
+      >
+    {:else if remote}
       <button class="bbtn" onclick={() => void download()} title="download {basename(path)} to open it in PowerPoint">download</button>
     {/if}
   </div>
+
+  {#if edits.conflicts.length > 0}
+    <div class="banner" role="alert">
+      <span>This deck changed on disk where you also edited it: {conflictList}.</span>
+      <!-- The banner goes with the choice: focus goes back to the stage so the
+           deck's keys (⌘S, arrows) keep working. -->
+      <button class="opt" onclick={() => resolveConflicts("mine")}>keep mine</button>
+      <button class="opt" onclick={() => resolveConflicts("theirs")}>use theirs</button>
+    </div>
+  {/if}
+  {#if trip?.state === "conflict"}
+    <div class="banner" role="alert">
+      <span
+        >{basename(path)} changed here while it was open in {officeApp}, so your last save there wasn't sent. Nothing
+        was overwritten.</span
+      >
+      <button
+        class="opt"
+        onclick={() => void settleTrip("overwrite")}
+        title="your {officeApp} version replaces the one here (the other changes are lost)">keep mine</button
+      >
+      <button
+        class="opt"
+        onclick={() => void settleTrip("copy")}
+        title="both stay: yours is saved beside it as a copy, and later {officeApp} saves go to the copy">keep both</button
+      >
+      <button
+        class="opt"
+        onclick={() => void settleTrip("theirs")}
+        title="opens the version here in {officeApp}; your unsent changes stay only in the window you have open">use theirs</button
+      >
+    </div>
+  {:else if trip?.state === "error" && trip.message !== null}
+    <div class="banner" role="alert"><span>{trip.message}</span></div>
+  {/if}
 
   <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
@@ -666,6 +1309,10 @@
     aria-label="slides"
     onkeydown={onKey}
     onclick={onStageClick}
+    onpointerdown={(e) => {
+      // The grey around the slide is "nothing": a press there deselects.
+      if (editMode && e.target === e.currentTarget && !texting) selectedShape = null;
+    }}
   >
     {#if deck !== null && scale > 0}
       <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -677,7 +1324,9 @@
         onpointerdown={onBoxPointerDown}
         onmousedown={(e) => {
           // Shift extends a text selection by default; here it draws a box.
-          if (areaMode || e.shiftKey) e.preventDefault();
+          // Typing in place: the press is the text's own (caret, selection).
+          if (texting) return;
+          if (areaMode || e.shiftKey || editMode) e.preventDefault();
         }}
         onpointermove={onBoxPointerMove}
         onpointerup={onBoxPointerUp}
@@ -686,6 +1335,24 @@
       >
         <div class="slide-scale" style:width="{w}px" style:height="{h}px" style:transform="scale({scale})" bind:this={slot}></div>
         {#if !presenting}
+          {#if editMode && edits.ready && edits.blocked === null && editSlide !== undefined}
+            <PptxEditLayer
+              bind:this={editLayer}
+              {edits}
+              slide={editSlide}
+              part={editSlide.slidePath}
+              slideW={w}
+              slideH={h}
+              {scale}
+              version={slideGen + deckGen}
+              bind:selected={selectedShape}
+              bind:texting
+              bind:holding
+              bind:notice={layerNotice}
+              slideEl={() => stageHandles.get(current)?.element ?? null}
+              onsave={() => void saveEdits()}
+            />
+          {/if}
           {#if areaMode}<div class="area-layer" aria-hidden="true"></div>{/if}
           {#if revealBox !== null && pick === null}
             <div
@@ -708,7 +1375,7 @@
               style:height="{pick.h * ptScale}px"
             ></div>
           {/if}
-          <span class="slide-ref">
+          <span class="slide-ref" hidden={editMode}>
             <ReferenceButton pick={slidePick} label="slide {current + 1}" text="slide {current + 1}" />
           </span>
         {/if}
@@ -748,10 +1415,22 @@
             class="thumb"
             class:on={i === current}
             class:dim={deck.presentation.slides[i]?.hidden === true}
+            class:dragging={thumbDrag?.moved === true && thumbDrag.from === i}
+            class:reorder={editMode}
             data-thumb={i}
             style:left="{i * (thumbW + THUMB_GAP)}px"
             style:width="{thumbW}px"
+            style:transform={thumbDrag?.moved === true && thumbDrag.from === i ? `translateX(${thumbDrag.dx}px)` : undefined}
+            onpointerdown={(e) => onThumbDown(e, i)}
+            onpointermove={onThumbMove}
+            onpointerup={onThumbUp}
+            onpointercancel={onThumbCancel}
+            ondragstart={(e) => e.preventDefault()}
             onclick={() => {
+              if (swallowClick) {
+                swallowClick = false;
+                return;
+              }
               go(i);
               stageEl?.focus();
             }}
@@ -762,6 +1441,7 @@
             <span class="num">{i + 1}</span>
           </button>
         {/each}
+        {#if dropMarkX !== null}<span class="drop-mark" aria-hidden="true" style:left="{dropMarkX}px"></span>{/if}
       </div>
     </div>
   {/if}
@@ -824,6 +1504,68 @@
 
   .spacer {
     flex: 1;
+  }
+
+  .edit-tools {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    min-width: 0;
+    padding-right: 0.35rem;
+    margin-right: 0.15rem;
+    border-right: 1px solid var(--edge);
+  }
+
+  .status {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    white-space: nowrap;
+    color: var(--muted);
+  }
+
+  .status.warn {
+    color: var(--warn);
+    cursor: help;
+  }
+
+  .status.ok {
+    color: var(--accent-text);
+  }
+
+  .dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--fg);
+    opacity: 0.6;
+  }
+
+  .bbtn.save.primed {
+    color: var(--accent-text);
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+  }
+
+  .bbtn.save.primed:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--accent) 24%, transparent);
+  }
+
+  .banner {
+    flex: none;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    padding: 0.35rem 0.6rem;
+    border-bottom: 1px solid color-mix(in srgb, var(--warn) 35%, var(--edge));
+    background: color-mix(in srgb, var(--warn) 8%, var(--bg));
+    color: var(--fg);
+    font-size: var(--text-xs);
+  }
+
+  .banner > span {
+    flex: 1 1 18rem;
+    min-width: 0;
   }
 
   .bbtn,
@@ -1087,6 +1829,30 @@
 
   .thumb.dim {
     opacity: 0.55;
+  }
+
+  .thumb.reorder {
+    touch-action: none;
+  }
+
+  .thumb.dragging {
+    z-index: 2;
+    cursor: grabbing;
+    transition: none;
+    box-shadow:
+      0 0 0 2px var(--accent),
+      0 4px 14px color-mix(in srgb, #000 25%, transparent);
+  }
+
+  .drop-mark {
+    position: absolute;
+    top: -3px;
+    bottom: -3px;
+    width: 2px;
+    margin-left: -1px;
+    border-radius: 1px;
+    background: var(--accent);
+    pointer-events: none;
   }
 
   .thumb:hover {

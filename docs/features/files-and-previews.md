@@ -917,7 +917,57 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   its text — and the strip mounts only the thumbnails near its visible span, two per tick. Charts
   draw with ECharts (most of the viewer's ~1.1 MB / 345 KB-gzip chunk, loaded only by a deck).
   Animations and transitions aren't played and missing fonts fall back to the system's; the ⓘ in
-  the bar says so, and counts shapes that couldn't be drawn. Refused past 100 MB.
+  the bar says so, and counts shapes that couldn't be drawn. Refused past 100 MB. A reveal's
+  plain line (`deck.pptx:3`, a deck check's problem on slide 3) lands on that slide.
+- **Editing a deck.** The bar's **edit** turns the stage into an editor (`PptxEditLayer.svelte`):
+  click a shape to select it (the grey around the slide deselects), drag it (snapping to the
+  slide's edges and centre and to other shapes, with guides and a position readout in points;
+  Shift keeps one axis, Alt turns snapping off, Esc puts it back), resize it from its handles
+  (pictures keep their aspect unless Shift; resized edges snap too; tables and rotated shapes move
+  only), nudge it with the arrows (Shift: 10 px; nudges within a second are one undo step), Delete
+  it, Tab through shapes and out. Text is edited **where it is drawn**: double-click puts the caret
+  at the click, a click on the selected shape does too, Enter selects all of it, and just typing
+  on a selected text shape replaces it, as in PowerPoint. You type into the renderer's own text
+  body in the slide's real fonts (bullet markers kept out of the text); Enter is a new paragraph
+  (its bullet shows at once), Shift+Enter a line break, paste is plain text, formatting
+  shortcuts are off, and Esc, a click elsewhere or focus leaving commits it; the slide redraws
+  then. A shape whose drawn text doesn't read back as its XML gets a box editor under it instead,
+  and that one redraws as you type. Empty text placeholders show dashed; a table, chart or group
+  says where to edit it. A drag previews by moving the drawn shape and commits once on release.
+  Drag a thumbnail to reorder slides (the strip scrolls at its ends). ⌘Z / ⇧⌘Z undo and redo
+  anywhere in the viewer and show the slide they changed, ⌘S saves (also mid-typing), Esc steps
+  back: text, selection, edit mode. While editing, slide-show keys (Backspace, Space, Enter, F) do
+  nothing to the deck; edit mode and the area tool exclude each other, and the slide's @ hides.
+  Layout and master shapes aren't selectable, nor is a shape whose id repeats on its slide.
+  Edits are operations over the package's parts (`pptxEdits.ts`), applied as text splices to the
+  part's own XML (`pptxXml.ts`): a move rewrites only the `<a:off>` values, a resize only
+  `<a:ext>`, a text edit only the `<a:t>` text the change falls in (a new paragraph copies its
+  neighbour's formatting), a reorder only `<p:sldIdLst>`; a placeholder that inherits its place
+  gets the `<a:xfrm>` PowerPoint itself writes, and theme, layout and master parts are never
+  touched. A part edits only when its bytes round-trip through UTF-8 exactly. A save sends just
+  the touched parts to `POST /fs/package` with the SHA-256 the edits were based on; the daemon
+  copies every other zip entry byte-for-byte (local header, data and descriptor) into a temp
+  sibling and renames it over the deck, or answers 409. The history lives in
+  `pptxEditStore.svelte.ts`, not the view: closing the tab keeps it (the tab's unsaved dot, the
+  close and quit prompts offer Save), it is journaled through the drafts journal under
+  `<path>#pptx-edits` (reopening the deck after a crash or reload brings the edits back at once,
+  with the unsaved dot), and our own save coming back from disk is not re-read. Any other change
+  on disk — an agent's python-pptx rewrite, PowerPoint — waits while you are mid-typing or
+  mid-drag, then rebases the edits: each one replays over the new file, and one whose shape
+  changed or vanished there waits in a banner naming its slide (**keep mine** / **use theirs**;
+  a kept edit becomes an edit of the new file); nothing is overwritten or dropped silently. A
+  refused save (409) rechecks the disk at once. While PowerPoint has the deck open
+  (its `~$` owner file sits beside it) the bar says so, because PowerPoint's next save replaces
+  the file without checking.
+- **The same deck in PowerPoint.** In the app, **PowerPoint** in the bar opens the deck in
+  Microsoft PowerPoint (or the system's app for it), saving unsaved edits here first. A deck on
+  this machine opens in place, and PowerPoint's saves come back through the viewer's disk reload,
+  on the same slide. A deck on a remote or cluster host takes a round trip run by the shell: a
+  working copy on this Mac opened in PowerPoint, watched, and each save uploaded with the host's
+  hash from the last download or upload as the precondition (`PUT /fs/file/stream`, streamed to
+  disk). If the host's file changed meanwhile, nothing is overwritten: the banner offers **save mine
+  as a copy**, **open theirs** or **overwrite**. **done** ends the trip. In a plain browser the
+  remote deck keeps its **download**.
 - **Diagram boards.** JSON Canvas (`.canvas`), Excalidraw (`.excalidraw`, `.excalidraw.json`)
   and draw.io (`.drawio`, `.dio`; `.drawio.svg` / `.drawio.png` stay images) open on one pannable
   surface, `BoardView.svelte`: drag or scroll to pan, pinch or ⌘/Ctrl+scroll to zoom at the
@@ -1414,6 +1464,23 @@ _Captured 2026-11-04 (the maintainer, in the session that built it); questionnai
 - **Pending.** How settled the rest is (the box in points, shape names as context, a click
   picking a shape, no crop for now), and whether anything is frozen, has not been asked yet —
   capture via **capture-feature-intent** when available.
+
+### Editing a deck, and the same deck in PowerPoint — why it exists
+_Captured 2026-11-04 (the maintainer, in the sessions that designed and built it)._
+
+- **Problem it solves:** the maintainer wants Chimaera to be great for .pptx work with agents,
+  and asked to be able to edit and drag things directly in the viewer, or to sync with local
+  PowerPoint so the same file can be opened there.
+- **Settled scope:** move, resize, retype, reorder slides and delete shapes; adding shapes isn't
+  wanted here. Pictures and figures move like any shape, as native objects, and themes keep
+  working. Editing sits behind an explicit **edit** toggle — the viewer stays a viewer by
+  default. "Open in PowerPoint" opens the real Microsoft PowerPoint, one button even for a remote
+  deck.
+- **Core bet:** editing is core, not the PowerPoint extension's — extensions can't ship a viewer
+  of their own — and every edit is a minimal diff: the file is the truth, an untouched zip entry
+  stays byte-identical, and a save carries the hash it was based on.
+- **Pending.** Whether the round-trip's conflict choices (copy, theirs, overwrite) are the right
+  three hasn't been asked — capture via **capture-feature-intent** when available.
 
 ### HTML in a web view of its own, and marking HTML — why it exists
 _Captured 2026-11-04 (the maintainer, in the session that built it)._

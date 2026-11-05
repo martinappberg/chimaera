@@ -481,6 +481,8 @@
       "paths": [
         "web-ui/src/lib/previews/**",
         "crates/chimaera-server/src/fs.rs",
+        "crates/chimaera-server/src/fs/**",
+        "crates/chimaera-app/src/shell/office.rs",
         "crates/chimaera-server/src/notebook.rs",
         "web-ui/src/lib/workspace/FileTree.svelte"
       ],

@@ -206,6 +206,47 @@ export async function fsWrite(
   return { mtime: res.headers.get("X-Mtime"), hash: res.headers.get("X-Content-Hash") };
 }
 
+/** The daemon has no package route (an older daemon): editing stays off. */
+export class PackageUnsupportedError extends Error {}
+
+/**
+ * Replace existing entries of the zip package at `path` (a .pptx) via POST
+ * /fs/package: the daemon copies every other entry byte-for-byte, so a save
+ * sends only the changed parts. `expectHash` (the package's SHA-256 as the
+ * edits saw it) is required; a moved-on disk answers 409 → FileConflictError.
+ * A package the daemon won't splice (zip64, encrypted, …) is a 400 ApiError
+ * whose message says why.
+ */
+export async function fsPatchPackage(
+  path: string,
+  entries: readonly { name: string; data: string }[],
+  expectHash: string,
+  signal?: AbortSignal,
+): Promise<WriteResult> {
+  const q = new URLSearchParams({ path, expect_hash: expectHash });
+  const res = await api(`/fs/package?${q.toString()}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ entries }),
+    ...(signal !== undefined ? { signal } : {}),
+  });
+  if (res.status === 409) {
+    throw new FileConflictError("file changed on disk", res.headers.get("X-Content-Hash"), res.headers.get("X-Mtime"));
+  }
+  if (res.status === 404 || res.status === 405) throw new PackageUnsupportedError("this daemon can't save decks");
+  if (!res.ok) {
+    let message = `save failed with status ${res.status}`;
+    try {
+      const errBody = (await res.json()) as { error?: string };
+      if (errBody.error) message = errBody.error;
+    } catch {
+      // non-JSON error body; keep the generic message
+    }
+    throw new ApiError(res.status, message);
+  }
+  return { mtime: res.headers.get("X-Mtime"), hash: res.headers.get("X-Content-Hash") };
+}
+
 // --- the unsaved-edit journal's daemon mirror -------------------------------
 // A new tunnel port is a new browser origin with an empty IndexedDB, so dirty
 // text is mirrored to the daemon (~/.chimaera/drafts). Older daemons lack the
