@@ -16,7 +16,7 @@
    * xterm instances in termPool). `path` is fixed for this instance's life —
    * every host remounts per path.
    */
-  import { onMount, untrack, type Component } from "svelte";
+  import { flushSync, onMount, untrack, type Component } from "svelte";
   import { openSearchPanel, closeSearchPanel, searchPanelOpen, findNext, findPrevious } from "@codemirror/search";
   import { findTarget } from "../shared/find";
   import { Compartment, EditorState, type Extension } from "@codemirror/state";
@@ -101,6 +101,16 @@
   let langName = $state("");
   /** Bumped per pick, so a slow load never lands over a later one. */
   let langPick = 0;
+  /** The picker's full list, rendered on first use: a kept-alive editor
+   *  otherwise carries ~170 options it never opens. Synchronous, so the
+   *  native popup the same press opens already has them. */
+  let langListed = $state(false);
+  function listLanguages(e: Event): void {
+    if (langListed) return;
+    flushSync(() => (langListed = true));
+    // Svelte re-selects the value only a tick later; the popup opens now.
+    (e.currentTarget as HTMLSelectElement).value = langName;
+  }
   const settingsCompartment = new Compartment();
   const extraCompartment = new Compartment();
   const langCompartment = new Compartment();
@@ -608,12 +618,18 @@
         aria-label="Language"
         title="Language for highlighting"
         value={langName}
+        onpointerdown={listLanguages}
+        onfocus={listLanguages}
         onchange={(e) => pickLanguage(e.currentTarget.value)}
       >
-        <option value="">Plain text</option>
-        {#each languageNames as name (name)}
-          <option value={name}>{name}</option>
-        {/each}
+        {#if langListed}
+          <option value="">Plain text</option>
+          {#each languageNames as name (name)}
+            <option value={name}>{name}</option>
+          {/each}
+        {:else}
+          <option value={langName}>{langName === "" ? "Plain text" : langName}</option>
+        {/if}
       </select>
     {/if}
   </footer>

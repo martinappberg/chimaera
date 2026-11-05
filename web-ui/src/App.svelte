@@ -2004,25 +2004,41 @@
   /** The shell each chat's Run buttons type into (chat id → shell id),
    *  used again while it lives so one chat's commands share a history. */
   const runShells = new Map<string, string>();
+  /** Each chat's runs, one after another: a second click while the first
+   *  waits for a new shell's prompt must neither open another shell nor
+   *  type ahead of the first command. */
+  const runQueues = new Map<string, Promise<void>>();
+
+  function runCommandFromPane(paneId: string, chatId: string, command: string): void {
+    const next = (runQueues.get(chatId) ?? Promise.resolve()).then(() => runOnce(paneId, chatId, command));
+    const settled = next.catch(() => {});
+    runQueues.set(chatId, settled);
+    void settled.then(() => {
+      if (runQueues.get(chatId) === settled) runQueues.delete(chatId);
+    });
+  }
 
   /**
    * A chat's Run button: type `command` into the chat's terminal and press
-   * Enter. The terminal is the shell this chat last ran in, while it lives;
-   * else a new shell in the chat's folder (its live cwd), on the chat's own
-   * host. It opens beside the chat (the adjacent pane, or a split), never
-   * over it, so the block and its output read side by side.
+   * Enter. The terminal is the shell this chat last ran in, while it lives
+   * and sits at its prompt; else a new shell in the chat's folder (its live
+   * cwd), on the chat's own host. It opens beside the chat (the adjacent
+   * pane, or a split), never over it, so the block and its output read side
+   * by side.
    */
-  async function runCommandFromPane(paneId: string, chatId: string, command: string): Promise<void> {
+  async function runOnce(paneId: string, chatId: string, command: string): Promise<void> {
     const input = terminalInput(command);
     const chat = sessionsById.get(chatId);
     if (input === "" || chat === undefined) return;
     const priorId = runShells.get(chatId);
     const prior = priorId !== undefined ? sessionsById.get(priorId) : undefined;
-    // A shell running something would hand the text to that program's
-    // stdin (a pager, a prompt, a REPL): only one at its prompt is reused.
-    const fresh = prior === undefined || !prior.alive || prior.phase === "running";
+    // Only a shell that says it is at its prompt (OSC 133) is reused: one
+    // running something, an agent's command, or no integration at all could
+    // hand the text to a program's stdin (a pager, a prompt, a REPL).
+    const reuse =
+      prior !== undefined && prior.alive && prior.phase === "ready" && (prior.exec_stage ?? null) === null;
     let shellId: string;
-    if (!fresh) {
+    if (reuse) {
       shellId = prior.id;
     } else {
       createError = null;
@@ -2047,10 +2063,14 @@
     // A new shell gets the text once it reaches its prompt (OSC 133), so its
     // rc files never read it and it is not echoed twice; a shell without the
     // integration gets it after the wait, as typed-ahead input.
-    if (fresh) await waitForPrompt(shellId, RUN_PROMPT_WAIT_MS);
+    if (!reuse) await waitForPrompt(shellId, RUN_PROMPT_WAIT_MS);
+    // A reused prompt may hold something half-typed: Ctrl-U clears the line
+    // first (bash, zsh and fish, emacs and vi insert modes alike), so the
+    // command never runs glued to it.
+    const text = reuse ? `\x15${input}` : input;
     // No pooled socket yet (the tab is still mounting): the one-shot socket
     // sends once the server is ready.
-    if (!pool.sendText(shellId, input)) typeIntoDetachedSession(shellId, input);
+    if (!pool.sendText(shellId, text)) typeIntoDetachedSession(shellId, text);
   }
 
   const RUN_PROMPT_WAIT_MS = 15_000;

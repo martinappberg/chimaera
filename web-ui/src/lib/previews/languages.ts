@@ -32,8 +32,9 @@ const typst = LanguageDescription.of({
   extensions: ["typ"],
   async load() {
     const m = await import("codemirror-lang-typst/lezer");
-    // Raw blocks (```python …```) highlight in their own language.
-    const { language } = m.typst_lezer({ codeLanguages: shipped });
+    // Raw blocks (```python …```) highlight in their own language, named
+    // the way every other fence is.
+    const { language } = m.typst_lezer({ codeLanguages: (name) => languageNamed(name) });
     return new LanguageSupport(language, [
       m.typstLezerIndentService,
       m.typstLezerListKeymap,
@@ -152,14 +153,14 @@ const FILE_NAMES: readonly [string, RegExp][] = [
   ["TOML", /^(Cargo|poetry|uv|pdm)\.lock$|^Pipfile$/],
   [
     "XML",
-    /\.(plist|csproj|vbproj|fsproj|vcxproj|props|targets|resx|xaml|kml|gpx|graphml|sbml|xlf|xliff|nuspec|pom|rss|atom|xul|tmx|xmi|launch|urdf|sdf)$/,
+    /\.(plist|csproj|vbproj|fsproj|vcxproj|props|targets|resx|xaml|kml|gpx|graphml|sbml|xlf|xliff|nuspec|pom|rss|atom|xul|tmx|xmi|launch|urdf)$/,
   ],
   ["HTML", /\.(svelte|astro|xhtml|shtml|ejs|erb|mustache|cshtml|razor)$/],
   ["Jinja", /\.(njk|nunjucks|twig|jinja2?\.[a-z]+)$/],
   ["Markdown", /\.(mdx|mdown|mkdn|markdn|mdwn|ronn|livemd)$/],
   ["Python", /\.(pyi|ipy|star|bazel|sky|gyp|gypi|wsgi|rpy|pyt|tac)$/],
   ["Python", /^(SConstruct|SConscript|wscript|WORKSPACE|Tiltfile|meson\.build|meson_options\.txt)$/],
-  ["R", /^\.Rprofile$|\.(Rprofile|rprofile)$/],
+  ["R", /\.[Rr]profile$/],
   ["Ruby", /\.(rake|gemspec|ru|podspec|jbuilder|ex|exs)$|^(Podfile|Fastfile|Brewfile|Vagrantfile|Guardfile|Capfile|Berksfile|Dangerfile)$/],
   ["Groovy", /\.(gvy|gy|gsh)$/],
   ["Scala", /\.(sc|sbt)$/],
@@ -313,6 +314,10 @@ const fenceAlias = new Map<string, string>(
   Object.entries(FENCE_ALIASES).flatMap(([lang, names]) => names.map((n): [string, string] => [n, lang])),
 );
 
+/** Fence names that mean "no language". Matched first, because the fuzzy
+ *  match finds an alias inside them: ```text and ```plaintext hold `tex`. */
+const PLAIN = new Set(["text", "txt", "plain", "plaintext", "output", "none", "nohighlight", "raw", "log"]);
+
 /**
  * The language a fence or a notebook kernel names (`python`, `R`, `console`,
  * `snakemake`), or null. Exact names and aliases first, then CodeMirror's
@@ -320,7 +325,7 @@ const fenceAlias = new Map<string, string>(
  */
 export function languageNamed(name: string, fuzzy = true): LanguageDescription | null {
   const key = name.trim().toLowerCase();
-  if (key === "") return null;
+  if (key === "" || PLAIN.has(key)) return null;
   const exact = LanguageDescription.matchLanguageName(languages, key, false);
   if (exact !== null) return exact;
   const mapped = fenceAlias.get(key);

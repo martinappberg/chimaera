@@ -519,15 +519,15 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   from code chrome.
 - **Run a shell block.** A settled fence a shell reads (```` ```bash ````, `sh`, `zsh`, `console`,
   `shell-session`, `sbatch`, …) also carries a ▶ **run in terminal** button beside Copy. A click
-  types the block into the chat's terminal and presses Enter: the shell this chat last ran in
-  while it lives and sits at its prompt, else a new shell in the chat's folder on the chat's host,
-  opened beside the chat (the adjacent pane, or a split). A new shell gets the text once it
-  reports its prompt (OSC 133; 15 s at most for a shell without the integration), so rc files
-  never read it. A transcript-style block (lines starting `$ `) runs only those lines, prompt
-  removed, with their `\` continuations. Control characters are dropped and tabs become spaces;
-  the payload is the block as rendered, read at click time, like Copy. Nothing runs without the
-  click, and a block still streaming has no button (`chat/runCommand.ts`; App's
-  `runCommandFromPane`).
+  types the block into the chat's terminal and presses Enter (details on the
+  [terminals](terminals.md#commands-typed-in-from-a-chat) page). A transcript-style block (lines
+  starting `$ `, and always a `console`-family fence) runs only those lines, prompt removed, with
+  their `\` continuations and heredoc bodies minus the `> ` continuation prompt; a `console` block
+  with no prompt is output and gets no button. Control characters and zero-width characters are
+  dropped, tabs become spaces, and a block with bidi controls gets no button (what it shows is not
+  what it would run). The payload is the block as rendered, read at click time, like Copy; only a
+  button the app made runs anything, never one an agent's raw HTML forged. Nothing runs without the
+  click, and a block still streaming has no button (`chat/runCommand.ts`; App's `runOnce`).
 - **Quote part of a reply back to the agent.** Select any text in the transcript — a sentence of a
   reply, a few table rows, a line of tool output — and a quiet **`>` quote in reply** chip appears at
   the selection's end (the context bridge's chip; the chord `⇧⌘R` / `Ctrl+Shift+R` does the same).

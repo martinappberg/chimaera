@@ -40,7 +40,7 @@
 <script lang="ts">
   import { copyText } from "../shared/clipboard";
   import { copyLabel, copyPayload, decorateCopyTargets } from "../shared/copyDecor";
-  import { decorateRunTargets, runCommandKey, runPayload, type RunCommand } from "./runCommand";
+  import { decorateRunTargets, isRunButton, runCommandKey, runPayload, type RunCommand } from "./runCommand";
   import { markScrollRegions, watchWidth } from "../shared/scrollRegion";
   import { getSetting } from "../settings/store.svelte";
   import { advanceSegments, type SegmenterState } from "./streamSegments";
@@ -426,9 +426,10 @@
     // allowlist keeps the `hidden` attribute (and class names like our own
     // .rw-hidden are forgeable), so textContent could smuggle invisible text
     // into the payload; innerText copies exactly what is rendered.
-    // Run: the same live-DOM payload rule as copy (runCommand.ts header).
+    // Run: only a button runCommand.ts made (agent HTML can forge the
+    // class), with copy's live-DOM payload rule (runCommand.ts header).
     const runBtn = target?.closest?.("button.md-run");
-    if (runBtn instanceof HTMLElement && runCommand !== undefined) {
+    if (runBtn instanceof HTMLElement && runCommand !== undefined && isRunButton(runBtn)) {
       const command = runPayload(runBtn);
       if (command.length > 0) runCommand(command);
       return;

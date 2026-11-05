@@ -74,7 +74,7 @@ describe("languageFor", () => {
   });
 
   it("leaves files no grammar fits as plain text", () => {
-    for (const path of ["notes.txt", "main.tf", "flake.nix", "pipeline.wdl", "reads.fasta", "LICENSE"]) {
+    for (const path of ["notes.txt", "main.tf", "flake.nix", "pipeline.wdl", "reads.fasta", "ligands.sdf", "LICENSE"]) {
       expect(nameOf(path)).toBeNull();
     }
   });
@@ -140,9 +140,8 @@ describe("languageNamed", () => {
     expect(languageNamed(fence)?.name ?? null).toBe(lang);
   });
 
-  it("finds nothing for an empty or plain name", () => {
-    expect(languageNamed("")).toBeNull();
-    expect(languageNamed("text", false)).toBeNull();
+  it("finds nothing for an empty or plain name, even fuzzily", () => {
+    for (const name of ["", "text", "plaintext", "txt", "output", "log"]) expect(languageNamed(name), name).toBeNull();
   });
 });
 

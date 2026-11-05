@@ -27,6 +27,30 @@ describe("commandText", () => {
   it("yields nothing for an empty block", () => {
     expect(commandText("  \n ")).toBe("");
   });
+
+  it("runs nothing from a console block that holds only output", () => {
+    expect(commandText("error: no such file\nexit 1", "console")).toBe("");
+    expect(commandText("$ ls\nfile", "console")).toBe("ls");
+    // The same lines in a bash fence are commands.
+    expect(commandText("make\nmake install", "bash")).toBe("make\nmake install");
+  });
+
+  it("drops the continuation prompt a pasted transcript keeps", () => {
+    // `> b` typed as is would redirect into a file named b.
+    expect(commandText("$ echo a \\\n> b\na b")).toBe("echo a \\\nb");
+  });
+
+  it("keeps a heredoc body, without its prompts, through its end marker", () => {
+    const block = ["$ cat <<EOF > notes.txt", "> one", "heredoc> two", "> EOF", "$ wc -l notes.txt", "2 notes.txt"].join("\n");
+    expect(commandText(block)).toBe("cat <<EOF > notes.txt\none\ntwo\nEOF\nwc -l notes.txt");
+    // Arithmetic is not a heredoc: the output line after it stays out.
+    expect(commandText("$ echo $((1<<x))\n2")).toBe("echo $((1<<x))");
+  });
+
+  it("refuses a block with bidi controls and drops zero-width characters", () => {
+    expect(commandText("echo safe \u202e;fr- mr\u202c")).toBe("");
+    expect(commandText("ec\u200bho ok\ufeff")).toBe("echo ok");
+  });
 });
 
 describe("terminalInput", () => {
