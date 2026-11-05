@@ -71,7 +71,10 @@ Implementation: `claude.rs`, `journal.rs`, `chat.rs::resolve_start_settings`, an
 Claude Code, Codex, Antigravity (Gemini models), Grok Build and Cursor CLI share the transcript,
 composer, permissions, queue and replay core. Session `capabilities` and `catalog` events
 control the available header/composer actions. ACP model choices come from the authenticated
-provider; unsupported actions are not guessed from the agent's brand. Forking works across all
+provider; unsupported actions are not guessed from the agent's brand. An Antigravity model
+remembered from its older combined ids (`gemini-3.8-flash-high`) comes back as that model and
+thinking level. A finished shell command shows its output on every runtime, including the ones
+that report it only in the command's raw result (Antigravity, Cursor). Forking works across all
 four using native history where available or a conversation copy. Same-session chat/terminal
 switching and rewind remain Claude/Codex-only until the new providers' native boundaries are
 verified. See [integration design](../agent-guides/agent-integrations.md) for the plugin boundary.
@@ -346,7 +349,8 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   "set off by DISABLE_AUTO_COMPACT". Codex has no such switch), then every plan window
   this chat knows, each with when it resets ("in 1h 40m", "Thu 09:00"), and **All limits** →
   Settings → Agents. Claude reports both plan windows on every request (`unifiedWindows`), Codex its
-  primary/secondary windows during each turn, Grok its weekly credit window after each turn; an
+  primary/secondary windows during each turn, Grok its weekly credit window after each turn (an
+unused week reads 0%); an
   Antigravity chat, whose stream reports none, shows the account's live read from Agent settings
   instead ([agents.md](agents.md#plan-usage)). Nothing
   shows for an agent that reports neither (Cursor). Subscription usage (`/usage`, `/cost`, the

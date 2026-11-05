@@ -147,6 +147,10 @@ pub(crate) async fn spawn_session(
                 Ok(path) => path,
                 Err(msg) => return Err(SpawnFailure::AgentUnavailable(msg)),
             };
+            // Read from the activation path, before the lease pins argv to
+            // the package it resolves to.
+            opts.env
+                .extend(crate::runtimes::managed_agent_env(state, agent_kind, &bin));
             let (guard, mut binaries) =
                 crate::runtime_retention::acquire(state, Some(agent_kind), vec![bin])
                     .await
