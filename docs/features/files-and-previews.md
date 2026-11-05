@@ -1016,7 +1016,8 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   window's budget of three live views — the cards most recently on screen keep theirs, the
   rest close and load again when scrolled back. The expand toggle sits under the page there,
   since nothing draws over a view. A browser tab, the Linux and Windows apps, and an app build
-  without pane views keep the sandboxed frame.
+  without pane views — or with pane views but older than this (`native_view_show` answers
+  `fit`; an older shell drops the crop silently) — keep the sandboxed frame.
 - **PDF rendering.** Cards, panes and region snapshots share nonzero raster dimensions capped at
   12 million pixels and 8192 pixels per edge (`shared/pdfCanvas.ts`). Each draw owns a fresh canvas,
   and failed draws are cancelled before their handles are discarded: a graphics-initialization

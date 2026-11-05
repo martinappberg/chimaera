@@ -327,8 +327,14 @@ function painted(el: Element): boolean {
 function drawn(el: Element): boolean {
   const check = (el as Element & { checkVisibility?: (o: object) => boolean }).checkVisibility;
   if (check !== undefined) return check.call(el, { opacityProperty: true, visibilityProperty: true });
-  const style = getComputedStyle(el);
-  return style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0";
+  // An older WebKit: walk up, since a parked layer hides its content
+  // through an ancestor's opacity.
+  for (let at: Element | null = el; at !== null; at = at.parentElement) {
+    const style = getComputedStyle(at);
+    if (style.display === "none" || style.opacity === "0") return false;
+    if (at === el && style.visibility === "hidden") return false;
+  }
+  return true;
 }
 
 /**
@@ -434,7 +440,7 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
   let scrolling = false;
   let scrollTimer: ReturnType<typeof setTimeout> | null = null;
   /** Embedded: the ancestors whose overflow crops it, nearest first
-   *  (re-collected by the safety check: cards don't move between parents). */
+   *  (re-collected after a resize: cards don't move between parents). */
   let clippers: Element[] | null = null;
 
   const loadingNow = (): boolean =>
@@ -610,12 +616,22 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
           const at = want?.rect ?? measure();
           if (at === null) continue;
           awaitPage(created ? showing : null);
-          const fit: ViewFit = params.embedded === true ? { clip: visibleClip(), passive: params.passive === true } : {};
-          const ok = await nativeViewShow(id, url, at, true, fit);
+          const embedded = params.embedded === true;
+          const fit: ViewFit = embedded ? { clip: visibleClip(), passive: params.passive === true } : {};
+          const wasShown = placed !== "";
+          const shown = await nativeViewShow(id, url, at, true, fit);
           // The view exists from here even if this action is gone: the
           // `finally` closes it then.
-          if (ok) created = true;
+          if (shown !== null) created = true;
           if (destroyed) break;
+          // A card needs the crop and the wheel hand-back: a shell that
+          // ignored them (an older app build) would draw it over the
+          // window's chrome, so the card keeps its frame instead.
+          const ok = shown !== null && (!embedded || shown.fit);
+          if (shown !== null && !ok) {
+            created = false;
+            void nativeViewClose(id);
+          }
           if (!ok) {
             failed = true;
             awaiting = false;
@@ -625,6 +641,8 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
           }
           showing = url;
           placed = "";
+          // A new URL loads hidden: the view the host saw is gone for now.
+          if (wasShown) params.onShown?.(false);
           report();
           control?.applyChip();
           // The page beat the call: place it on the next pass.
@@ -694,8 +712,14 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
     }
   };
 
+  // A resize (the card's, or the window's) is when a scroller's box can
+  // have changed: the clipping ancestors are read again then.
+  const onResize = (): void => {
+    clippers = null;
+    burst();
+  };
   const overlays = new OverlayWatch(node, burst);
-  const resizes = new ResizeObserver(burst);
+  const resizes = new ResizeObserver(onResize);
   resizes.observe(node);
 
   // The safety net for what nothing above reports: a pure move, or an
@@ -710,7 +734,6 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
       safety = setInterval(
         () => {
           if (document.visibilityState !== "visible") return;
-          clippers = null;
           if (!sameRect(measure(), lastRect)) burst();
           else void sync();
         },
@@ -735,7 +758,7 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
   document.addEventListener("drop", onDragEnd, true);
   document.addEventListener("transitionrun", burst, true);
   document.addEventListener("transitionend", burst, true);
-  window.addEventListener("resize", burst);
+  window.addEventListener("resize", onResize);
   document.addEventListener("scroll", onScroll, { capture: true, passive: true });
   report();
   armSafety();
@@ -770,7 +793,7 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
       document.removeEventListener("drop", onDragEnd, true);
       document.removeEventListener("transitionrun", burst, true);
       document.removeEventListener("transitionend", burst, true);
-      window.removeEventListener("resize", burst);
+      window.removeEventListener("resize", onResize);
       document.removeEventListener("scroll", onScroll, { capture: true });
       if (scrollTimer !== null) clearTimeout(scrollTimer);
       if (created && !busy) void nativeViewClose(id);

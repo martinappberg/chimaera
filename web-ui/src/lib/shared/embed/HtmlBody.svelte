@@ -26,7 +26,7 @@
   import { untrack } from "svelte";
   import SlowLoad from "../SlowLoad.svelte";
   import { PaneViewControl, paneView, paneViewsPossible } from "../paneView";
-  import { liveViews } from "./liveViews.svelte";
+  import { liveViews, type Still } from "./liveViews.svelte";
 
   interface Props {
     url: string | null;
@@ -46,6 +46,10 @@
   /** A still is taken this long after the page shows (its first paint
    *  settles: fonts, a chart drawing in). */
   const STILL_AFTER_MS = 800;
+  /** Retaken on its own at most this often (a heavy page may still have
+   *  been drawing at the first one; a scroll alone changes nothing). Leaving
+   *  a card the user worked in always retakes it. */
+  const STILL_REFRESH_MS = 10_000;
 
   const id = `card${(seq += 1)}`;
   let native = $state(paneViewsPossible());
@@ -57,7 +61,16 @@
   let host = $state<HTMLElement | null>(null);
   let stageWidth = $state(0);
 
-  const still = $derived(native ? liveViews.still(url, stageWidth) : null);
+  /** This card's own last still: it wins over a shared one (another card
+   *  of the same report may show it scrolled elsewhere). */
+  let ownStill = $state<{ url: string; still: Still } | null>(null);
+  let stillAt = 0;
+  const still = $derived.by((): Still | null => {
+    if (!native) return null;
+    const own = ownStill;
+    if (own !== null && own.url === url && Math.round(own.still.width) === Math.round(stageWidth)) return own.still;
+    return liveViews.still(url, stageWidth);
+  });
   /** Holds a view: one of the cards most recently on screen. Off screen
    *  it stays, hidden (`shown`), so scrolling back doesn't load it again. */
   const live = $derived(native && active && url !== null && liveViews.live(id));
@@ -77,17 +90,35 @@
   async function takeStill(): Promise<void> {
     const at = url;
     if (at === null || !live || !shownNow || loading || crashed) return;
+    stillAt = Date.now();
     const shot = await control.snapshot();
     if (shot !== null && at === url) {
-      liveViews.keepStill(at, { src: `data:image/png;base64,${shot.png}`, width: shot.width, height: shot.height });
+      const taken: Still = { src: `data:image/png;base64,${shot.png}`, width: shot.width, height: shot.height };
+      ownStill = { url: at, still: taken };
+      liveViews.keepStill(at, taken);
     }
   }
+
+  /** A card over the budget takes a view back when the pointer comes to
+   *  it: one evicted while its tab was parked never sees its observer
+   *  fire again on the tab's return. */
+  function claim(): void {
+    if (native && active && !live) liveViews.seen(id);
+  }
+
+  $effect(() => {
+    const el = host;
+    if (el === null) return;
+    el.addEventListener("pointerenter", claim);
+    return () => el.removeEventListener("pointerenter", claim);
+  });
 
   // A still each time the view settles on screen: once the page is up, and
   // again after every scroll or overlay that hid it (a heavy page may still
   // have been drawing at the first one).
   $effect(() => {
     if (!live || !shownNow || loading || crashed) return;
+    if (untrack(() => still) !== null && Date.now() - stillAt < STILL_REFRESH_MS) return;
     const timer = setTimeout(() => void takeStill(), STILL_AFTER_MS);
     return () => clearTimeout(timer);
   });
@@ -158,7 +189,7 @@
       {:else if still === null && active}
         <!-- Over the window's budget of live pages and never drawn yet. -->
         <div class="note">
-          <button class="pill" onclick={() => liveViews.seen(id)}>Show the page</button>
+          <button class="pill" onclick={claim}>Show the page</button>
         </div>
       {/if}
     </div>

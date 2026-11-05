@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Manager, Webview};
 
@@ -243,6 +243,16 @@ fn own_label(webview: &Webview, id: &str) -> Result<String, String> {
 #[cfg(not(target_os = "macos"))]
 const UNSUPPORTED: &str = "pane views are macOS-only for now";
 
+/// What `native_view_show` answers: the placement options this shell
+/// honours. A page that needs `clip`/`passive` (an embed card) checks it:
+/// an older shell drops unknown arguments without a word, and a card it
+/// laid out uncropped would draw over the window's chrome.
+#[derive(Debug, Serialize)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(super) struct Shown {
+    fit: bool,
+}
+
 /// Create the view, or point an existing one at `url` (only when it
 /// changed), then place and show it.
 // One named field per page-side option: a struct would only rename them.
@@ -257,7 +267,7 @@ pub(super) fn native_view_show(
     hidden: Option<bool>,
     clip: Option<ViewRect>,
     passive: Option<bool>,
-) -> Result<(), String> {
+) -> Result<Shown, String> {
     let label = own_label(&webview, &id)?;
     let hidden = hidden.unwrap_or(false);
     if !rect.valid() || clip.is_some_and(|c| !c.valid()) {
@@ -301,7 +311,7 @@ pub(super) fn native_view_show(
             // doesn't exist.
             lock(&views.views).remove(&label);
         }
-        shown
+        shown.map(|()| Shown { fit: true })
     }
     #[cfg(not(target_os = "macos"))]
     {

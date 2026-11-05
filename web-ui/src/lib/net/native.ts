@@ -376,7 +376,7 @@ export interface ViewRect {
  * this window (`crates/chimaera-app/src/shell/native_view.rs`). Creates the
  * view on first call; a later call with the same `id` moves it and navigates
  * only if `url` changed. `hidden` creates or navigates it without showing
- * it (a page still loading; `nativeViewPlace` shows it). False outside the
+ * it (a page still loading; `nativeViewPlace` shows it). Null outside the
  * app, or from an app build without pane views — the caller falls back to
  * an iframe.
  */
@@ -386,15 +386,22 @@ export async function nativeViewShow(
   rect: ViewRect,
   hidden: boolean,
   fit: ViewFit = {},
-): Promise<boolean> {
+): Promise<ViewShown | null> {
   const t = tauri();
-  if (t === null) return false;
+  if (t === null) return null;
   try {
-    await t.core.invoke<void>("native_view_show", { id, url, rect, hidden, ...fit });
-    return true;
+    const shown = await t.core.invoke<{ fit?: unknown } | null>("native_view_show", { id, url, rect, hidden, ...fit });
+    return { fit: shown?.fit === true };
   } catch {
-    return false;
+    return null;
   }
+}
+
+/** What the shell made of a `nativeViewShow`: `fit` = it honours `ViewFit`
+ *  (an app build before embed cards answered nothing, and drops the
+ *  arguments without a word). */
+export interface ViewShown {
+  fit: boolean;
 }
 
 /** How a view sits in a scroller (an embed card): `clip` crops it to the
