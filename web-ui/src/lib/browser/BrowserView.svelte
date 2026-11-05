@@ -59,6 +59,7 @@
     setBrowserTitle,
     targetLabel,
   } from "./proxy";
+  import { verifiedSessions } from "./verifiedSessions";
 
   interface Props {
     /** The BrowserTab instance id (title-store key). */
@@ -267,32 +268,54 @@
   /** Serial number guarding async flows against target changes mid-flight. */
   let epoch = 0;
 
+  /** The page's URL under a proxy session's `base`. */
+  const srcAt = (b: string): string => `${b}${path.startsWith("/") ? path : `/${path}`}`;
+
   async function connect(): Promise<void> {
     const mine = ++epoch;
     if (host === "") {
       phase = { kind: "blank" };
       return;
     }
-    phase = { kind: "connecting" };
     degraded = false;
+    // A target this window just reached (this pane remounted by a move, or
+    // the same app reopened): show its page at once, and re-check behind it.
+    const known = verifiedSessions.recent(host, port);
+    if (known !== null) {
+      proxyId = known.id;
+      base = known.base;
+      iframeSrc = srcAt(known.base);
+      phase = { kind: "ready" };
+    } else {
+      phase = { kind: "connecting" };
+    }
     try {
       const session = await mintProxy(host, port, confirmed);
       if (mine !== epoch) return;
-      proxyId = session.id;
-      base = session.base;
       const health = await proxyHealth(session.id);
       if (mine !== epoch) return;
       if (!health.ok) {
+        verifiedSessions.forget(host, port);
+        // As before: the session stays the pane's (the node hunt and a
+        // retry use it).
+        proxyId = session.id;
+        base = session.base;
         phase = {
           kind: "unreachable",
           detail: health.detail ?? `nothing is listening on ${targetLabel(host, port)}`,
         };
         return;
       }
-      iframeSrc = `${session.base}${path.startsWith("/") ? path : `/${path}`}`;
+      verifiedSessions.remember(host, port, session);
+      // Already showing this session's page: nothing to change.
+      if (known !== null && known.id === session.id && known.base === session.base) return;
+      proxyId = session.id;
+      base = session.base;
+      iframeSrc = srcAt(session.base);
       phase = { kind: "ready" };
     } catch (e) {
       if (mine !== epoch) return;
+      verifiedSessions.forget(host, port);
       if (e instanceof ConfirmRequired) {
         phase = { kind: "confirm", detail: e.message };
       } else {
@@ -429,7 +452,11 @@
         if (proxyId !== id || phase.kind !== "ready") return;
         if (h.ok) {
           degraded = false;
-        } else if (h.error === "expired") {
+          return;
+        }
+        // Not good enough to show at once on a remount any more.
+        verifiedSessions.forget(host, port);
+        if (h.error === "expired") {
           // Daemon restarted or the session idled out: re-mint and re-point
           // the iframe (same target, fresh ticket).
           void connect();
@@ -904,6 +931,9 @@
         class:hidden={phase.kind !== "ready"}
         use:paneView={{
           url: iframeSrc,
+          // A move (the tab dragged to another pane) takes the live page
+          // along instead of reloading it.
+          keep: `browser:${tabId}`,
           shown: visible && phase.kind === "ready",
           onFallback: () => (native = false),
           onLoading: (l) => {

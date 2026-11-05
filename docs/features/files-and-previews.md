@@ -739,7 +739,9 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   with the same report in a pane view: window process ~40 MB, report process ~950 MB). Same URL
   as the iframe, so remote windows load it through their tunnel the same way. The view follows
   the pane, hides while a menu, dialog or tooltip overlaps it or a drag runs, and closes with its
-  tab or the window's page. In a browser tab, on Linux/Windows, or against an app build without
+  tab or the window's page. Dragging the tab to another pane keeps the page — the same view is
+  re-placed, not reloaded (`paneView`'s `keep`, see [browser-pane](browser-pane.md)) — unless the
+  file changed on disk meanwhile, which loads the new version. In a browser tab, on Linux/Windows, or against an app build without
   pane views it stays the iframe.
   **Marking** (context bridge, like PDFs): a text selection in the page publishes the file, the
   quote and the nearest heading (`§ Heading`) with the usual `@ reference in agent` pill by the

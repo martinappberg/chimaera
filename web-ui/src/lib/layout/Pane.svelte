@@ -1,3 +1,13 @@
+<script module lang="ts">
+  /** Each pane's kept-alive views by pane id, outliving the component: a
+   *  split that collapses (a tab dragged out of its pane) remounts the
+   *  surviving pane, and a fresh instance would otherwise mount only its
+   *  active tab — every other view, a pane view's live page included, would
+   *  be lost to the remount. Bounded: a few panes per window. */
+  const liveByPane = new Map<string, string[]>();
+  const LIVE_PANES_KEPT = 16;
+</script>
+
 <script lang="ts">
   import { keepsPaneViewAlive, tabKey, trimLive, MAX_PANES, type PaneNode, type Tab } from "./layout";
   import { untrack, type Component } from "svelte";
@@ -153,7 +163,21 @@
   // state. The live set is a per-pane MRU capped at LIVE_CAP; views enter only
   // after being active, so nothing is first measured at a degenerate size.
   const LIVE_CAP = 8;
-  let liveKeys = $state<string[]>([]);
+  // This instance starts from what the pane kept before a remount (read once).
+  let liveKeys = $state<string[]>(untrack(() => liveByPane.get(node.id) ?? []));
+
+  // Remember the set for this pane's next instance (newest last; old ids go).
+  $effect(() => {
+    const keys = [...liveKeys];
+    const id = node.id;
+    liveByPane.delete(id);
+    liveByPane.set(id, keys);
+    while (liveByPane.size > LIVE_PANES_KEPT) {
+      const oldest = liveByPane.keys().next().value;
+      if (oldest === undefined) break;
+      liveByPane.delete(oldest);
+    }
+  });
 
   function retainView(tab: Tab): boolean {
     return keepsPaneViewAlive(

@@ -43,7 +43,7 @@
   import FolderIcon from "../shared/FolderIcon.svelte";
   import { browserTitles, targetLabel } from "../browser/proxy";
   import { agentBrowser, browserLinks } from "../browser/agentBrowserRuntime";
-  import { paneViewsPossible } from "../shared/paneView";
+  import { paneViewsPossible } from "../shared/paneViewRoute";
   import ExtensionsGlyph from "../plugins/ExtensionsGlyph.svelte";
   import { workspacePlugins } from "../plugins/store";
   import { pluginViewTitle } from "../plugins/platform";

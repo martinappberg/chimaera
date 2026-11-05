@@ -324,7 +324,7 @@
   import { sharedTabsLeft, type Handover } from "./lib/browser/agentBrowser";
   import type { BrowserLink } from "./lib/net/browserWire";
   import { targetLabel } from "./lib/browser/proxy";
-  import { paneViewsPossible } from "./lib/shared/paneView";
+  import { paneViewsPossible } from "./lib/shared/paneViewRoute";
   import UpdateToast from "./lib/workspace/UpdateToast.svelte";
   import {
     applyAppStatus,

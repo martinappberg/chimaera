@@ -9,11 +9,12 @@ Orientation for coding agents. This area owns the browser pane: a live web app (
 | `BrowserView.svelte` | The pane view: the page on `/proxy/{id}` — in the macOS app a native pane view of its own (`shared/paneView.ts`; URL bar, title and path from its `page` reports, back/forward/reload through `nav`, text selections as references), else the same-origin iframe — back / reload / external / address field, and overlay states in place of raw browser error pages. Mints and re-mints the proxy session. |
 | `frameLocation.ts` | Pure helpers both paths share: `inAppPath` (the app's own path under the proxy prefix), `onRootForm`, `pageAddress` (the app's own address for a reference: no query, no ticket). |
 | `proxy.ts` | Client of the proxy routes: `mintProxy` (idempotent per target), health polls, `ConfirmRequired`, address parsing, and the `browserTitles` store for tab names. |
+| `verifiedSessions.ts` | Proxy sessions this window minted and health-checked, by target, for 5 minutes: a remounted pane (a move, a reopen) shows its page at once and re-checks behind it. Kept out of `proxy.ts` so the entry bundle stays under budget. |
 | `agentOpen.ts` | Decides whether this window acts on a `browser_open` frame from `/ws/events`, and where the pane goes; `placeHandover` places a hand-over tab the same way. Pure: layout ops from `layout/layout.ts`, no DOM, no stores. |
 | `agentBrowser.ts` | The agent browser's window half, free of the DOM and the shell: `AgentBrowserChannel` answers each `browser_request` (open an agent's own page off-screen, drive/nav/close, hand over, the `state` marker) with one `browser_reply`; `PaneViewRegistry` (tab id → pane-view id); `shouldTakeOver` (the take-over gate); per-tab drive state for the chrome. Wire shapes live in `net/browserWire.ts`. |
 | `agentBrowserRuntime.ts` | The window's one `agentBrowser` channel on the real `native.ts` calls, the mirrored `browserLinks` store (tab → agent), and the debounced `browser_hello` (visibility, focus, size, registered tabs). App attaches it to its events socket. |
 
-Tests: `agentOpen.test.ts`, `agentBrowser.test.ts`.
+Tests: `agentOpen.test.ts`, `agentBrowser.test.ts`, `verifiedSessions.test.ts`.
 
 ## State owners
 
