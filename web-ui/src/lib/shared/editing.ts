@@ -80,13 +80,28 @@ export function setEditingHost(h: EditingHost): void {
   host = h;
 }
 
+/** Hosts for files the text editor doesn't own (a deck edited in its
+ *  viewer), each answering for the paths it claims. */
+const claimHosts: { owns: (path: string) => boolean; host: EditingHost }[] = [];
+
+/** Register a host for the dirty paths `owns` claims (checked before the
+ *  editor's own host). Registered once per module; never removed. */
+export function addEditingHost(owns: (path: string) => boolean, h: EditingHost): void {
+  claimHosts.push({ owns, host: h });
+}
+
+function hostFor(path: string): EditingHost | null {
+  return claimHosts.find((c) => c.owns(path))?.host ?? host;
+}
+
 /** Save a dirty file. With no editor loaded nothing can be dirty: true. */
 export function saveDirtyFile(path: string): Promise<boolean> {
-  return host === null ? Promise.resolve(true) : host.save(path);
+  const h = hostFor(path);
+  return h === null ? Promise.resolve(true) : h.save(path);
 }
 
 export function discardDirtyFile(path: string): void {
-  host?.discard(path);
+  hostFor(path)?.discard(path);
 }
 
 /**
