@@ -38,3 +38,17 @@ export function routeNativeView(id: string, fn: (ev: NativeViewEvent) => void): 
 export function paneViewsPossible(): boolean {
   return isNativeShell() && /Mac/.test(navigator.userAgent);
 }
+
+/** The window asks the page view in pane `paneId` to zoom (⌘+/⌘−, the
+ *  reset chord): +1 in, -1 out, 0 back to 100 %. `paneView` listens; a pane
+ *  without a live view ignores it. */
+export const PANE_ZOOM_EVENT = "chimaera:pane-zoom";
+
+export interface PaneZoom {
+  paneId: string;
+  step: 1 | -1 | 0;
+}
+
+export function zoomPaneView(paneId: string, step: 1 | -1 | 0): void {
+  window.dispatchEvent(new CustomEvent<PaneZoom>(PANE_ZOOM_EVENT, { detail: { paneId, step } }));
+}

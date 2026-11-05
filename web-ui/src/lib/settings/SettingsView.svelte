@@ -210,9 +210,9 @@
     { label: "Focus pane 1–9", chord: `${activeModLabel()}1–9` },
     { label: "Move active tab to pane 1–9", chord: `${paneMoveHint(1)}–9` },
     { label: "Reference selection in agent", chord: PINNED.reference },
-    { label: "Terminal text larger", chord: PINNED.fontPlus },
-    { label: "Terminal text smaller", chord: PINNED.fontMinus },
-    { label: "Terminal text reset", chord: PINNED.fontReset },
+    { label: "Larger text, zoom in", chord: PINNED.fontPlus },
+    { label: "Smaller text, zoom out", chord: PINNED.fontMinus },
+    { label: "Reset text size or zoom", chord: PINNED.fontReset },
   ]);
 
   /**

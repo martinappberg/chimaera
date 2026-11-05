@@ -281,7 +281,9 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   a slim strip. `Mod+Arrow` moves pane focus spatially; `Mod2+Arrow` carries the active tab into
   the neighbor — or, when there is no pane in that direction, **auto-splits a new one** on that
   side (capped at `MAX_PANES` and a minimum pane size); `Mod+1–9` focuses that numbered pane;
-  `⌘±`/`⌘0` bump one pane's terminal/markdown font. Two further chords step through the
+  `⌘+`/`⌘−`/`⌘0` bump or reset one pane's terminal/markdown font, and zoom an HTML or browser
+  page in its own view (the macOS app) as a browser does; a trackpad pinch zooms such a page
+  too. They match the character typed, so they work on any keyboard layout (`fontChord`). Two further chords step through the
   sidebar instead of the panes: `⌃⌘A` (`keys.cycleAgents`) opens the next agent in its agents
   list and `⌃⌘T` (`keys.cycleTerminals`) the next terminal in its terminals list (off macOS,
   `Alt+Shift+A/T`). Each wraps at the end and, from outside its group, starts at the first
@@ -295,8 +297,9 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   Its blank state offers file/session lookup and teaches dragging or holding the modifier
   to discover `Mod+1–9` (focus) and numbered tab moves (`⌃⌘1–9` on macOS;
   the second modifier layer elsewhere). The extra Control avoids macOS screenshot shortcuts.
-  Pane numbers appear only while holding
-  the modifier. Existing panes keep their shortcut numbers through splits, moves, and
+  Pane numbers appear only after holding
+  the modifier for a second (`chordHints.svelte.ts` `ARM_DELAY_MS`), so a chord, or a pause
+  between two, never flashes them. Existing panes keep their shortcut numbers through splits, moves, and
   reloads; new panes take the lowest free number. Agents, terminals, documents, and workspace views use the same tab move operation;
   moving or closing a session view leaves the underlying session running. Empty source panes
   collapse after their last tab moves away. Sessions are reachable from the sidebar or Quick Open.

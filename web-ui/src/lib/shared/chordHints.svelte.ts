@@ -13,9 +13,10 @@
 import { resolveMod, resolvePaneMoveMod } from "./keys";
 import { modifierSetting } from "./keybindings";
 
-/** Hold this long before the hints arm — long enough that executing a chord
- *  outruns it, short enough that a pause to think reveals them. */
-const ARM_DELAY_MS = 380;
+/** Hold this long before the hints arm — about a second, as macOS apps
+ *  reveal shortcuts on a held ⌘: a chord, or a pause between two, never
+ *  flashes them; a deliberate hold still does. */
+export const ARM_DELAY_MS = 1000;
 
 let active = $state(false);
 let layer = $state<"base" | "move" | null>(null);

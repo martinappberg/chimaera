@@ -287,7 +287,6 @@
     REFERENCE_CHORD,
   } from "./lib/shared/keys";
   import {
-    activeModLabel,
     isCapturing,
     keyHint,
     matchAction,
@@ -326,7 +325,7 @@
   import { sharedTabsLeft, type Handover } from "./lib/browser/agentBrowser";
   import type { BrowserLink } from "./lib/net/browserWire";
   import { targetLabel } from "./lib/browser/proxy";
-  import { paneViewsPossible } from "./lib/shared/paneViewRoute";
+  import { paneViewsPossible, zoomPaneView } from "./lib/shared/paneViewRoute";
   import UpdateToast from "./lib/workspace/UpdateToast.svelte";
   import {
     applyAppStatus,
@@ -2337,16 +2336,11 @@
     if (modalOpen() && !pickerOpen && !quickOpenOpen) return;
     // Per-pane text size (Cmd/Ctrl +/−/0, spec-pinned chords): intercepted
     // ONLY while the focused pane shows a font-sizable surface (a terminal or
-    // a rendered markdown document), so browser zoom keeps working elsewhere.
+    // a rendered markdown document) or a page in its own view (page zoom), so
+    // browser zoom keeps working elsewhere.
     if (!pickerOpen && !quickOpenOpen && layoutReady) {
       const step = fontChord(e);
-      // The dashboard owns the base-modifier Digit0 chord (the advertised
-      // ⌘0 / Ctrl+Shift+0): a font RESET here would swallow it on every
-      // terminal/markdown pane — the most common focus state. Font reset
-      // keeps its other spellings (⌘Numpad0; plain Ctrl+0 on non-mac,
-      // where the dashboard chord carries Shift).
-      const dashboardChord = step === 0 && chordDigit(e, modifierSetting()) === 0;
-      if (step !== null && !dashboardChord) {
+      if (step !== null) {
         const p = findPane(layout.root, layout.focusedPaneId);
         const active = p?.tabs[p.active];
         const sizable =
@@ -2358,6 +2352,18 @@
           e.preventDefault();
           e.stopPropagation();
           adjustFont(p.id, step);
+          return;
+        }
+        // An HTML page or a browser pane in its own view (the macOS app):
+        // the page zooms, as ⌘+/⌘− do in a browser.
+        const pageZoom =
+          active !== undefined &&
+          paneViewsPossible() &&
+          (active.surface === "browser" || (active.surface === "file" && viewKindFor(active.path) === "html"));
+        if (p !== null && pageZoom) {
+          e.preventDefault();
+          e.stopPropagation();
+          zoomPaneView(p.id, step);
           return;
         }
       }
@@ -2434,17 +2440,10 @@
         }
         return;
       }
-      // Pinned Mod+1–9 focuses the numbered pane; Mod+0 is the dashboard.
+      // Pinned Mod+1–9 focuses the numbered pane. Mod+0 is the font/zoom
+      // reset above, on a pane that has one; elsewhere it passes through.
       const n = chordDigit(e, modifierSetting());
-      if (n === 0 && detachedWindow) {
-        // A solo window does not pull in the workspace dashboard.
-        intercept();
-        return;
-      }
-      if (n === 0) {
-        intercept();
-        openDashboardSurface();
-      } else if (n !== null && n >= 1) {
+      if (n !== null && n >= 1) {
         intercept();
         const pane = panesOf(layout.root).find((p) => p.number === n);
         if (pane !== undefined) {
@@ -3142,7 +3141,7 @@
     });
   });
 
-  /** Open/focus the workspace dashboard (rail row, ⌘0, the landing default). */
+  /** Open/focus the workspace dashboard (rail row, the landing default). */
   function openDashboardSurface(): void {
     if (activeWsId === null || !layoutReady) return;
     layout = openDashboard(layout);
@@ -4441,11 +4440,11 @@
         {/snippet}
 
         <!-- The workspace dashboard: the fixed home row above the sessions —
-             the overview of everything below it. ⌘0, matching the ⌘1–9 rows. -->
+             the overview of everything below it. -->
         <button
           class="row dash-row"
           class:dash-active={dashboardOpen}
-          title="workspace dashboard ({activeModLabel()}0)"
+          title="workspace dashboard"
           onclick={openDashboardSurface}
         >
           <svg class="dash-glyph" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">

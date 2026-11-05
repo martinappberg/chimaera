@@ -861,6 +861,11 @@ pub(super) fn show(
             if cfg!(debug_assertions) {
                 wk.setInspectable(true);
             }
+            // A trackpad pinch zooms the page, as in a browser. Not on an
+            // embed card (`passive`): its scroller owns the gestures.
+            if !passive {
+                wk.setAllowsMagnification(true);
+            }
             // A file dragged in from Finder is the workbench's to take (it
             // uploads to the right host); the view would swallow it.
             let _: () = msg_send![&*wk, unregisterDraggedTypes];
@@ -1277,6 +1282,16 @@ pub(super) fn nav(app: &AppHandle, label: String, action: NavAction) -> Result<(
                     NavAction::Forward => drop(pane.wk.goForward()),
                     NavAction::Reload => drop(pane.wk.reload()),
                     NavAction::Stop => pane.wk.stopLoading(),
+                    NavAction::ZoomIn => pane
+                        .wk
+                        .setPageZoom(super::zoom_step(pane.wk.pageZoom(), true)),
+                    NavAction::ZoomOut => pane
+                        .wk
+                        .setPageZoom(super::zoom_step(pane.wk.pageZoom(), false)),
+                    NavAction::ZoomReset => {
+                        pane.wk.setPageZoom(1.0);
+                        pane.wk.setMagnification(1.0);
+                    }
                 }
             }
         });

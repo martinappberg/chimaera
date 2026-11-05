@@ -503,9 +503,9 @@ export async function nativeViewRegion(id: string, rect: ViewRect): Promise<Nati
   }
 }
 
-export type NativeViewNav = "back" | "forward" | "reload" | "stop";
+export type NativeViewNav = "back" | "forward" | "reload" | "stop" | "zoomin" | "zoomout" | "zoomreset";
 
-/** Drive a pane view's own history. */
+/** Drive a pane view's own history, or its page zoom. */
 export async function nativeViewNav(id: string, action: NativeViewNav): Promise<void> {
   const t = tauri();
   if (t === null) return;
