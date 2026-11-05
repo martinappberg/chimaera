@@ -178,6 +178,9 @@ impl Caps {
         if m.provides.knowledge.is_some() {
             atoms.insert(atom(&["knowledge"]));
         }
+        if let Some(program) = &m.provides.browser {
+            atoms.insert(atom(&["browser", program]));
+        }
         if m.setup.is_some() {
             atoms.insert(atom(&["setup-prompt"]));
         }
@@ -336,8 +339,24 @@ impl Caps {
         if has(&["setup-prompt"]) {
             plain("Has a setup prompt it sends to an agent you choose, shown in full first".into());
         }
+        // A browser program runs as the agent browser's headless browser, not
+        // as a job: its own line, without the jobs' limits.
+        let browsers: Vec<&str> = of_kind("browser")
+            .filter_map(|p| p.get(1).map(String::as_str))
+            .collect();
+        for program in &browsers {
+            lines.push(Line {
+                text: format!(
+                    "Runs {program} on this host as the browser agents' browser tools drive, \
+                     where it is switched on and when this host has no Chrome or Chromium of \
+                     its own"
+                ),
+                privileged: true,
+            });
+        }
         let programs: Vec<&str> = of_kind("program")
             .filter_map(|p| p.get(1).map(String::as_str))
+            .filter(|p| !browsers.contains(p))
             .collect();
         let shells: Vec<&str> = programs
             .iter()
@@ -427,6 +446,7 @@ impl Caps {
             "agent-tool",
             "hook-line",
             "knowledge",
+            "browser",
             "agent-plugin",
             "setup-prompt",
             "file-kind",

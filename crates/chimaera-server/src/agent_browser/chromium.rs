@@ -2,8 +2,11 @@
 //! daemon's host, driven over `--remote-debugging-pipe` ([`super::cdp`]).
 //!
 //! It answers when no app window can (a cluster job while the laptop is
-//! closed, a Linux host). Nothing is bundled or downloaded: the browser is
-//! `browser.path`, else a system install on PATH, else a macOS app bundle.
+//! closed, a Linux host). Nothing is bundled, and the engine never
+//! downloads: the browser is `browser.path`, else a system install on PATH,
+//! else a macOS app bundle, else one a plugin active in the session's
+//! workspace provides (`provides.browser`, [`crate::plugins::browser`]),
+//! which its tool downloaded on the user's click.
 //!
 //! - **One browser per daemon**, launched on the first `Open`, in its own
 //!   process group, with a throwaway profile under the node-local runtime
@@ -41,6 +44,7 @@ use super::{
     Action, ActionOut, BrowserError, ConsoleEntry, HistoryOp, ImageFormat, Modifier, NetworkEntry,
     Rect, RingsOut, TargetUrl, World,
 };
+use crate::plugins::browser::Offer;
 use crate::state::lock;
 use crate::{proxy, AppState};
 
@@ -95,6 +99,13 @@ const EVAL_RESULT_MAX: usize = 2 * 1024 * 1024;
 const PER_KEY_MAX: usize = 10_000;
 /// How long a discovery answer is reused (PATH entries can sit on NFS).
 const DISCOVERY_TTL: Duration = Duration::from_secs(30);
+/// After "no browser here" with no plugin offering one: the ways to get one,
+/// the opt-in download first.
+const GET_ONE: &str = "Ask the user to get one: in Extensions → Plugins, install the Chromium \
+     plugin, switch it on in this workspace and click Install under its Tools (it downloads a \
+     pinned chrome-headless-shell, checked against its sha256, into Chimaera's tools folder). \
+     Or install Chrome or Chromium on this host and set browser.path in Chimaera's settings to \
+     its executable, or connect the Chimaera app.";
 /// Executable names looked up on PATH, in order.
 const PATH_NAMES: [&str; 6] = [
     "google-chrome",
@@ -171,14 +182,18 @@ impl Chromium {
         }
     }
 
-    /// The browser this daemon would launch, or why it can't (no browser
-    /// found, login node, NFS profile dir…): model-facing text naming the
-    /// fix. The filesystem checks run off the reactor.
-    pub(crate) async fn available(&self, state: &AppState) -> Result<PathBuf, String> {
-        self.check(state).await.map_err(Unavailable::text)
+    /// The browser this daemon would launch for a session in `ws`, or why it
+    /// can't (no browser found, login node, NFS profile dir…): model-facing
+    /// text naming the fix. The filesystem checks run off the reactor.
+    pub(crate) async fn available(
+        &self,
+        state: &AppState,
+        ws: Option<&str>,
+    ) -> Result<PathBuf, String> {
+        self.check(state, ws).await.map_err(Unavailable::text)
     }
 
-    async fn check(&self, state: &AppState) -> Result<PathBuf, Unavailable> {
+    async fn check(&self, state: &AppState, ws: Option<&str>) -> Result<PathBuf, Unavailable> {
         if state.compute.is_login_node() {
             return Err(Unavailable::Refused(
                 "This daemon runs on a cluster login node, where Chimaera never starts a browser. \
@@ -198,7 +213,23 @@ impl Chromium {
             )));
         }
         let setting = lock(&state.settings).browser_path();
-        let exe = self.discover(setting).await?;
+        let exe = match self.discover(setting.clone()).await {
+            Ok(exe) => exe,
+            // A browser.path that names nothing is the user's own choice:
+            // say so rather than quietly using another browser.
+            Err(Unavailable::NoEngine(none)) if setting.is_none() => {
+                match crate::plugins::browser::offer(state, ws).await {
+                    Offer::Ready(exe) => exe,
+                    Offer::NotReady(why) => {
+                        return Err(Unavailable::NoEngine(format!("{none} {why}")))
+                    }
+                    Offer::Nothing => {
+                        return Err(Unavailable::NoEngine(format!("{none} {GET_ONE}")))
+                    }
+                }
+            }
+            Err(e) => return Err(e),
+        };
         let fs = tokio::task::spawn_blocking(|| profile_fs_ok(&chimaera_core::runtime_dir()))
             .await
             .unwrap_or(Ok(()));
@@ -239,14 +270,17 @@ impl Chromium {
     /// (≤ 15 s; `"loading": true` if it hadn't). Click/Key/Text answer
     /// `Done`, or `Value({"blocked": "<why>"})` when a main-frame navigation
     /// was refused since the last result.
+    /// `ws` is the session's workspace (which plugins' browsers it may use
+    /// when this opens the browser).
     pub(crate) async fn act(
         &self,
         state: &Arc<AppState>,
+        ws: Option<&str>,
         page: &str,
         action: Action,
     ) -> Result<ActionOut, BrowserError> {
         if let Action::Open { url, width, height } = action {
-            return self.open(state, page, &url, width, height).await;
+            return self.open(state, ws, page, &url, width, height).await;
         }
         let (browser, pg) = self.find(page)?;
         let _op = pg.op.lock().await;
@@ -372,6 +406,7 @@ impl Chromium {
     async fn open(
         &self,
         state: &Arc<AppState>,
+        ws: Option<&str>,
         key: &str,
         url: &TargetUrl,
         width: u32,
@@ -380,7 +415,7 @@ impl Chromium {
         let (width, height) = (width.clamp(200, 4096), height.clamp(200, 4096));
         let (browser, pg, existed) = {
             let _launch = self.launching.lock().await;
-            let browser = self.live_or_launch(state).await?;
+            let browser = self.live_or_launch(state, ws).await?;
             let existing = lock(&browser.pages).get(key).cloned();
             match existing {
                 Some(pg) => (browser, pg, true),
@@ -416,7 +451,11 @@ impl Chromium {
     }
 
     /// The running browser, or a fresh one. Caller holds `launching`.
-    async fn live_or_launch(&self, state: &Arc<AppState>) -> Result<Arc<Browser>, BrowserError> {
+    async fn live_or_launch(
+        &self,
+        state: &Arc<AppState>,
+        ws: Option<&str>,
+    ) -> Result<Arc<Browser>, BrowserError> {
         let current = lock(&self.browser).clone();
         if let Some(b) = current {
             if b.alive.load(Ordering::Acquire) {
@@ -428,7 +467,7 @@ impl Chromium {
         if state.compute.login_node_unknown() {
             let _ = state.compute.detection().await;
         }
-        let exe = self.check(state).await.map_err(Unavailable::error)?;
+        let exe = self.check(state, ws).await.map_err(Unavailable::error)?;
         let browser = Browser::launch(&exe).await?;
         *lock(&self.browser) = Some(Arc::clone(&browser));
         Ok(browser)
@@ -543,9 +582,7 @@ fn find_browser(
         .map(|h| h.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "this host".to_string());
     Err(format!(
-        "No Chrome or Chromium on {host}: looked for {} on PATH{}. Install one there (a \
-         user-space Chromium or chrome-headless-shell works) and set browser.path in Chimaera's \
-         settings to its executable, or connect the Chimaera app.",
+        "No Chrome or Chromium on {host}: looked for {} on PATH{}.",
         PATH_NAMES.join(", "),
         if cfg!(target_os = "macos") {
             " and in /Applications"
@@ -1112,7 +1149,12 @@ fn explain_startup(exe: &Path, stderr: &str, err: &CdpError) -> String {
         CdpError::Timeout => " within 20 s.",
         _ => ": it exited.",
     });
-    if lower.contains("no usable sandbox")
+    if lower.contains("running as root without --no-sandbox") {
+        out.push_str(
+            " The daemon runs as root, and Chromium won't start its sandbox as root. Run \
+             Chimaera as a normal user (Chimaera does not turn the sandbox off).",
+        );
+    } else if lower.contains("no usable sandbox")
         || lower.contains("setuid sandbox")
         || lower.contains("user namespace")
         || lower.contains("clone(clone_newuser")
@@ -1132,10 +1174,17 @@ fn explain_startup(exe: &Path, stderr: &str, err: &CdpError) -> String {
         );
     } else if let Some(lib) = missing_library(stderr) {
         out.push_str(&format!(
-            " A shared library it needs is missing: {lib}. Install it (or load the module that \
-             provides it), or use chrome-headless-shell, which needs fewer system libraries, and \
-             point browser.path at it."
+            " A shared library it needs is missing: {lib}. Ask the user to install it (or load \
+             the module that provides it)"
         ));
+        let headless_shell = exe
+            .file_name()
+            .is_some_and(|n| n == "chrome-headless-shell");
+        out.push_str(if headless_shell {
+            "; `ldd` on the browser lists every library it can't find."
+        } else {
+            ", or to use chrome-headless-shell, which needs fewer system libraries."
+        });
     } else if lower.contains("cannot open display") || lower.contains("missing x server") {
         out.push_str(
             " It tried to open a display: this browser build may not support --headless=new. \

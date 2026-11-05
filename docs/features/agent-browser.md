@@ -3,13 +3,15 @@
 One set of MCP tools (`browser_*`) that lets an agent open a web app, read it, act in it with
 real input, check its console and network, and hand the result to the user as a browser pane.
 Two engines answer the same tools: the **app engine** drives a pane view in a connected macOS
-app window, and the **Chromium engine** drives a headless Chrome or Chromium that is already on
-the daemon's host. Use it when an agent builds or fixes a web UI and must check its own work, or
+app window, and the **Chromium engine** drives a headless Chrome or Chromium on the daemon's
+host: one already installed there, or the one the first-party **Chromium** plugin downloads on
+the user's click. Use it when an agent builds or fixes a web UI and must check its own work, or
 when the user wants the agent to act in a page the user already has open.
 
 **Where it lives (shared):** daemon `crates/chimaera-server/src/agent_browser/` (`mod.rs` the
 pages and the reaper, `tools.rs` the tools, `channel.rs` the window request channel,
-`app_engine.rs`, `chromium.rs` + `cdp.rs`, `snapshot.js`), the tool listing and dispatch in
+`app_engine.rs`, `chromium.rs` + `cdp.rs`, `snapshot.js`), a plugin's browser in
+`plugins/browser.rs` (`offer`), the tool listing and dispatch in
 `mcp.rs`, shared panes in `links.rs`, the proxy mint in `proxy.rs` (`mint`, `target_of`). Shell
 `crates/chimaera-app/src/shell/native_view.rs` (`native_view_drive`, `native_view_show` with
 `agent`), `native_view/drive.rs` (pure parsing, key map, injected-input ledger),
@@ -92,15 +94,32 @@ marker), `layout/PaneTabs.svelte` (the chain link and chips). Wire: `browser_req
   `--remote-debugging-pipe` (never a port), with a throwaway 0700 profile under the node-local
   runtime dir. Discovery: the `browser.path` setting, else `google-chrome`,
   `google-chrome-stable`, `chromium`, `chromium-browser`, `chrome`, `chrome-headless-shell` on
-  PATH, else (macOS) the Google Chrome or Chromium app bundle. Nothing is bundled or downloaded.
-  Startup failures (sandbox, `/dev/shm`, missing libraries, no `--headless=new`) are explained
-  from the browser's stderr.
+  PATH, else (macOS) the Google Chrome or Chromium app bundle, else the browser of a plugin
+  active in the session's workspace (below). A `browser.path` that names nothing is an error,
+  never a fall-through. Nothing is bundled, and the engine itself never downloads. Startup
+  failures (sandbox, `/dev/shm`, missing libraries, no `--headless=new`) are explained from the
+  browser's stderr.
+- **A browser from a plugin (opt-in download).** A plugin's manifest may name one of its
+  `[[programs]]` that one of its `[[tools]]` installs as `provides.browser`
+  ([plugin guide](../agent-guides/plugins.md#programs-jobs-and-tools)). The first-party
+  **Chromium** plugin ([chimaera-plugin-chromium](https://github.com/martinappberg/chimaera-plugin-chromium))
+  does so with Chrome for Testing's `chrome-headless-shell`, pinned to one version for Linux
+  x86_64 and aarch64 and macOS Intel and Apple silicon. Getting it is three clicks the user
+  makes: install the plugin (Extensions → Plugins), switch it on in the workspace, click
+  **Install** under its Tools. The plugin host downloads over HTTPS, checks size and sha256
+  while it streams, unzips into `~/.chimaera/tools/chromium/` (or `plugins.toolsDir`), and
+  changes nothing else. The engine uses that browser only for sessions in workspaces where the
+  plugin is active, and only when the host has no browser of its own; the profile still lives
+  in the node-local runtime dir. Each missing step has its own refusal text: not switched on
+  here, switched on but not downloaded (with size and host), no build for this platform, the
+  plugin held or faulted, no plugin at all (the three clicks, then `browser.path`, then the
+  app). `plugins/browser.rs` (`offer`) is generic: it reads the manifest, never an id.
 - **The choice, for a new own page** (`tools::new_page`, `channel::choose`): an app-engine window
   on the session's workspace (any app-engine window when the session has no workspace) —
   visible and focused first, then visible, then any. None → the Chromium engine when
-  `Chromium::available` says yes. Neither → a refusal that names the fix: open the workspace in
-  the app, and why Chromium can't run here (no browser found, a bad `browser.path`, a login
-  node, a profile on a network filesystem).
+  `Chromium::available` says yes for the session's workspace. Neither → a refusal that names
+  the fix: open the workspace in the app, and why Chromium can't run here (no browser found and
+  how to get one, a bad `browser.path`, a login node, a profile on a network filesystem).
 - **A page never moves.** An own page is bound to its engine and window for life. When its
   window goes away the page is gone; the next `browser_navigate` makes a new page, maybe on the
   other engine, and the result says so. Shared panes are always app engine.
@@ -211,6 +230,9 @@ marker), `layout/PaneTabs.svelte` (the chain link and chips). Wire: `browser_req
 - `cargo test -p chimaera-server agent_browser`: the end-to-end tests drive the tools over a
   real `/ws/events` socket against a stand-in window (`src/tests/agent_browser.rs`), plus the
   Chromium engine's unit tests (`agent_browser/chromium/tests.rs`).
+- `cargo test -p chimaera-server a_plugin_tool_supplies_the_agent_browser`: `provides.browser`
+  validation, the Can line, and each step of a plugin's browser (off here, on but not
+  downloaded, installed, removed) through the real tool-install route (`tests/plugin_jobs.rs`).
 - `just browser-smoke`: the Chromium engine against a real browser
   (`agent_browser/chromium/live_tests.rs`; needs `CHIMAERA_TEST_CHROMIUM`).
 - `just app-check`: the shell's `drive.rs` unit tests (parsing, key map, ledger, eval wrapper).
@@ -220,12 +242,14 @@ marker), `layout/PaneTabs.svelte` (the chain link and chips). Wire: `browser_req
   snapshot, click and type in it, and read its console; share a pane by the chain link, watch
   the marker, act in the pane and check that the agent is told; `browser_show` and check that
   the page does not reload. With no app window, check the Chromium engine answers (or refuses
-  with the fix).
+  with the fix). On a host with no browser (an isolated daemon whose PATH has none), check the
+  refusal names the Chromium plugin, then install it, switch it on, Install its tool, and check
+  `browser_navigate` answers on `engine: chromium`.
 
 ## Status: partial
 
-- The app engine runs on macOS only. Linux and Windows pane views, file upload, a live view of
-  a Chromium page, and an opt-in Chromium download are not built.
+- The app engine runs on macOS only. Linux and Windows pane views, file upload and a live view
+  of a Chromium page are not built.
 
 ---
 

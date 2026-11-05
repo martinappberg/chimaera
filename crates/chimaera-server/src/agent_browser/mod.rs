@@ -651,7 +651,13 @@ pub(crate) async fn close_page(state: &Arc<crate::AppState>, bound: &Bound) {
             };
             app_engine::act(state, &addr, Action::Close).await
         }
-        Bound::Chromium { key } => state.browsers.chromium.act(state, key, Action::Close).await,
+        Bound::Chromium { key } => {
+            state
+                .browsers
+                .chromium
+                .act(state, None, key, Action::Close)
+                .await
+        }
     };
     if let Err(e) = result {
         tracing::debug!(error = %e, "agent browser: close failed");

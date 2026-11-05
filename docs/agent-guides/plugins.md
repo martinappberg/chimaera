@@ -323,6 +323,7 @@ What each part does, and what exists today:
 | `setup.prompt` | a new chat session of the user's chosen agent, sent this prompt | `plugins::setup_workspace` |
 | `provides.knowledge` | the plugin is the Knowledge provider; its `knowledge` export feeds the view and `GET /workspaces/{id}/knowledge` | `knowledge.rs`, `runtime::knowledge` |
 | `provides.mcp_tools` | tools served by the chimaera MCP where active, plus the `instructions` paragraph; pre-allowed at spawn. Unique names, 1–64 ASCII letters, digits, underscores or dashes — no dots (codex pre-approves a tool by a dotted config key a dot would split); built-in names are reserved | `plugins/tools.rs`, `runtime::offer` |
+| `provides.browser` | (0.2) one of its `[[programs]]` that one of its `[[tools]]` installs: the agent browser's Chromium engine runs it for sessions where the plugin is active, when the host has no Chrome or Chromium of its own ([below](#programs-jobs-and-tools)) | `plugins/browser.rs`, `agent_browser/chromium.rs` |
 | `provides.events` | declared events only (none by default): `hook`, `session-ended`, `switched-on`, `switched-off`; API 0.2 also supports file, settings and job events ([events](#events)) | `runtime`, workspace switch handler, `files.rs`, `pdata.rs`, `jobs.rs` |
 | `provides.views` | legacy string list; does not declare a platform screen. Use top-level `[[views]]` for screens | `manifest_json`; `platform::validate` for `[[views]]` |
 | `[[views]]`, `[[files]]`, `[[actions]]`, `[[settings]]` | API 0.2 screens, file kinds, file actions and declared settings; see the [platform reference](#the-platform-api-02) | `platform.rs`, `screens.rs`, `files.rs`, `pdata.rs` |
@@ -1035,6 +1036,17 @@ and 1 GB to spare). The host confines unpacking to that folder and adds its
 privileged processes: they can access files and network as the daemon user,
 and a `programs.network` description is disclosure, not an enforced network
 allowlist. Removing the plugin removes its managed tools.
+
+**A browser for the agent browser.** `provides.browser = "<program>"` names a
+program one of the plugin's tools installs; the manifest is refused otherwise
+(and on API 0.1). Where the plugin is active, the agent browser's Chromium
+engine launches that program when `browser.path`, the PATH and the macOS app
+bundles found nothing; it runs as the engine's headless browser (its own
+process group, a node-local profile, never on a login node), not as a job, so
+the job limits above don't apply to it. The card's Can list says so. The
+first-party [Chromium plugin](https://github.com/martinappberg/chimaera-plugin-chromium)
+is the example: a manifest, an empty component and `scripts/pin.sh`, which
+pins a Chrome for Testing version's four downloads by sha256 and size.
 
 ### Testing a 0.2 plugin
 

@@ -53,6 +53,7 @@ use serde_json::{json, Value};
 use crate::AppState;
 
 pub(crate) mod activity;
+pub(crate) mod browser;
 pub mod capabilities;
 pub(crate) mod files;
 pub(crate) mod hostfns;
@@ -418,6 +419,12 @@ pub(crate) struct Provides {
     /// did not declare, so a hook never instantiates a plugin that ignores it.
     #[serde(default)]
     pub(crate) events: Vec<EventKind>,
+    /// A browser for the agent browser's Chromium engine (0.2): the name of
+    /// one of its `[[programs]]` that one of its `[[tools]]` installs. Used
+    /// only where the plugin is active, and only when the host has no Chrome
+    /// or Chromium of its own (`browser`).
+    #[serde(default)]
+    pub(crate) browser: Option<String>,
 }
 
 impl Provides {
@@ -598,6 +605,16 @@ pub(crate) fn validate(m: &Manifest) -> Result<(), String> {
         }
     }
     platform::validate(m)?;
+    if let Some(program) = &m.provides.browser {
+        if m.api == "0.1" {
+            return Err("provides.browser needs api = \"0.2\"".into());
+        }
+        if !m.tools.iter().any(|t| t.programs.contains(program)) {
+            return Err(format!(
+                "provides.browser {program:?} must be a program one of its [[tools]] installs"
+            ));
+        }
+    }
     if let Some(release) = &m.release {
         if !valid_github(&release.github) {
             return Err(format!(
@@ -1218,6 +1235,7 @@ fn manifest_fields(m: &Manifest) -> Value {
             "knowledge": m.provides.knowledge,
             "mcp_tools": m.provides.mcp_tools,
             "views": m.provides.views,
+            "browser": m.provides.browser,
         },
         "setup": m.setup.as_ref().map(|s| json!({"prompt": s.prompt})),
         "detect": m.detect.any,
