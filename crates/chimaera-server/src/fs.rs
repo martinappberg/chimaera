@@ -1,10 +1,11 @@
 //! Filesystem endpoints: the folder picker (home + directories-only listing),
 //! and the file service backing file tabs — full directory listings, ranged
-//! raw reads, atomic single-file writes (lightweight editing), file management
-//! (create/rename/delete behind the file-manager context menus), server-
-//! rendered markdown, paged CSV/TSV tables (with a transparent gzip tier for
-//! .gz/.bgz), and short-lived tickets that let iframes/img tags fetch bytes
-//! without a bearer header.
+//! raw reads, atomic single-file writes (lightweight editing, plus streamed
+//! whole-file writes and Office package part replacement for big files),
+//! file management (create/rename/delete behind the file-manager context
+//! menus), server-rendered markdown, paged CSV/TSV tables (with a
+//! transparent gzip tier for .gz/.bgz), and short-lived tickets that let
+//! iframes/img tags fetch bytes without a bearer header.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -26,6 +27,7 @@ use serde_json::json;
 use crate::AppState;
 
 mod row_index;
+mod zip_splice;
 
 /// Hard cap on a single `fs/file` read.
 const MAX_FILE_CHUNK: u64 = 2 * 1024 * 1024;
@@ -906,6 +908,37 @@ pub(crate) async fn put_file(
         write_file(&query.path, &body, pre)
     })
     .await;
+    write_response(&state, &dirty_path, result).await
+}
+
+/// A save refused for its size (413), raised from inside blocking work.
+#[derive(Debug)]
+struct TooLarge(String);
+
+impl std::fmt::Display for TooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TooLarge {}
+
+fn too_large(message: impl Into<String>) -> Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(json!({"error": message.into()})),
+    )
+        .into_response()
+}
+
+/// The answer to every whole-file save route (`fs/file`, `fs/file/stream`,
+/// `fs/package`): 204 with the new `X-Mtime`/`X-Content-Hash`, 409 with the
+/// disk's, 413 for [`TooLarge`], 400 otherwise.
+async fn write_response(
+    state: &Arc<AppState>,
+    dirty_path: &str,
+    result: Result<anyhow::Result<WriteOutcome>, tokio::task::JoinError>,
+) -> Response {
     match result {
         Err(join) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -917,7 +950,7 @@ pub(crate) async fn put_file(
                 // A save is a git-relevant change: nudge the workspace(s)
                 // holding this path so the tree/panel refetch without any
                 // polling (and watching windows re-probe it promptly).
-                crate::git::mark_path_dirty(&state, &dirty_path).await;
+                crate::git::mark_path_dirty(state, dirty_path).await;
             }
             let mut response = StatusCode::NO_CONTENT.into_response();
             let headers = response.headers_mut();
@@ -946,18 +979,22 @@ pub(crate) async fn put_file(
             }
             response
         }
-        Ok(Err(err)) => bad_request(&err),
+        Ok(Err(err)) => match err.downcast_ref::<TooLarge>() {
+            Some(TooLarge(message)) => too_large(message.clone()),
+            None => bad_request(&err),
+        },
     }
 }
 
 /// The disk's current version of an existing file: its token, and its content
-/// hash when it is at most [`MAX_HASH_BYTES`]. Reads through `file`, so the
-/// answer describes that descriptor's inode.
-fn file_version(file: &mut std::fs::File) -> std::io::Result<(String, Option<String>)> {
+/// hash when it is at most `cap` bytes ([`MAX_HASH_BYTES`] for an `fs/file`
+/// save). Reads through `file`, so the answer describes that descriptor's
+/// inode.
+fn file_version(file: &mut std::fs::File, cap: u64) -> std::io::Result<(String, Option<String>)> {
     use sha2::{Digest, Sha256};
     let meta = file.metadata()?;
     let token = mtime_token(&meta);
-    if meta.len() > MAX_HASH_BYTES {
+    if meta.len() > cap {
         return Ok((token, None));
     }
     file.seek(SeekFrom::Start(0))?;
@@ -972,7 +1009,7 @@ fn file_version(file: &mut std::fs::File) -> std::io::Result<(String, Option<Str
             Err(err) => return Err(err),
         };
         seen += n as u64;
-        if seen > MAX_HASH_BYTES {
+        if seen > cap {
             // Grew past the cap mid-read: no hash, same as a big file.
             return Ok((token, None));
         }
@@ -982,9 +1019,9 @@ fn file_version(file: &mut std::fs::File) -> std::io::Result<(String, Option<Str
 }
 
 /// [`file_version`] by path; `None` when the file does not exist.
-fn path_version(path: &Path) -> anyhow::Result<Option<(String, Option<String>)>> {
+fn path_version(path: &Path, cap: u64) -> anyhow::Result<Option<(String, Option<String>)>> {
     match std::fs::File::open(path) {
-        Ok(mut file) => Ok(Some(file_version(&mut file).with_context(|| {
+        Ok(mut file) => Ok(Some(file_version(&mut file, cap).with_context(|| {
             format!("{}: failed to read current contents", path.display())
         })?)),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -1036,10 +1073,12 @@ fn judge(
 }
 
 /// The disk version `pre` needs to be judged: a stat for `expect_mtime`, the
-/// full hash only for `expect_hash`, nothing without a precondition.
+/// full hash (of a file up to `cap` bytes) only for `expect_hash`, nothing
+/// without a precondition.
 fn version_for(
     pre: Precondition<'_>,
     path: &Path,
+    cap: u64,
 ) -> anyhow::Result<Option<(String, Option<String>)>> {
     match pre {
         Precondition::None => Ok(None),
@@ -1050,7 +1089,7 @@ fn version_for(
                 Err(anyhow::Error::new(err).context(format!("{}: failed to stat", path.display())))
             }
         },
-        Precondition::Hash(_) => path_version(path),
+        Precondition::Hash(_) => path_version(path, cap),
     }
 }
 
@@ -1062,6 +1101,11 @@ struct TempFile(Option<PathBuf>);
 impl TempFile {
     fn disarm(&mut self) {
         self.0 = None;
+    }
+
+    /// The temp's path; only meaningful while armed.
+    fn path(&self) -> &Path {
+        self.0.as_deref().unwrap_or(Path::new(""))
     }
 }
 
@@ -1137,11 +1181,45 @@ fn sync_dir(dir: &Path) {
 /// A target with other hard links is rewritten in place instead (see
 /// [`write_in_place`]).
 fn write_file(raw: &str, bytes: &[u8], pre: Precondition<'_>) -> anyhow::Result<WriteOutcome> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::MetadataExt;
 
-    let expanded = expand_tilde(raw)?;
     let body_hash = sha256_hex(bytes);
-    let (target, existing) = match std::fs::metadata(&expanded) {
+    let (target, existing) = resolve_write_target(raw)?;
+
+    // First check: refuse before doing any write work.
+    if let Err(outcome) = judge(pre, version_for(pre, &target, MAX_HASH_BYTES)?, &body_hash) {
+        return Ok(outcome);
+    }
+
+    if existing.as_ref().is_some_and(|meta| meta.nlink() > 1) {
+        return write_in_place(&target, bytes, pre, body_hash);
+    }
+
+    let (mut file, mut guard) = create_temp(&target, existing.as_ref())?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("failed to write {}", guard.path().display()))?;
+    drop(file);
+
+    // Second check, as late as possible: another writer may have landed
+    // while the temp was written and synced. What remains is the gap between
+    // this read and rename(2) itself — POSIX has no compare-and-rename, and
+    // NFS offers no lock every writer honours — so a write landing in those
+    // microseconds is still replaced.
+    if let Err(outcome) = judge(pre, version_for(pre, &target, MAX_HASH_BYTES)?, &body_hash) {
+        return Ok(outcome);
+    }
+    rename_into_place(&mut guard, &target, body_hash)
+}
+
+/// Where a save of `raw` lands, resolved for [`write_file`] and the big-file
+/// writes alike: the canonical target (a live symlink resolved, so it is
+/// written THROUGH) and its metadata, or `None` metadata for a new file
+/// whose parent exists. Refuses directories, non-regular files and dangling
+/// symlinks.
+fn resolve_write_target(raw: &str) -> anyhow::Result<(PathBuf, Option<std::fs::Metadata>)> {
+    let expanded = expand_tilde(raw)?;
+    Ok(match std::fs::metadata(&expanded) {
         Ok(meta) if meta.is_dir() => {
             anyhow::bail!("{} is a directory", expanded.display());
         }
@@ -1181,16 +1259,18 @@ fn write_file(raw: &str, bytes: &[u8], pre: Precondition<'_>) -> anyhow::Result<
                 anyhow::Error::new(err).context(format!("{}: failed to stat", expanded.display()))
             );
         }
-    };
+    })
+}
 
-    // First check: refuse before doing any write work.
-    if let Err(outcome) = judge(pre, version_for(pre, &target)?, &body_hash) {
-        return Ok(outcome);
-    }
-
-    if existing.as_ref().is_some_and(|meta| meta.nlink() > 1) {
-        return write_in_place(&target, bytes, pre, body_hash);
-    }
+/// The hidden temp sibling a save of `target` is written to: born with the
+/// target's permission bits (never more permissive, even before the exact
+/// `fchmod`) and given its owner/group where allowed. The guard removes it
+/// unless [`rename_into_place`] disarms it.
+fn create_temp(
+    target: &Path,
+    existing: Option<&std::fs::Metadata>,
+) -> anyhow::Result<(std::fs::File, TempFile)> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let parent = target
         .parent()
@@ -1199,17 +1279,15 @@ fn write_file(raw: &str, bytes: &[u8], pre: Precondition<'_>) -> anyhow::Result<
         .file_name()
         .with_context(|| format!("{} has no file name", target.display()))?;
     let tmp = parent.join(temp_name(name));
-    let mode = existing
-        .as_ref()
-        .map_or(0o666, |meta| meta.permissions().mode() & 0o7777);
-    let mut file = std::fs::OpenOptions::new()
+    let mode = existing.map_or(0o666, |meta| meta.permissions().mode() & 0o7777);
+    let file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(mode)
         .open(&tmp)
         .with_context(|| format!("failed to create {}", tmp.display()))?;
-    let mut guard = TempFile(Some(tmp.clone()));
-    if let Some(meta) = &existing {
+    let guard = TempFile(Some(tmp.clone()));
+    if let Some(meta) = existing {
         // Owner first: a successful chown clears setuid/setgid bits, which
         // the exact chmod below then restores. The open's mode was filtered by
         // the umask; the chmod restores bits it dropped (e.g. group write on a
@@ -1219,29 +1297,28 @@ fn write_file(raw: &str, bytes: &[u8], pre: Precondition<'_>) -> anyhow::Result<
             tracing::warn!(path = %tmp.display(), %err, "failed to carry permissions onto tmp file");
         }
     }
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .with_context(|| format!("failed to write {}", tmp.display()))?;
-    drop(file);
+    Ok((file, guard))
+}
 
-    // Second check, as late as possible: another writer may have landed
-    // while the temp was written and synced. What remains is the gap between
-    // this read and rename(2) itself — POSIX has no compare-and-rename, and
-    // NFS offers no lock every writer honours — so a write landing in those
-    // microseconds is still replaced.
-    if let Err(outcome) = judge(pre, version_for(pre, &target)?, &body_hash) {
-        return Ok(outcome);
-    }
-    std::fs::rename(&tmp, &target)
+/// Rename a written, synced temp over `target`, then fsync the directory so
+/// the rename survives a crash. `hash` is the temp's content hash.
+fn rename_into_place(
+    guard: &mut TempFile,
+    target: &Path,
+    hash: String,
+) -> anyhow::Result<WriteOutcome> {
+    let tmp = guard.path().to_path_buf();
+    std::fs::rename(&tmp, target)
         .with_context(|| format!("failed to rename into {}", target.display()))?;
     guard.disarm();
-    sync_dir(parent);
-
-    let meta = std::fs::metadata(&target)
+    if let Some(parent) = target.parent() {
+        sync_dir(parent);
+    }
+    let meta = std::fs::metadata(target)
         .with_context(|| format!("{}: failed to stat after write", target.display()))?;
     Ok(WriteOutcome::Written {
         mtime: mtime_token(&meta),
-        hash: body_hash,
+        hash,
         wrote: true,
     })
 }
@@ -1264,21 +1341,22 @@ fn write_in_place(
         .write(true)
         .open(target)
         .with_context(|| format!("{}: failed to open for writing", target.display()))?;
-    let current =
-        match pre {
-            Precondition::None => None,
-            Precondition::Mtime(_) => Some((
-                mtime_token(
-                    &file
-                        .metadata()
-                        .with_context(|| format!("{}: failed to stat", target.display()))?,
-                ),
-                None,
-            )),
-            Precondition::Hash(_) => Some(file_version(&mut file).with_context(|| {
+    let current = match pre {
+        Precondition::None => None,
+        Precondition::Mtime(_) => Some((
+            mtime_token(
+                &file
+                    .metadata()
+                    .with_context(|| format!("{}: failed to stat", target.display()))?,
+            ),
+            None,
+        )),
+        Precondition::Hash(_) => {
+            Some(file_version(&mut file, MAX_HASH_BYTES).with_context(|| {
                 format!("{}: failed to read current contents", target.display())
-            })?),
-        };
+            })?)
+        }
+    };
     if let Err(outcome) = judge(pre, current, &body_hash) {
         return Ok(outcome);
     }
@@ -1295,6 +1373,347 @@ fn write_in_place(
         hash: body_hash,
         wrote: true,
     })
+}
+
+/// Largest file `fs/package` splices and `fs/file/stream` accepts. Both
+/// stream, so this bounds disk and I/O per save, not memory.
+pub(crate) const MAX_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
+/// Cap on a `fs/package` body: the base64 JSON of the changed parts only.
+pub(crate) const MAX_PACKAGE_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Deserialize)]
+pub(crate) struct BigWriteQuery {
+    path: String,
+    #[serde(default)]
+    expect_hash: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PackageRequest {
+    entries: Vec<PackageEntry>,
+}
+
+#[derive(Deserialize)]
+struct PackageEntry {
+    name: String,
+    /// Standard base64.
+    data: String,
+}
+
+/// POST /api/v1/fs/package?path=&expect_hash= — replace existing entries of
+/// a zip package (a .pptx/.docx/.xlsx) in place, every other entry kept
+/// byte-identical (`fs/zip_splice.rs`). Body `{"entries":[{"name","data"}]}`
+/// (≤ 64 entries, base64 data, ≤ 8 MiB). `expect_hash` is required: an edit
+/// is always relative to the bytes the client opened. Answers like
+/// `PUT fs/file`: 204 + `X-Mtime`/`X-Content-Hash`; 409 when the file moved
+/// on (or is gone); 413 over [`MAX_PACKAGE_BYTES`] or the body cap; 400 for
+/// an archive or request the splice refuses, with an `error` the UI shows.
+///
+/// There is no idempotent-retry shortcut as `PUT fs/file` has: after a lost
+/// reply the disk holds this save's output, but telling that apart from a
+/// foreign edit needs the hash of the output the client meant, which it
+/// cannot know before the daemon deflates. A retry answers 409, and the
+/// client re-reads.
+pub(crate) async fn post_package(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<BigWriteQuery>,
+    body: Bytes,
+) -> Response {
+    use base64::Engine as _;
+    if body.len() > MAX_PACKAGE_BODY_BYTES {
+        return too_large(format!(
+            "edit too large to save ({} bytes, limit {MAX_PACKAGE_BODY_BYTES})",
+            body.len()
+        ));
+    }
+    let Some(expect) = query.expect_hash.map(|h| h.to_ascii_lowercase()) else {
+        return bad_request(&anyhow::anyhow!("expect_hash is required"));
+    };
+    let request: PackageRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(err) => return bad_request(&anyhow::anyhow!("invalid request body: {err}")),
+    };
+    drop(body);
+    if request.entries.len() > zip_splice::MAX_REPLACED_ENTRIES {
+        return bad_request(&anyhow::anyhow!(
+            "too many entries in one save ({}, limit {})",
+            request.entries.len(),
+            zip_splice::MAX_REPLACED_ENTRIES
+        ));
+    }
+    let mut replacements = Vec::with_capacity(request.entries.len());
+    for entry in request.entries {
+        let Ok(data) = base64::engine::general_purpose::STANDARD.decode(entry.data.as_bytes())
+        else {
+            return bad_request(&anyhow::anyhow!("entry {:?}: invalid base64", entry.name));
+        };
+        replacements.push(zip_splice::Replacement {
+            name: entry.name,
+            data,
+        });
+    }
+    if let Err(err) = zip_splice::check_request(&replacements) {
+        return bad_request(&anyhow::Error::new(err));
+    }
+    let dirty_path = query.path.clone();
+    crate::plugins::files::mark_saved(&state, &dirty_path);
+    let permit = FILESYSTEM_WORK
+        .acquire()
+        .await
+        .expect("filesystem work semaphore is never closed");
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        write_package(&query.path, &expect, &replacements)
+    })
+    .await;
+    write_response(&state, &dirty_path, result).await
+}
+
+/// Splice `replacements` into the package at `raw`, judged against
+/// `expect` (a lowercase content hash).
+fn write_package(
+    raw: &str,
+    expect: &str,
+    replacements: &[zip_splice::Replacement],
+) -> anyhow::Result<WriteOutcome> {
+    let (target, existing) = resolve_write_target(raw)?;
+    let Some(existing) = existing else {
+        return Ok(WriteOutcome::Conflict {
+            mtime: None,
+            hash: None,
+        });
+    };
+    let package_too_large = |len: u64| {
+        anyhow::Error::new(TooLarge(format!(
+            "file too large to edit ({len} bytes, limit {MAX_PACKAGE_BYTES})"
+        )))
+    };
+    if existing.len() > MAX_PACKAGE_BYTES {
+        return Err(package_too_large(existing.len()));
+    }
+    let (mut source, _) =
+        open_regular(&target).with_context(|| format!("{}: failed to open", target.display()))?;
+    let ctx = || format!("{}: failed to read current contents", target.display());
+    let (token, hash) = file_version(&mut source, MAX_PACKAGE_BYTES).with_context(ctx)?;
+    let Some(hash) = hash else {
+        let len = source.metadata().with_context(ctx)?.len();
+        return Err(package_too_large(len));
+    };
+    if hash != expect {
+        return Ok(WriteOutcome::Conflict {
+            mtime: Some(token),
+            hash: Some(hash),
+        });
+    }
+    // The hash only vouches for the bytes the splice reads if no writer
+    // landed while it was taken.
+    let meta = source.metadata().with_context(ctx)?;
+    if mtime_token(&meta) != token {
+        return Ok(WriteOutcome::Conflict {
+            mtime: Some(mtime_token(&meta)),
+            hash: None,
+        });
+    }
+    let mut source = std::io::BufReader::with_capacity(256 * 1024, source);
+    let archive = zip_splice::read_archive(&mut source, meta.len())?;
+
+    let (file, guard) = create_temp(&target, Some(&existing))?;
+    let write_ctx = || format!("failed to write {}", guard.path().display());
+    let mut out = std::io::BufWriter::with_capacity(256 * 1024, HashingWriter::new(file));
+    zip_splice::splice(&mut source, &archive, replacements, &mut out)?;
+    let (file, out_hash) = out
+        .into_inner()
+        .map_err(std::io::IntoInnerError::into_error)
+        .with_context(write_ctx)?
+        .finish();
+    file.sync_all().with_context(write_ctx)?;
+    drop(file);
+    drop(source);
+
+    // Second check, as late as possible (see `write_file`). Reopening — not a
+    // cached stat — makes NFS revalidate the attributes, so an unchanged
+    // token means no writer landed and the full re-hash is skipped.
+    let unchanged = open_regular(&target).is_ok_and(|(_, now)| mtime_token(&now) == token);
+    if !unchanged {
+        let current = path_version(&target, MAX_PACKAGE_BYTES)?;
+        if let Err(outcome) = judge(Precondition::Hash(expect), current, &out_hash) {
+            return Ok(outcome);
+        }
+    }
+    commit_temp(guard, &target, out_hash)
+}
+
+/// PUT /api/v1/fs/file/stream?path=&expect_hash= — `PUT fs/file` for a
+/// whole file too big to buffer (the native app's "open in PowerPoint" round
+/// trip): the body streams into the temp sibling, ≤ [`MAX_PACKAGE_BYTES`]
+/// (past it the temp is deleted and the answer is 413), and only then is the
+/// precondition judged. `expect_hash` as in `PUT fs/file`, a missing file
+/// included (409), and so is the retry shortcut (the disk already holding
+/// exactly the body answers success without a write); without it the write
+/// is unconditional. Same 204/409 headers.
+pub(crate) async fn put_file_stream(
+    state: State<Arc<AppState>>,
+    query: Query<BigWriteQuery>,
+    body: Body,
+) -> Response {
+    stream_file(state, query, body, MAX_PACKAGE_BYTES).await
+}
+
+/// [`put_file_stream`] with its body cap as a parameter, so a test can hit
+/// the cap without streaming 256 MiB.
+pub(crate) async fn stream_file(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<BigWriteQuery>,
+    body: Body,
+    cap: u64,
+) -> Response {
+    use futures::StreamExt;
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncWriteExt;
+
+    let raw = query.path.clone();
+    let prepared = tokio::task::spawn_blocking(move || {
+        let (target, existing) = resolve_write_target(&raw)?;
+        let (file, guard) = create_temp(&target, existing.as_ref())?;
+        anyhow::Ok((target, file, guard))
+    })
+    .await;
+    let (target, file, guard) = match prepared {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err(err)) => return bad_request(&err),
+        Err(join) => return write_response(&state, &query.path, Err(join)).await,
+    };
+
+    let mut file = tokio::fs::File::from_std(file);
+    let mut hasher = Sha256::new();
+    let mut written: u64 = 0;
+    let mut stream = body.into_data_stream();
+    let failed = loop {
+        let chunk = match stream.next().await {
+            None => break None,
+            Some(Ok(chunk)) => chunk,
+            Some(Err(err)) => {
+                break Some(bad_request(&anyhow::anyhow!("upload stream failed: {err}")))
+            }
+        };
+        written += chunk.len() as u64;
+        if written > cap {
+            break Some(too_large(format!(
+                "file too large to save (limit {cap} bytes)"
+            )));
+        }
+        hasher.update(&chunk);
+        if let Err(err) = file.write_all(&chunk).await {
+            let err = anyhow::Error::new(err)
+                .context(format!("failed to write {}", guard.path().display()));
+            break Some(bad_request(&err));
+        }
+    };
+    let failed = match failed {
+        None => file.flush().await.err().map(|err| {
+            bad_request(
+                &anyhow::Error::new(err)
+                    .context(format!("failed to write {}", guard.path().display())),
+            )
+        }),
+        failed => failed,
+    };
+    let file = file.into_std().await;
+    if let Some(response) = failed {
+        // Off the reactor: the guard's drop removes the temp.
+        let _ = tokio::task::spawn_blocking(move || drop((file, guard))).await;
+        return response;
+    }
+    let body_hash = hex_lower(&hasher.finalize());
+
+    let dirty_path = query.path.clone();
+    crate::plugins::files::mark_saved(&state, &dirty_path);
+    let expect = query.expect_hash.map(|h| h.to_ascii_lowercase());
+    let permit = FILESYSTEM_WORK
+        .acquire()
+        .await
+        .expect("filesystem work semaphore is never closed");
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let write_ctx = || format!("failed to write {}", guard.path().display());
+        file.sync_all().with_context(write_ctx)?;
+        drop(file);
+        let pre = expect
+            .as_deref()
+            .map_or(Precondition::None, Precondition::Hash);
+        let current = version_for(pre, &target, MAX_PACKAGE_BYTES)?;
+        if let Err(outcome) = judge(pre, current, &body_hash) {
+            return Ok(outcome);
+        }
+        commit_temp(guard, &target, body_hash)
+    })
+    .await;
+    write_response(&state, &dirty_path, result).await
+}
+
+/// Put a written, synced temp in place of `target` (content hash `hash`):
+/// renamed over it, or — for a target with other hard links, judged at this
+/// moment — copied into it in place, as [`write_in_place`] does and at the
+/// same cost (a reader can see a torn file mid-copy). The temp is gone after
+/// either.
+fn commit_temp(mut guard: TempFile, target: &Path, hash: String) -> anyhow::Result<WriteOutcome> {
+    use std::os::unix::fs::MetadataExt;
+    if !std::fs::metadata(target).is_ok_and(|meta| meta.nlink() > 1) {
+        return rename_into_place(&mut guard, target, hash);
+    }
+    let ctx = || format!("failed to write {} in place", target.display());
+    let mut source = std::fs::File::open(guard.path()).with_context(ctx)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(target)
+        .with_context(ctx)?;
+    // Bytes before the truncate, so the file is never transiently empty.
+    let len = std::io::copy(&mut source, &mut file).with_context(ctx)?;
+    file.set_len(len).with_context(ctx)?;
+    file.sync_all().with_context(ctx)?;
+    let meta = file
+        .metadata()
+        .with_context(|| format!("{}: failed to stat after write", target.display()))?;
+    Ok(WriteOutcome::Written {
+        mtime: mtime_token(&meta),
+        hash,
+        wrote: true,
+    })
+}
+
+/// A writer that hashes what it passes on: the spliced package's
+/// `X-Content-Hash`, without reading the output back.
+struct HashingWriter<W> {
+    inner: W,
+    hasher: sha2::Sha256,
+}
+
+impl<W> HashingWriter<W> {
+    fn new(inner: W) -> Self {
+        use sha2::Digest;
+        Self {
+            inner,
+            hasher: sha2::Sha256::new(),
+        }
+    }
+
+    fn finish(self) -> (W, String) {
+        use sha2::Digest;
+        (self.inner, hex_lower(&self.hasher.finalize()))
+    }
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        use sha2::Digest;
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 #[cfg(test)]

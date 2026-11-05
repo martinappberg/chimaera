@@ -24,6 +24,7 @@ mod mastermind;
 mod mcp;
 mod notebook;
 mod notices;
+mod package;
 mod plugin_host;
 mod plugin_jobs;
 mod plugin_platform;
