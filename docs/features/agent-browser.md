@@ -267,3 +267,11 @@ _Captured 2026-11-05 (the maintainer, in the session that built it; the design d
 - **How settled it is:** all provisional. Only the why is settled; every piece can change if something works better, including the engine split, the tool set, the snapshot format and the pane chrome. The maintainer's #273 decisions (allowlist only, sharing through the chain link, eval allowed, user input pauses the agent, the app engine by default and Chromium otherwise) are the current design, not frozen contracts.
 - **Page reloads keep a share:** the maintainer asked that a shared pane stay shared when its page reloads because the agent changed the app's code. A share is keyed by the browser tab, so in-pane reloads and hot reloads never end it, and since 2026-11-05 neither does a reload of the Chimaera window.
 - **Do not change (or: open to change):** open to change; ask before weakening the navigation allowlist, which is the #273 Q1 decision.
+
+### Why a plugin can download the Chromium
+_Captured 2026-11-05 (the maintainer, in the session that built it; the opt-in download was planned in #273, and the maintainer chose a separate plugin over a built-in setting button)._
+
+- **Problem it solves:** the agent browser on cluster jobs and remote Linux hosts that have no Chrome or Chromium, where the user can't install one.
+- **How settled it is:** all open to change: the pinned version, serving only workspaces where the plugin is switched on, being used only when the host has no browser of its own, and being a separate plugin rather than built in.
+- **Deliberately left out or open:** nothing in particular; it is kept simple.
+- **Do not change (or: open to change):** open to change.
