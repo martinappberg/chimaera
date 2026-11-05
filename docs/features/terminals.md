@@ -170,6 +170,17 @@ official `@xterm/addon-search`; shared routing is described in
   decode above 1.4M base64 characters (about 1 MiB decoded); OSC 52 *reads* are silently swallowed
   so a process can't exfiltrate the clipboard over the PTY.
 
+## Commands typed in from a chat
+
+- **What & when.** A chat's shell block has a ▶ Run button ([chat mode](chat-mode.md)); a click
+  types the block into a terminal and presses Enter.
+- **Which terminal.** The shell that chat last ran in, while it lives and sits at its prompt
+  (OSC 133 `ready`); never one running something, whose program would read the text. Otherwise a
+  new shell in the chat's live folder on the chat's host, opened beside the chat. A new shell gets
+  the text once it reports its prompt, or after 15 s when it has no shell integration.
+- **Where it lives.** App's `runCommandFromPane` / `waitForPrompt`, through the pane controller's
+  `runCommandFrom`; the text goes through `sendText`, else a one-shot `typeIntoDetachedSession`.
+
 ## Command-line word navigation
 
 - **How it's used.** On macOS, Option+Left/Right moves by word in local and remote shells,
