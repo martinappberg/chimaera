@@ -52,6 +52,7 @@ daemon  ──WS /ws/chat/{id}──▶  chatWs.ts (ChatSocket)
 | State | Owner | Who mutates |
 |---|---|---|
 | `blocks`, `pendingSends`, plan, subagents, flags | `ChatStore` | `apply` and store methods only. |
+| Waiting messages taken back to edit (`editing`, `edited`) | `ChatStore` | `requestEdit` / `takeEdited` / `releaseEdits`; only a live `cancelled` returns words, never replay. |
 | Socket, resume `lastSeq` | `ChatSocket` | The socket; it feeds the store. |
 | Warm entries, scroll cursor | `chatPool.ts` | Acquire; App disposes. |
 | Drafts, dictation | `drafts.ts`, `Dictation` | `Composer`; `Dictation`. |

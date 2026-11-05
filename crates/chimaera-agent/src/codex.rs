@@ -1173,6 +1173,11 @@ struct PendingQuestion {
 /// handful; the cap only guards a runaway turn (login-node budgets).
 const COLLAB_AGENTS_CAP: usize = 32;
 
+/// Bound on [`CodexMapper::steers_awaiting_reply`]: one turn's user steers,
+/// already bounded by the retained-Send budget; this keeps the per-turn list
+/// bounded on its own.
+const STEERS_AWAITING_REPLY_MAX: usize = 64;
+
 /// One spawned collab subagent (multi-agent, 0.144.x): the parent thread's
 /// `subAgentActivity` markers open/close it, and every frame of the agent's
 /// OWN thread — which multiplexes onto this same connection — folds into its
@@ -1744,6 +1749,23 @@ struct CodexMapper {
     /// {input: []}` samples the model on the history as it stands), unless
     /// queued input opens that turn anyway.
     answer_owed: bool,
+    /// User steers codex took into this turn's history since the model last
+    /// wrote to the user, in the order read. Instant steering (on by default
+    /// since 0.163.0) records a steer within a second even while a command
+    /// runs, so its bubble reads sent while the reply is still to come
+    /// (live 0.166.0, PROTOCOL.md Pass 60). Cleared by the model's visible
+    /// reply on the turn; per turn; at most [`STEERS_AWAITING_REPLY_MAX`].
+    steers_awaiting_reply: Vec<Value>,
+    /// The running turn is being ended by Send now, not a Stop: whatever the
+    /// user sent for it is still to be answered. Per turn.
+    send_now_interrupt: bool,
+    /// Inputs of steers a Send now cut off before the model answered them.
+    /// Codex has them in history, yet a turn opened with newer input answers
+    /// only the newer input (live 0.166.0, three runs of three): the re-drive
+    /// carries them again, in order, ahead of the unread ones. With nothing
+    /// unread, an input-less turn answers them as they stand (live, three of
+    /// three), so they are never sent twice there.
+    resend_on_redrive: Vec<Value>,
     /// Interrupt watchdog: ticks remaining before we synthesize the abort the
     /// app-server never sent. Armed on `Interrupt`, counted down in `tick`,
     /// disarmed when a turn ends (`reset_turn_state`) or a fresh turn opens.
@@ -1929,6 +1951,9 @@ impl CodexMapper {
             agent_steers: HashSet::new(),
             read_unanswered: false,
             answer_owed: false,
+            steers_awaiting_reply: Vec::new(),
+            send_now_interrupt: false,
+            resend_on_redrive: Vec::new(),
             interrupt_grace: None,
             idle_flush_grace: None,
             start_ack: None,
@@ -2861,6 +2886,18 @@ impl CodexMapper {
                                 interrupted: true,
                             });
                             self.warn_unreceived_input(&mut step);
+                            // Send now ends the turn so what the user sent is
+                            // answered at once: the steers it already read
+                            // go with the next turn. A Stop owes nothing.
+                            if self.send_now_interrupt {
+                                // Appended: an earlier Send now's carry-over
+                                // may still wait behind a gated re-drive.
+                                let room = STEERS_AWAITING_REPLY_MAX
+                                    .saturating_sub(self.resend_on_redrive.len());
+                                let carried = std::mem::take(&mut self.steers_awaiting_reply);
+                                self.resend_on_redrive
+                                    .extend(carried.into_iter().take(room));
+                            }
                         }
                         // A failed turn is `turn/completed {status: "failed",
                         // error}` on current app-servers (the 0.153/0.156
@@ -3081,6 +3118,8 @@ impl CodexMapper {
         self.unread_opening_message = None;
         self.opening_turn_owned = false;
         self.read_unanswered = false;
+        self.steers_awaiting_reply.clear();
+        self.send_now_interrupt = false;
         self.startup_hooks.clear();
         self.streamed.clear();
         self.out_streamed.clear();
@@ -5022,8 +5061,21 @@ impl CodexMapper {
                     self.read_unanswered = false;
                 }
             }
-            "item/agentMessage/delta"
-            | "item/reasoning/textDelta"
+            // Written to the user: what it read is answered. Reasoning is
+            // not — after a steer's echo the model reasons, then waits for
+            // the running command before it replies (live 0.166.0) — and an
+            // agent message can open empty (live 0.166.0).
+            "item/agentMessage/delta" => {
+                self.read_unanswered = false;
+                self.steers_awaiting_reply.clear();
+            }
+            "item/completed"
+                if item["type"] == "agentMessage"
+                    && item["text"].as_str().is_some_and(|t| !t.trim().is_empty()) =>
+            {
+                self.steers_awaiting_reply.clear();
+            }
+            "item/reasoning/textDelta"
             | "item/reasoning/summaryTextDelta"
             | "item/reasoning/summaryPartAdded"
             | "item/plan/delta"
@@ -5051,11 +5103,28 @@ impl CodexMapper {
             .iter()
             .find(|(_, send)| send.client_msg_id == client_id)
             .map(|(order, _)| *order);
-        self.agent_steers.remove(client_id);
+        let from_agent = self.agent_steers.remove(client_id);
         if let Some(order) = unread {
-            self.unread_steers.remove(&order);
+            let send = self.unread_steers.remove(&order).expect("found above");
+            if !from_agent {
+                self.note_steer_awaiting_reply(send.input);
+            }
         } else if self.steer_pending_for(client_id) {
             self.read_before_answer.insert(client_id.to_string());
+            let input = self.pending_rpcs.values().find_map(|p| match p {
+                PendingRpc::Steer {
+                    input,
+                    client_msg_id,
+                    ..
+                } if client_msg_id == client_id => Some(input.clone()),
+                _ => None,
+            });
+            // Decline feedback rides the same RPC but is not the user's
+            // message: it is never carried again.
+            let feedback = self.feedback_steers.contains(client_id);
+            if let (Some(input), false, false) = (input, from_agent, feedback) {
+                self.note_steer_awaiting_reply(input);
+            }
         } else {
             return;
         }
@@ -5067,6 +5136,14 @@ impl CodexMapper {
             id: client_id.to_string(),
             state: UserMessageState::Sent,
         });
+    }
+
+    /// A user steer is in the turn's history and the model has not written to
+    /// the user since: a Send now must not leave it unanswered.
+    fn note_steer_awaiting_reply(&mut self, input: Value) {
+        if self.turn_active && self.steers_awaiting_reply.len() < STEERS_AWAITING_REPLY_MAX {
+            self.steers_awaiting_reply.push(input);
+        }
     }
 
     /// A refused steer that carried decline feedback: while its turn still
@@ -5172,6 +5249,12 @@ impl CodexMapper {
             self.redrive_batch(batch, step);
             return;
         }
+        // Everything a Send now cut off was already read: the model answers
+        // the history as it stands, before any after-turn message.
+        if !self.resend_on_redrive.is_empty() {
+            self.emit_answer_turn(step);
+            return;
+        }
         let Some(queued) = self.queued_sends.pop_front() else {
             if self.answer_owed {
                 self.emit_answer_turn(step);
@@ -5194,6 +5277,7 @@ impl CodexMapper {
         let mut events = Vec::new();
         self.read_before_answer.clear();
         self.feedback_steers.clear();
+        self.resend_on_redrive.clear();
         self.agent_steers.clear();
         for (_, steered) in std::mem::take(&mut self.unread_steers) {
             events.push(AgentEvent::UserMessageUpdate {
@@ -5873,8 +5957,11 @@ impl CodexMapper {
 
     fn open_turn(&mut self, input: Value, client_msg_id: Option<String>, step: &mut DriverStep) {
         // Any turn the driver opens reads the whole history, a steer left
-        // unanswered at the last turn's end included.
+        // unanswered at the last turn's end included. (A Send now's cut-off
+        // steers are spent by the re-drive or the answer turn that carries
+        // them; a turn opened any other way answers its own input.)
         self.answer_owed = false;
+        self.resend_on_redrive.clear();
         self.opening_turn_owned = true;
         let id = self.rpc_id();
         let mut params = json!({
@@ -6012,7 +6099,15 @@ impl CodexMapper {
             user_message_id: first.clone(),
             preceding_uuid: preceding,
         });
+        // Steers a Send now cut off unanswered ride ahead of the unread ones,
+        // in the order they were sent; their bubbles already read sent.
         let mut input: Vec<Value> = Vec::new();
+        for resent in std::mem::take(&mut self.resend_on_redrive) {
+            match resent {
+                Value::Array(items) => input.extend(items),
+                other => input.push(other),
+            }
+        }
         for send in batch {
             self.feedback_steers.remove(&send.client_msg_id);
             match send.input {
@@ -6277,6 +6372,9 @@ impl CodexMapper {
                 }
             }
             AgentCommand::Interrupt => {
+                // A Stop pressed after a Send now is still a Stop: nothing
+                // the turn read is owed an answer.
+                self.send_now_interrupt = false;
                 // Stop must stop: `turn/interrupt` leaves an active goal
                 // active, and the server opens the next continuation turn at
                 // once (live 0.162.1) — the Codex TUI pauses the goal on an
@@ -6583,6 +6681,7 @@ impl CodexMapper {
                         let send = self.queued_sends.remove(pos).expect("position exists");
                         let order = self.rpc_id();
                         self.deferred_steer_redrives.insert(order, send);
+                        self.send_now_interrupt = true;
                         self.interrupt(&mut step);
                     } else if self.turn_pending || self.pending_model_update.is_some() {
                         self.queued_sends[pos].steer_when_active = true;
@@ -6598,6 +6697,7 @@ impl CodexMapper {
                             .values()
                             .any(|send| send.client_msg_id == id))
                 {
+                    self.send_now_interrupt = true;
                     self.interrupt(&mut step);
                 }
             }
@@ -8750,6 +8850,190 @@ mod tests {
         // Already read: Send now does nothing.
         let step = m.on_command(AgentCommand::SendNow { id: b });
         assert!(step.outbound.is_empty() && step.events.is_empty());
+    }
+
+    /// Steer `text` into turn-A and acknowledge it; returns its id.
+    fn steer_acked(m: &mut CodexMapper, text: &str) -> String {
+        let step = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: text.into() }],
+        });
+        let AgentEvent::UserMessage { id: Some(id), .. } = &step.events[0] else {
+            panic!("expected UserMessage, got {:?}", step.events);
+        };
+        let rpc = step.outbound[0]["id"].as_u64().unwrap();
+        m.on_frame(&json!({ "id": rpc, "result": { "turnId": "turn-A" } }));
+        id.clone()
+    }
+
+    fn interrupted_turn_a(m: &mut CodexMapper) -> DriverStep {
+        m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "turn": { "id": "turn-A", "status": "interrupted" } },
+        }))
+    }
+
+    /// #355 (live 0.166.0, Pass 60): instant steering records A at once, so
+    /// its bubble reads sent while the model has not answered it. Send now
+    /// on the still-unread B must not leave A unanswered: a turn opened with
+    /// only B answers only B, so A's input rides ahead of B's.
+    #[test]
+    fn send_now_carries_steers_read_but_unanswered_into_the_redrive() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let a = steer_acked(&mut m, "A");
+        let step = m.on_frame(&read_item(&a));
+        assert!(step.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if *id == a
+        )));
+        // Reasoning is not an answer.
+        m.on_frame(&json!({
+            "method": "item/reasoning/summaryTextDelta",
+            "params": { "turnId": "turn-A", "delta": "waiting for the command" },
+        }));
+        let b = steer_acked(&mut m, "B");
+        let step = m.on_command(AgentCommand::SendNow { id: b.clone() });
+        assert_eq!(step.outbound[0]["method"], "turn/interrupt");
+        let step = interrupted_turn_a(&mut m);
+        let start = step
+            .outbound
+            .iter()
+            .find(|o| o["method"] == "turn/start")
+            .expect("the cut-off messages open the next turn");
+        assert_eq!(start["params"]["clientUserMessageId"], json!(b));
+        assert_eq!(
+            start["params"]["input"],
+            json!([{ "type": "text", "text": "A" }, { "type": "text", "text": "B" }])
+        );
+        assert!(
+            !step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::UserMessageUpdate { id, .. } if *id == a
+            )),
+            "A already read sent; only B resolves here"
+        );
+        assert!(m.resend_on_redrive.is_empty());
+    }
+
+    /// Everything waiting was read by the time Send now's interrupt ended
+    /// the turn (B was taken in while the interrupt was on its way): an
+    /// input-less turn answers it as it stands (live 0.166.0), before the
+    /// after-turn message, which still opens a turn of its own.
+    #[test]
+    fn send_now_with_every_steer_read_opens_an_answer_turn_first() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let a = steer_acked(&mut m, "A");
+        m.on_frame(&read_item(&a));
+        let b = steer_acked(&mut m, "B");
+        let step = m.on_command(AgentCommand::SendAfterTurn {
+            blocks: vec![ContentBlock::Text { text: "C".into() }],
+        });
+        let AgentEvent::UserMessage { id: Some(c), .. } = &step.events[0] else {
+            panic!("expected UserMessage");
+        };
+        let c = c.clone();
+        let step = m.on_command(AgentCommand::SendNow { id: b.clone() });
+        assert_eq!(step.outbound[0]["method"], "turn/interrupt");
+        m.on_frame(&read_item(&b));
+        let step = interrupted_turn_a(&mut m);
+        let start = step
+            .outbound
+            .iter()
+            .find(|o| o["method"] == "turn/start")
+            .expect("an answer turn opens");
+        assert_eq!(start["params"]["input"], json!([]));
+        assert!(start["params"].get("clientUserMessageId").is_none());
+        assert_eq!(m.queued_sends.len(), 1, "C waits for its own turn");
+        assert_eq!(m.queued_sends[0].client_msg_id, c);
+    }
+
+    /// Only the user's own steers are carried: decline feedback (even one
+    /// echoed before its answer) and another agent's message never are.
+    #[test]
+    fn send_now_never_carries_feedback_or_agent_steers() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let mut step = DriverStep::default();
+        m.dispatch_input(
+            json!([{ "type": "text", "text": "use the other file" }]),
+            &mut step,
+        );
+        let feedback_id = step.outbound[0]["params"]["clientUserMessageId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let feedback_rpc = step.outbound[0]["id"].as_u64().unwrap();
+        // Echoed before its RPC answer (the read-before-answer path).
+        m.on_frame(&read_item(&feedback_id));
+        m.on_frame(&json!({ "id": feedback_rpc, "result": { "turnId": "turn-A" } }));
+        let step = m.on_command(AgentCommand::SendIfRunning {
+            id: "k-agent".into(),
+            blocks: vec![ContentBlock::Text {
+                text: "from an agent".into(),
+            }],
+        });
+        let rpc = step.outbound[0]["id"].as_u64().unwrap();
+        m.on_frame(&json!({ "id": rpc, "result": { "turnId": "turn-A" } }));
+        m.on_frame(&read_item("k-agent"));
+        assert!(
+            m.steers_awaiting_reply.is_empty(),
+            "{:?}",
+            m.steers_awaiting_reply
+        );
+        let b = steer_acked(&mut m, "B");
+        m.on_command(AgentCommand::SendNow { id: b });
+        let step = interrupted_turn_a(&mut m);
+        let start = step
+            .outbound
+            .iter()
+            .find(|o| o["method"] == "turn/start")
+            .expect("B opens the next turn");
+        assert_eq!(
+            start["params"]["input"],
+            json!([{ "type": "text", "text": "B" }])
+        );
+    }
+
+    /// A reply clears the debt, and a Stop never owes one: neither opens a
+    /// turn for messages already read.
+    #[test]
+    fn answered_steers_and_stops_open_no_turn_after_the_interrupt() {
+        // Answered, then Send now on a message that is already read.
+        let mut m = mapper();
+        active_turn(&mut m);
+        let a = steer_acked(&mut m, "A");
+        m.on_frame(&read_item(&a));
+        m.on_frame(&json!({
+            "method": "item/agentMessage/delta",
+            "params": { "turnId": "turn-A", "itemId": "msg-1", "delta": "A=42" },
+        }));
+        let b = steer_acked(&mut m, "B");
+        m.on_command(AgentCommand::SendNow { id: b.clone() });
+        let step = interrupted_turn_a(&mut m);
+        let start = step
+            .outbound
+            .iter()
+            .find(|o| o["method"] == "turn/start")
+            .expect("B opens the next turn");
+        assert_eq!(
+            start["params"]["input"],
+            json!([{ "type": "text", "text": "B" }]),
+            "the answered A is not sent again"
+        );
+
+        // A Stop after a read steer ends the turn and owes nothing.
+        let mut m = mapper();
+        active_turn(&mut m);
+        let a = steer_acked(&mut m, "A");
+        m.on_frame(&read_item(&a));
+        m.on_command(AgentCommand::Interrupt);
+        let step = interrupted_turn_a(&mut m);
+        assert!(
+            !step.outbound.iter().any(|o| o["method"] == "turn/start"),
+            "a stop stays a stop: {:?}",
+            step.outbound
+        );
     }
 
     /// Decline feedback steered into the running turn has no bubble: its ack

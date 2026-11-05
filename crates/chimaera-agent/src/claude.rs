@@ -5150,6 +5150,15 @@ impl ClaudeMapper {
             // as a duplicate, and a fresh one would orphan the bubble's
             // rewind key. Already read (or nothing running): nothing to do.
             AgentCommand::SendNow { id } => {
+                // The pressed message may be the one the CLI is taking in
+                // right now (`Taken`: its bubble still waits for up to the
+                // requeue window). Send now acts on everything waiting
+                // whichever message it names (2.1.318 schema), so it names
+                // the next one still in the CLI's queue instead.
+                let id = match self.awaiting_read.front() {
+                    Some(next) if self.taken.as_ref().is_some_and(|t| t.id == id) => next.clone(),
+                    _ => id,
+                };
                 let at_cli = self.awaiting_read.contains(&id);
                 let waiting = at_cli || self.queued_sends.iter().any(|(q, _, _)| *q == id);
                 // A turn that is starting (a waiting batch was just read) is
@@ -7323,6 +7332,30 @@ pub(crate) mod tests {
             "subtype": "success", "request_id": ctl,
             "response": {"still_queued": [], "turn": "stopped"}}}));
         assert!(sent(&step, &d));
+    }
+
+    /// #355: Send now pressed on the message the CLI is taking in right now
+    /// (held `Taken`, its bubble still waiting) names the next one still
+    /// queued; the CLI's send-now acts on everything waiting either way.
+    /// Nothing else waiting: it is being read, so nothing is sent.
+    #[test]
+    fn send_now_on_a_taken_message_names_the_next_one_waiting() {
+        let (mut m, _a) = requeue_mapper_mid_turn();
+        let (b, _) = send_text(&mut m, "B", false);
+        let (c, _) = send_text(&mut m, "C", false);
+        m.on_frame(&lifecycle(&b, "started"));
+        assert!(m.taken.as_ref().is_some_and(|t| t.id == b));
+        let step = m.on_command(AgentCommand::SendNow { id: b.clone() });
+        assert_eq!(
+            step.outbound[0]["request"],
+            json!({ "subtype": "interrupt", "send_now": true, "message_uuid": c })
+        );
+
+        let (mut m, _a) = requeue_mapper_mid_turn();
+        let (b, _) = send_text(&mut m, "B", false);
+        m.on_frame(&lifecycle(&b, "started"));
+        let step = m.on_command(AgentCommand::SendNow { id: b });
+        assert!(step.outbound.is_empty(), "{:?}", step.outbound);
     }
 
     /// Live 2.1.310: a Stop naming a turn that already ended answered

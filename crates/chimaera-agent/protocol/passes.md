@@ -1797,3 +1797,34 @@ Found by the Codex `just chat-smoke` run for the stuck "next step" fix: `codex_c
 
 - Hermetic, new: `codex.rs` `completed_marker_before_the_agent_turn_end_leaves_the_close_to_it` (the 0.164.0 order: one finish line, closed on the turn end, no new stint).
 - Live: `codex_collab_subagent_surface` passes on codex-cli 0.164.0 with the relaxed assertion; `driver_codex_spawned_agents_draw_rows_on_both_runtimes` passed in the same day's Codex smoke.
+
+## Pass 60 — 2026-11-04: Send now with several waiting messages (issue #355; live probes claude 2.1.318 / 2.1.310, codex 0.166.0)
+
+Reported (#355): with more than one message waiting, Send now did not send them all at once. The maintainer asked that everything waiting go immediately, except messages queued for after the turn, and for a UI that fits.
+
+**Method.** Raw stream-json and app-server clients mirroring the drivers' frames, with every frame logged. Scenario: a foreground `python3 -c 'import time; time.sleep(25)'`, then A and B sent as mid-turn messages and C for after the turn, then Send now. Claude ran five times on haiku (2.1.318 naming A, B and C in turn, plus a double press; 2.1.310 naming A). Codex 0.166.0 (gpt-5.6-luna, low effort) ran twelve times: the default instant steering, `features.instant_interrupt=false`, and the candidate fixes. `~/.claude/settings.json` was unchanged.
+
+### Findings
+
+- **Claude: not reproduced.** Whichever message `interrupt {send_now, message_uuid}` names, A and B run together as one turn and C runs right after it as its own turn (claude-code.md › Mid-turn messages). One defect: Send now pressed on the message the CLI is taking in (`Taken`, still drawn waiting for up to `REQUEUE_WINDOW_MS`) did nothing, because its id had left `awaiting_read`.
+- **Codex: reproduced under the default instant steering.** A steer is echoed within about 1 s even while the command runs, so its bubble reads sent before any reply. Send now's `turn/interrupt` then leaves nothing unread to re-drive, and:
+  - the re-drive of a still-unread B answered only B (A got no reply);
+  - opening C after the interrupt answered only C (A and B got no reply);
+  - opening an input-less turn and steering B in as it started also answered only B.
+  - Two forms answer everything. An input-less `turn/start {input: []}`, when nothing was unread, answered A and B (three runs of three). Carrying A's input ahead of B's in the re-drive answered both (two of two).
+  - With `instant_interrupt=false` the steers wait unechoed and the existing re-drive delivers both.
+- **ACP: by design.** Send now moved the pressed message to the front and cancelled; `resume()` then started one queued message per turn, so the rest each waited a full turn and the pressed one jumped ahead of older ones.
+
+### ADOPTED
+
+- Codex (`codex.rs`): `steers_awaiting_reply` holds each user steer echoed on the turn until the model writes to the user (agent-message text; reasoning does not count). A Send now interrupt (`send_now_interrupt`; a Stop clears it) moves them to `resend_on_redrive` at the interrupted end. The re-drive carries their inputs ahead of the unread ones; with nothing unread, an input-less answer turn opens before the after-turn FIFO. Any other turn the driver opens drops them.
+- ACP (`acp.rs`): Send now joins every waiting message into one prompt, in the order sent (`Queued.joined`); each resolves `sent` with it, ✕ removes one part, and teardown drops every part.
+- Claude (`claude.rs`): Send now on a `Taken` message names `awaiting_read.front()`.
+- UI: the waiting stack has one **Send now** under its last bubble. It names the oldest next-step message, or the oldest after-turn one when only those wait, since every agent acts on the whole stack. Each waiting bubble gets ✎ (and ↑ in an empty composer takes back every waiting message of the user's). The edit withdraws it (`cancel_queued`) and returns its words and saved pictures to the asking view's composer only on `cancelled`, so a message the agent read first stays sent and is never duplicated (`ChatStore.requestEdit` / `takeEdited`). A Codex steer cannot be withdrawn, and says so.
+
+### Gate (Pass 60)
+
+- Hermetic, new: codex `send_now_carries_steers_read_but_unanswered_into_the_redrive`, `send_now_with_every_steer_read_opens_an_answer_turn_first`, `answered_steers_and_stops_open_no_turn_after_the_interrupt`; acp `send_now_sends_every_waiting_message_as_one_prompt`; claude `send_now_on_a_taken_message_names_the_next_one_waiting`; store `an edit returns a withdrawn message's words to the view that asked, once`, `a cancel nobody asked to edit returns nothing`.
+- Live, new: `tests/live.rs` `driver_codex_send_now_answers_every_waiting_message`. Through the real driver on codex 0.166.0 (gpt-5.6-luna), A is read, C waits for after the turn, and Send now is pressed on B: the turn it opens answers `A=42` and `B=63`, then C answers `C=99` (two runs of two). The pre-fix driver fails it with only `B=63`.
+- Live suites (2026-11-04): every Codex test on 0.166.0 (16); the Claude queue and Send now tests on 2.1.318 (send now spares background agents, mid-turn queue, `next` read mid-turn, `cancel_async_message`, Stop puts back a taken message, rapid queued sends, the end-to-end driver stack); `just chat-smoke-acp` on Grok 1.0.70, agy-acp 1.4.5 and Cursor 2026.10.22. One test failed in each group (`codex_collab_subagent_can_outlive_parent_turn`, `claude_stop_puts_back_a_just_taken_message`, Grok's startup handshake while its `initialize` took 12–16 s); none of them exercises the changed code, and each passed when rerun alone.
+- Live UI (isolated daemon, Vite on this branch, Claude haiku): A and B waiting for the next step and C for after the turn drew one Send now under the stack. ✎ on B put its text back in the composer, and the edited B was resent. Send now stopped the running command; A and the edited B were answered in one turn, then C. ↑ in the empty composer during a later turn took both waiting messages back into one draft, in order.

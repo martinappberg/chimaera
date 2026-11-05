@@ -46,6 +46,7 @@ Recorded at grok 1.0.46 (probed 2026-10-04/05, with model turns on the second da
 - A queued prompt starts after the preceding prompt response, not after the cancel notification is written (2026-10-01).
 - Cancellation resolves open permission requests as cancelled before sending `session/cancel` (2026-10-01).
 - ACP v1 has no mid-turn input: `session/prompt` is one at a time. A message to a busy ACP chat waits for the turn to end and then meets the wake policy (Pass 44).
+- Send now cancels the turn and sends every waiting message as ONE `session/prompt`, their blocks in the order sent, whichever bubble was pressed; each resolves `sent` with it. ✕ on one of that batch before it goes removes only its part. Before, the pressed message jumped the queue alone and the rest went one turn each (Pass 60).
 - No native fork is advertised. A conversation copy is held in the mapper until the first real user message and prepended to that prompt; opening a fork must not synthesize a turn. The handoff stays pending until the provider emits response content or tool activity, or completes the first prompt; then the driver journals `ForkContextConsumed`. A JSON-RPC rejection before acceptance keeps the copy for retry. An undelivered copy is recovered from its journal marker after a restart or reopen (2026-10-01).
 
 ## Permissions
