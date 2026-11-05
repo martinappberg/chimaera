@@ -405,16 +405,18 @@ _Captured 2026-07-12 (from the maintainer)._
   are open to improve; only the workspace-first framing (above) is the core bet.
 
 ### Open beside — why it exists
-_Intent pending — drafted from the maintainer's request, 2026-11-05; questionnaire not yet run._
+_Captured 2026-11-05 (from the maintainer)._
 
 - **Problem it solves (from the request).** "When in chat or MD documents or in general when you
   are in a main pane, you have the option to open something to the right … like in a horizontal
   pane if that is open", with the constraint that the control is "NOT too obvious, verbose". The
   maintainer chose both parts of the proposal: one beside rule for every gesture (reuse the
   neighbor, split only when alone), and a plain click from a chat landing beside it.
-- **Pending.** Whether plain-click-beside should cover shell terminals as well as chats (it
-  does: an agent TUI is a terminal pane), and which parts are a promise rather than "for now" —
-  capture via **capture-feature-intent**.
+- **How settled it is.** None of it is a promise yet (asked which parts are, the answer was
+  "Nope"): an **addition**, provisional throughout — including plain-click-beside covering shell
+  terminals as well as chats (an agent TUI is a terminal pane).
+- **Do not change (or: open to change):** nothing is frozen ("Nope") — the rule, the gestures
+  and the chat default are all open to improve.
 
 ### Fit-width tab strips — why they exist
 _Intent pending — drafted from the maintainer's request, 2026-09-06; questionnaire not yet run._
