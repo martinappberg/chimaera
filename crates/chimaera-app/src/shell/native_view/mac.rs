@@ -42,7 +42,8 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSBitmapImageFileType, NSBitmapImageRep, NSEvent, NSEventMask, NSImage, NSResponder, NSView,
+    NSApplication, NSBitmapImageFileType, NSBitmapImageRep, NSEvent, NSEventMask, NSImage,
+    NSResponder, NSView,
 };
 use objc2_foundation::{
     NSDictionary, NSError, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
@@ -388,8 +389,7 @@ fn clip_view(mtm: MainThreadMarker) -> Retained<NSView> {
     // layer-hosting child (the web view) either way.
     // SAFETY: selector checked before the call; `layer` is a CALayer or nil.
     unsafe {
-        let responds: bool = msg_send![&*view, respondsToSelector: objc2::sel!(setClipsToBounds:)];
-        if responds {
+        if responds(&*view, objc2::sel!(setClipsToBounds:)) {
             view.setClipsToBounds(true);
         }
         let layer: *mut AnyObject = msg_send![&*view, layer];
@@ -606,31 +606,52 @@ pub(super) fn close(app: &AppHandle, label: String) {
             pane.wk.setUIDelegate(None);
             pane.wk.stopLoading();
         }
-        end_process(&pane);
+        // Out of its window first, so the windows' web views `end_process`
+        // checks are everyone else's.
         pane.clip.removeFromSuperview();
+        if let Some(mtm) = MainThreadMarker::new() {
+            end_process(&pane.wk, mtm);
+        }
     });
 }
 
-/// The web processes `view` (a `WKWebView`) runs in now: its page's and,
-/// mid-navigation, the provisional page's. SPI, read only when WebKit has it.
-fn web_pids(view: &NSView) -> Vec<i32> {
-    // SAFETY: each selector is checked first; both getters return a pid_t
-    // (0 = no process).
-    unsafe {
-        let mut pids = Vec::new();
-        let responds: bool =
-            msg_send![view, respondsToSelector: objc2::sel!(_webProcessIdentifier)];
-        if responds {
-            pids.push(msg_send![view, _webProcessIdentifier]);
-        }
-        let responds: bool =
-            msg_send![view, respondsToSelector: objc2::sel!(_provisionalWebProcessIdentifier)];
-        if responds {
-            pids.push(msg_send![view, _provisionalWebProcessIdentifier]);
-        }
-        pids.retain(|pid: &i32| *pid > 0);
-        pids
+/// Whether `obj` answers `sel` (an SPI WebKit may drop or rename).
+fn responds<T: objc2::Message>(obj: &T, sel: objc2::runtime::Sel) -> bool {
+    // SAFETY: `respondsToSelector:` is NSObject's, safe on any object.
+    unsafe { msg_send![obj, respondsToSelector: sel] }
+}
+
+/// The web processes `view` runs pages in now: a `WKWebView`'s page and,
+/// mid-navigation, its provisional page. `None` for any other view, or when
+/// WebKit can no longer say (the SPI is gone).
+fn web_pids(view: &NSView) -> Option<Vec<i32>> {
+    if !responds(view, objc2::sel!(_webProcessIdentifier)) {
+        return None;
     }
+    // SAFETY: both getters checked; each returns a pid_t (0 = no process).
+    let mut pids: Vec<i32> = vec![unsafe { msg_send![view, _webProcessIdentifier] }];
+    if responds(view, objc2::sel!(_provisionalWebProcessIdentifier)) {
+        pids.push(unsafe { msg_send![view, _provisionalWebProcessIdentifier] });
+    }
+    pids.retain(|pid| *pid > 0);
+    Some(pids)
+}
+
+/// Every web process the app's windows show a page in: each window's own web
+/// view, every pane view, any other web view in them.
+fn window_pids(mtm: MainThreadMarker) -> Vec<i32> {
+    let mut pids = Vec::new();
+    let mut stack: Vec<Retained<NSView>> = NSApplication::sharedApplication(mtm)
+        .windows()
+        .iter()
+        .filter_map(|window| window.contentView())
+        .collect();
+    while let Some(view) = stack.pop() {
+        pids.extend(web_pids(&view).unwrap_or_default());
+        // A window's web view holds its pane views' clip boxes.
+        stack.extend(view.subviews().iter());
+    }
+    pids
 }
 
 /// End a closing view's web process now. Dropped alone, the view leaves its
@@ -641,25 +662,16 @@ fn web_pids(view: &NSView) -> Vec<i32> {
 /// `_killWebContentProcessAndResetState` SIGKILLs the page's process (and a
 /// provisional page's) at once and leaves the shared website data alone; the
 /// plain `_killWebContentProcess` left the process running (macOS 26). Each
-/// view gets a process of its own (measured: distinct pids for views
-/// on one origin, the window's included), but the kill would take down any
-/// other page in that process, so it's skipped when the owner or another
-/// live view reports the same pid. Fails closed: no SPI, no pid, no kill —
-/// the view just closes as before.
-fn end_process(pane: &Pane) {
-    let ours = web_pids(&pane.wk);
-    if ours.is_empty() {
+/// view gets a process of its own (measured: distinct pids for views on one
+/// origin, the window's included), but the kill would take down any other
+/// page in that process, so it's skipped when any web view left in the app's
+/// windows reports the same pid. Fails closed: no SPI, no pid, no kill — the
+/// view just closes as before.
+fn end_process(wk: &WKWebView, mtm: MainThreadMarker) {
+    let Some(ours) = web_pids(wk).filter(|pids| !pids.is_empty()) else {
         return;
-    }
-    // SAFETY: NSView accessor on the main thread.
-    let mut others: Vec<i32> = unsafe { pane.clip.superview() }
-        .map(|owner| web_pids(&owner))
-        .unwrap_or_default();
-    PANES.with(|panes| {
-        for other in panes.borrow().values() {
-            others.extend(web_pids(&other.wk));
-        }
-    });
+    };
+    let others = window_pids(mtm);
     if ours.iter().any(|pid| others.contains(pid)) {
         tracing::warn!(
             ?ours,
@@ -667,15 +679,11 @@ fn end_process(pane: &Pane) {
         );
         return;
     }
-    let kill = objc2::sel!(_killWebContentProcessAndResetState);
-    // SAFETY: the selector is checked first; it takes and returns nothing.
-    // No `PANES` borrow is held: the termination is reported synchronously.
-    unsafe {
-        let responds: bool = msg_send![&*pane.wk, respondsToSelector: kill];
-        if responds {
-            let _: () = msg_send![&*pane.wk, _killWebContentProcessAndResetState];
-            tracing::debug!(?ours, "pane view: ended its web process");
-        }
+    if responds(wk, objc2::sel!(_killWebContentProcessAndResetState)) {
+        // SAFETY: checked above; takes and returns nothing. No `PANES`
+        // borrow is held: the termination is reported synchronously.
+        let _: () = unsafe { msg_send![wk, _killWebContentProcessAndResetState] };
+        tracing::debug!(?ours, "pane view: ended its web process");
     }
 }
 

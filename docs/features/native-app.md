@@ -69,7 +69,7 @@ app-build` (never the root `cargo`).
   itself, WebKit ends the process only once the process handles the close, and a busy one —
   laying out a huge report, or swapping — took ~4 minutes (a 9.5 GB report, 2026-11-04). The
   delegates are cleared first, so the termination is never mistaken for a crash and reloaded,
-  and the kill is skipped if the window or another view reports the same process id.
+  and the kill is skipped if any other web view in the app's windows reports the same process id.
 - **The askpass wiring stays the app's own.** The local daemon is spawned without the app's
   `SSH_ASKPASS*` / `CHIMAERA_ASKPASS_*` variables (and a daemon that inherited them from an older
   app strips them from its sessions), so a terminal's `ssh` prompts on its tty and no agent can
