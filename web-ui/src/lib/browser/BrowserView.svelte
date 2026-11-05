@@ -799,7 +799,12 @@
         >
           <span class="held-dot" aria-hidden="true"></span>
           <span class="held-text">
-            {#if paused}<span class="held-state">Paused</span>{:else}<span class="held-name">{sharedWith.label ?? "agent"}</span>{#if driving}<span class="held-state"> driving</span>{/if}{/if}
+            {#if paused}
+              <span class="held-state">Paused</span>
+            {:else}
+              <span class="held-name">{sharedWith.label ?? "agent"}</span>
+              {#if driving}<span class="held-state">driving</span>{/if}
+            {/if}
           </span>
         </button>
         {#if paused}
@@ -1024,8 +1029,10 @@
      agent's hue on its border so the bond reads at a glance. The dot says
      what it is doing: a quiet hue disc idle, a breathing one while it
      drives, a hollow ring while paused. */
+  /* Shrinks before the bar overflows: the agent's name gives way (ellipsis),
+     the state word and Resume never do. */
   .held {
-    flex: none;
+    flex: 0 1 auto;
     display: inline-flex;
     align-items: center;
     height: 18px;
@@ -1078,10 +1085,24 @@
   }
 
   .held-text {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.5ch;
+    min-width: 0;
+    white-space: nowrap;
+  }
+
+  .held-name {
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
-    white-space: nowrap;
+  }
+
+  .held-state,
+  .held-dot,
+  .held-sep,
+  .held-resume {
+    flex: none;
   }
 
   .held-state {

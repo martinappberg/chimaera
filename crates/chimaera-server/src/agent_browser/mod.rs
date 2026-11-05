@@ -368,6 +368,9 @@ pub(crate) struct SharedPane {
     /// The agent's own page handed to the user (`browser_show`), counted
     /// against [`HANDED_OVER_MAX`] while it stays linked.
     pub(crate) handed_over: bool,
+    /// The page's last non-empty title (a handed-over pane's first answers
+    /// can come before its window reports one).
+    pub(crate) title: Option<String>,
 }
 
 /// Handed-over panes still linked to one agent, at most.
