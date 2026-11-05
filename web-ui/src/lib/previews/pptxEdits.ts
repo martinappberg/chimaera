@@ -152,7 +152,7 @@ export class DeckEditsCore {
   }
 
   /** What the file on disk holds for `part` (as far as this window knows). */
-  private disk(part: string): string | undefined {
+  disk(part: string): string | undefined {
     return this.saved.get(part) ?? this.origin.get(part);
   }
 

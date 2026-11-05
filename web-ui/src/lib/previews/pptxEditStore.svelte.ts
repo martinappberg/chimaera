@@ -86,6 +86,11 @@ export class DeckEdits {
     return c !== null && c.has(part) ? c.text(part) : null;
   }
 
+  /** What the file on disk holds for `part` (what a fresh load draws). */
+  diskText(part: string): string | null {
+    return this.core?.disk(part) ?? null;
+  }
+
   /** Parts the history touched (the view re-renders their slides). */
   touchedParts(): string[] {
     const c = this.core;

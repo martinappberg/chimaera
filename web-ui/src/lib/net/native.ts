@@ -550,6 +550,91 @@ export function listenNativeView(handler: (payload: unknown) => void): Promise<(
     .listen<unknown>("native-view", (e) => handler(e.payload));
 }
 
+// --- the same file in PowerPoint ------------------------------------------------
+
+/**
+ * A deck this window handed to PowerPoint (`office_open`). On this machine
+ * PowerPoint opens the file itself and there is no trip; for another host's
+ * file the shell keeps a working copy, watches it, and uploads each save
+ * with the host's hash as the precondition — a trip.
+ */
+export interface OfficeTrip {
+  /** The file on the host. */
+  path: string;
+  /** "watching": open in PowerPoint, everything uploaded; "uploading";
+   *  "conflict": the host's file changed since it was opened, nothing was
+   *  overwritten; "error": the last upload failed (`message` says why). */
+  state: "watching" | "uploading" | "conflict" | "error";
+  /** When the last save reached the host (ms since the epoch). */
+  uploaded_ms: number | null;
+  message: string | null;
+}
+
+/** What `openInOffice` did. */
+export interface OfficeOpened {
+  /** The app that opened it ("Microsoft PowerPoint", "Keynote", …). */
+  app: string;
+  /** A round trip runs for it (another host's file). */
+  trip: OfficeTrip | null;
+}
+
+/** Office files the shell hands to an app: PowerPoint decks for now. */
+const OFFICE_EXT = /\.(pptx|pptm|ppsx|potx)$/i;
+
+/** The shell can open `path` in PowerPoint (or the system's app for it). */
+export function canOpenInOffice(path: string): boolean {
+  return tauri() !== null && !/\bWindows\b/.test(navigator.userAgent) && OFFICE_EXT.test(path);
+}
+
+/** Open `path` in PowerPoint through the native shell. Rejects with the
+ *  shell's reason (no app for it, the host unreachable, …). */
+export async function openInOffice(path: string): Promise<OfficeOpened> {
+  const t = tauri();
+  if (t === null) throw new Error("only the app can open files in PowerPoint");
+  try {
+    return await t.core.invoke<OfficeOpened>("office_open", { path });
+  } catch (e) {
+    throw new Error(typeof e === "string" ? e : e instanceof Error ? e.message : "PowerPoint couldn't open it");
+  }
+}
+
+/** The round trip for `path` on this window's host, if one runs. */
+export async function officeTrip(path: string): Promise<OfficeTrip | null> {
+  const t = tauri();
+  if (t === null) return null;
+  try {
+    return await t.core.invoke<OfficeTrip | null>("office_trip", { path });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Settle a trip: "overwrite" uploads the PowerPoint copy over the host's
+ * changed file; "copy" uploads it beside it instead (resolves to the new
+ * path); "theirs" fetches the host's version into a new copy and opens that;
+ * "done" stops watching (refused while a save hasn't reached the host).
+ */
+export async function resolveOfficeTrip(
+  path: string,
+  choice: "overwrite" | "copy" | "theirs" | "done",
+): Promise<string | null> {
+  const t = tauri();
+  if (t === null) return null;
+  try {
+    return await t.core.invoke<string | null>("office_trip_resolve", { path, choice });
+  } catch (e) {
+    throw new Error(typeof e === "string" ? e : "that didn't work");
+  }
+}
+
+/** A trip of this window's host changed (`office-trip`, to that host's windows). */
+export function listenOfficeTrip(handler: (trip: OfficeTrip) => void): Promise<() => void> {
+  const t = tauri();
+  if (t === null) return Promise.resolve(() => {});
+  return t.event.listen<OfficeTrip>("office-trip", (e) => handler(e.payload));
+}
+
 /**
  * A newer signed app build exists (the shell's periodic updater check).
  * Broadcast to every window; presentation and snoozing are the UI's job.
