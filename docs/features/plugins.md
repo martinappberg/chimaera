@@ -25,7 +25,7 @@ activity log), `retired.rs` (plugins whose job moved into Chimaera,
 [below](#agent-notes)) — plus `agent_probe.rs` and `comms.rs` (the post window plugins' Timeline appends share);
 the interface `crates/chimaera-plugin-api` (the WIT world and its Rust bindings,
 [map](../../crates/chimaera-plugin-api/AGENTS.md)); the first-party plugins in their own
-repositories, [chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium), [chimaera-plugin-latex](https://github.com/martinappberg/chimaera-plugin-latex) and [chimaera-plugin-typst](https://github.com/martinappberg/chimaera-plugin-typst), whose releases
+repositories, [chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium), [chimaera-plugin-latex](https://github.com/martinappberg/chimaera-plugin-latex), [chimaera-plugin-typst](https://github.com/martinappberg/chimaera-plugin-typst) and [chimaera-plugin-pptx](https://github.com/martinappberg/chimaera-plugin-pptx), whose releases
 `plugins/plugins.lock` pins — the lock is all the daemon carries of them
 ([map](../../plugins/AGENTS.md)); the CLI `crates/chimaera/src/plugin.rs`; UI
 `web-ui/src/lib/plugins/` ([map](../../web-ui/src/lib/plugins/AGENTS.md)) — the `plugins`
@@ -95,8 +95,9 @@ installation or hook trust and on reconnect; it carries no plugin payload.
 - **What & when.** Opt-in capabilities that change what the UI or the agents get, off by
   default. The first-party ones are WASM plugins in their own repositories at the releases
   `plugins/plugins.lock` pins: **Mycelium** (fills Knowledge and "Where things stand"; adds
-  `knowledge_search` · `knowledge_get` for every agent here), and **LaTeX** and **Typst**
-  ([below](#programs-and-tools-the-privileged-tier)). The daemon carries none of them: each is
+  `knowledge_search` · `knowledge_get` for every agent here), **LaTeX** and **Typst**
+  ([below](#programs-and-tools-the-privileged-tier)), and **PowerPoint** (`render_slides` shows
+  agents their slides, `check_deck` finds layout problems, and plain themes or the user's own). The daemon carries none of them: each is
   listed as *available* until the user installs it on this host
   ([below](#versions-installs--updates)).
 - **How it's used.** Open Extensions from the rail's **Extensions** row or quick-open
@@ -242,7 +243,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     in separate repositories and install from locked releases; the daemon carries no plugin
     bytes. Capability trust, both WIT worlds, plugin screens and file views, query routes,
     switch events, program jobs and tool downloads are implemented (sections below).
-    LaTeX and Typst use the 0.2 platform. **Browse** remains disabled, "later".
+    LaTeX, Typst and PowerPoint use the 0.2 platform. **Browse** remains disabled, "later".
 
 ## The plugin host
 
@@ -695,7 +696,8 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   formatter) and download the ones it needs. It names each one in its manifest; nothing else
   can run. The host runs them as **jobs** under fixed limits, and downloads a **tool** only
   when you click Install. The locked first-party LaTeX and Typst plugins use this tier
-  for document compilation, diagnostics, and agent compilation tools.
+  for document compilation, diagnostics, and agent compilation tools; PowerPoint uses it to
+  render slides with LibreOffice.
 - **How to use.** Such a plugin's card says **runs programs** and lists every program under
   **Can** ("Runs latexmk"; a shell gets "Runs sh: this plugin can run any command on this
   host"; a program that reaches the network says so: "tlmgr uses the network: CTAN mirrors"). Before install, **Downloads** says what its tools would fetch and from where ("TeX
