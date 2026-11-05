@@ -1798,6 +1798,86 @@ Found by the Codex `just chat-smoke` run for the stuck "next step" fix: `codex_c
 - Hermetic, new: `codex.rs` `completed_marker_before_the_agent_turn_end_leaves_the_close_to_it` (the 0.164.0 order: one finish line, closed on the turn end, no new stint).
 - Live: `codex_collab_subagent_surface` passes on codex-cli 0.164.0 with the relaxed assertion; `driver_codex_spawned_agents_draw_rows_on_both_runtimes` passed in the same day's Codex smoke.
 
+## Pass 59 (2026-11-04 — live probes claude 2.1.318, codex 0.166.0, grok 1.0.70, agy-acp 1.4.5, cursor-agent 2026.10.22): drift pass to the latest of all five agents. Pins moved; two Claude mappings ADOPTED.
+
+Every agent's newest release against its pin: Claude Code 2.1.310 → 2.1.318 (npm latest; `stable` is 2.1.311, no 2.1.313 was published), Codex 0.164.0 → 0.166.0 (npm and GitHub latest; 0.165.0 between), Grok Build 1.0.46 → 1.0.70 (the stable channel), the standalone agy-acp-server 1.2.1 → 1.4.5, and Cursor CLI 2026.10.14 → 2026.10.22.
+
+**Method.** Each version was installed beside the user's own, never over it: Claude and Codex into throwaway npm prefixes, agy-acp 1.4.5 and Cursor 2026.10.22 downloaded from their official sources into a scratch folder; Grok 1.0.70 was already the managed install. `~/.claude/settings.json` hashed the same before and after every Claude probe. Probes:
+
+- Claude, on 2.1.310 and 2.1.318: a no-turn `initialize`; one billed haiku turn (Bash `echo hi`, then `ok`) with every frame logged and key sets diffed per frame kind; a no-turn `get_settings` + `mcp_status` on haiku and opus; `claude auth status --json`; `--help` and `sdk-tools.d.ts` diffs; the binaries' literal sets (subtypes, types, `*_vN` tokens) and all 2.5k zod `.describe()` strings paired old → new. Then the held-message ✕ probe below (four billed runs).
+- Codex, on 0.164.0 and 0.166.0: `generate-ts` / `generate-json-schema` (stable and `--experimental`) diffed; `--help`, `app-server --help` and `features list` diffed; one billed `echo hi` turn per version on gpt-5.6-luna and on the default model, frames diffed; an unknown model on each. Release notes rust-v0.165.0 and rust-v0.166.0 and the PRs they cite.
+- ACP: raw stdio clients against each new and pinned version: `initialize`, `session/new`, one billed `session/prompt` running `echo hi` (allow-once), `session/load` / resume, an image, MCP pre-approval through a stand-in HTTP server named `chimaera`, and the system-context `_meta` fields. 14 billed turns in all.
+- Issue #355 (Send now with several waiting messages): Claude 2.1.318 and 2.1.310 (five billed haiku runs) and Codex 0.166.0 (five billed gpt-5.6-luna runs) with A and B sent for the next step and C after the turn, during a foreground command.
+
+### Findings: Claude Code 2.1.318
+
+- **No drift in anything the driver maps.** The `initialize` response adds one key, `hook_on_failure_supported`; its `capabilities`, models, agents and output styles are unchanged; the command catalog adds `send-to-project` (82). `system/init.capabilities` adds `ask_user_question_unanswered_v1` (14 in all); the four tokens the driver keys on are present. `system/init` adds `ultrathink_available` / `ultrathink_typed_raises`; `result` adds `credential_expires_at` and two cache-creation usage fields; `get_settings` adds `applied.ultrathinkAvailable`. The `assistant`, `stream_event`, `command_lifecycle`, `system/status`, `rate_limit_event`, `tool_result` and `mcp_status` key sets are unchanged. Removed, never consumed: the `FileReadOutput` variant `file_unchanged`, the attachment `output_limit_note`, and a flag value `short_v2`. See [claude-code.md › Handshake](claude-code.md#handshake-and-initialize) and [Tolerated frames](claude-code.md#tolerated-frames).
+- **A held message's ✕ was lost (ADOPTED).** 2.1.318 counts a message read from stdin but not yet queued (held behind a model check or start-up work) as waiting: a Stop lists it in `still_queued`. The schema says `cancel_async_message` on it answers `cancelled: false` and "plants a cancel-pending mark, which the drain honours once the message is queued". Live it did not: with a foreground Bash running, `set_model`, then B (`next`) and `cancel_async_message B` in the same instant, the answer was `{cancelled: false}`, then B `queued`, `started` and `completed`, read into the running turn. That held for `opus[1m]` (a 12.5 s check) and `claude-fable-5-1` (2.2 s); `sonnet` (0.1 s) answered `set_model` before B queued and the ✕ worked. A second `cancel_async_message B` sent on that `queued` frame answered `{cancelled: true}` after its `cancelled` frame, and B never ran. The driver now remembers a `false` answer for a message still in `awaiting_read` (`held_cancels`), sends the cancel once more on its `queued` frame, and resolves the `cancelled` frame `Cancelled`. Before, the bubble stayed waiting and then ran.
+- **`system/session_writes_lost` (2.1.317, ADOPTED).** `{error_code: "ENOSPC" | "EDQUOT", lost: ["transcript" | "global_config"], transcript_session_ids?}`, "Sent at most once, as the CLI exits, after the last result"; `-p` then exits 1. It fell through the silent arm; it is now one Notice naming what was lost and why. Schema only; a full disk was not provoked.
+- New, not adopted: `ask_user_question_unanswered_v1` (an AskUserQuestion answer may mark a question `skipped` / `replied_in_chat` / `dismissed`); the `ui_placed` system push (Mods `$.ui.place`) and the opt-in `ui_prompt_paint` control; `pending_elicitation_requests` on `initialize`; the binary-only tokens `start_shell_task_v1`, `mcp_status_no_config_v1`, `background_tasks_moves_bash_v1`, `reply_gate_policy{,_disabled,_refused}_v1`, `read_widget_context_v1`, `program_use_case_stamps_v1`; the cloud-worker subtypes `inherited_asks_settled`, `start_folder`. `send_now: "delivering"` gains one case (the turn is compacting by itself: the CLI lets it end, then moves or stops); the driver already waits for the lifecycle frame.
+- Issue #355 does not reproduce on Claude (2.1.318 and 2.1.310): whichever of A, B or C `interrupt {send_now, message_uuid}` names, the receipt is `{still_queued: [A, B, C], send_now: "stopped"}`, A and B start in the same millisecond as one turn, and C starts at that turn's end as its own turn; a second send-now 0.4 s later answers `delivering` and changes nothing.
+
+### Changelog review: Claude Code 2.1.311–2.1.318
+
+Only entries that matter to a host driving the CLI structurally; TUI, IDE, Slack and cloud-only entries were skipped. 2.1.315 has no changelog section.
+
+| Version | Change | Chimaera today | Recommendation |
+|---|---|---|---|
+| 2.1.318 | `credential_expires_at` on `-p` results; `loginExpiresAt` in `claude auth status --json` | Neither is read; `agent_auth.rs` reads `loggedIn` | Adopt later: warn ahead of a sign-in expiry |
+| 2.1.318 | A message sent right after a model change is stopped or cancelled like a queued one | ✕ on it was lost (above) | **Adopted** |
+| 2.1.318 | Background subagents move a shell command to the background after 3 min | Lanes from `background_tasks_changed` | Ignore |
+| 2.1.318 | Mods: `prompt.submit` attachments stay in the turn; `$.model.fork` takes `effort` | Chimaera hosts Mods | Ignore; `chat-mods-smoke` |
+| 2.1.318 | Shared network homes: `~/.claude.json` and login survival fixes; an invalid `~/.claude.json` refuses non-interactive starts with a restore hint | Startup failure reaches `report_startup_failure` | Adopt later: show `startup_failure_reason` / `errors` verbatim |
+| 2.1.317 | `session_writes_lost`; `-p` exits 1 when a full disk or quota lost writes | Silently dropped | **Adopted** |
+| 2.1.317 | SDK hook callbacks take `onFailure: "block"` | No SDK callbacks | Ignore |
+| 2.1.317 | Self-paced `/loop` wakeups that went unscheduled when a field was missing | `autonomy.rs` keys on `scheduledFor` | Ignore (benefits) |
+| 2.1.317 | `claude -p` inside a session no longer shares its session id | The daemon scrubs `CLAUDE_CODE_SESSION_ID` / `CHILD_SESSION` | Ignore |
+| 2.1.316 / 2.1.311 | `ultrathink` raises effort to xhigh; `ultrathink_available` / `_typed_raises`, user frame `ultrathink_typed` | No ultrathink support | Adopt later, while init says `ultrathink_typed_raises` (false on this account) |
+| 2.1.316 | Shell commands no longer left running when Claude exits by itself | SIGTERM-first teardown | Ignore (benefits) |
+| 2.1.314 | `permissions.blockWritesOutsideWorkingDirectories`; host-only `--settings` keys for working-dir spelling and extra read paths | Not set | Adopt later, if a workspace needs a write fence |
+| 2.1.314 | `-p` no longer exits 0 with no output on a startup failure | Benefits | Ignore |
+| 2.1.311 | Interrupt no longer stalls behind an MCP resource read; `-p` transcript ordering; SubagentStop no longer fires twice a minute | — | Ignore (benefits) |
+| 2.1.311 | stream-json escapes DEL, C1 and Unicode format characters as `\uXXXX` | serde parse | Ignore |
+| binary | `ask_user_question_unanswered_v1` | `QuestionCard` has no skip; the answer sends `answers` only | Adopt later |
+| binary | `ui_placed` (Mods `$.ui.place`) | Dropped, so placed rows are not drawn | Adopt later (Mods parity) |
+
+### Findings: Codex 0.166.0
+
+- **No drift in anything the driver maps.** `ServerNotification`, `ServerRequest` and `ClientNotification` are byte-identical to 0.164.0 in the stable and experimental schemas; no definition was removed; the method unions grew 277 → 281, all additions; every method string the driver and daemon send is still present (besides the known fallbacks `turn/failed`, `thread/rollback`, `item/plan`). `--help` and `app-server --help` are identical. Live, the only frame differences are flat `startedAtMs` / `completedAtMs` on every item and two new `config/read` keys; frame order is identical.
+- `CodexErrorInfo` adds `modelNotFound` (an unknown model is now a readable, terminal message, where 0.164.0 showed the raw JSON body) and `policyCapacityUnavailable`; `ModelProviderError` data names a provider mismatch. Not read; the message shows as it comes. See [codex.md › Turn lifecycle](codex.md#turn-lifecycle).
+- `HookMetadata` already carried `handlerType` / `command` / `async` at 0.164.0 (codex.md said no command field); 0.166.0 adds `environmentId`. `review/start` is in both schemas (codex.md said no `review/*` RPC exists); 0.166.0 drops its `detached` delivery. Both lines corrected.
+- With no `model` in config, both versions open `gpt-6.1-sol` and it works. The probed account is now Plus: two rate-limit windows (300 min and 10080 min) with credits — recorded in [codex.md › Usage limits](codex.md#usage-limits). `model/list` is identical on both versions and includes GPT-6.1 Terra, now in the launcher's fresh-launch fallback list.
+- `instant_interrupt` stays default-on. **Issue #355 reproduces on Codex under it:** a steer sent during a foreground command echoes within 1 s, so its bubble resolves sent before the agent answered; Send now's `turn/interrupt` then re-drives only unechoed steers, and the echoed ones are never answered (a `turn/start` with new input ignores them; `turn/start {input: []}` answers them). With `instant_interrupt=false` the re-drive delivers both. The fix is Pass 60.
+
+### Release notes: Codex 0.165.0–0.166.0
+
+| Version | PR | Change | Chimaera today | Recommendation |
+|---|---|---|---|---|
+| 0.165 | #56445 | `model_not_found` terminal, provider message kept, `modelNotFound` | Shown as an Error; the turn aborts | Benefits now; adopt later: a "pick another model" hint |
+| 0.166 | #57452 | `policyCapacityUnavailable`, retried per Retry-After | `willRetry` notice | Ignore |
+| 0.166 | #57840 | Resume / input rejected on a provider mismatch, with `ModelProviderError` | A startup error or "turn/start failed: …" | Adopt later: name the fix from `error.data.type` |
+| 0.166 | #57172, #57420 | Item lifecycle timestamps | Durations from `durationMs` | Adopt later: real times in subagent replays |
+| 0.165 | #56163 | Effort changes mid-conversation on by default | `thread/settings/update` + read-back | Ignore |
+| 0.165 | #56330, #56133 | Agent-message wakes no longer restart work after an interrupt or a Plan switch | Server-started turns are generic | Ignore (benefits) |
+| 0.166 | #57227, #57839 | Resume and fork keep acknowledged permissions and reasoning-token accounting | Explicit settings at open | Ignore |
+| 0.166 | #57787, #57788 | Thread startup / shutdown races fixed | The Pass 46 "active writer" workaround | Ignore; keep it |
+| 0.166 | #57242 | `thread_unload_delay_secs` 1800 → 60 for an unsubscribed idle thread | One subscribed connection per chat | Ignore |
+| 0.166 | #57513 | The npm `codex.js` `execve`s the native binary | Own process group + killpg | Ignore (SIGTERM now reaches codex directly) |
+| 0.166 | #57181, #57279 | Named untrusted `additionalContext` | Agent messages steer as user input | Adopt later, once `untrusted_as_tool_output` is stable |
+| 0.165 | #56465 | `thread/memory/read` (experimental) | None | Adopt later, for Knowledge |
+| 0.166 | #57249 | `features.plugin_discovery_prefetch=false` skips startup plugin fetches | Inventory probes start full app-servers | Adopt later, version-gated |
+| 0.165/0.166 | #57337, #57293 | GPT-6.1 Terra | Missing from the fallback list | **Adopted** (`launcher.rs`) |
+
+### Findings: ACP
+
+- **Grok 1.0.70:** the handshake equals 1.0.46's except `promptCapabilities.image: true` (images below 512 px are rejected by the model). Shell permission requests offer a fourth option, `reject-always`, which the mapper already handles, and carry `x.ai/requestingSessionId`. `_x.ai/billing` lost `creditUsagePercent` server-side (1.0.46 too), so the Grok limit chip shows nothing. New and not adopted: `_meta.rules` system text, `session_info_update` titles, per-turn usage and cost, `_x.ai/queue/changed`.
+- **agy-acp 1.4.5:** `configOptions` reshaped (model families plus a `thinking_level` option), so a saved effort-suffixed pick no longer restores; `usage_update` and prompt `usage` are now sent; `allow_always` carries a security warning in `_meta`; `_meta.antigravity.systemPrompt.append` works. The installer fetches 1.4.5 from the same URL pattern with the same layout. The agy CLI's built-in `agy acp` (1.5.0) is a different server and is not adopted; its turns failed with a license error on the probed account.
+- **Cursor 2026.10.22:** no drift. Opt-in `subagents` and `parameterizedModelPicker` client capabilities exist in the bundle (both versions), unprobed. Its command list (~78) exceeds `SLASH_COMMANDS_CAP` (64) and is truncated.
+- agy's and Cursor's completed shell updates carry output only in `rawOutput`, which the adapter does not read. Details: [acp.md](acp.md).
+- The Grok billing fallback, the agy model-id migration, `rawOutput` shell output and agy's self-updater replacing the managed `bin/agy` symlink are follow-up work, not part of this pass.
+
+### Gate (Pass 59)
+
 ## Pass 60 — 2026-11-04: Send now with several waiting messages (issue #355; live probes claude 2.1.318 / 2.1.310, codex 0.166.0)
 
 Reported (#355): with more than one message waiting, Send now did not send them all at once. The maintainer asked that everything waiting go immediately, except messages queued for after the turn, and for a UI that fits.

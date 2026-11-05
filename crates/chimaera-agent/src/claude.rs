@@ -48,9 +48,9 @@ use crate::model::{
 use crate::model::{RemoteControlSnapshot, RemoteControlState};
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 
-/// CLI version these frame shapes were verified against (2026-10-23, the
-/// Claude part of chat-smoke 21/21 + chat-mods-smoke; PROTOCOL.md Pass 52).
-pub const TESTED_CLAUDE_VERSION: &str = "2.1.310";
+/// CLI version these frame shapes were verified against (2026-11-04, the
+/// Claude part of chat-smoke + chat-mods-smoke; PROTOCOL.md Pass 59).
+pub const TESTED_CLAUDE_VERSION: &str = "2.1.318";
 
 /// The environment variable that lowers Claude Code's auto-compact
 /// threshold to a percentage of its window (PROTOCOL.md Pass 55). Chimaera
@@ -201,6 +201,36 @@ fn queued_message_frame(uuid: &str, content: Value, priority: &str, requeue: boo
         frame["requeue_if_interrupted_within_ms"] = json!(REQUEUE_WINDOW_MS);
     }
     frame
+}
+
+/// The one line for `system/session_writes_lost {error_code, lost}`
+/// (2.1.317): what the CLI could not save, and why. `None` when it names
+/// nothing it lost.
+fn writes_lost_notice(frame: &Value) -> Option<String> {
+    let lost: Vec<&str> = frame["lost"]
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    let transcript = lost.contains(&"transcript");
+    let what = match (transcript, lost.contains(&"global_config")) {
+        (true, true) => "this conversation or its ~/.claude.json settings",
+        (true, false) => "this conversation",
+        (false, true) => "its ~/.claude.json settings",
+        (false, false) => return None,
+    };
+    let why = match frame["error_code"].as_str() {
+        Some("ENOSPC") => "the disk is full".to_string(),
+        Some("EDQUOT") => "the disk quota is used up".to_string(),
+        Some(code) if !code.is_empty() => truncate_label(code, 40),
+        _ => "a write failed".to_string(),
+    };
+    let after = if transcript {
+        " Reopening it may miss the latest turns."
+    } else {
+        ""
+    };
+    Some(format!("Claude couldn't save {what}: {why}.{after}"))
 }
 
 /// A waiting message the CLI has just taken in, which a Stop can still put
@@ -1186,6 +1216,12 @@ struct ClaudeMapper {
     /// (a subset of `awaiting_read`; one put back leaves, as the CLI puts a
     /// message back at most once).
     requeue_armed: HashSet<String>,
+    /// Waiting messages whose ✕ the CLI answered `cancelled: false` while
+    /// they still waited here: it had read them but not yet queued them
+    /// (held behind a model change or start-up work). Live 2.1.318 runs such
+    /// a message once it queues, so its `queued` frame sends the cancel
+    /// again (PROTOCOL.md Pass 59). A subset of `awaiting_read`.
+    held_cancels: HashSet<String>,
     /// The last waiting message the CLI took in since the model last spoke,
     /// while a Stop can still put it back. Only the last can be (the CLI's
     /// rule), so a newer one releases it.
@@ -1366,6 +1402,7 @@ impl ClaudeMapper {
             wakeup_source_capable: false,
             requeue_capable: false,
             requeue_armed: HashSet::new(),
+            held_cancels: HashSet::new(),
             taken: None,
             turn_messages: Vec::new(),
             next_ctl: 0,
@@ -1881,6 +1918,14 @@ impl ClaudeMapper {
             }
             // Remote Control bridge lifecycle (2.1.259).
             Some("bridge_state") => self.on_bridge_state(frame, step),
+            // 2.1.317: sent once, as the CLI exits, when a full disk or quota
+            // lost its writes. A lost transcript means a reopen misses turns.
+            Some("session_writes_lost") => {
+                if let Some(text) = writes_lost_notice(frame) {
+                    self.flush_prose(step);
+                    step.events.push(AgentEvent::Notice { text });
+                }
+            }
             // The CLI's own host-facing notices (`level`: info shows only in
             // transcript mode there; notice/suggestion/warning are visible).
             // Hook "says:" lines, model-switch notices, … ride this frame.
@@ -4122,6 +4167,12 @@ impl ClaudeMapper {
                 } else if taken {
                     // The turn has it; the CLI will not put it back now.
                     self.release_taken(step);
+                } else if self.awaiting_read.contains(&id) {
+                    // Read but not yet queued: the CLI will queue it, and
+                    // run it, once what holds it is done. Ask again then.
+                    let waiting = &self.awaiting_read;
+                    self.held_cancels.retain(|h| waiting.contains(h));
+                    self.held_cancels.insert(id);
                 }
             }
             PendingControl::ApplyFlags {
@@ -4412,6 +4463,12 @@ impl ClaudeMapper {
             }
             return;
         };
+        if frame["state"] == "queued" {
+            if self.held_cancels.remove(id) {
+                self.cancel_queued(id.to_string(), step);
+            }
+            return;
+        }
         let state = match frame["state"].as_str() {
             Some("started" | "completed") => UserMessageState::Sent,
             // Withdrawn by our ✕ (its `cancel_async_message` is still in
@@ -4419,10 +4476,11 @@ impl ClaudeMapper {
             // not ask for — the CLI sweeping its queue — is not the user
             // taking it back: the message was never delivered, so say so.
             Some("cancelled") => {
-                let ours = self
-                    .pending_controls
-                    .values()
-                    .any(|p| matches!(p, PendingControl::CancelQueued(q) if q == id));
+                let ours = self.held_cancels.contains(id)
+                    || self
+                        .pending_controls
+                        .values()
+                        .any(|p| matches!(p, PendingControl::CancelQueued(q) if q == id));
                 if ours {
                     UserMessageState::Cancelled
                 } else {
@@ -4433,6 +4491,7 @@ impl ClaudeMapper {
             _ => return,
         };
         let id = self.awaiting_read.remove(pos).expect("position exists");
+        self.held_cancels.remove(&id);
         if state != UserMessageState::Sent {
             self.requeue_armed.remove(&id);
             step.events
@@ -5126,13 +5185,7 @@ impl ClaudeMapper {
                 if self.awaiting_read.contains(&id)
                     || self.taken.as_ref().is_some_and(|t| t.id == id)
                 {
-                    let ctl = self.ctl_id();
-                    self.pending_controls
-                        .insert(ctl.clone(), PendingControl::CancelQueued(id.clone()));
-                    step.outbound.push(control_request_frame(
-                        &ctl,
-                        json!({ "subtype": "cancel_async_message", "message_uuid": id }),
-                    ));
+                    self.cancel_queued(id, &mut step);
                 } else {
                     self.queued_sends.retain(|(q, _, _)| q != &id);
                     step.events.push(AgentEvent::UserMessageUpdate {
@@ -5230,6 +5283,16 @@ impl ClaudeMapper {
         step
     }
 
+    /// Withdraw a message from the CLI's queue (`cancel_async_message`); it
+    /// resolves on the answer or its `cancelled` lifecycle frame.
+    fn cancel_queued(&mut self, id: String, step: &mut DriverStep) {
+        let ctl = self.ctl_id();
+        let request = json!({ "subtype": "cancel_async_message", "message_uuid": id });
+        self.pending_controls
+            .insert(ctl.clone(), PendingControl::CancelQueued(id));
+        step.outbound.push(control_request_frame(&ctl, request));
+    }
+
     fn interrupt(&mut self, step: &mut DriverStep) {
         // Recorded so on_result can stamp the abort as user-initiated
         // (TurnAborted.interrupted) — the ack itself says nothing and
@@ -5313,6 +5376,7 @@ impl ClaudeMapper {
         // A hard kill mid-queue must not strand a waiting message as "queued"
         // forever on replay — drop what the agent never read: the CLI's queue
         // died with it, and a held message was never even written.
+        self.held_cancels.clear();
         for id in std::mem::take(&mut self.awaiting_read) {
             events.push(AgentEvent::UserMessageUpdate {
                 id,
@@ -7191,6 +7255,94 @@ pub(crate) mod tests {
                 ..
             }]
         ));
+    }
+
+    /// Live 2.1.318 (Pass 59): ✕ on a message sent right after a model
+    /// change answers `cancelled: false` while the CLI still holds it behind
+    /// the model check; once that ends, the message queues and runs anyway.
+    /// Its `queued` frame sends the cancel again, which withdraws it.
+    #[test]
+    fn a_held_message_is_cancelled_once_it_queues() {
+        let mut m = native_mapper_mid_turn();
+        let (b, _) = send_text(&mut m, "B", false);
+        let step = m.on_command(AgentCommand::CancelQueued { id: b.clone() });
+        let ctl = step.outbound[0]["request_id"].as_str().unwrap().to_string();
+        let step = m.on_frame(&json!({
+            "type": "control_response",
+            "response": { "subtype": "success", "request_id": ctl,
+                          "response": { "cancelled": false } },
+        }));
+        assert!(step.events.is_empty() && step.outbound.is_empty());
+        let step = m.on_frame(&lifecycle(&b, "queued"));
+        assert!(step.events.is_empty());
+        assert_eq!(
+            step.outbound[0]["request"],
+            json!({ "subtype": "cancel_async_message", "message_uuid": b })
+        );
+        let retry = step.outbound[0]["request_id"].as_str().unwrap().to_string();
+        let step = m.on_frame(&lifecycle(&b, "cancelled"));
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::UserMessageUpdate {
+                id: b.clone(),
+                state: UserMessageState::Cancelled,
+            }]
+        );
+        let step = m.on_frame(&json!({
+            "type": "control_response",
+            "response": { "subtype": "success", "request_id": retry,
+                          "response": { "cancelled": true } },
+        }));
+        assert!(step.events.is_empty(), "already resolved");
+        assert!(m.held_cancels.is_empty());
+
+        // Only once: a second `queued` (a Stop putting it back) after the
+        // retry sends nothing more.
+        let (c, _) = send_text(&mut m, "C", false);
+        let step = m.on_command(AgentCommand::CancelQueued { id: c.clone() });
+        let ctl = step.outbound[0]["request_id"].as_str().unwrap().to_string();
+        m.on_frame(&json!({
+            "type": "control_response",
+            "response": { "subtype": "success", "request_id": ctl,
+                          "response": { "cancelled": false } },
+        }));
+        assert_eq!(m.on_frame(&lifecycle(&c, "queued")).outbound.len(), 1);
+        assert!(m.on_frame(&lifecycle(&c, "queued")).outbound.is_empty());
+    }
+
+    /// 2.1.317 `system/session_writes_lost`: one Notice naming what the CLI
+    /// could not save, and why.
+    #[test]
+    fn lost_session_writes_become_one_notice() {
+        let mut m = native_mapper_mid_turn();
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "session_writes_lost",
+            "error_code": "EDQUOT", "lost": ["transcript", "global_config"],
+            "transcript_session_ids": ["native-1"],
+        }));
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::Notice {
+                text: "Claude couldn't save this conversation or its ~/.claude.json settings: \
+                       the disk quota is used up. Reopening it may miss the latest turns."
+                    .into(),
+            }]
+        );
+        let notice = |frame: Value| match &m_notice(frame)[..] {
+            [AgentEvent::Notice { text }] => Some(text.clone()),
+            _ => None,
+        };
+        assert_eq!(
+            notice(json!({ "error_code": "ENOSPC", "lost": ["global_config"] })).as_deref(),
+            Some("Claude couldn't save its ~/.claude.json settings: the disk is full.")
+        );
+        assert_eq!(notice(json!({ "error_code": "ENOSPC", "lost": [] })), None);
+    }
+
+    fn m_notice(mut frame: Value) -> Vec<AgentEvent> {
+        frame["type"] = json!("system");
+        frame["subtype"] = json!("session_writes_lost");
+        native_mapper_mid_turn().on_frame(&frame).events
     }
 
     /// Live 2.1.289: a plain interrupt killed a running background agent for

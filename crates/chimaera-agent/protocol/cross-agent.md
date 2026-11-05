@@ -157,10 +157,11 @@ The latest full results, per gate. Earlier results are in [passes.md](passes.md)
 
 | Gate | Result | Versions | Date |
 |---|---|---|---|
-| `just chat-smoke` | 31/31 | claude 2.1.300, codex 0.162.1 | 2026-10-14 (Pass 44) |
-| `just chat-mods-smoke` | 1/1 | claude 2.1.310 | 2026-10-23 (Pass 52) |
-| `just chat-smoke-acp` | passed | grok 1.0.46, agy-acp 1.2.1, cursor-agent 2026.10.14-941492e | 2026-10-15 (Pass 45) |
+| `just chat-smoke` | GATE_SMOKE | claude 2.1.318, codex 0.166.0 | 2026-11-04 (Pass 59) |
+| `just chat-mods-smoke` | GATE_MODS | claude 2.1.318 | 2026-11-04 (Pass 59) |
+| `just chat-smoke-acp` | GATE_ACP | grok 1.0.70, agy-acp 1.4.5, cursor-agent 2026.10.22-27dcf5f | 2026-11-04 (Pass 59) |
 
+- Pass 59 ran every gate on the newest release of all five agents and moved every pin. Live handshakes there took 10–20 s against the suite's 20 s `HANDSHAKE` budget, because the suite loads the user's own MCP servers and SessionStart hooks (no `--strict-mcp-config`); an `initialize` or `thread/start` timeout passed on its own rerun each time. Rerun a handshake timeout alone, with no other probe on the same account, before calling it drift.
 - Pass 52 ran the Claude half of `just chat-smoke` (21/21) on claude 2.1.310 and moved the Claude pin there; the codex half stays at its own pin.
 - Pass 46 ran the codex half of `just chat-smoke` and Pass 47 added three live cases (`claude_wakeup_fires_as_a_named_turn`, `claude_goal_sets_and_clears`, `codex_goal_sets_pauses_and_clears`) on the same pins.
 - A full `just chat-smoke` repeats the complete approval, queue, background task, fork, rollback, compaction and driver lifecycle suite, not only an echo prompt (2026-10-01).
