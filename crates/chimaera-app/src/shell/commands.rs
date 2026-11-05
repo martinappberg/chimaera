@@ -1318,7 +1318,7 @@ pub(super) fn write_clipboard(app: AppHandle, text: String) -> Result<(), String
 /// paths are this machine's; a remote page's would name whatever happens to
 /// sit at that path here). On Windows the local daemon lives inside WSL2, so
 /// its paths are not host paths either.
-fn local_file_path(path: &str) -> Result<std::path::PathBuf, String> {
+pub(super) fn local_file_path(path: &str) -> Result<std::path::PathBuf, String> {
     if cfg!(windows) {
         return Err("not available on Windows".to_string());
     }

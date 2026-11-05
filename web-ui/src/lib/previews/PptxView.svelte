@@ -561,6 +561,8 @@
   let trip = $state.raw<OfficeTrip | null>(null);
   let officeBusy = $state(false);
   let officeError = $state<string | null>(null);
+  /** Where PowerPoint's saves go after "save mine as a copy". */
+  let officeNote = $state<string | null>(null);
   let officeApp = $state("PowerPoint");
 
   $effect(() => {
@@ -608,8 +610,10 @@
   async function settleTrip(choice: "overwrite" | "copy" | "theirs" | "done"): Promise<void> {
     officeError = null;
     try {
-      await resolveOfficeTrip(path, choice);
-      if (choice === "done") trip = null;
+      const copy = await resolveOfficeTrip(path, choice);
+      // After "copy" the trip follows the copy: this deck has none left.
+      if (choice === "done" || choice === "copy") trip = null;
+      if (choice === "copy" && copy !== null) officeNote = `PowerPoint now saves to ${basename(copy)}`;
     } catch (e) {
       officeError = e instanceof Error ? e.message : "that didn't work";
     }
@@ -1028,8 +1032,9 @@
     {/if}
     {#if downloadError !== null}<span class="bar-err">{downloadError}</span>{/if}
     {#if officeError !== null}<span class="bar-err">{officeError}</span>{/if}
+    {#if officeNote !== null}<span class="status" role="status">{officeNote}</span>{/if}
     <span class="spacer"></span>
-    {#if deck !== null && editMode}
+    {#if deck !== null && (editMode || edits.dirty || edits.saving)}
       <span class="edit-tools" role="group" aria-label="editing">
         {#if edits.blocked !== null}
           <span class="bar-err" title={edits.blocked}>can't edit: {edits.blocked}</span>

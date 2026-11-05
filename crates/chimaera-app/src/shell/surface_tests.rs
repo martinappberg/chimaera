@@ -156,10 +156,14 @@ fn every_command_has_exactly_one_authority_and_checks_it() {
     let daemon: BTreeSet<&str> = DAEMON_UI_COMMANDS.iter().copied().collect();
     assert_eq!(unique, daemon, "classification ≠ DAEMON_UI_COMMANDS");
 
-    let sources: Vec<String> = ["src/shell/commands.rs", "src/shell/cluster.rs"]
-        .iter()
-        .map(|p| read(&manifest_dir().join(p)))
-        .collect();
+    let sources: Vec<String> = [
+        "src/shell/commands.rs",
+        "src/shell/cluster.rs",
+        "src/shell/office.rs",
+    ]
+    .iter()
+    .map(|p| read(&manifest_dir().join(p)))
+    .collect();
     for (command, authority) in COMMAND_AUTHORITY {
         let needle = match authority {
             Authority::AnyWindow => continue,
@@ -175,7 +179,7 @@ fn every_command_has_exactly_one_authority_and_checks_it() {
                 // A top-level fn ends at the first closing brace in column 0.
                 Some(&rest[..rest.find("\n}\n").unwrap_or(rest.len())])
             })
-            .unwrap_or_else(|| panic!("no fn {command} in commands.rs/cluster.rs"));
+            .unwrap_or_else(|| panic!("no fn {command} in commands.rs/cluster.rs/office.rs"));
         assert!(
             body.contains(needle),
             "{command} is {authority:?} but its body never calls {needle}…)"
