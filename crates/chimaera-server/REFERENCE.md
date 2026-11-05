@@ -262,7 +262,7 @@ Answers: install/update `{id, version, previous, sha256, plugin}`, rollback `{id
 
 `hostfns.rs`: the WIT `host` interface, every limit in one place — workspace-relative `O_NOFOLLOW` fs under `fs::FILESYSTEM_WORK` (8 MiB / 4,096 caps), 64 KiB state per (plugin, workspace) (`PluginStates`), `note`-only Timeline appends on `notes::take_post_slot`, sessions, emit, log; serves the host's own call context, never the guest's `cx`.
 
-`tools.rs`: generic — `owner` (an active plugin first, else any in the catalog, for the refusal), `offered`/`call` through the runtime (MCP tools offered AND call-gated only where active, pre-allowed at spawn — only for a build not refused or faulted there).
+`tools.rs`: generic — `owner` (an active plugin first, else any in the catalog, for the refusal), `offered`/`call` through the runtime (MCP tools offered AND call-gated only where active, pre-allowed at spawn — only for a build not refused or faulted there), and `answer_content`: a tool answer's `![alt](output:<path>)` lines become MCP image blocks read from that plugin's own output folder (≤ 8, 2 MiB each, 8 MiB in all, no links followed; the line keeps the absolute path; one that can't be shown stays a line saying why), on the blocking pool behind the filesystem semaphore.
 
 **Trust** (docs/design/plugin-platform-plan.md §1–§2): `capabilities.rs` — `[access]` (`Access::of`: a 0.1 manifest without it keeps what 0.1 allowed; later APIs get nothing undeclared) and `Caps` (atoms as JSON arrays, `digest` = SHA-256 of the sorted atoms under `chimaera-caps/1`, `tier`, `covers` / `beyond`, `lines` — the card's Can list), set on every parsed manifest (`Manifest.caps`); `hostfns` refuses what `[access]` doesn't allow (the store's `HostState.access`).
 

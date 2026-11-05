@@ -132,7 +132,7 @@ impl Tier {
 }
 
 /// The atom kinds that make a plugin privileged.
-const PRIVILEGED_KINDS: &[&str] = &["program", "network", "download"];
+const PRIVILEGED_KINDS: &[&str] = &["program", "program-also", "network", "download"];
 
 /// A plugin's capabilities: a set of atoms.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -431,6 +431,7 @@ impl Caps {
             "setup-prompt",
             "file-kind",
             "program",
+            "program-also",
             "network",
             "download",
         ];
@@ -637,6 +638,10 @@ mod tests {
             "api = \"0.2\"\n[[programs]]\nname = \"soffice\"\nalso = [\"/Applications/LibreOffice.app/Contents/MacOS\", \"~/Applications/LibreOffice.app/Contents/MacOS\"]\n",
         );
         let text: Vec<String> = also.caps.lines().into_iter().map(|l| l.text).collect();
+        assert!(
+            !text.iter().any(|t| t.contains("can't describe")),
+            "{text:?}"
+        );
         assert!(
             text.contains(
                 &"Looks for soffice in /Applications/LibreOffice.app/Contents/MacOS, \

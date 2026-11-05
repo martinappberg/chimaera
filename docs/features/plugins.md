@@ -292,6 +292,12 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     over is measured against its cap before it is parsed (a parsed value costs many times its
     text). The host serves the
     workspace and session of the call in flight, never the context a guest passes back.
+  - **A tool's answer can show the agent pictures**: a line that is exactly
+    `![alt](output:<path>)`, naming a PNG, JPEG, WebP or GIF in that plugin's own output
+    folder for the workspace, reaches the agent as an MCP image in its place (≤ 8 an answer,
+    2 MiB each, 8 MiB in all, read without following links), and the line keeps the file's
+    absolute path for an agent whose client drops images; one that can't be shown stays a
+    line saying why (`tools.rs::answer_content`).
   - **What a plugin hands back is capped too** — a tool result at 256 KiB, the instruction
     paragraph at 8 KiB, a hook line at 1 KiB, a tool description at 2 KiB; a tool input
     schema must be a JSON object schema (≤ 16 KiB); at most 64 MCP tools per plugin, their
@@ -694,6 +700,10 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   Live 2026.09 · 152 MB from github.com"). Once installed, its **Tools** section shows each tool
   with **Install**, **Update** (the plugin names a newer version) and **Remove**. A program you
   already have wins over the plugin's copy unless the plugin offers a setting to prefer its own.
+  A program can also name the folders it is usually installed in when its installer leaves
+  the PATH alone, such as an app bundle ("Looks for soffice in
+  /Applications/LibreOffice.app/Contents/MacOS too"); those are looked in after the PATH and
+  before the plugin's own tools.
 - **Where it's wired.**
   - **Daemon** (`crates/chimaera-server/src/plugins/`): `jobs.rs` (the queue, the limits, the
     POSIX `sh` preamble that sets them, the captured login environment, process-group kills,
