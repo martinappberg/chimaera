@@ -243,7 +243,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     in separate repositories and install from locked releases; the daemon carries no plugin
     bytes. Capability trust, both WIT worlds, plugin screens and file views, query routes,
     switch events, program jobs and tool downloads are implemented (sections below).
-    LaTeX and Typst use the 0.2 platform. **Browse** remains disabled, "later".
+    LaTeX, Typst and PowerPoint use the 0.2 platform. **Browse** remains disabled, "later".
 
 ## The plugin host
 
