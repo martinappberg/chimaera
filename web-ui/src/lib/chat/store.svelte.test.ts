@@ -417,6 +417,42 @@ describe("ChatStore pending-send ordering", () => {
     expect(store.blocks.filter((b) => b.kind === "message")).toHaveLength(1);
   });
 
+  it("an edit returns a withdrawn message's words to the view that asked, once", () => {
+    const store = fold([
+      { type: "turn_started", turn_id: "t1" },
+      { type: "user_message", text: "first", id: "q1", queued: true },
+      { type: "user_message", text: "second", id: "q2", queued: true, attachment_paths: ["/tmp/a.png"] },
+      { type: "user_message", text: "third", id: "q3", queued: true },
+    ]);
+    const view = {};
+    const other = {};
+    store.requestEdit(["q1", "q2", "q3"], view);
+    let seq = 100;
+    const apply = (ev: Record<string, unknown>) => store.apply({ seq: seq++, ts: 0, ev } as SeqEvent);
+    apply({ type: "user_message_update", id: "q1", state: "cancelled" });
+    // Read before the withdrawal landed: sent, and never handed back.
+    apply({ type: "user_message_update", id: "q2", state: "sent" });
+    apply({ type: "user_message_update", id: "q3", state: "cancelled" });
+    expect(store.takeEdited(other)).toEqual([]);
+    const back = store.takeEdited(view);
+    expect(back.map((b) => [b.id, b.text])).toEqual([
+      ["q1", "first"],
+      ["q3", "third"],
+    ]);
+    expect(store.takeEdited(view)).toEqual([]);
+    expect(store.pendingSends).toHaveLength(0);
+    expect(store.blocks.filter((b) => b.kind === "user")).toHaveLength(1);
+  });
+
+  it("a cancel nobody asked to edit returns nothing", () => {
+    const store = fold([
+      { type: "turn_started", turn_id: "t1" },
+      { type: "user_message", text: "oops", id: "q1", queued: true },
+      { type: "user_message_update", id: "q1", state: "cancelled" },
+    ]);
+    expect(store.edited).toEqual([]);
+  });
+
   it("a dropped send stays in the stack as not-delivered, never in the transcript", () => {
     const store = fold([
       { type: "turn_started", turn_id: "t1" },
