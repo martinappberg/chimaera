@@ -189,6 +189,11 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   names and `dnd.ts` falls back to generic text, written only on a spot change. A tab-strip drop
   anchors only to the tabs in view — the scrolled-away run under the strip's controls is never
   a target — and lands after the last visible tab past them.
+- **Shared browser panes.** A browser pane shared with an agent (app only; the chain link on its
+  tab bar, like a linked terminal's) gets the agent's hue as its border, which breathes while the
+  agent drives the page, and the agent's own pane shows a chip per shared browser pane (click
+  reveals it, × stops sharing). See [agent-browser.md](agent-browser.md#sharing-a-pane-the-chain-link);
+  the code is `Pane.svelte` and `PaneTabs.svelte`.
 
 ## Detach & cross-window moves
 
