@@ -154,6 +154,15 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   edit can't be replaced away), or on a tab move/reorder. Tree single-click = preview, tree
   double-click / a created file = pinned; chat/quick-open/terminal-link/Finder opens = preview.
   The preview flag persists in the layout blob (`pv:1`, additive).
+- **Open beside.** One rule for every "beside" gesture: ⌘/Ctrl-click (or a middle click) on
+  a file or URL link in a chat, a document or a terminal, ⌘/Ctrl-click or ⌘/Ctrl+Enter on a
+  file-tree row, and **Open Beside (⌘-click)** in the right-click menu of a file link, a tree
+  row or a URL. It lands in the pane next to the source (`layout.ts` `focusBeside`: the nearest
+  neighbor, right first), and only splits right when the source is alone — so following links
+  stays in two panes and never passes the 4-pane cap. A plain click from a **chat or terminal**
+  that has a neighbor lands beside it too (`opensBesideSession`), so a file or app the agent
+  mentions opens next to the conversation instead of covering it; with no neighbor it opens in
+  the session's pane as before. A file already open anywhere is focused where it is.
 - **Document navigation.** Files open above the existing view in the current pane.
   Following nested Markdown links reuses the preview slot; small Back/Forward buttons in a
   compact bottom-left floating control appear only while hovering the document (or focusing
@@ -394,6 +403,20 @@ _Captured 2026-07-12 (from the maintainer)._
   workflow, but an **addition**, not a frozen contract.
 - **Do not change (or: open to change):** *"keep a smooth UX for the user"* — the keying mechanics
   are open to improve; only the workspace-first framing (above) is the core bet.
+
+### Open beside — why it exists
+_Captured 2026-11-05 (from the maintainer)._
+
+- **Problem it solves (from the request).** "When in chat or MD documents or in general when you
+  are in a main pane, you have the option to open something to the right … like in a horizontal
+  pane if that is open", with the constraint that the control is "NOT too obvious, verbose". The
+  maintainer chose both parts of the proposal: one beside rule for every gesture (reuse the
+  neighbor, split only when alone), and a plain click from a chat landing beside it.
+- **How settled it is.** None of it is a promise yet (asked which parts are, the answer was
+  "Nope"): an **addition**, provisional throughout — including plain-click-beside covering shell
+  terminals as well as chats (an agent TUI is a terminal pane).
+- **Do not change (or: open to change):** nothing is frozen ("Nope") — the rule, the gestures
+  and the chat default are all open to improve.
 
 ### Fit-width tab strips — why they exist
 _Intent pending — drafted from the maintainer's request, 2026-09-06; questionnaire not yet run._

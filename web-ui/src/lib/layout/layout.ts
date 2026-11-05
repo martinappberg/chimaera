@@ -1033,6 +1033,32 @@ export function adjacentPane(l: Layout, paneId: string): string | null {
   return null;
 }
 
+/**
+ * Focus the pane "beside" `paneId` — where an open-beside gesture (⌘/Ctrl-
+ * click, middle click, "Open Beside") lands: the nearest neighbor, else a
+ * fresh split to the right. Reusing the neighbor keeps a link-heavy flow to
+ * two panes instead of a new split per click, and keeps it under MAX_PANES
+ * (at the cap a neighbor always exists). A zoom clears: both should show.
+ */
+export function focusBeside(l: Layout, paneId: string): Layout {
+  if (findPane(l.root, paneId) === null) return l;
+  const shown: Layout = l.zoomedPaneId === null ? l : { ...l, zoomedPaneId: null };
+  const neighbor = adjacentPane(shown, paneId);
+  return neighbor !== null ? focusPane(shown, neighbor) : splitPane(shown, paneId, "row");
+}
+
+/**
+ * Whether a plain click from `paneId` should land beside it rather than in
+ * it: the pane shows a session (a chat or a terminal) and has a neighbor.
+ * A file or app opened from a conversation then sits next to it instead of
+ * covering it; with no neighbor it opens in the session's pane as before.
+ */
+export function opensBesideSession(l: Layout, paneId: string): boolean {
+  const p = findPane(l.root, paneId);
+  const active = p?.tabs[p.active];
+  return active?.surface === "terminal" && l.zoomedPaneId === null && adjacentPane(l, paneId) !== null;
+}
+
 export function toggleZoom(l: Layout): Layout {
   if (l.zoomedPaneId !== null) return { ...l, zoomedPaneId: null };
   return normalize({ ...l, zoomedPaneId: l.focusedPaneId });

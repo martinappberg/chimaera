@@ -28,7 +28,8 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 - **What & when.** The rail's FILES section: a lazily-loaded directory tree of the workspace
   root. Browse the project and open files into panes.
 - **How it's used.** Click a directory to expand/collapse; click a file to open it in the focused
-  pane. Start typing (or click the magnifier) to filter the loaded tree; the **collapse folders**
+  pane, or ⌘/Ctrl-click, ⌘/Ctrl+Enter, a middle click or **Open Beside** in its menu to open it
+  beside ([open beside](workbench.md#splitting-tabs--drag-and-drop)). Start typing (or click the magnifier) to filter the loaded tree; the **collapse folders**
   button beside it folds every open dir and returns to the top. A directory link clicked
   in a terminal/chat reveals + flashes its row. File rows drag out (drop into a pane/split, or
   onto an agent to reference). Arrow keys move focus, expand/collapse folders, and return

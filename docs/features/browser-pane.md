@@ -109,7 +109,7 @@ plane `ANY /proxy/{id}[/{*path}]`; agent-opened panes add the MCP `open_browser`
   panes ping health every 60s (doubles as the proxy keep-alive); navigation inside the
   app is tracked (same-origin iframe) and persisted onto the tab so reloads land where
   you were; `openBrowser` dedupes on target so clicking Jupyter's URL twice focuses the
-  pane you already have (Cmd/Ctrl+click forces a fresh split).
+  pane you already have (Cmd/Ctrl+click opens a fresh browser tab beside).
 - **In the macOS app the page is a web view of its own** (`shared/paneView.ts` over
   `chimaera-app` `shell/native_view.rs`), laid over the pane: its own web process, so a heavy
   app or dev server can only slow itself down, never the workbench (an iframe shares the
@@ -223,8 +223,9 @@ plane `ANY /proxy/{id}[/{*path}]`; agent-opened panes add the MCP `open_browser`
   shared right-click menu; App registers the pane opener, the same module-handler
   pattern the reference/upload inserters use), `net/native.ts` (`openExternal`), and the
   command + its IPC lockstep in `chimaera-app`.
-- **Key behaviors.** Click follows the default above; **Cmd/Ctrl+click** puts the pane in
-  a fresh split (matching file links); **right-click** any rendered link for *Open in
+- **Key behaviors.** Click follows the default above (from a chat or terminal with a
+  neighbor pane, it lands beside); **Cmd/Ctrl+click** or a middle click opens it beside —
+  the neighbor pane, else a split ([open beside](workbench.md#splitting-tabs--drag-and-drop)); **right-click** any rendered link for *Open in
   Chimaera* / *Open Beside* / *Open in Browser* / *Copy Link* — "Open in Chimaera"
   appears only when the URL is actually proxyable, so the menu never offers a pane that
   would just show "can't reach".
