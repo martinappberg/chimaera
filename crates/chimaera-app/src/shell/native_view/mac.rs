@@ -45,7 +45,9 @@ use block2::{DynBlock, RcBlock};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSImage, NSView};
+use objc2_app_kit::{
+    NSBitmapImageFileType, NSBitmapImageRep, NSEvent, NSImage, NSResponder, NSView,
+};
 use objc2_foundation::{
     NSDictionary, NSError, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
     NSURLRequest, NSURL,
@@ -59,11 +61,27 @@ use serde::Serialize;
 use tauri::{AppHandle, Webview};
 use tokio::sync::oneshot;
 
-use super::drive::{Injections, InputKind, World};
+use super::drive::{Injections, InputKind};
 use super::{NavAction, Policy, ViewRect};
 
-/// The content world the bridge lives in.
+/// The content world the bridge lives in (with its message handler).
 const WORLD: &str = "chimaera";
+/// The agent's own content world for evals: nothing of the shell's in it
+/// (no handler, no bridge object), so an agent's script can't speak as the
+/// bridge — post a "link" the shell would open in the user's browser, a
+/// chord, a reference.
+const AGENT_WORLD: &str = "chimaera-agent";
+
+/// Where a script call runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Realm {
+    /// The bridge's world: only the shell's own fixed scripts (`call`,
+    /// `fire`), never an agent's.
+    Bridge,
+    /// The agent's world (`AGENT_WORLD`).
+    Agent,
+    Page,
+}
 /// The message handler's name inside that world.
 const HANDLER: &str = "chimaeraPaneView";
 /// A message larger than this is dropped (the bridge caps its own text far
@@ -270,9 +288,15 @@ fn decide(label: &str, action: &WKNavigationAction) -> bool {
         return false;
     };
     // A frame inside the page loads as it would in an iframe: the page is
-    // already sandboxed, and its own frames are its business.
+    // already sandboxed, and its own frames are its business — except in an
+    // agent's own view, which frames only inline documents and its daemon
+    // (an agent must not reach the open web through an iframe).
     if !main_frame {
-        return url.scheme() != "file";
+        if url.scheme() == "file" {
+            return false;
+        }
+        let agent = with_pane(label, |pane| pane.agent).unwrap_or(true);
+        return !agent || super::agent_subframe_allowed(app, label, &url);
     }
     match super::main_frame_policy(app, label, &url) {
         Policy::Allow => true,
@@ -390,6 +414,105 @@ fn world(mtm: MainThreadMarker) -> Retained<WKContentWorld> {
     unsafe { WKContentWorld::worldWithName(&NSString::from_str(WORLD), mtm) }
 }
 
+fn content_world(realm: Realm, mtm: MainThreadMarker) -> Retained<WKContentWorld> {
+    match realm {
+        Realm::Bridge => world(mtm),
+        // SAFETY: as for `world`.
+        Realm::Agent => unsafe {
+            WKContentWorld::worldWithName(&NSString::from_str(AGENT_WORLD), mtm)
+        },
+        // SAFETY: the shared page world, on the main thread.
+        Realm::Page => unsafe { WKContentWorld::pageWorld(mtm) },
+    }
+}
+
+/// The bridge as a user script in its own world.
+///
+/// # Safety
+/// Main thread.
+unsafe fn bridge_script(mtm: MainThreadMarker) -> Retained<WKUserScript> {
+    WKUserScript::initWithSource_injectionTime_forMainFrameOnly_inContentWorld(
+        WKUserScript::alloc(mtm),
+        &NSString::from_str(chimaera_core::PANE_BRIDGE_JS),
+        WKUserScriptInjectionTime::AtDocumentStart,
+        true,
+        &world(mtm),
+    )
+}
+
+define_class!(
+    #[unsafe(super(NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "ChimaeraAgentViewSink"]
+    /// The next responder of an agent's own view: input the page didn't
+    /// take ends here instead of travelling up into the window's web view
+    /// (Chimaera's own UI). A user never touches an agent's view, so
+    /// nothing real is lost.
+    struct Sink;
+
+    unsafe impl NSObjectProtocol for Sink {}
+
+    impl Sink {
+        #[unsafe(method(keyDown:))]
+        fn key_down(&self, _event: &NSEvent) {}
+
+        #[unsafe(method(keyUp:))]
+        fn key_up(&self, _event: &NSEvent) {}
+
+        #[unsafe(method(flagsChanged:))]
+        fn flags_changed(&self, _event: &NSEvent) {}
+
+        #[unsafe(method(performKeyEquivalent:))]
+        fn perform_key_equivalent(&self, _event: &NSEvent) -> bool {
+            false
+        }
+
+        #[unsafe(method(scrollWheel:))]
+        fn scroll_wheel(&self, _event: &NSEvent) {}
+
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, _event: &NSEvent) {}
+
+        #[unsafe(method(mouseUp:))]
+        fn mouse_up(&self, _event: &NSEvent) {}
+
+        #[unsafe(method(mouseDragged:))]
+        fn mouse_dragged(&self, _event: &NSEvent) {}
+
+        #[unsafe(method(mouseMoved:))]
+        fn mouse_moved(&self, _event: &NSEvent) {}
+
+        // Unclaimed at the end of a chain AppKit would beep.
+        #[unsafe(method(noResponderFor:))]
+        fn no_responder_for(&self, _selector: objc2::runtime::Sel) {}
+    }
+);
+
+thread_local! {
+    /// Main thread only: the one sink (views hold it unretained).
+    static SINK: Retained<Sink> = {
+        let mtm = MainThreadMarker::new().expect("the sink lives on the main thread");
+        let this = Sink::alloc(mtm).set_ivars(());
+        // SAFETY: NSResponder's designated initializer on a fresh instance.
+        unsafe { msg_send![super(this), init] }
+    };
+}
+
+/// An agent's view ends its responder chain at the sink; a user's pane
+/// (one handed over) continues to its superview as AppKit set it up.
+fn set_chain(wk: &WKWebView, agent: bool) {
+    // SAFETY: main thread; the sink lives for the thread, the superview is
+    // the owner's live web view.
+    unsafe {
+        if agent {
+            SINK.with(|sink| wk.setNextResponder(Some(sink)));
+        } else {
+            let up = wk.superview();
+            wk.setNextResponder(up.as_deref().map(|v| -> &NSResponder { v }));
+        }
+    }
+}
+
 fn request(url: &tauri::Url) -> Option<Retained<NSURLRequest>> {
     let url = NSURL::URLWithString(&NSString::from_str(url.as_str()))?;
     Some(NSURLRequest::requestWithURL(&url))
@@ -428,6 +551,27 @@ unsafe fn add_recorder(controller: &WKUserContentController, mtm: MainThreadMark
     controller.addUserScript(&script);
 }
 
+/// Stop installing the recorder in view `label`'s future loads (WebKit
+/// removes user scripts only all at once: the bridge goes back alone). The
+/// page it shows now keeps its wrappers until it reloads.
+fn uninstrument(label: &str, mtm: MainThreadMarker) {
+    let Some((wk, was)) = with_pane_mut(label, |pane| {
+        let was = pane.instrumented;
+        pane.instrumented = false;
+        (pane.wk.clone(), was)
+    }) else {
+        return;
+    };
+    if was {
+        // SAFETY: main thread; the view's own controller (see `instrument`).
+        unsafe {
+            let controller = wk.configuration().userContentController();
+            controller.removeAllUserScripts();
+            controller.addUserScript(&bridge_script(mtm));
+        }
+    }
+}
+
 /// Install the recorder in view `label` for its future loads (once) and in
 /// the page it shows now.
 fn instrument(label: &str, mtm: MainThreadMarker) {
@@ -448,7 +592,7 @@ fn instrument(label: &str, mtm: MainThreadMarker) {
         run_js(
             &wk,
             mtm,
-            World::Page,
+            Realm::Page,
             chimaera_core::PANE_AGENT_JS,
             &[],
             None,
@@ -522,10 +666,14 @@ pub(super) fn show(
             pane.wk.setHidden(hidden);
             // A handed-over view is shown again without `agent`: from
             // then on it is the user's pane (the recorder stays).
+            let changed = pane.agent != agent;
             pane.agent = agent;
-            pane.instrumented
+            (pane.instrumented, changed.then(|| pane.wk.clone()))
         });
-        if let Some(instrumented) = existing {
+        if let Some((instrumented, changed)) = existing {
+            if let Some(wk) = changed {
+                set_chain(&wk, agent);
+            }
             if agent && !instrumented {
                 instrument(&label, mtm);
             }
@@ -547,14 +695,7 @@ pub(super) fn show(
                 &world,
                 &NSString::from_str(HANDLER),
             );
-            let script = WKUserScript::initWithSource_injectionTime_forMainFrameOnly_inContentWorld(
-                WKUserScript::alloc(mtm),
-                &NSString::from_str(chimaera_core::PANE_BRIDGE_JS),
-                WKUserScriptInjectionTime::AtDocumentStart,
-                true,
-                &world,
-            );
-            controller.addUserScript(&script);
+            controller.addUserScript(&bridge_script(mtm));
             if agent {
                 add_recorder(&controller, mtm);
             }
@@ -570,6 +711,9 @@ pub(super) fn show(
             let _: () = msg_send![&*wk, unregisterDraggedTypes];
             wk.setHidden(hidden);
             owner_wk.addSubview(&wk);
+            if agent {
+                set_chain(&wk, true);
+            }
             if let Some(request) = request(&url) {
                 let _ = wk.loadRequest(&request);
             }
@@ -720,7 +864,7 @@ type JsDone = Box<dyn FnOnce(Result<Option<String>, JsFail>) + Send>;
 unsafe fn run_js(
     wk: &WKWebView,
     mtm: MainThreadMarker,
-    world: World,
+    realm: Realm,
     source: &str,
     args: &[(&str, &str)],
     done: Option<JsDone>,
@@ -736,10 +880,7 @@ unsafe fn run_js(
         })
         .collect();
     let arguments = NSDictionary::<NSString, AnyObject>::from_slices(&key_refs, &value_refs);
-    let world = match world {
-        World::Bridge => self::world(mtm),
-        World::Page => WKContentWorld::pageWorld(mtm),
-    };
+    let world = content_world(realm, mtm);
     let block = done.map(|done| {
         let done =
             once(
@@ -771,7 +912,7 @@ unsafe fn run_js(
 pub(super) async fn js(
     app: &AppHandle,
     label: String,
-    world: World,
+    realm: Realm,
     source: String,
     args: Vec<(&'static str, String)>,
 ) -> Result<Option<String>, JsFail> {
@@ -790,7 +931,7 @@ pub(super) async fn js(
         });
         // SAFETY: main thread, a live view.
         let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
-            run_js(&wk, mtm, world, &source, &pairs, Some(done))
+            run_js(&wk, mtm, realm, &source, &pairs, Some(done))
         }));
     })
     .map_err(|e| JsFail::Gone(e.to_string()))?;
@@ -808,6 +949,9 @@ fn bridge_call(method: &str) -> String {
     )
 }
 
+/// A bridge call (rings, region, the pill) answers within this.
+const CALL_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Call `__chimaeraPaneView.<method>(arg)` in the bridge's world and answer
 /// its JSON result (`null` when the bridge isn't there yet).
 pub(super) async fn call(
@@ -816,14 +960,18 @@ pub(super) async fn call(
     method: &'static str,
     arg: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let answer = js(
-        app,
-        label,
-        World::Bridge,
-        bridge_call(method),
-        vec![("arg", arg.to_string())],
+    let answer = tokio::time::timeout(
+        CALL_TIMEOUT,
+        js(
+            app,
+            label,
+            Realm::Bridge,
+            bridge_call(method),
+            vec![("arg", arg.to_string())],
+        ),
     )
     .await
+    .map_err(|_| "the page didn't answer in time (busy, or still loading)".to_string())?
     .map_err(JsFail::text)?;
     match answer {
         Some(text) => Ok(serde_json::from_str(&text).unwrap_or(serde_json::Value::Null)),
@@ -839,7 +987,7 @@ unsafe fn fire(wk: &WKWebView, mtm: MainThreadMarker, method: &str, arg: &serde_
     run_js(
         wk,
         mtm,
-        World::Bridge,
+        Realm::Bridge,
         &bridge_call(method),
         &[("arg", &arg.to_string())],
         None,

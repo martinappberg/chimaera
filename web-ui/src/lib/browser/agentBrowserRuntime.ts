@@ -11,7 +11,7 @@ import { nativeViewClose, nativeViewDrive, nativeViewNav, nativeViewPlace, nativ
 import { paneViewsPossible, routeNativeView } from "../shared/paneView";
 import type { BrowserClientMessage } from "../net/browserWire";
 import { agentHue } from "../workspace/agentLinks";
-import { AgentBrowserChannel, hueHex, sameHello, type BrowserHello, type BrowserLink, type Handover } from "./agentBrowser";
+import { AgentBrowserChannel, PROBE_VIEW_ID, driveProbeSaysPresent, hueHex, sameHello, type BrowserHello, type BrowserLink, type Handover } from "./agentBrowser";
 
 /** What the runtime needs of the events socket (`net/events.ts`). */
 export interface AgentBrowserSocket {
@@ -83,12 +83,29 @@ export function setBrowserLinkLocally(tab: string, agent: string | null): void {
 const HELLO_DEBOUNCE_MS = 200;
 
 let lastHello: BrowserHello | null = null;
+
+/** Whether this app build can drive pages (`native_view_drive`), probed
+ *  once per page load; false until the probe says so. */
+let canDrive = false;
+let driveProbe: Promise<void> | null = null;
+
+function probeDrive(): Promise<void> {
+  driveProbe ??= paneViewsPossible()
+    ? nativeViewDrive(PROBE_VIEW_ID, { type: "rings", console_since: 0, network_since: 0 }).then(
+        () => ({ ok: true }) as const,
+        (error: unknown) => ({ ok: false, error }) as const,
+      ).then((outcome) => {
+        canDrive = driveProbeSaysPresent(outcome);
+      })
+    : Promise.resolve();
+  return driveProbe;
+}
 let helloTimer: ReturnType<typeof setTimeout> | null = null;
 
 function currentHello(): BrowserHello {
   return {
     type: "browser_hello",
-    app_engine: paneViewsPossible(),
+    app_engine: canDrive && paneViewsPossible(),
     visible: document.visibilityState === "visible",
     focused: document.hasFocus(),
     width: Math.round(window.innerWidth),
@@ -121,6 +138,11 @@ export function attachAgentBrowser(s: AgentBrowserSocket, handover: (h: Handover
   openPane = handover;
   lastHello = null;
   reportHello();
+  // An app build with pane views but no driving claims nothing until the
+  // probe answers; then the hello says what it can do.
+  void probeDrive().then(() => {
+    if (socket === s) reportHello();
+  });
   const onResize = (): void => {
     agentBrowser.relayout();
     scheduleHello();

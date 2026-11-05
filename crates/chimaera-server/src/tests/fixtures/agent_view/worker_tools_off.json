@@ -141,16 +141,24 @@
       "name": "open_browser"
     },
     {
-      "description": "Open a web app in your own browser page (or the given shared pane) and wait for it to load (up to 15 s). Only addresses on this host, loopback, or a node of the user's running Slurm jobs load. Your own page is invisible to the user until you call browser_show. `url` may also be \"back\", \"forward\" or \"reload\". Returns the final URL, title and HTTP status when known.",
+      "description": "Open a web app in your own browser page (or the given shared pane) and wait for it to load (up to 15 s). Only addresses on this host, loopback, or a node of the user's running Slurm jobs load. Your own page is invisible to the user until you call browser_show. `url` may also be \"back\", \"forward\" or \"reload\". Returns the final URL, title and HTTP status when known. The app engine loads pages through Chimaera's proxy, so an app that calls absolute /api/v1 or /ws/ paths (Chimaera's own UI) reaches the hosting daemon instead of itself: start that page with engine \"chromium\".",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "engine": {
+            "description": "The engine for a NEW own page (default: app when a Chimaera app window is connected, else chromium). A page never changes engine: close yours with browser_close first.",
+            "enum": [
+              "app",
+              "chromium"
+            ],
+            "type": "string"
+          },
           "height": {
             "description": "Viewport height in CSS px for your own page (default 800).",
             "type": "integer"
           },
           "page": {
-            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: the only pane the user shared with you, if exactly one is, else your own page.",
+            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: your own page when you have one; otherwise the pane the user shared with you, if exactly one is.",
             "type": "string"
           },
           "url": {
@@ -182,7 +190,7 @@
             "type": "integer"
           },
           "page": {
-            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: the only pane the user shared with you, if exactly one is, else your own page.",
+            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: your own page when you have one; otherwise the pane the user shared with you, if exactly one is.",
             "type": "string"
           },
           "viewport_only": {
@@ -199,7 +207,7 @@
       "annotations": {
         "readOnlyHint": true
       },
-      "description": "A PNG of the viewport, the full page, or one element (by ref or CSS selector), at most 1600 px wide.",
+      "description": "An image of the viewport, the full page, or one element (by ref or CSS selector): PNG (JPEG when large), at most 1600 px wide and 2000 px on its long edge. A page too tall to stay legible in one image gives the viewport instead.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -208,7 +216,7 @@
             "type": "boolean"
           },
           "page": {
-            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: the only pane the user shared with you, if exactly one is, else your own page.",
+            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: your own page when you have one; otherwise the pane the user shared with you, if exactly one is.",
             "type": "string"
           },
           "ref": {
@@ -234,7 +242,7 @@
         "additionalProperties": false,
         "properties": {
           "page": {
-            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: the only pane the user shared with you, if exactly one is, else your own page.",
+            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: your own page when you have one; otherwise the pane the user shared with you, if exactly one is.",
             "type": "string"
           },
           "ref": {
@@ -277,7 +285,7 @@
             "type": "boolean"
           },
           "page": {
-            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: the only pane the user shared with you, if exactly one is, else your own page.",
+            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: your own page when you have one; otherwise the pane the user shared with you, if exactly one is.",
             "type": "string"
           }
         },
@@ -309,7 +317,7 @@
             "type": "array"
           },
           "page": {
-            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: the only pane the user shared with you, if exactly one is, else your own page.",
+            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: your own page when you have one; otherwise the pane the user shared with you, if exactly one is.",
             "type": "string"
           },
           "ref": {
@@ -334,7 +342,7 @@
         "additionalProperties": false,
         "properties": {
           "page": {
-            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: the only pane the user shared with you, if exactly one is, else your own page.",
+            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: your own page when you have one; otherwise the pane the user shared with you, if exactly one is.",
             "type": "string"
           },
           "per_key": {
@@ -380,7 +388,7 @@
             "type": "array"
           },
           "page": {
-            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: the only pane the user shared with you, if exactly one is, else your own page.",
+            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: your own page when you have one; otherwise the pane the user shared with you, if exactly one is.",
             "type": "string"
           }
         },
@@ -403,7 +411,7 @@
             "type": "number"
           },
           "page": {
-            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: the only pane the user shared with you, if exactly one is, else your own page.",
+            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: your own page when you have one; otherwise the pane the user shared with you, if exactly one is.",
             "type": "string"
           },
           "ref": {
@@ -427,7 +435,7 @@
             "type": "string"
           },
           "page": {
-            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: the only pane the user shared with you, if exactly one is, else your own page.",
+            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: your own page when you have one; otherwise the pane the user shared with you, if exactly one is.",
             "type": "string"
           },
           "ref": {
@@ -463,7 +471,7 @@
             "type": "string"
           },
           "page": {
-            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: the only pane the user shared with you, if exactly one is, else your own page.",
+            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: your own page when you have one; otherwise the pane the user shared with you, if exactly one is.",
             "type": "string"
           }
         },
@@ -481,7 +489,7 @@
         "additionalProperties": false,
         "properties": {
           "page": {
-            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: the only pane the user shared with you, if exactly one is, else your own page.",
+            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: your own page when you have one; otherwise the pane the user shared with you, if exactly one is.",
             "type": "string"
           }
         },
@@ -502,7 +510,7 @@
             "type": "boolean"
           },
           "page": {
-            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: the only pane the user shared with you, if exactly one is, else your own page.",
+            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: your own page when you have one; otherwise the pane the user shared with you, if exactly one is.",
             "type": "string"
           },
           "selector": {
@@ -527,7 +535,7 @@
         "additionalProperties": false,
         "properties": {
           "page": {
-            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: the only pane the user shared with you, if exactly one is, else your own page.",
+            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: your own page when you have one; otherwise the pane the user shared with you, if exactly one is.",
             "type": "string"
           },
           "script": {
@@ -552,7 +560,7 @@
         "additionalProperties": false,
         "properties": {
           "page": {
-            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: the only pane the user shared with you, if exactly one is, else your own page.",
+            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: your own page when you have one; otherwise the pane the user shared with you, if exactly one is.",
             "type": "string"
           }
         },
@@ -567,7 +575,7 @@
         "additionalProperties": false,
         "properties": {
           "page": {
-            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: the only pane the user shared with you, if exactly one is, else your own page.",
+            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: your own page when you have one; otherwise the pane the user shared with you, if exactly one is.",
             "type": "string"
           }
         },

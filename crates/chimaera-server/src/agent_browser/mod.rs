@@ -57,8 +57,9 @@ impl fmt::Display for EngineKind {
     }
 }
 
-/// Where an `Eval` runs: the engine's isolated world (the pane bridge's
-/// content world on the app engine, an isolated world on Chromium), or the
+/// Where an `Eval` runs: the engine's isolated world (the shell's agent
+/// content world on the app engine, separate from the pane bridge's so an
+/// agent can't forge bridge reports; an isolated world on Chromium), or the
 /// page's own world.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -121,6 +122,23 @@ pub(crate) struct Rect {
     pub(crate) y: f64,
     pub(crate) width: f64,
     pub(crate) height: f64,
+}
+
+/// A screenshot's encoding (wire: `"format": "png" | "jpeg"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ImageFormat {
+    Png,
+    Jpeg,
+}
+
+impl ImageFormat {
+    pub(crate) fn mime(self) -> &'static str {
+        match self {
+            ImageFormat::Png => "image/png",
+            ImageFormat::Jpeg => "image/jpeg",
+        }
+    }
 }
 
 /// What an engine does to one page. Coordinates are CSS px in the page's
@@ -187,10 +205,14 @@ pub(crate) enum Action {
         dx: f64,
         dy: f64,
     },
+    /// `max_width` is in image px; `quality` (1–100) applies to JPEG only.
+    /// The result is `ActionOut::Png` carrying the requested format's bytes.
     Screenshot {
         clip: Option<Rect>,
         full_page: bool,
         max_width: u32,
+        format: ImageFormat,
+        quality: Option<u8>,
     },
     Rings {
         console_since: u64,
@@ -343,7 +365,13 @@ pub(crate) struct SharedPane {
     pub(crate) cursors: Cursors,
     /// The last target its URL mapped to (maps rescued paths back).
     pub(crate) origin: Option<TargetUrl>,
+    /// The agent's own page handed to the user (`browser_show`), counted
+    /// against [`HANDED_OVER_MAX`] while it stays linked.
+    pub(crate) handed_over: bool,
 }
+
+/// Handed-over panes still linked to one agent, at most.
+pub(crate) const HANDED_OVER_MAX: usize = 4;
 
 #[derive(Default)]
 struct Pages {

@@ -8,6 +8,7 @@ import {
   PaneViewRegistry,
   TAKEOVER_WINDOW_MS,
   decodeBrowserLinks,
+  driveProbeSaysPresent,
   hueHex,
   decodeBrowserRequest,
   offscreenRect,
@@ -370,6 +371,16 @@ describe("AgentBrowserChannel take-over", () => {
     expect(get(t.channel.driveState).get("tab-1")).toMatchObject({ paused: false });
   });
 
+  it("an unlinked pane held here stops being instrumented", () => {
+    const t = harness();
+    t.channel.registry.register("tab-1", "v1");
+    t.channel.forgetTab("tab-1");
+    expect(t.calls.at(-1)).toEqual(["drive", "v1", { type: "uninstrument" }]);
+    const n = t.calls.length;
+    t.channel.forgetTab("tab-elsewhere");
+    expect(t.calls).toHaveLength(n);
+  });
+
   it("an unlinked pane drops its marker", async () => {
     const t = harness();
     await t.channel.handle(request({ op: "state", tab: "tab-1", driving: true, paused: false }));
@@ -403,5 +414,24 @@ describe("state ops as the daemon sends them", () => {
     await t.channel.handle(req);
     expect(t.lastReply()).toEqual({ type: "browser_reply", rid: 9, ok: true, result: {} });
     expect(get(t.channel.driveState).get("tab-1")).toMatchObject({ driving: true, paused: false });
+  });
+});
+
+describe("driveProbeSaysPresent", () => {
+  it("reads the command answering as present", () => {
+    expect(driveProbeSaysPresent({ ok: true })).toBe(true);
+    expect(driveProbeSaysPresent({ ok: false, error: new Error("no such view") })).toBe(true);
+    expect(driveProbeSaysPresent({ ok: false, error: "bad view request" })).toBe(true);
+  });
+  it("reads the IPC refusing the command as absent", () => {
+    for (const error of [
+      new Error("Command native_view_drive not found"),
+      "native_view_drive not allowed. Permissions associated with this command: none",
+      new Error("not in the app"),
+      new Error(""),
+      42,
+    ]) {
+      expect(driveProbeSaysPresent({ ok: false, error })).toBe(false);
+    }
   });
 });

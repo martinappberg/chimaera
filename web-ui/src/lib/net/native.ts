@@ -499,9 +499,12 @@ export async function nativeViewNav(id: string, action: NativeViewNav): Promise<
  * Act on a pane view for an agent (the agent browser's app engine): an
  * action object as `crates/chimaera-app/src/shell/native_view/drive.rs`
  * defines it (`{type: "eval" | "click" | "move" | "drag" | "scroll" | "key" |
- * "text" | "screenshot" | "rings" | "instrument" | "cursor", …}`). Resolves to
- * the action's result; rejects with the shell's error text (the page's own
- * error message for an eval), which the caller hands back to the daemon.
+ * "text" | "screenshot" | "rings" | "instrument" | "uninstrument" | "cursor",
+ * …}`; an eval's `world` is `"isolated"` or `"page"`). Resolves to the
+ * action's result; rejects with the shell's error text (the page's own error
+ * message for an eval; one starting `paused by the user:` when the user took
+ * the page over mid-action), which the caller hands back to the daemon.
+ * Call `{type: "uninstrument"}` when a shared pane is unlinked.
  */
 export async function nativeViewDrive(id: string, action: unknown): Promise<unknown> {
   const t = tauri();

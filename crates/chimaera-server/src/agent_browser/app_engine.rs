@@ -9,7 +9,7 @@
 //! the agent's terms (`http://host:port/path`, [`map_href`]).
 //!
 //! The shell's "shown" reply says nothing about the load, so navigation waits
-//! here: before it, the bridge world gets a mark (`__chimaeraNav`); the load
+//! here: before it, the agent's isolated world gets a mark (`__chimaeraNav`); the load
 //! is done when a document without that mark reports `complete` (polled by
 //! eval). A same-document step (a fragment change, `pushState` history) keeps
 //! the mark, so that case is judged by the URL instead.
@@ -37,12 +37,15 @@ const LOAD_TIMEOUT: Duration = Duration::from_secs(15);
 /// A history step that loads no new document settles by URL; past this it
 /// reports whatever the page shows.
 const HISTORY_TIMEOUT: Duration = Duration::from_secs(8);
-/// Between load polls (each is one bridge eval, a few ms).
+/// Between load polls (each is one isolated-world eval, a few ms).
 const LOAD_POLL: Duration = Duration::from_millis(150);
 /// One load poll's own deadline: a page mid-commit may not answer.
 const POLL_EVAL_TIMEOUT: Duration = Duration::from_secs(3);
 
 static NAV_MARK: AtomicU64 = AtomicU64::new(1);
+
+/// The shell's answer when the page's JavaScript didn't run in time.
+const SHELL_BUSY: &str = "the page didn't answer in time";
 
 /// Act on one page. `Open` creates the view (or re-points it) at an
 /// allowlisted target; `Open`, `Navigate` and `History` resolve to
@@ -163,10 +166,21 @@ pub(crate) async fn act(
             clip,
             full_page,
             max_width,
+            format,
+            quality,
         } => {
-            let drive = json!({"type": "screenshot", "clip": clip, "full_page": full_page, "max_width": max_width});
+            let drive = json!({
+                "type": "screenshot",
+                "clip": clip,
+                "full_page": full_page,
+                "max_width": max_width,
+                "format": format,
+                "quality": quality,
+            });
             let out = drive_action(state, addr, drive, Duration::from_secs(20)).await?;
-            let b64 = out["png"].as_str().unwrap_or_default().to_string();
+            // The image's base64 rides the key its `format` names.
+            let key = out["format"].as_str().unwrap_or("png");
+            let b64 = out[key].as_str().unwrap_or_default().to_string();
             if b64.is_empty() {
                 return Err(BrowserError::Engine(
                     "The window answered the screenshot without an image.".to_string(),
@@ -456,7 +470,9 @@ async fn wait_load(
     }
 }
 
-/// A bridge/page-world eval: the body's return value, or the page's error.
+/// An isolated/page-world eval: the body's return value, or the page's
+/// error. The isolated world is the shell's agent content world, never the
+/// pane bridge's (an agent there could forge the bridge's reports).
 async fn eval(
     state: &AppState,
     addr: &Addr,
@@ -469,13 +485,15 @@ async fn eval(
         "type": "eval",
         "body": body,
         "args": args,
-        "world": match world { World::Isolated => "bridge", World::Page => "page" },
+        "world": match world { World::Isolated => "isolated", World::Page => "page" },
         "timeout_ms": timeout_ms,
     });
     let budget = Duration::from_millis(timeout_ms) + Duration::from_secs(5);
     match drive_action(state, addr, drive, budget).await {
         Ok(out) => Ok(out.get("value").cloned().unwrap_or(Value::Null)),
-        // The window's error for an eval is the script's own.
+        // The shell's own refusal reads as it is.
+        Err(BrowserError::Engine(e)) if e.starts_with(SHELL_BUSY) => Err(BrowserError::Timeout(e)),
+        // Otherwise the window's error for an eval is the script's own.
         Err(BrowserError::Engine(e)) => Err(BrowserError::Page(format!("The script failed: {e}"))),
         Err(e) => Err(e),
     }

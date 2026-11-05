@@ -300,7 +300,7 @@
           "body": "return args.n + 1;",
           "timeout_ms": 10000,
           "type": "eval",
-          "world": "bridge"
+          "world": "isolated"
         },
         "op": "drive",
         "rid": 19,
@@ -309,14 +309,16 @@
         "view": "ab-0123456789abcdef"
       },
       "name": "browser_request_drive_eval",
-      "note": "agent browser: a bridge-world eval; `args` (and each of its keys) is in scope in the body (reply {value})"
+      "note": "agent browser: an eval in the agent's isolated world; `args` (and each of its keys) is in scope in the body (reply {value})"
     },
     {
       "frame": {
         "action": {
           "clip": null,
+          "format": "png",
           "full_page": false,
           "max_width": 1600,
+          "quality": null,
           "type": "screenshot"
         },
         "op": "drive",

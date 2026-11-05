@@ -90,6 +90,11 @@ pub(super) enum DriveAction {
         full_page: bool,
         #[serde(default = "max_width")]
         max_width: u32,
+        #[serde(default)]
+        format: ShotFormat,
+        /// JPEG quality, 1–100.
+        #[serde(default = "jpeg_quality")]
+        quality: u8,
     },
     Rings {
         #[serde(default)]
@@ -98,6 +103,9 @@ pub(super) enum DriveAction {
         network_since: u64,
     },
     Instrument,
+    /// Stop installing the recorder in the view's future loads (a shared
+    /// pane the user unlinked); the page it shows now keeps it until reload.
+    Uninstrument,
     Cursor {
         show: bool,
         /// `#rrggbb`: the agent's hue (default: the brand violet).
@@ -121,16 +129,57 @@ fn drag_steps() -> u16 {
 fn max_width() -> u32 {
     1600
 }
+fn jpeg_quality() -> u8 {
+    80
+}
 
-/// Where an eval runs: the bridge's own content world (the page can't see
-/// it) or the page's world (its globals, its framework objects).
+/// Where an eval runs: a content world of the agent's own (`isolated`: the
+/// page can't see it, and it holds nothing of the shell's — no bridge
+/// object, no message handler), or the page's world (its globals, its
+/// framework objects). Never the bridge's world: a script there could post
+/// the bridge's messages (a "link" the shell would open in the user's
+/// browser, chords, references).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(super) enum World {
     #[default]
-    Bridge,
+    Isolated,
     Page,
 }
+
+/// A screenshot's encoding.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum ShotFormat {
+    #[default]
+    Png,
+    Jpeg,
+}
+
+impl ShotFormat {
+    /// The result's key for the base64 data, and its `format`.
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            ShotFormat::Png => "png",
+            ShotFormat::Jpeg => "jpeg",
+        }
+    }
+}
+
+/// A ctrl-click is the context-menu gesture.
+pub(super) const CONTEXT_MENU: &str =
+    "ctrl-click opens a native context menu, which would block the app";
+/// What a click or key on a native popup `<select>` would open.
+pub(super) const NATIVE_MENU: &str =
+    "that opens a native menu, which would block the app; use browser_select";
+/// A color input opens the system color panel.
+pub(super) const COLOR_PANEL: &str =
+    "a color input isn't supported (it opens the system color panel); set its value with browser_eval";
+/// A chord that reads or writes the user's clipboard.
+pub(super) const PASTEBOARD: &str =
+    "copy, cut and paste chords aren't sent: they would hand the user's clipboard to the page (type the text instead)";
+/// Starts the error of an action the user interrupted (take-over).
+pub(super) const PAUSED: &str = "paused by the user: they used the page while this action ran";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -280,11 +329,19 @@ pub(super) fn parse(value: serde_json::Value) -> Result<DriveAction, String> {
             }
             *timeout_ms = (*timeout_ms).clamp(1, EVAL_TIMEOUT_MAX_MS);
         }
-        DriveAction::Click { x, y, clicks, .. } => {
+        DriveAction::Click {
+            x,
+            y,
+            clicks,
+            modifiers,
+        } => {
             coord(*x, "x")?;
             coord(*y, "y")?;
             if !(1..=3).contains(clicks) {
                 return Err(bad("clicks must be 1, 2 or 3"));
+            }
+            if modifiers.contains(&Modifier::Ctrl) {
+                return Err(CONTEXT_MENU.into());
             }
         }
         DriveAction::Move { x, y } => {
@@ -306,7 +363,11 @@ pub(super) fn parse(value: serde_json::Value) -> Result<DriveAction, String> {
             coord(*dy, "dy")?;
         }
         DriveAction::Key { key, modifiers } => {
-            key_stroke(key, Mods::of(modifiers))?;
+            let mods = Mods::of(modifiers);
+            if touches_pasteboard(key, mods) {
+                return Err(PASTEBOARD.into());
+            }
+            key_stroke(key, mods)?;
         }
         DriveAction::Text { text, per_key } => {
             let max = if *per_key { PER_KEY_MAX } else { TEXT_MAX };
@@ -322,8 +383,14 @@ pub(super) fn parse(value: serde_json::Value) -> Result<DriveAction, String> {
             }
         }
         DriveAction::Screenshot {
-            clip, max_width, ..
+            clip,
+            max_width,
+            quality,
+            ..
         } => {
+            if !(1..=100).contains(quality) {
+                return Err(bad("quality must be 1–100"));
+            }
             if let Some(c) = clip {
                 for (v, name) in [(c.x, "clip.x"), (c.y, "clip.y")] {
                     coord(v, name)?;
@@ -350,7 +417,7 @@ pub(super) fn parse(value: serde_json::Value) -> Result<DriveAction, String> {
                 *l = l.chars().filter(|c| !c.is_control()).take(40).collect();
             }
         }
-        DriveAction::Rings { .. } | DriveAction::Instrument => {}
+        DriveAction::Rings { .. } | DriveAction::Instrument | DriveAction::Uninstrument => {}
     }
     Ok(action)
 }
@@ -558,6 +625,71 @@ pub(super) fn strokes(text: &str) -> Vec<Stroke> {
     out
 }
 
+/// ⌘C/⌘X/⌘V (with any other modifier) and ⌃V: the clipboard. ⌘A, ⌘Z and
+/// ⌘⇧Z stay.
+pub(super) fn touches_pasteboard(key: &str, mods: Mods) -> bool {
+    let k = key.to_ascii_lowercase();
+    (mods.meta && matches!(k.as_str(), "c" | "x" | "v")) || (mods.ctrl && k == "v")
+}
+
+/// A press that opens a focused popup `<select>`'s native menu.
+pub(super) fn may_open_menu(stroke: &Stroke) -> bool {
+    // Enter, Space, the arrows.
+    matches!(stroke, Stroke::Key(k) if matches!(k.code, 36 | 49 | 123..=126))
+}
+
+/// The agent-world answer of `MENU_AT` / `MENU_FOCUSED` → may it go on.
+pub(super) fn menu_verdict(verdict: &str) -> Result<(), String> {
+    match verdict {
+        "select" => Err(NATIVE_MENU.into()),
+        "color" => Err(COLOR_PANEL.into()),
+        _ => Ok(()),
+    }
+}
+
+/// Run in the agent's world before a press at `__chimaeraArgs` `{x, y}`:
+/// what is under the point, through open shadow roots and same-origin
+/// frames — `"select"` (a popup select), `"color"`, or `""`.
+pub(super) const MENU_AT: &str = "const p = JSON.parse(__chimaeraArgs);\n\
+     let doc = document, x = p.x, y = p.y, el = doc.elementFromPoint(x, y);\n\
+     for (let i = 0; el && i < 32; i++) {\n\
+       if (el.shadowRoot) {\n\
+         const inner = el.shadowRoot.elementFromPoint(x, y);\n\
+         if (inner && inner !== el) { el = inner; continue; }\n\
+       }\n\
+       if (el.localName === 'iframe' || el.localName === 'frame') {\n\
+         let d = null;\n\
+         try { d = el.contentDocument; } catch (_) {}\n\
+         if (d) {\n\
+           const r = el.getBoundingClientRect();\n\
+           x -= r.left + el.clientLeft; y -= r.top + el.clientTop;\n\
+           doc = d; el = d.elementFromPoint(x, y); continue;\n\
+         }\n\
+       }\n\
+       break;\n\
+     }\n\
+     for (let n = el, i = 0; n && i < 256; i++) {\n\
+       if (n.localName === 'select' && !(n.multiple || n.size > 1)) return 'select';\n\
+       if (n.localName === 'input' && String(n.type).toLowerCase() === 'color') return 'color';\n\
+       n = n.parentElement || (n.getRootNode && n.getRootNode().host) || null;\n\
+     }\n\
+     return '';";
+
+/// Run in the agent's world before a key that opens a focused select:
+/// `"select"` when focus (through shadow roots and same-origin frames) is
+/// on a popup select.
+pub(super) const MENU_FOCUSED: &str = "let a = document.activeElement;\n\
+     for (let i = 0; a && i < 32; i++) {\n\
+       if (a.shadowRoot && a.shadowRoot.activeElement) { a = a.shadowRoot.activeElement; continue; }\n\
+       if (a.localName === 'iframe' || a.localName === 'frame') {\n\
+         let d = null;\n\
+         try { d = a.contentDocument; } catch (_) {}\n\
+         if (d && d.activeElement) { a = d.activeElement; continue; }\n\
+       }\n\
+       break;\n\
+     }\n\
+     return a && a.localName === 'select' && !(a.multiple || a.size > 1) ? 'select' : '';";
+
 // --- take-over ----------------------------------------------------------------------
 
 /// The trusted DOM input the bridge reports, by what the shell injected.
@@ -601,6 +733,8 @@ pub(super) struct Injections {
     last_user: Option<Instant>,
     /// The agent's last action on this view.
     driven: Option<Instant>,
+    /// The user's last input on a driven view (rate limit or not).
+    user_seen: Option<Instant>,
 }
 
 impl Injections {
@@ -642,6 +776,7 @@ impl Injections {
         {
             return false;
         }
+        self.user_seen = Some(now);
         if self
             .last_user
             .is_some_and(|t| now.saturating_duration_since(t) < USER_INPUT_EVERY)
@@ -650,6 +785,14 @@ impl Injections {
         }
         self.last_user = Some(now);
         true
+    }
+}
+
+impl Injections {
+    /// The user used the view at or after `t` (a paced action that began at
+    /// `t` stops: take-over).
+    pub(super) fn user_since(&self, t: Instant) -> bool {
+        self.user_seen.is_some_and(|u| u >= t)
     }
 }
 
@@ -803,7 +946,7 @@ mod tests {
             DriveAction::Eval {
                 body: "return 1".into(),
                 args: None,
-                world: World::Bridge,
+                world: World::Isolated,
                 timeout_ms: 10_000
             }
         );
@@ -830,7 +973,9 @@ mod tests {
             DriveAction::Screenshot {
                 clip: None,
                 full_page: false,
-                max_width: 64
+                max_width: 64,
+                format: ShotFormat::Png,
+                quality: 80
             }
         );
         assert_eq!(
@@ -881,9 +1026,58 @@ mod tests {
             json!({"type": "screenshot", "clip": {"x": 0, "y": 0, "width": 0, "height": 5}}),
             json!({"type": "cursor", "show": true, "color": "red"}),
             json!("click"),
+            // The bridge's world is never the agent's.
+            json!({"type": "eval", "body": "1", "world": "bridge"}),
+            json!({"type": "screenshot", "quality": 0}),
+            json!({"type": "screenshot", "format": "gif"}),
         ] {
             assert!(parse(bad.clone()).is_err(), "{bad}");
         }
+        // Gestures that open a native menu or touch the clipboard are
+        // refused with text for the agent, not a parse error.
+        for (refused, why) in [
+            (
+                json!({"type": "click", "x": 1, "y": 1, "modifiers": ["ctrl"]}),
+                CONTEXT_MENU,
+            ),
+            (
+                json!({"type": "key", "key": "v", "modifiers": ["meta"]}),
+                PASTEBOARD,
+            ),
+            (
+                json!({"type": "key", "key": "C", "modifiers": ["meta", "shift"]}),
+                PASTEBOARD,
+            ),
+            (
+                json!({"type": "key", "key": "x", "modifiers": ["meta"]}),
+                PASTEBOARD,
+            ),
+            (
+                json!({"type": "key", "key": "v", "modifiers": ["ctrl"]}),
+                PASTEBOARD,
+            ),
+        ] {
+            assert_eq!(parse(refused).unwrap_err(), why);
+        }
+        for ok in [
+            json!({"type": "key", "key": "a", "modifiers": ["meta"]}),
+            json!({"type": "key", "key": "z", "modifiers": ["meta", "shift"]}),
+            json!({"type": "key", "key": "c", "modifiers": ["ctrl"]}),
+            json!({"type": "click", "x": 1, "y": 1, "modifiers": ["meta", "shift", "alt"]}),
+            json!({"type": "uninstrument"}),
+        ] {
+            assert!(parse(ok.clone()).is_ok(), "{ok}");
+        }
+        assert_eq!(
+            parse(json!({"type": "screenshot", "format": "jpeg", "quality": 60})).unwrap(),
+            DriveAction::Screenshot {
+                clip: None,
+                full_page: false,
+                max_width: 1600,
+                format: ShotFormat::Jpeg,
+                quality: 60
+            }
+        );
         // A non-US character types fine on its own.
         assert!(parse(json!({"type": "key", "key": "é"})).is_ok());
     }
@@ -929,6 +1123,29 @@ mod tests {
     }
 
     #[test]
+    fn native_menu_guards() {
+        let key = |k: &str| key_stroke(k, Mods::default()).unwrap();
+        for opens in [
+            "Enter",
+            " ",
+            "ArrowUp",
+            "ArrowDown",
+            "ArrowLeft",
+            "ArrowRight",
+        ] {
+            assert!(may_open_menu(&key(opens)), "{opens}");
+        }
+        for not in ["a", "Tab", "Escape", "Backspace", "é"] {
+            assert!(!may_open_menu(&key(not)), "{not}");
+        }
+        assert_eq!(menu_verdict("select").unwrap_err(), NATIVE_MENU);
+        assert_eq!(menu_verdict("color").unwrap_err(), COLOR_PANEL);
+        assert!(menu_verdict("").is_ok());
+        assert!(menu_verdict("anything else").is_ok());
+        assert!(MENU_AT.contains("elementFromPoint") && MENU_FOCUSED.contains("activeElement"));
+    }
+
+    #[test]
     fn text_paces_us_keys_and_inserts_the_rest() {
         let s = strokes("Hi é漢\n");
         assert_eq!(s.len(), 5, "{s:?}");
@@ -968,6 +1185,13 @@ mod tests {
         assert!(!ledger.report(InputKind::Key, ms(70_000)));
         ledger.drove(ms(70_000));
         assert!(ledger.report(InputKind::Key, ms(70_001)));
+        // The user's input marks the view for an action under way
+        // (rate-limited events or not).
+        let started = ms(70_002);
+        assert!(!ledger.user_since(started));
+        assert!(!ledger.report(InputKind::Key, ms(70_100)), "rate-limited");
+        assert!(ledger.user_since(started));
+        assert!(!ledger.user_since(ms(70_200)));
         // A storm stays bounded.
         for _ in 0..1000 {
             ledger.push(InputKind::Wheel, ms(3000));

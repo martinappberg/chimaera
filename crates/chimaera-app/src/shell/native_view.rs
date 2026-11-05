@@ -191,6 +191,28 @@ fn main_frame_policy(app: &AppHandle, label: &str, url: &tauri::Url) -> Policy {
     decide(&asked, daemon_navigation_allowed(app, &owner, url), url)
 }
 
+/// Whether an agent's own view may load `url` in a subframe: inline
+/// documents (`about:` incl. srcdoc, `data:`, `blob:`) and the owner's
+/// daemon files and proxied apps. Anything else would let an agent frame
+/// the open web (`<iframe src=https://…>`) and read it by screenshot; a
+/// user's pane keeps letting a page frame what it likes.
+fn agent_subframe(url: &tauri::Url, same_origin: bool) -> bool {
+    matches!(url.scheme(), "about" | "data" | "blob") || (same_origin && view_path_allowed(url))
+}
+
+/// `agent_subframe` for view `label`, against its owner's origin.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn agent_subframe_allowed(app: &AppHandle, label: &str, url: &tauri::Url) -> bool {
+    let Some(views) = app.try_state::<NativeViews>() else {
+        return false;
+    };
+    let owner = match lock(&views.views).get(label) {
+        Some(view) => view.owner.clone(),
+        None => return false,
+    };
+    agent_subframe(url, daemon_navigation_allowed(app, &owner, url))
+}
+
 /// A link the user clicked lets that URL out to their browser this long.
 const LINK_FRESH: Duration = Duration::from_millis(1500);
 
@@ -489,8 +511,36 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        child_label, decide, link_lets_out, proxy_base, valid_id, view_path_allowed, Policy,
+        agent_subframe, child_label, decide, link_lets_out, proxy_base, valid_id,
+        view_path_allowed, Policy,
     };
+
+    #[test]
+    fn an_agent_view_frames_only_inline_documents_and_its_daemon() {
+        let url = |s: &str| -> tauri::Url { s.parse().unwrap() };
+        for ok in [
+            "about:srcdoc",
+            "about:blank",
+            "data:text/html,x",
+            "blob:http://127.0.0.1:9/1-2",
+        ] {
+            assert!(agent_subframe(&url(ok), false), "{ok}");
+        }
+        assert!(agent_subframe(&url("http://127.0.0.1:9/proxy/p1/w"), true));
+        assert!(agent_subframe(
+            &url("http://127.0.0.1:9/raw/t-1/f.html"),
+            true
+        ));
+        for bad in [
+            ("https://example.com/", false),
+            ("http://127.0.0.1:9/api/v1/x", true),
+            ("http://127.0.0.1:10/proxy/p1/w", false),
+            ("javascript:alert(1)", false),
+            ("file:///etc/hosts", false),
+        ] {
+            assert!(!agent_subframe(&url(bad.0), bad.1), "{}", bad.0);
+        }
+    }
 
     #[test]
     fn only_the_link_the_user_clicked_goes_out() {

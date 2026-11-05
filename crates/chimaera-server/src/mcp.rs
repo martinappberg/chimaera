@@ -120,18 +120,18 @@ pub(crate) const MASTERMIND_READ_TOOLS: [&str; 8] = [
 /// harmless where it isn't listed.
 ///
 /// The agent browser's read tools (`snapshot`, `screenshot`, `inspect`,
-/// `source`, `console`, `network`, `wait`) only read a page, and `navigate`,
-/// `show` and `close` only move the agent's own off-screen page within the
-/// same allowlist as `open_browser`. The act tools (`click`, `type`,
-/// `press`, `scroll`, `select`, `eval`) follow the user's permission mode: a
-/// click can run a notebook cell.
-pub(crate) const ALWAYS_ALLOWED_TOOLS: [&str; 15] = [
+/// `source`, `console`, `network`, `wait`) only read a page; `show` hands the
+/// agent's own page over as a pane, under `open_browser`'s allowlist and rate
+/// limit; `close` closes only the agent's own page. `navigate` is NOT here:
+/// it can navigate or reload a pane the user shared, logged in. It and the
+/// act tools (`click`, `type`, `press`, `scroll`, `select`, `eval`) follow
+/// the user's permission mode: a click can run a notebook cell.
+pub(crate) const ALWAYS_ALLOWED_TOOLS: [&str; 14] = [
     "notify",
     "document_guide",
     "check_document",
     "open_browser",
     "update_plan",
-    "browser_navigate",
     "browser_snapshot",
     "browser_screenshot",
     "browser_inspect",

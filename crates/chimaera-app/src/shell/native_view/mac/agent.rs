@@ -17,21 +17,42 @@
 //!   needs a real drag session and doesn't happen.
 //!
 //! Paced work (keys, drag steps) runs as main-thread hops between tokio
-//! sleeps, so the main thread is never held.
+//! sleeps, so the main thread is never held, and stops when the user takes
+//! the page over (`drive::PAUSED`).
+//!
+//! Guards (#273 review):
+//! - Native menus: a ctrl-click is refused at parse; before a click (or a
+//!   drag's press) the agent world hit-tests the point and refuses a popup
+//!   `<select>` or a color input, and before Enter/Space/an arrow it refuses
+//!   a focused popup select — each would run an NSMenu (or the color
+//!   panel) loop on the main thread.
+//! - Keys the page leaves unhandled: WebKit re-sends an unhandled keyDown
+//!   to the app (`[NSApp sendEvent:]`, so menu key equivalents work from a
+//!   web view). For an injected key that would reach the menu bar (⌘W, ⌘Q…)
+//!   and the window's first responder — Chimaera's own UI. Every injected
+//!   keyDown is remembered (`INJECTED_KEYS`, kept alive so no real event
+//!   can reuse its address) and the app's `sendEvent:` drops it
+//!   (`guard_resend`). An agent's own view also ends its responder chain at
+//!   a sink (`super::set_chain`). Chords that touch the clipboard are
+//!   refused at parse.
+//! - Encoding a screenshot (PNG/JPEG + base64) happens off the main thread.
 
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use block2::RcBlock;
 use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
+use objc2::runtime::{AnyClass, AnyObject, Imp, Sel};
 use objc2::{msg_send, sel, AllocAnyThread, MainThreadMarker};
 use objc2_app_kit::{
-    NSBitmapImageFileType, NSBitmapImageRep, NSEvent, NSEventModifierFlags, NSEventType, NSImage,
-    NSResponder, NSScreen, NSWindow,
+    NSApplication, NSBitmapImageFileType, NSBitmapImageRep, NSEvent, NSEventModifierFlags,
+    NSEventType, NSImage, NSImageCompressionFactor, NSResponder, NSScreen, NSWindow,
 };
-use objc2_core_graphics::{CGEvent, CGEventField, CGScrollEventUnit};
+use objc2_core_graphics::{CGEvent, CGEventField, CGImage, CGScrollEventUnit};
 use objc2_foundation::{
     NSDictionary, NSError, NSNumber, NSPoint, NSProcessInfo, NSRect, NSSize, NSString,
 };
@@ -39,16 +60,25 @@ use objc2_web_kit::{WKSnapshotConfiguration, WKWebView};
 use serde_json::{json, Value};
 use tauri::AppHandle;
 
-use super::super::drive::{self, Clip, DriveAction, InputKind, KeyStroke, Mods, Stroke, World};
-use super::{fire, instrument, js, on_main, once, with_pane, with_pane_mut, JsFail};
+use super::super::drive::{
+    self, Clip, DriveAction, InputKind, KeyStroke, Mods, ShotFormat, Stroke, World,
+};
+use super::{
+    fire, instrument, js, on_main, once, uninstrument, with_pane, with_pane_mut, JsFail, Realm,
+};
 
 /// Between paced key presses.
 const KEY_GAP: Duration = Duration::from_millis(12);
 /// Between drag steps.
 const DRAG_GAP: Duration = Duration::from_millis(16);
 /// After an injected action, the bridge's gesture reports are its doing
-/// for this long (they arrive a few ms later; a selection 120 ms later).
-const QUIET: Duration = Duration::from_millis(750);
+/// for this long: they arrive a few ms later, and a selection counts for
+/// 1.5 s after trusted input (plus its 120 ms debounce) — so an agent's
+/// click followed by a scripted selection can't take the reference.
+const QUIET: Duration = Duration::from_millis(2000);
+/// A guard's hit test answers within this, or the press goes ahead (a
+/// page too busy to answer is too busy to open a menu).
+const GUARD_TIMEOUT: Duration = Duration::from_secs(2);
 /// An agent view put out of sight while it grows for a full-page shot.
 const OFF_BOUNDS_GAP: f64 = 64.0;
 
@@ -109,6 +139,7 @@ pub(in crate::shell::native_view) async fn drive(
             modifiers,
         } => {
             let mods = Mods::of(&modifiers);
+            guard_point(app, &label, x, y).await?;
             input(app, label, move |wk, mtm, label| {
                 cursor_at(label, wk, mtm, x, y, true);
                 let kinds = vec![InputKind::Pointer; usize::from(clicks)];
@@ -154,14 +185,20 @@ pub(in crate::shell::native_view) async fn drive(
         DriveAction::Drag { from, to, steps } => drag(app, label, from, to, steps).await,
         DriveAction::Key { key, modifiers } => {
             let stroke = drive::key_stroke(&key, Mods::of(&modifiers))?;
-            input(app, label, move |wk, _mtm, label| press(label, wk, &stroke)).await
+            if drive::may_open_menu(&stroke) {
+                guard_focus(app, &label).await?;
+            }
+            input(app, label, move |wk, mtm, label| {
+                press(label, wk, mtm, &stroke)
+            })
+            .await
         }
         DriveAction::Text {
             text,
             per_key: false,
         } => {
-            input(app, label, move |wk, _mtm, label| {
-                press(label, wk, &Stroke::Insert(text))
+            input(app, label, move |wk, mtm, label| {
+                press(label, wk, mtm, &Stroke::Insert(text))
             })
             .await
         }
@@ -169,12 +206,16 @@ pub(in crate::shell::native_view) async fn drive(
             text,
             per_key: true,
         } => {
+            let started = Instant::now();
             for (i, stroke) in drive::strokes(&text).into_iter().enumerate() {
                 if i > 0 {
                     tokio::time::sleep(KEY_GAP).await;
                 }
-                input(app, label.clone(), move |wk, _mtm, label| {
-                    press(label, wk, &stroke)
+                if drive::may_open_menu(&stroke) {
+                    guard_focus(app, &label).await?;
+                }
+                step(app, label.clone(), started, move |wk, mtm, label| {
+                    press(label, wk, mtm, &stroke)
                 })
                 .await?;
             }
@@ -184,7 +225,12 @@ pub(in crate::shell::native_view) async fn drive(
             clip,
             full_page,
             max_width,
-        } => screenshot(app, label, clip, full_page, max_width).await,
+            format,
+            quality,
+        } => {
+            let encoding = Encoding { format, quality };
+            screenshot(app, label, clip, full_page, max_width, encoding).await
+        }
         DriveAction::Rings {
             console_since,
             network_since,
@@ -208,6 +254,16 @@ pub(in crate::shell::native_view) async fn drive(
                     return Err("no such view".to_string());
                 }
                 instrument(&label, mtm);
+                Ok(json!({}))
+            })
+            .await
+        }
+        DriveAction::Uninstrument => {
+            on_main(app, move |mtm| {
+                if with_pane(&label, |_| ()).is_none() {
+                    return Err("no such view".to_string());
+                }
+                uninstrument(&label, mtm);
                 Ok(json!({}))
             })
             .await
@@ -253,6 +309,62 @@ async fn input(
     .await
 }
 
+/// A paced step of an action that began at `started`: refused once the
+/// user has used the page since (take-over).
+async fn step(
+    app: &AppHandle,
+    label: String,
+    started: Instant,
+    f: impl FnOnce(&WKWebView, MainThreadMarker, &str) + Send + 'static,
+) -> Result<Value, String> {
+    on_main(app, move |mtm| {
+        let (wk, paused) = with_pane(&label, |pane| {
+            (pane.wk.clone(), pane.injections.user_since(started))
+        })
+        .ok_or("no such view")?;
+        if paused {
+            return Err(drive::PAUSED.to_string());
+        }
+        f(&wk, mtm, &label);
+        Ok(json!({}))
+    })
+    .await
+}
+
+/// The agent world's verdict on a guard script → go on, or the refusal.
+async fn guard(app: &AppHandle, label: &str, source: &str, args: String) -> Result<(), String> {
+    let run = js(
+        app,
+        label.to_string(),
+        Realm::Agent,
+        source.to_string(),
+        vec![("__chimaeraArgs", args)],
+    );
+    match tokio::time::timeout(GUARD_TIMEOUT, run).await {
+        Ok(Ok(Some(verdict))) => drive::menu_verdict(&verdict),
+        Ok(Err(JsFail::Gone(why))) => Err(why),
+        // No document to ask (loading), or no answer: nothing can open a
+        // menu from there.
+        _ => Ok(()),
+    }
+}
+
+/// Refuse a press at `(x, y)` that would open a native menu or panel.
+async fn guard_point(app: &AppHandle, label: &str, x: f64, y: f64) -> Result<(), String> {
+    guard(
+        app,
+        label,
+        drive::MENU_AT,
+        json!({"x": x, "y": y}).to_string(),
+    )
+    .await
+}
+
+/// Refuse a key that would open the focused popup select's menu.
+async fn guard_focus(app: &AppHandle, label: &str) -> Result<(), String> {
+    guard(app, label, drive::MENU_FOCUSED, "{}".into()).await
+}
+
 /// Note injected input (and start the quiet window) before delivering it.
 fn record(label: &str, kinds: &[InputKind]) {
     let now = Instant::now();
@@ -272,12 +384,13 @@ fn restore(saved: Option<Saved>) {
 }
 
 /// A key press, or text inserted.
-fn press(label: &str, wk: &WKWebView, stroke: &Stroke) {
+fn press(label: &str, wk: &WKWebView, mtm: MainThreadMarker, stroke: &Stroke) {
     match stroke {
         Stroke::Key(key) => {
             let Some((down, up)) = key_events(wk, key) else {
                 return;
             };
+            remember_key(&down, mtm);
             record(label, &[InputKind::Key]);
             let saved = Saved::take(wk);
             wk.keyDown(&down);
@@ -306,6 +419,8 @@ async fn drag(
 ) -> Result<Value, String> {
     let [x0, y0] = from;
     let [x1, y1] = to;
+    guard_point(app, &label, x0, y0).await?;
+    let started = Instant::now();
     input(app, label.clone(), move |wk, mtm, label| {
         cursor_at(label, wk, mtm, x0, y0, false);
         record(label, &[InputKind::Pointer]);
@@ -318,11 +433,12 @@ async fn drag(
     })
     .await?;
     let mut moved = Ok(json!({}));
+    let mut at = (x0, y0);
     for i in 1..=steps {
         tokio::time::sleep(DRAG_GAP).await;
         let f = f64::from(i) / f64::from(steps);
         let (x, y) = (x0 + (x1 - x0) * f, y0 + (y1 - y0) * f);
-        moved = input(app, label.clone(), move |wk, mtm, label| {
+        moved = step(app, label.clone(), started, move |wk, mtm, label| {
             cursor_at(label, wk, mtm, x, y, false);
             record(label, &[]);
             if let Some(event) = mouse(wk, NSEventType::LeftMouseDragged, x, y, 1, Mods::default())
@@ -334,11 +450,14 @@ async fn drag(
         if moved.is_err() {
             break;
         }
+        at = (x, y);
     }
-    // Released and given back even after a failed step, if the view lives.
+    // Released where the pointer got to (and the responder given back) even
+    // after a failed or interrupted step, if the view lives.
+    let (rx, ry) = at;
     let released = input(app, label, move |wk, _mtm, label| {
         record(label, &[]);
-        if let Some(up) = mouse(wk, NSEventType::LeftMouseUp, x1, y1, 1, Mods::default()) {
+        if let Some(up) = mouse(wk, NSEventType::LeftMouseUp, rx, ry, 1, Mods::default()) {
             wk.mouseUp(&up);
         }
         restore(with_pane_mut(label, |pane| pane.drag_prior.take()).flatten());
@@ -528,6 +647,10 @@ async fn eval(
     world: World,
     timeout_ms: u64,
 ) -> Result<Value, String> {
+    let world = match world {
+        World::Isolated => Realm::Agent,
+        World::Page => Realm::Page,
+    };
     let params = drive::eval_params(args.as_ref());
     let source = drive::eval_source(&body, &params);
     let args_json = args.map_or_else(|| "{}".to_string(), |a| a.to_string());
@@ -592,17 +715,25 @@ const SETTLE: &str = "await new Promise((r) => {\
      return JSON.stringify(Math.max(document.documentElement?.scrollHeight ?? 0, document.body?.scrollHeight ?? 0));";
 const SCROLL_BACK: &str = "const p = JSON.parse(__chimaeraArgs); scrollTo(p.x, p.y); return '';";
 
+/// How a screenshot is encoded.
+#[derive(Debug, Clone, Copy)]
+struct Encoding {
+    format: ShotFormat,
+    quality: u8,
+}
+
 async fn screenshot(
     app: &AppHandle,
     label: String,
     clip: Option<Clip>,
     full_page: bool,
     max_width: u32,
+    encoding: Encoding,
 ) -> Result<Value, String> {
     if !full_page {
-        return snap(app, label, clip, max_width, None).await;
+        return snap(app, label, clip, max_width, None, encoding).await;
     }
-    let measured = js(app, label.clone(), World::Bridge, MEASURE.into(), vec![])
+    let measured = js(app, label.clone(), Realm::Agent, MEASURE.into(), vec![])
         .await
         .map_err(JsFail::text)?
         .and_then(|t| serde_json::from_str::<Value>(&t).ok())
@@ -617,12 +748,12 @@ async fn screenshot(
     // Grown only if the page is taller than its viewport.
     let mut tall = None;
     if frames.is_some() {
-        if let Ok(Some(t)) = js(app, label.clone(), World::Bridge, SETTLE.into(), vec![]).await {
+        if let Ok(Some(t)) = js(app, label.clone(), Realm::Agent, SETTLE.into(), vec![]).await {
             tall = t.parse::<f64>().ok();
         }
     }
     let limit = tall.map(|h| h.clamp(1.0, drive::FULL_PAGE_MAX));
-    let shot = snap(app, label.clone(), clip, max_width, limit).await;
+    let shot = snap(app, label.clone(), clip, max_width, limit, encoding).await;
     if let Some((saved, grown)) = frames {
         let back = label.clone();
         let _ = on_main(app, move |_mtm| {
@@ -638,7 +769,7 @@ async fn screenshot(
         let _ = js(
             app,
             label,
-            World::Bridge,
+            Realm::Agent,
             SCROLL_BACK.into(),
             vec![(
                 "__chimaeraArgs",
@@ -672,17 +803,29 @@ fn grow(label: &str, height: f64) -> Result<Option<(NSRect, NSRect)>, String> {
     Ok(Some((saved, grown)))
 }
 
+/// A snapshot's pixels on their way off the main thread.
+struct Frame<T>(T);
+
+// SAFETY: a CGImage is immutable and safe to use from any thread (Quartz's
+// documented contract); nothing else is in a Frame.
+unsafe impl<T> Send for Frame<T> {}
+
+/// A snapshot handed off the main thread, or why there is none.
+type Shot = Result<Frame<Retained<CGImage>>, String>;
+
 /// Snapshot the viewport (or `clip` of it, or the top `limit` px of a grown
-/// view) at one PNG pixel per CSS px, no wider than `max_width`.
+/// view) at one pixel per CSS px, no wider than `max_width`, encoded off
+/// the main thread.
 async fn snap(
     app: &AppHandle,
     label: String,
     clip: Option<Clip>,
     max_width: u32,
     limit: Option<f64>,
+    encoding: Encoding,
 ) -> Result<Value, String> {
-    let (tx, rx) = tokio::sync::oneshot::channel::<Result<Value, String>>();
-    on_main(app, move |mtm| {
+    let (tx, rx) = tokio::sync::oneshot::channel::<Shot>();
+    let css_width = on_main(app, move |mtm| {
         let wk = with_pane(&label, |pane| pane.wk.clone()).ok_or("no such view")?;
         let bounds = wk.bounds();
         let height = limit.map_or(bounds.size.height, |l| l.min(bounds.size.height));
@@ -712,14 +855,19 @@ async fn snap(
             ),
             NSSize::new(region.width, region.height),
         );
-        let css_width = region.width;
-        let send = once(Box::new(move |r: Result<Value, String>| {
+        let send = once(Box::new(move |r: Shot| {
             let _ = tx.send(r);
-        }) as Box<dyn FnOnce(Result<Value, String>) + Send>);
+        }) as Box<dyn FnOnce(Shot) + Send>);
         let block = RcBlock::new(move |image: *mut NSImage, error: *mut NSError| {
             // SAFETY: WebKit hands either a live image or a live error.
             let result = match unsafe { (image.as_ref(), error.as_ref()) } {
-                (Some(image), _) => encode(image, css_width),
+                // SAFETY: a null proposed rect asks for the image's own best
+                // representation; no context or hints.
+                (Some(image), _) => unsafe {
+                    image.CGImageForProposedRect_context_hints(std::ptr::null_mut(), None, None)
+                }
+                .map(Frame)
+                .ok_or_else(|| "no image data".to_string()),
                 (None, Some(error)) => Err(error.localizedDescription().to_string()),
                 (None, None) => Err("the view drew nothing".to_string()),
             };
@@ -732,30 +880,134 @@ async fn snap(
             config.setSnapshotWidth(Some(&NSNumber::new_f64(px_width / scale)));
             wk.takeSnapshotWithConfiguration_completionHandler(Some(&config), &block);
         }
-        Ok(())
+        Ok(region.width)
     })
     .await?;
-    rx.await.map_err(|_| "the view closed".to_string())?
+    let frame = rx.await.map_err(|_| "the view closed".to_string())??;
+    tokio::task::spawn_blocking(move || {
+        let frame = frame;
+        objc2::rc::autoreleasepool(|_| encode(&frame.0, css_width, encoding))
+    })
+    .await
+    .map_err(|_| "encoding the screenshot failed".to_string())?
 }
 
-fn encode(image: &NSImage, css_width: f64) -> Result<Value, String> {
-    // SAFETY: a null proposed rect asks for the image's own best
-    // representation; no context or hints.
-    let cg =
-        unsafe { image.CGImageForProposedRect_context_hints(std::ptr::null_mut(), None, None) }
-            .ok_or("no image data")?;
-    let rep = NSBitmapImageRep::initWithCGImage(NSBitmapImageRep::alloc(), &cg);
-    // SAFETY: an empty properties dictionary is valid for PNG.
-    let png = unsafe {
-        rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new())
-    }
-    .ok_or("PNG encoding failed")?;
+fn encode(cg: &CGImage, css_width: f64, encoding: Encoding) -> Result<Value, String> {
+    let rep = NSBitmapImageRep::initWithCGImage(NSBitmapImageRep::alloc(), cg);
+    let (kind, quality) = match encoding.format {
+        ShotFormat::Png => (NSBitmapImageFileType::PNG, None),
+        ShotFormat::Jpeg => (
+            NSBitmapImageFileType::JPEG,
+            Some(NSNumber::new_f64(f64::from(encoding.quality) / 100.0)),
+        ),
+    };
+    let properties = match &quality {
+        // SAFETY: an AppKit constant, read on any thread.
+        Some(q) => NSDictionary::from_slices(
+            &[unsafe { NSImageCompressionFactor }],
+            &[q.as_ref() as &AnyObject],
+        ),
+        None => NSDictionary::new(),
+    };
+    // SAFETY: the properties are empty, or JPEG's compression factor as an
+    // NSNumber.
+    let data = unsafe { rep.representationUsingType_properties(kind, &properties) }
+        .ok_or("encoding the screenshot failed")?;
     let (width, height) = (rep.pixelsWide(), rep.pixelsHigh());
+    let name = encoding.format.name();
     Ok(json!({
-        "png": base64::engine::general_purpose::STANDARD.encode(png.to_vec()),
+        name: base64::engine::general_purpose::STANDARD.encode(data.to_vec()),
+        "format": name,
         "width": width,
         "height": height,
-        // PNG px per CSS px: divide a point in the image by it to click it.
+        // Image px per CSS px: divide a point in the image by it to click it.
         "scale": if css_width > 0.0 { width as f64 / css_width } else { 1.0 },
     }))
+}
+
+// --- keys WebKit hands back ---------------------------------------------------------
+
+/// How long an injected keyDown is remembered (WebKit re-sends it once the
+/// page has answered; a hung page can take a while).
+const RESENT_WINDOW: Duration = Duration::from_secs(30);
+const RESENT_MAX: usize = 512;
+
+thread_local! {
+    /// Main thread only: injected keyDowns, retained so no real event can
+    /// take one's address while it is remembered.
+    static INJECTED_KEYS: RefCell<VecDeque<(Retained<NSEvent>, Instant)>> =
+        const { RefCell::new(VecDeque::new()) };
+}
+
+/// The app's `sendEvent:` before `guard_resend` wrapped it (`None`: not
+/// wrapped — the class has no such method).
+static PREVIOUS_SEND_EVENT: OnceLock<Option<Imp>> = OnceLock::new();
+
+type SendEventImp = unsafe extern "C-unwind" fn(&AnyObject, Sel, *mut NSEvent);
+
+fn remember_key(event: &Retained<NSEvent>, mtm: MainThreadMarker) {
+    guard_resend(mtm);
+    let now = Instant::now();
+    INJECTED_KEYS.with(|keys| {
+        let mut keys = keys.borrow_mut();
+        while keys
+            .front()
+            .is_some_and(|(_, at)| now.saturating_duration_since(*at) > RESENT_WINDOW)
+            || keys.len() >= RESENT_MAX
+        {
+            keys.pop_front();
+        }
+        keys.push_back((event.clone(), now));
+    });
+}
+
+/// Wrap the app's `sendEvent:` once so WebKit's re-send of an injected
+/// keyDown goes nowhere (see the module header).
+fn guard_resend(mtm: MainThreadMarker) {
+    PREVIOUS_SEND_EVENT.get_or_init(|| {
+        let app = NSApplication::sharedApplication(mtm);
+        let class: &AnyClass = app.class();
+        // SAFETY: the runtime's own lookups on a live class; `send_event`
+        // has `sendEvent:`'s C ABI — (id self, SEL _cmd, NSEvent *) -> void
+        // — which "v@:@" spells. The previous implementation is read before
+        // it is replaced, and is the class's own or the one it inherits.
+        unsafe {
+            let method = objc2::ffi::class_getInstanceMethod(class, sel!(sendEvent:));
+            if method.is_null() {
+                tracing::warn!("agent keys: the app has no sendEvent: to guard");
+                return None;
+            }
+            let previous = objc2::ffi::method_getImplementation(method)?;
+            let imp = std::mem::transmute::<SendEventImp, Imp>(send_event);
+            objc2::ffi::class_replaceMethod(
+                (class as *const AnyClass).cast_mut(),
+                sel!(sendEvent:),
+                imp,
+                c"v@:@".as_ptr(),
+            );
+            Some(previous)
+        }
+    });
+}
+
+/// `-[NSApplication sendEvent:]`, wrapped: an injected keyDown (WebKit
+/// re-sending it, the only way one gets here) is dropped; everything else
+/// goes on as before.
+unsafe extern "C-unwind" fn send_event(this: &AnyObject, cmd: Sel, event: *mut NSEvent) {
+    let ours = !event.is_null()
+        && INJECTED_KEYS.with(|keys| {
+            keys.borrow()
+                .iter()
+                .any(|(e, _)| std::ptr::eq(Retained::as_ptr(e), event.cast_const()))
+        });
+    if ours {
+        return;
+    }
+    if let Some(Some(previous)) = PREVIOUS_SEND_EVENT.get() {
+        // SAFETY: the implementation this one replaced, with its own ABI.
+        unsafe {
+            let previous = std::mem::transmute::<Imp, SendEventImp>(*previous);
+            previous(this, cmd, event);
+        }
+    }
 }

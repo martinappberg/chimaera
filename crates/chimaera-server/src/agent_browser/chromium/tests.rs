@@ -3,8 +3,8 @@
 
 use super::*;
 
-fn shared() -> (PageShared, mpsc::UnboundedReceiver<Event>) {
-    let (tx, rx) = mpsc::unbounded_channel();
+fn shared() -> (PageShared, mpsc::Receiver<Event>) {
+    let (tx, rx) = mpsc::channel(FETCH_QUEUE);
     (PageShared::new("T1".to_string(), tx), rx)
 }
 
@@ -143,20 +143,26 @@ fn console_and_exceptions_fill_the_console_ring() {
             {"type": "object", "className": "Object", "description": "Object",
              "preview": {"properties": [{"name": "a", "type": "number", "value": "1"}, {"name": "b", "type": "string", "value": "x"}]}}
         ]}),
-    ));
-    s.on_event(ev(
-        "Runtime.consoleAPICalled",
-        json!({"type": "endGroup", "args": []}),
-    ));
+    ), None);
+    s.on_event(
+        ev(
+            "Runtime.consoleAPICalled",
+            json!({"type": "endGroup", "args": []}),
+        ),
+        None,
+    );
     s.on_event(ev(
         "Runtime.exceptionThrown",
         json!({"timestamp": 6.0, "exceptionDetails": {"text": "Uncaught", "url": "http://h/app.js", "lineNumber": 9,
                "exception": {"description": "TypeError: x is undefined"}}}),
-    ));
-    s.on_event(ev(
-        "Runtime.consoleAPICalled",
-        json!({"type": "log", "args": [{"type": "string", "value": "é".repeat(2000)}]}),
-    ));
+    ), None);
+    s.on_event(
+        ev(
+            "Runtime.consoleAPICalled",
+            json!({"type": "log", "args": [{"type": "string", "value": "é".repeat(2000)}]}),
+        ),
+        None,
+    );
     let st = lock(&s.st);
     let c = st.console.since(0);
     assert_eq!(c.len(), 3);
@@ -173,44 +179,62 @@ fn console_and_exceptions_fill_the_console_ring() {
 #[test]
 fn network_events_record_failures_slow_requests_and_inflight() {
     let (s, _rx) = shared();
-    let send = |id: &str, url: &str, ts: f64, kind: &str| {
-        s.on_event(ev(
+    let send =
+        |id: &str, url: &str, ts: f64, kind: &str| {
+            s.on_event(ev(
             "Network.requestWillBeSent",
             json!({"requestId": id, "request": {"url": url, "method": "GET"}, "timestamp": ts,
                    "wallTime": 1000.0, "type": kind, "frameId": "T1"}),
-        ));
-    };
+        ), None);
+        };
     send("1", "http://h/missing", 1.0, "Fetch");
     send("2", "http://h/slow", 1.0, "XHR");
     send("3", "http://h/down", 1.0, "Fetch");
     send("4", "http://h/gone", 1.0, "Fetch");
     send("5", "http://h/", 1.0, "Document");
     send("6", "data:text/plain,x", 1.0, "Fetch");
+    s.on_event(
+        ev(
+            "Network.requestWillBeSent",
+            json!({"requestId": "7", "request": {"url": "http://other/frame", "method": "GET"},
+                   "timestamp": 1.0, "type": "Document", "frameId": "sub"}),
+        ),
+        None,
+    );
     assert_eq!(lock(&s.st).requests.len(), 5);
     s.on_event(ev(
         "Network.responseReceived",
         json!({"requestId": "1", "timestamp": 1.2, "type": "Fetch", "frameId": "T1", "response": {"status": 404}}),
-    ));
-    s.on_event(ev(
-        "Network.loadingFinished",
-        json!({"requestId": "1", "timestamp": 1.3}),
-    ));
-    s.on_event(ev(
-        "Network.loadingFinished",
-        json!({"requestId": "2", "timestamp": 2.5}),
-    ));
-    s.on_event(ev(
-        "Network.loadingFailed",
-        json!({"requestId": "3", "timestamp": 1.1, "errorText": "net::ERR_CONNECTION_REFUSED"}),
-    ));
+    ), None);
+    s.on_event(
+        ev(
+            "Network.loadingFinished",
+            json!({"requestId": "1", "timestamp": 1.3}),
+        ),
+        None,
+    );
+    s.on_event(
+        ev(
+            "Network.loadingFinished",
+            json!({"requestId": "2", "timestamp": 2.5}),
+        ),
+        None,
+    );
+    s.on_event(
+        ev(
+            "Network.loadingFailed",
+            json!({"requestId": "3", "timestamp": 1.1, "errorText": "net::ERR_CONNECTION_REFUSED"}),
+        ),
+        None,
+    );
     s.on_event(ev(
         "Network.loadingFailed",
         json!({"requestId": "4", "timestamp": 1.1, "errorText": "net::ERR_ABORTED", "canceled": true}),
-    ));
+    ), None);
     s.on_event(ev(
         "Network.responseReceived",
         json!({"requestId": "5", "timestamp": 1.1, "type": "Document", "frameId": "T1", "response": {"status": 200}}),
-    ));
+    ), None);
     let st = lock(&s.st);
     let n = st.network.since(0);
     assert_eq!(n.len(), 3, "{n:?}");
@@ -232,30 +256,48 @@ fn network_events_record_failures_slow_requests_and_inflight() {
 #[test]
 fn navigation_events_drive_the_settle_counters() {
     let (s, _rx) = shared();
-    s.on_event(ev("Page.frameStartedLoading", json!({"frameId": "T1"})));
-    s.on_event(ev("Page.frameStartedLoading", json!({"frameId": "sub"})));
-    s.on_event(ev(
-        "Page.frameNavigated",
-        json!({"frame": {"id": "sub", "parentId": "T1", "url": "http://h/frame"}}),
-    ));
-    s.on_event(ev(
-        "Page.frameNavigated",
-        json!({"frame": {"id": "T1", "url": "http://h/", "loaderId": "L"}}),
-    ));
+    s.on_event(
+        ev("Page.frameStartedLoading", json!({"frameId": "T1"})),
+        None,
+    );
+    s.on_event(
+        ev("Page.frameStartedLoading", json!({"frameId": "sub"})),
+        None,
+    );
+    s.on_event(
+        ev(
+            "Page.frameNavigated",
+            json!({"frame": {"id": "sub", "parentId": "T1", "url": "http://h/frame"}}),
+        ),
+        None,
+    );
+    s.on_event(
+        ev(
+            "Page.frameNavigated",
+            json!({"frame": {"id": "T1", "url": "http://h/", "loaderId": "L"}}),
+        ),
+        None,
+    );
     {
         let st = lock(&s.st);
         assert_eq!((st.load_seq, st.nav_seq, st.loading), (1, 1, true));
         assert_eq!(st.url, "http://h/");
     }
-    s.on_event(ev("Page.frameStoppedLoading", json!({"frameId": "T1"})));
-    s.on_event(ev(
-        "Page.navigatedWithinDocument",
-        json!({"frameId": "T1", "url": "http://h/#x"}),
-    ));
+    s.on_event(
+        ev("Page.frameStoppedLoading", json!({"frameId": "T1"})),
+        None,
+    );
+    s.on_event(
+        ev(
+            "Page.navigatedWithinDocument",
+            json!({"frameId": "T1", "url": "http://h/#x"}),
+        ),
+        None,
+    );
     s.on_event(ev(
         "Runtime.executionContextCreated",
         json!({"context": {"id": 7, "name": WORLD, "auxData": {"frameId": "T1", "isDefault": false}}}),
-    ));
+    ), None);
     {
         let st = lock(&s.st);
         assert!(!st.loading);
@@ -263,7 +305,7 @@ fn navigation_events_drive_the_settle_counters() {
         assert_eq!(st.url, "http://h/#x");
         assert_eq!(st.isolated_ctx, Some(7));
     }
-    s.on_event(ev("Runtime.executionContextsCleared", json!({})));
+    s.on_event(ev("Runtime.executionContextsCleared", json!({})), None);
     assert_eq!(lock(&s.st).isolated_ctx, None);
 }
 
@@ -271,10 +313,13 @@ fn navigation_events_drive_the_settle_counters() {
 async fn fetch_pauses_and_dialogs_go_to_the_page_task_and_waits_wake() {
     let (s, mut rx) = shared();
     let s = Arc::new(s);
-    s.on_event(ev(
-        "Fetch.requestPaused",
-        json!({"requestId": "f1", "request": {"url": "http://x/"}}),
-    ));
+    s.on_event(
+        ev(
+            "Fetch.requestPaused",
+            json!({"requestId": "f1", "request": {"url": "http://x/"}}),
+        ),
+        None,
+    );
     assert_eq!(rx.recv().await.unwrap().method, "Fetch.requestPaused");
 
     let waiter = {
@@ -407,4 +452,147 @@ fn small_helpers() {
     assert!(!args
         .iter()
         .any(|a| a.starts_with("--remote-debugging-port")));
+}
+
+fn router() -> (Arc<Router>, mpsc::Receiver<PopupJob>) {
+    let (to_popups, rx) = mpsc::channel(POPUP_QUEUE);
+    (
+        Arc::new(Router {
+            conn: OnceLock::new(),
+            sessions: Mutex::new(HashMap::new()),
+            attached: Mutex::new(HashMap::new()),
+            attached_tx: watch::channel(0).0,
+            popups: Mutex::new(HashMap::new()),
+            to_popups,
+        }),
+        rx,
+    )
+}
+
+fn browser_ev(method: &str, params: Value) -> Event {
+    Event {
+        method: method.to_string(),
+        params,
+        session: None,
+    }
+}
+
+#[tokio::test]
+async fn popups_are_held_closed_and_reported_to_their_opener() {
+    let (r, mut jobs) = router();
+    let (page, _rx) = shared();
+    let page = Arc::new(page);
+    lock(&r.sessions).insert("S".into(), Arc::clone(&page));
+
+    // Our own new target: parked until create_page claims it.
+    r.on_event(browser_ev(
+        "Target.attachedToTarget",
+        json!({"sessionId": "S2", "waitingForDebugger": true,
+               "targetInfo": {"targetId": "T2", "type": "page", "url": ""}}),
+    ));
+    assert_eq!(lock(&r.attached).get("T2").map(String::as_str), Some("S2"));
+    assert!(jobs.recv().await.unwrap().opener.is_none());
+
+    // A popup of T1: pending on the opener until its first document comes.
+    r.on_event(browser_ev(
+        "Target.attachedToTarget",
+        json!({"sessionId": "P", "waitingForDebugger": true,
+               "targetInfo": {"targetId": "TP", "type": "page", "url": "", "openerId": "T1"}}),
+    ));
+    let job = jobs.recv().await.unwrap();
+    assert_eq!(
+        (job.session.as_str(), job.opener.as_deref()),
+        ("P", Some("T1"))
+    );
+    assert_eq!(lock(&page.st).popups_pending, 1);
+    r.on_event(Event {
+        method: "Fetch.requestPaused".into(),
+        params: json!({"requestId": "r", "request": {"url": "http://elsewhere.example/x"}}),
+        session: Some("P".into()),
+    });
+    assert!(lock(&r.popups).is_empty());
+    let mut st = lock(&page.st);
+    assert_eq!(st.popups_pending, 0);
+    assert_eq!(
+        st.take_notes().as_deref(),
+        Some("A popup to http://elsewhere.example/x was blocked; use browser_navigate to open it.")
+    );
+    assert_eq!(st.take_notes(), None);
+    drop(st);
+
+    // Tabs that ran before auto-attach are left alone.
+    r.on_event(browser_ev(
+        "Target.attachedToTarget",
+        json!({"sessionId": "S0", "waitingForDebugger": false,
+               "targetInfo": {"targetId": "T0", "type": "page"}}),
+    ));
+    assert!(!lock(&r.attached).contains_key("T0"));
+    // A page's session detaching marks it gone.
+    r.on_event(browser_ev(
+        "Target.detachedFromTarget",
+        json!({"sessionId": "S"}),
+    ));
+    assert!(lock(&page.st).detached);
+}
+
+#[test]
+fn notes_join_a_blocked_navigation_and_a_popup() {
+    let (s, _rx) = shared();
+    s.note_blocked("GET", "http://a.example/", "outside the allowlist");
+    s.update(|st| st.popups_pending = 1);
+    s.note_popup(None);
+    let mut st = lock(&s.st);
+    assert_eq!(
+        st.take_notes().as_deref(),
+        Some("Blocked a navigation to http://a.example/: outside the allowlist A popup window was blocked.")
+    );
+    assert_eq!(st.popups_pending, 0);
+    assert_eq!(st.take_notes(), None);
+}
+
+#[tokio::test]
+async fn a_full_fetch_queue_refuses_instead_of_growing() {
+    let (tx, _rx) = mpsc::channel(1);
+    let s = PageShared::new("T1".into(), tx);
+    for id in ["a", "b"] {
+        s.on_event(
+            ev(
+                "Fetch.requestPaused",
+                json!({"requestId": id, "request": {"url": format!("http://h/{id}")}}),
+            ),
+            None,
+        );
+    }
+    let n = lock(&s.st).network.since(0);
+    assert_eq!(n.len(), 1);
+    assert_eq!(n[0].url, "http://h/b");
+    assert_eq!(
+        n[0].error.as_deref(),
+        Some("blocked: too many page loads at once")
+    );
+}
+
+#[test]
+fn subframe_blocks_stay_out_of_the_navigation_notes() {
+    let (s, _rx) = shared();
+    s.note_blocked_frame("GET", "http://evil.example/frame", "outside the allowlist");
+    let mut st = lock(&s.st);
+    assert_eq!(st.take_notes(), None);
+    assert_eq!(st.network.since(0)[0].url, "http://evil.example/frame");
+    assert!(local_document("about:srcdoc"));
+    assert!(local_document("DATA:text/html,x"));
+    assert!(local_document("blob:http://h/uuid"));
+    assert!(!local_document("http://h/"));
+}
+
+#[test]
+fn jpeg_sizes_come_from_the_frame_header() {
+    // SOI, an APP0 segment, then SOF0 for 640×480.
+    let mut jpg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00];
+    jpg.extend([0xFF, 0xC0, 0x00, 0x11, 0x08, 0x01, 0xE0, 0x02, 0x80]);
+    jpg.extend([0u8; 16]);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&jpg);
+    assert_eq!(jpeg_size(&b64), Some((640, 480)));
+    assert_eq!(image_size(&b64, ImageFormat::Jpeg), Some((640, 480)));
+    assert_eq!(jpeg_size("bm90IGEganBlZw=="), None);
 }

@@ -118,6 +118,9 @@ pub(crate) struct AppState {
     /// The agent browser (`agent_browser`): the window request channel,
     /// agents' pages, and the Chromium engine.
     pub(crate) browsers: crate::agent_browser::Browsers,
+    /// `/ws/events` sockets upgraded but not yet authenticated (`ws.rs`
+    /// bounds them: each may send one large frame before auth).
+    pub(crate) events_preauth: std::sync::atomic::AtomicUsize,
     /// Short-lived raw-access tickets for /raw/{ticket} (in-memory only).
     pub(crate) tickets: Mutex<fs::TicketStore>,
     /// Browser-pane proxy sessions (/proxy/{id} targets; in-memory only —
@@ -355,6 +358,7 @@ impl AppState {
             links: Mutex::new(HashMap::new()),
             browser_links: Mutex::new(HashMap::new()),
             browsers: crate::agent_browser::Browsers::new(),
+            events_preauth: std::sync::atomic::AtomicUsize::new(0),
             tickets: Mutex::new(fs::TicketStore::default()),
             proxies: Mutex::new(proxy::ProxyStore::default()),
             quickopen: Mutex::new(quickopen::QuickOpenCache::default()),

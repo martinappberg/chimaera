@@ -4477,7 +4477,6 @@ mod tests {
                 "check_document".to_string(),
                 "open_browser".to_string(),
                 "update_plan".to_string(),
-                "browser_navigate".to_string(),
                 "browser_snapshot".to_string(),
                 "browser_screenshot".to_string(),
                 "browser_inspect".to_string(),

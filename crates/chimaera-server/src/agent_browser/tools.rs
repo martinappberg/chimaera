@@ -12,14 +12,14 @@
 //! What a page says is data, never instructions; results quote it as such.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Value};
 
 use super::app_engine::{self, Addr};
 use super::{
-    Action, ActionOut, Bound, BrowserError, Cursors, EngineKind, HistoryOp, Modifier, OwnPage,
-    Rect, RingsOut, TargetUrl, World, APP_VIEWS_MAX,
+    Action, ActionOut, Bound, BrowserError, Cursors, EngineKind, HistoryOp, ImageFormat, Modifier,
+    OwnPage, Rect, RingsOut, TargetUrl, World, APP_VIEWS_MAX, HANDED_OVER_MAX,
 };
 use crate::AppState;
 
@@ -61,6 +61,15 @@ const DEFAULT_SIZE: (u32, u32) = (1280, 800);
 const WIDTH_RANGE: (u32, u32) = (320, 3840);
 const HEIGHT_RANGE: (u32, u32) = (240, 2400);
 const SCREENSHOT_MAX_WIDTH: u32 = 1600;
+/// A screenshot's long edge, in image px (model image inputs downscale past
+/// this anyway).
+const IMAGE_LONG_EDGE: u32 = 2000;
+/// A screenshot's base64 size; past it the PNG is retried once as JPEG.
+const IMAGE_B64_MAX: usize = 3_500_000;
+const JPEG_QUALITY: u8 = 80;
+/// A full page taller than this (CSS px) can't be one legible image within
+/// the long edge (scale < 0.5): the viewport is captured instead.
+const FULL_PAGE_MAX_CSS: f64 = 4000.0;
 const SNAPSHOT_DEFAULT_CHARS: u64 = 24_000;
 const SNAPSHOT_MAX_CHARS: u64 = 100_000;
 const SOURCE_DEFAULT_CHARS: u64 = 20_000;
@@ -107,8 +116,9 @@ const NEW_PAGE_HINT: &str = "Call browser_navigate to start a new page.";
 fn page_prop() -> Value {
     json!({
         "type": "string",
-        "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: the \
-                        only pane the user shared with you, if exactly one is, else your own page.",
+        "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: your \
+                        own page when you have one; otherwise the pane the user shared with you, \
+                        if exactly one is.",
     })
 }
 
@@ -146,11 +156,15 @@ pub(crate) fn tool_defs() -> Vec<Value> {
              to load (up to 15 s). Only addresses on this host, loopback, or a node of the user's \
              running Slurm jobs load. Your own page is invisible to the user until you call \
              browser_show. `url` may also be \"back\", \"forward\" or \"reload\". Returns the \
-             final URL, title and HTTP status when known.",
+             final URL, title and HTTP status when known. The app engine loads pages through \
+             Chimaera's proxy, so an app that calls absolute /api/v1 or /ws/ paths (Chimaera's \
+             own UI) reaches the hosting daemon instead of itself: start that page with \
+             engine \"chromium\".",
             &["url"],
             json!({
                 "url": {"type": "string", "description": "An http:// address, e.g. http://localhost:8888/lab, or back/forward/reload."},
                 "page": page_prop(),
+                "engine": {"type": "string", "enum": ["app", "chromium"], "description": "The engine for a NEW own page (default: app when a Chimaera app window is connected, else chromium). A page never changes engine: close yours with browser_close first."},
                 "width": {"type": "integer", "description": "Viewport width in CSS px for your own page (default 1280)."},
                 "height": {"type": "integer", "description": "Viewport height in CSS px for your own page (default 800)."},
             }),
@@ -169,8 +183,9 @@ pub(crate) fn tool_defs() -> Vec<Value> {
         ),
         def(
             "browser_screenshot",
-            "A PNG of the viewport, the full page, or one element (by ref or CSS selector), at \
-             most 1600 px wide.",
+            "An image of the viewport, the full page, or one element (by ref or CSS selector): \
+             PNG (JPEG when large), at most 1600 px wide and 2000 px on its long edge. A page \
+             too tall to stay legible in one image gives the viewport instead.",
             &[],
             json!({
                 "page": page_prop(),
@@ -512,7 +527,17 @@ fn pick_page(state: &AppState, agent: &str, arg: Option<&str>) -> Result<Which, 
         page: page.clone(),
     };
     match arg {
+        // A pane the user shares never retargets an agent that has its own
+        // page; it is the default only for an agent with none.
+        None if state.browsers.own(agent).is_some() => Ok(Which::Own),
         None if panes.len() == 1 => Ok(shared(&panes[0].0, &panes[0].1)),
+        None if panes.len() > 1 => {
+            let ids: Vec<&str> = panes.iter().map(|(_, page)| page.as_str()).collect();
+            Err(format!(
+                "Several panes are shared with you ({}): pass `page` to say which, or                  page \"own\" to use a page of your own.",
+                ids.join(", ")
+            ))
+        }
         None | Some("own") => Ok(Which::Own),
         Some(p) => panes
             .iter()
@@ -654,11 +679,42 @@ async fn prepare_shared(state: &Arc<AppState>, ctx: &Ctx, act: bool) {
 // ---- engine calls -----------------------------------------------------------
 
 async fn exec(state: &Arc<AppState>, ctx: &Ctx, action: Action) -> Result<ActionOut, BrowserError> {
-    match (&ctx.addr, &ctx.key) {
+    let input = matches!(
+        action,
+        Action::Click { .. }
+            | Action::Move { .. }
+            | Action::Drag { .. }
+            | Action::Key { .. }
+            | Action::Text { .. }
+            | Action::Scroll { .. }
+    );
+    let result = match (&ctx.addr, &ctx.key) {
         (Some(addr), _) => app_engine::act(state, addr, action).await,
         (None, Some(key)) => state.browsers.chromium.act(state, key, action).await,
         (None, None) => Err(BrowserError::NoEngine(NO_PAGE.to_string())),
+    };
+    match (result, &ctx.which) {
+        // The shell stopped paced input mid-way because the user took over;
+        // its takeover event may not have arrived yet.
+        (Err(BrowserError::Engine(e)), Which::Shared { tab, .. })
+            if input && is_shell_pause(&e) =>
+        {
+            let mut at = SystemTime::now();
+            state.browsers.update_shared(tab, |p| {
+                at = *p.paused.get_or_insert(at);
+                p.driving_shown = None;
+            });
+            Err(BrowserError::Refused(paused_text(&super::clock(at).await)))
+        }
+        (result, _) => result,
     }
+}
+
+/// The shell's answer when the user took over during an injected action.
+fn is_shell_pause(error: &str) -> bool {
+    error
+        .get(..18)
+        .is_some_and(|head| head.eq_ignore_ascii_case("paused by the user"))
 }
 
 /// Map a page URL into the agent's terms (the app engine loads through the
@@ -871,6 +927,18 @@ async fn navigate(state: &Arc<AppState>, agent: &str, which: Which, args: &Value
             ))
         }
     };
+    let want = match opt_str(args, "engine", 16) {
+        Ok(None) => None,
+        Ok(Some("app")) => Some(EngineKind::App),
+        Ok(Some("chromium")) => Some(EngineKind::Chromium),
+        Ok(Some(other)) => {
+            return error_result(format!(
+                "{other:?} is not an engine: \"app\" or \"chromium\"."
+            ))
+        }
+        Err(Failure::Plain(e)) => return error_result(e),
+        Err(Failure::Browser(e)) => return error_result(e.to_string()),
+    };
     let sized = args.get("width").is_some_and(|v| !v.is_null())
         || args.get("height").is_some_and(|v| !v.is_null());
     let history = match url.as_str() {
@@ -922,6 +990,19 @@ async fn navigate(state: &Arc<AppState>, agent: &str, which: Which, args: &Value
     let mut note = None;
     match existing {
         Some(Ok(mut ctx)) => {
+            if let Some(want) = want.filter(|w| *w != ctx.engine) {
+                return ctx.err(match &ctx.which {
+                    Which::Shared { page, .. } => format!(
+                        "{page} is a pane in the user's app window, so it runs on the app \
+                         engine. For a {want} page of your own, pass page \"own\"."
+                    ),
+                    Which::Own => format!(
+                        "Your page runs on the {} engine, and a page never changes engine. \
+                         Close it with browser_close first, then navigate with engine \"{want}\".",
+                        ctx.engine
+                    ),
+                });
+            }
             if let Some(refusal) = paused_refusal(state, &mut ctx).await {
                 return refusal;
             }
@@ -962,7 +1043,7 @@ async fn navigate(state: &Arc<AppState>, agent: &str, which: Which, args: &Value
 
     // A new own page.
     let previous = state.browsers.last_engine(agent);
-    let bound = match new_page(state, agent).await {
+    let bound = match new_page(state, agent, want).await {
         Ok(b) => b,
         Err(e) => return error_result(e.to_string()),
     };
@@ -1015,41 +1096,53 @@ async fn navigate(state: &Arc<AppState>, agent: &str, which: Which, args: &Value
 }
 
 /// Pick the engine for a new own page (CONTRACTS §2): an app window on the
-/// session's workspace, else Chromium, else a refusal naming the fix.
-async fn new_page(state: &Arc<AppState>, agent: &str) -> Result<Bound, BrowserError> {
+/// session's workspace, else Chromium, else a refusal naming the fix. With
+/// `want`, only that engine.
+async fn new_page(
+    state: &Arc<AppState>,
+    agent: &str,
+    want: Option<EngineKind>,
+) -> Result<Bound, BrowserError> {
     let workspace = crate::lock(&state.session_workspaces).get(agent).cloned();
     let token = chimaera_core::generate_token();
     let id = format!("ab-{}", &token[..16.min(token.len())]);
-    if let Some(socket) = state.browsers.channel.choose(workspace.as_deref()) {
-        if state.browsers.app_views() >= APP_VIEWS_MAX {
-            return Err(BrowserError::Refused(format!(
-                "{APP_VIEWS_MAX} agent pages are open in the app already, the most it keeps at \
-                 once. Close one you no longer need with browser_close (idle pages close after \
-                 10 minutes)."
+    let (app, here) = state.browsers.channel.app_windows(workspace.as_deref());
+    let app_part = if app > here {
+        "A Chimaera app window is connected, but none shows this session's workspace, so the \
+         app engine can't host your page: ask the user to open the workspace in the app."
+    } else {
+        "No Chimaera desktop app window is connected (the app engine needs the macOS app open \
+         on this workspace)."
+    };
+    if want != Some(EngineKind::Chromium) {
+        if let Some(socket) = state.browsers.channel.choose(workspace.as_deref()) {
+            if state.browsers.app_views() >= APP_VIEWS_MAX {
+                return Err(BrowserError::Refused(format!(
+                    "{APP_VIEWS_MAX} agent pages are open in the app already, the most it keeps \
+                     at once. Close one you no longer need with browser_close (idle pages close \
+                     after 10 minutes)."
+                )));
+            }
+            return Ok(Bound::App { socket, view: id });
+        }
+        if want == Some(EngineKind::App) {
+            return Err(BrowserError::NoEngine(format!(
+                "The app engine can't start a page: {app_part}"
             )));
         }
-        return Ok(Bound::App { socket, view: id });
     }
     if state.compute.login_node_unknown() {
         let _ = state.compute.detection().await;
     }
-    match state.browsers.chromium.available(state) {
+    match state.browsers.chromium.available(state).await {
         Ok(_) => Ok(Bound::Chromium { key: id }),
-        Err(why) => {
-            let (app, here) = state.browsers.channel.app_windows(workspace.as_deref());
-            let app_part = if app > here {
-                "A Chimaera app window is connected, but none shows this session's workspace, \
-                 so the app engine can't host your page: ask the user to open the workspace in \
-                 the app."
-            } else {
-                "No Chimaera desktop app window is connected (the app engine needs the macOS \
-                 app open on this workspace)."
-            };
-            Err(BrowserError::NoEngine(format!(
-                "No browser engine can serve this session. {app_part} The Chromium engine can't \
-                 run either: {why}"
-            )))
-        }
+        Err(why) if want == Some(EngineKind::Chromium) => Err(BrowserError::NoEngine(format!(
+            "The Chromium engine can't start a page: {why}"
+        ))),
+        Err(why) => Err(BrowserError::NoEngine(format!(
+            "No browser engine can serve this session. {app_part} The Chromium engine can't \
+             run either: {why}"
+        ))),
     }
 }
 
@@ -1124,11 +1217,14 @@ async fn snapshot(state: &Arc<AppState>, ctx: &mut Ctx, args: &Value) -> ToolRes
 
 async fn screenshot(state: &Arc<AppState>, ctx: &mut Ctx, args: &Value) -> ToolResult {
     let target = element_target(args)?;
-    let full_page = opt_bool(args, "full_page")?;
+    let mut full_page = opt_bool(args, "full_page")?;
     if target.is_some() && full_page {
         return Err(bad("Give an element or full_page, not both."));
     }
-    let clip = match &target {
+    let mut note = String::new();
+    // What is captured, in CSS px: it decides the image width that keeps the
+    // long edge within IMAGE_LONG_EDGE.
+    let (clip, css) = match &target {
         Some(t) => {
             let r = snap(state, ctx, "rect(args)", t.clone()).await?;
             if r.is_null() {
@@ -1137,31 +1233,64 @@ async fn screenshot(state: &Arc<AppState>, ctx: &mut Ctx, args: &Value) -> ToolR
                      browser_snapshot or browser_inspect.",
                 ));
             }
-            Some(Rect {
+            let rect = Rect {
                 x: r["x"].as_f64().unwrap_or(0.0),
                 y: r["y"].as_f64().unwrap_or(0.0),
                 width: r["width"].as_f64().unwrap_or(1.0),
                 height: r["height"].as_f64().unwrap_or(1.0),
-            })
+            };
+            (Some(rect), (rect.width, rect.height))
         }
         None => {
-            refresh_facts(state, ctx).await?;
-            None
+            let size = run_eval(
+                state,
+                ctx,
+                World::Isolated,
+                "const d = document.documentElement; \
+                 return [innerWidth, innerHeight, Math.max(d.scrollHeight, document.body ? document.body.scrollHeight : 0)];",
+                json!({}),
+                5_000,
+            )
+            .await?;
+            let vw = size[0].as_f64().unwrap_or(1280.0).max(1.0);
+            let vh = size[1].as_f64().unwrap_or(800.0).max(1.0);
+            let page_h = size[2].as_f64().unwrap_or(vh).max(vh);
+            if full_page && page_h > FULL_PAGE_MAX_CSS {
+                full_page = false;
+                note = format!(
+                    " The page is {} CSS px tall, too tall for one legible image, so this is \
+                     the viewport: scroll with browser_scroll and screenshot again, or capture \
+                     an element.",
+                    page_h.round()
+                );
+            }
+            (None, (vw, if full_page { page_h } else { vh }))
         }
     };
-    let out = exec(
-        state,
-        ctx,
-        Action::Screenshot {
-            clip,
-            full_page,
-            max_width: SCREENSHOT_MAX_WIDTH,
-        },
-    )
-    .await?;
+    let max_width = image_width(css);
+    let shoot = |format: ImageFormat| Action::Screenshot {
+        clip,
+        full_page,
+        max_width,
+        format,
+        quality: (format == ImageFormat::Jpeg).then_some(JPEG_QUALITY),
+    };
+    let mut format = ImageFormat::Png;
+    let mut out = exec(state, ctx, shoot(format)).await?;
+    if matches!(&out, ActionOut::Png { b64, .. } if b64.len() > IMAGE_B64_MAX) {
+        format = ImageFormat::Jpeg;
+        out = exec(state, ctx, shoot(format)).await?;
+    }
     let ActionOut::Png { b64, width, height } = out else {
         return Err(bad("The engine returned no image."));
     };
+    if b64.len() > IMAGE_B64_MAX {
+        return Err(bad(format!(
+            "The screenshot is too large to return ({} MB even as JPEG): capture an element, \
+             or the viewport instead of the full page.",
+            b64.len() / 1_000_000
+        )));
+    }
     let what = if full_page {
         "full page"
     } else if target.is_some() {
@@ -1169,12 +1298,25 @@ async fn screenshot(state: &Arc<AppState>, ctx: &mut Ctx, args: &Value) -> ToolR
     } else {
         "viewport"
     };
+    let kind = match format {
+        ImageFormat::Png => "PNG",
+        ImageFormat::Jpeg => "JPEG",
+    };
     Ok(json!({
         "content": [
-            {"type": "text", "text": format!("{}\nScreenshot ({what}), {width}×{height} px. {}", ctx.header(), ctx.url_line())},
-            {"type": "image", "data": b64, "mimeType": "image/png"},
+            {"type": "text", "text": format!("{}\nScreenshot ({what}), {width}×{height} px {kind}.{note} {}", ctx.header(), ctx.url_line())},
+            {"type": "image", "data": b64, "mimeType": format.mime()},
         ]
     }))
+}
+
+/// The image width (`max_width`) for a capture of `css` (w, h) CSS px:
+/// the long edge within [`IMAGE_LONG_EDGE`], the width within
+/// [`SCREENSHOT_MAX_WIDTH`].
+fn image_width((w, h): (f64, f64)) -> u32 {
+    let (w, h) = (w.max(1.0), h.max(1.0));
+    let fit = (f64::from(IMAGE_LONG_EDGE) * w / w.max(h)).floor() as u32;
+    fit.clamp(64, SCREENSHOT_MAX_WIDTH)
 }
 
 async fn inspect(state: &Arc<AppState>, ctx: &mut Ctx, args: &Value) -> ToolResult {
@@ -1877,11 +2019,30 @@ async fn show(state: &Arc<AppState>, ctx: &mut Ctx) -> ToolResult {
     };
     match (&ctx.addr, &ctx.key) {
         (Some(addr), _) => {
+            let handed = crate::links::panes_of(state, &ctx.agent)
+                .iter()
+                .filter(|(tab, _)| state.browsers.shared(tab).handed_over)
+                .count();
+            if handed >= HANDED_OVER_MAX {
+                return Err(bad(format!(
+                    "You already handed {handed} pages to the user that are still open as panes \
+                     ({HANDED_OVER_MAX} at most). Keep using one of them, or ask the user to close \
+                     or unlink one."
+                )));
+            }
+            // A hand-over opens a pane, like open_browser: the same budget.
+            state
+                .browser_opens
+                .admit(&ctx.agent)
+                .map_err(Failure::Plain)?;
             let tab = app_engine::handover(state, addr, &target, &ctx.agent).await?;
             // The view is the pane's now; the daemon no longer owns it.
             state.browsers.remove_own(&ctx.agent);
             let page = match crate::links::link_browser(state, &tab, &ctx.agent) {
-                Ok((page, _)) => page,
+                Ok((page, _)) => {
+                    state.browsers.update_shared(&tab, |p| p.handed_over = true);
+                    page
+                }
                 Err((_, e)) => {
                     return Ok(ctx.ok(format!(
                         "Opened your page for the user as a pane beside you (the same live \
@@ -2037,6 +2198,29 @@ mod tests {
         assert!(dropped > 0);
         assert!(kept.last().unwrap().starts_with("line 01999"));
         assert!(kept.iter().map(|l| l.len() + 1).sum::<usize>() <= LOG_MAX);
+    }
+
+    #[test]
+    fn screenshot_widths_keep_the_long_edge_bounded() {
+        // Wide: the width cap binds.
+        assert_eq!(image_width((1280.0, 800.0)), SCREENSHOT_MAX_WIDTH);
+        // Tall: the long edge (height) stays within IMAGE_LONG_EDGE.
+        let w = image_width((1280.0, 4000.0));
+        assert_eq!(w, 640);
+        assert!(f64::from(w) * 4000.0 / 1280.0 <= f64::from(IMAGE_LONG_EDGE));
+        // A sliver never asks for less than the engines accept.
+        assert_eq!(image_width((10.0, 100_000.0)), 64);
+        assert_eq!(image_width((0.0, 0.0)), SCREENSHOT_MAX_WIDTH);
+    }
+
+    #[test]
+    fn the_shells_take_over_abort_is_recognised() {
+        assert!(is_shell_pause("paused by the user"));
+        assert!(is_shell_pause(
+            "Paused by the user: typing stopped after 12 keys"
+        ));
+        assert!(!is_shell_pause("The script failed: paused"));
+        assert!(!is_shell_pause("paused"));
     }
 
     #[test]

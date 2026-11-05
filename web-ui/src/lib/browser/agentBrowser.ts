@@ -51,6 +51,25 @@ export const OFFSCREEN_GAP_PX = 64;
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null;
 
+/** The view id the shell probe drives: valid, and never a real view. */
+export const PROBE_VIEW_ID = "probe-none";
+
+/**
+ * Whether a probe of `native_view_drive` on a view that doesn't exist
+ * shows the command is there: the command answering at all (with "no such
+ * view", "bad view request", or a result) says yes; the IPC layer refusing
+ * the command name (an older app build: "not found", "not allowed" by its
+ * permissions) says no. Only an app that can drive pages claims the app
+ * engine; otherwise the daemon falls back to Chromium.
+ */
+export function driveProbeSaysPresent(outcome: { ok: true } | { ok: false; error: unknown }): boolean {
+  if (outcome.ok) return true;
+  const e = outcome.error;
+  const text = e instanceof Error ? e.message : typeof e === "string" ? e : "";
+  if (text === "") return false;
+  return !/not found|not allowed|denied|permission|unknown command|\bacl\b|not in the app/i.test(text);
+}
+
 /** `hsl(hue 65% 55%)` (the agent's link hue, as the chips paint it) as
  *  `#rrggbb`, the shell's cursor colour format. */
 export function hueHex(hue: number): string {
@@ -110,6 +129,11 @@ export class PaneViewRegistry {
   /** The hand-over will not complete (its tab went before adopting). */
   dropAdoption(tab: string): void {
     if (this.adopting.delete(tab)) this.changed();
+  }
+
+  /** The view mounted for `tab` in this window (not a pending adoption). */
+  mountedView(tab: string): string | null {
+    return this.byTab.get(tab) ?? null;
   }
 
   /** The adoption `tab` still waits for, if any. */
@@ -453,8 +477,12 @@ export class AgentBrowserChannel {
     }
   }
 
-  /** The agent no longer holds `tab` (unlinked): its marker goes. */
+  /** The agent no longer holds `tab` (unlinked): its marker goes, and its
+   *  view, if this window holds it, stops recording for the agent in its
+   *  future loads (best effort). */
   forgetTab(tab: string): void {
+    const view = this.registry.mountedView(tab);
+    if (view !== null) this.host.native.drive(view, { type: "uninstrument" }).catch(() => {});
     if (!this.drive.has(tab)) return;
     this.drive = new Map(this.drive);
     this.drive.delete(tab);

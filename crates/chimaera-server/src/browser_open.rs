@@ -176,8 +176,9 @@ impl BrowserOpens {
         state.browsers.channel.broadcast(Arc::from(frame));
     }
 
-    /// Record an open if the session is within its limits.
-    fn admit(&self, session_id: &str) -> Result<(), String> {
+    /// Record an open if the session is within its limits (also charged for
+    /// the agent browser's hand-over, `browser_show`: it opens a pane too).
+    pub(crate) fn admit(&self, session_id: &str) -> Result<(), String> {
         let mut inner = crate::lock(&self.inner);
         inner
             .sends

@@ -25,6 +25,9 @@ const PAGE: &str = r#"<!doctype html>
 <input id="i" style="position:absolute;left:20px;top:100px;width:200px;height:30px">
 <a id="away" href="http://blocked.invalid:81/" style="position:absolute;left:20px;top:160px">away</a>
 <a id="next" href="/next" style="position:absolute;left:20px;top:200px">next</a>
+<a id="pop" href="/popped" target="_blank" style="position:absolute;left:300px;top:20px">pop</a>
+<iframe id="f1" src="http://blocked.invalid:81/frame" style="position:absolute;left:300px;top:100px;width:100px;height:60px"></iframe>
+<iframe id="f2" src="http://localhost:{PORT}/framed" style="position:absolute;left:420px;top:100px;width:100px;height:60px"></iframe>
 <div style="height:3000px"></div>
 <script>
   window.pageVar = 42;
@@ -34,16 +37,22 @@ const PAGE: &str = r#"<!doctype html>
 </script>
 </body></html>"#;
 
-/// A tiny HTTP/1.1 server: `/` the page, `/next` a second page, `/slow`
-/// after 1.2 s, `/redirect` to a host off the allowlist, anything else 404.
-async fn serve() -> u16 {
+type Hits = Arc<std::sync::Mutex<Vec<String>>>;
+
+/// A tiny HTTP/1.1 server on all loopback names: `/` the page, `/next` a
+/// second page, `/framed` a frame, `/slow` after 1.2 s, `/redirect` to a
+/// host off the allowlist, anything else 404. Every path asked is logged.
+async fn serve() -> (u16, Hits) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    let hits: Hits = Arc::default();
+    let log = Arc::clone(&hits);
     tokio::spawn(async move {
         loop {
             let Ok((mut sock, _)) = listener.accept().await else {
                 return;
             };
+            let log = Arc::clone(&log);
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 8192];
                 let mut n = 0;
@@ -58,8 +67,10 @@ async fn serve() -> u16 {
                 }
                 let head = String::from_utf8_lossy(&buf[..n]).to_string();
                 let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
+                log.lock().unwrap().push(path.clone());
                 let (status, extra, body) = match path.as_str() {
-                    "/" => ("200 OK", "", PAGE.to_string()),
+                    "/" => ("200 OK", "", PAGE.replace("{PORT}", &port.to_string())),
+                    "/framed" => ("200 OK", "", "<p>framed</p>".to_string()),
                     "/next" => (
                         "200 OK",
                         "",
@@ -85,7 +96,7 @@ async fn serve() -> u16 {
             });
         }
     });
-    port
+    (port, hits)
 }
 
 fn target(port: u16, path: &str) -> TargetUrl {
@@ -156,10 +167,13 @@ async fn drives_a_real_chromium() {
     );
     lock(&state.settings).put(map).unwrap();
 
-    let port = serve().await;
+    let (port, hits) = serve().await;
     let c = Chromium::new();
+    // The engine refuses while the login-node question is open; the core
+    // runs this detection before it asks (tools.rs does).
+    let _ = state.compute.detection().await;
     assert_eq!(
-        c.available(&state).unwrap(),
+        c.available(&state).await.unwrap(),
         PathBuf::from(&exe),
         "discovery honours browser.path"
     );
@@ -391,6 +405,8 @@ async fn drives_a_real_chromium() {
                 clip: None,
                 full_page: false,
                 max_width: 400,
+                format: ImageFormat::Png,
+                quality: None,
             },
         )
         .await
@@ -415,6 +431,8 @@ async fn drives_a_real_chromium() {
                 }),
                 full_page: false,
                 max_width: 1600,
+                format: ImageFormat::Png,
+                quality: None,
             },
         )
         .await
@@ -431,6 +449,8 @@ async fn drives_a_real_chromium() {
                 clip: None,
                 full_page: true,
                 max_width: 800,
+                format: ImageFormat::Png,
+                quality: None,
             },
         )
         .await
@@ -441,6 +461,110 @@ async fn drives_a_real_chromium() {
             assert!(height >= 3000, "full page height {height}");
         }
         other => panic!("{other:?}"),
+    }
+
+    match c
+        .act(
+            &state,
+            "p",
+            Action::Screenshot {
+                clip: None,
+                full_page: false,
+                max_width: 400,
+                format: ImageFormat::Jpeg,
+                quality: Some(50),
+            },
+        )
+        .await
+        .unwrap()
+    {
+        ActionOut::Png { b64, width, height } => {
+            assert!(b64.starts_with("/9j/"), "a JPEG");
+            assert_eq!((width, height), (400, 300));
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // Frames: an allowlisted cross-site frame (localhost vs 127.0.0.1)
+    // loaded; one off the allowlist was refused before it was sent.
+    let mut framed = false;
+    for _ in 0..40 {
+        if hits.lock().unwrap().iter().any(|h| h == "/framed") {
+            framed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(framed, "the allowlisted frame loaded");
+
+    // Popups: a target=_blank click is held, refused unsent and reported.
+    // (The page was scrolled above; the link sits at the top.)
+    eval(
+        &c,
+        &state,
+        World::Page,
+        "scrollTo(0, 0); return 1;",
+        Value::Null,
+    )
+    .await;
+    let (x, y) = center(&c, &state, "#pop").await;
+    match c
+        .act(
+            &state,
+            "p",
+            Action::Click {
+                x,
+                y,
+                clicks: 1,
+                modifiers: vec![],
+            },
+        )
+        .await
+        .unwrap()
+    {
+        ActionOut::Value(v) => {
+            let note = v["blocked"].as_str().unwrap();
+            assert!(
+                note.contains(&format!(
+                    "A popup to http://127.0.0.1:{port}/popped was blocked"
+                )),
+                "{note}"
+            );
+        }
+        other => panic!("popup click: {other:?}"),
+    }
+    // One from script (no user gesture: Chrome's own blocker may stop it
+    // first; the headless shell has none).
+    eval(
+        &c,
+        &state,
+        World::Page,
+        "window.open('/popped2'); return 1;",
+        Value::Null,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let pages = {
+        let b = lock(&c.browser).clone().unwrap();
+        let t = b
+            .conn
+            .call("Target.getTargets", json!({}), None, CALL)
+            .await
+            .unwrap();
+        t["targetInfos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["type"] == "page")
+            .count()
+    };
+    assert_eq!(pages, 1, "no popup survives");
+    {
+        let h = hits.lock().unwrap();
+        assert!(
+            !h.iter().any(|p| p.starts_with("/popped")),
+            "a popup's request was never sent: {h:?}"
+        );
     }
 
     // Rings: the console messages, the 404 and the slow request.
@@ -483,6 +607,19 @@ async fn drives_a_real_chromium() {
         .expect("slow entry");
     assert!(slow.ms.unwrap() >= 1000.0);
     assert_eq!(rings.inflight, 0);
+    let frame = rings
+        .network
+        .iter()
+        .find(|n| n.url == "http://blocked.invalid:81/frame")
+        .expect("the refused frame is in the network ring");
+    assert!(
+        frame
+            .error
+            .as_deref()
+            .unwrap()
+            .starts_with("blocked: blocked.invalid:81 is outside the allowlist"),
+        "{frame:?}"
+    );
     let next = rings.console_next;
     match c
         .act(

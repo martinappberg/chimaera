@@ -28,7 +28,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -38,8 +38,8 @@ use tokio::sync::{mpsc, watch};
 
 use super::cdp::{CdpError, Conn, Event};
 use super::{
-    Action, ActionOut, BrowserError, ConsoleEntry, HistoryOp, Modifier, NetworkEntry, Rect,
-    RingsOut, TargetUrl, World,
+    Action, ActionOut, BrowserError, ConsoleEntry, HistoryOp, ImageFormat, Modifier, NetworkEntry,
+    Rect, RingsOut, TargetUrl, World,
 };
 use crate::state::lock;
 use crate::{proxy, AppState};
@@ -69,6 +69,20 @@ const LOAD: Duration = Duration::from_secs(15);
 /// and how long to wait for that navigation to settle.
 const NAV_START_GRACE: Duration = Duration::from_millis(120);
 const NAV_SETTLE: Duration = Duration::from_secs(5);
+/// Fetch pauses queued per page, and decided at once.
+const FETCH_QUEUE: usize = 64;
+const FETCH_CONCURRENCY: usize = 16;
+/// Popups being closed at once; past this a popup is closed unread.
+const POPUP_QUEUE: usize = 16;
+const POPUP_CONCURRENCY: usize = 8;
+/// How long a popup may take to ask for its first document before it is
+/// closed without a URL.
+const POPUP_WAIT: Duration = Duration::from_secs(3);
+/// How long an auto-attached page target may stay unclaimed before it is
+/// treated as a window opened without an opener, and closed.
+const UNCLAIMED_GRACE: Duration = Duration::from_secs(5);
+/// Auto-attached page targets awaiting their `create_page`.
+const MAX_UNCLAIMED: usize = 32;
 /// Bytes of browser stderr kept for startup diagnostics.
 const STDERR_TAIL: usize = 16 * 1024;
 /// The isolated world's name (the snapshot script runs there).
@@ -159,12 +173,12 @@ impl Chromium {
 
     /// The browser this daemon would launch, or why it can't (no browser
     /// found, login node, NFS profile dir…): model-facing text naming the
-    /// fix.
-    pub(crate) fn available(&self, state: &AppState) -> Result<PathBuf, String> {
-        self.check(state).map_err(Unavailable::text)
+    /// fix. The filesystem checks run off the reactor.
+    pub(crate) async fn available(&self, state: &AppState) -> Result<PathBuf, String> {
+        self.check(state).await.map_err(Unavailable::text)
     }
 
-    fn check(&self, state: &AppState) -> Result<PathBuf, Unavailable> {
+    async fn check(&self, state: &AppState) -> Result<PathBuf, Unavailable> {
         if state.compute.is_login_node() {
             return Err(Unavailable::Refused(
                 "This daemon runs on a cluster login node, where Chimaera never starts a browser. \
@@ -173,13 +187,26 @@ impl Chromium {
                     .to_string(),
             ));
         }
+        // Unknown is not "no": a failed Slurm probe must never let a login
+        // node launch a browser.
+        if state.compute.login_node_unknown() {
+            return Err(Unavailable::Refused(format!(
+                "Couldn't tell whether this host is a cluster login node (the Slurm probe \
+                 failed), and Chimaera never starts a browser on one. Try again in a moment; if \
+                 this host is not a cluster, start the daemon with {}=1.",
+                chimaera_core::cluster::ENV_NOT_A_CLUSTER
+            )));
+        }
         let setting = lock(&state.settings).browser_path();
-        let exe = self.discover(setting)?;
-        profile_fs_ok(&chimaera_core::runtime_dir()).map_err(Unavailable::Refused)?;
+        let exe = self.discover(setting).await?;
+        let fs = tokio::task::spawn_blocking(|| profile_fs_ok(&chimaera_core::runtime_dir()))
+            .await
+            .unwrap_or(Ok(()));
+        fs.map_err(Unavailable::Refused)?;
         Ok(exe)
     }
 
-    fn discover(&self, setting: Option<String>) -> Result<PathBuf, Unavailable> {
+    async fn discover(&self, setting: Option<String>) -> Result<PathBuf, Unavailable> {
         {
             let cached = lock(&self.discovery);
             if let Some(d) = cached.as_ref() {
@@ -188,9 +215,15 @@ impl Chromium {
                 }
             }
         }
-        let path_var = std::env::var_os("PATH").unwrap_or_default();
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        let result = find_browser(setting.as_deref(), &path_var, home.as_deref());
+        // Metadata walks over PATH, whose entries can sit on NFS.
+        let wanted = setting.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let path_var = std::env::var_os("PATH").unwrap_or_default();
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            find_browser(wanted.as_deref(), &path_var, home.as_deref())
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("browser discovery failed: {e}")));
         *lock(&self.discovery) = Some(Discovery {
             setting,
             at: Instant::now(),
@@ -287,8 +320,10 @@ impl Chromium {
                 clip,
                 full_page,
                 max_width,
+                format,
+                quality,
             } => {
-                pg.screenshot(&browser.conn, clip, full_page, max_width)
+                pg.screenshot(&browser.conn, clip, full_page, max_width, format, quality)
                     .await
             }
             Action::Rings {
@@ -393,7 +428,7 @@ impl Chromium {
         if state.compute.login_node_unknown() {
             let _ = state.compute.detection().await;
         }
-        let exe = self.check(state).map_err(Unavailable::error)?;
+        let exe = self.check(state).await.map_err(Unavailable::error)?;
         let browser = Browser::launch(&exe).await?;
         *lock(&self.browser) = Some(Arc::clone(&browser));
         Ok(browser)
@@ -596,8 +631,8 @@ struct Browser {
     stderr: Arc<Mutex<VecDeque<u8>>>,
     /// By page key.
     pages: Mutex<HashMap<String, Arc<Page>>>,
-    /// By CDP session id: where the reader routes a page's events.
-    sessions: Arc<Mutex<HashMap<String, Arc<PageShared>>>>,
+    /// Where the reader routes events; the browser-level target state.
+    router: Arc<Router>,
     /// The launch's own about:blank tab(s), closed once a page exists.
     initial: Mutex<Vec<String>>,
 }
@@ -705,24 +740,35 @@ impl Browser {
             tokio::net::unix::pipe::Receiver::from_owned_fd(our_in).map_err(|e| io("pipe", e))?;
         let writer =
             tokio::net::unix::pipe::Sender::from_owned_fd(our_out).map_err(|e| io("pipe", e))?;
-        let sessions: Arc<Mutex<HashMap<String, Arc<PageShared>>>> = Arc::default();
+        let (to_popups, popups_rx) = mpsc::channel(POPUP_QUEUE);
+        let router = Arc::new(Router {
+            conn: OnceLock::new(),
+            sessions: Mutex::new(HashMap::new()),
+            attached: Mutex::new(HashMap::new()),
+            attached_tx: watch::channel(0).0,
+            popups: Mutex::new(HashMap::new()),
+            to_popups,
+        });
         let conn = {
-            let route = Arc::clone(&sessions);
-            let on_close = Arc::clone(&sessions);
+            let route = Arc::clone(&router);
+            let on_close = Arc::clone(&router);
             let alive = Arc::clone(&alive);
             Conn::start(
                 reader,
                 writer,
-                move |ev| route_event(&route, ev),
+                move |ev| route.on_event(ev),
                 move |_why| {
                     alive.store(false, Ordering::Release);
-                    let all: Vec<Arc<PageShared>> = lock(&on_close).values().cloned().collect();
+                    let all: Vec<Arc<PageShared>> =
+                        lock(&on_close.sessions).values().cloned().collect();
                     for shared in all {
                         shared.update(|st| st.detached = true);
                     }
                 },
             )
         };
+        let _ = router.conn.set(Arc::downgrade(&conn));
+        tokio::spawn(popup_task(Arc::downgrade(&router), popups_rx));
         let browser = Arc::new(Browser {
             conn,
             pgid,
@@ -731,7 +777,7 @@ impl Browser {
             exited,
             stderr,
             pages: Mutex::new(HashMap::new()),
-            sessions,
+            router,
             initial: Mutex::new(Vec::new()),
         });
 
@@ -757,6 +803,28 @@ impl Browser {
                 CALL,
             )
             .await;
+        // Every new page target starts paused and attached to us: our own
+        // (claimed by `create_page`, gated before it runs) and any popup
+        // (closed unread, see `Router`). Without this a popup would be an
+        // ungated page nobody reaps.
+        if let Err(e) = browser
+            .conn
+            .call(
+                "Target.setAutoAttach",
+                json!({"autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true,
+                       "filter": [{"type": "page"}]}),
+                None,
+                CALL,
+            )
+            .await
+        {
+            browser.kill();
+            return Err(BrowserError::Engine(format!(
+                "The headless browser ({}) is too old for Chimaera: Target.setAutoAttach failed \
+                 ({e}). Use a current Chrome, Chromium or chrome-headless-shell.",
+                exe.display()
+            )));
+        }
         if let Ok(targets) = browser
             .conn
             .call("Target.getTargets", json!({}), None, CALL)
@@ -832,7 +900,11 @@ impl Browser {
             .as_str()
             .ok_or_else(|| BrowserError::Engine("createTarget gave no targetId".into()))?
             .to_string();
-        match self.attach(state, &target_id, width, height).await {
+        let attached = match self.claim(&target_id).await {
+            Ok(session) => self.attach(state, &target_id, session, width, height).await,
+            Err(e) => Err(e),
+        };
+        match attached {
             Ok(pg) => {
                 let initial = std::mem::take(&mut *lock(&self.initial));
                 for id in initial {
@@ -849,30 +921,37 @@ impl Browser {
         }
     }
 
+    /// The session the browser auto-attached for our new target (its event
+    /// may come before or after `createTarget`'s answer).
+    async fn claim(&self, target_id: &str) -> Result<String, BrowserError> {
+        let mut rx = self.router.attached_tx.subscribe();
+        let deadline = Instant::now() + CALL;
+        loop {
+            let got = lock(&self.router.attached).remove(target_id);
+            if let Some(session) = got {
+                return Ok(session);
+            }
+            let woke = tokio::time::timeout_at(deadline.into(), rx.changed()).await;
+            if !matches!(woke, Ok(Ok(()))) {
+                return Err(BrowserError::Engine(
+                    "The headless browser never attached the new page.".to_string(),
+                ));
+            }
+        }
+    }
+
+    /// Wires up a claimed (still paused) target, then lets it run.
     async fn attach(
         &self,
         state: &Arc<AppState>,
         target_id: &str,
+        session: String,
         width: u32,
         height: u32,
     ) -> Result<Arc<Page>, BrowserError> {
-        let attached = self
-            .conn
-            .call(
-                "Target.attachToTarget",
-                json!({"targetId": target_id, "flatten": true}),
-                None,
-                CALL,
-            )
-            .await
-            .map_err(engine)?;
-        let session = attached["sessionId"]
-            .as_str()
-            .ok_or_else(|| BrowserError::Engine("attachToTarget gave no sessionId".into()))?
-            .to_string();
-        let (to_task, rx) = mpsc::unbounded_channel();
+        let (to_task, rx) = mpsc::channel(FETCH_QUEUE);
         let shared = Arc::new(PageShared::new(target_id.to_string(), to_task));
-        lock(&self.sessions).insert(session.clone(), Arc::clone(&shared));
+        lock(&self.router.sessions).insert(session.clone(), Arc::clone(&shared));
         let task = tokio::spawn(page_task(
             Arc::clone(&self.conn),
             session.clone(),
@@ -900,19 +979,33 @@ impl Browser {
                 json!({"maxTotalBufferSize": 2_000_000, "maxResourceBufferSize": 1_000_000}),
             ),
             (
+                // Every document, main frame and subframes: the allowlist.
                 "Fetch.enable",
                 json!({"patterns": [{"urlPattern": "*", "resourceType": "Document", "requestStage": "Request"}]}),
             ),
         ];
         for (method, params) in setup {
             if let Err(e) = self.conn.call(method, params, Some(&session), CALL).await {
-                lock(&self.sessions).remove(&session);
+                lock(&self.router.sessions).remove(&session);
                 return Err(engine(e));
             }
         }
         if let Err(e) = pg.set_viewport(&self.conn, width, height).await {
-            lock(&self.sessions).remove(&session);
+            lock(&self.router.sessions).remove(&session);
             return Err(e);
+        }
+        if let Err(e) = self
+            .conn
+            .call(
+                "Runtime.runIfWaitingForDebugger",
+                json!({}),
+                Some(&session),
+                CALL,
+            )
+            .await
+        {
+            lock(&self.router.sessions).remove(&session);
+            return Err(engine(e));
         }
         Ok(pg)
     }
@@ -933,7 +1026,7 @@ impl Browser {
     fn drop_page(&self, key: &str) {
         let removed = lock(&self.pages).remove(key);
         if let Some(pg) = removed {
-            lock(&self.sessions).remove(&pg.session);
+            lock(&self.router.sessions).remove(&pg.session);
         }
     }
 }
@@ -1117,6 +1210,7 @@ struct Mark {
     nav: u64,
     load: u64,
     blocked: u64,
+    popup: u64,
 }
 
 impl Page {
@@ -1173,6 +1267,7 @@ impl Page {
             nav: st.nav_seq,
             load: st.load_seq,
             blocked: st.blocked_seq,
+            popup: st.popup_seq,
         }
     }
 
@@ -1320,16 +1415,24 @@ impl Page {
         if loading {
             out["loading"] = Value::Bool(true);
         }
+        if let Some(note) = lock(&self.shared.st).take_notes() {
+            out["blocked"] = Value::String(note);
+        }
         Ok(ActionOut::Value(out))
     }
 
-    /// After a click/key/text: if it started a navigation, wait for that to
-    /// settle so the next read sees the new page; report a block.
+    /// After a click/key/text: if it started a navigation or a popup, wait
+    /// for that to settle so the next read sees the new page; report what
+    /// was blocked (a navigation off the allowlist, a popup).
     async fn after_input(&self, mark: Mark) -> Result<ActionOut, BrowserError> {
+        let nav_started = |st: &PageState| st.load_seq > mark.load || st.nav_seq > mark.nav;
         let started = self
             .shared
             .wait(Instant::now() + NAV_START_GRACE, |st| {
-                st.load_seq > mark.load || st.nav_seq > mark.nav || st.blocked_seq > mark.blocked
+                nav_started(st)
+                    || st.blocked_seq > mark.blocked
+                    || st.popups_pending > 0
+                    || st.popup_seq > mark.popup
             })
             .await;
         if started {
@@ -1337,19 +1440,16 @@ impl Page {
                 .wait(Instant::now() + NAV_SETTLE, |st| {
                     st.crashed
                         || st.detached
-                        || st.blocked_seq > mark.blocked
-                        || ((st.nav_seq > mark.nav || st.load_seq > mark.load) && !st.loading)
+                        || ((st.blocked_seq > mark.blocked || !nav_started(st) || !st.loading)
+                            && st.popups_pending == 0)
                 })
                 .await;
         }
-        let mut st = lock(&self.shared.st);
-        if st.blocked_seq > st.blocked_reported {
-            st.blocked_reported = st.blocked_seq;
-            if let Some(why) = st.blocked.clone() {
-                return Ok(ActionOut::Value(json!({"blocked": why})));
-            }
-        }
-        Ok(ActionOut::Done)
+        let note = lock(&self.shared.st).take_notes();
+        Ok(match note {
+            Some(why) => ActionOut::Value(json!({"blocked": why})),
+            None => ActionOut::Done,
+        })
     }
 
     // -- eval --
@@ -1369,7 +1469,6 @@ impl Page {
                 "expression": expression,
                 "awaitPromise": true,
                 "returnByValue": true,
-                "userGesture": true,
             });
             if world == World::Isolated {
                 params["contextId"] = json!(self.isolated_context(conn).await?);
@@ -1597,6 +1696,8 @@ impl Page {
         clip: Option<Rect>,
         full_page: bool,
         max_width: u32,
+        format: ImageFormat,
+        quality: Option<u8>,
     ) -> Result<ActionOut, BrowserError> {
         let m = self.call(conn, "Page.getLayoutMetrics", json!({})).await?;
         let vv = if m["cssVisualViewport"].is_object() {
@@ -1634,15 +1735,20 @@ impl Page {
         } else {
             1.0
         };
+        let mut params = json!({
+            "format": "png",
+            "clip": {"x": x, "y": y, "width": w, "height": h, "scale": scale},
+            "captureBeyondViewport": beyond,
+            "fromSurface": true,
+        });
+        if format == ImageFormat::Jpeg {
+            params["format"] = json!("jpeg");
+            params["quality"] = json!(quality.unwrap_or(80).clamp(1, 100));
+        }
         let shot = conn
             .call(
                 "Page.captureScreenshot",
-                json!({
-                    "format": "png",
-                    "clip": {"x": x, "y": y, "width": w, "height": h, "scale": scale},
-                    "captureBeyondViewport": beyond,
-                    "fromSurface": true,
-                }),
+                params,
                 Some(&self.session),
                 Duration::from_secs(30),
             )
@@ -1652,8 +1758,8 @@ impl Page {
             .as_str()
             .ok_or_else(|| BrowserError::Engine("captureScreenshot gave no data".into()))?
             .to_string();
-        let (width, height) =
-            png_size(&b64).unwrap_or(((w * scale).round() as u32, (h * scale).round() as u32));
+        let (width, height) = image_size(&b64, format)
+            .unwrap_or(((w * scale).round() as u32, (h * scale).round() as u32));
         Ok(ActionOut::Png { b64, width, height })
     }
 
@@ -1920,6 +2026,48 @@ fn key_events(def: &KeyDef, modifiers: &[Modifier]) -> Vec<Value> {
     vec![down, up]
 }
 
+/// The encoded image's real size (PNG's IHDR, JPEG's SOF), from its
+/// first bytes only.
+fn image_size(b64: &str, format: ImageFormat) -> Option<(u32, u32)> {
+    match format {
+        ImageFormat::Png => png_size(b64),
+        ImageFormat::Jpeg => jpeg_size(b64),
+    }
+}
+
+/// Width and height from a base64 JPEG's start-of-frame marker. Decodes
+/// at most the first 48 KB; Chrome's SOF comes right after the tables.
+fn jpeg_size(b64: &str) -> Option<(u32, u32)> {
+    let take = b64.len().min(64 * 1024) / 4 * 4;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.get(..take)?)
+        .ok()?;
+    if bytes.get(..2)? != [0xFF, 0xD8] {
+        return None;
+    }
+    let mut i = 2;
+    while i + 4 <= bytes.len() {
+        if bytes[i] != 0xFF {
+            return None;
+        }
+        let marker = bytes[i + 1];
+        if marker == 0xFF {
+            i += 1; // fill byte
+            continue;
+        }
+        let len = usize::from(u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]));
+        let sof = (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC);
+        if sof {
+            let f = bytes.get(i + 5..i + 9)?;
+            let h = u32::from(u16::from_be_bytes([f[0], f[1]]));
+            let w = u32::from(u16::from_be_bytes([f[2], f[3]]));
+            return Some((w, h));
+        }
+        i += 2 + len;
+    }
+    None
+}
+
 /// Width and height from a base64 PNG's IHDR, decoding only its header.
 fn png_size(b64: &str) -> Option<(u32, u32)> {
     let head = base64::engine::general_purpose::STANDARD
@@ -2014,8 +2162,31 @@ struct PageState {
     blocked_seq: u64,
     blocked_reported: u64,
     blocked: Option<String>,
+    /// Popups this page opened: still being closed, closed, and the last
+    /// one's note.
+    popups_pending: u32,
+    popup_seq: u64,
+    popup_reported: u64,
+    popup: Option<String>,
     crashed: bool,
     detached: bool,
+}
+
+impl PageState {
+    /// What was blocked since the last result said so (a navigation off
+    /// the allowlist, a popup), marking it said.
+    fn take_notes(&mut self) -> Option<String> {
+        let mut notes = Vec::new();
+        if self.blocked_seq > self.blocked_reported {
+            self.blocked_reported = self.blocked_seq;
+            notes.extend(self.blocked.clone());
+        }
+        if self.popup_seq > self.popup_reported {
+            self.popup_reported = self.popup_seq;
+            notes.extend(self.popup.clone());
+        }
+        (!notes.is_empty()).then(|| notes.join(" "))
+    }
 }
 
 struct PageShared {
@@ -2023,12 +2194,13 @@ struct PageShared {
     st: Mutex<PageState>,
     /// Bumped on every change a waiter may care about.
     changed: watch::Sender<u64>,
-    /// Events that need an async answer (Fetch pauses, dialogs).
-    to_task: mpsc::UnboundedSender<Event>,
+    /// Fetch pauses, decided by `page_task` (bounded: a full queue fails
+    /// the request rather than growing).
+    to_task: mpsc::Sender<Event>,
 }
 
 impl PageShared {
-    fn new(target_id: String, to_task: mpsc::UnboundedSender<Event>) -> Self {
+    fn new(target_id: String, to_task: mpsc::Sender<Event>) -> Self {
         PageShared {
             target_id,
             st: Mutex::new(PageState::default()),
@@ -2065,12 +2237,54 @@ impl PageShared {
         frame.as_str() == Some(self.target_id.as_str())
     }
 
-    /// One event for this page. Runs on the CDP reader task: no waiting.
-    fn on_event(&self, ev: Event) {
+    /// One event for this page. Runs on the CDP reader task: no waiting
+    /// (`conn` only fires).
+    fn on_event(&self, ev: Event, conn: Option<&Conn>) {
         let p = &ev.params;
         match ev.method.as_str() {
-            "Fetch.requestPaused" | "Page.javascriptDialogOpening" => {
-                let _ = self.to_task.send(ev);
+            "Fetch.requestPaused" => {
+                let request_id = p["requestId"].as_str().unwrap_or_default().to_string();
+                let session = ev.session.clone();
+                if let Err(e) = self.to_task.try_send(ev) {
+                    // Never leave a request paused: refuse it.
+                    let ev = e.into_inner();
+                    let url = ev.params["request"]["url"].as_str().unwrap_or_default();
+                    self.note_blocked_frame("GET", url, "too many page loads at once");
+                    if let Some(conn) = conn {
+                        conn.fire(
+                            "Fetch.failRequest",
+                            json!({"requestId": request_id, "errorReason": "BlockedByClient"}),
+                            session.as_deref(),
+                        );
+                    }
+                }
+            }
+            "Page.javascriptDialogOpening" => {
+                let kind = p["type"].as_str().unwrap_or("alert").to_string();
+                let message = p["message"].as_str().unwrap_or_default();
+                // Nobody can answer a dialog in a headless page, and an open
+                // one stalls every script: accept alerts and leave-page
+                // prompts, dismiss confirm/prompt.
+                let accept = matches!(kind.as_str(), "alert" | "beforeunload");
+                let text = format!(
+                    "[{kind} dialog, {}] {message}",
+                    if accept { "accepted" } else { "dismissed" }
+                );
+                self.update(|st| {
+                    st.console.push(|id| ConsoleEntry {
+                        id,
+                        level: "warn".to_string(),
+                        text: cap(&text, TEXT_MAX),
+                        at: now_ms(),
+                    })
+                });
+                if let Some(conn) = conn {
+                    conn.fire(
+                        "Page.handleJavaScriptDialog",
+                        json!({"accept": accept}),
+                        ev.session.as_deref(),
+                    );
+                }
             }
             "Runtime.consoleAPICalled" => {
                 let Some(level) = console_level(p["type"].as_str().unwrap_or("log")) else {
@@ -2234,6 +2448,12 @@ impl PageShared {
             .unwrap_or_else(now_ms);
         let document = p["type"] == "Document";
         let main_doc = document && self.is_main(&p["frameId"]);
+        // A subframe's document may finish in its own (out-of-process)
+        // target, which never reports back here: tracking it would hold the
+        // in-flight count up forever. Its allowlist verdict is in the ring.
+        if document && !main_doc {
+            return;
+        }
         let redirect = p["redirectResponse"]["status"]
             .as_u64()
             .and_then(|s| u16::try_from(s).ok());
@@ -2282,6 +2502,40 @@ impl PageShared {
                 ms: None,
                 at: now_ms(),
             });
+        });
+    }
+
+    /// A subframe document refused by the allowlist: in the network ring
+    /// only (the page itself didn't navigate).
+    fn note_blocked_frame(&self, method: &str, url: &str, why: &str) {
+        let error = format!("blocked: {why}");
+        self.update(|st| {
+            st.network.push(|id| NetworkEntry {
+                id,
+                method: method.to_string(),
+                url: cap(url, URL_MAX),
+                status: None,
+                error: Some(cap(&error, ERROR_MAX)),
+                ms: None,
+                at: now_ms(),
+            });
+        });
+    }
+
+    /// A popup this page opened was closed (its first document's URL, if
+    /// it asked for one).
+    fn note_popup(&self, url: Option<&str>) {
+        let text = match url.filter(|u| !u.is_empty()) {
+            Some(u) => format!(
+                "A popup to {} was blocked; use browser_navigate to open it.",
+                cap(u, URL_MAX)
+            ),
+            None => "A popup window was blocked.".to_string(),
+        };
+        self.update(|st| {
+            st.popups_pending = st.popups_pending.saturating_sub(1);
+            st.popup_seq += 1;
+            st.popup = Some(text);
         });
     }
 }
@@ -2394,99 +2648,308 @@ fn cap(s: &str, max: usize) -> String {
     format!("{}…", &s[..end])
 }
 
-fn route_event(sessions: &Mutex<HashMap<String, Arc<PageShared>>>, ev: Event) {
-    match ev.session.as_deref() {
-        Some(s) => {
-            let shared = lock(sessions).get(s).cloned();
-            if let Some(shared) = shared {
-                shared.on_event(ev);
-            }
-        }
-        None if ev.method == "Target.detachedFromTarget" => {
-            let shared = ev.params["sessionId"]
-                .as_str()
-                .and_then(|s| lock(sessions).get(s).cloned());
-            if let Some(shared) = shared {
-                shared.update(|st| st.detached = true);
-            }
-        }
-        None => {}
-    }
+/// Where the CDP reader sends every event, and the browser-level target
+/// state: our pages by session, auto-attached page targets not yet claimed
+/// by `create_page`, and popups being closed.
+struct Router {
+    conn: OnceLock<Weak<Conn>>,
+    /// Our pages, by CDP session id.
+    sessions: Mutex<HashMap<String, Arc<PageShared>>>,
+    /// Target id → session id of auto-attached page targets nobody has
+    /// claimed yet (bounded by [`MAX_UNCLAIMED`]).
+    attached: Mutex<HashMap<String, String>>,
+    attached_tx: watch::Sender<u64>,
+    /// Popups being closed, by session id.
+    popups: Mutex<HashMap<String, Popup>>,
+    to_popups: mpsc::Sender<PopupJob>,
 }
 
-/// Answers a page's Fetch pauses (the allowlist) and dialogs, for the
-/// page's life.
-async fn page_task(
-    conn: Arc<Conn>,
+struct Popup {
+    target_id: String,
+    opener: String,
+}
+
+struct PopupJob {
     session: String,
-    shared: Arc<PageShared>,
-    state: Weak<AppState>,
-    mut rx: mpsc::UnboundedReceiver<Event>,
-) {
-    while let Some(ev) = rx.recv().await {
+    target_id: String,
+    /// `None`: a page target without an opener, closed if nobody claims it.
+    opener: Option<String>,
+}
+
+impl Router {
+    fn conn(&self) -> Option<Arc<Conn>> {
+        self.conn.get().and_then(Weak::upgrade)
+    }
+
+    fn page_by_target(&self, target_id: &str) -> Option<Arc<PageShared>> {
+        lock(&self.sessions)
+            .values()
+            .find(|s| s.target_id == target_id)
+            .cloned()
+    }
+
+    /// Runs on the CDP reader task: no waiting, only fires.
+    fn on_event(&self, ev: Event) {
+        let conn = self.conn();
+        if let Some(s) = ev.session.as_deref() {
+            let shared = lock(&self.sessions).get(s).cloned();
+            if let Some(shared) = shared {
+                shared.on_event(ev, conn.as_deref());
+                return;
+            }
+            if ev.method == "Fetch.requestPaused" {
+                // A popup's first document: refuse it unsent, close the
+                // popup, and tell its opener where it was going.
+                let popup = lock(&self.popups).remove(s);
+                if let Some(popup) = popup {
+                    if let Some(conn) = conn.as_deref() {
+                        conn.fire(
+                            "Fetch.failRequest",
+                            json!({"requestId": ev.params["requestId"], "errorReason": "BlockedByClient"}),
+                            Some(s),
+                        );
+                        conn.fire(
+                            "Target.closeTarget",
+                            json!({"targetId": popup.target_id}),
+                            None,
+                        );
+                    }
+                    if let Some(opener) = self.page_by_target(&popup.opener) {
+                        opener.note_popup(ev.params["request"]["url"].as_str());
+                    }
+                }
+            }
+            return;
+        }
         let p = &ev.params;
         match ev.method.as_str() {
-            "Fetch.requestPaused" => {
-                let Some(request_id) = p["requestId"].as_str() else {
-                    continue;
-                };
-                let url = p["request"]["url"].as_str().unwrap_or_default();
-                let method = p["request"]["method"].as_str().unwrap_or("GET");
-                let main = p["resourceType"] == "Document" && shared.is_main(&p["frameId"]);
-                let verdict = if main {
-                    allow_document(&state, url).await
-                } else {
-                    Ok(())
-                };
-                let (cmd, params) = match verdict {
-                    Ok(()) => ("Fetch.continueRequest", json!({"requestId": request_id})),
-                    Err(why) => {
-                        tracing::info!(%url, %why, "agent browser: blocked a main-frame navigation");
-                        shared.note_blocked(method, url, &why);
-                        (
-                            "Fetch.failRequest",
-                            json!({"requestId": request_id, "errorReason": "BlockedByClient"}),
-                        )
+            "Target.attachedToTarget" => {
+                let session = p["sessionId"].as_str().unwrap_or_default().to_string();
+                let info = &p["targetInfo"];
+                let target_id = info["targetId"].as_str().unwrap_or_default().to_string();
+                // Tabs that existed before auto-attach was on run already.
+                if p["waitingForDebugger"] != true || session.is_empty() {
+                    return;
+                }
+                if info["type"] != "page" {
+                    if let Some(conn) = conn.as_deref() {
+                        conn.fire("Runtime.runIfWaitingForDebugger", json!({}), Some(&session));
+                        conn.fire(
+                            "Target.detachFromTarget",
+                            json!({"sessionId": session}),
+                            None,
+                        );
                     }
+                    return;
+                }
+                let opener = info["openerId"]
+                    .as_str()
+                    .filter(|o| !o.is_empty())
+                    .map(str::to_string);
+                match &opener {
+                    Some(o) => {
+                        if let Some(page) = self.page_by_target(o) {
+                            page.update(|st| st.popups_pending += 1);
+                        }
+                        lock(&self.popups).insert(
+                            session.clone(),
+                            Popup {
+                                target_id: target_id.clone(),
+                                opener: o.clone(),
+                            },
+                        );
+                    }
+                    None => {
+                        let mut attached = lock(&self.attached);
+                        if attached.len() < MAX_UNCLAIMED {
+                            attached.insert(target_id.clone(), session.clone());
+                        }
+                        drop(attached);
+                        self.attached_tx.send_modify(|n| *n = n.wrapping_add(1));
+                    }
+                }
+                let job = PopupJob {
+                    session,
+                    target_id,
+                    opener,
                 };
-                let _ = conn
-                    .call(cmd, params, Some(&session), Duration::from_secs(5))
-                    .await;
+                if let Err(e) = self.to_popups.try_send(job) {
+                    // Too many at once: close it unread (it never ran).
+                    let job = e.into_inner();
+                    if job.opener.is_some() {
+                        let popup = lock(&self.popups).remove(&job.session);
+                        if let Some(page) = popup.and_then(|p| self.page_by_target(&p.opener)) {
+                            page.note_popup(None);
+                        }
+                        if let Some(conn) = conn.as_deref() {
+                            conn.fire(
+                                "Target.closeTarget",
+                                json!({"targetId": job.target_id}),
+                                None,
+                            );
+                        }
+                    }
+                }
             }
-            "Page.javascriptDialogOpening" => {
-                let kind = p["type"].as_str().unwrap_or("alert").to_string();
-                let message = p["message"].as_str().unwrap_or_default();
-                // Nobody can answer a dialog in a headless page, and an open
-                // one stalls every script: accept alerts and leave-page
-                // prompts, dismiss confirm/prompt.
-                let accept = matches!(kind.as_str(), "alert" | "beforeunload");
-                let text = format!(
-                    "[{kind} dialog, {}] {message}",
-                    if accept { "accepted" } else { "dismissed" }
-                );
-                shared.update(|st| {
-                    st.console.push(|id| ConsoleEntry {
-                        id,
-                        level: "warn".to_string(),
-                        text: cap(&text, TEXT_MAX),
-                        at: now_ms(),
-                    })
-                });
-                let _ = conn
-                    .call(
-                        "Page.handleJavaScriptDialog",
-                        json!({"accept": accept}),
-                        Some(&session),
-                        Duration::from_secs(5),
-                    )
-                    .await;
+            "Target.detachedFromTarget" => {
+                let Some(s) = p["sessionId"].as_str() else {
+                    return;
+                };
+                let shared = lock(&self.sessions).get(s).cloned();
+                if let Some(shared) = shared {
+                    shared.update(|st| st.detached = true);
+                }
+                let popup = lock(&self.popups).remove(s);
+                if let Some(page) = popup.and_then(|p| self.page_by_target(&p.opener)) {
+                    page.note_popup(None);
+                }
+                lock(&self.attached).retain(|_, v| v != s);
             }
             _ => {}
         }
     }
 }
 
-/// The allowlist for a main-frame document: `Err` is why it was refused.
+/// Closes popups and unclaimed page targets, a few at a time.
+async fn popup_task(router: Weak<Router>, mut rx: mpsc::Receiver<PopupJob>) {
+    let mut jobs = tokio::task::JoinSet::new();
+    while let Some(job) = rx.recv().await {
+        while jobs.try_join_next().is_some() {}
+        while jobs.len() >= POPUP_CONCURRENCY {
+            jobs.join_next().await;
+        }
+        let Some(router) = router.upgrade() else {
+            return;
+        };
+        jobs.spawn(close_popup(router, job));
+    }
+}
+
+async fn close_popup(router: Arc<Router>, job: PopupJob) {
+    let Some(conn) = router.conn() else {
+        return;
+    };
+    if job.opener.is_none() {
+        // Ours, unless nobody claims it: a window opened without an opener
+        // (it is still paused, so it never sent anything).
+        tokio::time::sleep(UNCLAIMED_GRACE).await;
+        let unclaimed = lock(&router.attached).remove(&job.target_id).is_some();
+        if unclaimed {
+            conn.fire(
+                "Target.closeTarget",
+                json!({"targetId": job.target_id}),
+                None,
+            );
+        }
+        return;
+    }
+    // Hold the popup's first document so its URL is known and nothing is
+    // sent; the router refuses it and closes the popup when it comes.
+    let held = conn
+        .call(
+            "Fetch.enable",
+            json!({"patterns": [{"urlPattern": "*", "resourceType": "Document", "requestStage": "Request"}]}),
+            Some(&job.session),
+            Duration::from_secs(5),
+        )
+        .await
+        .is_ok();
+    if held {
+        conn.fire(
+            "Runtime.runIfWaitingForDebugger",
+            json!({}),
+            Some(&job.session),
+        );
+        tokio::time::sleep(POPUP_WAIT).await;
+    }
+    // Still here: it never asked for a document (an empty window), or the
+    // hold failed.
+    let popup = lock(&router.popups).remove(&job.session);
+    if let Some(popup) = popup {
+        conn.fire(
+            "Target.closeTarget",
+            json!({"targetId": popup.target_id}),
+            None,
+        );
+        if let Some(page) = router.page_by_target(&popup.opener) {
+            page.note_popup(None);
+        }
+    }
+}
+
+/// Decides a page's Fetch pauses (the allowlist, for every document the
+/// page loads), several at once, for the page's life.
+async fn page_task(
+    conn: Arc<Conn>,
+    session: String,
+    shared: Arc<PageShared>,
+    state: Weak<AppState>,
+    mut rx: mpsc::Receiver<Event>,
+) {
+    let mut jobs = tokio::task::JoinSet::new();
+    while let Some(ev) = rx.recv().await {
+        while jobs.try_join_next().is_some() {}
+        while jobs.len() >= FETCH_CONCURRENCY {
+            jobs.join_next().await;
+        }
+        jobs.spawn(decide(
+            Arc::clone(&conn),
+            session.clone(),
+            Arc::clone(&shared),
+            state.clone(),
+            ev,
+        ));
+    }
+}
+
+/// One paused document request: continue it, or fail it with
+/// `BlockedByClient` and say why.
+async fn decide(
+    conn: Arc<Conn>,
+    session: String,
+    shared: Arc<PageShared>,
+    state: Weak<AppState>,
+    ev: Event,
+) {
+    let p = &ev.params;
+    let Some(request_id) = p["requestId"].as_str() else {
+        return;
+    };
+    let url = p["request"]["url"].as_str().unwrap_or_default();
+    let method = p["request"]["method"].as_str().unwrap_or("GET");
+    let verdict = if local_document(url) {
+        Ok(())
+    } else {
+        allow_document(&state, url).await
+    };
+    let (cmd, params) = match verdict {
+        Ok(()) => ("Fetch.continueRequest", json!({"requestId": request_id})),
+        Err(why) => {
+            if shared.is_main(&p["frameId"]) {
+                tracing::info!(%url, %why, "agent browser: blocked a main-frame navigation");
+                shared.note_blocked(method, url, &why);
+            } else {
+                tracing::info!(%url, %why, "agent browser: blocked a subframe document");
+                shared.note_blocked_frame(method, url, &why);
+            }
+            (
+                "Fetch.failRequest",
+                json!({"requestId": request_id, "errorReason": "BlockedByClient"}),
+            )
+        }
+    };
+    let _ = conn
+        .call(cmd, params, Some(&session), Duration::from_secs(5))
+        .await;
+}
+
+/// Documents that never leave the browser (srcdoc is `about:srcdoc`).
+fn local_document(url: &str) -> bool {
+    let lower = url.get(..6).unwrap_or(url).to_ascii_lowercase();
+    lower.starts_with("about:") || lower.starts_with("data:") || lower.starts_with("blob:")
+}
+
+/// The allowlist for a document: `Err` is why it was refused.
 async fn allow_document(state: &Weak<AppState>, url: &str) -> Result<(), String> {
     let Some((host, port)) = http_target(url) else {
         return Err("only http and https pages can be opened".to_string());
