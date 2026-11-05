@@ -563,7 +563,6 @@ export function fontChord(e: KeyboardEvent): 1 | -1 | 0 | null {
     case "=":
       return 1;
     case "-":
-    case "−":
       return -1;
     case "0":
       return 0;
