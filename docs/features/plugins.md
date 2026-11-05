@@ -936,3 +936,15 @@ _Captured 2026-09-29 (from the maintainer, via capture-feature-intent)._
 The design decisions of 2026-09-29 are recorded in the
 [plugin platform plan](../design/plugin-platform-plan.md#decisions-maintainer-2026-09-29) and the
 [LaTeX and Typst plan](../design/latex-reports-plan.md#decisions).
+
+### Pictures in tool answers and a program's usual folders (the PowerPoint plugin) — why it exists
+_Captured 2026-11-04 from the maintainer's decisions on the
+[PowerPoint plugin design](../design/pptx-plugin-plan.md); no questionnaire was run._
+
+- **Problem it solves:** agents write decks blind. Viewing decks and referencing slides
+  stay core; authoring help is an opt-in first-party plugin because its picture engine is
+  LibreOffice, which not everyone wants.
+- **Decisions:** a tool answer shows pictures through a markdown picture line (no WIT
+  change); `[[programs]] also` finds macOS's LibreOffice without PATH setup; no one-click
+  LibreOffice yet (host unpackers for app images next); the plugin is named "PowerPoint".
+- **Do not change (or: open to change):** _pending capture._
