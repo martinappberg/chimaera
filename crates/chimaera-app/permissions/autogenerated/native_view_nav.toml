@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-native-view-nav"
+description = "Enables the native_view_nav command without any pre-configured scope."
+commands.allow = ["native_view_nav"]
+
+[[permission]]
+identifier = "deny-native-view-nav"
+description = "Denies the native_view_nav command without any pre-configured scope."
+commands.deny = ["native_view_nav"]

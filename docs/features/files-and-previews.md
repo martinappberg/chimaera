@@ -712,6 +712,29 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   tags) but never *read* them with `fetch`/XHR, so a report cannot read out the files around it —
   a report that fetches its data as JSON still needs it inline. The split live preview (`srcdoc`)
   has no URL, so its relative assets still do not load.
+  **In the macOS app, Preview is a web view of its own** (`shared/paneView.ts` over
+  `chimaera-app` `shell/native_view.rs`), laid over the pane: its own web process, so a heavy page
+  can only slow itself down. An iframe shares the window's process and main thread with chat,
+  terminals and every pane — a 40 MB, 3.4 M-element report cost that process 1–1.7 GB, tipped it
+  into WebKit's memory-pressure cache flushing and froze the whole window (2026-11-04; measured
+  with the same report in a pane view: window process ~40 MB, report process ~950 MB). Same URL
+  as the iframe, so remote windows load it through their tunnel the same way. The view follows
+  the pane, hides while a menu, dialog or tooltip overlaps it or a drag runs, and closes with its
+  tab or the window's page. In a browser tab, on Linux/Windows, or against an app build without
+  pane views it stays the iframe.
+  **Marking** (context bridge, like PDFs): a text selection in the page publishes the file, the
+  quote and the nearest heading (`§ Heading`) with the usual `@ reference in agent` pill by the
+  selection and the reference chord; the area tool (app only) freezes the view to a snapshot,
+  and a dragged box sends its PNG crop, the text under it and `#xywh=` in document CSS px. Both
+  ride the pane bridge (`chimaera_core::PANE_BRIDGE_JS`): in the app it runs in a WebKit content
+  world of its own that the page's scripts can't see; on the framed path the daemon appends it to
+  the page asked for with `?bridge=1` and it posts to the parent, which accepts only that frame.
+  It acts only on trusted input: a selection right after real input, a chord the page didn't
+  handle itself, and (in the app) only a link the user clicked opens the real browser — a
+  script's own `a.click()` or navigation away is cancelled. A view whose own process keeps
+  dying (a page over WebKit's limit) is reloaded at most twice a minute, then shows "This page
+  stopped responding" with Reload. Frames inside a report load as they would in its iframe,
+  external ones included.
   **PDF** runs on pdf.js's **legacy** build: the modern build calls `Map.prototype.getOrInsertComputed`
   on every render and range read, which WebKit (the macOS app) and Chromium before 145 lack, so its
   pages stayed blank. pdf.js's standard fonts, CMaps, wasm decoders and ICC profiles ship with our
@@ -1323,3 +1346,18 @@ _Intent pending — drafted from the maintainer's request, 2026-09-26; questionn
   pasted into terminal agents, table fragments counting rows the RFC 7111 way (so they differ by
   one from the grid's row numbers), and the chip-only affordance (no context menu) have not been confirmed
   with the maintainer — capture via **capture-feature-intent** when available.
+
+### HTML in a web view of its own, and marking HTML — why it exists
+_Captured 2026-11-04 (the maintainer, in the session that built it)._
+
+- **Problem it solves:** a large HTML report opened on a remote made the whole window
+  unresponsive — "I cannot use that window"; the page "works but takes a LONG ass time to look
+  at", and going back to chat was barely usable too. Separately: "be able to mark things in HTML
+  like we do for PDFs". The ask was to "fix this properly once and for all", to make sure it
+  works on remotes too, and to run all HTML this way rather than above a size threshold
+  ("considering some people do web dev"). The browser fallback "still needs to be there".
+- **How settled it is:** "Can change" — the whole implementation is provisional (pane views,
+  the bridge, the pill, the area tool, the wording). Only the why above is settled.
+- **Do not change (or: open to change):** nothing is frozen; the area is open to improvement.
+- **Left open:** native pane views on Linux/Windows (they keep the iframe for now), and the agent
+  browser's pane engine (#273) building on pane views.

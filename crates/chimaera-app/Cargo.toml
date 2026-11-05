@@ -71,8 +71,13 @@ chimaera-server = { path = "../chimaera-server" }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 block2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSArray", "NSError", "NSBundle", "NSObject", "NSDictionary"] }
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSDockTile", "NSResponder"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSArray", "NSError", "NSBundle", "NSObject", "NSDictionary", "NSData", "NSGeometry", "NSURL", "NSURLRequest"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSDockTile", "NSResponder", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSView"] }
+# Pane views (`shell/native_view/mac.rs`): a WKWebView the shell owns, its
+# delegates, the bridge's content world, message handler and user script,
+# snapshots and calls into the world. The same objc2-web-kit wry links.
+objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "objc2-app-kit", "block2", "WKWebView", "WKWebViewConfiguration", "WKUserContentController", "WKUserScript", "WKContentWorld", "WKScriptMessage", "WKScriptMessageHandler", "WKSnapshotConfiguration", "WKFrameInfo", "WKNavigation", "WKNavigationAction", "WKNavigationDelegate", "WKUIDelegate", "WKWindowFeatures"] }
+base64 = "0.22"
 objc2-user-notifications = { version = "0.3", default-features = false, features = ["std", "bitflags", "block2", "UNUserNotificationCenter", "UNNotification", "UNNotificationContent", "UNNotificationRequest", "UNNotificationResponse", "UNNotificationSound", "UNNotificationSettings", "UNNotificationTrigger"] }
 
 # Linux/Windows notifications (freedesktop D-Bus / WinRT toasts). macOS goes

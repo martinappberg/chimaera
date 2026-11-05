@@ -25,6 +25,7 @@ mod cluster;
 mod commands;
 mod connect;
 mod drag;
+mod native_view;
 pub(crate) mod notices;
 #[cfg(target_os = "macos")]
 mod print_frame;
@@ -624,8 +625,13 @@ pub(super) fn authorize_daemon_origin(
     }
 
     let sequence = DAEMON_CAPABILITY_SEQ.fetch_add(1, Ordering::Relaxed);
+    // Scoped to the window's own web view (a `WebviewWindow`'s web view
+    // shares its label), not the whole window: Tauri grants a window-scoped
+    // capability to every web view in it. Defence in depth — pane views
+    // (`native_view.rs`) are plain WKWebViews with no IPC at all, but any
+    // future Tauri web view added to a window must not inherit the grants.
     let mut capability = CapabilityBuilder::new(format!("daemon-ui-{window_label}-{sequence}"))
-        .window(window_label)
+        .webview(window_label)
         .local(false)
         .remote(format!("http://127.0.0.1:{port}/*"));
     for permission in DAEMON_UI_CORE_PERMISSIONS
@@ -1279,6 +1285,13 @@ pub fn run() {
             commands::copy_file_to_clipboard,
             commands::reveal_in_file_manager,
             commands::open_external,
+            native_view::native_view_show,
+            native_view::native_view_place,
+            native_view::native_view_close,
+            native_view::native_view_snapshot,
+            native_view::native_view_chip,
+            native_view::native_view_region,
+            native_view::native_view_nav,
             commands::answer_askpass,
             commands::list_askpass,
             commands::cache_appearance,
@@ -1318,6 +1331,7 @@ pub fn run() {
                 // teardown destroys every window and forgetting them would
                 // defeat restore.
                 tauri::WindowEvent::Destroyed => {
+                    native_view::close_owned(window.app_handle(), window.label());
                     lock(&shell.allowed_daemon_ports).remove(window.label());
                     let mut last_focused = lock(&shell.last_focused_window);
                     if last_focused.as_deref() == Some(window.label()) {
@@ -1426,6 +1440,7 @@ pub fn run() {
             }
             // Route ssh auth prompts (password / 2FA) to the UI. Managed
             // before the listener starts so an early prompt finds the state.
+            app.manage(native_view::NativeViews::default());
             app.manage(crate::askpass::Askpass::default());
             if let Err(e) = crate::askpass::install(&handle) {
                 // Non-fatal: hosts with key/agent auth still connect; only

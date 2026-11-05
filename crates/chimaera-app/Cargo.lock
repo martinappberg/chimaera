@@ -809,6 +809,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "arboard",
+ "base64 0.22.1",
  "block2",
  "chimaera-core",
  "chimaera-remote",
@@ -819,6 +820,7 @@ dependencies = [
  "objc2-app-kit",
  "objc2-foundation",
  "objc2-user-notifications",
+ "objc2-web-kit",
  "open",
  "serde",
  "serde_json",

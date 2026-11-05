@@ -109,6 +109,22 @@ plane `ANY /proxy/{id}[/{*path}]`; agent-opened panes add the MCP `open_browser`
   app is tracked (same-origin iframe) and persisted onto the tab so reloads land where
   you were; `openBrowser` dedupes on target so clicking Jupyter's URL twice focuses the
   pane you already have (Cmd/Ctrl+click forces a fresh split).
+- **In the macOS app the page is a web view of its own** (`shared/paneView.ts` over
+  `chimaera-app` `shell/native_view.rs`), laid over the pane: its own web process, so a heavy
+  app or dev server can only slow itself down, never the workbench (an iframe shares the
+  window's process and main thread — a 40 MB HTML report froze a whole window that way,
+  2026-11-04). Same `/proxy/{id}/…` URL, so it works through a remote window's tunnel the
+  same way. The URL bar, the persisted path and the tab title follow the page through the
+  pane bridge's `page` reports; back/forward/reload drive the view itself; a click in the
+  page focuses the pane; ⌘/Ctrl chords pressed in the page still reach the workbench. A
+  whole-document navigation an app built for `/` makes to a root-form path (`/lab/tree/…`)
+  is put back under its `/proxy/{id}` by the view (the daemon's rescue covers subresources
+  only); a clicked link to anywhere else opens in the real browser, and a script's own
+  navigation away is cancelled. Selecting text in the page offers `@ reference in agent`
+  (`FileSelection` whose path is the app's own address, `http://host:port/path#hash`, never
+  the query — Jupyter's `?token=` is a credential — nor the proxy ticket). In a browser tab,
+  on Linux/Windows, or against an app build without pane views it stays the same-origin
+  iframe, unchanged.
 - **URL detection** (`urlLinks.ts`): pure client-side regex over rendered terminal
   lines — zero daemon validation calls. Only proxyable URLs underline: loopback hosts,
   or any host with an explicit port. Ordinary web URLs (`https://github.com/…`) stay
@@ -286,3 +302,9 @@ _Captured 2026-10-04 (from the maintainer, in the session that built it)._
 - **Silent, by decision:** he chose no permission prompt ("I'd rather it be silent") and
   confirmed "Silent everywhere" after being shown the shared-host risk recorded under
   Key constraints. Do not add a prompt, or a per-host exception, without asking.
+
+### In a web view of its own (the macOS app)
+_Captured 2026-11-04 (the maintainer)._ The why and its grade live with the HTML preview's entry in
+[files and previews](files-and-previews.md#html-in-a-web-view-of-its-own-and-marking-html--why-it-exists):
+all HTML and web apps run this way in the app, including web-dev pages; the implementation is
+provisional ("Can change") and nothing in it is frozen.

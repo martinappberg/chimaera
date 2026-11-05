@@ -4589,7 +4589,15 @@ pub(crate) async fn raw(
             return raw_not_found();
         }
     };
-    serve_raw(file, &meta, &path, &headers, RawRoute::File { fresh_for }).await
+    serve_raw(
+        file,
+        &meta,
+        &path,
+        &headers,
+        RawRoute::File { fresh_for },
+        None,
+    )
+    .await
 }
 
 /// GET /raw/{ticket}/{*rest} — a file beside an HTML report, so the report's
@@ -4617,6 +4625,7 @@ pub(crate) async fn raw(
 pub(crate) async fn raw_asset(
     State(state): State<Arc<AppState>>,
     axum::extract::Path((ticket, rest)): axum::extract::Path<(String, String)>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
     headers: HeaderMap,
 ) -> Response {
     let Some(path) = crate::lock(&state.tickets).lookup(&ticket) else {
@@ -4631,6 +4640,9 @@ pub(crate) async fn raw_asset(
         .file_name()
         .filter(|name| name.as_encoded_bytes() == rest.as_bytes())
         .map(PathBuf::from);
+    // A preview frame asks for its own page with the pane bridge appended
+    // (see [`PANE_BRIDGE_TAIL`]); nothing else ever gets it.
+    let bridge = own.is_some() && wants_pane_bridge(query.as_deref());
     let (Some(relative), Some(dir)) = (own.or_else(|| asset_relative(&rest)), path.parent()) else {
         return raw_not_found();
     };
@@ -4655,8 +4667,39 @@ pub(crate) async fn raw_asset(
         &relative,
         &headers,
         RawRoute::Folder,
+        bridge.then(pane_bridge_tail),
     )
     .await
+}
+
+/// The pane bridge as appended to a framed HTML preview: the same script the
+/// app injects into a native pane view (`chimaera_core::PANE_BRIDGE_JS`),
+/// here posting to the parent window. After `</html>` on purpose: the parser
+/// still runs it, and nothing before the page's own doctype changes (a
+/// leading script would drop the page into quirks mode).
+fn pane_bridge_tail() -> &'static str {
+    static TAIL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TAIL.get_or_init(|| format!("\n<script>{}</script>\n", chimaera_core::PANE_BRIDGE_JS))
+}
+
+/// The bridged page's `ETag` part: a hash of the bridge itself, so a daemon
+/// whose bridge changed (at any length) never answers 304 for an old copy.
+fn pane_bridge_tag() -> &'static str {
+    static TAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TAG.get_or_init(|| {
+        // FNV-1a: stable across builds and platforms (unlike `DefaultHasher`).
+        let hash = chimaera_core::PANE_BRIDGE_JS
+            .bytes()
+            .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+                (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+            });
+        format!("{hash:016x}")
+    })
+}
+
+/// `?bridge=1` among the query's pairs.
+fn wants_pane_bridge(query: Option<&str>) -> bool {
+    query.is_some_and(|q| q.split('&').any(|pair| pair == "bridge=1"))
 }
 
 fn raw_not_found() -> Response {
@@ -4812,16 +4855,27 @@ fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {
 /// revalidates to a 304 instead of re-downloading over the tunnel. A file
 /// in a report's folder is `private, no-cache`: revalidated every load.
 /// `name` decides the content type, and with `route` the sandbox
-/// ([`raw_security_headers`], on every status).
+/// ([`raw_security_headers`], on every status). `append` (the pane bridge
+/// on a preview's own page) is streamed after the file: it gets its own
+/// `ETag` and is never served in ranges.
 async fn serve_raw(
     mut file: tokio::fs::File,
     meta: &std::fs::Metadata,
     name: &Path,
     headers: &HeaderMap,
     route: RawRoute,
+    append: Option<&'static str>,
 ) -> Response {
     let total = meta.len();
-    let etag = raw_etag(meta);
+    let etag = match append {
+        None => raw_etag(meta),
+        Some(_) => format!(
+            "\"{}-{}-pb{}\"",
+            mtime_token(meta),
+            meta.len(),
+            pane_bridge_tag()
+        ),
+    };
     let mime = mime_guess::from_path(name).first_or_octet_stream();
     let security = raw_security_headers(&mime, route);
     let cache_control = match route {
@@ -4847,6 +4901,7 @@ async fn serve_raw(
 
     let range = headers
         .get(header::RANGE)
+        .filter(|_| append.is_none())
         .and_then(|v| v.to_str().ok())
         .and_then(|v| parse_byte_range(v, total));
     let (status, span) = match range {
@@ -4876,13 +4931,22 @@ async fn serve_raw(
 
     // Stream the selected span. The previous `vec![0; len]` loaded an
     // un-ranged file (or attacker-chosen large range) wholly into daemon RSS.
-    let body = Body::from_stream(tokio_util::io::ReaderStream::new(file.take(len)));
+    let tail = append.unwrap_or("");
+    let body = Body::from_stream(tokio_util::io::ReaderStream::new(
+        file.take(len).chain(tail.as_bytes()),
+    ));
     let mut response = (
         status,
         [
             (header::CONTENT_TYPE, mime.essence_str().to_string()),
-            (header::ACCEPT_RANGES, "bytes".to_string()),
-            (header::CONTENT_LENGTH, len.to_string()),
+            (
+                header::ACCEPT_RANGES,
+                if append.is_some() { "none" } else { "bytes" }.to_string(),
+            ),
+            (
+                header::CONTENT_LENGTH,
+                (len + tail.len() as u64).to_string(),
+            ),
         ],
         body,
     )
