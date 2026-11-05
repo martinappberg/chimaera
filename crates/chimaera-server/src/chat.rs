@@ -4477,6 +4477,16 @@ mod tests {
                 "check_document".to_string(),
                 "open_browser".to_string(),
                 "update_plan".to_string(),
+                "browser_navigate".to_string(),
+                "browser_snapshot".to_string(),
+                "browser_screenshot".to_string(),
+                "browser_inspect".to_string(),
+                "browser_source".to_string(),
+                "browser_console".to_string(),
+                "browser_network".to_string(),
+                "browser_wait".to_string(),
+                "browser_show".to_string(),
+                "browser_close".to_string(),
             ])
         );
         let ask = chat_mcp_auto_approve(Some(MastermindMode::Ask), Vec::new())

@@ -33,7 +33,10 @@ export type NativeViewEvent =
   | { id: string; kind: "page"; url: string; title: string }
   /** The view's own web process died twice within a minute; the shell
    *  stopped reloading it. */
-  | { id: string; kind: "crashed" };
+  | { id: string; kind: "crashed" }
+  /** Trusted input in the view that matches no input an agent injected:
+   *  the person at the window acted (agent browser take-over). */
+  | { id: string; kind: "user_input" };
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null;
 const str = (v: unknown): v is string => typeof v === "string";
@@ -56,6 +59,8 @@ export function decodeNativeViewEvent(raw: unknown): NativeViewEvent | null {
       return { id, kind: "reference" };
     case "crashed":
       return { id, kind: "crashed" };
+    case "user_input":
+      return { id, kind: "user_input" };
     case "key":
       if (!str(raw.key) || !str(raw.code)) return null;
       if (![raw.metaKey, raw.ctrlKey, raw.altKey, raw.shiftKey].every(bool)) return null;
@@ -136,7 +141,7 @@ export function samePill(
 /** A framed page's events carry no view id: the frame is the address. */
 type WithoutId<T> = T extends unknown ? Omit<T, "id"> : never;
 
-export type FrameEvent = WithoutId<Exclude<NativeViewEvent, { kind: "crashed" }>>;
+export type FrameEvent = WithoutId<Exclude<NativeViewEvent, { kind: "crashed" | "user_input" }>>;
 
 /**
  * A `message` from a framed page's bridge (`{chimaeraPaneView: msg}`), or
@@ -147,8 +152,8 @@ export type FrameEvent = WithoutId<Exclude<NativeViewEvent, { kind: "crashed" }>
 export function decodeFrameMessage(data: unknown): FrameEvent | null {
   if (!isObj(data) || !isObj(data.chimaeraPaneView)) return null;
   const m = data.chimaeraPaneView;
-  // A crash is the shell's to report, never a page's.
-  if (m.kind === "crashed") return null;
+  // A crash and a take-over are the shell's to report, never a page's.
+  if (m.kind === "crashed" || m.kind === "user_input") return null;
   // Same shapes as the native event, addressed by the frame instead of an id.
   const ev = decodeNativeViewEvent({ ...m, id: "" });
   if (ev === null) return null;

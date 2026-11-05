@@ -19,6 +19,7 @@
   } from "./assetTransition";
   import Spinner from "../previews/Spinner.svelte";
   import { browserOpener } from "../browser/agentOpen";
+  import { agentBrowser, browserLinks } from "../browser/agentBrowserRuntime";
   import { findTargetsChanged, targetIn } from "../shared/find";
   import type { DashCtx } from "../dashboard/dash";
 
@@ -121,17 +122,25 @@
 
   /** When this pane shows a linked terminal: the leash-holder's hue, and
    *  whether that agent is executing here right now (border pulse). */
+  /** A shared browser pane counts the same: its agent's hue, and the
+   *  border breathes while the agent drives the page. */
   const linkedAgentId = $derived(
     activeTab !== null && activeTab.surface === "terminal"
       ? (links.get(activeTab.sessionId) ?? null)
-      : null,
+      : activeTab !== null && activeTab.surface === "browser"
+        ? ($browserLinks.get(activeTab.id) ?? null)
+        : null,
   );
   const linkHue = $derived(linkedAgentId !== null ? agentHue(linkedAgentId) : null);
+  const browserDrive = agentBrowser.driveState;
   const agentExec = $derived(
     linkedAgentId !== null &&
       activeTab !== null &&
-      activeTab.surface === "terminal" &&
-      sessions.get(activeTab.sessionId)?.exec_stage === "executing",
+      (activeTab.surface === "terminal"
+        ? sessions.get(activeTab.sessionId)?.exec_stage === "executing"
+        : activeTab.surface === "browser" &&
+          $browserDrive.get(activeTab.id)?.driving === true &&
+          $browserDrive.get(activeTab.id)?.paused !== true),
   );
 
   // --- view keep-alive (the "keep tabs in RAM" model) -----------------------
@@ -589,6 +598,15 @@
         onRevealOpener={() => {
           if (tab.openedBy !== undefined) linkCtrl.reveal(tab.openedBy, node.id);
         }}
+        adopt={tab.adopt}
+        onAdopted={() => ctrl.browserAdopted(tab.id)}
+        sharedWith={$browserLinks.has(tab.id)
+          ? browserOpener($browserLinks.get(tab.id) ?? "", sessions, names)
+          : null}
+        onRevealShared={() => {
+          const agent = $browserLinks.get(tab.id);
+          if (agent !== undefined) linkCtrl.reveal(agent, node.id);
+        }}
       />
     {:else if viewErrors.browser}
       {@render loadFailure("browser", "browser pane")}
@@ -653,6 +671,7 @@
     {fileNames}
     {links}
     {linkCtrl}
+    {wsId}
     {dropSpot}
     {ctrl}
     bind:el={tabbarEl}

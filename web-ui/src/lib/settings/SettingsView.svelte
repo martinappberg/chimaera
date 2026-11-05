@@ -162,6 +162,8 @@
   const isCommsDef = (d: SettingDef) => d.id.startsWith("agents.communication.");
   /** Agent-wide session behavior: a titled block of its own. */
   const isContextDef = (d: SettingDef) => d.id === "agents.autoCompact" || d.id === "agents.autoCompactAt";
+  /** The agent browser's own block. */
+  const isBrowserDef = (d: SettingDef) => d.id === "browser.path";
 
   // A section asked for from elsewhere (Quick Open "Usage", the dashboard's
   // cost line): clear any search that hides it, then scroll there once shown.
@@ -311,8 +313,9 @@
                  ordinary schema rows. -->
             {@const comms = group.defs.filter(isCommsDef)}
             {@const context = group.defs.filter(isContextDef)}
+            {@const browser = group.defs.filter(isBrowserDef)}
             <section data-section={group.category}>
-              {#if q === "" || group.defs.some((d) => !isCommsDef(d) && !isContextDef(d))}
+              {#if q === "" || group.defs.some((d) => !isCommsDef(d) && !isContextDef(d) && !isBrowserDef(d))}
                 <AgentsSettings visible={tabVisible} />
               {:else}
                 <h2 class="cat">{group.category}</h2>
@@ -320,6 +323,12 @@
               {#if context.length > 0}
                 <h3 class="subcat">Context</h3>
                 {#each context as def (def.id)}
+                  <SettingRow {def} />
+                {/each}
+              {/if}
+              {#if browser.length > 0}
+                <h3 class="subcat">Browser</h3>
+                {#each browser as def (def.id)}
                   <SettingRow {def} />
                 {/each}
               {/if}

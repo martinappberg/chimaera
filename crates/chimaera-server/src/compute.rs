@@ -304,6 +304,26 @@ impl ComputeService {
         }
     }
 
+    /// Whether this daemon sits on a cluster login node: not inside a Slurm
+    /// allocation, Slurm was detected here (the CACHED detection; every
+    /// window's first `/compute` fills it), and the user didn't say the host
+    /// isn't a cluster. The agent browser never launches Chromium there.
+    pub(crate) fn is_login_node(&self) -> bool {
+        self.self_job.is_none()
+            && !self.not_a_cluster
+            && self.detected.load(Ordering::Acquire) == DET_SLURM
+    }
+
+    /// Whether [`Self::is_login_node`] can't answer yet: no job, and no
+    /// detection has run. The agent browser runs one ([`Self::detection`])
+    /// before it considers Chromium, so an unasked daemon never counts as
+    /// "not a login node".
+    pub(crate) fn login_node_unknown(&self) -> bool {
+        self.self_job.is_none()
+            && !self.not_a_cluster
+            && self.detected.load(Ordering::Acquire) == DET_UNKNOWN
+    }
+
     /// Whether this daemon runs as a cluster workspace job — a job may start
     /// hours after the click that queued it, with nobody watching (the
     /// restart pick-up message is withheld there).

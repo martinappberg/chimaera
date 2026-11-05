@@ -21,6 +21,13 @@ use serde::{Deserialize, Serialize};
 /// preview. One copy here, so the two transports can't drift.
 pub const PANE_BRIDGE_JS: &str = include_str!("pane_bridge.js");
 
+/// The page-world recorder (`pane_agent.js`) for a pane view an agent
+/// drives: console output, uncaught errors, failed or slow requests and the
+/// number in flight, handed to the pane bridge's rings. The app injects it
+/// into the page's own world (agent views, and a shared pane on
+/// `instrument`); never served to a framed preview.
+pub const PANE_AGENT_JS: &str = include_str!("pane_agent.js");
+
 /// Version of the chimaera workspace.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

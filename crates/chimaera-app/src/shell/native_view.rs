@@ -29,6 +29,14 @@
 //! user's browser through `open_external`'s rules, and a script's own
 //! navigation away is just cancelled. The view is not a Tauri web view, so
 //! it has no IPC at all.
+//!
+//! Agents drive views through `native_view_drive` (the agent browser's app
+//! engine, #273): real input, evals, screenshots and the console/network
+//! rings, on the calling window's own views only. An agent's own view is
+//! shown with `agent` (framed outside the owner's bounds by the page, so
+//! WebKit keeps it running at full speed) and carries the page-world
+//! recorder (`chimaera_core::PANE_AGENT_JS`). The parsing and the pure rules
+//! are `drive.rs`; the native half is `mac/agent.rs`.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -38,6 +46,7 @@ use serde::Deserialize;
 use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Manager, Webview};
 
+mod drive;
 #[cfg(target_os = "macos")]
 mod mac;
 
@@ -232,9 +241,12 @@ pub(super) fn native_view_show(
     url: String,
     rect: ViewRect,
     hidden: Option<bool>,
+    agent: Option<bool>,
 ) -> Result<(), String> {
     let label = own_label(&webview, &id)?;
     let hidden = hidden.unwrap_or(false);
+    // Absent (an older page) = a user's pane.
+    let agent = agent.unwrap_or(false);
     if !rect.valid() {
         return Err("bad view request".into());
     }
@@ -265,9 +277,12 @@ pub(super) fn native_view_show(
             &webview,
             label.clone(),
             parsed,
-            navigate,
             rect,
-            hidden,
+            mac::ShowAs {
+                navigate,
+                hidden,
+                agent,
+            },
         );
         if shown.is_err() {
             // Never made (the owner is going): no record of a view that
@@ -279,7 +294,7 @@ pub(super) fn native_view_show(
     #[cfg(not(target_os = "macos"))]
     {
         lock(&views.views).remove(&label);
-        let _ = (navigate, hidden);
+        let _ = (navigate, hidden, agent);
         Err(UNSUPPORTED.into())
     }
 }
@@ -403,6 +418,29 @@ pub(super) fn native_view_nav(
     #[cfg(target_os = "macos")]
     {
         mac::nav(&app, label, action)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (app, label, action);
+        Err(UNSUPPORTED.into())
+    }
+}
+
+/// Act on a view for an agent: input, eval, screenshot, rings, the
+/// recorder, the agent cursor (`drive::DriveAction`). Answers the action's
+/// result, or the error as text for the agent to read.
+#[tauri::command]
+pub(super) async fn native_view_drive(
+    app: AppHandle,
+    webview: Webview,
+    id: String,
+    action: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let label = own_label(&webview, &id)?;
+    let action = drive::parse(action)?;
+    #[cfg(target_os = "macos")]
+    {
+        mac::agent_drive(&app, label, action).await
     }
     #[cfg(not(target_os = "macos"))]
     {

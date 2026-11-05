@@ -1,3 +1,4 @@
+mod agent_browser;
 mod agent_probe;
 mod agent_view;
 mod agents;

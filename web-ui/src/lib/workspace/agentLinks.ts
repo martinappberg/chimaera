@@ -3,6 +3,11 @@
  * terminal sessions it may reach (one agent per terminal — a re-link moves
  * the leash; an agent may hold many). The daemon owns the edges; the UI
  * mirrors them from /ws/events snapshots and mutates via PUT/DELETE.
+ *
+ * Browser tabs link the same way (the agent browser, #273): a shared
+ * browser pane is one the agent's browser tools may read and drive. Same
+ * one-agent-per-tab rule; mirrored from the sessions frame's
+ * `browser_links` (`browser/agentBrowserRuntime.ts`).
  */
 
 import { api, ApiError } from "../net/api";
@@ -21,6 +26,14 @@ export interface LinkCtrl {
   reveal(sessionId: string, besidePaneId: string): void;
   link(terminalId: string, agentId: string): void;
   unlink(terminalId: string): void;
+  /** Share browser tab `tab` with an agent (moves it from any other). */
+  linkBrowser(tab: string, agentId: string): void;
+  unlinkBrowser(tab: string): void;
+  /** Show browser tab `tab` in its pane (an agent pane's chip). */
+  revealBrowser(tab: string): void;
+  /** What a chip calls browser tab `tab`; null when this window doesn't
+   *  hold it (no chip: there is nothing here to reveal). */
+  browserLabel(tab: string): string | null;
 }
 
 /**
@@ -70,6 +83,20 @@ export async function putLink(terminalId: string, agentId: string): Promise<void
 
 export async function deleteLink(terminalId: string): Promise<void> {
   await ok(await api(`/links/${terminalId}`, { method: "DELETE" }));
+}
+
+export async function putBrowserLink(tab: string, agentId: string): Promise<void> {
+  await ok(
+    await api("/links/browser", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tab, agent_id: agentId }),
+    }),
+  );
+}
+
+export async function deleteBrowserLink(tab: string): Promise<void> {
+  await ok(await api(`/links/browser/${encodeURIComponent(tab)}`, { method: "DELETE" }));
 }
 
 /** A selected terminal always travels by ID: display names can collide or change. */

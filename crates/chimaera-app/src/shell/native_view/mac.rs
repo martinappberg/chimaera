@@ -20,12 +20,25 @@
 //! Every `WKWebView` touch is on the main thread: views live in a
 //! main-thread registry, reached through `run_on_main_thread`, and the async
 //! commands wait on a oneshot for a completion handler's answer.
+//!
+//! Agent driving (`native_view_drive`, `agent.rs`) injects real NSEvents
+//! into a view. The bridge reports trusted input back (`input`), which the
+//! shell matches against what it injected (take-over: an unmatched report is
+//! the user, `user_input` on the owner); `input` itself never reaches the
+//! page. While an agent drives a view — always for an agent's own view, and
+//! for a short quiet window after each injected action on a shared one — the
+//! bridge's focus, link, chord and selection reports are the agent's doing
+//! and are dropped, so an agent's click can't focus a pane, open the user's
+//! browser, close a tab or take the reference.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+mod agent;
+pub(super) use agent::drive as agent_drive;
 
 use base64::Engine as _;
 use block2::{DynBlock, RcBlock};
@@ -46,6 +59,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Webview};
 use tokio::sync::oneshot;
 
+use super::drive::{Injections, InputKind, World};
 use super::{NavAction, Policy, ViewRect};
 
 /// The content world the bridge lives in.
@@ -73,6 +87,43 @@ struct Pane {
     link: Option<(String, Instant)>,
     /// When its web process died, newest last, within `CRASH_WINDOW`.
     crashes: Vec<Instant>,
+    /// An agent's own view (off-bounds, never the user's to touch): every
+    /// focus/link/chord/selection report is the agent's.
+    agent: bool,
+    /// The page-world recorder is installed for its loads.
+    instrumented: bool,
+    /// Draw the agent cursor for injected pointer input (a pane the user
+    /// watches), in this style.
+    cursor: Option<agent::CursorStyle>,
+    /// Injected input waiting for the bridge's report (take-over).
+    injections: Injections,
+    /// Reports that an injected action causes are dropped until then.
+    quiet_until: Option<Instant>,
+    /// The window's first responder before a drag took it, put back at the
+    /// drag's end.
+    drag_prior: Option<agent::Saved>,
+}
+
+impl Pane {
+    fn new(wk: Retained<WKWebView>, delegate: Retained<Delegate>, agent: bool) -> Self {
+        Pane {
+            wk,
+            _delegate: delegate,
+            link: None,
+            crashes: Vec::new(),
+            agent,
+            instrumented: false,
+            cursor: None,
+            injections: Injections::default(),
+            quiet_until: None,
+            drag_prior: None,
+        }
+    }
+
+    /// Whether the bridge's user-gesture reports now come from the agent.
+    fn agent_active(&self, now: Instant) -> bool {
+        self.agent || self.quiet_until.is_some_and(|t| now < t)
+    }
 }
 
 thread_local! {
@@ -278,8 +329,35 @@ fn forward(label: &str, message: &WKScriptMessage) {
     else {
         return;
     };
+    let kind = event.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+    let now = Instant::now();
+    // Trusted input, for take-over: matched against what the shell
+    // injected; only the user's (unmatched) becomes an event.
+    if kind == "input" {
+        let reported = event
+            .get("type")
+            .and_then(|t| t.as_str())
+            .and_then(InputKind::of_report);
+        let user = reported.is_some_and(|input| {
+            PANES.with(|panes| {
+                panes
+                    .borrow_mut()
+                    .get_mut(label)
+                    .is_some_and(|pane| pane.injections.report(input, now))
+            })
+        });
+        if user {
+            notify(label, serde_json::json!({"kind": "user_input"}));
+        }
+        return;
+    }
+    if matches!(kind, "focus" | "link" | "key" | "selection" | "reference")
+        && with_pane(label, |pane| pane.agent_active(now)).unwrap_or(false)
+    {
+        return;
+    }
     // A trusted link click is the shell's own business (see `clicked`).
-    if event.get("kind").and_then(|k| k.as_str()) == Some("link") {
+    if kind == "link" {
         if let Some(href) = event.get("href").and_then(|h| h.as_str()) {
             let href = href.to_string();
             PANES.with(|panes| {
@@ -329,6 +407,55 @@ fn with_pane<T>(label: &str, f: impl FnOnce(&Pane) -> T) -> Option<T> {
     PANES.with(|panes| panes.borrow().get(label).map(f))
 }
 
+/// Keep `f` short and free of WebKit calls that could spin a run loop: the
+/// registry stays borrowed while it runs.
+fn with_pane_mut<T>(label: &str, f: impl FnOnce(&mut Pane) -> T) -> Option<T> {
+    PANES.with(|panes| panes.borrow_mut().get_mut(label).map(f))
+}
+
+/// The page-world recorder as a user script, for every later load.
+///
+/// # Safety
+/// Main thread, a live configuration's controller.
+unsafe fn add_recorder(controller: &WKUserContentController, mtm: MainThreadMarker) {
+    let script = WKUserScript::initWithSource_injectionTime_forMainFrameOnly_inContentWorld(
+        WKUserScript::alloc(mtm),
+        &NSString::from_str(chimaera_core::PANE_AGENT_JS),
+        WKUserScriptInjectionTime::AtDocumentStart,
+        true,
+        &WKContentWorld::pageWorld(mtm),
+    );
+    controller.addUserScript(&script);
+}
+
+/// Install the recorder in view `label` for its future loads (once) and in
+/// the page it shows now.
+fn instrument(label: &str, mtm: MainThreadMarker) {
+    let Some((wk, fresh)) = with_pane_mut(label, |pane| {
+        let fresh = !pane.instrumented;
+        pane.instrumented = true;
+        (pane.wk.clone(), fresh)
+    }) else {
+        return;
+    };
+    // SAFETY: main thread; a live view's configuration (WebKit hands a
+    // copy whose controller is the view's own).
+    unsafe {
+        if fresh {
+            add_recorder(&wk.configuration().userContentController(), mtm);
+        }
+        // The recorder guards against running twice in one document.
+        run_js(
+            &wk,
+            mtm,
+            World::Page,
+            chimaera_core::PANE_AGENT_JS,
+            &[],
+            None,
+        );
+    }
+}
+
 /// The frame for `rect` (CSS px from the owner's top left) in the owner
 /// web view's own coordinates, flipped or not.
 fn frame_in(owner: &NSView, rect: ViewRect) -> NSRect {
@@ -359,30 +486,49 @@ fn on_owner(
         .map_err(|e| e.to_string())
 }
 
+/// How `show` treats a view.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ShowAs {
+    /// Load the URL into an existing view (the page asked for a new one).
+    pub(super) navigate: bool,
+    /// Keep it hidden (the page reveals it once its document reports in,
+    /// so nothing flashes over the loading state).
+    pub(super) hidden: bool,
+    /// An agent's own view (`Pane::agent`), with the page-world recorder.
+    pub(super) agent: bool,
+}
+
 /// Place `label` at `rect`: create it on `url` (bridge first), or point an
-/// existing one at `url` when the page asked for a new URL. `hidden` keeps
-/// it hidden (the page reveals it once its document reports in, so nothing
-/// flashes over the loading state).
+/// existing one at `url` when the page asked for a new URL.
 pub(super) fn show(
     app: &AppHandle,
     owner: &Webview,
     label: String,
     url: tauri::Url,
-    navigate: bool,
     rect: ViewRect,
-    hidden: bool,
+    how: ShowAs,
 ) -> Result<(), String> {
     let _ = APP.set(app.clone());
+    let ShowAs {
+        navigate,
+        hidden,
+        agent,
+    } = how;
     on_owner(owner, move |owner_wk, mtm| {
         let frame = frame_in(owner_wk, rect);
-        let existing = PANES.with(|panes| {
-            panes.borrow().get(&label).map(|pane| {
-                // SAFETY: NSView geometry on the main thread.
-                pane.wk.setFrame(frame);
-                pane.wk.setHidden(hidden);
-            })
+        let existing = with_pane_mut(&label, |pane| {
+            // SAFETY: NSView geometry on the main thread.
+            pane.wk.setFrame(frame);
+            pane.wk.setHidden(hidden);
+            // A handed-over view is shown again without `agent`: from
+            // then on it is the user's pane (the recorder stays).
+            pane.agent = agent;
+            pane.instrumented
         });
-        if existing.is_some() {
+        if let Some(instrumented) = existing {
+            if agent && !instrumented {
+                instrument(&label, mtm);
+            }
             if navigate {
                 load(&label, &url);
             }
@@ -409,6 +555,9 @@ pub(super) fn show(
                 &world,
             );
             controller.addUserScript(&script);
+            if agent {
+                add_recorder(&controller, mtm);
+            }
             let wk = WKWebView::initWithFrame_configuration(WKWebView::alloc(mtm), frame, &config);
             let delegate = Delegate::new(mtm, label.clone());
             wk.setNavigationDelegate(Some(ProtocolObject::from_ref(&*delegate)));
@@ -424,17 +573,9 @@ pub(super) fn show(
             if let Some(request) = request(&url) {
                 let _ = wk.loadRequest(&request);
             }
-            PANES.with(|panes| {
-                panes.borrow_mut().insert(
-                    label,
-                    Pane {
-                        wk,
-                        _delegate: delegate,
-                        link: None,
-                        crashes: Vec::new(),
-                    },
-                )
-            });
+            let mut pane = Pane::new(wk, delegate, agent);
+            pane.instrumented = agent;
+            PANES.with(|panes| panes.borrow_mut().insert(label, pane));
         }
     })
 }
@@ -549,54 +690,178 @@ fn png_of(image: &NSImage) -> Result<Snapshot, String> {
     })
 }
 
+/// Why a script call failed: the view is gone, or WebKit refused the
+/// script (it didn't parse, or threw outside a wrapper; WebKit's message is
+/// opaque).
+#[derive(Debug)]
+pub(super) enum JsFail {
+    Gone(String),
+    Script(String),
+}
+
+impl JsFail {
+    fn text(self) -> String {
+        match self {
+            JsFail::Gone(s) | JsFail::Script(s) => s,
+        }
+    }
+}
+
+/// Where a script call's answer goes.
+type JsDone = Box<dyn FnOnce(Result<Option<String>, JsFail>) + Send>;
+
+/// Start `source` (an async function body) in `world` with string
+/// arguments, answering through `done` (`Ok(None)` = it returned nothing,
+/// or something other than a string). Arguments cross as JS strings, never
+/// spliced into source.
+///
+/// # Safety
+/// Main thread, a live view.
+unsafe fn run_js(
+    wk: &WKWebView,
+    mtm: MainThreadMarker,
+    world: World,
+    source: &str,
+    args: &[(&str, &str)],
+    done: Option<JsDone>,
+) {
+    let keys: Vec<Retained<NSString>> = args.iter().map(|(k, _)| NSString::from_str(k)).collect();
+    let values: Vec<Retained<NSString>> = args.iter().map(|(_, v)| NSString::from_str(v)).collect();
+    let key_refs: Vec<&NSString> = keys.iter().map(|k| &**k).collect();
+    let value_refs: Vec<&AnyObject> = values
+        .iter()
+        .map(|v| {
+            let o: &AnyObject = v;
+            o
+        })
+        .collect();
+    let arguments = NSDictionary::<NSString, AnyObject>::from_slices(&key_refs, &value_refs);
+    let world = match world {
+        World::Bridge => self::world(mtm),
+        World::Page => WKContentWorld::pageWorld(mtm),
+    };
+    let block = done.map(|done| {
+        let done =
+            once(
+                Box::new(move |r: Result<Option<String>, String>| done(r.map_err(JsFail::Script)))
+                    as Box<dyn FnOnce(Result<Option<String>, String>) + Send>,
+            );
+        RcBlock::new(move |result: *mut AnyObject, error: *mut NSError| {
+            // SAFETY: WebKit hands either a result (or nil) or an error.
+            let answer = match unsafe { (result.as_ref(), error.as_ref()) } {
+                (_, Some(error)) => Err(error.localizedDescription().to_string()),
+                (Some(result), None) => {
+                    Ok(result.downcast_ref::<NSString>().map(|s| s.to_string()))
+                }
+                (None, None) => Ok(None),
+            };
+            done(answer);
+        })
+    });
+    wk.callAsyncJavaScript_arguments_inFrame_inContentWorld_completionHandler(
+        &NSString::from_str(source),
+        Some(&arguments),
+        None,
+        &world,
+        block.as_deref(),
+    );
+}
+
+/// Run `source` in view `label` and wait for its answer.
+pub(super) async fn js(
+    app: &AppHandle,
+    label: String,
+    world: World,
+    source: String,
+    args: Vec<(&'static str, String)>,
+) -> Result<Option<String>, JsFail> {
+    let (tx, rx) = oneshot::channel::<Result<Option<String>, JsFail>>();
+    app.run_on_main_thread(move || {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let Some(wk) = with_pane(&label, |pane| pane.wk.clone()) else {
+            let _ = tx.send(Err(JsFail::Gone("no such view".into())));
+            return;
+        };
+        let pairs: Vec<(&str, &str)> = args.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let done: JsDone = Box::new(move |r| {
+            let _ = tx.send(r);
+        });
+        // SAFETY: main thread, a live view.
+        let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+            run_js(&wk, mtm, world, &source, &pairs, Some(done))
+        }));
+    })
+    .map_err(|e| JsFail::Gone(e.to_string()))?;
+    rx.await
+        .map_err(|_| JsFail::Gone("the view closed".into()))?
+}
+
+/// The source that calls `__chimaeraPaneView.<method>(JSON.parse(arg))`
+/// and answers its JSON.
+fn bridge_call(method: &str) -> String {
+    format!(
+        "const b = globalThis.__chimaeraPaneView;\
+         if (b === undefined || typeof b.{method} !== 'function') return 'null';\
+         return JSON.stringify(b.{method}(JSON.parse(arg)) ?? null);"
+    )
+}
+
 /// Call `__chimaeraPaneView.<method>(arg)` in the bridge's world and answer
-/// its JSON result. `arg` crosses as a JSON string argument, never spliced
-/// into source.
+/// its JSON result (`null` when the bridge isn't there yet).
 pub(super) async fn call(
     app: &AppHandle,
     label: String,
     method: &'static str,
     arg: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let arg = arg.to_string();
-    ask(app, label, move |wk, mtm, send| {
-        let send = once(send);
-        let body = NSString::from_str(&format!(
-            "const b = globalThis.__chimaeraPaneView;\
-             if (b === undefined) return 'null';\
-             return JSON.stringify(b.{method}(JSON.parse(arg)) ?? null);"
-        ));
-        let key = NSString::from_str("arg");
-        let value = NSString::from_str(&arg);
-        let value: &AnyObject = &value;
-        let arguments = NSDictionary::<NSString, AnyObject>::from_slices(&[&*key], &[value]);
-        let block = RcBlock::new(move |result: *mut AnyObject, error: *mut NSError| {
-            // SAFETY: WebKit hands either a result (or nil) or an error.
-            let answer = match unsafe { (result.as_ref(), error.as_ref()) } {
-                (_, Some(error)) => Err(error.localizedDescription().to_string()),
-                (Some(result), None) => result
-                    .downcast_ref::<NSString>()
-                    .map(|s| {
-                        serde_json::from_str(&s.to_string()).unwrap_or(serde_json::Value::Null)
-                    })
-                    .ok_or_else(|| "unexpected answer".to_string()),
-                (None, None) => Ok(serde_json::Value::Null),
-            };
-            send(answer);
-        });
-        // SAFETY: a live WKWebView on the main thread; `arguments` maps a
-        // string key to a string, which WebKit bridges to a JS string.
-        unsafe {
-            wk.callAsyncJavaScript_arguments_inFrame_inContentWorld_completionHandler(
-                &body,
-                Some(&arguments),
-                None,
-                &world(mtm),
-                Some(&block),
-            );
-        }
-    })
+    let answer = js(
+        app,
+        label,
+        World::Bridge,
+        bridge_call(method),
+        vec![("arg", arg.to_string())],
+    )
     .await
+    .map_err(JsFail::text)?;
+    match answer {
+        Some(text) => Ok(serde_json::from_str(&text).unwrap_or(serde_json::Value::Null)),
+        None => Ok(serde_json::Value::Null),
+    }
+}
+
+/// Call a bridge method without waiting for it (the agent cursor).
+///
+/// # Safety
+/// Main thread, a live view.
+unsafe fn fire(wk: &WKWebView, mtm: MainThreadMarker, method: &str, arg: &serde_json::Value) {
+    run_js(
+        wk,
+        mtm,
+        World::Bridge,
+        &bridge_call(method),
+        &[("arg", &arg.to_string())],
+        None,
+    );
+}
+
+/// Run `f` on the main thread and wait for its answer.
+pub(super) async fn on_main<T: Send + 'static>(
+    app: &AppHandle,
+    f: impl FnOnce(MainThreadMarker) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let (tx, rx) = oneshot::channel::<Result<T, String>>();
+    app.run_on_main_thread(move || {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let result = catch_unwind(AssertUnwindSafe(|| f(mtm)))
+            .unwrap_or_else(|_| Err("the shell failed on that action".into()));
+        let _ = tx.send(result);
+    })
+    .map_err(|e| e.to_string())?;
+    rx.await.map_err(|_| "the view closed".to_string())?
 }
 
 /// Back, forward, reload or stop.

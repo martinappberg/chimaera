@@ -3,36 +3,31 @@
 //! An agent that has just started a web app asks for it to be shown; the
 //! daemon validates the address, applies the proxy's own mint allowlist
 //! ([`crate::proxy::check_target`] — the same function, never a copy), and
-//! pushes a `browser_open` frame on `/ws/events`. The windows decide whether
-//! to act (the one holding the session's tab, else a visible window on the
-//! same workspace) and open the pane through the ordinary browser-pane path,
-//! which mints its proxy ticket on mount as it always has. The tool mints
-//! nothing.
+//! writes a `browser_open` frame to every authenticated `/ws/events` socket
+//! at once, through the sockets' immediate send path
+//! (`agent_browser::channel`). The windows decide whether to act (the one
+//! holding the session's tab, else a visible window on the same workspace)
+//! and open the pane through the ordinary browser-pane path, which mints its
+//! proxy ticket on mount as it always has. The tool mints nothing.
 //!
-//! Deliberately one-way: nothing about the page ever flows back to the
-//! agent. And deliberately unqueued: a frame reaches only the windows
-//! connected when it is pushed (a reconnecting window starts at the head,
-//! like notices), so a pane never pops open minutes after the call. The tool
+//! Deliberately one-way: nothing about the page flows back through this
+//! tool (the agent browser, `agent_browser`, is the way to see a page). And
+//! deliberately unqueued: a frame reaches only the windows connected when it
+//! is written, so a pane never pops open minutes after the call. The tool
 //! says so honestly when no window is connected at all.
 //!
-//! Bounded: a small frame ring, per-session rate limits over a capped map,
-//! and a consumer count maintained by the `/ws/events` handler.
+//! Bounded: per-session rate limits over a capped map; each socket's queue
+//! is the channel's bounded one.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::proxy::{self, Refusal};
 use crate::AppState;
 
-/// Frames kept for windows mid-pass (each window drains them within one
-/// events-loop pass; the ring only bridges that gap).
-const RING_CAP: usize = 16;
-/// A frame older than this is dropped instead of delivered: a window whose
-/// socket stalled must not open a pane long after the agent moved on.
-const FRAME_MAX_AGE: Duration = Duration::from_secs(10);
 /// Per-session limits: [`BURST_CAP`] opens in any [`BURST_WINDOW`], and
 /// [`HOURLY_CAP`] per hour. A burst, not a minimum gap: an agent presenting a
 /// frontend and its dashboard in one step makes two calls back to back, and
@@ -153,69 +148,32 @@ pub(crate) fn parse_url(raw: &str) -> Result<Target, String> {
     Ok(Target { host, port, path })
 }
 
-/// The agent-open feed: the frame ring, the rate-limit history, and how many
-/// windows are listening.
+/// The agent-open feed: the rate-limit history and how many frames went out.
 #[derive(Default)]
 pub(crate) struct BrowserOpens {
     inner: Mutex<Inner>,
-    /// Authenticated `/ws/events` sockets right now (see [`ConsumerGuard`]).
-    consumers: AtomicUsize,
+    /// Frames written so far (tests read it: a refused call writes none).
+    sent: AtomicU64,
 }
 
 #[derive(Default)]
 struct Inner {
-    next: u64,
-    ring: VecDeque<(u64, Instant, Arc<str>)>,
     /// Per-session open times within the last hour.
     sends: HashMap<String, VecDeque<Instant>>,
 }
 
-/// Counts one `/ws/events` consumer for as long as it lives — dropped on
-/// every exit path of the socket handler.
-pub(crate) struct ConsumerGuard<'a>(&'a BrowserOpens);
-
-impl Drop for ConsumerGuard<'_> {
-    fn drop(&mut self) {
-        self.0.consumers.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
 impl BrowserOpens {
-    pub(crate) fn consumer(&self) -> ConsumerGuard<'_> {
-        self.consumers.fetch_add(1, Ordering::Relaxed);
-        ConsumerGuard(self)
-    }
-
-    pub(crate) fn consumers(&self) -> usize {
-        self.consumers.load(Ordering::Relaxed)
-    }
-
-    /// The newest frame id: a (re)connecting window starts here.
+    /// How many `browser_open` frames were written so far.
+    #[cfg(test)]
     pub(crate) fn head(&self) -> u64 {
-        crate::lock(&self.inner).next
+        self.sent.load(Ordering::Relaxed)
     }
 
-    /// Fresh frames newer than `last`, advancing the window's mark.
-    pub(crate) fn since(&self, last: &mut u64) -> Vec<Arc<str>> {
-        let inner = crate::lock(&self.inner);
-        let frames = inner
-            .ring
-            .iter()
-            .filter(|(id, at, _)| *id > *last && at.elapsed() <= FRAME_MAX_AGE)
-            .map(|(_, _, frame)| frame.clone())
-            .collect();
-        *last = inner.next;
-        frames
-    }
-
-    fn push(&self, frame: String) {
-        let mut inner = crate::lock(&self.inner);
-        inner.next += 1;
-        let id = inner.next;
-        inner.ring.push_back((id, Instant::now(), Arc::from(frame)));
-        while inner.ring.len() > RING_CAP {
-            inner.ring.pop_front();
-        }
+    /// Write a frame to every connected window now (no ring: a window that
+    /// connects later never opens the pane).
+    fn push(&self, state: &AppState, frame: String) {
+        self.sent.fetch_add(1, Ordering::Relaxed);
+        state.browsers.channel.broadcast(Arc::from(frame));
     }
 
     /// Record an open if the session is within its limits.
@@ -271,6 +229,28 @@ impl BrowserOpens {
     }
 }
 
+/// What an agent reads when the mint allowlist refuses a target: shared by
+/// `open_browser` and the agent browser (`verb` = "Not opened" / "Not
+/// loaded"). `shown` is the address as the agent gave it.
+pub(crate) fn refusal_text(
+    refusal: &Refusal,
+    verb: &str,
+    host: &str,
+    port: u16,
+    shown: &str,
+) -> String {
+    let host = proxy::normalize_host(host);
+    match refusal {
+        Refusal::Invalid => format!("{verb}: {host:?} is not a valid host name."),
+        Refusal::ConfirmRequired => format!(
+            "{verb}: {host} is not this host, loopback, or a node of one of the \
+             user's running Slurm jobs, so Chimaera opens it only after the user \
+             confirms it themselves. Give the user the URL ({shown}) to open."
+        ),
+        Refusal::Daemon => format!("{verb}: port {port} on this host is Chimaera itself."),
+    }
+}
+
 /// The `open_browser` tool: validate, apply the mint allowlist, rate-limit,
 /// push. `Ok` and `Err` are both text the agent reads (`Err` as a tool
 /// error).
@@ -278,41 +258,57 @@ pub(crate) async fn open(state: &AppState, session_id: &str, url: &str) -> Resul
     let target = parse_url(url)?;
     let shown = target.url();
     let host = proxy::normalize_host(&target.host);
-    match proxy::check_target(state, &host, target.port).await {
-        Ok(_) => {}
-        Err(Refusal::Invalid) => {
-            return Err(format!(
-                "Not opened: {:?} is not a valid host name.",
-                target.host
-            ));
-        }
-        Err(Refusal::ConfirmRequired) => {
-            return Err(format!(
-                "Not opened: {host} is not this host, loopback, or a node of one of the \
-                 user's running Slurm jobs, so Chimaera opens it only after the user \
-                 confirms it themselves. Give the user the URL ({shown}) to open."
-            ));
-        }
-        Err(Refusal::Daemon) => {
-            return Err(format!(
-                "Not opened: port {} on this host is Chimaera itself.",
-                target.port
-            ));
-        }
+    if let Err(refusal) = proxy::check_target(state, &host, target.port).await {
+        return Err(refusal_text(
+            &refusal,
+            "Not opened",
+            &target.host,
+            target.port,
+            &shown,
+        ));
     }
-    // Checked before the budget is spent: a call nobody could see costs
-    // nothing, and the answer tells the agent to hand the URL over instead.
-    if state.browser_opens.consumers() == 0 {
-        return Ok(format!(
+    match present(state, session_id, &target, &host)? {
+        Presented::NoWindow => Ok(format!(
             "Not opened: no Chimaera window is connected right now. Tell the user the \
              URL ({shown}) so they can open it themselves."
-        ));
+        )),
+        Presented::Sent => Ok(format!(
+            "Requested a browser pane for {shown}: a window showing this session, and any \
+             other visible window on this workspace, opens it beside your session. This \
+             says nothing about whether the page loads or works, nor that the user is \
+             looking; nothing from the page comes back through this tool (the browser_* \
+             tools are how you see a page). Call again only for a different address, not \
+             after the app reloads."
+        )),
+    }
+}
+
+/// Whether a `browser_open` frame went out.
+pub(crate) enum Presented {
+    NoWindow,
+    Sent,
+}
+
+/// Rate-limit and write the `browser_open` frame for an already-allowlisted
+/// target (`host` normalized). Shared by `open_browser` and the agent
+/// browser's Chromium hand-over (`browser_show`).
+pub(crate) fn present(
+    state: &AppState,
+    session_id: &str,
+    target: &Target,
+    host: &str,
+) -> Result<Presented, String> {
+    // Checked before the budget is spent: a call nobody could see costs
+    // nothing, and the answer tells the agent to hand the URL over instead.
+    if state.browsers.channel.socket_count() == 0 {
+        return Ok(Presented::NoWindow);
     }
     state.browser_opens.admit(session_id)?;
     let workspace_id = crate::lock(&state.session_workspaces)
         .get(session_id)
         .cloned();
     state.browser_opens.push(
+        state,
         crate::ws::frames::browser_open(
             session_id,
             workspace_id.as_deref(),
@@ -322,13 +318,7 @@ pub(crate) async fn open(state: &AppState, session_id: &str, url: &str) -> Resul
         )
         .to_string(),
     );
-    state.changes.notify_waiters();
-    Ok(format!(
-        "Requested a browser pane for {shown}: a window showing this session, and any \
-         other visible window on this workspace, opens it beside your session. This says nothing about whether the page loads or works, nor that \
-         the user is looking; nothing from the page comes back to you. Call again only \
-         for a different address, not after the app reloads."
-    ))
+    Ok(Presented::Sent)
 }
 
 #[cfg(test)]
@@ -441,42 +431,5 @@ mod tests {
             assert!(opens.admit(&format!("s-{i}")).is_ok());
         }
         assert_eq!(crate::lock(&opens.inner).sends.len(), SESSIONS_CAP);
-    }
-
-    #[test]
-    fn frames_reach_only_windows_connected_at_push() {
-        let opens = BrowserOpens::default();
-        for i in 0..(RING_CAP + 5) {
-            opens.push(format!("f{i}"));
-        }
-        assert_eq!(crate::lock(&opens.inner).ring.len(), RING_CAP);
-        // A window connecting now starts at the head: nothing replays.
-        let mut late = opens.head();
-        assert!(opens.since(&mut late).is_empty());
-        opens.push("next".into());
-        assert_eq!(opens.since(&mut late), vec![Arc::<str>::from("next")]);
-        assert!(opens.since(&mut late).is_empty());
-
-        // A stale frame is never delivered.
-        let mut mark = opens.head();
-        crate::lock(&opens.inner).ring.push_back((
-            mark + 1,
-            Instant::now() - FRAME_MAX_AGE * 2,
-            Arc::from("old"),
-        ));
-        crate::lock(&opens.inner).next = mark + 1;
-        assert!(opens.since(&mut mark).is_empty());
-    }
-
-    #[test]
-    fn consumers_count_live_guards() {
-        let opens = BrowserOpens::default();
-        assert_eq!(opens.consumers(), 0);
-        let a = opens.consumer();
-        let b = opens.consumer();
-        assert_eq!(opens.consumers(), 2);
-        drop(a);
-        drop(b);
-        assert_eq!(opens.consumers(), 0);
     }
 }

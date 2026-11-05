@@ -39,8 +39,8 @@ async fn mcp_handshake_auth_and_tool_listing() {
     assert_eq!(status, StatusCode::ACCEPTED);
 
     // tools/list names the three linked-terminal tools, the two document
-    // tools, notify, open_browser, and agent communication's four — and no
-    // update_plan for a terminal session.
+    // tools, notify, open_browser, the agent browser's sixteen, and agent
+    // communication's four — and no update_plan for a terminal session.
     let (status, out) = mcp_post(
         &state,
         &id,
@@ -65,6 +65,22 @@ async fn mcp_handshake_auth_and_tool_listing() {
             "check_document",
             "notify",
             "open_browser",
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_screenshot",
+            "browser_inspect",
+            "browser_source",
+            "browser_click",
+            "browser_type",
+            "browser_press",
+            "browser_scroll",
+            "browser_select",
+            "browser_console",
+            "browser_network",
+            "browser_wait",
+            "browser_eval",
+            "browser_show",
+            "browser_close",
             "workspace_agents",
             "read_agent",
             "message_agent",

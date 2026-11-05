@@ -7,8 +7,9 @@
 use super::support::*;
 use crate::*;
 
-/// Every session's MCP tools (linked-terminal, document, notify, open_browser).
-const BASE_TOOLS: [&str; 7] = [
+/// Every session's MCP tools (linked-terminal, document, notify, open_browser,
+/// the agent browser's).
+const BASE_TOOLS: [&str; 23] = [
     "list_terminals",
     "run_in_terminal",
     "read_terminal",
@@ -16,6 +17,22 @@ const BASE_TOOLS: [&str; 7] = [
     "check_document",
     "notify",
     "open_browser",
+    "browser_navigate",
+    "browser_snapshot",
+    "browser_screenshot",
+    "browser_inspect",
+    "browser_source",
+    "browser_click",
+    "browser_type",
+    "browser_press",
+    "browser_scroll",
+    "browser_select",
+    "browser_console",
+    "browser_network",
+    "browser_wait",
+    "browser_eval",
+    "browser_show",
+    "browser_close",
 ];
 
 /// Agent communication's tools (every agent, while it is on).

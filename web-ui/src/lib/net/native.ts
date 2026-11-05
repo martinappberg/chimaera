@@ -376,15 +376,24 @@ export interface ViewRect {
  * this window (`crates/chimaera-app/src/shell/native_view.rs`). Creates the
  * view on first call; a later call with the same `id` moves it and navigates
  * only if `url` changed. `hidden` creates or navigates it without showing
- * it (a page still loading; `nativeViewPlace` shows it). False outside the
- * app, or from an app build without pane views — the caller falls back to
- * an iframe.
+ * it (a page still loading; `nativeViewPlace` shows it). `agent` marks an
+ * agent's own view (the agent browser): the shell records its console and
+ * network for `nativeViewDrive`, and treats every gesture in it as the
+ * agent's; showing a view again without it hands it to the user. False
+ * outside the app, or from an app build without pane views — the caller
+ * falls back to an iframe.
  */
-export async function nativeViewShow(id: string, url: string, rect: ViewRect, hidden: boolean): Promise<boolean> {
+export async function nativeViewShow(
+  id: string,
+  url: string,
+  rect: ViewRect,
+  hidden: boolean,
+  agent = false,
+): Promise<boolean> {
   const t = tauri();
   if (t === null) return false;
   try {
-    await t.core.invoke<void>("native_view_show", { id, url, rect, hidden });
+    await t.core.invoke<void>("native_view_show", { id, url, rect, hidden, agent });
     return true;
   } catch {
     return false;
@@ -483,6 +492,24 @@ export async function nativeViewNav(id: string, action: NativeViewNav): Promise<
     await t.core.invoke<void>("native_view_nav", { id, action });
   } catch {
     /* gone with its window or an older app build */
+  }
+}
+
+/**
+ * Act on a pane view for an agent (the agent browser's app engine): an
+ * action object as `crates/chimaera-app/src/shell/native_view/drive.rs`
+ * defines it (`{type: "eval" | "click" | "move" | "drag" | "scroll" | "key" |
+ * "text" | "screenshot" | "rings" | "instrument" | "cursor", …}`). Resolves to
+ * the action's result; rejects with the shell's error text (the page's own
+ * error message for an eval), which the caller hands back to the daemon.
+ */
+export async function nativeViewDrive(id: string, action: unknown): Promise<unknown> {
+  const t = tauri();
+  if (t === null) throw new Error("not in the app");
+  try {
+    return await t.core.invoke<unknown>("native_view_drive", { id, action });
+  } catch (e) {
+    throw new Error(typeof e === "string" ? e : e instanceof Error ? e.message : String(e));
   }
 }
 

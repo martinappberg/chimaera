@@ -86,7 +86,7 @@ async fn open_browser_frame_reaches_connected_windows() {
             }
         }
     }
-    assert_eq!(state.browser_opens.consumers(), 1);
+    assert_eq!(state.browsers.channel.socket_count(), 1);
 
     let (is_error, text) = open(&state, &agent, "http://LOCALHOST:5173/app?x=1#top").await;
     assert!(!is_error, "{text}");
@@ -133,12 +133,12 @@ async fn open_browser_frame_reaches_connected_windows() {
     // The consumer count follows the socket down (the handler notices the
     // close on its next receive).
     for _ in 0..50 {
-        if state.browser_opens.consumers() == 0 {
+        if state.browsers.channel.socket_count() == 0 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    assert_eq!(state.browser_opens.consumers(), 0);
+    assert_eq!(state.browsers.channel.socket_count(), 0);
     server.abort();
     state.sessions.kill(&agent).ok();
 }

@@ -19,7 +19,14 @@
 // with the page, a selection counts only right after real input, and a link
 // click is reported (native path) so the shell hands a URL to the user's
 // browser only for a click the user made. Nothing here changes the page
-// except the reference pill, drawn in a closed shadow root.
+// except the reference pill and (a pane an agent drives) the agent's
+// cursor, each drawn in a closed shadow root.
+//
+// Native views also carry what agent driving needs (`chimaera-app`'s
+// `native_view_drive`): trusted pointer/key/wheel input reported for
+// take-over, the console/network rings the page-world recorder
+// (`pane_agent.js`) fills, and the agent cursor. None of it exists in the
+// framed transport.
 (() => {
   "use strict";
   if (globalThis.__chimaeraPaneView !== undefined) return;
@@ -39,6 +46,164 @@
   const TEXT_MAX = 20000;
   const REGION_MAX = 4000;
   const HEADING_MAX = 120;
+
+  // --- agent driving (native views only) ------------------------------------------
+  // Trusted input, reported so the shell can tell its own injected events
+  // from the user's (take-over): it matches each report against what it
+  // just injected, and only an unmatched one is the user. Wheel events come
+  // in bursts; one report per burst is enough to notice a hand.
+  let lastWheel = 0;
+  const reportInput = (e) => {
+    if (!e.isTrusted) return;
+    if (e.type === "wheel") {
+      const t = Date.now();
+      if (t - lastWheel < 200) return;
+      lastWheel = t;
+    }
+    post({ kind: "input", type: e.type });
+  };
+  if (native !== null) {
+    addEventListener("pointerdown", reportInput, true);
+    addEventListener("keydown", reportInput, true);
+    addEventListener("wheel", reportInput, { capture: true, passive: true });
+  }
+
+  // The rings: what the page-world recorder (`pane_agent.js`, present only
+  // in a view an agent drives) noted, kept here where the page can't reach
+  // them. Ids count from 1 per ring; `since` asks for ids ≥ it; an entry
+  // pushed out of a full ring is simply gone.
+  const RING_MAX = 300;
+  const rings = { console: [], network: [], consoleNext: 1, networkNext: 1, inflight: 0 };
+  const capText = (v, max) => {
+    const s = typeof v === "string" ? v : v === null || v === undefined ? "" : String(v);
+    return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+  };
+  const finite = (v) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+  const LEVELS = new Set(["log", "info", "warn", "error", "debug"]);
+  const pushRing = (ring, entry) => {
+    ring.push(entry);
+    if (ring.length > RING_MAX) ring.splice(0, ring.length - RING_MAX);
+  };
+  if (native !== null) {
+    document.addEventListener("chimaera:rec", (e) => {
+      const detail = e.detail;
+      if (typeof detail !== "string" || detail.length > 16384) return;
+      let r;
+      try {
+        r = JSON.parse(detail);
+      } catch {
+        return;
+      }
+      if (r === null || typeof r !== "object") return;
+      if (r.t === "inflight") {
+        rings.inflight = Math.min(100000, Math.max(0, Math.trunc(finite(r.n))));
+      } else if (r.t === "console") {
+        pushRing(rings.console, {
+          id: rings.consoleNext++,
+          level: LEVELS.has(r.level) ? r.level : "log",
+          text: capText(r.text, 1900),
+          at: finite(r.at),
+        });
+      } else if (r.t === "net") {
+        pushRing(rings.network, {
+          id: rings.networkNext++,
+          method: capText(r.method, 16),
+          url: capText(r.url, 1600),
+          status: Number.isInteger(r.status) ? r.status : null,
+          error: typeof r.error === "string" ? capText(r.error, 300) : null,
+          ms: finite(r.ms),
+          at: finite(r.at),
+        });
+      }
+    });
+  }
+  const readRings = (arg) => {
+    const cs = finite(Number(arg?.console_since));
+    const ns = finite(Number(arg?.network_since));
+    return {
+      console: rings.console.filter((x) => x.id >= cs),
+      network: rings.network.filter((x) => x.id >= ns),
+      inflight: rings.inflight,
+      console_next: rings.consoleNext,
+      network_next: rings.networkNext,
+    };
+  };
+
+  // The agent's cursor on a pane the user watches (shared or handed over):
+  // where the agent points and a ripple where it clicks. A closed shadow
+  // root that never takes a hit, faded out when the agent goes quiet.
+  let cursorHost = null;
+  let cursorArrow = null;
+  let cursorTag = null;
+  let cursorFade = 0;
+  const ensureCursor = () => {
+    if (cursorHost !== null && cursorHost.isConnected) return;
+    cursorHost = document.createElement("chimaera-pane-cursor");
+    cursorHost.style.cssText =
+      "all:initial;position:fixed;left:0;top:0;width:0;height:0;z-index:2147483647;pointer-events:none;display:block;";
+    const root = cursorHost.attachShadow({ mode: "closed" });
+    const style = document.createElement("style");
+    style.textContent =
+      "*{pointer-events:none;box-sizing:border-box}" +
+      ".c{position:fixed;left:0;top:0;transition:transform 90ms ease-out,opacity .4s;will-change:transform}" +
+      ".c.idle{opacity:0}" +
+      "svg{display:block;filter:drop-shadow(0 1px 2px rgba(0,0,0,.35))}" +
+      ".t{position:absolute;left:16px;top:18px;padding:2px 7px;border-radius:9px;white-space:nowrap;" +
+      "font:600 11px/16px -apple-system,system-ui,sans-serif;color:#fff;background:var(--a)}" +
+      ".t:empty{display:none}" +
+      ".r{position:fixed;width:28px;height:28px;margin:-14px 0 0 -14px;border-radius:50%;" +
+      "border:2px solid var(--a);animation:r .5s ease-out forwards}" +
+      "@keyframes r{from{transform:scale(.3);opacity:.9}to{transform:scale(1.6);opacity:0}}";
+    cursorArrow = document.createElement("div");
+    cursorArrow.className = "c idle";
+    // Built node by node: a page under Trusted Types refuses innerHTML.
+    const SVG = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(SVG, "svg");
+    for (const [k, v] of [["width", "18"], ["height", "22"], ["viewBox", "0 0 18 22"]]) svg.setAttribute(k, v);
+    const path = document.createElementNS(SVG, "path");
+    for (const [k, v] of [
+      ["d", "M1.5 1.5v16.2l4.3-4.1 2.9 6.6 2.7-1.2-2.9-6.5h6z"],
+      ["fill", "var(--a)"],
+      ["stroke", "#fff"],
+      ["stroke-width", "1.5"],
+      ["stroke-linejoin", "round"],
+    ])
+      path.setAttribute(k, v);
+    svg.append(path);
+    cursorArrow.append(svg);
+    cursorTag = document.createElement("span");
+    cursorTag.className = "t";
+    cursorArrow.append(cursorTag);
+    root.append(style, cursorArrow);
+    document.documentElement.append(cursorHost);
+  };
+  const drawCursor = (arg) => {
+    if (arg === null || typeof arg !== "object" || arg.hide === true) {
+      if (cursorHost !== null) cursorHost.remove();
+      cursorHost = null;
+      return null;
+    }
+    if (document.documentElement === null) return null;
+    ensureCursor();
+    const color = typeof arg.color === "string" && /^#[0-9a-fA-F]{6}$/.test(arg.color) ? arg.color : "#6d5dfc";
+    cursorHost.style.setProperty("--a", color);
+    cursorTag.textContent = typeof arg.label === "string" ? arg.label.slice(0, 40) : "";
+    const x = finite(Number(arg.x));
+    const y = finite(Number(arg.y));
+    cursorArrow.style.transform = `translate(${x - 1}px,${y - 1}px)`;
+    cursorArrow.classList.remove("idle");
+    if (arg.click === true) {
+      const ripple = document.createElement("div");
+      ripple.className = "r";
+      ripple.style.left = `${x}px`;
+      ripple.style.top = `${y}px`;
+      cursorArrow.before(ripple);
+      setTimeout(() => ripple.remove(), 600);
+    }
+    clearTimeout(cursorFade);
+    cursorFade = setTimeout(() => cursorArrow?.classList.add("idle"), 4000);
+    return null;
+  };
 
   // --- focus, input and chords ------------------------------------------------
   /** When the user last pressed, released or typed in the page. */
@@ -293,6 +458,11 @@
       return region(r);
     },
   };
+  // What the shell asks a view an agent drives (never the framed copy).
+  if (native !== null) {
+    api.rings = readRings;
+    api.cursor = drawCursor;
+  }
   Object.defineProperty(globalThis, "__chimaeraPaneView", { value: Object.freeze(api) });
 
   if (framed) {

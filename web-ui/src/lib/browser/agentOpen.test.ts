@@ -3,6 +3,7 @@ import {
   type Layout,
   MAX_PANES,
   activateTab,
+  clearBrowserAdopt,
   defaultLayout,
   findPane,
   focusPane,
@@ -24,6 +25,7 @@ import {
   browserOpener,
   parseAgentBrowserOpen,
   placeAgentBrowser,
+  placeHandover,
   shouldActOnAgentBrowserOpen,
 } from "./agentOpen";
 
@@ -334,5 +336,36 @@ describe("who opened a browser pane", () => {
       label: null,
       agentKind: null,
     });
+  });
+});
+
+describe("placeHandover", () => {
+  const h = { sessionId: "s-agent", host: "localhost", port: 8888, path: "/lab", view: "ab-1" };
+
+  it("opens a fresh tab adopting the view beside the agent, focus kept", () => {
+    const l = withAgent();
+    const agentPane = sessionPaneId(l, "s-agent")!;
+    const { layout, tabId } = placeHandover(l, h);
+    expect(layout.focusedPaneId).toBe(l.focusedPaneId);
+    const [b] = browserTabs(layout);
+    expect(b.pane).not.toBe(agentPane);
+    expect(b.tab).toMatchObject({ id: tabId, host: "localhost", port: 8888, path: "/lab", openedBy: "s-agent", adopt: "ab-1" });
+  });
+
+  it("never re-points a tab already on the target (its view is another page)", () => {
+    const first = placeAgentBrowser(withAgent(), frame({ host: "localhost", port: 8888, path: "/tree" }));
+    const { layout, tabId } = placeHandover(first, h);
+    const tabs = browserTabs(layout);
+    expect(tabs).toHaveLength(2);
+    expect(tabs.find((t) => t.tab.surface === "browser" && t.tab.id !== tabId)?.tab).toMatchObject({ path: "/tree" });
+  });
+
+  it("never persists the adoption, and drops it once adopted", () => {
+    const { layout, tabId } = placeHandover(withAgent(), h);
+    const restored = deserializeLayout(serializeLayout(layout))!;
+    expect(browserTabs(restored)[0].tab).not.toHaveProperty("adopt");
+    const cleared = clearBrowserAdopt(layout, tabId);
+    expect(browserTabs(cleared)[0].tab).not.toHaveProperty("adopt");
+    expect(clearBrowserAdopt(cleared, tabId)).toBe(cleared);
   });
 });

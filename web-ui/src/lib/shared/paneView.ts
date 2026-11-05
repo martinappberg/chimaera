@@ -37,6 +37,16 @@
  *   freezing it behind a stand-in) creates a `PaneViewControl` and passes it
  *   in; its calls are no-ops until the view exists.
  *
+ * - **Adoption.** A host can take on a view that already exists in this
+ *   window (`adopt`: an agent's own page, framed off-screen by
+ *   `browser/agentBrowser.ts`, that the agent handed to the user). The
+ *   action uses that id and shows the view once more at the URL it was last
+ *   shown at — the shell navigates only on a changed URL, so the live page
+ *   carries on (no reload), and a show without `agent` hands the view to
+ *   the person. Whatever the host's own `url` is then counts as shown. From
+ *   then on it owns the view like one it made: hidden while parked, closed
+ *   on destroy.
+ *
  * `onFallback` fires when the shell can't show the view (outside the app, an
  * app build without pane views, a refused URL): the caller renders its
  * iframe instead.
@@ -88,6 +98,15 @@ export interface PaneViewParams {
   onLoading?: (loading: boolean) => void;
   /** The host's handle on this view (see `PaneViewControl`). */
   control?: PaneViewControl;
+  /** Take on this existing view (read once, at mount): `id`, and the URL
+   *  this window last showed it at. */
+  adopt?: { id: string; url: string };
+  /** The shell's id for this view once it exists (and null once it went):
+   *  what the agent browser addresses a shared pane by. */
+  onViewId?: (id: string | null) => void;
+  /** The person acted in the page while input was being injected by an
+   *  agent (the shell's `user_input`). */
+  onUserInput?: () => void;
 }
 
 /** The longest a loading view stays hidden waiting for its page. */
@@ -197,7 +216,9 @@ export class PaneViewControl {
 const routes = new Map<string, (ev: NativeViewEvent) => void>();
 let listening = false;
 
-function route(id: string, fn: (ev: NativeViewEvent) => void): () => void {
+/** Receive the `native-view` events of view `id` (the last route set for an
+ *  id wins). Returns the unroute, which removes only its own route. */
+export function routeNativeView(id: string, fn: (ev: NativeViewEvent) => void): () => void {
   routes.set(id, fn);
   if (!listening) {
     listening = true;
@@ -340,9 +361,12 @@ class OverlayWatch {
 
 /** `use:paneView={{ url, shown, … }}` on the placeholder element. */
 export function paneView(node: HTMLElement, initial: PaneViewParams) {
-  const id = `v${(seq += 1)}-${Math.random().toString(36).slice(2, 8)}`;
+  const adopt = initial.adopt ?? null;
+  const id = adopt?.id ?? `v${(seq += 1)}-${Math.random().toString(36).slice(2, 8)}`;
   let params = initial;
-  let created = false;
+  /** An adopted view exists already; it waits to be shown here once. */
+  let created = adopt !== null;
+  let adopting = adopt !== null;
   let failed = false;
   let destroyed = false;
   /** What the shell shows now: a rect, or null (hidden). */
@@ -365,7 +389,7 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
   let crashed = false;
 
   const loadingNow = (): boolean =>
-    !failed && !crashed && params.url !== null && (awaiting || showing !== params.url);
+    !failed && !crashed && params.url !== null && (awaiting || (!adopting && showing !== params.url));
   const report = (): void => {
     const now = loadingNow();
     if (now === reported || destroyed) return;
@@ -427,6 +451,9 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
         control?.applyChip();
         params.onPage?.({ url: ev.url, title: ev.title });
         break;
+      case "user_input":
+        params.onUserInput?.();
+        break;
       case "crashed":
         crashed = true;
         awaiting = false;
@@ -438,7 +465,7 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
     }
   };
 
-  const unroute = route(id, onEvent);
+  const unroute = routeNativeView(id, onEvent);
   const bound: PaneTransport = {
     live: () => created && !destroyed && !failed,
     snapshot: () => nativeViewSnapshot(id),
@@ -484,6 +511,28 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
       do {
         again = false;
         if (destroyed || failed) return;
+        if (adopting && adopt !== null && params.url !== null && params.shown && !dragging) {
+          const at = wanted() ?? measure();
+          if (at === null) continue;
+          adopting = false;
+          // Its last URL again (no navigation: a reload would lose the very
+          // state that was handed over), without `agent`: the person's now.
+          // Hidden like a create; the next pass places it.
+          const ok = await nativeViewShow(id, adopt.url, at, true, false);
+          if (destroyed) break;
+          if (!ok) {
+            failed = true;
+            params.onFallback?.();
+            return;
+          }
+          showing = params.url;
+          placed = null;
+          report();
+          params.onViewId?.(id);
+          control?.applyChip();
+          again = true;
+          continue;
+        }
         const rect = wanted();
         const url = params.url;
         if (!crashed && params.shown && !dragging && url !== null && (!created || url !== showing)) {
@@ -496,7 +545,10 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
           const ok = await nativeViewShow(id, url, at, true);
           // The view exists from here even if this action is gone: the
           // `finally` closes it then.
-          if (ok) created = true;
+          if (ok) {
+            created = true;
+            if (!destroyed) params.onViewId?.(id);
+          }
           if (destroyed) break;
           if (!ok) {
             failed = true;
@@ -614,6 +666,7 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
       destroyed = true;
       clearLoadTimer();
       unroute();
+      if (created && !adopting) params.onViewId?.(null);
       control?.unbind(bound);
       if (frame !== 0) cancelAnimationFrame(frame);
       if (safety !== null) clearInterval(safety);

@@ -179,6 +179,13 @@ export interface BrowserTab {
    * attribution must stay true. Optional and additive in the saved layout.
    */
   openedBy?: string;
+  /**
+   * Transient, never persisted: the id of a live pane view this tab takes
+   * on when its view mounts (an agent's own page handed to the user, #273),
+   * so the page carries on in place instead of loading again. Cleared once
+   * adopted (`clearBrowserAdopt`).
+   */
+  adopt?: string;
 }
 export type Tab =
   | TerminalTab
@@ -906,6 +913,22 @@ export function freshBrowserTab(
   const tab: BrowserTab = { surface: "browser", id: uid(), host, port, path };
   if (openedBy !== undefined) tab.openedBy = openedBy;
   return tab;
+}
+
+/** The tab's view took on its `adopt` view: later mounts make their own. */
+export function clearBrowserAdopt(l: Layout, id: string): Layout {
+  const loc = findBrowser(l, id);
+  if (loc === null || loc.tab.adopt === undefined) return l;
+  const root = withPane(l.root, loc.paneId, (p) => ({
+    ...p,
+    tabs: p.tabs.map((t, i) => {
+      if (i !== loc.index || t.surface !== "browser") return t;
+      const next: BrowserTab = { ...t };
+      delete next.adopt;
+      return next;
+    }),
+  }));
+  return root === l.root ? l : { ...l, root };
 }
 
 /** Credit a browser instance to the agent session that (re)opened it. */
