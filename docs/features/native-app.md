@@ -70,6 +70,12 @@ app-build` (never the root `cargo`).
   laying out a huge report, or swapping — took ~4 minutes (a 9.5 GB report, 2026-11-04). The
   delegates are cleared first, so the termination is never mistaken for a crash and reloaded,
   and the kill is skipped if any other web view in the app's windows reports the same process id.
+  The
+  [agent browser](agent-browser.md)'s app engine drives these views through `native_view_drive`
+  (real NSEvent input, evals, native screenshots, the console/network rings; the calling
+  window's own views only), and `native_view_show` with `agent` shows an agent's own page just
+  past the window's right edge, where WebKit keeps it running at full speed. macOS only, like
+  pane views.
 - **The askpass wiring stays the app's own.** The local daemon is spawned without the app's
   `SSH_ASKPASS*` / `CHIMAERA_ASKPASS_*` variables (and a daemon that inherited them from an older
   app strips them from its sessions), so a terminal's `ssh` prompts on its tty and no agent can

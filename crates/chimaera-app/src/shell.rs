@@ -1292,6 +1292,7 @@ pub fn run() {
             native_view::native_view_chip,
             native_view::native_view_region,
             native_view::native_view_nav,
+            native_view::native_view_drive,
             commands::answer_askpass,
             commands::list_askpass,
             commands::cache_appearance,

@@ -265,6 +265,13 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/sessions/{id}/fork", post(chat::fork_session))
         .route("/sessions/{id}/git", get(git::session_git))
         .route("/links", get(links::list_links).put(links::put_link))
+        // Browser tabs shared with an agent's browser tools (before the
+        // terminal route: `browser` is never a terminal id).
+        .route(
+            "/links/browser",
+            get(links::list_browser_links).put(links::put_browser_link),
+        )
+        .route("/links/browser/{tab}", delete(links::delete_browser_link))
         .route("/links/{terminal_id}", delete(links::delete_link))
         .route("/agents", get(launcher::list_agents))
         .route(

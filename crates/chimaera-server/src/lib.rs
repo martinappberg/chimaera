@@ -1,4 +1,5 @@
 mod agent_auth;
+mod agent_browser;
 mod agent_docs;
 mod agent_probe;
 mod agent_setup;

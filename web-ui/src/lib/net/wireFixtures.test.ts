@@ -19,6 +19,7 @@ import {
 } from "../workspace/sessions";
 import { parseUpdateStatus } from "../workspace/update.svelte";
 import { EventsSocket, type EventsSocketHandlers } from "./events";
+import { decodeBrowserLinks, decodeBrowserRequest, type BrowserHello } from "./browserWire";
 import chatEvents from "./fixtures/wire/chat-events.json";
 import chatSocket from "./fixtures/wire/chat-socket.json";
 import eventsBus from "./fixtures/wire/events-bus.json";
@@ -352,7 +353,10 @@ describe("events-bus: /ws/events frames through EventsSocket", () => {
   function attach() {
     const seen: Seen[] = [];
     const handlers: EventsSocketHandlers = {
-      onSessions: (sessions, links) => seen.push({ kind: "sessions", detail: { n: sessions.length, links } }),
+      onSessions: (sessions, links, browserLinks) => {
+        seen.push({ kind: "sessions", detail: { n: sessions.length, links } });
+        if (browserLinks !== undefined) seen.push({ kind: "browser_links", detail: browserLinks });
+      },
       onSettings: (settings) => seen.push({ kind: "settings", detail: settings }),
       onGit: (epochs, repos) => seen.push({ kind: "git", detail: { epochs, repos } }),
       onTimeline: (epochs) => seen.push({ kind: "timeline", detail: epochs }),
@@ -364,6 +368,7 @@ describe("events-bus: /ws/events frames through EventsSocket", () => {
       onPlatform: (frame) => seen.push({ kind: "platform", detail: frame.type }),
       onNotices: (notices) => seen.push({ kind: "notices", detail: notices.length }),
       onBrowserOpen: (open) => seen.push({ kind: "browser_open", detail: open }),
+      onBrowserRequest: (req) => seen.push({ kind: "browser_request", detail: req }),
       onStatus: () => {},
       onFatal: (message) => seen.push({ kind: "fatal", detail: message }),
     };
@@ -404,19 +409,74 @@ describe("events-bus: /ws/events frames through EventsSocket", () => {
     plugin_emit: (seen) => expect(seen).toEqual([{ kind: "platform", detail: "plugin" }]),
     error_unauthorized: (seen) => expect(seen).toEqual([{ kind: "fatal", detail: "unauthorized" }]),
   };
+  /** A sessions frame reaches onSessions (and its browser links, when it
+   *  carries them); every agent-browser request reaches onBrowserRequest
+   *  with its envelope — one case per op, whatever the daemon names them. */
+  const expectationFor = (c: Fixture["cases"][number]): ((seen: Seen[]) => void) | undefined => {
+    const named = expectations[c.name];
+    const links = decodeBrowserLinks(c.frame.browser_links);
+    if (named !== undefined && c.frame.type === "sessions" && links !== undefined) {
+      return (seen) => {
+        named(seen.filter((s) => s.kind !== "browser_links"));
+        expect(seen.find((s) => s.kind === "browser_links")?.detail).toEqual(links);
+      };
+    }
+    if (named !== undefined) return named;
+    if (c.frame.type === "browser_request") {
+      return (seen) =>
+        expect(seen).toEqual([
+          { kind: "browser_request", detail: expect.objectContaining({ rid: c.frame.rid, op: c.frame.op }) },
+        ]);
+    }
+    return undefined;
+  };
   it("has an expectation for every fixture case and vice versa", () => {
-    expect(Object.keys(expectations).sort()).toEqual(eventsBus.cases.map((c) => c.name).sort());
+    const names = eventsBus.cases.map((c) => c.name);
+    for (const c of eventsBus.cases) expect(expectationFor(c), c.name).toBeDefined();
+    for (const name of Object.keys(expectations)) expect(names).toContain(name);
   });
   for (const c of eventsBus.cases) {
     for (const [label, frame] of variants(c.frame)) {
       it(`${c.name} (${label})`, () => {
         const { socket, ws, seen } = attach();
         ws.receive(frame);
-        expectations[c.name](seen);
+        expectationFor(c)?.(seen);
         socket.close();
       });
     }
   }
+  it("every browser_request case decodes, with its op's fields", () => {
+    for (const c of eventsBus.cases.filter((c) => c.frame.type === "browser_request")) {
+      const req = decodeBrowserRequest(c.frame);
+      expect(req, c.name).not.toBeNull();
+      expect(["open", "drive", "nav", "close", "handover", "state"], c.name).toContain(req!.op);
+    }
+  });
+  it("a browser_request reaches the handler, and a sessions frame's browser_links decode", () => {
+    const { socket, ws, seen } = attach();
+    ws.receive({ type: "browser_request", rid: 3, op: "drive", view: null, tab: "t1", action: { type: "key", key: "Enter" } });
+    ws.receive({ type: "sessions", sessions: [], links: [], browser_links: [{ tab: "t1", agent_id: "s-chat1" }] });
+    expect(seen).toEqual([
+      { kind: "browser_request", detail: expect.objectContaining({ rid: 3, op: "drive", view: null, tab: "t1" }) },
+      { kind: "sessions", detail: { n: 0, links: [] } },
+      { kind: "browser_links", detail: [{ tab: "t1", agent_id: "s-chat1" }] },
+    ]);
+    socket.close();
+  });
+  it("re-sends the browser hello after every (re)auth, and send respects a closed socket", () => {
+    const { socket, ws } = attach();
+    const hello: BrowserHello = { type: "browser_hello", app_engine: true, visible: true, focused: true, width: 800, height: 600, tabs: [] };
+    socket.setHello(hello);
+    expect(ws.sent.at(-1)).toEqual(hello);
+    ws.close();
+    expect(socket.send({ type: "browser_reply", rid: 1, ok: true, result: {} })).toBe(false);
+    vi.runOnlyPendingTimers();
+    const next = FakeWebSocket.instances.at(-1)!;
+    expect(next).not.toBe(ws);
+    next.open();
+    expect(next.sent).toEqual([expect.objectContaining({ type: "auth" }), expect.objectContaining({ type: "watch" }), hello]);
+    socket.close();
+  });
   it("parses the browser_open frame's fields the way the pane expects", () => {
     const frame = eventsBus.cases.find((c) => c.name === "browser_open")!.frame;
     expect(parseAgentBrowserOpen(frame)).not.toBeNull();

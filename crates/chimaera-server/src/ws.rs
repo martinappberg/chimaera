@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::json;
@@ -32,9 +32,16 @@ const MAX_TERMINAL_INPUT_MESSAGE: usize = 1024 * 1024;
 /// text block. Leave room for JSON escaping and field overhead, but reject a
 /// giant frame in tungstenite before serde allocates the command tree.
 const MAX_CHAT_COMMAND_MESSAGE: usize = 10 * 1024 * 1024;
-/// The events socket accepts only tiny watch registrations. Cap the frame
-/// before serde can allocate attacker-chosen path arrays.
-const MAX_EVENTS_INPUT_MESSAGE: usize = 128 * 1024;
+/// The events socket takes watch registrations and the agent browser's
+/// window answers (`browser_reply`, CONTRACTS §2), the largest a screenshot
+/// capped at `channel::REPLY_MAX`. The frame cap sits above that so an
+/// over-cap reply is refused as one reply, not by killing the socket. Before
+/// auth only [`EVENTS_PREAUTH_MAX`] sockets may hold that allowance.
+const MAX_EVENTS_INPUT_MESSAGE: usize = 12 * 1024 * 1024;
+/// Every events-socket text frame except a `browser_reply` stays this small
+/// (watch registrations, hellos, events): a bigger one is ignored before
+/// serde allocates its path arrays.
+const MAX_EVENTS_CONTROL_MESSAGE: usize = 128 * 1024;
 /// Queue terminal input in bounded pieces so the PTY channel's item capacity
 /// also implies a byte capacity.
 const TERMINAL_INPUT_CHUNK: usize = 64 * 1024;
@@ -181,6 +188,54 @@ enum ClientMessage {
         #[serde(default)]
         git_repos: Vec<String>,
     },
+    /// `/ws/events` only: what this window can do for the agent browser and
+    /// whether it is visible/focused, plus the browser tabs it holds (sent on
+    /// connect and whenever any of it changes; `agent_browser::channel`).
+    BrowserHello {
+        #[serde(default)]
+        app_engine: bool,
+        #[serde(default)]
+        visible: bool,
+        #[serde(default)]
+        focused: bool,
+        #[serde(default)]
+        width: u32,
+        #[serde(default)]
+        height: u32,
+        #[serde(default)]
+        tabs: Vec<String>,
+        /// Additive: what each of those tabs shows (`{tab, title, url}`, the
+        /// URL in app terms). Agents see these read-only.
+        #[serde(default)]
+        pages: Vec<crate::agent_browser::channel::HelloPage>,
+    },
+    /// `/ws/events` only: the answer to a `browser_request` with this `rid`.
+    BrowserReply {
+        rid: u64,
+        #[serde(default)]
+        ok: bool,
+        #[serde(default)]
+        result: Option<serde_json::Value>,
+        #[serde(default)]
+        error: Option<String>,
+    },
+    /// `/ws/events` only: `takeover` / `resume` on a shared pane, or
+    /// `view_lost` for an agent's own view.
+    BrowserEvent {
+        kind: String,
+        #[serde(default)]
+        view: Option<String>,
+        #[serde(default)]
+        tab: Option<String>,
+    },
+}
+
+/// Just enough of an over-cap `browser_reply` to fail its request.
+#[derive(Deserialize)]
+struct ReplyHead {
+    #[serde(rename = "type")]
+    kind: String,
+    rid: u64,
 }
 
 /// GET /ws/sessions/{id}
@@ -576,9 +631,9 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                                 // existing path.
                             }
                         }
-                        // Ignore re-auth, the events-bus `watch` frame, and
-                        // unknown message types.
-                        Ok(ClientMessage::Auth { .. }) | Ok(ClientMessage::Watch { .. }) | Err(_) => {}
+                        // Ignore re-auth, the events-bus frames, and unknown
+                        // message types.
+                        Ok(_) | Err(_) => {}
                     }
                 }
                 // Client went away: drop the attachment, the session lives on.
@@ -1063,9 +1118,54 @@ pub(crate) async fn events_ws(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> Response {
+    // The transport cap is fixed at upgrade (axum can't raise it after the
+    // auth frame), so the big-reply allowance is bounded before auth by how
+    // many sockets may sit unauthenticated at once (each for ≤ 5 s).
+    let Some(preauth) = PreauthSlot::take(&state) else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "too many unauthenticated event sockets",
+        )
+            .into_response();
+    };
     ws.max_message_size(MAX_EVENTS_INPUT_MESSAGE)
         .max_frame_size(MAX_EVENTS_INPUT_MESSAGE)
-        .on_upgrade(move |socket| handle_events(socket, state))
+        .on_upgrade(move |socket| handle_events(socket, state, preauth))
+}
+
+/// Events sockets upgraded but not yet authenticated, at most.
+const EVENTS_PREAUTH_MAX: usize = 8;
+
+/// One unauthenticated events socket; released when auth ends either way.
+struct PreauthSlot(Arc<AppState>);
+
+impl PreauthSlot {
+    fn take(state: &Arc<AppState>) -> Option<Self> {
+        let count = &state.events_preauth;
+        let mut now = count.load(std::sync::atomic::Ordering::Acquire);
+        loop {
+            if now >= EVENTS_PREAUTH_MAX {
+                return None;
+            }
+            match count.compare_exchange(
+                now,
+                now + 1,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(PreauthSlot(state.clone())),
+                Err(actual) => now = actual,
+            }
+        }
+    }
+}
+
+impl Drop for PreauthSlot {
+    fn drop(&mut self) {
+        self.0
+            .events_preauth
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 /// Minimum gap between snapshot frames (<= 4/s). Also the reuse window of
@@ -1076,8 +1176,10 @@ pub(crate) const EVENTS_THROTTLE: Duration = Duration::from_millis(250);
 /// child exiting on its own).
 const EVENTS_TICK: Duration = Duration::from_secs(1);
 
-async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
-    if authenticate(&mut socket, &state).await.is_none() {
+async fn handle_events(mut socket: WebSocket, state: Arc<AppState>, preauth: PreauthSlot) {
+    let authed = authenticate(&mut socket, &state).await.is_some();
+    drop(preauth);
+    if !authed {
         let _ = send_json(&mut socket, &frames::error("unauthorized")).await;
         return;
     }
@@ -1106,12 +1208,13 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
     let mut last_notice = state.notices.head();
     // Plugin `emit` frames, same rule: from now on, never a replay.
     let mut last_plugin_event = state.plugin_runtime.events_head();
-    // Agent `open_browser` frames, same rule: a window that was not here when
-    // the agent asked never opens the pane later.
-    let mut last_browser_open = state.browser_opens.head();
-    // Counted for `open_browser`'s honest "no window is connected" answer;
-    // dropped on every exit path below.
-    let _consumer = state.browser_opens.consumer();
+    // The agent browser's per-socket queue (`agent_browser::channel`):
+    // requests for this window and `open_browser` frames, written the moment
+    // they arrive (a branch of the loop below and during its throttle
+    // sleep), never at the next snapshot pass. Unregistered (pending
+    // requests failed) on every exit path below.
+    let (registration, mut outbox) = state.browsers.channel.register();
+    let socket_id = registration.id;
     // A new window's FIRST settings frame gets one fresh disk read (off the
     // reactor, through the store's gate): a hand-edit inside the watcher's
     // poll window must not greet a fresh window with stale settings.
@@ -1178,63 +1281,77 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
         return;
     }
 
+    // Pinned across the waits below, so neither outbox nor reply traffic can
+    // starve the tick-driven pass (fs polling), and a change announced while
+    // this socket was busy sending is still seen: the subscription is armed
+    // before each pass, and the tick's deadline only moves when a pass runs.
+    let tick = tokio::time::sleep(EVENTS_TICK);
+    tokio::pin!(tick);
+    let mut changed = Box::pin(state.changes.subscribe());
+    changed.as_mut().enable();
     loop {
-        tokio::select! {
-            _ = state.changes.notified() => {}
-            _ = tokio::time::sleep(EVENTS_TICK) => {}
-            first = touched.recv(), if touched_open => {
-                let mut paths: Vec<std::path::PathBuf> = Vec::new();
-                match first {
-                    Ok(batch) => paths.extend(batch.iter().cloned()),
-                    // Skipped writes are the poll's to find; no fast path now.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        touched_open = false;
-                    }
-                }
-                // Everything queued since coalesces into this one stat pass
-                // (bounded by the channel's capacity).
-                loop {
-                    match touched.try_recv() {
+        loop {
+            tokio::select! {
+                _ = &mut changed => break,
+                _ = &mut tick => break,
+                first = touched.recv(), if touched_open => {
+                    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+                    match first {
                         Ok(batch) => paths.extend(batch.iter().cloned()),
-                        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
-                        Err(_) => break,
-                    }
-                }
-                let changes = fs_watch.poll_touched(&paths).await;
-                if send_fs_changes(&mut socket, changes).await.is_err() {
-                    return;
-                }
-                // Fall through to the regular sends: a steady stream of
-                // writes must neither starve them (the tick restarts every
-                // iteration) nor outrun the throttle below, which bounds
-                // these passes to four a second per window.
-            }
-            msg = socket.recv() => match msg {
-                // The only client frame on this bus: which workspace this window
-                // shows + the exact mounted paths whose disk state it renders.
-                Some(Ok(Message::Text(text))) => {
-                    if let Ok(ClientMessage::Watch { workspace_id, files, dirs, git_repos }) =
-                        serde_json::from_str::<ClientMessage>(&text)
-                    {
-                        watch.set(workspace_id);
-                        watch.set_repos(git_repos);
-                        if fs_watch.set(files, dirs) {
-                            // Establish new metadata baselines immediately when
-                            // the two-second client-I/O ceiling allows it. New
-                            // directory name baselines are separately batched.
-                            let changes = fs_watch.poll(false).await;
-                            if send_fs_changes(&mut socket, changes).await.is_err() {
-                                return;
-                            }
+                        // Skipped writes are the poll's to find; no fast path now.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            touched_open = false;
                         }
                     }
-                    continue;
+                    // Everything queued since coalesces into this one stat pass
+                    // (bounded by the channel's capacity).
+                    loop {
+                        match touched.try_recv() {
+                            Ok(batch) => paths.extend(batch.iter().cloned()),
+                            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                            Err(_) => break,
+                        }
+                    }
+                    let changes = fs_watch.poll_touched(&paths).await;
+                    if send_fs_changes(&mut socket, changes).await.is_err() {
+                        return;
+                    }
+                    // On to the regular sends: a steady stream of writes must
+                    // neither starve them nor outrun the throttle below, which
+                    // bounds these passes to four a second per window.
+                    break;
                 }
-                Some(Ok(_)) => continue,
-                Some(Err(_)) | None => return,
-            },
+                frame = outbox.recv() => match frame {
+                    Some(frame) => {
+                        if socket.send(Message::Text(frame.as_ref().into())).await.is_err() {
+                            return;
+                        }
+                    }
+                    None => return,
+                },
+                msg = socket.recv() => match msg {
+                    // Client frames on this bus: which workspace this window shows
+                    // + the mounted paths it renders, and the agent browser's.
+                    Some(Ok(Message::Text(text))) => {
+                        if events_client_text(&mut socket, &state, socket_id, &mut watch, &mut fs_watch, &text)
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) | None => return,
+                },
+            }
         }
+        // Re-armed before the pass: a change during the pass or the throttle
+        // wakes the next wait at once.
+        changed = Box::pin(state.changes.subscribe());
+        changed.as_mut().enable();
+        tick.as_mut()
+            .reset(tokio::time::Instant::now() + EVENTS_TICK);
         if send_settings_snapshot(&mut socket, &state, &mut last_settings_gen)
             .await
             .is_err()
@@ -1288,17 +1405,6 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
                 return;
             }
         }
-        // `{"type":"browser_open", ...}` — additive, like the plugin frames
-        // below: a client ignores types it doesn't know.
-        for frame in state.browser_opens.since(&mut last_browser_open) {
-            if socket
-                .send(Message::Text(frame.as_ref().into()))
-                .await
-                .is_err()
-            {
-                return;
-            }
-        }
         // `{"type":"plugin", ...}` — additive; a client ignores types it
         // doesn't know.
         for frame in state
@@ -1317,8 +1423,135 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
         if send_fs_changes(&mut socket, fs_changes).await.is_err() {
             return;
         }
-        tokio::time::sleep(EVENTS_THROTTLE).await;
+        // The throttle bounds snapshot passes, never the agent browser:
+        // requests go out and replies come in while it runs.
+        let throttle = tokio::time::sleep(EVENTS_THROTTLE);
+        tokio::pin!(throttle);
+        loop {
+            tokio::select! {
+                _ = &mut throttle => break,
+                frame = outbox.recv() => match frame {
+                    Some(frame) => {
+                        if socket.send(Message::Text(frame.as_ref().into())).await.is_err() {
+                            return;
+                        }
+                    }
+                    None => return,
+                },
+                msg = socket.recv() => match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        if events_client_text(&mut socket, &state, socket_id, &mut watch, &mut fs_watch, &text)
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) | None => return,
+                },
+            }
+        }
     }
+}
+
+/// One client text frame on `/ws/events`. `Err` = the socket failed.
+async fn events_client_text(
+    socket: &mut WebSocket,
+    state: &Arc<AppState>,
+    socket_id: crate::agent_browser::channel::SocketId,
+    watch: &mut crate::git::WatchGuard,
+    fs_watch: &mut crate::fs_watch::FsWatch,
+    text: &str,
+) -> Result<(), axum::Error> {
+    use crate::agent_browser::channel::{Hello, REPLY_MAX};
+    if text.len() > MAX_EVENTS_CONTROL_MESSAGE {
+        // Only a reply may be this big; past its cap it fails as itself.
+        if text.len() > REPLY_MAX {
+            if let Ok(head) = serde_json::from_str::<ReplyHead>(text) {
+                if head.kind == "browser_reply" {
+                    state.browsers.channel.reply(
+                        socket_id,
+                        head.rid,
+                        Err(format!(
+                            "The window's answer was larger than {} MB.",
+                            REPLY_MAX / (1024 * 1024)
+                        )),
+                    );
+                }
+            }
+            return Ok(());
+        }
+        if !text.contains("\"browser_reply\"") {
+            return Ok(());
+        }
+    }
+    match serde_json::from_str::<ClientMessage>(text) {
+        Ok(ClientMessage::Watch {
+            workspace_id,
+            files,
+            dirs,
+            git_repos,
+        }) => {
+            state
+                .browsers
+                .channel
+                .set_workspace(socket_id, workspace_id.clone());
+            watch.set(workspace_id);
+            watch.set_repos(git_repos);
+            if fs_watch.set(files, dirs) {
+                // Establish new metadata baselines immediately when the
+                // two-second client-I/O ceiling allows it. New directory name
+                // baselines are separately batched.
+                let changes = fs_watch.poll(false).await;
+                send_fs_changes(socket, changes).await?;
+            }
+        }
+        Ok(ClientMessage::BrowserHello {
+            app_engine,
+            visible,
+            focused,
+            width,
+            height,
+            tabs,
+            pages,
+        }) => state.browsers.channel.hello(
+            socket_id,
+            Hello {
+                app_engine,
+                visible,
+                focused,
+                width,
+                height,
+                tabs,
+                pages,
+            },
+        ),
+        Ok(ClientMessage::BrowserReply {
+            rid,
+            ok,
+            result,
+            error,
+        }) => {
+            let outcome = if ok {
+                Ok(result.unwrap_or(serde_json::Value::Null))
+            } else {
+                Err(error.unwrap_or_else(|| "The window could not do that.".to_string()))
+            };
+            state.browsers.channel.reply(socket_id, rid, outcome);
+        }
+        Ok(ClientMessage::BrowserEvent { kind, view, tab }) => {
+            crate::agent_browser::on_event(
+                state,
+                socket_id,
+                &kind,
+                view.as_deref(),
+                tab.as_deref(),
+            );
+        }
+        Ok(_) | Err(_) => {}
+    }
+    Ok(())
 }
 
 /// Installs and hook trust affect every workspace on this host. Push only
@@ -1646,6 +1879,99 @@ mod tests {
         assert!(encoded.len() <= MAX_CHAT_COMMAND_MESSAGE);
     }
 
+    /// The agent browser's client messages, exactly as the web UI sends them
+    /// (`web-ui/src/lib/net/browserWire.ts`, `browser/agentBrowser.test.ts`).
+    #[test]
+    fn browser_client_messages_parse_as_the_web_ui_sends_them() {
+        let parse = |text: &str| serde_json::from_str::<ClientMessage>(text).unwrap();
+        match parse(
+            r#"{"type":"browser_hello","app_engine":true,"visible":true,"focused":false,"width":1440,"height":900,"tabs":["a","b"]}"#,
+        ) {
+            ClientMessage::BrowserHello {
+                app_engine,
+                visible,
+                focused,
+                width,
+                height,
+                tabs,
+                pages,
+            } => {
+                assert!(app_engine && visible && !focused);
+                assert_eq!((width, height), (1440, 900));
+                assert_eq!(tabs, vec!["a".to_string(), "b".to_string()]);
+                assert!(pages.is_empty(), "older windows send no pages");
+            }
+            _ => panic!("not a hello"),
+        }
+        match parse(
+            r#"{"type":"browser_hello","app_engine":true,"visible":true,"focused":true,"width":1440,"height":900,"tabs":["a"],"pages":[{"tab":"a","title":"Lab","url":"http://localhost:8888/lab"}]}"#,
+        ) {
+            ClientMessage::BrowserHello { pages, .. } => assert_eq!(
+                pages,
+                vec![crate::agent_browser::channel::HelloPage {
+                    tab: "a".into(),
+                    title: "Lab".into(),
+                    url: "http://localhost:8888/lab".into(),
+                }]
+            ),
+            _ => panic!("not a hello"),
+        }
+        match parse(r#"{"type":"browser_reply","rid":7,"ok":true,"result":{"value":42}}"#) {
+            ClientMessage::BrowserReply {
+                rid,
+                ok,
+                result,
+                error,
+            } => {
+                assert_eq!((rid, ok), (7, true));
+                assert_eq!(result, Some(json!({"value": 42})));
+                assert_eq!(error, None);
+            }
+            _ => panic!("not a reply"),
+        }
+        match parse(
+            r#"{"type":"browser_reply","rid":7,"ok":false,"error":"ReferenceError: x is not defined"}"#,
+        ) {
+            ClientMessage::BrowserReply {
+                rid,
+                ok,
+                result,
+                error,
+            } => {
+                assert_eq!((rid, ok, result), (7, false, None));
+                assert_eq!(error.as_deref(), Some("ReferenceError: x is not defined"));
+            }
+            _ => panic!("not a reply"),
+        }
+        for (text, want) in [
+            (
+                r#"{"type":"browser_event","kind":"view_lost","view":"ab-1","tab":null}"#,
+                ("view_lost", Some("ab-1"), None),
+            ),
+            (
+                r#"{"type":"browser_event","kind":"takeover","view":"v1","tab":"tab-1"}"#,
+                ("takeover", Some("v1"), Some("tab-1")),
+            ),
+            (
+                r#"{"type":"browser_event","kind":"resume","view":"v1","tab":"tab-1"}"#,
+                ("resume", Some("v1"), Some("tab-1")),
+            ),
+        ] {
+            match parse(text) {
+                ClientMessage::BrowserEvent { kind, view, tab } => {
+                    assert_eq!((kind.as_str(), view.as_deref(), tab.as_deref()), want)
+                }
+                _ => panic!("not an event: {text}"),
+            }
+        }
+        // An over-cap reply still yields its rid without the body.
+        let head: ReplyHead = serde_json::from_str(
+            r#"{"type":"browser_reply","rid":9,"ok":true,"result":{"png":"AAAA"}}"#,
+        )
+        .unwrap();
+        assert_eq!((head.kind.as_str(), head.rid), ("browser_reply", 9));
+    }
+
     /// The `/ws/sessions/{id}` text frames → `pty-socket.json` (the binary
     /// snapshot and output frames carry no JSON and are not pinned).
     #[test]
@@ -1817,6 +2143,11 @@ mod tests {
             ),
         ];
         let links = vec![crate::links::link_json("s-shell1", "s-chat1")];
+        let browser_links = vec![crate::links::browser_link_json("k3x9a2b", "s-chat1", "p1")];
+        let fields = |v: serde_json::Value| match v {
+            serde_json::Value::Object(m) => m,
+            _ => unreachable!("an object literal"),
+        };
         let epochs: BTreeMap<String, u64> = BTreeMap::from([("w1".to_string(), 3)]);
         let repos: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::from([(
             "w1".to_string(),
@@ -1836,10 +2167,10 @@ mod tests {
         pin(
             "events-bus",
             "crates/chimaera-server/src/ws.rs",
-            "/ws/events frames (ws::frames): the sessions roster + links, settings, the invalidation frames, fs changes, update status, notices, browser_open, the plugin platform frames, and the error.",
+            "/ws/events frames (ws::frames): the sessions roster + links + browser links, settings, the invalidation frames, fs changes, update status, notices, browser_open, the agent browser's browser_request ops, the plugin platform frames, and the error.",
             vec![
-                case("sessions", "the full roster (a shell row, a chat row; session-rows.json has every row shape) and one link", frames::sessions(rows, links)),
-                case("sessions_empty", "no sessions, no links", frames::sessions(vec![], vec![])),
+                case("sessions", "the full roster (a shell row, a chat row; session-rows.json has every row shape), one terminal link and one shared browser tab (page = the id the agent uses)", frames::sessions(rows, links, browser_links)),
+                case("sessions_empty", "no sessions, no links", frames::sessions(vec![], vec![], vec![])),
                 case(
                     "settings",
                     "the settings map (settings.json ground truth, any JSON)",
@@ -1870,6 +2201,53 @@ mod tests {
                     "browser_open",
                     "an agent asked for a browser pane",
                     frames::browser_open("s-chat1", Some("w1"), &"127.0.0.1", &5173u16, &"/docs"),
+                ),
+                case(
+                    "browser_request_open",
+                    "agent browser: show an agent's own view off-bounds at this daemon-relative URL (reply {} once shown)",
+                    frames::browser_request(17, "open", Some("ab-0123456789abcdef"), None,
+                        fields(serde_json::json!({"url": "/proxy/p-0123/lab?token=x", "width": 1280, "height": 800}))),
+                ),
+                case(
+                    "browser_request_drive",
+                    "agent browser: one native_view_drive action on an own view (reply = its result)",
+                    frames::browser_request(18, "drive", Some("ab-0123456789abcdef"), None,
+                        fields(serde_json::json!({"action": {"type": "click", "x": 120.0, "y": 48.0, "clicks": 1, "modifiers": ["shift"]}}))),
+                ),
+                case(
+                    "browser_request_drive_eval",
+                    "agent browser: an eval in the agent's isolated world; `args` (and each of its keys) is in scope in the body (reply {value})",
+                    frames::browser_request(19, "drive", Some("ab-0123456789abcdef"), None,
+                        fields(serde_json::json!({"action": {"type": "eval", "body": "return args.n + 1;", "args": {"n": 1}, "world": "isolated", "timeout_ms": 10000}}))),
+                ),
+                case(
+                    "browser_request_drive_shared",
+                    "agent browser: a drive on a pane the user shared, addressed by its tab (view null)",
+                    frames::browser_request(20, "drive", None, Some("k3x9a2b"),
+                        fields(serde_json::json!({"action": {"type": "screenshot", "clip": null, "full_page": false, "max_width": 1600, "format": "png", "quality": null}}))),
+                ),
+                case(
+                    "browser_request_nav",
+                    "agent browser: a history step (back|forward|reload|stop)",
+                    frames::browser_request(21, "nav", Some("ab-0123456789abcdef"), None,
+                        fields(serde_json::json!({"action": "back"}))),
+                ),
+                case(
+                    "browser_request_close",
+                    "agent browser: close an own view",
+                    frames::browser_request(22, "close", Some("ab-0123456789abcdef"), None, serde_json::Map::new()),
+                ),
+                case(
+                    "browser_request_handover",
+                    "agent browser: open the live own view as a pane beside the agent (reply {tab})",
+                    frames::browser_request(23, "handover", Some("ab-0123456789abcdef"), None,
+                        fields(serde_json::json!({"host": "localhost", "port": 8888, "path": "/lab", "agent": "s-chat1"}))),
+                ),
+                case(
+                    "browser_request_state",
+                    "agent browser: the driving/paused marker for a shared pane (no native call; reply {})",
+                    frames::browser_request(24, "state", None, Some("k3x9a2b"),
+                        fields(serde_json::json!({"driving": true, "paused": false}))),
                 ),
                 case("plugin_view", "a plugin screen should re-render", frames::plugin_view("latex", "w1", "preview")),
                 case("plugin_surface", "a plugin published a data surface key", frames::plugin_surface(&"latex", &"w1", &"figures", &"fig-1")),

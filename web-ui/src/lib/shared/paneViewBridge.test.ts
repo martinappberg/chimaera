@@ -148,3 +148,12 @@ describe("crashes", () => {
     expect(decodeFrameMessage({ chimaeraPaneView: { kind: "crashed" } })).toBeNull();
   });
 });
+
+describe("user input (agent browser take-over)", () => {
+  it("reads the shell's report", () => {
+    expect(decodeNativeViewEvent({ id: "v1", kind: "user_input" })).toEqual({ id: "v1", kind: "user_input" });
+  });
+  it("never takes one from a framed page", () => {
+    expect(decodeFrameMessage({ chimaeraPaneView: { kind: "user_input" } })).toBeNull();
+  });
+});

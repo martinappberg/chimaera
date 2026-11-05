@@ -29,6 +29,14 @@
 //! user's browser through `open_external`'s rules, and a script's own
 //! navigation away is just cancelled. The view is not a Tauri web view, so
 //! it has no IPC at all.
+//!
+//! Agents drive views through `native_view_drive` (the agent browser's app
+//! engine, #273): real input, evals, screenshots and the console/network
+//! rings, on the calling window's own views only. An agent's own view is
+//! shown with `agent` (framed outside the owner's bounds by the page, so
+//! WebKit keeps it running at full speed) and carries the page-world
+//! recorder (`chimaera_core::PANE_AGENT_JS`). The parsing and the pure rules
+//! are `drive.rs`; the native half is `mac/agent.rs`.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -38,6 +46,7 @@ use serde::{Deserialize, Serialize};
 use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Manager, Webview};
 
+mod drive;
 #[cfg(target_os = "macos")]
 mod mac;
 
@@ -203,6 +212,28 @@ fn main_frame_policy(app: &AppHandle, label: &str, url: &tauri::Url) -> Policy {
     decide(&asked, daemon_navigation_allowed(app, &owner, url), url)
 }
 
+/// Whether an agent's own view may load `url` in a subframe: inline
+/// documents (`about:` incl. srcdoc, `data:`, `blob:`) and the owner's
+/// daemon files and proxied apps. Anything else would let an agent frame
+/// the open web (`<iframe src=https://…>`) and read it by screenshot; a
+/// user's pane keeps letting a page frame what it likes.
+fn agent_subframe(url: &tauri::Url, same_origin: bool) -> bool {
+    matches!(url.scheme(), "about" | "data" | "blob") || (same_origin && view_path_allowed(url))
+}
+
+/// `agent_subframe` for view `label`, against its owner's origin.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn agent_subframe_allowed(app: &AppHandle, label: &str, url: &tauri::Url) -> bool {
+    let Some(views) = app.try_state::<NativeViews>() else {
+        return false;
+    };
+    let owner = match lock(&views.views).get(label) {
+        Some(view) => view.owner.clone(),
+        None => return false,
+    };
+    agent_subframe(url, daemon_navigation_allowed(app, &owner, url))
+}
+
 /// A link the user clicked lets that URL out to their browser this long.
 const LINK_FRESH: Duration = Duration::from_millis(1500);
 
@@ -267,9 +298,12 @@ pub(super) fn native_view_show(
     hidden: Option<bool>,
     clip: Option<ViewRect>,
     passive: Option<bool>,
+    agent: Option<bool>,
 ) -> Result<Shown, String> {
     let label = own_label(&webview, &id)?;
     let hidden = hidden.unwrap_or(false);
+    // Absent (an older page) = a user's pane.
+    let agent = agent.unwrap_or(false);
     if !rect.valid() || clip.is_some_and(|c| !c.valid()) {
         return Err("bad view request".into());
     }
@@ -300,11 +334,14 @@ pub(super) fn native_view_show(
             &webview,
             label.clone(),
             parsed,
-            navigate,
             rect,
-            clip,
-            passive.unwrap_or(false),
-            hidden,
+            mac::ShowAs {
+                navigate,
+                hidden,
+                clip,
+                passive: passive.unwrap_or(false),
+                agent,
+            },
         );
         if shown.is_err() {
             // Never made (the owner is going): no record of a view that
@@ -316,7 +353,7 @@ pub(super) fn native_view_show(
     #[cfg(not(target_os = "macos"))]
     {
         lock(&views.views).remove(&label);
-        let _ = (navigate, hidden, clip, passive);
+        let _ = (navigate, hidden, clip, passive, agent);
         Err(UNSUPPORTED.into())
     }
 }
@@ -453,6 +490,29 @@ pub(super) fn native_view_nav(
     }
 }
 
+/// Act on a view for an agent: input, eval, screenshot, rings, the
+/// recorder, the agent cursor (`drive::DriveAction`). Answers the action's
+/// result, or the error as text for the agent to read.
+#[tauri::command]
+pub(super) async fn native_view_drive(
+    app: AppHandle,
+    webview: Webview,
+    id: String,
+    action: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let label = own_label(&webview, &id)?;
+    let action = drive::parse(action)?;
+    #[cfg(target_os = "macos")]
+    {
+        mac::agent_drive(&app, label, action).await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (app, label, action);
+        Err(UNSUPPORTED.into())
+    }
+}
+
 fn close_view(app: &AppHandle, label: &str) {
     if let Some(views) = app.try_state::<NativeViews>() {
         if lock(&views.views).remove(label).is_none() {
@@ -493,8 +553,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        child_label, clip_box, decide, link_lets_out, proxy_base, valid_id, view_path_allowed,
-        Policy, ViewRect,
+        agent_subframe, child_label, clip_box, decide, link_lets_out, proxy_base, valid_id,
+        view_path_allowed, Policy, ViewRect,
     };
 
     fn r(x: f64, y: f64, width: f64, height: f64) -> ViewRect {
@@ -534,6 +594,33 @@ mod tests {
             parts(clip_box(card, Some(r(0.0, 439.5, 800.0, 300.0)))),
             None
         );
+    }
+
+    #[test]
+    fn an_agent_view_frames_only_inline_documents_and_its_daemon() {
+        let url = |s: &str| -> tauri::Url { s.parse().unwrap() };
+        for ok in [
+            "about:srcdoc",
+            "about:blank",
+            "data:text/html,x",
+            "blob:http://127.0.0.1:9/1-2",
+        ] {
+            assert!(agent_subframe(&url(ok), false), "{ok}");
+        }
+        assert!(agent_subframe(&url("http://127.0.0.1:9/proxy/p1/w"), true));
+        assert!(agent_subframe(
+            &url("http://127.0.0.1:9/raw/t-1/f.html"),
+            true
+        ));
+        for bad in [
+            ("https://example.com/", false),
+            ("http://127.0.0.1:9/api/v1/x", true),
+            ("http://127.0.0.1:10/proxy/p1/w", false),
+            ("javascript:alert(1)", false),
+            ("file:///etc/hosts", false),
+        ] {
+            assert!(!agent_subframe(&url(bad.0), bad.1), "{}", bad.0);
+        }
     }
 
     #[test]

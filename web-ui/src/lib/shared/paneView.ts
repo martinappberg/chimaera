@@ -37,6 +37,16 @@
  *   freezing it behind a stand-in) creates a `PaneViewControl` and passes it
  *   in; its calls are no-ops until the view exists.
  *
+ * - **Adoption.** A host can take on a view that already exists in this
+ *   window (`adopt`: an agent's own page, framed off-screen by
+ *   `browser/agentBrowser.ts`, that the agent handed to the user). The
+ *   action uses that id and shows the view once more at the URL it was last
+ *   shown at — the shell navigates only on a changed URL, so the live page
+ *   carries on (no reload), and a show without `agent` hands the view to
+ *   the person. Whatever the host's own `url` is then counts as shown. From
+ *   then on it owns the view like one it made: hidden while parked, closed
+ *   on destroy.
+ *
  * - **Embedded.** An embed card (`embedded`) sits in a scrolling document,
  *   not a pane. Its view is cropped to the part of its clipping ancestors
  *   on screen (the page keeps its place), hidden while its layer is parked
@@ -99,6 +109,15 @@ export interface PaneViewParams {
   onLoading?: (loading: boolean) => void;
   /** The host's handle on this view (see `PaneViewControl`). */
   control?: PaneViewControl;
+  /** Take on this existing view (read once, at mount): `id`, and the URL
+   *  this window last showed it at. */
+  adopt?: { id: string; url: string };
+  /** The shell's id for this view once it exists (and null once it went):
+   *  what the agent browser addresses a shared pane by. */
+  onViewId?: (id: string | null) => void;
+  /** The person acted in the page while input was being injected by an
+   *  agent (the shell's `user_input`). */
+  onUserInput?: () => void;
   /** An embed card in a scrolling document (see "Embedded"). */
   embedded?: boolean;
   /** Embedded: the wheel over the view scrolls the document around it. */
@@ -109,6 +128,45 @@ export interface PaneViewParams {
   /** The view came on screen (`true`) or was hidden: a snapshot is only
    *  worth taking while it is shown. */
   onShown?: (shown: boolean) => void;
+  /** A pane: when a menu, popover or dialog comes over the view (which then
+   *  hides, see "Overlap"), the page as it was, to draw in the placeholder
+   *  instead of a blank; `null` once the view is back (or loads anew). */
+  onCoverStill?: (still: NativeViewSnapshot | null) => void;
+}
+
+/** The longest an overlay waits for the still of the page under it before
+ *  the view hides anyway (blank, as before stills): a menu opening late
+ *  reads worse than a blank pane. */
+export const COVER_STILL_MS = 250;
+
+/** Whether the view's hiding for an overlay should first take a still:
+ *  it is on screen now, it hides for an overlay (not a park, a drag, a
+ *  load), the host draws stills, and none is up already. Pure. */
+export function wantsCoverStill(s: {
+  shownNow: boolean;
+  hiding: boolean;
+  covered: boolean;
+  hostDraws: boolean;
+  stillUp: boolean;
+}): boolean {
+  return s.shownNow && s.hiding && s.covered && s.hostDraws && !s.stillUp;
+}
+
+/** `p`, or null once `ms` passed first. */
+function within<T>(p: Promise<T | null>, ms: number): Promise<T | null> {
+  return Promise.race([p, new Promise<null>((r) => setTimeout(() => r(null), ms))]);
+}
+
+/** One frame (a still set by the host gets painted before the view goes),
+ *  bounded for a hidden window, where rAF does not run. */
+function nextPaint(): Promise<void> {
+  return new Promise((r) => {
+    const t = setTimeout(r, 50);
+    requestAnimationFrame(() => {
+      clearTimeout(t);
+      r();
+    });
+  });
 }
 
 /** The longest a loading view stays hidden waiting for its page. */
@@ -218,7 +276,9 @@ export class PaneViewControl {
 const routes = new Map<string, (ev: NativeViewEvent) => void>();
 let listening = false;
 
-function route(id: string, fn: (ev: NativeViewEvent) => void): () => void {
+/** Receive the `native-view` events of view `id` (the last route set for an
+ *  id wins). Returns the unroute, which removes only its own route. */
+export function routeNativeView(id: string, fn: (ev: NativeViewEvent) => void): () => void {
   routes.set(id, fn);
   if (!listening) {
     listening = true;
@@ -412,9 +472,12 @@ class OverlayWatch {
 
 /** `use:paneView={{ url, shown, … }}` on the placeholder element. */
 export function paneView(node: HTMLElement, initial: PaneViewParams) {
-  const id = `v${(seq += 1)}-${Math.random().toString(36).slice(2, 8)}`;
+  const adopt = initial.adopt ?? null;
+  const id = adopt?.id ?? `v${(seq += 1)}-${Math.random().toString(36).slice(2, 8)}`;
   let params = initial;
-  let created = false;
+  /** An adopted view exists already; it waits to be shown here once. */
+  let created = adopt !== null;
+  let adopting = adopt !== null;
   let failed = false;
   let destroyed = false;
   /** What the shell shows now (`placementKey`; "" = hidden). */
@@ -430,6 +493,9 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
   let awaiting = false;
   /** The URL navigated away from: its late events are not the new page. */
   let leaving: string | null = null;
+  /** Where the page itself last said it is (its own navigation): a host
+   *  that follows it there by setting `url` must not reload it. */
+  let pageUrl: string | null = null;
   let loadTimer: ReturnType<typeof setTimeout> | null = null;
   let reported: boolean | null = null;
   /** The view's own process died for good (the shell stopped reloading):
@@ -438,13 +504,25 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
   /** Embedded: its document is scrolling and the view stands down for the
    *  host's still. */
   let scrolling = false;
+  /** The last `wanted()` hid the view because an overlay covers it. */
+  let covered = false;
+  /** The host is drawing a still for an overlay (`onCoverStill`). */
+  let stillUp = false;
+  /** This cover already tried for a still (a slow or failed snapshot is
+   *  not retried until the view has been back on screen). */
+  let stillTried = false;
+  const dropStill = (): void => {
+    if (!stillUp) return;
+    stillUp = false;
+    params.onCoverStill?.(null);
+  };
   let scrollTimer: ReturnType<typeof setTimeout> | null = null;
   /** Embedded: the ancestors whose overflow crops it, nearest first
    *  (re-collected after a resize: cards don't move between parents). */
   let clippers: Element[] | null = null;
 
   const loadingNow = (): boolean =>
-    !failed && !crashed && params.url !== null && (awaiting || showing !== params.url);
+    !failed && !crashed && params.url !== null && (awaiting || (!adopting && showing !== params.url));
   const report = (): void => {
     const now = loadingNow();
     if (now === reported || destroyed) return;
@@ -496,6 +574,7 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
         // Every view starts on about:blank before the shell points it at
         // its URL: that is not the page.
         if (isBlank(ev.url)) break;
+        pageUrl = ev.url;
         if (crashed) {
           crashed = false;
           landed();
@@ -505,6 +584,9 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
         // A new document starts without the pill: give it back.
         control?.applyChip();
         params.onPage?.({ url: ev.url, title: ev.title });
+        break;
+      case "user_input":
+        params.onUserInput?.();
         break;
       case "crashed":
         crashed = true;
@@ -517,7 +599,7 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
     }
   };
 
-  const unroute = route(id, onEvent);
+  const unroute = routeNativeView(id, onEvent);
   const bound: PaneTransport = {
     live: () => created && !destroyed && !failed,
     snapshot: () => nativeViewSnapshot(id),
@@ -575,6 +657,7 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
 
   /** Where the view should be right now: null = hidden. */
   const wanted = (): Placement | null => {
+    covered = false;
     if (!params.shown || params.url === null || dragging || awaiting || crashed || control?.frozen === true) {
       return null;
     }
@@ -590,7 +673,11 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
     if (rect === null) return null;
     const clip = embedded ? visibleClip() : null;
     const seen = clip === null ? rect : overlap(rect, clip);
-    if (seen === null || overlays.covering(seen)) return null;
+    if (seen === null) return null;
+    if (overlays.covering(seen)) {
+      covered = true;
+      return null;
+    }
     return { rect, clip, passive: embedded && params.passive === true };
   };
 
@@ -604,8 +691,38 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
       do {
         again = false;
         if (destroyed || failed) return;
+        if (adopting && adopt !== null && params.url !== null && params.shown && !dragging) {
+          const at = wanted()?.rect ?? measure();
+          if (at === null) continue;
+          adopting = false;
+          // Its last URL again (no navigation: a reload would lose the very
+          // state that was handed over), without `agent`: the person's now.
+          // Hidden like a create; the next pass places it.
+          const shown = await nativeViewShow(id, adopt.url, at, true, { agent: false });
+          if (destroyed) break;
+          if (shown === null) {
+            failed = true;
+            params.onFallback?.();
+            return;
+          }
+          showing = params.url;
+          placed = "";
+          report();
+          params.onViewId?.(id);
+          control?.applyChip();
+          again = true;
+          continue;
+        }
         const want = wanted();
         const url = params.url;
+        if (created && !awaiting && url !== null && url !== showing && sameUrl(url, pageUrl)) {
+          // The page went there itself (a script's `location.assign`, an
+          // agent driving it): it already shows this URL.
+          showing = url;
+          report();
+          again = true;
+          continue;
+        }
         // A card is made only once it could be shown: one in a parked tab
         // or scrolled past (still "shown" to its observer) loads nothing.
         const ready = params.embedded !== true || want !== null;
@@ -622,7 +739,10 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
           const shown = await nativeViewShow(id, url, at, true, fit);
           // The view exists from here even if this action is gone: the
           // `finally` closes it then.
-          if (shown !== null) created = true;
+          if (shown !== null) {
+            created = true;
+            if (!destroyed) params.onViewId?.(id);
+          }
           if (destroyed) break;
           // A card needs the crop and the wheel hand-back: a shell that
           // ignored them (an older app build) would draw it over the
@@ -641,6 +761,7 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
           }
           showing = url;
           placed = "";
+          dropStill();
           // A new URL loads hidden: the view the host saw is gone for now.
           if (wasShown) params.onShown?.(false);
           report();
@@ -649,16 +770,45 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
           if (!awaiting) again = true;
         } else if (created && placementKey(want) !== placed) {
           const was = placed !== "";
+          if (
+            wantsCoverStill({
+              shownNow: was,
+              hiding: want === null,
+              covered,
+              hostDraws: params.onCoverStill !== undefined,
+              stillUp: stillUp || stillTried,
+            })
+          ) {
+            // The page as it is, while the view is still on screen to be
+            // captured; the host draws it, then the view goes.
+            stillTried = true;
+            const shot = await within(nativeViewSnapshot(id), COVER_STILL_MS);
+            if (destroyed) break;
+            if (shot !== null) {
+              stillUp = true;
+              params.onCoverStill?.(shot);
+              await nextPaint();
+              if (destroyed) break;
+            }
+            // The overlay may have gone meanwhile: decide again.
+            again = true;
+            continue;
+          }
           placed = placementKey(want);
           await (want === null ? nativeViewPlace(id, null) : nativeViewPlace(id, want.rect, fitOf(want)));
           if (was !== (want !== null) && !destroyed) params.onShown?.(want !== null);
+          // Back on screen over its still: the still can go.
+          if (want !== null && !destroyed) {
+            stillTried = false;
+            dropStill();
+          }
         }
       } while (again && !destroyed);
     } finally {
       busy = false;
       // Closed while a call was in flight (a create the shell finished
       // after the close went): close again now.
-      if (destroyed && created) void nativeViewClose(id);
+      if (destroyed && created && !adopting) void nativeViewClose(id);
     }
   }
 
@@ -783,6 +933,7 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
       destroyed = true;
       clearLoadTimer();
       unroute();
+      if (created && !adopting) params.onViewId?.(null);
       control?.unbind(bound);
       if (frame !== 0) cancelAnimationFrame(frame);
       if (safety !== null) clearInterval(safety);
@@ -796,7 +947,9 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
       window.removeEventListener("resize", onResize);
       document.removeEventListener("scroll", onScroll, { capture: true });
       if (scrollTimer !== null) clearTimeout(scrollTimer);
-      if (created && !busy) void nativeViewClose(id);
+      // A hand-over not taken on yet is not this action's to close: the
+      // agent browser still holds it (the next mount adopts it).
+      if (created && !adopting && !busy) void nativeViewClose(id);
     },
   };
 }

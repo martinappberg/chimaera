@@ -113,10 +113,20 @@ pub(crate) fn native_ui_reset() -> Value {
 
 // ---- /ws/events ----------------------------------------------------------
 
-/// The full session roster (PTY rows + chat rows, `session_view`) and the
-/// agent↔terminal links. Re-sent whole on every change; no diffs.
-pub(crate) fn sessions(sessions: Vec<Value>, links: Vec<Value>) -> Value {
-    json!({"type": "sessions", "sessions": sessions, "links": links})
+/// The full session roster (PTY rows + chat rows, `session_view`), the
+/// agent↔terminal links, and (additively) the agent↔browser-tab links
+/// (`links::browser_links_json`). Re-sent whole on every change; no diffs.
+pub(crate) fn sessions(
+    sessions: Vec<Value>,
+    links: Vec<Value>,
+    browser_links: Vec<Value>,
+) -> Value {
+    json!({
+        "type": "sessions",
+        "sessions": sessions,
+        "links": links,
+        "browser_links": browser_links,
+    })
 }
 
 /// The full settings map (settings.json ground truth).
@@ -194,6 +204,28 @@ pub(crate) fn browser_open(
         "port": port,
         "path": path,
     })
+}
+
+/// The agent browser asks ONE window to act on a pane view (CONTRACTS §2):
+/// `op` is `open|drive|nav|close|handover|state`, `view` an agent's own view
+/// id (`null` for a shared pane), `tab` the shared pane's browser tab (`null`
+/// for an own view); `fields` are the op's own keys. The window answers with
+/// a `browser_reply` carrying the same `rid`. The host's keys land last, so
+/// no op field can pose as another.
+pub(crate) fn browser_request(
+    rid: u64,
+    op: &str,
+    view: Option<&str>,
+    tab: Option<&str>,
+    fields: serde_json::Map<String, Value>,
+) -> Value {
+    let mut frame = Value::Object(fields);
+    frame["type"] = json!("browser_request");
+    frame["rid"] = json!(rid);
+    frame["op"] = json!(op);
+    frame["view"] = json!(view);
+    frame["tab"] = json!(tab);
+    frame
 }
 
 /// A plugin screen changed: windows showing it render it again.

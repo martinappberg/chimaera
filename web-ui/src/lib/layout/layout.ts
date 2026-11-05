@@ -179,6 +179,14 @@ export interface BrowserTab {
    * attribution must stay true. Optional and additive in the saved layout.
    */
   openedBy?: string;
+  /**
+   * Transient, never persisted: the id of a live pane view this tab takes
+   * on when its view mounts (an agent's own page handed to the user, #273),
+   * so the page carries on in place instead of loading again. Read once by
+   * the tab's view; left in place after (a later mount finds the adoption
+   * done and makes its own view).
+   */
+  adopt?: string;
 }
 export type Tab =
   | TerminalTab

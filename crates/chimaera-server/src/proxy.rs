@@ -418,18 +418,49 @@ pub(crate) async fn create_proxy(
         }
     };
 
+    let id = mint_entry(&state, &host, req.port, class);
+    tracing::info!(%id, %host, port = req.port, "proxy session minted");
+    Json(json!({"id": id, "host": host, "port": req.port, "url": format!("/proxy/{id}/")}))
+        .into_response()
+}
+
+/// Mint (or refresh) the entry for an allowlisted target, without the HTTP
+/// route's `confirm` path: the agent browser's app engine loads its pages
+/// through `/proxy/{id}{path}` exactly like a pane. `Err` is the same
+/// refusal [`check_target`] gives.
+pub(crate) async fn mint(state: &AppState, host: &str, port: u16) -> Result<String, Refusal> {
+    let host = normalize_host(host);
+    let class = check_target(state, &host, port).await?;
+    let id = mint_entry(state, &host, port, class);
+    tracing::info!(%id, %host, port, "proxy session minted for the agent browser");
+    Ok(id)
+}
+
+/// The target a live proxy id is pinned to (the agent browser reports page
+/// URLs in the agent's terms, `http://host:port/path`, not `/proxy/{id}`).
+pub(crate) fn target_of(state: &AppState, id: &str) -> Option<(String, u16)> {
+    crate::lock(&state.proxies)
+        .entries
+        .get(id)
+        .map(|e| (e.host.clone(), e.port))
+}
+
+/// Insert or refresh the entry for `host:port` (already classified) and
+/// return its id. Relay children evicted on the way are killed outside the
+/// store lock.
+fn mint_entry(state: &AppState, host: &str, port: u16, class: HostClass) -> String {
     let (id, evicted) = {
         let mut store = crate::lock(&state.proxies);
         let mut evicted = store.purge();
         if let Some((id, entry)) = store
             .entries
             .iter_mut()
-            .find(|(_, e)| e.host == host && e.port == req.port)
+            .find(|(_, e)| e.host == host && e.port == port)
         {
             entry.last_used = Instant::now();
             // A re-mint is a fresh classification: refresh the stored class and
-            // reset the revalidation clock (the confirm gate above already
-            // re-ran classify_host). A CHANGED class invalidates the proven
+            // reset the revalidation clock (the caller's gate already re-ran
+            // classify_host). A CHANGED class invalidates the proven
             // route — most importantly, a compute node whose allocation ended
             // and is now a confirmed Other must not keep its ssh relay: drop
             // the route and kill the orphaned child (outside the lock, below).
@@ -463,8 +494,8 @@ pub(crate) async fn create_proxy(
             store.entries.insert(
                 id.clone(),
                 ProxyEntry {
-                    host: host.clone(),
-                    port: req.port,
+                    host: host.to_string(),
+                    port,
                     last_used: Instant::now(),
                     class,
                     revalidated_at: Instant::now(),
@@ -479,9 +510,7 @@ pub(crate) async fn create_proxy(
     for child in evicted {
         kill_relay(child);
     }
-    tracing::info!(%id, %host, port = req.port, "proxy session minted");
-    Json(json!({"id": id, "host": host, "port": req.port, "url": format!("/proxy/{id}/")}))
-        .into_response()
+    id
 }
 
 /// GET /api/v1/proxy — the live sessions (debugging / UI reconciliation).

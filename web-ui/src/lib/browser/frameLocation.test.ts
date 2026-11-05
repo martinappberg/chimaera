@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { inAppPath, onRootForm, pageAddress } from "./frameLocation";
+import { inAppPath, onRootForm, pageAddress, proxySessionOf } from "./frameLocation";
 
 const at = (href: string) => new URL(href, "http://127.0.0.1:7777");
 const base = "/proxy/abc";
@@ -36,5 +36,17 @@ describe("pageAddress", () => {
   });
   it("brackets an IPv6 host and roots a bare path", () => {
     expect(pageAddress("::1", 8000, "docs")).toBe("http://[::1]:8000/docs");
+  });
+});
+
+describe("proxySessionOf", () => {
+  const at = (href: string) => new URL(href, "http://127.0.0.1:7000");
+  it("reads the session id and the app's own path", () => {
+    expect(proxySessionOf(at("/proxy/p-2/lab/tree?x=1#h"))).toEqual({ id: "p-2", path: "/lab/tree?x=1#h" });
+    expect(proxySessionOf(at("/proxy/p-2"))).toEqual({ id: "p-2", path: "/" });
+  });
+  it("is null off the proxy", () => {
+    expect(proxySessionOf(at("/raw/t/a.html"))).toBeNull();
+    expect(proxySessionOf(at("/lab"))).toBeNull();
   });
 });

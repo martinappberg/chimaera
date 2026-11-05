@@ -42,6 +42,8 @@
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
   import { browserTitles, targetLabel } from "../browser/proxy";
+  import { agentBrowser, browserLinks } from "../browser/agentBrowserRuntime";
+  import { paneViewsPossible } from "../shared/paneView";
   import ExtensionsGlyph from "../plugins/ExtensionsGlyph.svelte";
   import { workspacePlugins } from "../plugins/store";
   import { pluginViewTitle } from "../plugins/platform";
@@ -57,6 +59,8 @@
     /** terminal session id -> agent session id (the linked-terminal edges). */
     links: Map<string, string>;
     linkCtrl: LinkCtrl;
+    /** The window's workspace (a browser tab shares with its agents). */
+    wsId?: string | null;
     dropSpot: DropSpot | null;
     ctrl: LayoutCtrl;
     /** Bound by Pane so the dnd hit-tester can target this bar. */
@@ -72,6 +76,7 @@
     fileNames,
     links,
     linkCtrl,
+    wsId = null,
     dropSpot,
     ctrl,
     el = $bindable(null),
@@ -94,6 +99,49 @@
     }
     return out;
   });
+
+  /** The pane's active tab, when it is a browser on a target. */
+  const activeBrowser = $derived.by(() => {
+    const t = node.tabs[node.active];
+    return t !== undefined && t.surface === "browser" && t.host !== "" ? t : null;
+  });
+
+  /** The agent a shown browser pane is shared with (its own chrome says
+   *  so; this marks the menu row). */
+  const browserAgentId = $derived(
+    activeBrowser !== null ? ($browserLinks.get(activeBrowser.id) ?? null) : null,
+  );
+
+  /** Chips on an AGENT pane: the browser panes in this window shared with
+   *  it (one held elsewhere has nothing here to reveal). */
+  const linkedBrowsers = $derived.by(() => {
+    if (activeSession === null || activeSession.kind !== "agent") return [];
+    const out: { tab: string; label: string }[] = [];
+    for (const [tab, agent] of $browserLinks) {
+      if (agent !== activeSession.id) continue;
+      const fallback = linkCtrl.browserLabel(tab);
+      if (fallback === null) continue;
+      out.push({ tab, label: $browserTitles.get(tab) ?? fallback });
+    }
+    return out;
+  });
+
+  const browserDrive = agentBrowser.driveState;
+
+  /** Chip dot modifier for a shared browser pane: what is its agent doing? */
+  function browserChipState(tab: string): string {
+    const d = $browserDrive.get(tab);
+    if (d?.paused === true) return "queued";
+    if (d?.driving === true) return "exec";
+    return "ready";
+  }
+
+  function browserChipTitle(tab: string): string {
+    const d = $browserDrive.get(tab);
+    const doing =
+      d?.paused === true ? "paused, you took over" : d?.driving === true ? "the agent is driving it" : "shared";
+    return `browser pane · ${doing} — click to show`;
+  }
 
   /** Back-reference on a TERMINAL pane: the agent holding its leash. */
   const linkedAgentId = $derived(
@@ -152,21 +200,29 @@
 
   let linkMenuOpen = $state(false);
 
-  /** Live agents in this terminal's workspace, offered by the link menu. */
+  /** Live agents in this terminal's workspace — or, for a browser pane
+   *  (the app only: an agent drives a page through its pane view), in the
+   *  window's — offered by the link menu. */
   const agentChoices = $derived.by(() => {
-    if (activeSession === null || activeSession.kind !== "shell") return [];
+    let workspace: string | null;
+    if (activeSession !== null && activeSession.kind === "shell") workspace = activeSession.workspace_id;
+    else if (activeBrowser !== null && paneViewsPossible()) workspace = wsId;
+    else return [];
     return [...sessions.values()].filter(
-      (s) =>
-        s.kind === "agent" && s.alive && s.workspace_id === activeSession.workspace_id,
+      (s) => s.kind === "agent" && s.alive && s.workspace_id === workspace,
     );
   });
 
+  /** The agent the link menu marks as holding this pane. */
+  const menuLinkedId = $derived(activeBrowser !== null ? browserAgentId : linkedAgentId);
+
   function chooseAgent(agentId: string): void {
-    if (activeSession === null) return;
-    if (linkedAgentId === agentId) {
-      linkCtrl.unlink(activeSession.id);
-    } else {
-      linkCtrl.link(activeSession.id, agentId);
+    if (activeBrowser !== null) {
+      if (browserAgentId === agentId) linkCtrl.unlinkBrowser(activeBrowser.id);
+      else linkCtrl.linkBrowser(activeBrowser.id, agentId);
+    } else if (activeSession !== null) {
+      if (linkedAgentId === agentId) linkCtrl.unlink(activeSession.id);
+      else linkCtrl.link(activeSession.id, agentId);
     }
     linkMenuOpen = false;
   }
@@ -940,9 +996,9 @@
   <!-- Linked-terminal chips: on an agent pane, the complete map of the
        terminals it holds; on a linked terminal, the way back to its agent.
        Always visible (the bond is state, not chrome), hue = the agent's. -->
-  {#if linkedTerminals.length > 0 && activeSession !== null}
+  {#if (linkedTerminals.length > 0 || linkedBrowsers.length > 0) && activeSession !== null}
     {@const hue = agentHue(activeSession.id)}
-    <div class="links" role="group" aria-label="linked terminals">
+    <div class="links" role="group" aria-label="linked terminals and browser panes">
       {#each linkedTerminals as tid (tid)}
         <span class="chip" style:--hue={hue}>
           <button class="chip-main" title={chipTitle(tid)} onclick={() => linkCtrl.reveal(tid, node.id)}>
@@ -950,6 +1006,19 @@
             <span class="chip-name">{sessionLabel(tid)}</span>
           </button>
           <button class="chip-x" title="unlink" aria-label="unlink {sessionLabel(tid)}" onclick={() => linkCtrl.unlink(tid)}>&times;</button>
+        </span>
+      {/each}
+      {#each linkedBrowsers as b (b.tab)}
+        <span class="chip" style:--hue={hue}>
+          <button class="chip-main" title={browserChipTitle(b.tab)} onclick={() => linkCtrl.revealBrowser(b.tab)}>
+            <span class="chip-dot {browserChipState(b.tab)}"></span>
+            <svg class="chip-globe" viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
+              <circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.3" />
+              <path d="M2 8h12M8 2c1.8 1.7 2.6 3.7 2.6 6S9.8 12.3 8 14M8 2C6.2 3.7 5.4 5.7 5.4 8s.8 4.3 2.6 6" fill="none" stroke="currentColor" stroke-width="1.1" />
+            </svg>
+            <span class="chip-name">{b.label}</span>
+          </button>
+          <button class="chip-x" title="stop sharing" aria-label="stop sharing {b.label}" onclick={() => linkCtrl.unlinkBrowser(b.tab)}>&times;</button>
         </span>
       {/each}
     </div>
@@ -1110,15 +1179,18 @@
         <button
           class="ctl"
           class:on={linkMenuOpen}
-          title={linkedAgentId !== null
+          title={menuLinkedId !== null
             ? "linked — drag onto an agent to move · click to choose"
-            : "drag onto an agent to link · click to choose"}
+            : activeBrowser !== null
+              ? "drag onto an agent to let it use this page · click to choose"
+              : "drag onto an agent to link · click to choose"}
           aria-label="link to agent"
           aria-haspopup="menu"
           aria-expanded={linkMenuOpen}
           onpointerdown={(e) => {
-            if (activeTerminal !== null) {
-              ctrl.dragSurface(e, activeTerminal, () => (linkMenuOpen = !linkMenuOpen));
+            const subject = activeTerminal ?? activeBrowser;
+            if (subject !== null) {
+              ctrl.dragSurface(e, subject, () => (linkMenuOpen = !linkMenuOpen));
             }
           }}
           onkeydown={(e) => {
@@ -1182,7 +1254,7 @@
           <button class="overlay-row link-menu-item" role="menuitem" onclick={() => chooseAgent(a.id)}>
             <span class="chip-dot menu-dot" style:--hue={agentHue(a.id)}></span>
             <span class="link-menu-name">{sessionLabel(a.id)}</span>
-            {#if linkedAgentId === a.id}
+            {#if menuLinkedId === a.id}
               <span class="link-menu-state">linked · click to unlink</span>
             {/if}
           </button>
@@ -1614,9 +1686,15 @@
     white-space: nowrap;
   }
 
-  .chip-spark {
+  .chip-spark,
+  .chip-globe {
     flex: none;
     color: hsl(var(--hue) 55% 55%);
+  }
+
+  /* The globe sits close to its dot: one mark, two facts (state, kind). */
+  .chip-globe {
+    margin-left: -2px;
   }
 
   .chip-dot {

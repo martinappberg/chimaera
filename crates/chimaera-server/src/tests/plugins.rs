@@ -741,6 +741,16 @@ async fn worker_settings_pre_allow_only_active_plugin_tools() {
             "mcp__chimaera__check_document",
             "mcp__chimaera__open_browser",
             "mcp__chimaera__update_plan",
+            "mcp__chimaera__browser_snapshot",
+            "mcp__chimaera__browser_screenshot",
+            "mcp__chimaera__browser_inspect",
+            "mcp__chimaera__browser_source",
+            "mcp__chimaera__browser_console",
+            "mcp__chimaera__browser_network",
+            "mcp__chimaera__browser_wait",
+            "mcp__chimaera__browser_show",
+            "mcp__chimaera__browser_close",
+            "mcp__chimaera__browser_pages",
             "mcp__chimaera__knowledge_search",
             "mcp__chimaera__knowledge_get"
         ])

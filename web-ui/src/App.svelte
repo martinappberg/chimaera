@@ -73,8 +73,11 @@
   import { EventsSocket } from "./lib/net/events";
   import {
     agentHue,
+    deleteBrowserLink,
     deleteLink,
+    listBrowserLinks,
     listLinks,
+    putBrowserLink,
     putLink,
     termReference,
     type Link,
@@ -151,6 +154,8 @@
     openBrowser,
     openTab,
     freshBrowserTab,
+    findBrowser,
+    panes,
     setBrowserPath,
     setBrowserTarget,
     openDashboard,
@@ -303,10 +308,23 @@
   } from "./lib/net/native";
   import { clearBrowserNotices, deliverBrowserNotices } from "./lib/workspace/notices";
   import {
-    placeAgentBrowser,
+    agentOpenShare,
+    placeAgentBrowserTab,
+    placeHandover,
     shouldActOnAgentBrowserOpen,
     type AgentBrowserOpen,
   } from "./lib/browser/agentOpen";
+  import {
+    agentBrowser,
+    attachAgentBrowser,
+    browserLinks,
+    setBrowserLinkLocally,
+    setBrowserLinks,
+  } from "./lib/browser/agentBrowserRuntime";
+  import { sharedTabsLeft, type Handover } from "./lib/browser/agentBrowser";
+  import type { BrowserLink } from "./lib/net/browserWire";
+  import { targetLabel } from "./lib/browser/proxy";
+  import { paneViewsPossible } from "./lib/shared/paneView";
   import UpdateToast from "./lib/workspace/UpdateToast.svelte";
   import {
     applyAppStatus,
@@ -610,8 +628,9 @@
     tabLabel: (tab) => tabLabel(tab),
     sessionAlive: (id) => sessionsById.get(id)?.alive ?? false,
     paneSessionId: (paneId) => osDropSession(paneId)?.id ?? null,
-    linkTargetsFor: (tab) => linkTargetsFor(tab),
-    linkSessionsFor: (tab) => linkSessionsFor(tab),
+    linkTargetsFor: (tab, linkIntent) => linkTargetsFor(tab, linkIntent),
+    linkSessionsFor: (tab, linkIntent) => linkSessionsFor(tab, linkIntent),
+    linkBrowser: (tabId, agentId) => linkBrowserTo(tabId, agentId),
     referenceFileDrop: (paneId, path, kind) => referenceFileDrop(paneId, path, kind),
     referenceCommitDrop: (paneId, tab) => referenceCommitDrop(paneId, tab),
     linkByDrop: (terminalId, agentPaneId) => linkByDrop(terminalId, agentPaneId),
@@ -1134,10 +1153,55 @@
   // The 5s sessions + links poll, only while /ws/events is down.
   conn.pollWhileEventsDown({
     sessions: pollSessions,
-    listLinks,
+    // Browser links ride along; a daemon without them leaves the mirror as is.
+    listLinks: () => Promise.all([listLinks(), listBrowserLinks().catch(() => null)]),
     applySessions,
-    setLinks: (l: Link[]) => (links = l),
+    setLinks: ([l, b]: [Link[], BrowserLink[] | null]) => {
+      links = l;
+      if (b !== null) setBrowserLinks(b);
+    },
   });
+
+  // A shared browser tab that leaves this window's layout — closed, its pane
+  // closed, dragged to another window — stops being shared: the daemon
+  // otherwise keeps the link until its agent ends. Neither a reload (the
+  // tab comes back with the layout, its new view registers, the hello lists
+  // it again) nor a workspace switch (`layoutReady` drops across it) is a
+  // close.
+  let heldShared = new Set<string>();
+  let heldWs: string | null = null;
+  $effect(() => {
+    const linked = $browserLinks;
+    const ws = activeWsId;
+    const ready = layoutReady;
+    const present = new Set<string>();
+    for (const p of panes(layout.root)) {
+      for (const t of p.tabs) if (t.surface === "browser") present.add(t.id);
+    }
+    untrack(() => {
+      if (ready && ws === heldWs) {
+        for (const tab of sharedTabsLeft(heldShared, present, linked)) unshareClosed(tab);
+      }
+      // A hand-over whose tab went before its view took the page on: the
+      // page has no owner left.
+      if (ready) {
+        agentBrowser.registry.keepDescribed(present);
+        for (const [tab, view] of agentBrowser.registry.pendingAdoptions()) {
+          if (!present.has(tab)) agentBrowser.abandonAdoption(tab, view);
+        }
+      }
+      heldWs = ws;
+      heldShared = ready ? new Set([...present].filter((t) => linked.has(t))) : new Set();
+    });
+  });
+
+  /** The tab went: no flash on failure (nothing on screen to explain it). */
+  function unshareClosed(tab: string): void {
+    setBrowserLinkLocally(tab, null);
+    deleteBrowserLink(tab).catch(() => {
+      // the daemon prunes it with its agent; the next frame says what holds
+    });
+  }
 
   // Persist the layout (debounced in viewState) whenever it changes, keyed
   // by (window, workspace) so each workspace keeps its own tree.
@@ -1226,9 +1290,10 @@
     window.addEventListener("dragleave", onWindowDragLeave);
     window.addEventListener("drop", onWindowDrop);
     const events = new EventsSocket({
-      onSessions: (list, linkList) => {
+      onSessions: (list, linkList, browserLinkList) => {
         applySessions(list);
         if (linkList !== undefined) links = linkList;
+        if (browserLinkList !== undefined) setBrowserLinks(browserLinkList);
       },
       onSettings: applyRemoteSettings,
       onGit: onGitNudge,
@@ -1261,14 +1326,20 @@
         });
       },
       onBrowserOpen: onAgentBrowserOpen,
+      onBrowserRequest: (req) => void agentBrowser.handle(req),
       // RTT reset + comms refetch on recovery, then eventsUp, then the
-      // dead-link save retry (net/connection.svelte.ts).
-      onStatus: (up) => conn.noteEventsStatus(up),
+      // dead-link save retry (net/connection.svelte.ts). A drop also ends
+      // every agent page this window served (the daemon failed them).
+      onStatus: (up) => {
+        if (!up) agentBrowser.socketDown();
+        conn.noteEventsStatus(up);
+      },
       onFatal: (message) => {
         if (message === "unauthorized") notifyUnauthorized();
       },
     });
     eventsSocket = events;
+    const detachAgentBrowser = attachAgentBrowser(events, agentBrowserHandover);
     // Register this window's workspace so the daemon's git backstop polls it.
     events.watch(activeWsId);
     const diskWatches = currentDiskWatches();
@@ -1368,6 +1439,7 @@
       setSameFileOpener(null);
       recentsRail.dispose();
       setChatLinkContext(null);
+      detachAgentBrowser();
       events.close();
       pool.disposePool();
       chatPool.disposeAllChats();
@@ -1763,7 +1835,35 @@
       visible: document.visibilityState === "visible",
     };
     if (!shouldActOnAgentBrowserOpen(open, view)) return;
-    layout = placeAgentBrowser(layout, open);
+    const placed = placeAgentBrowserTab(layout, open);
+    layout = placed.layout;
+    // Shared with the opener, like a chain-link share (and moved to the
+    // latest opener on a re-point): its browser tools drive this pane.
+    const share = agentOpenShare(placed.tabId, open, paneViewsPossible());
+    if (share !== null && get(browserLinks).get(share.tab) !== share.agent) {
+      linkBrowserTo(share.tab, share.agent);
+    }
+  }
+
+  /**
+   * The agent browser's hand-over (`browser_show`): the agent's own page,
+   * live in this window off-screen, opens as a tab that adopts its view —
+   * placed like an agent-opened pane, focus untouched — and is shared with
+   * that agent (the daemon links it; mirrored here at once). Throws, with
+   * the reason the agent reads, when there is no layout to place it in.
+   */
+  function agentBrowserHandover(h: Handover): string {
+    if (!layoutReady) throw new Error("this window is still restoring its layout");
+    const placed = placeHandover(layout, {
+      sessionId: h.agent,
+      host: h.host,
+      port: h.port,
+      path: h.path,
+      view: h.view,
+    });
+    layout = placed.layout;
+    setBrowserLinkLocally(placed.tabId, h.agent);
+    return placed.tabId;
   }
 
   /** The Mod2+B chord / a manual open: a blank browser pane (address entry). */
@@ -3779,9 +3879,14 @@
    * `tab`: panes showing a live agent session, when the payload is a shell
    * terminal (files and agents themselves never link).
    */
-  function linkTargetsFor(tab: Tab): ReadonlyMap<string, string> | undefined {
-    if (tab.surface !== "terminal") return undefined;
-    if (sessionsById.get(tab.sessionId)?.kind !== "shell") return undefined;
+  function linkTargetsFor(tab: Tab, linkIntent: boolean): ReadonlyMap<string, string> | undefined {
+    // A browser tab links only from its chain (a link-intent drag): a plain
+    // tab move keeps the bands for the payloads that type a reference.
+    const linkable =
+      tab.surface === "terminal"
+        ? sessionsById.get(tab.sessionId)?.kind === "shell"
+        : tab.surface === "browser" && linkIntent;
+    if (!linkable) return undefined;
     const targets = new Map<string, string>();
     const walk = (n: typeof layout.root): void => {
       if (n.type === "pane") {
@@ -3804,13 +3909,21 @@
    * targets while dragging that shell terminal (the always-present target —
    * the agent needn't be open in a pane). Undefined for non-shell payloads.
    */
-  function linkSessionsFor(tab: Tab): ReadonlySet<string> | undefined {
-    if (tab.surface !== "terminal") return undefined;
-    const term = sessionsById.get(tab.sessionId);
-    if (term === undefined || term.kind !== "shell") return undefined;
+  function linkSessionsFor(tab: Tab, linkIntent: boolean): ReadonlySet<string> | undefined {
+    let workspaceId: string | null;
+    if (tab.surface === "terminal") {
+      const term = sessionsById.get(tab.sessionId);
+      if (term === undefined || term.kind !== "shell") return undefined;
+      workspaceId = term.workspace_id;
+    } else if (tab.surface === "browser" && linkIntent) {
+      // A browser tab belongs to the window's workspace.
+      workspaceId = activeWsId;
+    } else {
+      return undefined;
+    }
     const out = new Set<string>();
     for (const s of sessions) {
-      if (s.kind === "agent" && s.alive && s.workspace_id === term.workspace_id) out.add(s.id);
+      if (s.kind === "agent" && s.alive && s.workspace_id === workspaceId) out.add(s.id);
     }
     return out.size > 0 ? out : undefined;
   }
@@ -3913,6 +4026,21 @@
     pool.focusTerminal(agentId);
   }
 
+  // --- shared browser panes (the agent browser) --------------------------------
+
+  /** Share browser tab `tabId` with an agent: optimistic, the next sessions
+   *  frame is authoritative (and a failure reverts with a flash). */
+  function linkBrowserTo(tabId: string, agentId: string): void {
+    const agent = sessionsById.get(agentId);
+    if (agent === undefined || agent.kind !== "agent" || !agent.alive) return;
+    const before = get(browserLinks).get(tabId) ?? null;
+    setBrowserLinkLocally(tabId, agentId);
+    putBrowserLink(tabId, agentId).catch((err) => {
+      setBrowserLinkLocally(tabId, before);
+      showFlash(`Could not share the page: ${err instanceof Error ? err.message : "request failed"}`);
+    });
+  }
+
   /** Link mutations + reveal for the pane top bars (chips and the menu). */
   const linkCtrl: LinkCtrl = {
     reveal(sessionId, besidePaneId) {
@@ -3935,6 +4063,27 @@
         showFlash(`Could not unlink terminal: ${err instanceof Error ? err.message : "request failed"}`);
         links = await listLinks().catch(() => links);
       });
+    },
+    linkBrowser(tabId, agentId) {
+      linkBrowserTo(tabId, agentId);
+    },
+    unlinkBrowser(tabId) {
+      const before = get(browserLinks).get(tabId) ?? null;
+      setBrowserLinkLocally(tabId, null);
+      deleteBrowserLink(tabId).catch((err) => {
+        setBrowserLinkLocally(tabId, before);
+        showFlash(`Could not stop sharing the page: ${err instanceof Error ? err.message : "request failed"}`);
+      });
+    },
+    revealBrowser(tabId) {
+      const loc = findBrowser(layout, tabId);
+      if (loc === null) return;
+      layout = activateTab(focusPane(layout, loc.paneId), loc.paneId, loc.index);
+    },
+    browserLabel(tabId) {
+      const loc = findBrowser(layout, tabId);
+      if (loc === null) return null;
+      return loc.tab.host === "" ? "Browser" : targetLabel(loc.tab.host, loc.tab.port);
     },
   };
 

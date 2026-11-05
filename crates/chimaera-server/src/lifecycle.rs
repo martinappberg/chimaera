@@ -205,6 +205,9 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     // Idle sweep for browser-pane proxy sessions (kills their relay children).
     tokio::spawn(proxy::sweeper(state.clone()));
 
+    // The agent browser's housekeeping: idle pages, pane markers, Chromium.
+    tokio::spawn(crate::agent_browser::reaper(state.clone()));
+
     // The notice feed's edge detector (agent finished / needs you).
     tokio::spawn(crate::notices::run(state.clone()));
 
@@ -235,6 +238,9 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     // A relay child (`ssh -N -L`) outlives its parent unless killed — never
     // strand one on a login node.
     proxy::shutdown_relays(&state);
+    // Same for a headless Chromium the agent browser launched (its whole
+    // process group).
+    state.browsers.chromium.shutdown();
 
     // Dead-but-visible chats (a ProtocolError entry the ChatManager keeps in
     // the registry with alive=false) are excluded from the snapshot above, so

@@ -16,8 +16,15 @@
    * instead of same-origin reads, history goes through the shell, and a
    * text selection in it can be referenced in an agent. The iframe stays the
    * browser's path and the fallback for an app build without pane views.
+   *
+   * The agent browser (#273): a pane shared with an agent (the chain link)
+   * registers its view so the agent's browser tools can address it by tab,
+   * shows who holds it at the trailing end of the bar ("driving" while the
+   * agent acts, "Paused · Resume" after the person took over), and reports
+   * the person's own input in the page as a take-over. A hand-over tab
+   * (`adopt`) takes on the agent's live page instead of loading it again.
    */
-  import { onDestroy, untrack } from "svelte";
+  import { onDestroy, onMount, untrack } from "svelte";
   import { get } from "svelte/store";
   import Spinner from "../previews/Spinner.svelte";
   import { pageVisible } from "../shared/visibility";
@@ -26,6 +33,8 @@
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import { agentHue } from "../workspace/agentLinks";
   import type { BrowserOpener } from "./agentOpen";
+  import { agentBrowser } from "./agentBrowserRuntime";
+  import { describePage } from "./agentBrowser";
   import { PaneViewControl, paneView, paneViewsPossible } from "../shared/paneView";
   import { referencePill } from "../shared/paneViewBridge";
   import {
@@ -37,14 +46,16 @@
     type FileSelection,
   } from "../shared/reference";
   import { PINNED } from "../shared/keys";
-  import { inAppPath, onRootForm, pageAddress } from "./frameLocation";
+  import { inAppPath, onRootForm, pageAddress, proxySessionOf } from "./frameLocation";
   import {
     ConfirmRequired,
     isLoopbackHost,
     mintProxy,
     parseAddress,
+    browserTitles,
     probeNodes,
     proxyHealth,
+    proxyTarget,
     setBrowserTitle,
     targetLabel,
   } from "./proxy";
@@ -71,6 +82,13 @@
     opener?: BrowserOpener | null;
     /** Show the opening agent's session (its tab, revealed beside). */
     onRevealOpener?: () => void;
+    /** A hand-over: the live pane view this tab takes on (no reload). */
+    adopt?: string;
+    /** The agent this pane is shared with (the chain link), as the roster
+     *  knows it now; null when not shared. */
+    sharedWith?: BrowserOpener | null;
+    /** Show the agent it is shared with. */
+    onRevealShared?: () => void;
   }
 
   let {
@@ -84,6 +102,9 @@
     onFocusRequest,
     opener = null,
     onRevealOpener,
+    adopt,
+    sharedWith = null,
+    onRevealShared,
   }: Props = $props();
 
   type Phase =
@@ -115,9 +136,65 @@
   let viewLoading = $state(true);
   /** The native view's page process died for good (until a reload). */
   let viewCrashed = $state(false);
+  /** The page as it was when a menu or popover came over the view (the
+   *  view hides under overlays): drawn in its place instead of a blank. */
+  let coverStill = $state<{ src: string; width: number; height: number } | null>(null);
   const control = new PaneViewControl();
   /** The native view's page sits on a root-form (rescued) path. */
   let viewRootForm = false;
+
+  // --- the agent browser ------------------------------------------------------
+
+  /** The hand-over view this mount may still adopt (with the URL it was
+   *  last shown at): read once, so a later view of this tab (a new target,
+   *  a remount) makes its own. Gone already (the page closed, another
+   *  window): this tab just loads its target. */
+  let adoptable = $state<{ id: string; url: string } | undefined>(
+    untrack(() => (adopt !== undefined ? (agentBrowser.adoption(adopt) ?? undefined) : undefined)),
+  );
+  /** The id of this tab's live pane view, as registered. */
+  let viewId: string | null = null;
+
+  function onViewId(id: string | null): void {
+    if (id === null) {
+      if (viewId !== null) agentBrowser.registry.unregister(tabId, viewId);
+      viewId = null;
+      return;
+    }
+    viewId = id;
+    if (id === adoptable?.id) {
+      adoptable = undefined;
+      // The tab's `adopt` stays as it is: changing the layout here, mid
+      // hand-over, must not disturb the view that just took the page on. A
+      // later mount finds the adoption done and makes its own view.
+      agentBrowser.adopted(tabId, id);
+    } else {
+      agentBrowser.registry.register(tabId, id);
+    }
+  }
+
+  // A hand-over whose page is already gone (or already adopted by an
+  // earlier mount): nothing to adopt, so this view loads its target.
+  onMount(() => {
+    if (adopt !== undefined && adoptable === undefined) agentBrowser.registry.dropAdoption(tabId);
+  });
+
+  // What this pane shows, for agents reading the window's panes (the
+  // hello's `pages`): re-said whenever its title or target changes.
+  $effect(() => {
+    const title = $browserTitles.get(tabId) ?? null;
+    if (host === "") return;
+    agentBrowser.registry.describe(tabId, describePage(host, port, livePath ?? path, title));
+  });
+
+  const driveState = agentBrowser.driveState;
+  const drive = $derived(sharedWith !== null ? $driveState.get(tabId) : undefined);
+  const driving = $derived(drive?.driving === true && !drive.paused);
+  const paused = $derived(drive?.paused === true);
+
+  function resume(): void {
+    agentBrowser.resume(tabId);
+  }
 
   // --- the compute-node hunt --------------------------------------------------
   //
@@ -224,11 +301,63 @@
     }
   }
 
+  // --- following the page to another target -----------------------------------
+  //
+  // An agent driving a shared pane navigates it with `location.assign` to
+  // `/proxy/{id}…` — possibly another app (another session id). The pane
+  // follows: the tab is re-pointed at that target so its title, address and
+  // saved layout stay true, while the live view stays (no reload).
+
+  /** A re-point this view asked for itself: the target effect takes the
+   *  page as it is instead of starting over. */
+  let following: { host: string; port: number; id: string; path: string; title: string } | null = null;
+  let followSeq = 0;
+
+  function followPage(u: URL, title: string): void {
+    // A load this pane started is still settling: a late report from the
+    // page it left is not a navigation.
+    if (viewLoading) return;
+    const session = proxySessionOf(u);
+    if (session === null || session.id === proxyId) return;
+    const mine = ++followSeq;
+    void proxyTarget(session.id).then((target) => {
+      if (mine !== followSeq || target === null || base === null) return;
+      if (target.host === host && target.port === port) {
+        // The same app on a fresh session: just its id changes.
+        proxyId = session.id;
+        base = `/proxy/${session.id}`;
+        notePage(session.path, title);
+        return;
+      }
+      following = { ...target, id: session.id, path: session.path, title };
+      onRetarget(target.host, target.port, session.path, true);
+    });
+  }
+
   // (Re)connect whenever the target identity changes.
   $effect(() => {
     void host;
     void port;
     untrack(() => {
+      const f = following;
+      following = null;
+      followSeq += 1;
+      if (f !== null && f.host === host && f.port === port && phase.kind === "ready") {
+        proxyId = f.id;
+        base = `/proxy/${f.id}`;
+        livePath = f.path;
+        draft = null;
+        nodeHits = [];
+        degraded = false;
+        pageSel = null;
+        unpublish();
+        // The view is already there: `paneView` sees the page's own URL and
+        // only takes note of it.
+        iframeSrc = `${base}${f.path}`;
+        const t = f.title.trim();
+        setBrowserTitle(tabId, t.length > 0 ? t : null);
+        return;
+      }
       livePath = null;
       draft = null;
       confirmed = false;
@@ -372,7 +501,10 @@
     }
     if (u.origin !== location.origin) return;
     const inApp = inAppPath(u, b);
-    if (inApp === null) return;
+    if (inApp === null) {
+      followPage(u, page.title);
+      return;
+    }
     viewRootForm = onRootForm(u, b);
     notePage(inApp, page.title);
   }
@@ -427,6 +559,9 @@
   });
 
   onDestroy(() => {
+    // A hand-over not taken on yet stays the channel's: a remount (a zoom,
+    // a pane move) adopts it next; App closes it once the tab is gone.
+    if (viewId !== null) agentBrowser.registry.unregister(tabId, viewId);
     titleObserver?.disconnect();
     setBrowserTitle(tabId, null);
     unpublish();
@@ -645,10 +780,57 @@
         <path d="M6.5 3H3.8A1.3 1.3 0 0 0 2.5 4.3v7.9a1.3 1.3 0 0 0 1.3 1.3h7.9a1.3 1.3 0 0 0 1.3-1.3V9.5M9.5 2.5H13.5V6.5M13.2 2.8 7.5 8.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
       </svg>
     </button>
-    <!-- Who put this page here: the agent's mark + its live name, trailing
-         the bar so nothing the user aims at moves when it appears. A
-         mousedown never takes focus; the click reveals that agent. -->
-    {#if opener !== null}
+    <!-- Who holds this page: the agent it is shared with (its hue, its
+         name; a breathing dot while it acts, "Paused · Resume" after the
+         person took over), else who put it here. Trailing the bar so
+         nothing the user aims at moves when it appears. A mousedown never
+         takes focus; the name reveals that agent. -->
+    {#if sharedWith !== null}
+      <span
+        class="held"
+        class:driving
+        class:paused
+        class:ended={!sharedWith.live}
+        style:--hue={agentHue(sharedWith.id)}
+        role="group"
+        aria-label="shared with {sharedWith.label ?? 'an agent'}"
+      >
+        <button
+          class="held-main"
+          title={paused
+            ? `paused — you took over from ${sharedWith.label ?? "the agent"}`
+            : driving
+              ? `${sharedWith.label ?? "the agent"} is driving this page — act in it to take over`
+              : `shared with ${sharedWith.label ?? "an agent"}: its browser tools can read and use this page — click to show it`}
+          aria-label={paused
+            ? `paused, you took over from ${sharedWith.label ?? "the agent"} — show the agent`
+            : driving
+              ? `${sharedWith.label ?? "the agent"} is driving — show the agent`
+              : `shared with ${sharedWith.label ?? "an agent"} — show the agent`}
+          onmousedown={(e) => e.preventDefault()}
+          onclick={() => onRevealShared?.()}
+        >
+          <span class="held-dot" aria-hidden="true"></span>
+          <span class="held-text">
+            {#if paused}
+              <span class="held-state">Paused</span>
+            {:else}
+              <span class="held-name">{sharedWith.label ?? "agent"}</span>
+              {#if driving}<span class="held-state">driving</span>{/if}
+            {/if}
+          </span>
+        </button>
+        {#if paused}
+          <span class="held-sep" aria-hidden="true">·</span>
+          <button
+            class="held-resume"
+            title="hand the page back to {sharedWith.label ?? 'the agent'}"
+            onmousedown={(e) => e.preventDefault()}
+            onclick={resume}>Resume</button
+          >
+        {/if}
+      </span>
+    {:else if opener !== null}
       {#if opener.live}
         <button
           class="opener"
@@ -735,8 +917,24 @@
           onReference: onViewReference,
           onPage: onViewPage,
           control,
+          adopt: adoptable,
+          onViewId,
+          onUserInput: () => agentBrowser.userInput(tabId),
+          onCoverStill: (shot) =>
+            (coverStill = shot === null ? null : { src: `data:image/png;base64,${shot.png}`, width: shot.width, height: shot.height }),
         }}
       >
+        {#if coverStill !== null && !viewCrashed}
+          <img
+            class="cover-still"
+            src={coverStill.src}
+            alt=""
+            aria-hidden="true"
+            draggable="false"
+            style:width="{coverStill.width}px"
+            style:height="{coverStill.height}px"
+          />
+        {/if}
         {#if viewCrashed}
           <div class="state">
             <div class="state-title">This page stopped responding</div>
@@ -853,6 +1051,176 @@
     }
   }
 
+  /* The agent holding a shared pane: the opener chip's shape, wearing the
+     agent's hue on its border so the bond reads at a glance. The dot says
+     what it is doing: a quiet hue disc idle, a breathing one while it
+     drives, a hollow ring while paused. */
+  /* Shrinks before the bar overflows: the agent's name gives way (ellipsis),
+     the state word and Resume never do. */
+  .held {
+    flex: 0 1 auto;
+    display: inline-flex;
+    align-items: center;
+    height: 18px;
+    max-width: 260px;
+    min-width: 0;
+    margin-left: 4px;
+    border: 1px solid hsl(var(--hue) 45% 55% / 0.45);
+    border-radius: 9px;
+    background: hsl(var(--hue) 50% 55% / 0.08);
+    color: var(--fg);
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    line-height: 1;
+    user-select: none;
+  }
+
+  .held.ended {
+    border-style: dashed;
+    border-color: var(--edge);
+    background: none;
+    color: var(--muted);
+  }
+
+  .held-main,
+  .held-resume {
+    appearance: none;
+    border: none;
+    background: none;
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
+    height: 100%;
+    display: inline-flex;
+    align-items: center;
+    min-width: 0;
+    border-radius: 9px;
+  }
+
+  .held-main {
+    gap: 5px;
+    padding: 0 8px 0 6px;
+  }
+
+  .held.paused .held-main {
+    padding-right: 3px;
+  }
+
+  .held-main:hover {
+    background: hsl(var(--hue) 50% 55% / 0.1);
+  }
+
+  .held-text {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.5ch;
+    min-width: 0;
+    white-space: nowrap;
+  }
+
+  .held-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .held-state,
+  .held-dot,
+  .held-sep,
+  .held-resume {
+    flex: none;
+  }
+
+  .held-state {
+    color: var(--muted);
+  }
+
+  .held-dot {
+    position: relative;
+    flex: none;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: hsl(var(--hue) 40% 55% / 0.6);
+  }
+
+  .held.ended .held-dot {
+    background: none;
+    border: 1px solid var(--muted);
+  }
+
+  .held.driving .held-dot {
+    background: hsl(var(--hue) 65% 55%);
+  }
+
+  /* Breathing via transform/opacity on a static halo (composited), like the
+     linked-terminal chip's exec pulse. */
+  .held.driving .held-dot::after {
+    content: "";
+    position: absolute;
+    inset: -3.5px;
+    pointer-events: none;
+    border-radius: 50%;
+    background: hsl(var(--hue) 65% 55% / 0.35);
+    opacity: 0;
+    transform: scale(0.5);
+    animation: held-pulse 1.4s ease-in-out infinite;
+  }
+
+  @keyframes held-pulse {
+    50% {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+
+  /* Hidden document: nobody sees the pulse (the html.app-hidden contract). */
+  :global(html.app-hidden) .held.driving .held-dot::after {
+    animation-play-state: paused;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .held.driving .held-dot::after {
+      animation: none;
+    }
+  }
+
+  .held.paused .held-dot {
+    background: none;
+    border: 1.5px solid hsl(var(--hue) 60% 55%);
+  }
+
+  .held-sep {
+    color: var(--muted);
+  }
+
+  .held-resume {
+    padding: 0 8px 0 4px;
+    color: var(--accent-text);
+    font-weight: 600;
+  }
+
+  .held-resume:hover {
+    color: var(--fg);
+  }
+
+  .held-main:focus-visible,
+  .held-resume:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: -2px;
+  }
+
+  /* A narrow pane keeps the dot (and Resume, the one thing to act on). */
+  @container browser-chrome (max-width: 520px) {
+    .held:not(.paused) .held-text {
+      display: none;
+    }
+
+    .held:not(.paused) .held-main {
+      padding: 0 5px;
+    }
+  }
+
   .nav {
     display: inline-flex;
     align-items: center;
@@ -951,6 +1319,16 @@
     height: 100%;
     border: none;
     background: transparent;
+  }
+
+  /* The page under a menu: the view's own snapshot at its CSS size, laid
+     where the view sits. Inert; the view is back over it once the menu goes. */
+  .cover-still {
+    position: absolute;
+    top: 0;
+    left: 0;
+    pointer-events: none;
+    user-select: none;
   }
 
   .frame.hidden {

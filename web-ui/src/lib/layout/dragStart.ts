@@ -43,12 +43,16 @@ export interface DragStartHost {
   sessionAlive(sessionId: string): boolean;
   /** The live session a pane shows (names the ref/link band), or null. */
   paneSessionId(paneId: string): string | null;
-  linkTargetsFor(tab: Tab): ReadonlyMap<string, string> | undefined;
-  linkSessionsFor(tab: Tab): ReadonlySet<string> | undefined;
+  /** Agent panes a drag of `tab` links to (`linkIntent`: it started from a
+   *  pane's chain control). */
+  linkTargetsFor(tab: Tab, linkIntent: boolean): ReadonlyMap<string, string> | undefined;
+  linkSessionsFor(tab: Tab, linkIntent: boolean): ReadonlySet<string> | undefined;
   referenceFileDrop(paneId: string, path: string, kind: "file" | "dir"): void;
   referenceCommitDrop(paneId: string, tab: Tab): void;
   linkByDrop(terminalId: string, agentPaneId: string): void;
   linkBySession(terminalId: string, agentId: string): void;
+  /** Share a browser tab with an agent (its chain dropped on the agent). */
+  linkBrowser(tabId: string, agentId: string): void;
   focusTerminal(sessionId: string): void;
   /** Focus the session the layout's focused pane shows, if any. */
   focusFocusedSession(): void;
@@ -122,8 +126,8 @@ export function createDragStart(host: DragStartHost): DragStart {
           ? tab.sha
           : undefined;
     const armed = new Set<string>();
-    const linkTargets = host.linkTargetsFor(tab);
-    const linkSessions = host.linkSessionsFor(tab);
+    const linkTargets = host.linkTargetsFor(tab, linkIntent);
+    const linkSessions = host.linkSessionsFor(tab, linkIntent);
     if (linkTargets !== undefined) for (const id of linkTargets.keys()) armed.add(id);
     if (refPath !== undefined) {
       for (const p of panes(host.getLayout().root)) {
@@ -160,6 +164,7 @@ export function createDragStart(host: DragStartHost): DragStart {
             // Link-intent drop on an agent (its view, tab, or rail row): link,
             // then surface the agent.
             if (tab.surface === "terminal") host.linkBySession(tab.sessionId, spot.sessionId);
+            else if (tab.surface === "browser") host.linkBrowser(tab.id, spot.sessionId);
             return;
           }
           // A link-intent drag (from the link icon) only ever links — a drop
