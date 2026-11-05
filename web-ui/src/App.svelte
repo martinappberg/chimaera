@@ -2016,8 +2016,15 @@
     const input = terminalInput(command);
     const chat = sessionsById.get(chatId);
     if (input === "" || chat === undefined) return;
-    let shellId = runShells.get(chatId);
-    if (shellId === undefined || sessionsById.get(shellId)?.alive !== true) {
+    const priorId = runShells.get(chatId);
+    const prior = priorId !== undefined ? sessionsById.get(priorId) : undefined;
+    // A shell running something would hand the text to that program's
+    // stdin (a pager, a prompt, a REPL): only one at its prompt is reused.
+    const fresh = prior === undefined || !prior.alive || prior.phase === "running";
+    let shellId: string;
+    if (!fresh) {
+      shellId = prior.id;
+    } else {
       createError = null;
       try {
         const cwd = chat.cwd_current ?? chat.cwd;
@@ -2036,11 +2043,32 @@
       layout = neighbor !== null ? focusPane(layout, neighbor) : splitPane(layout, paneId, "row");
     }
     layout = openSession(layout, shellId);
-    // A shell spawned a moment ago has no pooled socket yet: the one-shot
-    // socket sends once the server is ready, and the PTY holds it as typed
-    // ahead until the prompt reads it.
-    if (!pool.sendText(shellId, input)) typeIntoDetachedSession(shellId, input);
     pool.focusTerminal(shellId);
+    // A new shell gets the text once it reaches its prompt (OSC 133), so its
+    // rc files never read it and it is not echoed twice; a shell without the
+    // integration gets it after the wait, as typed-ahead input.
+    if (fresh) await waitForPrompt(shellId, RUN_PROMPT_WAIT_MS);
+    // No pooled socket yet (the tab is still mounting): the one-shot socket
+    // sends once the server is ready.
+    if (!pool.sendText(shellId, input)) typeIntoDetachedSession(shellId, input);
+  }
+
+  const RUN_PROMPT_WAIT_MS = 15_000;
+
+  /** Resolves when `id` reports its prompt, has died, or `ms` passed. A
+   *  one-shot wait for one click, not a standing poll. A row missing from
+   *  the roster is still waited for: a snapshot taken before the create
+   *  landed can briefly leave it out. */
+  function waitForPrompt(id: string, ms: number): Promise<void> {
+    const deadline = Date.now() + ms;
+    return new Promise((resolve) => {
+      const check = () => {
+        const s = sessionsById.get(id);
+        if ((s !== undefined && (!s.alive || s.phase === "ready")) || Date.now() >= deadline) resolve();
+        else setTimeout(check, 100);
+      };
+      check();
+    });
   }
 
   /** Open (or focus) the source-control panel in the focused pane. */

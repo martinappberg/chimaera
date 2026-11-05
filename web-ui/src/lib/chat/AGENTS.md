@@ -43,6 +43,7 @@ daemon  ──WS /ws/chat/{id}──▶  chatWs.ts (ChatSocket)
 | `McpPanel`, `UsagePanel`, `UsageMeter` | `/mcp`, `/usage` and the usage meter (its popover also holds a Claude chat's Auto-compact switch: `store.autoCompact` from the `auto_compact` read-back, `set_auto_compact` capability; `store.autoCompactDisabledBy` disables it, reading Off, "set off by <var>"; `store.contextCompactAt`, the `context_usage` event's `auto_compact_at`, draws a notch on the Context bar and "Auto-compact at N%", hidden while it is off; a Codex chat shows the line without a switch). |
 | `ArtifactGallery`, `artifacts.ts`, `embeds.ts`, `FileChip`, `ProseChip`, `hoverTargets.ts` | Embeds, written files, hover previews. |
 | `paths.ts`, `UserText` | Path links; the user-message bubble. |
+| `runCommand.ts` | Run buttons on settled shell fences: which fences, the typed text; App picks the terminal. |
 | `ChatFind`, `chatFind.ts`, `quoteSelection.ts` | Find in chat; quote a selection. |
 | `nativeUi.ts`, `mods.svelte.ts`, `Mod*.svelte`, `modClient.ts`, `nativeComposer.ts` | [Claude Mods](REFERENCE.md#claude-mods): never journaled or replayed. |
 

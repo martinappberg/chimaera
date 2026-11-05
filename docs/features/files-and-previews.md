@@ -289,6 +289,25 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   mode, and call `git::mark_path_dirty` so the git panel refreshes without polling. Gzip
   decompress is capped at 64 MB/request (defuses gzip bombs). Open-at-line requests
   (`shared/reveal.ts`) place the cursor, center the range and flash it.
+- **Languages.** Every code surface — the editor, compare and diff views, notebook cells,
+  markdown fences, embed cards — picks a grammar through one module, `previews/languages.ts`:
+  `languageFor(path, text)` for a file, `languageNamed(name)` for a fence or kernel. The list is
+  CodeMirror's own (`@codemirror/language-data`, each loaded on first use) plus Typst and a few
+  research dialects that borrow a shipped grammar under their own name: **Snakemake** (Snakefile,
+  `.smk` → Python), **Nextflow** (`.nf`, `nextflow.config` → Groovy), **Makefile**, **Justfile**
+  and **Apptainer** (`Singularity`, `.def`) → Shell, and **R Markdown** / **Quarto** (Markdown
+  with `{r}` chunks highlighted). Names the list misses or gets wrong are mapped by table: cluster
+  job scripts (`.sbatch`, `.slurm`, `.pbs`), shell dotfiles and `.env`, `Containerfile`, MATLAB
+  `.m` (Octave's grammar), `.cfg`/`.conf`/ignore files/`requirements.txt` (INI), lockfiles, JSON
+  and XML variants, `.pyi`, `.F90`, `.cu`, `.svelte`, `.bib`, and more; fences accept the short
+  names agents write (```` ```py ````, `console`, `rs`, `matlab`). A file with no extension falls
+  back to its `#!` line (`#!/usr/bin/env python3`, `-S snakemake`, `Rscript`). Languages with no
+  close grammar (HCL, Nix, WDL) stay plain text rather than wear a wrong one. Linting is not core:
+  the only marks in the gutter are plugins' `diagnostics/1`.
+- **The language picker.** The editor's bottom bar names the file's language; picking another
+  (or Plain text) re-highlights in place and is remembered per file in this browser
+  (`languageOverrides`, a capped LRU in localStorage, `previews/pathMemory.ts`). Picking what the
+  file is detected as goes back to detecting.
 
 ## Rendered previews
 
@@ -794,7 +813,7 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   download so it can play locally. A parked pane pauses its video (it doesn't resume by
   itself); audio keeps playing.
 - **Notebooks.** `.ipynb` opens read-only in `NotebookView.svelte`: code cells highlighted
-  (the editor's `--syn-*` palette, parsers from `@codemirror/language-data` plus Typst, `previews/languages.ts`, via `highlight.ts`)
+  (the editor's `--syn-*` palette, the kernel's language through `previews/languages.ts` `languageNamed`, via `highlight.ts`)
   beside their `[n]` execution counts; markdown cells through `marked` + DOMPurify with chat's
   profile (no `<style>`, web links in a new tab without an opener), math (`$…$`, `$$…$$`,
   `\(…\)`, `\[…\]`, `\begin{…}` blocks) typeset through the shared KaTeX policy only when a
