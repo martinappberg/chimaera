@@ -1,7 +1,8 @@
 <script lang="ts">
   import { customModelSelection, modelChoice } from "./modelPicker";
   import { agentProductName } from "../shared/agentNames";
-  import { onDestroy, tick, untrack } from "svelte";
+  import { onDestroy, setContext, tick, untrack } from "svelte";
+  import { runCommandKey, type RunCommand } from "./runCommand";
   import { displayName, forkSession, rewindSession, renameSession, type Session } from "../workspace/sessions";
   import { fsValidate } from "../previews/files";
   import { openPath, type OpenPathOptions, type PathKind } from "../shared/openPath";
@@ -179,6 +180,9 @@
     };
     /** Open one of this chat's subagents as a view of its own. */
     onOpenSubagent?: (agentId: string, title: string, newSplit: boolean) => void;
+    /** Type a shell block from the transcript into this chat's terminal
+     *  and run it (the block's Run button; `runCommand.ts`). */
+    onRunCommand?: (command: string) => void;
   }
 
   let {
@@ -193,7 +197,14 @@
     onForked,
     subagent,
     onOpenSubagent,
+    onRunCommand,
   }: Props = $props();
+
+  // Every Markdown in this transcript reads it; set once, at init, and
+  // forwarding through `onRunCommand` keeps it current with the prop.
+  if (untrack(() => onRunCommand) !== undefined) {
+    setContext<RunCommand>(runCommandKey, (command) => onRunCommand?.(command));
+  }
 
   // The component is keyed on session id by its parent: one instance per
   // retained pane layer. Ordinary tab switches keep that tree (and its bounded

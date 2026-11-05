@@ -81,6 +81,7 @@
     type LinkCtrl,
   } from "./lib/workspace/agentLinks";
   import { typeIntoDetachedSession } from "./lib/terminal/ws";
+  import { terminalInput } from "./lib/chat/runCommand";
   import { reconnectingSockets } from "./lib/net/reconnect";
   import { insertIntoComposer } from "./lib/chat/composerBus";
   import { volatileChatDrafts } from "./lib/chat/drafts";
@@ -2000,6 +2001,48 @@
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
 
+  /** The shell each chat's Run buttons type into (chat id → shell id),
+   *  used again while it lives so one chat's commands share a history. */
+  const runShells = new Map<string, string>();
+
+  /**
+   * A chat's Run button: type `command` into the chat's terminal and press
+   * Enter. The terminal is the shell this chat last ran in, while it lives;
+   * else a new shell in the chat's folder (its live cwd), on the chat's own
+   * host. It opens beside the chat (the adjacent pane, or a split), never
+   * over it, so the block and its output read side by side.
+   */
+  async function runCommandFromPane(paneId: string, chatId: string, command: string): Promise<void> {
+    const input = terminalInput(command);
+    const chat = sessionsById.get(chatId);
+    if (input === "" || chat === undefined) return;
+    let shellId = runShells.get(chatId);
+    if (shellId === undefined || sessionsById.get(shellId)?.alive !== true) {
+      createError = null;
+      try {
+        const cwd = chat.cwd_current ?? chat.cwd;
+        const s = await createSession(chat.workspace_id, "shell", null, spawnSize(), { cwd });
+        recentlyCreated.add(s.id);
+        if (needsAppend(sessions, s)) sessions.push(s);
+        shellId = s.id;
+        runShells.set(chatId, shellId);
+      } catch (e) {
+        createError = e instanceof ApiError ? e.message : "failed to start terminal";
+        return;
+      }
+    }
+    if (paneForTab(layout.root, { surface: "terminal", sessionId: shellId }) === null) {
+      const neighbor = adjacentPane(layout, paneId);
+      layout = neighbor !== null ? focusPane(layout, neighbor) : splitPane(layout, paneId, "row");
+    }
+    layout = openSession(layout, shellId);
+    // A shell spawned a moment ago has no pooled socket yet: the one-shot
+    // socket sends once the server is ready, and the PTY holds it as typed
+    // ahead until the prompt reads it.
+    if (!pool.sendText(shellId, input)) typeIntoDetachedSession(shellId, input);
+    pool.focusTerminal(shellId);
+  }
+
   /** Open (or focus) the source-control panel in the focused pane. */
   function openGitPanel(): void {
     if (activeWsId === null || !layoutReady) return;
@@ -3549,6 +3592,9 @@
     },
     openSubagentFrom(paneId, sessionId, agentId, title, newSplit) {
       openSubagentFromPane(paneId, sessionId, agentId, title, newSplit);
+    },
+    runCommandFrom(paneId, sessionId, command) {
+      void runCommandFromPane(paneId, sessionId, command);
     },
     revealPathInTree(path) {
       revealInTree(path);
