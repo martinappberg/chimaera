@@ -156,6 +156,12 @@ export interface LayoutCtrl {
     title: string,
     newSplit: boolean,
   ): void;
+  /**
+   * Run `command` (a chat's shell block) for the chat `sessionId` shown in
+   * `paneId`: in the terminal that chat last ran in while it lives, else a
+   * new shell in the chat's folder, beside the chat.
+   */
+  runCommandFrom(paneId: string, sessionId: string, command: string): void;
   /** Persist a Finder instance's current directory (its navigation state). */
   navigateFinder(id: string, path: string): void;
   /** Persist a browser instance's current in-app path (navigation state). */

@@ -63,7 +63,14 @@ app-build` (never the root `cargo`).
   (`shell/native_view.rs`). Each sits in a clip box of its own, so an HTML embed card's view is
   cropped to its scroller ([embed cards](files-and-previews.md#embed-cards)); the wheel over a
   passive one (a card nobody clicked into) goes back to the window's page through an app-wide
-  local event monitor, since a web view never chains a wheel out the way an iframe does. The
+  local event monitor, since a web view never chains a wheel out the way an iframe does.
+  Closing a view ends its web process right away (`end_process` in `shell/native_view/mac.rs`,
+  WebKit's `_killWebContentProcessAndResetState`, checked with `respondsToSelector:`): left to
+  itself, WebKit ends the process only once the process handles the close, and a busy one —
+  laying out a huge report, or swapping — took ~4 minutes (a 9.5 GB report, 2026-11-04). The
+  delegates are cleared first, so the termination is never mistaken for a crash and reloaded,
+  and the kill is skipped if any other web view in the app's windows reports the same process id.
+  The
   [agent browser](agent-browser.md)'s app engine drives these views through `native_view_drive`
   (real NSEvent input, evals, native screenshots, the console/network rings; the calling
   window's own views only), and `native_view_show` with `agent` shows an agent's own page just

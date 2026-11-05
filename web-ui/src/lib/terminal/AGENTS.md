@@ -37,6 +37,7 @@ Tests: `*.test.ts` beside the modules. `net/fixtures/wire/pty-socket.json` + `pt
 - **A parked attach omits grid dims.** A hidden window's stale dims must never reflow the server grid (`ws.ts`, `SessionSocketHandlers.parked`).
 - **Resize before reset.** When the server tags a resync with its grid, resize to that grid before the snapshot is written (`onReset` doc).
 - **Input frames drop while the socket is down.** `sendText` returns `false` then, and the caller falls back to a one-shot socket. See the rule bullet "Never lose a user action to a closed socket".
+- **Only a click submits.** Context-bridge references carry no newline; a chat's Run button (`chat/runCommand.ts`) ends in Enter, waits for a new shell's prompt first, and reuses only a shell at its prompt (App's `runOnce`).
 - **Only real files underline.** `links.ts` validates every candidate with the daemon. General web URLs are not linkified (`urlLinks.ts` header).
 - **Local echo is a ghost, never buffer state.** The xterm buffer holds only what the server sent (`localEcho.ts` header).
 - **xterm plants a `<style>` element.** `hoistStyles` moves it out of the re-parented element. See the rule bullet "Hide with opacity + inert".

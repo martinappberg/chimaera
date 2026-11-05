@@ -18,8 +18,7 @@
  * the shared KaTeX policy, time-sliced.
  */
 import type { Parser, Tree } from "@lezer/common";
-import { LanguageDescription } from "@codemirror/language";
-import { languages } from "../languages";
+import { languageNamed } from "../languages";
 import { highlightCode } from "@lezer/highlight";
 import { codeHighlight } from "../cm";
 import { safeDecodeUri } from "../files";
@@ -155,7 +154,7 @@ interface Fence {
 function highlight(fence: Fence, later: (fence: Fence) => void): void {
   const { code, lang, text } = fence;
   if (text.length > HIGHLIGHT_MAX || !code.isConnected) return;
-  const desc = LanguageDescription.matchLanguageName(languages, lang, true);
+  const desc = languageNamed(lang);
   if (desc === null) return;
   if (desc.support !== undefined) {
     paint(code, desc.support.language.parser, text);

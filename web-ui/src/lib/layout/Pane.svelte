@@ -399,6 +399,7 @@
             ctrl.revealWorktreeSession(forked.id, forked.workspace_id)}
           onOpenSubagent={(agentId: string, title: string, newSplit: boolean) =>
             ctrl.openSubagentFrom(node.id, s.id, agentId, title, newSplit)}
+          onRunCommand={(command: string) => ctrl.runCommandFrom(node.id, s.id, command)}
         />
       {:else if viewErrors.chat}
         {@render loadFailure("chat", "chat view")}
@@ -497,6 +498,7 @@
           visible={active}
           onOpenFile={(p: string) => ctrl.openFileFrom(node.id, p, false)}
           onOpenPath={(p: string, k: "file" | "dir") => ctrl.openPathFrom(node.id, p, k, false)}
+          onRunCommand={(command: string) => ctrl.runCommandFrom(node.id, parent.id, command)}
         />
       {:else if viewErrors.chat}
         {@render loadFailure("chat", "chat view")}

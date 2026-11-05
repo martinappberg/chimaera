@@ -40,6 +40,7 @@
 <script lang="ts">
   import { copyText } from "../shared/clipboard";
   import { copyLabel, copyPayload, decorateCopyTargets } from "../shared/copyDecor";
+  import { decorateRunTargets, isRunButton, runCommandKey, runPayload, type RunCommand } from "./runCommand";
   import { markScrollRegions, watchWidth } from "../shared/scrollRegion";
   import { getSetting } from "../settings/store.svelte";
   import { advanceSegments, type SegmenterState } from "./streamSegments";
@@ -59,7 +60,7 @@
   import { activateUrl, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
   import { contextMenu } from "../shared/contextMenu.svelte";
   import { safeDecodeUri } from "../previews/files";
-  import { mount, unmount, untrack } from "svelte";
+  import { getContext, mount, unmount, untrack } from "svelte";
   import { parseSizeHint, splitTarget } from "../shared/embed/embed";
   import { mountEmbed } from "../shared/embed/mount.svelte";
   import type { EmbedResolver } from "./embeds";
@@ -108,6 +109,10 @@
     embeds,
     hoverTargets,
   }: Props = $props();
+
+  /** A chat's "run this block in a terminal" (ChatView's context); absent
+   *  everywhere else, so no other surface grows Run buttons. */
+  const runCommand = getContext<RunCommand | undefined>(runCommandKey);
 
   /** Ids to chips (knowledge entries and any other reference source):
    *  only with a hover registry to hold them, on settled content. */
@@ -421,6 +426,14 @@
     // allowlist keeps the `hidden` attribute (and class names like our own
     // .rw-hidden are forgeable), so textContent could smuggle invisible text
     // into the payload; innerText copies exactly what is rendered.
+    // Run: only a button runCommand.ts made (agent HTML can forge the
+    // class), with copy's live-DOM payload rule (runCommand.ts header).
+    const runBtn = target?.closest?.("button.md-run");
+    if (runBtn instanceof HTMLElement && runCommand !== undefined && isRunButton(runBtn)) {
+      const command = runPayload(runBtn);
+      if (command.length > 0) runCommand(command);
+      return;
+    }
     const copyBtn = target?.closest?.("button.md-copy");
     if (copyBtn instanceof HTMLElement) {
       const code = copyPayload(copyBtn);
@@ -969,6 +982,8 @@
     if (current === lastSettledHtml) return;
     lastSettledHtml = current;
     decorateCopyTargets(el);
+    // Settled only: a block still streaming may be half a command.
+    if (runCommand !== undefined) decorateRunTargets(el);
     stampPaths(el);
     linkRefs(el);
     markTableRegions(el);
@@ -1222,6 +1237,31 @@
     transition:
       opacity 0.12s ease,
       color 0.12s ease;
+  }
+  .md :global(.md-run) {
+    position: absolute;
+    top: 5px;
+    right: 31px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 4px;
+    background: color-mix(in srgb, var(--term-bg) 82%, transparent);
+    border: 1px solid var(--edge);
+    border-radius: 5px;
+    color: var(--muted);
+    cursor: pointer;
+    opacity: 0;
+    transition:
+      opacity 0.12s ease,
+      color 0.12s ease;
+  }
+  .md :global(pre:hover .md-run),
+  .md :global(.md-run:focus-visible) {
+    opacity: 1;
+  }
+  .md :global(.md-run:hover) {
+    color: var(--accent);
   }
   .md :global(pre:hover .md-copy),
   .md :global(blockquote:hover > .md-copy),
