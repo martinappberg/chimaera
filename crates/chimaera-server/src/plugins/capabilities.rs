@@ -184,6 +184,9 @@ impl Caps {
         // Running programs and downloading them: what makes it privileged.
         for program in &m.programs {
             atoms.insert(atom(&["program", &program.name]));
+            for dir in &program.also {
+                atoms.insert(atom(&["program-also", &program.name, dir]));
+            }
             if let Some(net) = &program.network {
                 atoms.insert(atom(&["network", &program.name, net.trim()]));
             }
@@ -359,6 +362,21 @@ impl Caps {
                      time and memory limits)",
                     others.join(", ")
                 ),
+                privileged: true,
+            });
+        }
+        let mut also: Vec<(&str, Vec<&str>)> = Vec::new();
+        for p in of_kind("program-also") {
+            if let [_, program, dir] = p.as_slice() {
+                match also.iter_mut().find(|(name, _)| name == program) {
+                    Some((_, dirs)) => dirs.push(dir),
+                    None => also.push((program, vec![dir])),
+                }
+            }
+        }
+        for (program, dirs) in also {
+            lines.push(Line {
+                text: format!("Looks for {program} in {} too", dirs.join(", ")),
                 privileged: true,
             });
         }
@@ -610,6 +628,26 @@ mod tests {
         // Saying it reaches the network is asking for more.
         assert_ne!(quiet.caps.digest(), loud.caps.digest());
         assert!(!loud.caps.beyond(&quiet.caps).is_empty());
+    }
+
+    #[test]
+    fn a_programs_usual_folders_are_said_and_counted() {
+        let plain = manifest("api = \"0.2\"\n[[programs]]\nname = \"soffice\"\n");
+        let also = manifest(
+            "api = \"0.2\"\n[[programs]]\nname = \"soffice\"\nalso = [\"/Applications/LibreOffice.app/Contents/MacOS\", \"~/Applications/LibreOffice.app/Contents/MacOS\"]\n",
+        );
+        let text: Vec<String> = also.caps.lines().into_iter().map(|l| l.text).collect();
+        assert!(
+            text.contains(
+                &"Looks for soffice in /Applications/LibreOffice.app/Contents/MacOS, \
+                  ~/Applications/LibreOffice.app/Contents/MacOS too"
+                    .to_string()
+            ),
+            "{text:?}"
+        );
+        // Another place to run a program from is asking for more.
+        assert_ne!(plain.caps.digest(), also.caps.digest());
+        assert!(!also.caps.beyond(&plain.caps).is_empty());
     }
 
     #[test]

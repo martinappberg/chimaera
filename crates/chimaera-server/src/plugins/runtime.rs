@@ -1264,10 +1264,22 @@ impl PluginRuntime {
             Ok(Reply::Unsupported) => tool_error(format!("{} can't resume a tool", m.name)),
             Ok(Reply::ToolResult(result)) => {
                 let text = clip(&result.text, RESULT_MAX);
+                // Picture lines name files in this plugin's own output
+                // folder here (`tools::answer_content`); read off the reactor.
+                let dir = super::output::folder(&state.plugin_platform.output_root, &m.id, ws);
+                let content = match crate::fs::FILESYSTEM_WORK.acquire().await {
+                    Ok(permit) => tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        super::tools::answer_content(&dir, &text)
+                    })
+                    .await
+                    .unwrap_or_else(|e| vec![json!({"type": "text", "text": format!("the answer could not be read: {e}")})]),
+                    Err(_) => vec![json!({ "type": "text", "text": text })],
+                };
                 if result.is_error {
-                    tool_error(text)
+                    json!({ "content": content, "isError": true })
                 } else {
-                    json!({ "content": [{ "type": "text", "text": text }] })
+                    json!({ "content": content })
                 }
             }
             Ok(_) => unreachable!("call-tool answers ToolResult"),
