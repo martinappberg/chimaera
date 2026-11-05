@@ -213,12 +213,25 @@ describe("AgentBrowserChannel requests", () => {
 
   it("drive passes the action through and answers with the shell's result or message", async () => {
     const t = harness({ driveResult: { value: 42 } });
+    await t.channel.handle(request({ op: "open", view: "ab-1", url: "/proxy/p/", width: 800, height: 600 }));
+    t.calls.length = 0;
     await t.channel.handle(request({ op: "drive", view: "ab-1", action: { type: "eval", body: "return 42" } }));
     expect(t.calls).toEqual([["drive", "ab-1", { type: "eval", body: "return 42" }]]);
     expect(t.lastReply()).toEqual({ type: "browser_reply", rid: 7, ok: true, result: { value: 42 } });
     const bad = harness({ driveError: "ReferenceError: x is not defined" });
+    await bad.channel.handle(request({ op: "open", view: "ab-1", url: "/proxy/p/", width: 800, height: 600 }));
     await bad.channel.handle(request({ op: "drive", view: "ab-1", action: { type: "eval", body: "x" } }));
     expect(bad.lastReply()).toEqual({ type: "browser_reply", rid: 7, ok: false, error: "ReferenceError: x is not defined" });
+  });
+
+  it("drives only agent pages this window opened, never another pane view by its id", async () => {
+    const t = harness();
+    t.channel.registry.register("tab-1", "v9-abc");
+    await t.channel.handle(request({ op: "drive", view: "v9-abc", action: { type: "eval", body: "return 1" } }));
+    expect(t.lastReply()).toMatchObject({ ok: false, error: expect.stringContaining("not an agent page") });
+    await t.channel.handle(request({ op: "nav", view: "v3-html", action: "reload" }));
+    expect(t.lastReply()).toMatchObject({ ok: false });
+    expect(t.calls).toEqual([]);
   });
 
   it("a request addressing a tab resolves the tab's own pane view", async () => {
@@ -417,6 +430,7 @@ describe("agent cursor colour", () => {
     expect(t.calls.at(-1)).toEqual(["drive", "v1", { type: "cursor", show: true, label: "Claude", color: "#336699" }]);
     await t.channel.handle(request({ op: "drive", tab: "tab-1", action: { type: "cursor", show: true, color: "#000000" } }));
     expect(t.calls.at(-1)).toEqual(["drive", "v1", { type: "cursor", show: true, color: "#000000" }]);
+    await t.channel.handle(request({ op: "open", view: "ab-1", url: "/proxy/p/", width: 800, height: 600 }));
     await t.channel.handle(request({ op: "drive", view: "ab-1", action: { type: "cursor", show: true } }));
     expect(t.calls.at(-1)).toEqual(["drive", "ab-1", { type: "cursor", show: true }]);
   });

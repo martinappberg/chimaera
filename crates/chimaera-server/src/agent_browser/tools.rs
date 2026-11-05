@@ -799,8 +799,46 @@ async fn snap(
     call: &str,
     args: Value,
 ) -> Result<Value, BrowserError> {
+    // The script stays defined in the isolated world for the document's
+    // life: ask with a short body first and send the whole script (~16 KB,
+    // every `browser_wait` poll otherwise) only when this document lacks it.
+    let quick = format!(
+        "if (globalThis.__snap?.v !== {v}) return {{ {NEED}: true }};\n\
+         return await globalThis.__snap.{call};",
+        v = snapshot_version(),
+    );
+    let first = run_eval(
+        state,
+        ctx,
+        World::Isolated,
+        &quick,
+        args.clone(),
+        HELPER_TIMEOUT_MS,
+    )
+    .await?;
+    if first.get(NEED) != Some(&Value::Bool(true)) {
+        return Ok(first);
+    }
     let body = format!("{SNAPSHOT_JS}\nreturn await globalThis.__snap.{call};");
     run_eval(state, ctx, World::Isolated, &body, args, HELPER_TIMEOUT_MS).await
+}
+
+/// The marker a quick helper call answers when the script must be sent.
+const NEED: &str = "__chimaeraNeedSnap";
+
+/// `snapshot.js`'s own version (`const V = N;`), so the quick call asks for
+/// exactly the script this daemon carries.
+fn snapshot_version() -> &'static str {
+    static V: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        SNAPSHOT_JS
+            .split("const V = ")
+            .nth(1)
+            .and_then(|rest| rest.split(';').next())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+            .unwrap_or_else(|| "0".to_string())
+    });
+    &V
 }
 
 async fn refresh_facts(state: &Arc<AppState>, ctx: &mut Ctx) -> Result<(), BrowserError> {
@@ -1227,7 +1265,9 @@ async fn snapshot(state: &Arc<AppState>, ctx: &mut Ctx, args: &Value) -> ToolRes
         state,
         ctx,
         "snapshot(args)",
-        json!({"maxChars": max, "viewportOnly": viewport_only}),
+        // The app engine shows the page under the daemon's `/proxy/{id}`:
+        // the header names the path as the app does.
+        json!({"maxChars": max, "viewportOnly": viewport_only, "stripProxy": ctx.engine == EngineKind::App}),
     )
     .await?;
     let text = out["text"].as_str().unwrap_or_default();
@@ -2158,6 +2198,12 @@ async fn close(state: &Arc<AppState>, ctx: &mut Ctx) -> ToolResult {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_snapshot_script_names_its_version() {
+        let v = super::snapshot_version();
+        assert!(v != "0" && v.bytes().all(|b| b.is_ascii_digit()), "{v}");
+    }
+
     use super::*;
 
     #[test]

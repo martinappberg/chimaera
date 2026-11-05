@@ -11,7 +11,7 @@
 //   select(ref, {value|label}) set a native <select> and fire input/change
 //   watch() / delta(maxMs)    what an action changed (mutations, URL, focus)
 (() => {
-  const V = 10;
+  const V = 11;
   if (globalThis.__snap?.v === V) return;
   const st0 = (globalThis.__snapState ??= { refOf: new WeakMap(), byRef: new Map(), next: 1 });
   const refOf = st0.refOf; // element → "e12", stable across snapshots
@@ -258,7 +258,7 @@
     }
     const t0 = performance.now();
     walk(document.body || document.documentElement, 0, window, null);
-    const header = `page ${JSON.stringify(document.title)} ${appPath()} viewport=${vw}x${vh} scroll=${Math.round(scrollY)}/${document.documentElement.scrollHeight}`;
+    const header = `page ${JSON.stringify(document.title)} ${opts.stripProxy ? appPath() : location.pathname} viewport=${vw}x${vh} scroll=${Math.round(scrollY)}/${document.documentElement.scrollHeight}`;
     return { text: header + "\n" + lines.join("\n") + (truncated ? "\n… (truncated at " + max + " chars)" : ""), chars, refs, nodes, truncated, ms: Math.round((performance.now() - t0) * 10) / 10 };
   }
 

@@ -498,6 +498,9 @@ pub(crate) fn on_event(
             spawn_state(state, socket, tab, false, true);
         }
         ("resume", Some(tab)) => {
+            if crate::links::browser_link_of(state, tab).is_none() {
+                return;
+            }
             state.browsers.update_shared(tab, |p| p.paused = None);
             spawn_state(state, socket, tab, false, false);
         }

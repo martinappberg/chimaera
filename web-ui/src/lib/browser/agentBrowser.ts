@@ -503,7 +503,12 @@ export class AgentBrowserChannel {
   }
 
   private resolve(req: BrowserRequest): { view: string; tab: string | null } {
-    if (req.view !== null) return { view: req.view, tab: req.tab ?? this.registry.tabFor(req.view) };
+    if (req.view !== null) {
+      // Only an agent page this window opened: never another pane view of
+      // the window (an HTML preview, a browser tab nobody shared).
+      if (!this.own.has(req.view)) throw new Refusal("that page is not an agent page of this window");
+      return { view: req.view, tab: req.tab ?? this.registry.tabFor(req.view) };
+    }
     if (req.tab === null) throw new Refusal("missing view or tab");
     const view = this.registry.viewFor(req.tab);
     if (view === null) throw new Refusal("that pane isn't open in this window any more");
