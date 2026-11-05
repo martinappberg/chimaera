@@ -128,6 +128,14 @@ plane `ANY /proxy/{id}[/{*path}]`; agent-opened panes add the MCP `open_browser`
   iframe, unchanged. In the app the same pane view is what the [agent browser](agent-browser.md)
   drives when the user shares the pane with an agent by its chain link; the pane bar then shows
   the agent driving, or "Paused · Resume" after the user took over.
+- **Moving a pane keeps its page.** Dragging the tab to another pane, or a split collapsing
+  around it, remounts the view: the unmount parks the native view hidden for 2.5 s under the
+  tab's id, and the new mount takes the same view back — the shell only re-places it, no reload,
+  scroll and app state intact (`paneView`'s `keep`). A tab mounted in the background of the
+  pane it landed in claims it the same way, and a pane remembers which of its tabs were kept
+  alive across a remount (`Pane.svelte`). A remount also shows the page at once when this
+  window verified the same target's proxy session in the last 5 minutes, re-checking it behind
+  the page (`browser/verifiedSessions.ts`) instead of waiting for a mint and a health check.
 - **URL detection** (`urlLinks.ts`): pure client-side regex over rendered terminal
   lines — zero daemon validation calls. Only proxyable URLs underline: loopback hosts,
   or any host with an explicit port. Ordinary web URLs (`https://github.com/…`) stay

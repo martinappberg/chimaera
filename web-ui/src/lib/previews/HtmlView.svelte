@@ -543,6 +543,9 @@
           class="native-slot"
           use:paneView={{
             url,
+            // A move (the tab dragged to another pane) takes the live page
+            // along instead of reloading it.
+            keep: `html:${path}`,
             shown: shown.pane && mode === "preview",
             onFallback: () => (native = false),
             onLoading: (l) => {

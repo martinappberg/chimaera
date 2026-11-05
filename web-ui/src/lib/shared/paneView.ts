@@ -47,6 +47,14 @@
  *   then on it owns the view like one it made: hidden while parked, closed
  *   on destroy.
  *
+ * - **Moves keep the page.** A pane whose view unmounts and mounts again
+ *   (its tab dragged to another pane, a split, zoom) would lose the page to
+ *   a close and a fresh load. With `keep` (the tab's identity) an unmount
+ *   parks the view hidden for `PARK_MS` instead, and the next mount with the
+ *   same `keep` takes it on like an adoption: the shell only re-places it,
+ *   so the page, its scroll and its running state carry on. One nobody
+ *   claims closes as before.
+ *
  * - **Embedded.** An embed card (`embedded`) sits in a scrolling document,
  *   not a pane. Its view is cropped to the part of its clipping ancestors
  *   on screen (the page keeps its place), hidden while its layer is parked
@@ -64,8 +72,6 @@
 
 import {
   type ViewFit,
-  isNativeShell,
-  listenNativeView,
   nativeViewChip,
   nativeViewClose,
   nativeViewNav,
@@ -79,7 +85,8 @@ import {
   type NativeViewSnapshot,
   type ViewRect,
 } from "../net/native";
-import { chordInit, decodeNativeViewEvent, samePill, type NativeViewEvent } from "./paneViewBridge";
+import { chordInit, samePill, type NativeViewEvent } from "./paneViewBridge";
+import { routeNativeView } from "./paneViewRoute";
 
 export interface PaneViewParams {
   /** Same-origin `/raw/…` or `/proxy/…` URL; null while it is being minted. */
@@ -112,6 +119,10 @@ export interface PaneViewParams {
   /** Take on this existing view (read once, at mount): `id`, and the URL
    *  this window last showed it at. */
   adopt?: { id: string; url: string };
+  /** The page's identity across remounts (its tab): an unmount parks the
+   *  view under it, and a mount with the same `keep` takes it back (see
+   *  "Moves keep the page"). Not for embed cards. */
+  keep?: string;
   /** The shell's id for this view once it exists (and null once it went):
    *  what the agent browser addresses a shared pane by. */
   onViewId?: (id: string | null) => void;
@@ -270,36 +281,7 @@ export class PaneViewControl {
   }
 }
 
-// One `native-view` listener per window, routing by view id. It stays for
-// the window's life: one idle callback, and no subscribe/unsubscribe race
-// when the last view closes as the next one opens.
-const routes = new Map<string, (ev: NativeViewEvent) => void>();
-let listening = false;
-
-/** Receive the `native-view` events of view `id` (the last route set for an
- *  id wins). Returns the unroute, which removes only its own route. */
-export function routeNativeView(id: string, fn: (ev: NativeViewEvent) => void): () => void {
-  routes.set(id, fn);
-  if (!listening) {
-    listening = true;
-    void listenNativeView((raw) => {
-      const ev = decodeNativeViewEvent(raw);
-      if (ev !== null) routes.get(ev.id)?.(ev);
-    }).catch(() => (listening = false));
-  }
-  return () => {
-    if (routes.get(id) === fn) routes.delete(id);
-  };
-}
-
-/**
- * Whether pane views are worth trying here: the macOS app (the shell builds
- * them on WKWebView). The Linux and Windows apps go straight to the iframe
- * instead of paying a failing call per page.
- */
-export function paneViewsPossible(): boolean {
-  return isNativeShell() && /Mac/.test(navigator.userAgent);
-}
+export { paneViewsPossible, routeNativeView } from "./paneViewRoute";
 
 /** Roles whose element floats over the workbench when positioned out of
  *  flow. Not `status`: live regions (a chat's screen-reader announcer) sit
@@ -329,6 +311,76 @@ const SETTLE_FRAMES = 10;
 const SAFETY_MS = 1000;
 
 let seq = 0;
+
+/** How long an unmounted view waits to be taken back before it closes:
+ *  a move remounts in the same update; a little slack covers a slow one. */
+const PARK_MS = 2500;
+
+/** A parked view: its id, the URL the shell last showed it at, and where
+ *  the page itself last said it is (null: it never said). */
+export interface Parked {
+  id: string;
+  url: string;
+  page: string | null;
+}
+
+/**
+ * Views parked by an unmount, by `keep`: each waits `ms` to be taken back
+ * (a move remounts its pane), then closes. Hiding, closing and the clock
+ * come in so the rules are testable without a shell.
+ */
+export class ParkedViews {
+  private readonly views = new Map<string, Parked & { timer: ReturnType<typeof setTimeout> }>();
+
+  constructor(
+    private readonly hide: (id: string) => void,
+    private readonly close: (id: string) => void,
+    private readonly ms: number,
+    private readonly clock: {
+      set: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
+      clear: (t: ReturnType<typeof setTimeout>) => void;
+    } = { set: (fn, ms) => setTimeout(fn, ms), clear: (t) => clearTimeout(t) },
+  ) {}
+
+  /** Park view `id` under `keep`: `url` is what the shell was last asked
+   *  to show, `page` where the page itself last said it is. A view already
+   *  parked there gives way: it closes. */
+  park(keep: string, id: string, url: string, page: string | null = null): void {
+    const prior = this.views.get(keep);
+    if (prior !== undefined) {
+      this.clock.clear(prior.timer);
+      if (prior.id !== id) this.close(prior.id);
+    }
+    this.hide(id);
+    const timer = this.clock.set(() => {
+      if (this.views.get(keep)?.id !== id) return;
+      this.views.delete(keep);
+      this.close(id);
+    }, this.ms);
+    this.views.set(keep, { id, url, page, timer });
+  }
+
+  /** The view parked under `keep`, now the caller's (its close is off). */
+  take(keep: string): Parked | null {
+    const p = this.views.get(keep);
+    if (p === undefined) return null;
+    this.views.delete(keep);
+    this.clock.clear(p.timer);
+    return { id: p.id, url: p.url, page: p.page };
+  }
+}
+
+/** Mounts that may take a parked view back, by `keep`: a move can mount
+ *  the new pane before the old one parks, and a tab mounted in the
+ *  background makes no view of its own to notice it — so a park calls the
+ *  waiting mount to claim it at once. */
+const waiting = new Map<string, () => void>();
+
+const parked = new ParkedViews(
+  (id) => void nativeViewPlace(id, null),
+  (id) => void nativeViewClose(id),
+  PARK_MS,
+);
 
 const sameRect = (a: ViewRect | null, b: ViewRect | null): boolean =>
   a !== null &&
@@ -473,7 +525,19 @@ class OverlayWatch {
 /** `use:paneView={{ url, shown, … }}` on the placeholder element. */
 export function paneView(node: HTMLElement, initial: PaneViewParams) {
   const adopt = initial.adopt ?? null;
-  const id = adopt?.id ?? `v${(seq += 1)}-${Math.random().toString(36).slice(2, 8)}`;
+  /** The shell's id for this view; a parked view taken back brings its own. */
+  let id = adopt?.id ?? `v${(seq += 1)}-${Math.random().toString(36).slice(2, 8)}`;
+  /** The URL an adopted view was last shown at (a hand-over, or a view
+   *  parked by a move): shown again as it is, never reloaded. */
+  let adoptUrl: string | null = adopt?.url ?? null;
+  /** The view being adopted came from this pane's own park (a move), not a
+   *  hand-over: it is this mount's to release even before it was shown. */
+  let fromPark = false;
+  /** The URL the shell was last asked to point this view at (a park
+   *  records it: an in-flight navigation has already moved the view). */
+  let asked: string | null = adoptUrl;
+  /** The `keep` this mount waits under for a parked view (see `wait`). */
+  let waitKey: string | null = null;
   let params = initial;
   /** An adopted view exists already; it waits to be shown here once. */
   let created = adopt !== null;
@@ -565,7 +629,11 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
         window.dispatchEvent(new KeyboardEvent("keydown", chordInit(ev)));
         break;
       case "selection":
-        params.onSelection?.({ text: ev.text, context: ev.context, rect: ev.rect });
+        params.onSelection?.({
+          text: ev.text,
+          context: ev.context,
+          rect: ev.rect,
+        });
         break;
       case "reference":
         params.onReference?.();
@@ -599,7 +667,7 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
     }
   };
 
-  const unroute = routeNativeView(id, onEvent);
+  let unroute = routeNativeView(id, onEvent);
   const bound: PaneTransport = {
     live: () => created && !destroyed && !failed,
     snapshot: () => nativeViewSnapshot(id),
@@ -622,7 +690,12 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
   const measure = (): ViewRect | null => {
     const r = node.getBoundingClientRect();
     if (r.width < 1 || r.height < 1) return null;
-    return { x: Math.round(r.left), y: Math.round(r.top), width: Math.round(r.width), height: Math.round(r.height) };
+    return {
+      x: Math.round(r.left),
+      y: Math.round(r.top),
+      width: Math.round(r.width),
+      height: Math.round(r.height),
+    };
   };
 
   /** Embedded: the part of the window its clipping ancestors leave
@@ -691,21 +764,30 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
       do {
         again = false;
         if (destroyed || failed) return;
-        if (adopting && adopt !== null && params.url !== null && params.shown && !dragging) {
+        claimParked();
+        if (adopting && adoptUrl !== null && params.url !== null && params.shown && !dragging) {
           const at = wanted()?.rect ?? measure();
           if (at === null) continue;
           adopting = false;
           // Its last URL again (no navigation: a reload would lose the very
           // state that was handed over), without `agent`: the person's now.
           // Hidden like a create; the next pass places it.
-          const shown = await nativeViewShow(id, adopt.url, at, true, { agent: false });
+          asked = adoptUrl;
+          const shown = await nativeViewShow(id, adoptUrl, at, true, {
+            agent: false,
+          });
           if (destroyed) break;
           if (shown === null) {
             failed = true;
             params.onFallback?.();
             return;
           }
-          showing = params.url;
+          // A hand-over takes the agent's page as this pane's URL. A view
+          // back from a park is at its old URL: if this mount wants another
+          // (the file changed on disk meanwhile) and the page isn't there
+          // by itself, the next pass loads it.
+          const target = params.url;
+          showing = !fromPark || target === null || target === adoptUrl || sameUrl(target, pageUrl) ? target : adoptUrl;
           placed = "";
           report();
           params.onViewId?.(id);
@@ -736,6 +818,7 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
           const embedded = params.embedded === true;
           const fit: ViewFit = embedded ? { clip: visibleClip(), passive: params.passive === true } : {};
           const wasShown = placed !== "";
+          asked = url;
           const shown = await nativeViewShow(id, url, at, true, fit);
           // The view exists from here even if this action is gone: the
           // `finally` closes it then.
@@ -806,9 +889,9 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
       } while (again && !destroyed);
     } finally {
       busy = false;
-      // Closed while a call was in flight (a create the shell finished
-      // after the close went): close again now.
-      if (destroyed && created && !adopting) void nativeViewClose(id);
+      // Gone while a call was in flight (a create the shell finished, or a
+      // move's placement): let the view go now — parked for a remount.
+      if (destroyed && created && (!adopting || fromPark)) release();
     }
   }
 
@@ -909,7 +992,58 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
   document.addEventListener("transitionrun", burst, true);
   document.addEventListener("transitionend", burst, true);
   window.addEventListener("resize", onResize);
-  document.addEventListener("scroll", onScroll, { capture: true, passive: true });
+  document.addEventListener("scroll", onScroll, {
+    capture: true,
+    passive: true,
+  });
+  /** A view this pane's previous mount parked (a move): take it back
+   *  instead of making a new one, so the page carries on. Claimed even in a
+   *  background tab: it stays hidden until shown, like any parked tab. */
+  function claimParked(): void {
+    if (created || destroyed || params.keep === undefined || params.embedded === true) return;
+    const back = parked.take(params.keep);
+    if (back === null) return;
+    unroute();
+    id = back.id;
+    unroute = routeNativeView(id, onEvent);
+    adoptUrl = back.url;
+    asked = back.url;
+    pageUrl = back.page;
+    created = true;
+    adopting = true;
+    fromPark = true;
+    stopWaiting();
+  }
+
+  function claimNow(): void {
+    claimParked();
+    burst();
+  }
+  /** Wait under `keep` for a view parked there (a move can park the old
+   *  pane's view after this one mounted). Only until this mount has one. */
+  function wait(keep: string | undefined): void {
+    stopWaiting();
+    if (keep === undefined || created || destroyed || params.embedded === true) return;
+    waitKey = keep;
+    waiting.set(keep, claimNow);
+  }
+  function stopWaiting(): void {
+    if (waitKey !== null && waiting.get(waitKey) === claimNow) waiting.delete(waitKey);
+    waitKey = null;
+  }
+
+  /** This mount is done with its view: park it for the next mount of the
+   *  same `keep` (a move), or close it. A dead or broken page isn't kept. */
+  function release(): void {
+    if (params.keep !== undefined && params.embedded !== true && !failed && !crashed && asked !== null) {
+      parked.park(params.keep, id, asked, pageUrl);
+      waiting.get(params.keep)?.();
+    } else {
+      void nativeViewClose(id);
+    }
+  }
+
+  wait(initial.keep);
   report();
   armSafety();
   burst();
@@ -918,7 +1052,9 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
     update(next: PaneViewParams): void {
       // A new URL is a fresh load: a crashed page gives way to it.
       if (crashed && next.url !== params.url) crashed = false;
+      const keepMoved = next.keep !== params.keep;
       params = next;
+      if (keepMoved) wait(params.keep);
       report();
       const nextControl = next.control ?? null;
       if (nextControl !== control) {
@@ -931,6 +1067,7 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
     },
     destroy(): void {
       destroyed = true;
+      stopWaiting();
       clearLoadTimer();
       unroute();
       if (created && !adopting) params.onViewId?.(null);
@@ -949,7 +1086,7 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
       if (scrollTimer !== null) clearTimeout(scrollTimer);
       // A hand-over not taken on yet is not this action's to close: the
       // agent browser still holds it (the next mount adopts it).
-      if (created && !adopting && !busy) void nativeViewClose(id);
+      if (created && (!adopting || fromPark) && !busy) release();
     },
   };
 }

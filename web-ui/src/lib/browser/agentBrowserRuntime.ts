@@ -8,7 +8,7 @@
 
 import { get, writable, type Readable } from "svelte/store";
 import { nativeViewClose, nativeViewDrive, nativeViewNav, nativeViewPlace, nativeViewShow } from "../net/native";
-import { paneViewsPossible, routeNativeView } from "../shared/paneView";
+import { paneViewsPossible, routeNativeView } from "../shared/paneViewRoute";
 import type { BrowserClientMessage } from "../net/browserWire";
 import { agentHue } from "../workspace/agentLinks";
 import { AgentBrowserChannel, PROBE_VIEW_ID, driveProbeSaysPresent, hueHex, sameHello, type BrowserHello, type BrowserLink, type Handover } from "./agentBrowser";
