@@ -116,6 +116,8 @@ fn answer(model: &StdMutex<PageModel>, req: &Value) -> Result<Value, String> {
                             json!({"newDocument": false, "mutations": 3, "urlChanged": false, "titleChanged": false, "url": href, "title": "Demo", "focus": null, "dialog": null})
                         } else if body.contains("throw new Error('nope')") {
                             return Err("Error: nope\n    at eval".to_string());
+                        } else if body.contains("return location.href;") {
+                            json!(href)
                         } else if body.contains("return 6 * 7;") {
                             json!(42)
                         } else {
@@ -1038,6 +1040,202 @@ async fn the_shells_take_over_abort_pauses_the_pane() {
     drop(window);
     server.abort();
     state.sessions.kill(&agent).ok();
+}
+
+#[tokio::test]
+async fn a_file_opens_as_a_ticketed_page_and_reloads_under_a_fresh_ticket() {
+    let state = quiet_state().await;
+    let (agent, ws) = agent_on(&state, "ab-file").await;
+    let root = lock(&state.workspaces).get(&ws).unwrap().root;
+    std::fs::create_dir_all(root.join("out/figs")).unwrap();
+    std::fs::write(root.join("out/my report.html"), "<h1>v1</h1>").unwrap();
+    std::fs::write(root.join("out/figs/a.png"), "png").unwrap();
+    std::fs::write(root.join("out/data.csv"), "a,b").unwrap();
+    let (addr, server) = serve(&state).await;
+    let window = connect_window(addr, &ws, &[]).await;
+    wait_hello(&state, &ws).await;
+
+    // Not found, a folder, a shared pane, or both arguments: refused.
+    for (args, says) in [
+        (json!({"path": "out/missing.html"}), "not found"),
+        (json!({"path": "out"}), "is not a file"),
+        (json!({"path": "out/data.csv"}), "is not a page"),
+        (
+            json!({"path": "out/my report.html", "page": "p1"}),
+            "own page only",
+        ),
+        (
+            json!({"path": "out/my report.html", "url": "http://localhost:1/"}),
+            "not both",
+        ),
+        (
+            json!({"url": "file://elsewhere/x.html"}),
+            "Only a file on this host",
+        ),
+    ] {
+        let r = tool(&state, &agent, "browser_navigate", args.clone()).await;
+        assert!(is_error(&r) && text_of(&r).contains(says), "{args}: {r}");
+    }
+    assert!(state.browsers.own(&agent).is_none());
+
+    // Relative to the workspace root (the session's cwd has no `out/`):
+    // the window loads the ticketed page on its own daemon origin, and the
+    // agent reads it as the file.
+    let r = tool(
+        &state,
+        &agent,
+        "browser_navigate",
+        json!({"path": "out/my report.html"}),
+    )
+    .await;
+    assert!(!is_error(&r), "{r}");
+    let canonical = std::fs::canonicalize(root.join("out/my report.html")).unwrap();
+    let text = text_of(&r);
+    assert!(
+        text.contains(&format!("Loaded file://{}", canonical.display())),
+        "{text}"
+    );
+    assert!(
+        !text.contains("/raw/"),
+        "the ticket stays out of the agent's terms: {text}"
+    );
+    let opened = window.ops("open");
+    let first = opened[0]["url"].as_str().unwrap().to_string();
+    assert!(
+        first.starts_with("/raw/t-") && first.ends_with("/my%20report.html"),
+        "{first}"
+    );
+
+    // The page and its folder's assets serve, sandboxed, with no bearer.
+    let ticket = first.split('/').nth(2).unwrap().to_string();
+    let page = raw_get(&state, &first).await;
+    assert_eq!(page.0, StatusCode::OK);
+    assert!(page.1.contains("sandbox"), "{:?}", page.1);
+    assert_eq!(page.2, "<h1>v1</h1>");
+    let asset = raw_get(&state, &format!("/raw/{ticket}/figs/a.png")).await;
+    assert_eq!(asset.0, StatusCode::OK);
+
+    // A file:// URL names the same file: the same ticket while it is unchanged.
+    let r = tool(
+        &state,
+        &agent,
+        "browser_navigate",
+        json!({"url": format!("file://{}", canonical.display()).replace(' ', "%20")}),
+    )
+    .await;
+    assert!(!is_error(&r), "{r}");
+    let navigated = window
+        .requests()
+        .into_iter()
+        .filter(|q| q["op"] == "drive")
+        .rev()
+        .find_map(|q| q["action"]["args"]["url"].as_str().map(str::to_owned))
+        .unwrap();
+    assert_eq!(navigated, first);
+
+    // Unchanged, a reload is a plain reload.
+    let navs_before = window.ops("nav").len();
+    let r = tool(&state, &agent, "browser_navigate", json!({"url": "reload"})).await;
+    assert!(!is_error(&r), "{r}");
+    assert_eq!(window.ops("nav").len(), navs_before + 1);
+
+    // Rewritten, a reload loads it under a new ticket.
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+    let f = std::fs::File::options()
+        .write(true)
+        .open(&canonical)
+        .unwrap();
+    f.set_modified(later).unwrap();
+    std::fs::write(&canonical, "<h1>v2</h1>").unwrap();
+    f.set_modified(later).unwrap();
+    let r = tool(&state, &agent, "browser_navigate", json!({"url": "reload"})).await;
+    assert!(!is_error(&r), "{r}");
+    assert!(text_of(&r).contains("Loaded file://"), "{r}");
+    assert_eq!(
+        window.ops("nav").len(),
+        navs_before + 1,
+        "no plain reload this time"
+    );
+    let page = window
+        .requests()
+        .into_iter()
+        .filter(|q| q["op"] == "drive")
+        .rev()
+        .find_map(|q| q["action"]["args"]["url"].as_str().map(str::to_owned))
+        .unwrap();
+    assert!(
+        page.starts_with("/raw/t-") && !page.contains(&ticket),
+        "{page}"
+    );
+    assert_eq!(raw_get(&state, &page).await.2, "<h1>v2</h1>");
+
+    // A file is handed over as a link in the reply, not a browser pane.
+    let r = tool(&state, &agent, "browser_show", json!({})).await;
+    assert!(
+        is_error(&r) && text_of(&r).contains("[my report.html]("),
+        "{r}"
+    );
+    assert!(window.ops("handover").is_empty());
+    assert!(state.browsers.own(&agent).is_some());
+
+    // The agent browser never opens the daemon's own API.
+    let r = tool(
+        &state,
+        &agent,
+        "browser_navigate",
+        json!({"url": format!("http://127.0.0.1:{}/api/v1/sessions", state.port)}),
+    )
+    .await;
+    assert!(is_error(&r), "{r}");
+
+    drop(window);
+    server.abort();
+    state.sessions.kill(&agent).ok();
+}
+
+/// GET a `/raw` path with no auth: (status, CSP, body).
+async fn raw_get(state: &Arc<AppState>, path: &str) -> (StatusCode, String, String) {
+    let resp = app(state.clone())
+        .oneshot(Request::get(path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let csp = resp
+        .headers()
+        .get("content-security-policy")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    (status, csp, String::from_utf8_lossy(&body).into_owned())
+}
+
+#[tokio::test]
+async fn console_text_names_file_pages_as_files() {
+    use crate::agent_browser::file_page::{file_url, map_text};
+    let state = quiet_state().await;
+    // A ticket the agent browser didn't mint (the user's own preview) stays
+    // as it is.
+    assert_eq!(
+        file_url(&state, "http://127.0.0.1:9/raw/t-abc/index.html"),
+        None
+    );
+    state
+        .browsers
+        .files
+        .remember("t-abc", std::path::Path::new("/r/out/index.html"));
+    let line = "Error at http://127.0.0.1:9/raw/t-abc/app.js:3:7 (see /raw/t-zzz/x.js)";
+    assert_eq!(
+        map_text(&state, line),
+        "Error at file:///r/out/app.js:3:7 (see /raw/t-zzz/x.js)"
+    );
+    assert_eq!(
+        file_url(&state, "/raw/t-abc/figs/run%232.png?x#y").as_deref(),
+        Some("file:///r/out/figs/run%232.png?x#y")
+    );
+    assert_eq!(map_text(&state, "no urls here"), "no urls here");
 }
 
 #[tokio::test]

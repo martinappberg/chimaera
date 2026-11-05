@@ -141,7 +141,7 @@
       "name": "open_browser"
     },
     {
-      "description": "Open a web app and wait for it to load (up to 15 s). Checking something opens a hidden page of your own; a pane the user is watching (one you opened with open_browser, say) is reused only for the same app, navigated in place. Page \"own\" always means the hidden page (to check something in the background without touching the user's view); page \"p1\" sends a shared pane to another app. Only addresses on this host, loopback, or a node of the user's running Slurm jobs load. Your own page is invisible to the user until you call browser_show. `url` may also be \"back\", \"forward\" or \"reload\". Returns the final URL, title and HTTP status when known. The app engine loads pages through Chimaera's proxy, so an app that calls absolute /api/v1 or /ws/ paths (Chimaera's own UI) reaches the hosting daemon instead of itself: start that page with engine \"chromium\".",
+      "description": "Open a web app and wait for it to load (up to 15 s). Checking something opens a hidden page of your own; a pane the user is watching (one you opened with open_browser, say) is reused only for the same app, navigated in place. Page \"own\" always means the hidden page (to check something in the background without touching the user's view); page \"p1\" sends a shared pane to another app. Only addresses on this host, loopback, or a node of the user's running Slurm jobs load. To check a file you wrote (an HTML report, a plot), pass `path` instead (HTML, SVG or an image): no web server needed; it loads like the user's HTML preview (scripts run, relative assets from its own folder load, fetch/XHR of other files is blocked). Your own page is invisible to the user until you call browser_show. `url` may also be \"back\", \"forward\" or \"reload\" (a reload picks up a file you rewrote). Returns the final URL, title and HTTP status when known. The app engine loads pages through Chimaera's proxy, so an app that calls absolute /api/v1 or /ws/ paths (Chimaera's own UI) reaches the hosting daemon instead of itself: start that page with engine \"chromium\".",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -161,8 +161,12 @@
             "description": "\"own\" (your hidden page) or a shared pane's id (\"p1\"…). Default: the shared pane showing the same app, else your hidden page.",
             "type": "string"
           },
+          "path": {
+            "description": "A file on this host to open as a page, e.g. report/index.html: relative to your working directory (then the workspace root), or absolute. Pass this or `url`.",
+            "type": "string"
+          },
           "url": {
-            "description": "An http:// address, e.g. http://localhost:8888/lab, or back/forward/reload.",
+            "description": "An http:// address, e.g. http://localhost:8888/lab, a file:// URL, or back/forward/reload. Pass this or `path`.",
             "type": "string"
           },
           "width": {
@@ -170,9 +174,7 @@
             "type": "integer"
           }
         },
-        "required": [
-          "url"
-        ],
+        "required": [],
         "type": "object"
       },
       "name": "browser_navigate"

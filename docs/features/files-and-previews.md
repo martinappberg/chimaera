@@ -704,7 +704,8 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   XSL, SVG, MathML, any `+xml` — an XML file's XHTML `<script>` would run in the daemon's origin)
   gets a script-less `sandbox`.
   **Caching over a tunnel:** a ticket is minted with the file's version token, and minting again
-  for the same path + version while it lives answers the *same* ticket (its expiry renewed) — so
+  for the same path + version while it lives answers the *same* ticket (its expiry renewed, never
+  shortened: an agent's file page holds the same ticket for an hour) — so
   the URL is stable for as long as the file is unchanged, and a re-render, a tab switch or a reload
   reuses the browser's copy instead of re-downloading. `/raw` responses carry a strong `ETag`
   (version + size), `Last-Modified` and `Cache-Control: private, max-age=<the ticket's remaining

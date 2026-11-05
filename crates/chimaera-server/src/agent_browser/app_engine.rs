@@ -378,6 +378,11 @@ fn proxy_path(path: &str) -> Option<(&str, String)> {
 
 /// Mint the target's proxy id: the path the view loads on its daemon origin.
 async fn proxied_path(state: &AppState, url: &TargetUrl) -> Result<String, BrowserError> {
+    // A file page is the window's own daemon origin already (`/raw/` is a
+    // path a pane view may show), never an app behind the proxy.
+    if super::file_page::is_file_target(state, url) {
+        return Ok(url.path.clone());
+    }
     match crate::proxy::mint(state, &url.host, url.port).await {
         Ok(id) => Ok(format!("/proxy/{id}{}", url.path)),
         Err(refusal) => Err(BrowserError::Refused(crate::browser_open::refusal_text(
