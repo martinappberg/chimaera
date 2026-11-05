@@ -3,7 +3,6 @@ import {
   type Layout,
   MAX_PANES,
   activateTab,
-  clearBrowserAdopt,
   defaultLayout,
   findPane,
   focusPane,
@@ -360,12 +359,9 @@ describe("placeHandover", () => {
     expect(tabs.find((t) => t.tab.surface === "browser" && t.tab.id !== tabId)?.tab).toMatchObject({ path: "/tree" });
   });
 
-  it("never persists the adoption, and drops it once adopted", () => {
-    const { layout, tabId } = placeHandover(withAgent(), h);
+  it("never persists the adoption", () => {
+    const { layout } = placeHandover(withAgent(), h);
     const restored = deserializeLayout(serializeLayout(layout))!;
     expect(browserTabs(restored)[0].tab).not.toHaveProperty("adopt");
-    const cleared = clearBrowserAdopt(layout, tabId);
-    expect(browserTabs(cleared)[0].tab).not.toHaveProperty("adopt");
-    expect(clearBrowserAdopt(cleared, tabId)).toBe(cleared);
   });
 });

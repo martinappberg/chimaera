@@ -11,7 +11,7 @@
 //   select(ref, {value|label}) set a native <select> and fire input/change
 //   watch() / delta(maxMs)    what an action changed (mutations, URL, focus)
 (() => {
-  const V = 8;
+  const V = 10;
   if (globalThis.__snap?.v === V) return;
   const st0 = (globalThis.__snapState ??= { refOf: new WeakMap(), byRef: new Map(), next: 1 });
   const refOf = st0.refOf; // element → "e12", stable across snapshots
@@ -165,6 +165,34 @@
     return s;
   }
 
+  // The path as the app names it: a page the app engine shows through the
+  // daemon's proxy carries a `/proxy/<id>` prefix the app never sees.
+  const appPath = () => location.pathname.replace(/^\/proxy\/[\w-]+(?=\/|$)/, "") || "/";
+
+  // What sits at a control's centre still reaches it when it is the
+  // control's own label (a styled box over a hidden native input).
+  // `a` encloses `b` across shadow boundaries (a host encloses its tree).
+  const encloses = (a, b) => {
+    for (let n = b; n; n = n.parentNode || n.host) if (n === a) return true;
+    return false;
+  };
+  const reaches = (el, hit) => {
+    if (!hit) return false;
+    if (hit === el || el.contains(hit) || encloses(hit, el)) return true;
+    // Hit-test again inside the control's own shadow tree: the document
+    // only sees the host.
+    const root = el.getRootNode && el.getRootNode();
+    if (root && root !== document && typeof root.elementFromPoint === "function") {
+      const r = el.getBoundingClientRect();
+      const inner = root.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      if (inner && (inner === el || el.contains(inner) || encloses(inner, el))) return true;
+    }
+    const labels = el.labels ? [...el.labels] : [];
+    const wrap = el.closest ? el.closest("label") : null;
+    if (wrap) labels.push(wrap);
+    return labels.some((l) => l === hit || l.contains(hit));
+  };
+
   function snapshot(opts = {}) {
     const max = opts.maxChars ?? 24000;
     const viewportOnly = opts.viewportOnly ?? false;
@@ -230,7 +258,7 @@
     }
     const t0 = performance.now();
     walk(document.body || document.documentElement, 0, window, null);
-    const header = `page ${JSON.stringify(document.title)} ${location.pathname} viewport=${vw}x${vh} scroll=${Math.round(scrollY)}/${document.documentElement.scrollHeight}`;
+    const header = `page ${JSON.stringify(document.title)} ${appPath()} viewport=${vw}x${vh} scroll=${Math.round(scrollY)}/${document.documentElement.scrollHeight}`;
     return { text: header + "\n" + lines.join("\n") + (truncated ? "\n… (truncated at " + max + " chars)" : ""), chars, refs, nodes, truncated, ms: Math.round((performance.now() - t0) * 10) / 10 };
   }
 
@@ -253,7 +281,7 @@
     let w = el.ownerDocument.defaultView;
     while (w && w !== window && w.frameElement) { const fr = w.frameElement.getBoundingClientRect(); x += fr.left; y += fr.top; w = w.parent; }
     const hit = document.elementFromPoint(x, y);
-    const covered = !(hit && (hit === el || el.contains(hit) || hit.contains(el) || hit.localName === "iframe"));
+    const covered = !(reaches(el, hit) || (hit && hit.localName === "iframe"));
     return {
       x: Math.round(x), y: Math.round(y), w: Math.round(r.width), h: Math.round(r.height),
       covered, by: covered && hit ? desc(hit) : null,
@@ -323,7 +351,7 @@
     const hit = document.elementFromPoint(cx, cy);
     const visible = !invisible(el, cs) && r.width > 0 && r.height > 0;
     const inView = r.y + r.height > 0 && r.y < innerHeight && r.x + r.width > 0 && r.x < innerWidth;
-    const covered = visible && inView && !(hit && (hit === el || el.contains(hit) || hit.contains(el)));
+    const covered = visible && inView && !reaches(el, hit);
     const html = el.outerHTML;
     return {
       ref: refFor(el), element: desc(el), tag: el.localName,

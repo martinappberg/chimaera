@@ -153,7 +153,6 @@
     openBrowser,
     openTab,
     freshBrowserTab,
-    clearBrowserAdopt,
     findBrowser,
     panes,
     setBrowserPath,
@@ -1177,6 +1176,13 @@
     untrack(() => {
       if (ready && ws === heldWs) {
         for (const tab of heldShared) if (!present.has(tab) && linked.has(tab)) unshareClosed(tab);
+      }
+      // A hand-over whose tab went before its view took the page on: the
+      // page has no owner left.
+      if (ready) {
+        for (const [tab, view] of agentBrowser.registry.pendingAdoptions()) {
+          if (!present.has(tab)) agentBrowser.abandonAdoption(tab, view);
+        }
       }
       heldWs = ws;
       heldShared = ready ? new Set([...present].filter((t) => linked.has(t))) : new Set();
@@ -3645,9 +3651,6 @@
     },
     retargetBrowser(id, host, port, path, found) {
       layout = setBrowserTarget(layout, id, host, port, path, found);
-    },
-    browserAdopted(id) {
-      layout = clearBrowserAdopt(layout, id);
     },
     openDiffFrom(paneId, path, mode, newSplit, keep) {
       openDiffFromPane(paneId, path, mode, newSplit, keep === true);

@@ -92,8 +92,8 @@ pub(super) enum DriveAction {
         max_width: u32,
         #[serde(default)]
         format: ShotFormat,
-        /// JPEG quality, 1–100.
-        #[serde(default = "jpeg_quality")]
+        /// JPEG quality, 1–100 (absent or null: the default).
+        #[serde(default = "jpeg_quality", deserialize_with = "quality_or_default")]
         quality: u8,
     },
     Rings {
@@ -129,6 +129,11 @@ fn drag_steps() -> u16 {
 fn max_width() -> u32 {
     1600
 }
+/// `quality` as the daemon sends it: a number, or null for the default.
+fn quality_or_default<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u8, D::Error> {
+    Ok(<Option<u8> as serde::Deserialize>::deserialize(d)?.unwrap_or_else(jpeg_quality))
+}
+
 fn jpeg_quality() -> u8 {
     80
 }
@@ -1076,6 +1081,17 @@ mod tests {
                 max_width: 1600,
                 format: ShotFormat::Jpeg,
                 quality: 60
+            }
+        );
+        // The daemon sends `quality: null` for a PNG: the default.
+        assert_eq!(
+            parse(json!({"type": "screenshot", "format": "png", "quality": null})).unwrap(),
+            DriveAction::Screenshot {
+                clip: None,
+                full_page: false,
+                max_width: 1600,
+                format: ShotFormat::Png,
+                quality: 80
             }
         );
         // A non-US character types fine on its own.

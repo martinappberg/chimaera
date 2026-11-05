@@ -82,8 +82,6 @@
     onRevealOpener?: () => void;
     /** A hand-over: the live pane view this tab takes on (no reload). */
     adopt?: string;
-    /** The view took `adopt` on (the tab drops it). */
-    onAdopted?: () => void;
     /** The agent this pane is shared with (the chain link), as the roster
      *  knows it now; null when not shared. */
     sharedWith?: BrowserOpener | null;
@@ -103,7 +101,6 @@
     opener = null,
     onRevealOpener,
     adopt,
-    onAdopted,
     sharedWith = null,
     onRevealShared,
   }: Props = $props();
@@ -162,20 +159,19 @@
     viewId = id;
     if (id === adoptable?.id) {
       adoptable = undefined;
+      // The tab's `adopt` stays as it is: changing the layout here, mid
+      // hand-over, must not disturb the view that just took the page on. A
+      // later mount finds the adoption done and makes its own view.
       agentBrowser.adopted(tabId, id);
-      onAdopted?.();
     } else {
       agentBrowser.registry.register(tabId, id);
     }
   }
 
-  // A hand-over whose page is already gone: nothing to adopt, so the tab
-  // forgets it and loads its target like any other.
+  // A hand-over whose page is already gone (or already adopted by an
+  // earlier mount): nothing to adopt, so this view loads its target.
   onMount(() => {
-    if (adopt !== undefined && adoptable === undefined) {
-      agentBrowser.registry.dropAdoption(tabId);
-      onAdopted?.();
-    }
+    if (adopt !== undefined && adoptable === undefined) agentBrowser.registry.dropAdoption(tabId);
   });
 
   const driveState = agentBrowser.driveState;
@@ -550,9 +546,8 @@
   });
 
   onDestroy(() => {
-    // A hand-over this tab never took on (it closed first, or its view
-    // never came up): the page has no other owner.
-    if (adoptable !== undefined) agentBrowser.abandonAdoption(tabId, adoptable.id);
+    // A hand-over not taken on yet stays the channel's: a remount (a zoom,
+    // a pane move) adopts it next; App closes it once the tab is gone.
     if (viewId !== null) agentBrowser.registry.unregister(tabId, viewId);
     titleObserver?.disconnect();
     setBrowserTitle(tabId, null);

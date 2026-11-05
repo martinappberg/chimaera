@@ -722,7 +722,7 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
       busy = false;
       // Closed while a call was in flight (a create the shell finished
       // after the close went): close again now.
-      if (destroyed && created) void nativeViewClose(id);
+      if (destroyed && created && !adopting) void nativeViewClose(id);
     }
   }
 
@@ -861,7 +861,9 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
       window.removeEventListener("resize", onResize);
       document.removeEventListener("scroll", onScroll, { capture: true });
       if (scrollTimer !== null) clearTimeout(scrollTimer);
-      if (created && !busy) void nativeViewClose(id);
+      // A hand-over not taken on yet is not this action's to close: the
+      // agent browser still holds it (the next mount adopts it).
+      if (created && !adopting && !busy) void nativeViewClose(id);
     },
   };
 }

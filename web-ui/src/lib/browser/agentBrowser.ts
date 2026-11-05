@@ -136,6 +136,11 @@ export class PaneViewRegistry {
     return this.byTab.get(tab) ?? null;
   }
 
+  /** Every hand-over still waiting for its view: [tab, view]. */
+  pendingAdoptions(): [string, string][] {
+    return [...this.adopting];
+  }
+
   /** The adoption `tab` still waits for, if any. */
   pendingAdoption(tab: string): string | null {
     return this.adopting.get(tab) ?? null;
@@ -258,8 +263,11 @@ function size(v: unknown, what: string): number {
  *  adopt it: it stays framed off-screen (and survives a socket drop) until
  *  that tab's view takes it on. */
 interface OwnView {
-  /** The URL this window last showed it at (an adopting pane shows it
-   *  there again: no navigation). */
+  /** The URL this window last SHOWED it at — not where the page is now:
+   *  the agent navigates in the page (`location.assign`), which the shell
+   *  never hears of, and the shell navigates a re-shown view only when the
+   *  URL differs from the one it was last shown at. So an adopting pane
+   *  shows it at this URL to keep the live page, wherever it went since. */
   url: string;
   width: number;
   height: number;

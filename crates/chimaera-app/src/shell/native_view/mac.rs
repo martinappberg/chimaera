@@ -437,13 +437,29 @@ fn world(mtm: MainThreadMarker) -> Retained<WKContentWorld> {
     unsafe { WKContentWorld::worldWithName(&NSString::from_str(WORLD), mtm) }
 }
 
+thread_local! {
+    /// Main thread only: the agent world, held for the app's life. A named
+    /// world nothing retains is torn down after each call, taking its
+    /// globals (the snapshot script's refs) with it; the bridge world lives
+    /// because each view's user script and handler hold it.
+    static AGENT_WORLD_HELD: std::cell::OnceCell<Retained<WKContentWorld>> =
+        const { std::cell::OnceCell::new() };
+}
+
+fn agent_world(mtm: MainThreadMarker) -> Retained<WKContentWorld> {
+    AGENT_WORLD_HELD.with(|held| {
+        held.get_or_init(|| {
+            // SAFETY: a named world is created once per name and shared.
+            unsafe { WKContentWorld::worldWithName(&NSString::from_str(AGENT_WORLD), mtm) }
+        })
+        .clone()
+    })
+}
+
 fn content_world(realm: Realm, mtm: MainThreadMarker) -> Retained<WKContentWorld> {
     match realm {
         Realm::Bridge => world(mtm),
-        // SAFETY: as for `world`.
-        Realm::Agent => unsafe {
-            WKContentWorld::worldWithName(&NSString::from_str(AGENT_WORLD), mtm)
-        },
+        Realm::Agent => agent_world(mtm),
         // SAFETY: the shared page world, on the main thread.
         Realm::Page => unsafe { WKContentWorld::pageWorld(mtm) },
     }

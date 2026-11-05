@@ -1026,3 +1026,24 @@ async fn the_shells_take_over_abort_pauses_the_pane() {
     server.abort();
     state.sessions.kill(&agent).ok();
 }
+
+#[tokio::test]
+async fn console_text_names_proxied_urls_in_the_agents_terms() {
+    let state = quiet_state().await;
+    let id = crate::proxy::mint(&state, "127.0.0.1", 47320)
+        .await
+        .expect("loopback mints");
+    let trace = format!(
+        "Uncaught Error: boom\n@http://127.0.0.1:59342/proxy/{id}/rings.html:3:91 (http://127.0.0.1:59342/proxy/{id}/rings.html:3:105)"
+    );
+    assert_eq!(
+        crate::agent_browser::app_engine::map_text(&state, &trace),
+        "Uncaught Error: boom\n@http://127.0.0.1:47320/rings.html:3:91 (http://127.0.0.1:47320/rings.html:3:105)"
+    );
+    // An unknown id, or no URL at all, is left as it is.
+    let other = "see http://127.0.0.1:1/proxy/p-unknown/x and /proxy/ alone";
+    assert_eq!(
+        crate::agent_browser::app_engine::map_text(&state, other),
+        other
+    );
+}

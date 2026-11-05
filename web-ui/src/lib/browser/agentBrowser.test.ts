@@ -298,6 +298,21 @@ describe("AgentBrowserChannel hand-over", () => {
     expect(t.channel.registry.viewFor("tab-h")).toBe("ab-1");
   });
 
+  it("adopts at the URL last shown even after the agent navigated in the page", async () => {
+    const t = harness();
+    await t.channel.handle(request({ op: "open", view: "ab-1", url: "/proxy/p-a1ad/", width: 800, height: 600 }));
+    // `browser_navigate` runs location.assign in the page: the shell hears
+    // nothing, the page reports where it went.
+    t.routes.get("ab-1")?.({ id: "ab-1", kind: "page", url: "http://127.0.0.1:7000/proxy/p-c2cd/", title: "marimo" });
+    await t.channel.handle(request({ op: "handover", view: "ab-1", host: "127.0.0.1", port: 47402, path: "/", agent: "s-a" }));
+    // Shown again at the URL the shell holds: no navigation, the page lives.
+    expect(t.channel.adoption("ab-1")).toEqual({ id: "ab-1", url: "/proxy/p-a1ad/" });
+    expect(t.calls.some((c) => c[0] === "close")).toBe(false);
+    expect(t.channel.registry.pendingAdoptions()).toEqual([["tab-h", "ab-1"]]);
+    t.channel.adopted("tab-h", "ab-1");
+    expect(t.channel.registry.pendingAdoptions()).toEqual([]);
+  });
+
   it("refuses a page it doesn't hold or a malformed address", async () => {
     const t = harness();
     await t.channel.handle(request({ op: "handover", view: "ab-x", host: "localhost", port: 8888, path: "/", agent: "s-a" }));

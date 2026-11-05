@@ -297,6 +297,43 @@ pub(crate) fn map_href(state: &AppState, href: &str, fallback: Option<&TargetUrl
     }
 }
 
+/// Free text (a console message, a stack trace) with every proxied URL in
+/// it put in the agent's terms: `scheme://authority/proxy/{id}` becomes the
+/// id's `http://host:port`. Unknown ids are left alone.
+pub(crate) fn map_text(state: &AppState, text: &str) -> String {
+    const MARK: &str = "/proxy/";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(MARK) {
+        let before = &rest[..at];
+        // The URL's start: the nearest `http://` / `https://` in the same
+        // whitespace-free run.
+        let run_start = before
+            .rfind(|c: char| c.is_whitespace() || c == '(' || c == '"' || c == '\'')
+            .map_or(0, |i| i + 1);
+        let run = &before[run_start..];
+        let scheme = run.rfind("http://").or_else(|| run.rfind("https://"));
+        let after = &rest[at + MARK.len()..];
+        let id_len = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+            .unwrap_or(after.len());
+        let id = &after[..id_len];
+        match (scheme, crate::proxy::target_of(state, id)) {
+            (Some(s), Some((host, port))) if !id.is_empty() => {
+                out.push_str(&before[..run_start + s]);
+                out.push_str(&format!("http://{host}:{port}"));
+                rest = &after[id_len..];
+            }
+            _ => {
+                out.push_str(&rest[..at + MARK.len()]);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// The target a `/proxy/{id}` URL is pinned to, if `href` is one.
 pub(crate) fn target_in(state: &AppState, href: &str) -> Option<TargetUrl> {
     let (_, path) = split_href(href)?;

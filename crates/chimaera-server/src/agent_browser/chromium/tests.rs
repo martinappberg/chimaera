@@ -88,10 +88,16 @@ fn named_keys_and_characters_map_to_cdp() {
 #[test]
 fn eval_wraps_the_body_with_named_args() {
     let e = eval_expression("return a + b;", &json!({"a": 1, "b": "x"})).unwrap();
-    assert!(e.starts_with("(async function(a, b) {\nreturn a + b;\n}).call(globalThis, 1, \"x\")"));
+    assert!(e.starts_with(
+        "(async function(a, b, args) {\nreturn a + b;\n}).call(globalThis, 1, \"x\", {\"a\":1,\"b\":\"x\"})"
+    ));
     assert!(e.contains("JSON.stringify"));
     let e = eval_expression("return 1;", &Value::Null).unwrap();
-    assert!(e.contains(".call(globalThis)"));
+    assert!(e.contains("(async function(args)"));
+    assert!(e.contains(".call(globalThis, {})"));
+    // A key named `args` keeps its own value.
+    let e = eval_expression("return args;", &json!({"args": 3})).unwrap();
+    assert!(e.starts_with("(async function(args) {\nreturn args;\n}).call(globalThis, 3)"));
     assert!(eval_expression("", &json!({"a-b": 1})).is_err());
     assert!(eval_expression("", &json!({"this": 1})).is_err());
     assert!(eval_expression("", &json!([1])).is_err());

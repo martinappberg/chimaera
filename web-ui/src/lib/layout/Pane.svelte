@@ -599,7 +599,6 @@
           if (tab.openedBy !== undefined) linkCtrl.reveal(tab.openedBy, node.id);
         }}
         adopt={tab.adopt}
-        onAdopted={() => ctrl.browserAdopted(tab.id)}
         sharedWith={$browserLinks.has(tab.id)
           ? browserOpener($browserLinks.get(tab.id) ?? "", sessions, names)
           : null}

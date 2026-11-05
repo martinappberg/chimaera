@@ -1813,6 +1813,12 @@ fn eval_expression(body: &str, args: &Value) -> Result<String, BrowserError> {
         names.push(k.as_str());
         values.push(serde_json::to_string(v).unwrap_or_else(|_| "null".into()));
     }
+    // `args` is the whole object too, unless a key takes that name (the app
+    // engine's wrapper binds it the same way; the core's bodies read it).
+    if !map.contains_key("args") {
+        names.push("args");
+        values.push(serde_json::to_string(map).unwrap_or_else(|_| "{}".into()));
+    }
     Ok(format!(
         "(async function({}) {{\n{body}\n}}).call(globalThis{}{}).then((v) => {{ \
          const s = JSON.stringify(v === undefined ? null : v); return s === undefined ? 'null' : s; }})",

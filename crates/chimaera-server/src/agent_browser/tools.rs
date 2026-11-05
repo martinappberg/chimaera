@@ -25,6 +25,11 @@ use crate::AppState;
 
 /// The page helpers, sent as the head of every helper eval (idempotent,
 /// version-guarded in the page).
+/// A ring cursor that reads nothing: past any id a page will reach, and
+/// exact as a JavaScript number (the app engine's request crosses the
+/// window's page, where `u64::MAX` would arrive as a float).
+const RING_SKIP: u64 = (1 << 53) - 1;
+
 const SNAPSHOT_JS: &str = include_str!("snapshot.js");
 
 pub(crate) const TOOL_NAMES: [&str; 16] = [
@@ -1739,8 +1744,8 @@ async fn rings(
         )),
     };
     let first = unpack(get(console_since, network_since).await?)?;
-    let console_reset = console_since != u64::MAX && first.console_next < console_since;
-    let network_reset = network_since != u64::MAX && first.network_next < network_since;
+    let console_reset = console_since != RING_SKIP && first.console_next < console_since;
+    let network_reset = network_since != RING_SKIP && first.network_next < network_since;
     if !console_reset && !network_reset {
         return Ok((first, false));
     }
@@ -1809,13 +1814,19 @@ async fn console(state: &Arc<AppState>, ctx: &mut Ctx, args: &Value) -> ToolResu
     };
     refresh_facts(state, ctx).await?;
     let since = cursors_of(state, ctx).console;
-    let (out, restarted) = rings(state, ctx, since, u64::MAX).await?;
+    let (out, restarted) = rings(state, ctx, since, RING_SKIP).await?;
     set_cursors(state, ctx, |c| c.console = out.console_next);
     let lines: Vec<String> = out
         .console
         .iter()
         .filter(|e| keep(&e.level))
-        .map(|e| format!("[{}] {}: {}", clock_ms(e.at), e.level, e.text))
+        .map(|e| {
+            let text = match ctx.engine {
+                EngineKind::App => app_engine::map_text(state, &e.text),
+                EngineKind::Chromium => e.text.clone(),
+            };
+            format!("[{}] {}: {}", clock_ms(e.at), e.level, text)
+        })
         .collect();
     let mut head = Vec::new();
     if restarted {
@@ -1847,7 +1858,7 @@ async fn console(state: &Arc<AppState>, ctx: &mut Ctx, args: &Value) -> ToolResu
 async fn network(state: &Arc<AppState>, ctx: &mut Ctx) -> ToolResult {
     refresh_facts(state, ctx).await?;
     let since = cursors_of(state, ctx).network;
-    let (out, restarted) = rings(state, ctx, u64::MAX, since).await?;
+    let (out, restarted) = rings(state, ctx, RING_SKIP, since).await?;
     set_cursors(state, ctx, |c| c.network = out.network_next);
     // The app engine's record holds proxied URLs: report them in the
     // agent's terms, like the page URL.
@@ -1933,7 +1944,7 @@ async fn wait(state: &Arc<AppState>, ctx: &mut Ctx, args: &Value) -> ToolResult 
             }
         }
         if network_idle {
-            let (out, _) = rings(state, ctx, u64::MAX, net_cursor.unwrap_or(u64::MAX)).await?;
+            let (out, _) = rings(state, ctx, RING_SKIP, net_cursor.unwrap_or(RING_SKIP)).await?;
             if net_cursor != Some(out.network_next) || out.inflight > 0 {
                 quiet_since = Instant::now();
             }
