@@ -29,7 +29,7 @@ marker), `layout/PaneTabs.svelte` (the chain link and chips). Wire: `browser_req
 
 ## The tools (agent side)
 
-- **What & when.** Every MCP-equipped session (workers and Masterminds, every tier) gets the 16
+- **What & when.** Every MCP-equipped session (workers and Masterminds, every tier) gets the 17
   tools below beside `open_browser`. The session instructions tell the agent to use them to
   check its work, and to hand a working page over with `browser_show`.
 - **How it's used.** A typical loop: `browser_navigate {url}` → `browser_snapshot` (text with
@@ -38,7 +38,8 @@ marker), `layout/PaneTabs.svelte` (the chain link and chips). Wire: `browser_req
 
   | Tool | Does |
   |---|---|
-  | `browser_navigate` | Opens the agent's own page (or re-points it, or a shared pane) at an allowlisted `url`, or `back`/`forward`/`reload`; waits for the load (≤ 15 s). Returns the final URL, title and HTTP status when known. `width`/`height` size the own page (default 1280×800). |
+  | `browser_pages` | Lists what the agent can use: its hidden page, the panes shared with it (`p1`… — it can drive them) and the panes the user has open in its workspace (`v1`… — read-only). |
+  | `browser_navigate` | Opens the agent's own hidden page (or re-points it) at an allowlisted `url`, or `back`/`forward`/`reload`; waits for the load (≤ 15 s). With no `page`, a shared pane already showing the same app (host:port) is navigated in place instead, so the agent never opens a second session beside the user's; any other app opens the hidden page. Returns the final URL, title and HTTP status when known. `width`/`height` size the own page (default 1280×800). |
   | `browser_snapshot` | The page as compact text: roles, names, states, and a ref on each interactive element. Default 24,000 characters, at most 100,000; `viewport_only` keeps what is in view. |
   | `browser_screenshot` | A PNG of the viewport, the full page, or one element (`ref` or `selector`), at most 1600 px wide. |
   | `browser_inspect` | One element: outerHTML (first 4 KB), attributes, computed styles (a default set or the names asked), box, visible or covered. |
@@ -55,10 +56,14 @@ marker), `layout/PaneTabs.svelte` (the chain link and chips). Wire: `browser_req
   | `browser_show` | Hands the agent's own page to the user as a pane beside the agent (see [Hand-over](#hand-over-browser_show)). |
   | `browser_close` | Closes the agent's own page. A shared pane stays the user's. |
 
-- **Which page.** Each call takes an optional `page`: `"own"` or a shared pane's id (`"p1"`,
-  `"p2"`…). With no `page`, the call goes to the only shared pane if exactly one is linked to
-  the agent, else to the own page. `browser_navigate` on the own page lists the panes shared
-  with the agent.
+- **Which page.** Each call takes an optional `page`: `"own"` (the hidden page), a shared
+  pane's id (`"p1"`…) or a pane the user has open (`"v1"`…, read-only: snapshot, screenshot,
+  inspect, source, console, network and wait work; acting is refused with "ask the user to
+  share it"). With no `page`: `browser_navigate` uses a shared pane showing the same app, else
+  the hidden page (checking something never moves the user's pane to another app); the other
+  tools use the own page if there is one, else the single shared pane. A `v` pane is used only
+  when named. An agent may always ask for its own hidden page; when a shared pane shows the same
+  app the result notes that notebook-like apps allow one editing session.
 - **Every result names its engine.** The first line reads
   `[browser · engine: app|chromium · page: own|shared pane "Title" (p1)]`, with `· throttled`
   when the page reports `document.visibilityState === "hidden"`. A new own page on a different
@@ -118,7 +123,10 @@ marker), `layout/PaneTabs.svelte` (the chain link and chips). Wire: `browser_req
 ## Sharing a pane (the chain link)
 
 - **What & when.** The user lets an agent act in a browser pane they already have open (logged
-  in, at the right place). Only in the macOS app: an agent drives a pane through its pane view.
+  in, at the right place). A pane an agent opens with `open_browser` is shared with that agent
+  automatically: one page, which the agent drives while the user watches, instead of a hidden
+  duplicate that would fight the user's session. Only in the macOS app: an agent drives a pane
+  through its pane view.
 - **How it's used.** The browser tab's chain link works like a linked terminal's: drag the pane
   bar's chain onto an agent, or open "link to agent" from it. The pane gets
   the agent's hue and the agent pane gets a chip (a dot shows driving or paused; click reveals
@@ -126,7 +134,8 @@ marker), `layout/PaneTabs.svelte` (the chain link and chips). Wire: `browser_req
   while linked).
 - **Key behaviors.** One agent per tab, many tabs per agent; a re-link moves it; at most 64
   links per daemon. Links are in memory only. A link ends with its agent, when the user unlinks
-  it, or when the tab closes (the window unlinks). The first use from a window installs the
+  it, or when the tab or its pane closes (the window unlinks). It survives page reloads (an app
+  reloading after the agent changed its code) and Chimaera window reloads. The first use from a window installs the
   page-world recorder and the agent cursor in the pane (`instrument`, `cursor`).
 - **Where it lives.** `links.rs` (`link_browser`, `unlink_browser`, `panes_of`, the routes),
   `PaneTabs.svelte` (menu, chips), `App.svelte` (`LinkCtrl.linkBrowser`/`unlinkBrowser`,
