@@ -1241,6 +1241,9 @@ fn tick_all(app: &AppHandle, endpoints: HashMap<String, Option<(u16, String)>>) 
 }
 
 /// Delete a finished trip's working copies (only ever under the office root).
+/// A copy PowerPoint still holds open (an older one after "use theirs", whose
+/// window may hold changes) is left alone: deleting it would send that
+/// window's next save nowhere.
 fn remove_copies(trip: &Trip, root: &Path) {
     for dir in trip
         .retired
@@ -1248,7 +1251,7 @@ fn remove_copies(trip: &Trip, root: &Path) {
         .map(PathBuf::as_path)
         .chain(trip.local_path.parent())
     {
-        if dir.starts_with(root) && dir != root {
+        if dir.starts_with(root) && dir != root && !RealDisk.held_open(&dir.join(trip.name())) {
             let _ = std::fs::remove_dir_all(dir);
         }
     }

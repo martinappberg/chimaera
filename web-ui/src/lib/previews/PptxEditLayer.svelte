@@ -71,7 +71,7 @@
    */
   import { untrack } from "svelte";
   import type { DeckEdits } from "./pptxEditStore.svelte";
-  import { LINE_BREAK, PptxXmlError, readText, readXfrm, type Xfrm } from "./pptxXml";
+  import { LINE_BREAK, PptxXmlError, readText, readTexts, readXfrm, type Xfrm } from "./pptxXml";
 
   interface Props {
     edits: DeckEdits;
@@ -133,14 +133,15 @@
     const xml = edits.partText(part);
     const out = new Set<string>();
     if (xml === null) return out;
+    let texts: Map<string, string[]>;
+    try {
+      texts = readTexts(xml);
+    } catch {
+      return out;
+    }
     for (const it of items) {
-      if (!it.text) continue;
-      try {
-        const paras = readText(xml, it.id);
-        if (paras !== null && paras.every((p) => p.trim() === "")) out.add(it.id);
-      } catch {
-        // Not readable: not offered as empty.
-      }
+      const paras = it.text ? texts.get(it.id) : undefined;
+      if (paras !== undefined && paras.every((p) => p.trim() === "")) out.add(it.id);
     }
     return out;
   });
@@ -794,6 +795,12 @@
       for (const m of markers) m.removeAttribute("contenteditable");
     };
     el.focus({ preventScroll: true });
+    placeCaret(el, at);
+  }
+
+  /** The caret at `at` (client coordinates) inside `el`; all of it selected
+   *  when `at` is null or misses its text. */
+  function placeCaret(el: HTMLElement, at: { x: number; y: number } | null): void {
     const sel = window.getSelection();
     // The layer still covers the slide until its `texting` class lands; the
     // caret's hit test must see the text under it.
@@ -1001,7 +1008,9 @@
     const it = at === null ? null : hit(at);
     if (it === null) return;
     selected = it.id;
-    if (it.text) startText(it, { x: e.clientX, y: e.clientY });
+    // The still click before it already opened this text: just move the caret.
+    if (textFor === it.id && body !== null) placeCaret(body, { x: e.clientX, y: e.clientY });
+    else if (it.text) startText(it, { x: e.clientX, y: e.clientY });
     else say(cannotEdit(it));
   }}
 >

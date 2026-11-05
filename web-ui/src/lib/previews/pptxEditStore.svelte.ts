@@ -146,7 +146,13 @@ export class DeckEdits {
       return;
     }
     const wasDirty = this.core.dirty;
+    const moved = hash !== this.core.diskHash;
     const { conflicts } = await this.core.rebase(read, hash);
+    if (moved && this.saveFailed) {
+      // The refused save's "changed on disk" is answered by this rebase.
+      this.saveFailed = false;
+      this.error = null;
+    }
     this.sync();
     if (wasDirty && conflicts.length === 0 && this.core.dirty) this.flashNote("merged with a change on disk");
   }

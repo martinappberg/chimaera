@@ -521,6 +521,18 @@ export function readText(xml: string, id: string): string[] | null {
   return body === null ? null : paragraphs(xml, body).map((p) => p.text);
 }
 
+/** Every text shape's paragraphs in one scan of the part (shape id → text). */
+export function readTexts(xml: string): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  for (const el of walk(scan(xml))) {
+    const id = shapeId(xml, el);
+    if (id === null || out.has(id)) continue;
+    const body = txBodyOf(el);
+    if (body !== null) out.set(id, paragraphs(xml, body).map((p) => p.text));
+  }
+  return out;
+}
+
 function commonPrefix(a: string, b: string): number {
   let k = 0;
   while (k < a.length && k < b.length && a[k] === b[k]) k++;
