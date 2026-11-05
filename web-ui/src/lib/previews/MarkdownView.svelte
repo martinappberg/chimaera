@@ -92,7 +92,7 @@
   import DocIssues from "./DocIssues.svelte";
   import PublishButton from "./PublishButton.svelte";
   import { HoverPreviews } from "./doc/hoverController.svelte";
-  import { hasUrlScheme, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
+  import { activateUrl, hasUrlScheme, isWebUrl, OPEN_BESIDE, urlMenuEntries } from "../shared/urlOpen";
   import { pathPaneFrom } from "../shared/openPath";
   import { contextMenu } from "../shared/contextMenu.svelte";
   import { revealRequest, takeReveal, type Reveal } from "../shared/reveal";
@@ -1100,12 +1100,18 @@
   }
 
   /** A middle-click would open the raw href in a new BROWSER tab — for a
-   *  document-relative path, the app origin's 404. A file link opens beside
-   *  instead; a web link keeps the browser's own new-tab behavior. */
+   *  document-relative path, the app origin's 404, and in the native app
+   *  nothing at all (its navigation guard). Both kinds open beside instead,
+   *  as in a chat: a file in the neighbor pane, a web link as a browser pane
+   *  beside (a live local app) or in the real browser. */
   function onLinkAuxClick(e: MouseEvent): void {
     if (e.button !== 1 || (e.target as Element | null)?.closest?.(".embed-card") != null) return;
     const href = (e.target as Element | null)?.closest?.("a[href]")?.getAttribute("href") ?? "";
-    if (isWebUrl(href)) return;
+    if (isWebUrl(href)) {
+      e.preventDefault();
+      activateUrl(href, true);
+      return;
+    }
     followLink(e, true);
   }
 
@@ -1144,12 +1150,22 @@
     );
   }
 
+  /** Right-click a link: a web link offers Chimaera / Browser / Copy; a
+   *  link to another file opens here or beside (an in-document `#anchor` and
+   *  `mailto:`/`tel:` keep the web view's own menu). */
   function onLinkContextMenu(e: MouseEvent): void {
     if ((e.target as Element | null)?.closest?.(".embed-card") != null) return;
     const anchor = (e.target as Element | null)?.closest?.("a[href]");
     const href = anchor?.getAttribute("href") ?? "";
-    if (anchor === null || anchor === undefined || !isWebUrl(href)) return;
-    contextMenu.openAt(e, urlMenuEntries(href));
+    if (anchor === null || anchor === undefined) return;
+    if (isWebUrl(href)) {
+      contextMenu.openAt(e, urlMenuEntries(href));
+    } else if (readingEl?.contains(anchor) === true && href !== "" && !href.startsWith("#") && !hasUrlScheme(href)) {
+      contextMenu.openAt(e, [
+        { label: "Open", onSelect: () => followLink(e, false) },
+        { label: OPEN_BESIDE, onSelect: () => followLink(e, true) },
+      ]);
+    }
   }
   let chipPos = $state<{ x: number; y: number } | null>(null);
 

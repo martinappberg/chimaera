@@ -125,7 +125,8 @@ official `@xterm/addon-search`; shared routing is described in
   (`paper.pdf#page=3&xywh=72,272,320,220`, `de.tsv#row=40-42`, `book.xlsx#sheet=S&range=D6:E7`,
   `talk.wav#t=12`, `nb.ipynb#cell=7`, `deck.md#slide=3`; see
   [pointing at part of a file](files-and-previews.md#pointing-at-part-of-a-file)). A directory opens/reuses the
-  Finder beside the terminal. Cmd/Ctrl+click forces a new split. Clicking a name several files
+  Finder beside the terminal. Cmd/Ctrl+click opens it beside, and so does a plain click when the
+  terminal has a neighbor pane ([open beside](workbench.md#splitting-tabs--drag-and-drop)). Clicking a name several files
   answer to opens a menu of the matches.
 - **Where it lives.** `web-ui/src/lib/terminal/links.ts` (`PathLinkProvider`), the parser it
   shares with chat `web-ui/src/lib/shared/fileRef.ts` (cases in `fileRefs.fixture.json`), the

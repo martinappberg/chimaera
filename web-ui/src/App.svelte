@@ -124,6 +124,8 @@
   import {
     activateTab,
     adjacentPane,
+    focusBeside,
+    opensBesideSession,
     allFilePaths,
     closePane,
     cycleTab,
@@ -1798,15 +1800,17 @@
   /**
    * Open a proxyable URL as a browser pane FROM `fromPane`: reuse an existing
    * pane on the same host:port (clicking Jupyter's printed URL twice lands
-   * where you already are), or split beside when Cmd/Ctrl is held — the same
-   * grammar file links follow. Every link surface routes through here.
+   * where you already are), or a fresh browser tab beside (`focusBeside`)
+   * when Cmd/Ctrl is held — the same grammar file links follow. From a chat
+   * or terminal with a neighbor, a plain click lands beside it too
+   * (`opensBesideSession`). Every link surface routes through here.
    */
   function openBrowserFromPane(paneId: string, target: UrlTarget, newSplit: boolean): void {
     if (newSplit) {
-      layout = splitPane(layout, paneId, "row");
-      layout = openTab(layout, freshBrowserTab(target.host, target.port, target.path));
+      layout = openTab(focusBeside(layout, paneId), freshBrowserTab(target.host, target.port, target.path));
     } else {
-      layout = openBrowser(focusPane(layout, paneId), target.host, target.port, target.path);
+      const at = opensBesideSession(layout, paneId) ? focusBeside(layout, paneId) : focusPane(layout, paneId);
+      layout = openBrowser(at, target.host, target.port, target.path);
     }
     // The browser surface took focus: pull DOM focus off whatever had it so
     // plain keys stop reaching a PTY that is no longer the focused view.
@@ -1918,8 +1922,10 @@
    * changes row, touched-files popover): an already-open tab is focused wherever
    * it lives (reuse existing, no duplicates); otherwise it lands in the ACTIVE
    * (focused) pane — the same "opens in the pane you're in" rule the FILES tree
-   * and quick-open already follow. Cmd/Ctrl (newSplit) forces a fresh split to
-   * the right instead, the escape hatch when you want it beside the source.
+   * and quick-open already follow. Cmd/Ctrl (newSplit) opens it beside the
+   * source instead (`focusBeside`: the neighbor pane, else a split right), and
+   * so does a plain open from a chat or terminal that has a neighbor
+   * (`opensBesideSession`), so the conversation stays in view.
    */
   function openFileFromPane(paneId: string, path: string, newSplit: boolean, pinned = false): void {
     layout = pinPaths(layout, get(dirtyFiles));
@@ -1927,9 +1933,8 @@
     if (existing !== null) {
       layout = activateTab(layout, existing.paneId, existing.index);
       if (pinned) layout = pinTab(layout, existing.paneId, existing.index);
-    } else if (newSplit) {
-      layout = splitPane(layout, paneId, "row");
-      layout = openFile(layout, path, !pinned);
+    } else if (newSplit || opensBesideSession(layout, paneId)) {
+      layout = openFile(focusBeside(layout, paneId), path, !pinned);
     } else {
       // Open in the active pane (the source pane the click just focused). Opens
       // are PREVIEW tabs (italic, replaced by the next preview open) unless the
@@ -2268,9 +2273,8 @@
   }
 
   /**
-   * A directory link from a pane: reuse an open Finder (unless Cmd/Ctrl forced a
-   * split), else open a fresh Finder beside the source terminal — adjacent pane,
-   * or a split to the right when the window has one pane.
+   * A directory link from a pane: reuse an open Finder (unless Cmd/Ctrl asks for
+   * a new one), else open a fresh Finder beside the source (`focusBeside`).
    */
   function openDirInFinder(paneId: string, path: string, newSplit: boolean): void {
     const targetId = newSplit ? null : targetFinderId();
@@ -2279,13 +2283,7 @@
       const loc = findFinder(layout, targetId);
       if (loc !== null) layout = activateTab(layout, loc.paneId, loc.index);
     } else {
-      const neighbor = newSplit ? null : adjacentPane(layout, paneId);
-      if (neighbor !== null) {
-        layout = openFinder(focusPane(layout, neighbor), path).layout;
-      } else {
-        layout = splitPane(layout, paneId, "row");
-        layout = openFinder(layout, path).layout;
-      }
+      layout = openFinder(focusBeside(layout, paneId), path).layout;
     }
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
@@ -4803,6 +4801,7 @@
                 root={workspace.root}
                 onOpen={openFilePath}
                 onOpenPinned={(p) => openFilePath(p, true)}
+                onOpenBeside={(p) => openFileFromPane(layout.focusedPaneId, p, true)}
                 onDragStart={onTreeEntryDown}
                 dropAction={dropSpot?.kind === "fileOp" ? dropSpot.operation : "upload"}
                 activePath={focusedFilePath}

@@ -10,7 +10,8 @@ import { requestReveal, type Reveal } from "./reveal";
 export type PathKind = "file" | "dir";
 
 export interface OpenPathOptions {
-  /** Cmd/Ctrl-click: open beside the source in a fresh split. */
+  /** Cmd/Ctrl-click (or middle click, "Open Beside"): open beside the source —
+   *  its neighbor pane, else a fresh split to the right. */
   split?: boolean;
   /** A link inside this document, rather than an unrelated file open. */
   documentFrom?: string;

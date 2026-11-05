@@ -425,7 +425,9 @@ unused week reads 0%); an
   the candidates resolve against the session's live cwd, its spawn cwd and the workspace root,
   then the workspace index (unique basename or path suffix). Click opens the file at the line, or
   at a locator's spot (`paper.pdf#page=3&xywh=…`, `de.tsv#row=5-9`, `demo.mp4#t=30`);
-  Cmd/Ctrl+click opens it in a split; a directory opens in the Finder; a name several files
+  Cmd/Ctrl+click, a middle click or **Open Beside** in its right-click menu opens it beside;
+  with a neighbor pane a plain click lands there too, keeping the chat in view
+  ([open beside](workbench.md#splitting-tabs--drag-and-drop)); a directory opens in the Finder; a name several files
   answer to (dashed underline) asks which in the context menu. Every renderer in a chat shares one
   batched, cached resolver (`paths.ts` `PathResolver`), its answers keyed by the candidate AND the
   base ladder + workspace it resolved against: a miss is asked again after 15 s, after every turn

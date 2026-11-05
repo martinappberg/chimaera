@@ -154,6 +154,15 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   edit can't be replaced away), or on a tab move/reorder. Tree single-click = preview, tree
   double-click / a created file = pinned; chat/quick-open/terminal-link/Finder opens = preview.
   The preview flag persists in the layout blob (`pv:1`, additive).
+- **Open beside.** One rule for every "beside" gesture: ⌘/Ctrl-click (or a middle click) on
+  a file or URL link in a chat, a document or a terminal, ⌘/Ctrl-click or ⌘/Ctrl+Enter on a
+  file-tree row, and **Open Beside (⌘-click)** in the right-click menu of a file link, a tree
+  row or a URL. It lands in the pane next to the source (`layout.ts` `focusBeside`: the nearest
+  neighbor, right first), and only splits right when the source is alone — so following links
+  stays in two panes and never passes the 4-pane cap. A plain click from a **chat or terminal**
+  that has a neighbor lands beside it too (`opensBesideSession`), so a file or app the agent
+  mentions opens next to the conversation instead of covering it; with no neighbor it opens in
+  the session's pane as before. A file already open anywhere is focused where it is.
 - **Document navigation.** Files open above the existing view in the current pane.
   Following nested Markdown links reuses the preview slot; small Back/Forward buttons in a
   compact bottom-left floating control appear only while hovering the document (or focusing
