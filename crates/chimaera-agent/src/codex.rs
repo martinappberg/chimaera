@@ -34,11 +34,10 @@ use sha2::{Digest, Sha256};
 
 use crate::ndjson::JsonlChild;
 
-/// CLI version these frame shapes were verified against (2026-10-23, the
+/// CLI version these frame shapes were verified against (2026-11-04, the
 /// codex chat-smoke cases 15/15 incl. both multi-agent runtimes through the
-/// driver + generated-schema diff from 0.158.0 and 0.162.1; PROTOCOL.md
-/// Pass 51).
-pub const TESTED_CODEX_VERSION: &str = "0.164.0";
+/// driver + generated-schema diff from 0.164.0; PROTOCOL.md Pass 59).
+pub const TESTED_CODEX_VERSION: &str = "0.166.0";
 
 /// The collab `wait` row's title. The main-thread fold (`lib.rs`) reads it
 /// as "waiting on a subagent": a steer ends that wait at once (0.162.1, live,

@@ -11,11 +11,16 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use tokio::task::JoinHandle;
 
-pub const TESTED_GROK_VERSION: &str = "1.0.46";
-pub const TESTED_AGY_VERSION: &str = "1.2.1";
+/// Grok Build's stable channel, verified by chat-smoke-acp (PROTOCOL.md
+/// Pass 59).
+pub const TESTED_GROK_VERSION: &str = "1.0.70";
+/// The standalone `agy-acp-server` release the installer fetches beside the
+/// agy CLI (`runtimes.rs`), verified by chat-smoke-acp (Pass 59). Not the
+/// CLI's built-in `agy acp`, a different server.
+pub const TESTED_AGY_VERSION: &str = "1.4.5";
 /// `cursor-agent --version` of the build whose `acp` server was probed
-/// (PROTOCOL.md, ACP › Cursor). Turn-level facts await a signed-in run.
-pub const TESTED_CURSOR_VERSION: &str = "2026.10.14-941492e";
+/// (PROTOCOL.md, ACP › Cursor; Pass 59).
+pub const TESTED_CURSOR_VERSION: &str = "2026.10.22-27dcf5f";
 const MAX_PENDING: usize = 64;
 const MAX_CHOICES: usize = 64;
 
