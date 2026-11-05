@@ -1765,7 +1765,15 @@
    *  `sent`, so a disconnect or a no-op never lies about delivery. */
   function deliverWaitingNow(sends: PendingSend[]) {
     const waiting = sends.filter((s) => s.state === "queued");
-    const target = waiting.find((s) => !s.afterTurn) ?? waiting[0];
+    // The user's own message first: naming another agent's message would
+    // make it the user's delivery (Codex re-drives it instead of returning
+    // it to that agent's inbox).
+    const own = waiting.filter((s) => !isAgentOrigin(s.origin));
+    const target =
+      own.find((s) => !s.afterTurn) ??
+      waiting.find((s) => !s.afterTurn) ??
+      own[0] ??
+      waiting[0];
     if (target !== undefined) sendCommand({ type: "send_now", id: target.id }, "couldn't send now");
   }
 
@@ -1798,6 +1806,9 @@
     const back = untrack(() => store.takeEdited(quoteOwner));
     if (back.length > 0) void restoreEdited(back);
   });
+  // Closed before the agent confirmed a withdrawal: any view of this chat
+  // (or the next one mounted) takes the words back, so they are never lost.
+  onDestroy(() => store.releaseEdits(quoteOwner));
 
   /** Words first, as one draft in the order sent; then the pictures, from
    *  the daemon's saved copies. */
@@ -3731,7 +3742,7 @@
                   />
                 </div>
               {/if}
-              {#if send.state === "queued" && !readOnly}
+              {#if send.state === "queued" && !readOnly && supports("cancel_queued")}
                 <button
                   class="edit-btn"
                   title="edit (↑ in an empty composer takes back every waiting message)"

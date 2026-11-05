@@ -444,6 +444,20 @@ describe("ChatStore pending-send ordering", () => {
     expect(store.blocks.filter((b) => b.kind === "user")).toHaveLength(1);
   });
 
+  it("a view that closes before the withdrawal lands hands its edit to the next view", () => {
+    const store = fold([
+      { type: "turn_started", turn_id: "t1" },
+      { type: "user_message", text: "keep me", id: "q1", queued: true },
+    ]);
+    const closing = {};
+    const next = {};
+    store.requestEdit(["q1"], closing);
+    store.releaseEdits(closing);
+    store.apply({ seq: 50, ts: 0, ev: { type: "user_message_update", id: "q1", state: "cancelled" } } as SeqEvent);
+    expect(store.takeEdited(next).map((b) => b.text)).toEqual(["keep me"]);
+    expect(store.edited).toEqual([]);
+  });
+
   it("a cancel nobody asked to edit returns nothing", () => {
     const store = fold([
       { type: "turn_started", turn_id: "t1" },

@@ -259,7 +259,8 @@ export interface EditedSend {
   id: string;
   text: string;
   attachmentPaths: string[];
-  owner: object;
+  /** Null once the asking view closed: any view of the chat takes it. */
+  owner: object | null;
 }
 
 /** Identity every transcript block carries alongside its variant body. */
@@ -815,7 +816,7 @@ export class ChatStore {
    *  so only a `cancelled` that answers it here returns the words. A message
    *  the agent read first resolves `sent` and is never returned. Bounded by
    *  the pending stack it is drawn from. */
-  private editing = new Map<string, object>();
+  private editing = new Map<string, object | null>();
   /** Withdrawn messages whose words go back to the composer of the view
    *  that asked (its token), oldest first; that view drains them
    *  (`takeEdited`). */
@@ -836,12 +837,22 @@ export class ChatStore {
     for (const id of ids) this.editing.delete(id);
   }
 
-  /** `owner`'s withdrawn messages to put back in its composer, oldest first. */
+  /** `owner`'s withdrawn messages to put back in its composer, oldest
+   *  first, with any a closed view left behind (`releaseEdits`). */
   takeEdited(owner: object): EditedSend[] {
-    const mine = this.edited.filter((e) => e.owner === owner);
+    const mine = this.edited.filter((e) => e.owner === owner || e.owner === null);
     if (mine.length === 0) return [];
-    this.edited = this.edited.filter((e) => e.owner !== owner);
+    this.edited = this.edited.filter((e) => e.owner !== owner && e.owner !== null);
     return mine;
+  }
+
+  /** A view is closing: what it asked to edit goes to whichever view of
+   *  this chat drains next, instead of being lost with it. */
+  releaseEdits(owner: object) {
+    for (const [id, o] of this.editing) if (o === owner) this.editing.set(id, null);
+    if (this.edited.some((e) => e.owner === owner)) {
+      this.edited = this.edited.map((e) => (e.owner === owner ? { ...e, owner: null } : e));
+    }
   }
 
   /** The NET front shift the client cap has applied to `blocks`, cumulative:
@@ -1345,6 +1356,7 @@ export class ChatStore {
           // entirely (it was never in `blocks`), so nothing to clean up there.
           this.pendingSends.splice(pIdx, 1);
           if (editor !== undefined) {
+            // (null: the asking view closed; any view takes the words back.)
             // Raw state: the owner token must keep its identity.
             this.edited = [
               ...this.edited,
