@@ -205,19 +205,22 @@ fn queued_message_frame(uuid: &str, content: Value, priority: &str, requeue: boo
 
 /// The one line for `system/session_writes_lost {error_code, lost}`
 /// (2.1.317): what the CLI could not save, and why. `None` when it names
-/// nothing it lost.
+/// nothing it lost; a kind this driver does not know still says so.
 fn writes_lost_notice(frame: &Value) -> Option<String> {
     let lost: Vec<&str> = frame["lost"]
         .as_array()?
         .iter()
         .filter_map(Value::as_str)
         .collect();
+    if lost.is_empty() {
+        return None;
+    }
     let transcript = lost.contains(&"transcript");
     let what = match (transcript, lost.contains(&"global_config")) {
-        (true, true) => "this conversation or its ~/.claude.json settings",
+        (true, true) => "this conversation or ~/.claude.json",
         (true, false) => "this conversation",
-        (false, true) => "its ~/.claude.json settings",
-        (false, false) => return None,
+        (false, true) => "~/.claude.json",
+        (false, false) => "some of its files",
     };
     let why = match frame["error_code"].as_str() {
         Some("ENOSPC") => "the disk is full".to_string(),
@@ -4241,6 +4244,7 @@ impl ClaudeMapper {
                 if let Some(pos) = self.awaiting_read.iter().position(|q| q == id) {
                     let id = self.awaiting_read.remove(pos).expect("position exists");
                     self.requeue_armed.remove(&id);
+                    self.held_cancels.remove(&id);
                     step.events.push(AgentEvent::UserMessageUpdate {
                         id,
                         state: UserMessageState::Sent,
@@ -7323,7 +7327,7 @@ pub(crate) mod tests {
         assert_eq!(
             step.events,
             vec![AgentEvent::Notice {
-                text: "Claude couldn't save this conversation or its ~/.claude.json settings: \
+                text: "Claude couldn't save this conversation or ~/.claude.json: \
                        the disk quota is used up. Reopening it may miss the latest turns."
                     .into(),
             }]
@@ -7334,7 +7338,11 @@ pub(crate) mod tests {
         };
         assert_eq!(
             notice(json!({ "error_code": "ENOSPC", "lost": ["global_config"] })).as_deref(),
-            Some("Claude couldn't save its ~/.claude.json settings: the disk is full.")
+            Some("Claude couldn't save ~/.claude.json: the disk is full.")
+        );
+        assert_eq!(
+            notice(json!({ "error_code": "EIO", "lost": ["memory"] })).as_deref(),
+            Some("Claude couldn't save some of its files: EIO.")
         );
         assert_eq!(notice(json!({ "error_code": "ENOSPC", "lost": [] })), None);
     }
