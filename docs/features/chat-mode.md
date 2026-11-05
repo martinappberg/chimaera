@@ -94,13 +94,18 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   the steered message's `userMessage` item — not the RPC ack). Then it leaves the stack and enters
   the transcript right there, solid — mid-turn if that is where it was read. A Codex steer read
   just as its turn finishes (recorded, but no model step after it) is answered in an input-less
-  follow-up turn, so it never sits read and unanswered (Pass 54). Each waiting bubble
-  has **Send now** (stops the current turn, unless Claude can take the message into it by moving what the turn waits on to the background; every waiting message is then read at once — claude
-  keeps its queue through the interrupt, and Chimaera re-sends the steers Codex drops; Claude's
+  follow-up turn, so it never sits read and unanswered (Pass 54). The stack has one
+  **Send now** under its last bubble (stops the current turn, unless Claude can take the messages into it by moving what the turn waits on to the background; everything waiting for the next step is then read at once, as one turn, and after-turn messages run right after it — claude
+  keeps its queue through the interrupt; Chimaera re-sends the steers Codex drops and carries the ones Codex had read but not yet answered; an ACP chat gets every waiting message as one prompt; Claude's
   background agents keep running, because Chimaera sends the CLI's own send-now rather than its
-  Stop, which ends them for good) and **✕**
+  Stop, which ends them for good; PROTOCOL.md Pass 60). Each waiting bubble has **✎**, and **↑** in an
+  empty composer does the same for all of them: the message is withdrawn and its words (and
+  pictures) come back to the composer to edit, only once the agent confirms the withdrawal, so one
+  it read first stays sent. And each has **✕**
   (pulls it back — Claude `cancel_async_message`, an ACP or Codex next-turn queue item
-  removed locally; a Codex steer can't be withdrawn and says so).
+  removed locally; a Codex steer can't be withdrawn and says so). On Claude Code 2.1.318 a
+  message sent while a model switch is still being checked waits unqueued; Chimaera repeats its ✕
+  once it queues, so the message is withdrawn instead of running (PROTOCOL.md Pass 59).
   Stop never drops the queue. On Claude Code 2.1.310+ that holds across the race too: a waiting
   message the agent took in just as you pressed Stop stays in the stack and runs as a turn of its
   own (the CLI puts it back); it shows as read only once Claude's reply to it begins. A Stop also
@@ -1042,6 +1047,7 @@ _Captured 2026-09-28 from the maintainer's own words in the session that built i
 - **Why (maintainer, verbatim):** "Claude transcripts have like a new 'send now' and also items that are queued seem to be read even mid a turn ? is this true ? can we fix so chimaera works this way as well. And also if multiple messages are queued I assume they should all be read at the same time? This is just for good measure to keep on par with the other tools". Then: "Do a similar check for codex too to make sure we are on par".
 - **Decision the maintainer took (asked, with both agents' native defaults and his own Codex desktop setting `followUpQueueMode = "queue"` laid out):** "Read at next step" for both agents — Enter while an agent works is read at its next tool call and shows grey until then; a chord sends a message for after the turn instead; every waiting bubble has Send now and ✕. (The chord became ⌥↩ because the proposed ⇧⌘↩ is Zoom Pane here.)
 - _Settled vs. free-to-change, and what must not be "fixed": pending — not yet asked. The stated goal is parity with the official Claude and Codex clients._
+- **2026-11-04 (#355, maintainer, verbatim):** "If you have more than 1 msg in the queue, need to fix the queue handling here. All queued up (unless queued after turn) should send immediately. Can we figure out good UI / UX for this?" Offered one Send now for the whole waiting stack instead of one per bubble, he chose "Yes, one control", then added: "but if so, one should be able to edit the waiting stack I feel too" — hence ✎ and ↑ to take waiting messages back to the composer.
 
 ### Quoting part of a reply back to the agent — why it exists
 _Captured 2026-09-28 from the maintainer, in the session that built it._

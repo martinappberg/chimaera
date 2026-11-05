@@ -48,13 +48,23 @@ impl Plugin for Fixture {
         vec![ToolDef::new(
             "build",
             "Run the fixture's stand-in build and answer with what it printed.",
-            json!({"type": "object", "properties": {"slow": {"type": "boolean"}}}),
+            json!({"type": "object", "properties": {"slow": {"type": "boolean"}, "picture": {"type": "boolean"}}}),
         )]
     }
 
     fn call_tool(cx: Context, name: &str, args: Value) -> ToolResult {
         if name != "build" {
             return ToolResult::error(format!("unknown tool {name}"));
+        }
+        // A picture in the answer (the host turns the line into an image).
+        if args.get("picture").and_then(Value::as_bool) == Some(true) {
+            const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+            return match platform::output_write(&cx, "pictures/one.png", PNG) {
+                Ok(()) => ToolResult::text(
+                    "here it is:\n![one](output:pictures/one.png)\n![none](output:pictures/none.png)",
+                ),
+                Err(e) => ToolResult::error(e),
+            };
         }
         let script = if args.get("slow").and_then(Value::as_bool) == Some(true) {
             "sleep 60; echo late"

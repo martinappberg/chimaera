@@ -844,7 +844,7 @@ has what 0.2 adds:
 
 ### Screens: `ui/1`
 
-A view's tree is `{"ui": "1", "root": <node>}`; a node is `{"type": …,
+A view's tree is `{"ui": "1", "root": <node>}` (and optionally `"fill": true`, below); a node is `{"type": …,
 props…, "children": […]}` (`chimaera_plugin_api::ui` has helpers). Props are
 semantic, never visual: `tone` is `neutral | accent | good | warn | bad`, `size`
 `small | large`, `gap` `small | large`. The daemon checks every tree before a
@@ -903,7 +903,10 @@ action's `open`), `panel` (the dashboard, after core's sections), `file` (a
 claimed file; the view owns the pane: the root stack's last child grows to its
 height, and an `editor` or `pdf` first in a split pane, a stack or a tab fills
 it — an embedded viewer shows no path bar), `status` (a chip in a claimed file's bar), `card` (inside its
-Extensions card). The UI renders only on open, on an action, and on
+Extensions card). Any other view takes the same layout when its tree says
+`"fill": true` beside `ui` and `root` (a tab whose split puts an `image` or `pdf`
+first in a pane: the PowerPoint plugin's Slides and Themes); otherwise a viewer
+keeps its fixed box. The UI renders only on open, on an action, and on
 `invalidate`; nothing polls.
 
 ### Data surfaces
@@ -947,6 +950,10 @@ version = ["-v"]           # the arguments that print its version
 [[programs]]
 name = "tlmgr"
 network = "CTAN mirrors (TeX Live packages)"   # what it reaches: said on the card, not enforced
+
+[[programs]]
+name = "soffice"
+also = ["/Applications/LibreOffice.app/Contents/MacOS"]   # ≤ 4 folders (absolute or ~/…) looked in after the PATH, before your tools; on the card
 
 [[tools]]                  # a side program the host downloads on the user's click
 id = "tinytex"
@@ -998,6 +1005,16 @@ duration_ms, stdout, stderr}` for this plugin's jobs in this workspace. When
 one ends the plugin hears `job-finished {id, exit, timed_out, duration_ms}`
 (with the 30 s budget, so it can digest a large output), and windows get a
 `job` frame.
+
+**Pictures in a tool's answer.** A line of the answer's text that is exactly
+`![alt](output:<path>)`, naming a PNG, JPEG, WebP or GIF the plugin wrote into its
+output folder, reaches the agent as an MCP `image` block in that place; the line stays
+as its caption with the file's absolute path (an agent whose client drops images can
+still open it). At most 8 pictures an answer, 2 MiB each and 8 MiB in all; a missing,
+oversized, linked or mislabelled one stays a line saying why. Any other text is
+untouched, so a plugin that never writes such a line answers exactly as before. The
+PowerPoint plugin's `render_slides` is the worked example: slides LibreOffice rendered,
+rasterized in the component, shown to the agent in the same answer.
 
 **A long agent tool** starts a job and answers `ToolResult::wait(job_id,
 "still building")`. The host holds the agent's call until the job ends (at most

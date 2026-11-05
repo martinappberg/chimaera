@@ -956,10 +956,10 @@ hook's `additionalContext`, a chat send or steer, a billed wake. One switch
 *Added 2026-09-26. Plan: [plugin-system-plan.md](../design/plugin-system-plan.md); what users see:
 [features/plugins.md](../features/plugins.md); authoring: [plugins.md](plugins.md).*
 
-Opt-in capabilities beyond the core (Mycelium's Knowledge reader, LaTeX, Typst) are **workbench
+Opt-in capabilities beyond the core (Mycelium's Knowledge reader, LaTeX, Typst, PowerPoint) are **workbench
 plugins**, with their feature logic in separate repositories. API 0.2 implements
 semantic screens, declared native programs, downloaded tools, output folders,
-settings and durable plugin state. LaTeX and Typst use that platform:
+settings and durable plugin state. LaTeX, Typst and PowerPoint use that platform:
 [plugin-platform-plan.md](../design/plugin-platform-plan.md),
 [latex-reports-plan.md](../design/latex-reports-plan.md). A plugin is a
 Rust crate compiled to one portable WebAssembly component (`plugin.wasm`, `wasm32-wasip2`)

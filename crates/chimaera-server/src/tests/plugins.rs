@@ -445,9 +445,11 @@ async fn plugin_tools_appear_only_where_switched_on_and_present() {
     let with = tools(&state, &worker, "wk").await;
     assert!(with.contains(&"knowledge_search".to_string()), "{with:?}");
     assert!(with.contains(&"knowledge_get".to_string()));
-    assert!(instructions(&state, &worker, "wk")
-        .await
-        .contains("Project knowledge (the mycelium plugin)"));
+    // Within the first 4 KB: Claude Code truncates a server's instructions
+    // past that, and chimaera's own text alone is longer.
+    let said = instructions(&state, &worker, "wk").await;
+    let at = said.find("Project knowledge (the mycelium plugin)");
+    assert!(at.is_some_and(|i| i < 1_000), "{said}");
 
     // Switched back off: back to exactly the base list.
     request(

@@ -11,11 +11,16 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use tokio::task::JoinHandle;
 
-pub const TESTED_GROK_VERSION: &str = "1.0.46";
-pub const TESTED_AGY_VERSION: &str = "1.2.1";
+/// Grok Build's stable channel, verified by chat-smoke-acp (PROTOCOL.md
+/// Pass 59).
+pub const TESTED_GROK_VERSION: &str = "1.0.70";
+/// The standalone `agy-acp-server` release the installer fetches beside the
+/// agy CLI (`runtimes.rs`), verified by chat-smoke-acp (Pass 59). Not the
+/// CLI's built-in `agy acp`, a different server.
+pub const TESTED_AGY_VERSION: &str = "1.4.5";
 /// `cursor-agent --version` of the build whose `acp` server was probed
-/// (PROTOCOL.md, ACP › Cursor). Turn-level facts await a signed-in run.
-pub const TESTED_CURSOR_VERSION: &str = "2026.10.14-941492e";
+/// (PROTOCOL.md, ACP › Cursor; Pass 59).
+pub const TESTED_CURSOR_VERSION: &str = "2026.10.22-27dcf5f";
 const MAX_PENDING: usize = 64;
 const MAX_CHOICES: usize = 64;
 
@@ -274,6 +279,10 @@ enum Pending {
 struct Queued {
     id: String,
     blocks: Vec<ContentBlock>,
+    /// Messages a Send now joined to this one: they go out in the same
+    /// prompt, after its blocks, in the order they were sent, and each
+    /// resolves `sent` with it.
+    joined: Vec<(String, Vec<ContentBlock>)>,
 }
 pub struct AcpMapper {
     native: String,
@@ -696,10 +705,12 @@ impl AcpMapper {
                 step.events
                     .push(Self::echo(&item.blocks, item.id.clone(), true, true));
             }
-            step.events.push(AgentEvent::UserMessageUpdate {
-                id: item.id,
-                state: UserMessageState::Dropped,
-            });
+            for id in std::iter::once(item.id).chain(item.joined.into_iter().map(|(id, _)| id)) {
+                step.events.push(AgentEvent::UserMessageUpdate {
+                    id,
+                    state: UserMessageState::Dropped,
+                });
+            }
             step.events.push(AgentEvent::Error {
                 message: "Too many pending agent requests; resend this message".into(),
                 fatal: false,
@@ -710,6 +721,7 @@ impl AcpMapper {
         let mut prompt: Vec<Value> = item
             .blocks
             .iter()
+            .chain(item.joined.iter().flat_map(|(_, blocks)| blocks.iter()))
             // A blank block reads to the agent as a message that came through
             // empty (ingress strips them; this is the backstop).
             .filter(|b| b.has_content())
@@ -738,6 +750,12 @@ impl AcpMapper {
                 id: item.id,
                 state: UserMessageState::Sent,
             });
+            for (id, _) in item.joined {
+                step.events.push(AgentEvent::UserMessageUpdate {
+                    id,
+                    state: UserMessageState::Sent,
+                });
+            }
         } else {
             step.events
                 .push(Self::echo(&item.blocks, item.id, false, false));
@@ -1019,9 +1037,18 @@ impl Mapper for AcpMapper {
                 if self.busy() {
                     step.events
                         .push(Self::echo(&blocks, id.clone(), true, true));
-                    self.queue.push_back(Queued { id, blocks });
+                    self.queue.push_back(Queued {
+                        id,
+                        blocks,
+                        joined: Vec::new(),
+                    });
                 } else {
-                    self.start(Queued { id, blocks }, false, &mut step);
+                    let item = Queued {
+                        id,
+                        blocks,
+                        joined: Vec::new(),
+                    };
+                    self.start(item, false, &mut step);
                 }
             }
             AgentCommand::SendIfRunning { id, .. } => {
@@ -1031,18 +1058,50 @@ impl Mapper for AcpMapper {
                 })
             }
             AgentCommand::CancelQueued { id } => {
+                let mut found = false;
                 if let Some(index) = self.queue.iter().position(|q| q.id == id) {
-                    self.queue.remove(index);
+                    let mut item = self.queue.remove(index).unwrap();
+                    // Withdrawing the head of a Send now batch leaves the
+                    // rest of it in place, still first.
+                    if !item.joined.is_empty() {
+                        let (next, blocks) = item.joined.remove(0);
+                        item.id = next;
+                        item.blocks = blocks;
+                        self.queue.insert(index, item);
+                    }
+                    found = true;
+                } else if let Some(item) = self
+                    .queue
+                    .iter_mut()
+                    .find(|q| q.joined.iter().any(|(j, _)| *j == id))
+                {
+                    item.joined.retain(|(j, _)| *j != id);
+                    found = true;
+                }
+                if found {
                     step.events.push(AgentEvent::UserMessageUpdate {
                         id,
                         state: UserMessageState::Cancelled,
                     });
                 }
             }
+            // ACP has no input mid-turn, so every waiting message waits for
+            // the turn's end. Send now ends it, and they all go at once as
+            // one prompt in the order sent — the pressed one's place in that
+            // order is unchanged — rather than one turn each.
             AgentCommand::SendNow { id } => {
-                if let Some(index) = self.queue.iter().position(|q| q.id == id) {
-                    let item = self.queue.remove(index).unwrap();
-                    self.queue.push_front(item);
+                if self
+                    .queue
+                    .iter()
+                    .any(|q| q.id == id || q.joined.iter().any(|(j, _)| *j == id))
+                {
+                    let mut waiting = std::mem::take(&mut self.queue).into_iter();
+                    let mut head = waiting.next().expect("the queue holds the pressed message");
+                    for item in waiting {
+                        head.joined.push((item.id, item.blocks));
+                        head.joined.extend(item.joined);
+                    }
+                    self.queue.push_back(head);
                     self.cancel(&mut step);
                 }
             }
@@ -1584,10 +1643,15 @@ impl Mapper for AcpMapper {
                 option_id: "cancelled".into(),
             })
             .collect();
-        events.extend(self.queue.drain(..).map(|q| AgentEvent::UserMessageUpdate {
-            id: q.id,
-            state: UserMessageState::Dropped,
-        }));
+        events.extend(
+            self.queue
+                .drain(..)
+                .flat_map(|q| std::iter::once(q.id).chain(q.joined.into_iter().map(|(id, _)| id)))
+                .map(|id| AgentEvent::UserMessageUpdate {
+                    id,
+                    state: UserMessageState::Dropped,
+                }),
+        );
         events
     }
 }
@@ -1981,22 +2045,50 @@ mod tests {
         assert_eq!(ended.outbound[0]["params"]["prompt"][0]["text"], "queued");
     }
     #[test]
-    fn send_now_promotes_selected_message_and_stale_ids_do_not_interrupt() {
+    fn send_now_sends_every_waiting_message_as_one_prompt() {
         let mut m = mapper();
         let first = send(&mut m, "first");
-        send(&mut m, "second");
-        let third = send(&mut m, "third");
-        let AgentEvent::UserMessage { id: Some(id), .. } = &third.events[0] else {
-            panic!()
-        };
+        let ids: Vec<String> = ["second", "third", "fourth"]
+            .iter()
+            .map(|text| {
+                let step = send(&mut m, text);
+                let AgentEvent::UserMessage { id: Some(id), .. } = &step.events[0] else {
+                    panic!()
+                };
+                id.clone()
+            })
+            .collect();
         assert!(m
             .on_command(AgentCommand::SendNow { id: "stale".into() })
             .outbound
             .is_empty());
-        m.on_command(AgentCommand::SendNow { id: id.clone() });
+        // Pressed on the last one: all three still go, in the order sent.
+        m.on_command(AgentCommand::SendNow { id: ids[2].clone() });
+        // Withdrawing one of the batch before it goes leaves the others.
+        let step = m.on_command(AgentCommand::CancelQueued { id: ids[1].clone() });
+        assert!(step.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::UserMessageUpdate { id, state: UserMessageState::Cancelled } if *id == ids[1]
+        )));
         let ended =
             m.on_frame(&json!({"id":first.outbound[0]["id"],"result":{"stopReason":"cancelled"}}));
-        assert_eq!(ended.outbound[0]["params"]["prompt"][0]["text"], "third");
+        let prompt = &ended.outbound[0]["params"]["prompt"];
+        assert_eq!(prompt[0]["text"], "second");
+        assert_eq!(prompt[1]["text"], "fourth");
+        assert_eq!(prompt.as_array().unwrap().len(), 2);
+        let sent: Vec<&String> = ended
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::UserMessageUpdate {
+                    id,
+                    state: UserMessageState::Sent,
+                } => Some(id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sent, vec![&ids[0], &ids[2]]);
+        assert!(m.queue.is_empty());
     }
     #[test]
     fn config_uses_provider_readback_and_removes_disappeared_controls() {

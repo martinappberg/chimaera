@@ -338,7 +338,7 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   `cursor-agent`), `launcher.rs` (detection, `build_acp_chat_command` → `cursor-agent acp`),
   `chat.rs` (ACP spawn, `NO_OPEN_BROWSER=1`), `runtimes.rs` (managed install, `cursor-agent`
   shim), `agent_updates.rs` (release from the official installer),
-  `chimaera_agent::acp::CURSOR` (pinned to `TESTED_CURSOR_VERSION` 2026.10.14-941492e).
+  `chimaera_agent::acp::CURSOR` (pinned to `TESTED_CURSOR_VERSION` 2026.10.22-27dcf5f).
 - **Key behaviors.** Detection searches the PATH for `cursor-agent`, never `cursor` — that name
   is the Cursor editor's app launcher — and the shim is named `cursor-agent` for the same
   reason. Chat is the shared ACP adapter: approvals, cancel, queued sends, resume through

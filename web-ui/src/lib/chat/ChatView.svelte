@@ -78,7 +78,7 @@
   import ArtifactGallery from "./ArtifactGallery.svelte";
   import { EmbedResolver } from "./embeds";
   import { HoverTargets } from "./hoverTargets";
-  import { resolveTargets } from "../shared/embed/embed";
+  import { isMissing, rawUrl, resolveFile, resolveTargets } from "../shared/embed/embed";
   import { HoverPreviews } from "../previews/doc/hoverController.svelte";
   import PermissionCard from "./PermissionCard.svelte";
   import ElicitationCard from "./ElicitationCard.svelte";
@@ -115,11 +115,12 @@
   import { quotableRange, quoteChipPosition } from "./quoteSelection";
   import { get } from "svelte/store";
   import { skillBlocksForText, type ComposerCommand } from "./composer";
-  import type { ImageAttachment } from "./images";
+  import { imageToAttachment, type ImageAttachment } from "./images";
   import type {
     BackgroundTask,
     ChatBlock,
     CheckpointRef,
+    EditedSend,
     PendingPermission,
     PendingQuestion,
     PendingSend,
@@ -1755,11 +1756,79 @@
     sendCommand({ type: "cancel_queued", id }, "couldn't cancel");
   }
 
-  /** Stop the running turn so this waiting message — and every other one
-   *  still waiting — is read right away. The bubble stays until the daemon
-   *  resolves it `sent`, so a disconnect or a no-op never lies about delivery. */
-  function deliverQueuedNow(id: string) {
-    sendCommand({ type: "send_now", id }, "couldn't send now");
+  /** Stop the running turn so every waiting message is read right away.
+   *  Each agent acts on the whole stack whichever message the command names
+   *  (Claude's send-now, Codex's re-drive, ACP's one prompt), so the stack
+   *  has one control and it names the oldest message meant for the next
+   *  step — or, with only after-turn ones waiting, the oldest of those,
+   *  which then runs next. Bubbles stay until the daemon resolves them
+   *  `sent`, so a disconnect or a no-op never lies about delivery. */
+  function deliverWaitingNow(sends: PendingSend[]) {
+    const waiting = sends.filter((s) => s.state === "queued");
+    // The user's own message first: naming another agent's message would
+    // make it the user's delivery (Codex re-drives it instead of returning
+    // it to that agent's inbox).
+    const own = waiting.filter((s) => !isAgentOrigin(s.origin));
+    const target =
+      own.find((s) => !s.afterTurn) ??
+      waiting.find((s) => !s.afterTurn) ??
+      own[0] ??
+      waiting[0];
+    if (target !== undefined) sendCommand({ type: "send_now", id: target.id }, "couldn't send now");
+  }
+
+  /** Take waiting messages back to the composer to edit them: each is
+   *  withdrawn (`cancel_queued`), and its words return once the agent
+   *  confirms (`cancelled`). One the agent read first stays sent, and
+   *  nothing comes back for it. */
+  function editQueued(ids: string[]) {
+    if (ids.length === 0) return;
+    store.requestEdit(ids, quoteOwner);
+    for (const id of ids) {
+      if (!sendCommand({ type: "cancel_queued", id }, "couldn't take it back")) {
+        store.forgetEdit(ids);
+        return;
+      }
+    }
+  }
+
+  /** ↑ in an empty composer: every message of the user's still waiting. */
+  function recallWaiting(): boolean {
+    const ids = store.pendingSends
+      .filter((s) => s.state === "queued" && !isAgentOrigin(s.origin))
+      .map((s) => s.id);
+    editQueued(ids);
+    return ids.length > 0;
+  }
+
+  $effect(() => {
+    if (store.edited.length === 0) return;
+    const back = untrack(() => store.takeEdited(quoteOwner));
+    if (back.length > 0) void restoreEdited(back);
+  });
+  // Closed before the agent confirmed a withdrawal: any view of this chat
+  // (or the next one mounted) takes the words back, so they are never lost.
+  onDestroy(() => store.releaseEdits(quoteOwner));
+
+  /** Words first, as one draft in the order sent; then the pictures, from
+   *  the daemon's saved copies. */
+  async function restoreEdited(back: EditedSend[]) {
+    const text = back
+      .map((b) => b.text)
+      .filter((t) => t.trim() !== "")
+      .join("\n\n");
+    if (text !== "") insertIntoComposer(session.id, text, "block", quoteOwner);
+    for (const path of back.flatMap((b) => b.attachmentPaths)) {
+      const hit = await resolveFile(path);
+      const url = hit !== null && !isMissing(hit) ? rawUrl(hit) : null;
+      if (url === null) continue;
+      try {
+        const image = await imageToAttachment(await (await fetch(url)).blob());
+        if (image !== null) insertIntoComposer(session.id, "", "block", quoteOwner, image);
+      } catch {
+        // The picture is gone or unreadable: the words still came back.
+      }
+    }
   }
 
   /** Dialog-only slash commands get native UI here instead of the CLI's
@@ -3624,8 +3693,10 @@
          (and crowding) the composer. When the agent reads it — at its next
          step, mid-turn, or after the turn for an after-turn send — it leaves
          this stack and enters `blocks` right there. Send now interrupts the
-         turn so every waiting message is read at once; a Stop preserves them;
-         ✕ cancels one. Dropped sends remain visible as "not delivered" until
+         turn so every waiting message is read at once — one control for the
+         whole stack, since every agent acts on all of it; a Stop preserves
+         them; ✎ (or ↑ in an empty composer) takes one back to edit; ✕
+         cancels one. Dropped sends remain visible as "not delivered" until
          dismissed, with replay-safe state owned by the daemon. -->
     {#if pinnedSends.length > 0}
       {@const waiting = pinnedSends.filter((s) => s.state === "queued").length}
@@ -3671,15 +3742,23 @@
                   />
                 </div>
               {/if}
-              {#if send.state === "queued" && store.running}
+              {#if send.state === "queued" && !readOnly && supports("cancel_queued")}
                 <button
-                  class="send-now-btn"
-                  title={waiting > 1
-                    ? "stop the current turn and send the waiting messages now"
-                    : "stop the current turn and send this now"}
-                  aria-label="send now (stops the current turn)"
-                  onclick={() => deliverQueuedNow(send.id)}
-                >Send now</button>
+                  class="edit-btn"
+                  title="edit (↑ in an empty composer takes back every waiting message)"
+                  aria-label="edit waiting message"
+                  onclick={() => editQueued([send.id])}
+                >
+                  <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+                    <path
+                      d="M10.8 2.2a1.5 1.5 0 0 1 2.1 0l.9.9a1.5 1.5 0 0 1 0 2.1L6 13H3v-3z"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.4"
+                      stroke-linejoin="round"
+                    />
+                  </svg>
+                </button>
               {/if}
               <button
                 class="cancel-btn"
@@ -3707,6 +3786,18 @@
           </div>
           {/if}
         {/each}
+        {#if waiting > 0 && store.running && !readOnly}
+          <div class="pending-actions">
+            <button
+              class="send-now-btn"
+              title={waiting > 1
+                ? `stop the current turn and send the ${waiting} waiting messages now`
+                : "stop the current turn and send it now"}
+              aria-label="send now (stops the current turn)"
+              onclick={() => deliverWaitingNow(pinnedSends)}
+            >Send now</button>
+          </div>
+        {/if}
       </div>
     {/if}
     {/if}
@@ -3900,6 +3991,7 @@
     onNativeEdit={agentKind === "claude" && mods.attached ? (request) => socket.nativeUi.request(request) : undefined}
     sessionId={session.id}
     imageInput={capabilities.image_input}
+    onRecallWaiting={supports("cancel_queued") ? recallWaiting : undefined}
     view={quoteOwner}
     running={agentBusy}
     disabled={composerDisabled}
@@ -4476,6 +4568,39 @@
   }
   .cancel-btn:hover {
     color: var(--err);
+  }
+  /* ✎ on a waiting bubble: take it back to the composer. Same quiet reveal
+     as ✕ (opacity only, so hovering never moves the row). */
+  .edit-btn {
+    display: inline-flex;
+    align-items: center;
+    background: none;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    padding: 0 2px;
+    opacity: 0;
+    transition:
+      opacity 0.12s ease,
+      color 0.12s ease;
+  }
+  .pending-msg:hover .edit-btn,
+  .edit-btn:focus-visible {
+    opacity: 1;
+  }
+  .edit-btn:hover {
+    color: var(--accent);
+  }
+  @media (hover: none) {
+    .edit-btn,
+    .cancel-btn {
+      opacity: 1;
+    }
+  }
+  /* The stack's one Send now, under its last bubble on the user's side. */
+  .pending-actions {
+    display: flex;
+    justify-content: flex-end;
   }
   .suggestion-row {
     display: flex;
