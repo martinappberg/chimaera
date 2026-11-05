@@ -67,6 +67,8 @@ Scope: this directory is the front half of chat mode, the rich UI that renders C
 
 ## Copy and quote selection
 
+A settled shell fence also gets a Run button (`runCommand.ts`): the chat hands its Markdown the action through the `runCommandKey` context (set by `ChatView` from its `onRunCommand` prop), so no other Markdown host grows the button; the payload follows copy's live-DOM rule (`copyPayload`), then `commandText` drops control characters and keeps only a transcript's `$ ` lines.
+
 The transcript's copy affordances — fenced code blocks, blockquotes, and whole assistant messages — reuse `../shared/clipboard.ts` (the native-first clipboard writer lifted out of the terminal pool) — see the shared/ area. Selection-copy depends on settled prose being plain text nodes: the settle swap to the canonical parse ([The streaming render pipeline](#the-streaming-render-pipeline)) renders span-free, because span-fragmented text copies with a hard newline at every visual wrap point.
 
 A selection in the transcript joins the workbench's context bridge (`../shared/reference.ts`): `ChatView` publishes it as a `chat` selection and floats the shared `ReferenceChip` ("quote in reply") on the chat root (`quoteSelection.ts` holds the DOM helpers); App resolves its target to this same chat only and inserts `composeChatQuote`'s blockquote as a `block` into the publishing view's composer. A chat whose composer is disabled offers none. Keep that chip (and any other floating chrome) OFF the `.column`: `readingAnchor.ts` binary-searches the column's children as a vertical stack of rows, which an absolutely positioned child would break.

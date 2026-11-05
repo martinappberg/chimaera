@@ -16,18 +16,13 @@
    * xterm instances in termPool). `path` is fixed for this instance's life —
    * every host remounts per path.
    */
-  import { onMount, untrack, type Component } from "svelte";
+  import { flushSync, onMount, untrack, type Component } from "svelte";
   import { openSearchPanel, closeSearchPanel, searchPanelOpen, findNext, findPrevious } from "@codemirror/search";
   import { findTarget } from "../shared/find";
   import { Compartment, EditorState, type Extension } from "@codemirror/state";
   import { EditorView, lineNumbers, highlightSpecialChars, drawSelection } from "@codemirror/view";
-  import {
-    LanguageDescription,
-    syntaxHighlighting,
-    bracketMatching,
-    indentUnit,
-  } from "@codemirror/language";
-  import { languages } from "./languages";
+  import { syntaxHighlighting, bracketMatching, indentUnit, type LanguageDescription } from "@codemirror/language";
+  import { languageCalled, languageFor, languageNames, languageOverrides } from "./languages";
   import {
     codeHighlight as highlight,
     makeCodeTheme as makeTheme,
@@ -37,7 +32,7 @@
     clearRevealFlash,
     REVEAL_FLASH_MS,
   } from "./cm";
-  import { basename, humanSize, type FileChunk } from "./files";
+  import { humanSize, type FileChunk } from "./files";
   import { openBuffer, releaseBuffer, presence } from "./buffers.svelte";
   import { getSetting } from "../settings/store.svelte";
   import { isMac } from "../shared/keys";
@@ -97,9 +92,25 @@
    *  moves between panes): this one must not accept keystrokes. It resumes
    *  if that view unmounts first. */
   let superseded = $state(false);
-  /** The filename-matched language pack, once loaded (a resumed view's
-   *  fresh state must carry it again). */
+  /** The language pack in use, once loaded (a resumed view's fresh state
+   *  must carry it again). */
   let langSupport: Extension = [];
+  /** What the file's name (else its `#!` line) says it is; set at mount. */
+  let detected: LanguageDescription | null = null;
+  /** The language shown and picked in the bar ("" is plain text). */
+  let langName = $state("");
+  /** Bumped per pick, so a slow load never lands over a later one. */
+  let langPick = 0;
+  /** The picker's full list, rendered on first use: a kept-alive editor
+   *  otherwise carries ~170 options it never opens. Synchronous, so the
+   *  native popup the same press opens already has them. */
+  let langListed = $state(false);
+  function listLanguages(e: Event): void {
+    if (langListed) return;
+    flushSync(() => (langListed = true));
+    // Svelte re-selects the value only a tick later; the popup opens now.
+    (e.currentTarget as HTMLSelectElement).value = langName;
+  }
   const settingsCompartment = new Compartment();
   const extraCompartment = new Compartment();
   const langCompartment = new Compartment();
@@ -280,18 +291,12 @@
     const onWindowBlur = () => buf.flushAutosave();
     window.addEventListener("blur", onWindowBlur);
 
-    // Language by filename, loaded lazily into its compartment.
-    const desc = autoLanguage ? LanguageDescription.matchFilename(languages, basename(buf.path)) : null;
-    if (desc !== null) {
-      void desc
-        .load()
-        .then((support) => {
-          langSupport = support;
-          if (view === v) v.dispatch({ effects: langCompartment.reconfigure(support) });
-        })
-        .catch(() => {
-          // language pack failed to load; plain text is fine
-        });
+    // Language by file name, else the first line's `#!`, unless a pick for
+    // this file is remembered; loaded lazily into its compartment.
+    if (autoLanguage) {
+      detected = languageFor(buf.path, v.state.doc.line(1).text);
+      const picked = languageOverrides.get(buf.path);
+      setLanguage(picked === null ? detected : picked === "" ? null : (languageCalled(picked) ?? detected));
     }
 
     return () => {
@@ -309,6 +314,31 @@
       v.destroy();
     };
   });
+
+  function setLanguage(desc: LanguageDescription | null): void {
+    langName = desc?.name ?? "";
+    const pick = ++langPick;
+    const apply = (support: Extension) => {
+      if (pick !== langPick) return;
+      langSupport = support;
+      view?.dispatch({ effects: langCompartment.reconfigure(support) });
+    };
+    if (desc === null) {
+      apply([]);
+      return;
+    }
+    desc.load().then(apply, () => {
+      // language pack failed to load; plain text is fine
+    });
+  }
+
+  /** A pick in the bar: remembered for this file unless it is what the
+   *  file says it is anyway, which goes back to detecting. */
+  function pickLanguage(name: string): void {
+    if (name === (detected?.name ?? "")) languageOverrides.forget(buf.path);
+    else languageOverrides.set(buf.path, name);
+    setLanguage(name === "" ? null : languageCalled(name));
+  }
 
   // --- reveal: "open this file at line N" ----------------------------------
   let flashTimer: ReturnType<typeof setTimeout> | null = null;
@@ -582,6 +612,26 @@
       <span class="spacer"></span>
       {#if buf.note !== null}<span class="hint">{buf.note}</span>{/if}
     {/if}
+    {#if autoLanguage}
+      <select
+        class="lang"
+        aria-label="Language"
+        title="Language for highlighting"
+        value={langName}
+        onpointerdown={listLanguages}
+        onfocus={listLanguages}
+        onchange={(e) => pickLanguage(e.currentTarget.value)}
+      >
+        {#if langListed}
+          <option value="">Plain text</option>
+          {#each languageNames as name (name)}
+            <option value={name}>{name}</option>
+          {/each}
+        {:else}
+          <option value={langName}>{langName === "" ? "Plain text" : langName}</option>
+        {/if}
+      </select>
+    {/if}
   </footer>
 </div>
 
@@ -764,6 +814,30 @@
     font-family: var(--mono);
     opacity: 0.7;
     white-space: nowrap;
+  }
+
+  .lang {
+    appearance: none;
+    border: none;
+    background: none;
+    font: inherit;
+    font-size: var(--text-xs);
+    color: var(--muted);
+    cursor: pointer;
+    padding: 0.1rem 0.4rem;
+    border-radius: 4px;
+    max-width: 12rem;
+    text-overflow: ellipsis;
+  }
+
+  .lang:hover {
+    background: var(--row-hover);
+    color: var(--fg);
+  }
+
+  .lang:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
   }
 
   .more-btn {

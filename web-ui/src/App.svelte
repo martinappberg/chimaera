@@ -81,6 +81,7 @@
     type LinkCtrl,
   } from "./lib/workspace/agentLinks";
   import { typeIntoDetachedSession } from "./lib/terminal/ws";
+  import { terminalInput } from "./lib/chat/runCommand";
   import { reconnectingSockets } from "./lib/net/reconnect";
   import { insertIntoComposer } from "./lib/chat/composerBus";
   import { volatileChatDrafts } from "./lib/chat/drafts";
@@ -2000,6 +2001,96 @@
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
 
+  /** The shell each chat's Run buttons type into (chat id → shell id),
+   *  used again while it lives so one chat's commands share a history. */
+  const runShells = new Map<string, string>();
+  /** Each chat's runs, one after another: a second click while the first
+   *  waits for a new shell's prompt must neither open another shell nor
+   *  type ahead of the first command. */
+  const runQueues = new Map<string, Promise<void>>();
+
+  function runCommandFromPane(paneId: string, chatId: string, command: string): void {
+    const next = (runQueues.get(chatId) ?? Promise.resolve()).then(() => runOnce(paneId, chatId, command));
+    const settled = next.catch(() => {});
+    runQueues.set(chatId, settled);
+    void settled.then(() => {
+      if (runQueues.get(chatId) === settled) runQueues.delete(chatId);
+    });
+  }
+
+  /**
+   * A chat's Run button: type `command` into the chat's terminal and press
+   * Enter. The terminal is the shell this chat last ran in, while it lives
+   * and sits at its prompt; else a new shell in the chat's folder (its live
+   * cwd), on the chat's own host. It opens beside the chat (the adjacent
+   * pane, or a split), never over it, so the block and its output read side
+   * by side.
+   */
+  async function runOnce(paneId: string, chatId: string, command: string): Promise<void> {
+    const input = terminalInput(command);
+    const chat = sessionsById.get(chatId);
+    if (input === "" || chat === undefined) return;
+    const priorId = runShells.get(chatId);
+    const prior = priorId !== undefined ? sessionsById.get(priorId) : undefined;
+    // Only a shell that says it is at its prompt (OSC 133) is reused: one
+    // running something, an agent's command, or no integration at all could
+    // hand the text to a program's stdin (a pager, a prompt, a REPL).
+    const reuse =
+      prior !== undefined && prior.alive && prior.phase === "ready" && (prior.exec_stage ?? null) === null;
+    let shellId: string;
+    if (reuse) {
+      shellId = prior.id;
+    } else {
+      createError = null;
+      try {
+        const cwd = chat.cwd_current ?? chat.cwd;
+        const s = await createSession(chat.workspace_id, "shell", null, spawnSize(), { cwd });
+        recentlyCreated.add(s.id);
+        if (needsAppend(sessions, s)) sessions.push(s);
+        shellId = s.id;
+        runShells.set(chatId, shellId);
+      } catch (e) {
+        createError = e instanceof ApiError ? e.message : "failed to start terminal";
+        return;
+      }
+    }
+    if (paneForTab(layout.root, { surface: "terminal", sessionId: shellId }) === null) {
+      const neighbor = adjacentPane(layout, paneId);
+      layout = neighbor !== null ? focusPane(layout, neighbor) : splitPane(layout, paneId, "row");
+    }
+    layout = openSession(layout, shellId);
+    pool.focusTerminal(shellId);
+    // A new shell gets the text once it reaches its prompt (OSC 133), so its
+    // rc files never read it and it is not echoed twice; a shell without the
+    // integration gets it after the wait, as typed-ahead input.
+    if (!reuse) await waitForPrompt(shellId, RUN_PROMPT_WAIT_MS);
+    // A reused prompt may hold something half-typed: Ctrl-U clears the line
+    // first (bash, zsh and fish, emacs and vi insert modes alike), so the
+    // command never runs glued to it.
+    const text = reuse ? `\x15${input}` : input;
+    // No pooled socket yet (the tab is still mounting): the one-shot socket
+    // sends once the server is ready.
+    if (!pool.sendText(shellId, text)) typeIntoDetachedSession(shellId, text);
+  }
+
+  const RUN_PROMPT_WAIT_MS = 15_000;
+
+  /** Resolves when `id` reports its prompt, has died, or `ms` passed. A
+   *  one-shot wait for one click, not a standing poll. A row missing from
+   *  the roster is still waited for: a snapshot taken before the create
+   *  landed can briefly leave it out. */
+  function waitForPrompt(id: string, ms: number): Promise<void> {
+    const deadline = Date.now() + ms;
+    return new Promise((resolve) => {
+      const check = () => {
+        const s = sessionsById.get(id);
+        if ((s !== undefined && (!s.alive || s.phase === "ready")) || Date.now() >= deadline) resolve();
+        else setTimeout(check, 100);
+      };
+      check();
+    });
+  }
+
   /** Open (or focus) the source-control panel in the focused pane. */
   function openGitPanel(): void {
     if (activeWsId === null || !layoutReady) return;
@@ -3549,6 +3640,9 @@
     },
     openSubagentFrom(paneId, sessionId, agentId, title, newSplit) {
       openSubagentFromPane(paneId, sessionId, agentId, title, newSplit);
+    },
+    runCommandFrom(paneId, sessionId, command) {
+      void runCommandFromPane(paneId, sessionId, command);
     },
     revealPathInTree(path) {
       revealInTree(path);

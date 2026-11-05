@@ -16,8 +16,8 @@
   import { Compartment, EditorState, StateEffect } from "@codemirror/state";
   import { EditorView, lineNumbers, highlightSpecialChars } from "@codemirror/view";
   import { MergeView } from "@codemirror/merge";
-  import { LanguageDescription, syntaxHighlighting } from "@codemirror/language";
-  import { languages } from "./languages";
+  import { syntaxHighlighting } from "@codemirror/language";
+  import { languageFor } from "./languages";
   import { codeHighlight, makeCodeTheme } from "./cm";
   import { fetchGitDiff, gitRepoStatuses, gitStatus, type DiffMode, type GitDiff } from "../workspace/git";
   import { basename } from "./files";
@@ -170,8 +170,8 @@
     });
     merge = view;
 
-    // Language by filename, loaded lazily, appended to both sides.
-    const desc = LanguageDescription.matchFilename(languages, basename(path));
+    // Language by file name (else the `#!` line), loaded lazily, appended to both sides.
+    const desc = languageFor(path, d.b);
     if (desc !== null) {
       void desc
         .load()
