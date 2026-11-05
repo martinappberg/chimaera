@@ -60,11 +60,15 @@ app-build` (never the root `cargo`).
   (`get_webview_window`, which `deliver_to` uses) keep finding the window — a Tauri child web
   view would make Tauri stop counting it as a webview window. It loads only its window's daemon
   origin under `/raw/` or `/proxy/`; a clicked link elsewhere goes to the real browser
-  (`shell/native_view.rs`). The [agent browser](agent-browser.md)'s app engine drives these
-  views through `native_view_drive` (real NSEvent input, evals, native screenshots, the
-  console/network rings; the calling window's own views only), and `native_view_show` with
-  `agent` shows an agent's own page just past the window's right edge, where WebKit keeps it
-  running at full speed. macOS only, like pane views.
+  (`shell/native_view.rs`). Each sits in a clip box of its own, so an HTML embed card's view is
+  cropped to its scroller ([embed cards](files-and-previews.md#embed-cards)); the wheel over a
+  passive one (a card nobody clicked into) goes back to the window's page through an app-wide
+  local event monitor, since a web view never chains a wheel out the way an iframe does. The
+  [agent browser](agent-browser.md)'s app engine drives these views through `native_view_drive`
+  (real NSEvent input, evals, native screenshots, the console/network rings; the calling
+  window's own views only), and `native_view_show` with `agent` shows an agent's own page just
+  past the window's right edge, where WebKit keeps it running at full speed. macOS only, like
+  pane views.
 - **The askpass wiring stays the app's own.** The local daemon is spawned without the app's
   `SSH_ASKPASS*` / `CHIMAERA_ASKPASS_*` variables (and a daemon that inherited them from an older
   app strips them from its sessions), so a terminal's `ssh` prompts on its tty and no agent can

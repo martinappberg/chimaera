@@ -754,13 +754,14 @@ async fn screenshot(
     }
     let limit = tall.map(|h| h.clamp(1.0, drive::FULL_PAGE_MAX));
     let shot = snap(app, label.clone(), clip, max_width, limit, encoding).await;
-    if let Some((saved, grown)) = frames {
+    if let Some(grown) = frames {
         let back = label.clone();
         let _ = on_main(app, move |_mtm| {
             with_pane(&back, |pane| {
                 // A page that placed the view meanwhile keeps its place.
-                if pane.wk.frame() == grown {
-                    pane.wk.setFrame(saved);
+                if pane.clip.frame() == grown.box_grown {
+                    pane.clip.setFrame(grown.box_saved);
+                    pane.wk.setFrame(grown.page_saved);
                 }
             });
             Ok(())
@@ -782,25 +783,44 @@ async fn screenshot(
 }
 
 /// Grow the view to `height` CSS px, out of sight beside its owner (a pane
-/// the user sees mustn't spill 8000 px over the workbench). `(saved, grown)`
-/// frames, or `None` when it is already that tall.
-fn grow(label: &str, height: f64) -> Result<Option<(NSRect, NSRect)>, String> {
-    let wk = with_pane(label, |pane| pane.wk.clone()).ok_or("no such view")?;
-    let saved = wk.frame();
-    if height <= saved.size.height + 0.5 {
+/// the user sees mustn't spill 8000 px over the workbench): its clip box
+/// moves there at the grown size, the page at the box's origin. The frames
+/// to put back, or `None` when it is already that tall.
+fn grow(label: &str, height: f64) -> Result<Option<Grown>, String> {
+    let (wk, clip) =
+        with_pane(label, |pane| (pane.wk.clone(), pane.clip.clone())).ok_or("no such view")?;
+    let page_saved = wk.frame();
+    if height <= page_saved.size.height + 0.5 {
         return Ok(None);
     }
-    // SAFETY: the superview is the owner's live web view (we added it).
-    let owner_width = unsafe { wk.superview() }.map_or(0.0, |o| o.bounds().size.width);
-    let grown = NSRect::new(
+    let box_saved = clip.frame();
+    // SAFETY: the clip box's superview is the owner's live web view (we
+    // added it).
+    let owner_width = unsafe { clip.superview() }.map_or(0.0, |o| o.bounds().size.width);
+    let box_grown = NSRect::new(
         NSPoint::new(
-            owner_width.max(saved.origin.x + saved.size.width) + OFF_BOUNDS_GAP,
+            owner_width.max(box_saved.origin.x + box_saved.size.width) + OFF_BOUNDS_GAP,
             0.0,
         ),
-        NSSize::new(saved.size.width, height),
+        NSSize::new(page_saved.size.width, height),
     );
-    wk.setFrame(grown);
-    Ok(Some((saved, grown)))
+    clip.setFrame(box_grown);
+    wk.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), box_grown.size));
+    Ok(Some(Grown {
+        box_saved,
+        page_saved,
+        box_grown,
+    }))
+}
+
+/// A view grown for a full-page screenshot: its clip box's and page's
+/// frames before, and the box's grown frame (a page that placed the view
+/// meanwhile has moved the box off it).
+#[derive(Clone, Copy)]
+struct Grown {
+    box_saved: NSRect,
+    page_saved: NSRect,
+    box_grown: NSRect,
 }
 
 /// A snapshot's pixels on their way off the main thread.

@@ -376,10 +376,10 @@ export interface ViewRect {
  * this window (`crates/chimaera-app/src/shell/native_view.rs`). Creates the
  * view on first call; a later call with the same `id` moves it and navigates
  * only if `url` changed. `hidden` creates or navigates it without showing
- * it (a page still loading; `nativeViewPlace` shows it). `agent` marks an
- * agent's own view (the agent browser): the shell records its console and
- * network for `nativeViewDrive`, and treats every gesture in it as the
- * agent's; showing a view again without it hands it to the user. False
+ * it (a page still loading; `nativeViewPlace` shows it). `opts.agent` marks
+ * an agent's own view (the agent browser): the shell records its console
+ * and network for `nativeViewDrive`, and treats every gesture in it as the
+ * agent's; showing a view again without it hands it to the user. Null
  * outside the app, or from an app build without pane views — the caller
  * falls back to an iframe.
  */
@@ -388,24 +388,45 @@ export async function nativeViewShow(
   url: string,
   rect: ViewRect,
   hidden: boolean,
-  agent = false,
-): Promise<boolean> {
+  opts: ViewShowOptions = {},
+): Promise<ViewShown | null> {
   const t = tauri();
-  if (t === null) return false;
+  if (t === null) return null;
   try {
-    await t.core.invoke<void>("native_view_show", { id, url, rect, hidden, agent });
-    return true;
+    const shown = await t.core.invoke<{ fit?: unknown } | null>("native_view_show", { id, url, rect, hidden, ...opts });
+    return { fit: shown?.fit === true };
   } catch {
-    return false;
+    return null;
   }
 }
 
+/** What the shell made of a `nativeViewShow`: `fit` = it honours `ViewFit`
+ *  (an app build before embed cards answered nothing, and drops the
+ *  arguments without a word). */
+export interface ViewShown {
+  fit: boolean;
+}
+
+/** How a view sits in a scroller (an embed card): `clip` crops it to the
+ *  scroller's visible part (the page keeps its place), and `passive` hands
+ *  the wheel over it back to this page until the card is clicked into. */
+export interface ViewFit {
+  clip?: ViewRect | null;
+  passive?: boolean;
+}
+
+/** `nativeViewShow`'s options: the placement (`ViewFit`) and `agent` (an
+ *  agent's own view; absent = a user's pane). */
+export interface ViewShowOptions extends ViewFit {
+  agent?: boolean;
+}
+
 /** Move a pane view (`rect`), or hide it (`null`). */
-export async function nativeViewPlace(id: string, rect: ViewRect | null): Promise<void> {
+export async function nativeViewPlace(id: string, rect: ViewRect | null, fit: ViewFit = {}): Promise<void> {
   const t = tauri();
   if (t === null) return;
   try {
-    await t.core.invoke<void>("native_view_place", { id, rect });
+    await t.core.invoke<void>("native_view_place", { id, rect, ...fit });
   } catch {
     /* gone with its window or an older app build: nothing to move */
   }

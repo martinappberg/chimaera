@@ -30,7 +30,7 @@ export const browserLinks: Readable<ReadonlyMap<string, string>> = { subscribe: 
 
 export const agentBrowser = new AgentBrowserChannel({
   native: {
-    show: nativeViewShow,
+    show: async (id, url, rect, hidden, agent) => (await nativeViewShow(id, url, rect, hidden, { agent })) !== null,
     drive: nativeViewDrive,
     nav: nativeViewNav,
     close: nativeViewClose,

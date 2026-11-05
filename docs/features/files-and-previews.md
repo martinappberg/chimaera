@@ -995,12 +995,29 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   a table with no rows to show says why where they would be — only the header, an empty file or
   sheet, the table ending before the slice, a row further in than one read goes — and one that
   fits the card is counted once, `3 rows`);
-  an HTML report (the sandboxed frame on the folder-scoped raw URL, fixed height, expand);
+  an HTML report (the folder-scoped raw URL, fixed height, expand — see **HTML cards in the app**
+  below);
   video/audio (`#t=start,end`, the browser seeks natively); a notebook cell (`#cell=N`, else the
   first cell that drew a figure); a Marp slide (`#slide=N`); a markdown excerpt (`#heading`, else
   the opening, clipped with a fade and **more**); a plain file or folder card for everything else.
   Missing files show a dashed card that says so (and looks again when it comes back on screen);
   failed loads say why, with **try again** — never a blank box.
+- **HTML cards in the app.** In the macOS app an HTML card is a web view of its own laid over the
+  card, like an HTML preview (`shared/embed/HtmlBody.svelte` on `shared/paneView.ts`'s embedded
+  mode): an iframe shares the window's web process, and a 52 MB, 3.6 M-element report in one card
+  took that process to 8–9 GB and 20–75 % CPU at rest, freezing the window with the chat in it
+  (2026-11-04; the same card as a view of its own: window process ~47 MB). The view is cropped
+  to the part of the card its scroller shows (the page keeps its place) and hides once scrolled
+  out, under a menu or while its layer is parked. The wheel over a card scrolls the document or
+  transcript around it until you click into the card; then it scrolls the page, until the pointer
+  is back outside the card. Once a page has shown, its snapshot is kept as the card's still
+  (`shared/embed/liveViews.svelte.ts`, per `/raw` URL, a dozen per window): it stands in while
+  the document scrolls (a view would trail the scroll by a frame), and for a card past the
+  window's budget of three live views — the cards most recently on screen keep theirs, the
+  rest close and load again when scrolled back. The expand toggle sits under the page there,
+  since nothing draws over a view. A browser tab, the Linux and Windows apps, and an app build
+  without pane views — or with pane views but older than this (`native_view_show` answers
+  `fit`; an older shell drops the crop silently) — keep the sandboxed frame.
 - **PDF rendering.** Cards, panes and region snapshots share nonzero raster dimensions capped at
   12 million pixels and 8192 pixels per edge (`shared/pdfCanvas.ts`). Each draw owns a fresh canvas,
   and failed draws are cancelled before their handles are discarded: a graphics-initialization
