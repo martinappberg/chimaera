@@ -754,21 +754,23 @@
 
   {#if zone !== null}
     <!-- A zone preview always says what it is: the rectangle alone can't tell
-         "split right" from "add as tab" at a glance. -->
-    <div class="drop drop-{zone}" class:banded={bandArmed}>
+         "split right" from "add as tab" at a glance. Every drop wash here is
+         `data-overlay`: a pane view (a native page drawn above the DOM)
+         stands down for it, under a still of its page, like for a menu. -->
+    <div data-overlay class="drop drop-{zone}" class:banded={bandArmed}>
       <span class="drop-chip">{zoneWord(zone)}</span>
     </div>
   {:else if linkBand}
     <!-- Distinct from the split/adopt zones: a labeled, dashed band over the
          agent's input area. Dropping links the terminal and types its
          @term: reference into the composer (never submits). -->
-    <div class="drop-link" class:hued={ownAgentHue !== null} style:--band-hue={ownAgentHue}>
+    <div data-overlay class="drop-link" class:hued={ownAgentHue !== null} style:--band-hue={ownAgentHue}>
       <span class="drop-chip">link to {activeSessionName ?? "this agent"}</span>
     </div>
   {:else if linkPane}
     <!-- Link-intent drag: the whole agent view is one target (no aiming for a
          band). Full-pane wash in the agent's hue, centered label. -->
-    <div class="drop-linkpane" class:hued={ownAgentHue !== null} style:--band-hue={ownAgentHue}>
+    <div data-overlay class="drop-linkpane" class:hued={ownAgentHue !== null} style:--band-hue={ownAgentHue}>
       <span class="drop-chip">link to {activeSessionName ?? "this agent"}</span>
     </div>
   {/if}
@@ -776,7 +778,7 @@
   {#if refBand}
     <!-- Drag-to-reference: types the path into this session's input, never
          opens a tab, never submits. Visibly distinct from the adopt zone. -->
-    <div class="drop-ref">
+    <div data-overlay class="drop-ref">
       <span class="drop-chip"
         ><span class="drop-ref-at">@</span> reference in {activeSessionName ?? "this session"}</span
       >
@@ -786,7 +788,7 @@
   {#if uploadPane}
     <!-- OS-desktop drop: uploads to the session's host, then types the
          path — same "@ reference" grammar, whole pane as the target. -->
-    <div class="drop-upload">
+    <div data-overlay class="drop-upload">
       <span class="drop-chip"
         ><span class="drop-ref-at">@</span> upload &amp; reference in {activeSessionName ??
           "this session"}</span
@@ -796,7 +798,7 @@
     <!-- OS-desktop drop onto a Finder pane: a quiet frame says this pane is
          receiving; the Finder's own column/row highlight says WHERE (a
          whole-pane wash hid exactly that). -->
-    <div class="drop-frame">
+    <div data-overlay class="drop-frame">
       <!-- The destination, named once at the pane's foot (never inside the
            column: an in-flow chip would grow the column mid-drag). -->
       <span class="drop-chip folder">upload into <b>{dirLabel(uploadDir)}</b></span>

@@ -41,6 +41,7 @@ Tests: `*.test.ts` beside the modules.
 
 - **Layout ops are pure.** An op takes a `Layout` and returns a new one with structural sharing. Keep DOM and stores out of `layout.ts`; `browser/agentOpen.ts` depends on that to stay unit-testable.
 - **The pane cap is 4 for auto-splits and chords.** A manual drag-tear is not capped (`MAX_PANES` comment).
+- **A drop wash is an overlay.** Every drag-target wash in `Pane.svelte` (split/tab zones, link and reference bands, upload) carries `data-overlay`: a pane view's native page is drawn above the DOM and would hide it, so it stands down under a still of its page while the wash shows (`shared/paneView.ts` overlay watch). A new wash needs the attribute too.
 - **Every pane view renders inside `<svelte:boundary>`** (`Pane.svelte`), so one view that throws fails alone. See the rule bullet "A view that throws fails alone".
 - **Keep-alive hides with `opacity:0` + `inert`.** See the rule bullet "Hide with opacity + inert". `keepsPaneViewAlive` decides which tabs keep their component tree: every non-terminal tab, and a terminal tab shown as chat. A PTY tab parks its xterm DOM in the terminal pool instead.
 - **A cross-window move is sender-removes-on-ack.** The sender drops its tabs only after an ok-ack. A lost or refused ack leaves the tabs in place (`crossWindow.ts` header).

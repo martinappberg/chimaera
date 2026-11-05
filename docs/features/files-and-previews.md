@@ -738,7 +738,8 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   into WebKit's memory-pressure cache flushing and froze the whole window (2026-11-04; measured
   with the same report in a pane view: window process ~40 MB, report process ~950 MB). Same URL
   as the iframe, so remote windows load it through their tunnel the same way. The view follows
-  the pane, hides while a menu, dialog or tooltip overlaps it or a drag runs, and closes with its
+  the pane, stands down under a still of its page while a menu, dialog, tooltip or a drag's drop
+  wash overlaps it, and closes with its
   tab or the window's page. Dragging the tab to another pane keeps the page — the same view is
   re-placed, not reloaded (`paneView`'s `keep`, see [browser-pane](browser-pane.md)) — unless the
   file changed on disk meanwhile, which loads the new version. In a browser tab, on Linux/Windows, or against an app build without
