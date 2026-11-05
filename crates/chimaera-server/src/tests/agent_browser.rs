@@ -1245,6 +1245,24 @@ async fn the_users_other_panes_are_visible_read_only() {
         "{on_t1:?}"
     );
 
+    // A screenshot never resizes or scrolls the user's pane.
+    let r = tool(
+        &state,
+        &agent,
+        "browser_screenshot",
+        json!({"page": "v1", "full_page": true}),
+    )
+    .await;
+    assert!(
+        is_error(&r) && text_of(&r).contains("resizes the pane"),
+        "{r}"
+    );
+
+    // With no page of its own, back/forward never move a shared pane
+    // unnamed (they may leave the app); a reload may.
+    let r = tool(&state, &agent, "browser_navigate", json!({"url": "back"})).await;
+    assert!(is_error(&r) && text_of(&r).contains("need `page`"), "{r}");
+
     // Act tools are refused with the share hint; show/close don't apply.
     let refusal = "This is the user's pane, visible to you read-only. Ask the user to share it \
                    with you (the chain-link button on its tab) to click or type in it.";

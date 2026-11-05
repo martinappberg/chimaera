@@ -11,7 +11,7 @@
 //   select(ref, {value|label}) set a native <select> and fire input/change
 //   watch() / delta(maxMs)    what an action changed (mutations, URL, focus)
 (() => {
-  const V = 11;
+  const V = 12;
   if (globalThis.__snap?.v === V) return;
   const st0 = (globalThis.__snapState ??= { refOf: new WeakMap(), byRef: new Map(), next: 1 });
   const refOf = st0.refOf; // element → "e12", stable across snapshots
@@ -324,7 +324,7 @@
     const el = resolve(t);
     if (!el) return null;
     let r = viewportRect(el);
-    if (r.y < 0 || r.x < 0 || r.y + r.height > innerHeight || r.x + r.width > innerWidth) {
+    if (!t.noScroll && (r.y < 0 || r.x < 0 || r.y + r.height > innerHeight || r.x + r.width > innerWidth)) {
       el.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "instant" });
       await new Promise((res) => setTimeout(res, 60));
       r = viewportRect(el);

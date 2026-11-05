@@ -1206,6 +1206,15 @@ async fn navigate(
             Ok(which) => which,
             Err(e) => return error_result(e),
         };
+        // Back and forward can leave the app: a pane the user watches takes
+        // them only when named, like any navigation to another app.
+        if page_arg.is_none() && matches!(which, Which::Shared { .. }) && op != HistoryOp::Reload {
+            return error_result(
+                "With no page of your own, back and forward need `page` (\"p1\"…): they may \
+                 take the user's pane to another app."
+                    .to_string(),
+            );
+        }
         if matches!(which, Which::Visible { .. }) {
             return error_result(READ_ONLY_TEXT.to_string());
         }
@@ -1398,12 +1407,27 @@ async fn navigate(
 /// host:port, if any. A pane whose app isn't known yet (shared, never used)
 /// is asked once for its URL.
 async fn pane_showing(state: &Arc<AppState>, agent: &str, target: &TargetUrl) -> Option<Which> {
+    // What each pane shows now, as its window last said (the user may have
+    // moved it to another app since the agent last looked).
+    let listed: std::collections::HashMap<String, String> = crate::lock(&state.session_workspaces)
+        .get(agent)
+        .cloned()
+        .map(|ws| state.browsers.channel.listed_pages(&ws))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| !p.url.is_empty())
+        .map(|p| (p.tab, p.url))
+        .collect();
     for (tab, page) in crate::links::panes_of(state, agent) {
         let which = Which::Shared {
             tab: tab.clone(),
             page,
         };
-        let origin = match state.browsers.shared(&tab).origin {
+        let now = listed
+            .get(&tab)
+            .and_then(|url| crate::browser_open::parse_url(url).ok())
+            .map(TargetUrl::from);
+        let origin = match now.or(state.browsers.shared(&tab).origin) {
             Some(origin) => Some(origin),
             None => {
                 let Ok(mut ctx) = resolve(state, agent, which.clone()) else {
@@ -1565,12 +1589,30 @@ async fn screenshot(state: &Arc<AppState>, ctx: &mut Ctx, args: &Value) -> ToolR
     if target.is_some() && full_page {
         return Err(bad("Give an element or full_page, not both."));
     }
+    let read_only = matches!(ctx.which, Which::Visible { .. });
+    if read_only && full_page {
+        return Err(bad(
+            "A full-page capture resizes the pane, and this one is the user's (read-only): \
+             capture the viewport or an element in view.",
+        ));
+    }
     let mut note = String::new();
     // What is captured, in CSS px: it decides the image width that keeps the
     // long edge within IMAGE_LONG_EDGE.
     let (clip, css) = match &target {
         Some(t) => {
-            let r = snap(state, ctx, "rect(args)", t.clone()).await?;
+            let mut t = t.clone();
+            if read_only {
+                // Never scroll the user's own pane.
+                t["noScroll"] = json!(true);
+            }
+            let r = snap(state, ctx, "rect(args)", t).await?;
+            if r.is_null() && read_only {
+                return Err(bad(
+                    "That element isn't in view in the user's pane, and a read-only pane is \
+                     never scrolled: capture the viewport, or ask the user to share the pane.",
+                ));
+            }
             if r.is_null() {
                 return Err(bad(
                     "That element isn't on the page, or has no visible area: check it with \
