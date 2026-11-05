@@ -447,6 +447,46 @@ async fn an_agents_tool_waits_for_its_job_and_gets_the_final_answer() {
 }
 
 #[tokio::test]
+async fn a_tool_answer_shows_pictures_from_its_own_output_folder() {
+    crate::plugins::test_catalog::privileged();
+    let state = test_state();
+    let ws = make_workspace(&state, "jobs-picture").await;
+    let sid = inject_agent(&state, "kp1");
+    lock(&state.session_workspaces).insert(sid.clone(), ws.clone());
+    lock(&state.workspaces)
+        .set_plugin_on(&ws, PID, true)
+        .unwrap();
+    let (status, out) = mcp_post(
+        &state,
+        &sid,
+        "kp1",
+        json!({
+            "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+            "params": {"name": "build", "arguments": {"picture": true}},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let content = out["result"]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 3, "{out}");
+    let folder = crate::plugins::output::folder(&state.plugin_platform.output_root, PID, &ws);
+    let caption = content[0]["text"].as_str().unwrap();
+    assert!(
+        caption.contains(&format!(
+            "![one]({})",
+            folder.join("pictures/one.png").display()
+        )),
+        "{caption}"
+    );
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["mimeType"], "image/png");
+    let missing = content[2]["text"].as_str().unwrap();
+    assert!(missing.starts_with("none: "), "{missing}");
+    assert!(missing.contains("(not shown: "), "{missing}");
+    state.sessions.kill(&sid).ok();
+}
+
+#[tokio::test]
 async fn a_tools_folder_setting_moves_where_tools_install() {
     let _one = TOOL_DOWNLOADS.lock().await;
     let fake = FakeReleases::start().await;

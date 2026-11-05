@@ -226,6 +226,35 @@ pub(crate) struct ProgramDecl {
     /// card, part of the capability digest, not enforced (plan §1).
     #[serde(default)]
     pub(crate) network: Option<String>,
+    /// Folders it is usually installed in when an installer leaves the
+    /// PATH alone (an application bundle): absolute, or `~/…` for the
+    /// daemon user's home. Looked in after the PATH, before the plugin's
+    /// own tools; disclosed on the card, part of the capability digest.
+    #[serde(default)]
+    pub(crate) also: Vec<String>,
+}
+
+/// An `also` folder as an absolute path (`~/` is the daemon user's home);
+/// None when there is no home to expand.
+pub(crate) fn also_dir(dir: &str) -> Option<std::path::PathBuf> {
+    match dir.strip_prefix("~/") {
+        Some(rest) => std::env::var_os("HOME")
+            .filter(|h| !h.is_empty())
+            .map(|h| std::path::PathBuf::from(h).join(rest)),
+        None => Some(std::path::PathBuf::from(dir)),
+    }
+}
+
+/// `also` folders: a few, each absolute or under `~/`, plain components.
+fn valid_also(dir: &str) -> bool {
+    let rest = dir.strip_prefix("~/").or_else(|| dir.strip_prefix('/'));
+    rest.is_some_and(|rest| {
+        dir.len() <= 200
+            && !dir.chars().any(|c| c.is_control() || c == ':')
+            && rest
+                .split('/')
+                .all(|part| !part.is_empty() && part != "." && part != "..")
+    })
 }
 
 /// Programs that run anything they are given: a plugin declaring one gets
@@ -349,6 +378,13 @@ fn validate_programs(m: &Manifest) -> Result<(), String> {
         if p.version.len() > 8 || p.version.iter().any(|a| a.len() > 64) {
             return Err(format!(
                 "program {}: `version` is a few short arguments",
+                p.name
+            ));
+        }
+        if p.also.len() > 4 || !p.also.iter().all(|d| valid_also(d)) {
+            return Err(format!(
+                "program {}: `also` is at most 4 folders, each absolute or under `~/`, \
+                 with no `..`",
                 p.name
             ));
         }
@@ -829,6 +865,29 @@ mod tests {
         super::super::parse_manifest(&format!(
             "id = \"demo\"\nname = \"Demo\"\nversion = \"0.1.0\"\nsummary = \"x\"\napi = \"0.2\"\n{extra}"
         ))
+    }
+
+    #[test]
+    fn a_programs_usual_folders_are_absolute_or_home_and_few() {
+        let with = |also: &str| {
+            manifest(&format!(
+                "[[programs]]\nname = \"soffice\"\nalso = {also}\n"
+            ))
+        };
+        assert!(with(r#"["/Applications/LibreOffice.app/Contents/MacOS"]"#).is_ok());
+        assert!(with(r#"["~/Applications/LibreOffice.app/Contents/MacOS"]"#).is_ok());
+        for bad in [
+            r#"["Applications/X"]"#,
+            r#"["/opt/../etc"]"#,
+            r#"["~/./x"]"#,
+            r#"["~user/x"]"#,
+            r#"["/a:/b"]"#,
+            r#"["/a//b"]"#,
+            r#"["/a", "/b", "/c", "/d", "/e"]"#,
+        ] {
+            let err = with(bad).unwrap_err();
+            assert!(err.contains("`also`"), "{bad}: {err}");
+        }
     }
 
     #[test]

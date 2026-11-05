@@ -51,6 +51,8 @@
   let { ws, wsRoot, plugin, view, file = undefined, compact = false, fill = false }: Props = $props();
 
   let result = $state<RenderResult | null>(null);
+  /** A file view always fills; any other view when its tree asks (`fill`). */
+  const fills = $derived(fill || (result?.ok === true && result.tree.fill === true && !compact));
   let loadError = $state<string | null>(null);
   let busy = $state(false);
   let note = $state<{ text: string; tone: "neutral" | "bad" } | null>(null);
@@ -262,7 +264,7 @@
   });
 </script>
 
-<div class="screen" class:compact class:fill bind:this={host} aria-busy={busy}>
+<div class="screen" class:compact class:fill={fills} bind:this={host} aria-busy={busy}>
   {#if task !== null}
     <div class="task" role="status" aria-live="polite">
       <div class="task-head">
