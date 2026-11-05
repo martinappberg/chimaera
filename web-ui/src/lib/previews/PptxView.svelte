@@ -343,6 +343,9 @@
     const now = deck;
     if (now === null) return;
     for (const [i, slide] of now.presentation.slides.entries()) {
+      // Text being typed into the stage's slide is already on screen; it is
+      // redrawn when the typing ends (the thumbnail follows then too).
+      if (texting && i === current) continue;
       const text = edits.partText(slide.slidePath);
       if (text === null) continue;
       const was = drawn.get(slide.slidePath) ?? edits.diskText(slide.slidePath);
@@ -354,6 +357,7 @@
 
   $effect(() => {
     void edits.version;
+    void texting;
     untrack(syncEdited);
   });
 
@@ -1185,6 +1189,7 @@
               version={slideGen + deckGen}
               bind:selected={selectedShape}
               bind:texting
+              slideEl={() => stageHandles.get(current)?.element ?? null}
             />
           {/if}
           {#if areaMode}<div class="area-layer" aria-hidden="true"></div>{/if}

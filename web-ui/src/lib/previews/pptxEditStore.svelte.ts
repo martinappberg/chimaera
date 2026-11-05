@@ -62,6 +62,9 @@ export class DeckEdits {
   unjournaled = $state(false);
   /** Why this deck can't be edited, when it can't. */
   blocked = $state<string | null>(null);
+  /** The history exists (the first version was attached). `core` itself is
+   *  a plain field, so this is what views react to. */
+  ready = $state(false);
 
   private core: DeckEditsCore | null = null;
   private views = 0;
@@ -76,9 +79,6 @@ export class DeckEdits {
     this.path = path;
   }
 
-  get ready(): boolean {
-    return this.core !== null;
-  }
 
   /** Text of `part` with every edit applied, when it has edits or is loaded. */
   partText(part: string): string | null {
@@ -137,6 +137,7 @@ export class DeckEdits {
     if (this.core === null) {
       this.core = new DeckEditsCore(read, hash);
       await this.restoreJournal();
+      this.ready = true;
       this.sync();
       return;
     }

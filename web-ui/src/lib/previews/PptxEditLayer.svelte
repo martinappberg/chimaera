@@ -70,8 +70,11 @@
     /** Bumped when the slide was redrawn: the shapes are re-read. */
     version: number;
     selected: string | null;
-    /** Text editing took the keyboard (the view's keys stand down). */
+    /** Text editing took the keyboard (the view's keys stand down, and it
+     *  holds the slide's redraw so the caret isn't drawn away). */
     texting: boolean;
+    /** The stage's rendered element for this slide (edited in place). */
+    slideEl: () => HTMLElement | null;
   }
 
   let {
@@ -84,6 +87,7 @@
     version,
     selected = $bindable(null),
     texting = $bindable(false),
+    slideEl,
   }: Props = $props();
 
   const items = $derived.by(() => {
@@ -283,6 +287,7 @@
   }
 
   function onPointerMove(e: PointerEvent): void {
+    onHover(e);
     const cur = g;
     if (cur === null || e.pointerId !== cur.pointer) return;
     const at = toSlide(e);
@@ -391,18 +396,99 @@
   }
 
   // --- text -----------------------------------------------------------------------
+  //
+  // Text is edited where it is drawn: the renderer lays a text body out as a
+  // column of paragraph <div>s holding run <span>s (bullets are absolutely
+  // positioned marker spans), so the shape's own body becomes editable and
+  // you type into the slide in its real fonts. Edits go to the history as you
+  // type, but the slide isn't redrawn under the caret (`texting` holds the
+  // view's redraw); finishing commits and redraws, autofit included. A body
+  // whose drawn text doesn't read back as the file's falls back to a box
+  // editor under the shape, rather than guessing.
 
-  /** Line separator in the editor stands for a line break (`a:br`). */
+  /** Line separator in the fallback editor stands for a line break (`a:br`). */
   const LS = " ";
   let textFor = $state<string | null>(null);
+  /** The fallback box editor is up (the in-place one couldn't be used). */
+  let boxed = $state(false);
   let draft = $state("");
   let textEl = $state<HTMLTextAreaElement | null>(null);
   let textFrom: string[] = [];
   let textGesture = "";
   let textTimer: ReturnType<typeof setTimeout> | null = null;
   let textError = $state<string | null>(null);
+  /** The renderer's text body being edited in place, and its teardown. */
+  let body: HTMLElement | null = null;
+  let undoBody: (() => void) | null = null;
 
-  function startText(it: EditItem): void {
+  const NBSP = / /g;
+
+  function isMarker(el: Element): boolean {
+    return el instanceof HTMLElement && el.style.position === "absolute";
+  }
+
+  /** The text of one drawn paragraph: runs' text, `<br>` as a line break,
+   *  bullet markers skipped; the placeholder `<br>` an empty block carries
+   *  is not a break. */
+  function readBlock(el: Node): string {
+    let s = "";
+    for (const n of Array.from(el.childNodes)) {
+      if (n.nodeType === Node.TEXT_NODE) s += n.textContent ?? "";
+      else if (n instanceof Element) {
+        if (isMarker(n)) continue;
+        if (n.tagName === "BR") s += LINE_BREAK;
+        else s += readBlock(n);
+      }
+    }
+    return s;
+  }
+
+  /** The body's paragraphs as the editor holds them now. A browser puts text
+   *  typed into an emptied body straight into it (no block): that's a
+   *  paragraph too. */
+  function readBody(el: HTMLElement): string[] {
+    const out: string[] = [];
+    let loose: string | null = null;
+    for (const n of Array.from(el.childNodes)) {
+      if (n instanceof HTMLElement && (n.tagName === "DIV" || n.tagName === "P")) {
+        if (loose !== null) out.push(loose);
+        loose = null;
+        out.push(readBlock(n));
+      } else if (n.nodeType === Node.TEXT_NODE) {
+        loose = (loose ?? "") + (n.textContent ?? "");
+      } else if (n instanceof Element && !isMarker(n)) {
+        loose = (loose ?? "") + (n.tagName === "BR" ? LINE_BREAK : readBlock(n));
+      }
+    }
+    if (loose !== null) out.push(loose);
+    return (out.length === 0 ? [""] : out).map((p) => {
+      const t = p.replace(NBSP, " ");
+      return t.endsWith(LINE_BREAK) ? t.slice(0, -1) : t;
+    });
+  }
+
+  /** The renderer's element for shape `it`: positioned at its box. */
+  function drawnShape(it: EditItem): HTMLElement | null {
+    const root = slideEl();
+    if (root === null) return null;
+    const near = (a: string, b: number) => Math.abs(parseFloat(a) - b) < 0.75;
+    let found: HTMLElement | null = null;
+    for (const el of Array.from(root.querySelectorAll<HTMLElement>("div"))) {
+      const st = el.style;
+      if (st.position !== "absolute") continue;
+      if (near(st.left, it.x) && near(st.top, it.y) && near(st.width, it.w) && near(st.height, it.h)) found = el;
+    }
+    return found;
+  }
+
+  function textBodyOf(shape: HTMLElement): HTMLElement | null {
+    for (const el of Array.from(shape.querySelectorAll<HTMLElement>("div"))) {
+      if (el.style.display === "flex" && el.style.flexDirection === "column") return el;
+    }
+    return null;
+  }
+
+  function startText(it: EditItem, at: { x: number; y: number } | null = null): void {
     const xml = edits.partText(part);
     if (xml === null) return;
     let paras: string[] | null;
@@ -415,14 +501,126 @@
     if (paras === null) return;
     textFrom = paras;
     textGesture = `text-${it.id}-${++seq}`;
-    draft = paras.map((p) => p.split(LINE_BREAK).join(LS)).join("\n");
     textFor = it.id;
     textError = null;
     texting = true;
-    queueMicrotask(() => {
-      textEl?.focus();
-      textEl?.select();
-    });
+    const shape = drawnShape(it);
+    const el = shape === null ? null : textBodyOf(shape);
+    const same = (a: readonly string[], b: readonly string[]) =>
+      a.length === b.length && a.every((v, k) => v.replace(NBSP, " ") === b[k]!.replace(NBSP, " "));
+    if (el !== null && same(readBody(el), paras)) beginInPlace(el, at);
+    else {
+      boxed = true;
+      draft = paras.map((p) => p.split(LINE_BREAK).join(LS)).join("\n");
+      queueMicrotask(() => {
+        textEl?.focus();
+        textEl?.select();
+      });
+    }
+  }
+
+  /** Formatting the file model can't take yet; everything else types. */
+  const BLOCKED_INPUT = /^format|^insertFromDrop$|^insertLink$/;
+
+  function beginInPlace(el: HTMLElement, at: { x: number; y: number } | null): void {
+    body = el;
+    const original = new Set(Array.from(el.children));
+    const markers = Array.from(el.querySelectorAll<HTMLElement>("span")).filter(isMarker);
+    for (const m of markers) m.contentEditable = "false";
+    el.contentEditable = "true";
+    el.spellcheck = true;
+    el.classList.add("pptx-editing");
+    const onBefore = (e: InputEvent) => {
+      if (BLOCKED_INPUT.test(e.inputType)) e.preventDefault();
+    };
+    const onPaste = (e: ClipboardEvent) => {
+      e.preventDefault();
+      const text = e.clipboardData?.getData("text/plain") ?? "";
+      // One pasted line break is a new paragraph, as typing Enter would be.
+      document.execCommand("insertText", false, text.replace(/\r\n?/g, "\n"));
+    };
+    const onInput = () => {
+      bulletNewBlocks(el, original);
+      if (textTimer !== null) clearTimeout(textTimer);
+      textTimer = setTimeout(writeText, 160);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      e.stopPropagation();
+      if (e.key === "Escape") {
+        e.preventDefault();
+        endText();
+      } else if ((e.metaKey || e.ctrlKey) && /^[biu]$/i.test(e.key)) e.preventDefault();
+      else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") {
+        // ⌘S while typing commits the text, then the view saves.
+        endText();
+        e.preventDefault();
+        el.dispatchEvent(new KeyboardEvent("keydown", { key: "s", metaKey: e.metaKey, ctrlKey: e.ctrlKey }));
+      }
+    };
+    el.addEventListener("beforeinput", onBefore);
+    el.addEventListener("paste", onPaste);
+    el.addEventListener("input", onInput);
+    el.addEventListener("keydown", onKey);
+    undoBody = () => {
+      el.removeEventListener("beforeinput", onBefore);
+      el.removeEventListener("paste", onPaste);
+      el.removeEventListener("input", onInput);
+      el.removeEventListener("keydown", onKey);
+      el.removeAttribute("contenteditable");
+      el.classList.remove("pptx-editing");
+      for (const m of markers) m.removeAttribute("contenteditable");
+    };
+    el.focus({ preventScroll: true });
+    const sel = window.getSelection();
+    // The layer still covers the slide until the `texting` class lands; the
+    // hit test for the caret must see the text under it, not the layer.
+    if (layerEl !== null) layerEl.style.pointerEvents = "none";
+    const range = at === null ? null : caretAt(at.x, at.y);
+    if (layerEl !== null) layerEl.style.pointerEvents = "";
+    if (sel !== null) {
+      sel.removeAllRanges();
+      if (range !== null && el.contains(range.startContainer)) sel.addRange(range);
+      else {
+        const all = document.createRange();
+        all.selectNodeContents(el);
+        sel.addRange(all);
+      }
+    }
+  }
+
+  /** A paragraph Enter just made is a copy of the block without its marker
+   *  (the marker isn't editable, so the browser doesn't carry it): give it
+   *  the previous paragraph's, so a bullet shows while typing, as it will
+   *  once the slide is redrawn from the file. */
+  function bulletNewBlocks(el: HTMLElement, original: ReadonlySet<Element>): void {
+    let prevMarker: HTMLElement | null = null;
+    for (const block of Array.from(el.children)) {
+      if (!(block instanceof HTMLElement)) continue;
+      const own = Array.from(block.children).find(isMarker) as HTMLElement | undefined;
+      if (own !== undefined) prevMarker = own;
+      else if (original.has(block)) prevMarker = null;
+      else if (prevMarker !== null && block.dataset.pptxNew === undefined) {
+        block.dataset.pptxNew = "";
+        const copy = prevMarker.cloneNode(true) as HTMLElement;
+        copy.contentEditable = "false";
+        block.prepend(copy);
+      }
+    }
+  }
+
+  function caretAt(x: number, y: number): Range | null {
+    const d = document as Document & {
+      caretRangeFromPoint?: (x: number, y: number) => Range | null;
+      caretPositionFromPoint?: (x: number, y: number) => { offsetNode: Node; offset: number } | null;
+    };
+    if (d.caretPositionFromPoint !== undefined) {
+      const p = d.caretPositionFromPoint(x, y);
+      if (p === null) return null;
+      const r = document.createRange();
+      r.setStart(p.offsetNode, p.offset);
+      return r;
+    }
+    return d.caretRangeFromPoint?.(x, y) ?? null;
   }
 
   function writeText(): void {
@@ -430,7 +628,8 @@
     textTimer = null;
     const id = textFor;
     if (id === null) return;
-    const to = draft.split("\n").map((p) => p.split(LS).join(LINE_BREAK));
+    const to =
+      body !== null ? readBody(body) : draft.split("\n").map((p) => p.split(LS).join(LINE_BREAK));
     const ok = edits.edit({ kind: "text", part, shape: id, from: textFrom, to }, textGesture);
     textError = ok ? null : edits.error;
   }
@@ -443,10 +642,35 @@
   function endText(): void {
     if (textFor === null) return;
     writeText();
+    undoBody?.();
+    undoBody = null;
+    body = null;
+    boxed = false;
     textFor = null;
+    window.getSelection()?.removeAllRanges();
+    // Releasing `texting` lets the view redraw the slide from the file.
     texting = false;
     layerEl?.focus({ preventScroll: true });
   }
+
+  // A press outside the text being edited finishes it; on another shape it
+  // also selects (and can start dragging) that shape, as in PowerPoint.
+  $effect(() => {
+    if (textFor === null || boxed) return;
+    const onDown = (e: PointerEvent) => {
+      const t = e.target as Node | null;
+      if (body !== null && t !== null && body.contains(t)) return;
+      endText();
+      const r = layerEl?.getBoundingClientRect();
+      if (r !== undefined && e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom) {
+        e.preventDefault();
+        e.stopPropagation();
+        onPointerDown(e);
+      }
+    };
+    window.addEventListener("pointerdown", onDown, true);
+    return () => window.removeEventListener("pointerdown", onDown, true);
+  });
 
   function onTextKey(e: KeyboardEvent): void {
     e.stopPropagation();
@@ -464,17 +688,14 @@
   }
 
   $effect(() => () => {
-    if (textTimer !== null) {
-      clearTimeout(textTimer);
-      writeText();
-    }
+    if (textFor !== null) endText();
   });
 
   const textItem = $derived(items.find((it) => it.id === textFor) ?? null);
-  /** The editor sits under the shape, or above it when there's no room. */
+  /** The fallback editor sits under the shape, or above it when there's no room. */
   const textBox = $derived.by(() => {
     const it = textItem;
-    if (it === null) return null;
+    if (it === null || !boxed) return null;
     const W = slideW * scale;
     const H = slideH * scale;
     const width = Math.min(W - 16, Math.max(260, it.w * scale));
@@ -485,6 +706,16 @@
     const top = room >= Math.min(height, 80) ? below : Math.max(8, it.y * scale - height - 8);
     return { left, top, width, maxHeight: Math.max(48, Math.min(height, top === below ? room : it.y * scale - 16)) };
   });
+
+  // --- hover ----------------------------------------------------------------------
+
+  /** The shape under the pointer (outlined; the cursor says what a press does). */
+  let hoverId = $state<string | null>(null);
+  function onHover(e: PointerEvent): void {
+    if (g !== null || texting) return;
+    const at = toSlide(e);
+    hoverId = at === null ? null : (hit(at)?.id ?? null);
+  }
 
   // --- drawing ------------------------------------------------------------------
 
@@ -508,17 +739,20 @@
   onpointermove={onPointerMove}
   onpointerup={end}
   onpointercancel={end}
+  onpointerleave={() => (hoverId = null)}
+  class:texting={texting && !boxed}
+  class:over-shape={hoverId !== null}
   ondblclick={(e) => {
     const at = toSlide(e);
     const it = at === null ? null : hit(at);
     if (it !== null) {
       selected = it.id;
-      startText(it);
+      startText(it, { x: e.clientX, y: e.clientY });
     }
   }}
 >
   {#each items as it (it.id)}
-    {#if it.id !== selected}
+    {#if it.id !== selected && it.id === hoverId}
       <div
         class="hover-box"
         aria-hidden="true"
@@ -540,6 +774,7 @@
     <div
       class="sel-box"
       class:moving={live !== null}
+      class:editing={textFor !== null && !boxed}
       style:left="{shown.x * scale}px"
       style:top="{shown.y * scale}px"
       style:width="{shown.w * scale}px"
@@ -597,17 +832,41 @@
     touch-action: none;
   }
 
-  /* Every shape shows where it is while editing, quietly. */
+  .edit-layer.over-shape {
+    cursor: move;
+  }
+
+  /* Editing text in place: the slide's own text takes the pointer. */
+  .edit-layer.texting {
+    pointer-events: none;
+  }
+
+  /* The shape under the pointer, quietly. */
   .hover-box {
     position: absolute;
     box-sizing: border-box;
-    border: 1px dashed transparent;
+    border: 1px solid color-mix(in srgb, var(--accent) 55%, transparent);
     transform-origin: center;
     pointer-events: none;
   }
 
-  .edit-layer:hover .hover-box {
-    border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+  .sel-box.editing {
+    border-style: dashed;
+    border-width: 1px;
+    box-shadow: none;
+  }
+
+  /* The renderer's text body while it is being typed into. */
+  :global(.pptx-editing) {
+    outline: none;
+    cursor: text;
+    user-select: text;
+    -webkit-user-select: text;
+    caret-color: var(--accent);
+  }
+
+  :global(.pptx-editing ::selection) {
+    background: color-mix(in srgb, var(--accent) 30%, transparent);
   }
 
   .sel-box {
