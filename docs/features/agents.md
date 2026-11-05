@@ -198,7 +198,8 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   install method for a bare binary behind our symlink, and claude's would install a second copy
   elsewhere, leaving the managed link stale); your own binary's `update` passes through untouched.
   agy updates itself unasked, writing the new build over the path it ran from. For a managed agy that
-  path is the activation link, so the shim, a managed agy's terminal and sign-in spawns, and every
+  path is the activation link, so the shim, a managed agy's terminal, sign-in and extension-action
+  spawns, and every
   background probe run it with `AGY_CLI_DISABLE_AUTO_UPDATE=true` (`runtimes::AGY_NO_SELF_UPDATE`).
   Your own agy keeps its updater outside probes. An activation it already rewrote keeps every agy
   package until the next managed install or update restores the link (PROTOCOL.md Pass 61).

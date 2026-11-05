@@ -716,6 +716,7 @@ pub(crate) async fn start(
                 .env
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
+                .chain(crate::runtimes::managed_agent_env(kind, detection.managed))
                 .collect(),
             stdin: recipe.accepts_code,
             cwd: workspace.root.clone(),
@@ -873,13 +874,6 @@ async fn run_login(
     let (id, workspace) = op.read(|p| (p.id.clone(), p.workspace_id.clone()));
     let prelude = crate::agent_probe::ProbePrelude::write(state, Some(&workspace)).await;
     let mut env = crate::api::session_env(state, &id, "dark", prelude.path());
-    if let Some(bin) = argv.first() {
-        env.extend(crate::runtimes::managed_agent_env(
-            state,
-            kind,
-            Path::new(bin),
-        ));
-    }
     if no_browser {
         match no_browser_dir().await {
             Ok(dir) => env = with_path_prefix(env, &dir),

@@ -155,17 +155,19 @@ pub(crate) fn is_managed(path: &Path, managed_root: &Path) -> bool {
 /// `true` counts) leaves the update to it.
 pub(crate) const AGY_NO_SELF_UPDATE: (&str, &str) = ("AGY_CLI_DISABLE_AUTO_UPDATE", "true");
 
-/// The environment a spawn of `bin` needs because Chimaera manages it. A
-/// user's own agy keeps its updater: that install is theirs.
-pub(crate) fn managed_agent_env(
-    state: &AppState,
-    kind: AgentKind,
-    bin: &Path,
-) -> Option<(String, String)> {
-    (kind == AgentKind::Antigravity && owns_binary(state, bin)).then(|| {
-        let (name, value) = AGY_NO_SELF_UPDATE;
-        (name.to_string(), value.to_string())
-    })
+/// [`AGY_NO_SELF_UPDATE`] as an owned environment pair.
+pub(crate) fn agy_no_self_update() -> (String, String) {
+    let (name, value) = AGY_NO_SELF_UPDATE;
+    (name.to_string(), value.to_string())
+}
+
+/// The environment a spawn needs because Chimaera manages the binary it
+/// runs. `managed` is detection's verdict (`AgentDetection::managed`), read
+/// on the activation path: a leased, canonicalized path may not start with
+/// a managed root that has a symlinked component. A user's own agy keeps
+/// its updater: that install is theirs.
+pub(crate) fn managed_agent_env(kind: AgentKind, managed: bool) -> Option<(String, String)> {
+    (kind == AgentKind::Antigravity && managed).then(agy_no_self_update)
 }
 
 // --- curated install scripts -------------------------------------------------
@@ -2163,40 +2165,11 @@ esac
 
     #[test]
     fn only_a_managed_agy_spawn_turns_off_self_update() {
-        let dir = test_dir("managed-agent-env");
-        let mut state = AppState::new(
-            "token".into(),
-            "host".into(),
-            1,
-            0,
-            dir.join("data"),
-            dir.join("config"),
-        );
-        state.managed_root = dir.join("agents");
-        let managed = state.managed_root.join("bin/agy");
         let expected = Some((AGY_NO_SELF_UPDATE.0.into(), AGY_NO_SELF_UPDATE.1.into()));
-        assert_eq!(
-            managed_agent_env(&state, AgentKind::Antigravity, &managed),
-            expected
-        );
-        // The package a lease pins argv to is managed too.
-        let package = state.managed_root.join("agy/1.3.4/bin/agy");
-        assert_eq!(
-            managed_agent_env(&state, AgentKind::Antigravity, &package),
-            expected
-        );
-        assert_eq!(
-            managed_agent_env(&state, AgentKind::Antigravity, &dir.join("own/agy")),
-            None
-        );
-        assert_eq!(
-            managed_agent_env(
-                &state,
-                AgentKind::Codex,
-                &state.managed_root.join("bin/codex")
-            ),
-            None
-        );
+        assert_eq!(agy_no_self_update(), expected.clone().unwrap());
+        assert_eq!(managed_agent_env(AgentKind::Antigravity, true), expected);
+        assert_eq!(managed_agent_env(AgentKind::Antigravity, false), None);
+        assert_eq!(managed_agent_env(AgentKind::Codex, true), None);
     }
 
     #[test]

@@ -1918,7 +1918,7 @@ Reported (#355): with more than one message waiting, Send now did not send them 
 
 ## Pass 61 — 2026-11-04: ACP follow-ups from the latest-versions drift pass (grok 1.0.70, agy-acp 1.4.5, agy 1.3.4/1.5.0, cursor-agent 2026.10.22)
 
-The same day's drift pass probed the newest Grok Build, Antigravity and Cursor releases with raw ACP clients, logging every frame. Its `just chat-smoke-acp` run passed 3/3 on Grok 1.0.70, agy-acp 1.4.5 and Cursor 2026.10.22. The pins move in a separate re-pin. This pass adopts the four gaps that run found. Facts are in [acp.md](acp.md).
+The same day's drift pass probed the newest Grok Build, Antigravity and Cursor releases with raw ACP clients, logging every frame. Its `just chat-smoke-acp` run passed 3/3 on Grok 1.0.70, agy-acp 1.4.5 and Cursor 2026.10.22. The pins moved in Pass 59 (#371), which recorded these gaps as not yet handled. This pass adopts the four gaps that run found. Facts are in [acp.md](acp.md).
 
 ### Findings
 
@@ -1932,7 +1932,7 @@ The same day's drift pass probed the newest Grok Build, Antigravity and Cursor r
 - `grok_billing_usage`: a `currentPeriod` without a percent is 0%.
 - `AcpMapper::split_thought_level`: a model id that is not offered, but whose `-<level>` suffix splits into an offered model and an offered thinking level, sends both `session/set_config_option`s. Restore or pick, no notice. The level goes out only after the model's answer (`deferred_effort`, for any thinking-level change made while a model change is unanswered): the first live run sent both at once, and agy answered the level first, still `high`, because its model change reset it.
 - `raw_shell_output`: a completed or failed update with no `content` draws `combinedOutput`, else `stdout` then `stderr`, capped like `content`.
-- `runtimes::AGY_NO_SELF_UPDATE` (`AGY_CLI_DISABLE_AUTO_UPDATE=true`): every probe (`agent_probe::base_command`; a probe reads and never updates an install, the user's own included) and every spawn of a managed agy (the shim's managed fallback, PTY agent sessions, sign-in; `runtimes::managed_agent_env`). A user's own agy keeps its updater. Retention names a rewritten activation link in its log instead of an opaque I/O error.
+- `runtimes::AGY_NO_SELF_UPDATE` (`AGY_CLI_DISABLE_AUTO_UPDATE=true`): every probe (`agent_probe::base_command`; a probe reads and never updates an install, the user's own included) and every spawn of a managed agy (the shim's managed fallback, PTY agent sessions, sign-in, extension actions; `runtimes::managed_agent_env`, judged by detection's `managed` on the activation path, since a leased path is canonical). A user's own agy keeps its updater. Retention names a rewritten activation link in its log instead of an opaque I/O error.
 
 ### Not adopted (recorded for later)
 

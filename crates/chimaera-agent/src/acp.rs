@@ -276,6 +276,12 @@ enum Pending {
     /// Grok's `_x.ai/billing`: the account's credit window after a turn.
     GrokBilling,
 }
+impl Pending {
+    /// A model change, by config option or by `session/set_model`.
+    fn changes_model(&self) -> bool {
+        matches!(self, Pending::Model(_)) || matches!(self, Pending::Config(c, ..) if c == "model")
+    }
+}
 struct Queued {
     id: String,
     blocks: Vec<ContentBlock>,
@@ -399,8 +405,13 @@ fn raw_shell_output(raw: &Value) -> Option<ToolContent> {
         (None, Some(one), None) | (None, None, Some(one)) => one,
         (None, None, None) => return None,
     };
+    Some(output_content(output))
+}
+
+/// A tool's text output, capped the same way wherever it comes from.
+fn output_content(output: &str) -> ToolContent {
     let (text, truncated) = cap_head_tail(output, 3072, 1024);
-    Some(ToolContent::Output { text, truncated })
+    ToolContent::Output { text, truncated }
 }
 
 fn text(v: &Value) -> String {
@@ -941,10 +952,7 @@ impl AcpMapper {
             .collect()
     }
     fn config_command(&mut self, category: &str, value: &str, step: &mut DriverStep) {
-        let model_in_flight = self
-            .pending
-            .values()
-            .any(|p| matches!(p, Pending::Config(c, ..) if c == "model"));
+        let model_in_flight = self.pending.values().any(Pending::changes_model);
         if category == "thought_level" && model_in_flight {
             self.deferred_effort = Some((value.into(), !self.restoring));
             return;
@@ -1003,14 +1011,17 @@ impl AcpMapper {
         if category != "model" {
             return None;
         }
-        let (model, level) = value.rsplit_once('-')?;
         let offers = |category: &str, value: &str| {
             rows(&self.config)
                 .find(|c| c["category"] == category)
                 .is_some_and(|c| rows(&c["options"]).any(|o| o["value"] == value))
         };
-        (offers("model", model) && offers("thought_level", level))
-            .then(|| (model.to_owned(), level.to_owned()))
+        // Every hyphen, so a level that has one of its own still splits.
+        value.match_indices('-').find_map(|(at, _)| {
+            let (model, level) = (&value[..at], &value[at + 1..]);
+            (offers("model", model) && offers("thought_level", level))
+                .then(|| (model.to_owned(), level.to_owned()))
+        })
     }
     fn catalog(&self) -> AgentEvent {
         AgentEvent::Catalog {
@@ -1207,7 +1218,7 @@ impl Mapper for AcpMapper {
                 return step;
             };
             let error = frame.get("error").map(|e| text(&e["message"]));
-            let model_answered = matches!(&pending, Pending::Config(c, ..) if c == "model");
+            let model_answered = pending.changes_model();
             match pending {
                 Pending::Prompt(turn_id) => {
                     self.flush_into(&mut step);
@@ -1620,12 +1631,9 @@ impl Mapper for AcpMapper {
                                 truncated,
                             })
                         } else if v["content"]["type"] == "text" {
-                            let (text, truncated) = cap_head_tail(
+                            Some(output_content(
                                 v["content"]["text"].as_str().unwrap_or_default(),
-                                3072,
-                                1024,
-                            );
-                            Some(ToolContent::Output { text, truncated })
+                            ))
                         } else {
                             None
                         }
@@ -2851,6 +2859,42 @@ mod tests {
                 "{unknown}"
             );
         }
+    }
+
+    /// A level with a hyphen of its own still splits, and a level change
+    /// also waits behind a `session/set_model` model change.
+    #[test]
+    fn thinking_level_split_and_hold_cover_every_model_change() {
+        let mut m = mapper();
+        m.set_config(&json!([
+            {"id":"model","category":"model","type":"select","currentValue":"m-x",
+             "options":[{"value":"m-x","name":"X"},{"value":"m-y","name":"Y"}]},
+            {"id":"level","category":"thought_level","type":"select","currentValue":"low",
+             "options":[{"value":"low","name":"Low"},{"value":"extra-high","name":"Extra high"}]}]));
+        let model = m.on_command(AgentCommand::SetModel {
+            model_id: "m-y-extra-high".into(),
+        });
+        assert_eq!(model.outbound[0]["params"]["value"], "m-y");
+        let answered = m.on_frame(&json!({"id":model.outbound[0]["id"],"result":{}}));
+        assert_eq!(answered.outbound[0]["params"]["configId"], "level");
+        assert_eq!(answered.outbound[0]["params"]["value"], "extra-high");
+
+        // Models listed outside configOptions change by `session/set_model`.
+        let session = json!({"models":{"availableModels":[{"modelId":"a"},{"modelId":"b"}],"currentModelId":"a"},
+            "configOptions":[{"id":"level","category":"thought_level","type":"select","currentValue":"low",
+             "options":[{"value":"low","name":"Low"},{"value":"high","name":"High"}]}]});
+        let mut m = AcpMapper::new("session".into(), &json!({}), &session, "");
+        let model = m.on_command(AgentCommand::SetModel {
+            model_id: "b".into(),
+        });
+        assert_eq!(model.outbound[0]["method"], "session/set_model");
+        let held = m.on_command(AgentCommand::SetEffort {
+            effort_id: "high".into(),
+        });
+        assert!(held.outbound.is_empty());
+        let answered = m.on_frame(&json!({"id":model.outbound[0]["id"],"result":{}}));
+        assert_eq!(answered.outbound[0]["method"], "session/set_config_option");
+        assert_eq!(answered.outbound[0]["params"]["value"], "high");
     }
 
     /// A finished shell call that carries its output only in `rawOutput`

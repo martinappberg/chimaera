@@ -186,11 +186,10 @@ pub(crate) fn base_command(
     // A probe reads; it never updates an install. agy's updater would
     // otherwise spawn from a `/usage` read and overwrite the binary it was
     // started from (a managed activation link included), whoever owns it.
-    let (name, value) = crate::runtimes::AGY_NO_SELF_UPDATE;
     let env: Vec<(String, String)> = prelude
         .map(|path| ("CHIMAERA_PRELUDE".to_string(), path.display().to_string()))
         .into_iter()
-        .chain([(name.to_string(), value.to_string())])
+        .chain([crate::runtimes::agy_no_self_update()])
         .collect();
     for name in crate::api::spawn_env_remove(&env) {
         cmd.env_remove(name);

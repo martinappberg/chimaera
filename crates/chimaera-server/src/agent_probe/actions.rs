@@ -104,7 +104,11 @@ pub(crate) async fn run(
     let Ok(Ok((completion, prelude))) = prepared else {
         return crate::plugins::bad_request("Couldn't prepare extension management.");
     };
-    let env = crate::api::session_env(&state, &sid, "dark", prelude.as_deref());
+    let mut env = crate::api::session_env(&state, &sid, "dark", prelude.as_deref());
+    // `bin` is the leased package path; detection (cached) judged the
+    // activation path. agy's updater would rewrite that link mid-action.
+    let managed = crate::launcher::detect(&state, kind, false).await.managed;
+    env.extend(crate::runtimes::managed_agent_env(kind, managed));
     let env_remove = crate::api::spawn_env_remove(&env);
     let mut argv = vec![
         "/bin/bash".into(),
