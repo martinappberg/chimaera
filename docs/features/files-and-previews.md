@@ -877,7 +877,9 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
 - **PowerPoint decks.** `.pptx` (and `.pptm`, `.ppsx`, `.potx`) open in `PptxView.svelte`,
   drawn by `@aiden0z/pptx-renderer` in the Marp viewer's chrome: arrows / PageUp / PageDown /
   Space / Home / End page the deck, a thumbnail strip jumps, **present** goes full screen,
-  `#slide=N` reveals a slide (clamped to the deck), and **speaker notes** (read straight from the
+  `#slide=N` reveals a slide (clamped to the deck; `#slide=N&xywh=…` outlines a box on it), the
+  slide's **@** and the area tool point an agent at the slide or part of it ([Pointing at part of
+  a file](#pointing-at-part-of-a-file)), and **speaker notes** (read straight from the
   package; the renderer doesn't model them) show under the stage — under the deck's zip entry cap,
   one part at a time, each inflated only if it declares ≤1 MB (≤32 MB for all notes) and abandoned
   at 1 MB whatever it declared, so a zip bomb in `notesSlide*.xml` is skipped (that slide's notes
@@ -1066,7 +1068,14 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
     under the block. The values go along as TSV, header first.
   - **Video/audio:** the bar's **@ 0:12** button sends the playhead; **mark range** twice marks a
     range, which the button (and the chord) then sends.
-  - **Notebook cell / slide:** hover it; its **@** button sends it, with its source or text.
+  - **Notebook cell / slide:** hover it; its **@** button sends it, with its source or text. A
+    PowerPoint slide sends its title as the context and the rest of its text.
+  - **Part of a PowerPoint slide:** the bar's **select area** tool (or Shift-drag) draws a box; a
+    plain click (or Shift-click) picks the shape under the pointer, its own box. The box goes in
+    points from the slide's top-left — the deck's PDF export has the same page in points, and
+    python-pptx's EMU are 12700 per point — with the names of the shapes under it (as
+    PowerPoint's selection pane and `shape.name` call them) and their text, a table as
+    `a | b / c | d`. No crop yet: the slide is laid-out HTML, not pixels.
 - **What the agent gets.** One line, `@<path>#<locator> (<context>) "<quote>"`, each part after the
   path optional:
 
@@ -1081,6 +1090,8 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   | spreadsheet | `@book.xlsx#sheet=Q1%20Summary&range=D6:E7 "score\tnote\n2.5\tsecond…"` |
   | media | `@talk.wav#t=3.5`, `@talk.wav#t=2,6.25` |
   | notebook cell / slide | `@analysis.ipynb#cell=2 "import pandas…"`, `@deck.md#slide=2 "Results…"` |
+  | PowerPoint slide | `@deck.pptx#slide=2 (Results) "Effect held across cohorts · Figure 2…"` |
+  | PowerPoint area / shape | `@deck.pptx#slide=3&xywh=43,115,433,109 (Gene table) "gene \| log2FC / TP53 \| 2.1"` |
 
   The pixels: a **chat** target gets the crop as an image attachment (the pasted-screenshot
   pipeline and its caps), delivered in one insert with the locator so both land in the same
@@ -1092,7 +1103,8 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   `crop` / `label`, `composeSelectionReference`, `referenceNow`), `shared/ReferenceChip.svelte` +
   `ReferenceButton.svelte`, `App.svelte` `referenceSelection` (the one handler: chat attach vs
   terminal upload), the viewers (`PdfView`, `ImageView`, `TableView` + `XlsxView`, `MediaView`,
-  `NotebookView`, `SlidesView`, `MarkdownView`), region math in `previews/imageRegion.ts`. The
+  `NotebookView`, `SlidesView`, `PptxView` + `pptxRefs.ts`, `MarkdownView`), region math in
+  `previews/imageRegion.ts`. The
   daemon's `fs/xlsx` reports the sheet's used-range `origin`, so A1 references are the sheet's own.
 - **Key behaviors.**
   - **Locators are links too.** The same fragments open at the spot from chat, a terminal, or a
