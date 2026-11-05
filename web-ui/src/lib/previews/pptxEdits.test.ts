@@ -106,6 +106,11 @@ describe("DeckEditsCore", () => {
     expect(readText(core.text(S1), "2")).toEqual(["mine"]);
     expect(core.dirty).toBe(true);
     expect(core.conflicts).toHaveLength(0);
+    // Kept mine is now an edit of their file: replaying it there fits.
+    const again = new DeckEditsCore(reader({ [S1]: slide(box("2", 0, "theirs")) }), "h2");
+    await again.restore([...core.history]);
+    expect(again.conflicts).toHaveLength(0);
+    expect(readText(again.text(S1), "2")).toEqual(["mine"]);
   });
 
   it("keeping theirs drops the held edit; a vanished shape can't be kept", async () => {

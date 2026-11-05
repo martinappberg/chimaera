@@ -91,6 +91,20 @@ function shapeExists(xml: string, id: string): boolean {
   }
 }
 
+/** `op` with its `from` read from `base` (what it now replaces). */
+function rebased(op: DeckOp, base: string): DeckOp {
+  switch (op.kind) {
+    case "xfrm":
+      return { ...op, from: readXfrm(base, op.shape) };
+    case "text":
+      return { ...op, from: readText(base, op.shape) ?? op.from };
+    case "order":
+      return { ...op, from: slideOrder(base) };
+    case "delete":
+      return op;
+  }
+}
+
 /** A short description of an operation, for the conflict banner. */
 export function describeOp(op: DeckOp): string {
   switch (op.kind) {
@@ -327,8 +341,11 @@ export class DeckEditsCore {
         continue;
       }
       try {
-        this.current.set(op.part, applyOp(this.text(op.part), op));
-        this.ops.push(op);
+        const base = this.text(op.part);
+        this.current.set(op.part, applyOp(base, op));
+        // Kept over the new file: it is now an edit OF that file, so a later
+        // rebase or a journal restore judges it against what it replaced.
+        this.ops.push(rebased(op, base));
       } catch (e) {
         if (!(e instanceof PptxXmlError)) throw e;
         lost++;

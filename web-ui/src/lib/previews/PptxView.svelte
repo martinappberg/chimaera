@@ -490,6 +490,11 @@
     await edits.save();
   }
 
+  function resolveConflicts(choice: "mine" | "theirs"): void {
+    edits.resolve(choice);
+    stageEl?.focus({ preventScroll: true });
+  }
+
   function undoEdit(): void {
     edits.undo();
   }
@@ -614,6 +619,7 @@
   async function settleTrip(choice: "overwrite" | "copy" | "theirs" | "done"): Promise<void> {
     officeError = null;
     try {
+      stageEl?.focus({ preventScroll: true });
       const copy = await resolveOfficeTrip(path, choice);
       // After "copy" the trip follows the copy: this deck has none left.
       if (choice === "done" || choice === "copy") trip = null;
@@ -891,18 +897,6 @@
   function onKey(e: KeyboardEvent): void {
     if (editMode && !presenting && deck !== null && !texting) {
       const mod = (e.metaKey || e.ctrlKey) && !e.altKey;
-      const k = e.key.toLowerCase();
-      if (mod && (k === "z" || k === "y")) {
-        e.preventDefault();
-        if (k === "y" || e.shiftKey) redoEdit();
-        else undoEdit();
-        return;
-      }
-      if (mod && k === "s") {
-        e.preventDefault();
-        void saveEdits();
-        return;
-      }
       if (!mod && !e.altKey && editLayer?.key(e) === true) {
         e.preventDefault();
         return;
@@ -953,6 +947,25 @@
         return;
     }
     e.preventDefault();
+  }
+
+  /** ⌘S, ⌘Z and ⇧⌘Z / ⌘Y anywhere in the viewer (the stage, the strip after
+   *  a drag, the bar's buttons), not only on the stage. A text field keeps
+   *  its own undo. */
+  function onViewKey(e: KeyboardEvent): void {
+    if (!(e.metaKey || e.ctrlKey) || e.altKey || deck === null || presenting || texting) return;
+    if (!(editMode || edits.dirty)) return;
+    const t = e.target as HTMLElement | null;
+    if (t !== null && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+    const k = e.key.toLowerCase();
+    if (k === "s") {
+      e.preventDefault();
+      void saveEdits();
+    } else if (k === "z" || k === "y") {
+      e.preventDefault();
+      if (k === "y" || e.shiftKey) redoEdit();
+      else undoEdit();
+    }
   }
 
   async function togglePresent(): Promise<void> {
@@ -1010,7 +1023,8 @@
   const hiddenSlide = $derived(deck?.presentation.slides[current]?.hidden === true);
 </script>
 
-<div class="pptx-view">
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div class="pptx-view" onkeydown={onViewKey}>
   <div class="slides-bar">
     {#if deck !== null}
       <button class="bbtn icon" onclick={() => go(current - 1)} disabled={current === 0} title="previous slide (←)" aria-label="previous slide">
@@ -1129,8 +1143,10 @@
           ? `Your ${edits.conflicts[0]} touches`
           : `${edits.conflicts.length} of your edits touch`} what changed.</span
       >
-      <button class="opt" onclick={() => edits.resolve("mine")}>keep mine</button>
-      <button class="opt" onclick={() => edits.resolve("theirs")}>use theirs</button>
+      <!-- The banner goes with the choice: focus goes back to the stage so the
+           deck's keys (⌘S, arrows) keep working. -->
+      <button class="opt" onclick={() => resolveConflicts("mine")}>keep mine</button>
+      <button class="opt" onclick={() => resolveConflicts("theirs")}>use theirs</button>
     </div>
   {/if}
   {#if trip?.state === "conflict"}
