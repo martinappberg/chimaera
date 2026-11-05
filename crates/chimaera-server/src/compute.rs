@@ -526,6 +526,18 @@ impl ComputeService {
         }
     }
 
+    /// Tests: settle detection as "no scheduler" without probing. The real
+    /// probe runs the user's login shell, and on macOS a child forked while
+    /// another test's pipe is still inheritable keeps that pipe open until
+    /// it exits, stalling unrelated subprocess tests past their deadline.
+    #[cfg(test)]
+    pub(crate) async fn assume_no_scheduler(&self) {
+        let mut inner = self.inner.lock().await;
+        inner.detection = Some(Detection::None);
+        inner.detected_at = Some(Instant::now());
+        self.detected.store(DET_NONE, Ordering::Release);
+    }
+
     /// Detect, mirroring the verdict into [`Self::detected`].
     async fn detect(&self) -> Option<Detection> {
         let found = detect_tools(self.bindir.as_deref()).await;

@@ -226,6 +226,24 @@ async fn connect_window(addr: std::net::SocketAddr, workspace: &str, tabs: &[&st
     window
 }
 
+/// The settings every test here starts from: a fixed git, so a window's
+/// first `/ws/events` frames never resolve git through the user's login
+/// shell. A slow login shell forked while another test's pipe is still
+/// inheritable (macOS sets close-on-exec after `pipe()`) holds that pipe
+/// open and stalls unrelated subprocess tests past their deadlines.
+const QUIET_GIT: &str = "/usr/bin/git";
+
+/// A test state with Slurm detection already settled ("none") and git
+/// pinned ([`QUIET_GIT`]): nothing here runs the user's login shell.
+async fn quiet_state() -> Arc<AppState> {
+    let state = test_state();
+    state.compute.assume_no_scheduler().await;
+    let mut map = serde_json::Map::new();
+    map.insert("git.path".into(), QUIET_GIT.into());
+    lock(&state.settings).put(map).unwrap();
+    state
+}
+
 async fn serve(state: &Arc<AppState>) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -279,7 +297,7 @@ async fn agent_on(state: &Arc<AppState>, label: &str) -> (String, String) {
 
 #[tokio::test]
 async fn the_app_engine_drives_an_own_page_through_the_window() {
-    let state = test_state();
+    let state = quiet_state().await;
     let (agent, ws) = agent_on(&state, "ab-own").await;
     let (addr, server) = serve(&state).await;
     let window = connect_window(addr, &ws, &[]).await;
@@ -432,7 +450,7 @@ async fn the_app_engine_drives_an_own_page_through_the_window() {
 
 #[tokio::test]
 async fn a_closed_window_takes_its_pages_with_it() {
-    let state = test_state();
+    let state = quiet_state().await;
     let (agent, ws) = agent_on(&state, "ab-gone").await;
     let (addr, server) = serve(&state).await;
     let window = connect_window(addr, &ws, &[]).await;
@@ -467,7 +485,7 @@ async fn a_closed_window_takes_its_pages_with_it() {
 
 #[tokio::test]
 async fn a_shared_pane_is_the_default_page_and_pauses_on_take_over() {
-    let state = test_state();
+    let state = quiet_state().await;
     let (agent, ws) = agent_on(&state, "ab-shared").await;
     let (addr, server) = serve(&state).await;
     let window = connect_window(addr, &ws, &["t1"]).await;
@@ -580,7 +598,7 @@ async fn a_shared_pane_is_the_default_page_and_pauses_on_take_over() {
 
 #[tokio::test]
 async fn show_hands_the_live_view_over_as_a_shared_pane() {
-    let state = test_state();
+    let state = quiet_state().await;
     let (agent, ws) = agent_on(&state, "ab-show").await;
     let (addr, server) = serve(&state).await;
     let window = connect_window(addr, &ws, &[]).await;
@@ -628,7 +646,7 @@ async fn show_hands_the_live_view_over_as_a_shared_pane() {
 
 #[tokio::test]
 async fn no_app_window_on_the_workspace_and_no_chromium_is_a_refusal_naming_the_fix() {
-    let state = test_state();
+    let state = quiet_state().await;
     let (agent, _ws) = agent_on(&state, "ab-none").await;
     let other = make_workspace(&state, "ab-other").await;
     let (addr, server) = serve(&state).await;
@@ -640,7 +658,7 @@ async fn no_app_window_on_the_workspace_and_no_chromium_is_a_refusal_naming_the_
         &state,
         Method::PUT,
         "/api/v1/settings",
-        Some(json!({"browser.path": "/nonexistent/chimaera-test-chrome"})),
+        Some(json!({"browser.path": "/nonexistent/chimaera-test-chrome", "git.path": QUIET_GIT})),
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
@@ -671,7 +689,7 @@ async fn no_app_window_on_the_workspace_and_no_chromium_is_a_refusal_naming_the_
 
 #[tokio::test]
 async fn browser_link_routes_validate_authenticate_and_ride_the_sessions_frame() {
-    let state = test_state();
+    let state = quiet_state().await;
     let agent = inject_agent(&state, "ab");
     let other = inject_agent(&state, "ab2");
 
@@ -772,7 +790,7 @@ async fn link_tab(state: &Arc<AppState>, tab: &str, agent: &str) -> String {
 
 #[tokio::test]
 async fn a_shared_pane_never_retargets_an_agent_with_its_own_page() {
-    let state = test_state();
+    let state = quiet_state().await;
     let (agent, ws) = agent_on(&state, "ab-default").await;
     let (addr, server) = serve(&state).await;
     let window = connect_window(addr, &ws, &["t1", "t2"]).await;
@@ -815,13 +833,13 @@ async fn a_shared_pane_never_retargets_an_agent_with_its_own_page() {
 
 #[tokio::test]
 async fn an_engine_asked_for_is_honoured_only_when_a_page_starts() {
-    let state = test_state();
+    let state = quiet_state().await;
     let (agent, ws) = agent_on(&state, "ab-engine").await;
     let (status, _) = request(
         &state,
         Method::PUT,
         "/api/v1/settings",
-        Some(json!({"browser.path": "/nonexistent/chimaera-test-chrome"})),
+        Some(json!({"browser.path": "/nonexistent/chimaera-test-chrome", "git.path": QUIET_GIT})),
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
@@ -893,7 +911,7 @@ async fn an_engine_asked_for_is_honoured_only_when_a_page_starts() {
 
 #[tokio::test]
 async fn a_large_screenshot_comes_back_as_jpeg() {
-    let state = test_state();
+    let state = quiet_state().await;
     let (agent, ws) = agent_on(&state, "ab-jpeg").await;
     let (addr, server) = serve(&state).await;
     let window = connect_window(addr, &ws, &[]).await;
@@ -934,7 +952,7 @@ async fn a_large_screenshot_comes_back_as_jpeg() {
 
 #[tokio::test]
 async fn hand_overs_are_rate_limited_and_capped() {
-    let state = test_state();
+    let state = quiet_state().await;
     let (agent, ws) = agent_on(&state, "ab-handovers").await;
     let (addr, server) = serve(&state).await;
     let window = connect_window(addr, &ws, &[]).await;
@@ -986,7 +1004,7 @@ async fn hand_overs_are_rate_limited_and_capped() {
 
 #[tokio::test]
 async fn the_shells_take_over_abort_pauses_the_pane() {
-    let state = test_state();
+    let state = quiet_state().await;
     let (agent, ws) = agent_on(&state, "ab-abort").await;
     let (addr, server) = serve(&state).await;
     let window = connect_window(addr, &ws, &["t1"]).await;
