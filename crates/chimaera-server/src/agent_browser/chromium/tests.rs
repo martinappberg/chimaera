@@ -444,7 +444,8 @@ fn discovery_prefers_the_setting_then_path() {
     if !cfg!(target_os = "macos") {
         let empty = std::env::join_paths([dir.join("empty")]).unwrap();
         let err = find_browser(None, &empty, None).unwrap_err();
-        assert!(err.contains("set browser.path"), "{err}");
+        // The ways to get one are added by `check`, which knows the plugins.
+        assert!(err.starts_with("No Chrome or Chromium on "), "{err}");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -111,9 +111,10 @@ marker), `layout/PaneTabs.svelte` (the chain link and chips). Wire: `browser_req
   changes nothing else. The engine uses that browser only for sessions in workspaces where the
   plugin is active, and only when the host has no browser of its own; the profile still lives
   in the node-local runtime dir. Each missing step has its own refusal text: not switched on
-  here, switched on but not downloaded (with size and host), no build for this platform, the
-  plugin held or faulted, no plugin at all (the three clicks, then `browser.path`, then the
-  app). `plugins/browser.rs` (`offer`) is generic: it reads the manifest, never an id.
+  here, switched on but not downloaded (with size and host), installed but its program not
+  runnable (Remove and Install again), no build for this platform, the plugin held or faulted
+  (each followed by the `browser.path` and app alternatives), no plugin at all (the three clicks,
+  then `browser.path`, then the app). `plugins/browser.rs` (`offer`) is generic: it reads the manifest, never an id.
 - **The choice, for a new own page** (`tools::new_page`, `channel::choose`): an app-engine window
   on the session's workspace (any app-engine window when the session has no workspace) —
   visible and focused first, then visible, then any. None → the Chromium engine when
@@ -232,7 +233,7 @@ marker), `layout/PaneTabs.svelte` (the chain link and chips). Wire: `browser_req
   Chromium engine's unit tests (`agent_browser/chromium/tests.rs`).
 - `cargo test -p chimaera-server a_plugin_tool_supplies_the_agent_browser`: `provides.browser`
   validation, the Can line, and each step of a plugin's browser (off here, on but not
-  downloaded, installed, removed) through the real tool-install route (`tests/plugin_jobs.rs`).
+  downloaded, installed, not runnable, removed) through the real tool-install route (`tests/plugin_jobs.rs`).
 - `just browser-smoke`: the Chromium engine against a real browser
   (`agent_browser/chromium/live_tests.rs`; needs `CHIMAERA_TEST_CHROMIUM`).
 - `just app-check`: the shell's `drive.rs` unit tests (parsing, key map, ledger, eval wrapper).

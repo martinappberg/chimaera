@@ -901,9 +901,15 @@ async fn exec(state: &Arc<AppState>, ctx: &Ctx, action: Action) -> Result<Action
     let result = match (&ctx.addr, &ctx.key) {
         (Some(addr), _) => app_engine::act(state, addr, action).await,
         (None, Some(key)) => {
-            let ws = crate::lock(&state.session_workspaces)
-                .get(&ctx.agent)
-                .cloned();
+            // Only opening a page may launch the browser, which depends on
+            // the plugins active in the session's workspace.
+            let ws = matches!(action, Action::Open { .. })
+                .then(|| {
+                    crate::lock(&state.session_workspaces)
+                        .get(&ctx.agent)
+                        .cloned()
+                })
+                .flatten();
             state
                 .browsers
                 .chromium

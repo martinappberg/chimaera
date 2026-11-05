@@ -106,6 +106,9 @@ const GET_ONE: &str = "Ask the user to get one: in Extensions → Plugins, insta
      pinned chrome-headless-shell, checked against its sha256, into Chimaera's tools folder). \
      Or install Chrome or Chromium on this host and set browser.path in Chimaera's settings to \
      its executable, or connect the Chimaera app.";
+/// After a plugin's browser that isn't ready yet: the user's other ways.
+const OR_OWN: &str = "Or the user can set browser.path in Chimaera's settings to a Chrome or \
+     Chromium on this host, or connect the Chimaera app.";
 /// Executable names looked up on PATH, in order.
 const PATH_NAMES: [&str; 6] = [
     "google-chrome",
@@ -221,7 +224,7 @@ impl Chromium {
                 match crate::plugins::browser::offer(state, ws).await {
                     Offer::Ready(exe) => exe,
                     Offer::NotReady(why) => {
-                        return Err(Unavailable::NoEngine(format!("{none} {why}")))
+                        return Err(Unavailable::NoEngine(format!("{none} {why} {OR_OWN}")))
                     }
                     Offer::Nothing => {
                         return Err(Unavailable::NoEngine(format!("{none} {GET_ONE}")))
@@ -1183,7 +1186,8 @@ fn explain_startup(exe: &Path, stderr: &str, err: &CdpError) -> String {
         out.push_str(if headless_shell {
             "; `ldd` on the browser lists every library it can't find."
         } else {
-            ", or to use chrome-headless-shell, which needs fewer system libraries."
+            ", or to use chrome-headless-shell, which needs fewer system libraries, by pointing \
+             browser.path at it."
         });
     } else if lower.contains("cannot open display") || lower.contains("missing x server") {
         out.push_str(

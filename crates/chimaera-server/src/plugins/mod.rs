@@ -605,10 +605,9 @@ pub(crate) fn validate(m: &Manifest) -> Result<(), String> {
         }
     }
     platform::validate(m)?;
+    // A 0.1 manifest can't declare [[tools]] (refused above), so this also
+    // keeps provides.browser to 0.2.
     if let Some(program) = &m.provides.browser {
-        if m.api == "0.1" {
-            return Err("provides.browser needs api = \"0.2\"".into());
-        }
         if !m.tools.iter().any(|t| t.programs.contains(program)) {
             return Err(format!(
                 "provides.browser {program:?} must be a program one of its [[tools]] installs"

@@ -808,6 +808,17 @@ async fn a_plugin_tool_supplies_the_agent_browser_where_it_is_on() {
         other => panic!("expected the installed browser, got {other:?}"),
     }
 
+    // Installed but its program not runnable: Remove and Install again,
+    // never "click Install" on a card that shows it installed.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let exe = tools.join("1.0.0/bin/fixture-tool");
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let why = words(offer(&state, Some(&ws)).await);
+        assert!(why.contains("Remove it and click Install again"), "{why}");
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     // Another workspace where it is off gets nothing from it.
     let other = make_workspace(&state, "browser-plugin-off").await;
     let why = words(offer(&state, Some(&other)).await);

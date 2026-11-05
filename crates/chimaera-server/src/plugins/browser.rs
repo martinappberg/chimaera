@@ -80,29 +80,38 @@ pub(crate) async fn offer(state: &AppState, ws: Option<&str>) -> Offer {
             });
             continue;
         };
-        let installed = super::toolchain::installed_bin(state, &m.id, &tool.id).await;
-        let exe = installed.map(|bin| bin.join(program));
-        let usable = match exe.clone() {
-            Some(exe) => tokio::task::spawn_blocking(move || executable(&exe))
-                .await
-                .unwrap_or(false),
-            None => false,
+        let Some(bin) = super::toolchain::installed_bin(state, &m.id, &tool.id).await else {
+            why.get_or_insert_with(|| {
+                format!(
+                    "The {name} plugin is switched on in this workspace, but its {tool} isn't \
+                     downloaded on this host yet. Ask the user to click Install under Tools on \
+                     the {name} card in Extensions → Plugins (about {mb} MB from {host}, \
+                     checked against its pinned sha256), then call browser_navigate again.",
+                    name = m.name,
+                    tool = tool.name,
+                    mb = artifact.size.div_ceil(1_000_000),
+                    host = super::platform::https_host(&artifact.url).unwrap_or("its publisher"),
+                )
+            });
+            continue;
         };
-        if usable {
-            if let Some(exe) = exe {
-                return Offer::Ready(exe);
-            }
+        let exe = bin.join(program);
+        let found = tokio::task::spawn_blocking(move || {
+            crate::launcher::is_executable(&exe).then_some(exe)
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some(exe) = found {
+            return Offer::Ready(exe);
         }
         why.get_or_insert_with(|| {
             format!(
-                "The {name} plugin is switched on in this workspace, but its {tool} isn't \
-                 downloaded on this host yet. Ask the user to click Install under Tools on the \
-                 {name} card in Extensions → Plugins (about {mb} MB from {host}, checked \
-                 against its pinned sha256), then call browser_navigate again.",
+                "The {name} plugin's {tool} is installed on this host, but {program} isn't \
+                 there in a runnable form. Ask the user to Remove it and click Install again \
+                 under Tools on the {name} card in Extensions → Plugins.",
                 name = m.name,
                 tool = tool.name,
-                mb = artifact.size.div_ceil(1_000_000),
-                host = super::platform::https_host(&artifact.url).unwrap_or("its publisher"),
             )
         });
     }
@@ -132,9 +141,4 @@ fn not_active(state: &AppState, m: &Manifest, has_workspace: bool) -> String {
          downloaded yet, to click Install under its Tools), then call browser_navigate again.",
         name = m.name
     )
-}
-
-fn executable(p: &std::path::Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
