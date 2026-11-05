@@ -1878,7 +1878,7 @@ Only entries that matter to a host driving the CLI structurally; TUI, IDE, Slack
 ### Gate (Pass 59)
 
 - Hermetic, new: `claude.rs` `a_held_message_is_cancelled_once_it_queues` (the `false` answer, the retry on `queued`, `Cancelled`, at most one retry) and `lost_session_writes_become_one_notice`. `launcher.rs` `curated_lists_cover_every_agent` lists GPT-6.1 Terra.
-- `just check`: green except `tests::plugins::agent_plugin_install_ignores_forged_completion_title`, which fails on this Mac with or without this change (no pin reaches the server) and passes in CI on `main`; three `git_sessions` worktree tests failed once under a load average of 17 and passed alone.
+- `just check`: green on the final tree (rebased on `main` with Pass 60). Two earlier runs failed `tests::plugins::agent_plugin_install_ignores_forged_completion_title` (a 10 s wait, nothing a pin reaches) and, once, three `git_sessions` worktree tests, all under a load average of 17; each passed alone or in the final run.
 - `just chat-smoke`: 43/43 on claude 2.1.318 and codex 0.166.0, no reruns. An earlier run of the same suite on unchanged driver code needed reruns for eleven `initialize` / `thread/start` timeouts, each of which passed alone: that run overlapped other live probes on the same accounts, and the user's own MCP servers and hooks put handshakes at 10–20 s against the 20 s budget ([cross-agent.md › Native-driver compatibility](cross-agent.md#native-driver-compatibility)).
 - `just chat-smoke-acp`: 3/3 on grok 1.0.70, agy-acp 1.4.5 and cursor-agent 2026.10.22-27dcf5f.
 - `just chat-mods-smoke`: 1/1 on claude 2.1.318.
