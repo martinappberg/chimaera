@@ -1376,6 +1376,21 @@ _Intent pending — drafted from the maintainer's request, 2026-09-26; questionn
   one from the grid's row numbers), and the chip-only affordance (no context menu) have not been confirmed
   with the maintainer — capture via **capture-feature-intent** when available.
 
+### Pointing at a PowerPoint slide or part of one — why it exists
+_Captured 2026-11-04 (the maintainer, in the session that built it); questionnaire partly run._
+
+- **Problem it solves:** the maintainer is "super interested in driving good .pptx through
+  Chimaera", and a deck in the preview could not be pointed at ("Går ej att referera från en PP
+  till agent", issue #345). The ask: "one should be able to reference like we do in other
+  documents but parts of a pptx", and "reference stuff should be there by default".
+- **Core bet:** references into a deck are built in and on by default, not part of an
+  extension. Authoring help (themes, slide pictures for agents, deck checks) is a separate,
+  opt-in first-party extension; editing in the viewer and opening the same file in PowerPoint
+  are their own follow-up.
+- **Pending.** How settled the rest is (the box in points, shape names as context, a click
+  picking a shape, no crop for now), and whether anything is frozen, has not been asked yet —
+  capture via **capture-feature-intent** when available.
+
 ### HTML in a web view of its own, and marking HTML — why it exists
 _Captured 2026-11-04 (the maintainer, in the session that built it)._
 
