@@ -106,7 +106,9 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   pictures) come back to the composer to edit, only once the agent confirms the withdrawal, so one
   it read first stays sent. And each has **✕**
   (pulls it back — Claude `cancel_async_message`, an ACP or Codex next-turn queue item
-  removed locally; a Codex steer can't be withdrawn and says so).
+  removed locally; a Codex steer can't be withdrawn and says so). On Claude Code 2.1.318 a
+  message sent while a model switch is still being checked waits unqueued; Chimaera repeats its ✕
+  once it queues, so the message is withdrawn instead of running (PROTOCOL.md Pass 59).
   Stop never drops the queue. On Claude Code 2.1.310+ that holds across the race too: a waiting
   message the agent took in just as you pressed Stop stays in the stack and runs as a turn of its
   own (the CLI puts it back); it shows as read only once Claude's reply to it begins. A Stop also
