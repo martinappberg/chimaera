@@ -1406,7 +1406,6 @@ Claude's `/loop` (a self-paced `ScheduleWakeup`, or `CronCreate` jobs for an int
 - Hermetic: `autonomy.rs` (7 tests: wakeups, stop, jitter and next run, delete/list level-set, one-shot and expiry, goal set/check/clear, status resync and adoption), `cron.rs` (10), `claude.rs` `a_fired_wakeup_opens_a_turn_named_by_its_reason`, `only_an_unsent_command_with_something_due_is_a_wake`, `goal_set_check_and_clear_map_from_the_cli_frames`, the codex goal tests (`goal_updates_map_the_status_verbatim_and_ignore_other_threads` … `sleep_items_render_a_waiting_row`), `tests/manager.rs` `a_loop_wakeup_fires_as_a_named_turn_and_the_row_knows_whats_next` (fake-claude `loop`) and `a_resumed_respawn_keeps_its_jobs_and_a_fresh_one_does_not`, `journal.rs` `reopening_remembers_the_last_goal_and_jobs`, `claude.rs` `a_stale_cli_command_never_names_a_later_turn`, `tests/wire_contract.rs` `loop_and_goal_wire_shapes_are_additive`, `chimaera-server` `goal_outcome` (3) and `restart_message_asks_to_reschedule_a_lost_wakeup`.
 - Live: `just chat-smoke` adds `claude_wakeup_fires_as_a_named_turn`, `claude_goal_sets_and_clears`, `codex_goal_sets_pauses_and_clears`.
 
-
 ## Pass 48 — 2026-10-16: native Codex task tool at thread open
 
 Installed Codex 0.158.0; `TESTED_CODEX_VERSION` remains 0.162.1. Generated the installed CLI's experimental JSON schema before editing the driver; start, resume and fork accept the `config` map. The [official configuration schema](https://developers.openai.com/codex/config-schema.json) describes `tools.update_plan.enabled`, default false.
@@ -1877,6 +1876,14 @@ Only entries that matter to a host driving the CLI structurally; TUI, IDE, Slack
 - The Grok billing fallback, the agy model-id migration, `rawOutput` shell output and agy's self-updater replacing the managed `bin/agy` symlink are follow-up work, not part of this pass.
 
 ### Gate (Pass 59)
+
+- Hermetic, new: `claude.rs` `a_held_message_is_cancelled_once_it_queues` (the `false` answer, the retry on `queued`, `Cancelled`, at most one retry) and `lost_session_writes_become_one_notice`. `launcher.rs` `curated_lists_cover_every_agent` lists GPT-6.1 Terra.
+- `just check`: green except `tests::plugins::agent_plugin_install_ignores_forged_completion_title`, which fails on this Mac with or without this change (no pin reaches the server) and passes in CI on `main`; three `git_sessions` worktree tests failed once under a load average of 17 and passed alone.
+- `just chat-smoke`: 43/43 on claude 2.1.318 and codex 0.166.0, no reruns. An earlier run of the same suite on unchanged driver code needed reruns for eleven `initialize` / `thread/start` timeouts, each of which passed alone: that run overlapped other live probes on the same accounts, and the user's own MCP servers and hooks put handshakes at 10–20 s against the 20 s budget ([cross-agent.md › Native-driver compatibility](cross-agent.md#native-driver-compatibility)).
+- `just chat-smoke-acp`: 3/3 on grok 1.0.70, agy-acp 1.4.5 and cursor-agent 2026.10.22-27dcf5f.
+- `just chat-mods-smoke`: 1/1 on claude 2.1.318.
+- `~/.claude/settings.json` hashed the same before and after every run.
+- Pins moved: `TESTED_CLAUDE_VERSION` 2.1.318, `TESTED_CODEX_VERSION` 0.166.0, `TESTED_GROK_VERSION` 1.0.70, `TESTED_AGY_VERSION` 1.4.5 (the version the installer fetches), `TESTED_CURSOR_VERSION` 2026.10.22-27dcf5f.
 
 ## Pass 60 — 2026-11-04: Send now with several waiting messages (issue #355; live probes claude 2.1.318 / 2.1.310, codex 0.166.0)
 
