@@ -45,7 +45,7 @@
     type FileSelection,
   } from "../shared/reference";
   import { PINNED } from "../shared/keys";
-  import { inAppPath, onRootForm, pageAddress } from "./frameLocation";
+  import { inAppPath, onRootForm, pageAddress, proxySessionOf } from "./frameLocation";
   import {
     ConfirmRequired,
     isLoopbackHost,
@@ -53,6 +53,7 @@
     parseAddress,
     probeNodes,
     proxyHealth,
+    proxyTarget,
     setBrowserTitle,
     targetLabel,
   } from "./proxy";
@@ -291,11 +292,63 @@
     }
   }
 
+  // --- following the page to another target -----------------------------------
+  //
+  // An agent driving a shared pane navigates it with `location.assign` to
+  // `/proxy/{id}…` — possibly another app (another session id). The pane
+  // follows: the tab is re-pointed at that target so its title, address and
+  // saved layout stay true, while the live view stays (no reload).
+
+  /** A re-point this view asked for itself: the target effect takes the
+   *  page as it is instead of starting over. */
+  let following: { host: string; port: number; id: string; path: string; title: string } | null = null;
+  let followSeq = 0;
+
+  function followPage(u: URL, title: string): void {
+    // A load this pane started is still settling: a late report from the
+    // page it left is not a navigation.
+    if (viewLoading) return;
+    const session = proxySessionOf(u);
+    if (session === null || session.id === proxyId) return;
+    const mine = ++followSeq;
+    void proxyTarget(session.id).then((target) => {
+      if (mine !== followSeq || target === null || base === null) return;
+      if (target.host === host && target.port === port) {
+        // The same app on a fresh session: just its id changes.
+        proxyId = session.id;
+        base = `/proxy/${session.id}`;
+        notePage(session.path, title);
+        return;
+      }
+      following = { ...target, id: session.id, path: session.path, title };
+      onRetarget(target.host, target.port, session.path, true);
+    });
+  }
+
   // (Re)connect whenever the target identity changes.
   $effect(() => {
     void host;
     void port;
     untrack(() => {
+      const f = following;
+      following = null;
+      followSeq += 1;
+      if (f !== null && f.host === host && f.port === port && phase.kind === "ready") {
+        proxyId = f.id;
+        base = `/proxy/${f.id}`;
+        livePath = f.path;
+        draft = null;
+        nodeHits = [];
+        degraded = false;
+        pageSel = null;
+        unpublish();
+        // The view is already there: `paneView` sees the page's own URL and
+        // only takes note of it.
+        iframeSrc = `${base}${f.path}`;
+        const t = f.title.trim();
+        setBrowserTitle(tabId, t.length > 0 ? t : null);
+        return;
+      }
       livePath = null;
       draft = null;
       confirmed = false;
@@ -439,7 +492,10 @@
     }
     if (u.origin !== location.origin) return;
     const inApp = inAppPath(u, b);
-    if (inApp === null) return;
+    if (inApp === null) {
+      followPage(u, page.title);
+      return;
+    }
     viewRootForm = onRootForm(u, b);
     notePage(inApp, page.title);
   }

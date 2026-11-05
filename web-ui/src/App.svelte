@@ -75,6 +75,7 @@
     agentHue,
     deleteBrowserLink,
     deleteLink,
+    listBrowserLinks,
     listLinks,
     putBrowserLink,
     putLink,
@@ -154,6 +155,7 @@
     freshBrowserTab,
     clearBrowserAdopt,
     findBrowser,
+    panes,
     setBrowserPath,
     setBrowserTarget,
     openDashboard,
@@ -319,6 +321,7 @@
     setBrowserLinks,
   } from "./lib/browser/agentBrowserRuntime";
   import type { Handover } from "./lib/browser/agentBrowser";
+  import type { BrowserLink } from "./lib/net/browserWire";
   import { targetLabel } from "./lib/browser/proxy";
   import UpdateToast from "./lib/workspace/UpdateToast.svelte";
   import {
@@ -1148,10 +1151,45 @@
   // The 5s sessions + links poll, only while /ws/events is down.
   conn.pollWhileEventsDown({
     sessions: pollSessions,
-    listLinks,
+    // Browser links ride along; a daemon without them leaves the mirror as is.
+    listLinks: () => Promise.all([listLinks(), listBrowserLinks().catch(() => null)]),
     applySessions,
-    setLinks: (l: Link[]) => (links = l),
+    setLinks: ([l, b]: [Link[], BrowserLink[] | null]) => {
+      links = l;
+      if (b !== null) setBrowserLinks(b);
+    },
   });
+
+  // A shared browser tab that leaves this window — closed, its pane closed,
+  // the window closing — stops being shared: the daemon otherwise keeps the
+  // link until its agent ends. A workspace switch is not a close (the
+  // layout restores with the workspace): `layoutReady` drops across it.
+  let heldShared = new Set<string>();
+  let heldWs: string | null = null;
+  $effect(() => {
+    const linked = $browserLinks;
+    const ws = activeWsId;
+    const ready = layoutReady;
+    const present = new Set<string>();
+    for (const p of panes(layout.root)) {
+      for (const t of p.tabs) if (t.surface === "browser") present.add(t.id);
+    }
+    untrack(() => {
+      if (ready && ws === heldWs) {
+        for (const tab of heldShared) if (!present.has(tab) && linked.has(tab)) unshareClosed(tab);
+      }
+      heldWs = ws;
+      heldShared = ready ? new Set([...present].filter((t) => linked.has(t))) : new Set();
+    });
+  });
+
+  /** The tab went: no flash on failure (nothing on screen to explain it). */
+  function unshareClosed(tab: string, keepalive = false): void {
+    setBrowserLinkLocally(tab, null);
+    deleteBrowserLink(tab, keepalive).catch(() => {
+      // the daemon prunes it with its agent; the next frame says what holds
+    });
+  }
 
   // Persist the layout (debounced in viewState) whenever it changes, keyed
   // by (window, workspace) so each workspace keeps its own tree.
@@ -1359,6 +1397,8 @@
     const onPagehide = () => {
       void flushViewState();
       void flushSettings();
+      // The window is going (or reloading): its panes' pages go with it.
+      for (const tab of heldShared) unshareClosed(tab, true);
     };
     const onCopy = () => rememberCopy();
     // Holding the app modifier reveals numbered pane destinations.

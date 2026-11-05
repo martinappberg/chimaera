@@ -10,7 +10,8 @@ import { get, writable, type Readable } from "svelte/store";
 import { nativeViewClose, nativeViewDrive, nativeViewNav, nativeViewPlace, nativeViewShow } from "../net/native";
 import { paneViewsPossible, routeNativeView } from "../shared/paneView";
 import type { BrowserClientMessage } from "../net/browserWire";
-import { AgentBrowserChannel, sameHello, type BrowserHello, type BrowserLink, type Handover } from "./agentBrowser";
+import { agentHue } from "../workspace/agentLinks";
+import { AgentBrowserChannel, hueHex, sameHello, type BrowserHello, type BrowserLink, type Handover } from "./agentBrowser";
 
 /** What the runtime needs of the events socket (`net/events.ts`). */
 export interface AgentBrowserSocket {
@@ -44,6 +45,11 @@ export const agentBrowser = new AgentBrowserChannel({
   shared: (tab) => get(links).has(tab),
   route: routeNativeView,
   now: () => Date.now(),
+  helloNow: () => reportHello(),
+  cursorColor: (tab) => {
+    const agent = get(links).get(tab);
+    return agent === undefined ? null : hueHex(agentHue(agent));
+  },
 });
 
 /** Replace the mirrored links (a sessions frame). A tab no longer shared

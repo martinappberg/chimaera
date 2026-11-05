@@ -8,6 +8,7 @@ import {
   PaneViewRegistry,
   TAKEOVER_WINDOW_MS,
   decodeBrowserLinks,
+  hueHex,
   decodeBrowserRequest,
   offscreenRect,
   sameHello,
@@ -67,6 +68,8 @@ function harness(opts: { shared?: Set<string>; showOk?: boolean; driveResult?: u
       };
     },
     now: () => now,
+    helloNow: () => void sent.push({ type: "browser_event", kind: "hello-now" } as unknown as BrowserEventMsg),
+    cursorColor: (tab) => (shared.has(tab) ? "#336699" : null),
   };
   const channel = new AgentBrowserChannel(host);
   return {
@@ -271,6 +274,8 @@ describe("AgentBrowserChannel hand-over", () => {
     await t.channel.handle(request({ op: "handover", view: "ab-1", host: "localhost", port: 8888, path: "/lab/../tree", agent: "s-a" }));
     expect(t.handovers).toEqual([{ view: "ab-1", host: "localhost", port: 8888, path: "/tree", agent: "s-a" }]);
     expect(t.lastReply()).toEqual({ type: "browser_reply", rid: 7, ok: true, result: { tab: "tab-h" } });
+    // The hello listing the tab goes out before the reply.
+    expect(t.sent.slice(-2).map((m) => ("kind" in m ? m.kind : m.type))).toEqual(["hello-now", "browser_reply"]);
     // The pane adopts it at the URL this window last showed it at.
     expect(t.channel.adoption("ab-1")).toEqual({ id: "ab-1", url: "/proxy/p/lab" });
     expect(t.channel.adoption("ab-unknown")).toBeNull();
@@ -370,5 +375,33 @@ describe("AgentBrowserChannel take-over", () => {
     await t.channel.handle(request({ op: "state", tab: "tab-1", driving: true, paused: false }));
     t.channel.forgetTab("tab-1");
     expect(get(t.channel.driveState).has("tab-1")).toBe(false);
+  });
+});
+
+describe("agent cursor colour", () => {
+  it("is the agent's link hue as #rrggbb", () => {
+    expect(hueHex(0)).toBe("#d74242");
+    for (const h of [180, 205, 230, 265, 320]) expect(hueHex(h)).toMatch(/^#[0-9a-f]{6}$/);
+  });
+
+  it("is added to a cursor action on a shared pane, unless one was given", async () => {
+    const t = harness({ shared: new Set(["tab-1"]) });
+    t.channel.registry.register("tab-1", "v1");
+    await t.channel.handle(request({ op: "drive", tab: "tab-1", action: { type: "cursor", show: true, label: "Claude" } }));
+    expect(t.calls.at(-1)).toEqual(["drive", "v1", { type: "cursor", show: true, label: "Claude", color: "#336699" }]);
+    await t.channel.handle(request({ op: "drive", tab: "tab-1", action: { type: "cursor", show: true, color: "#000000" } }));
+    expect(t.calls.at(-1)).toEqual(["drive", "v1", { type: "cursor", show: true, color: "#000000" }]);
+    await t.channel.handle(request({ op: "drive", view: "ab-1", action: { type: "cursor", show: true } }));
+    expect(t.calls.at(-1)).toEqual(["drive", "ab-1", { type: "cursor", show: true }]);
+  });
+});
+
+describe("state ops as the daemon sends them", () => {
+  it("take view null and the tab", async () => {
+    const t = harness();
+    const req = decodeBrowserRequest({ type: "browser_request", rid: 9, op: "state", view: null, tab: "tab-1", driving: true, paused: false })!;
+    await t.channel.handle(req);
+    expect(t.lastReply()).toEqual({ type: "browser_reply", rid: 9, ok: true, result: {} });
+    expect(get(t.channel.driveState).get("tab-1")).toMatchObject({ driving: true, paused: false });
   });
 });

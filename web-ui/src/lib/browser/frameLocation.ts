@@ -52,3 +52,12 @@ export function pageAddress(host: string, port: number, inApp: string): string {
   const path = pathOnly.startsWith("/") ? pathOnly : `/${pathOnly}`;
   return `http://${h}:${port}${path}${hash}`;
 }
+
+/** A same-origin page URL under some proxy session, `/proxy/{id}{path}`:
+ *  that session's id and the app's own path (+ query + fragment). Null for
+ *  anything else (a `/raw/` page, a root-form path). */
+export function proxySessionOf(u: { pathname: string; search: string; hash: string }): { id: string; path: string } | null {
+  const m = /^\/proxy\/([^/]+)(\/.*)?$/.exec(u.pathname);
+  if (m === null) return null;
+  return { id: m[1], path: `${m[2] ?? "/"}${u.search}${u.hash}` };
+}

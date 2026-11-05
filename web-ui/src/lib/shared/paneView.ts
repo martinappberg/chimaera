@@ -382,6 +382,9 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
   let awaiting = false;
   /** The URL navigated away from: its late events are not the new page. */
   let leaving: string | null = null;
+  /** Where the page itself last said it is (its own navigation): a host
+   *  that follows it there by setting `url` must not reload it. */
+  let pageUrl: string | null = null;
   let loadTimer: ReturnType<typeof setTimeout> | null = null;
   let reported: boolean | null = null;
   /** The view's own process died for good (the shell stopped reloading):
@@ -441,6 +444,7 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
         // Every view starts on about:blank before the shell points it at
         // its URL: that is not the page.
         if (isBlank(ev.url)) break;
+        pageUrl = ev.url;
         if (crashed) {
           crashed = false;
           landed();
@@ -535,6 +539,14 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
         }
         const rect = wanted();
         const url = params.url;
+        if (created && !awaiting && url !== null && url !== showing && sameUrl(url, pageUrl)) {
+          // The page went there itself (a script's `location.assign`, an
+          // agent driving it): it already shows this URL.
+          showing = url;
+          report();
+          again = true;
+          continue;
+        }
         if (!crashed && params.shown && !dragging && url !== null && (!created || url !== showing)) {
           // A create or a new URL: the shell makes or points the view
           // hidden, and it stays so until the page reports in (set before

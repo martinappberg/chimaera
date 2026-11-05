@@ -34,6 +34,8 @@ Tests: `agentOpen.test.ts`, `agentBrowser.test.ts`.
 - **An agent's own page is a pane view framed past the window's right edge** (`offscreenRect`): WebKit counts it visible and runs it at full speed. It follows window resizes (`relayout`) and closes when the events socket drops (the daemon failed it).
 - **A hand-over adopts, never reloads.** The tab carries a transient `adopt` (view id, never persisted); its view shows the page again at the URL this window last showed it at and without `agent` (the shell then navigates nothing and hands the view to the person), then owns it like any pane view. Until it mounts, requests by tab resolve to the adopting view.
 - **Take-over is gated** (`shouldTakeOver`): only a shared pane, not paused, that its agent drives now or acted on within 15 s. The window pauses at once and the daemon's `state` confirms.
+- **A pane follows its page to another target.** A page that navigates itself to another `/proxy/{id}` (an agent's `location.assign`) re-points the tab (`proxyTarget` resolves the id) while the live view stays; `paneView` takes a `url` the page itself already reported as shown, without a reload.
+- **A shared tab that leaves the window is unshared** (`DELETE /links/browser/{tab}`, App): closed, its pane closed, or the window going (`pagehide`, keepalive). A workspace switch is not a close. A tab dragged to another window is unshared too.
 - **A browser tab shares only from its chain** (a link-intent drag or the menu), and only in the app (an agent drives a page through its pane view).
 - **Polls stop while hidden.** `BrowserView` reads `pageVisible`. See the rule bullet on recurring work.
 

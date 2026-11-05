@@ -51,6 +51,22 @@ export const OFFSCREEN_GAP_PX = 64;
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null;
 
+/** `hsl(hue 65% 55%)` (the agent's link hue, as the chips paint it) as
+ *  `#rrggbb`, the shell's cursor colour format. */
+export function hueHex(hue: number): string {
+  const s = 0.65;
+  const l = 0.55;
+  const a = s * Math.min(l, 1 - l);
+  const channel = (n: number): string => {
+    const k = (n + hue / 30) % 12;
+    const v = l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+    return Math.round(v * 255)
+      .toString(16)
+      .padStart(2, "0");
+  };
+  return `#${channel(0)}${channel(8)}${channel(4)}`;
+}
+
 /** Where an agent's own page sits: just past the window's right edge, at
  *  the size the agent asked for. */
 export function offscreenRect(viewportWidth: number, width: number, height: number): ViewRect {
@@ -186,6 +202,12 @@ export interface AgentBrowserHost {
   /** Receive a view's events (`shared/paneView.ts` `routeNativeView`). */
   route(view: string, fn: (ev: NativeViewEvent) => void): () => void;
   now(): number;
+  /** Send this window's `browser_hello` now, past its debounce (a
+   *  hand-over's new tab must be known before the agent's next call). */
+  helloNow(): void;
+  /** The agent cursor's colour on a shared tab (`#rrggbb`, the hue of the
+   *  agent it is shared with), or null. */
+  cursorColor(tab: string): string | null;
 }
 
 const NAV_ACTIONS: readonly NativeViewNav[] = ["back", "forward", "reload", "stop"];
@@ -288,8 +310,17 @@ export class AgentBrowserChannel {
       case "drive": {
         const { view, tab } = this.resolve(req);
         if (!isObj(f.action)) throw new Refusal("missing action");
-        if (tab !== null) this.noteDrive(tab);
-        return await this.host.native.drive(view, f.action);
+        let action: Record<string, unknown> = f.action;
+        if (tab !== null) {
+          this.noteDrive(tab);
+          // The cursor drawn over a shared pane wears its agent's hue, the
+          // colour of the pane's border and chips.
+          if (action.type === "cursor" && action.color === undefined) {
+            const color = this.host.cursorColor(tab);
+            if (color !== null) action = { ...action, color };
+          }
+        }
+        return await this.host.native.drive(view, action);
       }
       case "nav": {
         const { view, tab } = this.resolve(req);
@@ -327,6 +358,9 @@ export class AgentBrowserChannel {
         const tab = this.host.handover({ view, host: open.host, port: open.port, path: open.path, agent: open.sessionId });
         own.handedTo = tab;
         this.registry.expectAdoption(tab, view);
+        // Before the reply: the daemon must know the tab is here by the time
+        // the agent's next call addresses it.
+        this.host.helloNow();
         return { tab };
       }
       case "state": {

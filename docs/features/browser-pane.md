@@ -15,7 +15,8 @@ the pane, `proxy.ts` the mint/health client + title store) +
 `layout/layout.ts`. Wire: `POST/GET /api/v1/proxy`, `DELETE /api/v1/proxy/{id}`,
 `GET /api/v1/proxy/{id}/health` (bearer-authed) and the unauthenticated ticketed data
 plane `ANY /proxy/{id}[/{*path}]`; agent-opened panes add the MCP `open_browser` tool
-(`browser_open.rs`) and a `browser_open` frame on `/ws/events`.
+(`browser_open.rs`) and a `browser_open` frame on `/ws/events`. Agents that see and drive pages
+(the `browser_*` tools, shared panes, take-over) are the [agent browser](agent-browser.md).
 
 ## Proxy sessions (the ticket model)
 
@@ -124,7 +125,9 @@ plane `ANY /proxy/{id}[/{*path}]`; agent-opened panes add the MCP `open_browser`
   (`FileSelection` whose path is the app's own address, `http://host:port/path#hash`, never
   the query — Jupyter's `?token=` is a credential — nor the proxy ticket). In a browser tab,
   on Linux/Windows, or against an app build without pane views it stays the same-origin
-  iframe, unchanged.
+  iframe, unchanged. In the app the same pane view is what the [agent browser](agent-browser.md)
+  drives when the user shares the pane with an agent by its chain link; the pane bar then shows
+  the agent driving, or "Paused · Resume" after the user took over.
 - **URL detection** (`urlLinks.ts`): pure client-side regex over rendered terminal
   lines — zero daemon validation calls. Only proxyable URLs underline: loopback hosts,
   or any host with an explicit port. Ordinary web URLs (`https://github.com/…`) stay
@@ -135,18 +138,21 @@ plane `ANY /proxy/{id}[/{*path}]`; agent-opened panes add the MCP `open_browser`
 - **What & when.** An agent that has just started a web app (a dev server, a notebook, a
   dashboard) calls the MCP tool `open_browser {url}` so the person watching the workspace
   sees what it is building, beside the agent, instead of a printed URL. Every MCP-equipped
-  session has it (workers and Masterminds). It is **showing, not inspecting**: strictly
-  one-way — nothing about the page (content, screenshots, load state) ever reaches the agent,
-  and a successful call says nothing about whether the page works, so agents verify their
-  app with their own tooling first and use the pane to present the result.
+  session has it (workers and Masterminds). It is **showing, not inspecting**: the tool is
+  one-way — nothing about the page (content, screenshots, load state) comes back through it,
+  and a successful call says nothing about whether the page works. To see and check a page,
+  an agent uses the [agent browser](agent-browser.md)'s `browser_*` tools, and hands a
+  working page over with `browser_show`, which keeps the live page; the tool description and
+  the session instructions point there.
 - **How it works.** The daemon parses the URL with the terminal link rules (`http` only, no
   userinfo, an explicit port unless the host is loopback — then 80; path, query and fragment
   kept), then applies the proxy's own mint allowlist (`proxy::check_target`, the function
   `POST /proxy` uses). A target that would need the in-pane confirmation is refused with a
   tool error telling the agent to give the user the URL; the daemon's own port stays refused.
-  An accepted call pushes one additive frame on `/ws/events` —
-  `{"type":"browser_open","session_id","workspace_id","host","port","path"}` — and mints
-  nothing: the pane mints its ticket on mount, as every pane does. Older UIs ignore the
+  An accepted call writes one additive frame to every authenticated `/ws/events` socket at
+  once — `{"type":"browser_open","session_id","workspace_id","host","port","path"}`, through
+  the agent browser's per-socket queue (`agent_browser::channel::broadcast`), so it never waits
+  for the socket's next snapshot pass — and mints nothing: the pane mints its ticket on mount, as every pane does. Older UIs ignore the
   unknown frame type.
 - **Which window, where, and focus.** The window whose layout holds the calling session's tab
   acts, and so does any *visible* window showing the same workspace without that tab (a
@@ -175,13 +181,14 @@ plane `ANY /proxy/{id}[/{*path}]`; agent-opened panes add the MCP `open_browser`
   window was connected (`chat/toolLabels.ts`; the address from Claude's input, else from the
   result text, which is all a Codex row carries; the query is left off, a Jupyter `?token=`
   being a credential). The expanded row shows the full result.
-- **Key behaviors.** No queueing: a frame reaches only the windows connected when it is sent
-  (a stale one older than 10 s is dropped), and with no window connected the tool says so and
-  tells the agent to hand over the URL. Rate-limited per session (3 in any 10 s — an agent
+- **Key behaviors.** No queueing: a frame reaches only the windows connected when it is
+  written (a socket whose queue is full drops it), and with no window connected the tool says
+  so and tells the agent to hand over the URL. Rate-limited per session (3 in any 10 s — an agent
   presenting a frontend and its dashboard in one step gets both — and 12 per hour; the
   refusal says how long to wait; bounded history). Always allowed: the harness does not prompt for it, since targets are
-  held to the mint allowlist with no confirm path. **Where it lives:** `crates/chimaera-server/src/browser_open.rs` (parse, feed,
-  limits, consumer count), the tool def in `mcp.rs`, the frame in `ws.rs::handle_events`,
+  held to the mint allowlist with no confirm path. **Where it lives:** `crates/chimaera-server/src/browser_open.rs` (parse, limits,
+  the frame; `present` is shared with the agent browser's Chromium hand-over), the tool def in
+  `mcp.rs`, the write in `agent_browser/channel.rs` + `ws.rs::handle_events`,
   the UI half in `browser/agentOpen.ts` + `net/events.ts` + `App.svelte::onAgentBrowserOpen`,
   the attribution in `browser/BrowserView.svelte` (fed by `layout/Pane.svelte`).
 - **Known limit.** A page that focuses itself on load (an `autofocus` field) can still pull

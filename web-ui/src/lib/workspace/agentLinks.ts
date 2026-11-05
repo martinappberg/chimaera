@@ -11,6 +11,7 @@
  */
 
 import { api, ApiError } from "../net/api";
+import { decodeBrowserLinks, type BrowserLink } from "../net/browserWire";
 
 export interface Link {
   terminal_id: string;
@@ -95,8 +96,17 @@ export async function putBrowserLink(tab: string, agentId: string): Promise<void
   );
 }
 
-export async function deleteBrowserLink(tab: string): Promise<void> {
-  await ok(await api(`/links/browser/${encodeURIComponent(tab)}`, { method: "DELETE" }));
+/** `keepalive` lets the request outlive a closing window. */
+export async function deleteBrowserLink(tab: string, keepalive = false): Promise<void> {
+  await ok(await api(`/links/browser/${encodeURIComponent(tab)}`, { method: "DELETE", keepalive }));
+}
+
+/** Every shared browser tab (the same list as the sessions frame's
+ *  `browser_links`): the fallback poll's source while `/ws/events` is down. */
+export async function listBrowserLinks(): Promise<BrowserLink[]> {
+  const res = await api("/links/browser");
+  if (!res.ok) throw new ApiError(res.status, "failed to list browser links");
+  return decodeBrowserLinks(await res.json()) ?? [];
 }
 
 /** A selected terminal always travels by ID: display names can collide or change. */
