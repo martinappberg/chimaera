@@ -126,7 +126,8 @@
       "mcp__chimaera__browser_network",
       "mcp__chimaera__browser_wait",
       "mcp__chimaera__browser_show",
-      "mcp__chimaera__browser_close"
+      "mcp__chimaera__browser_close",
+      "mcp__chimaera__browser_pages"
     ]
   },
   "statusLine": {

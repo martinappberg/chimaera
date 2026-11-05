@@ -385,6 +385,9 @@ struct Pages {
     last_engine: HashMap<String, EngineKind>,
     /// One browser call at a time per agent.
     locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// Per agent: the `vN` id of each unshared pane it can see (stable while
+    /// the tab stays listed).
+    visible_ids: HashMap<String, HashMap<String, u32>>,
 }
 
 /// The agent browser's daemon-wide state (`AppState::browsers`).
@@ -458,6 +461,25 @@ impl Browsers {
     pub(crate) fn update_shared(&self, tab: &str, f: impl FnOnce(&mut SharedPane)) {
         let mut pages = crate::lock(&self.pages);
         f(pages.shared.entry(tab.to_string()).or_default());
+    }
+
+    /// `agent`'s ids for the visible panes `tabs`: kept for tabs still
+    /// listed, the smallest free `vN` for new ones. Returns (tab, id) in id
+    /// order.
+    pub(crate) fn visible_ids(&self, agent: &str, tabs: &[String]) -> Vec<(String, String)> {
+        let mut pages = crate::lock(&self.pages);
+        let ids = pages.visible_ids.entry(agent.to_string()).or_default();
+        ids.retain(|tab, _| tabs.contains(tab));
+        for tab in tabs {
+            if !ids.contains_key(tab) {
+                let used: std::collections::HashSet<u32> = ids.values().copied().collect();
+                let n = (1..).find(|n| !used.contains(n)).unwrap_or(1);
+                ids.insert(tab.clone(), n);
+            }
+        }
+        let mut out: Vec<(u32, String)> = ids.iter().map(|(t, n)| (*n, t.clone())).collect();
+        out.sort();
+        out.into_iter().map(|(n, t)| (t, format!("v{n}"))).collect()
     }
 
     /// Drop what was kept about a tab (its link moved or ended).
@@ -550,8 +572,11 @@ pub(crate) async fn reaper(state: Arc<crate::AppState>) {
 }
 
 fn sweep_shared(state: &Arc<crate::AppState>) {
-    let linked: std::collections::HashSet<String> =
+    // Kept for shared panes and for panes agents can see read-only (their
+    // console/network cursors).
+    let mut linked: std::collections::HashSet<String> =
         crate::lock(&state.browser_links).keys().cloned().collect();
+    linked.extend(state.browsers.channel.listed_tabs());
     let mut lower = Vec::new();
     {
         let mut pages = crate::lock(&state.browsers.pages);
@@ -593,6 +618,7 @@ async fn reap_pages(state: &Arc<crate::AppState>) {
             own,
             locks,
             last_engine,
+            visible_ids,
             ..
         } = &mut *pages;
         // A lock someone holds or waits on stays; the rest go with their page.
@@ -602,6 +628,7 @@ async fn reap_pages(state: &Arc<crate::AppState>) {
                 || crate::chat::session_alive(state, agent)
         });
         last_engine.retain(|agent, _| crate::chat::session_alive(state, agent));
+        visible_ids.retain(|agent, _| crate::chat::session_alive(state, agent));
         doomed
     };
     for (agent, page) in doomed {

@@ -30,7 +30,9 @@ import { writable, type Readable } from "svelte/store";
 import type { NativeViewNav, ViewRect } from "../net/native";
 import type { NativeViewEvent } from "../shared/paneViewBridge";
 import { parseAgentBrowserOpen } from "./agentOpen";
-import type { BrowserEventMsg, BrowserReply, BrowserRequest } from "../net/browserWire";
+import { pageAddress } from "./frameLocation";
+import { targetLabel } from "./proxy";
+import type { BrowserEventMsg, BrowserPage, BrowserReply, BrowserRequest } from "../net/browserWire";
 
 export {
   decodeBrowserLinks,
@@ -39,6 +41,7 @@ export {
   type BrowserEventMsg,
   type BrowserHello,
   type BrowserLink,
+  type BrowserPage,
   type BrowserReply,
   type BrowserRequest,
 } from "../net/browserWire";
@@ -86,6 +89,20 @@ export function hueHex(hue: number): string {
   return `#${channel(0)}${channel(8)}${channel(4)}`;
 }
 
+/** The longest title a hello carries. */
+export const PAGE_TITLE_MAX = 200;
+
+/** What a pane shows, for the hello: its title (host:port when it has
+ *  none, capped) and its address in the app's terms (no `/proxy/`, no
+ *  query). */
+export function describePage(host: string, port: number, path: string, title: string | null): { title: string; url: string } {
+  const t = (title ?? "").trim();
+  return {
+    title: (t === "" ? targetLabel(host, port) : t).slice(0, PAGE_TITLE_MAX),
+    url: pageAddress(host, port, path),
+  };
+}
+
 /** Where an agent's own page sits: just past the window's right edge, at
  *  the size the agent asked for. */
 export function offscreenRect(viewportWidth: number, width: number, height: number): ViewRect {
@@ -103,6 +120,7 @@ export function offscreenRect(viewportWidth: number, width: number, height: numb
 export class PaneViewRegistry {
   private readonly byTab = new Map<string, string>();
   private readonly adopting = new Map<string, string>();
+  private readonly described = new Map<string, { title: string; url: string }>();
   private readonly subs = new Set<() => void>();
 
   register(tab: string, view: string): void {
@@ -118,6 +136,32 @@ export class PaneViewRegistry {
     if (this.byTab.get(tab) !== view) return;
     this.byTab.delete(tab);
     this.changed();
+  }
+
+  /** What `tab` shows now (`describePage`); a change re-sends the hello. */
+  describe(tab: string, page: { title: string; url: string }): void {
+    const had = this.described.get(tab);
+    if (had !== undefined && had.title === page.title && had.url === page.url) return;
+    this.described.set(tab, page);
+    if (this.byTab.has(tab) || this.adopting.has(tab)) this.changed();
+  }
+
+  /** Forget what tabs no longer in the window showed (App, on a layout
+   *  change; a remount re-describes before this could matter). */
+  keepDescribed(present: ReadonlySet<string>): void {
+    for (const tab of [...this.described.keys()]) {
+      if (!present.has(tab) && !this.adopting.has(tab)) this.described.delete(tab);
+    }
+  }
+
+  /** One entry per tab in `tabs()` that has said what it shows. */
+  pages(): BrowserPage[] {
+    const out: BrowserPage[] = [];
+    for (const tab of this.tabs()) {
+      const p = this.described.get(tab);
+      if (p !== undefined) out.push({ tab, ...p });
+    }
+    return out;
   }
 
   /** `tab` was opened to adopt `view` (a hand-over). */
@@ -404,6 +448,8 @@ export class AgentBrowserChannel {
         if (open === null) throw new Refusal("missing or malformed page address");
         const tab = this.host.handover({ view, host: open.host, port: open.port, path: open.path, agent: open.sessionId });
         own.handedTo = tab;
+        // Known to readers before its view mounts.
+        this.registry.describe(tab, describePage(open.host, open.port, open.path, null));
         this.registry.expectAdoption(tab, view);
         // Before the reply: the daemon must know the tab is here by the time
         // the agent's next call addresses it.

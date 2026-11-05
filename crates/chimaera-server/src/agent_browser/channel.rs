@@ -53,13 +53,40 @@ pub(crate) struct Hello {
     pub(crate) height: u32,
     /// Browser tab ids this window holds with a live pane view.
     pub(crate) tabs: Vec<String>,
+    /// What those tabs show (additive; older windows send none).
+    pub(crate) pages: Vec<HelloPage>,
 }
+
+/// One tab's title and app-terms URL, as the window reports it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub(crate) struct HelloPage {
+    pub(crate) tab: String,
+    #[serde(default)]
+    pub(crate) title: String,
+    #[serde(default)]
+    pub(crate) url: String,
+}
+
+/// A reported page title, in chars, and URL, in bytes, at most.
+pub(crate) const PAGE_TITLE_MAX: usize = 200;
+pub(crate) const PAGE_URL_MAX: usize = 2048;
 
 impl Hello {
     /// Clip what a client sent to the registry's bounds.
     pub(crate) fn bounded(mut self) -> Self {
         self.tabs.retain(|t| !t.is_empty() && t.len() <= TAB_ID_MAX);
         self.tabs.truncate(HELLO_TABS_MAX);
+        self.pages
+            .retain(|p| !p.tab.is_empty() && p.tab.len() <= TAB_ID_MAX);
+        self.pages.truncate(HELLO_TABS_MAX);
+        for page in &mut self.pages {
+            if page.title.chars().count() > PAGE_TITLE_MAX {
+                page.title = page.title.chars().take(PAGE_TITLE_MAX).collect();
+            }
+            if page.url.len() > PAGE_URL_MAX {
+                page.url.clear();
+            }
+        }
         self
     }
 
@@ -205,6 +232,45 @@ impl Channel {
             .map(|(_, id)| id)
     }
 
+    /// The tabs windows on `workspace` hold, each with what its window says
+    /// it shows (title and URL empty when the window didn't say), deduped,
+    /// in tab order.
+    pub(crate) fn listed_pages(&self, workspace: &str) -> Vec<HelloPage> {
+        let inner = crate::lock(&self.inner);
+        let mut out: std::collections::BTreeMap<String, HelloPage> = Default::default();
+        for s in inner.sockets.values() {
+            if s.workspace.as_deref() != Some(workspace) {
+                continue;
+            }
+            let Some(hello) = &s.hello else { continue };
+            for tab in &hello.tabs {
+                let info = hello.pages.iter().find(|p| &p.tab == tab);
+                let entry = out.entry(tab.clone()).or_insert_with(|| HelloPage {
+                    tab: tab.clone(),
+                    ..HelloPage::default()
+                });
+                if let Some(info) = info {
+                    if entry.title.is_empty() && entry.url.is_empty() {
+                        entry.title = info.title.clone();
+                        entry.url = info.url.clone();
+                    }
+                }
+            }
+        }
+        out.into_values().collect()
+    }
+
+    /// Every tab some window lists (any workspace).
+    pub(crate) fn listed_tabs(&self) -> std::collections::HashSet<String> {
+        let inner = crate::lock(&self.inner);
+        inner
+            .sockets
+            .values()
+            .filter_map(|s| s.hello.as_ref())
+            .flat_map(|h| h.tabs.iter().cloned())
+            .collect()
+    }
+
     /// The window holding browser tab `tab` with a live pane view, if any.
     pub(crate) fn socket_with_tab(&self, tab: &str) -> Option<SocketId> {
         let inner = crate::lock(&self.inner);
@@ -333,6 +399,7 @@ mod tests {
             width: 1440,
             height: 900,
             tabs: tabs.iter().map(|t| t.to_string()).collect(),
+            pages: Vec::new(),
         }
     }
 
@@ -487,6 +554,48 @@ mod tests {
         .bounded();
         assert_eq!(bounded.tabs.len(), HELLO_TABS_MAX);
         assert!(!bounded.tabs.contains(&long));
+
+        let page = |tab: &str, title: String, url: String| HelloPage {
+            tab: tab.into(),
+            title,
+            url,
+        };
+        let bounded = Hello {
+            pages: (0..HELLO_TABS_MAX + 3)
+                .map(|i| {
+                    page(
+                        &format!("t{i}"),
+                        "x".repeat(PAGE_TITLE_MAX + 5),
+                        "http://a/".into(),
+                    )
+                })
+                .chain([
+                    page("", "t".into(), "u".into()),
+                    page(&long, "t".into(), "u".into()),
+                ])
+                .collect(),
+            ..Hello::default()
+        }
+        .bounded();
+        assert_eq!(bounded.pages.len(), HELLO_TABS_MAX);
+        assert!(bounded
+            .pages
+            .iter()
+            .all(|p| p.title.chars().count() == PAGE_TITLE_MAX));
+        let long_url = Hello {
+            pages: vec![page(
+                "t1",
+                "T".into(),
+                format!("http://a/{}", "p".repeat(PAGE_URL_MAX)),
+            )],
+            ..Hello::default()
+        }
+        .bounded();
+        assert_eq!(
+            long_url.pages[0].url, "",
+            "an over-long URL is dropped, not cut"
+        );
+        assert_eq!(long_url.pages[0].title, "T");
     }
 
     #[tokio::test]

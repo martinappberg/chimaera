@@ -163,6 +163,16 @@ fn answer(model: &StdMutex<PageModel>, req: &Value) -> Result<Value, String> {
 
 /// Connect a stand-in window: authed, watching `workspace`, saying hello.
 async fn connect_window(addr: std::net::SocketAddr, workspace: &str, tabs: &[&str]) -> FakeWindow {
+    connect_window_showing(addr, workspace, tabs, "").await
+}
+
+/// [`connect_window`] whose pane already shows `href` (a proxied URL).
+async fn connect_window_showing(
+    addr: std::net::SocketAddr,
+    workspace: &str,
+    tabs: &[&str],
+    href: &str,
+) -> FakeWindow {
     let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/events"))
         .await
         .unwrap();
@@ -183,7 +193,10 @@ async fn connect_window(addr: std::net::SocketAddr, workspace: &str, tabs: &[&st
     }
     let (out, mut out_rx) = tokio::sync::mpsc::channel::<String>(16);
     let seen = Arc::new(StdMutex::new(Vec::new()));
-    let model = Arc::new(StdMutex::new(PageModel::default()));
+    let model = Arc::new(StdMutex::new(PageModel {
+        href: href.to_string(),
+        handovers: 0,
+    }));
     let log = seen.clone();
     let task = tokio::spawn(async move {
         loop {
@@ -560,7 +573,7 @@ async fn a_shared_pane_is_the_default_page_and_pauses_on_take_over() {
         &state,
         &agent,
         "browser_navigate",
-        json!({"url": "http://localhost:5173/x"}),
+        json!({"url": "http://localhost:5173/x", "page": "p1"}),
     )
     .await;
     assert!(is_error(&r) && text_of(&r).contains("Paused"), "{r}");
@@ -1046,4 +1059,239 @@ async fn console_text_names_proxied_urls_in_the_agents_terms() {
         crate::agent_browser::app_engine::map_text(&state, other),
         other
     );
+}
+
+#[tokio::test]
+async fn navigate_reuses_the_pane_showing_the_same_app_and_hides_anything_else() {
+    let state = test_state();
+    let (agent, ws) = agent_on(&state, "ab-reuse").await;
+    let (addr, server) = serve(&state).await;
+    // The pane the agent opened with open_browser (auto-shared): it shows
+    // localhost:5173 through the daemon's proxy.
+    let id = crate::proxy::mint(&state, "localhost", 5173).await.unwrap();
+    let window = connect_window_showing(
+        addr,
+        &ws,
+        &["t1"],
+        &format!("http://127.0.0.1:9/proxy/{id}/notebook"),
+    )
+    .await;
+    wait_hello(&state, &ws).await;
+    link_tab(&state, "t1", &agent).await;
+
+    // The same app (any loopback spelling): the pane, navigated in place.
+    let r = tool(
+        &state,
+        &agent,
+        "browser_navigate",
+        json!({"url": "http://127.0.0.1:5173/notebook?file=a.py"}),
+    )
+    .await;
+    let text = text_of(&r);
+    assert!(!is_error(&r), "{text}");
+    assert!(text.contains("page: shared pane"), "{text}");
+    assert!(text.contains("(p1)]"), "{text}");
+    assert!(window.ops("open").is_empty(), "no hidden second session");
+    assert!(state.browsers.own(&agent).is_none());
+
+    // Another app: a hidden page of its own; the pane stays on its app.
+    let r = tool(
+        &state,
+        &agent,
+        "browser_navigate",
+        json!({"url": "http://localhost:6006/"}),
+    )
+    .await;
+    let text = text_of(&r);
+    assert!(!is_error(&r), "{text}");
+    assert!(
+        text.starts_with("[browser · engine: app · page: own]"),
+        "{text}"
+    );
+    assert_eq!(window.ops("open").len(), 1);
+    assert!(!text.contains("shows the same app"), "{text}");
+
+    // page "own" on the pane's app: the hidden page, with a note.
+    let r = tool(
+        &state,
+        &agent,
+        "browser_navigate",
+        json!({"url": "http://localhost:5173/notebook", "page": "own"}),
+    )
+    .await;
+    let text = text_of(&r);
+    assert!(!is_error(&r), "{text}");
+    assert!(
+        text.starts_with("[browser · engine: app · page: own]"),
+        "{text}"
+    );
+    assert!(
+        text.contains("The user's pane p1 shows the same app; apps like notebooks allow one editing session, so use page \"p1\""),
+        "{text}"
+    );
+
+    // With an own page, the same app with no `page` is still the pane.
+    let r = tool(
+        &state,
+        &agent,
+        "browser_navigate",
+        json!({"url": "http://localhost:5173/notebook"}),
+    )
+    .await;
+    assert!(text_of(&r).contains("(p1)]"), "{r}");
+    // Other tools with no `page` keep the rule: the own page.
+    let r = tool(&state, &agent, "browser_snapshot", json!({})).await;
+    assert!(
+        text_of(&r).starts_with("[browser · engine: app · page: own]"),
+        "{r}"
+    );
+    // An explicit `page` sends the pane to another app.
+    let r = tool(
+        &state,
+        &agent,
+        "browser_navigate",
+        json!({"url": "http://localhost:6006/", "page": "p1"}),
+    )
+    .await;
+    assert!(text_of(&r).contains("(p1)]"), "{r}");
+    assert_eq!(window.ops("open").len(), 1, "still one hidden page");
+
+    drop(window);
+    server.abort();
+    state.sessions.kill(&agent).ok();
+}
+
+async fn hello_with_pages(window: &FakeWindow, pages: &[(&str, &str, &str)]) {
+    let tabs: Vec<&str> = pages.iter().map(|(tab, _, _)| *tab).collect();
+    let pages: Vec<Value> = pages
+        .iter()
+        .map(|(tab, title, url)| json!({"tab": tab, "title": title, "url": url}))
+        .collect();
+    window
+        .send(
+            json!({"type": "browser_hello", "app_engine": true, "visible": true, "focused": true,
+                     "width": 1440, "height": 900, "tabs": tabs, "pages": pages}),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn the_users_other_panes_are_visible_read_only() {
+    let state = test_state();
+    let (agent, ws) = agent_on(&state, "ab-visible").await;
+    let other_ws = make_workspace(&state, "ab-visible-other").await;
+    let (addr, server) = serve(&state).await;
+    let window = connect_window(addr, &ws, &[]).await;
+    hello_with_pages(
+        &window,
+        &[
+            ("t1", "Lab", "http://localhost:8888/lab"),
+            ("t2", "Dash", "http://localhost:8050/"),
+        ],
+    )
+    .await;
+    // A window on another workspace is never visible to this agent.
+    let elsewhere = connect_window(addr, &other_ws, &["t9"]).await;
+    wait_hello(&state, &ws).await;
+    for _ in 0..100 {
+        if state.browsers.channel.listed_pages(&ws).len() == 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    link_tab(&state, "t2", &agent).await;
+
+    let r = tool(&state, &agent, "browser_pages", json!({})).await;
+    let text = text_of(&r);
+    assert!(!is_error(&r), "{text}");
+    assert!(text.contains("Your hidden page: none"), "{text}");
+    assert!(
+        text.contains(
+            "Shared with you (you can drive them):\n- p1 \"Dash\" http://localhost:8050/"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "read-only (ask the user to share one to act):\n- v1 \"Lab\" http://localhost:8888/lab"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("t9") && !text.contains("v2"), "{text}");
+
+    // Read tools work with an explicit vN, and never draw a cursor there.
+    let r = tool(&state, &agent, "browser_snapshot", json!({"page": "v1"})).await;
+    let text = text_of(&r);
+    assert!(!is_error(&r), "{text}");
+    assert!(
+        text.starts_with("[browser · engine: app · page: user's pane \"Demo\" (v1, read-only)]"),
+        "{text}"
+    );
+    let r = tool(&state, &agent, "browser_console", json!({"page": "v1"})).await;
+    assert!(!is_error(&r), "{r}");
+    let on_t1: Vec<Value> = window
+        .requests()
+        .into_iter()
+        .filter(|r| r["tab"] == "t1")
+        .collect();
+    assert!(
+        on_t1.iter().any(|r| r["action"]["type"] == "instrument"),
+        "{on_t1:?}"
+    );
+    assert!(
+        on_t1
+            .iter()
+            .all(|r| r["action"]["type"] != "cursor" && r["op"] != "state"),
+        "{on_t1:?}"
+    );
+
+    // Act tools are refused with the share hint; show/close don't apply.
+    let refusal = "This is the user's pane, visible to you read-only. Ask the user to share it \
+                   with you (the chain-link button on its tab) to click or type in it.";
+    for (name, args) in [
+        ("browser_click", json!({"page": "v1", "ref": "e1"})),
+        ("browser_type", json!({"page": "v1", "text": "x"})),
+        ("browser_eval", json!({"page": "v1", "script": "return 1;"})),
+        (
+            "browser_navigate",
+            json!({"page": "v1", "url": "http://localhost:8888/tree"}),
+        ),
+    ] {
+        let r = tool(&state, &agent, name, args).await;
+        assert!(is_error(&r) && text_of(&r).contains(refusal), "{name}: {r}");
+    }
+    let r = tool(&state, &agent, "browser_close", json!({"page": "v1"})).await;
+    assert!(is_error(&r) && text_of(&r).contains("stays theirs"), "{r}");
+
+    // Never a default: with no page, the one shared pane (p1) answers.
+    let r = tool(&state, &agent, "browser_snapshot", json!({})).await;
+    assert!(text_of(&r).contains("(p1)]"), "{r}");
+
+    // Ids stay put while a tab stays listed; a new tab takes the next free one.
+    hello_with_pages(
+        &window,
+        &[
+            ("t0", "New", "http://localhost:9000/"),
+            ("t1", "Lab", "http://localhost:8888/lab"),
+            ("t2", "Dash", "http://localhost:8050/"),
+        ],
+    )
+    .await;
+    for _ in 0..100 {
+        if state.browsers.channel.listed_pages(&ws).len() == 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let r = tool(&state, &agent, "browser_pages", json!({})).await;
+    let text = text_of(&r);
+    assert!(text.contains("- v1 \"Lab\""), "{text}");
+    assert!(text.contains("- v2 \"New\""), "{text}");
+    let r = tool(&state, &agent, "browser_snapshot", json!({"page": "v7"})).await;
+    assert!(is_error(&r) && text_of(&r).contains("browser_pages"), "{r}");
+
+    drop(window);
+    drop(elsewhere);
+    server.abort();
+    state.sessions.kill(&agent).ok();
 }

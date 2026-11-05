@@ -134,6 +134,12 @@ export function shouldActOnAgentBrowserOpen(open: AgentBrowserOpen, view: Window
  * to the calling session (`openedBy`), so its chrome can say who opened it.
  */
 export function placeAgentBrowser(l: Layout, open: AgentBrowserOpen): Layout {
+  return placeAgentBrowserTab(l, open).layout;
+}
+
+/** `placeAgentBrowser`, also naming the tab that now shows the page (a
+ *  re-pointed one or a fresh one). */
+export function placeAgentBrowserTab(l: Layout, open: AgentBrowserOpen): { layout: Layout; tabId: string } {
   const focused = l.focusedPaneId;
   const anchor = sessionPaneId(l, open.sessionId) ?? focused;
   const covers = (paneId: string) => paneId === anchor || paneId === focused;
@@ -150,7 +156,7 @@ export function placeAgentBrowser(l: Layout, open: AgentBrowserOpen): Layout {
     // The latest opener wins: the pane now shows what THIS agent asked for.
     next = setBrowserOpener(setBrowserPath(next, existing.id, open.path), existing.id, open.sessionId);
     if (p.active === index || !covers(p.id)) {
-      return restoreFocus(activateTab(next, p.id, index), l);
+      return { layout: restoreFocus(activateTab(next, p.id, index), l), tabId: existing.id };
     }
     // Showing it in place would hide what the user is looking at: move it.
     next = detachTab(next, p.id, index);
@@ -158,7 +164,23 @@ export function placeAgentBrowser(l: Layout, open: AgentBrowserOpen): Layout {
     break;
   }
   tab ??= freshBrowserTab(open.host, open.port, open.path, open.sessionId);
-  return placeBeside(next, tab, anchor, covers, l);
+  return { layout: placeBeside(next, tab, anchor, covers, l), tabId: tab.id };
+}
+
+/**
+ * One page per agent (#273): a pane an agent opens with `open_browser` is
+ * shared with it, so its browser tools drive the page the user watches —
+ * marker, cursor, take-over — instead of a hidden duplicate fighting it
+ * (a single-editor app like marimo would). Only where a pane view can be
+ * driven (`paneViews`: the app); the iframe fallback shares nothing. A
+ * re-pointed tab goes to its latest opener.
+ */
+export function agentOpenShare(
+  tabId: string,
+  open: AgentBrowserOpen,
+  paneViews: boolean,
+): { tab: string; agent: string } | null {
+  return paneViews ? { tab: tabId, agent: open.sessionId } : null;
 }
 
 /**

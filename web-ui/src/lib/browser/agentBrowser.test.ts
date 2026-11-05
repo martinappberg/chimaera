@@ -8,6 +8,8 @@ import {
   PaneViewRegistry,
   TAKEOVER_WINDOW_MS,
   decodeBrowserLinks,
+  describePage,
+  PAGE_TITLE_MAX,
   driveProbeSaysPresent,
   hueHex,
   decodeBrowserRequest,
@@ -481,5 +483,62 @@ describe("sharedTabsLeft", () => {
   });
   it("a reload starts with nothing held, so it unshares nothing", () => {
     expect(sharedTabsLeft(new Set(), new Set(["t1", "t2"]), linked)).toEqual([]);
+  });
+});
+
+describe("hello pages", () => {
+  it("describe a pane by its title (else host:port) and its app address", () => {
+    expect(describePage("127.0.0.1", 8888, "/lab/tree?token=abc#x", "JupyterLab")).toEqual({
+      title: "JupyterLab",
+      url: "http://127.0.0.1:8888/lab/tree#x",
+    });
+    expect(describePage("localhost", 2718, "/", "  ")).toEqual({ title: "localhost:2718", url: "http://localhost:2718/" });
+    expect(describePage("::1", 80, "/", null).url).toBe("http://[::1]:80/");
+    expect(describePage("h", 1, "/", "x".repeat(500)).title).toHaveLength(PAGE_TITLE_MAX);
+  });
+
+  it("list one entry per registered tab, in the tabs' order", () => {
+    const r = new PaneViewRegistry();
+    r.register("t2", "v2");
+    r.register("t1", "v1");
+    r.describe("t1", { title: "One", url: "http://h:1/" });
+    r.describe("t2", { title: "Two", url: "http://h:2/" });
+    r.describe("t9", { title: "Elsewhere", url: "http://h:9/" });
+    expect(r.pages()).toEqual([
+      { tab: "t1", title: "One", url: "http://h:1/" },
+      { tab: "t2", title: "Two", url: "http://h:2/" },
+    ]);
+    r.keepDescribed(new Set(["t2"]));
+    expect(r.pages()).toEqual([{ tab: "t2", title: "Two", url: "http://h:2/" }]);
+  });
+
+  it("re-send the hello on a title or target change of a registered tab only", () => {
+    const r = new PaneViewRegistry();
+    r.register("t1", "v1");
+    const changes = vi.fn();
+    r.onChange(changes);
+    r.describe("t1", { title: "A", url: "http://h:1/" });
+    r.describe("t1", { title: "A", url: "http://h:1/" });
+    expect(changes).toHaveBeenCalledTimes(1);
+    r.describe("t1", { title: "B", url: "http://h:1/" });
+    r.describe("t1", { title: "B", url: "http://h:1/next" });
+    expect(changes).toHaveBeenCalledTimes(3);
+    r.describe("t-unmounted", { title: "C", url: "http://h:3/" });
+    expect(changes).toHaveBeenCalledTimes(3);
+  });
+
+  it("count a page as new in the hello diff", () => {
+    const base: BrowserHello = { type: "browser_hello", app_engine: true, visible: true, focused: true, width: 1, height: 1, tabs: ["t1"] };
+    const page = { tab: "t1", title: "A", url: "http://h:1/" };
+    expect(sameHello({ ...base, pages: [page] }, { ...base, pages: [page] })).toBe(true);
+    expect(sameHello({ ...base, pages: [page] }, { ...base, pages: [{ ...page, title: "B" }] })).toBe(false);
+    expect(sameHello(base, { ...base, pages: [page] })).toBe(false);
+  });
+
+  it("know a hand-over tab before its view mounts", async () => {
+    const t = harness();
+    await t.channel.handle(request({ op: "open", view: "ab-1", url: "/proxy/p/", width: 800, height: 600 }));
+    await t.channel.handle(request({ op: "handover", view: "ab-1", host: "127.0.0.1", port: 2718, path: "/?file=x", agent: "s-a" }));
+    expect(t.channel.registry.pages()).toEqual([{ tab: "tab-h", title: "127.0.0.1:2718", url: "http://127.0.0.1:2718/" }]);
   });
 });

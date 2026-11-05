@@ -124,7 +124,7 @@
       "name": "notify"
     },
     {
-      "description": "Show the user a web app you started (a dev server, a notebook, a dashboard) in a Chimaera browser pane beside this session. Only addresses on this host, loopback, or a node of the user's running Slurm jobs open; for anything else, give the user the URL. This only shows the page to the user: nothing about the page comes back, and a successful call says nothing about whether it loaded or works. To see and check a page yourself, use the browser_* tools (browser_navigate, browser_snapshot…), and hand the result over with browser_show, which keeps the live page. Call once per app, not on every reload. Rate-limited per session.",
+      "description": "Show the user a web app you started (a dev server, a notebook, a dashboard) in a Chimaera browser pane beside this session. Only addresses on this host, loopback, or a node of the user's running Slurm jobs open; for anything else, give the user the URL. A successful call says nothing about whether the page loaded or works. Once open, the pane is shared with you: the browser_* tools read and drive it with the user watching (browser_navigate to the same app reuses it). To check something without touching the user's view, use a hidden page (browser_navigate to another app, or page \"own\"). Call once per app, not on every reload. Rate-limited per session.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -141,7 +141,7 @@
       "name": "open_browser"
     },
     {
-      "description": "Open a web app in your own browser page (or the given shared pane) and wait for it to load (up to 15 s). Only addresses on this host, loopback, or a node of the user's running Slurm jobs load. Your own page is invisible to the user until you call browser_show. `url` may also be \"back\", \"forward\" or \"reload\". Returns the final URL, title and HTTP status when known. The app engine loads pages through Chimaera's proxy, so an app that calls absolute /api/v1 or /ws/ paths (Chimaera's own UI) reaches the hosting daemon instead of itself: start that page with engine \"chromium\".",
+      "description": "Open a web app and wait for it to load (up to 15 s). Checking something opens a hidden page of your own; a pane the user is watching (one you opened with open_browser, say) is reused only for the same app, navigated in place. Page \"own\" always means the hidden page (to check something in the background without touching the user's view); page \"p1\" sends a shared pane to another app. Only addresses on this host, loopback, or a node of the user's running Slurm jobs load. Your own page is invisible to the user until you call browser_show. `url` may also be \"back\", \"forward\" or \"reload\". Returns the final URL, title and HTTP status when known. The app engine loads pages through Chimaera's proxy, so an app that calls absolute /api/v1 or /ws/ paths (Chimaera's own UI) reaches the hosting daemon instead of itself: start that page with engine \"chromium\".",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -158,7 +158,7 @@
             "type": "integer"
           },
           "page": {
-            "description": "\"own\" (your own page) or a shared pane's id (\"p1\"…). Default: your own page when you have one; otherwise the pane the user shared with you, if exactly one is.",
+            "description": "\"own\" (your hidden page) or a shared pane's id (\"p1\"…). Default: the shared pane showing the same app, else your hidden page.",
             "type": "string"
           },
           "url": {
@@ -583,6 +583,19 @@
         "type": "object"
       },
       "name": "browser_close"
+    },
+    {
+      "annotations": {
+        "readOnlyHint": true
+      },
+      "description": "List every page you can see: your hidden page, panes shared with you (pN, you can drive them) and panes the user has open in this workspace (vN, read-only: the read tools work on them with page \"vN\"; ask the user to share one to act).",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "browser_pages"
     }
   ]
 }

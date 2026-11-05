@@ -128,6 +128,45 @@ export interface PaneViewParams {
   /** The view came on screen (`true`) or was hidden: a snapshot is only
    *  worth taking while it is shown. */
   onShown?: (shown: boolean) => void;
+  /** A pane: when a menu, popover or dialog comes over the view (which then
+   *  hides, see "Overlap"), the page as it was, to draw in the placeholder
+   *  instead of a blank; `null` once the view is back (or loads anew). */
+  onCoverStill?: (still: NativeViewSnapshot | null) => void;
+}
+
+/** The longest an overlay waits for the still of the page under it before
+ *  the view hides anyway (blank, as before stills): a menu opening late
+ *  reads worse than a blank pane. */
+export const COVER_STILL_MS = 250;
+
+/** Whether the view's hiding for an overlay should first take a still:
+ *  it is on screen now, it hides for an overlay (not a park, a drag, a
+ *  load), the host draws stills, and none is up already. Pure. */
+export function wantsCoverStill(s: {
+  shownNow: boolean;
+  hiding: boolean;
+  covered: boolean;
+  hostDraws: boolean;
+  stillUp: boolean;
+}): boolean {
+  return s.shownNow && s.hiding && s.covered && s.hostDraws && !s.stillUp;
+}
+
+/** `p`, or null once `ms` passed first. */
+function within<T>(p: Promise<T | null>, ms: number): Promise<T | null> {
+  return Promise.race([p, new Promise<null>((r) => setTimeout(() => r(null), ms))]);
+}
+
+/** One frame (a still set by the host gets painted before the view goes),
+ *  bounded for a hidden window, where rAF does not run. */
+function nextPaint(): Promise<void> {
+  return new Promise((r) => {
+    const t = setTimeout(r, 50);
+    requestAnimationFrame(() => {
+      clearTimeout(t);
+      r();
+    });
+  });
 }
 
 /** The longest a loading view stays hidden waiting for its page. */
@@ -465,6 +504,18 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
   /** Embedded: its document is scrolling and the view stands down for the
    *  host's still. */
   let scrolling = false;
+  /** The last `wanted()` hid the view because an overlay covers it. */
+  let covered = false;
+  /** The host is drawing a still for an overlay (`onCoverStill`). */
+  let stillUp = false;
+  /** This cover already tried for a still (a slow or failed snapshot is
+   *  not retried until the view has been back on screen). */
+  let stillTried = false;
+  const dropStill = (): void => {
+    if (!stillUp) return;
+    stillUp = false;
+    params.onCoverStill?.(null);
+  };
   let scrollTimer: ReturnType<typeof setTimeout> | null = null;
   /** Embedded: the ancestors whose overflow crops it, nearest first
    *  (re-collected after a resize: cards don't move between parents). */
@@ -606,6 +657,7 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
 
   /** Where the view should be right now: null = hidden. */
   const wanted = (): Placement | null => {
+    covered = false;
     if (!params.shown || params.url === null || dragging || awaiting || crashed || control?.frozen === true) {
       return null;
     }
@@ -621,7 +673,11 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
     if (rect === null) return null;
     const clip = embedded ? visibleClip() : null;
     const seen = clip === null ? rect : overlap(rect, clip);
-    if (seen === null || overlays.covering(seen)) return null;
+    if (seen === null) return null;
+    if (overlays.covering(seen)) {
+      covered = true;
+      return null;
+    }
     return { rect, clip, passive: embedded && params.passive === true };
   };
 
@@ -705,6 +761,7 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
           }
           showing = url;
           placed = "";
+          dropStill();
           // A new URL loads hidden: the view the host saw is gone for now.
           if (wasShown) params.onShown?.(false);
           report();
@@ -713,9 +770,38 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
           if (!awaiting) again = true;
         } else if (created && placementKey(want) !== placed) {
           const was = placed !== "";
+          if (
+            wantsCoverStill({
+              shownNow: was,
+              hiding: want === null,
+              covered,
+              hostDraws: params.onCoverStill !== undefined,
+              stillUp: stillUp || stillTried,
+            })
+          ) {
+            // The page as it is, while the view is still on screen to be
+            // captured; the host draws it, then the view goes.
+            stillTried = true;
+            const shot = await within(nativeViewSnapshot(id), COVER_STILL_MS);
+            if (destroyed) break;
+            if (shot !== null) {
+              stillUp = true;
+              params.onCoverStill?.(shot);
+              await nextPaint();
+              if (destroyed) break;
+            }
+            // The overlay may have gone meanwhile: decide again.
+            again = true;
+            continue;
+          }
           placed = placementKey(want);
           await (want === null ? nativeViewPlace(id, null) : nativeViewPlace(id, want.rect, fitOf(want)));
           if (was !== (want !== null) && !destroyed) params.onShown?.(want !== null);
+          // Back on screen over its still: the still can go.
+          if (want !== null && !destroyed) {
+            stillTried = false;
+            dropStill();
+          }
         }
       } while (again && !destroyed);
     } finally {

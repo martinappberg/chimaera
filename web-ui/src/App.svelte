@@ -308,7 +308,8 @@
   } from "./lib/net/native";
   import { clearBrowserNotices, deliverBrowserNotices } from "./lib/workspace/notices";
   import {
-    placeAgentBrowser,
+    agentOpenShare,
+    placeAgentBrowserTab,
     placeHandover,
     shouldActOnAgentBrowserOpen,
     type AgentBrowserOpen,
@@ -323,6 +324,7 @@
   import { sharedTabsLeft, type Handover } from "./lib/browser/agentBrowser";
   import type { BrowserLink } from "./lib/net/browserWire";
   import { targetLabel } from "./lib/browser/proxy";
+  import { paneViewsPossible } from "./lib/shared/paneView";
   import UpdateToast from "./lib/workspace/UpdateToast.svelte";
   import {
     applyAppStatus,
@@ -1183,6 +1185,7 @@
       // A hand-over whose tab went before its view took the page on: the
       // page has no owner left.
       if (ready) {
+        agentBrowser.registry.keepDescribed(present);
         for (const [tab, view] of agentBrowser.registry.pendingAdoptions()) {
           if (!present.has(tab)) agentBrowser.abandonAdoption(tab, view);
         }
@@ -1832,7 +1835,14 @@
       visible: document.visibilityState === "visible",
     };
     if (!shouldActOnAgentBrowserOpen(open, view)) return;
-    layout = placeAgentBrowser(layout, open);
+    const placed = placeAgentBrowserTab(layout, open);
+    layout = placed.layout;
+    // Shared with the opener, like a chain-link share (and moved to the
+    // latest opener on a re-point): its browser tools drive this pane.
+    const share = agentOpenShare(placed.tabId, open, paneViewsPossible());
+    if (share !== null && get(browserLinks).get(share.tab) !== share.agent) {
+      linkBrowserTo(share.tab, share.agent);
+    }
   }
 
   /**

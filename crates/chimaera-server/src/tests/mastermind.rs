@@ -9,7 +9,7 @@ use crate::*;
 
 /// Every session's MCP tools (linked-terminal, document, notify, open_browser,
 /// the agent browser's).
-const BASE_TOOLS: [&str; 23] = [
+const BASE_TOOLS: [&str; 24] = [
     "list_terminals",
     "run_in_terminal",
     "read_terminal",
@@ -33,6 +33,7 @@ const BASE_TOOLS: [&str; 23] = [
     "browser_eval",
     "browser_show",
     "browser_close",
+    "browser_pages",
 ];
 
 /// Agent communication's tools (every agent, while it is on).

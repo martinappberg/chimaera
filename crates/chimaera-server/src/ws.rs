@@ -204,6 +204,10 @@ enum ClientMessage {
         height: u32,
         #[serde(default)]
         tabs: Vec<String>,
+        /// Additive: what each of those tabs shows (`{tab, title, url}`, the
+        /// URL in app terms). Agents see these read-only.
+        #[serde(default)]
+        pages: Vec<crate::agent_browser::channel::HelloPage>,
     },
     /// `/ws/events` only: the answer to a `browser_request` with this `rid`.
     BrowserReply {
@@ -1510,6 +1514,7 @@ async fn events_client_text(
             width,
             height,
             tabs,
+            pages,
         }) => state.browsers.channel.hello(
             socket_id,
             Hello {
@@ -1519,6 +1524,7 @@ async fn events_client_text(
                 width,
                 height,
                 tabs,
+                pages,
             },
         ),
         Ok(ClientMessage::BrowserReply {
@@ -1888,11 +1894,26 @@ mod tests {
                 width,
                 height,
                 tabs,
+                pages,
             } => {
                 assert!(app_engine && visible && !focused);
                 assert_eq!((width, height), (1440, 900));
                 assert_eq!(tabs, vec!["a".to_string(), "b".to_string()]);
+                assert!(pages.is_empty(), "older windows send no pages");
             }
+            _ => panic!("not a hello"),
+        }
+        match parse(
+            r#"{"type":"browser_hello","app_engine":true,"visible":true,"focused":true,"width":1440,"height":900,"tabs":["a"],"pages":[{"tab":"a","title":"Lab","url":"http://localhost:8888/lab"}]}"#,
+        ) {
+            ClientMessage::BrowserHello { pages, .. } => assert_eq!(
+                pages,
+                vec![crate::agent_browser::channel::HelloPage {
+                    tab: "a".into(),
+                    title: "Lab".into(),
+                    url: "http://localhost:8888/lab".into(),
+                }]
+            ),
             _ => panic!("not a hello"),
         }
         match parse(r#"{"type":"browser_reply","rid":7,"ok":true,"result":{"value":42}}"#) {

@@ -34,6 +34,7 @@
   import { agentHue } from "../workspace/agentLinks";
   import type { BrowserOpener } from "./agentOpen";
   import { agentBrowser } from "./agentBrowserRuntime";
+  import { describePage } from "./agentBrowser";
   import { PaneViewControl, paneView, paneViewsPossible } from "../shared/paneView";
   import { referencePill } from "../shared/paneViewBridge";
   import {
@@ -51,6 +52,7 @@
     isLoopbackHost,
     mintProxy,
     parseAddress,
+    browserTitles,
     probeNodes,
     proxyHealth,
     proxyTarget,
@@ -134,6 +136,9 @@
   let viewLoading = $state(true);
   /** The native view's page process died for good (until a reload). */
   let viewCrashed = $state(false);
+  /** The page as it was when a menu or popover came over the view (the
+   *  view hides under overlays): drawn in its place instead of a blank. */
+  let coverStill = $state<{ src: string; width: number; height: number } | null>(null);
   const control = new PaneViewControl();
   /** The native view's page sits on a root-form (rescued) path. */
   let viewRootForm = false;
@@ -172,6 +177,14 @@
   // earlier mount): nothing to adopt, so this view loads its target.
   onMount(() => {
     if (adopt !== undefined && adoptable === undefined) agentBrowser.registry.dropAdoption(tabId);
+  });
+
+  // What this pane shows, for agents reading the window's panes (the
+  // hello's `pages`): re-said whenever its title or target changes.
+  $effect(() => {
+    const title = $browserTitles.get(tabId) ?? null;
+    if (host === "") return;
+    agentBrowser.registry.describe(tabId, describePage(host, port, livePath ?? path, title));
   });
 
   const driveState = agentBrowser.driveState;
@@ -907,8 +920,21 @@
           adopt: adoptable,
           onViewId,
           onUserInput: () => agentBrowser.userInput(tabId),
+          onCoverStill: (shot) =>
+            (coverStill = shot === null ? null : { src: `data:image/png;base64,${shot.png}`, width: shot.width, height: shot.height }),
         }}
       >
+        {#if coverStill !== null && !viewCrashed}
+          <img
+            class="cover-still"
+            src={coverStill.src}
+            alt=""
+            aria-hidden="true"
+            draggable="false"
+            style:width="{coverStill.width}px"
+            style:height="{coverStill.height}px"
+          />
+        {/if}
         {#if viewCrashed}
           <div class="state">
             <div class="state-title">This page stopped responding</div>
@@ -1293,6 +1319,16 @@
     height: 100%;
     border: none;
     background: transparent;
+  }
+
+  /* The page under a menu: the view's own snapshot at its CSS size, laid
+     where the view sits. Inert; the view is back over it once the menu goes. */
+  .cover-still {
+    position: absolute;
+    top: 0;
+    left: 0;
+    pointer-events: none;
+    user-select: none;
   }
 
   .frame.hidden {

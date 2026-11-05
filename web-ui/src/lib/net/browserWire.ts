@@ -82,6 +82,17 @@ export interface BrowserHello {
   height: number;
   /** Browser tabs with a live pane view in this window (sorted). */
   tabs: string[];
+  /** What each of `tabs` shows (same order; agents may read any pane in
+   *  their workspace): its title (≤ 200 chars, host:port when it has none)
+   *  and its address in the app's terms, `http://host:port/path` — never
+   *  the `/proxy/` URL, and no query (a token rides there). */
+  pages?: BrowserPage[];
+}
+
+export interface BrowserPage {
+  tab: string;
+  title: string;
+  url: string;
 }
 
 export type BrowserClientMessage = BrowserReply | BrowserEventMsg | BrowserHello;
@@ -96,6 +107,14 @@ export function sameHello(a: BrowserHello | null, b: BrowserHello): boolean {
     a.width === b.width &&
     a.height === b.height &&
     a.tabs.length === b.tabs.length &&
-    a.tabs.every((t, i) => t === b.tabs[i])
+    a.tabs.every((t, i) => t === b.tabs[i]) &&
+    samePages(a.pages ?? [], b.pages ?? [])
+  );
+}
+
+function samePages(a: BrowserPage[], b: BrowserPage[]): boolean {
+  return (
+    a.length === b.length &&
+    a.every((p, i) => p.tab === b[i].tab && p.title === b[i].title && p.url === b[i].url)
   );
 }

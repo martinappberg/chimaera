@@ -275,11 +275,12 @@ pub(crate) async fn open(state: &AppState, session_id: &str, url: &str) -> Resul
         )),
         Presented::Sent => Ok(format!(
             "Requested a browser pane for {shown}: a window showing this session, and any \
-             other visible window on this workspace, opens it beside your session. This \
-             says nothing about whether the page loads or works, nor that the user is \
-             looking; nothing from the page comes back through this tool (the browser_* \
-             tools are how you see a page). Call again only for a different address, not \
-             after the app reloads."
+             other visible window on this workspace, opens it beside your session. Once it \
+             opens it is shared with you: browser_navigate to this app drives that pane, with \
+             the user watching, and browser_snapshot reads it (page \"own\" is a hidden page of \
+             your own instead). This says nothing about whether the page loads or works, nor \
+             that the user is looking. Call again only for a different address, not after the \
+             app reloads."
         )),
     }
 }

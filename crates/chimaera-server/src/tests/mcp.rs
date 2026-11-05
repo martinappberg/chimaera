@@ -81,6 +81,7 @@ async fn mcp_handshake_auth_and_tool_listing() {
             "browser_eval",
             "browser_show",
             "browser_close",
+            "browser_pages",
             "workspace_agents",
             "read_agent",
             "message_agent",

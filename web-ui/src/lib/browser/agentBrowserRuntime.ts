@@ -111,6 +111,7 @@ function currentHello(): BrowserHello {
     width: Math.round(window.innerWidth),
     height: Math.round(window.innerHeight),
     tabs: agentBrowser.registry.tabs(),
+    pages: agentBrowser.registry.pages(),
   };
 }
 

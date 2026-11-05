@@ -4486,6 +4486,7 @@ mod tests {
                 "browser_wait".to_string(),
                 "browser_show".to_string(),
                 "browser_close".to_string(),
+                "browser_pages".to_string(),
             ])
         );
         let ask = chat_mcp_auto_approve(Some(MastermindMode::Ask), Vec::new())

@@ -1202,6 +1202,7 @@ mod tests {
                 "mcp__chimaera__browser_wait",
                 "mcp__chimaera__browser_show",
                 "mcp__chimaera__browser_close",
+                "mcp__chimaera__browser_pages",
             ])
         );
         use std::os::unix::fs::PermissionsExt;
@@ -1283,6 +1284,7 @@ mod tests {
                 "mcp__chimaera__browser_wait",
                 "mcp__chimaera__browser_show",
                 "mcp__chimaera__browser_close",
+                "mcp__chimaera__browser_pages",
                 "mcp__chimaera__workspace_status",
                 "mcp__chimaera__list_changed_files",
                 "mcp__chimaera__read_timeline",
