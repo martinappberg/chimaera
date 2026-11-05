@@ -733,8 +733,10 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   handle itself, and (in the app) only a link the user clicked opens the real browser — a
   script's own `a.click()` or navigation away is cancelled. A view whose own process keeps
   dying (a page over WebKit's limit) is reloaded at most twice a minute, then shows "This page
-  stopped responding" with Reload. Frames inside a report load as they would in its iframe,
-  external ones included.
+  stopped responding" with Reload. Closing a view (its pane, its card, its window) ends its
+  process at once, even mid-layout: WebKit alone waited for the process to handle the close, ~4
+  minutes for a busy 9.5 GB report ([native app](native-app.md)). Frames inside a report load as
+  they would in its iframe, external ones included.
   **PDF** runs on pdf.js's **legacy** build: the modern build calls `Map.prototype.getOrInsertComputed`
   on every render and range read, which WebKit (the macOS app) and Chromium before 145 lack, so its
   pages stayed blank. pdf.js's standard fonts, CMaps, wasm decoders and ICC profiles ship with our

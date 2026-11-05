@@ -592,16 +592,91 @@ pub(super) fn place(
     })
 }
 
-/// Take a view out of its window for good.
+/// Take a view out of its window for good, and its web process with it.
 pub(super) fn close(app: &AppHandle, label: String) {
     let _ = app.run_on_main_thread(move || {
-        if let Some(pane) = PANES.with(|panes| panes.borrow_mut().remove(&label)) {
-            // SAFETY: main thread; stop the page before the view goes so
-            // its process is released with it.
-            unsafe { pane.wk.stopLoading() };
-            pane.clip.removeFromSuperview();
+        let Some(pane) = PANES.with(|panes| panes.borrow_mut().remove(&label)) else {
+            return;
+        };
+        // SAFETY: main thread, a live WKWebView. Delegates first: the end
+        // below reports a termination synchronously, and a closing view
+        // must not be reloaded.
+        unsafe {
+            pane.wk.setNavigationDelegate(None);
+            pane.wk.setUIDelegate(None);
+            pane.wk.stopLoading();
+        }
+        end_process(&pane);
+        pane.clip.removeFromSuperview();
+    });
+}
+
+/// The web processes `view` (a `WKWebView`) runs in now: its page's and,
+/// mid-navigation, the provisional page's. SPI, read only when WebKit has it.
+fn web_pids(view: &NSView) -> Vec<i32> {
+    // SAFETY: each selector is checked first; both getters return a pid_t
+    // (0 = no process).
+    unsafe {
+        let mut pids = Vec::new();
+        let responds: bool =
+            msg_send![view, respondsToSelector: objc2::sel!(_webProcessIdentifier)];
+        if responds {
+            pids.push(msg_send![view, _webProcessIdentifier]);
+        }
+        let responds: bool =
+            msg_send![view, respondsToSelector: objc2::sel!(_provisionalWebProcessIdentifier)];
+        if responds {
+            pids.push(msg_send![view, _provisionalWebProcessIdentifier]);
+        }
+        pids.retain(|pid: &i32| *pid > 0);
+        pids
+    }
+}
+
+/// End a closing view's web process now. Dropped alone, the view leaves its
+/// process to exit once it handles WebKit's close message, and a busy one —
+/// laying out a huge report, or swapping — takes minutes to get to it
+/// (a 9.5 GB report process lived 4 minutes past its view, 2026-11-04).
+///
+/// `_killWebContentProcessAndResetState` SIGKILLs the page's process (and a
+/// provisional page's) at once and leaves the shared website data alone; the
+/// plain `_killWebContentProcess` left the process running (macOS 26). Each
+/// view gets a process of its own (measured: distinct pids for views
+/// on one origin, the window's included), but the kill would take down any
+/// other page in that process, so it's skipped when the owner or another
+/// live view reports the same pid. Fails closed: no SPI, no pid, no kill —
+/// the view just closes as before.
+fn end_process(pane: &Pane) {
+    let ours = web_pids(&pane.wk);
+    if ours.is_empty() {
+        return;
+    }
+    // SAFETY: NSView accessor on the main thread.
+    let mut others: Vec<i32> = unsafe { pane.clip.superview() }
+        .map(|owner| web_pids(&owner))
+        .unwrap_or_default();
+    PANES.with(|panes| {
+        for other in panes.borrow().values() {
+            others.extend(web_pids(&other.wk));
         }
     });
+    if ours.iter().any(|pid| others.contains(pid)) {
+        tracing::warn!(
+            ?ours,
+            "pane view: its web process is shared; closing without ending it"
+        );
+        return;
+    }
+    let kill = objc2::sel!(_killWebContentProcessAndResetState);
+    // SAFETY: the selector is checked first; it takes and returns nothing.
+    // No `PANES` borrow is held: the termination is reported synchronously.
+    unsafe {
+        let responds: bool = msg_send![&*pane.wk, respondsToSelector: kill];
+        if responds {
+            let _: () = msg_send![&*pane.wk, _killWebContentProcessAndResetState];
+            tracing::debug!(?ours, "pane view: ended its web process");
+        }
+    }
 }
 
 /// Run `f` on the main thread with a live view; its answer comes back
