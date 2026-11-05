@@ -68,6 +68,9 @@
   let viewLoading = $state(true);
   /** The native view's page process died for good (until a reload). */
   let viewCrashed = $state(false);
+  /** The page as it was when an overlay (a menu, a drop wash) covered the
+   *  view: drawn in its place while the native view stands down. */
+  let coverStill = $state<{ src: string; width: number; height: number } | null>(null);
   const control = new PaneViewControl();
 
   type Mode = "preview" | "split" | "edit";
@@ -558,9 +561,23 @@
             onFocus: () => onFocusRequest?.(),
             onSelection: onPageSelection,
             onReference: onPageReference,
+            onCoverStill: (shot) =>
+              (coverStill =
+                shot === null ? null : { src: `data:image/png;base64,${shot.png}`, width: shot.width, height: shot.height }),
             control,
           }}
         >
+          {#if coverStill !== null && !viewCrashed}
+            <img
+              class="cover-still"
+              src={coverStill.src}
+              alt=""
+              aria-hidden="true"
+              draggable="false"
+              style:width="{coverStill.width}px"
+              style:height="{coverStill.height}px"
+            />
+          {/if}
           {#if viewCrashed}
             <div class="view-crashed">
               <span>This page stopped responding</span>
@@ -748,6 +765,14 @@
     position: absolute;
     inset: 0;
     background: #ffffff;
+  }
+
+  .cover-still {
+    position: absolute;
+    top: 0;
+    left: 0;
+    pointer-events: none;
+    user-select: none;
   }
 
   /* A page whose process died for good: said quietly where it was, on the
