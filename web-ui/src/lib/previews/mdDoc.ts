@@ -8,6 +8,7 @@
  */
 
 import type { Reveal } from "../shared/reveal";
+import { createPathMemory, type PathMemory, type PathStore } from "./pathMemory";
 
 // --- frontmatter ---------------------------------------------------------------
 
@@ -378,62 +379,13 @@ export function isMdMode(v: unknown): v is MdMode {
   return typeof v === "string" && MODES.includes(v);
 }
 
-export interface ModeMemory {
-  get(path: string): MdMode | null;
-  set(path: string, mode: MdMode): void;
-}
+export type ModeMemory = Pick<PathMemory<MdMode>, "get" | "set">;
 
-type ModeStore = Pick<Storage, "getItem" | "setItem">;
-
-/**
- * The last mode picked per file: a least-recently-used list of `[path,
- * mode]` pairs (newest last) under one key, capped at `cap`. Storage can be
- * missing or throw anywhere (private windows, a full quota, a sandboxed
- * webview): every access is guarded, and a failure only forgets.
- */
+/** The last mode picked per file (`pathMemory.ts`). */
 export function createModeMemory(
-  storage: () => ModeStore | null,
+  storage: () => PathStore | null,
   key = "chimaera.markdownModes",
   cap = 300,
 ): ModeMemory {
-  function load(): [string, MdMode][] {
-    try {
-      const raw = storage()?.getItem(key) ?? null;
-      if (raw === null) return [];
-      const data: unknown = JSON.parse(raw);
-      if (!Array.isArray(data)) return [];
-      return data.filter(
-        (e): e is [string, MdMode] =>
-          Array.isArray(e) && e.length === 2 && typeof e[0] === "string" && isMdMode(e[1]),
-      );
-    } catch {
-      return [];
-    }
-  }
-  function save(list: [string, MdMode][]): void {
-    try {
-      storage()?.setItem(key, JSON.stringify(list.slice(-cap)));
-    } catch {
-      // quota / unavailable: the memory is a convenience
-    }
-  }
-  return {
-    get(path) {
-      const list = load();
-      const i = list.findIndex((e) => e[0] === path);
-      if (i === -1) return null;
-      const entry = list[i];
-      if (i !== list.length - 1) {
-        list.splice(i, 1);
-        list.push(entry);
-        save(list);
-      }
-      return entry[1];
-    },
-    set(path, mode) {
-      const list = load().filter((e) => e[0] !== path);
-      list.push([path, mode]);
-      save(list);
-    },
-  };
+  return createPathMemory(storage, key, isMdMode, cap);
 }
