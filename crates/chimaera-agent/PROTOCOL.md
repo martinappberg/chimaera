@@ -8,11 +8,11 @@ Sources: **live** = probed against the real CLI at the version named; **official
 
 | Provider | Driver | Pin (current value) | Live gate | Reference | Latest pass |
 |---|---|---|---|---|---|
-| Claude Code stream-json | `src/claude.rs` | `TESTED_CLAUDE_VERSION` = 2.1.318 | `just chat-smoke` | [claude-code.md](protocol/claude-code.md) | Pass 59 |
-| Codex app-server | `src/codex.rs` | `TESTED_CODEX_VERSION` = 0.166.0 | `just chat-smoke` | [codex.md](protocol/codex.md) | Pass 59 |
-| ACP: Grok Build | `src/acp.rs` | `TESTED_GROK_VERSION` = 1.0.70 | `just chat-smoke-acp` | [acp.md](protocol/acp.md) | Pass 59 |
-| ACP: Google Antigravity | `src/acp.rs` | `TESTED_AGY_VERSION` = 1.4.5 | `just chat-smoke-acp` | [acp.md](protocol/acp.md) | Pass 59 |
-| ACP: Cursor CLI | `src/acp.rs` | `TESTED_CURSOR_VERSION` = 2026.10.22-27dcf5f | `just chat-smoke-acp` | [acp.md](protocol/acp.md) | Pass 59 |
+| Claude Code stream-json | `src/claude.rs` | `TESTED_CLAUDE_VERSION` = 2.1.318 | `just chat-smoke` | [claude-code.md](protocol/claude-code.md) | Pass 60 |
+| Codex app-server | `src/codex.rs` | `TESTED_CODEX_VERSION` = 0.166.0 | `just chat-smoke` | [codex.md](protocol/codex.md) | Pass 60 |
+| ACP: Grok Build | `src/acp.rs` | `TESTED_GROK_VERSION` = 1.0.70 | `just chat-smoke-acp` | [acp.md](protocol/acp.md) | Pass 60 |
+| ACP: Google Antigravity | `src/acp.rs` | `TESTED_AGY_VERSION` = 1.4.5 | `just chat-smoke-acp` | [acp.md](protocol/acp.md) | Pass 60 |
+| ACP: Cursor CLI | `src/acp.rs` | `TESTED_CURSOR_VERSION` = 2026.10.22-27dcf5f | `just chat-smoke-acp` | [acp.md](protocol/acp.md) | Pass 60 |
 | Claude Mods native UI | `src/native_ui.rs` | `TESTED_CLAUDE_VERSION` | `just chat-mods-smoke` | [mods.md](protocol/mods.md) | Pass 59 |
 
 The shared rules are in [cross-agent.md](protocol/cross-agent.md). The live gates bill turns, except `chat-mods-smoke`.
