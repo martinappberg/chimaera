@@ -732,6 +732,8 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   tags) but never *read* them with `fetch`/XHR, so a report cannot read out the files around it —
   a report that fetches its data as JSON still needs it inline. The split live preview (`srcdoc`)
   has no URL, so its relative assets still do not load.
+  **Zoom like a browser:** in the macOS app ⌘+/⌘−/⌘0 zoom the page and a trackpad pinch
+  magnifies it (per pane, kept across a move).
   **In the macOS app, Preview is a web view of its own** (`shared/paneView.ts` over
   `chimaera-app` `shell/native_view.rs`), laid over the pane: its own web process, so a heavy page
   can only slow itself down. An iframe shares the window's process and main thread with chat,

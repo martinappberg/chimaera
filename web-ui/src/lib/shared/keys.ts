@@ -507,11 +507,7 @@ export const PINNED = {
   reference: isMac ? "⇧⌘R" : "Ctrl+Shift+R",
   fontPlus: isMac ? "⌘+" : "Ctrl++",
   fontMinus: isMac ? "⌘−" : "Ctrl+-",
-  // The base-modifier Digit0 belongs to the dashboard (App.svelte's chord
-  // handler yields it); reset keeps the spellings the dashboard chord
-  // doesn't claim — the numpad zero on mac, plain Ctrl+0 elsewhere (the
-  // non-mac dashboard chord carries Shift).
-  fontReset: isMac ? "⌘Num0" : "Ctrl+0",
+  fontReset: isMac ? "⌘0" : "Ctrl+0",
 } as const;
 
 /**
@@ -548,19 +544,34 @@ export const REFERENCE_CHORD: ParsedChord = {
 };
 
 /**
- * Font-size chord action for `e`, when it is one: Cmd on macOS / Ctrl
+ * Font-size / zoom chord action for `e`, when it is one: Cmd on macOS / Ctrl
  * elsewhere with +/−/0 (spec-pinned — these shadow browser zoom, so callers
- * must intercept them ONLY while a terminal pane is focused; everywhere else
- * browser zoom keeps working). "+1"/-"1" = step, 0 = reset.
+ * must intercept them ONLY while a font-sizable or zoomable pane is focused;
+ * everywhere else browser zoom keeps working). "+1"/-"1" = step, 0 = reset.
+ *
+ * Matched by the character typed, as a browser does, not the key's place:
+ * on a Swedish or German layout "+" sits where a US keyboard has "−", so a
+ * physical-key match zoomed the wrong way. `=` steps up too (unshifted `+`
+ * on US layouts); the keypad keys count by place; `0` also by place, for
+ * layouts whose top-row digits need Shift (AZERTY).
  */
 export function fontChord(e: KeyboardEvent): 1 | -1 | 0 | null {
   const mod = isMac ? e.metaKey && !e.ctrlKey && !e.altKey : e.ctrlKey && !e.metaKey && !e.altKey;
   if (!mod) return null;
-  switch (e.code) {
-    case "Equal": // + is Shift+Equal on most layouts; both step up
-    case "NumpadAdd":
+  switch (e.key) {
+    case "+":
+    case "=":
       return 1;
-    case "Minus":
+    case "-":
+    case "−":
+      return -1;
+    case "0":
+      return 0;
+  }
+  switch (e.code) {
+    case "NumpadAdd":
+    case "NumpadEqual":
+      return 1;
     case "NumpadSubtract":
       return -1;
     case "Digit0":
@@ -573,7 +584,7 @@ export function fontChord(e: KeyboardEvent): 1 | -1 | 0 | null {
 
 /**
  * Digit 0..9 when the event carries exactly the base modifier (pane focus is
- * pinned to Mod+1–9 and Mod+0 is the workspace dashboard; the digit comes
+ * pinned to Mod+1–9 (Mod+0 is the font/zoom reset, `fontChord`); the digit comes
  * from the physical key so Shift-digit symbol layouts don't break it).
  * `move` matches the numbered tab-move modifier instead. Null otherwise.
  */

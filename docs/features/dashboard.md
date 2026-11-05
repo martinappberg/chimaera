@@ -4,7 +4,7 @@ The landing surface of a workspace, re-centred on questions: what needs me (the 
 lane), what happened while I was away (**Since you left**), where the project stands
 (**Where things stand**), and who is running (the one-line **Now**) — every element one click
 from the live session, the Timeline, or Knowledge. An empty workspace layout opens onto it;
-⌘0 / the rail's `dashboard` row reach it any time. This is the dashboard/Mastermind design
+the rail's `dashboard` row reaches it any time. This is the dashboard/Mastermind design
 ([docs/design/agent-dashboard-plan.md](../design/agent-dashboard-plan.md)) through v1 — the surface (v0.1),
 the status-feed depth (v0.2), the Mastermind (v1, now a window panel) — re-centred by
 [docs/design/timeline-knowledge-plugins-plan.md](../design/timeline-knowledge-plugins-plan.md) §3 and §8.
@@ -15,7 +15,7 @@ the status-feed depth (v0.2), the Mastermind (v1, now a window panel) — re-cen
 `mastermindPanelState.svelte.ts`, `dash.ts`); the
 `dashboard` surface in `web-ui/src/lib/layout/layout.ts` (`DashboardTab`, `openDashboard`,
 key `v:dashboard`) and its branches in `Pane.svelte`/`PaneTabs.svelte`; the landing switch
-+ rail row + ⌘0 in `web-ui/src/App.svelte` (`pruneAndAutoOpen`, `openDashboardSurface`,
++ rail row in `web-ui/src/App.svelte` (`pruneAndAutoOpen`, `openDashboardSurface`,
 `dashCtx`). The surface renders from the existing `/ws/events` roster, the chat journal
 via `web-ui/src/lib/chat/chatPool.ts` (`acquireChat`/`releaseChat`, refcounted), the git status store,
 the Timeline / Knowledge / plugin stores (`workspace/timeline.svelte.ts`,
@@ -32,8 +32,8 @@ workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
   of the first session. A restored non-empty layout is never touched.
 - **How it's used.** Automatic (setting `dashboard.landing`, default `auto`; `never`
   restores the old first-session behavior). Manual: the fixed `dashboard` rail row above
-  the terminals section, or Mod+0 (the same pinned-chord family as Mod+1–9; the digit `0`
-  ride-along lives in `web-ui/src/lib/shared/keys.ts::chordDigit`). The
+  the terminals section. (Mod+0 opened it until 2026-11-05; it is now the font/zoom reset,
+  as in a browser.) The
   `dashboard.roster` setting (default `line`) picks the one-line Now or today's roster as
   cards (the dashboard's "show cards" / "show one line" links flip it); in cards mode
   `dashboard.cardDensity` keeps cards comfortable, forces compact rows, or retains the

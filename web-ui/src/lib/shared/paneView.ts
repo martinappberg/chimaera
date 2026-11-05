@@ -86,7 +86,7 @@ import {
   type ViewRect,
 } from "../net/native";
 import { chordInit, samePill, type NativeViewEvent } from "./paneViewBridge";
-import { routeNativeView } from "./paneViewRoute";
+import { PANE_ZOOM_EVENT, routeNativeView, type PaneZoom } from "./paneViewRoute";
 
 export interface PaneViewParams {
   /** Same-origin `/raw/…` or `/proxy/…` URL; null while it is being minted. */
@@ -996,6 +996,14 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
     capture: true,
     passive: true,
   });
+  // ⌘+/⌘−/reset on this pane: the page's own zoom, as in a browser.
+  const onZoom = (ev: Event): void => {
+    const z = (ev as CustomEvent<PaneZoom>).detail;
+    if (!created || destroyed || failed || params.embedded === true || !params.shown) return;
+    if (node.closest(".pane")?.getAttribute("data-pane-id") !== z.paneId) return;
+    void nativeViewNav(id, z.step === 0 ? "zoomreset" : z.step > 0 ? "zoomin" : "zoomout");
+  };
+  window.addEventListener(PANE_ZOOM_EVENT, onZoom);
   /** A view this pane's previous mount parked (a move): take it back
    *  instead of making a new one, so the page carries on. Claimed even in a
    *  background tab: it stays hidden until shown, like any parked tab. */
@@ -1083,6 +1091,7 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
       document.removeEventListener("transitionend", burst, true);
       window.removeEventListener("resize", onResize);
       document.removeEventListener("scroll", onScroll, { capture: true });
+      window.removeEventListener(PANE_ZOOM_EVENT, onZoom);
       if (scrollTimer !== null) clearTimeout(scrollTimer);
       // A hand-over not taken on yet is not this action's to close: the
       // agent browser still holds it (the next mount adopts it).

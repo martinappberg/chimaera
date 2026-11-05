@@ -120,7 +120,9 @@ fn owner_of(app: &AppHandle, label: &str) -> Option<(String, String)> {
     views.get(label).map(|v| (v.owner.clone(), v.id.clone()))
 }
 
-/// `native_view_nav`'s actions.
+/// `native_view_nav`'s actions. The zoom steps are the page's own zoom, as
+/// ⌘+/⌘−/⌘0 are in a browser (the workbench routes those chords here for an
+/// HTML or browser pane); a reset also undoes a trackpad pinch.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(super) enum NavAction {
@@ -128,6 +130,36 @@ pub(super) enum NavAction {
     Forward,
     Reload,
     Stop,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+}
+
+/// Page zoom levels, as browsers step them.
+const ZOOM_LEVELS: [f64; 13] = [
+    0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0,
+];
+
+/// The next zoom level from `current` (`up` or down), clamped to the ends.
+/// A level between two steps (a page zoom set elsewhere) moves to the
+/// nearest step in that direction.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(super) fn zoom_step(current: f64, up: bool) -> f64 {
+    const EPS: f64 = 1e-3;
+    if up {
+        ZOOM_LEVELS
+            .iter()
+            .copied()
+            .find(|&z| z > current + EPS)
+            .unwrap_or(ZOOM_LEVELS[ZOOM_LEVELS.len() - 1])
+    } else {
+        ZOOM_LEVELS
+            .iter()
+            .rev()
+            .copied()
+            .find(|&z| z < current - EPS)
+            .unwrap_or(ZOOM_LEVELS[0])
+    }
 }
 
 /// What a view does with a main-frame navigation.
@@ -554,8 +586,20 @@ mod tests {
 
     use super::{
         agent_subframe, child_label, clip_box, decide, link_lets_out, proxy_base, valid_id,
-        view_path_allowed, Policy, ViewRect,
+        view_path_allowed, zoom_step, Policy, ViewRect,
     };
+
+    #[test]
+    fn zoom_steps_like_a_browser_and_clamps() {
+        assert_eq!(zoom_step(1.0, true), 1.1);
+        assert_eq!(zoom_step(1.0, false), 0.9);
+        assert_eq!(zoom_step(3.0, true), 3.0);
+        assert_eq!(zoom_step(0.5, false), 0.5);
+        // Between two steps (a pinch, or a zoom set elsewhere): the nearest
+        // step that way.
+        assert_eq!(zoom_step(1.2, true), 1.25);
+        assert_eq!(zoom_step(1.2, false), 1.1);
+    }
 
     fn r(x: f64, y: f64, width: f64, height: f64) -> ViewRect {
         ViewRect {

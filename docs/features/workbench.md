@@ -281,7 +281,9 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   a slim strip. `Mod+Arrow` moves pane focus spatially; `Mod2+Arrow` carries the active tab into
   the neighbor — or, when there is no pane in that direction, **auto-splits a new one** on that
   side (capped at `MAX_PANES` and a minimum pane size); `Mod+1–9` focuses that numbered pane;
-  `⌘±`/`⌘0` bump one pane's terminal/markdown font. Two further chords step through the
+  `⌘+`/`⌘−`/`⌘0` bump or reset one pane's terminal/markdown font, and zoom an HTML or browser
+  page in its own view (the macOS app) as a browser does; a trackpad pinch zooms such a page
+  too. They match the character typed, so they work on any keyboard layout (`fontChord`). Two further chords step through the
   sidebar instead of the panes: `⌃⌘A` (`keys.cycleAgents`) opens the next agent in its agents
   list and `⌃⌘T` (`keys.cycleTerminals`) the next terminal in its terminals list (off macOS,
   `Alt+Shift+A/T`). Each wraps at the end and, from outside its group, starts at the first

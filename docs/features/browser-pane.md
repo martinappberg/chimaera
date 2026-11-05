@@ -110,6 +110,9 @@ plane `ANY /proxy/{id}[/{*path}]`; agent-opened panes add the MCP `open_browser`
   app is tracked (same-origin iframe) and persisted onto the tab so reloads land where
   you were; `openBrowser` dedupes on target so clicking Jupyter's URL twice focuses the
   pane you already have (Cmd/Ctrl+click opens a fresh browser tab beside).
+- **Zoom like a browser.** In the macOS app, ⌘+/⌘−/⌘0 zoom the focused browser pane's page
+  (WebKit page zoom, from the pane or from inside the page) and a trackpad pinch magnifies
+  it; each pane keeps its own zoom while its view lives, a move included.
 - **In the macOS app the page is a web view of its own** (`shared/paneView.ts` over
   `chimaera-app` `shell/native_view.rs`), laid over the pane: its own web process, so a heavy
   app or dev server can only slow itself down, never the workbench (an iframe shares the
