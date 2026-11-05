@@ -374,6 +374,18 @@ fn startup_failures_are_explained() {
         &CdpError::Gone("pipe closed".into()),
     );
     assert!(msg.contains("missing: libnss3.so"), "{msg}");
+    assert!(
+        msg.contains("chrome-headless-shell, which needs fewer"),
+        "{msg}"
+    );
+    // Already the headless shell: never "use chrome-headless-shell".
+    let msg = explain_startup(
+        Path::new("/t/chrome-headless-shell-linux64/chrome-headless-shell"),
+        "chrome-headless-shell: error while loading shared libraries: libnss3.so: cannot open",
+        &CdpError::Gone("pipe closed".into()),
+    );
+    assert!(msg.contains("missing: libnss3.so"), "{msg}");
+    assert!(!msg.contains("use chrome-headless-shell"), "{msg}");
     let msg = explain_startup(
         exe,
         "Creating shared memory in /dev/shm/.org.chromium.Chromium.x failed",
@@ -381,6 +393,12 @@ fn startup_failures_are_explained() {
     );
     assert!(msg.contains("within 20 s"));
     assert!(msg.contains("/dev/shm"));
+    let msg = explain_startup(
+        exe,
+        "[1105:ERROR:zygote_host_impl_linux.cc:117] Running as root without --no-sandbox is not supported.",
+        &CdpError::Gone("x".into()),
+    );
+    assert!(msg.contains("runs as root"), "{msg}");
     let msg = explain_startup(exe, "", &CdpError::Gone("x".into()));
     assert!(!msg.contains("last output"));
 }
@@ -426,7 +444,8 @@ fn discovery_prefers_the_setting_then_path() {
     if !cfg!(target_os = "macos") {
         let empty = std::env::join_paths([dir.join("empty")]).unwrap();
         let err = find_browser(None, &empty, None).unwrap_err();
-        assert!(err.contains("set browser.path"), "{err}");
+        // The ways to get one are added by `check`, which knows the plugins.
+        assert!(err.starts_with("No Chrome or Chromium on "), "{err}");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

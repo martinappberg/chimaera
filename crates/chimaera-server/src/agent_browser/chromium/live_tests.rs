@@ -111,6 +111,7 @@ async fn eval(c: &Chromium, s: &Arc<AppState>, world: World, body: &str, args: V
     match c
         .act(
             s,
+            None,
             "p",
             Action::Eval {
                 world,
@@ -173,7 +174,7 @@ async fn drives_a_real_chromium() {
     // runs this detection before it asks (tools.rs does).
     let _ = state.compute.detection().await;
     assert_eq!(
-        c.available(&state).await.unwrap(),
+        c.available(&state, None).await.unwrap(),
         PathBuf::from(&exe),
         "discovery honours browser.path"
     );
@@ -182,6 +183,7 @@ async fn drives_a_real_chromium() {
     assert!(matches!(
         c.act(
             &state,
+            None,
             "p",
             Action::Rings {
                 console_since: 0,
@@ -196,6 +198,7 @@ async fn drives_a_real_chromium() {
     let out = c
         .act(
             &state,
+            None,
             "p",
             Action::Open {
                 url: target(port, "/"),
@@ -254,6 +257,7 @@ async fn drives_a_real_chromium() {
     match c
         .act(
             &state,
+            None,
             "p",
             Action::Eval {
                 world: World::Page,
@@ -270,6 +274,7 @@ async fn drives_a_real_chromium() {
     match c
         .act(
             &state,
+            None,
             "p",
             Action::Eval {
                 world: World::Page,
@@ -289,6 +294,7 @@ async fn drives_a_real_chromium() {
     let out = c
         .act(
             &state,
+            None,
             "p",
             Action::Click {
                 x,
@@ -314,6 +320,7 @@ async fn drives_a_real_chromium() {
     let (x, y) = center(&c, &state, "#i").await;
     c.act(
         &state,
+        None,
         "p",
         Action::Click {
             x,
@@ -326,6 +333,7 @@ async fn drives_a_real_chromium() {
     .unwrap();
     c.act(
         &state,
+        None,
         "p",
         Action::Text {
             text: "hello".into(),
@@ -336,6 +344,7 @@ async fn drives_a_real_chromium() {
     .unwrap();
     c.act(
         &state,
+        None,
         "p",
         Action::Text {
             text: " wörld!".into(),
@@ -346,6 +355,7 @@ async fn drives_a_real_chromium() {
     .unwrap();
     c.act(
         &state,
+        None,
         "p",
         Action::Key {
             key: "Backspace".into(),
@@ -367,6 +377,7 @@ async fn drives_a_real_chromium() {
     // Scroll and move.
     c.act(
         &state,
+        None,
         "p",
         Action::Scroll {
             x: 300.0,
@@ -392,7 +403,7 @@ async fn drives_a_real_chromium() {
         y
     };
     assert!(scrolled > 0.0, "the wheel scrolled the page");
-    c.act(&state, "p", Action::Move { x: 10.0, y: 10.0 })
+    c.act(&state, None, "p", Action::Move { x: 10.0, y: 10.0 })
         .await
         .unwrap();
 
@@ -400,6 +411,7 @@ async fn drives_a_real_chromium() {
     match c
         .act(
             &state,
+            None,
             "p",
             Action::Screenshot {
                 clip: None,
@@ -421,6 +433,7 @@ async fn drives_a_real_chromium() {
     match c
         .act(
             &state,
+            None,
             "p",
             Action::Screenshot {
                 clip: Some(Rect {
@@ -444,6 +457,7 @@ async fn drives_a_real_chromium() {
     match c
         .act(
             &state,
+            None,
             "p",
             Action::Screenshot {
                 clip: None,
@@ -466,6 +480,7 @@ async fn drives_a_real_chromium() {
     match c
         .act(
             &state,
+            None,
             "p",
             Action::Screenshot {
                 clip: None,
@@ -511,6 +526,7 @@ async fn drives_a_real_chromium() {
     match c
         .act(
             &state,
+            None,
             "p",
             Action::Click {
                 x,
@@ -573,6 +589,7 @@ async fn drives_a_real_chromium() {
         rings = match c
             .act(
                 &state,
+                None,
                 "p",
                 Action::Rings {
                     console_since: 0,
@@ -624,6 +641,7 @@ async fn drives_a_real_chromium() {
     match c
         .act(
             &state,
+            None,
             "p",
             Action::Rings {
                 console_since: next,
@@ -641,6 +659,7 @@ async fn drives_a_real_chromium() {
     match c
         .act(
             &state,
+            None,
             "p",
             Action::Navigate {
                 url: target(port, "/redirect"),
@@ -659,12 +678,16 @@ async fn drives_a_real_chromium() {
         port: 81,
         path: "/".into(),
     };
-    match c.act(&state, "p", Action::Navigate { url: off }).await {
+    match c
+        .act(&state, None, "p", Action::Navigate { url: off })
+        .await
+    {
         Err(BrowserError::Refused(m)) => assert!(m.contains("blocked.invalid:81"), "{m}"),
         other => panic!("direct: {other:?}"),
     }
     c.act(
         &state,
+        None,
         "p",
         Action::Navigate {
             url: target(port, "/"),
@@ -676,6 +699,7 @@ async fn drives_a_real_chromium() {
     match c
         .act(
             &state,
+            None,
             "p",
             Action::Click {
                 x,
@@ -697,6 +721,7 @@ async fn drives_a_real_chromium() {
     // A link that's allowed navigates, and history goes back.
     c.act(
         &state,
+        None,
         "p",
         Action::Navigate {
             url: target(port, "/"),
@@ -708,6 +733,7 @@ async fn drives_a_real_chromium() {
     assert_eq!(
         c.act(
             &state,
+            None,
             "p",
             Action::Click {
                 x,
@@ -736,6 +762,7 @@ async fn drives_a_real_chromium() {
     match c
         .act(
             &state,
+            None,
             "p",
             Action::History {
                 op: HistoryOp::Back,
@@ -753,6 +780,7 @@ async fn drives_a_real_chromium() {
     match c
         .act(
             &state,
+            None,
             "p",
             Action::History {
                 op: HistoryOp::Reload,
@@ -769,6 +797,7 @@ async fn drives_a_real_chromium() {
     match c
         .act(
             &state,
+            None,
             "q",
             Action::Open {
                 url: target(port, "/next"),
@@ -785,6 +814,7 @@ async fn drives_a_real_chromium() {
     let (w, h) = match c
         .act(
             &state,
+            None,
             "q",
             Action::Eval {
                 world: World::Page,
@@ -801,12 +831,13 @@ async fn drives_a_real_chromium() {
     };
     assert_eq!((w, h), (500, 400));
     assert_eq!(
-        c.act(&state, "q", Action::Close).await.unwrap(),
+        c.act(&state, None, "q", Action::Close).await.unwrap(),
         ActionOut::Done
     );
     assert!(matches!(
         c.act(
             &state,
+            None,
             "q",
             Action::Rings {
                 console_since: 0,
@@ -848,6 +879,7 @@ async fn drives_a_real_chromium() {
     // A new Open relaunches; shutdown kills the group at once.
     c.act(
         &state,
+        None,
         "p",
         Action::Open {
             url: target(port, "/next"),
@@ -881,6 +913,7 @@ async fn drives_a_real_chromium() {
     assert!(matches!(
         c.act(
             &state,
+            None,
             "p",
             Action::Rings {
                 console_since: 0,

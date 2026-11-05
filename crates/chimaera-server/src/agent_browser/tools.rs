@@ -900,7 +900,22 @@ async fn exec(state: &Arc<AppState>, ctx: &Ctx, action: Action) -> Result<Action
     );
     let result = match (&ctx.addr, &ctx.key) {
         (Some(addr), _) => app_engine::act(state, addr, action).await,
-        (None, Some(key)) => state.browsers.chromium.act(state, key, action).await,
+        (None, Some(key)) => {
+            // Only opening a page may launch the browser, which depends on
+            // the plugins active in the session's workspace.
+            let ws = matches!(action, Action::Open { .. })
+                .then(|| {
+                    crate::lock(&state.session_workspaces)
+                        .get(&ctx.agent)
+                        .cloned()
+                })
+                .flatten();
+            state
+                .browsers
+                .chromium
+                .act(state, ws.as_deref(), key, action)
+                .await
+        }
         (None, None) => Err(BrowserError::NoEngine(NO_PAGE.to_string())),
     };
     match (result, &ctx.which) {
@@ -1500,7 +1515,12 @@ async fn new_page(
     if state.compute.login_node_unknown() {
         let _ = state.compute.detection().await;
     }
-    match state.browsers.chromium.available(state).await {
+    match state
+        .browsers
+        .chromium
+        .available(state, workspace.as_deref())
+        .await
+    {
         Ok(_) => Ok(Bound::Chromium { key: id }),
         Err(why) if want == Some(EngineKind::Chromium) => Err(BrowserError::NoEngine(format!(
             "The Chromium engine can't start a page: {why}"

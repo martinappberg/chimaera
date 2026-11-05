@@ -97,7 +97,10 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   `plugins/plugins.lock` pins: **Mycelium** (fills Knowledge and "Where things stand"; adds
   `knowledge_search` · `knowledge_get` for every agent here), **LaTeX** and **Typst**
   ([below](#programs-and-tools-the-privileged-tier)), and **PowerPoint** (`render_slides` shows
-  agents their slides, `check_deck` finds layout problems, and plain themes or the user's own). The daemon carries none of them: each is
+  agents their slides, `check_deck` finds layout problems, and plain themes or the user's own),
+  and **Chromium** (a headless `chrome-headless-shell` for the
+  [agent browser](agent-browser.md#engines-and-how-one-is-chosen) on a host with none, downloaded
+  only from its Tools' Install). The daemon carries none of them: each is
   listed as *available* until the user installs it on this host
   ([below](#versions-installs--updates)).
 - **How it's used.** Open Extensions from the rail's **Extensions** row or quick-open
@@ -708,6 +711,14 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   the PATH alone, such as an app bundle ("Looks for soffice in
   /Applications/LibreOffice.app/Contents/MacOS too"); those are looked in after the PATH and
   before the plugin's own tools.
+- **A tool as the agent browser's Chromium.** A plugin whose manifest says
+  `provides.browser = "<program>"` (one of its tools' programs) supplies the
+  [agent browser](agent-browser.md)'s headless browser on a host with none: its card's Can list
+  says "Runs chrome-headless-shell on this host as the browser agents' browser tools drive, where
+  it is switched on and when this host has no Chrome or Chromium of its own" (in place of the job
+  programs' "Runs programs" line: the job limits don't apply to it), and the engine runs it only for sessions in workspaces where the plugin
+  is active and its tool is installed (`plugins/browser.rs`). The first-party Chromium plugin
+  is the one that does.
 - **Where it's wired.**
   - **Daemon** (`crates/chimaera-server/src/plugins/`): `jobs.rs` (the queue, the limits, the
     POSIX `sh` preamble that sets them, the captured login environment, process-group kills,

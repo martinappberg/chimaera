@@ -7,6 +7,8 @@ its `plugin.toml`, and each publishing a GitHub release per version:
 - Mycelium, the Knowledge provider: [martinappberg/chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium)
 - LaTeX (privileged: latexmk, TinyTeX): [martinappberg/chimaera-plugin-latex](https://github.com/martinappberg/chimaera-plugin-latex)
 - Typst (privileged: typst): [martinappberg/chimaera-plugin-typst](https://github.com/martinappberg/chimaera-plugin-typst)
+- PowerPoint (privileged: LibreOffice): [martinappberg/chimaera-plugin-pptx](https://github.com/martinappberg/chimaera-plugin-pptx)
+- Chromium (privileged: a downloaded chrome-headless-shell, `provides.browser`): [martinappberg/chimaera-plugin-chromium](https://github.com/martinappberg/chimaera-plugin-chromium)
 
 This directory holds what the chimaera repository needs of them: the lock
 that names them and pins one release of each (the only plugin data the daemon

@@ -845,7 +845,7 @@ const DEFS = {
     title: "Agent Browser",
     category: "Agents",
     description:
-      "The Chrome or Chromium agents' browser tools use when no app window is connected. Empty finds a system Chrome or Chromium.",
+      "The Chrome or Chromium agents' browser tools use when no app window is connected. Empty finds one on this host, else the Chromium plugin's download (Extensions → Plugins).",
     type: "string",
     default: "",
     placeholder: "find Chrome / Chromium",
