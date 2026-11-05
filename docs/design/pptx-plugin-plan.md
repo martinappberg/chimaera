@@ -340,6 +340,18 @@ Built as planned, with these differences, each found in the live run:
 - **Renders carry a version** in their stamp, so an update never answers with
   pictures an older build drew.
 
+- **Plainer themes, chosen by the agent or the user** (the maintainer's review of
+  the first four): Clarity, Ink, Folio and Lab became **Academic** (white, navy, a
+  conference look), **Classic** (white, serif headings), **Business** and **Dark**.
+  Statement and Big Number gave way to **Two Figures** and **References**, Figure
+  and Notes became **Figure and Text**, content slides carry a presenter and venue
+  footer, and body text is 22 to 24 pt. No theme is the default: the agent uses the
+  theme, template (`.pptx` or `.potx`) or look the user names, picks by purpose
+  otherwise, and asks when it can't tell; settings can pin a theme or a template for
+  a workspace. A look described in words becomes a theme through `themekit.py make`
+  (colours, fonts, sizes, cover style, bullets, logo), which keeps every layout and
+  `idx` and fixes colours too light to read.
+
 Proven live (isolated daemon, a fictional data set): Claude (Sonnet 5.5) built a
 themed 7-slide deck with native charts, rendered it, saw the contact sheet and single
 slides, and re-rendered to "Nothing to fix"; Codex (gpt-6.1-sol) called
