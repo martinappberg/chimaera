@@ -438,7 +438,18 @@ fn initialize_result(
         .get("protocolVersion")
         .and_then(|v| v.as_str())
         .unwrap_or(PROTOCOL_FALLBACK);
-    let mut instructions = format!("{INSTRUCTIONS}{DOCUMENTS_INSTRUCTIONS}");
+    // Active plugins' paragraphs come first: Claude Code keeps only the first
+    // ~4 KB of a server's instructions ("… [truncated]"), which chimaera's
+    // own text fills, so a paragraph appended after it never reached Claude.
+    // None when no plugin is on: a plugin-free workspace hands agents
+    // byte-identical instructions.
+    let mut instructions = String::new();
+    for paragraph in plugin_paragraphs {
+        instructions.push_str(paragraph.trim());
+        instructions.push_str("\n\n");
+    }
+    instructions.push_str(INSTRUCTIONS);
+    instructions.push_str(DOCUMENTS_INSTRUCTIONS);
     instructions.push_str(&task_list_instructions(kind, chat));
     if comms_on {
         instructions.push_str(&crate::comms::instructions(
@@ -449,11 +460,6 @@ fn initialize_result(
     }
     if mastermind {
         instructions.push_str(MASTERMIND_INSTRUCTIONS);
-    }
-    // Active plugins append their own paragraph — nothing when none is on,
-    // so a plugin-free workspace hands agents byte-identical instructions.
-    for paragraph in plugin_paragraphs {
-        instructions.push_str(paragraph);
     }
     json!({
         "protocolVersion": requested,

@@ -1,8 +1,9 @@
 # PowerPoint: a plugin that helps agents make good decks
 
-> **Dated design record (2026-11-04), pre-implementation proposal.** Awaiting the
-> maintainer's go-ahead. Nothing here has shipped. Viewing decks and referencing
-> slides stay core ([document workbench](document-workbench-plan.md), issue
+> **Dated design record (2026-11-04).** The maintainer approved the
+> recommended answers the same day (A as a picture line, B yes, C3 now, the name
+> PowerPoint); [as built](#as-built-2026-11-04) records what changed while building.
+> Viewing decks and referencing slides stay core ([document workbench](document-workbench-plan.md), issue
 > martinappberg/chimaera#345); this plan is the opt-in authoring half.
 
 Agents write `.pptx` files blind. They place boxes on blank slides, overflow text,
@@ -315,3 +316,32 @@ it to `plugins/plugins.lock`.
 - **`line` as slide.** The deck viewer could treat an `open-file` line as a slide (as
   `#slide=N` already is), so a problem's **Go to** lands on its slide. The viewer
   session's call.
+
+## As built (2026-11-04)
+
+Built as planned, with these differences, each found in the live run:
+
+- **Plugin paragraphs now come first in `initialize`.** Claude Code keeps only the
+  first ~4 KB of an MCP server's instructions, and chimaera's own text fills that, so
+  every plugin's paragraph (LaTeX's and Typst's too) was cut off before Claude saw it.
+  The paragraphs now lead (`mcp.rs::initialize_result`); a plugin-free workspace is
+  unchanged.
+- **The paragraph names the competing skill.** With Claude's own pptx skill
+  installed, the first two live runs went to pptxgenjs from scratch. The paragraph now
+  says the plugin's tools take precedence for .pptx work here; the third run started
+  with that skill, then loaded the plugin's tools and finished the loop on them.
+- **A screen can fill its tab** (`"fill": true` on the tree): the `image` node's
+  fixed 240 px box made slides unreadable in a tab. Slides and Themes show one
+  picture at a time (a switch in the header) that takes the tab's height.
+- **The theme helper ships with the workbench plugin** (`deck_themes` writes
+  `scripts/deck.py` beside the templates), not only in the agent-side skill.
+- **Overflow lines must run on from their box**: a chart label repeating a title's
+  word ("May") was read as the title's overflow.
+- **Renders carry a version** in their stamp, so an update never answers with
+  pictures an older build drew.
+
+Proven live (isolated daemon, a fictional data set): Claude (Sonnet 5.5) built a
+themed 7-slide deck with native charts, rendered it, saw the contact sheet and single
+slides, and re-rendered to "Nothing to fix"; Codex (gpt-6.1-sol) called
+`render_slides` and described the slide's picture (colour and layout). An 11.5 MB deck
+went through the copy path; the measured overflow matched the picture.

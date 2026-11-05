@@ -844,7 +844,7 @@ has what 0.2 adds:
 
 ### Screens: `ui/1`
 
-A view's tree is `{"ui": "1", "root": <node>}`; a node is `{"type": …,
+A view's tree is `{"ui": "1", "root": <node>}` (and optionally `"fill": true`, below); a node is `{"type": …,
 props…, "children": […]}` (`chimaera_plugin_api::ui` has helpers). Props are
 semantic, never visual: `tone` is `neutral | accent | good | warn | bad`, `size`
 `small | large`, `gap` `small | large`. The daemon checks every tree before a
@@ -903,7 +903,10 @@ action's `open`), `panel` (the dashboard, after core's sections), `file` (a
 claimed file; the view owns the pane: the root stack's last child grows to its
 height, and an `editor` or `pdf` first in a split pane, a stack or a tab fills
 it — an embedded viewer shows no path bar), `status` (a chip in a claimed file's bar), `card` (inside its
-Extensions card). The UI renders only on open, on an action, and on
+Extensions card). Any other view takes the same layout when its tree says
+`"fill": true` beside `ui` and `root` (a tab whose split puts an `image` or `pdf`
+first in a pane: the PowerPoint plugin's Slides and Themes); otherwise a viewer
+keeps its fixed box. The UI renders only on open, on an action, and on
 `invalidate`; nothing polls.
 
 ### Data surfaces

@@ -162,8 +162,10 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     settings and tools — pinned by `crates/chimaera-server/src/tests/agent_view.rs`. Where
     active, a plugin's tools join `tools/list`, pass the call gate (elsewhere a call is refused,
     JSON-RPC -32602, "… isn't switched on in this workspace …"), and its instruction paragraph
-    joins `initialize`, in catalog (id) order. A plugin that can't answer (refused, faulted)
-    adds nothing.
+    joins `initialize`, in catalog (id) order, **before** chimaera's own text: Claude Code
+    keeps only the first ~4 KB of a server's instructions, which chimaera's text alone
+    fills, so a paragraph after it never reached Claude (`mcp.rs::initialize_result`). A
+    plugin that can't answer (refused, faulted) adds nothing.
   - **Pre-allowed at spawn:** claude — `mcp__chimaera__<tool>` in the generated settings'
     `permissions.allow` (chat and TUI); codex chat — the driver's `mcp_auto_approve`; codex
     TUI — `-c mcp_servers.chimaera.url=…` + `bearer_token_env_var="CHIMAERA_MCP_KEY"` (the key
