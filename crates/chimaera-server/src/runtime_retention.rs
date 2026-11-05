@@ -299,7 +299,17 @@ fn valid_version(name: &str) -> bool {
 }
 
 fn active_version(root: &Path, kind: AgentKind, executable: &str) -> anyhow::Result<String> {
-    let target = std::fs::read_link(root.join("bin").join(executable))?;
+    let link = root.join("bin").join(executable);
+    // An agent's own updater can write its new build over the path it ran
+    // from (agy did, 2026-11-03). Which package is live is then unknown, so
+    // nothing is pruned until the next managed install restores the link.
+    anyhow::ensure!(
+        std::fs::symlink_metadata(&link)?.file_type().is_symlink(),
+        "{} replaced its activation link with a file (its own updater); \
+         keeping every package until the next install or update",
+        kind.product_name()
+    );
+    let target = std::fs::read_link(link)?;
     let components: Vec<_> = target.components().collect();
     anyhow::ensure!(
         components.len() >= 4
@@ -422,6 +432,24 @@ mod tests {
         assert!(!old.exists());
         assert!(!older.exists());
         assert!(current.join("companion").exists());
+    }
+
+    /// agy's own updater wrote its new build over `bin/agy` (2026-11-03):
+    /// the live package is unknown, so nothing is pruned, and the reason
+    /// says so.
+    #[test]
+    fn a_self_updated_activation_keeps_every_package() {
+        let f = Fixture::new();
+        let old = f.package("agy", "1.2.16");
+        let chat_owner = f.package("agy", "1.3.4");
+        std::fs::write(f.root().join("bin/agy"), "a newer build, written in place").unwrap();
+        let error = prune_locked(&f.root(), AgentKind::Antigravity).unwrap_err();
+        assert!(
+            error.to_string().contains("replaced its activation link"),
+            "{error}"
+        );
+        assert!(old.join("companion").exists());
+        assert!(chat_owner.join("companion").exists());
     }
 
     #[tokio::test]

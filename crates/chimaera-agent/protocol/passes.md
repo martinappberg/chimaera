@@ -1915,3 +1915,31 @@ Reported (#355): with more than one message waiting, Send now did not send them 
 - Live, new: `tests/live.rs` `driver_codex_send_now_answers_every_waiting_message`. Through the real driver on codex 0.166.0 (gpt-5.6-luna), A is read, C waits for after the turn, and Send now is pressed on B: the turn it opens answers `A=42` and `B=63`, then C answers `C=99` (two runs of two). The pre-fix driver fails it with only `B=63`.
 - Live suites (2026-11-04): every Codex test on 0.166.0 (16); the Claude queue and Send now tests on 2.1.318 (send now spares background agents, mid-turn queue, `next` read mid-turn, `cancel_async_message`, Stop puts back a taken message, rapid queued sends, the end-to-end driver stack); `just chat-smoke-acp` on Grok 1.0.70, agy-acp 1.4.5 and Cursor 2026.10.22. One test failed in each group (`codex_collab_subagent_can_outlive_parent_turn`, `claude_stop_puts_back_a_just_taken_message`, Grok's startup handshake while its `initialize` took 12–16 s); none of them exercises the changed code, and each passed when rerun alone.
 - Live UI (isolated daemon, Vite on this branch, Claude haiku): A and B waiting for the next step and C for after the turn drew one Send now under the stack. ✎ on B put its text back in the composer, and the edited B was resent. Send now stopped the running command; A and the edited B were answered in one turn, then C. ↑ in the empty composer during a later turn took both waiting messages back into one draft, in order.
+
+## Pass 61 — 2026-11-04: ACP follow-ups from the latest-versions drift pass (grok 1.0.70, agy-acp 1.4.5, agy 1.3.4/1.5.0, cursor-agent 2026.10.22)
+
+The same day's drift pass probed the newest Grok Build, Antigravity and Cursor releases with raw ACP clients, logging every frame. Its `just chat-smoke-acp` run passed 3/3 on Grok 1.0.70, agy-acp 1.4.5 and Cursor 2026.10.22. The pins moved in Pass 59 (#371), which recorded these gaps as not yet handled. This pass adopts the four gaps that run found. Facts are in [acp.md](acp.md).
+
+### Findings
+
+- **Grok billing reads empty.** `_x.ai/billing` no longer carries `config.creditUsagePercent`, on 1.0.46 and 1.0.70 against the same account. The answer is proto3 JSON, which omits zero values, so an unused week has `currentPeriod` and no percent. `grok_billing_usage` returned no window, so the limit chip and the Agent-settings read showed nothing.
+- **agy-acp 1.4.5 split the model control.** `model` now lists families and a `thinking_level` control (`thought_level`) carries the effort. A model remembered from 1.2.1's combined ids (`gemini-3.8-flash-high`) was "not offered": restoring it raised a notice and lost the effort.
+- **No shell output for agy or Cursor.** Their completed shell update has no `content`. The output is in `rawOutput`: agy `combinedOutput`, Cursor `stdout`/`stderr`. Only Grok's rows showed output.
+- **agy rewrites its managed install.** agy's own background updater writes the new build over the path agy was started from. On 2026-11-03 the managed `bin/agy` activation symlink became a 1.5.0 regular file, with `agy/1.3.4/` intact. Reproduced 2026-11-04 in a throwaway managed layout and HOME: one `agy -p /usage` (the daemon's own usage probe) replaced the link within seconds, and `update_status.json` read "Update successful". `AGY_CLI_DISABLE_AUTO_UPDATE=true` stops it (the log says so and the link stays); `=1` does not. Effects of a rewritten link: retention's `active_version` fails (`read_link` on a file), so agy packages are never pruned (fail-closed, no data lost). Update awareness reads the new binary's own version, so no update is offered that would restore the link. Per-version leases no longer apply to that binary.
+
+### Adopted
+
+- `grok_billing_usage`: a `currentPeriod` without a percent is 0%.
+- `AcpMapper::split_thought_level`: a model id that is not offered, but whose `-<level>` suffix splits into an offered model and an offered thinking level, sends both `session/set_config_option`s. Restore or pick, no notice. The level goes out only after the model's answer (`deferred_effort`, for any thinking-level change made while a model change is unanswered): the first live run sent both at once, and agy answered the level first, still `high`, because its model change reset it.
+- `raw_shell_output`: a completed or failed update with no `content` draws `combinedOutput`, else `stdout` then `stderr`, capped like `content`.
+- `runtimes::AGY_NO_SELF_UPDATE` (`AGY_CLI_DISABLE_AUTO_UPDATE=true`): every probe (`agent_probe::base_command`; a probe reads and never updates an install, the user's own included) and every spawn of a managed agy (the shim's managed fallback, PTY agent sessions, sign-in, extension actions; `runtimes::managed_agent_env`, judged by detection's `managed` on the activation path, since a leased path is canonical). A user's own agy keeps its updater. Retention names a rewritten activation link in its log instead of an opaque I/O error.
+
+### Not adopted (recorded for later)
+
+- A system-context channel for fork copies instead of prepending them to the first prompt: Grok `session/new` `_meta.rules` and agy-acp 1.4.5 `_meta.antigravity.systemPrompt.append` (advertised as `agentCapabilities._meta.antigravity.systemPrompt.append`). Both answered a secret word given only there. This changes `ForkContextConsumed`'s meaning and needs its own design.
+- Cursor's opt-in `clientCapabilities.subagents` (subagent lanes) and `_meta.parameterizedModelPicker` (plain model ids plus per-model options): bundle shapes only, no live turn.
+- Moving Antigravity chat to `agy acp` (1.5.0 CLI): it advertises no `mcpCapabilities`, and on the probed account every turn answered "You do not have a valid license" while the standalone server worked.
+
+### Gate (Pass 61)
+
+- Hermetic, new: `acp.rs` `grok_billing_without_a_percent_reads_an_unused_period`, `a_combined_model_id_restores_as_model_and_thinking_level`, `shell_output_comes_from_raw_output_when_content_is_absent` (all from the logged frames); `runtimes.rs` `shim_turns_off_self_update_for_the_managed_agy_only`, `only_a_managed_agy_spawn_turns_off_self_update`; `agent_probe.rs` `probes_never_start_an_agent_self_update`; `runtime_retention.rs` `a_self_updated_activation_keeps_every_package`.

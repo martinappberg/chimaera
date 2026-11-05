@@ -143,10 +143,15 @@ pub(crate) async fn spawn_session(
             resume,
         } => {
             let agent_kind = *agent_kind;
-            let bin = match crate::launcher::detect(state, agent_kind, false).await.path {
+            let detection = crate::launcher::detect(state, agent_kind, false).await;
+            let bin = match detection.path {
                 Ok(path) => path,
                 Err(msg) => return Err(SpawnFailure::AgentUnavailable(msg)),
             };
+            opts.env.extend(crate::runtimes::managed_agent_env(
+                agent_kind,
+                detection.managed,
+            ));
             let (guard, mut binaries) =
                 crate::runtime_retention::acquire(state, Some(agent_kind), vec![bin])
                     .await

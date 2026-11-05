@@ -716,6 +716,7 @@ pub(crate) async fn start(
                 .env
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
+                .chain(crate::runtimes::managed_agent_env(kind, detection.managed))
                 .collect(),
             stdin: recipe.accepts_code,
             cwd: workspace.root.clone(),

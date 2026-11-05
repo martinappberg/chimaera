@@ -276,6 +276,12 @@ enum Pending {
     /// Grok's `_x.ai/billing`: the account's credit window after a turn.
     GrokBilling,
 }
+impl Pending {
+    /// A model change, by config option or by `session/set_model`.
+    fn changes_model(&self) -> bool {
+        matches!(self, Pending::Model(_)) || matches!(self, Pending::Config(c, ..) if c == "model")
+    }
+}
 struct Queued {
     id: String,
     blocks: Vec<ContentBlock>,
@@ -312,6 +318,11 @@ pub struct AcpMapper {
     /// between turns, and its command is listed only after the handshake.
     /// The request waits here (mode id, chosen) until it can be sent.
     deferred_mode: Option<(String, bool)>,
+    /// A thinking-level change made while a model change is unanswered
+    /// (level, chosen), sent once that answer lands. agy-acp 1.4.5 runs two
+    /// `set_config_option`s at once and the model's resets the level: sent
+    /// back to back, `thinking_level low` answered `high` (live 2026-11-04).
+    deferred_effort: Option<(String, bool)>,
     /// Which agent the frames come from: each names an MCP tool call in its
     /// own pinned shape (`mcp_call`, PROTOCOL.md Pass 45).
     kind: &'static str,
@@ -353,10 +364,16 @@ fn context_usage(used: &Value, size: &Value) -> Option<AgentEvent> {
 /// for the daemon's Agent-settings read.
 pub fn grok_billing_usage(result: &Value) -> (Vec<UsageWindow>, bool) {
     let config = &result["config"];
-    let Some(pct) = config["creditUsagePercent"].as_f64() else {
+    let period = &config["currentPeriod"];
+    // The answer is proto3 JSON, which omits a zero-valued field: an unused
+    // week has `currentPeriod` and no `creditUsagePercent` (live 2026-11-04,
+    // Grok 1.0.46 and 1.0.70 alike). Without a period nothing is known.
+    let Some(pct) = config["creditUsagePercent"]
+        .as_f64()
+        .or_else(|| period.is_object().then_some(0.0))
+    else {
         return (Vec::new(), false);
     };
-    let period = &config["currentPeriod"];
     let label = match period["type"].as_str() {
         Some("USAGE_PERIOD_TYPE_WEEKLY") => "weekly limit",
         Some("USAGE_PERIOD_TYPE_MONTHLY") => "monthly limit",
@@ -370,6 +387,31 @@ pub fn grok_billing_usage(result: &Value) -> (Vec<UsageWindow>, bool) {
         resets_at: period["end"].as_str().map(|end| truncate_label(end, 40)),
     };
     (vec![window], pct >= 100.0)
+}
+
+/// A finished shell call's output from its `rawOutput`, for agents whose
+/// completed update carries no `content` (live 2026-11-04): agy-acp 1.4.5
+/// `{combinedOutput, exitCode, …}`, Cursor 2026.10.22 `{exitCode, stdout,
+/// stderr}`. Grok sends `content` text and never reaches here.
+fn raw_shell_output(raw: &Value) -> Option<ToolContent> {
+    let field = |key: &str| raw[key].as_str().filter(|s| !s.is_empty());
+    let joined;
+    let output = match (field("combinedOutput"), field("stdout"), field("stderr")) {
+        (Some(combined), ..) => combined,
+        (None, Some(out), Some(err)) => {
+            joined = format!("{}\n{err}", out.trim_end_matches('\n'));
+            &joined
+        }
+        (None, Some(one), None) | (None, None, Some(one)) => one,
+        (None, None, None) => return None,
+    };
+    Some(output_content(output))
+}
+
+/// A tool's text output, capped the same way wherever it comes from.
+fn output_content(output: &str) -> ToolContent {
+    let (text, truncated) = cap_head_tail(output, 3072, 1024);
+    ToolContent::Output { text, truncated }
 }
 
 fn text(v: &Value) -> String {
@@ -467,6 +509,7 @@ impl AcpMapper {
             rate_limit_sent: None,
             always_approve: false,
             deferred_mode: None,
+            deferred_effort: None,
             kind,
             mcp_auto_approve: None,
             mcp_calls: HashMap::new(),
@@ -909,11 +952,21 @@ impl AcpMapper {
             .collect()
     }
     fn config_command(&mut self, category: &str, value: &str, step: &mut DriverStep) {
+        let model_in_flight = self.pending.values().any(Pending::changes_model);
+        if category == "thought_level" && model_in_flight {
+            self.deferred_effort = Some((value.into(), !self.restoring));
+            return;
+        }
         let control = rows(&self.config)
             .find(|c| c["category"] == category)
             .cloned();
         if let Some(c) = control {
             if !rows(&c["options"]).any(|o| o["value"] == value) {
+                if let Some((model, level)) = self.split_thought_level(category, value) {
+                    self.config_command("model", &model, step);
+                    self.config_command("thought_level", &level, step);
+                    return;
+                }
                 step.events.push(AgentEvent::Notice {
                     text: "That option is not offered by this agent".into(),
                 });
@@ -948,6 +1001,27 @@ impl AcpMapper {
             };
             self.request(method, params, pending, step);
         }
+    }
+    /// A model id that bundles its thinking level (agy-acp 1.2.1 offered
+    /// `gemini-3.8-flash-high`; 1.4.5 offers model `gemini-3.8-flash` plus a
+    /// `thought_level` control) as the two values it now is, when the agent
+    /// offers both. A remembered pick from the old catalog then restores the
+    /// same model and effort instead of a "not offered" notice.
+    fn split_thought_level(&self, category: &str, value: &str) -> Option<(String, String)> {
+        if category != "model" {
+            return None;
+        }
+        let offers = |category: &str, value: &str| {
+            rows(&self.config)
+                .find(|c| c["category"] == category)
+                .is_some_and(|c| rows(&c["options"]).any(|o| o["value"] == value))
+        };
+        // Every hyphen, so a level that has one of its own still splits.
+        value.match_indices('-').find_map(|(at, _)| {
+            let (model, level) = (&value[..at], &value[at + 1..]);
+            (offers("model", model) && offers("thought_level", level))
+                .then(|| (model.to_owned(), level.to_owned()))
+        })
     }
     fn catalog(&self) -> AgentEvent {
         AgentEvent::Catalog {
@@ -1144,6 +1218,7 @@ impl Mapper for AcpMapper {
                 return step;
             };
             let error = frame.get("error").map(|e| text(&e["message"]));
+            let model_answered = pending.changes_model();
             match pending {
                 Pending::Prompt(turn_id) => {
                     self.flush_into(&mut step);
@@ -1274,6 +1349,15 @@ impl Mapper for AcpMapper {
                 }
                 Pending::Model(value) => self.changed("model", value, true, &mut step),
                 Pending::Mode(value, chosen) => self.changed("mode", value, chosen, &mut step),
+            }
+            // Answered or refused, the model change is settled: the held
+            // level is checked against the controls that answer left.
+            if model_answered {
+                if let Some((level, chosen)) = self.deferred_effort.take() {
+                    let restoring = std::mem::replace(&mut self.restoring, !chosen);
+                    self.config_command("thought_level", &level, &mut step);
+                    self.restoring = restoring;
+                }
             }
             return step;
         }
@@ -1547,17 +1631,19 @@ impl Mapper for AcpMapper {
                                 truncated,
                             })
                         } else if v["content"]["type"] == "text" {
-                            let (text, truncated) = cap_head_tail(
+                            Some(output_content(
                                 v["content"]["text"].as_str().unwrap_or_default(),
-                                3072,
-                                1024,
-                            );
-                            Some(ToolContent::Output { text, truncated })
+                            ))
                         } else {
                             None
                         }
                     })
                     .collect::<Vec<_>>();
+                let content = if content.is_empty() && ended {
+                    raw_shell_output(&update["rawOutput"]).into_iter().collect()
+                } else {
+                    content
+                };
                 let content = match content.len() {
                     0 => None,
                     1 => content.into_iter().next(),
@@ -2660,6 +2746,238 @@ mod tests {
         assert!(matches!(
             step.events.first(),
             Some(AgentEvent::ToolCall { .. })
+        ));
+    }
+
+    /// Grok 1.0.70 against an unused week, captured 2026-11-04: proto3 JSON
+    /// omits the zero `creditUsagePercent`, so the period alone means 0%.
+    #[test]
+    fn grok_billing_without_a_percent_reads_an_unused_period() {
+        let live = json!({"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY",
+            "start":"2026-11-02T22:01:10.278537+00:00","end":"2026-11-09T22:01:10.278537+00:00"},
+            "onDemandCap":{"val":0},"onDemandUsed":{"val":0},"prepaidBalance":{"val":0},
+            "isUnifiedBillingUser":true,"billingPeriodStart":"2026-11-02T22:01:10.278537+00:00",
+            "billingPeriodEnd":"2026-11-09T22:01:10.278537+00:00"},"subscription_tier":"SuperGrok Lite"});
+        let (windows, reached) = grok_billing_usage(&live);
+        assert!(!reached);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].label, "weekly limit");
+        assert_eq!(windows[0].utilization, 0.0);
+        assert_eq!(
+            windows[0].resets_at.as_deref(),
+            Some("2026-11-09T22:01:10.278537+00:00")
+        );
+        // No period, no percent: nothing to show (an older or refused read).
+        assert!(grok_billing_usage(&json!({"config":{}})).0.is_empty());
+        assert!(grok_billing_usage(&json!({})).0.is_empty());
+    }
+
+    /// agy-acp 1.4.5's catalog (captured 2026-11-04): a model family plus a
+    /// separate `thinking_level`. A pick remembered from 1.2.1's combined ids
+    /// restores as both values, quietly, the level only once the model's
+    /// answer is in (sent together, agy's model change reset the level).
+    #[test]
+    fn a_combined_model_id_restores_as_model_and_thinking_level() {
+        let config = |model: &str, level: &str| {
+            json!([
+            {"id":"model","name":"Model","category":"model","type":"select","currentValue":model,
+             "options":[{"value":"gemini-4-argon","name":"Gemini 4 Argon"},{"value":"gemini-3.8-flash","name":"Gemini 3.8 Flash"}]},
+            {"id":"thinking_level","name":"Thinking Level","category":"thought_level","type":"select","currentValue":level,
+             "options":[{"value":"low","name":"Low"},{"value":"medium","name":"Medium"},{"value":"high","name":"High"}]},
+            {"id":"mode","name":"Session Mode","category":"mode","type":"select","currentValue":"default",
+             "options":[{"value":"default","name":"Default"},{"value":"auto_edit","name":"Auto Edit"},{"value":"yolo","name":"YOLO"}]}])
+        };
+        let set = |step: &DriverStep| -> Vec<(Value, Value)> {
+            step.outbound
+                .iter()
+                .map(|f| {
+                    assert_eq!(f["method"], "session/set_config_option");
+                    (
+                        f["params"]["configId"].clone(),
+                        f["params"]["value"].clone(),
+                    )
+                })
+                .collect()
+        };
+        let no_notice = |step: &DriverStep| {
+            assert!(
+                !step
+                    .events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::Notice { .. })),
+                "{:?}",
+                step.events
+            )
+        };
+        let mut m = mapper();
+        m.set_config(&config("gemini-3.8-flash", "high"));
+        m.restoring = true;
+        let model = m.on_command(AgentCommand::SetModel {
+            model_id: "gemini-4-argon-low".into(),
+        });
+        m.restoring = false;
+        no_notice(&model);
+        assert_eq!(set(&model), [(json!("model"), json!("gemini-4-argon"))]);
+        let answered = m.on_frame(&json!({"id":model.outbound[0]["id"],
+            "result":{"configOptions":config("gemini-4-argon","high")}}));
+        no_notice(&answered);
+        assert_eq!(set(&answered), [(json!("thinking_level"), json!("low"))]);
+        let level = m.on_frame(&json!({"id":answered.outbound[0]["id"],
+            "result":{"configOptions":config("gemini-4-argon","low")}}));
+        // A restore is not a pick, for the level either.
+        assert!(level.events.iter().any(|e| matches!(e,
+            AgentEvent::EffortState { effort: Some(l), chosen: false, .. } if l == "low")));
+        assert!(!level
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::EffortState { chosen: true, .. })));
+
+        // A level picked while a model change is unanswered waits for it,
+        // and the latest pick wins.
+        let model = m.on_command(AgentCommand::SetModel {
+            model_id: "gemini-3.8-flash".into(),
+        });
+        for effort_id in ["medium", "high"] {
+            let held = m.on_command(AgentCommand::SetEffort {
+                effort_id: effort_id.into(),
+            });
+            assert!(held.outbound.is_empty() && held.events.is_empty());
+        }
+        let refused = m.on_frame(
+            &json!({"id":model.outbound[0]["id"],"error":{"code":-32603,"message":"no"}}),
+        );
+        assert_eq!(set(&refused), [(json!("thinking_level"), json!("high"))]);
+
+        // Either half unknown is still not offered.
+        for unknown in ["gemini-9-low", "gemini-4-argon-ultra", "gemini"] {
+            let step = m.on_command(AgentCommand::SetModel {
+                model_id: unknown.into(),
+            });
+            assert!(step.outbound.is_empty(), "{unknown}");
+            assert!(
+                matches!(step.events[..], [AgentEvent::Notice { .. }]),
+                "{unknown}"
+            );
+        }
+    }
+
+    /// A level with a hyphen of its own still splits, and a level change
+    /// also waits behind a `session/set_model` model change.
+    #[test]
+    fn thinking_level_split_and_hold_cover_every_model_change() {
+        let mut m = mapper();
+        m.set_config(&json!([
+            {"id":"model","category":"model","type":"select","currentValue":"m-x",
+             "options":[{"value":"m-x","name":"X"},{"value":"m-y","name":"Y"}]},
+            {"id":"level","category":"thought_level","type":"select","currentValue":"low",
+             "options":[{"value":"low","name":"Low"},{"value":"extra-high","name":"Extra high"}]}]));
+        let model = m.on_command(AgentCommand::SetModel {
+            model_id: "m-y-extra-high".into(),
+        });
+        assert_eq!(model.outbound[0]["params"]["value"], "m-y");
+        let answered = m.on_frame(&json!({"id":model.outbound[0]["id"],"result":{}}));
+        assert_eq!(answered.outbound[0]["params"]["configId"], "level");
+        assert_eq!(answered.outbound[0]["params"]["value"], "extra-high");
+
+        // Models listed outside configOptions change by `session/set_model`.
+        let session = json!({"models":{"availableModels":[{"modelId":"a"},{"modelId":"b"}],"currentModelId":"a"},
+            "configOptions":[{"id":"level","category":"thought_level","type":"select","currentValue":"low",
+             "options":[{"value":"low","name":"Low"},{"value":"high","name":"High"}]}]});
+        let mut m = AcpMapper::new("session".into(), &json!({}), &session, "");
+        let model = m.on_command(AgentCommand::SetModel {
+            model_id: "b".into(),
+        });
+        assert_eq!(model.outbound[0]["method"], "session/set_model");
+        let held = m.on_command(AgentCommand::SetEffort {
+            effort_id: "high".into(),
+        });
+        assert!(held.outbound.is_empty());
+        let answered = m.on_frame(&json!({"id":model.outbound[0]["id"],"result":{}}));
+        assert_eq!(answered.outbound[0]["method"], "session/set_config_option");
+        assert_eq!(answered.outbound[0]["params"]["value"], "high");
+    }
+
+    /// A finished shell call that carries its output only in `rawOutput`
+    /// (frames captured 2026-11-04) draws that output on the row.
+    #[test]
+    fn shell_output_comes_from_raw_output_when_content_is_absent() {
+        let output = |step: &DriverStep| match step.events.last() {
+            Some(AgentEvent::ToolCallUpdate {
+                status: ToolStatus::Completed,
+                content: Some(ToolContent::Output { text, .. }),
+                ..
+            }) => text.clone(),
+            other => panic!("expected a completed row with output, got {other:?}"),
+        };
+        // agy-acp 1.4.5
+        let mut m = mapper();
+        let id = "d597df073fc54e419fd71e6f776397c8";
+        m.on_frame(&update(json!({"toolCallId":id,"title":"touch probe-file.txt && echo hi","kind":"execute",
+            "status":"pending","rawInput":{"CommandLine":"touch probe-file.txt && echo hi"},"sessionUpdate":"tool_call"})));
+        m.on_frame(&update(
+            json!({"toolCallId":id,"kind":"execute","status":"in_progress",
+            "title":"touch probe-file.txt && echo hi","sessionUpdate":"tool_call_update"}),
+        ));
+        let done = m.on_frame(&update(json!({"toolCallId":id,"status":"completed","rawOutput":{
+            "commandLine":"touch probe-file.txt && echo hi","workingDir":"/tmp/w","exitCode":0,"exit_code":0,
+            "combinedOutput":"hi\r\n","formatted_output":"hi\r\n"},"sessionUpdate":"tool_call_update"})));
+        assert_eq!(output(&done), "hi\r\n");
+
+        // cursor-agent 2026.10.22-27dcf5f, with stderr appended.
+        let mut m = mapper();
+        m.kind = CURSOR.kind;
+        let id = "call-6ad532a1-b8f6-4648-a10b-d5650c7ba563-0\nfc_d6b24cd1-c5e2-914b-8ea9-8ca4a374f363_0";
+        m.on_frame(&update(json!({"sessionUpdate":"tool_call","toolCallId":id,
+            "title":"`touch probe-file.txt && echo hi`","kind":"execute","status":"pending",
+            "rawInput":{"command":"touch probe-file.txt && echo hi"}})));
+        let done = m.on_frame(&update(
+            json!({"sessionUpdate":"tool_call_update","toolCallId":id,
+            "status":"completed","rawOutput":{"exitCode":0,"stdout":"hi\n","stderr":""}}),
+        ));
+        assert_eq!(output(&done), "hi\n");
+        let id = "second";
+        m.on_frame(&update(
+            json!({"sessionUpdate":"tool_call","toolCallId":id,"title":"`ls nope`",
+            "kind":"execute","status":"pending"}),
+        ));
+        let done = m.on_frame(&update(json!({"sessionUpdate":"tool_call_update","toolCallId":id,
+            "status":"failed","rawOutput":{"exitCode":1,"stdout":"partial\n","stderr":"ls: nope: No such file\n"}})));
+        assert!(matches!(
+            done.events.last(),
+            Some(AgentEvent::ToolCallUpdate {
+                status: ToolStatus::Failed,
+                content: Some(ToolContent::Output { text, .. }),
+                ..
+            }) if text == "partial\nls: nope: No such file\n"
+        ));
+
+        // Content wins when present; an MCP result and an empty stream add nothing.
+        let mut m = mapper();
+        let done = m.on_frame(&update(json!({"sessionUpdate":"tool_call_update","toolCallId":"g",
+            "status":"completed","content":[{"type":"content","content":{"type":"text","text":"hi\n"}}],
+            "rawOutput":{"combinedOutput":"other"}})));
+        assert_eq!(output(&done), "hi\n");
+        for raw in [
+            json!({"success":true}),
+            json!({"exitCode":0,"stdout":"","stderr":""}),
+        ] {
+            let done = m.on_frame(&update(
+                json!({"sessionUpdate":"tool_call_update","toolCallId":"m",
+                "status":"completed","rawOutput":raw}),
+            ));
+            assert!(matches!(
+                done.events.last(),
+                Some(AgentEvent::ToolCallUpdate { content: None, .. })
+            ));
+        }
+        // An unfinished update never reads rawOutput.
+        let running = m.on_frame(&update(
+            json!({"sessionUpdate":"tool_call_update","toolCallId":"r",
+            "status":"in_progress","rawOutput":{"combinedOutput":"partial"}}),
+        ));
+        assert!(matches!(
+            running.events.last(),
+            Some(AgentEvent::ToolCallUpdate { content: None, .. })
         ));
     }
 }
