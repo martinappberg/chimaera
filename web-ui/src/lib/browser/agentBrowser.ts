@@ -171,6 +171,21 @@ export class PaneViewRegistry {
   }
 }
 
+/**
+ * The shared tabs this window held that have left its layout since (closed,
+ * their pane closed, dragged to another window) and are still linked: the
+ * ones to unshare. The caller skips the comparison across a workspace
+ * switch or a layout still restoring; a reload starts with nothing held,
+ * so it unshares nothing.
+ */
+export function sharedTabsLeft(
+  held: ReadonlySet<string>,
+  present: ReadonlySet<string>,
+  linked: ReadonlyMap<string, string>,
+): string[] {
+  return [...held].filter((tab) => !present.has(tab) && linked.has(tab));
+}
+
 // --- drive state and the take-over gate --------------------------------------
 
 /** What a shared pane's chrome shows about its agent (the daemon's `state`

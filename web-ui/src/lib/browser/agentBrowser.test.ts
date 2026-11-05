@@ -13,6 +13,7 @@ import {
   decodeBrowserRequest,
   offscreenRect,
   sameHello,
+  sharedTabsLeft,
   shouldTakeOver,
   type AgentBrowserHost,
   type BrowserEventMsg,
@@ -462,5 +463,23 @@ describe("driveProbeSaysPresent", () => {
     ]) {
       expect(driveProbeSaysPresent({ ok: false, error })).toBe(false);
     }
+  });
+});
+
+describe("sharedTabsLeft", () => {
+  const linked = new Map([
+    ["t1", "s-a"],
+    ["t2", "s-a"],
+  ]);
+  it("unshares a held tab that left the layout", () => {
+    expect(sharedTabsLeft(new Set(["t1", "t2"]), new Set(["t2", "t3"]), linked)).toEqual(["t1"]);
+  });
+  it("leaves alone a tab still here, one already unlinked, and one never held", () => {
+    expect(sharedTabsLeft(new Set(["t1"]), new Set(["t1"]), linked)).toEqual([]);
+    expect(sharedTabsLeft(new Set(["t9"]), new Set(), linked)).toEqual([]);
+    expect(sharedTabsLeft(new Set(), new Set(), linked)).toEqual([]);
+  });
+  it("a reload starts with nothing held, so it unshares nothing", () => {
+    expect(sharedTabsLeft(new Set(), new Set(["t1", "t2"]), linked)).toEqual([]);
   });
 });

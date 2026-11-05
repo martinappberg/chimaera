@@ -96,9 +96,8 @@ export async function putBrowserLink(tab: string, agentId: string): Promise<void
   );
 }
 
-/** `keepalive` lets the request outlive a closing window. */
-export async function deleteBrowserLink(tab: string, keepalive = false): Promise<void> {
-  await ok(await api(`/links/browser/${encodeURIComponent(tab)}`, { method: "DELETE", keepalive }));
+export async function deleteBrowserLink(tab: string): Promise<void> {
+  await ok(await api(`/links/browser/${encodeURIComponent(tab)}`, { method: "DELETE" }));
 }
 
 /** Every shared browser tab (the same list as the sessions frame's

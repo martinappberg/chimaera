@@ -319,7 +319,7 @@
     setBrowserLinkLocally,
     setBrowserLinks,
   } from "./lib/browser/agentBrowserRuntime";
-  import type { Handover } from "./lib/browser/agentBrowser";
+  import { sharedTabsLeft, type Handover } from "./lib/browser/agentBrowser";
   import type { BrowserLink } from "./lib/net/browserWire";
   import { targetLabel } from "./lib/browser/proxy";
   import UpdateToast from "./lib/workspace/UpdateToast.svelte";
@@ -1159,10 +1159,12 @@
     },
   });
 
-  // A shared browser tab that leaves this window — closed, its pane closed,
-  // the window closing — stops being shared: the daemon otherwise keeps the
-  // link until its agent ends. A workspace switch is not a close (the
-  // layout restores with the workspace): `layoutReady` drops across it.
+  // A shared browser tab that leaves this window's layout — closed, its pane
+  // closed, dragged to another window — stops being shared: the daemon
+  // otherwise keeps the link until its agent ends. Neither a reload (the
+  // tab comes back with the layout, its new view registers, the hello lists
+  // it again) nor a workspace switch (`layoutReady` drops across it) is a
+  // close.
   let heldShared = new Set<string>();
   let heldWs: string | null = null;
   $effect(() => {
@@ -1175,7 +1177,7 @@
     }
     untrack(() => {
       if (ready && ws === heldWs) {
-        for (const tab of heldShared) if (!present.has(tab) && linked.has(tab)) unshareClosed(tab);
+        for (const tab of sharedTabsLeft(heldShared, present, linked)) unshareClosed(tab);
       }
       // A hand-over whose tab went before its view took the page on: the
       // page has no owner left.
@@ -1190,9 +1192,9 @@
   });
 
   /** The tab went: no flash on failure (nothing on screen to explain it). */
-  function unshareClosed(tab: string, keepalive = false): void {
+  function unshareClosed(tab: string): void {
     setBrowserLinkLocally(tab, null);
-    deleteBrowserLink(tab, keepalive).catch(() => {
+    deleteBrowserLink(tab).catch(() => {
       // the daemon prunes it with its agent; the next frame says what holds
     });
   }
@@ -1403,8 +1405,6 @@
     const onPagehide = () => {
       void flushViewState();
       void flushSettings();
-      // The window is going (or reloading): its panes' pages go with it.
-      for (const tab of heldShared) unshareClosed(tab, true);
     };
     const onCopy = () => rememberCopy();
     // Holding the app modifier reveals numbered pane destinations.

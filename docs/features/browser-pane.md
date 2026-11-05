@@ -297,6 +297,7 @@ _Captured 2026-07-21 (from the maintainer, on the shipping PR)._
 
 ### Why agents can open a pane (`open_browser`)
 _Captured 2026-10-04 (from the maintainer, in the session that built it)._
+_Superseded 2026-11-05 in part by the entry below: the "one direction" and "never a way to validate" points._
 
 - **Problem it solves (maintainer's words):** "the in app browser is nice if we want
   someone to be able to preview what is building". The pane is the person's view of the
@@ -309,6 +310,11 @@ _Captured 2026-10-04 (from the maintainer, in the session that built it)._
 - **Silent, by decision:** he chose no permission prompt ("I'd rather it be silent") and
   confirmed "Silent everywhere" after being shown the shared-host risk recorded under
   Key constraints. Do not add a prompt, or a per-host exception, without asking.
+
+### `open_browser` beside the agent browser
+_Captured 2026-11-05 (the maintainer, issue #273)._
+
+- **Superseded:** agents now check pages with the agent browser's `browser_*` tools ([agent browser](agent-browser.md)). `open_browser` stays the "show the user" call: it reports nothing back, and its texts point agents at the `browser_*` tools for checking. The 2026-10-04 "never a way to validate" and "one direction" points are replaced by this; "silent, by decision" still holds.
 
 ### In a web view of its own (the macOS app)
 _Captured 2026-11-04 (the maintainer)._ The why and its grade live with the HTML preview's entry in

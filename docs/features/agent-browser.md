@@ -227,7 +227,10 @@ marker), `layout/PaneTabs.svelte` (the chain link and chips). Wire: `browser_req
 > this line is derived and may be regenerated; everything below is deliberate and must not
 > be "helpfully" changed without asking.
 
-### Why agents can see and drive pages — _Intent pending_
+### Why agents can see and drive pages
+_Captured 2026-11-05 (the maintainer, in the session that built it; the design decisions are on issue #273)._
 
-_Intent pending — not yet captured from the maintainer. The design decisions recorded on
-issue #273 (Q1–Q5) are the source for the capture-feature-intent step._
+- **Problem it solves:** agents check their own web work. An agent building or fixing a web UI (a dev server, a notebook, a dashboard) sees and drives the page itself, inside Chimaera, instead of guessing or running a headless script the user never sees.
+- **How settled it is:** all provisional. Only the why is settled; every piece can change if something works better, including the engine split, the tool set, the snapshot format and the pane chrome. The maintainer's #273 decisions (allowlist only, sharing through the chain link, eval allowed, user input pauses the agent, the app engine by default and Chromium otherwise) are the current design, not frozen contracts.
+- **Page reloads keep a share:** the maintainer asked that a shared pane stay shared when its page reloads because the agent changed the app's code. A share is keyed by the browser tab, so in-pane reloads and hot reloads never end it, and since 2026-11-05 neither does a reload of the Chimaera window.
+- **Do not change (or: open to change):** open to change; ask before weakening the navigation allowlist, which is the #273 Q1 decision.
