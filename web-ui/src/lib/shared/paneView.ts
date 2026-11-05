@@ -37,12 +37,23 @@
  *   freezing it behind a stand-in) creates a `PaneViewControl` and passes it
  *   in; its calls are no-ops until the view exists.
  *
+ * - **Embedded.** An embed card (`embedded`) sits in a scrolling document,
+ *   not a pane. Its view is cropped to the part of its clipping ancestors
+ *   on screen (the page keeps its place), hidden while its layer is parked
+ *   (transparent) or once it is scrolled out, and the wheel over a `passive`
+ *   one scrolls the document instead of the page (the shell hands it back:
+ *   a view never chains a wheel the way an iframe does). A scroll of an
+ *   ancestor follows the card frame by frame; with `stillWhileScrolling`
+ *   (the host draws a still of the page in the placeholder, which scrolls
+ *   in step) the view hides instead, and comes back once scrolling stops.
+ *
  * `onFallback` fires when the shell can't show the view (outside the app, an
  * app build without pane views, a refused URL): the caller renders its
  * iframe instead.
  */
 
 import {
+  type ViewFit,
   isNativeShell,
   listenNativeView,
   nativeViewChip,
@@ -88,6 +99,16 @@ export interface PaneViewParams {
   onLoading?: (loading: boolean) => void;
   /** The host's handle on this view (see `PaneViewControl`). */
   control?: PaneViewControl;
+  /** An embed card in a scrolling document (see "Embedded"). */
+  embedded?: boolean;
+  /** Embedded: the wheel over the view scrolls the document around it. */
+  passive?: boolean;
+  /** Embedded: hide the view while its document scrolls (the host shows a
+   *  still of it in the placeholder); without one the view follows. */
+  stillWhileScrolling?: boolean;
+  /** The view came on screen (`true`) or was hidden: a snapshot is only
+   *  worth taking while it is shown. */
+  onShown?: (shown: boolean) => void;
 }
 
 /** The longest a loading view stays hidden waiting for its page. */
@@ -232,6 +253,13 @@ const OVERLAY_SELECTOR = [
   "[data-overlay]",
 ].join(",");
 
+/** An embedded view stays hidden this long after its document last
+ *  scrolled (a wheel's momentum sends a scroll every frame until it ends). */
+const SCROLL_SETTLE_MS = 140;
+/** The embedded safety check: a card moves with no scroll and no resize of
+ *  its own when the document above it reflows. */
+const EMBEDDED_SAFETY_MS = 300;
+
 /** Smaller than this is not something a person reads over the page. */
 const OVERLAY_MIN_PX = 8;
 /** Frames a geometry burst runs on after the rect stopped moving. */
@@ -250,6 +278,36 @@ const sameRect = (a: ViewRect | null, b: ViewRect | null): boolean =>
   a.width === b.width &&
   a.height === b.height;
 
+/** `a` cut to `b`, or null when less than a pixel of it is left. */
+export function overlap(a: ViewRect, b: ViewRect): ViewRect | null {
+  const x = Math.max(a.x, b.x);
+  const y = Math.max(a.y, b.y);
+  const right = Math.min(a.x + a.width, b.x + b.width);
+  const bottom = Math.min(a.y + a.height, b.y + b.height);
+  return right - x >= 1 && bottom - y >= 1 ? { x, y, width: right - x, height: bottom - y } : null;
+}
+
+/** Where a view should be: its rect, the visible part of its scroller
+ *  (embedded only), and whether the wheel over it is the document's. */
+interface Placement {
+  rect: ViewRect;
+  clip: ViewRect | null;
+  passive: boolean;
+}
+
+const placementKey = (p: Placement | null): string =>
+  p === null
+    ? ""
+    : `${p.rect.x},${p.rect.y},${p.rect.width},${p.rect.height}|${p.clip === null ? "" : `${p.clip.x},${p.clip.y},${p.clip.width},${p.clip.height}`}|${p.passive ? 1 : 0}`;
+
+const fitOf = (p: Placement): ViewFit => (p.clip === null ? {} : { clip: p.clip, passive: p.passive });
+
+/** Whether an element's overflow clips what it holds. */
+function clipsContent(el: Element): boolean {
+  const style = getComputedStyle(el);
+  return style.overflowX !== "visible" || style.overflowY !== "visible" || /paint|strict|content/.test(style.contain);
+}
+
 const intersects = (a: DOMRect, b: ViewRect): boolean =>
   a.width >= OVERLAY_MIN_PX &&
   a.height >= OVERLAY_MIN_PX &&
@@ -261,7 +319,12 @@ const intersects = (a: DOMRect, b: ViewRect): boolean =>
 /** Whether an overlay candidate is actually painted: not in a parked
  *  (inert) layer, and not hidden by itself or an ancestor. */
 function painted(el: Element): boolean {
-  if (el.closest("[inert]") !== null) return false;
+  return el.closest("[inert]") === null && drawn(el);
+}
+
+/** Whether nothing hides an element: it, or an ancestor, is not
+ *  `display:none`, `visibility:hidden` or fully transparent. */
+function drawn(el: Element): boolean {
   const check = (el as Element & { checkVisibility?: (o: object) => boolean }).checkVisibility;
   if (check !== undefined) return check.call(el, { opacityProperty: true, visibilityProperty: true });
   const style = getComputedStyle(el);
@@ -300,7 +363,9 @@ class OverlayWatch {
     if (on) {
       // Whatever came and went while unwatched is re-collected.
       this.dirty = true;
-      this.observer.observe(document.body, { childList: true, subtree: true });
+      // `inert` flips park and un-park layers (a parked overlay stops
+      // counting; an embedded view's own layer hides it).
+      this.observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["inert"] });
     } else {
       this.observer.disconnect();
     }
@@ -312,6 +377,7 @@ class OverlayWatch {
   private relevant(records: MutationRecord[]): boolean {
     if (this.found.some((el) => !el.isConnected)) return true;
     for (const r of records) {
+      if (r.type === "attributes") return true;
       for (const n of r.addedNodes) {
         if (n instanceof Element && (n.matches(OVERLAY_SELECTOR) || n.querySelector(OVERLAY_SELECTOR) !== null)) {
           return true;
@@ -345,8 +411,8 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
   let created = false;
   let failed = false;
   let destroyed = false;
-  /** What the shell shows now: a rect, or null (hidden). */
-  let placed: ViewRect | null = null;
+  /** What the shell shows now (`placementKey`; "" = hidden). */
+  let placed = "";
   /** The URL the shell was last asked to show. */
   let showing: string | null = null;
   let dragging = false;
@@ -363,6 +429,13 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
   /** The view's own process died for good (the shell stopped reloading):
    *  hidden, so the host's error state shows, until a page reports in. */
   let crashed = false;
+  /** Embedded: its document is scrolling and the view stands down for the
+   *  host's still. */
+  let scrolling = false;
+  let scrollTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Embedded: the ancestors whose overflow crops it, nearest first
+   *  (re-collected by the safety check: cards don't move between parents). */
+  let clippers: Element[] | null = null;
 
   const loadingNow = (): boolean =>
     !failed && !crashed && params.url !== null && (awaiting || showing !== params.url);
@@ -464,14 +537,55 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
     return { x: Math.round(r.left), y: Math.round(r.top), width: Math.round(r.width), height: Math.round(r.height) };
   };
 
+  /** Embedded: the part of the window its clipping ancestors leave
+   *  visible (each one's padding box, scrollbars excluded). */
+  const visibleClip = (): ViewRect => {
+    if (clippers === null) {
+      clippers = [];
+      for (let p = node.parentElement; p !== null && p !== document.documentElement; p = p.parentElement) {
+        if (clipsContent(p)) clippers.push(p);
+      }
+    }
+    let left = 0;
+    let top = 0;
+    let right = window.innerWidth;
+    let bottom = window.innerHeight;
+    for (const el of clippers) {
+      const box = el.getBoundingClientRect();
+      const x = box.left + el.clientLeft;
+      const y = box.top + el.clientTop;
+      left = Math.max(left, x);
+      top = Math.max(top, y);
+      right = Math.min(right, x + el.clientWidth);
+      bottom = Math.min(bottom, y + el.clientHeight);
+    }
+    return {
+      x: Math.round(left),
+      y: Math.round(top),
+      width: Math.max(0, Math.round(right - left)),
+      height: Math.max(0, Math.round(bottom - top)),
+    };
+  };
+
   /** Where the view should be right now: null = hidden. */
-  const wanted = (): ViewRect | null => {
+  const wanted = (): Placement | null => {
     if (!params.shown || params.url === null || dragging || awaiting || crashed || control?.frozen === true) {
       return null;
     }
+    const embedded = params.embedded === true;
+    // A pane gets its layer's state as `shown`; a card reads it itself: a
+    // parked layer is transparent (and inert, whose flip wakes the overlay
+    // watch). Not `inert` alone: the hover preview's content is inert and
+    // on screen.
+    if (embedded && ((scrolling && params.stillWhileScrolling === true) || !drawn(node))) {
+      return null;
+    }
     const rect = measure();
-    if (rect === null || overlays.covering(rect)) return null;
-    return rect;
+    if (rect === null) return null;
+    const clip = embedded ? visibleClip() : null;
+    const seen = clip === null ? rect : overlap(rect, clip);
+    if (seen === null || overlays.covering(seen)) return null;
+    return { rect, clip, passive: embedded && params.passive === true };
   };
 
   async function sync(): Promise<void> {
@@ -484,16 +598,20 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
       do {
         again = false;
         if (destroyed || failed) return;
-        const rect = wanted();
+        const want = wanted();
         const url = params.url;
-        if (!crashed && params.shown && !dragging && url !== null && (!created || url !== showing)) {
+        // A card is made only once it could be shown: one in a parked tab
+        // or scrolled past (still "shown" to its observer) loads nothing.
+        const ready = params.embedded !== true || want !== null;
+        if (!crashed && params.shown && ready && !dragging && url !== null && (!created || url !== showing)) {
           // A create or a new URL: the shell makes or points the view
           // hidden, and it stays so until the page reports in (set before
           // the call: a fast page can report before the call returns).
-          const at = rect ?? measure();
+          const at = want?.rect ?? measure();
           if (at === null) continue;
           awaitPage(created ? showing : null);
-          const ok = await nativeViewShow(id, url, at, true);
+          const fit: ViewFit = params.embedded === true ? { clip: visibleClip(), passive: params.passive === true } : {};
+          const ok = await nativeViewShow(id, url, at, true, fit);
           // The view exists from here even if this action is gone: the
           // `finally` closes it then.
           if (ok) created = true;
@@ -506,14 +624,16 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
             return;
           }
           showing = url;
-          placed = null;
+          placed = "";
           report();
           control?.applyChip();
           // The page beat the call: place it on the next pass.
           if (!awaiting) again = true;
-        } else if (created && !(rect === null && placed === null) && !sameRect(rect, placed)) {
-          placed = rect;
-          await nativeViewPlace(id, rect);
+        } else if (created && placementKey(want) !== placed) {
+          const was = placed !== "";
+          placed = placementKey(want);
+          await (want === null ? nativeViewPlace(id, null) : nativeViewPlace(id, want.rect, fitOf(want)));
+          if (was !== (want !== null) && !destroyed) params.onShown?.(want !== null);
         }
       } while (again && !destroyed);
     } finally {
@@ -553,6 +673,27 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
     if (frame === 0) frame = requestAnimationFrame(tick);
   }
 
+  // Embedded: a scroll of anything holding the card moves it.
+  const onScroll = (e: Event): void => {
+    if (params.embedded !== true || destroyed) return;
+    const target = e.target;
+    if (!(target instanceof Node) || !target.contains(node)) return;
+    if (params.stillWhileScrolling !== true) {
+      burst();
+      return;
+    }
+    if (scrollTimer !== null) clearTimeout(scrollTimer);
+    scrollTimer = setTimeout(() => {
+      scrollTimer = null;
+      scrolling = false;
+      burst();
+    }, SCROLL_SETTLE_MS);
+    if (!scrolling) {
+      scrolling = true;
+      void sync();
+    }
+  };
+
   const overlays = new OverlayWatch(node, burst);
   const resizes = new ResizeObserver(burst);
   resizes.observe(node);
@@ -566,11 +707,15 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
     const want = params.shown && !destroyed && !failed;
     overlays.watch(want);
     if (want && safety === null) {
-      safety = setInterval(() => {
-        if (document.visibilityState !== "visible") return;
-        if (!sameRect(measure(), lastRect)) burst();
-        else void sync();
-      }, SAFETY_MS);
+      safety = setInterval(
+        () => {
+          if (document.visibilityState !== "visible") return;
+          clippers = null;
+          if (!sameRect(measure(), lastRect)) burst();
+          else void sync();
+        },
+        params.embedded === true ? EMBEDDED_SAFETY_MS : SAFETY_MS,
+      );
     } else if (!want && safety !== null) {
       clearInterval(safety);
       safety = null;
@@ -591,6 +736,7 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
   document.addEventListener("transitionrun", burst, true);
   document.addEventListener("transitionend", burst, true);
   window.addEventListener("resize", burst);
+  document.addEventListener("scroll", onScroll, { capture: true, passive: true });
   report();
   armSafety();
   burst();
@@ -625,6 +771,8 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
       document.removeEventListener("transitionrun", burst, true);
       document.removeEventListener("transitionend", burst, true);
       window.removeEventListener("resize", burst);
+      document.removeEventListener("scroll", onScroll, { capture: true });
+      if (scrollTimer !== null) clearTimeout(scrollTimer);
       if (created && !busy) void nativeViewClose(id);
     },
   };

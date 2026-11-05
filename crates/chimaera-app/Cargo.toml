@@ -72,7 +72,7 @@ chimaera-server = { path = "../chimaera-server" }
 objc2 = "0.6"
 block2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSArray", "NSError", "NSBundle", "NSObject", "NSDictionary", "NSData", "NSGeometry", "NSURL", "NSURLRequest"] }
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSDockTile", "NSResponder", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSView"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "block2", "NSApplication", "NSDockTile", "NSEvent", "NSResponder", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSView", "NSWindow"] }
 # Pane views (`shell/native_view/mac.rs`): a WKWebView the shell owns, its
 # delegates, the bridge's content world, message handler and user script,
 # snapshots and calls into the world. The same objc2-web-kit wry links.

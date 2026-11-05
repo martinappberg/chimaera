@@ -380,23 +380,37 @@ export interface ViewRect {
  * app, or from an app build without pane views — the caller falls back to
  * an iframe.
  */
-export async function nativeViewShow(id: string, url: string, rect: ViewRect, hidden: boolean): Promise<boolean> {
+export async function nativeViewShow(
+  id: string,
+  url: string,
+  rect: ViewRect,
+  hidden: boolean,
+  fit: ViewFit = {},
+): Promise<boolean> {
   const t = tauri();
   if (t === null) return false;
   try {
-    await t.core.invoke<void>("native_view_show", { id, url, rect, hidden });
+    await t.core.invoke<void>("native_view_show", { id, url, rect, hidden, ...fit });
     return true;
   } catch {
     return false;
   }
 }
 
+/** How a view sits in a scroller (an embed card): `clip` crops it to the
+ *  scroller's visible part (the page keeps its place), and `passive` hands
+ *  the wheel over it back to this page until the card is clicked into. */
+export interface ViewFit {
+  clip?: ViewRect | null;
+  passive?: boolean;
+}
+
 /** Move a pane view (`rect`), or hide it (`null`). */
-export async function nativeViewPlace(id: string, rect: ViewRect | null): Promise<void> {
+export async function nativeViewPlace(id: string, rect: ViewRect | null, fit: ViewFit = {}): Promise<void> {
   const t = tauri();
   if (t === null) return;
   try {
-    await t.core.invoke<void>("native_view_place", { id, rect });
+    await t.core.invoke<void>("native_view_place", { id, rect, ...fit });
   } catch {
     /* gone with its window or an older app build: nothing to move */
   }

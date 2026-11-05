@@ -67,6 +67,27 @@ impl ViewRect {
     }
 }
 
+/// The box a view shows through: `rect` cut to `clip` (the visible part of
+/// the scroller an embed card sits in), or `None` when nothing of it is
+/// left. The page keeps `rect`'s position inside that box, so a card half
+/// scrolled out is cropped rather than squeezed or shifted.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn clip_box(rect: ViewRect, clip: Option<ViewRect>) -> Option<ViewRect> {
+    let Some(clip) = clip else {
+        return Some(rect);
+    };
+    let x = rect.x.max(clip.x);
+    let y = rect.y.max(clip.y);
+    let right = (rect.x + rect.width).min(clip.x + clip.width);
+    let bottom = (rect.y + rect.height).min(clip.y + clip.height);
+    (right - x >= 1.0 && bottom - y >= 1.0).then_some(ViewRect {
+        x,
+        y,
+        width: right - x,
+        height: bottom - y,
+    })
+}
+
 /// One view: whose it is, its page-chosen id, and the URL the page last
 /// asked for. In-page navigation leaves the asked-for URL alone, so asking
 /// again for the same URL never reloads the view.
@@ -224,6 +245,8 @@ const UNSUPPORTED: &str = "pane views are macOS-only for now";
 
 /// Create the view, or point an existing one at `url` (only when it
 /// changed), then place and show it.
+// One named field per page-side option: a struct would only rename them.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub(super) fn native_view_show(
     app: AppHandle,
@@ -232,10 +255,12 @@ pub(super) fn native_view_show(
     url: String,
     rect: ViewRect,
     hidden: Option<bool>,
+    clip: Option<ViewRect>,
+    passive: Option<bool>,
 ) -> Result<(), String> {
     let label = own_label(&webview, &id)?;
     let hidden = hidden.unwrap_or(false);
-    if !rect.valid() {
+    if !rect.valid() || clip.is_some_and(|c| !c.valid()) {
         return Err("bad view request".into());
     }
     let owner = webview.label().to_string();
@@ -267,6 +292,8 @@ pub(super) fn native_view_show(
             parsed,
             navigate,
             rect,
+            clip,
+            passive.unwrap_or(false),
             hidden,
         );
         if shown.is_err() {
@@ -279,31 +306,36 @@ pub(super) fn native_view_show(
     #[cfg(not(target_os = "macos"))]
     {
         lock(&views.views).remove(&label);
-        let _ = (navigate, hidden);
+        let _ = (navigate, hidden, clip, passive);
         Err(UNSUPPORTED.into())
     }
 }
 
 /// Move a view, or hide it (`rect` absent): a parked tab, an overlay that
-/// must draw above it, a load still under way.
+/// must draw above it, a load still under way. `clip` crops it to the part
+/// of its scroller on screen (an embed card); `passive` hands the wheel
+/// over it back to the page, so a transcript scrolls past a card instead of
+/// sticking in it until the card is clicked.
 #[tauri::command]
 pub(super) fn native_view_place(
     webview: Webview,
     id: String,
     rect: Option<ViewRect>,
+    clip: Option<ViewRect>,
+    passive: Option<bool>,
 ) -> Result<(), String> {
     let label = own_label(&webview, &id)?;
-    if rect.is_some_and(|r| !r.valid()) {
+    if rect.is_some_and(|r| !r.valid()) || clip.is_some_and(|c| !c.valid()) {
         return Err("bad view request".into());
     }
-    tracing::debug!(%label, ?rect, "native view: place");
+    tracing::trace!(%label, ?rect, ?clip, ?passive, "native view: place");
     #[cfg(target_os = "macos")]
     {
-        mac::place(&webview, label, rect)
+        mac::place(&webview, label, rect, clip, passive.unwrap_or(false))
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (label, rect);
+        let _ = (label, rect, clip, passive);
         Ok(())
     }
 }
@@ -451,8 +483,48 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        child_label, decide, link_lets_out, proxy_base, valid_id, view_path_allowed, Policy,
+        child_label, clip_box, decide, link_lets_out, proxy_base, valid_id, view_path_allowed,
+        Policy, ViewRect,
     };
+
+    fn r(x: f64, y: f64, width: f64, height: f64) -> ViewRect {
+        ViewRect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    fn parts(v: Option<ViewRect>) -> Option<(f64, f64, f64, f64)> {
+        v.map(|v| v.parts())
+    }
+
+    #[test]
+    fn a_card_is_cropped_to_its_scroller() {
+        let card = r(10.0, 80.0, 400.0, 360.0);
+        // No clip: the view is the card.
+        assert_eq!(parts(clip_box(card, None)), Some(card.parts()));
+        // Half scrolled out of the top: only the part still on screen.
+        assert_eq!(
+            parts(clip_box(card, Some(r(0.0, 200.0, 800.0, 600.0)))),
+            Some((10.0, 200.0, 400.0, 240.0))
+        );
+        // Wholly on screen: unchanged.
+        assert_eq!(
+            parts(clip_box(card, Some(r(0.0, 0.0, 800.0, 900.0)))),
+            Some(card.parts())
+        );
+        // Scrolled out, or a sliver under a pixel: nothing to show.
+        assert_eq!(
+            parts(clip_box(card, Some(r(0.0, 440.0, 800.0, 300.0)))),
+            None
+        );
+        assert_eq!(
+            parts(clip_box(card, Some(r(0.0, 439.5, 800.0, 300.0)))),
+            None
+        );
+    }
 
     #[test]
     fn only_the_link_the_user_clicked_goes_out() {

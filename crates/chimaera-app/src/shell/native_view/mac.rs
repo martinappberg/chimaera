@@ -17,13 +17,22 @@
 //! (`deliver_to`). The navigation policy (`super::main_frame_policy`) runs in
 //! the view's navigation delegate; popups go through its UI delegate.
 //!
+//! Each `WKWebView` sits in a clip box of its own (a plain `NSView` that
+//! clips to its bounds), the box being the owner's subview: an embed card
+//! half scrolled out of its transcript is cropped to what is still on screen
+//! (`super::clip_box`) while its page keeps its place. A passive view's wheel
+//! goes to the owner instead (`wheel_monitor`): WebKit never chains a wheel
+//! out of a view the way it chains one out of an iframe, so a transcript
+//! would otherwise stick at every card it scrolls past.
+//!
 //! Every `WKWebView` touch is on the main thread: views live in a
 //! main-thread registry, reached through `run_on_main_thread`, and the async
 //! commands wait on a oneshot for a completion handler's answer.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::ptr::NonNull;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -32,7 +41,9 @@ use block2::{DynBlock, RcBlock};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSImage, NSView};
+use objc2_app_kit::{
+    NSBitmapImageFileType, NSBitmapImageRep, NSEvent, NSEventMask, NSImage, NSResponder, NSView,
+};
 use objc2_foundation::{
     NSDictionary, NSError, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
     NSURLRequest, NSURL,
@@ -68,6 +79,11 @@ const CRASH_WINDOW: Duration = Duration::from_secs(60);
 /// and WebKit told the shell about it.
 struct Pane {
     wk: Retained<WKWebView>,
+    /// The clip box `wk` sits in (the owner's subview).
+    clip: Retained<NSView>,
+    /// The wheel over it goes to the owner page (an embed card nobody has
+    /// clicked into yet).
+    passive: bool,
     _delegate: Retained<Delegate>,
     /// The last link the user clicked (trusted, reported by the bridge).
     link: Option<(String, Instant)>,
@@ -78,6 +94,8 @@ struct Pane {
 thread_local! {
     /// Main thread only: child label → its view.
     static PANES: RefCell<HashMap<String, Pane>> = RefCell::new(HashMap::new());
+    /// The wheel monitor is installed (once, for the app's life).
+    static WHEEL_MONITOR: Cell<bool> = const { Cell::new(false) };
 }
 
 define_class!(
@@ -341,6 +359,108 @@ fn frame_in(owner: &NSView, rect: ViewRect) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(w.max(1.0), h.max(1.0)))
 }
 
+/// Lay `pane` out for `rect` cut to `clip`: the box at the visible part, the
+/// page inside it at `rect`'s own place. False when nothing is visible.
+fn arrange(owner: &NSView, pane: &Pane, rect: ViewRect, clip: Option<ViewRect>) -> bool {
+    let Some(shown) = super::clip_box(rect, clip) else {
+        return false;
+    };
+    pane.clip.setFrame(frame_in(owner, shown));
+    // The box is not flipped: the page's top sits `rect.y - shown.y` below
+    // the box's top.
+    let (x, y, w, h) = rect.parts();
+    let (sx, sy, _, sh) = shown.parts();
+    let inner = NSRect::new(
+        NSPoint::new(x - sx, sh - (y - sy) - h),
+        NSSize::new(w.max(1.0), h.max(1.0)),
+    );
+    // SAFETY: NSView geometry on the main thread.
+    pane.wk.setFrame(inner);
+    true
+}
+
+/// A clip box: an `NSView` whose subviews draw only inside it.
+fn clip_view(mtm: MainThreadMarker) -> Retained<NSView> {
+    let view = NSView::initWithFrame(NSView::alloc(mtm), NSRect::ZERO);
+    view.setWantsLayer(true);
+    // `clipsToBounds` is macOS 14+ (and defaults off from that SDK on);
+    // before it AppKit clipped subviews already. The layer's mask covers a
+    // layer-hosting child (the web view) either way.
+    // SAFETY: selector checked before the call; `layer` is a CALayer or nil.
+    unsafe {
+        let responds: bool = msg_send![&*view, respondsToSelector: objc2::sel!(setClipsToBounds:)];
+        if responds {
+            view.setClipsToBounds(true);
+        }
+        let layer: *mut AnyObject = msg_send![&*view, layer];
+        if !layer.is_null() {
+            let _: () = msg_send![layer, setMasksToBounds: true];
+        }
+    }
+    view
+}
+
+/// The owner page under a passive view takes its wheel: a scroll there goes
+/// to the owner's web view, which hit-tests the card's placeholder and
+/// scrolls the transcript around it. Hover and clicks still reach the view.
+fn wheel_monitor() {
+    if WHEEL_MONITOR.with(|on| on.replace(true)) {
+        return;
+    }
+    let block = RcBlock::new(|event: NonNull<NSEvent>| -> *mut NSEvent {
+        // SAFETY: AppKit hands a live event for the duration of the call.
+        let ev = unsafe { event.as_ref() };
+        let owner = catch_unwind(AssertUnwindSafe(|| passive_owner_under(ev)))
+            .ok()
+            .flatten();
+        match owner {
+            Some(owner) => {
+                owner.scrollWheel(ev);
+                std::ptr::null_mut()
+            }
+            None => event.as_ptr(),
+        }
+    });
+    // SAFETY: the handler returns the event it was given or null. The
+    // monitor stays for the app's life (one per app, nothing to remove).
+    let monitor = unsafe {
+        NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::ScrollWheel, &block)
+    };
+    std::mem::forget(monitor);
+}
+
+/// The owner web view of a shown, passive view under `ev`'s pointer.
+fn passive_owner_under(ev: &NSEvent) -> Option<Retained<NSResponder>> {
+    let mtm = MainThreadMarker::new()?;
+    let window = ev.window(mtm)?;
+    let at = ev.locationInWindow();
+    PANES.with(|panes| {
+        panes.borrow().values().find_map(|pane| {
+            if !pane.passive || pane.clip.isHidden() {
+                return None;
+            }
+            let same = pane
+                .clip
+                .window()
+                .is_some_and(|w| Retained::as_ptr(&w) == Retained::as_ptr(&window));
+            if !same {
+                return None;
+            }
+            let p = pane.clip.convertPoint_fromView(at, None);
+            let b = pane.clip.bounds();
+            let inside = p.x >= b.origin.x
+                && p.y >= b.origin.y
+                && p.x < b.origin.x + b.size.width
+                && p.y < b.origin.y + b.size.height;
+            if !inside {
+                return None;
+            }
+            // SAFETY: NSView accessor on the main thread.
+            unsafe { pane.clip.superview() }.map(Retained::into_super)
+        })
+    })
+}
+
 /// Run `f` on the main thread with the owner's WKWebView (the superview).
 fn on_owner(
     owner: &Webview,
@@ -359,10 +479,11 @@ fn on_owner(
         .map_err(|e| e.to_string())
 }
 
-/// Place `label` at `rect`: create it on `url` (bridge first), or point an
-/// existing one at `url` when the page asked for a new URL. `hidden` keeps
-/// it hidden (the page reveals it once its document reports in, so nothing
-/// flashes over the loading state).
+/// Place `label` at `rect` (cut to `clip`): create it on `url` (bridge
+/// first), or point an existing one at `url` when the page asked for a new
+/// URL. `hidden` keeps it hidden (the page reveals it once its document
+/// reports in, so nothing flashes over the loading state).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn show(
     app: &AppHandle,
     owner: &Webview,
@@ -370,16 +491,20 @@ pub(super) fn show(
     url: tauri::Url,
     navigate: bool,
     rect: ViewRect,
+    clip: Option<ViewRect>,
+    passive: bool,
     hidden: bool,
 ) -> Result<(), String> {
     let _ = APP.set(app.clone());
     on_owner(owner, move |owner_wk, mtm| {
-        let frame = frame_in(owner_wk, rect);
+        if passive {
+            wheel_monitor();
+        }
         let existing = PANES.with(|panes| {
-            panes.borrow().get(&label).map(|pane| {
-                // SAFETY: NSView geometry on the main thread.
-                pane.wk.setFrame(frame);
-                pane.wk.setHidden(hidden);
+            panes.borrow_mut().get_mut(&label).map(|pane| {
+                pane.passive = passive;
+                let visible = arrange(owner_wk, pane, rect, clip);
+                pane.clip.setHidden(hidden || !visible);
             })
         });
         if existing.is_some() {
@@ -409,7 +534,11 @@ pub(super) fn show(
                 &world,
             );
             controller.addUserScript(&script);
-            let wk = WKWebView::initWithFrame_configuration(WKWebView::alloc(mtm), frame, &config);
+            let wk = WKWebView::initWithFrame_configuration(
+                WKWebView::alloc(mtm),
+                frame_in(owner_wk, rect),
+                &config,
+            );
             let delegate = Delegate::new(mtm, label.clone());
             wk.setNavigationDelegate(Some(ProtocolObject::from_ref(&*delegate)));
             wk.setUIDelegate(Some(ProtocolObject::from_ref(&*delegate)));
@@ -419,35 +548,46 @@ pub(super) fn show(
             // A file dragged in from Finder is the workbench's to take (it
             // uploads to the right host); the view would swallow it.
             let _: () = msg_send![&*wk, unregisterDraggedTypes];
-            wk.setHidden(hidden);
-            owner_wk.addSubview(&wk);
+            let pane = Pane {
+                wk,
+                clip: clip_view(mtm),
+                passive,
+                _delegate: delegate,
+                link: None,
+                crashes: Vec::new(),
+            };
+            pane.clip.addSubview(&pane.wk);
+            let visible = arrange(owner_wk, &pane, rect, clip);
+            pane.clip.setHidden(hidden || !visible);
+            owner_wk.addSubview(&pane.clip);
             if let Some(request) = request(&url) {
-                let _ = wk.loadRequest(&request);
+                let _ = pane.wk.loadRequest(&request);
             }
-            PANES.with(|panes| {
-                panes.borrow_mut().insert(
-                    label,
-                    Pane {
-                        wk,
-                        _delegate: delegate,
-                        link: None,
-                        crashes: Vec::new(),
-                    },
-                )
-            });
+            PANES.with(|panes| panes.borrow_mut().insert(label, pane));
         }
     })
 }
 
-/// Move a view, or hide it (`None`).
-pub(super) fn place(owner: &Webview, label: String, rect: Option<ViewRect>) -> Result<(), String> {
+/// Move a view (cut to `clip`), or hide it (`None`).
+pub(super) fn place(
+    owner: &Webview,
+    label: String,
+    rect: Option<ViewRect>,
+    clip: Option<ViewRect>,
+    passive: bool,
+) -> Result<(), String> {
     on_owner(owner, move |owner_wk, _mtm| {
-        with_pane(&label, |pane| match rect {
-            Some(rect) => {
-                pane.wk.setFrame(frame_in(owner_wk, rect));
-                pane.wk.setHidden(false);
-            }
-            None => pane.wk.setHidden(true),
+        if passive {
+            wheel_monitor();
+        }
+        PANES.with(|panes| {
+            let mut panes = panes.borrow_mut();
+            let Some(pane) = panes.get_mut(&label) else {
+                return;
+            };
+            pane.passive = passive;
+            let visible = rect.is_some_and(|rect| arrange(owner_wk, pane, rect, clip));
+            pane.clip.setHidden(!visible);
         });
     })
 }
@@ -459,7 +599,7 @@ pub(super) fn close(app: &AppHandle, label: String) {
             // SAFETY: main thread; stop the page before the view goes so
             // its process is released with it.
             unsafe { pane.wk.stopLoading() };
-            pane.wk.removeFromSuperview();
+            pane.clip.removeFromSuperview();
         }
     });
 }
