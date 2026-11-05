@@ -1213,6 +1213,32 @@ async fn raw_get(state: &Arc<AppState>, path: &str) -> (StatusCode, String, Stri
 }
 
 #[tokio::test]
+async fn console_text_names_file_pages_as_files() {
+    use crate::agent_browser::file_page::{file_url, map_text};
+    let state = quiet_state().await;
+    // A ticket the agent browser didn't mint (the user's own preview) stays
+    // as it is.
+    assert_eq!(
+        file_url(&state, "http://127.0.0.1:9/raw/t-abc/index.html"),
+        None
+    );
+    state
+        .browsers
+        .files
+        .remember("t-abc", std::path::Path::new("/r/out/index.html"));
+    let line = "Error at http://127.0.0.1:9/raw/t-abc/app.js:3:7 (see /raw/t-zzz/x.js)";
+    assert_eq!(
+        map_text(&state, line),
+        "Error at file:///r/out/app.js:3:7 (see /raw/t-zzz/x.js)"
+    );
+    assert_eq!(
+        file_url(&state, "/raw/t-abc/figs/run%232.png?x#y").as_deref(),
+        Some("file:///r/out/figs/run%232.png?x#y")
+    );
+    assert_eq!(map_text(&state, "no urls here"), "no urls here");
+}
+
+#[tokio::test]
 async fn console_text_names_proxied_urls_in_the_agents_terms() {
     let state = quiet_state().await;
     let id = crate::proxy::mint(&state, "127.0.0.1", 47320)

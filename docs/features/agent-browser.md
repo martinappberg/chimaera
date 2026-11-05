@@ -87,8 +87,9 @@ marker), `layout/PaneTabs.svelte` (the chain link and chips). Wire: `browser_req
   with `browser_navigate {path: "out/report.html"}` (relative to its working directory, then the
   workspace root; absolute and `~/` work too) or `{url: "file:///…/report.html"}`. No web server:
   before this, an agent had to start one to look at its own report. Pages only: HTML, SVG and
-  images (`PAGE_EXTENSIONS`) — `browser_navigate` is pre-allowed, so any other file would show the
-  agent what its permission mode might have asked about. Only the agent's own page
+  images (`PAGE_EXTENSIONS`), since `browser_navigate` is pre-allowed. That gates what the tool
+  opens; an HTML page can still load files beneath its own folder (no `..`, no hidden names), as
+  the user's preview can. Only the agent's own page
   opens a file (a shared pane holds an app); a folder, a missing file, or a `file://` URL naming
   another host is refused.
 - **How it loads.** Never as `file://`, which would let the page read the whole disk. The file
@@ -101,7 +102,8 @@ marker), `layout/PaneTabs.svelte` (the chain link and chips). Wire: `browser_req
   path on the daemon's own port its allowlist lets through.
 - **What the agent sees.** Every URL in a result (the page, network lines, console text) reads
   as `file:///dir/rest`, never the ticket (`file_page::file_url`, from a bounded ticket → file
-  registry). Tickets for file pages live an hour, renewed by each mint of the unchanged file.
+  registry). Tickets for file pages live an hour, renewed by each mint of the unchanged file (a
+  renewal never shortens a ticket, so the user's 10-minute preview of the same file doesn't cut it).
 - **Reload picks up a rewrite.** `reload` mints the ticket again: while the file is unchanged
   and its ticket lives, that is the same ticket and a plain reload; once the file changed (a new
   version) or the ticket expired, the page navigates to the new ticket's address.

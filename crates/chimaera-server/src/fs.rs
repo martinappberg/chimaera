@@ -4792,7 +4792,9 @@ impl TicketStore {
         if let Some(version) = &version {
             if let Some(existing) = self.by_version.get(&(path.clone(), version.clone())) {
                 if let Some(ticket) = self.tickets.get_mut(existing) {
-                    ticket.expires = Instant::now() + ttl;
+                    // Never shorten: a preview's 10-minute renewal must not
+                    // cut an agent file page's longer ticket (`mint_for`).
+                    ticket.expires = ticket.expires.max(Instant::now() + ttl);
                     return existing.clone();
                 }
             }
@@ -4865,6 +4867,20 @@ impl TicketStore {
 #[cfg(test)]
 mod ticket_store_tests {
     use super::*;
+
+    #[test]
+    fn a_shorter_renewal_never_cuts_a_longer_ticket() {
+        let mut store = TicketStore::default();
+        let path = PathBuf::from("/r/report.html");
+        let long = store.mint_for(path.clone(), Some("v".into()), Duration::from_secs(3600));
+        let again = store.mint(path, Some("v".into()));
+        assert_eq!(again, long, "same file, same version: the same ticket");
+        let (_, left) = store.lookup_ttl(&long).unwrap();
+        assert!(
+            left > TICKET_TTL,
+            "the preview's renewal kept the hour: {left:?}"
+        );
+    }
 
     #[test]
     fn ticket_store_evicts_oldest_at_hard_cap() {

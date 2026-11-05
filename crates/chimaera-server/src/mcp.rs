@@ -440,7 +440,10 @@ pub(crate) async fn mcp(
 }
 
 /// Resolve the session's workspace (via `session_workspaces`), if any.
-fn workspace_of(state: &AppState, agent_id: &str) -> Option<crate::workspaces::Workspace> {
+pub(crate) fn workspace_of(
+    state: &AppState,
+    agent_id: &str,
+) -> Option<crate::workspaces::Workspace> {
     // Sequential locks, never nested — the workspace store must not nest
     // inside the row locks (see `session_view::sessions_json`).
     let ws_id = crate::lock(&state.session_workspaces)
@@ -850,16 +853,22 @@ async fn check_document(state: &Arc<AppState>, agent_id: &str, args: &Value) -> 
     let Some(raw) = args.get("path").and_then(|p| p.as_str()) else {
         return tool_error("missing required argument: path".to_string());
     };
-    let cwd = state
-        .sessions
-        .get(agent_id)
-        .map(|info| info.cwd)
-        .or_else(|| state.chat.get(agent_id).map(|info| info.cwd));
+    let cwd = session_cwd(state, agent_id);
     let root = workspace_of(state, agent_id).map(|w| w.root);
     match crate::doc_check::agent_report(raw.to_string(), cwd, root).await {
         Ok(report) => tool_text(report),
         Err(err) => tool_error(err),
     }
+}
+
+/// The working directory a session started in (a terminal's or a chat's):
+/// the first base for a relative path an agent names.
+pub(crate) fn session_cwd(state: &AppState, agent_id: &str) -> Option<std::path::PathBuf> {
+    state
+        .sessions
+        .get(agent_id)
+        .map(|info| info.cwd)
+        .or_else(|| state.chat.get(agent_id).map(|info| info.cwd))
 }
 
 /// The `notify` tool def (base tier — every session has it).

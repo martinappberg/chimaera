@@ -2499,6 +2499,12 @@ impl PageShared {
         if url.starts_with("data:") || url.starts_with("blob:") {
             return;
         }
+        // The browser fetches `/favicon.ico` by itself, for every page: a
+        // 404 or a sandboxed file page's blocked icon is not the page's
+        // failure, so it never reaches the record.
+        if is_browser_favicon(p) {
+            return;
+        }
         let method = p["request"]["method"].as_str().unwrap_or("GET").to_string();
         let ts = p["timestamp"].as_f64().unwrap_or(0.0);
         let at = p["wallTime"]
@@ -3036,6 +3042,17 @@ async fn allow_document(state: &Weak<AppState>, url: &str) -> Result<(), String>
         Ok(Err(proxy::Refusal::Invalid)) => Err(format!("`{host}` is not a valid host.")),
         Err(_) => Err("couldn't check the target against the allowlist in time".to_string()),
     }
+}
+
+/// A `Network.requestWillBeSent` for the icon the browser asks for on its
+/// own (initiator `other`, not a document), not one the page linked.
+fn is_browser_favicon(p: &Value) -> bool {
+    p["initiator"]["type"] == "other"
+        && p["type"] != "Document"
+        && url_path(p["request"]["url"].as_str().unwrap_or_default())
+            .split(['?', '#'])
+            .next()
+            == Some("/favicon.ico")
 }
 
 /// The path (+ query) of an absolute URL; `/` when it has none.

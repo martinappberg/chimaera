@@ -17,6 +17,54 @@ fn ev(method: &str, params: Value) -> Event {
 }
 
 #[test]
+fn only_ticketed_files_pass_on_the_daemons_port() {
+    // `allow_document` lets a daemon-port document through only when this is
+    // a `/raw/t-…` path: never the UI, the API or a bare `/raw/`.
+    let raw = |u: &str| super::super::file_page::is_raw_path(url_path(u));
+    assert!(raw("http://127.0.0.1:9/raw/t-abc/report.html"));
+    assert!(raw("http://[::1]:9/raw/t-abc/figs/a.png?x=1"));
+    assert!(!raw("http://127.0.0.1:9/"));
+    assert!(!raw("http://127.0.0.1:9"));
+    assert!(!raw("http://127.0.0.1:9/api/v1/sessions"));
+    assert!(!raw("http://127.0.0.1:9/raw/"));
+    assert!(!raw("http://127.0.0.1:9/raw/other/x"));
+    assert!(!raw("http://127.0.0.1:9/proxy/p-1/raw/t-abc/x"));
+    assert!(!raw("http://127.0.0.1:9?/raw/t-abc/x"));
+    assert_eq!(url_path("http://h:1?q=/raw/t-a"), "?q=/raw/t-a");
+}
+
+#[test]
+fn the_browsers_own_favicon_request_is_not_the_pages() {
+    let req = |url: &str, initiator: &str, kind: &str| json!({"request": {"url": url}, "initiator": {"type": initiator}, "type": kind});
+    assert!(is_browser_favicon(&req(
+        "http://127.0.0.1:9/favicon.ico",
+        "other",
+        "Other"
+    )));
+    assert!(is_browser_favicon(&req(
+        "http://localhost:5173/favicon.ico?v=1",
+        "other",
+        "Other"
+    )));
+    // One the page linked, a document, or another path is the page's.
+    assert!(!is_browser_favicon(&req(
+        "http://localhost:5173/favicon.ico",
+        "parser",
+        "Other"
+    )));
+    assert!(!is_browser_favicon(&req(
+        "http://localhost:5173/favicon.ico",
+        "other",
+        "Document"
+    )));
+    assert!(!is_browser_favicon(&req(
+        "http://localhost:5173/app/favicon.ico",
+        "other",
+        "Other"
+    )));
+}
+
+#[test]
 fn http_targets_parse_host_and_port() {
     assert_eq!(
         http_target("http://127.0.0.1:8888/lab?x=1"),

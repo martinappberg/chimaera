@@ -837,7 +837,13 @@ async fn pages(state: &Arc<AppState>, agent: &str) -> Value {
                 let (url, title) = match &ctx.facts {
                     Some(f) => (f.url.clone(), f.title.clone()),
                     None => (
-                        page.target.as_ref().map(TargetUrl::url).unwrap_or_default(),
+                        page.target
+                            .as_ref()
+                            .map(|t| {
+                                let url = t.url();
+                                file_page::file_url(state, &url).unwrap_or(url)
+                            })
+                            .unwrap_or_default(),
                         String::new(),
                     ),
                 };
@@ -1264,7 +1270,8 @@ async fn navigate(
         // A file page reloads under a ticket minted again: the same address
         // while the file is unchanged and its ticket lives (a plain reload),
         // a new one after it expired or the file was rewritten.
-        if op == HistoryOp::Reload {
+        // Files open only in the own page, so only it can need a new ticket.
+        if op == HistoryOp::Reload && ctx.which == Which::Own {
             let href = run_eval(
                 state,
                 &mut ctx,
@@ -1282,6 +1289,9 @@ async fn navigate(
             };
             if let Some(target) = fresh {
                 ctx.origin = Some(target.clone());
+                state
+                    .browsers
+                    .update_own(agent, |p| p.target = Some(target.clone()));
                 let out = exec(state, &ctx, Action::Navigate { url: target }).await;
                 return match out {
                     Ok(out) => loaded(state, &mut ctx, out, None).await,
@@ -1299,7 +1309,7 @@ async fn navigate(
     // A file opens as a ticketed page on this daemon (`file_page`), never
     // through the proxy, and never in a pane the user watches: a browser
     // pane holds an app, not a file.
-    let file = file_page::requested(path_arg, Some(&url));
+    let file = file_page::requested(path_arg, &url);
     if url.to_ascii_lowercase().starts_with("file:") && file.is_none() {
         return error_result(
             "Only a file on this host opens (file:///path or file://localhost/path).".to_string(),
@@ -1318,23 +1328,24 @@ async fn navigate(
                 Err(e) => return error_result(e),
             }
         }
-        None => match crate::browser_open::parse_url(&url) {
-            Ok(t) => t.into(),
-            Err(e) => return error_result(e),
-        },
-    };
-    if file.is_none() {
-        let host = crate::proxy::normalize_host(&target.host);
-        if let Err(refusal) = crate::proxy::check_target(state, &host, target.port).await {
-            return error_result(crate::browser_open::refusal_text(
-                &refusal,
-                "Not loaded",
-                &target.host,
-                target.port,
-                &target.url(),
-            ));
+        None => {
+            let target: TargetUrl = match crate::browser_open::parse_url(&url) {
+                Ok(t) => t.into(),
+                Err(e) => return error_result(e),
+            };
+            let host = crate::proxy::normalize_host(&target.host);
+            if let Err(refusal) = crate::proxy::check_target(state, &host, target.port).await {
+                return error_result(crate::browser_open::refusal_text(
+                    &refusal,
+                    "Not loaded",
+                    &target.host,
+                    target.port,
+                    &target.url(),
+                ));
+            }
+            target
         }
-    }
+    };
 
     // One page: with no `page`, a pane shared with this agent that shows
     // the same app is the page (navigated in place), so the agent never
@@ -2347,16 +2358,10 @@ async fn network(state: &Arc<AppState>, ctx: &mut Ctx) -> ToolResult {
     let since = cursors_of(state, ctx).network;
     let (out, restarted) = rings(state, ctx, RING_SKIP, since).await?;
     set_cursors(state, ctx, |c| c.network = out.network_next);
-    // Chromium asks the daemon's own origin for a file page's favicon by
-    // itself; that request is the browser's, not the page's.
-    let network: Vec<_> = out
-        .network
-        .iter()
-        .filter(|e| !file_page::is_daemon_favicon(state, &e.url))
-        .collect();
     // The app engine's record holds proxied URLs, a file page's ticketed
     // ones: report them in the agent's terms, like the page URL.
-    let urls: Vec<String> = network
+    let urls: Vec<String> = out
+        .network
         .iter()
         .map(|e| match (file_page::file_url(state, &e.url), ctx.engine) {
             (Some(file), _) => file,
@@ -2364,7 +2369,8 @@ async fn network(state: &Arc<AppState>, ctx: &mut Ctx) -> ToolResult {
             (None, EngineKind::Chromium) => e.url.clone(),
         })
         .collect();
-    let lines: Vec<String> = network
+    let lines: Vec<String> = out
+        .network
         .iter()
         .zip(urls)
         .map(|(e, url)| {
@@ -2524,6 +2530,13 @@ async fn show(state: &Arc<AppState>, ctx: &mut Ctx) -> ToolResult {
         )));
     }
     let target: TargetUrl = match crate::browser_open::parse_url(&url) {
+        // A ticketed file whose path is no longer known: still not an app.
+        Ok(t) if file_page::is_raw_path(&t.path) => {
+            return Err(bad(
+                "Your page is a file, which opens for the user as a preview, not a browser \
+                 pane: link the file in your reply. Your page stays yours.",
+            ))
+        }
         Ok(t) => t.into(),
         Err(_) => match &ctx.origin {
             Some(t) => t.clone(),

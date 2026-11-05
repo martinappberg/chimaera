@@ -27,9 +27,10 @@ use crate::AppState;
 /// unchanged file): longer than a preview's, since an agent can spend a
 /// while in one page; the idle reaper closes the page itself sooner.
 const FILE_TICKET_TTL: Duration = Duration::from_secs(3600);
-/// What opens as a page: what the feature is for (a report, a plot), not
-/// any file. `browser_navigate` is pre-allowed, so a wider set would show an
-/// agent files its permission mode would have asked about.
+/// What `browser_navigate` opens directly: what the feature is for (a
+/// report, a plot), not any file, since the tool is pre-allowed. This gates
+/// the entry only: an HTML page can still load files beneath its own folder
+/// (no `..`, no hidden names), exactly as the user's preview can.
 const PAGE_EXTENSIONS: &[&str] = &[
     "html", "htm", "xhtml", "svg", "png", "jpg", "jpeg", "gif", "webp", "avif",
 ];
@@ -45,7 +46,7 @@ pub(crate) struct FileTickets {
 }
 
 impl FileTickets {
-    fn remember(&self, ticket: &str, path: &Path) {
+    pub(crate) fn remember(&self, ticket: &str, path: &Path) {
         let mut entries = crate::lock(&self.entries);
         if entries.iter().any(|(t, _)| t == ticket) {
             return;
@@ -68,11 +69,17 @@ impl FileTickets {
 /// What `browser_navigate` was asked to open, when it names a file: the
 /// `path` argument, or a `url` that is a `file:` URL. `None` for anything
 /// else (an http address, back/forward/reload).
-pub(crate) fn requested(path_arg: Option<&str>, url: Option<&str>) -> Option<String> {
+pub(crate) fn requested(path_arg: Option<&str>, url: &str) -> Option<String> {
     if let Some(path) = path_arg {
-        return Some(path.trim().to_string());
+        let path = path.trim();
+        // A `file://` URL copied from a result into `path` names the same file.
+        return Some(from_file_url(path).unwrap_or_else(|| path.to_string()));
     }
-    let url = url?.trim();
+    from_file_url(url.trim())
+}
+
+/// The local path a `file:` URL names on this host.
+fn from_file_url(url: &str) -> Option<String> {
     let local = crate::embed::strip_file_scheme(url)?;
     // A file URL's query or fragment is not part of the file's name.
     let local = local.split(['?', '#']).next().unwrap_or(local);
@@ -82,16 +89,8 @@ pub(crate) fn requested(path_arg: Option<&str>, url: Option<&str>) -> Option<Str
 /// Open `raw` (absolute, `~/…`, or relative to the session's working
 /// directory, then its workspace root) as a page target on this daemon.
 pub(crate) async fn target(state: &AppState, agent: &str, raw: &str) -> Result<TargetUrl, String> {
-    let cwd = state
-        .sessions
-        .get(agent)
-        .map(|info| info.cwd)
-        .or_else(|| state.chat.get(agent).map(|info| info.cwd));
-    let root = {
-        // Sequential locks, never nested (see `mcp::workspace_of`).
-        let ws_id = crate::lock(&state.session_workspaces).get(agent).cloned();
-        ws_id.and_then(|id| crate::lock(&state.workspaces).get(&id).map(|w| w.root))
-    };
+    let cwd = crate::mcp::session_cwd(state, agent);
+    let root = crate::mcp::workspace_of(state, agent).map(|w| w.root);
     let raw = raw.to_string();
     let found = crate::doc_check::run_blocking(move || {
         let path = crate::doc_check::resolve_for_agent(&raw, cwd.as_deref(), root.as_deref())?;
@@ -180,7 +179,26 @@ pub(crate) fn file_url(state: &AppState, href: &str) -> Option<String> {
         ("", _) | (_, None) => file,
         (rest, Some(dir)) => dir.join(rest),
     };
-    Some(format!("file://{}{tail}", local.display()))
+    Some(format!(
+        "file://{}{tail}",
+        encode_url_path(&local.to_string_lossy())
+    ))
+}
+
+/// A path as a `file:` URL's path: only what would change what the URL
+/// names is escaped (`%`, `?`, `#`), so it reads as the path and round-trips
+/// through [`requested`].
+fn encode_url_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        match c {
+            '%' => out.push_str("%25"),
+            '?' => out.push_str("%3F"),
+            '#' => out.push_str("%23"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Every file-page URL in free text (a console line) put in the agent's
@@ -209,23 +227,6 @@ pub(crate) fn map_text(state: &AppState, text: &str) -> String {
 /// one thing on the daemon's own port an agent page may load.
 pub(crate) fn is_raw_path(path: &str) -> bool {
     path.starts_with("/raw/t-")
-}
-
-/// Whether `url` is the daemon's own `/favicon.ico` (the request a browser
-/// makes by itself for a file page, which the page's opaque origin blocks).
-pub(crate) fn is_daemon_favicon(state: &AppState, url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("http://") else {
-        return false;
-    };
-    let Some((authority, path)) = rest.split_once('/') else {
-        return false;
-    };
-    let Some((host, port)) = authority.rsplit_once(':') else {
-        return false;
-    };
-    path == "favicon.ico"
-        && port.parse() == Ok(state.port)
-        && crate::proxy::is_loopback_host(&crate::proxy::normalize_host(host))
 }
 
 /// Whether `target` is a file page on this daemon (not an app to proxy).
@@ -285,21 +286,25 @@ mod tests {
     #[test]
     fn a_path_or_a_file_url_names_a_file() {
         assert_eq!(
-            requested(Some(" out/r.html "), None).as_deref(),
+            requested(Some(" out/r.html "), "").as_deref(),
             Some("out/r.html")
         );
         assert_eq!(
-            requested(None, Some("file:///tmp/my%20report.html#top")).as_deref(),
+            requested(None, "file:///tmp/my%20report.html#top").as_deref(),
             Some("/tmp/my report.html")
         );
         assert_eq!(
-            requested(None, Some("file://localhost/tmp/r.html")).as_deref(),
+            requested(None, "file://localhost/tmp/r.html").as_deref(),
             Some("/tmp/r.html")
         );
-        assert_eq!(requested(None, Some("file://elsewhere/tmp/r.html")), None);
-        assert_eq!(requested(None, Some("http://localhost:8888/")), None);
-        assert_eq!(requested(None, Some("reload")), None);
-        assert_eq!(requested(None, None), None);
+        assert_eq!(requested(None, "file://elsewhere/tmp/r.html"), None);
+        assert_eq!(requested(None, "http://localhost:8888/"), None);
+        assert_eq!(requested(None, "reload"), None);
+        assert_eq!(requested(None, ""), None);
+        assert_eq!(
+            requested(Some("file:///tmp/a%23b.html"), "").as_deref(),
+            Some("/tmp/a#b.html")
+        );
     }
 
     #[test]
@@ -347,6 +352,20 @@ mod tests {
         ] {
             assert!(!is_page_file(Path::new(no)), "{no}");
         }
+    }
+
+    #[test]
+    fn reported_file_urls_round_trip() {
+        for path in [
+            "/r/run#2.html",
+            "/r/a?b.html",
+            "/r/100%25.html",
+            "/r/my report.html",
+        ] {
+            let url = format!("file://{}", encode_url_path(path));
+            assert_eq!(requested(None, &url).as_deref(), Some(path), "{url}");
+        }
+        assert_eq!(encode_url_path("/r/my report.html"), "/r/my report.html");
     }
 
     #[test]
