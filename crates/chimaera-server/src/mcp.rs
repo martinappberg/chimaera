@@ -46,6 +46,11 @@ use crate::AppState;
 
 /// Protocol version offered when the client's is unknown to us.
 const PROTOCOL_FALLBACK: &str = "2025-06-18";
+
+/// How much of the `initialize` instructions active plugins' paragraphs
+/// may lead with (`initialize_result`): Claude Code keeps only the first
+/// ~4 KB, and chimaera's own opening paragraphs take about 2 KB of it.
+const PLUGIN_LEAD_MAX: usize = 2048;
 /// Journal entries returned by read_terminal when unspecified.
 const DEFAULT_READ_COMMANDS: usize = 5;
 /// Screen lines returned by read_terminal in screen mode.
@@ -441,12 +446,20 @@ fn initialize_result(
     // Active plugins' paragraphs come first: Claude Code keeps only the first
     // ~4 KB of a server's instructions ("… [truncated]"), which chimaera's
     // own text fills, so a paragraph appended after it never reached Claude.
-    // None when no plugin is on: a plugin-free workspace hands agents
-    // byte-identical instructions.
+    // Only up to `PLUGIN_LEAD_MAX` of them lead, so plugins together can't
+    // push chimaera's own opening (~2 KB) out of that window; the rest
+    // follow it. None when no plugin is on: a plugin-free workspace hands
+    // agents byte-identical instructions.
     let mut instructions = String::new();
+    let mut trailing = Vec::new();
     for paragraph in plugin_paragraphs {
-        instructions.push_str(paragraph.trim());
-        instructions.push_str("\n\n");
+        let paragraph = paragraph.trim();
+        if instructions.len() + paragraph.len() + 2 <= PLUGIN_LEAD_MAX {
+            instructions.push_str(paragraph);
+            instructions.push_str("\n\n");
+        } else {
+            trailing.push(paragraph);
+        }
     }
     instructions.push_str(INSTRUCTIONS);
     instructions.push_str(DOCUMENTS_INSTRUCTIONS);
@@ -460,6 +473,10 @@ fn initialize_result(
     }
     if mastermind {
         instructions.push_str(MASTERMIND_INSTRUCTIONS);
+    }
+    for paragraph in trailing {
+        instructions.push_str("\n\n");
+        instructions.push_str(paragraph);
     }
     json!({
         "protocolVersion": requested,
@@ -2487,6 +2504,38 @@ mod tests {
             .as_str()
             .unwrap()
             .contains(TASK_LIST_FINISH_INSTRUCTIONS));
+    }
+
+    /// Plugins' paragraphs lead, but together never push chimaera's own
+    /// opening out of Claude Code's ~4 KB window: one that would pass the
+    /// lead budget follows chimaera's text instead.
+    #[test]
+    fn plugin_paragraphs_lead_within_a_budget() {
+        let short = "Short plugin paragraph.".to_string();
+        let long = "x".repeat(PLUGIN_LEAD_MAX);
+        let result = initialize_result(
+            &json!({}),
+            "test-agent",
+            None,
+            false,
+            false,
+            false,
+            false,
+            &[format!("\n\n{short}"), long.clone(), "Third.".to_string()],
+        );
+        let text = result["instructions"].as_str().unwrap();
+        assert!(
+            text.starts_with("Short plugin paragraph.\n\nThird.\n\n"),
+            "{text}"
+        );
+        let core = text.find(INSTRUCTIONS).unwrap();
+        assert!(core < PLUGIN_LEAD_MAX, "{core}");
+        assert!(text.ends_with(&long));
+        let plain = initialize_result(&json!({}), "a", None, false, false, false, false, &[]);
+        assert!(plain["instructions"]
+            .as_str()
+            .unwrap()
+            .starts_with(INSTRUCTIONS));
     }
 
     /// The plan paragraph and tool follow the runtime and the surface: a

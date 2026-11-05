@@ -166,13 +166,21 @@ pub(crate) fn answer_content(dir: &Path, text: &str) -> Vec<Value> {
         }
         pending.clear();
     };
+    let mut fenced = false;
     for line in text.split_inclusive('\n') {
-        let Some((alt, path)) = picture_line(line) else {
+        // A picture line quoted inside a code block is an example, not a picture.
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+        }
+        let Some((alt, path)) = picture_line(line).filter(|_| !fenced) else {
             pending.push_str(line);
             continue;
         };
         let eol = if line.ends_with('\n') { "\n" } else { "" };
-        let abs = dir.join(path);
+        let abs = match super::output::relative(path) {
+            Ok(rel) => dir.join(rel),
+            Err(_) => dir.join(path),
+        };
         match picture(dir, path, shown, bytes_total) {
             Ok((mime, data)) => {
                 shown += 1;
@@ -216,7 +224,9 @@ mod tests {
     #[test]
     fn an_answer_without_pictures_is_one_text_block_as_before() {
         let dir = temp("plain");
-        let text = "built: 0 errors\n![not ours](https://example.com/x.png)\n";
+        let text = "built: 0 errors\n![not ours](https://example.com/x.png)\n\
+                    ```md\n![example](output:shots/s1.png)\n```\n";
+        std::fs::write(dir.join("shots/s1.png"), PNG).unwrap();
         assert_eq!(
             answer_content(&dir, text),
             vec![json!({"type": "text", "text": text})]

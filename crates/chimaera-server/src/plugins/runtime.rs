@@ -1267,14 +1267,18 @@ impl PluginRuntime {
                 // Picture lines name files in this plugin's own output
                 // folder here (`tools::answer_content`); read off the reactor.
                 let dir = super::output::folder(&state.plugin_platform.output_root, &m.id, ws);
+                let plain = |text: String| vec![json!({ "type": "text", "text": text })];
                 let content = match crate::fs::FILESYSTEM_WORK.acquire().await {
-                    Ok(permit) => tokio::task::spawn_blocking(move || {
-                        let _permit = permit;
-                        super::tools::answer_content(&dir, &text)
-                    })
-                    .await
-                    .unwrap_or_else(|e| vec![json!({"type": "text", "text": format!("the answer could not be read: {e}")})]),
-                    Err(_) => vec![json!({ "type": "text", "text": text })],
+                    Ok(permit) => {
+                        let answer = text.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let _permit = permit;
+                            super::tools::answer_content(&dir, &answer)
+                        })
+                        .await
+                        .unwrap_or_else(|_| plain(text))
+                    }
+                    Err(_) => plain(text),
                 };
                 if result.is_error {
                     json!({ "content": content, "isError": true })
