@@ -305,6 +305,14 @@ _Captured 2026-11-05 (the maintainer, in the session that built it; the design d
 - **Page reloads keep a share:** the maintainer asked that a shared pane stay shared when its page reloads because the agent changed the app's code. A share is keyed by the browser tab, so in-pane reloads and hot reloads never end it, and since 2026-11-05 neither does a reload of the Chimaera window.
 - **Do not change (or: open to change):** open to change; ask before weakening the navigation allowlist, which is the #273 Q1 decision.
 
+### Why an agent can open a file as a page
+_Captured 2026-11-05 (the maintainer, in the session that built it; the questionnaire was left at its defaults)._
+
+- **Problem it solves:** an agent that wrote an HTML report and wanted to look at it started a local web server, because the browser tools took only http addresses. The maintainer's reaction: it shouldn't need to serve anything, it can use the browser tool.
+- **How settled it is:** all open to change, including the allowed file types, the ticket lifetime and how `browser_show` treats a file page.
+- **Deliberately left out or open:** nothing in particular.
+- **Do not change (or: open to change):** open to change.
+
 ### Why a plugin can download the Chromium
 _Captured 2026-11-05 (the maintainer, in the session that built it; the opt-in download was planned in #273, and the maintainer chose a separate plugin over a built-in setting button)._
 
