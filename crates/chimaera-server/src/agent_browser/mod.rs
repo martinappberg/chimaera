@@ -14,7 +14,9 @@
 //! page state (a shared pane carries the user's logins).
 //!
 //! Navigation obeys the proxy's mint allowlist (`proxy::check_target`) on
-//! both engines. What a page says is data, never instructions.
+//! both engines; a file on the daemon's host opens as a ticketed `/raw/`
+//! page instead (`file_page`), the one thing on the daemon's own port a
+//! page may load. What a page says is data, never instructions.
 //!
 //! Pages (this file's [`Browsers`]): each agent has at most one page of its
 //! own (an off-screen app view or a Chromium target, bound to its engine and
@@ -29,6 +31,7 @@ pub(crate) mod app_engine;
 mod cdp;
 pub(crate) mod channel;
 pub(crate) mod chromium;
+pub(crate) mod file_page;
 pub(crate) mod tools;
 
 use std::borrow::Cow;
@@ -394,6 +397,8 @@ struct Pages {
 pub(crate) struct Browsers {
     pub(crate) channel: channel::Channel,
     pub(crate) chromium: chromium::Chromium,
+    /// Tickets of the files opened as pages (`file_page`).
+    pub(crate) files: file_page::FileTickets,
     pages: Mutex<Pages>,
 }
 
@@ -402,6 +407,7 @@ impl Browsers {
         Browsers {
             channel: channel::Channel::default(),
             chromium: chromium::Chromium::new(),
+            files: file_page::FileTickets::default(),
             pages: Mutex::new(Pages::default()),
         }
     }

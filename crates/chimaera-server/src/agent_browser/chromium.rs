@@ -3028,12 +3028,20 @@ async fn allow_document(state: &Weak<AppState>, url: &str) -> Result<(), String>
             "{host}:{port} is outside the allowlist (loopback, this host, or a node one of your \
              running jobs is on). Ask the user to open it in a browser pane instead."
         )),
+        // A ticketed file (`file_page`): the one daemon path a page may load.
+        Ok(Err(proxy::Refusal::Daemon)) if super::file_page::is_raw_path(url_path(url)) => Ok(()),
         Ok(Err(proxy::Refusal::Daemon)) => Err(format!(
             "{host}:{port} is the Chimaera daemon itself, which the agent browser never opens."
         )),
         Ok(Err(proxy::Refusal::Invalid)) => Err(format!("`{host}` is not a valid host.")),
         Err(_) => Err("couldn't check the target against the allowlist in time".to_string()),
     }
+}
+
+/// The path (+ query) of an absolute URL; `/` when it has none.
+fn url_path(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    rest.find(['/', '?', '#']).map_or("/", |at| &rest[at..])
 }
 
 /// `http(s)://[user@]host[:port]/…` → (host, port).

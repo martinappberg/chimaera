@@ -4775,6 +4775,18 @@ impl TicketStore {
         self.create(path, version, TICKET_TTL)
     }
 
+    /// [`Self::mint`] with its own lifetime: the agent browser's file pages
+    /// (`agent_browser::file_page`) outlive a preview's ten minutes, because
+    /// an agent may work in one page longer than that.
+    pub(crate) fn mint_for(
+        &mut self,
+        path: PathBuf,
+        version: Option<String>,
+        ttl: Duration,
+    ) -> String {
+        self.create(path, version, ttl)
+    }
+
     fn create(&mut self, path: PathBuf, version: Option<String>, ttl: Duration) -> String {
         self.purge();
         if let Some(version) = &version {

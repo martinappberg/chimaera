@@ -41,7 +41,7 @@ marker), `layout/PaneTabs.svelte` (the chain link and chips). Wire: `browser_req
   | Tool | Does |
   |---|---|
   | `browser_pages` | Lists what the agent can use: its hidden page, the panes shared with it (`p1`… — it can drive them) and the panes the user has open in its workspace (`v1`… — read-only). |
-  | `browser_navigate` | Opens the agent's own hidden page (or re-points it) at an allowlisted `url`, or `back`/`forward`/`reload`; waits for the load (≤ 15 s). With no `page`, a shared pane already showing the same app (host:port) is navigated in place instead, so the agent never opens a second session beside the user's; any other app opens the hidden page. Returns the final URL, title and HTTP status when known. `width`/`height` size the own page (default 1280×800). |
+  | `browser_navigate` | Opens the agent's own hidden page (or re-points it) at an allowlisted `url`, a file on the daemon's host (`path`, or a `file://` `url`; see [Files as pages](#files-as-pages)), or `back`/`forward`/`reload`; waits for the load (≤ 15 s). With no `page`, a shared pane already showing the same app (host:port) is navigated in place instead, so the agent never opens a second session beside the user's; any other app opens the hidden page. Returns the final URL, title and HTTP status when known. `width`/`height` size the own page (default 1280×800). |
   | `browser_snapshot` | The page as compact text: roles, names, states, and a ref on each interactive element. Default 24,000 characters, at most 100,000; `viewport_only` keeps what is in view. |
   | `browser_screenshot` | A PNG of the viewport, the full page, or one element (`ref` or `selector`), at most 1600 px wide. |
   | `browser_inspect` | One element: outerHTML (first 4 KB), attributes, computed styles (a default set or the names asked), box, visible or covered. |
@@ -80,6 +80,37 @@ marker), `layout/PaneTabs.svelte` (the chain link and chips). Wire: `browser_req
 - **Where it lives.** `agent_browser/tools.rs` (`tool_defs`, `call`, `pick_page`, `new_page`,
   one tool function each), `agent_browser/snapshot.js` (the snapshot and page helpers, one
   script on both engines), `mcp.rs` (listing, the instructions paragraph, the dispatch arm).
+
+## Files as pages
+
+- **What & when.** An agent that wrote an HTML report, a plot or a small static page checks it
+  with `browser_navigate {path: "out/report.html"}` (relative to its working directory, then the
+  workspace root; absolute and `~/` work too) or `{url: "file:///…/report.html"}`. No web server:
+  before this, an agent had to start one to look at its own report. Pages only: HTML, SVG and
+  images (`PAGE_EXTENSIONS`) — `browser_navigate` is pre-allowed, so any other file would show the
+  agent what its permission mode might have asked about. Only the agent's own page
+  opens a file (a shared pane holds an app); a folder, a missing file, or a `file://` URL naming
+  another host is refused.
+- **How it loads.** Never as `file://`, which would let the page read the whole disk. The file
+  loads the way the HTML preview loads it: under a ticket, `GET /raw/{ticket}/{name}` on this
+  daemon ([files and previews](files-and-previews.md)) — `CSP: sandbox allow-scripts` (an opaque
+  origin), relative assets from its own folder downward only, no CORS, so scripts run but the
+  page can't read the files around it. The agent sees the page the user's preview shows. The app
+  engine loads the `/raw/` path on the window's daemon origin (a pane view may show `/raw/`);
+  the Chromium engine loads `http://127.0.0.1:{daemon port}/raw/…`, and `/raw/t-…` is the only
+  path on the daemon's own port its allowlist lets through.
+- **What the agent sees.** Every URL in a result (the page, network lines, console text) reads
+  as `file:///dir/rest`, never the ticket (`file_page::file_url`, from a bounded ticket → file
+  registry). Tickets for file pages live an hour, renewed by each mint of the unchanged file.
+- **Reload picks up a rewrite.** `reload` mints the ticket again: while the file is unchanged
+  and its ticket lives, that is the same ticket and a plain reload; once the file changed (a new
+  version) or the ticket expired, the page navigates to the new ticket's address.
+- **Hand-over.** `browser_show` on a file page doesn't open a browser pane (a browser tab holds
+  an app, not a file): it tells the agent to link the file in its reply, where the user sees
+  the chat's preview card or opens it beside the chat.
+- **Where it lives.** `agent_browser/file_page.rs` (resolve, mint, `remint`, URL mapping),
+  `fs::TicketStore::mint_for`, the `navigate` and `show` arms in `tools.rs`, `proxied_path` in
+  `app_engine.rs`, `allow_document` in `chromium.rs`.
 
 ## Engines and how one is chosen
 
@@ -239,6 +270,9 @@ marker), `layout/PaneTabs.svelte` (the chain link and chips). Wire: `browser_req
 - `just app-check`: the shell's `drive.rs` unit tests (parsing, key map, ledger, eval wrapper).
 - `npm --prefix web-ui run test -- src/lib/browser`: the window half (`agentBrowser.test.ts`)
   and the wire fixtures (`net/wireFixtures.test.ts`).
+- `cargo test -p chimaera-server a_file_opens_as_a_ticketed_page`: a file page end to end
+  (refusals, the `/raw` page and its asset, `file://` URLs, reload after a rewrite, the
+  hand-over refusal).
 - Live (**verify-app**): in the macOS app, start a local web server, ask an agent to navigate,
   snapshot, click and type in it, and read its console; share a pane by the chain link, watch
   the marker, act in the pane and check that the agent is told; `browser_show` and check that
