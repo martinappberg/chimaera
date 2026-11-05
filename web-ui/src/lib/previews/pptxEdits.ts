@@ -109,13 +109,13 @@ function rebased(op: DeckOp, base: string): DeckOp {
 export function describeOp(op: DeckOp): string {
   switch (op.kind) {
     case "xfrm":
-      return "a move or resize";
+      return "move";
     case "text":
-      return "a text edit";
+      return "text";
     case "delete":
-      return "a deleted shape";
+      return "delete";
     case "order":
-      return "the slide order";
+      return "slide order";
   }
 }
 
@@ -205,6 +205,9 @@ export class DeckEditsCore {
   push(op: DeckOp, gesture: string | null = null): void {
     const before = this.text(op.part);
     const after = applyOp(before, op);
+    // An edit that changes nothing is no undo step (and keeps redo) — unless
+    // it folds into this gesture's step, which it may be undoing in part.
+    if (after === before && (gesture === null || gesture !== this.lastGesture)) return;
     const last = this.ops[this.ops.length - 1];
     if (
       gesture !== null &&
@@ -309,6 +312,9 @@ export class DeckEditsCore {
    *  outlived it) is dropped as done; anything else is held. */
   private replant(op: DeckOp): void {
     const base = this.origin.has(op.part) ? this.text(op.part) : null;
+    // A delete whose shape is already gone (deleted there too, or a journal
+    // that outlived its save) is done, not a conflict.
+    if (op.kind === "delete" && base !== null && !shapeExists(base, op.shape)) return;
     if (base !== null) {
       try {
         const after = applyOp(base, op);

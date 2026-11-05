@@ -54,8 +54,12 @@ export class DeckEdits {
   saving = $state(false);
   /** The last save or edit failure, shown in the bar. */
   error = $state<string | null>(null);
-  /** Edits a change on disk left undecided (descriptions). */
-  conflicts = $state<string[]>([]);
+  /** Edits a change on disk left undecided: what kind, and on which part. */
+  conflicts = $state<{ label: string; part: string }[]>([]);
+  /** The last save failed (kept until a save succeeds, unlike edit errors). */
+  saveFailed = $state(false);
+  /** Ask the view's file entry to recheck the disk (after a 409). */
+  onConflict: (() => void) | null = null;
   /** A quiet note ("saved", "merged with a change on disk"). */
   note = $state<string | null>(null);
   /** The journal could not record the edits (shown: never silently "safe"). */
@@ -91,11 +95,11 @@ export class DeckEdits {
     return this.core?.disk(part) ?? null;
   }
 
-  /** Parts the history touched (the view re-renders their slides). */
-  touchedParts(): string[] {
-    const c = this.core;
-    if (c === null) return [];
-    return [...new Set(c.history.map((op) => op.part))];
+  /** Unsaved edits journaled for this deck (a crash, a reload), so the view
+   *  attaches at once instead of waiting for edit mode. */
+  async hasJournal(): Promise<boolean> {
+    const rec = await drafts.find(this.path + JOURNAL_SUFFIX).catch(() => null);
+    return rec !== null;
   }
 
   /** Load `part` so edits to it apply at once (call before a gesture). */
@@ -180,7 +184,7 @@ export class DeckEdits {
       this.error = `that edit can't be written to this slide (${e.message})`;
       return false;
     }
-    this.error = null;
+    if (!this.saveFailed) this.error = null;
     this.sync();
     return true;
   }
@@ -231,13 +235,16 @@ export class DeckEdits {
       );
       if (res.hash === null) throw new Error("the daemon didn't report what it wrote");
       c.markSaved(parts, res.hash);
+      this.saveFailed = false;
       noteWrite(this.path, res.mtime);
       this.sync();
       this.flashNote("saved");
       return !c.dirty;
     } catch (e) {
+      this.saveFailed = true;
       if (e instanceof FileConflictError) {
         this.error = "the deck changed on disk — your edits are kept; reloading to merge them";
+        this.onConflict?.();
       } else if (e instanceof PackageUnsupportedError) {
         this.error = "this daemon is too old to save deck edits; update it to save";
       } else if (e instanceof ApiError) {
@@ -287,7 +294,7 @@ export class DeckEdits {
     this.dirty = c?.dirty ?? false;
     this.canUndo = c?.canUndo ?? false;
     this.canRedo = c?.canRedo ?? false;
-    this.conflicts = (c?.conflicts ?? []).map(describeOp);
+    this.conflicts = (c?.conflicts ?? []).map((op) => ({ label: describeOp(op), part: op.part }));
     this.version += 1;
     setDirty(this.path, this.dirty || this.conflicts.length > 0);
     this.scheduleJournal();

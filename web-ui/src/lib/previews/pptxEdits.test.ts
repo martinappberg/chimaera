@@ -138,6 +138,22 @@ describe("DeckEditsCore", () => {
     expect(readText(core.text(S1), "2")).toEqual(["b"]);
   });
 
+  it("an edit that changes nothing is no undo step and keeps redo", async () => {
+    const core = new DeckEditsCore(reader({ [S1]: slide(box("2", 0, "a")) }), "h0");
+    await core.ensure(S1);
+    core.push(move("2", 0, 5));
+    core.undo();
+    core.push({ kind: "text", part: S1, shape: "2", from: ["a"], to: ["a"] });
+    expect(core.history).toHaveLength(0);
+    expect(core.canRedo).toBe(true);
+  });
+
+  it("a delete of a shape that is already gone is done, not a conflict", async () => {
+    const core = new DeckEditsCore(reader({ [S1]: slide(box("2", 0, "a")) }), "h0");
+    await core.restore([{ kind: "delete", part: S1, shape: "9" }]);
+    expect(core.conflicts).toHaveLength(0);
+  });
+
   it("refuses an edit that can't apply and leaves the history alone", async () => {
     const core = new DeckEditsCore(reader({ [S1]: slide(box("2", 0, "a")) }), "h0");
     await core.ensure(S1);
