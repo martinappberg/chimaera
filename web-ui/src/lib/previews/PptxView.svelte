@@ -694,7 +694,8 @@
       if (!gone) trip = t;
     });
     void listenOfficeTrip((t) => {
-      if (t.path === p) trip = t;
+      // A trip ends on its own once PowerPoint closes the deck, all sent.
+      if (t.path === p) trip = t.state === "done" ? null : t;
     }).then((un) => {
       if (gone) un();
       else stop = un;
@@ -1255,9 +1256,6 @@
           : `open ${basename(path)} in PowerPoint${edits.dirty ? " (your edits here are saved first)" : ""}`}
         >{officeBusy ? "opening…" : "PowerPoint"}</button
       >
-      {#if trip !== null}
-        <button class="bbtn" onclick={() => void settleTrip("done")} title="stop sending PowerPoint's saves back">done</button>
-      {/if}
     {:else if remote}
       <button class="bbtn" onclick={() => void download()} title="download {basename(path)} to open it in PowerPoint">download</button>
     {/if}
@@ -1274,10 +1272,25 @@
   {/if}
   {#if trip?.state === "conflict"}
     <div class="banner" role="alert">
-      <span>{basename(path)} changed on this host since it was opened in {officeApp}. Nothing was overwritten.</span>
-      <button class="opt" onclick={() => void settleTrip("copy")}>save mine as a copy</button>
-      <button class="opt" onclick={() => void settleTrip("theirs")}>open theirs</button>
-      <button class="opt danger" onclick={() => void settleTrip("overwrite")}>overwrite</button>
+      <span
+        >{basename(path)} changed here while it was open in {officeApp}, so your last save there wasn't sent. Nothing
+        was overwritten.</span
+      >
+      <button
+        class="opt"
+        onclick={() => void settleTrip("overwrite")}
+        title="your {officeApp} version replaces the one here (the other changes are lost)">keep mine</button
+      >
+      <button
+        class="opt"
+        onclick={() => void settleTrip("copy")}
+        title="both stay: yours is saved beside it as a copy, and later {officeApp} saves go to the copy">keep both</button
+      >
+      <button
+        class="opt"
+        onclick={() => void settleTrip("theirs")}
+        title="opens the version here in {officeApp}; your unsent changes stay only in the window you have open">use theirs</button
+      >
     </div>
   {:else if trip?.state === "error" && trip.message !== null}
     <div class="banner" role="alert"><span>{trip.message}</span></div>
@@ -1553,10 +1566,6 @@
   .banner > span {
     flex: 1 1 18rem;
     min-width: 0;
-  }
-
-  .opt.danger {
-    color: var(--err);
   }
 
   .bbtn,

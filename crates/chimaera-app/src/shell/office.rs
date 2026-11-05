@@ -71,6 +71,9 @@ pub(crate) enum TripState {
     Uploading,
     Conflict,
     Error,
+    /// PowerPoint closed the deck with every save on the host: the trip is
+    /// over (only ever sent, never stored).
+    Done,
 }
 
 /// One round trip, as persisted. Holds no token: the endpoint is re-read
@@ -294,6 +297,10 @@ pub(crate) trait Disk {
     /// The file's SHA-256 when it is a complete zip, `None` while it is not
     /// (a save still being written); `Err` with a short human reason.
     fn complete_hash(&self, path: &Path) -> Result<Option<String>, String>;
+    /// An app holds the file open: PowerPoint (like Word) keeps a `~$` owner
+    /// file beside a document it has open. A working copy has a directory of
+    /// its own, so any owner file there is this deck's.
+    fn held_open(&self, path: &Path) -> bool;
 }
 
 pub(crate) enum Sent {
@@ -342,9 +349,27 @@ pub(crate) struct Watch {
     waiting: bool,
     /// The last hash taken, so a retry or a resolution doesn't re-read it.
     hashed: Option<(Fingerprint, String)>,
+    /// PowerPoint has had the deck open (its owner file was seen), or the
+    /// trip was resumed at launch (it was open when the trip began).
+    app_seen: bool,
+    /// Polls in a row with PowerPoint's owner file gone.
+    closed_polls: u8,
 }
 
+/// Polls PowerPoint's owner file must stay gone before the trip ends (a save
+/// can briefly replace the files beside it).
+const CLOSED_POLLS: u8 = 3;
+
 impl Watch {
+    /// A trip resumed at launch: its deck was open in PowerPoint when the
+    /// trip began, so the owner file going (or being gone) ends it.
+    fn resumed() -> Self {
+        Watch {
+            app_seen: true,
+            ..Watch::default()
+        }
+    }
+
     fn settled_at(fp: Option<Fingerprint>, hash: &str) -> Self {
         Watch {
             seen: fp,
@@ -416,6 +441,12 @@ pub(crate) fn step(
     now_ms: u64,
     uploading: &mut dyn FnMut(&Trip),
 ) -> bool {
+    if disk.held_open(&trip.local_path) {
+        watch.app_seen = true;
+        watch.closed_polls = 0;
+    } else if watch.app_seen {
+        watch.closed_polls = watch.closed_polls.saturating_add(1);
+    }
     // Held: only the person's choice moves a conflict on.
     if trip.state == TripState::Conflict {
         return false;
@@ -547,6 +578,18 @@ pub(crate) fn save_copy(
         Ok(Sent::Conflict { .. }) => Err(format!("{} refused the copy", trip.alias)),
         Err(failure) => Err(failure.message()),
     }
+}
+
+/// The trip is over: PowerPoint closed the deck (its owner file stayed gone
+/// for a few polls after being seen) and the host has every save. A trip in
+/// conflict, failing or mid-upload never ends this way — the person decides.
+pub(crate) fn finished(trip: &Trip, watch: &mut Watch, disk: &dyn Disk) -> bool {
+    trip.state == TripState::Watching
+        && trip.message.is_none()
+        && watch.app_seen
+        && watch.closed_polls >= CLOSED_POLLS
+        && !watch.retry
+        && may_finish(trip, watch, disk).is_ok()
 }
 
 /// "done" is refused while the working copy holds what the host lacks.
@@ -707,6 +750,17 @@ struct RealDisk;
 impl Disk for RealDisk {
     fn stat(&self, path: &Path) -> Option<Fingerprint> {
         std::fs::metadata(path).ok().map(|meta| fingerprint(&meta))
+    }
+
+    fn held_open(&self, path: &Path) -> bool {
+        let Some(dir) = path.parent() else {
+            return false;
+        };
+        std::fs::read_dir(dir).is_ok_and(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .any(|e| e.file_name().to_string_lossy().starts_with("~$"))
+        })
     }
 
     fn complete_hash(&self, path: &Path) -> Result<Option<String>, String> {
@@ -1080,11 +1134,16 @@ pub(crate) fn start(app: &AppHandle) {
     let root = chimaera_core::data_dir().join("office");
     let store = TripStore::load(chimaera_core::data_dir().join("office-trips.json"), &root);
     let resume = !store.trips.is_empty();
+    let watch = store
+        .trips
+        .iter()
+        .map(|t| (t.key(), Watch::resumed()))
+        .collect();
     app.manage(Office {
         root,
         inner: Mutex::new(Inner {
             store,
-            watch: HashMap::new(),
+            watch,
             running: resume,
         }),
         io: tokio::sync::Mutex::new(()),
@@ -1160,12 +1219,38 @@ fn tick_all(app: &AppHandle, endpoints: HashMap<String, Option<(u16, String)>>) 
             emit(app, &trip);
             dirty = true;
         }
+        if finished(&trip, &mut watch, &RealDisk) {
+            remove_copies(&trip, &office.root);
+            {
+                let mut inner = lock(&office.inner);
+                inner.store.remove(&key);
+                inner.watch.remove(&key);
+            }
+            trip.state = TripState::Done;
+            emit(app, &trip);
+            dirty = true;
+            continue;
+        }
         let mut inner = lock(&office.inner);
         let _ = inner.store.put(&key, trip);
         inner.watch.insert(key, watch);
     }
     if dirty {
         office.persist();
+    }
+}
+
+/// Delete a finished trip's working copies (only ever under the office root).
+fn remove_copies(trip: &Trip, root: &Path) {
+    for dir in trip
+        .retired
+        .iter()
+        .map(PathBuf::as_path)
+        .chain(trip.local_path.parent())
+    {
+        if dir.starts_with(root) && dir != root {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }
 
@@ -1396,16 +1481,7 @@ pub(super) async fn office_trip_resolve(
         };
         let forget = choice == "done" && outcome.is_ok();
         if forget {
-            for dir in trip
-                .retired
-                .iter()
-                .map(PathBuf::as_path)
-                .chain(trip.local_path.parent())
-            {
-                if dir.starts_with(&root) && dir != root {
-                    let _ = std::fs::remove_dir_all(dir);
-                }
-            }
+            remove_copies(&trip, &root);
         }
         (outcome, trip, watch, forget)
     })
@@ -1620,6 +1696,7 @@ mod tests {
         fp: RefCell<Option<Fingerprint>>,
         hash: RefCell<Result<Option<String>, String>>,
         hashes: RefCell<usize>,
+        open: RefCell<bool>,
     }
 
     impl FakeDisk {
@@ -1628,6 +1705,7 @@ mod tests {
                 fp: RefCell::new(Some(fp(1))),
                 hash: RefCell::new(Ok(Some(h('a')))),
                 hashes: RefCell::new(0),
+                open: RefCell::new(false),
             }
         }
 
@@ -1645,6 +1723,9 @@ mod tests {
         fn complete_hash(&self, _: &Path) -> Result<Option<String>, String> {
             *self.hashes.borrow_mut() += 1;
             self.hash.borrow().clone()
+        }
+        fn held_open(&self, _: &Path) -> bool {
+            *self.open.borrow()
         }
     }
 
@@ -1854,6 +1935,51 @@ mod tests {
         assert_eq!(trip.state, TripState::Watching);
         assert_eq!(trip.base_hash, h('b'));
         assert_eq!(trip.conflict_hash, None);
+    }
+
+    #[test]
+    fn closing_the_deck_in_powerpoint_ends_a_trip_once_everything_is_sent() {
+        let (mut trip, mut watch) = opened();
+        let disk = FakeDisk::new();
+        let host = FakeHost::default();
+        // Not seen open yet (PowerPoint still starting): never ends.
+        for _ in 0..5 {
+            tick(&mut trip, &mut watch, &disk, &host);
+        }
+        assert!(!finished(&trip, &mut watch, &disk));
+        // Open, then a save that isn't on the host yet, then closed.
+        *disk.open.borrow_mut() = true;
+        tick(&mut trip, &mut watch, &disk, &host);
+        disk.save(2, 'b');
+        *disk.open.borrow_mut() = false;
+        tick(&mut trip, &mut watch, &disk, &host);
+        assert!(
+            !finished(&trip, &mut watch, &disk),
+            "an unsent save holds it"
+        );
+        // The save goes up; after a few closed polls the trip is over.
+        tick(&mut trip, &mut watch, &disk, &host);
+        assert_eq!(host.uploads.borrow().len(), 1);
+        for _ in 0..CLOSED_POLLS {
+            tick(&mut trip, &mut watch, &disk, &host);
+        }
+        assert!(finished(&trip, &mut watch, &disk));
+        // A conflict never ends on its own.
+        trip.state = TripState::Conflict;
+        assert!(!finished(&trip, &mut watch, &disk));
+    }
+
+    #[test]
+    fn a_resumed_trip_ends_when_powerpoint_has_closed_it() {
+        let (trip, _) = opened();
+        let mut watch = Watch::resumed();
+        let disk = FakeDisk::new();
+        let host = FakeHost::default();
+        let mut trip = trip;
+        for _ in 0..=CLOSED_POLLS {
+            tick(&mut trip, &mut watch, &disk, &host);
+        }
+        assert!(finished(&trip, &mut watch, &disk));
     }
 
     #[test]

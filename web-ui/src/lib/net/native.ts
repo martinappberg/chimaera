@@ -563,8 +563,10 @@ export interface OfficeTrip {
   path: string;
   /** "watching": open in PowerPoint, everything uploaded; "uploading";
    *  "conflict": the host's file changed since it was opened, nothing was
-   *  overwritten; "error": the last upload failed (`message` says why). */
-  state: "watching" | "uploading" | "conflict" | "error";
+   *  overwritten; "error": the last upload failed (`message` says why);
+   *  "done": PowerPoint closed the deck with every save on the host, and
+   *  the trip is over. */
+  state: "watching" | "uploading" | "conflict" | "error" | "done";
   /** When the last save reached the host (ms since the epoch). */
   uploaded_ms: number | null;
   message: string | null;
@@ -610,10 +612,11 @@ export async function officeTrip(path: string): Promise<OfficeTrip | null> {
 }
 
 /**
- * Settle a trip: "overwrite" uploads the PowerPoint copy over the host's
- * changed file; "copy" uploads it beside it instead (resolves to the new
- * path); "theirs" fetches the host's version into a new copy and opens that;
- * "done" stops watching (refused while a save hasn't reached the host).
+ * Settle a trip's conflict: "overwrite" (keep mine) uploads the PowerPoint
+ * copy over the host's changed file; "copy" (keep both) uploads it beside it
+ * instead (resolves to the new path); "theirs" fetches the host's version
+ * into a new copy and opens that. ("done" ends a trip by hand; a trip ends on
+ * its own when PowerPoint closes the deck with everything sent.)
  */
 export async function resolveOfficeTrip(
   path: string,
