@@ -517,6 +517,17 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   reveal spans shortly after its fade), because span-fragmented text copies with a hard newline
   at every visual wrap point. Blockquotes render as a quiet accent-washed quote card, distinct
   from code chrome.
+- **Run a shell block.** A settled fence a shell reads (```` ```bash ````, `sh`, `zsh`, `console`,
+  `shell-session`, `sbatch`, …) also carries a ▶ **run in terminal** button beside Copy. A click
+  types the block into the chat's terminal and presses Enter (details on the
+  [terminals](terminals.md#commands-typed-in-from-a-chat) page). A transcript-style block (lines
+  starting `$ `, and always a `console`-family fence) runs only those lines, prompt removed, with
+  their `\` continuations and heredoc bodies minus the `> ` continuation prompt; a `console` block
+  with no prompt is output and gets no button. Control characters and zero-width characters are
+  dropped, tabs become spaces, and a block with bidi controls gets no button (what it shows is not
+  what it would run). The payload is the block as rendered, read at click time, like Copy; only a
+  button the app made runs anything, never one an agent's raw HTML forged. Nothing runs without the
+  click, and a block still streaming has no button (`chat/runCommand.ts`; App's `runOnce`).
 - **Quote part of a reply back to the agent.** Select any text in the transcript — a sentence of a
   reply, a few table rows, a line of tool output — and a quiet **`>` quote in reply** chip appears at
   the selection's end (the context bridge's chip; the chord `⇧⌘R` / `Ctrl+Shift+R` does the same).
@@ -1310,3 +1321,12 @@ _Captured 2026-10-15 (from the maintainer, in-session, while the chat-UX batch w
 _Intent pending — not yet captured from the maintainer (shipped 2026-10-15, autonomous session)._
 
 - Derived context, not intent: the 2026-10-14 batch's cross-runtime review found the ACP chats getting less silently — every pre-allowed chimaera tool still raised a permission card there, and Cursor's to-do list was discarded. Both were held back until the frames were captured live (the repo's rule: agent wire formats are pinned, never guessed; PROTOCOL.md Pass 45). Decisions made without the maintainer and open: the driver answers only an offered allow-once (never a standing allow-always in the agent), a cancelled Cursor to-do leaves the card rather than drawing a fourth state, and an agent's own plan-tool rows are hidden as Claude's TodoWrite is. Run **capture-feature-intent** with the maintainer to replace this stub.
+
+### Running a shell block from chat — why it exists
+_Captured 2026-11-04 (the maintainer, in the session that built it)._
+
+- **Problem it solves:** when an agent gives "terminal commands it would want you to run", "one
+  should be able to do this in chat", not by copying them into a terminal by hand.
+- **How settled it is:** the why is settled; which fences qualify, which terminal it picks and how
+  the text is typed are additions, free to change if improved.
+- **Do not change (or: open to change):** open to change; nothing about the Run behavior is frozen.

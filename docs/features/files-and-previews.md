@@ -289,6 +289,25 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   mode, and call `git::mark_path_dirty` so the git panel refreshes without polling. Gzip
   decompress is capped at 64 MB/request (defuses gzip bombs). Open-at-line requests
   (`shared/reveal.ts`) place the cursor, center the range and flash it.
+- **Languages.** Every code surface — the editor, compare and diff views, notebook cells,
+  markdown fences, embed cards — picks a grammar through one module, `previews/languages.ts`:
+  `languageFor(path, text)` for a file, `languageNamed(name)` for a fence or kernel. The list is
+  CodeMirror's own (`@codemirror/language-data`, each loaded on first use) plus Typst and a few
+  research dialects that borrow a shipped grammar under their own name: **Snakemake** (Snakefile,
+  `.smk` → Python), **Nextflow** (`.nf`, `nextflow.config` → Groovy), **Makefile**, **Justfile**
+  and **Apptainer** (`Singularity`, `.def`) → Shell, and **R Markdown** / **Quarto** (Markdown
+  with `{r}` chunks highlighted). Names the list misses or gets wrong are mapped by table: cluster
+  job scripts (`.sbatch`, `.slurm`, `.pbs`), shell dotfiles and `.env`, `Containerfile`, MATLAB
+  `.m` (Octave's grammar), `.cfg`/`.conf`/ignore files/`requirements.txt` (INI), lockfiles, JSON
+  and XML variants, `.pyi`, `.F90`, `.cu`, `.svelte`, `.bib`, and more; fences accept the short
+  names agents write (```` ```py ````, `console`, `rs`, `matlab`). A file with no extension falls
+  back to its `#!` line (`#!/usr/bin/env python3`, `-S snakemake`, `Rscript`). Languages with no
+  close grammar (HCL, Nix, WDL) stay plain text rather than wear a wrong one. Linting is not core:
+  the only marks in the gutter are plugins' `diagnostics/1`.
+- **The language picker.** The editor's bottom bar names the file's language; picking another
+  (or Plain text) re-highlights in place and is remembered per file in this browser
+  (`languageOverrides`, a capped LRU in localStorage, `previews/pathMemory.ts`). Picking what the
+  file is detected as goes back to detecting.
 
 ## Rendered previews
 
@@ -733,8 +752,10 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   handle itself, and (in the app) only a link the user clicked opens the real browser — a
   script's own `a.click()` or navigation away is cancelled. A view whose own process keeps
   dying (a page over WebKit's limit) is reloaded at most twice a minute, then shows "This page
-  stopped responding" with Reload. Frames inside a report load as they would in its iframe,
-  external ones included.
+  stopped responding" with Reload. Closing a view (its pane, its card, its window) ends its
+  process at once, even mid-layout: WebKit alone waited for the process to handle the close, ~4
+  minutes for a busy 9.5 GB report ([native app](native-app.md)). Frames inside a report load as
+  they would in its iframe, external ones included.
   **PDF** runs on pdf.js's **legacy** build: the modern build calls `Map.prototype.getOrInsertComputed`
   on every render and range read, which WebKit (the macOS app) and Chromium before 145 lack, so its
   pages stayed blank. pdf.js's standard fonts, CMaps, wasm decoders and ICC profiles ship with our
@@ -794,7 +815,7 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   download so it can play locally. A parked pane pauses its video (it doesn't resume by
   itself); audio keeps playing.
 - **Notebooks.** `.ipynb` opens read-only in `NotebookView.svelte`: code cells highlighted
-  (the editor's `--syn-*` palette, parsers from `@codemirror/language-data` plus Typst, `previews/languages.ts`, via `highlight.ts`)
+  (the editor's `--syn-*` palette, the kernel's language through `previews/languages.ts` `languageNamed`, via `highlight.ts`)
   beside their `[n]` execution counts; markdown cells through `marked` + DOMPurify with chat's
   profile (no `<style>`, web links in a new tab without an opener), math (`$…$`, `$$…$$`,
   `\(…\)`, `\[…\]`, `\begin{…}` blocks) typeset through the shared KaTeX policy only when a
@@ -877,7 +898,9 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
 - **PowerPoint decks.** `.pptx` (and `.pptm`, `.ppsx`, `.potx`) open in `PptxView.svelte`,
   drawn by `@aiden0z/pptx-renderer` in the Marp viewer's chrome: arrows / PageUp / PageDown /
   Space / Home / End page the deck, a thumbnail strip jumps, **present** goes full screen,
-  `#slide=N` reveals a slide (clamped to the deck), and **speaker notes** (read straight from the
+  `#slide=N` reveals a slide (clamped to the deck; `#slide=N&xywh=…` outlines a box on it), the
+  slide's **@** and the area tool point an agent at the slide or part of it ([Pointing at part of
+  a file](#pointing-at-part-of-a-file)), and **speaker notes** (read straight from the
   package; the renderer doesn't model them) show under the stage — under the deck's zip entry cap,
   one part at a time, each inflated only if it declares ≤1 MB (≤32 MB for all notes) and abandoned
   at 1 MB whatever it declared, so a zip bomb in `notesSlide*.xml` is skipped (that slide's notes
@@ -1066,7 +1089,14 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
     under the block. The values go along as TSV, header first.
   - **Video/audio:** the bar's **@ 0:12** button sends the playhead; **mark range** twice marks a
     range, which the button (and the chord) then sends.
-  - **Notebook cell / slide:** hover it; its **@** button sends it, with its source or text.
+  - **Notebook cell / slide:** hover it; its **@** button sends it, with its source or text. A
+    PowerPoint slide sends its title as the context and the rest of its text.
+  - **Part of a PowerPoint slide:** the bar's **select area** tool (or Shift-drag) draws a box; a
+    plain click (or Shift-click) picks the shape under the pointer, its own box. The box goes in
+    points from the slide's top-left — the deck's PDF export has the same page in points, and
+    python-pptx's EMU are 12700 per point — with the names of the shapes under it (as
+    PowerPoint's selection pane and `shape.name` call them) and their text, a table as
+    `a | b / c | d`. No crop yet: the slide is laid-out HTML, not pixels.
 - **What the agent gets.** One line, `@<path>#<locator> (<context>) "<quote>"`, each part after the
   path optional:
 
@@ -1081,6 +1111,8 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   | spreadsheet | `@book.xlsx#sheet=Q1%20Summary&range=D6:E7 "score\tnote\n2.5\tsecond…"` |
   | media | `@talk.wav#t=3.5`, `@talk.wav#t=2,6.25` |
   | notebook cell / slide | `@analysis.ipynb#cell=2 "import pandas…"`, `@deck.md#slide=2 "Results…"` |
+  | PowerPoint slide | `@deck.pptx#slide=2 (Results) "Effect held across cohorts · Figure 2…"` |
+  | PowerPoint area / shape | `@deck.pptx#slide=3&xywh=43,115,433,109 (Gene table) "gene \| log2FC / TP53 \| 2.1"` |
 
   The pixels: a **chat** target gets the crop as an image attachment (the pasted-screenshot
   pipeline and its caps), delivered in one insert with the locator so both land in the same
@@ -1092,7 +1124,8 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   `crop` / `label`, `composeSelectionReference`, `referenceNow`), `shared/ReferenceChip.svelte` +
   `ReferenceButton.svelte`, `App.svelte` `referenceSelection` (the one handler: chat attach vs
   terminal upload), the viewers (`PdfView`, `ImageView`, `TableView` + `XlsxView`, `MediaView`,
-  `NotebookView`, `SlidesView`, `MarkdownView`), region math in `previews/imageRegion.ts`. The
+  `NotebookView`, `SlidesView`, `PptxView` + `pptxRefs.ts`, `MarkdownView`), region math in
+  `previews/imageRegion.ts`. The
   daemon's `fs/xlsx` reports the sheet's used-range `origin`, so A1 references are the sheet's own.
 - **Key behaviors.**
   - **Locators are links too.** The same fragments open at the spot from chat, a terminal, or a
@@ -1364,6 +1397,21 @@ _Intent pending — drafted from the maintainer's request, 2026-09-26; questionn
   one from the grid's row numbers), and the chip-only affordance (no context menu) have not been confirmed
   with the maintainer — capture via **capture-feature-intent** when available.
 
+### Pointing at a PowerPoint slide or part of one — why it exists
+_Captured 2026-11-04 (the maintainer, in the session that built it); questionnaire partly run._
+
+- **Problem it solves:** the maintainer is "super interested in driving good .pptx through
+  Chimaera", and a deck in the preview could not be pointed at ("Går ej att referera från en PP
+  till agent", issue #345). The ask: "one should be able to reference like we do in other
+  documents but parts of a pptx", and "reference stuff should be there by default".
+- **Core bet:** references into a deck are built in and on by default, not part of an
+  extension. Authoring help (themes, slide pictures for agents, deck checks) is a separate,
+  opt-in first-party extension; editing in the viewer and opening the same file in PowerPoint
+  are their own follow-up.
+- **Pending.** How settled the rest is (the box in points, shape names as context, a click
+  picking a shape, no crop for now), and whether anything is frozen, has not been asked yet —
+  capture via **capture-feature-intent** when available.
+
 ### HTML in a web view of its own, and marking HTML — why it exists
 _Captured 2026-11-04 (the maintainer, in the session that built it)._
 
@@ -1378,3 +1426,17 @@ _Captured 2026-11-04 (the maintainer, in the session that built it)._
 - **Do not change (or: open to change):** nothing is frozen; the area is open to improvement.
 - **Left open:** native pane views on Linux/Windows (they keep the iframe for now), and the agent
   browser's pane engine (#273) building on pane views.
+
+### Code files in every common format, and a language picker — why it exists
+_Captured 2026-11-04 (the maintainer, in the session that built it)._
+
+- **Problem it solves:** code files are "not as big of a deal and not something people should
+  use a lot, but sometimes you want to go into the code and understand what it does", and
+  research files ("rust files, snakemake files etc.") are "quite common". The ask was to keep it
+  "simple still and useful but that all of these work", with the file-name mapping made
+  exhaustive.
+- **How settled it is:** the why is settled; the language tables, the dialect choices and the
+  picker are additions, free to change if improved.
+- **Deliberately left out:** "we skip all real Linters" — "If something is out of scope it should
+  be an extension". Core reads and highlights; checking code is not core.
+- **Do not change (or: open to change):** nothing is frozen; the area is open to improvement.

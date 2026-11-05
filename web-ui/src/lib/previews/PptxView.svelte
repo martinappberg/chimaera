@@ -11,6 +11,12 @@
    * input and every external load target stripped first (`pptxDeck.ts`), so
    * a deck never fetches anything; web links in it open through the app.
    * Animations and transitions aren't played — the bar says so quietly.
+   *
+   * Context bridge: the slide's @ sends the slide (its title and text); the
+   * area tool (or Shift-drag) sends a box on it in points, a plain click in
+   * the tool the shape under the pointer, with the shapes' names and text
+   * (`pptxRefs.ts`). `#slide=N&xywh=…` reveals that slide with the box
+   * outlined.
    */
   import { untrack } from "svelte";
   import type { SlideHandle } from "@aiden0z/pptx-renderer";
@@ -24,6 +30,11 @@
   import { activateUrl } from "../shared/urlOpen";
   import { isRemoteHost } from "../net/api";
   import Spinner from "./Spinner.svelte";
+  import ReferenceButton from "../shared/ReferenceButton.svelte";
+  import ReferenceChip from "../shared/ReferenceChip.svelte";
+  import { activeSelection, clearSelection, setSelection, type FileSelection } from "../shared/reference";
+  import { dragRegion, screenToPage, type Point, type Region } from "./imageRegion";
+  import { areaReference, itemAt, PX_TO_PT, slideItems, slideReference, snapBox, type SlideItem } from "./pptxRefs";
 
   interface Props {
     path: string;
@@ -97,6 +108,7 @@
     apply: ({ d, bytes }, still) => {
       disposeAll();
       revokeMedia();
+      clearPick();
       deck = d;
       deckGen += 1;
       error = null;
@@ -216,13 +228,20 @@
     const req = takeReveal(path);
     if (req?.slide === undefined) return;
     const i = req.slide - 1;
-    if (untrack(() => deck) === null) pendingSlide = i;
-    else go(i);
+    untrack(() => {
+      revealed = req.region === undefined ? null : { slide: i, region: req.region };
+      // The followed box replaces a pick, even on the slide already shown.
+      if (revealed !== null) clearPick();
+      if (deck === null) pendingSlide = i;
+      else go(i);
+    });
   });
 
   function go(i: number): void {
     if (deck === null) return;
-    current = Math.min(Math.max(0, i), count - 1);
+    const next = Math.min(Math.max(0, i), count - 1);
+    if (next !== current) clearPick();
+    current = next;
   }
 
   let stageW = $state(0);
@@ -233,6 +252,166 @@
   );
   const thumbW = $derived(Math.round((THUMB_H * w) / h));
   const thumbScale = $derived(THUMB_H / h);
+
+  // --- pointing at a slide, or part of one (context bridge) ------------------------
+
+  /** The slide in points, and screen pixels per point on the stage. */
+  const ptW = $derived(w * PX_TO_PT);
+  const ptH = $derived(h * PX_TO_PT);
+  const ptScale = $derived(scale / PX_TO_PT);
+
+  /** The area tool is on: a drag on the slide draws a box, a click picks a shape. */
+  let areaMode = $state(false);
+  /** The box being drawn, then the one pointed at (points, on the current slide). */
+  let pick = $state.raw<Region | null>(null);
+  /** The box is drawn and published (its chip shows). */
+  let pickReady = $state(false);
+  /** What the chip's tooltip says is pointed at ("Chart 3 on slide 2"). */
+  let pickLabel = $state("area");
+  /** A gesture on the slide: where it started, and whether it became a drag. */
+  let boxFrom: { at: Point; client: Point; pointer: number; moved: boolean } | null = null;
+  const selOwner = {};
+  let published: FileSelection | null = null;
+  /** A `#slide=N&xywh=` reveal, outlined while its slide is on the stage. */
+  let revealed = $state.raw<{ slide: number; region: Region & { percent?: boolean } } | null>(null);
+  let boxEl = $state<HTMLDivElement | null>(null);
+  const CHIP_W = 170;
+  const CHIP_H = 28;
+
+  /** The current slide's shapes, read once per slide per deck. */
+  let itemsMemo: { deck: Deck; index: number; items: SlideItem[] } | null = null;
+  function itemsOf(i: number): SlideItem[] {
+    const d = deck;
+    if (d === null) return [];
+    if (itemsMemo?.deck !== d || itemsMemo.index !== i) itemsMemo = { deck: d, index: i, items: slideItems(d.presentation, i) };
+    return itemsMemo.items;
+  }
+
+  function slidePick(): FileSelection | null {
+    return deck === null ? null : slideReference(path, current + 1, itemsOf(current));
+  }
+
+  function slidePoint(e: PointerEvent): Point | null {
+    const r = boxEl?.getBoundingClientRect();
+    return r === undefined || !(ptScale > 0) ? null : screenToPage(e.clientX, e.clientY, { x: r.left, y: r.top }, ptScale);
+  }
+
+  function onBoxPointerDown(e: PointerEvent): void {
+    if (e.button !== 0 || deck === null || presenting || !(areaMode || e.shiftKey)) return;
+    const at = slidePoint(e);
+    if (at === null) return;
+    e.preventDefault();
+    e.stopPropagation();
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    stageEl?.focus({ preventScroll: true });
+    clearPick();
+    revealed = null;
+    window.getSelection()?.removeAllRanges();
+    boxFrom = { at, client: { x: e.clientX, y: e.clientY }, pointer: e.pointerId, moved: false };
+  }
+
+  function onBoxPointerMove(e: PointerEvent): void {
+    const from = boxFrom;
+    if (from === null || e.pointerId !== from.pointer) return;
+    // A few pixels of jitter is a click, not a box.
+    if (!from.moved && Math.hypot(e.clientX - from.client.x, e.clientY - from.client.y) < 4) return;
+    from.moved = true;
+    const to = slidePoint(e);
+    if (to !== null) pick = dragRegion(from.at, to, ptW, ptH);
+  }
+
+  function onBoxPointerUp(e: PointerEvent): void {
+    const el = e.currentTarget as HTMLElement;
+    if (el.hasPointerCapture(e.pointerId)) el.releasePointerCapture(e.pointerId);
+    const from = boxFrom;
+    if (from === null || e.pointerId !== from.pointer) return;
+    boxFrom = null;
+    let p = pick;
+    if (p === null) {
+      // A drag that spans nothing on the slide points at nothing.
+      if (from.moved) return;
+      // A click: the shape under the pointer, its own box.
+      const hit = itemAt(itemsOf(current), from.at);
+      p = hit === null ? null : snapBox(hit.box, ptW, ptH);
+      if (p === null) return;
+      pick = p;
+    }
+    const sel = areaReference(path, current + 1, itemsOf(current), p);
+    published = sel;
+    pickLabel = sel.label ?? "area";
+    setSelection(selOwner, sel);
+    pickReady = true;
+  }
+
+  /** The browser took the pointer mid-gesture: drop it, never publish half a box. */
+  function onBoxPointerCancel(e: PointerEvent): void {
+    const el = e.currentTarget as HTMLElement;
+    if (el.hasPointerCapture(e.pointerId)) el.releasePointerCapture(e.pointerId);
+    if (boxFrom === null || e.pointerId !== boxFrom.pointer) return;
+    clearPick();
+  }
+
+  /** While pointing, a click on the slide is the gesture's own: a linked
+   *  shape's jump or web link (the renderer's listeners, on the target)
+   *  must not run. The slide's @ is a button of its own. */
+  function onBoxClickCapture(e: MouseEvent): void {
+    if (!(areaMode || e.shiftKey)) return;
+    if ((e.target as Element | null)?.closest?.(".slide-ref") != null) return;
+    e.preventDefault();
+    e.stopPropagation();
+  }
+
+  function clearPick(): void {
+    boxFrom = null;
+    pick = null;
+    pickReady = false;
+    if (published !== null) {
+      published = null;
+      clearSelection(selOwner);
+    }
+  }
+
+  function toggleArea(): void {
+    areaMode = !areaMode;
+    if (!areaMode) clearPick();
+    stageEl?.focus({ preventScroll: true });
+  }
+
+  // A newer selection elsewhere replaces this box.
+  $effect(() => {
+    const a = $activeSelection;
+    if (published === null || a === published) return;
+    published = null;
+    pickReady = false;
+    if (boxFrom === null) pick = null;
+  });
+
+  $effect(() => () => {
+    if (published !== null) clearSelection(selOwner);
+    published = null;
+  });
+
+  /** The revealed box in points (a `percent:` one is relative to the slide). */
+  const revealBox = $derived.by(() => {
+    const r = revealed;
+    if (r === null || r.slide !== current || deck === null) return null;
+    const { percent, ...raw } = r.region;
+    const box = percent === true ? { x: (raw.x * ptW) / 100, y: (raw.y * ptH) / 100, w: (raw.w * ptW) / 100, h: (raw.h * ptH) / 100 } : raw;
+    return snapBox(box, ptW, ptH);
+  });
+
+  /** The chip sits under the box's bottom-right corner, inside the stage. */
+  const chipPos = $derived.by(() => {
+    const p = pick;
+    if (p === null || !pickReady || presenting) return null;
+    const left0 = (stageW - w * scale) / 2;
+    const top0 = (stageH - h * scale) / 2;
+    const clamp = (n: number, lo: number, hi: number) => Math.min(Math.max(n, lo), Math.max(lo, hi));
+    return {
+      x: clamp(left0 + (p.x + p.w) * ptScale - CHIP_W, 4, stageW - CHIP_W),
+      y: clamp(top0 + (p.y + p.h) * ptScale + 6, 4, stageH - CHIP_H - 4),
+    };
+  });
 
   let stageEl = $state<HTMLDivElement | null>(null);
   let stripEl = $state<HTMLDivElement | null>(null);
@@ -320,6 +499,9 @@
 
   function onKey(e: KeyboardEvent): void {
     if (e.metaKey || e.ctrlKey || e.altKey) return;
+    // Enter and Space on a control inside the stage (the slide's @, a
+    // slide link) activate it; they page the deck only from the stage.
+    if ((e.key === "Enter" || e.key === " ") && e.target !== e.currentTarget) return;
     if (deck === null) return;
     switch (e.key) {
       case "ArrowRight":
@@ -346,8 +528,11 @@
         void togglePresent();
         break;
       case "Escape":
-        if (!presenting) return;
-        void togglePresent();
+        if (presenting) void togglePresent();
+        else if (pick !== null) clearPick();
+        else if (revealBox !== null) revealed = null;
+        else if (areaMode) areaMode = false;
+        else return;
         break;
       default:
         return;
@@ -382,6 +567,10 @@
 
   /** Web links inside a slide open through the app, never in this page. */
   function onStageClick(e: MouseEvent): void {
+    if (areaMode || e.shiftKey) {
+      e.preventDefault();
+      return;
+    }
     const a = (e.target as Element | null)?.closest?.("a[href]");
     if (a === null || a === undefined) return;
     e.preventDefault();
@@ -437,6 +626,26 @@
         <button class="bbtn" class:on={showNotes} onclick={() => (showNotes = !showNotes)} title="show or hide the speaker notes">notes</button>
       {/if}
       <button class="bbtn" class:on={showThumbs} onclick={() => (showThumbs = !showThumbs)} title="show or hide the thumbnail strip">thumbnails</button>
+      <button
+        class="bbtn icon area-btn"
+        class:on={areaMode}
+        onclick={toggleArea}
+        aria-label="select an area"
+        aria-pressed={areaMode}
+        title={areaMode
+          ? "drag a box on the slide, or click a shape, to reference it in an agent — click to stop (Esc)"
+          : "select an area or a shape to reference in an agent (or Shift-drag)"}
+      >
+        <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"
+          ><path
+            d="M2.5 5V3.5a1 1 0 0 1 1-1H5M11 2.5h1.5a1 1 0 0 1 1 1V5M13.5 11v1.5a1 1 0 0 1-1 1H11M5 13.5H3.5a1 1 0 0 1-1-1V11M7.2 2.5h1.6M7.2 13.5h1.6M2.5 7.2v1.6M13.5 7.2v1.6"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.3"
+            stroke-linecap="round"
+          /></svg
+        >
+      </button>
       <button class="bbtn" onclick={() => void togglePresent()} title="present full screen (F)">present</button>
     {/if}
     {#if remote}
@@ -459,9 +668,54 @@
     onclick={onStageClick}
   >
     {#if deck !== null && scale > 0}
-      <div class="slide-box" style:width="{w * scale}px" style:height="{h * scale}px">
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div
+        class="slide-box"
+        bind:this={boxEl}
+        style:width="{w * scale}px"
+        style:height="{h * scale}px"
+        onpointerdown={onBoxPointerDown}
+        onmousedown={(e) => {
+          // Shift extends a text selection by default; here it draws a box.
+          if (areaMode || e.shiftKey) e.preventDefault();
+        }}
+        onpointermove={onBoxPointerMove}
+        onpointerup={onBoxPointerUp}
+        onpointercancel={onBoxPointerCancel}
+        onclickcapture={onBoxClickCapture}
+      >
         <div class="slide-scale" style:width="{w}px" style:height="{h}px" style:transform="scale({scale})" bind:this={slot}></div>
+        {#if !presenting}
+          {#if areaMode}<div class="area-layer" aria-hidden="true"></div>{/if}
+          {#if revealBox !== null && pick === null}
+            <div
+              class="pick-mark revealed"
+              aria-hidden="true"
+              style:left="{revealBox.x * ptScale}px"
+              style:top="{revealBox.y * ptScale}px"
+              style:width="{revealBox.w * ptScale}px"
+              style:height="{revealBox.h * ptScale}px"
+            ></div>
+          {/if}
+          {#if pick !== null}
+            <div
+              class="pick-mark"
+              class:drawing={!pickReady}
+              aria-hidden="true"
+              style:left="{pick.x * ptScale}px"
+              style:top="{pick.y * ptScale}px"
+              style:width="{pick.w * ptScale}px"
+              style:height="{pick.h * ptScale}px"
+            ></div>
+          {/if}
+          <span class="slide-ref">
+            <ReferenceButton pick={slidePick} label="slide {current + 1}" text="slide {current + 1}" />
+          </span>
+        {/if}
       </div>
+      {#if chipPos !== null && pick !== null}
+        <ReferenceChip x={chipPos.x} y={chipPos.y} label={pickLabel} />
+      {/if}
       {#if presenting}
         <span class="present-count">{current + 1} / {count}</span>
       {/if}
@@ -641,6 +895,9 @@
     z-index: 1000;
   }
 
+  /* Clipped, never scrollable: the slide's unscaled layout box overflows it,
+     and a scroll container would let a focus or scroll-into-view of the @
+     inside it slide the deck sideways. */
   .slide-box {
     position: relative;
     flex: none;
@@ -650,6 +907,12 @@
     box-shadow:
       0 0 0 1px color-mix(in srgb, var(--fg) 10%, transparent),
       0 2px 12px color-mix(in srgb, var(--fg) 14%, transparent);
+  }
+
+  @supports (overflow: clip) {
+    .slide-box {
+      overflow: clip;
+    }
   }
 
   .presenting .slide-box {
@@ -681,6 +944,55 @@
     position: absolute !important;
     left: 0;
     top: 0;
+  }
+
+  /* The slide's @: shown while the stage is hovered or it has focus. */
+  .slide-ref {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    z-index: 2;
+    opacity: 0;
+    transition: opacity 0.12s ease;
+  }
+
+  .stage:hover .slide-ref,
+  .slide-ref:focus-within {
+    opacity: 1;
+  }
+
+  /* The area tool takes the slide's pointer: links and slide jumps wait. */
+  .area-layer {
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    cursor: crosshair;
+  }
+
+  /* The pointed-at area: solid once drawn, dashed while dragging. */
+  .pick-mark {
+    position: absolute;
+    z-index: 1;
+    box-sizing: border-box;
+    pointer-events: none;
+    border: 1.5px solid var(--accent);
+    border-radius: 2px;
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--term-bg) 70%, transparent);
+  }
+
+  .pick-mark.drawing {
+    border-style: dashed;
+    background: color-mix(in srgb, var(--accent) 6%, transparent);
+  }
+
+  /* A followed reference: outlined, not filled, so the slide reads through. */
+  .pick-mark.revealed {
+    background: none;
+  }
+
+  .bbtn.on.area-btn {
+    color: var(--accent);
   }
 
   .present-count {
@@ -822,7 +1134,8 @@
   @media (prefers-reduced-motion: reduce) {
     .bbtn,
     .opt,
-    .thumb {
+    .thumb,
+    .slide-ref {
       transition: none;
     }
   }
