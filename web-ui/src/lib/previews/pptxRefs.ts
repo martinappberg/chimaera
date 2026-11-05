@@ -21,7 +21,7 @@ import {
 } from "@aiden0z/pptx-renderer";
 import type { FileSelection } from "../shared/reference";
 import { xywhFragment } from "../shared/locator";
-import type { Point, Region } from "./imageRegion";
+import { dragRegion, type Point, type Region } from "./imageRegion";
 
 /** CSS pixels (the renderer's unit, 96 dpi) to points. */
 export const PX_TO_PT = 0.75;
@@ -61,8 +61,8 @@ export function entriesText(entries: readonly TextIndexEntry[]): string {
   let rowAt: number | null = null;
   const flush = () => {
     const text = rows
+      .filter((r) => r.some((c) => c !== ""))
       .map((r) => r.join(" | "))
-      .filter((r) => r !== "")
       .join(" / ");
     if (text !== "") lines.push(text);
     rows = [];
@@ -76,7 +76,11 @@ export function entriesText(entries: readonly TextIndexEntry[]): string {
       const r = e.rowIndex ?? 0;
       if (rowAt !== r) rows.push([]);
       rowAt = r;
-      rows[rows.length - 1].push(flat(e.text));
+      // The index leaves blank cells out; keep their columns so a value
+      // stays under its header.
+      const row = rows[rows.length - 1];
+      while (e.cellIndex !== undefined && row.length < e.cellIndex) row.push("");
+      row.push(flat(e.text));
     } else {
       flush();
       lines.push(e.text.trim());
@@ -186,11 +190,7 @@ export function itemAt(items: readonly SlideItem[], p: Point): SlideItem | null 
 
 /** A shape's box snapped outward to whole points and kept on the slide. */
 export function snapBox(r: Region, slideW: number, slideH: number): Region | null {
-  const x0 = Math.max(0, Math.floor(r.x));
-  const y0 = Math.max(0, Math.floor(r.y));
-  const x1 = Math.min(Math.ceil(slideW), Math.ceil(r.x + r.w));
-  const y1 = Math.min(Math.ceil(slideH), Math.ceil(r.y + r.h));
-  return x1 > x0 && y1 > y0 ? { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } : null;
+  return dragRegion({ x: r.x, y: r.y }, { x: r.x + r.w, y: r.y + r.h }, slideW, slideH);
 }
 
 function joinText(items: readonly SlideItem[]): string {

@@ -99,6 +99,17 @@ describe("a node's text", () => {
     expect(entriesText(cells)).toBe("gene | log2FC / TP53 | 2.1");
   });
 
+  it("keeps a blank cell's column (the index leaves blank cells out)", () => {
+    const cells = [
+      entry({ nodeType: "table", textKind: "table-cell", text: "gene", rowIndex: 0, cellIndex: 0 }),
+      entry({ nodeType: "table", textKind: "table-cell", text: "log2FC", rowIndex: 0, cellIndex: 1 }),
+      entry({ nodeType: "table", textKind: "table-cell", text: "padj", rowIndex: 0, cellIndex: 2 }),
+      entry({ nodeType: "table", textKind: "table-cell", text: "MYC", rowIndex: 1, cellIndex: 0 }),
+      entry({ nodeType: "table", textKind: "table-cell", text: "0.04", rowIndex: 1, cellIndex: 2 }),
+    ];
+    expect(entriesText(cells)).toBe("gene | log2FC | padj / MYC |  | 0.04");
+  });
+
   it("puts a group's children on their own lines", () => {
     expect(entriesText([entry({ text: " Step 1 " }), entry({ text: "Step 2" })])).toBe("Step 1\nStep 2");
   });

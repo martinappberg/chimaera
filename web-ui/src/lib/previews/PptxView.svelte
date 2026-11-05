@@ -230,6 +230,8 @@
     const i = req.slide - 1;
     untrack(() => {
       revealed = req.region === undefined ? null : { slide: i, region: req.region };
+      // The followed box replaces a pick, even on the slide already shown.
+      if (revealed !== null) clearPick();
       if (deck === null) pendingSlide = i;
       else go(i);
     });
@@ -266,7 +268,8 @@
   let pickReady = $state(false);
   /** What the chip's tooltip says is pointed at ("Chart 3 on slide 2"). */
   let pickLabel = $state("area");
-  let boxFrom: { at: Point; client: Point; pointer: number } | null = null;
+  /** A gesture on the slide: where it started, and whether it became a drag. */
+  let boxFrom: { at: Point; client: Point; pointer: number; moved: boolean } | null = null;
   const selOwner = {};
   let published: FileSelection | null = null;
   /** A `#slide=N&xywh=` reveal, outlined while its slide is on the stage. */
@@ -304,14 +307,15 @@
     clearPick();
     revealed = null;
     window.getSelection()?.removeAllRanges();
-    boxFrom = { at, client: { x: e.clientX, y: e.clientY }, pointer: e.pointerId };
+    boxFrom = { at, client: { x: e.clientX, y: e.clientY }, pointer: e.pointerId, moved: false };
   }
 
   function onBoxPointerMove(e: PointerEvent): void {
     const from = boxFrom;
     if (from === null || e.pointerId !== from.pointer) return;
     // A few pixels of jitter is a click, not a box.
-    if (pick === null && Math.hypot(e.clientX - from.client.x, e.clientY - from.client.y) < 4) return;
+    if (!from.moved && Math.hypot(e.clientX - from.client.x, e.clientY - from.client.y) < 4) return;
+    from.moved = true;
     const to = slidePoint(e);
     if (to !== null) pick = dragRegion(from.at, to, ptW, ptH);
   }
@@ -324,6 +328,8 @@
     boxFrom = null;
     let p = pick;
     if (p === null) {
+      // A drag that spans nothing on the slide points at nothing.
+      if (from.moved) return;
       // A click: the shape under the pointer, its own box.
       const hit = itemAt(itemsOf(current), from.at);
       p = hit === null ? null : snapBox(hit.box, ptW, ptH);
@@ -335,6 +341,24 @@
     pickLabel = sel.label ?? "area";
     setSelection(selOwner, sel);
     pickReady = true;
+  }
+
+  /** The browser took the pointer mid-gesture: drop it, never publish half a box. */
+  function onBoxPointerCancel(e: PointerEvent): void {
+    const el = e.currentTarget as HTMLElement;
+    if (el.hasPointerCapture(e.pointerId)) el.releasePointerCapture(e.pointerId);
+    if (boxFrom === null || e.pointerId !== boxFrom.pointer) return;
+    clearPick();
+  }
+
+  /** While pointing, a click on the slide is the gesture's own: a linked
+   *  shape's jump or web link (the renderer's listeners, on the target)
+   *  must not run. The slide's @ is a button of its own. */
+  function onBoxClickCapture(e: MouseEvent): void {
+    if (!(areaMode || e.shiftKey)) return;
+    if ((e.target as Element | null)?.closest?.(".slide-ref") != null) return;
+    e.preventDefault();
+    e.stopPropagation();
   }
 
   function clearPick(): void {
@@ -475,6 +499,9 @@
 
   function onKey(e: KeyboardEvent): void {
     if (e.metaKey || e.ctrlKey || e.altKey) return;
+    // Enter and Space on a control inside the stage (the slide's @, a
+    // slide link) activate it; they page the deck only from the stage.
+    if ((e.key === "Enter" || e.key === " ") && e.target !== e.currentTarget) return;
     if (deck === null) return;
     switch (e.key) {
       case "ArrowRight":
@@ -501,8 +528,9 @@
         void togglePresent();
         break;
       case "Escape":
-        if (pick !== null) clearPick();
-        else if (presenting) void togglePresent();
+        if (presenting) void togglePresent();
+        else if (pick !== null) clearPick();
+        else if (revealBox !== null) revealed = null;
         else if (areaMode) areaMode = false;
         else return;
         break;
@@ -653,7 +681,8 @@
         }}
         onpointermove={onBoxPointerMove}
         onpointerup={onBoxPointerUp}
-        onpointercancel={onBoxPointerUp}
+        onpointercancel={onBoxPointerCancel}
+        onclickcapture={onBoxClickCapture}
       >
         <div class="slide-scale" style:width="{w}px" style:height="{h}px" style:transform="scale({scale})" bind:this={slot}></div>
         {#if !presenting}
