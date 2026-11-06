@@ -408,6 +408,14 @@ _Captured 2026-09-29 (from the maintainer)._
   (reverse history search) — today's best pick, not a contract.
 - **Do not change (or: open to change):** open to change, apart from the core safety promise.
 
+### Window names in Mission Control — why it exists
+_Captured 2026-11-05 (from the maintainer, in the session that built it)._
+
+- **Problem it solves.** With several Chimaera windows open, Mission Control (F3) shows a wall of near-identical thumbnails; the maintainer wanted each window's project name "much bigger, only in this state, so that one can see which window is which", the way their Pocket app shows "Pocket is here".
+- **Deliberate.** Only a workspace's **main** window gets a card ("when people open separate windows too … just the workspace main window"). The **chimaera logo** belongs on it. A remote window's **host must read clearly**: "if you have the same project in multiple remotes it is nice to see clearly". The maintainer raised whether waiting input should show; it shows as a Dock-style badge, not yet explicitly confirmed.
+- **Motion is a requirement, not polish.** It appears **at once** on entering Mission Control and **fades out** on the way back ("the fade back though! is very important … only when we enter mission control should it be direct"). It must not linger or flicker on quick in-and-out or on hovering thumbnails, and it must never cost a visible hitch ("my whole computer just glitches … we don't want").
+- **Do not change (or: open to change):** the detection mechanism and the card's exact design are open to change; the behaviour above (main window only, instant in / fade out, no flicker, no system hitch, host legible, logo present) is what to keep.
+
 ### Dock activation and closing the last window
 _Captured 2026-09-25 (from the maintainer)._
 
