@@ -296,6 +296,7 @@
     askpassActive,
     closeThisWindow,
     isNativeShell,
+    onMissionControl,
     onFocusSession,
     onMenu,
     onUnsavedPrompt,
@@ -327,6 +328,7 @@
   import { targetLabel } from "./lib/browser/proxy";
   import { paneViewsPossible, zoomPaneView } from "./lib/shared/paneViewRoute";
   import UpdateToast from "./lib/workspace/UpdateToast.svelte";
+  import WindowNameCard from "./lib/workspace/WindowNameCard.svelte";
   import {
     applyAppStatus,
     checkForUpdates,
@@ -2587,31 +2589,83 @@
     return document.querySelector("dialog[open], [aria-modal='true']") !== null;
   }
 
+  /**
+   * What names this window: its host (remote only; a compute-node daemon —
+   * the snapshot's `self`, daemon truth, not the URL hash — appends its node,
+   * so a job window never poses as its login node), its workspace, and, for
+   * a detached window, the tab it shows. The OS title and the Mission
+   * Control name card both read it.
+   */
+  const windowIdentity = $derived.by(() => {
+    const node = $computeStatus?.self?.node;
+    const hostWithNode = node ? `${hostAlias} › ${node}` : hostAlias;
+    let tab: string | null = null;
+    if (detachedWindow) {
+      const only = tabCount(layout) === 1 ? panesOf(layout.root)[0]?.tabs[0] : undefined;
+      const p = findPane(layout.root, layout.focusedPaneId);
+      const shown = only ?? p?.tabs[p.active];
+      if (shown !== undefined) tab = tabLabel(shown);
+    }
+    return { host: isRemoteWindow ? hostWithNode : null, workspace: workspace?.name ?? null, tab };
+  });
+
+  /**
+   * macOS Mission Control is open (native shell only): a workspace's main
+   * window shows its name card. A torn-off window and Home don't — the
+   * workspace window is the one you pick. The page hears nothing of Mission
+   * Control while it is open, so a focus, key or click here means it has
+   * closed onto this window: the card goes then, without waiting for the
+   * shell's next read.
+   */
+  let missionControl = $state(false);
+  $effect(() => {
+    let off: (() => void) | null = null;
+    let gone = false;
+    void onMissionControl((open) => (missionControl = open)).then((stop) => {
+      if (gone) stop();
+      else off = stop;
+    });
+    return () => {
+      gone = true;
+      off?.();
+    };
+  });
+  $effect(() => {
+    if (!missionControl) return;
+    const back = (): void => {
+      missionControl = false;
+    };
+    // The window itself taking focus, not an element inside it (a capture
+    // listener would see those too, and something can focus while open).
+    const windowFocus = (e: FocusEvent): void => {
+      if (e.target === window) back();
+    };
+    // A click or key is the person back in this window. Not pointer moves or
+    // wheels: Mission Control hands those to the window under the pointer
+    // while it is still open.
+    window.addEventListener("focus", windowFocus);
+    window.addEventListener("pointerdown", back, true);
+    window.addEventListener("keydown", back, true);
+    return () => {
+      window.removeEventListener("focus", windowFocus);
+      window.removeEventListener("pointerdown", back, true);
+      window.removeEventListener("keydown", back, true);
+    };
+  });
+  const nameCardShown = $derived(missionControl && !detachedWindow && workspace !== null);
+
   $effect(() => {
     // The workspace leads; a remote window wears its host so a wall of similar
     // windows is legible:
     //   "my_project •cluster | chimaera"  (remote, in a workspace)
     //   "my_project | chimaera"           (local — the host is implicit)
     // Home (no workspace) drops the workspace but keeps the host when remote.
-    // A compute-node daemon (the snapshot's `self` — daemon truth, not the
-    // URL hash) appends its node: "my_project •cluster › n042 | …",
-    // so a job window never poses as its login node.
-    const node = $computeStatus?.self?.node;
-    const hostWithNode = node ? `${hostAlias} › ${node}` : hostAlias;
-    const host = isRemoteWindow ? hostWithNode : null;
-    let scope = workspace
-      ? host
-        ? `${workspace.name} •${host}`
-        : workspace.name
-      : (host ?? "");
+    // A job window's node trails its host: "my_project •cluster › n042 | …".
+    const { host, workspace: ws, tab } = windowIdentity;
+    let scope = ws !== null ? (host ? `${ws} •${host}` : ws) : (host ?? "");
     // A detached solo window is named for what it shows: the tab leads, the
     // workspace scope trails — "claude (2) — my_project | chimaera".
-    if (detachedWindow) {
-      const only = tabCount(layout) === 1 ? panesOf(layout.root)[0]?.tabs[0] : undefined;
-      const p = findPane(layout.root, layout.focusedPaneId);
-      const shown = only ?? p?.tabs[p.active];
-      if (shown !== undefined) scope = scope ? `${tabLabel(shown)} — ${scope}` : tabLabel(shown);
-    }
+    if (tab !== null) scope = scope ? `${tab} — ${scope}` : tab;
     const base = scope ? `${scope} | chimaera` : "chimaera";
     const title = needsYou > 0 ? `(${needsYou}) ${base}` : base;
     document.title = title;
@@ -5405,6 +5459,15 @@
 {#if updateNotice !== null && $assetTransition === null}
   <UpdateToast notice={updateNotice} />
 {/if}
+
+<!-- The window's name, large, while macOS Mission Control shows it shrunk
+     among others. -->
+<WindowNameCard
+  shown={nameCardShown}
+  name={workspace?.name ?? ""}
+  host={windowIdentity.host}
+  waiting={needsYou}
+/>
 
 <!-- Transient outcome chip: an action that would otherwise fail in silence
      (a refused detach, a blocked popup, a cross-window move that timed out). -->

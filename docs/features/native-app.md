@@ -147,6 +147,12 @@ app-build` (never the root `cargo`).
   during startup) it opens Home. A repeated launch focuses the most recent on-screen window the same way. Minimized
   windows are never mass-restored.
 
+## Window names in Mission Control (macOS)
+
+- **What & when.** While Mission Control or App Exposé shows every window as a thumbnail, each workspace's main window shows its name large: the chimaera mark on an app tile, the workspace name sized to fit one line, a host pill for a remote window (so the same project on two hosts reads apart), and a Dock-style badge on the tile when chats in that window wait on the person. Torn-off windows and Home show nothing. It appears at once and fades out as Mission Control zooms back.
+- **Where it lives.** `crates/chimaera-app/src/shell/mission_control.rs` (the watcher, event `mission-control`), `web-ui/src/lib/net/native.ts::onMissionControl`, `web-ui/src/lib/workspace/WindowNameCard.svelte`, and App's `nameCardShown`.
+- **Key behaviors.** macOS gives no public signal, and the page sees nothing (no visibility change, blur or resize; the thumbnail is the live window). The shell polls the on-screen window ids (`CGWindowListCreate`, ~0.3 ms) every 250 ms while the app has a window, every 50 ms while open, and describes a window (owner, layer, size; no Screen Recording or Accessibility permission needed) only the first time its id appears: describing costs the window server ~1 ms with measured stalls of 30–130 ms, felt as a hitch of the whole screen, so steady state describes nothing. open = a Dock window at layer 18; closing = a 1×1 Dock window at layer 0 parked off screen, which appears ~0.25 s before the layer-18 window goes. Hovering a thumbnail flips Mission Control's second full-screen window between layers 20 and 0 and shows a small title label at layer 20; neither counts. A new layer-18 window number is a new opening even with no close seen between, and a focus, key or click in the window drops the card at once. Pointer moves and wheels do not: Mission Control delivers them to the window under the pointer while open. The card is `data-overlay`, so pane views step aside under it.
+
 ## Home launcher
 
 - **What & when.** Home is workspace-first: **Open folder** registers an existing folder;

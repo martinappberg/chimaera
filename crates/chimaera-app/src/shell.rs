@@ -25,6 +25,8 @@ mod cluster;
 mod commands;
 mod connect;
 mod drag;
+#[cfg(target_os = "macos")]
+mod mission_control;
 mod native_view;
 pub(crate) mod notices;
 mod office;
@@ -1439,6 +1441,9 @@ pub fn run() {
             // through this AppKit delegate hook (see `unsaved`).
             #[cfg(target_os = "macos")]
             unsaved::install_os_quit_hook(&handle);
+            // The page names its window large while Mission Control is open.
+            #[cfg(target_os = "macos")]
+            mission_control::install(&handle);
             // The menu-bar / system-tray status item. Installed before the
             // daemon is up (its click handlers read Shell.local, populated by
             // runtime); non-fatal if the platform tray is unavailable.

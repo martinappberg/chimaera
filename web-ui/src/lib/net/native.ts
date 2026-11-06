@@ -648,6 +648,17 @@ export function onAppUpdate(handler: (version: string) => void): Promise<() => v
   return t.event.listen<string>("app-update", (e) => handler(e.payload));
 }
 
+/**
+ * macOS Mission Control opened (`true`) or closed (`false`). Broadcast to
+ * every window by the shell's watcher (`shell/mission_control.rs`); the page
+ * itself sees no sign of it. Never fires outside the macOS app.
+ */
+export function onMissionControl(handler: (open: boolean) => void): Promise<() => void> {
+  const t = tauri();
+  if (t === null) return Promise.resolve(() => {});
+  return t.event.listen<boolean>("mission-control", (e) => handler(e.payload === true));
+}
+
 export async function disconnectHost(alias: string): Promise<void> {
   await tauri()?.core.invoke<void>("disconnect_host", { alias });
 }
