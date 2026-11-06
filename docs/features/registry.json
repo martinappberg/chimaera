@@ -614,6 +614,7 @@
         "crates/chimaera-app/src/**",
         "web-ui/src/lib/net/native.ts",
         "web-ui/src/lib/workspace/UpdateToast.svelte",
+    "web-ui/src/lib/workspace/WindowNameCard.svelte",
         "web-ui/src/lib/workspace/update.svelte.ts"
       ],
       "maps": [

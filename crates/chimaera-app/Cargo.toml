@@ -83,7 +83,9 @@ objc2-app-kit = { version = "0.3", default-features = false, features = ["std", 
 objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "objc2-app-kit", "block2", "WKWebView", "WKWebViewConfiguration", "WKUserContentController", "WKUserScript", "WKContentWorld", "WKScriptMessage", "WKScriptMessageHandler", "WKSnapshotConfiguration", "WKFrameInfo", "WKNavigation", "WKNavigationAction", "WKNavigationDelegate", "WKUIDelegate", "WKWindowFeatures", "objc2-core-foundation"] }
 # Agent driving (`native_view_drive`): a CGEvent pixel wheel turned into the
 # NSEvent a view's `scrollWheel:` takes, and snapshots read back as CGImages.
-objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGEvent", "CGEventTypes", "CGImage"] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGEvent", "CGEventTypes", "CGImage", "CGWindow"] }
+# Mission Control detection (`shell/mission_control.rs`): the window list it reads (a CFArray keyed by CFStrings).
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFArray", "CFString"] }
 base64 = "0.22"
 objc2-user-notifications = { version = "0.3", default-features = false, features = ["std", "bitflags", "block2", "UNUserNotificationCenter", "UNNotification", "UNNotificationContent", "UNNotificationRequest", "UNNotificationResponse", "UNNotificationSound", "UNNotificationSettings", "UNNotificationTrigger"] }
 
