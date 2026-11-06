@@ -2618,18 +2618,7 @@
    * shell's next read.
    */
   let missionControl = $state(false);
-  $effect(() => {
-    let off: (() => void) | null = null;
-    let gone = false;
-    void onMissionControl((open) => (missionControl = open)).then((stop) => {
-      if (gone) stop();
-      else off = stop;
-    });
-    return () => {
-      gone = true;
-      off?.();
-    };
-  });
+  $effect(() => asyncDisposer(onMissionControl((open) => (missionControl = open))));
   $effect(() => {
     if (!missionControl) return;
     const back = (): void => {
@@ -5460,15 +5449,6 @@
   <UpdateToast notice={updateNotice} />
 {/if}
 
-<!-- The window's name, large, while macOS Mission Control shows it shrunk
-     among others. -->
-<WindowNameCard
-  shown={nameCardShown}
-  name={workspace?.name ?? ""}
-  host={windowIdentity.host}
-  waiting={needsYou}
-/>
-
 <!-- Transient outcome chip: an action that would otherwise fail in silence
      (a refused detach, a blocked popup, a cross-window move that timed out). -->
 {#if flash.text !== null}
@@ -5601,6 +5581,16 @@
     </div>
   {/if}
 {/if}
+
+<!-- The window's name, large, while macOS Mission Control shows it shrunk
+     among others. Last in the markup: it mounts as Mission Control opens, and
+     a sibling inserted ahead of large content re-resolves all of it. -->
+<WindowNameCard
+  shown={nameCardShown}
+  name={workspace?.name ?? ""}
+  host={windowIdentity.host}
+  waiting={needsYou}
+/>
 
 <style>
   /* Parked Home under its Settings page: opacity + inert (never visibility,

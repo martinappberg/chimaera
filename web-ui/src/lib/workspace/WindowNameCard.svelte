@@ -7,8 +7,9 @@
    * shows inside it.
    *
    * Only a workspace's main window shows it (App decides). Anatomy, read at
-   * a quarter of the window's size: the chimaera mark on an app tile (so a Chimaera window reads as one among other apps' windows),
-   * the name sized to fit one line, a host pill for a remote window, and a
+   * a quarter of the window's size: the chimaera mark on an app tile (so a
+   * Chimaera window reads as one among other apps' windows), the name sized
+   * to fit one line, a host pill for a remote window, and a
    * Dock-style badge on the tile when chats in this window wait on the
    * person — the moment you pick a window is when that matters most.
    *
@@ -35,7 +36,9 @@
 
   let { shown, name, host = null, waiting = 0 }: Props = $props();
 
-  const reduced = typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
+  // Asked when the fade starts, so a Reduce Motion change applies at once.
+  const reduced = (): boolean =>
+    typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
 
   // The name's size follows its length so a long workspace name still sits
   // on one line; CSS clamps both ends.
@@ -47,7 +50,7 @@
     class="window-name-card"
     data-overlay
     aria-hidden="true"
-    out:fade={{ duration: reduced ? 0 : 260, easing: cubicOut }}
+    out:fade={{ duration: reduced() ? 0 : 260, easing: cubicOut }}
   >
     <div class="card-body">
       <div class="tile" class:waiting={waiting > 0}>
@@ -112,8 +115,8 @@
     );
     border: 1px solid color-mix(in srgb, var(--fg) 9%, transparent);
     box-shadow:
-      0 0.6vmin 2.4vmin color-mix(in srgb, #000 16%, transparent),
-      inset 0 1px 0 color-mix(in srgb, #fff 30%, transparent);
+      var(--overlay-shadow),
+      inset 0 1px 0 color-mix(in srgb, var(--bg) 40%, transparent);
     margin-bottom: 3.4vmin;
   }
   .tile :global(svg) {
@@ -124,7 +127,7 @@
     box-shadow:
       0 0 0 0.5vmin color-mix(in srgb, var(--warn) 55%, transparent),
       0 0 4vmin color-mix(in srgb, var(--warn) 30%, transparent),
-      0 0.6vmin 2.4vmin color-mix(in srgb, #000 16%, transparent);
+      var(--overlay-shadow);
   }
   /* A Dock badge: the count of chats waiting on the person. */
   .badge {
@@ -141,11 +144,11 @@
     font-size: clamp(14px, 3.6vmin, 36px);
     font-weight: 700;
     font-variant-numeric: tabular-nums;
-    color: #fff;
-    background: linear-gradient(180deg, #ff5b4f, #e5372b);
+    color: var(--bg);
+    background: linear-gradient(180deg, color-mix(in srgb, var(--err) 88%, var(--bg)), var(--err));
     box-shadow:
       0 0 0 0.45vmin var(--bg),
-      0 0.4vmin 1.2vmin color-mix(in srgb, #000 22%, transparent);
+      var(--overlay-shadow);
   }
 
   /* Sized to the window and to its own length: one line at a quarter of the

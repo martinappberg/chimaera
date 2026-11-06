@@ -20,9 +20,9 @@
 //! The event is `true` on each opening — again for a new layer-18 window even
 //! when no close was seen between them (a quick out-and-in fits between two
 //! reads, and the page hides its card on the first touch) — and `false` as
-//! soon as it starts closing. Reading owners, layers and numbers from
-//! `CGWindowListCopyWindowInfo` needs no Screen Recording or Accessibility
-//! permission (window *names* would).
+//! soon as it starts closing. Reading window ids, owners, layers and sizes
+//! needs no Screen Recording or Accessibility permission (window *names*
+//! would).
 //!
 //! One thread polls every `POLL` while the app has a window (`POLL_OPEN`
 //! while open) and sends only changes. A poll asks for the on-screen window
@@ -120,13 +120,14 @@ fn spread(dock: &[DockWindow]) -> Option<i64> {
 struct Seen(HashMap<CGWindowID, Option<DockWindow>>);
 
 impl Seen {
-    /// The Dock windows among `on_screen`, describing only ids not seen yet
-    /// (`describe` answers for the ids it is given; one it skips counts as
-    /// not the Dock's, so it is never asked about again).
+    /// The Dock windows among `on_screen`, describing only ids not seen yet.
+    /// `describe` answers for the ids it is given: one it skips is gone or not
+    /// the Dock's and is never asked about again; a call that fails (`None`)
+    /// remembers nothing, so the next poll asks again.
     fn dock_windows(
         &mut self,
         on_screen: &[CGWindowID],
-        describe: impl FnOnce(&[CGWindowID]) -> Vec<(CGWindowID, Option<DockWindow>)>,
+        describe: impl FnOnce(&[CGWindowID]) -> Option<Vec<(CGWindowID, Option<DockWindow>)>>,
     ) -> Vec<DockWindow> {
         let fresh: Vec<CGWindowID> = on_screen
             .iter()
@@ -134,14 +135,16 @@ impl Seen {
             .filter(|id| !self.0.contains_key(id))
             .collect();
         if !fresh.is_empty() {
-            if self.0.len() + fresh.len() > SEEN_CAP {
-                self.0.retain(|id, _| on_screen.contains(id));
-            }
-            for id in &fresh {
-                self.0.insert(*id, None);
-            }
-            for (id, window) in describe(&fresh) {
-                self.0.insert(id, window);
+            if let Some(described) = describe(&fresh) {
+                if self.0.len() + fresh.len() > SEEN_CAP {
+                    self.0.retain(|id, _| on_screen.contains(id));
+                }
+                for id in &fresh {
+                    self.0.insert(*id, None);
+                }
+                for (id, window) in described {
+                    self.0.insert(id, window);
+                }
             }
         }
         on_screen
@@ -170,24 +173,21 @@ fn dock_windows(seen: &mut Seen) -> Vec<DockWindow> {
     })
 }
 
-/// Owner, layer and size of `ids`, one window-server call for all of them.
-fn describe(ids: &[CGWindowID]) -> Vec<(CGWindowID, Option<DockWindow>)> {
+/// Owner, layer and size of `ids`, one window-server call for all of them;
+/// `None` when the call itself fails.
+fn describe(ids: &[CGWindowID]) -> Option<Vec<(CGWindowID, Option<DockWindow>)>> {
     let mut values: Vec<*const c_void> =
         ids.iter().map(|&id| id as usize as *const c_void).collect();
     // No callbacks: the values are plain ids, as `CGWindowListCreate` returns them.
-    let Some(array) = (unsafe {
+    let array = unsafe {
         CFArray::new(
             None,
             values.as_mut_ptr(),
             values.len() as isize,
             std::ptr::null(),
         )
-    }) else {
-        return Vec::new();
-    };
-    let Some(list) = (unsafe { CGWindowListCreateDescriptionFromArray(Some(&array)) }) else {
-        return Vec::new();
-    };
+    }?;
+    let list = unsafe { CGWindowListCreateDescriptionFromArray(Some(&array)) }?;
     // CFArray of CFDictionary is toll-free bridged to NSArray of NSDictionary,
     // the CFString keys to NSString, CFNumber to NSNumber.
     let list: &CFArray = &list;
@@ -206,7 +206,8 @@ fn describe(ids: &[CGWindowID]) -> Vec<(CGWindowID, Option<DockWindow>)> {
         dict.objectForKey(k)
             .and_then(|v| v.downcast::<NSNumber>().ok())
     };
-    list.iter()
+    let described = list
+        .iter()
         .filter_map(|window| {
             let id = number(&window, number_key)?.as_i64();
             let is_dock = window
@@ -231,7 +232,8 @@ fn describe(ids: &[CGWindowID]) -> Vec<(CGWindowID, Option<DockWindow>)> {
             };
             Some((id as CGWindowID, Some(dock)))
         })
-        .collect()
+        .collect();
+    Some(described)
 }
 
 #[cfg(test)]
@@ -337,7 +339,7 @@ mod tests {
         let spread_window = w(18, 7, 2560.0, 1440.0);
         let first = seen.dock_windows(&[1, 7], |ids| {
             assert_eq!(ids, [1, 7]);
-            vec![(1, None), (7, Some(spread_window))]
+            Some(vec![(1, None), (7, Some(spread_window))])
         });
         assert_eq!(first, [spread_window]);
         // The same windows again: nothing to describe.
@@ -347,7 +349,7 @@ mod tests {
         let marker = w(0, 9, 1.0, 1.0);
         let next = seen.dock_windows(&[1, 7, 9, 11], |ids| {
             assert_eq!(ids, [9, 11]);
-            vec![(9, Some(marker))]
+            Some(vec![(9, Some(marker))])
         });
         assert_eq!(next, [spread_window, marker]);
         let _ = seen.dock_windows(&[11], |_| panic!("a skipped id was asked about again"));
@@ -359,10 +361,24 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_describe_is_asked_again() {
+        let mut seen = Seen::default();
+        let spread_window = w(18, 7, 2560.0, 1440.0);
+        assert_eq!(seen.dock_windows(&[7], |_| None), []);
+        let next = seen.dock_windows(&[7], |ids| {
+            assert_eq!(ids, [7]);
+            Some(vec![(7, Some(spread_window))])
+        });
+        assert_eq!(next, [spread_window]);
+    }
+
+    #[test]
     fn seen_stays_bounded() {
         let mut seen = Seen::default();
         for id in 0..(SEEN_CAP as u32 * 3) {
-            let _ = seen.dock_windows(&[id], |ids| ids.iter().map(|&id| (id, None)).collect());
+            let _ = seen.dock_windows(&[id], |ids| {
+                Some(ids.iter().map(|&id| (id, None)).collect())
+            });
         }
         assert!(seen.0.len() <= SEEN_CAP);
     }
