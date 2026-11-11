@@ -32,6 +32,8 @@
   import { validateEntryName } from "../shared/fsNames";
   import { InlineRename, renameFocus } from "../shared/inlineRename.svelte";
   import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
+  import { isMac } from "../shared/keys";
+  import { OPEN_BESIDE } from "../shared/urlOpen";
   import { hasLocalFiles, revealEntries, writeClipboard } from "../net/native";
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
@@ -47,6 +49,9 @@
     onOpen(path: string): void;
     /** Open a file as a PERMANENT tab (double click, or a just-created file). */
     onOpenPinned(path: string): void;
+    /** Open a file beside the focused pane (⌘/Ctrl-click, ⌘/Ctrl+Enter, a
+     *  middle click, "Open Beside"). */
+    onOpenBeside(path: string): void;
     /** Begin a pointer drag of a tree entry — file OR dir (same grammar as
      *  rail rows and pane tabs). `onEntryClick` is the sub-threshold action
      *  (open for files, expand/collapse for dirs), routed through the drag so
@@ -84,6 +89,7 @@
     root,
     onOpen,
     onOpenPinned,
+    onOpenBeside,
     onDragStart,
     activePath,
     reveal = null,
@@ -748,6 +754,7 @@
       e.preventDefault();
       if (entry.broken) return; // a dangling symlink opens nothing
       if (entry.kind === "dir") toggle(entry.path);
+      else if (e.key === "Enter" && (isMac ? e.metaKey : e.ctrlKey)) onOpenBeside(entry.path);
       else onOpen(entry.path);
     } else if (e.key === "F2") {
       e.preventDefault();
@@ -850,7 +857,10 @@
       ];
     }
     const dirTarget = entry.kind === "dir" ? entry.path : dirname(entry.path);
+    const beside: ContextMenuEntry[] =
+      entry.kind === "file" ? [{ label: OPEN_BESIDE, onSelect: () => onOpenBeside(entry.path) }, "separator"] : [];
     return [
+      ...beside,
       { label: "New File…", onSelect: () => beginCreate("file", dirTarget) },
       { label: "New Folder…", onSelect: () => beginCreate("dir", dirTarget) },
       "separator",
@@ -1217,12 +1227,20 @@
         // Both kinds click via the drag's sub-threshold path — a DOM onclick
         // would ALSO fire after a completed drag (pointer capture retargets
         // the click back to this row) and double-act. Skip while renaming.
+        const beside = isMac ? e.metaKey : e.ctrlKey;
         onDragStart(e, entry.path, entry.kind, () => {
           if (edit?.mode === "rename" && edit.path === entry.path) return;
           if (entry.broken) return; // a dangling symlink opens nothing
           if (entry.kind === "dir") toggle(entry.path);
+          else if (beside) onOpenBeside(entry.path);
           else onOpen(entry.path);
         });
+      }}
+      onauxclick={(e) => {
+        // A middle click opens a file beside, as on links.
+        if (e.button !== 1 || entry.kind !== "file" || entry.broken) return;
+        e.preventDefault();
+        onOpenBeside(entry.path);
       }}
       ondblclick={() => {
         // VS Code: double-click a file PINS it (the two single-clicks already

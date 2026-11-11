@@ -243,6 +243,40 @@
       ]
     },
     {
+      "id": "agent-browser",
+      "name": "Agent browser (agents see and drive pages)",
+      "page": "docs/features/agent-browser.md",
+      "paths": [
+        "crates/chimaera-server/src/agent_browser/**",
+        "crates/chimaera-server/src/tests/agent_browser.rs",
+        "crates/chimaera-app/src/shell/native_view/drive.rs",
+        "crates/chimaera-app/src/shell/native_view/mac/agent.rs",
+        "crates/chimaera-core/src/pane_agent.js",
+        "web-ui/src/lib/browser/agentBrowser.ts",
+        "web-ui/src/lib/browser/agentBrowserRuntime.ts",
+        "web-ui/src/lib/net/browserWire.ts"
+      ],
+      "maps": [
+        "crates/chimaera-server/AGENTS.md",
+        "crates/chimaera-app/AGENTS.md",
+        "crates/chimaera-core/AGENTS.md",
+        "web-ui/src/lib/browser/AGENTS.md",
+        "web-ui/src/lib/net/AGENTS.md"
+      ],
+      "rules": [
+        ".claude/rules/daemon.md",
+        ".claude/rules/native-app.md",
+        ".claude/rules/web-ui.md"
+      ],
+      "checks": [
+        "cargo test -p chimaera-server agent_browser",
+        "just browser-smoke",
+        "just app-check",
+        "npm --prefix web-ui run check",
+        "npm --prefix web-ui run test"
+      ]
+    },
+    {
       "id": "browser-pane",
       "name": "Browser pane (reverse-proxied web apps)",
       "page": "docs/features/browser-pane.md",
@@ -447,6 +481,8 @@
       "paths": [
         "web-ui/src/lib/previews/**",
         "crates/chimaera-server/src/fs.rs",
+        "crates/chimaera-server/src/fs/**",
+        "crates/chimaera-app/src/shell/office.rs",
         "crates/chimaera-server/src/notebook.rs",
         "web-ui/src/lib/workspace/FileTree.svelte"
       ],
@@ -578,6 +614,7 @@
         "crates/chimaera-app/src/**",
         "web-ui/src/lib/net/native.ts",
         "web-ui/src/lib/workspace/UpdateToast.svelte",
+    "web-ui/src/lib/workspace/WindowNameCard.svelte",
         "web-ui/src/lib/workspace/update.svelte.ts"
       ],
       "maps": [

@@ -727,6 +727,29 @@ async fn resolve(
     if let Some(exe) = found {
         return Ok((exe, None));
     }
+    // Where an installer that leaves the PATH alone puts it.
+    let also: Vec<String> = m
+        .programs
+        .iter()
+        .find(|p| p.name == program)
+        .map(|p| {
+            p.also
+                .iter()
+                .filter_map(|d| super::platform::also_dir(d))
+                .map(|d| d.display().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    if !also.is_empty() {
+        let (name, dirs) = (program.to_string(), also.join(":"));
+        let found = tokio::task::spawn_blocking(move || on_path(&name, &dirs))
+            .await
+            .ok()
+            .flatten();
+        if let Some(exe) = found {
+            return Ok((exe, None));
+        }
+    }
     for t in providers {
         if let Some(bin) = super::toolchain::installed_bin(state, &m.id, &t.id).await {
             let exe = bin.join(program);
@@ -1452,6 +1475,28 @@ pub(crate) async fn cancel_route(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_programs_usual_folder_is_searched_as_a_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-also-{}-{}",
+            std::process::id(),
+            &chimaera_core::generate_token()[..8]
+        ));
+        let app = dir.join("Office.app/Contents/MacOS");
+        std::fs::create_dir_all(&app).unwrap();
+        let exe = app.join("soffice");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let abs = super::super::platform::also_dir(&app.display().to_string()).unwrap();
+        assert_eq!(on_path("soffice", &abs.display().to_string()), Some(exe));
+        let home = super::super::platform::also_dir("~/Applications/X.app").unwrap();
+        assert!(
+            home.is_absolute() && home.ends_with("Applications/X.app"),
+            "{home:?}"
+        );
+    }
 
     #[test]
     fn env_names_and_the_hosts_own() {

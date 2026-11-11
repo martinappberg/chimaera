@@ -48,6 +48,40 @@ app-build` (never the root `cargo`).
   copy to local windows and Home), `local-daemon-updated` only to local windows, and askpass prompts
   only to the windows allowed to answer them. A test fails on any broadcast of those events, and
   another pins Tauri's internal dispatch names to the locked Tauri version.
+- **The grants follow the window's own web view, not the window.** A daemon window's
+  capability names its web view's label (`authorize_daemon_origin`; for every daemon window
+  the two labels are the same). Tauri hands a window-scoped capability to every web view in
+  that window, so this keeps any future Tauri web view in a window from inheriting the grants.
+  Defence in depth: pane views are plain WKWebViews with no IPC.
+- **A deck in PowerPoint** (`shell/office.rs`): `office_open` takes the host from the calling
+  window's own scope, never an argument. A local window's deck opens in Microsoft PowerPoint (or
+  the default app); a remote window's deck (macro-free types only) goes on a round trip — a
+  working copy under the data dir, each PowerPoint save uploaded with the host's hash as its
+  precondition, a conflict held for the person, and the trip ending once PowerPoint closes the
+  deck with everything sent ([files and previews](files-and-previews.md)).
+- **Pane views** (macOS): an HTML preview or browser pane is a `WKWebView` the shell owns,
+  laid over the pane — its own web process, so a heavy page can't freeze the window
+  ([files and previews](files-and-previews.md#rendered-previews), [browser pane](browser-pane.md#the-pane-ui)).
+  It is a plain subview, never a Tauri web view: it has no IPC, and Tauri's window lookups
+  (`get_webview_window`, which `deliver_to` uses) keep finding the window — a Tauri child web
+  view would make Tauri stop counting it as a webview window. It loads only its window's daemon
+  origin under `/raw/` or `/proxy/`; a clicked link elsewhere goes to the real browser
+  (`shell/native_view.rs`). Each sits in a clip box of its own, so an HTML embed card's view is
+  cropped to its scroller ([embed cards](files-and-previews.md#embed-cards)); the wheel over a
+  passive one (a card nobody clicked into) goes back to the window's page through an app-wide
+  local event monitor, since a web view never chains a wheel out the way an iframe does.
+  Closing a view ends its web process right away (`end_process` in `shell/native_view/mac.rs`,
+  WebKit's `_killWebContentProcessAndResetState`, checked with `respondsToSelector:`): left to
+  itself, WebKit ends the process only once the process handles the close, and a busy one —
+  laying out a huge report, or swapping — took ~4 minutes (a 9.5 GB report, 2026-11-04). The
+  delegates are cleared first, so the termination is never mistaken for a crash and reloaded,
+  and the kill is skipped if any other web view in the app's windows reports the same process id.
+  The
+  [agent browser](agent-browser.md)'s app engine drives these views through `native_view_drive`
+  (real NSEvent input, evals, native screenshots, the console/network rings; the calling
+  window's own views only), and `native_view_show` with `agent` shows an agent's own page just
+  past the window's right edge, where WebKit keeps it running at full speed. macOS only, like
+  pane views.
 - **The askpass wiring stays the app's own.** The local daemon is spawned without the app's
   `SSH_ASKPASS*` / `CHIMAERA_ASKPASS_*` variables (and a daemon that inherited them from an older
   app strips them from its sessions), so a terminal's `ssh` prompts on its tty and no agent can
@@ -112,6 +146,12 @@ app-build` (never the root `cargo`).
   hidden it restores ONLY the most recently used one (the rest stay in the Dock); with no window (only
   during startup) it opens Home. A repeated launch focuses the most recent on-screen window the same way. Minimized
   windows are never mass-restored.
+
+## Window names in Mission Control (macOS)
+
+- **What & when.** While Mission Control or App Exposé shows every window as a thumbnail, each workspace's main window shows its name large: the chimaera mark on an app tile, the workspace name sized to fit one line, a host pill for a remote window (so the same project on two hosts reads apart), and a Dock-style badge on the tile when chats in that window wait on the person. Torn-off windows and Home show nothing. It appears at once and fades out as Mission Control zooms back.
+- **Where it lives.** `crates/chimaera-app/src/shell/mission_control.rs` (the watcher, event `mission-control`), `web-ui/src/lib/net/native.ts::onMissionControl`, `web-ui/src/lib/workspace/WindowNameCard.svelte`, and App's `nameCardShown`.
+- **Key behaviors.** macOS gives no public signal, and the page sees nothing (no visibility change, blur or resize; the thumbnail is the live window). The shell polls the on-screen window ids (`CGWindowListCreate`, ~0.3 ms) every 250 ms while the app has a window, every 50 ms while open, and describes a window (owner, layer, size; no Screen Recording or Accessibility permission needed) only the first time its id appears: describing costs the window server ~1 ms with measured stalls of 30–130 ms, felt as a hitch of the whole screen, so steady state describes nothing. open = a Dock window at layer 18; closing = a 1×1 Dock window at layer 0 parked off screen, which appears ~0.25 s before the layer-18 window goes. Hovering a thumbnail flips Mission Control's second full-screen window between layers 20 and 0 and shows a small title label at layer 20; neither counts. A new layer-18 window number is a new opening even with no close seen between, and a focus, key or click in the window drops the card at once. Pointer moves and wheels do not: Mission Control delivers them to the window under the pointer while open. The card is `data-overlay`, so pane views step aside under it.
 
 ## Home launcher
 
@@ -363,6 +403,14 @@ _Captured 2026-09-29 (from the maintainer)._
 - **Deliberate / non-obvious.** F5 instead of Ctrl+R off macOS was chosen so terminals keep Ctrl+R
   (reverse history search) — today's best pick, not a contract.
 - **Do not change (or: open to change):** open to change, apart from the core safety promise.
+
+### Window names in Mission Control — why it exists
+_Captured 2026-11-05 (from the maintainer, in the session that built it)._
+
+- **Problem it solves.** With several Chimaera windows open, Mission Control (F3) shows a wall of near-identical thumbnails; the maintainer wanted each window's project name "much bigger, only in this state, so that one can see which window is which", the way their Pocket app shows "Pocket is here".
+- **Deliberate.** Only a workspace's **main** window gets a card ("when people open separate windows too … just the workspace main window"). The **chimaera logo** belongs on it. A remote window's **host must read clearly**: "if you have the same project in multiple remotes it is nice to see clearly". The maintainer raised whether waiting input should show; it shows as a Dock-style badge, not yet explicitly confirmed.
+- **Motion is a requirement, not polish.** It appears **at once** on entering Mission Control and **fades out** on the way back ("the fade back though! is very important … only when we enter mission control should it be direct"). It must not linger or flicker on quick in-and-out or on hovering thumbnails, and it must never cost a visible hitch ("my whole computer just glitches … we don't want").
+- **Do not change (or: open to change):** the detection mechanism and the card's exact design are open to change; the behaviour above (main window only, instant in / fade out, no flicker, no system hitch, host legible, logo present) is what to keep.
 
 ### Dock activation and closing the last window
 _Captured 2026-09-25 (from the maintainer)._

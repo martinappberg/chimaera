@@ -363,6 +363,282 @@ export async function openExternal(url: string): Promise<boolean> {
   }
 }
 
+/** A pane's rectangle in CSS px of this window (the window's points). */
+export interface ViewRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * Show a page (`/raw/…` or `/proxy/…` on this daemon) in a web view of its
+ * own laid over `rect` — its own web process, so a heavy page can't freeze
+ * this window (`crates/chimaera-app/src/shell/native_view.rs`). Creates the
+ * view on first call; a later call with the same `id` moves it and navigates
+ * only if `url` changed. `hidden` creates or navigates it without showing
+ * it (a page still loading; `nativeViewPlace` shows it). `opts.agent` marks
+ * an agent's own view (the agent browser): the shell records its console
+ * and network for `nativeViewDrive`, and treats every gesture in it as the
+ * agent's; showing a view again without it hands it to the user. Null
+ * outside the app, or from an app build without pane views — the caller
+ * falls back to an iframe.
+ */
+export async function nativeViewShow(
+  id: string,
+  url: string,
+  rect: ViewRect,
+  hidden: boolean,
+  opts: ViewShowOptions = {},
+): Promise<ViewShown | null> {
+  const t = tauri();
+  if (t === null) return null;
+  try {
+    const shown = await t.core.invoke<{ fit?: unknown } | null>("native_view_show", { id, url, rect, hidden, ...opts });
+    return { fit: shown?.fit === true };
+  } catch {
+    return null;
+  }
+}
+
+/** What the shell made of a `nativeViewShow`: `fit` = it honours `ViewFit`
+ *  (an app build before embed cards answered nothing, and drops the
+ *  arguments without a word). */
+export interface ViewShown {
+  fit: boolean;
+}
+
+/** How a view sits in a scroller (an embed card): `clip` crops it to the
+ *  scroller's visible part (the page keeps its place), and `passive` hands
+ *  the wheel over it back to this page until the card is clicked into. */
+export interface ViewFit {
+  clip?: ViewRect | null;
+  passive?: boolean;
+}
+
+/** `nativeViewShow`'s options: the placement (`ViewFit`) and `agent` (an
+ *  agent's own view; absent = a user's pane). */
+export interface ViewShowOptions extends ViewFit {
+  agent?: boolean;
+}
+
+/** Move a pane view (`rect`), or hide it (`null`). */
+export async function nativeViewPlace(id: string, rect: ViewRect | null, fit: ViewFit = {}): Promise<void> {
+  const t = tauri();
+  if (t === null) return;
+  try {
+    await t.core.invoke<void>("native_view_place", { id, rect, ...fit });
+  } catch {
+    /* gone with its window or an older app build: nothing to move */
+  }
+}
+
+/** Close a pane view. */
+export async function nativeViewClose(id: string): Promise<void> {
+  const t = tauri();
+  if (t === null) return;
+  try {
+    await t.core.invoke<void>("native_view_close", { id });
+  } catch {
+    /* already gone */
+  }
+}
+
+/** A pane view's visible viewport as rendered: a PNG (base64) and the
+ *  viewport's size in CSS px (the PNG is usually denser). */
+export interface NativeViewSnapshot {
+  png: string;
+  width: number;
+  height: number;
+}
+
+/** Capture a pane view's viewport. Take it while the view is shown; null
+ *  outside the app, from an older build, or when the view is gone. */
+export async function nativeViewSnapshot(id: string): Promise<NativeViewSnapshot | null> {
+  const t = tauri();
+  if (t === null) return null;
+  try {
+    return await t.core.invoke<NativeViewSnapshot>("native_view_snapshot", { id });
+  } catch {
+    return null;
+  }
+}
+
+/** The "reference in agent" pill the shell draws in a pane view next to its
+ *  page's text selection (shown only while a selection exists). */
+export interface NativeViewChip {
+  text: string;
+  title: string;
+  enabled: boolean;
+}
+
+/** Set (or with `null` remove) a pane view's in-page reference pill. */
+export async function nativeViewChip(id: string, chip: NativeViewChip | null): Promise<void> {
+  const t = tauri();
+  if (t === null) return;
+  try {
+    await t.core.invoke<void>("native_view_chip", { id, chip });
+  } catch {
+    /* gone, or an app build without the pill: the chord still references */
+  }
+}
+
+/** What lies under a rect of a pane view's viewport, and where the page was
+ *  scrolled when it was read (document CSS px). `text` is capped by the
+ *  shell. */
+export interface NativeViewRegion {
+  text: string;
+  scrollX: number;
+  scrollY: number;
+  title: string;
+}
+
+/** Read the text under `rect` (CSS px of the view's viewport). */
+export async function nativeViewRegion(id: string, rect: ViewRect): Promise<NativeViewRegion | null> {
+  const t = tauri();
+  if (t === null) return null;
+  try {
+    return await t.core.invoke<NativeViewRegion>("native_view_region", { id, rect });
+  } catch {
+    return null;
+  }
+}
+
+export type NativeViewNav = "back" | "forward" | "reload" | "stop" | "zoomin" | "zoomout" | "zoomreset";
+
+/** Drive a pane view's own history, or its page zoom. */
+export async function nativeViewNav(id: string, action: NativeViewNav): Promise<void> {
+  const t = tauri();
+  if (t === null) return;
+  try {
+    await t.core.invoke<void>("native_view_nav", { id, action });
+  } catch {
+    /* gone with its window or an older app build */
+  }
+}
+
+/**
+ * Act on a pane view for an agent (the agent browser's app engine): an
+ * action object as `crates/chimaera-app/src/shell/native_view/drive.rs`
+ * defines it (`{type: "eval" | "click" | "move" | "drag" | "scroll" | "key" |
+ * "text" | "screenshot" | "rings" | "instrument" | "uninstrument" | "cursor",
+ * …}`; an eval's `world` is `"isolated"` or `"page"`). Resolves to the
+ * action's result; rejects with the shell's error text (the page's own error
+ * message for an eval; one starting `paused by the user:` when the user took
+ * the page over mid-action), which the caller hands back to the daemon.
+ * Call `{type: "uninstrument"}` when a shared pane is unlinked.
+ */
+export async function nativeViewDrive(id: string, action: unknown): Promise<unknown> {
+  const t = tauri();
+  if (t === null) throw new Error("not in the app");
+  try {
+    return await t.core.invoke<unknown>("native_view_drive", { id, action });
+  } catch (e) {
+    throw new Error(typeof e === "string" ? e : e instanceof Error ? e.message : String(e));
+  }
+}
+
+/**
+ * What a pane view reports about its page (`native-view`, delivered to the
+ * owning window's web view only). Shapes in `shared/paneViewBridge.ts`,
+ * which decodes them; this stays the untyped wire.
+ */
+export function listenNativeView(handler: (payload: unknown) => void): Promise<() => void> {
+  const t = tauri();
+  if (t === null) return Promise.resolve(() => {});
+  return t.webviewWindow
+    .getCurrentWebviewWindow()
+    .listen<unknown>("native-view", (e) => handler(e.payload));
+}
+
+// --- the same file in PowerPoint ------------------------------------------------
+
+/**
+ * A deck this window handed to PowerPoint (`office_open`). On this machine
+ * PowerPoint opens the file itself and there is no trip; for another host's
+ * file the shell keeps a working copy, watches it, and uploads each save
+ * with the host's hash as the precondition — a trip.
+ */
+export interface OfficeTrip {
+  /** The file on the host. */
+  path: string;
+  /** "watching": open in PowerPoint, everything uploaded; "uploading";
+   *  "conflict": the host's file changed since it was opened, nothing was
+   *  overwritten; "error": the last upload failed (`message` says why);
+   *  "done": PowerPoint closed the deck with every save on the host, and
+   *  the trip is over. */
+  state: "watching" | "uploading" | "conflict" | "error" | "done";
+  /** When the last save reached the host (ms since the epoch). */
+  uploaded_ms: number | null;
+  message: string | null;
+}
+
+/** What `openInOffice` did. */
+export interface OfficeOpened {
+  /** The app that opened it ("Microsoft PowerPoint", "Keynote", …). */
+  app: string;
+  /** A round trip runs for it (another host's file). */
+  trip: OfficeTrip | null;
+}
+
+/** Office files the shell hands to an app: PowerPoint decks for now. */
+const OFFICE_EXT = /\.(pptx|pptm|ppsx|potx)$/i;
+
+/** The shell can open `path` in PowerPoint (or the system's app for it). */
+export function canOpenInOffice(path: string): boolean {
+  return tauri() !== null && !/\bWindows\b/.test(navigator.userAgent) && OFFICE_EXT.test(path);
+}
+
+/** Open `path` in PowerPoint through the native shell. Rejects with the
+ *  shell's reason (no app for it, the host unreachable, …). */
+export async function openInOffice(path: string): Promise<OfficeOpened> {
+  const t = tauri();
+  if (t === null) throw new Error("only the app can open files in PowerPoint");
+  try {
+    return await t.core.invoke<OfficeOpened>("office_open", { path });
+  } catch (e) {
+    throw new Error(typeof e === "string" ? e : e instanceof Error ? e.message : "PowerPoint couldn't open it");
+  }
+}
+
+/** The round trip for `path` on this window's host, if one runs. */
+export async function officeTrip(path: string): Promise<OfficeTrip | null> {
+  const t = tauri();
+  if (t === null) return null;
+  try {
+    return await t.core.invoke<OfficeTrip | null>("office_trip", { path });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Settle a trip's conflict: "overwrite" (keep mine) uploads the PowerPoint
+ * copy over the host's changed file; "copy" (keep both) uploads it beside it
+ * instead (resolves to the new path); "theirs" fetches the host's version
+ * into a new copy and opens that. ("done" ends a trip by hand; a trip ends on
+ * its own when PowerPoint closes the deck with everything sent.)
+ */
+export async function resolveOfficeTrip(
+  path: string,
+  choice: "overwrite" | "copy" | "theirs" | "done",
+): Promise<string | null> {
+  const t = tauri();
+  if (t === null) return null;
+  try {
+    return await t.core.invoke<string | null>("office_trip_resolve", { path, choice });
+  } catch (e) {
+    throw new Error(typeof e === "string" ? e : "that didn't work");
+  }
+}
+
+/** A trip of this window's host changed (`office-trip`, to that host's windows). */
+export function listenOfficeTrip(handler: (trip: OfficeTrip) => void): Promise<() => void> {
+  const t = tauri();
+  if (t === null) return Promise.resolve(() => {});
+  return t.event.listen<OfficeTrip>("office-trip", (e) => handler(e.payload));
+}
+
 /**
  * A newer signed app build exists (the shell's periodic updater check).
  * Broadcast to every window; presentation and snoozing are the UI's job.
@@ -371,6 +647,17 @@ export function onAppUpdate(handler: (version: string) => void): Promise<() => v
   const t = tauri();
   if (t === null) return Promise.resolve(() => {});
   return t.event.listen<string>("app-update", (e) => handler(e.payload));
+}
+
+/**
+ * macOS Mission Control opened (`true`) or closed (`false`). Broadcast to
+ * every window by the shell's watcher (`shell/mission_control.rs`); the page
+ * itself sees no sign of it. Never fires outside the macOS app.
+ */
+export function onMissionControl(handler: (open: boolean) => void): Promise<() => void> {
+  const t = tauri();
+  if (t === null) return Promise.resolve(() => {});
+  return t.event.listen<boolean>("mission-control", (e) => handler(e.payload === true));
 }
 
 export async function disconnectHost(alias: string): Promise<void> {

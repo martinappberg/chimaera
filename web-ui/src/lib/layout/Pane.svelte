@@ -1,3 +1,13 @@
+<script module lang="ts">
+  /** Each pane's kept-alive views by pane id, outliving the component: a
+   *  split that collapses (a tab dragged out of its pane) remounts the
+   *  surviving pane, and a fresh instance would otherwise mount only its
+   *  active tab — every other view, a pane view's live page included, would
+   *  be lost to the remount. Bounded: a few panes per window. */
+  const liveByPane = new Map<string, string[]>();
+  const LIVE_PANES_KEPT = 16;
+</script>
+
 <script lang="ts">
   import { keepsPaneViewAlive, tabKey, trimLive, MAX_PANES, type PaneNode, type Tab } from "./layout";
   import { untrack, type Component } from "svelte";
@@ -19,6 +29,7 @@
   } from "./assetTransition";
   import Spinner from "../previews/Spinner.svelte";
   import { browserOpener } from "../browser/agentOpen";
+  import { agentBrowser, browserLinks } from "../browser/agentBrowserRuntime";
   import { findTargetsChanged, targetIn } from "../shared/find";
   import type { DashCtx } from "../dashboard/dash";
 
@@ -121,17 +132,25 @@
 
   /** When this pane shows a linked terminal: the leash-holder's hue, and
    *  whether that agent is executing here right now (border pulse). */
+  /** A shared browser pane counts the same: its agent's hue, and the
+   *  border breathes while the agent drives the page. */
   const linkedAgentId = $derived(
     activeTab !== null && activeTab.surface === "terminal"
       ? (links.get(activeTab.sessionId) ?? null)
-      : null,
+      : activeTab !== null && activeTab.surface === "browser"
+        ? ($browserLinks.get(activeTab.id) ?? null)
+        : null,
   );
   const linkHue = $derived(linkedAgentId !== null ? agentHue(linkedAgentId) : null);
+  const browserDrive = agentBrowser.driveState;
   const agentExec = $derived(
     linkedAgentId !== null &&
       activeTab !== null &&
-      activeTab.surface === "terminal" &&
-      sessions.get(activeTab.sessionId)?.exec_stage === "executing",
+      (activeTab.surface === "terminal"
+        ? sessions.get(activeTab.sessionId)?.exec_stage === "executing"
+        : activeTab.surface === "browser" &&
+          $browserDrive.get(activeTab.id)?.driving === true &&
+          $browserDrive.get(activeTab.id)?.paused !== true),
   );
 
   // --- view keep-alive (the "keep tabs in RAM" model) -----------------------
@@ -144,7 +163,21 @@
   // state. The live set is a per-pane MRU capped at LIVE_CAP; views enter only
   // after being active, so nothing is first measured at a degenerate size.
   const LIVE_CAP = 8;
-  let liveKeys = $state<string[]>([]);
+  // This instance starts from what the pane kept before a remount (read once).
+  let liveKeys = $state<string[]>(untrack(() => liveByPane.get(node.id) ?? []));
+
+  // Remember the set for this pane's next instance (newest last; old ids go).
+  $effect(() => {
+    const keys = [...liveKeys];
+    const id = node.id;
+    liveByPane.delete(id);
+    liveByPane.set(id, keys);
+    while (liveByPane.size > LIVE_PANES_KEPT) {
+      const oldest = liveByPane.keys().next().value;
+      if (oldest === undefined) break;
+      liveByPane.delete(oldest);
+    }
+  });
 
   function retainView(tab: Tab): boolean {
     return keepsPaneViewAlive(
@@ -390,6 +423,7 @@
             ctrl.revealWorktreeSession(forked.id, forked.workspace_id)}
           onOpenSubagent={(agentId: string, title: string, newSplit: boolean) =>
             ctrl.openSubagentFrom(node.id, s.id, agentId, title, newSplit)}
+          onRunCommand={(command: string) => ctrl.runCommandFrom(node.id, s.id, command)}
         />
       {:else if viewErrors.chat}
         {@render loadFailure("chat", "chat view")}
@@ -409,7 +443,13 @@
   {:else if tab.surface === "file"}
     {@const FileView = views.file}
     {#if FileView !== undefined}
-      <FileView path={tab.path} {wsRoot} fontSize={node.fontSize} visible={active} />
+      <FileView
+        path={tab.path}
+        {wsRoot}
+        fontSize={node.fontSize}
+        visible={active}
+        onFocusRequest={() => ctrl.focusPane(node.id)}
+      />
     {:else if viewErrors.file}
       {@render loadFailure("file", "file view")}
     {:else}
@@ -482,6 +522,7 @@
           visible={active}
           onOpenFile={(p: string) => ctrl.openFileFrom(node.id, p, false)}
           onOpenPath={(p: string, k: "file" | "dir") => ctrl.openPathFrom(node.id, p, k, false)}
+          onRunCommand={(command: string) => ctrl.runCommandFrom(node.id, parent.id, command)}
         />
       {:else if viewErrors.chat}
         {@render loadFailure("chat", "chat view")}
@@ -583,6 +624,14 @@
         onRevealOpener={() => {
           if (tab.openedBy !== undefined) linkCtrl.reveal(tab.openedBy, node.id);
         }}
+        adopt={tab.adopt}
+        sharedWith={$browserLinks.has(tab.id)
+          ? browserOpener($browserLinks.get(tab.id) ?? "", sessions, names)
+          : null}
+        onRevealShared={() => {
+          const agent = $browserLinks.get(tab.id);
+          if (agent !== undefined) linkCtrl.reveal(agent, node.id);
+        }}
       />
     {:else if viewErrors.browser}
       {@render loadFailure("browser", "browser pane")}
@@ -647,6 +696,7 @@
     {fileNames}
     {links}
     {linkCtrl}
+    {wsId}
     {dropSpot}
     {ctrl}
     bind:el={tabbarEl}
@@ -704,21 +754,23 @@
 
   {#if zone !== null}
     <!-- A zone preview always says what it is: the rectangle alone can't tell
-         "split right" from "add as tab" at a glance. -->
-    <div class="drop drop-{zone}" class:banded={bandArmed}>
+         "split right" from "add as tab" at a glance. Every drop wash here is
+         `data-overlay`: a pane view (a native page drawn above the DOM)
+         stands down for it, under a still of its page, like for a menu. -->
+    <div data-overlay class="drop drop-{zone}" class:banded={bandArmed}>
       <span class="drop-chip">{zoneWord(zone)}</span>
     </div>
   {:else if linkBand}
     <!-- Distinct from the split/adopt zones: a labeled, dashed band over the
          agent's input area. Dropping links the terminal and types its
          @term: reference into the composer (never submits). -->
-    <div class="drop-link" class:hued={ownAgentHue !== null} style:--band-hue={ownAgentHue}>
+    <div data-overlay class="drop-link" class:hued={ownAgentHue !== null} style:--band-hue={ownAgentHue}>
       <span class="drop-chip">link to {activeSessionName ?? "this agent"}</span>
     </div>
   {:else if linkPane}
     <!-- Link-intent drag: the whole agent view is one target (no aiming for a
          band). Full-pane wash in the agent's hue, centered label. -->
-    <div class="drop-linkpane" class:hued={ownAgentHue !== null} style:--band-hue={ownAgentHue}>
+    <div data-overlay class="drop-linkpane" class:hued={ownAgentHue !== null} style:--band-hue={ownAgentHue}>
       <span class="drop-chip">link to {activeSessionName ?? "this agent"}</span>
     </div>
   {/if}
@@ -726,7 +778,7 @@
   {#if refBand}
     <!-- Drag-to-reference: types the path into this session's input, never
          opens a tab, never submits. Visibly distinct from the adopt zone. -->
-    <div class="drop-ref">
+    <div data-overlay class="drop-ref">
       <span class="drop-chip"
         ><span class="drop-ref-at">@</span> reference in {activeSessionName ?? "this session"}</span
       >
@@ -736,7 +788,7 @@
   {#if uploadPane}
     <!-- OS-desktop drop: uploads to the session's host, then types the
          path — same "@ reference" grammar, whole pane as the target. -->
-    <div class="drop-upload">
+    <div data-overlay class="drop-upload">
       <span class="drop-chip"
         ><span class="drop-ref-at">@</span> upload &amp; reference in {activeSessionName ??
           "this session"}</span
@@ -746,7 +798,7 @@
     <!-- OS-desktop drop onto a Finder pane: a quiet frame says this pane is
          receiving; the Finder's own column/row highlight says WHERE (a
          whole-pane wash hid exactly that). -->
-    <div class="drop-frame">
+    <div data-overlay class="drop-frame">
       <!-- The destination, named once at the pane's foot (never inside the
            column: an in-flow chip would grow the column mid-drag). -->
       <span class="drop-chip folder">upload into <b>{dirLabel(uploadDir)}</b></span>

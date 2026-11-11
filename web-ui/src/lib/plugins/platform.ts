@@ -345,6 +345,9 @@ const base = (ws: string, pid: string): string =>
 export interface UiTree {
   ui: string;
   root: UiNodeData;
+  /** The screen asks its body to take the pane's height, as a file view's
+   *  does (a tab whose split holds a viewer). */
+  fill?: boolean;
 }
 
 /** A screen node: `{type, …props, children?}`; see `ui/UiNode.svelte`. */

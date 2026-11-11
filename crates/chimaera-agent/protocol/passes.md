@@ -1406,7 +1406,6 @@ Claude's `/loop` (a self-paced `ScheduleWakeup`, or `CronCreate` jobs for an int
 - Hermetic: `autonomy.rs` (7 tests: wakeups, stop, jitter and next run, delete/list level-set, one-shot and expiry, goal set/check/clear, status resync and adoption), `cron.rs` (10), `claude.rs` `a_fired_wakeup_opens_a_turn_named_by_its_reason`, `only_an_unsent_command_with_something_due_is_a_wake`, `goal_set_check_and_clear_map_from_the_cli_frames`, the codex goal tests (`goal_updates_map_the_status_verbatim_and_ignore_other_threads` … `sleep_items_render_a_waiting_row`), `tests/manager.rs` `a_loop_wakeup_fires_as_a_named_turn_and_the_row_knows_whats_next` (fake-claude `loop`) and `a_resumed_respawn_keeps_its_jobs_and_a_fresh_one_does_not`, `journal.rs` `reopening_remembers_the_last_goal_and_jobs`, `claude.rs` `a_stale_cli_command_never_names_a_later_turn`, `tests/wire_contract.rs` `loop_and_goal_wire_shapes_are_additive`, `chimaera-server` `goal_outcome` (3) and `restart_message_asks_to_reschedule_a_lost_wakeup`.
 - Live: `just chat-smoke` adds `claude_wakeup_fires_as_a_named_turn`, `claude_goal_sets_and_clears`, `codex_goal_sets_pauses_and_clears`.
 
-
 ## Pass 48 — 2026-10-16: native Codex task tool at thread open
 
 Installed Codex 0.158.0; `TESTED_CODEX_VERSION` remains 0.162.1. Generated the installed CLI's experimental JSON schema before editing the driver; start, resume and fork accept the `config` map. The [official configuration schema](https://developers.openai.com/codex/config-schema.json) describes `tools.update_plan.enabled`, default false.
@@ -1797,3 +1796,150 @@ Found by the Codex `just chat-smoke` run for the stuck "next step" fix: `codex_c
 
 - Hermetic, new: `codex.rs` `completed_marker_before_the_agent_turn_end_leaves_the_close_to_it` (the 0.164.0 order: one finish line, closed on the turn end, no new stint).
 - Live: `codex_collab_subagent_surface` passes on codex-cli 0.164.0 with the relaxed assertion; `driver_codex_spawned_agents_draw_rows_on_both_runtimes` passed in the same day's Codex smoke.
+
+## Pass 59 (2026-11-04 — live probes claude 2.1.318, codex 0.166.0, grok 1.0.70, agy-acp 1.4.5, cursor-agent 2026.10.22): drift pass to the latest of all five agents. Pins moved; two Claude mappings ADOPTED.
+
+Every agent's newest release against its pin: Claude Code 2.1.310 → 2.1.318 (npm latest; `stable` is 2.1.311, no 2.1.313 was published), Codex 0.164.0 → 0.166.0 (npm and GitHub latest; 0.165.0 between), Grok Build 1.0.46 → 1.0.70 (the stable channel), the standalone agy-acp-server 1.2.1 → 1.4.5, and Cursor CLI 2026.10.14 → 2026.10.22.
+
+**Method.** Each version was installed beside the user's own, never over it: Claude and Codex into throwaway npm prefixes, agy-acp 1.4.5 and Cursor 2026.10.22 downloaded from their official sources into a scratch folder; Grok 1.0.70 was already the managed install. `~/.claude/settings.json` hashed the same before and after every Claude probe. Probes:
+
+- Claude, on 2.1.310 and 2.1.318: a no-turn `initialize`; one billed haiku turn (Bash `echo hi`, then `ok`) with every frame logged and key sets diffed per frame kind; a no-turn `get_settings` + `mcp_status` on haiku and opus; `claude auth status --json`; `--help` and `sdk-tools.d.ts` diffs; the binaries' literal sets (subtypes, types, `*_vN` tokens) and all 2.5k zod `.describe()` strings paired old → new. Then the held-message ✕ probe below (four billed runs).
+- Codex, on 0.164.0 and 0.166.0: `generate-ts` / `generate-json-schema` (stable and `--experimental`) diffed; `--help`, `app-server --help` and `features list` diffed; one billed `echo hi` turn per version on gpt-5.6-luna and on the default model, frames diffed; an unknown model on each. Release notes rust-v0.165.0 and rust-v0.166.0 and the PRs they cite.
+- ACP: raw stdio clients against each new and pinned version: `initialize`, `session/new`, one billed `session/prompt` running `echo hi` (allow-once), `session/load` / resume, an image, MCP pre-approval through a stand-in HTTP server named `chimaera`, and the system-context `_meta` fields. 14 billed turns in all.
+- Issue #355 (Send now with several waiting messages): Claude 2.1.318 and 2.1.310 (five billed haiku runs) and Codex 0.166.0 (five billed gpt-5.6-luna runs) with A and B sent for the next step and C after the turn, during a foreground command.
+
+### Findings: Claude Code 2.1.318
+
+- **No drift in anything the driver maps.** The `initialize` response adds one key, `hook_on_failure_supported`; its `capabilities`, models, agents and output styles are unchanged; the command catalog adds `send-to-project` (82). `system/init.capabilities` adds `ask_user_question_unanswered_v1` (14 in all); the four tokens the driver keys on are present. `system/init` adds `ultrathink_available` / `ultrathink_typed_raises`; `result` adds `credential_expires_at` and two cache-creation usage fields; `get_settings` adds `applied.ultrathinkAvailable`. The `assistant`, `stream_event`, `command_lifecycle`, `system/status`, `rate_limit_event`, `tool_result` and `mcp_status` key sets are unchanged. Removed, never consumed: the `FileReadOutput` variant `file_unchanged`, the attachment `output_limit_note`, and a flag value `short_v2`. See [claude-code.md › Handshake](claude-code.md#handshake-and-initialize) and [Tolerated frames](claude-code.md#tolerated-frames).
+- **A held message's ✕ was lost (ADOPTED).** 2.1.318 counts a message read from stdin but not yet queued (held behind a model check or start-up work) as waiting: a Stop lists it in `still_queued`. The schema says `cancel_async_message` on it answers `cancelled: false` and "plants a cancel-pending mark, which the drain honours once the message is queued". Live it did not: with a foreground Bash running, `set_model`, then B (`next`) and `cancel_async_message B` in the same instant, the answer was `{cancelled: false}`, then B `queued`, `started` and `completed`, read into the running turn. That held for `opus[1m]` (a 12.5 s check) and `claude-fable-5-1` (2.2 s); `sonnet` (0.1 s) answered `set_model` before B queued and the ✕ worked. A second `cancel_async_message B` sent on that `queued` frame answered `{cancelled: true}` after its `cancelled` frame, and B never ran. The driver now remembers a `false` answer for a message still in `awaiting_read` (`held_cancels`), sends the cancel once more on its `queued` frame, and resolves the `cancelled` frame `Cancelled`. Before, the bubble stayed waiting and then ran.
+- **`system/session_writes_lost` (2.1.317, ADOPTED).** `{error_code: "ENOSPC" | "EDQUOT", lost: ["transcript" | "global_config"], transcript_session_ids?}`, "Sent at most once, as the CLI exits, after the last result"; `-p` then exits 1. It fell through the silent arm; it is now one Notice naming what was lost and why. Schema only; a full disk was not provoked.
+- New, not adopted: `ask_user_question_unanswered_v1` (an AskUserQuestion answer may mark a question `skipped` / `replied_in_chat` / `dismissed`); the `ui_placed` system push (Mods `$.ui.place`) and the opt-in `ui_prompt_paint` control; `pending_elicitation_requests` on `initialize`; the binary-only tokens `start_shell_task_v1`, `mcp_status_no_config_v1`, `background_tasks_moves_bash_v1`, `reply_gate_policy{,_disabled,_refused}_v1`, `read_widget_context_v1`, `program_use_case_stamps_v1`; the cloud-worker subtypes `inherited_asks_settled`, `start_folder`. `send_now: "delivering"` gains one case (the turn is compacting by itself: the CLI lets it end, then moves or stops); the driver already waits for the lifecycle frame.
+- Issue #355 does not reproduce on Claude (2.1.318 and 2.1.310): whichever of A, B or C `interrupt {send_now, message_uuid}` names, the receipt is `{still_queued: [A, B, C], send_now: "stopped"}`, A and B start in the same millisecond as one turn, and C starts at that turn's end as its own turn; a second send-now 0.4 s later answers `delivering` and changes nothing.
+
+### Changelog review: Claude Code 2.1.311–2.1.318
+
+Only entries that matter to a host driving the CLI structurally; TUI, IDE, Slack and cloud-only entries were skipped. 2.1.315 has no changelog section.
+
+| Version | Change | Chimaera today | Recommendation |
+|---|---|---|---|
+| 2.1.318 | `credential_expires_at` on `-p` results; `loginExpiresAt` in `claude auth status --json` | Neither is read; `agent_auth.rs` reads `loggedIn` | Adopt later: warn ahead of a sign-in expiry |
+| 2.1.318 | A message sent right after a model change is stopped or cancelled like a queued one | ✕ on it was lost (above) | **Adopted** |
+| 2.1.318 | Background subagents move a shell command to the background after 3 min | Lanes from `background_tasks_changed` | Ignore |
+| 2.1.318 | Mods: `prompt.submit` attachments stay in the turn; `$.model.fork` takes `effort` | Chimaera hosts Mods | Ignore; `chat-mods-smoke` |
+| 2.1.318 | Shared network homes: `~/.claude.json` and login survival fixes; an invalid `~/.claude.json` refuses non-interactive starts with a restore hint | Startup failure reaches `report_startup_failure` | Adopt later: show `startup_failure_reason` / `errors` verbatim |
+| 2.1.317 | `session_writes_lost`; `-p` exits 1 when a full disk or quota lost writes | Silently dropped | **Adopted** |
+| 2.1.317 | SDK hook callbacks take `onFailure: "block"` | No SDK callbacks | Ignore |
+| 2.1.317 | Self-paced `/loop` wakeups that went unscheduled when a field was missing | `autonomy.rs` keys on `scheduledFor` | Ignore (benefits) |
+| 2.1.317 | `claude -p` inside a session no longer shares its session id | The daemon scrubs `CLAUDE_CODE_SESSION_ID` / `CHILD_SESSION` | Ignore |
+| 2.1.316 / 2.1.311 | `ultrathink` raises effort to xhigh; `ultrathink_available` / `_typed_raises`, user frame `ultrathink_typed` | No ultrathink support | Adopt later, while init says `ultrathink_typed_raises` (false on this account) |
+| 2.1.316 | Shell commands no longer left running when Claude exits by itself | SIGTERM-first teardown | Ignore (benefits) |
+| 2.1.314 | `permissions.blockWritesOutsideWorkingDirectories`; host-only `--settings` keys for working-dir spelling and extra read paths | Not set | Adopt later, if a workspace needs a write fence |
+| 2.1.314 | `-p` no longer exits 0 with no output on a startup failure | Benefits | Ignore |
+| 2.1.311 | Interrupt no longer stalls behind an MCP resource read; `-p` transcript ordering; SubagentStop no longer fires twice a minute | — | Ignore (benefits) |
+| 2.1.311 | stream-json escapes DEL, C1 and Unicode format characters as `\uXXXX` | serde parse | Ignore |
+| binary | `ask_user_question_unanswered_v1` | `QuestionCard` has no skip; the answer sends `answers` only | Adopt later |
+| binary | `ui_placed` (Mods `$.ui.place`) | Dropped, so placed rows are not drawn | Adopt later (Mods parity) |
+
+### Findings: Codex 0.166.0
+
+- **No drift in anything the driver maps.** `ServerNotification`, `ServerRequest` and `ClientNotification` are byte-identical to 0.164.0 in the stable and experimental schemas; no definition was removed; the method unions grew 277 → 281, all additions; every method string the driver and daemon send is still present (besides the known fallbacks `turn/failed`, `thread/rollback`, `item/plan`). `--help` and `app-server --help` are identical. Live, the only frame differences are flat `startedAtMs` / `completedAtMs` on every item and two new `config/read` keys; frame order is identical.
+- `CodexErrorInfo` adds `modelNotFound` (an unknown model is now a readable, terminal message, where 0.164.0 showed the raw JSON body) and `policyCapacityUnavailable`; `ModelProviderError` data names a provider mismatch. Not read; the message shows as it comes. See [codex.md › Turn lifecycle](codex.md#turn-lifecycle).
+- `HookMetadata` already carried `handlerType` / `command` / `async` at 0.164.0 (codex.md said no command field); 0.166.0 adds `environmentId`. `review/start` is in both schemas (codex.md said no `review/*` RPC exists); 0.166.0 drops its `detached` delivery. Both lines corrected.
+- With no `model` in config, both versions open `gpt-6.1-sol` and it works. The probed account is now Plus: two rate-limit windows (300 min and 10080 min) with credits — recorded in [codex.md › Usage limits](codex.md#usage-limits). `model/list` is identical on both versions and includes GPT-6.1 Terra, now in the launcher's fresh-launch fallback list.
+- `instant_interrupt` stays default-on. **Issue #355 reproduces on Codex under it:** a steer sent during a foreground command echoes within 1 s, so its bubble resolves sent before the agent answered; Send now's `turn/interrupt` then re-drives only unechoed steers, and the echoed ones are never answered (a `turn/start` with new input ignores them; `turn/start {input: []}` answers them). With `instant_interrupt=false` the re-drive delivers both. The fix is Pass 60.
+
+### Release notes: Codex 0.165.0–0.166.0
+
+| Version | PR | Change | Chimaera today | Recommendation |
+|---|---|---|---|---|
+| 0.165 | #56445 | `model_not_found` terminal, provider message kept, `modelNotFound` | Shown as an Error; the turn aborts | Benefits now; adopt later: a "pick another model" hint |
+| 0.166 | #57452 | `policyCapacityUnavailable`, retried per Retry-After | `willRetry` notice | Ignore |
+| 0.166 | #57840 | Resume / input rejected on a provider mismatch, with `ModelProviderError` | A startup error or "turn/start failed: …" | Adopt later: name the fix from `error.data.type` |
+| 0.166 | #57172, #57420 | Item lifecycle timestamps | Durations from `durationMs` | Adopt later: real times in subagent replays |
+| 0.165 | #56163 | Effort changes mid-conversation on by default | `thread/settings/update` + read-back | Ignore |
+| 0.165 | #56330, #56133 | Agent-message wakes no longer restart work after an interrupt or a Plan switch | Server-started turns are generic | Ignore (benefits) |
+| 0.166 | #57227, #57839 | Resume and fork keep acknowledged permissions and reasoning-token accounting | Explicit settings at open | Ignore |
+| 0.166 | #57787, #57788 | Thread startup / shutdown races fixed | The Pass 46 "active writer" workaround | Ignore; keep it |
+| 0.166 | #57242 | `thread_unload_delay_secs` 1800 → 60 for an unsubscribed idle thread | One subscribed connection per chat | Ignore |
+| 0.166 | #57513 | The npm `codex.js` `execve`s the native binary | Own process group + killpg | Ignore (SIGTERM now reaches codex directly) |
+| 0.166 | #57181, #57279 | Named untrusted `additionalContext` | Agent messages steer as user input | Adopt later, once `untrusted_as_tool_output` is stable |
+| 0.165 | #56465 | `thread/memory/read` (experimental) | None | Adopt later, for Knowledge |
+| 0.166 | #57249 | `features.plugin_discovery_prefetch=false` skips startup plugin fetches | Inventory probes start full app-servers | Adopt later, version-gated |
+| 0.165/0.166 | #57337, #57293 | GPT-6.1 Terra | Missing from the fallback list | **Adopted** (`launcher.rs`) |
+
+### Findings: ACP
+
+- **Grok 1.0.70:** the handshake equals 1.0.46's except `promptCapabilities.image: true` (images below 512 px are rejected by the model). Shell permission requests offer a fourth option, `reject-always`, which the mapper already handles, and carry `x.ai/requestingSessionId`. `_x.ai/billing` lost `creditUsagePercent` server-side (1.0.46 too), so the Grok limit chip shows nothing. New and not adopted: `_meta.rules` system text, `session_info_update` titles, per-turn usage and cost, `_x.ai/queue/changed`.
+- **agy-acp 1.4.5:** `configOptions` reshaped (model families plus a `thinking_level` option), so a saved effort-suffixed pick no longer restores; `usage_update` and prompt `usage` are now sent; `allow_always` carries a security warning in `_meta`; `_meta.antigravity.systemPrompt.append` works. The installer fetches 1.4.5 from the same URL pattern with the same layout. The agy CLI's built-in `agy acp` (1.5.0) is a different server and is not adopted; its turns failed with a license error on the probed account.
+- **Cursor 2026.10.22:** no drift. Opt-in `subagents` and `parameterizedModelPicker` client capabilities exist in the bundle (both versions), unprobed. Its command list (~78) exceeds `SLASH_COMMANDS_CAP` (64) and is truncated.
+- agy's and Cursor's completed shell updates carry output only in `rawOutput`, which the adapter does not read. Details: [acp.md](acp.md).
+- The Grok billing fallback, the agy model-id migration, `rawOutput` shell output and agy's self-updater replacing the managed `bin/agy` symlink are follow-up work, not part of this pass.
+
+### Gate (Pass 59)
+
+- Hermetic, new: `claude.rs` `a_held_message_is_cancelled_once_it_queues` (the `false` answer, the retry on `queued`, `Cancelled`, at most one retry) and `lost_session_writes_become_one_notice`. `launcher.rs` `curated_lists_cover_every_agent` lists GPT-6.1 Terra.
+- `just check`: green on the final tree (rebased on `main` with Pass 60). Two earlier runs failed `tests::plugins::agent_plugin_install_ignores_forged_completion_title` (a 10 s wait, nothing a pin reaches) and, once, three `git_sessions` worktree tests, all under a load average of 17; each passed alone or in the final run.
+- `just chat-smoke`: 43/43 on claude 2.1.318 and codex 0.166.0, no reruns. An earlier run of the same suite on unchanged driver code needed reruns for eleven `initialize` / `thread/start` timeouts, each of which passed alone: that run overlapped other live probes on the same accounts, and the user's own MCP servers and hooks put handshakes at 10–20 s against the 20 s budget ([cross-agent.md › Native-driver compatibility](cross-agent.md#native-driver-compatibility)).
+- `just chat-smoke-acp`: 3/3 on grok 1.0.70, agy-acp 1.4.5 and cursor-agent 2026.10.22-27dcf5f.
+- `just chat-mods-smoke`: 1/1 on claude 2.1.318.
+- `~/.claude/settings.json` hashed the same before and after every run.
+- Pins moved: `TESTED_CLAUDE_VERSION` 2.1.318, `TESTED_CODEX_VERSION` 0.166.0, `TESTED_GROK_VERSION` 1.0.70, `TESTED_AGY_VERSION` 1.4.5 (the version the installer fetches), `TESTED_CURSOR_VERSION` 2026.10.22-27dcf5f.
+
+## Pass 60 — 2026-11-04: Send now with several waiting messages (issue #355; live probes claude 2.1.318 / 2.1.310, codex 0.166.0)
+
+Reported (#355): with more than one message waiting, Send now did not send them all at once. The maintainer asked that everything waiting go immediately, except messages queued for after the turn, and for a UI that fits.
+
+**Method.** Raw stream-json and app-server clients mirroring the drivers' frames, with every frame logged. Scenario: a foreground `python3 -c 'import time; time.sleep(25)'`, then A and B sent as mid-turn messages and C for after the turn, then Send now. Claude ran five times on haiku (2.1.318 naming A, B and C in turn, plus a double press; 2.1.310 naming A). Codex 0.166.0 (gpt-5.6-luna, low effort) ran twelve times: the default instant steering, `features.instant_interrupt=false`, and the candidate fixes. `~/.claude/settings.json` was unchanged.
+
+### Findings
+
+- **Claude: not reproduced.** Whichever message `interrupt {send_now, message_uuid}` names, A and B run together as one turn and C runs right after it as its own turn (claude-code.md › Mid-turn messages). One defect: Send now pressed on the message the CLI is taking in (`Taken`, still drawn waiting for up to `REQUEUE_WINDOW_MS`) did nothing, because its id had left `awaiting_read`.
+- **Codex: reproduced under the default instant steering.** A steer is echoed within about 1 s even while the command runs, so its bubble reads sent before any reply. Send now's `turn/interrupt` then leaves nothing unread to re-drive, and:
+  - the re-drive of a still-unread B answered only B (A got no reply);
+  - opening C after the interrupt answered only C (A and B got no reply);
+  - opening an input-less turn and steering B in as it started also answered only B.
+  - Two forms answer everything. An input-less `turn/start {input: []}`, when nothing was unread, answered A and B (three runs of three). Carrying A's input ahead of B's in the re-drive answered both (two of two).
+  - With `instant_interrupt=false` the steers wait unechoed and the existing re-drive delivers both.
+- **ACP: by design.** Send now moved the pressed message to the front and cancelled; `resume()` then started one queued message per turn, so the rest each waited a full turn and the pressed one jumped ahead of older ones.
+
+### ADOPTED
+
+- Codex (`codex.rs`): `steers_awaiting_reply` holds each user steer echoed on the turn until the model writes to the user (agent-message text; reasoning does not count). A Send now interrupt (`send_now_interrupt`; a Stop clears it) moves them to `resend_on_redrive` at the interrupted end. The re-drive carries their inputs ahead of the unread ones; with nothing unread, an input-less answer turn opens before the after-turn FIFO. Any other turn the driver opens drops them.
+- ACP (`acp.rs`): Send now joins every waiting message into one prompt, in the order sent (`Queued.joined`); each resolves `sent` with it, ✕ removes one part, and teardown drops every part.
+- Claude (`claude.rs`): Send now on a `Taken` message names `awaiting_read.front()`.
+- UI: the waiting stack has one **Send now** under its last bubble. It names the oldest next-step message, or the oldest after-turn one when only those wait, since every agent acts on the whole stack. Each waiting bubble gets ✎ (and ↑ in an empty composer takes back every waiting message of the user's). The edit withdraws it (`cancel_queued`) and returns its words and saved pictures to the asking view's composer only on `cancelled`, so a message the agent read first stays sent and is never duplicated (`ChatStore.requestEdit` / `takeEdited`). A Codex steer cannot be withdrawn, and says so.
+
+### Gate (Pass 60)
+
+- Hermetic, new: codex `send_now_carries_steers_read_but_unanswered_into_the_redrive`, `send_now_with_every_steer_read_opens_an_answer_turn_first`, `answered_steers_and_stops_open_no_turn_after_the_interrupt`; acp `send_now_sends_every_waiting_message_as_one_prompt`; claude `send_now_on_a_taken_message_names_the_next_one_waiting`; store `an edit returns a withdrawn message's words to the view that asked, once`, `a cancel nobody asked to edit returns nothing`.
+- Live, new: `tests/live.rs` `driver_codex_send_now_answers_every_waiting_message`. Through the real driver on codex 0.166.0 (gpt-5.6-luna), A is read, C waits for after the turn, and Send now is pressed on B: the turn it opens answers `A=42` and `B=63`, then C answers `C=99` (two runs of two). The pre-fix driver fails it with only `B=63`.
+- Live suites (2026-11-04): every Codex test on 0.166.0 (16); the Claude queue and Send now tests on 2.1.318 (send now spares background agents, mid-turn queue, `next` read mid-turn, `cancel_async_message`, Stop puts back a taken message, rapid queued sends, the end-to-end driver stack); `just chat-smoke-acp` on Grok 1.0.70, agy-acp 1.4.5 and Cursor 2026.10.22. One test failed in each group (`codex_collab_subagent_can_outlive_parent_turn`, `claude_stop_puts_back_a_just_taken_message`, Grok's startup handshake while its `initialize` took 12–16 s); none of them exercises the changed code, and each passed when rerun alone.
+- Live UI (isolated daemon, Vite on this branch, Claude haiku): A and B waiting for the next step and C for after the turn drew one Send now under the stack. ✎ on B put its text back in the composer, and the edited B was resent. Send now stopped the running command; A and the edited B were answered in one turn, then C. ↑ in the empty composer during a later turn took both waiting messages back into one draft, in order.
+
+## Pass 61 — 2026-11-04: ACP follow-ups from the latest-versions drift pass (grok 1.0.70, agy-acp 1.4.5, agy 1.3.4/1.5.0, cursor-agent 2026.10.22)
+
+The same day's drift pass probed the newest Grok Build, Antigravity and Cursor releases with raw ACP clients, logging every frame. Its `just chat-smoke-acp` run passed 3/3 on Grok 1.0.70, agy-acp 1.4.5 and Cursor 2026.10.22. The pins moved in Pass 59 (#371), which recorded these gaps as not yet handled. This pass adopts the four gaps that run found. Facts are in [acp.md](acp.md).
+
+### Findings
+
+- **Grok billing reads empty.** `_x.ai/billing` no longer carries `config.creditUsagePercent`, on 1.0.46 and 1.0.70 against the same account. The answer is proto3 JSON, which omits zero values, so an unused week has `currentPeriod` and no percent. `grok_billing_usage` returned no window, so the limit chip and the Agent-settings read showed nothing.
+- **agy-acp 1.4.5 split the model control.** `model` now lists families and a `thinking_level` control (`thought_level`) carries the effort. A model remembered from 1.2.1's combined ids (`gemini-3.8-flash-high`) was "not offered": restoring it raised a notice and lost the effort.
+- **No shell output for agy or Cursor.** Their completed shell update has no `content`. The output is in `rawOutput`: agy `combinedOutput`, Cursor `stdout`/`stderr`. Only Grok's rows showed output.
+- **agy rewrites its managed install.** agy's own background updater writes the new build over the path agy was started from. On 2026-11-03 the managed `bin/agy` activation symlink became a 1.5.0 regular file, with `agy/1.3.4/` intact. Reproduced 2026-11-04 in a throwaway managed layout and HOME: one `agy -p /usage` (the daemon's own usage probe) replaced the link within seconds, and `update_status.json` read "Update successful". `AGY_CLI_DISABLE_AUTO_UPDATE=true` stops it (the log says so and the link stays); `=1` does not. Effects of a rewritten link: retention's `active_version` fails (`read_link` on a file), so agy packages are never pruned (fail-closed, no data lost). Update awareness reads the new binary's own version, so no update is offered that would restore the link. Per-version leases no longer apply to that binary.
+
+### Adopted
+
+- `grok_billing_usage`: a `currentPeriod` without a percent is 0%.
+- `AcpMapper::split_thought_level`: a model id that is not offered, but whose `-<level>` suffix splits into an offered model and an offered thinking level, sends both `session/set_config_option`s. Restore or pick, no notice. The level goes out only after the model's answer (`deferred_effort`, for any thinking-level change made while a model change is unanswered): the first live run sent both at once, and agy answered the level first, still `high`, because its model change reset it.
+- `raw_shell_output`: a completed or failed update with no `content` draws `combinedOutput`, else `stdout` then `stderr`, capped like `content`.
+- `runtimes::AGY_NO_SELF_UPDATE` (`AGY_CLI_DISABLE_AUTO_UPDATE=true`): every probe (`agent_probe::base_command`; a probe reads and never updates an install, the user's own included) and every spawn of a managed agy (the shim's managed fallback, PTY agent sessions, sign-in, extension actions; `runtimes::managed_agent_env`, judged by detection's `managed` on the activation path, since a leased path is canonical). A user's own agy keeps its updater. Retention names a rewritten activation link in its log instead of an opaque I/O error.
+
+### Not adopted (recorded for later)
+
+- A system-context channel for fork copies instead of prepending them to the first prompt: Grok `session/new` `_meta.rules` and agy-acp 1.4.5 `_meta.antigravity.systemPrompt.append` (advertised as `agentCapabilities._meta.antigravity.systemPrompt.append`). Both answered a secret word given only there. This changes `ForkContextConsumed`'s meaning and needs its own design.
+- Cursor's opt-in `clientCapabilities.subagents` (subagent lanes) and `_meta.parameterizedModelPicker` (plain model ids plus per-model options): bundle shapes only, no live turn.
+- Moving Antigravity chat to `agy acp` (1.5.0 CLI): it advertises no `mcpCapabilities`, and on the probed account every turn answered "You do not have a valid license" while the standalone server worked.
+
+### Gate (Pass 61)
+
+- Hermetic, new: `acp.rs` `grok_billing_without_a_percent_reads_an_unused_period`, `a_combined_model_id_restores_as_model_and_thinking_level`, `shell_output_comes_from_raw_output_when_content_is_absent` (all from the logged frames); `runtimes.rs` `shim_turns_off_self_update_for_the_managed_agy_only`, `only_a_managed_agy_spawn_turns_off_self_update`; `agent_probe.rs` `probes_never_start_an_agent_self_update`; `runtime_retention.rs` `a_self_updated_activation_keeps_every_package`.

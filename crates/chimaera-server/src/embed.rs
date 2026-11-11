@@ -178,7 +178,7 @@ fn target_path(raw: &str) -> Option<String> {
 
 /// `file:///abs` and `file://localhost/abs` as `/abs`; any other host is
 /// not this machine.
-fn strip_file_scheme(t: &str) -> Option<&str> {
+pub(crate) fn strip_file_scheme(t: &str) -> Option<&str> {
     let head = t.get(..5)?;
     if !head.eq_ignore_ascii_case("file:") {
         return None;
@@ -210,7 +210,7 @@ fn has_scheme(t: &str) -> bool {
 }
 
 /// `%XX` escapes decoded; the input as-is when the result is not UTF-8.
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     if !s.contains('%') {
         return s.to_string();
     }

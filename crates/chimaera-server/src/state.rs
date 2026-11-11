@@ -112,6 +112,15 @@ pub(crate) struct AppState {
     /// terminal session id -> agent session id: the linked-terminal edges
     /// (one agent per terminal; see the `links` module).
     pub(crate) links: Mutex<HashMap<String, String>>,
+    /// browser tab id -> the agent it is shared with + its page id (see the
+    /// `links` module; memory only, like terminal links).
+    pub(crate) browser_links: Mutex<HashMap<String, crate::links::BrowserLink>>,
+    /// The agent browser (`agent_browser`): the window request channel,
+    /// agents' pages, and the Chromium engine.
+    pub(crate) browsers: crate::agent_browser::Browsers,
+    /// `/ws/events` sockets upgraded but not yet authenticated (`ws.rs`
+    /// bounds them: each may send one large frame before auth).
+    pub(crate) events_preauth: std::sync::atomic::AtomicUsize,
     /// Short-lived raw-access tickets for /raw/{ticket} (in-memory only).
     pub(crate) tickets: Mutex<fs::TicketStore>,
     /// Browser-pane proxy sessions (/proxy/{id} targets; in-memory only —
@@ -345,6 +354,9 @@ impl AppState {
             current_cwds: Mutex::new(HashMap::new()),
             exec_status: Mutex::new(HashMap::new()),
             links: Mutex::new(HashMap::new()),
+            browser_links: Mutex::new(HashMap::new()),
+            browsers: crate::agent_browser::Browsers::new(),
+            events_preauth: std::sync::atomic::AtomicUsize::new(0),
             tickets: Mutex::new(fs::TicketStore::default()),
             proxies: Mutex::new(proxy::ProxyStore::default()),
             quickopen: Mutex::new(quickopen::QuickOpenCache::default()),

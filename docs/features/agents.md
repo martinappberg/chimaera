@@ -197,6 +197,12 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   with a pointer at chimaera's own updater (field failure: codex's self-updater can't detect an
   install method for a bare binary behind our symlink, and claude's would install a second copy
   elsewhere, leaving the managed link stale); your own binary's `update` passes through untouched.
+  agy updates itself unasked, writing the new build over the path it ran from. For a managed agy that
+  path is the activation link, so the shim, a managed agy's terminal, sign-in and extension-action
+  spawns, and every
+  background probe run it with `AGY_CLI_DISABLE_AUTO_UPDATE=true` (`runtimes::AGY_NO_SELF_UPDATE`).
+  Your own agy keeps its updater outside probes. An activation it already rewrote keeps every agy
+  package until the next managed install or update restores the link (PROTOCOL.md Pass 61).
 
 ## Sign in
 
@@ -338,7 +344,7 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   `cursor-agent`), `launcher.rs` (detection, `build_acp_chat_command` → `cursor-agent acp`),
   `chat.rs` (ACP spawn, `NO_OPEN_BROWSER=1`), `runtimes.rs` (managed install, `cursor-agent`
   shim), `agent_updates.rs` (release from the official installer),
-  `chimaera_agent::acp::CURSOR` (pinned to `TESTED_CURSOR_VERSION` 2026.10.14-941492e).
+  `chimaera_agent::acp::CURSOR` (pinned to `TESTED_CURSOR_VERSION` 2026.10.22-27dcf5f).
 - **Key behaviors.** Detection searches the PATH for `cursor-agent`, never `cursor` — that name
   is the Cursor editor's app launcher — and the shim is named `cursor-agent` for the same
   reason. Chat is the shared ACP adapter: approvals, cancel, queued sends, resume through

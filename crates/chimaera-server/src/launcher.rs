@@ -66,6 +66,7 @@ pub(crate) fn models(kind: AgentKind) -> &'static [(&'static str, &'static str)]
         AgentKind::Codex => &[
             ("gpt-6.1-sol", "GPT-6.1 Sol"),
             ("gpt-6-astra", "GPT-6 Astra"),
+            ("gpt-6.1-terra", "GPT-6.1 Terra"),
             ("gpt-6-sol", "GPT-6 Sol"),
             ("gpt-6-luna", "GPT-6 Luna"),
             ("gpt-5.6-sol", "GPT-5.6 Sol"),
@@ -3029,7 +3030,7 @@ mod tests {
         assert!(!is_outdated(AgentKind::Claude, Some("0.1.99")));
         // The curated FALLBACK lists (the live Init catalog wins once seen):
         // claude's family aliases, which the CLI resolves itself; codex's
-        // 0.160 defaults, whose ids thread/start accepts verbatim.
+        // model/list ids (0.166.0), which thread/start accepts verbatim.
         assert_eq!(
             models(AgentKind::Claude),
             [
@@ -3044,6 +3045,7 @@ mod tests {
             [
                 ("gpt-6.1-sol", "GPT-6.1 Sol"),
                 ("gpt-6-astra", "GPT-6 Astra"),
+                ("gpt-6.1-terra", "GPT-6.1 Terra"),
                 ("gpt-6-sol", "GPT-6 Sol"),
                 ("gpt-6-luna", "GPT-6 Luna"),
                 ("gpt-5.6-sol", "GPT-5.6 Sol")

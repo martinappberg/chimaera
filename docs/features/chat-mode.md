@@ -71,7 +71,10 @@ Implementation: `claude.rs`, `journal.rs`, `chat.rs::resolve_start_settings`, an
 Claude Code, Codex, Antigravity (Gemini models), Grok Build and Cursor CLI share the transcript,
 composer, permissions, queue and replay core. Session `capabilities` and `catalog` events
 control the available header/composer actions. ACP model choices come from the authenticated
-provider; unsupported actions are not guessed from the agent's brand. Forking works across all
+provider; unsupported actions are not guessed from the agent's brand. An Antigravity model
+remembered from its older combined ids (`gemini-3.8-flash-high`) comes back as that model and
+thinking level. A finished shell command shows its output on every runtime, including the ones
+that report it only in the command's raw result (Antigravity, Cursor). Forking works across all
 four using native history where available or a conversation copy. Same-session chat/terminal
 switching and rewind remain Claude/Codex-only until the new providers' native boundaries are
 verified. See [integration design](../agent-guides/agent-integrations.md) for the plugin boundary.
@@ -94,13 +97,18 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   the steered message's `userMessage` item — not the RPC ack). Then it leaves the stack and enters
   the transcript right there, solid — mid-turn if that is where it was read. A Codex steer read
   just as its turn finishes (recorded, but no model step after it) is answered in an input-less
-  follow-up turn, so it never sits read and unanswered (Pass 54). Each waiting bubble
-  has **Send now** (stops the current turn, unless Claude can take the message into it by moving what the turn waits on to the background; every waiting message is then read at once — claude
-  keeps its queue through the interrupt, and Chimaera re-sends the steers Codex drops; Claude's
+  follow-up turn, so it never sits read and unanswered (Pass 54). The stack has one
+  **Send now** under its last bubble (stops the current turn, unless Claude can take the messages into it by moving what the turn waits on to the background; everything waiting for the next step is then read at once, as one turn, and after-turn messages run right after it — claude
+  keeps its queue through the interrupt; Chimaera re-sends the steers Codex drops and carries the ones Codex had read but not yet answered; an ACP chat gets every waiting message as one prompt; Claude's
   background agents keep running, because Chimaera sends the CLI's own send-now rather than its
-  Stop, which ends them for good) and **✕**
+  Stop, which ends them for good; PROTOCOL.md Pass 60). Each waiting bubble has **✎**, and **↑** in an
+  empty composer does the same for all of them: the message is withdrawn and its words (and
+  pictures) come back to the composer to edit, only once the agent confirms the withdrawal, so one
+  it read first stays sent. And each has **✕**
   (pulls it back — Claude `cancel_async_message`, an ACP or Codex next-turn queue item
-  removed locally; a Codex steer can't be withdrawn and says so).
+  removed locally; a Codex steer can't be withdrawn and says so). On Claude Code 2.1.318 a
+  message sent while a model switch is still being checked waits unqueued; Chimaera repeats its ✕
+  once it queues, so the message is withdrawn instead of running (PROTOCOL.md Pass 59).
   Stop never drops the queue. On Claude Code 2.1.310+ that holds across the race too: a waiting
   message the agent took in just as you pressed Stop stays in the stack and runs as a turn of its
   own (the CLI puts it back); it shows as read only once Claude's reply to it begins. A Stop also
@@ -343,7 +351,8 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   "set off by DISABLE_AUTO_COMPACT". Codex has no such switch), then every plan window
   this chat knows, each with when it resets ("in 1h 40m", "Thu 09:00"), and **All limits** →
   Settings → Agents. Claude reports both plan windows on every request (`unifiedWindows`), Codex its
-  primary/secondary windows during each turn, Grok its weekly credit window after each turn; an
+  primary/secondary windows during each turn, Grok its weekly credit window after each turn (an
+unused week reads 0%); an
   Antigravity chat, whose stream reports none, shows the account's live read from Agent settings
   instead ([agents.md](agents.md#plan-usage)). Nothing
   shows for an agent that reports neither (Cursor). Subscription usage (`/usage`, `/cost`, the
@@ -416,7 +425,9 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   the candidates resolve against the session's live cwd, its spawn cwd and the workspace root,
   then the workspace index (unique basename or path suffix). Click opens the file at the line, or
   at a locator's spot (`paper.pdf#page=3&xywh=…`, `de.tsv#row=5-9`, `demo.mp4#t=30`);
-  Cmd/Ctrl+click opens it in a split; a directory opens in the Finder; a name several files
+  Cmd/Ctrl+click, a middle click or **Open Beside** in its right-click menu opens it beside;
+  with a neighbor pane a plain click lands there too, keeping the chat in view
+  ([open beside](workbench.md#splitting-tabs--drag-and-drop)); a directory opens in the Finder; a name several files
   answer to (dashed underline) asks which in the context menu. Every renderer in a chat shares one
   batched, cached resolver (`paths.ts` `PathResolver`), its answers keyed by the candidate AND the
   base ladder + workspace it resolved against: a miss is asked again after 15 s, after every turn
@@ -517,6 +528,17 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   reveal spans shortly after its fade), because span-fragmented text copies with a hard newline
   at every visual wrap point. Blockquotes render as a quiet accent-washed quote card, distinct
   from code chrome.
+- **Run a shell block.** A settled fence a shell reads (```` ```bash ````, `sh`, `zsh`, `console`,
+  `shell-session`, `sbatch`, …) also carries a ▶ **run in terminal** button beside Copy. A click
+  types the block into the chat's terminal and presses Enter (details on the
+  [terminals](terminals.md#commands-typed-in-from-a-chat) page). A transcript-style block (lines
+  starting `$ `, and always a `console`-family fence) runs only those lines, prompt removed, with
+  their `\` continuations and heredoc bodies minus the `> ` continuation prompt; a `console` block
+  with no prompt is output and gets no button. Control characters and zero-width characters are
+  dropped, tabs become spaces, and a block with bidi controls gets no button (what it shows is not
+  what it would run). The payload is the block as rendered, read at click time, like Copy; only a
+  button the app made runs anything, never one an agent's raw HTML forged. Nothing runs without the
+  click, and a block still streaming has no button (`chat/runCommand.ts`; App's `runOnce`).
 - **Quote part of a reply back to the agent.** Select any text in the transcript — a sentence of a
   reply, a few table rows, a line of tool output — and a quiet **`>` quote in reply** chip appears at
   the selection's end (the context bridge's chip; the chord `⇧⌘R` / `Ctrl+Shift+R` does the same).
@@ -685,7 +707,7 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   and Cursor report no subagents on their ACP wires, so they show neither. PROTOCOL.md Pass 42.
 - **The task list is the plan card, whichever tool spells it.** Every plan source — Claude's `TodoWrite` or its incremental `TaskCreate`/`TaskUpdate`/`TaskList` family, chimaera's `update_plan`, Codex's built-in `update_plan`, an ACP agent's plan — arrives as the one `plan` level-set, and none leaves bookkeeping rows in the transcript. The Task family carries more than a checklist, so its rows can show **who owns a step** (`@name`) and **what blocks it** (a dashed checkbox and "after #1": a blocked task is still `todo`), plus a muted detail line when the task's description says more than its subject. Blockers are filtered to ones still open, so finishing a dependency visibly unblocks its dependents. The in-progress summary prefers the agent's own present-continuous `activeForm` ("Running tests"). Plans without these fields render without them.
 - **Chats are asked to keep a plan card, each in its own runtime's words.** The chimaera MCP server's `initialize` instructions ask a chat for the card on any request that edits files or runs more than one command, and the wording depends on the runtime and surface (`mcp.rs` `task_list_instructions(kind, chat)`, `plan_tool_for`). A **Claude chat** is offered chimaera's `update_plan` tool (a whole-list level-set of `{content, status}` steps that the daemon journals as the normalized `plan` event) and asked to use it: Claude Code offers no TaskCreate/TaskUpdate under `-p` (probed on 2.1.300). A **Codex chat** uses its built-in `update_plan`, explicitly enabled by the driver through `config: {"tools.update_plan.enabled": true}` on thread start, resume and fork. The native tool defaults to disabled; an app-server launch flag alone did not expose it in the live probe. No second MCP task tool is offered (PROTOCOL.md Pass 48). An **ACP chat** is told what its runtime really has (live-probed, PROTOCOL.md Pass 45) and is not offered chimaera's tool: a **Cursor chat** is pointed at its built-in TodoWrite, whose list reaches the client as `cursor/update_todos` and draws the card (`acp.rs` folds `merge: true` by id, answers the documented `accepted` outcome, and hides the agent's own `Update TODOs` rows); a **Grok chat** at its `todo_write`, which arrives as the ACP `plan` update (its `todo_write` rows are hidden too); an **Antigravity chat** is told that no plan tool reaches the card, since it has none, and asked to keep the steps in its reply. A **terminal session** of any kind gets neither: its own task list renders in the terminal. `update_plan` stays in `mcp::ALWAYS_ALLOWED_TOOLS` (Claude `permissions.allow`; Codex and the ACP chats `mcp_auto_approve`), harmless where the tool isn't listed, and the Claude driver hides its `mcp__chimaera__update_plan` call row (`claude.rs` `CHIMAERA_PLAN_TOOL`). A plan written as a file or prose draws nothing.
-- **Pre-allowed chimaera tools are silent on every chat runtime.** `mcp::ALWAYS_ALLOWED_TOOLS` (`notify`, the document tools, `open_browser`, `update_plan`) and an active plugin's tools raise no permission card: Claude through the generated `permissions.allow`, Codex through `SpawnSpec.mcp_auto_approve` (its app-server elicits every MCP call), and since Pass 45 the ACP chats (Antigravity, Grok, Cursor) through the same `mcp_auto_approve`, which `chat.rs` sets for them and the ACP driver answers at the `session/request_permission` with the offered allow-once option. Each agent names an MCP call in its own live-captured shape, and the driver pre-approves only an exact match — one server, a listed tool, the title agreeing with the structured fields — so a shell command, another server, an unlisted tool such as `list_terminals`, or a reworded frame still asks. The agent keeps no standing grant (never allow-always), so what runs silently is exactly the daemon's list. **Verified live (2026-10-15, Pass 45)** in this worktree's isolated daemon, one turn each asking for `notify`, `open_browser` and `list_terminals`: a Cursor chat and a Grok chat each journaled three tool rows and exactly one `permission_request` — `list_terminals` — with `notify` and `open_browser` run unasked; the same Cursor turn then drew three `plan` level-sets from its TodoWrite (`alpha`/`beta`: todo → done/todo → done/done) and a kept chat showed the card with 1/3 done, the second step in flight and no `Update TODOs` rows; Grok's `todo_write` drew its `plan` (`alpha` done, `beta` todo). An Antigravity chat (its managed package copied into the isolated daemon's own root) did the same: three rows, one ask for `list_terminals`. `just chat-smoke-acp` passed for all three (the Cursor case now asks through a shell command: Cursor applies its own file edits without a permission request, and only a command outside its allowlist asks).
+- **Pre-allowed chimaera tools are silent on every chat runtime.** `mcp::ALWAYS_ALLOWED_TOOLS` (`notify`, the document tools, `open_browser`, `update_plan`, the agent browser's read tools plus `browser_navigate`/`browser_show`/`browser_close`) and an active plugin's tools raise no permission card: Claude through the generated `permissions.allow`, Codex through `SpawnSpec.mcp_auto_approve` (its app-server elicits every MCP call), and since Pass 45 the ACP chats (Antigravity, Grok, Cursor) through the same `mcp_auto_approve`, which `chat.rs` sets for them and the ACP driver answers at the `session/request_permission` with the offered allow-once option. Each agent names an MCP call in its own live-captured shape, and the driver pre-approves only an exact match — one server, a listed tool, the title agreeing with the structured fields — so a shell command, another server, an unlisted tool such as `list_terminals`, or a reworded frame still asks. The agent keeps no standing grant (never allow-always), so what runs silently is exactly the daemon's list. **Verified live (2026-10-15, Pass 45)** in this worktree's isolated daemon, one turn each asking for `notify`, `open_browser` and `list_terminals`: a Cursor chat and a Grok chat each journaled three tool rows and exactly one `permission_request` — `list_terminals` — with `notify` and `open_browser` run unasked; the same Cursor turn then drew three `plan` level-sets from its TodoWrite (`alpha`/`beta`: todo → done/todo → done/done) and a kept chat showed the card with 1/3 done, the second step in flight and no `Update TODOs` rows; Grok's `todo_write` drew its `plan` (`alpha` done, `beta` todo). An Antigravity chat (its managed package copied into the isolated daemon's own root) did the same: three rows, one ask for `list_terminals`. `just chat-smoke-acp` passed for all three (the Cursor case now asks through a shell command: Cursor applies its own file edits without a permission request, and only a command outside its allowlist asks).
 - **Pinned work.** Tasks, subagents and background work distinguish what the agent plans to do,
   who is working, and what continues in the background. Only non-empty cards render. Three or more
   kinds, including goals and schedules, fold into one labelled [work strip](loops-and-goals.md#the-folded-work-strip),
@@ -1031,6 +1053,7 @@ _Captured 2026-09-28 from the maintainer's own words in the session that built i
 - **Why (maintainer, verbatim):** "Claude transcripts have like a new 'send now' and also items that are queued seem to be read even mid a turn ? is this true ? can we fix so chimaera works this way as well. And also if multiple messages are queued I assume they should all be read at the same time? This is just for good measure to keep on par with the other tools". Then: "Do a similar check for codex too to make sure we are on par".
 - **Decision the maintainer took (asked, with both agents' native defaults and his own Codex desktop setting `followUpQueueMode = "queue"` laid out):** "Read at next step" for both agents — Enter while an agent works is read at its next tool call and shows grey until then; a chord sends a message for after the turn instead; every waiting bubble has Send now and ✕. (The chord became ⌥↩ because the proposed ⇧⌘↩ is Zoom Pane here.)
 - _Settled vs. free-to-change, and what must not be "fixed": pending — not yet asked. The stated goal is parity with the official Claude and Codex clients._
+- **2026-11-04 (#355, maintainer, verbatim):** "If you have more than 1 msg in the queue, need to fix the queue handling here. All queued up (unless queued after turn) should send immediately. Can we figure out good UI / UX for this?" Offered one Send now for the whole waiting stack instead of one per bubble, he chose "Yes, one control", then added: "but if so, one should be able to edit the waiting stack I feel too" — hence ✎ and ↑ to take waiting messages back to the composer.
 
 ### Quoting part of a reply back to the agent — why it exists
 _Captured 2026-09-28 from the maintainer, in the session that built it._
@@ -1310,3 +1333,12 @@ _Captured 2026-10-15 (from the maintainer, in-session, while the chat-UX batch w
 _Intent pending — not yet captured from the maintainer (shipped 2026-10-15, autonomous session)._
 
 - Derived context, not intent: the 2026-10-14 batch's cross-runtime review found the ACP chats getting less silently — every pre-allowed chimaera tool still raised a permission card there, and Cursor's to-do list was discarded. Both were held back until the frames were captured live (the repo's rule: agent wire formats are pinned, never guessed; PROTOCOL.md Pass 45). Decisions made without the maintainer and open: the driver answers only an offered allow-once (never a standing allow-always in the agent), a cancelled Cursor to-do leaves the card rather than drawing a fourth state, and an agent's own plan-tool rows are hidden as Claude's TodoWrite is. Run **capture-feature-intent** with the maintainer to replace this stub.
+
+### Running a shell block from chat — why it exists
+_Captured 2026-11-04 (the maintainer, in the session that built it)._
+
+- **Problem it solves:** when an agent gives "terminal commands it would want you to run", "one
+  should be able to do this in chat", not by copying them into a terminal by hand.
+- **How settled it is:** the why is settled; which fences qualify, which terminal it picks and how
+  the text is typed are additions, free to change if improved.
+- **Do not change (or: open to change):** open to change; nothing about the Run behavior is frozen.

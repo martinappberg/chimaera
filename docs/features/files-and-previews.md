@@ -28,7 +28,8 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 - **What & when.** The rail's FILES section: a lazily-loaded directory tree of the workspace
   root. Browse the project and open files into panes.
 - **How it's used.** Click a directory to expand/collapse; click a file to open it in the focused
-  pane. Start typing (or click the magnifier) to filter the loaded tree; the **collapse folders**
+  pane, or ⌘/Ctrl-click, ⌘/Ctrl+Enter, a middle click or **Open Beside** in its menu to open it
+  beside ([open beside](workbench.md#splitting-tabs--drag-and-drop)). Start typing (or click the magnifier) to filter the loaded tree; the **collapse folders**
   button beside it folds every open dir and returns to the top. A directory link clicked
   in a terminal/chat reveals + flashes its row. File rows drag out (drop into a pane/split, or
   onto an agent to reference). Arrow keys move focus, expand/collapse folders, and return
@@ -289,6 +290,25 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   mode, and call `git::mark_path_dirty` so the git panel refreshes without polling. Gzip
   decompress is capped at 64 MB/request (defuses gzip bombs). Open-at-line requests
   (`shared/reveal.ts`) place the cursor, center the range and flash it.
+- **Languages.** Every code surface — the editor, compare and diff views, notebook cells,
+  markdown fences, embed cards — picks a grammar through one module, `previews/languages.ts`:
+  `languageFor(path, text)` for a file, `languageNamed(name)` for a fence or kernel. The list is
+  CodeMirror's own (`@codemirror/language-data`, each loaded on first use) plus Typst and a few
+  research dialects that borrow a shipped grammar under their own name: **Snakemake** (Snakefile,
+  `.smk` → Python), **Nextflow** (`.nf`, `nextflow.config` → Groovy), **Makefile**, **Justfile**
+  and **Apptainer** (`Singularity`, `.def`) → Shell, and **R Markdown** / **Quarto** (Markdown
+  with `{r}` chunks highlighted). Names the list misses or gets wrong are mapped by table: cluster
+  job scripts (`.sbatch`, `.slurm`, `.pbs`), shell dotfiles and `.env`, `Containerfile`, MATLAB
+  `.m` (Octave's grammar), `.cfg`/`.conf`/ignore files/`requirements.txt` (INI), lockfiles, JSON
+  and XML variants, `.pyi`, `.F90`, `.cu`, `.svelte`, `.bib`, and more; fences accept the short
+  names agents write (```` ```py ````, `console`, `rs`, `matlab`). A file with no extension falls
+  back to its `#!` line (`#!/usr/bin/env python3`, `-S snakemake`, `Rscript`). Languages with no
+  close grammar (HCL, Nix, WDL) stay plain text rather than wear a wrong one. Linting is not core:
+  the only marks in the gutter are plugins' `diagnostics/1`.
+- **The language picker.** The editor's bottom bar names the file's language; picking another
+  (or Plain text) re-highlights in place and is remembered per file in this browser
+  (`languageOverrides`, a capped LRU in localStorage, `previews/pathMemory.ts`). Picking what the
+  file is detected as goes back to detecting.
 
 ## Rendered previews
 
@@ -684,7 +704,8 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   XSL, SVG, MathML, any `+xml` — an XML file's XHTML `<script>` would run in the daemon's origin)
   gets a script-less `sandbox`.
   **Caching over a tunnel:** a ticket is minted with the file's version token, and minting again
-  for the same path + version while it lives answers the *same* ticket (its expiry renewed) — so
+  for the same path + version while it lives answers the *same* ticket (its expiry renewed, never
+  shortened: an agent's file page holds the same ticket for an hour) — so
   the URL is stable for as long as the file is unchanged, and a re-render, a tab switch or a reload
   reuses the browser's copy instead of re-downloading. `/raw` responses carry a strong `ETag`
   (version + size), `Last-Modified` and `Cache-Control: private, max-age=<the ticket's remaining
@@ -712,6 +733,36 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   tags) but never *read* them with `fetch`/XHR, so a report cannot read out the files around it —
   a report that fetches its data as JSON still needs it inline. The split live preview (`srcdoc`)
   has no URL, so its relative assets still do not load.
+  **Zoom like a browser:** in the macOS app ⌘+/⌘−/⌘0 zoom the page and a trackpad pinch
+  magnifies it (per pane, kept across a move).
+  **In the macOS app, Preview is a web view of its own** (`shared/paneView.ts` over
+  `chimaera-app` `shell/native_view.rs`), laid over the pane: its own web process, so a heavy page
+  can only slow itself down. An iframe shares the window's process and main thread with chat,
+  terminals and every pane — a 40 MB, 3.4 M-element report cost that process 1–1.7 GB, tipped it
+  into WebKit's memory-pressure cache flushing and froze the whole window (2026-11-04; measured
+  with the same report in a pane view: window process ~40 MB, report process ~950 MB). Same URL
+  as the iframe, so remote windows load it through their tunnel the same way. The view follows
+  the pane, stands down under a still of its page while a menu, dialog, tooltip or a drag's drop
+  wash overlaps it, and closes with its
+  tab or the window's page. Dragging the tab to another pane keeps the page — the same view is
+  re-placed, not reloaded (`paneView`'s `keep`, see [browser-pane](browser-pane.md)) — unless the
+  file changed on disk meanwhile, which loads the new version. In a browser tab, on Linux/Windows, or against an app build without
+  pane views it stays the iframe.
+  **Marking** (context bridge, like PDFs): a text selection in the page publishes the file, the
+  quote and the nearest heading (`§ Heading`) with the usual `@ reference in agent` pill by the
+  selection and the reference chord; the area tool (app only) freezes the view to a snapshot,
+  and a dragged box sends its PNG crop, the text under it and `#xywh=` in document CSS px. Both
+  ride the pane bridge (`chimaera_core::PANE_BRIDGE_JS`): in the app it runs in a WebKit content
+  world of its own that the page's scripts can't see; on the framed path the daemon appends it to
+  the page asked for with `?bridge=1` and it posts to the parent, which accepts only that frame.
+  It acts only on trusted input: a selection right after real input, a chord the page didn't
+  handle itself, and (in the app) only a link the user clicked opens the real browser — a
+  script's own `a.click()` or navigation away is cancelled. A view whose own process keeps
+  dying (a page over WebKit's limit) is reloaded at most twice a minute, then shows "This page
+  stopped responding" with Reload. Closing a view (its pane, its card, its window) ends its
+  process at once, even mid-layout: WebKit alone waited for the process to handle the close, ~4
+  minutes for a busy 9.5 GB report ([native app](native-app.md)). Frames inside a report load as
+  they would in its iframe, external ones included.
   **PDF** runs on pdf.js's **legacy** build: the modern build calls `Map.prototype.getOrInsertComputed`
   on every render and range read, which WebKit (the macOS app) and Chromium before 145 lack, so its
   pages stayed blank. pdf.js's standard fonts, CMaps, wasm decoders and ICC profiles ship with our
@@ -771,7 +822,7 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   download so it can play locally. A parked pane pauses its video (it doesn't resume by
   itself); audio keeps playing.
 - **Notebooks.** `.ipynb` opens read-only in `NotebookView.svelte`: code cells highlighted
-  (the editor's `--syn-*` palette, parsers from `@codemirror/language-data` plus Typst, `previews/languages.ts`, via `highlight.ts`)
+  (the editor's `--syn-*` palette, the kernel's language through `previews/languages.ts` `languageNamed`, via `highlight.ts`)
   beside their `[n]` execution counts; markdown cells through `marked` + DOMPurify with chat's
   profile (no `<style>`, web links in a new tab without an opener), math (`$…$`, `$$…$$`,
   `\(…\)`, `\[…\]`, `\begin{…}` blocks) typeset through the shared KaTeX policy only when a
@@ -854,7 +905,9 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
 - **PowerPoint decks.** `.pptx` (and `.pptm`, `.ppsx`, `.potx`) open in `PptxView.svelte`,
   drawn by `@aiden0z/pptx-renderer` in the Marp viewer's chrome: arrows / PageUp / PageDown /
   Space / Home / End page the deck, a thumbnail strip jumps, **present** goes full screen,
-  `#slide=N` reveals a slide (clamped to the deck), and **speaker notes** (read straight from the
+  `#slide=N` reveals a slide (clamped to the deck; `#slide=N&xywh=…` outlines a box on it), the
+  slide's **@** and the area tool point an agent at the slide or part of it ([Pointing at part of
+  a file](#pointing-at-part-of-a-file)), and **speaker notes** (read straight from the
   package; the renderer doesn't model them) show under the stage — under the deck's zip entry cap,
   one part at a time, each inflated only if it declares ≤1 MB (≤32 MB for all notes) and abandoned
   at 1 MB whatever it declared, so a zip bomb in `notesSlide*.xml` is skipped (that slide's notes
@@ -868,7 +921,57 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   its text — and the strip mounts only the thumbnails near its visible span, two per tick. Charts
   draw with ECharts (most of the viewer's ~1.1 MB / 345 KB-gzip chunk, loaded only by a deck).
   Animations and transitions aren't played and missing fonts fall back to the system's; the ⓘ in
-  the bar says so, and counts shapes that couldn't be drawn. Refused past 100 MB.
+  the bar says so, and counts shapes that couldn't be drawn. Refused past 100 MB. A reveal's
+  plain line (`deck.pptx:3`, a deck check's problem on slide 3) lands on that slide.
+- **Editing a deck.** The bar's **edit** turns the stage into an editor (`PptxEditLayer.svelte`):
+  click a shape to select it (the grey around the slide deselects), drag it (snapping to the
+  slide's edges and centre and to other shapes, with guides and a position readout in points;
+  Shift keeps one axis, Alt turns snapping off, Esc puts it back), resize it from its handles
+  (pictures keep their aspect unless Shift; resized edges snap too; tables and rotated shapes move
+  only), nudge it with the arrows (Shift: 10 px; nudges within a second are one undo step), Delete
+  it, Tab through shapes and out. Text is edited **where it is drawn**: double-click puts the caret
+  at the click, a click on the selected shape does too, Enter selects all of it, and just typing
+  on a selected text shape replaces it, as in PowerPoint. You type into the renderer's own text
+  body in the slide's real fonts (bullet markers kept out of the text); Enter is a new paragraph
+  (its bullet shows at once), Shift+Enter a line break, paste is plain text, formatting
+  shortcuts are off, and Esc, a click elsewhere or focus leaving commits it; the slide redraws
+  then. A shape whose drawn text doesn't read back as its XML gets a box editor under it instead,
+  and that one redraws as you type. Empty text placeholders show dashed; a table, chart or group
+  says where to edit it. A drag previews by moving the drawn shape and commits once on release.
+  Drag a thumbnail to reorder slides (the strip scrolls at its ends). ⌘Z / ⇧⌘Z undo and redo
+  anywhere in the viewer and show the slide they changed, ⌘S saves (also mid-typing), Esc steps
+  back: text, selection, edit mode. While editing, slide-show keys (Backspace, Space, Enter, F) do
+  nothing to the deck; edit mode and the area tool exclude each other, and the slide's @ hides.
+  Layout and master shapes aren't selectable, nor is a shape whose id repeats on its slide.
+  Edits are operations over the package's parts (`pptxEdits.ts`), applied as text splices to the
+  part's own XML (`pptxXml.ts`): a move rewrites only the `<a:off>` values, a resize only
+  `<a:ext>`, a text edit only the `<a:t>` text the change falls in (a new paragraph copies its
+  neighbour's formatting), a reorder only `<p:sldIdLst>`; a placeholder that inherits its place
+  gets the `<a:xfrm>` PowerPoint itself writes, and theme, layout and master parts are never
+  touched. A part edits only when its bytes round-trip through UTF-8 exactly. A save sends just
+  the touched parts to `POST /fs/package` with the SHA-256 the edits were based on; the daemon
+  copies every other zip entry byte-for-byte (local header, data and descriptor) into a temp
+  sibling and renames it over the deck, or answers 409. The history lives in
+  `pptxEditStore.svelte.ts`, not the view: closing the tab keeps it (the tab's unsaved dot, the
+  close and quit prompts offer Save), it is journaled through the drafts journal under
+  `<path>#pptx-edits` (reopening the deck after a crash or reload brings the edits back at once,
+  with the unsaved dot), and our own save coming back from disk is not re-read. Any other change
+  on disk — an agent's python-pptx rewrite, PowerPoint — waits while you are mid-typing or
+  mid-drag, then rebases the edits: each one replays over the new file, and one whose shape
+  changed or vanished there waits in a banner naming its slide (**keep mine** / **use theirs**;
+  a kept edit becomes an edit of the new file); nothing is overwritten or dropped silently. A
+  refused save (409) rechecks the disk at once. While PowerPoint has the deck open
+  (its `~$` owner file sits beside it) the bar says so, because PowerPoint's next save replaces
+  the file without checking.
+- **The same deck in PowerPoint.** In the app, **PowerPoint** in the bar opens the deck in
+  Microsoft PowerPoint (or the system's app for it), saving unsaved edits here first. A deck on
+  this machine opens in place, and PowerPoint's saves come back through the viewer's disk reload,
+  on the same slide. A deck on a remote or cluster host takes a round trip run by the shell: a
+  working copy on this Mac opened in PowerPoint, watched, and each save uploaded with the host's
+  hash from the last download or upload as the precondition (`PUT /fs/file/stream`, streamed to
+  disk). If the host's file changed meanwhile, nothing is overwritten: the banner offers **save mine
+  as a copy**, **open theirs** or **overwrite**. **done** ends the trip. In a plain browser the
+  remote deck keeps its **download**.
 - **Diagram boards.** JSON Canvas (`.canvas`), Excalidraw (`.excalidraw`, `.excalidraw.json`)
   and draw.io (`.drawio`, `.dio`; `.drawio.svg` / `.drawio.png` stay images) open on one pannable
   surface, `BoardView.svelte`: drag or scroll to pan, pinch or ⌘/Ctrl+scroll to zoom at the
@@ -972,12 +1075,29 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   a table with no rows to show says why where they would be — only the header, an empty file or
   sheet, the table ending before the slice, a row further in than one read goes — and one that
   fits the card is counted once, `3 rows`);
-  an HTML report (the sandboxed frame on the folder-scoped raw URL, fixed height, expand);
+  an HTML report (the folder-scoped raw URL, fixed height, expand — see **HTML cards in the app**
+  below);
   video/audio (`#t=start,end`, the browser seeks natively); a notebook cell (`#cell=N`, else the
   first cell that drew a figure); a Marp slide (`#slide=N`); a markdown excerpt (`#heading`, else
   the opening, clipped with a fade and **more**); a plain file or folder card for everything else.
   Missing files show a dashed card that says so (and looks again when it comes back on screen);
   failed loads say why, with **try again** — never a blank box.
+- **HTML cards in the app.** In the macOS app an HTML card is a web view of its own laid over the
+  card, like an HTML preview (`shared/embed/HtmlBody.svelte` on `shared/paneView.ts`'s embedded
+  mode): an iframe shares the window's web process, and a 52 MB, 3.6 M-element report in one card
+  took that process to 8–9 GB and 20–75 % CPU at rest, freezing the window with the chat in it
+  (2026-11-04; the same card as a view of its own: window process ~47 MB). The view is cropped
+  to the part of the card its scroller shows (the page keeps its place) and hides once scrolled
+  out, under a menu or while its layer is parked. The wheel over a card scrolls the document or
+  transcript around it until you click into the card; then it scrolls the page, until the pointer
+  is back outside the card. Once a page has shown, its snapshot is kept as the card's still
+  (`shared/embed/liveViews.svelte.ts`, per `/raw` URL, a dozen per window): it stands in while
+  the document scrolls (a view would trail the scroll by a frame), and for a card past the
+  window's budget of three live views — the cards most recently on screen keep theirs, the
+  rest close and load again when scrolled back. The expand toggle sits under the page there,
+  since nothing draws over a view. A browser tab, the Linux and Windows apps, and an app build
+  without pane views — or with pane views but older than this (`native_view_show` answers
+  `fit`; an older shell drops the crop silently) — keep the sandboxed frame.
 - **PDF rendering.** Cards, panes and region snapshots share nonzero raster dimensions capped at
   12 million pixels and 8192 pixels per edge (`shared/pdfCanvas.ts`). Each draw owns a fresh canvas,
   and failed draws are cancelled before their handles are discarded: a graphics-initialization
@@ -1026,7 +1146,14 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
     under the block. The values go along as TSV, header first.
   - **Video/audio:** the bar's **@ 0:12** button sends the playhead; **mark range** twice marks a
     range, which the button (and the chord) then sends.
-  - **Notebook cell / slide:** hover it; its **@** button sends it, with its source or text.
+  - **Notebook cell / slide:** hover it; its **@** button sends it, with its source or text. A
+    PowerPoint slide sends its title as the context and the rest of its text.
+  - **Part of a PowerPoint slide:** the bar's **select area** tool (or Shift-drag) draws a box; a
+    plain click (or Shift-click) picks the shape under the pointer, its own box. The box goes in
+    points from the slide's top-left — the deck's PDF export has the same page in points, and
+    python-pptx's EMU are 12700 per point — with the names of the shapes under it (as
+    PowerPoint's selection pane and `shape.name` call them) and their text, a table as
+    `a | b / c | d`. No crop yet: the slide is laid-out HTML, not pixels.
 - **What the agent gets.** One line, `@<path>#<locator> (<context>) "<quote>"`, each part after the
   path optional:
 
@@ -1041,6 +1168,8 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   | spreadsheet | `@book.xlsx#sheet=Q1%20Summary&range=D6:E7 "score\tnote\n2.5\tsecond…"` |
   | media | `@talk.wav#t=3.5`, `@talk.wav#t=2,6.25` |
   | notebook cell / slide | `@analysis.ipynb#cell=2 "import pandas…"`, `@deck.md#slide=2 "Results…"` |
+  | PowerPoint slide | `@deck.pptx#slide=2 (Results) "Effect held across cohorts · Figure 2…"` |
+  | PowerPoint area / shape | `@deck.pptx#slide=3&xywh=43,115,433,109 (Gene table) "gene \| log2FC / TP53 \| 2.1"` |
 
   The pixels: a **chat** target gets the crop as an image attachment (the pasted-screenshot
   pipeline and its caps), delivered in one insert with the locator so both land in the same
@@ -1052,7 +1181,8 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   `crop` / `label`, `composeSelectionReference`, `referenceNow`), `shared/ReferenceChip.svelte` +
   `ReferenceButton.svelte`, `App.svelte` `referenceSelection` (the one handler: chat attach vs
   terminal upload), the viewers (`PdfView`, `ImageView`, `TableView` + `XlsxView`, `MediaView`,
-  `NotebookView`, `SlidesView`, `MarkdownView`), region math in `previews/imageRegion.ts`. The
+  `NotebookView`, `SlidesView`, `PptxView` + `pptxRefs.ts`, `MarkdownView`), region math in
+  `previews/imageRegion.ts`. The
   daemon's `fs/xlsx` reports the sheet's used-range `origin`, so A1 references are the sheet's own.
 - **Key behaviors.**
   - **Locators are links too.** The same fragments open at the spot from chat, a terminal, or a
@@ -1328,3 +1458,74 @@ _Intent pending — drafted from the maintainer's request, 2026-09-26; questionn
   pasted into terminal agents, table fragments counting rows the RFC 7111 way (so they differ by
   one from the grid's row numbers), and the chip-only affordance (no context menu) have not been confirmed
   with the maintainer — capture via **capture-feature-intent** when available.
+
+### Pointing at a PowerPoint slide or part of one — why it exists
+_Captured 2026-11-04 (the maintainer, in the session that built it); questionnaire partly run._
+
+- **Problem it solves:** the maintainer is "super interested in driving good .pptx through
+  Chimaera", and a deck in the preview could not be pointed at ("Går ej att referera från en PP
+  till agent", issue #345). The ask: "one should be able to reference like we do in other
+  documents but parts of a pptx", and "reference stuff should be there by default".
+- **Core bet:** references into a deck are built in and on by default, not part of an
+  extension. Authoring help (themes, slide pictures for agents, deck checks) is a separate,
+  opt-in first-party extension; editing in the viewer and opening the same file in PowerPoint
+  are their own follow-up.
+- **Pending.** How settled the rest is (the box in points, shape names as context, a click
+  picking a shape, no crop for now), and whether anything is frozen, has not been asked yet —
+  capture via **capture-feature-intent** when available.
+
+### Editing a deck, and the same deck in PowerPoint — why it exists
+_Captured 2026-11-04 (the maintainer, in the sessions that designed and built it)._
+
+- **Problem it solves:** the maintainer wants Chimaera to be great for .pptx work with agents,
+  and asked to be able to edit and drag things directly in the viewer, or to sync with local
+  PowerPoint so the same file can be opened there.
+- **Settled scope:** move, resize, retype, reorder slides and delete shapes; adding shapes isn't
+  wanted here. Pictures and figures move like any shape, as native objects, and themes keep
+  working. Editing sits behind an explicit **edit** toggle — the viewer stays a viewer by
+  default. "Open in PowerPoint" opens the real Microsoft PowerPoint, one button even for a remote
+  deck.
+- **Core bet:** editing is core, not the PowerPoint extension's — extensions can't ship a viewer
+  of their own — and every edit is a minimal diff: the file is the truth, an untouched zip entry
+  stays byte-identical, and a save carries the hash it was based on.
+- **Pending.** Whether the round-trip's conflict choices (copy, theirs, overwrite) are the right
+  three hasn't been asked — capture via **capture-feature-intent** when available.
+
+### HTML in a web view of its own, and marking HTML — why it exists
+_Captured 2026-11-04 (the maintainer, in the session that built it)._
+
+- **Problem it solves:** a large HTML report opened on a remote made the whole window
+  unresponsive — "I cannot use that window"; the page "works but takes a LONG ass time to look
+  at", and going back to chat was barely usable too. Separately: "be able to mark things in HTML
+  like we do for PDFs". The ask was to "fix this properly once and for all", to make sure it
+  works on remotes too, and to run all HTML this way rather than above a size threshold
+  ("considering some people do web dev"). The browser fallback "still needs to be there".
+- **How settled it is:** "Can change" — the whole implementation is provisional (pane views,
+  the bridge, the pill, the area tool, the wording). Only the why above is settled.
+- **Do not change (or: open to change):** nothing is frozen; the area is open to improvement.
+- **Left open:** native pane views on Linux/Windows (they keep the iframe for now), and the agent
+  browser's pane engine (#273) building on pane views.
+
+### Zooming an HTML page — why it exists
+_Intent pending — drafted from the maintainer's request, 2026-11-05; questionnaire not yet run._
+
+- **Problem it solves (from the request).** "Is it possible to zoom in on HTML with the normal
+  controls? Does not need to add anything extra for this, just like how it would be on a webpage
+  normally." Alongside it, the maintainer noted ⌘+/⌘− "not working correctly before" (the
+  position-matched chords on a non-US layout) and that the dashboard may not need ⌘0 anymore.
+- **Pending.** Which parts are a promise rather than "for now" — capture via
+  **capture-feature-intent**.
+
+### Code files in every common format, and a language picker — why it exists
+_Captured 2026-11-04 (the maintainer, in the session that built it)._
+
+- **Problem it solves:** code files are "not as big of a deal and not something people should
+  use a lot, but sometimes you want to go into the code and understand what it does", and
+  research files ("rust files, snakemake files etc.") are "quite common". The ask was to keep it
+  "simple still and useful but that all of these work", with the file-name mapping made
+  exhaustive.
+- **How settled it is:** the why is settled; the language tables, the dialect choices and the
+  picker are additions, free to change if improved.
+- **Deliberately left out:** "we skip all real Linters" — "If something is out of scope it should
+  be an extension". Core reads and highlights; checking code is not core.
+- **Do not change (or: open to change):** nothing is frozen; the area is open to improvement.

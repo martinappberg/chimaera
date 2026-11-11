@@ -25,7 +25,7 @@ activity log), `retired.rs` (plugins whose job moved into Chimaera,
 [below](#agent-notes)) — plus `agent_probe.rs` and `comms.rs` (the post window plugins' Timeline appends share);
 the interface `crates/chimaera-plugin-api` (the WIT world and its Rust bindings,
 [map](../../crates/chimaera-plugin-api/AGENTS.md)); the first-party plugins in their own
-repositories, [chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium), [chimaera-plugin-latex](https://github.com/martinappberg/chimaera-plugin-latex) and [chimaera-plugin-typst](https://github.com/martinappberg/chimaera-plugin-typst), whose releases
+repositories, [chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium), [chimaera-plugin-latex](https://github.com/martinappberg/chimaera-plugin-latex), [chimaera-plugin-typst](https://github.com/martinappberg/chimaera-plugin-typst) and [chimaera-plugin-pptx](https://github.com/martinappberg/chimaera-plugin-pptx), whose releases
 `plugins/plugins.lock` pins — the lock is all the daemon carries of them
 ([map](../../plugins/AGENTS.md)); the CLI `crates/chimaera/src/plugin.rs`; UI
 `web-ui/src/lib/plugins/` ([map](../../web-ui/src/lib/plugins/AGENTS.md)) — the `plugins`
@@ -95,8 +95,12 @@ installation or hook trust and on reconnect; it carries no plugin payload.
 - **What & when.** Opt-in capabilities that change what the UI or the agents get, off by
   default. The first-party ones are WASM plugins in their own repositories at the releases
   `plugins/plugins.lock` pins: **Mycelium** (fills Knowledge and "Where things stand"; adds
-  `knowledge_search` · `knowledge_get` for every agent here), and **LaTeX** and **Typst**
-  ([below](#programs-and-tools-the-privileged-tier)). The daemon carries none of them: each is
+  `knowledge_search` · `knowledge_get` for every agent here), **LaTeX** and **Typst**
+  ([below](#programs-and-tools-the-privileged-tier)), and **PowerPoint** (`render_slides` shows
+  agents their slides, `check_deck` finds layout problems, and plain themes or the user's own),
+  and **Chromium** (a headless `chrome-headless-shell` for the
+  [agent browser](agent-browser.md#engines-and-how-one-is-chosen) on a host with none, downloaded
+  only from its Tools' Install). The daemon carries none of them: each is
   listed as *available* until the user installs it on this host
   ([below](#versions-installs--updates)).
 - **How it's used.** Open Extensions from the rail's **Extensions** row or quick-open
@@ -162,8 +166,10 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     settings and tools — pinned by `crates/chimaera-server/src/tests/agent_view.rs`. Where
     active, a plugin's tools join `tools/list`, pass the call gate (elsewhere a call is refused,
     JSON-RPC -32602, "… isn't switched on in this workspace …"), and its instruction paragraph
-    joins `initialize`, in catalog (id) order. A plugin that can't answer (refused, faulted)
-    adds nothing.
+    joins `initialize`, in catalog (id) order, **before** chimaera's own text: Claude Code
+    keeps only the first ~4 KB of a server's instructions, which chimaera's text alone
+    fills, so a paragraph after it never reached Claude (`mcp.rs::initialize_result`). A
+    plugin that can't answer (refused, faulted) adds nothing.
   - **Pre-allowed at spawn:** claude — `mcp__chimaera__<tool>` in the generated settings'
     `permissions.allow` (chat and TUI); codex chat — the driver's `mcp_auto_approve`; codex
     TUI — `-c mcp_servers.chimaera.url=…` + `bearer_token_env_var="CHIMAERA_MCP_KEY"` (the key
@@ -240,7 +246,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     in separate repositories and install from locked releases; the daemon carries no plugin
     bytes. Capability trust, both WIT worlds, plugin screens and file views, query routes,
     switch events, program jobs and tool downloads are implemented (sections below).
-    LaTeX and Typst use the 0.2 platform. **Browse** remains disabled, "later".
+    LaTeX, Typst and PowerPoint use the 0.2 platform. **Browse** remains disabled, "later".
 
 ## The plugin host
 
@@ -292,6 +298,12 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     over is measured against its cap before it is parsed (a parsed value costs many times its
     text). The host serves the
     workspace and session of the call in flight, never the context a guest passes back.
+  - **A tool's answer can show the agent pictures**: a line that is exactly
+    `![alt](output:<path>)`, naming a PNG, JPEG, WebP or GIF in that plugin's own output
+    folder for the workspace, reaches the agent as an MCP image in its place (≤ 8 an answer,
+    2 MiB each, 8 MiB in all, read without following links), and the line keeps the file's
+    absolute path for an agent whose client drops images; one that can't be shown stays a
+    line saying why (`tools.rs::answer_content`).
   - **What a plugin hands back is capped too** — a tool result at 256 KiB, the instruction
     paragraph at 8 KiB, a hook line at 1 KiB, a tool description at 2 KiB; a tool input
     schema must be a JSON object schema (≤ 16 KiB); at most 64 MCP tools per plugin, their
@@ -687,13 +699,26 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   formatter) and download the ones it needs. It names each one in its manifest; nothing else
   can run. The host runs them as **jobs** under fixed limits, and downloads a **tool** only
   when you click Install. The locked first-party LaTeX and Typst plugins use this tier
-  for document compilation, diagnostics, and agent compilation tools.
+  for document compilation, diagnostics, and agent compilation tools; PowerPoint uses it to
+  render slides with LibreOffice.
 - **How to use.** Such a plugin's card says **runs programs** and lists every program under
   **Can** ("Runs latexmk"; a shell gets "Runs sh: this plugin can run any command on this
   host"; a program that reaches the network says so: "tlmgr uses the network: CTAN mirrors"). Before install, **Downloads** says what its tools would fetch and from where ("TeX
   Live 2026.09 · 152 MB from github.com"). Once installed, its **Tools** section shows each tool
   with **Install**, **Update** (the plugin names a newer version) and **Remove**. A program you
   already have wins over the plugin's copy unless the plugin offers a setting to prefer its own.
+  A program can also name the folders it is usually installed in when its installer leaves
+  the PATH alone, such as an app bundle ("Looks for soffice in
+  /Applications/LibreOffice.app/Contents/MacOS too"); those are looked in after the PATH and
+  before the plugin's own tools.
+- **A tool as the agent browser's Chromium.** A plugin whose manifest says
+  `provides.browser = "<program>"` (one of its tools' programs) supplies the
+  [agent browser](agent-browser.md)'s headless browser on a host with none: its card's Can list
+  says "Runs chrome-headless-shell on this host as the browser agents' browser tools drive, where
+  it is switched on and when this host has no Chrome or Chromium of its own" (in place of the job
+  programs' "Runs programs" line: the job limits don't apply to it), and the engine runs it only for sessions in workspaces where the plugin
+  is active and its tool is installed (`plugins/browser.rs`). The first-party Chromium plugin
+  is the one that does.
 - **On Windows**, plugin jobs run in a Job Object with per-process memory, CPU-time and below-normal
   priority limits (no per-file size limit), and the `current` activation pointer is a small pointer
   file instead of a symlink. Agent-plugin installs are not available (run the agent's own `plugin`
@@ -928,3 +953,15 @@ _Captured 2026-09-29 (from the maintainer, via capture-feature-intent)._
 The design decisions of 2026-09-29 are recorded in the
 [plugin platform plan](../design/plugin-platform-plan.md#decisions-maintainer-2026-09-29) and the
 [LaTeX and Typst plan](../design/latex-reports-plan.md#decisions).
+
+### Pictures in tool answers and a program's usual folders (the PowerPoint plugin) — why it exists
+_Captured 2026-11-04 from the maintainer's decisions on the
+[PowerPoint plugin design](../design/pptx-plugin-plan.md); no questionnaire was run._
+
+- **Problem it solves:** agents write decks blind. Viewing decks and referencing slides
+  stay core; authoring help is an opt-in first-party plugin because its picture engine is
+  LibreOffice, which not everyone wants.
+- **Decisions:** a tool answer shows pictures through a markdown picture line (no WIT
+  change); `[[programs]] also` finds macOS's LibreOffice without PATH setup; no one-click
+  LibreOffice yet (host unpackers for app images next); the plugin is named "PowerPoint".
+- **Do not change (or: open to change):** _pending capture._

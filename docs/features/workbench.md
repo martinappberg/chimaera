@@ -159,6 +159,15 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   edit can't be replaced away), or on a tab move/reorder. Tree single-click = preview, tree
   double-click / a created file = pinned; chat/quick-open/terminal-link/Finder opens = preview.
   The preview flag persists in the layout blob (`pv:1`, additive).
+- **Open beside.** One rule for every "beside" gesture: ⌘/Ctrl-click (or a middle click) on
+  a file or URL link in a chat, a document or a terminal, ⌘/Ctrl-click or ⌘/Ctrl+Enter on a
+  file-tree row, and **Open Beside (⌘-click)** in the right-click menu of a file link, a tree
+  row or a URL. It lands in the pane next to the source (`layout.ts` `focusBeside`: the nearest
+  neighbor, right first), and only splits right when the source is alone — so following links
+  stays in two panes and never passes the 4-pane cap. A plain click from a **chat or terminal**
+  that has a neighbor lands beside it too (`opensBesideSession`), so a file or app the agent
+  mentions opens next to the conversation instead of covering it; with no neighbor it opens in
+  the session's pane as before. A file already open anywhere is focused where it is.
 - **Document navigation.** Files open above the existing view in the current pane.
   Following nested Markdown links reuses the preview slot; small Back/Forward buttons in a
   compact bottom-left floating control appear only while hovering the document (or focusing
@@ -194,6 +203,11 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   names and `dnd.ts` falls back to generic text, written only on a spot change. A tab-strip drop
   anchors only to the tabs in view — the scrolled-away run under the strip's controls is never
   a target — and lands after the last visible tab past them.
+- **Shared browser panes.** A browser pane shared with an agent (app only; the chain link on its
+  tab bar, like a linked terminal's) gets the agent's hue as its border, which breathes while the
+  agent drives the page, and the agent's own pane shows a chip per shared browser pane (click
+  reveals it, × stops sharing). See [agent-browser.md](agent-browser.md#sharing-a-pane-the-chain-link);
+  the code is `Pane.svelte` and `PaneTabs.svelte`.
 
 ## Detach & cross-window moves
 
@@ -272,7 +286,9 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   a slim strip. `Mod+Arrow` moves pane focus spatially; `Mod2+Arrow` carries the active tab into
   the neighbor — or, when there is no pane in that direction, **auto-splits a new one** on that
   side (capped at `MAX_PANES` and a minimum pane size); `Mod+1–9` focuses that numbered pane;
-  `⌘±`/`⌘0` bump one pane's terminal/markdown font. Two further chords step through the
+  `⌘+`/`⌘−`/`⌘0` bump or reset one pane's terminal/markdown font, and zoom an HTML or browser
+  page in its own view (the macOS app) as a browser does; a trackpad pinch zooms such a page
+  too. They match the character typed, so they work on any keyboard layout (`fontChord`). Two further chords step through the
   sidebar instead of the panes: `⌃⌘A` (`keys.cycleAgents`) opens the next agent in its agents
   list and `⌃⌘T` (`keys.cycleTerminals`) the next terminal in its terminals list (off macOS,
   `Alt+Shift+A/T`). Each wraps at the end and, from outside its group, starts at the first
@@ -286,8 +302,9 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   Its blank state offers file/session lookup and teaches dragging or holding the modifier
   to discover `Mod+1–9` (focus) and numbered tab moves (`⌃⌘1–9` on macOS;
   the second modifier layer elsewhere). The extra Control avoids macOS screenshot shortcuts.
-  Pane numbers appear only while holding
-  the modifier. Existing panes keep their shortcut numbers through splits, moves, and
+  Pane numbers appear only after holding
+  the modifier for a second (`chordHints.svelte.ts` `ARM_DELAY_MS`), so a chord, or a pause
+  between two, never flashes them. Existing panes keep their shortcut numbers through splits, moves, and
   reloads; new panes take the lowest free number. Agents, terminals, documents, and workspace views use the same tab move operation;
   moving or closing a session view leaves the underlying session running. Empty source panes
   collapse after their last tab moves away. Sessions are reachable from the sidebar or Quick Open.
@@ -394,6 +411,20 @@ _Captured 2026-07-12 (from the maintainer)._
   workflow, but an **addition**, not a frozen contract.
 - **Do not change (or: open to change):** *"keep a smooth UX for the user"* — the keying mechanics
   are open to improve; only the workspace-first framing (above) is the core bet.
+
+### Open beside — why it exists
+_Captured 2026-11-05 (from the maintainer)._
+
+- **Problem it solves (from the request).** "When in chat or MD documents or in general when you
+  are in a main pane, you have the option to open something to the right … like in a horizontal
+  pane if that is open", with the constraint that the control is "NOT too obvious, verbose". The
+  maintainer chose both parts of the proposal: one beside rule for every gesture (reuse the
+  neighbor, split only when alone), and a plain click from a chat landing beside it.
+- **How settled it is.** None of it is a promise yet (asked which parts are, the answer was
+  "Nope"): an **addition**, provisional throughout — including plain-click-beside covering shell
+  terminals as well as chats (an agent TUI is a terminal pane).
+- **Do not change (or: open to change):** nothing is frozen ("Nope") — the rule, the gestures
+  and the chat default are all open to improve.
 
 ### Fit-width tab strips — why they exist
 _Intent pending — drafted from the maintainer's request, 2026-09-06; questionnaire not yet run._

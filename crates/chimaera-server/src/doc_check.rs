@@ -180,7 +180,7 @@ where
 
 /// An agent's `path`: absolute (or `~`) as given; otherwise the first of
 /// `cwd/path`, `root/path` that exists.
-fn resolve_for_agent(
+pub(crate) fn resolve_for_agent(
     raw: &str,
     cwd: Option<&Path>,
     root: Option<&Path>,

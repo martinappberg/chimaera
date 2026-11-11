@@ -1316,7 +1316,7 @@ pub(super) fn write_clipboard(app: AppHandle, text: String) -> Result<(), String
 /// paths are this machine's; a remote page's would name whatever happens to
 /// sit at that path here). Windows pages name paths in wire form
 /// (`C:/x/y`); the shell hands the OS its native backslash form.
-fn local_file_path(path: &str) -> Result<std::path::PathBuf, String> {
+pub(super) fn local_file_path(path: &str) -> Result<std::path::PathBuf, String> {
     #[cfg(windows)]
     let path = &path.replace('/', "\\");
     existing_absolute_path(path)

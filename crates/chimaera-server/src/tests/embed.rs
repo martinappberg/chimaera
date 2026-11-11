@@ -595,6 +595,62 @@ async fn raw_assets_revalidate_every_load() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// A framed preview asks for its own page with `?bridge=1` and gets the pane
+/// bridge appended after the document; the plain page, its assets, and any
+/// range stay byte-for-byte the file.
+#[tokio::test]
+async fn a_preview_page_can_carry_the_pane_bridge() {
+    let state = test_state();
+    let root = test_dir("embed-pane-bridge");
+    let page = "<!doctype html><title>r</title><p>hi</p></html>";
+    std::fs::write(root.join("index.html"), page).unwrap();
+    std::fs::write(root.join("app.js"), "console.log(1)").unwrap();
+    let ticket = ticket_for(&state, &root.join("index.html")).await;
+
+    let (status, plain_headers, plain) =
+        get_with(&state, &format!("/raw/{ticket}/index.html"), &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(&plain[..], page.as_bytes());
+
+    let uri = format!("/raw/{ticket}/index.html?bridge=1");
+    let (status, headers, body) = get_with(&state, &uri, &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let body = std::str::from_utf8(&body).unwrap();
+    assert!(body.starts_with(page), "the page comes first, untouched");
+    let tail = &body[page.len()..];
+    assert!(tail.trim_start().starts_with("<script>"));
+    assert!(tail.contains("__chimaeraPaneView"));
+    assert_eq!(
+        header_str(&headers, "content-length"),
+        body.len().to_string()
+    );
+    assert_eq!(header_str(&headers, "accept-ranges"), "none");
+    assert_eq!(
+        header_str(&headers, "content-security-policy"),
+        "sandbox allow-scripts"
+    );
+    // Its own validator: a cached plain page never answers a bridged ask.
+    assert_ne!(
+        header_str(&headers, "etag"),
+        header_str(&plain_headers, "etag")
+    );
+    let etag = header_str(&headers, "etag").to_string();
+    let (status, _, _) = get_with(&state, &uri, &[("if-none-match", &etag)]).await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+    // A range ask on the bridged page gets the whole thing, never a slice
+    // that cuts the tail.
+    let (status, _, ranged) = get_with(&state, &uri, &[("range", "bytes=0-3")]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ranged.len(), body.len());
+
+    // Only the page itself: an asset asked the same way is just the asset.
+    let (_, _, js) = get_with(&state, &format!("/raw/{ticket}/app.js?bridge=1"), &[]).await;
+    assert_eq!(&js[..], b"console.log(1)");
+    // The script can't end its own element early.
+    assert!(!chimaera_core::PANE_BRIDGE_JS.contains("</script"));
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// A filesystem path handed over as a target (an embed card resolving a
 /// tool's location) arrives percent-escaped wherever the daemon would read
 /// URL syntax (the UI's `pathTarget`), and names the same file: `#`, `?`

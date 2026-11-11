@@ -132,7 +132,8 @@ official `@xterm/addon-search`; shared routing is described in
   (`paper.pdf#page=3&xywh=72,272,320,220`, `de.tsv#row=40-42`, `book.xlsx#sheet=S&range=D6:E7`,
   `talk.wav#t=12`, `nb.ipynb#cell=7`, `deck.md#slide=3`; see
   [pointing at part of a file](files-and-previews.md#pointing-at-part-of-a-file)). A directory opens/reuses the
-  Finder beside the terminal. Cmd/Ctrl+click forces a new split. Clicking a name several files
+  Finder beside the terminal. Cmd/Ctrl+click opens it beside, and so does a plain click when the
+  terminal has a neighbor pane ([open beside](workbench.md#splitting-tabs--drag-and-drop)). Clicking a name several files
   answer to opens a menu of the matches.
 - **Where it lives.** `web-ui/src/lib/terminal/links.ts` (`PathLinkProvider`), the parser it
   shares with chat `web-ui/src/lib/shared/fileRef.ts` (cases in `fileRefs.fixture.json`), the
@@ -176,6 +177,20 @@ official `@xterm/addon-search`; shared routing is described in
   *writes* are honored (a remote agent's only path back to the Mac clipboard), but rejected before
   decode above 1.4M base64 characters (about 1 MiB decoded); OSC 52 *reads* are silently swallowed
   so a process can't exfiltrate the clipboard over the PTY.
+
+## Commands typed in from a chat
+
+- **What & when.** A chat's shell block has a ▶ Run button ([chat mode](chat-mode.md)); a click
+  types the block into a terminal and presses Enter.
+- **Which terminal.** The shell that chat last ran in, while it lives, reports its prompt (OSC 133
+  `ready`) and runs no agent command; never one running something or without the integration,
+  whose program could read the text. Otherwise a new shell in the chat's live folder on the chat's
+  host, opened beside the chat. A new shell gets the text once it reports its prompt, or after 15 s
+  when it has no shell integration; a reused one gets Ctrl-U first, so nothing half-typed on its
+  line runs glued to the command. One chat's runs go one after another, in click order.
+- **Where it lives.** App's `runCommandFromPane` (the per-chat queue) / `runOnce` /
+  `waitForPrompt`, through the pane controller's `runCommandFrom`; the text goes through
+  `sendText`, else a one-shot `typeIntoDetachedSession`.
 
 ## Command-line word navigation
 

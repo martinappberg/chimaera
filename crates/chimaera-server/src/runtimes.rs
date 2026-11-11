@@ -145,6 +145,31 @@ pub(crate) fn is_managed(path: &Path, managed_root: &Path) -> bool {
     path.starts_with(managed_root)
 }
 
+/// agy's built-in updater (1.3.4+, a background process spawned by a print
+/// or interactive run) overwrites the very path agy was started from with a
+/// regular file. For a managed agy that is `bin/agy`, the activation
+/// symlink (seen 2026-11-03: a 1.5.0 file where the 1.3.4 link was), so the
+/// version layout, retention and per-version leases stop describing what
+/// runs. Chimaera updates its own installs; this switch (live: logged
+/// "Auto-update disabled via environment variable"; `1` is ignored, only
+/// `true` counts) leaves the update to it.
+pub(crate) const AGY_NO_SELF_UPDATE: (&str, &str) = ("AGY_CLI_DISABLE_AUTO_UPDATE", "true");
+
+/// [`AGY_NO_SELF_UPDATE`] as an owned environment pair.
+pub(crate) fn agy_no_self_update() -> (String, String) {
+    let (name, value) = AGY_NO_SELF_UPDATE;
+    (name.to_string(), value.to_string())
+}
+
+/// The environment a spawn needs because Chimaera manages the binary it
+/// runs. `managed` is detection's verdict (`AgentDetection::managed`), read
+/// on the activation path: a leased, canonicalized path may not start with
+/// a managed root that has a symlinked component. A user's own agy keeps
+/// its updater: that install is theirs.
+pub(crate) fn managed_agent_env(kind: AgentKind, managed: bool) -> Option<(String, String)> {
+    (kind == AgentKind::Antigravity && managed).then(agy_no_self_update)
+}
+
 // --- curated install scripts -------------------------------------------------
 
 /// Official artifact base URLs (see module docs for verification notes).
@@ -1244,6 +1269,17 @@ fi
 "#,
         managed = sq(&format!("{}/{}", managed_bin.display(), kind.as_str())),
     );
+    // agy's own updater would overwrite the managed activation link with a
+    // regular file (`AGY_NO_SELF_UPDATE`); a user's own agy keeps it.
+    let fallback = if kind == AgentKind::Antigravity {
+        let (name, value) = AGY_NO_SELF_UPDATE;
+        format!(
+            "{fallback}if [ \"$real\" = {managed} ]; then {name}={value}; export {name}; fi\n",
+            managed = sq(&format!("{}/{}", managed_bin.display(), kind.as_str())),
+        )
+    } else {
+        fallback
+    };
     let exec = match kind {
         // Theme via a minimal --settings file; the user's own flags come
         // after ours, so an explicit `--settings` they typed still wins.
@@ -2115,6 +2151,52 @@ esac
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "managed-codex");
 
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// agy's own updater would overwrite the managed activation link, so a
+    /// managed agy runs with it off; a user's own agy keeps its updater.
+    #[test]
+    fn shim_turns_off_self_update_for_the_managed_agy_only() {
+        let dir = test_dir("shim-agy-update");
+        let shim_dir = dir.join("shims");
+        let managed = dir.join("agents").join("bin");
+        let user = dir.join("user-bin");
+        std::fs::create_dir_all(&managed).unwrap();
+        std::fs::create_dir_all(&user).unwrap();
+        let (name, value) = AGY_NO_SELF_UPDATE;
+        let report = format!("#!/bin/sh\necho \"$0 [${{{name}:-}}]\"\n");
+        write_exec(&managed.join("agy"), &report);
+        write_shims(&shim_dir, &managed, &HashMap::new()).unwrap();
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let run = |path: String| {
+            let mut cmd = std::process::Command::new(shim_dir.join("agy"));
+            cmd.env_clear().env("PATH", path).env("HOME", &home);
+            let out = cmd.output().expect("shim ran");
+            assert!(out.status.success(), "{out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let path =
+            |extra: &Path| format!("{}:{}:/usr/bin:/bin", shim_dir.display(), extra.display());
+        assert_eq!(
+            run(path(&dir.join("empty"))),
+            format!("{} [{value}]", managed.join("agy").display())
+        );
+        write_exec(&user.join("agy"), &report);
+        assert_eq!(
+            run(path(&user)),
+            format!("{} []", user.join("agy").display())
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn only_a_managed_agy_spawn_turns_off_self_update() {
+        let expected = Some((AGY_NO_SELF_UPDATE.0.into(), AGY_NO_SELF_UPDATE.1.into()));
+        assert_eq!(agy_no_self_update(), expected.clone().unwrap());
+        assert_eq!(managed_agent_env(AgentKind::Antigravity, true), expected);
+        assert_eq!(managed_agent_env(AgentKind::Antigravity, false), None);
+        assert_eq!(managed_agent_env(AgentKind::Codex, true), None);
     }
 
     #[test]

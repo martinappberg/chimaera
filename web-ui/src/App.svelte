@@ -73,14 +73,18 @@
   import { EventsSocket } from "./lib/net/events";
   import {
     agentHue,
+    deleteBrowserLink,
     deleteLink,
+    listBrowserLinks,
     listLinks,
+    putBrowserLink,
     putLink,
     termReference,
     type Link,
     type LinkCtrl,
   } from "./lib/workspace/agentLinks";
   import { typeIntoDetachedSession } from "./lib/terminal/ws";
+  import { terminalInput } from "./lib/chat/runCommand";
   import { reconnectingSockets } from "./lib/net/reconnect";
   import { insertIntoComposer } from "./lib/chat/composerBus";
   import { volatileChatDrafts } from "./lib/chat/drafts";
@@ -120,6 +124,8 @@
   import {
     activateTab,
     adjacentPane,
+    focusBeside,
+    opensBesideSession,
     allFilePaths,
     closePane,
     cycleTab,
@@ -150,6 +156,8 @@
     openBrowser,
     openTab,
     freshBrowserTab,
+    findBrowser,
+    panes,
     setBrowserPath,
     setBrowserTarget,
     openDashboard,
@@ -280,7 +288,6 @@
     REFERENCE_CHORD,
   } from "./lib/shared/keys";
   import {
-    activeModLabel,
     isCapturing,
     keyHint,
     matchAction,
@@ -290,6 +297,7 @@
     askpassActive,
     closeThisWindow,
     isNativeShell,
+    onMissionControl,
     onFocusSession,
     onMenu,
     onUnsavedPrompt,
@@ -303,11 +311,25 @@
   } from "./lib/net/native";
   import { clearBrowserNotices, deliverBrowserNotices } from "./lib/workspace/notices";
   import {
-    placeAgentBrowser,
+    agentOpenShare,
+    placeAgentBrowserTab,
+    placeHandover,
     shouldActOnAgentBrowserOpen,
     type AgentBrowserOpen,
   } from "./lib/browser/agentOpen";
+  import {
+    agentBrowser,
+    attachAgentBrowser,
+    browserLinks,
+    setBrowserLinkLocally,
+    setBrowserLinks,
+  } from "./lib/browser/agentBrowserRuntime";
+  import { sharedTabsLeft, type Handover } from "./lib/browser/agentBrowser";
+  import type { BrowserLink } from "./lib/net/browserWire";
+  import { targetLabel } from "./lib/browser/proxy";
+  import { paneViewsPossible, zoomPaneView } from "./lib/shared/paneViewRoute";
   import UpdateToast from "./lib/workspace/UpdateToast.svelte";
+  import WindowNameCard from "./lib/workspace/WindowNameCard.svelte";
   import {
     applyAppStatus,
     checkForUpdates,
@@ -610,8 +632,9 @@
     tabLabel: (tab) => tabLabel(tab),
     sessionAlive: (id) => sessionsById.get(id)?.alive ?? false,
     paneSessionId: (paneId) => osDropSession(paneId)?.id ?? null,
-    linkTargetsFor: (tab) => linkTargetsFor(tab),
-    linkSessionsFor: (tab) => linkSessionsFor(tab),
+    linkTargetsFor: (tab, linkIntent) => linkTargetsFor(tab, linkIntent),
+    linkSessionsFor: (tab, linkIntent) => linkSessionsFor(tab, linkIntent),
+    linkBrowser: (tabId, agentId) => linkBrowserTo(tabId, agentId),
     referenceFileDrop: (paneId, path, kind) => referenceFileDrop(paneId, path, kind),
     referenceCommitDrop: (paneId, tab) => referenceCommitDrop(paneId, tab),
     linkByDrop: (terminalId, agentPaneId) => linkByDrop(terminalId, agentPaneId),
@@ -1134,10 +1157,55 @@
   // The 5s sessions + links poll, only while /ws/events is down.
   conn.pollWhileEventsDown({
     sessions: pollSessions,
-    listLinks,
+    // Browser links ride along; a daemon without them leaves the mirror as is.
+    listLinks: () => Promise.all([listLinks(), listBrowserLinks().catch(() => null)]),
     applySessions,
-    setLinks: (l: Link[]) => (links = l),
+    setLinks: ([l, b]: [Link[], BrowserLink[] | null]) => {
+      links = l;
+      if (b !== null) setBrowserLinks(b);
+    },
   });
+
+  // A shared browser tab that leaves this window's layout — closed, its pane
+  // closed, dragged to another window — stops being shared: the daemon
+  // otherwise keeps the link until its agent ends. Neither a reload (the
+  // tab comes back with the layout, its new view registers, the hello lists
+  // it again) nor a workspace switch (`layoutReady` drops across it) is a
+  // close.
+  let heldShared = new Set<string>();
+  let heldWs: string | null = null;
+  $effect(() => {
+    const linked = $browserLinks;
+    const ws = activeWsId;
+    const ready = layoutReady;
+    const present = new Set<string>();
+    for (const p of panes(layout.root)) {
+      for (const t of p.tabs) if (t.surface === "browser") present.add(t.id);
+    }
+    untrack(() => {
+      if (ready && ws === heldWs) {
+        for (const tab of sharedTabsLeft(heldShared, present, linked)) unshareClosed(tab);
+      }
+      // A hand-over whose tab went before its view took the page on: the
+      // page has no owner left.
+      if (ready) {
+        agentBrowser.registry.keepDescribed(present);
+        for (const [tab, view] of agentBrowser.registry.pendingAdoptions()) {
+          if (!present.has(tab)) agentBrowser.abandonAdoption(tab, view);
+        }
+      }
+      heldWs = ws;
+      heldShared = ready ? new Set([...present].filter((t) => linked.has(t))) : new Set();
+    });
+  });
+
+  /** The tab went: no flash on failure (nothing on screen to explain it). */
+  function unshareClosed(tab: string): void {
+    setBrowserLinkLocally(tab, null);
+    deleteBrowserLink(tab).catch(() => {
+      // the daemon prunes it with its agent; the next frame says what holds
+    });
+  }
 
   // Persist the layout (debounced in viewState) whenever it changes, keyed
   // by (window, workspace) so each workspace keeps its own tree.
@@ -1226,9 +1294,10 @@
     window.addEventListener("dragleave", onWindowDragLeave);
     window.addEventListener("drop", onWindowDrop);
     const events = new EventsSocket({
-      onSessions: (list, linkList) => {
+      onSessions: (list, linkList, browserLinkList) => {
         applySessions(list);
         if (linkList !== undefined) links = linkList;
+        if (browserLinkList !== undefined) setBrowserLinks(browserLinkList);
       },
       onSettings: applyRemoteSettings,
       onGit: onGitNudge,
@@ -1261,14 +1330,20 @@
         });
       },
       onBrowserOpen: onAgentBrowserOpen,
+      onBrowserRequest: (req) => void agentBrowser.handle(req),
       // RTT reset + comms refetch on recovery, then eventsUp, then the
-      // dead-link save retry (net/connection.svelte.ts).
-      onStatus: (up) => conn.noteEventsStatus(up),
+      // dead-link save retry (net/connection.svelte.ts). A drop also ends
+      // every agent page this window served (the daemon failed them).
+      onStatus: (up) => {
+        if (!up) agentBrowser.socketDown();
+        conn.noteEventsStatus(up);
+      },
       onFatal: (message) => {
         if (message === "unauthorized") notifyUnauthorized();
       },
     });
     eventsSocket = events;
+    const detachAgentBrowser = attachAgentBrowser(events, agentBrowserHandover);
     // Register this window's workspace so the daemon's git backstop polls it.
     events.watch(activeWsId);
     const diskWatches = currentDiskWatches();
@@ -1368,6 +1443,7 @@
       setSameFileOpener(null);
       recentsRail.dispose();
       setChatLinkContext(null);
+      detachAgentBrowser();
       events.close();
       pool.disposePool();
       chatPool.disposeAllChats();
@@ -1726,15 +1802,17 @@
   /**
    * Open a proxyable URL as a browser pane FROM `fromPane`: reuse an existing
    * pane on the same host:port (clicking Jupyter's printed URL twice lands
-   * where you already are), or split beside when Cmd/Ctrl is held — the same
-   * grammar file links follow. Every link surface routes through here.
+   * where you already are), or a fresh browser tab beside (`focusBeside`)
+   * when Cmd/Ctrl is held — the same grammar file links follow. From a chat
+   * or terminal with a neighbor, a plain click lands beside it too
+   * (`opensBesideSession`). Every link surface routes through here.
    */
   function openBrowserFromPane(paneId: string, target: UrlTarget, newSplit: boolean): void {
     if (newSplit) {
-      layout = splitPane(layout, paneId, "row");
-      layout = openTab(layout, freshBrowserTab(target.host, target.port, target.path));
+      layout = openTab(focusBeside(layout, paneId), freshBrowserTab(target.host, target.port, target.path));
     } else {
-      layout = openBrowser(focusPane(layout, paneId), target.host, target.port, target.path);
+      const at = opensBesideSession(layout, paneId) ? focusBeside(layout, paneId) : focusPane(layout, paneId);
+      layout = openBrowser(at, target.host, target.port, target.path);
     }
     // The browser surface took focus: pull DOM focus off whatever had it so
     // plain keys stop reaching a PTY that is no longer the focused view.
@@ -1763,7 +1841,35 @@
       visible: document.visibilityState === "visible",
     };
     if (!shouldActOnAgentBrowserOpen(open, view)) return;
-    layout = placeAgentBrowser(layout, open);
+    const placed = placeAgentBrowserTab(layout, open);
+    layout = placed.layout;
+    // Shared with the opener, like a chain-link share (and moved to the
+    // latest opener on a re-point): its browser tools drive this pane.
+    const share = agentOpenShare(placed.tabId, open, paneViewsPossible());
+    if (share !== null && get(browserLinks).get(share.tab) !== share.agent) {
+      linkBrowserTo(share.tab, share.agent);
+    }
+  }
+
+  /**
+   * The agent browser's hand-over (`browser_show`): the agent's own page,
+   * live in this window off-screen, opens as a tab that adopts its view —
+   * placed like an agent-opened pane, focus untouched — and is shared with
+   * that agent (the daemon links it; mirrored here at once). Throws, with
+   * the reason the agent reads, when there is no layout to place it in.
+   */
+  function agentBrowserHandover(h: Handover): string {
+    if (!layoutReady) throw new Error("this window is still restoring its layout");
+    const placed = placeHandover(layout, {
+      sessionId: h.agent,
+      host: h.host,
+      port: h.port,
+      path: h.path,
+      view: h.view,
+    });
+    layout = placed.layout;
+    setBrowserLinkLocally(placed.tabId, h.agent);
+    return placed.tabId;
   }
 
   /** The Mod2+B chord / a manual open: a blank browser pane (address entry). */
@@ -1818,8 +1924,10 @@
    * changes row, touched-files popover): an already-open tab is focused wherever
    * it lives (reuse existing, no duplicates); otherwise it lands in the ACTIVE
    * (focused) pane — the same "opens in the pane you're in" rule the FILES tree
-   * and quick-open already follow. Cmd/Ctrl (newSplit) forces a fresh split to
-   * the right instead, the escape hatch when you want it beside the source.
+   * and quick-open already follow. Cmd/Ctrl (newSplit) opens it beside the
+   * source instead (`focusBeside`: the neighbor pane, else a split right), and
+   * so does a plain open from a chat or terminal that has a neighbor
+   * (`opensBesideSession`), so the conversation stays in view.
    */
   function openFileFromPane(paneId: string, path: string, newSplit: boolean, pinned = false): void {
     layout = pinPaths(layout, get(dirtyFiles));
@@ -1827,9 +1935,8 @@
     if (existing !== null) {
       layout = activateTab(layout, existing.paneId, existing.index);
       if (pinned) layout = pinTab(layout, existing.paneId, existing.index);
-    } else if (newSplit) {
-      layout = splitPane(layout, paneId, "row");
-      layout = openFile(layout, path, !pinned);
+    } else if (newSplit || opensBesideSession(layout, paneId)) {
+      layout = openFile(focusBeside(layout, paneId), path, !pinned);
     } else {
       // Open in the active pane (the source pane the click just focused). Opens
       // are PREVIEW tabs (italic, replaced by the next preview open) unless the
@@ -2001,6 +2108,96 @@
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
 
+  /** The shell each chat's Run buttons type into (chat id → shell id),
+   *  used again while it lives so one chat's commands share a history. */
+  const runShells = new Map<string, string>();
+  /** Each chat's runs, one after another: a second click while the first
+   *  waits for a new shell's prompt must neither open another shell nor
+   *  type ahead of the first command. */
+  const runQueues = new Map<string, Promise<void>>();
+
+  function runCommandFromPane(paneId: string, chatId: string, command: string): void {
+    const next = (runQueues.get(chatId) ?? Promise.resolve()).then(() => runOnce(paneId, chatId, command));
+    const settled = next.catch(() => {});
+    runQueues.set(chatId, settled);
+    void settled.then(() => {
+      if (runQueues.get(chatId) === settled) runQueues.delete(chatId);
+    });
+  }
+
+  /**
+   * A chat's Run button: type `command` into the chat's terminal and press
+   * Enter. The terminal is the shell this chat last ran in, while it lives
+   * and sits at its prompt; else a new shell in the chat's folder (its live
+   * cwd), on the chat's own host. It opens beside the chat (the adjacent
+   * pane, or a split), never over it, so the block and its output read side
+   * by side.
+   */
+  async function runOnce(paneId: string, chatId: string, command: string): Promise<void> {
+    const input = terminalInput(command);
+    const chat = sessionsById.get(chatId);
+    if (input === "" || chat === undefined) return;
+    const priorId = runShells.get(chatId);
+    const prior = priorId !== undefined ? sessionsById.get(priorId) : undefined;
+    // Only a shell that says it is at its prompt (OSC 133) is reused: one
+    // running something, an agent's command, or no integration at all could
+    // hand the text to a program's stdin (a pager, a prompt, a REPL).
+    const reuse =
+      prior !== undefined && prior.alive && prior.phase === "ready" && (prior.exec_stage ?? null) === null;
+    let shellId: string;
+    if (reuse) {
+      shellId = prior.id;
+    } else {
+      createError = null;
+      try {
+        const cwd = chat.cwd_current ?? chat.cwd;
+        const s = await createSession(chat.workspace_id, "shell", null, spawnSize(), { cwd });
+        recentlyCreated.add(s.id);
+        if (needsAppend(sessions, s)) sessions.push(s);
+        shellId = s.id;
+        runShells.set(chatId, shellId);
+      } catch (e) {
+        createError = e instanceof ApiError ? e.message : "failed to start terminal";
+        return;
+      }
+    }
+    if (paneForTab(layout.root, { surface: "terminal", sessionId: shellId }) === null) {
+      const neighbor = adjacentPane(layout, paneId);
+      layout = neighbor !== null ? focusPane(layout, neighbor) : splitPane(layout, paneId, "row");
+    }
+    layout = openSession(layout, shellId);
+    pool.focusTerminal(shellId);
+    // A new shell gets the text once it reaches its prompt (OSC 133), so its
+    // rc files never read it and it is not echoed twice; a shell without the
+    // integration gets it after the wait, as typed-ahead input.
+    if (!reuse) await waitForPrompt(shellId, RUN_PROMPT_WAIT_MS);
+    // A reused prompt may hold something half-typed: Ctrl-U clears the line
+    // first (bash, zsh and fish, emacs and vi insert modes alike), so the
+    // command never runs glued to it.
+    const text = reuse ? `\x15${input}` : input;
+    // No pooled socket yet (the tab is still mounting): the one-shot socket
+    // sends once the server is ready.
+    if (!pool.sendText(shellId, text)) typeIntoDetachedSession(shellId, text);
+  }
+
+  const RUN_PROMPT_WAIT_MS = 15_000;
+
+  /** Resolves when `id` reports its prompt, has died, or `ms` passed. A
+   *  one-shot wait for one click, not a standing poll. A row missing from
+   *  the roster is still waited for: a snapshot taken before the create
+   *  landed can briefly leave it out. */
+  function waitForPrompt(id: string, ms: number): Promise<void> {
+    const deadline = Date.now() + ms;
+    return new Promise((resolve) => {
+      const check = () => {
+        const s = sessionsById.get(id);
+        if ((s !== undefined && (!s.alive || s.phase === "ready")) || Date.now() >= deadline) resolve();
+        else setTimeout(check, 100);
+      };
+      check();
+    });
+  }
+
   /** Open (or focus) the source-control panel in the focused pane. */
   function openGitPanel(): void {
     if (activeWsId === null || !layoutReady) return;
@@ -2078,9 +2275,8 @@
   }
 
   /**
-   * A directory link from a pane: reuse an open Finder (unless Cmd/Ctrl forced a
-   * split), else open a fresh Finder beside the source terminal — adjacent pane,
-   * or a split to the right when the window has one pane.
+   * A directory link from a pane: reuse an open Finder (unless Cmd/Ctrl asks for
+   * a new one), else open a fresh Finder beside the source (`focusBeside`).
    */
   function openDirInFinder(paneId: string, path: string, newSplit: boolean): void {
     const targetId = newSplit ? null : targetFinderId();
@@ -2089,13 +2285,7 @@
       const loc = findFinder(layout, targetId);
       if (loc !== null) layout = activateTab(layout, loc.paneId, loc.index);
     } else {
-      const neighbor = newSplit ? null : adjacentPane(layout, paneId);
-      if (neighbor !== null) {
-        layout = openFinder(focusPane(layout, neighbor), path).layout;
-      } else {
-        layout = splitPane(layout, paneId, "row");
-        layout = openFinder(layout, path).layout;
-      }
+      layout = openFinder(focusBeside(layout, paneId), path).layout;
     }
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
@@ -2149,16 +2339,11 @@
     if (modalOpen() && !pickerOpen && !quickOpenOpen) return;
     // Per-pane text size (Cmd/Ctrl +/−/0, spec-pinned chords): intercepted
     // ONLY while the focused pane shows a font-sizable surface (a terminal or
-    // a rendered markdown document), so browser zoom keeps working elsewhere.
+    // a rendered markdown document) or a page in its own view (page zoom), so
+    // browser zoom keeps working elsewhere.
     if (!pickerOpen && !quickOpenOpen && layoutReady) {
       const step = fontChord(e);
-      // The dashboard owns the base-modifier Digit0 chord (the advertised
-      // ⌘0 / Ctrl+Shift+0): a font RESET here would swallow it on every
-      // terminal/markdown pane — the most common focus state. Font reset
-      // keeps its other spellings (⌘Numpad0; plain Ctrl+0 on non-mac,
-      // where the dashboard chord carries Shift).
-      const dashboardChord = step === 0 && chordDigit(e, modifierSetting()) === 0;
-      if (step !== null && !dashboardChord) {
+      if (step !== null) {
         const p = findPane(layout.root, layout.focusedPaneId);
         const active = p?.tabs[p.active];
         const sizable =
@@ -2170,6 +2355,18 @@
           e.preventDefault();
           e.stopPropagation();
           adjustFont(p.id, step);
+          return;
+        }
+        // An HTML page or a browser pane in its own view (the macOS app):
+        // the page zooms, as ⌘+/⌘− do in a browser.
+        const pageZoom =
+          active !== undefined &&
+          paneViewsPossible() &&
+          (active.surface === "browser" || (active.surface === "file" && viewKindFor(active.path) === "html"));
+        if (p !== null && pageZoom) {
+          e.preventDefault();
+          e.stopPropagation();
+          zoomPaneView(p.id, step);
           return;
         }
       }
@@ -2246,17 +2443,10 @@
         }
         return;
       }
-      // Pinned Mod+1–9 focuses the numbered pane; Mod+0 is the dashboard.
+      // Pinned Mod+1–9 focuses the numbered pane. Mod+0 is the font/zoom
+      // reset above, on a pane that has one; elsewhere it passes through.
       const n = chordDigit(e, modifierSetting());
-      if (n === 0 && detachedWindow) {
-        // A solo window does not pull in the workspace dashboard.
-        intercept();
-        return;
-      }
-      if (n === 0) {
-        intercept();
-        openDashboardSurface();
-      } else if (n !== null && n >= 1) {
+      if (n !== null && n >= 1) {
         intercept();
         const pane = panesOf(layout.root).find((p) => p.number === n);
         if (pane !== undefined) {
@@ -2400,31 +2590,72 @@
     return document.querySelector("dialog[open], [aria-modal='true']") !== null;
   }
 
+  /**
+   * What names this window: its host (remote only; a compute-node daemon —
+   * the snapshot's `self`, daemon truth, not the URL hash — appends its node,
+   * so a job window never poses as its login node), its workspace, and, for
+   * a detached window, the tab it shows. The OS title and the Mission
+   * Control name card both read it.
+   */
+  const windowIdentity = $derived.by(() => {
+    const node = $computeStatus?.self?.node;
+    const hostWithNode = node ? `${hostAlias} › ${node}` : hostAlias;
+    let tab: string | null = null;
+    if (detachedWindow) {
+      const only = tabCount(layout) === 1 ? panesOf(layout.root)[0]?.tabs[0] : undefined;
+      const p = findPane(layout.root, layout.focusedPaneId);
+      const shown = only ?? p?.tabs[p.active];
+      if (shown !== undefined) tab = tabLabel(shown);
+    }
+    return { host: isRemoteWindow ? hostWithNode : null, workspace: workspace?.name ?? null, tab };
+  });
+
+  /**
+   * macOS Mission Control is open (native shell only): a workspace's main
+   * window shows its name card. A torn-off window and Home don't — the
+   * workspace window is the one you pick. The page hears nothing of Mission
+   * Control while it is open, so a focus, key or click here means it has
+   * closed onto this window: the card goes then, without waiting for the
+   * shell's next read.
+   */
+  let missionControl = $state(false);
+  $effect(() => asyncDisposer(onMissionControl((open) => (missionControl = open))));
+  $effect(() => {
+    if (!missionControl) return;
+    const back = (): void => {
+      missionControl = false;
+    };
+    // The window itself taking focus, not an element inside it (a capture
+    // listener would see those too, and something can focus while open).
+    const windowFocus = (e: FocusEvent): void => {
+      if (e.target === window) back();
+    };
+    // A click or key is the person back in this window. Not pointer moves or
+    // wheels: Mission Control hands those to the window under the pointer
+    // while it is still open.
+    window.addEventListener("focus", windowFocus);
+    window.addEventListener("pointerdown", back, true);
+    window.addEventListener("keydown", back, true);
+    return () => {
+      window.removeEventListener("focus", windowFocus);
+      window.removeEventListener("pointerdown", back, true);
+      window.removeEventListener("keydown", back, true);
+    };
+  });
+  const nameCardShown = $derived(missionControl && !detachedWindow && workspace !== null);
+
   $effect(() => {
     // The workspace leads; a remote window wears its host so a wall of similar
     // windows is legible:
     //   "my_project •cluster | chimaera"  (remote, in a workspace)
     //   "my_project | chimaera"           (local — the host is implicit)
     // Home (no workspace) drops the workspace but keeps the host when remote.
-    // A compute-node daemon (the snapshot's `self` — daemon truth, not the
-    // URL hash) appends its node: "my_project •cluster › n042 | …",
-    // so a job window never poses as its login node.
-    const node = $computeStatus?.self?.node;
-    const hostWithNode = node ? `${hostAlias} › ${node}` : hostAlias;
-    const host = isRemoteWindow ? hostWithNode : null;
-    let scope = workspace
-      ? host
-        ? `${workspace.name} •${host}`
-        : workspace.name
-      : (host ?? "");
+    // A job window's node trails its host: "my_project •cluster › n042 | …".
+    const { host, workspace: ws, tab } = windowIdentity;
+    let scope = ws !== null ? (host ? `${ws} •${host}` : ws) : (host ?? "");
     // A detached solo window is named for what it shows: the tab leads, the
     // workspace scope trails — "claude (2) — my_project | chimaera".
-    if (detachedWindow) {
-      const only = tabCount(layout) === 1 ? panesOf(layout.root)[0]?.tabs[0] : undefined;
-      const p = findPane(layout.root, layout.focusedPaneId);
-      const shown = only ?? p?.tabs[p.active];
-      if (shown !== undefined) scope = scope ? `${tabLabel(shown)} — ${scope}` : tabLabel(shown);
-    }
+    if (tab !== null) scope = scope ? `${tab} — ${scope}` : tab;
     const base = scope ? `${scope} | chimaera` : "chimaera";
     const title = needsYou > 0 ? `(${needsYou}) ${base}` : base;
     document.title = title;
@@ -2955,7 +3186,7 @@
     });
   });
 
-  /** Open/focus the workspace dashboard (rail row, ⌘0, the landing default). */
+  /** Open/focus the workspace dashboard (rail row, the landing default). */
   function openDashboardSurface(): void {
     if (activeWsId === null || !layoutReady) return;
     layout = openDashboard(layout);
@@ -3552,6 +3783,9 @@
     openSubagentFrom(paneId, sessionId, agentId, title, newSplit) {
       openSubagentFromPane(paneId, sessionId, agentId, title, newSplit);
     },
+    runCommandFrom(paneId, sessionId, command) {
+      void runCommandFromPane(paneId, sessionId, command);
+    },
     revealPathInTree(path) {
       revealInTree(path);
     },
@@ -3687,9 +3921,14 @@
    * `tab`: panes showing a live agent session, when the payload is a shell
    * terminal (files and agents themselves never link).
    */
-  function linkTargetsFor(tab: Tab): ReadonlyMap<string, string> | undefined {
-    if (tab.surface !== "terminal") return undefined;
-    if (sessionsById.get(tab.sessionId)?.kind !== "shell") return undefined;
+  function linkTargetsFor(tab: Tab, linkIntent: boolean): ReadonlyMap<string, string> | undefined {
+    // A browser tab links only from its chain (a link-intent drag): a plain
+    // tab move keeps the bands for the payloads that type a reference.
+    const linkable =
+      tab.surface === "terminal"
+        ? sessionsById.get(tab.sessionId)?.kind === "shell"
+        : tab.surface === "browser" && linkIntent;
+    if (!linkable) return undefined;
     const targets = new Map<string, string>();
     const walk = (n: typeof layout.root): void => {
       if (n.type === "pane") {
@@ -3712,13 +3951,21 @@
    * targets while dragging that shell terminal (the always-present target —
    * the agent needn't be open in a pane). Undefined for non-shell payloads.
    */
-  function linkSessionsFor(tab: Tab): ReadonlySet<string> | undefined {
-    if (tab.surface !== "terminal") return undefined;
-    const term = sessionsById.get(tab.sessionId);
-    if (term === undefined || term.kind !== "shell") return undefined;
+  function linkSessionsFor(tab: Tab, linkIntent: boolean): ReadonlySet<string> | undefined {
+    let workspaceId: string | null;
+    if (tab.surface === "terminal") {
+      const term = sessionsById.get(tab.sessionId);
+      if (term === undefined || term.kind !== "shell") return undefined;
+      workspaceId = term.workspace_id;
+    } else if (tab.surface === "browser" && linkIntent) {
+      // A browser tab belongs to the window's workspace.
+      workspaceId = activeWsId;
+    } else {
+      return undefined;
+    }
     const out = new Set<string>();
     for (const s of sessions) {
-      if (s.kind === "agent" && s.alive && s.workspace_id === term.workspace_id) out.add(s.id);
+      if (s.kind === "agent" && s.alive && s.workspace_id === workspaceId) out.add(s.id);
     }
     return out.size > 0 ? out : undefined;
   }
@@ -3821,6 +4068,21 @@
     pool.focusTerminal(agentId);
   }
 
+  // --- shared browser panes (the agent browser) --------------------------------
+
+  /** Share browser tab `tabId` with an agent: optimistic, the next sessions
+   *  frame is authoritative (and a failure reverts with a flash). */
+  function linkBrowserTo(tabId: string, agentId: string): void {
+    const agent = sessionsById.get(agentId);
+    if (agent === undefined || agent.kind !== "agent" || !agent.alive) return;
+    const before = get(browserLinks).get(tabId) ?? null;
+    setBrowserLinkLocally(tabId, agentId);
+    putBrowserLink(tabId, agentId).catch((err) => {
+      setBrowserLinkLocally(tabId, before);
+      showFlash(`Could not share the page: ${err instanceof Error ? err.message : "request failed"}`);
+    });
+  }
+
   /** Link mutations + reveal for the pane top bars (chips and the menu). */
   const linkCtrl: LinkCtrl = {
     reveal(sessionId, besidePaneId) {
@@ -3843,6 +4105,27 @@
         showFlash(`Could not unlink terminal: ${err instanceof Error ? err.message : "request failed"}`);
         links = await listLinks().catch(() => links);
       });
+    },
+    linkBrowser(tabId, agentId) {
+      linkBrowserTo(tabId, agentId);
+    },
+    unlinkBrowser(tabId) {
+      const before = get(browserLinks).get(tabId) ?? null;
+      setBrowserLinkLocally(tabId, null);
+      deleteBrowserLink(tabId).catch((err) => {
+        setBrowserLinkLocally(tabId, before);
+        showFlash(`Could not stop sharing the page: ${err instanceof Error ? err.message : "request failed"}`);
+      });
+    },
+    revealBrowser(tabId) {
+      const loc = findBrowser(layout, tabId);
+      if (loc === null) return;
+      layout = activateTab(focusPane(layout, loc.paneId), loc.paneId, loc.index);
+    },
+    browserLabel(tabId) {
+      const loc = findBrowser(layout, tabId);
+      if (loc === null) return null;
+      return loc.tab.host === "" ? "Browser" : targetLabel(loc.tab.host, loc.tab.port);
     },
   };
 
@@ -4202,11 +4485,11 @@
         {/snippet}
 
         <!-- The workspace dashboard: the fixed home row above the sessions —
-             the overview of everything below it. ⌘0, matching the ⌘1–9 rows. -->
+             the overview of everything below it. -->
         <button
           class="row dash-row"
           class:dash-active={dashboardOpen}
-          title="workspace dashboard ({activeModLabel()}0)"
+          title="workspace dashboard"
           onclick={openDashboardSurface}
         >
           <svg class="dash-glyph" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
@@ -4562,6 +4845,7 @@
                 root={workspace.root}
                 onOpen={openFilePath}
                 onOpenPinned={(p) => openFilePath(p, true)}
+                onOpenBeside={(p) => openFileFromPane(layout.focusedPaneId, p, true)}
                 onDragStart={onTreeEntryDown}
                 dropAction={dropSpot?.kind === "fileOp" ? dropSpot.operation : "upload"}
                 activePath={focusedFilePath}
@@ -5299,6 +5583,16 @@
     </div>
   {/if}
 {/if}
+
+<!-- The window's name, large, while macOS Mission Control shows it shrunk
+     among others. Last in the markup: it mounts as Mission Control opens, and
+     a sibling inserted ahead of large content re-resolves all of it. -->
+<WindowNameCard
+  shown={nameCardShown}
+  name={workspace?.name ?? ""}
+  host={windowIdentity.host}
+  waiting={needsYou}
+/>
 
 <style>
   /* Parked Home under its Settings page: opacity + inert (never visibility,

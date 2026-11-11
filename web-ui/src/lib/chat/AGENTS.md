@@ -25,7 +25,7 @@ daemon  ──WS /ws/chat/{id}──▶  chatWs.ts (ChatSocket)
 | `chatPool.ts`, `chatPoolRegistry.ts` | Warm store and socket per session; the registry App imports. |
 | `ChatView.svelte` | The host: transcript window, composer, overlays. |
 | `transcriptWindow.ts`, `readingAnchor.ts`, `heightModel.ts` | Window math, reading anchor, row heights. |
-| `Markdown`, `streamSegments.ts`, `revealLedger.ts`, `tables.ts`, `markedExtensions.ts`, `MathText`, `math.ts` | Sanitized prose and math, streamed. |
+| `Markdown`, `streamSegments.ts`, `revealLedger.ts`, `tables.ts`, `markedExtensions.ts`, `MathText`, `math.ts` | Sanitized prose and math, streamed. A file link opens here or beside (⌘/Ctrl-click, a middle click, its right-click menu); the layout decides where ([open beside](../../../../docs/features/workbench.md#splitting-tabs--drag-and-drop)). |
 | `ChatHeader`, `ModelPicker`, `EffortPopover`, `capabilities.ts` | Header controls from capabilities. |
 | `Composer`, `composer.ts`, `composerHeight.ts`, `composerBus.ts`, `drafts.ts` | Input, slash completion, inserts, drafts; one context row for branch/worktree, linked terminals and notices, only when populated; terminal completion opens through `@term`, with no permanent launcher. |
 | `stopConfirm.ts` + `StopNote.svelte` | Esc / Stop / Clear goal ask once ("Also stops 2 subagents · Esc again to stop") when that action also ends background subagents or workflows, the line above the control pressed and worded by the real gesture; otherwise they act at once. |
@@ -43,6 +43,7 @@ daemon  ──WS /ws/chat/{id}──▶  chatWs.ts (ChatSocket)
 | `McpPanel`, `UsagePanel`, `UsageMeter` | `/mcp`, `/usage` and the usage meter (its popover also holds a Claude chat's Auto-compact switch: `store.autoCompact` from the `auto_compact` read-back, `set_auto_compact` capability; `store.autoCompactDisabledBy` disables it, reading Off, "set off by <var>"; `store.contextCompactAt`, the `context_usage` event's `auto_compact_at`, draws a notch on the Context bar and "Auto-compact at N%", hidden while it is off; a Codex chat shows the line without a switch). |
 | `ArtifactGallery`, `artifacts.ts`, `embeds.ts`, `FileChip`, `ProseChip`, `hoverTargets.ts` | Embeds, written files, hover previews. |
 | `paths.ts`, `UserText` | Path links; the user-message bubble. |
+| `runCommand.ts` | Run buttons on settled shell fences: which fences, the typed text; App picks the terminal. |
 | `ChatFind`, `chatFind.ts`, `quoteSelection.ts` | Find in chat; quote a selection. |
 | `nativeUi.ts`, `mods.svelte.ts`, `Mod*.svelte`, `modClient.ts`, `nativeComposer.ts` | [Claude Mods](REFERENCE.md#claude-mods): never journaled or replayed. |
 
@@ -51,6 +52,7 @@ daemon  ──WS /ws/chat/{id}──▶  chatWs.ts (ChatSocket)
 | State | Owner | Who mutates |
 |---|---|---|
 | `blocks`, `pendingSends`, plan, subagents, flags | `ChatStore` | `apply` and store methods only. |
+| Waiting messages taken back to edit (`editing`, `edited`) | `ChatStore` | `requestEdit` / `takeEdited` / `releaseEdits`; only a live `cancelled` returns words, never replay. |
 | Socket, resume `lastSeq` | `ChatSocket` | The socket; it feeds the store. |
 | Warm entries, scroll cursor | `chatPool.ts` | Acquire; App disposes. |
 | Drafts, dictation | `drafts.ts`, `Dictation` | `Composer`; `Dictation`. |

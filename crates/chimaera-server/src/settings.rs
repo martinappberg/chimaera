@@ -277,6 +277,14 @@ impl SettingsStore {
         (!s.is_empty()).then(|| s.to_string())
     }
 
+    /// Daemon-consumed key: the Chrome or Chromium the agent browser's
+    /// Chromium engine launches (`browser.path`). `None` (unset or blank)
+    /// means "find a system Chrome/Chromium" (`agent_browser::chromium`).
+    pub(crate) fn browser_path(&self) -> Option<String> {
+        let s = self.map.get("browser.path")?.as_str()?.trim();
+        (!s.is_empty()).then(|| s.to_string())
+    }
+
     /// Daemon-consumed key: directory names quick-open skips while walking.
     /// None = the built-in default list.
     pub(crate) fn quickopen_ignore_dirs(&self) -> Option<Vec<String>> {

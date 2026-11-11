@@ -7,7 +7,8 @@ Orientation for coding agents. This area owns the client side of every daemon co
 | File | What it owns |
 |---|---|
 | `api.ts` | Window identity from the URL fragment (`#token=…&ws=…&host=…&win=…`), persisted to sessionStorage, then stripped from the address bar. `api()` fetch with bearer auth. The `unauthorized` latch. The `/health` poll. |
-| `events.ts` | `EventsSocket`: the daemon-wide `/ws/events` socket. Auth frame, then full `sessions` snapshots and the other pushes (`EventsSocketHandlers`: settings, git epochs, notices, `browser_open`, update status, plugin frames). Reconnects forever on unclean closes. |
+| `events.ts` | `EventsSocket`: the daemon-wide `/ws/events` socket. Auth frame, then full `sessions` snapshots and the other pushes (`EventsSocketHandlers`: settings, git epochs, notices, `browser_open`, `browser_request`, update status, plugin frames). `send` carries the agent browser's client messages (false when not open: dropped, never queued); `setHello` keeps the `browser_hello` and re-sends it after every (re)auth. Reconnects forever on unclean closes. |
+| `browserWire.ts` | The agent browser's `/ws/events` wire: `decodeBrowserRequest`, `decodeBrowserLinks` (the sessions frame's `browser_links`), and the client messages (`browser_reply`, `browser_event`, `browser_hello`, `sameHello`). What a window does with a request is `browser/agentBrowser.ts`. |
 | `reconnect.ts` | The backoff curve, jitter, hidden-document slow tier, `nudgeReconnectors`, the `reconnectingSockets` count, and `UNKNOWN_SESSION_RETRIES`. Shared by `terminal/ws.ts` and `chat/chatWs.ts` so the two cannot drift. |
 | `poll.ts` | `POLL_FAST_MS` / `POLL_SLOW_MS` tiers, `healthPollDelayMs`, and `startVisibilityPoll` with its catch-up fetch on visibility return. |
 | `rtt.ts` | Rolling minimum of `/health` fetch timings = the link RTT estimate. `LINK_RTT_BADGE_MS` sets when the host chip shows it. |

@@ -467,6 +467,46 @@ async fn an_agents_tool_waits_for_its_job_and_gets_the_final_answer() {
 
 #[cfg(unix)] // the fixture's programs and tool are POSIX stand-ins
 #[tokio::test]
+async fn a_tool_answer_shows_pictures_from_its_own_output_folder() {
+    crate::plugins::test_catalog::privileged();
+    let state = test_state();
+    let ws = make_workspace(&state, "jobs-picture").await;
+    let sid = inject_agent(&state, "kp1");
+    lock(&state.session_workspaces).insert(sid.clone(), ws.clone());
+    lock(&state.workspaces)
+        .set_plugin_on(&ws, PID, true)
+        .unwrap();
+    let (status, out) = mcp_post(
+        &state,
+        &sid,
+        "kp1",
+        json!({
+            "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+            "params": {"name": "build", "arguments": {"picture": true}},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let content = out["result"]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 3, "{out}");
+    let folder = crate::plugins::output::folder(&state.plugin_platform.output_root, PID, &ws);
+    let caption = content[0]["text"].as_str().unwrap();
+    assert!(
+        caption.contains(&format!(
+            "![one]({})",
+            folder.join("pictures/one.png").display()
+        )),
+        "{caption}"
+    );
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["mimeType"], "image/png");
+    let missing = content[2]["text"].as_str().unwrap();
+    assert!(missing.starts_with("none: "), "{missing}");
+    assert!(missing.contains("(not shown: "), "{missing}");
+    state.sessions.kill(&sid).ok();
+}
+
+#[tokio::test]
 async fn a_tools_folder_setting_moves_where_tools_install() {
     let _one = TOOL_DOWNLOADS.lock().await;
     let fake = FakeReleases::start().await;
@@ -688,4 +728,134 @@ async fn a_login_environment_capture_outlives_a_caller_that_gave_up() {
         );
     };
     assert!(env.iter().any(|(k, _)| k == "PATH"));
+}
+
+/// A plugin that names one of its tools' programs as `provides.browser`
+/// (the privileged fixture's component under another manifest).
+const BROWSER_PID: &str = "test-browser";
+fn browser_manifest() -> String {
+    let artifacts: String = crate::plugins::platform::PLATFORMS
+        .iter()
+        .map(|p| {
+            format!(
+                "[[tools.artifacts]]\nplatform = \"{p}\"\n\
+                 url = \"https://example.invalid/fixture-tool-1.0.0.tar.gz\"\n\
+                 sha256 = \"6c79c8a92fe19b07bd7782b9b59b3520c5cb5fd84f1e8039a8b038535c49d6b9\"\n\
+                 size = 325\nunpack = \"tar.gz\"\nbin = \"bin\"\n\n"
+            )
+        })
+        .collect();
+    format!(
+        "id = \"{BROWSER_PID}\"\nname = \"Browser fixture\"\nversion = \"0.1.0\"\n\
+         summary = \"Provides a stand-in browser, for chimaera's tests.\"\napi = \"0.2\"\n\n\
+         [provides]\nmcp_tools = [\"build\"]\nbrowser = \"fixture-tool\"\n\n\
+         [[programs]]\nname = \"fixture-tool\"\n\n\
+         [[tools]]\nid = \"fixture-tool\"\nname = \"Fixture browser\"\nversion = \"1.0.0\"\n\
+         programs = [\"fixture-tool\"]\n\n{artifacts}"
+    )
+}
+
+/// `provides.browser`: refused unless a tool installs the program; on the
+/// card's Can list; offered to the Chromium engine only where the plugin is
+/// switched on and its tool is installed, and each missing step is named.
+#[tokio::test]
+async fn a_plugin_tool_supplies_the_agent_browser_where_it_is_on() {
+    use crate::plugins::browser::{offer, Offer};
+    let bad =
+        browser_manifest().replace("browser = \"fixture-tool\"", "browser = \"google-chrome\"");
+    let err = crate::plugins::parse_manifest(&bad).unwrap_err();
+    assert!(err.contains("provides.browser"), "{err}");
+
+    let _one = TOOL_DOWNLOADS.lock().await;
+    let fake = FakeReleases::start().await;
+    fake.put("/fixture-tool-1.0.0.tar.gz", TOOL.to_vec());
+    crate::plugins::toolchain::set_downloads_for_tests("https://example.invalid", fake.base());
+    let m = crate::plugins::test_catalog::add(
+        &browser_manifest(),
+        crate::plugins::test_catalog::dist_test_bytes("test-privileged/plugin.wasm"),
+    );
+    assert!(
+        m.caps.lines().iter().any(|l| l.privileged
+            && l.text
+                .starts_with("Runs fixture-tool on this host as the browser")),
+        "{:?}",
+        m.caps.lines()
+    );
+    assert!(
+        !m.caps
+            .lines()
+            .iter()
+            .any(|l| l.text.contains("can't describe") || l.text.starts_with("Runs programs")),
+        "{:?}",
+        m.caps.lines()
+    );
+    let state = test_state();
+    let ws = make_workspace(&state, "browser-plugin").await;
+    let words = |o: Offer| match o {
+        Offer::NotReady(why) => why,
+        other => panic!("expected words, got {other:?}"),
+    };
+
+    // Installed here, off in this workspace: switch it on.
+    let why = words(offer(&state, Some(&ws)).await);
+    assert!(why.contains("not switched on in this workspace"), "{why}");
+    // No workspace: never.
+    let why = words(offer(&state, None).await);
+    assert!(why.contains("has no workspace"), "{why}");
+
+    let (status, body) = request(
+        &state,
+        Method::PUT,
+        &format!("/api/v1/workspaces/{ws}/plugins/{BROWSER_PID}"),
+        Some(json!({"on": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // On, nothing downloaded: the user's click is the next step.
+    let why = words(offer(&state, Some(&ws)).await);
+    assert!(why.contains("Install under Tools"), "{why}");
+    assert!(why.contains("example.invalid"), "{why}");
+
+    let (status, done) = request(
+        &state,
+        Method::POST,
+        &format!("/api/v1/plugins/{BROWSER_PID}/tools/fixture-tool/install"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{done}");
+    let tools = crate::plugins::toolchain::tools_root(&state)
+        .join(BROWSER_PID)
+        .join("fixture-tool");
+    match offer(&state, Some(&ws)).await {
+        Offer::Ready(exe) => assert_eq!(exe, tools.join("1.0.0/bin/fixture-tool")),
+        other => panic!("expected the installed browser, got {other:?}"),
+    }
+
+    // Installed but its program not runnable: Remove and Install again,
+    // never "click Install" on a card that shows it installed.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let exe = tools.join("1.0.0/bin/fixture-tool");
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let why = words(offer(&state, Some(&ws)).await);
+        assert!(why.contains("Remove it and click Install again"), "{why}");
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // Another workspace where it is off gets nothing from it.
+    let other = make_workspace(&state, "browser-plugin-off").await;
+    let why = words(offer(&state, Some(&other)).await);
+    assert!(why.contains("not switched on"), "{why}");
+
+    let (status, _) = request(
+        &state,
+        Method::DELETE,
+        &format!("/api/v1/plugins/{BROWSER_PID}/tools/fixture-tool"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let why = words(offer(&state, Some(&ws)).await);
+    assert!(why.contains("isn't downloaded"), "{why}");
 }

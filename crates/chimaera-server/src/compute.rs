@@ -305,6 +305,26 @@ impl ComputeService {
         }
     }
 
+    /// Whether this daemon sits on a cluster login node: not inside a Slurm
+    /// allocation, Slurm was detected here (the CACHED detection; every
+    /// window's first `/compute` fills it), and the user didn't say the host
+    /// isn't a cluster. The agent browser never launches Chromium there.
+    pub(crate) fn is_login_node(&self) -> bool {
+        self.self_job.is_none()
+            && !self.not_a_cluster
+            && self.detected.load(Ordering::Acquire) == DET_SLURM
+    }
+
+    /// Whether [`Self::is_login_node`] can't answer yet: no job, and no
+    /// detection has run. The agent browser runs one ([`Self::detection`])
+    /// before it considers Chromium, so an unasked daemon never counts as
+    /// "not a login node".
+    pub(crate) fn login_node_unknown(&self) -> bool {
+        self.self_job.is_none()
+            && !self.not_a_cluster
+            && self.detected.load(Ordering::Acquire) == DET_UNKNOWN
+    }
+
     /// Whether this daemon runs as a cluster workspace job — a job may start
     /// hours after the click that queued it, with nobody watching (the
     /// restart pick-up message is withheld there).
@@ -505,6 +525,18 @@ impl ComputeService {
                 json!({"error": "scancel did not answer (controller busy?) — the job was NOT stopped"}),
             ),
         }
+    }
+
+    /// Tests: settle detection as "no scheduler" without probing. The real
+    /// probe runs the user's login shell, and on macOS a child forked while
+    /// another test's pipe is still inheritable keeps that pipe open until
+    /// it exits, stalling unrelated subprocess tests past their deadline.
+    #[cfg(test)]
+    pub(crate) async fn assume_no_scheduler(&self) {
+        let mut inner = self.inner.lock().await;
+        inner.detection = Some(Detection::None);
+        inner.detected_at = Some(Instant::now());
+        self.detected.store(DET_NONE, Ordering::Release);
     }
 
     /// Detect, mirroring the verdict into [`Self::detected`].

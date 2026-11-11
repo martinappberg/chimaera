@@ -17,18 +17,19 @@ Orientation for coding agents. This crate is the daemon: every HTTP route, every
 | `launcher.rs` | argv assembly, binary detection and resolution, role prompts. |
 | `agent_state.rs`, `agents.rs`, `spawn.rs` | Pure agent state; hook ingest and writers (the per-session Claude `--settings` file also carries `autoCompactEnabled`: the reopened conversation's pick, else `agents.autoCompact` On/Off, and `env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` from `agents.autoCompactAt`, via `chat::claude_compaction` → `agents::Compaction`; `refresh_settings_compaction` brings a reused file up to date); PTY spawn (a Codex TUI gets the threshold as `-c model_post_turn_compact_threshold_percent`, `launcher::push_codex_compact_at`). |
 | `git/` | Read-only git: repositories, session tracker, diffs, history. |
-| `fs.rs`, `embed.rs`, `notebook.rs` | Filesystem service and previews; link targets; notebook pages. |
+| `fs.rs` + `fs/`, `embed.rs`, `notebook.rs` | Filesystem service and previews (`fs/row_index.rs`: table row offsets; `fs/zip_splice.rs`: byte-exact Office package edits for `fs/package`); link targets; notebook pages. |
 | `fs_watch.rs`, `doc_check.rs`, `drafts.rs`, `agent_docs.rs` | Disk monitor; dialect checker; draft mirror; "teach agents" docs. |
 | `proxy.rs`, `browser_open.rs` | Browser-pane reverse proxy; the agent `open_browser` tool. |
+| `agent_browser/` | The agent browser's `browser_*` MCP tools (`tools.rs`) over two engines: the app engine drives a pane view in a connected app window through the `/ws/events` request channel (`app_engine.rs`, `channel.rs`), the Chromium engine a headless browser over `--remote-debugging-pipe` (`chromium.rs`, `cdp.rs`); a file on the host opens as a ticketed `/raw/` page (`file_page.rs`); pages, shared panes, take-over and the reaper in `mod.rs` ([reference](REFERENCE.md#agent_browser), [feature](../../docs/features/agent-browser.md)). |
 | `download.rs`, `upload.rs`, `voice/` | Ticketed downloads; streamed uploads; dictation relay. |
 | `notices.rs`, `update.rs` | The notice feed; the self-update reporter. |
 | `runtimes.rs`, `runtime_retention.rs`, `agent_updates.rs` | Managed agent runtimes, their cleanup, release awareness. |
 | `environment.rs`, `compute.rs` | Environment preludes; Slurm awareness and `/compute`. |
 | `timeline.rs`, `episodes.rs`, `history/` | The Timeline, what writes it, per-session history. |
 | `subagents.rs`, `recents_archive.rs`, `knowledge.rs` | A subagent's transcript; archived Recents; the Knowledge snapshot. |
-| `plugins/` | The plugin host: lock, catalog, trust, runtime, platform, jobs. |
+| `plugins/` | The plugin host: lock, catalog, trust, runtime, platform, jobs; `browser.rs` offers the agent browser's Chromium engine a plugin's `provides.browser` program. |
 | `agent_probe.rs` + `agent_probe/` | Ask agents: plugins, skills, connections, extensions, usage. |
-| `comms.rs`, `mcp.rs` | Agent communication; the per-session MCP endpoint and tiers. Chat instructions require a final task-tool update before replying; no user refresh action or inferred completion. Core tool `annotations` come from `mcp::tool_annotations` (`READ_ONLY_TOOLS` get `readOnlyHint`; `read_messages` is never idempotent, it settles what it shows); a new read-only tool belongs on that list (PROTOCOL.md Pass 53). |
+| `comms.rs`, `mcp.rs` | Agent communication; the per-session MCP endpoint and tiers. Chat instructions require a final task-tool update before replying; no user refresh action or inferred completion. Core tool `annotations` come from `mcp::tool_annotations` (`READ_ONLY_TOOLS` get `readOnlyHint`; `read_messages` is never idempotent, it settles what it shows); a new read-only tool belongs on that list (PROTOCOL.md Pass 53). Active plugins' paragraphs lead the `initialize` instructions: Claude Code keeps only the first ~4 KB, which chimaera's own text fills. |
 | `workspaces`, `links`, `settings`, `quickopen`, `recents`, `naming`, `view_state` | Roots, linked terminals, settings, palette, Recents, view-state. |
 
 Cross-module topics: [status feed](REFERENCE.md#the-status-feed-v02), [Mastermind](REFERENCE.md#the-mastermind--the-coordinator-inside-agent-communication), [Codex MCP injection](REFERENCE.md#codex-mcp-injection), [chat-mode seam](REFERENCE.md#chatrs--the-chat-mode-seam), [agent integration](REFERENCE.md#agent-integration-and-view-persistence).

@@ -212,6 +212,10 @@ pub(crate) async fn run(
     };
     let (command, action_env) = action_command(&completion, trust, &bin, args);
     env.extend(action_env);
+    // `bin` is the leased package path; detection (cached) judged the
+    // activation path. agy's updater would rewrite that link mid-action.
+    let managed = crate::launcher::detect(&state, kind, false).await.managed;
+    env.extend(crate::runtimes::managed_agent_env(kind, managed));
     let env_remove = crate::api::spawn_env_remove(&env);
     let result = state.sessions.spawn(chimaera_pty::SpawnOpts {
         cwd: workspace.root,

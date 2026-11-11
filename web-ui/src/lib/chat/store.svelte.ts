@@ -253,6 +253,16 @@ export interface PendingSend {
   origin: string | null;
 }
 
+/** A waiting message withdrawn to be edited: its words go back to the
+ *  composer of the view that asked (`owner`). */
+export interface EditedSend {
+  id: string;
+  text: string;
+  attachmentPaths: string[];
+  /** Null once the asking view closed: any view of the chat takes it. */
+  owner: object | null;
+}
+
 /** Identity every transcript block carries alongside its variant body. */
 interface BlockIdentity {
   /** Stable per-store row identity — the transcript's keyed-render key.
@@ -801,6 +811,50 @@ export class ChatStore {
    *  removes it; `dropped` marks it "not delivered" and it stays here. */
   pendingSends = $state<PendingSend[]>([]);
 
+  /** Waiting messages this view asked to take back for editing (✎ or ↑ in
+   *  an empty composer). Not replayed: an edit is one view's live gesture,
+   *  so only a `cancelled` that answers it here returns the words. A message
+   *  the agent read first resolves `sent` and is never returned. Bounded by
+   *  the pending stack it is drawn from. */
+  private editing = new Map<string, object | null>();
+  /** Withdrawn messages whose words go back to the composer of the view
+   *  that asked (its token), oldest first; that view drains them
+   *  (`takeEdited`). */
+  edited = $state.raw<EditedSend[]>([]);
+
+  /** Mark waiting messages as being taken back for editing by `owner` (the
+   *  asking view's token); the view sends their `cancel_queued`. */
+  requestEdit(ids: string[], owner: object) {
+    for (const id of ids) {
+      if (this.pendingSends.some((p) => p.id === id && p.state === "queued")) {
+        this.editing.set(id, owner);
+      }
+    }
+  }
+
+  /** Give up an edit whose cancel never left (closed socket). */
+  forgetEdit(ids: string[]) {
+    for (const id of ids) this.editing.delete(id);
+  }
+
+  /** `owner`'s withdrawn messages to put back in its composer, oldest
+   *  first, with any a closed view left behind (`releaseEdits`). */
+  takeEdited(owner: object): EditedSend[] {
+    const mine = this.edited.filter((e) => e.owner === owner || e.owner === null);
+    if (mine.length === 0) return [];
+    this.edited = this.edited.filter((e) => e.owner !== owner && e.owner !== null);
+    return mine;
+  }
+
+  /** A view is closing: what it asked to edit goes to whichever view of
+   *  this chat drains next, instead of being lost with it. */
+  releaseEdits(owner: object) {
+    for (const [id, o] of this.editing) if (o === owner) this.editing.set(id, null);
+    if (this.edited.some((e) => e.owner === owner)) {
+      this.edited = this.edited.map((e) => (e.owner === owner ? { ...e, owner: null } : e));
+    }
+  }
+
   /** The NET front shift the client cap has applied to `blocks`, cumulative:
    *  each trim drops the oldest batch and inserts one notice in its place, so
    *  the counter advances by dropped − 1. That makes a block's virtual index
@@ -970,6 +1024,7 @@ export class ChatStore {
     // replay re-delivers any that are still live.
     this.pending = [];
     this.pendingSends = [];
+    this.editing.clear();
     this.questions = [];
     this.elicitations = [];
     // trimmedCount restarts with the transcript; the generation bump is what
@@ -1269,6 +1324,8 @@ export class ChatStore {
         if (pIdx === -1) break; // unknown / already resolved
         const pending = this.pendingSends[pIdx];
         const state = ev.state as string;
+        const editor = this.editing.get(id);
+        this.editing.delete(id);
         if (state === "sent") {
           // Read: leave the pending stack and enter the transcript at the
           // CURRENT end — where the agent read it (a step boundary mid-turn,
@@ -1298,6 +1355,14 @@ export class ChatStore {
           // Pulled back before the agent saw it — it never happened. Vanish
           // entirely (it was never in `blocks`), so nothing to clean up there.
           this.pendingSends.splice(pIdx, 1);
+          if (editor !== undefined) {
+            // (null: the asking view closed; any view takes the words back.)
+            // Raw state: the owner token must keep its identity.
+            this.edited = [
+              ...this.edited,
+              { id, text: pending.text, attachmentPaths: [...pending.attachmentPaths], owner: editor },
+            ];
+          }
         } else {
           // dropped: the agent never got it — keep it visible as "not
           // delivered" so the text can be copied and re-sent.
@@ -1925,6 +1990,7 @@ export class ChatStore {
         this.reconcileOpenTools();
         this.expirePendingAsks();
         this.pendingSends = [];
+        this.editing.clear();
         this.backgroundTasks = [];
         // A portable target received the old conversation as one hidden
         // primer. Its copied source UUIDs/turn ids do NOT exist in the fresh

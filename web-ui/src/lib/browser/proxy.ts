@@ -26,6 +26,25 @@ export class ConfirmRequired extends Error {
   }
 }
 
+/** The target a proxy session forwards to (`GET /api/v1/proxy` lists every
+ *  live one), or null when it is unknown (expired, another daemon). */
+export async function proxyTarget(id: string): Promise<{ host: string; port: number } | null> {
+  try {
+    const res = await api("/proxy", { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) return null;
+    const body = (await res.json()) as { proxies?: unknown };
+    if (!Array.isArray(body.proxies)) return null;
+    for (const p of body.proxies as Record<string, unknown>[]) {
+      if (p?.id === id && typeof p.host === "string" && typeof p.port === "number") {
+        return { host: p.host, port: p.port };
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Mint (or refresh — the daemon is idempotent per target) a proxy session.
  * `confirm` asserts the user approved a non-allowlisted target.

@@ -21,6 +21,7 @@
 
 import { openExternal, writeClipboard } from "../net/native";
 import type { ContextMenuEntry } from "./contextMenu.svelte";
+import { isMac } from "./keys";
 
 /** A proxyable target: what the browser pane needs to open it. */
 export interface UrlTarget {
@@ -98,6 +99,9 @@ export function webUrl(raw: string): string | null {
 
 // --- the pane opener (registered by App, which owns the layout) ---------------
 
+/** The "open beside" menu row, with the click that does the same. */
+export const OPEN_BESIDE = `Open Beside (${isMac ? "⌘-click" : "Ctrl+click"})`;
+
 type PaneOpener = (target: UrlTarget, newSplit: boolean) => void;
 let paneOpener: PaneOpener | null = null;
 
@@ -127,8 +131,8 @@ export function openInPane(url: string, newSplit = false): boolean {
 
 /**
  * The default activation for a rendered link: a live local app opens in a
- * pane, anything else in the real browser. `newSplit` (Cmd/Ctrl) forces the
- * pane into a fresh split, matching what Cmd/Ctrl+click means on file links.
+ * pane, anything else in the real browser. `newSplit` (Cmd/Ctrl) opens it
+ * beside the source pane, matching what Cmd/Ctrl+click means on file links.
  */
 export function activateUrl(url: string, newSplit = false): void {
   if (!isWebUrl(url)) return;
@@ -145,7 +149,7 @@ export function urlMenuEntries(url: string): ContextMenuEntry[] {
   if (proxyableUrl(url) !== null && paneOpener !== null) {
     entries.push(
       { label: "Open in Chimaera", onSelect: () => openInPane(url) },
-      { label: "Open Beside", onSelect: () => openInPane(url, true) },
+      { label: OPEN_BESIDE, onSelect: () => openInPane(url, true) },
     );
   }
   entries.push({ label: "Open in Browser", onSelect: () => openInSystemBrowser(url) });

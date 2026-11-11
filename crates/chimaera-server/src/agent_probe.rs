@@ -184,9 +184,13 @@ pub(crate) fn base_command(
     // must not make the probe a nested child session, and an inherited
     // prelude pair (a daemon started in a chimaera terminal) must neither
     // suppress this probe's prelude nor run another session's.
+    // A probe reads; it never updates an install. agy's updater would
+    // otherwise spawn from a `/usage` read and overwrite the binary it was
+    // started from (a managed activation link included), whoever owns it.
     let env: Vec<(String, String)> = prelude
         .map(|path| ("CHIMAERA_PRELUDE".to_string(), path.display().to_string()))
         .into_iter()
+        .chain([crate::runtimes::agy_no_self_update()])
         .collect();
     for name in crate::api::spawn_env_remove(&env) {
         cmd.env_remove(name);
@@ -1350,6 +1354,18 @@ pub(crate) async fn skills(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A probe reads: agy's updater (spawned by `agy -p /usage`) must not
+    /// rewrite whichever agy it ran, managed or the user's own.
+    #[test]
+    fn probes_never_start_an_agent_self_update() {
+        let cmd = base_command(&["agy".into()], None, None);
+        let (name, value) = crate::runtimes::AGY_NO_SELF_UPDATE;
+        assert!(cmd
+            .as_std()
+            .get_envs()
+            .any(|(k, v)| k == name && v == Some(std::ffi::OsStr::new(value))));
+    }
 
     #[test]
     fn invalidation_rejects_in_flight_results_without_broadcasting_refreshes() {

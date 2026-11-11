@@ -451,9 +451,11 @@ async fn plugin_tools_appear_only_where_switched_on_and_present() {
     let with = tools(&state, &worker, "wk").await;
     assert!(with.contains(&"knowledge_search".to_string()), "{with:?}");
     assert!(with.contains(&"knowledge_get".to_string()));
-    assert!(instructions(&state, &worker, "wk")
-        .await
-        .contains("Project knowledge (the mycelium plugin)"));
+    // Within the first 4 KB: Claude Code truncates a server's instructions
+    // past that, and chimaera's own text alone is longer.
+    let said = instructions(&state, &worker, "wk").await;
+    let at = said.find("Project knowledge (the mycelium plugin)");
+    assert!(at.is_some_and(|i| i < 1_000), "{said}");
 
     // Switched back off: back to exactly the base list.
     request(
@@ -745,6 +747,16 @@ async fn worker_settings_pre_allow_only_active_plugin_tools() {
             "mcp__chimaera__check_document",
             "mcp__chimaera__open_browser",
             "mcp__chimaera__update_plan",
+            "mcp__chimaera__browser_snapshot",
+            "mcp__chimaera__browser_screenshot",
+            "mcp__chimaera__browser_inspect",
+            "mcp__chimaera__browser_source",
+            "mcp__chimaera__browser_console",
+            "mcp__chimaera__browser_network",
+            "mcp__chimaera__browser_wait",
+            "mcp__chimaera__browser_show",
+            "mcp__chimaera__browser_close",
+            "mcp__chimaera__browser_pages",
             "mcp__chimaera__knowledge_search",
             "mcp__chimaera__knowledge_get"
         ])

@@ -132,7 +132,7 @@ impl Tier {
 }
 
 /// The atom kinds that make a plugin privileged.
-const PRIVILEGED_KINDS: &[&str] = &["program", "network", "download"];
+const PRIVILEGED_KINDS: &[&str] = &["program", "program-also", "network", "download"];
 
 /// A plugin's capabilities: a set of atoms.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -178,12 +178,18 @@ impl Caps {
         if m.provides.knowledge.is_some() {
             atoms.insert(atom(&["knowledge"]));
         }
+        if let Some(program) = &m.provides.browser {
+            atoms.insert(atom(&["browser", program]));
+        }
         if m.setup.is_some() {
             atoms.insert(atom(&["setup-prompt"]));
         }
         // Running programs and downloading them: what makes it privileged.
         for program in &m.programs {
             atoms.insert(atom(&["program", &program.name]));
+            for dir in &program.also {
+                atoms.insert(atom(&["program-also", &program.name, dir]));
+            }
             if let Some(net) = &program.network {
                 atoms.insert(atom(&["network", &program.name, net.trim()]));
             }
@@ -333,8 +339,24 @@ impl Caps {
         if has(&["setup-prompt"]) {
             plain("Has a setup prompt it sends to an agent you choose, shown in full first".into());
         }
+        // A browser program runs as the agent browser's headless browser, not
+        // as a job: its own line, without the jobs' limits.
+        let browsers: Vec<&str> = of_kind("browser")
+            .filter_map(|p| p.get(1).map(String::as_str))
+            .collect();
+        for program in &browsers {
+            lines.push(Line {
+                text: format!(
+                    "Runs {program} on this host as the browser agents' browser tools drive, \
+                     where it is switched on and when this host has no Chrome or Chromium of \
+                     its own"
+                ),
+                privileged: true,
+            });
+        }
         let programs: Vec<&str> = of_kind("program")
             .filter_map(|p| p.get(1).map(String::as_str))
+            .filter(|p| !browsers.contains(p))
             .collect();
         let shells: Vec<&str> = programs
             .iter()
@@ -359,6 +381,21 @@ impl Caps {
                      time and memory limits)",
                     others.join(", ")
                 ),
+                privileged: true,
+            });
+        }
+        let mut also: Vec<(&str, Vec<&str>)> = Vec::new();
+        for p in of_kind("program-also") {
+            if let [_, program, dir] = p.as_slice() {
+                match also.iter_mut().find(|(name, _)| name == program) {
+                    Some((_, dirs)) => dirs.push(dir),
+                    None => also.push((program, vec![dir])),
+                }
+            }
+        }
+        for (program, dirs) in also {
+            lines.push(Line {
+                text: format!("Looks for {program} in {} too", dirs.join(", ")),
                 privileged: true,
             });
         }
@@ -409,10 +446,12 @@ impl Caps {
             "agent-tool",
             "hook-line",
             "knowledge",
+            "browser",
             "agent-plugin",
             "setup-prompt",
             "file-kind",
             "program",
+            "program-also",
             "network",
             "download",
         ];
@@ -610,6 +649,30 @@ mod tests {
         // Saying it reaches the network is asking for more.
         assert_ne!(quiet.caps.digest(), loud.caps.digest());
         assert!(!loud.caps.beyond(&quiet.caps).is_empty());
+    }
+
+    #[test]
+    fn a_programs_usual_folders_are_said_and_counted() {
+        let plain = manifest("api = \"0.2\"\n[[programs]]\nname = \"soffice\"\n");
+        let also = manifest(
+            "api = \"0.2\"\n[[programs]]\nname = \"soffice\"\nalso = [\"/Applications/LibreOffice.app/Contents/MacOS\", \"~/Applications/LibreOffice.app/Contents/MacOS\"]\n",
+        );
+        let text: Vec<String> = also.caps.lines().into_iter().map(|l| l.text).collect();
+        assert!(
+            !text.iter().any(|t| t.contains("can't describe")),
+            "{text:?}"
+        );
+        assert!(
+            text.contains(
+                &"Looks for soffice in /Applications/LibreOffice.app/Contents/MacOS, \
+                  ~/Applications/LibreOffice.app/Contents/MacOS too"
+                    .to_string()
+            ),
+            "{text:?}"
+        );
+        // Another place to run a program from is asking for more.
+        assert_ne!(plain.caps.digest(), also.caps.digest());
+        assert!(!also.caps.beyond(&plain.caps).is_empty());
     }
 
     #[test]

@@ -23,7 +23,10 @@ import {
   type AgentBrowserOpen,
   browserOpener,
   parseAgentBrowserOpen,
+  agentOpenShare,
   placeAgentBrowser,
+  placeAgentBrowserTab,
+  placeHandover,
   shouldActOnAgentBrowserOpen,
 } from "./agentOpen";
 
@@ -334,5 +337,69 @@ describe("who opened a browser pane", () => {
       label: null,
       agentKind: null,
     });
+  });
+});
+
+describe("placeHandover", () => {
+  const h = { sessionId: "s-agent", host: "localhost", port: 8888, path: "/lab", view: "ab-1" };
+
+  it("opens a fresh tab adopting the view beside the agent, focus kept", () => {
+    const l = withAgent();
+    const agentPane = sessionPaneId(l, "s-agent")!;
+    const { layout, tabId } = placeHandover(l, h);
+    expect(layout.focusedPaneId).toBe(l.focusedPaneId);
+    const [b] = browserTabs(layout);
+    expect(b.pane).not.toBe(agentPane);
+    expect(b.tab).toMatchObject({ id: tabId, host: "localhost", port: 8888, path: "/lab", openedBy: "s-agent", adopt: "ab-1" });
+  });
+
+  it("never re-points a tab already on the target (its view is another page)", () => {
+    const first = placeAgentBrowser(withAgent(), frame({ host: "localhost", port: 8888, path: "/tree" }));
+    const { layout, tabId } = placeHandover(first, h);
+    const tabs = browserTabs(layout);
+    expect(tabs).toHaveLength(2);
+    expect(tabs.find((t) => t.tab.surface === "browser" && t.tab.id !== tabId)?.tab).toMatchObject({ path: "/tree" });
+  });
+
+  it("never persists the adoption", () => {
+    const { layout } = placeHandover(withAgent(), h);
+    const restored = deserializeLayout(serializeLayout(layout))!;
+    expect(browserTabs(restored)[0].tab).not.toHaveProperty("adopt");
+  });
+});
+
+describe("auto-share on open_browser (one page per agent)", () => {
+  it("shares the placed pane with its opener in the app", () => {
+    const { layout, tabId } = placeAgentBrowserTab(withAgent(), frame({ path: "/app" }));
+    expect(browserTabs(layout)[0].tab).toMatchObject({ id: tabId });
+    expect(agentOpenShare(tabId, frame(), true)).toEqual({ tab: tabId, agent: "s-agent" });
+  });
+
+  it("shares nothing in the iframe fallback (no pane view to drive)", () => {
+    const { tabId } = placeAgentBrowserTab(withAgent(), frame());
+    expect(agentOpenShare(tabId, frame(), false)).toBeNull();
+  });
+
+  it("moves the link to the latest opener of a re-pointed tab", () => {
+    const first = placeAgentBrowserTab(withAgent(), frame({ path: "/a" }));
+    const again = placeAgentBrowserTab(first.layout, frame({ sessionId: "s-other", path: "/b" }));
+    expect(again.tabId).toBe(first.tabId);
+    expect(browserTabs(again.layout)).toHaveLength(1);
+    expect(agentOpenShare(again.tabId, frame({ sessionId: "s-other" }), true)).toEqual({
+      tab: first.tabId,
+      agent: "s-other",
+    });
+  });
+
+  it("names the moved tab when showing it in place would cover the user", () => {
+    let l = withAgent();
+    const placed = placeAgentBrowserTab(l, frame());
+    l = placed.layout;
+    // The user brings the agent back over the browser in that pane.
+    const browserPane = browserTabs(l)[0].pane;
+    l = openSession(focusPane(l, browserPane), "s-agent");
+    const again = placeAgentBrowserTab(l, frame({ path: "/c" }));
+    expect(again.tabId).toBe(placed.tabId);
+    expect(browserTabs(again.layout).find((b) => b.tab.id === placed.tabId)?.tab).toMatchObject({ path: "/c" });
   });
 });

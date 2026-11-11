@@ -473,8 +473,12 @@ pub(crate) async fn shared_sessions_snapshot(state: &AppState) -> Arc<String> {
     state
         .sessions_snapshot
         .get_or_build(generation, EVENTS_SNAPSHOT_REUSE, || {
-            crate::ws::frames::sessions(sessions_json(state), crate::links::links_json(state))
-                .to_string()
+            crate::ws::frames::sessions(
+                sessions_json(state),
+                crate::links::links_json(state),
+                crate::links::browser_links_json(state),
+            )
+            .to_string()
         })
         .await
 }

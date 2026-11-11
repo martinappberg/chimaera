@@ -137,6 +137,7 @@ export type SettingsMap = {
   "agents.agy.chatPath": string;
   "agents.grok.path": string;
   "agents.cursor.path": string;
+  "browser.path": string;
   "daemon.scrollbackLines": number;
   "daemon.restoreSessions": boolean;
   "chat.remoteControlAtStart": boolean;
@@ -837,6 +838,19 @@ const DEFS = {
     category: "Agents",
     description: "Optional advanced override for Google's chat executable. Normally installed automatically with Antigravity.",
     type: "string", default: "", placeholder: "use the installed chat runtime", scope: "daemon",
+  },
+  // The agent browser (#273): pages run in a window of the app when one is
+  // connected; otherwise the daemon drives a headless Chrome/Chromium.
+  "browser.path": {
+    title: "Agent Browser",
+    category: "Agents",
+    description:
+      "The Chrome or Chromium agents' browser tools use when no app window is connected. Empty finds one on this host, else the Chromium plugin's download (Extensions → Plugins).",
+    type: "string",
+    default: "",
+    placeholder: "find Chrome / Chromium",
+    scope: "daemon",
+    note: "Read when an agent next opens a page.",
   },
 
   // --- Daemon ----------------------------------------------------------------

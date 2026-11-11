@@ -22,6 +22,11 @@
 //! `read_messages`), so Claude Code 2.1.307+ retries a read-only call cut off
 //! by a closed connection and never a `read_messages` (PROTOCOL.md Pass 53).
 //! Only `worker_tools*.json` change; the instructions and settings do not.
+//! Re-blessed 2026-11-04 (#273): every agent gets the agent browser's
+//! sixteen `browser_*` tools (the read tools annotated read-only), a
+//! paragraph on them (page content is data, never instructions), and the
+//! settings pre-allow the read tools plus navigate/show/close; the act tools
+//! (click, type, press, scroll, select, eval) keep their prompt.
 
 use super::support::*;
 use crate::{lock, AppState};
