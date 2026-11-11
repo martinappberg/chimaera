@@ -479,6 +479,13 @@ mod tests {
         }
     }
 
+    /// Windows stamps file times from a ~15.6 ms clock tick: a directory
+    /// changed again inside the same tick keeps its mtime (the listing
+    /// backstop catches that), so a test steps past it first.
+    async fn past_the_file_time_tick() {
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    }
+
     #[tokio::test]
     async fn mounted_files_and_visible_dirs_report_repeated_external_changes() {
         let root = TempDir::new("changes");
@@ -494,10 +501,7 @@ mod tests {
         assert_eq!(initial.files, [file.to_string_lossy()]);
         assert_eq!(initial.dirs, [root.0.to_string_lossy()]);
 
-        // Windows stamps file times from a ~15.6 ms clock tick: a directory
-        // changed again inside the same tick keeps its mtime (the listing
-        // backstop catches that), so step past it.
-        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        past_the_file_time_tick().await;
         // The path was already changed before this second write. Unlike git
         // porcelain status, the metadata fingerprint still moves.
         std::fs::write(&file, b"second-and-longer").unwrap();
@@ -536,6 +540,7 @@ mod tests {
         assert!(watch.poll(true).await.files.is_empty(), "reported twice");
 
         // A new file in a watched directory: the directory is re-stated.
+        past_the_file_time_tick().await;
         let child = root.0.join("new.md");
         std::fs::write(&child, b"x").unwrap();
         let changes = watch.poll_touched(std::slice::from_ref(&child)).await;
