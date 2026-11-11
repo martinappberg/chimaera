@@ -112,14 +112,17 @@ fn anyone_listens(state: &AppState) -> bool {
 }
 
 /// The editor is about to save `path` (as the save request names it).
+/// Keyed in the spelling [`touched`] later hears it by: `~` expanded, in
+/// wire form (on Windows a request's `C:\x` arrives there as `C:/x`).
 pub(crate) fn mark_saved(state: &AppState, path: &str) {
     if !anyone_listens(state) {
         return;
     }
+    let key = chimaera_core::paths::wire_path(&chimaera_core::paths::expand_tilde(path));
     let mut files = crate::lock(&state.plugin_platform.files);
     files.saved.retain(|_, at| at.elapsed() < SAVED_MARK);
     if files.saved.len() < 256 {
-        files.saved.insert(path.to_string(), Instant::now());
+        files.saved.insert(key, Instant::now());
     }
 }
 

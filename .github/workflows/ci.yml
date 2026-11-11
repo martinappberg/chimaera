@@ -146,6 +146,74 @@ jobs:
           CHIMAERA_WIRE_FIXTURES: check
       - run: cargo test --manifest-path plugins/Cargo.toml
 
+  # The native Windows daemon: the compile/lint/test gate for every
+  # cfg(windows) path (macOS cannot link them), then a live smoke of the real
+  # chimaera.exe -- start, authenticate, round-trip a PowerShell PTY, stop via
+  # the session-preserving /api/v1/stop and require the process to exit.
+  windows:
+    needs: ui-build
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: web-ui-dist
+          path: web-ui/dist
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+      - run: rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: windows-latest
+          workspaces: |
+            .
+            plugins
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Git Bash ships on the runner; the script is the same one the rust job runs.
+      - run: bash scripts/build-plugins.sh
+        shell: bash
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Every test binary runs even after one fails: a Windows regression
+      # rarely comes alone, and one run should show all of them.
+      - run: cargo test --workspace --no-fail-fast
+        env:
+          CHIMAERA_WIRE_FIXTURES: check
+      - name: Native daemon smoke
+        shell: pwsh
+        run: |
+          cargo build -p chimaera
+          $env:CHIMAERA_HOME = Join-Path $env:RUNNER_TEMP 'chimaera-home'
+          $workspace = Join-Path $env:RUNNER_TEMP 'smoke-workspace'
+          New-Item -ItemType Directory -Force $env:CHIMAERA_HOME, $workspace | Out-Null
+          $daemon = Start-Process -FilePath (Resolve-Path target/debug/chimaera.exe) `
+            -ArgumentList 'serve' -PassThru -NoNewWindow `
+            -RedirectStandardOutput (Join-Path $env:RUNNER_TEMP 'daemon.out') `
+            -RedirectStandardError (Join-Path $env:RUNNER_TEMP 'daemon.err')
+          $manifest = Join-Path $env:CHIMAERA_HOME 'data/manifest.json'
+          $deadline = (Get-Date).AddSeconds(60)
+          while (-not (Test-Path $manifest)) {
+            if ($daemon.HasExited -or (Get-Date) -gt $deadline) {
+              Get-Content (Join-Path $env:RUNNER_TEMP 'daemon.err') -ErrorAction SilentlyContinue
+              throw 'daemon did not write its manifest'
+            }
+            Start-Sleep -Milliseconds 250
+          }
+          # --stop ends with POST /api/v1/stop; the process must then exit by itself.
+          node scripts/smoke-daemon.mjs $manifest $workspace --stop
+          if ($LASTEXITCODE -ne 0) {
+            $daemon.Kill()
+            Get-Content (Join-Path $env:RUNNER_TEMP 'daemon.err') -ErrorAction SilentlyContinue
+            throw 'smoke failed'
+          }
+          if (-not $daemon.WaitForExit(15000)) {
+            $daemon.Kill()
+            throw 'daemon still running 15 s after /api/v1/stop'
+          }
+          Write-Host "daemon exited with code $($daemon.ExitCode)"
+
   musl:
     needs: ui-build
     runs-on: ubuntu-24.04

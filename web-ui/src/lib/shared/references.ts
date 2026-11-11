@@ -17,6 +17,7 @@ import { writable, get, type Readable } from "svelte/store";
 
 import type { HostTarget } from "../previews/doc/hoverController.svelte";
 import { pathTarget } from "./embed/embed";
+import { isAbsolute, joinPath } from "./paths";
 
 /** A place in a file: 1-based lines, inclusive; workspace-relative path. */
 export interface RefSpan {
@@ -183,7 +184,7 @@ export function referenceHoverTarget(targets: readonly RefTarget[]): HostTarget 
   if (t === undefined || src === undefined) return null;
   const whole = src.end_line <= 0;
   if (!whole && src.end_line <= src.line) return null;
-  const path = src.path.startsWith("/") ? src.path : t.base ? `${t.base}/${src.path}` : null;
+  const path = isAbsolute(src.path) ? src.path : t.base ? joinPath(t.base, src.path) : null;
   if (path === null) return null;
   const fragment = whole ? null : `L${src.line}-L${src.end_line}`;
   const others = targets.length > 1 ? ` · ${targets.length} entries use this id` : "";

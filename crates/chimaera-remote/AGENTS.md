@@ -10,7 +10,7 @@ Parent map: repo-root [AGENTS.md](../../AGENTS.md). Behavior: the
 
 **Scope.** Two clients share this library: the CLI (`crates/chimaera/src/connect.rs`,
 `status.rs`, `compute.rs`) and the native app (`crates/chimaera-app/src/shell/`,
-`askpass.rs`, `wsl.rs`). Both speak the same protocol to a host.
+`askpass.rs`). Both speak the same protocol to a host.
 
 **Not owned here.** The daemon and `chimaera job-host` live in `chimaera-server`
 ([map](../chimaera-server/AGENTS.md)). The Slurm parsers, `LaunchSpec`, the job
@@ -31,7 +31,7 @@ proxy's compute-node hop lives in the server's `proxy.rs`.
 
 | Section | Main items |
 |---|---|
-| Transport | `ASKPASS_ALIAS_ENV`, `ASKPASS_CANCELLED`, `WslTransport` + `set_wsl_transport`, `transport_command` (+ the test-only `FAKE_TRANSPORT`), bounded child output (`CHILD_STDOUT_MAX_BYTES`, `output_bounded`), `control_path`/`control_dir`/`prepare_control_dir`, `ssh_opts`, `learn_ssh_config`, `ssh_cmd`/`scp_cmd`, `interactive_ssh_argv`. |
+| Transport | `ASKPASS_ALIAS_ENV`, `ASKPASS_CANCELLED`, `multiplexing`, `transport_command` (+ the test-only `FAKE_TRANSPORT`), bounded child output (`CHILD_STDOUT_MAX_BYTES`, `output_bounded`), `control_path`/`control_dir`/`prepare_control_dir`, `ssh_opts`, `learn_ssh_config`, `ssh_cmd`/`scp_cmd`, `interactive_ssh_argv`. |
 | `// --- Round-robin login nodes` | `Route` (`Alias`/`Node`/`NodeViaAlias`), the `ROUTES` map, `route_of`. |
 | Connect types | `Phase`, `ConnectOpts`, `ClusterHost`, `LoginDaemon`, `RemoteHome`, `Decision` + `update_decision`, `TunnelPhaseError`, `Tunnel`. |
 | Master health | `cancel_master_forward`, `clear_wedged_master`, `bounded_mux_ssh`, `http_alive`, `http_alive_authed`. |
@@ -49,7 +49,7 @@ All state is per process. A relaunch relearns it.
 - **`HOST_KEY_STRICT`.** Per alias, whether the user's `ssh -G` says `StrictHostKeyChecking yes`. Learned by `learn_ssh_config` at each public entry that dials; unlearned = TOFU.
 - **`ROUTES`.** The learned `Route` per alias. Tunnels, stops, session counts, compute tunnels and wedge checks all read it.
 - **`SCHEDULERS`.** The scheduler the last detecting probe found per host.
-- **`WSL_TRANSPORT`.** Set by the app on Windows. `None` on unix.
+- **Windows has no ControlMaster.** `multiplexing()` is false there: `ssh_opts` emits `ControlMaster=no`/`ControlPath=none`, every call is its own connection (re-auth each time), and the `-O check/exit/cancel` operations return at once.
 - **`HostsStore`.** The host list. Every mutation re-reads the file under `hosts.json.lock` (5 s bounded wait, then unlocked). It refuses to save when the file existed but could not be read.
 - **`cluster.rs` caches.** `QUEUES` (queue per host, also saved to `data_dir()/cluster-queues/` so the 60 s floor holds across processes), `FLIGHTS` (one exec per host at a time), `FACTS` (discovery, `FACTS_TTL` = 24 h).
 - **`Tunnel` / `ComputeTunnel`.** Each owns its ssh child. A forward that the master holds stays bound until `close()` cancels it with `ssh -O cancel`.
@@ -59,7 +59,7 @@ All state is per process. A relaunch relearns it.
 - **Never name a real cluster or site.** No cluster, site or institution names go in code, comments, tests or docs. Use generic examples (`cluster`, `login.example.edu`).
 - **One ControlMaster per destination.** Every ssh and scp call goes through `ssh_opts` (`ControlMaster=auto`, `ControlPersist=10m`, `StrictHostKeyChecking=accept-new` unless the user's own config is stricter). Do not add an ssh call that bypasses it. A new master can ask the user for a password or 2FA again.
 - **A failed probe decides nothing.** Only a probe that ran may read the cached scheduler or conclude "nothing running". A refused host key, a refused sign-in, or too many keys (`fatal_ssh_failure`) ends the connect at once with a plain message; chimaera never edits `known_hosts`.
-- **Never reimplement the ssh client.** The user's `~/.ssh/config` (ProxyJump, keys, 2FA) applies because this crate runs the system `ssh`. On Windows, ssh runs inside the WSL distro, because Win32-OpenSSH has no ControlMaster.
+- **Never reimplement the ssh client.** The user's `~/.ssh/config` (ProxyJump, keys, 2FA) applies because this crate runs the system `ssh`. On Windows that is the built-in OpenSSH, without ControlMaster (degraded: no connection sharing).
 - **Set the askpass alias per child.** `ASKPASS_ALIAS_ENV` goes on each ssh/scp process. A process-global value would show one host's prompt in another host's window.
 - **`connect` is the CLI's and the app's shared path.** Change it once, here. `RemoteOps` methods take `&impl Fn(Phase)`, not `&dyn`. A `dyn` makes the `connect` future `!Send` and breaks the app's `spawn`.
 - **Resolve and upload the binary before you stop a daemon.** A failed fetch or upload must not leave a host without a daemon (the running one keeps its inode across the rename). `stop_remote` sends SIGTERM only and never SIGKILL.

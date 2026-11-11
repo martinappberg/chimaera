@@ -2,6 +2,7 @@ import { writable } from "svelte/store";
 
 import { healthPollDelayMs, startVisibilityPoll, type PollHandle } from "./poll";
 import { recordLinkRtt } from "./rtt";
+import { isAbsolute } from "../shared/paths";
 
 const TOKEN_KEY = "chimaera:token";
 const WS_KEY = "chimaera.ws";
@@ -46,7 +47,7 @@ function initFromHash(): string | null {
   // A file the shell asks this window to show once (a cluster file peek).
   // Held in memory only, never sessionStorage: a reload must not reopen it.
   const openFromHash = params.get("open");
-  if (openFromHash !== null && openFromHash.startsWith("/")) pendingOpen = openFromHash;
+  if (openFromHash !== null && isAbsolute(openFromHash)) pendingOpen = openFromHash;
   if (detachedFromHash) {
     sessionStorage.setItem(DETACHED_KEY, "1");
     // A detached browser popup is an auxiliary context: it inherited a CLONE

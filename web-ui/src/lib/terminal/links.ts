@@ -15,6 +15,13 @@
  * referenced line (Cmd/Ctrl+click = new split); dirs open in the Finder; a
  * name several files answer to asks which in the shared context menu. Works
  * identically in every session — agents and shells.
+ *
+ * On a Windows host (its directories arrive as `C:/…` or `//srv/share/…`) a
+ * shell prints native paths — `C:\Users\me\x.rs:12`, `.\src\a.rs`,
+ * `src\main.rs:2:5` — so the scan reads that host's text with every `\` as
+ * `/` (index for index, so the underline still lands on the printed text) and
+ * candidates reach the daemon in its wire form. A Unix host's text is scanned
+ * as printed: there a backslash is an escape, never a separator.
  */
 
 import type { ILink, ILinkProvider, Terminal } from "@xterm/xterm";
@@ -29,6 +36,7 @@ import {
   type LinkContext,
 } from "../shared/fileRef";
 import type { PathKind } from "../shared/openPath";
+import { isAbsolute, rootOf } from "../shared/paths";
 import { workspaceRelative } from "../shared/reference";
 import type { Reveal } from "../shared/reveal";
 
@@ -56,16 +64,38 @@ export interface Candidate {
   ref: FileRef;
 }
 
+/** Whether a session's directories are on a Windows host: a drive or UNC
+ *  root, never `/`. */
+export function windowsHost(ctx: LinkContext): boolean {
+  for (const dir of [ctx.cwd, ctx.spawnCwd, ctx.root]) {
+    if (dir == null) continue;
+    const root = rootOf(dir);
+    if (root !== "") return root !== "/";
+  }
+  return false;
+}
+
+/**
+ * A Windows shell's text with its native paths in wire form, index for
+ * index: every `\` becomes `/` and a drive letter before `:\` is upper-cased
+ * (`c:\x\a.rs` → `C:/x/a.rs`), so offsets into it are offsets into `text`.
+ */
+export function nativeToWire(text: string): string {
+  if (!text.includes("\\")) return text;
+  return text.replace(/([A-Za-z]):\\/g, (_m, d: string) => `${d.toUpperCase()}:/`).replace(/\\/g, "/");
+}
+
 /**
  * Scan `text` for path-like candidates (indexes into that string). With
  * `bare`, also emit single-segment names (bare directories / extensionless
  * files like `crates`, `justfile`) — reserved for the on-hover path, never
  * the prefetch, so agent/terminal prose is never mass-validated on the
  * daemon (it lives on shared login nodes). Whether such a name actually
- * becomes a link is then decided per line by [`bareLinkable`].
+ * becomes a link is then decided per line by [`bareLinkable`]. `windows`
+ * reads native Windows paths (see the module header).
  */
-export function extractCandidates(text: string, bare = false): Candidate[] {
-  return extractFileRefs(text, { bare }).map((f) => ({
+export function extractCandidates(text: string, bare = false, windows = false): Candidate[] {
+  return extractFileRefs(windows ? nativeToWire(text) : text, { bare }).map((f) => ({
     raw: f.ref.path,
     start: f.start,
     length: f.end - f.start,
@@ -222,7 +252,7 @@ function cacheKey(bases: string[], ws: string | null, candidate: string): string
   // Absolute and ~ candidates resolve the same under any base or workspace.
   // Relative verdicts key on the workspace too: the daemon's index
   // fallbacks make the answer depend on it, not just on the bases.
-  const abs = candidate.startsWith("/") || candidate.startsWith("~");
+  const abs = isAbsolute(candidate) || candidate.startsWith("~");
   return abs ? `\u0000${candidate}` : `${bases.join("\u0001")}\u0000${ws ?? ""}\u0000${candidate}`;
 }
 
@@ -409,20 +439,22 @@ class PathLinkProvider implements ILinkProvider {
       return;
     }
     const text = grp.g.text;
+    const ctx = this.host.context(this.sessionId);
+    const windows = windowsHost(ctx);
+    const scan = windows ? nativeToWire(text) : text;
     // Hover path: one line group at a time, so bare directory names are worth
     // resolving here (the prefetch below never does this over whole screens).
-    const candidates = extractCandidates(text, true);
-    const strict = new Set(extractCandidates(text).map((c) => c.start));
+    const candidates = extractCandidates(scan, true);
+    const strict = new Set(extractCandidates(scan).map((c) => c.start));
     // Paths a TUI hard-wrapped across this row and its neighbours.
     const { groups, self } = neighbourGroups(this.term, grp);
-    const joined = wrappedRefs(groups.map((x) => x.g.text)).filter(
+    const joined = wrappedRefs(groups.map((x) => (windows ? nativeToWire(x.g.text) : x.g.text))).filter(
       (w) => w.first.row <= self && w.last.row >= self,
     );
     if (candidates.length === 0 && joined.length === 0) {
       callback(undefined);
       return;
     }
-    const ctx = this.host.context(this.sessionId);
     const raws = [...candidates.map((c) => c.raw), ...joined.map((w) => w.ref.path)];
     void validateAll(raws, ctx).then(() => {
       const links: ILink[] = [];
@@ -448,7 +480,7 @@ class PathLinkProvider implements ILinkProvider {
         ]);
       }
       // Bare names link only on a listing / `ls -l` line, never in prose.
-      const bareOk = bareLinkable(text, (word) => lookup(word, ctx) !== null);
+      const bareOk = bareLinkable(scan, (word) => lookup(word, ctx) !== null);
       for (const c of candidates) {
         if (!strict.has(c.start) && !bareOk.has(c.raw)) continue;
         const endIdx = c.start + c.length - 1;
@@ -530,9 +562,11 @@ export function registerPathLinks(term: Terminal, sessionId: string, host: LinkH
       groups.push(g);
       row = g.end + 1;
     }
-    const raws = groups.flatMap((g) => extractCandidates(g.g.text).map((c) => c.raw));
-    for (const w of wrappedRefs(groups.map((g) => g.g.text))) raws.push(w.ref.path);
-    if (raws.length > 0) void validateAll(raws, host.context(sessionId));
+    const ctx = host.context(sessionId);
+    const texts = windowsHost(ctx) ? groups.map((g) => nativeToWire(g.g.text)) : groups.map((g) => g.g.text);
+    const raws = texts.flatMap((t) => extractCandidates(t).map((c) => c.raw));
+    for (const w of wrappedRefs(texts)) raws.push(w.ref.path);
+    if (raws.length > 0) void validateAll(raws, ctx);
   };
   const schedule = () => {
     if (timer === null) timer = setTimeout(prefetch, PREFETCH_INTERVAL_MS);

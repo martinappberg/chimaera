@@ -1,0 +1,28 @@
+# LF everywhere, on every platform. The wire-fixture tests compare files
+# byte-for-byte and chimaera-server embeds scripts with include_str!, so an
+# autocrlf checkout on Windows would break both.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.icns binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.wasm binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.tgz binary
+*.xz binary
+*.tar binary
+*.docx binary
+*.xlsx binary
+*.pptx binary
+*.mp4 binary
+*.wav binary

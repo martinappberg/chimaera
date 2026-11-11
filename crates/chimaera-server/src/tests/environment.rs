@@ -484,11 +484,15 @@ async fn hand_edits_of_both_stores_land_after_one_poll() {
         lock(&state.env_preludes).data_cached().workspaces["w-1"].text,
         "ml hand-edited"
     );
-    let prelude = crate::environment::materialize_prelude(&state, &session, "w-1", None, None)
-        .expect("the polled workspace prelude");
-    let text = std::fs::read_to_string(&prelude).unwrap();
-    crate::environment::remove_prelude_file(&session);
-    assert!(text.contains("ml hand-edited"), "{text}");
+    // Preludes are POSIX shell: a Windows spawn never gets one.
+    #[cfg(unix)]
+    {
+        let prelude = crate::environment::materialize_prelude(&state, &session, "w-1", None, None)
+            .expect("the polled workspace prelude");
+        let text = std::fs::read_to_string(&prelude).unwrap();
+        crate::environment::remove_prelude_file(&session);
+        assert!(text.contains("ml hand-edited"), "{text}");
+    }
 
     // Settled: the next pass sees both recorded mtimes and does nothing.
     assert!(!crate::settings::poll_external_edit(&state).await);
@@ -522,12 +526,16 @@ async fn environment_prelude_answers_from_the_cache_while_the_read_is_stalled() 
     });
     stall.wait_entered().await;
 
-    let session = format!("env-prelude-stalled-{}", std::process::id());
-    let prelude = crate::environment::materialize_prelude(&state, &session, "w-1", None, None)
-        .expect("the cached host prelude");
-    let text = std::fs::read_to_string(&prelude).unwrap();
-    crate::environment::remove_prelude_file(&session);
-    assert!(text.contains("ml cached"), "{text}");
+    // Preludes are POSIX shell: a Windows spawn never gets one.
+    #[cfg(unix)]
+    {
+        let session = format!("env-prelude-stalled-{}", std::process::id());
+        let prelude = crate::environment::materialize_prelude(&state, &session, "w-1", None, None)
+            .expect("the cached host prelude");
+        let text = std::fs::read_to_string(&prelude).unwrap();
+        crate::environment::remove_prelude_file(&session);
+        assert!(text.contains("ml cached"), "{text}");
+    }
     assert_eq!(lock(&state.settings).scrollback_lines(), None);
     let (status, _) = request(&state, Method::GET, "/api/v1/health", None).await;
     assert_eq!(status, StatusCode::OK);

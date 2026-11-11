@@ -34,7 +34,8 @@ enum Command {
         /// shell (or SSH channel) that started it. `connect` uses this to start
         /// a daemon on a remote host without relying on the host having
         /// util-linux `setsid`/`nohup` — the portable path that works on any
-        /// POSIX remote (Linux, macOS, the BSDs).
+        /// POSIX remote (Linux, macOS, the BSDs). On Windows it starts a
+        /// detached process with no console.
         #[arg(long)]
         daemonize: bool,
         /// Bind 0.0.0.0 instead of loopback — what a cluster workspace job

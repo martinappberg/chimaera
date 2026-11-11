@@ -12,23 +12,29 @@ async fn shell_display_name_tracks_foreground_command() {
     )
     .await;
     let workspace_id = ws["id"].as_str().unwrap().to_string();
-    let root = std::fs::canonicalize(&root).unwrap();
+    let root = canonical(&root);
     let id = inject_shell(&state, &root, &workspace_id);
+    shell_ready(&state, &id).await;
 
     // Idle at the workspace root: named after the shell binary.
-    wait_display_name(&state, &id, "bash").await;
+    wait_display_name(&state, &id, &shell_name()).await;
     assert_eq!(session_entry(&state, &id).await["renamed"], false);
 
     // A running foreground command takes over the name...
     let att = state.sessions.attach(&id).expect("attach");
+    // Windows has no `sleep` program; ping is the stock stand-in.
+    #[cfg(unix)]
+    let (command, program) = ("sleep 5", "sleep");
+    #[cfg(windows)]
+    let (command, program) = ("ping -n 11 127.0.0.1", "PING");
     att.input
-        .send(bytes::Bytes::from("sleep 5\n"))
+        .send(bytes::Bytes::from(format!("{command}{ENTER}")))
         .await
         .expect("send input");
-    wait_display_name(&state, &id, "sleep").await;
+    wait_display_name(&state, &id, program).await;
 
     // ...and the name falls back to the shell once it exits.
-    wait_display_name(&state, &id, "bash").await;
+    wait_display_name(&state, &id, &shell_name()).await;
 
     state.sessions.kill(&id).ok();
 }
@@ -46,30 +52,32 @@ async fn shell_display_name_uses_workspace_relative_cwd() {
     )
     .await;
     let workspace_id = ws["id"].as_str().unwrap().to_string();
-    let root = std::fs::canonicalize(&root).unwrap();
+    let root = canonical(&root);
     let id = inject_shell(&state, &root, &workspace_id);
+    shell_ready(&state, &id).await;
 
-    wait_display_name(&state, &id, "bash").await;
+    wait_display_name(&state, &id, &shell_name()).await;
 
     // cd into a subdirectory: the idle shell is named by where it sits,
     // relative to the workspace root.
     let att = state.sessions.attach(&id).expect("attach");
     att.input
-        .send(bytes::Bytes::from("cd crates\n"))
+        .send(bytes::Bytes::from(format!("cd crates{ENTER}")))
         .await
         .expect("send input");
     wait_display_name(&state, &id, "crates").await;
 
     // cd back to the root: the shell name again.
     att.input
-        .send(bytes::Bytes::from("cd ..\n"))
+        .send(bytes::Bytes::from(format!("cd ..{ENTER}")))
         .await
         .expect("send input");
-    wait_display_name(&state, &id, "bash").await;
+    wait_display_name(&state, &id, &shell_name()).await;
 
     state.sessions.kill(&id).ok();
 }
 
+#[cfg(unix)]
 /// End-to-end shell integration: a real bash spawned the way
 /// create_session spawns it (integration injected, hermetic HOME) must
 /// reach phase `ready` and populate the command journal with command
@@ -152,8 +160,9 @@ async fn cwd_current_tracks_shell_cd_and_falls_back_to_spawn_cwd() {
     )
     .await;
     let workspace_id = ws["id"].as_str().unwrap().to_string();
-    let root = std::fs::canonicalize(&root).unwrap();
+    let root = canonical(&root);
     let id = inject_shell(&state, &root, &workspace_id);
+    shell_ready(&state, &id).await;
 
     // The watcher's first poll reports the spawn cwd.
     wait_cwd_current(&state, &id, &root).await;
@@ -161,14 +170,14 @@ async fn cwd_current_tracks_shell_cd_and_falls_back_to_spawn_cwd() {
     // cd into a subdirectory: cwd_current follows...
     let att = state.sessions.attach(&id).expect("attach");
     att.input
-        .send(bytes::Bytes::from("cd sub\n"))
+        .send(bytes::Bytes::from(format!("cd sub{ENTER}")))
         .await
         .expect("send input");
     wait_cwd_current(&state, &id, &root.join("sub")).await;
 
     // ...and back.
     att.input
-        .send(bytes::Bytes::from("cd ..\n"))
+        .send(bytes::Bytes::from(format!("cd ..{ENTER}")))
         .await
         .expect("send input");
     wait_cwd_current(&state, &id, &root).await;

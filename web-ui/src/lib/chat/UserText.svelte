@@ -8,6 +8,7 @@
   import { chipLabels } from "./artifacts";
   import MathText from "./MathText.svelte";
   import { splitUserMath } from "./math";
+  import { basename } from "../shared/paths";
   import {
     mentionChipLabel,
     menuPoint,
@@ -139,8 +140,7 @@
    *  any other token. */
   function chipLabel(t: Token): string | null {
     if (!t.mention || t.ref === null) return null;
-    const segments = t.ref.path.split("/").filter((s) => s !== "");
-    return mentionChipLabel(t.text, t.ref.path, names.get(t.ref.path) ?? segments.at(-1) ?? t.ref.path);
+    return mentionChipLabel(t.text, t.ref.path, names.get(t.ref.path) ?? (basename(t.ref.path) || t.ref.path));
   }
 
   function isDir(t: Token, res: Resolution | undefined): boolean {

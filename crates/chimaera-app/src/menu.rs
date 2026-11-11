@@ -196,11 +196,8 @@ pub fn install(app: &App) -> tauri::Result<()> {
                 }
             }
             "reload-window" => {
-                // Only the focused window. The WSL wizard is shell-local:
-                // reloading it mid-install would orphan the running step.
-                if let Some(window) =
-                    focused_window(app).filter(|w| !w.label().starts_with("wsl-setup"))
-                {
+                // Only the focused window.
+                if let Some(window) = focused_window(app) {
                     let _ = window.eval(RELOAD_WINDOW_JS);
                 }
             }
@@ -226,8 +223,8 @@ fn focused_window(app: &AppHandle) -> Option<WebviewWindow> {
 }
 
 /// Enable Settings for a focused daemon page, including Home, which shows it
-/// as a full page. The WSL wizard (no scope-map entry) and a login-node
-/// terminal window (no settings surface) stay excluded. Called whenever focus
+/// as a full page. A login-node terminal window (no settings surface) stays
+/// excluded. Called whenever focus
 /// or the focused window's scope changes. Cheap; a no-op before the menu is
 /// managed.
 pub(crate) fn sync_settings_enabled(app: &AppHandle) {

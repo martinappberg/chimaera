@@ -439,7 +439,7 @@
         <ul>
           <li><strong>Daemon:</strong> fully static musl binaries for <code>x86_64</code> and <code>aarch64</code> Linux that run on old-glibc systems (verified on glibc 2.17, no root), plus an <code>aarch64</code> macOS build.</li>
           <li><strong>Native app:</strong> macOS on Apple Silicon, and Linux as an AppImage / <code>.deb</code> / <code>.rpm</code>.</li>
-          <li><strong>Windows (beta):</strong> a native app whose daemon runs the Linux musl binary inside WSL2, reached over localhost. The engine and the SSH-connect path are CI-tested; the first-run wizard and the interop askpass chain haven't had a hands-on pass on retail hardware yet, so it ships as a clearly-labeled <strong>beta</strong> download. Expect to walk through a couple of setup steps on first launch.</li>
+          <li><strong>Windows (beta):</strong> a native app with a native daemon: terminals open in PowerShell, and Claude Code, Codex and the other agents run from their own Windows installs. No WSL needed. It ships as a clearly-labeled <strong>beta</strong> until it has had a hands-on pass on retail hardware. Connecting to remote hosts works without SSH connection sharing, so a password or 2FA host asks once per connection step.</li>
         </ul>
         <p>
           The daemon uses bounded preview extraction and capped state. Durable history uses

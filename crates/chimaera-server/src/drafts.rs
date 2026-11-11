@@ -211,13 +211,13 @@ fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
 }
 
 /// Create the drafts directory owner-only (unsaved text may be sensitive).
+/// Windows sets no mode: the directory inherits the profile's user-only ACL.
 fn ensure_root(root: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    match std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(root)
-    {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    match builder.create(root) {
         Ok(()) => Ok(()),
         Err(err) => {
             Err(anyhow::Error::new(err).context(format!("failed to create {}", root.display())))
@@ -230,7 +230,6 @@ fn ensure_root(root: &Path) -> anyhow::Result<()> {
 /// removed on any failure.
 fn write_private(dest: &Path, contents: &[u8]) -> anyhow::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let name = dest
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -240,11 +239,11 @@ fn write_private(dest: &Path, contents: &[u8]) -> anyhow::Result<()> {
         &chimaera_core::generate_token()[..16]
     ));
     let result = (|| -> std::io::Result<()> {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&tmp)?;
         file.write_all(contents)?;
         file.sync_all()?;
         drop(file);

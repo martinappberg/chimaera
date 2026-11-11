@@ -3,6 +3,7 @@ import { writable } from "svelte/store";
 
 import { api, ApiError } from "../net/api";
 import { sessionsPollDelayMs, startVisibilityPoll } from "../net/poll";
+import { basename } from "../shared/paths";
 import { getSetting, resolvedTheme } from "../settings/store.svelte";
 
 export interface Workspace {
@@ -210,9 +211,9 @@ export function branchLabel(git: {
   return git.detached ? (git.head ? `Commit ${git.head}` : "Detached checkout") : "No commits yet";
 }
 
-/** The last path component. */
+/** The last path component; a root names itself (`/`, `C:/`). */
 export function baseName(path: string): string {
-  return path.split("/").filter(Boolean).pop() ?? path;
+  return basename(path) || path;
 }
 
 /** The one display name for a session, used identically everywhere. */

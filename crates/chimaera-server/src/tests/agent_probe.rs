@@ -64,6 +64,7 @@ fn row<'a>(rows: &'a [serde_json::Value], id: &str) -> &'a serde_json::Value {
         .unwrap_or_else(|| panic!("{id} not in {rows:?}"))
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn connections_are_workspace_scoped_cached_and_redacted() {
     let state = test_state();
@@ -183,6 +184,7 @@ else
 fi
 "#;
 
+#[cfg(unix)]
 #[tokio::test]
 async fn connector_dialog_revalidates_and_completes_both_cli_callbacks() {
     for kind in [AgentKind::Claude, AgentKind::Codex] {
@@ -265,6 +267,7 @@ async fn connector_dialog_revalidates_and_completes_both_cli_callbacks() {
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn hosted_connector_uses_settings_without_forcing_oauth_and_is_workspace_scoped() {
     let state = test_state();
@@ -325,6 +328,7 @@ async fn hosted_connector_uses_settings_without_forcing_oauth_and_is_workspace_s
     assert!(!root.join("login-args").exists());
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn connector_dialog_cancels_and_retries_without_accepting_failure() {
     let state = test_state();
@@ -359,6 +363,7 @@ async fn connector_dialog_cancels_and_retries_without_accepting_failure() {
 
 const THREE_PLUGINS: &str = r#"[{"id":"alpha@m","enabled":true},{"id":"beta@m","enabled":true},{"id":"gamma@m","enabled":true}]"#;
 
+#[cfg(unix)]
 #[tokio::test]
 async fn host_prelude_reaches_claude_plugin_list() {
     let state = test_state();
@@ -390,6 +395,7 @@ esac
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn plugin_details_share_one_login_shell_and_prelude_run() {
     let state = test_state();
@@ -434,6 +440,7 @@ esac
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn forged_markers_and_a_failed_details_call_stay_contained() {
     let state = test_state();
@@ -482,6 +489,7 @@ esac
     assert_eq!(row(&rows, "gamma@m")["skills_n"], 3);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn probe_prelude_file_is_removed_after_the_probe() {
     let state = test_state();
@@ -527,6 +535,7 @@ esac
     .expect("the probe's prelude file outlived the probe");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn codex_probe_gets_the_workspace_prelude_and_claude_the_host_alone() {
     let state = test_state();
@@ -582,6 +591,7 @@ done
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn new_agent_inventory_routes_preserve_identity_and_native_provenance() {
     let state = test_state();
@@ -675,6 +685,7 @@ esac
     assert!(!connections.to_string().contains("secret"));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn skill_retry_recovers_a_failed_version_check_without_prompting_unknown_builds() {
     let state = test_state();
@@ -724,6 +735,7 @@ esac
     assert_eq!(detection.version.as_deref(), Some("1.2.14"));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn native_extension_action_preserves_arguments_and_invalidates_inventory() {
     let state = test_state();

@@ -6,8 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+chimaera-core.workspace = true
 anyhow.workspace = true
-nix.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -18,3 +18,9 @@ tracing.workspace = true
 [dev-dependencies]
 chimaera-wire-fixtures.workspace = true
 tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

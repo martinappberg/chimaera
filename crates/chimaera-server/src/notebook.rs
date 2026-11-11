@@ -803,6 +803,7 @@ mod unit_tests {
     /// A FIFO in the notebook's place (swapped in after the path check) is
     /// refused at once — a plain open would wait for a writer forever while
     /// holding the one notebook permit.
+    #[cfg(unix)] // FIFOs and `mkfifo` exist only on Unix
     #[test]
     fn a_fifo_in_place_of_the_notebook_never_blocks() {
         let dir = std::env::temp_dir().join(format!("chimaera-nb-fifo-{}", std::process::id()));

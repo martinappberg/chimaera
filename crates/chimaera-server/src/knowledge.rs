@@ -29,7 +29,7 @@
 //! switched off, updated, removed or changes build.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use axum::http::StatusCode;
@@ -667,9 +667,9 @@ pub(crate) async fn recorded_since_last_check(
 /// AGENTS.md).
 fn guidance_file(root: &Path, rel: &str) -> bool {
     let path = root.join(rel);
-    let inside = std::fs::canonicalize(&path)
+    let inside = chimaera_core::paths::canonicalize(&path)
         .ok()
-        .zip(std::fs::canonicalize(root).ok())
+        .zip(chimaera_core::paths::canonicalize(root).ok())
         .is_some_and(|(target, root)| target.starts_with(root));
     inside && std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() <= 1024 * 1024)
 }
@@ -741,7 +741,7 @@ fn guidance(root: &Path) -> Vec<Value> {
         };
         out.push(json!({"path": file, "label": label, "description": description}));
     }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = chimaera_core::paths::home_dir() {
         let dir = home
             .join(".claude/projects")
             .join(crate::launcher::encode_cwd(root))
@@ -757,7 +757,7 @@ fn guidance(root: &Path) -> Vec<Value> {
                 let index = dir.join("MEMORY.md");
                 let path = if index.is_file() { index } else { dir };
                 out.push(json!({
-                    "path": path,
+                    "path": chimaera_core::paths::wire_path(&path),
                     "label": "claude memory",
                     "description": format!(
                         "{notes} note{} claude keeps for this project on this host",

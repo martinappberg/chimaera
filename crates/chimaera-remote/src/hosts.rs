@@ -1,13 +1,8 @@
 //! Saved remote hosts: the ssh aliases this machine has connected to (or the
 //! user has added), stored as JSON at `~/.chimaera/hosts.json`. This is
-//! client-side state — aliases resolve through the ssh config of WHEREVER
-//! ssh runs, never through anything chimaera stores. On unix that is the
-//! user's `~/.ssh/config`; on Windows ssh runs INSIDE the WSL distro (the
-//! transport — Win32-OpenSSH has no ControlMaster), so aliases and keys
-//! resolve against the DISTRO's `~/.ssh`, not `C:\Users\...\.ssh`. A
-//! wizard-fresh distro has neither — user-facing copy must say which file
-//! counts, or every first Windows connect fails "could not resolve
-//! hostname" against a config that looks correct in their terminal.
+//! client-side state — aliases resolve through the user's ssh config
+//! (`~/.ssh/config`; `%USERPROFILE%\.ssh\config` on Windows), never through
+//! anything chimaera stores.
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -45,13 +40,9 @@ pub fn normalize_alias(input: &str) -> anyhow::Result<String> {
 }
 
 /// Which ssh config file the user must edit — the one ssh actually reads.
-/// On Windows ssh runs inside the WSL distro, so pointing at
-/// `C:\Users\...\.ssh\config` (which their terminal uses) would send them
-/// to a file chimaera never consults.
 fn ssh_config_hint() -> &'static str {
     if cfg!(windows) {
-        "~/.ssh/config INSIDE your WSL distro (keys go there too — the \
-         Windows-side ~/.ssh is not used)"
+        "your .ssh\\config in your user profile"
     } else {
         "your ~/.ssh/config"
     }
@@ -657,7 +648,7 @@ mod tests {
             "-oProxyCommand=x",
         ] {
             let err = normalize_alias(bad).unwrap_err().to_string();
-            assert!(err.contains("~/.ssh/config"), "{bad:?}: {err}");
+            assert!(err.contains("config"), "{bad:?}: {err}");
         }
     }
 

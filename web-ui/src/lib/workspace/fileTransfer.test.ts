@@ -91,3 +91,21 @@ describe("clipboard transfer lifecycle", () => {
     expect(fileClip()).toBeNull();
   });
 });
+
+describe("file transfer on a Windows daemon's paths", () => {
+  it("blocks self, descendant and drive-root transfers", () => {
+    const dir = { path: "C:/work/data", kind: "dir" } as const;
+    for (const to of ["C:/work/data", "C:/work/data/", "C:/work/data/sub"]) {
+      expect(transferBlock(dir, to, "copy")).not.toBeNull();
+    }
+    expect(transferBlock(dir, "C:/work/database", "copy")).toBeNull();
+    expect(transferBlock({ path: "C:/", kind: "dir" }, "D:/x", "copy")).not.toBeNull();
+    expect(transferBlock({ path: "C:/note.txt", kind: "file" }, "C:/", "move")).toBe("Already in this folder");
+  });
+
+  it("joins the destination once, including at a drive root", async () => {
+    vi.mocked(fsMoveOp).mockResolvedValue("D:/note.txt");
+    await transferInto({ path: "C:/work/note.txt", kind: "file" }, "D:/", "move");
+    expect(fsMoveOp).toHaveBeenCalledWith("C:/work/note.txt", "D:/note.txt");
+  });
+});

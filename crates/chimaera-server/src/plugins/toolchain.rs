@@ -13,12 +13,17 @@
 //!   link on the way; refuses absolute paths, `..`, hard links, devices and
 //!   FIFOs; allows a symbolic link only when it is relative and stays inside
 //!   the folder, and never writes through one (`O_EXCL | O_NOFOLLOW`); and
-//!   stops at 4 GiB unpacked or 200,000 entries.
+//!   stops at 4 GiB unpacked or 200,000 entries. On Windows the same walk
+//!   runs on cap-std (junctions refused like links), and a link entry is
+//!   checked but never made: symbolic links need privileges there.
 //! - **Nothing outside the folder changes**: no PATH edit, no rc file. A
 //!   tool's `bin` joins the PATH of that plugin's jobs only (`jobs`).
 //! - **Layout**: `<data dir>/tools/<plugin>/<tool>/<version>/` behind an
-//!   atomic `current` link; two versions kept. `setup` steps run once after
-//!   unpacking, as jobs of the tool's own programs, before `current` moves.
+//!   atomic `current` link (on Windows a `current` file naming the version,
+//!   renamed into place: a link there needs privileges, and a junction
+//!   can't be swapped atomically); two versions kept. `setup` steps run
+//!   once after unpacking, as jobs of the tool's own programs, before
+//!   `current` moves.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -30,6 +35,7 @@ use axum::extract::{Path as AxPath, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+#[cfg(unix)]
 use rustix::fs::{FileType, Mode, OFlags};
 use serde_json::{json, Value};
 use tokio::io::AsyncReadExt;
@@ -73,7 +79,7 @@ impl Installs {
 #[cfg(test)]
 static DOWNLOAD_OVERRIDE: Mutex<Option<(String, String)>> = Mutex::new(None);
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn set_downloads_for_tests(from: &str, to: &str) {
     *crate::lock(&DOWNLOAD_OVERRIDE) = Some((from.to_string(), to.to_string()));
 }
@@ -126,8 +132,10 @@ fn tools_dir_setting(state: &AppState) -> Option<Result<PathBuf, String>> {
 fn expand_dir(raw: &str, var: impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
     let mut out = String::new();
     let mut rest = raw;
-    if rest == "~" || rest.starts_with("~/") {
-        out.push_str(&var("HOME").ok_or("HOME isn't set, so ~ can't be expanded")?);
+    if rest == "~" || rest.starts_with("~/") || (cfg!(windows) && rest.starts_with("~\\")) {
+        // Windows keeps the home folder in USERPROFILE; HOME is usually unset.
+        let home = var("HOME").or_else(|| cfg!(windows).then(|| var("USERPROFILE")).flatten());
+        out.push_str(&home.ok_or("HOME isn't set, so ~ can't be expanded")?);
         rest = &rest[1..];
     }
     while let Some(at) = rest.find('$') {
@@ -170,9 +178,30 @@ fn unpack_limit(free: Option<u64>) -> u64 {
 }
 
 /// Bytes free to this user on the filesystem holding `dir` (blocking).
+#[cfg(unix)]
 fn free_bytes(dir: &Path) -> Option<u64> {
     let st = rustix::fs::statvfs(dir).ok()?;
     Some(st.f_bavail.saturating_mul(st.f_frsize))
+}
+
+/// Bytes free to this user (quotas applied) on the volume holding `dir`
+/// (blocking).
+#[cfg(windows)]
+fn free_bytes(dir: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut avail = 0u64;
+    // SAFETY: `wide` is NUL-terminated and outlives the call; the out
+    // pointer is a live u64 and the two optional ones are null.
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut avail,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(avail)
 }
 
 fn tool_dir(state: &AppState, plugin: &str, tool: &str) -> PathBuf {
@@ -219,10 +248,36 @@ fn read_record(version_dir: &Path) -> Option<Record> {
     Some(record)
 }
 
+/// The version `current` names: the link's target (Unix), or the small
+/// file's text (Windows).
+fn current_name(dir: &Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        let target = std::fs::read_link(dir.join("current")).ok()?;
+        Some(target.file_name()?.to_str()?.to_string())
+    }
+    #[cfg(windows)]
+    {
+        let path = dir.join("current");
+        // The tool's own setup programs can write here too: a plain file,
+        // capped, or nothing.
+        if !std::fs::symlink_metadata(&path).ok()?.is_file() {
+            return None;
+        }
+        let mut text = String::new();
+        File::open(&path)
+            .ok()?
+            .take(256)
+            .read_to_string(&mut text)
+            .ok()?;
+        let name = text.trim();
+        (!name.is_empty() && !name.contains('\\')).then(|| name.to_string())
+    }
+}
+
 /// The installed version's folder and record (blocking).
 fn current(dir: &Path) -> Option<(PathBuf, Record)> {
-    let target = std::fs::read_link(dir.join("current")).ok()?;
-    let name = target.file_name()?.to_str()?.to_string();
+    let name = current_name(dir)?;
     if name.starts_with('.') || name.contains('/') {
         return None;
     }
@@ -304,12 +359,14 @@ fn entry_path(raw: &[u8]) -> Result<PathBuf, String> {
     Ok(out)
 }
 
+#[cfg(unix)]
 fn dir_flags() -> OFlags {
     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
 }
 
 /// The folder `rel` names beneath `root`, each component made if missing,
 /// none ever a link.
+#[cfg(unix)]
 fn dir_beneath(root: &File, rel: &Path) -> Result<File, String> {
     let mut dir = root.try_clone().map_err(|e| e.to_string())?;
     for part in rel.components() {
@@ -326,6 +383,54 @@ fn dir_beneath(root: &File, rel: &Path) -> Result<File, String> {
         );
     }
     Ok(dir)
+}
+
+#[cfg(windows)]
+fn dir_beneath(root: &File, rel: &Path) -> Result<File, String> {
+    use cap_fs_ext::DirExt;
+    let mut dir = crate::download::cap_dir(root).map_err(|e| e.to_string())?;
+    for part in rel.components() {
+        let Component::Normal(name) = part else {
+            return Err(format!("{}: not a plain path", rel.display()));
+        };
+        match dir.create_dir(name) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("{}: {e}", rel.display())),
+        }
+        dir = dir
+            .open_dir_nofollow(name)
+            .map_err(|e| format!("{}: {e} (a link where a folder must be)", rel.display()))?;
+    }
+    Ok(dir.into_std_file())
+}
+
+/// A new regular file `name` in `parent`: never over an entry already
+/// there, never through a link. `perms` is a Unix mode (Windows: the
+/// folder's ACL applies).
+fn create_new_file(parent: &File, name: &std::ffi::OsStr, perms: u32) -> std::io::Result<File> {
+    #[cfg(unix)]
+    {
+        Ok(File::from(rustix::fs::openat(
+            parent,
+            name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(perms as rustix::fs::RawMode),
+        )?))
+    }
+    #[cfg(windows)]
+    {
+        use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+        let _ = perms;
+        let mut options = cap_std::fs::OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+        crate::download::cap_dir(parent)?
+            .open_with(name, &options)
+            .map(cap_std::fs::File::into_std)
+    }
 }
 
 /// The parent folder of `rel` beneath `root`, and its last name.
@@ -392,14 +497,8 @@ fn write_entry(
 ) -> Result<(), String> {
     let (parent, name) = parent_beneath(root, rel)?;
     let perms = if mode & 0o111 != 0 { 0o755 } else { 0o644 };
-    let fd = rustix::fs::openat(
-        &parent,
-        name.as_os_str(),
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::from_raw_mode(perms),
-    )
-    .map_err(|e| format!("{}: {e}", rel.display()))?;
-    let mut file = File::from(fd);
+    let mut file = create_new_file(&parent, name.as_os_str(), perms)
+        .map_err(|e| format!("{}: {e}", rel.display()))?;
     let mut buf = vec![0u8; 64 << 10];
     loop {
         let n = from
@@ -425,10 +524,17 @@ fn link_entry(root: &File, rel: &Path, target: &str, budget: &mut Budget) -> Res
             rel.display()
         ));
     }
-    let (parent, name) = parent_beneath(root, rel)?;
-    rustix::fs::symlinkat(target, &parent, name.as_os_str())
-        .map_err(|e| format!("{}: {e}", rel.display()))?;
-    budget.links.push(rel.to_path_buf());
+    #[cfg(unix)]
+    {
+        let (parent, name) = parent_beneath(root, rel)?;
+        rustix::fs::symlinkat(target, &parent, name.as_os_str())
+            .map_err(|e| format!("{}: {e}", rel.display()))?;
+        budget.links.push(rel.to_path_buf());
+    }
+    // Checked like any link, never made: a symbolic link needs Developer
+    // Mode or an administrator on Windows.
+    #[cfg(windows)]
+    let _ = (root, budget);
     Ok(())
 }
 
@@ -538,28 +644,48 @@ fn unpack_zip(file: File, root: &File, budget: &mut Budget) -> Result<(), String
         let name = entry.name_raw().to_vec();
         let rel = entry_path(&name)?;
         let mode = entry.unix_mode().unwrap_or(0o644);
-        // zip keeps 16 bits of Unix mode; rustix's `RawMode` is u16 on
-        // macOS and u32 on Linux.
-        let ftype = FileType::from_raw_mode(mode as rustix::fs::RawMode);
+        let (is_link, is_regular) = zip_kind(mode);
         if entry.is_dir() {
             dir_beneath(root, &rel)?;
-        } else if ftype == FileType::Symlink {
+        } else if is_link {
             let mut target = String::new();
             (&mut entry)
                 .take(4096)
                 .read_to_string(&mut target)
                 .map_err(|e| e.to_string())?;
             link_entry(root, &rel, &target, budget)?;
-        } else if ftype == FileType::RegularFile
-            || ftype == FileType::Unknown
-            || mode & 0o170000 == 0
-        {
+        } else if is_regular || mode & 0o170000 == 0 {
             write_entry(root, &rel, mode, &mut entry, budget)?;
         } else {
             return Err(format!("{}: not a file, folder or link", rel.display()));
         }
     }
     Ok(())
+}
+
+/// A zip entry's Unix mode as (a symbolic link, a regular file or a type
+/// this host can't name).
+#[cfg(unix)]
+fn zip_kind(mode: u32) -> (bool, bool) {
+    // zip keeps 16 bits of Unix mode; rustix's `RawMode` is u16 on macOS
+    // and u32 on Linux.
+    let ftype = FileType::from_raw_mode(mode as rustix::fs::RawMode);
+    (
+        ftype == FileType::Symlink,
+        ftype == FileType::RegularFile || ftype == FileType::Unknown,
+    )
+}
+
+#[cfg(windows)]
+fn zip_kind(mode: u32) -> (bool, bool) {
+    // The S_IFMT values every Unix shares (and `FileType::from_raw_mode`
+    // reads); anything else is Unknown there, so a file here.
+    const KNOWN: [u32; 6] = [0o010000, 0o020000, 0o040000, 0o060000, 0o120000, 0o140000];
+    let ftype = mode & 0o170000;
+    (
+        ftype == 0o120000,
+        ftype == 0o100000 || !KNOWN.contains(&ftype),
+    )
 }
 
 /// Unpack `archive` (`kind`: tar, tar.gz, tar.xz, zip, none) into `dest`,
@@ -573,7 +699,7 @@ pub(crate) fn unpack(
     max_entries: usize,
 ) -> Result<u64, String> {
     std::fs::create_dir(dest).map_err(|e| format!("{}: {e}", dest.display()))?;
-    let root = File::open(dest).map_err(|e| e.to_string())?;
+    let root = crate::download::open_dir_path(dest).map_err(|e| e.to_string())?;
     let mut budget = Budget {
         bytes: 0,
         entries: 0,
@@ -801,7 +927,10 @@ fn activate(dir: &Path, version: &str) -> Result<(), String> {
         ".current-{}",
         &chimaera_core::generate_token()[..8]
     ));
+    #[cfg(unix)]
     std::os::unix::fs::symlink(version, &tmp).map_err(|e| e.to_string())?;
+    #[cfg(windows)]
+    std::fs::write(&tmp, version).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, dir.join("current")).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         e.to_string()
@@ -939,8 +1068,11 @@ async fn install_inner(
         return Err(err);
     }
     // `unpack = "none"`: the file is the program, so it takes the program's
-    // name (a release names it `jq-linux-amd64`; jobs ask for `jq`).
+    // name (a release names it `jq-linux-amd64`; jobs ask for `jq`). Windows
+    // runs a file only by its extension.
     let name = tool.programs.first().unwrap_or(&tool.id).clone();
+    #[cfg(windows)]
+    let name = format!("{name}.exe");
     installs.set(&key, "unpacking", 0, 0);
     let unpacked = {
         let (archive, staging, kind) = (archive.clone(), staging.clone(), artifact.unpack.clone());
@@ -1248,6 +1380,7 @@ mod tests {
         unpack(&archive, "tar", &dest, "x", 1 << 20, 100).map(|n| (dest, n))
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_good_archive_unpacks_with_its_inside_links() {
         let bytes = tar_of(&[
@@ -1325,6 +1458,7 @@ mod tests {
         assert!(unpack_xz(cut, "xz-cut").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_tools_folder_setting_expands_home_and_variables() {
         let var = |name: &str| match name {
@@ -1355,6 +1489,7 @@ mod tests {
         assert!(expand_dir("${SCRATCH/t", var).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_unfinished_installs_leftovers_go_and_nothing_else() {
         let dir = temp("leftovers");
@@ -1380,6 +1515,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_hostile_archive_corpus_is_refused() {
         let outside = temp("outside");
@@ -1510,6 +1646,7 @@ mod tests {
         unpack(&archive, "zip", &dest, "x", 1 << 20, max_entries).map(|_| dest)
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_hostile_zip_corpus_is_refused() {
         let good = zip_of(&[
@@ -1586,6 +1723,135 @@ mod tests {
         assert_eq!(unpack_limit(Some(100 << 30)), UNPACKED_MAX);
         assert_eq!(unpack_limit(Some(FREE_AFTER_MIN + (300 << 20))), 300 << 20);
         assert_eq!(unpack_limit(Some(FREE_AFTER_MIN / 2)), 0);
+    }
+
+    /// Windows: the hostile cases that need no link on disk are refused as
+    /// on Unix; a link entry is checked (an outward one refuses the
+    /// archive) but never made; and a junction where a folder must be is
+    /// never walked through.
+    #[cfg(windows)]
+    #[test]
+    fn windows_unpacks_confined_and_never_makes_links() {
+        let bytes = tar_of(&[
+            ("tool/", tar::EntryType::Directory, b"", ""),
+            ("tool/bin/", tar::EntryType::Directory, b"", ""),
+            (
+                "tool/bin/run.cmd",
+                tar::EntryType::Regular,
+                b"@echo hi\r\n",
+                "",
+            ),
+            ("tool/run-link", tar::EntryType::Symlink, b"", "bin/run.cmd"),
+        ]);
+        let (dest, _) = unpack_bytes(&bytes, "win-good").unwrap();
+        assert!(dest.join("tool/bin/run.cmd").is_file());
+        assert!(std::fs::symlink_metadata(dest.join("tool/run-link")).is_err());
+        for (label, bytes, why) in [
+            (
+                "dotdot",
+                tar_of(&[("../evil", tar::EntryType::Regular, b"x", "")]),
+                "`..`",
+            ),
+            (
+                "absolute",
+                tar_of(&[("/tmp/evil", tar::EntryType::Regular, b"x", "")]),
+                "absolute",
+            ),
+            (
+                "drive",
+                tar_of(&[("C:/evil", tar::EntryType::Regular, b"x", "")]),
+                "not a relative path",
+            ),
+            (
+                "backslash-dotdot",
+                tar_of(&[("a\\..\\..\\evil", tar::EntryType::Regular, b"x", "")]),
+                "`..`",
+            ),
+            (
+                "hardlink",
+                tar_of(&[("a", tar::EntryType::Link, b"", "C:/Windows")]),
+                "hard link",
+            ),
+            (
+                "link-out",
+                tar_of(&[("a", tar::EntryType::Symlink, b"", "../../etc")]),
+                "leaves the folder",
+            ),
+            (
+                "link-abs",
+                tar_of(&[("a", tar::EntryType::Symlink, b"", "/etc")]),
+                "leaves the folder",
+            ),
+            (
+                "fifo",
+                tar_of(&[("p", tar::EntryType::Fifo, b"", "")]),
+                "Fifo",
+            ),
+        ] {
+            let err = unpack_bytes(&bytes, label).unwrap_err();
+            assert!(err.contains(why), "{label}: {err}");
+        }
+        let zip = zip_of(&[
+            ("bin/tool.cmd", b"@echo hi", 0o100755),
+            ("bin/alias", b"tool.cmd", 0o120777),
+        ]);
+        let out = unpack_zip_bytes(&zip, "win-zip", 100).unwrap();
+        assert!(out.join("bin/tool.cmd").is_file());
+        assert!(std::fs::symlink_metadata(out.join("bin/alias")).is_err());
+
+        // A junction planted where a folder must be.
+        let root = temp("win-junction");
+        let outside = temp("win-junction-outside");
+        junction::create(&outside, root.join("j")).unwrap();
+        let root_fd = crate::download::open_dir_path(&root).unwrap();
+        let err = dir_beneath(&root_fd, Path::new("j/sub")).unwrap_err();
+        assert!(err.contains("a link where a folder must be"), "{err}");
+        let mut body: &[u8] = b"x";
+        let mut budget = Budget {
+            bytes: 0,
+            entries: 0,
+            max_bytes: 1 << 20,
+            max_entries: 10,
+            links: Vec::new(),
+        };
+        assert!(write_entry(&root_fd, Path::new("j/f"), 0o644, &mut body, &mut budget).is_err());
+        assert!(write_entry(&root_fd, Path::new("j"), 0o644, &mut body, &mut budget).is_err());
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_current_is_a_file_naming_the_version() {
+        let dir = temp("win-current");
+        for v in ["1.0.0", "2.0.0"] {
+            std::fs::create_dir_all(dir.join(v)).unwrap();
+            let record = Record {
+                version: v.into(),
+                platform: "windows-x86_64".into(),
+                sha256: String::new(),
+                bytes: 1,
+                bin: Some("bin".into()),
+                installed_ms: 0,
+            };
+            std::fs::write(
+                dir.join(v).join(RECORD),
+                serde_json::to_vec(&record).unwrap(),
+            )
+            .unwrap();
+            activate(&dir, v).unwrap();
+            let (version_dir, rec) = current(&dir).unwrap();
+            assert_eq!(version_dir, dir.join(v));
+            assert_eq!(rec.version, v);
+        }
+        assert!(std::fs::metadata(dir.join("current")).unwrap().is_file());
+        std::fs::write(dir.join("current"), "..\\elsewhere").unwrap();
+        assert!(current(&dir).is_none());
+        assert!(free_bytes(&dir).is_some_and(|b| b > 0));
+        let home = |name: &str| (name == "USERPROFILE").then(|| r"C:\Users\me".to_string());
+        assert_eq!(
+            expand_dir("~/tools", home).unwrap(),
+            PathBuf::from(r"C:\Users\me/tools")
+        );
     }
 
     #[test]

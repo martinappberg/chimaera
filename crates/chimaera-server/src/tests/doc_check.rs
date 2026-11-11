@@ -8,7 +8,7 @@ use crate::{lock, AppState};
 /// A document folder with a few real targets, canonicalized (the checker
 /// reports canonical paths).
 fn fixture(label: &str) -> PathBuf {
-    let dir = std::fs::canonicalize(test_dir(label)).unwrap();
+    let dir = canonical(&test_dir(label));
     std::fs::create_dir_all(dir.join("figs")).unwrap();
     std::fs::write(dir.join("figs/UMAP.png"), b"png").unwrap();
     std::fs::write(
@@ -418,6 +418,8 @@ fn check_within(path: PathBuf, root: Option<PathBuf>, secs: u64) -> Vec<Issue> {
         .unwrap()
 }
 
+// FIFOs, `mkfifo` and `/dev/zero` exist only on Unix.
+#[cfg(unix)]
 fn mkfifo(path: &std::path::Path) {
     let status = std::process::Command::new("mkfifo")
         .arg(path)
@@ -428,6 +430,7 @@ fn mkfifo(path: &std::path::Path) {
 
 /// A `#L` fragment makes the checker read its target: a device that never
 /// ends (`/dev/zero`) or a FIFO with no writer must never be opened.
+#[cfg(unix)]
 #[test]
 fn special_file_targets_are_never_read() {
     let dir = fixture("dc-special");
@@ -450,6 +453,7 @@ fn special_file_targets_are_never_read() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_fifo_or_device_document_is_refused_without_opening_it() {
     let dir = fixture("dc-fifo-doc");
@@ -489,11 +493,14 @@ fn oversize_targets_are_not_read() {
         Some(&b"abcd"[..])
     );
     assert_eq!(crate::doc_check::read_regular(&small, 3).unwrap(), None);
-    let pipe = dir.join("pipe");
-    mkfifo(&pipe);
-    for special in [pipe.as_path(), std::path::Path::new("/dev/zero")] {
-        let err = crate::doc_check::read_regular(special, 16).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{special:?}");
+    #[cfg(unix)]
+    {
+        let pipe = dir.join("pipe");
+        mkfifo(&pipe);
+        for special in [pipe.as_path(), std::path::Path::new("/dev/zero")] {
+            let err = crate::doc_check::read_regular(special, 16).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{special:?}");
+        }
     }
 }
 
@@ -705,7 +712,7 @@ async fn agent_docs_installs_are_idempotent() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["created"], true);
     let skill = home.join(".claude/skills/chimaera-docs/SKILL.md");
-    assert_eq!(body["path"], skill.to_string_lossy().as_ref());
+    assert_eq!(body["path"], wire(&skill));
     assert_eq!(
         std::fs::read_to_string(&skill).unwrap(),
         crate::agent_docs::skill_text()

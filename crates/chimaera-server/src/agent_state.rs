@@ -468,6 +468,9 @@ impl AgentRecord {
     /// a new one appends, and the oldest entries fall off past the cap.
     /// Returns whether the list changed (re-touching the newest is a no-op).
     pub(crate) fn touch_file(&mut self, path: &str) -> bool {
+        // Hooks on Windows report native paths; the list is wire data.
+        #[cfg(windows)]
+        let path = &chimaera_core::paths::wire_path_windows(path);
         if self.files_touched.last().is_some_and(|last| last == path) {
             return false;
         }

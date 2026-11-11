@@ -569,7 +569,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     <plugin.toml>` prints a manifest's tier, digest and Can list with no daemon.
   - **Settings → Extensions → Unverified Plugins** (`plugins.allowUnverified`, on by default):
     off, only verified plugins install and run on this host. An admin's
-    `/etc/chimaera/policy.json` (`{"plugins": {"allowUnverified", "allowPrivileged": "all" |
+    `/etc/chimaera/policy.json` (`%ProgramData%\chimaera\policy.json` on Windows) (`{"plugins": {"allowUnverified", "allowPrivileged": "all" |
     "verified" | "none", "blocked": [ids]}}`) can only tighten it; a file that doesn't parse
     fails closed (no unverified and no program-running plugin) and the install form says so.
     The daemon looks at the file every minute, whatever `update.autoCheck` says, and a change
@@ -719,6 +719,10 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   programs' "Runs programs" line: the job limits don't apply to it), and the engine runs it only for sessions in workspaces where the plugin
   is active and its tool is installed (`plugins/browser.rs`). The first-party Chromium plugin
   is the one that does.
+- **On Windows**, plugin jobs run in a Job Object with per-process memory, CPU-time and below-normal
+  priority limits (no per-file size limit), and the `current` activation pointer is a small pointer
+  file instead of a symlink. Agent-plugin installs are not available (run the agent's own `plugin`
+  commands).
 - **Where it's wired.**
   - **Daemon** (`crates/chimaera-server/src/plugins/`): `jobs.rs` (the queue, the limits, the
     POSIX `sh` preamble that sets them, the captured login environment, process-group kills,

@@ -14,6 +14,7 @@
   import DOMPurify from "dompurify";
   import { Marked } from "marked";
   import { basename, dirname, fsValidate, isImagePath, rawTicketUrl, resolveDocPath, safeDecodeUri } from "../files";
+  import { isRoot, isUnder } from "../../shared/paths";
   import { openPath, pathPaneFrom } from "../../shared/openPath";
   import { activateUrl } from "../../shared/urlOpen";
   import { followDocHref, showLinkHint } from "../docLinks";
@@ -84,10 +85,10 @@
   function bases(): string[] {
     const out: string[] = [];
     let dir = dirname(path);
-    const stop = wsRoot !== null && dir.startsWith(wsRoot) ? wsRoot : null;
+    const stop = wsRoot !== null && isUnder(dir, wsRoot) ? wsRoot : null;
     for (let i = 0; i < 8; i++) {
       out.push(dir);
-      if (dir === "/" || dir === stop) break;
+      if (isRoot(dir) || dir === stop) break;
       const up = dirname(dir);
       if (up === dir) break;
       dir = up;

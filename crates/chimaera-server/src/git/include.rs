@@ -414,7 +414,7 @@ fn copy_matching(
                 report.copied += 1;
                 report.bytes += n;
                 if report.names.len() < REPORTED_NAMES {
-                    report.names.push(rel.to_string_lossy().into_owned());
+                    report.names.push(chimaera_core::paths::wire_path(&rel));
                 }
             }
             Err(err) => {
@@ -573,6 +573,7 @@ mod tests {
         std::fs::write(src.join("secrets/deep/k.pem"), "k").unwrap();
         std::fs::write(src.join("node_modules/pkg/.env"), "no").unwrap();
         std::fs::write(src.join("build.log"), "no").unwrap();
+        #[cfg(unix)]
         std::os::unix::fs::symlink("/etc/hosts", src.join(".env.link")).unwrap();
         let patterns = Patterns::parse(".env\n.env.link\nsecrets/\n");
         // What `ls-files --others --ignored --directory` would print.

@@ -959,7 +959,7 @@ fn one_line(text: &str) -> String {
 fn rel(path: &str, root: Option<&Path>) -> String {
     let p = Path::new(path);
     match root.and_then(|r| p.strip_prefix(r).ok()) {
-        Some(r) if !r.as_os_str().is_empty() => r.to_string_lossy().into_owned(),
+        Some(r) if !r.as_os_str().is_empty() => chimaera_core::paths::wire_path(r),
         _ => path.to_string(),
     }
 }
@@ -1263,7 +1263,7 @@ fn transcript_pointer(live: &Live, record: &AgentRecord, native: Option<&str>) -
     let path = record
         .transcript_path
         .as_ref()
-        .map(|p| p.to_string_lossy().into_owned());
+        .map(|p| chimaera_core::paths::wire_path(p));
     if live.was_chat {
         Transcript {
             kind: "chat".into(),

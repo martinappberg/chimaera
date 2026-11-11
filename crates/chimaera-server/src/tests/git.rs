@@ -258,7 +258,7 @@ async fn git_worktree_create_is_managed_and_registered() {
     assert_eq!(body["worktree"]["branch"], "feat/x");
     assert!(wt_path.join("a.txt").exists(), "worktree is checked out");
     // Confined to the managed root.
-    let managed = std::fs::canonicalize(&state.worktrees_root).unwrap();
+    let managed = canonical(&state.worktrees_root);
     assert!(
         wt_path.starts_with(&managed),
         "{wt_path:?} under {managed:?}"
@@ -473,6 +473,7 @@ async fn git_status_on_a_non_repo_says_so() {
     assert_eq!(body["repo"], false);
 }
 
+#[cfg(unix)]
 /// `mark_path_dirty` canonicalizes before the `starts_with(ws.root)` prefix
 /// check, so a path that reaches the workspace through a symlink (sharing no
 /// component prefix with the canonical root) still bumps the git epoch. Before
@@ -526,6 +527,7 @@ async fn mark_path_dirty_canonicalizes_symlinked_paths() {
     );
 }
 
+#[cfg(unix)]
 /// What an agent-plugin install puts first on PATH: the Git binary path
 /// setting's directory — only when set, absolute and new enough — and never
 /// a login-shell git (already on that shell's PATH).

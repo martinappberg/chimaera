@@ -39,6 +39,31 @@ sha2 = "0.11"
 hostname = "0.4"
 nix = { version = "0.31", features = ["signal", "process", "fs"] }
 rustix = { version = "1", features = ["fs"] }
+# Windows: job objects, process liveness and the other Win32 calls the
+# daemon makes where Unix uses nix/rustix. The app workspace pins the same
+# major (0.61).
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+] }
+# Directory-confined file access that works on Windows too (the daemon's
+# rustix dirfd code is Unix-only); already in the graph through wasmtime-wasi.
+cap-std = "4"
+cap-fs-ext = "4"
+# Directory junctions: Windows' unprivileged stand-in for a directory symlink.
+junction = "1"
+# canonicalize without the Windows `\\?\` verbatim prefix (a no-op on Unix).
+dunce = "1"
 open = "5"
 mimalloc = "0.1"
 

@@ -112,11 +112,24 @@ fn app_askpass_env(vars: &[(String, String)], app_shim: &std::path::Path) -> Vec
 /// PATH — or the fixed system default when that is empty. A bare
 /// "{shims}:" tail is an empty final PATH member, which sh searches as
 /// the cwd (measured: a repo-local ./curl ran inside an install session).
+#[cfg(unix)]
 pub(crate) fn spawn_path(shims: &str, inherited: &str) -> String {
     if inherited.is_empty() {
         format!("{shims}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
     } else {
         format!("{shims}:{inherited}")
+    }
+}
+
+/// Windows lists PATH with `;`, and its fixed default is the system
+/// directories under `%SystemRoot%`.
+#[cfg(windows)]
+pub(crate) fn spawn_path(shims: &str, inherited: &str) -> String {
+    if inherited.is_empty() {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        format!(r"{shims};{root}\System32;{root};{root}\System32\WindowsPowerShell\v1.0")
+    } else {
+        format!("{shims};{inherited}")
     }
 }
 

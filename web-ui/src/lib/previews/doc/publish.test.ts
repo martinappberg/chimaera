@@ -92,6 +92,27 @@ describe("paths", () => {
     expect(stemOf("/ws/QC report.v2.md")).toBe("QC report.v2");
     expect(stemOf("/ws/a:b.md")).toBe("a-b");
   });
+
+  it("keeps a Windows drive or share root", () => {
+    expect(relPath("C:/ws/docs", "C:/ws/data/x.csv")).toBe("../data/x.csv");
+    expect(isInside("C:/ws/a", "C:/ws")).toBe(true);
+    expect(isInside("C:/wsx/a", "C:/ws")).toBe(false);
+    expect(isInside("C:/x", "C:/")).toBe(true);
+    expect(isInside("D:/x", "C:/")).toBe(false);
+    expect(commonDir(["C:/ws/docs", "C:/ws/data"])).toBe("C:/ws");
+    expect(commonDir(["C:/a", "C:/b"])).toBe("C:/");
+    expect(commonDir(["//srv/share/a/b", "//srv/share/a/c"])).toBe("//srv/share/a");
+    expect(stemOf("C:/ws/report.md")).toBe("report");
+  });
+
+  it("names exports Windows accepts", () => {
+    expect(stemOf("/ws/CON.md")).toBe("CON-document");
+    expect(stemOf("/ws/nul.tar.md")).toBe("nul.tar-document");
+    expect(stemOf("/ws/lpt1.md")).toBe("lpt1-document");
+    expect(stemOf("/ws/console.md")).toBe("console");
+    expect(stemOf("/ws/notes. .md")).toBe("notes");
+    expect(stemOf("/ws/....md")).toBe("document");
+  });
 });
 
 describe("the bundle", () => {
@@ -126,6 +147,23 @@ describe("the bundle", () => {
     ]);
     expect(plan.rewrites).toEqual([]);
     expect(plan.bytes).toBe(30);
+  });
+
+  it("lays out a bundle on a Windows drive", () => {
+    const src = "![p](figs/p.png) and [m](C:/ws/docs/methods.md)";
+    const [p] = docTargets(src);
+    const from = src.indexOf("C:/");
+    const m = target("C:/ws/docs/methods.md", { from, to: from + "C:/ws/docs/methods.md".length });
+    const plan = planBundle("C:/ws/docs/report.md", "C:/ws", [
+      found(p, "figs/p.png", "C:/ws/docs/figs/p.png"),
+      found(m, "C:/ws/docs/methods.md", "C:/ws/docs/methods.md"),
+      found(target("../../out.png", null, "image"), "../../out.png", "C:/out.png"),
+    ]);
+    expect(plan.root).toBe("C:/ws/docs");
+    expect(plan.doc).toBe("report/report.md");
+    expect(plan.files.map((f) => f.entry)).toEqual(["report/figs/p.png", "report/methods.md"]);
+    expect(plan.skipped).toEqual([{ href: "../../out.png", why: "outside" }]);
+    expect(applyEdits(src, plan.rewrites)).toBe("![p](figs/p.png) and [m](methods.md)");
   });
 
   it("rewrites absolute paths to relative ones, fragment kept", () => {

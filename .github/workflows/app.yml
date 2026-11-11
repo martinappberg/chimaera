@@ -103,11 +103,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: npm ci
         working-directory: crates/chimaera-app
-      # tauri's beforeBuildCommand installs and builds web-ui;
+      # tauri's beforeBuildCommand installs and builds web-ui on every leg;
       # setup-node above guarantees it sees a modern node — the UI build
-      # uses the exact version in .nvmrc. The windows
-      # overlay SKIPS that command: nothing in the Windows bundle consumes
-      # web-ui/dist (chimaera-server, its only consumer, is cfg(unix)).
+      # uses the exact version in .nvmrc. chimaera-server embeds the resulting
+      # web-ui/dist on all three platforms.
       #
       # createUpdaterArtifacts is forced off here: this check only proves the
       # app compiles and bundles. The signed updater artifact needs
@@ -115,7 +114,7 @@ jobs:
       # (release.yml on main) — a PR must not require it.
       - run: npx tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
         working-directory: crates/chimaera-app
-      # On Unix the app workspace pulls in chimaera-server, whose RustEmbed
+      # The app workspace pulls in chimaera-server, whose RustEmbed
       # derive requires web-ui/dist at compile time. Run tests after Tauri's
       # beforeBuildCommand has created that directory on a clean runner.
       - run: cargo test

@@ -4,7 +4,8 @@
 //! Locally, [`shell_launch`] materializes the scripts under the runtime dir
 //! and returns the argv + env that spawn the user's shell with the
 //! integration injected (bash `--init-file`, zsh `ZDOTDIR` shim, fish
-//! `vendor_conf.d`) while still sourcing their normal rc files. For remote
+//! `vendor_conf.d`; on Windows, PowerShell dot-sources its script after the
+//! user's profile) while still sourcing their normal rc files. For remote
 //! hosts (where nothing is installed), [`snippet`] returns a self-contained
 //! bash+zsh script the user can append to a remote rc file.
 
@@ -15,6 +16,7 @@ use anyhow::Context;
 pub const BASH: &str = include_str!("shellint/integration.bash");
 pub const ZSH: &str = include_str!("shellint/integration.zsh");
 pub const FISH: &str = include_str!("shellint/integration.fish");
+pub const POWERSHELL: &str = include_str!("shellint/integration.ps1");
 
 /// The environment-prelude sourcing block, POSIX syntax (bash and zsh both
 /// source it verbatim; fish gets an env-capture handler in its integration
@@ -104,6 +106,9 @@ pub fn materialize_in(base: &Path) -> anyhow::Result<PathBuf> {
     write_if_changed(&bash_script, BASH)?;
     write_if_changed(&zsh_script, ZSH)?;
     write_if_changed(&fish_dir.join("chimaera.fish"), FISH)?;
+    if cfg!(windows) {
+        write_if_changed(&dir.join("integration.ps1"), POWERSHELL)?;
+    }
 
     // bash --init-file replacement for ~/.bashrc: theirs first, then ours,
     // then the environment prelude (last, so it can override the rc).
@@ -135,8 +140,25 @@ pub fn materialize_in(base: &Path) -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
+/// The PowerShell argv that dot-sources `script` after the user's profile
+/// and stays interactive. `-ExecutionPolicy Bypass` scopes to this process:
+/// the default policy on client Windows refuses every script file.
+fn powershell_argv(shell: &str, script: &Path) -> Vec<String> {
+    let script = script.to_string_lossy().replace('\'', "''");
+    vec![
+        shell.to_string(),
+        "-NoLogo".to_string(),
+        "-NoExit".to_string(),
+        "-ExecutionPolicy".to_string(),
+        "Bypass".to_string(),
+        "-Command".to_string(),
+        format!(". '{script}'"),
+    ]
+}
+
 /// Compose the launch for `shell` with integration injected, materializing
-/// scripts under `base`. Unknown shells launch plain (no integration).
+/// scripts under `base`. Unknown shells launch plain (no integration), and
+/// so does cmd.exe, whose execs run in sentinel mode.
 pub fn shell_launch_for(shell: &str, base: &Path) -> anyhow::Result<ShellLaunch> {
     let dir = materialize_in(base)?;
     let name = Path::new(shell)
@@ -147,6 +169,16 @@ pub fn shell_launch_for(shell: &str, base: &Path) -> anyhow::Result<ShellLaunch>
         argv: vec![shell.to_string()],
         env: Vec::new(),
     };
+    if cfg!(windows) {
+        let name = name.to_ascii_lowercase();
+        if matches!(
+            name.strip_suffix(".exe").unwrap_or(&name),
+            "powershell" | "pwsh"
+        ) {
+            launch.argv = powershell_argv(shell, &dir.join("integration.ps1"));
+        }
+        return Ok(launch);
+    }
     match name.as_str() {
         "bash" => {
             launch.argv.push("--init-file".to_string());
@@ -221,6 +253,7 @@ mod tests {
         ] {
             assert!(dir.join(f).is_file(), "{f} missing");
         }
+        assert_eq!(dir.join("integration.ps1").is_file(), cfg!(windows));
         // Re-materializing rewrites nothing.
         materialize_in(&base).unwrap();
         let second = std::fs::metadata(dir.join("integration.bash"))
@@ -232,6 +265,83 @@ mod tests {
     }
 
     #[test]
+    fn powershell_argv_quotes_the_script_path() {
+        let argv = powershell_argv("pwsh.exe", Path::new("C:/Users/O'Brien/rt/integration.ps1"));
+        assert_eq!(
+            argv,
+            [
+                "pwsh.exe",
+                "-NoLogo",
+                "-NoExit",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                ". 'C:/Users/O''Brien/rt/integration.ps1'",
+            ]
+        );
+        assert!(POWERSHELL.contains("133;D;"));
+        assert!(POWERSHELL.contains("633;E;"));
+        assert!(POWERSHELL.contains("PSConsoleHostReadLine"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_launch_shapes() {
+        let base = test_base("winlaunch");
+        let ps = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+        let launch = shell_launch_for(ps, &base).unwrap();
+        assert_eq!(launch.argv[0], ps);
+        assert_eq!(launch.argv[5], "-Command");
+        assert!(launch.argv[6].ends_with("integration.ps1'"));
+        assert!(launch.env.is_empty());
+        let pwsh = shell_launch_for("C:/Program Files/PowerShell/7/PWSH.EXE", &base).unwrap();
+        assert_eq!(pwsh.argv.len(), 7);
+        let cmd = shell_launch_for(r"C:\Windows\system32\cmd.exe", &base).unwrap();
+        assert_eq!(cmd.argv, vec![r"C:\Windows\system32\cmd.exe"]);
+        assert!(cmd.env.is_empty());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The script parses and runs under the PowerShell this machine has
+    /// (5.1 at least): with redirected stdin PSReadLine is absent, so the
+    /// wrapped prompt reports only the cwd, in the drive-URL form.
+    #[test]
+    #[cfg(windows)]
+    fn powershell_prompt_reports_cwd() {
+        let base = test_base("psprompt");
+        let dir = materialize_in(&base).unwrap();
+        let script = dir.join("integration.ps1");
+        let out = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+            ])
+            .arg(format!(
+                ". '{}'; . '{}'; Set-Location C:\\Windows; [Console]::Out.Write((prompt))",
+                script.display(),
+                script.display()
+            ))
+            .output()
+            .expect("run powershell");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.trim().is_empty(), "stderr: {stderr}");
+        assert!(stdout.contains("\x1b]7;file://"), "{stdout:?}");
+        assert!(stdout.contains("/C:/Windows\x07"), "{stdout:?}");
+        assert!(stdout.contains("PS C:\\Windows>"), "{stdout:?}");
+        assert!(
+            !stdout.contains("133;A"),
+            "no PSReadLine, no prompt marks: {stdout:?}"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn launch_shapes_per_shell() {
         let base = test_base("launch");
 

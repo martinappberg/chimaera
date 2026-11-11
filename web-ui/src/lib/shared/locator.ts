@@ -19,6 +19,7 @@
  */
 
 import type { Locator } from "./reveal";
+import { basename } from "./paths";
 
 /** The keys a locator fragment may carry (a heading slug never has `=`). */
 const KEYS = new Set(["page", "xywh", "t", "row", "col", "cell", "sheet", "range", "slide"]);
@@ -131,7 +132,7 @@ function decodeSheet(v: string): string | null {
 }
 
 function extensionOf(path: string): string {
-  const base = path.slice(path.lastIndexOf("/") + 1);
+  const base = basename(path);
   const dot = base.lastIndexOf(".");
   return dot > 0 ? base.slice(dot + 1).toLowerCase() : "";
 }

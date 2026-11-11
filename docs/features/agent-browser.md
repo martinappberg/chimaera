@@ -246,6 +246,10 @@ marker), `layout/PaneTabs.svelte` (the chain link and chips). Wire: `browser_req
 
 - **macOS only for the app engine.** The Linux and Windows apps have no pane views; there the
   Chromium engine answers, or the refusal says what is missing.
+- **No engine on Windows.** The Chromium engine's DevTools pipe (fds 3 and 4) and its
+  process-group teardown are POSIX, so a Windows daemon's browser tools refuse and say so
+  (`chromium.rs`, `NOT_ON_WINDOWS`). Chrome and Edge take the pipe on Windows as inherited handles
+  (`--remote-debugging-io-pipes`), and a Job Object would replace the group; not built.
 - **Native `<select>`:** clicking one would open an NSMenu with a nested main-thread loop, so
   `browser_click` refuses it; use `browser_select`. A custom (drawn) listbox clicks normally.
 - **No right-click**, ever (the same NSMenu problem). No context-menu path exists.
@@ -286,7 +290,7 @@ marker), `layout/PaneTabs.svelte` (the chain link and chips). Wire: `browser_req
 ## Status: partial
 
 - The app engine runs on macOS only. Linux and Windows pane views, file upload and a live view
-  of a Chromium page are not built.
+  of a Chromium page are not built, and neither is the Chromium engine on Windows.
 
 ---
 

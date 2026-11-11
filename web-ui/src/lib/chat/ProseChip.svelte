@@ -12,6 +12,7 @@
   import { isMissing, resolveFile, type TargetInfo, type TargetResult } from "../shared/embed/embed";
   import { fragmentReveal, parseEmbedFragment } from "../shared/embed/fragment";
   import type { Reveal } from "../shared/reveal";
+  import { isAbsolute } from "../shared/paths";
   import type { HoverTargets } from "./hoverTargets";
 
   interface Props {
@@ -36,7 +37,7 @@
   }
 
   function ask(): Promise<TargetResult | null> {
-    const pending = resolve !== undefined ? resolve() : shown.startsWith("/") ? resolveFile(shown) : Promise.resolve(null);
+    const pending = resolve !== undefined ? resolve() : isAbsolute(shown) ? resolveFile(shown) : Promise.resolve(null);
     return pending.then((a) => {
       if (alive && a !== null) answer = a;
       return a;

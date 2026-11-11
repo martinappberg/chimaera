@@ -61,6 +61,7 @@ import {
   rewriteTabPaths,
   cycleTab,
   trimLive,
+  openFinder,
 } from "./layout";
 
 describe("adaptive empty panes and stable numbered destinations", () => {
@@ -870,5 +871,28 @@ describe("trimLive", () => {
     const k = keys(10);
     const out = trimLive(k, new Set(k.slice(1).map((key) => key.slice(2))), 8);
     expect(out).toEqual(k);
+  });
+});
+
+describe("daemon paths on a Windows host (wire form)", () => {
+  const finderPath = (l: Layout): string | undefined => {
+    const t = allTabs(l).find((x) => x.surface === "finder");
+    return t?.surface === "finder" ? t.path : undefined;
+  };
+
+  it("renames and deletes under drive-letter paths", () => {
+    let l = openFile(defaultLayout(), "C:/proj/old/a.md");
+    l = openFile(l, "C:/proj/older/b.md");
+    l = rewriteTabPaths(l, "C:/proj/old", "C:/proj/new");
+    expect(allFilePaths(l).sort()).toEqual(["C:/proj/new/a.md", "C:/proj/older/b.md"]);
+    l = pruneDeletedPath(l, "C:/proj/new");
+    expect(allFilePaths(l)).toEqual(["C:/proj/older/b.md"]);
+  });
+
+  it("a Finder at a deleted top-level folder retargets to the drive root", () => {
+    const l = openFinder(defaultLayout(), "C:/top/sub").layout;
+    expect(finderPath(pruneDeletedPath(l, "C:/top"))).toBe("C:/");
+    const unix = openFinder(defaultLayout(), "/top/sub").layout;
+    expect(finderPath(pruneDeletedPath(unix, "/top"))).toBe("/");
   });
 });

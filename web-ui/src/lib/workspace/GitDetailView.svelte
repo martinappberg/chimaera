@@ -32,6 +32,7 @@
   import { midTruncate } from "../previews/files";
   import { copyText } from "../shared/clipboard";
   import { referenceCommit } from "../shared/reference";
+  import { relativeTo } from "../shared/paths";
   import FileIcon from "../shared/FileIcon.svelte";
   import GitHistoryList from "./GitHistoryList.svelte";
 
@@ -170,7 +171,7 @@
   const relPath = $derived.by(() => {
     if (tab.path === undefined) return null;
     const r = repoForPath($gitRepos, tab.path);
-    const rel = r !== null && tab.path.startsWith(`${r.path}/`) ? tab.path.slice(r.path.length + 1) : null;
+    const rel = r !== null ? relativeTo(tab.path, r.path) : null;
     return rel !== null && rel.includes("/") ? rel : null;
   });
 

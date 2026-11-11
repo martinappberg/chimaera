@@ -144,6 +144,21 @@ describe("file patterns (the daemon's rules)", () => {
     expect(workspaceRelative("/w/p", "/w/pp/a.tex")).toBeNull();
     expect(workspaceRelative(null, "/w/p/a.tex")).toBeNull();
   });
+
+  it("handles a Windows daemon's drive-letter paths", async () => {
+    expect(workspaceRelative("C:/w/p", "C:/w/p/a/b.tex")).toBe("a/b.tex");
+    expect(workspaceRelative("C:/", "C:/a.tex")).toBe("a.tex");
+    expect(workspaceRelative("C:/w/p", "C:/w/p")).toBeNull();
+    expect(workspaceRelative("C:/w/p", "D:/w/p/a.tex")).toBeNull();
+    expect(plainRelative("C:/Windows/x")).toBe(false);
+    expect(plainRelative("C:x")).toBe(false);
+    expect(plainRelative("//srv/share/x")).toBe(false);
+    expect(plainRelative("a\\..\\..\\x")).toBe(false);
+    expect(plainRelative("a\\b.tex")).toBe(true);
+    await expect(resolvePlace("w", "C:/w/p", "demo", "a/b.tex")).resolves.toBe("C:/w/p/a/b.tex");
+    await expect(resolvePlace("w", "C:/", "demo", "a.tex")).resolves.toBe("C:/a.tex");
+    await expect(resolvePlace("w", "C:/w/p", "demo", "D:/x")).rejects.toThrow();
+  });
 });
 
 describe("what a plugin draws where", () => {

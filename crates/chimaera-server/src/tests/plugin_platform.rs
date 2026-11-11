@@ -202,10 +202,7 @@ async fn a_0_2_plugin_draws_every_node_and_acts() {
     }
     // The roots it asked for: the workspace and its output folder.
     let kv = find(&tree["root"], "keyvalue").unwrap();
-    assert_eq!(
-        kv["items"][0]["value"],
-        root_of(&state, &ws).display().to_string()
-    );
+    assert_eq!(kv["items"][0]["value"], wire(&root_of(&state, &ws)));
 
     // An action answers the new tree.
     let after = act(&state, &ws, "count", json!({"by": 2})).await;

@@ -24,7 +24,8 @@ fn skill(value: &Value, kind: AgentKind, root: &Path) -> Option<Value> {
         text(&value["source"], "path")
     } else {
         text(value, "path")
-    };
+    }
+    .map(|p| chimaera_core::paths::wire_path(Path::new(&p)));
     let plugin = text(value, "plugin")
         .or_else(|| text(&value["source"], "plugin"))
         .or_else(|| text(&value["source"], "plugin_name"));
@@ -49,13 +50,19 @@ fn skill(value: &Value, kind: AgentKind, root: &Path) -> Option<Value> {
     )
 }
 
+/// A plugin Grok loads from Claude's folders (either separator: the path is
+/// the agent's own, Windows-style there).
+fn claude_compat(path: &str) -> bool {
+    chimaera_core::paths::wire_path(Path::new(path)).contains("/.claude/")
+}
+
 fn grok_inventory(raw: &Value, root: &Path) -> Result<Value, &'static str> {
     let plugins: Vec<Value> = rows(raw,"plugins")?.iter().filter_map(|p| {
         let id = text(p,"name")?;
         Some(json!({"id":id,"enabled":p["enabled"].as_bool(),"scope":text(p,"scope"),
             "skills_n":p["provides"]["skills"].as_u64(),"has_hooks":p["provides"]["hooks"].as_bool(),
-            "actions": if p["scope"] == "project" || p["path"].as_str().is_some_and(|p| p.contains("/.claude/")) { vec![] } else { vec!["enable_plugin","disable_plugin","update_plugin"] },
-            "origin": if p["path"].as_str().is_some_and(|p| p.contains("/.claude/")) { "Claude compatibility" } else { "Grok" }}))
+            "actions": if p["scope"] == "project" || p["path"].as_str().is_some_and(claude_compat) { vec![] } else { vec!["enable_plugin","disable_plugin","update_plugin"] },
+            "origin": if p["path"].as_str().is_some_and(claude_compat) { "Claude compatibility" } else { "Grok" }}))
     }).collect();
     let skills: Vec<Value> = rows(raw, "skills")?
         .iter()

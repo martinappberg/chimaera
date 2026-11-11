@@ -239,6 +239,9 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         // The only way (besides an OS signal) to bring the daemon down — the
         // app drives it through the tunnel to shut a remote host down.
         .route("/shutdown", post(api::shutdown))
+        // In-band SIGTERM: stop the daemon, keeping every session for the
+        // next start (how a Windows client stops it).
+        .route("/stop", post(crate::lifecycle::stop))
         .route("/sessions/{id}/exec", post(api::exec_session))
         // Streamed to disk with its own per-file/per-session caps (see
         // `upload`); the DefaultBodyLimit override only lifts axum's 2MB

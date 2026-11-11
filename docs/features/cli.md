@@ -31,6 +31,9 @@ same static binary is the daemon, the remote-connect client, and the operator's 
 - **`kill` never SIGKILLs and never removes a live daemon's manifest.** It SIGTERMs the manifest pid,
   polls `is_alive()` ~5s, and removes the manifest **only** once the daemon is confirmed dead — so a
   daemon that survives (it still holds its port) never leaves clients reading "not running".
+- **On Windows**, `kill` has no SIGTERM: it calls `POST /api/v1/stop` (the graceful path SIGTERM takes
+  on Unix, with a restart handoff), then falls back to `TerminateProcess` if the daemon doesn't exit
+  (sessions are then lost).
 - **Layering is strictly one-way:** the binary → server / remote → core. The binary crate is
   delegation-only.
 

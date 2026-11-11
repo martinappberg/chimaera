@@ -89,6 +89,11 @@ and cluster-only connections). Replacement resolution precedes any daemon stop.
   The CLI and the app change `hosts.json` under one lock (`hosts.json.lock`), each change
   re-read from disk first, so neither writes back a stale copy over the other's.
 
+**On Windows**, the built-in OpenSSH has no ControlMaster, so every ssh call is its own connection
+(`ControlMaster=no`, `ControlPath=none`): key auth works but is slower, and password/2FA hosts
+prompt once per ssh call. Askpass uses the app exe itself as `SSH_ASKPASS` (`SSH_ASKPASS_REQUIRE=force`)
+over a token-gated loopback relay. The "one ControlMaster per host" behavior below does not apply.
+
 ## Key behaviors & gotchas
 
 - **One ControlMaster per host.** Every ssh/scp call rides one chimaera-owned master
@@ -121,7 +126,7 @@ and cluster-only connections). Replacement resolution precedes any daemon stop.
   `cancelled` relay reply — a secret always ends in a newline and that never does, so Enter on a
   prompt (an empty secret) stays an answer, and a relay that refused or died, replying nothing,
   is no cancel: ssh keeps its old "no answer" — the helper exits 75, and its shim (unix
-  `askpass.sh`, the WSL wrapper) sends `SIGTERM` to the ssh that ran it after leaving
+  `askpass.sh`) sends `SIGTERM` to the ssh that ran it after leaving
   `authentication cancelled` on stderr. Only Escape or the modal's cancel button cancels; a
   click on the backdrop does not, since a cancel now ends the attempt. `resolve_daemon` and `locate` read that line
   off a probe's failure — the first probe (before the cached scheduler is consulted, so a known

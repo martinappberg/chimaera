@@ -296,6 +296,7 @@ impl ComputeService {
         }
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     #[cfg(test)]
     pub(crate) fn with_bindir_and_job(dir: PathBuf, job: &str) -> Self {
         ComputeService {
@@ -576,6 +577,11 @@ pub(crate) async fn detect_tools(bindir: Option<&Path>) -> Option<Detection> {
         tracing::warn!(dir = %dir.display(), "CHIMAERA_SLURM_BINDIR set but scancel/squeue/sinfo not all present");
         return Some(Detection::None);
     }
+    // No Slurm client runs natively on Windows: definitively absent, never a
+    // login-shell probe to retry (CHIMAERA_SLURM_BINDIR above still applies).
+    if cfg!(windows) {
+        return Some(Detection::None);
+    }
     let shell = chimaera_core::login_shell();
     let out = run_capped(&shell, &["-lc".into(), "printf %s \"$PATH\"".into()]).await;
     let Some(path) = out else {
@@ -655,23 +661,7 @@ fn parse_queue_row(stdout: &str) -> Option<QueueRow> {
 /// PATH, resolved fresh). Empty PATH members are skipped — searching the cwd
 /// is sh legacy the daemon must not inherit.
 fn find_on_path(path: &str, name: &str) -> Option<PathBuf> {
-    std::env::split_paths(path)
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .map(|dir| dir.join(name))
-        .find(|p| is_executable(p))
-}
-
-#[cfg(unix)]
-fn is_executable(p: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    p.metadata()
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn is_executable(p: &Path) -> bool {
-    p.is_file()
+    chimaera_core::paths::find_on_path(name, Some(std::ffi::OsStr::new(path)))
 }
 
 /// One refresh: the user's queue, the partitions, and — when `self_job` is
@@ -1176,15 +1166,13 @@ mod tests {
     }
 
     /// Write executable stand-ins into `dir`.
+    #[cfg(unix)]
     fn tools(dir: &Path, scripts: &[(&str, &str)]) {
         for (name, body) in scripts {
             let p = dir.join(name);
             std::fs::write(&p, body).unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
     }
 
@@ -1440,6 +1428,8 @@ mod tests {
         );
     }
 
+    // The stand-in tools are sh scripts.
+    #[cfg(unix)]
     #[test]
     fn find_on_path_walks_skips_and_requires_exec() {
         let dir = test_dir("path");
@@ -1453,12 +1443,13 @@ mod tests {
 
         let path = format!("/nonexistent::{}", bin.display());
         assert_eq!(find_on_path(&path, "squeue"), Some(exe));
-        #[cfg(unix)]
         assert_eq!(find_on_path(&path, "sinfo"), None);
         assert_eq!(find_on_path("", "squeue"), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // The stand-in tools are sh scripts.
+    #[cfg(unix)]
     #[tokio::test]
     async fn snapshot_none_without_slurm_and_slurm_with_bindir() {
         // A bindir missing the binaries → none (and no login-shell probe).
@@ -1573,6 +1564,8 @@ mod tests {
         assert!(svc.inner.lock().await.agent_context.is_none());
     }
 
+    // The stand-in tools are sh scripts.
+    #[cfg(unix)]
     #[tokio::test]
     async fn cancel_self_stops_only_its_own_job() {
         // Not in a job → 404, without detecting anything.
@@ -1626,6 +1619,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // The stand-in tools are sh scripts.
+    #[cfg(unix)]
     #[tokio::test]
     async fn job_is_live_reads_state_absence_and_refusal() {
         let dir = test_dir("live");
@@ -1652,7 +1647,6 @@ mod tests {
         assert_eq!(job_is_live(&squeue, "1").await, Some(true));
         // Asked about this user's jobs only, with the name to prove it ours.
         let asked = std::fs::read_to_string(&args).unwrap();
-        #[cfg(unix)]
         assert_eq!(
             asked.trim(),
             format!(
@@ -1709,6 +1703,8 @@ mod tests {
     /// floods its stdout and then hangs is stopped at the cap and answers
     /// at once (it used to be read whole and then waited out to the
     /// deadline, which reads as "unanswered").
+    // The stand-in tools are sh scripts.
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_checked_caps_a_flood() {
         let dir = test_dir("flood");
@@ -1755,6 +1751,7 @@ mod tests {
     /// Run a just-written stand-in until the kernel lets it (a fork in
     /// another test can hold it busy for a moment), so the asserted calls
     /// that follow never meet "Text file busy".
+    #[cfg(unix)]
     fn runnable(script: &Path) {
         for _ in 0..100 {
             match std::process::Command::new(script).output() {

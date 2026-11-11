@@ -12,6 +12,8 @@
  * The shapes agents are told to write, and the ones they write anyway:
  *   src/x.rs:12   src/x.rs:12:3   src/x.rs:12-20   src/x.ts(12,3)
  *   src/x.rs#L12  src/x.rs#L12-L20  src/x.rs#L12C3  file:///abs/x.rs
+ *   C:/proj/x.rs:12  file:///C:/proj/x.rs (a Windows host's wire form: a
+ *   single letter and `:/` at the start is a drive, not a line suffix)
  *   paper.pdf#page=3&xywh=72,90,200,120  data.csv#row=5-9  demo.mp4#t=12,20
  *   (a locator: `locator.ts` parses it into the spot the viewer reveals)
  *   @src/x.ts (a Claude mention)  @"raw data/qc report.tsv" (Claude's quoted
@@ -29,6 +31,7 @@
  */
 
 import { isLocatorKey, parseLocator } from "./locator";
+import { isAbsolute } from "./paths";
 import type { Locator, Reveal } from "./reveal";
 
 /** A parsed reference. Lines and columns are 1-based. */
@@ -85,8 +88,16 @@ const TRAIL = new Set([...".,;:!?…。，、；：！？"]);
 /** `name.ext`: a letter-led extension. Long ones are real (`.safetensors`). */
 const NAME_EXT_RE = /^(.+)\.([\p{L}][\p{L}\p{N}_]{0,15})$/u;
 /** Characters no path candidate carries: controls, globs, shell syntax,
- *  backslashes (Windows paths never resolve on the daemon). */
+ *  backslashes (a Windows host speaks `C:/…`; the terminal converts a native
+ *  `C:\…` itself, `terminal/links.ts`). */
 const FORBIDDEN_RE = /[\u0000-\u001f\u007f\\*?"<>|`{}$]/;
+/** A drive-rooted path's prefix (`C:/`): its colon is not a line suffix. */
+const DRIVE_PREFIX_RE = /^[A-Za-z]:\//;
+
+/** Where the colons that may carry a line suffix begin: past a drive. */
+function colonFrom(path: string): number {
+  return DRIVE_PREFIX_RE.test(path) ? 2 : 0;
+}
 /** `me@example.com`: an address, not `icon@2x.png`. */
 const EMAIL_RE =
   /^[^@/\s]+@[^@/\s]+\.(?:com|org|net|edu|gov|io|dev|ai|co|uk|de|fr|jp|cn|ch|info|me|app)$/i;
@@ -181,7 +192,7 @@ function count(s: string, ch: string): number {
 function qualifies(path: string, bare: boolean): boolean {
   if (path.length === 0 || utf8Bytes(path) > FILE_REF_MAX_BYTES) return false;
   if (!/[\p{L}\p{N}]/u.test(path)) return false;
-  if (FORBIDDEN_RE.test(path) || path.includes(":")) return false;
+  if (FORBIDDEN_RE.test(path) || path.includes(":", colonFrom(path))) return false;
   if (path.startsWith("-") || path.startsWith("//")) return false;
   if (path.includes("/")) {
     // Dates and fractions (2024/01/02, 1/2) are not paths.
@@ -295,8 +306,10 @@ export function findFileRef(text: string, opts: FileRefOptions = {}): FoundRef |
     if (m === null || m[2] === undefined) return null;
     const host = (m[1] ?? "").toLowerCase();
     if (host !== "" && host !== "localhost") return null;
-    from += p.length - m[2].length;
-    p = m[2];
+    // `file:///C:/x`: the drive path is `C:/x`.
+    const body = /^\/[A-Za-z]:\//.test(m[2]) ? m[2].slice(1) : m[2];
+    from += p.length - body.length;
+    p = body;
     url = true;
   } else if (/^[a-z][a-z0-9+.-]*:\/\//i.test(p)) {
     return null; // another scheme: a web link, never a path
@@ -315,7 +328,7 @@ export function findFileRef(text: string, opts: FileRefOptions = {}): FoundRef |
 
   let ref: FileRef;
   const lines = anchor !== null ? lineAnchor(anchor) : null;
-  const colon = p.indexOf(":");
+  const colon = p.indexOf(":", colonFrom(p));
   if (colon >= 0) {
     const m = LINE_SUFFIX_RE.exec(p.slice(colon));
     // A colon that is not a line suffix: a scheme, `std::fs`, `host:path`.
@@ -490,14 +503,14 @@ export interface LinkContext {
  * root. Empty when nothing is known.
  */
 export function resolveBases(ctx: LinkContext, path: string): string[] {
-  if (path.startsWith("/") || path.startsWith("~")) {
+  if (isAbsolute(path) || path.startsWith("~")) {
     const any = ctx.cwd ?? ctx.spawnCwd ?? ctx.root ?? "/";
     return [any];
   }
   const dotted = path.startsWith("./") || path.startsWith("../");
   const out: string[] = [];
   for (const b of dotted ? [ctx.cwd, ctx.spawnCwd] : [ctx.cwd, ctx.spawnCwd, ctx.root]) {
-    if (b != null && b.startsWith("/") && !out.includes(b)) out.push(b);
+    if (b != null && isAbsolute(b) && !out.includes(b)) out.push(b);
   }
   return out;
 }

@@ -38,8 +38,8 @@ pub(crate) struct Anchor {
 impl Anchor {
     pub(crate) fn json(&self) -> serde_json::Value {
         json!({
-            "repo": self.repo.to_string_lossy(),
-            "worktree": self.worktree.to_string_lossy(),
+            "repo": chimaera_core::paths::wire_path(&self.repo),
+            "worktree": chimaera_core::paths::wire_path(&self.worktree),
             "branch": self.branch,
             "head": self.head,
             "at_ms": self.at_ms,

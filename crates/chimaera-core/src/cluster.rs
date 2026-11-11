@@ -821,6 +821,9 @@ mod tests {
         assert!(!dev.contains("AGENT_RULES_SOURCE"));
     }
 
+    // The job script runs on a cluster's Linux nodes; a Windows `bash` (Git
+    // Bash) reads paths and line endings its own way.
+    #[cfg(unix)]
     #[test]
     fn job_script_is_valid_bash() {
         let s = job_script(&JobScript {
@@ -849,6 +852,8 @@ mod tests {
         std::fs::canonicalize(&d).unwrap()
     }
 
+    // Cluster folders are remote POSIX paths.
+    #[cfg(unix)]
     #[test]
     fn browse_dir_lists_folders_marking_git_and_workspaces() {
         let root = scratch("dir");

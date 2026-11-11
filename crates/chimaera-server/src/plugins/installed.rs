@@ -24,8 +24,9 @@
 //!   `verified`, none (a copy installed before it was kept, or a local build
 //!   without one) is not, a mismatch is a fault and the copy never loads
 //!   until the same version is installed again (the card's Reinstall).
-//! - **Links move atomically**: a symlink under a fresh name, then rename(2)
-//!   over the old one — `runtimes.rs`'s idiom for the managed agent CLIs.
+//! - **Links move atomically**: a symlink (on Windows a pointer file) under
+//!   a fresh name, then rename(2) over the old one — `runtimes.rs`'s idiom
+//!   for the managed agent CLIs.
 //!   An update never touches the version in use; the version it replaced
 //!   becomes `previous`, and older ones are removed (two versions on disk at
 //!   most). Use previous swaps `current` and `previous`, so it is reversible.
@@ -290,9 +291,8 @@ fn read_capped(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
 /// The version a link in `dir` names; `None` when there is no link. A link
 /// naming anything but a plain version directory is refused.
 fn link(dir: &Path, name: &str) -> Result<Option<String>, String> {
-    match std::fs::read_link(dir.join(name)) {
+    match read_link_target(&dir.join(name)) {
         Ok(target) => {
-            let target = target.to_string_lossy().into_owned();
             super::plugin_version(&target)
                 .map_err(|_| format!("{name} points at {target:?}, not a version directory"))?;
             Ok(Some(target))
@@ -302,7 +302,7 @@ fn link(dir: &Path, name: &str) -> Result<Option<String>, String> {
     }
 }
 
-/// Point `dir/name` at `version` atomically: a symlink under a fresh name,
+/// Point `dir/name` at `version` atomically: a link under a fresh name,
 /// then rename(2) over the old link. The target is relative, so a moved
 /// data dir keeps working.
 fn swap_link(dir: &Path, name: &str, version: &str) -> std::io::Result<()> {
@@ -311,8 +311,37 @@ fn swap_link(dir: &Path, name: &str, version: &str) -> std::io::Result<()> {
         Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err),
         _ => {}
     }
-    std::os::unix::fs::symlink(version, &staged)?;
+    write_link(version, &staged)?;
     std::fs::rename(&staged, dir.join(name))
+}
+
+/// A link is a symlink on Unix. Windows creates symlinks only with
+/// Developer Mode or elevation, so there it is a pointer file holding the
+/// version name; rename replaces an existing file atomically there too.
+#[cfg(unix)]
+fn write_link(target: &str, at: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, at)
+}
+
+#[cfg(windows)]
+fn write_link(target: &str, at: &Path) -> std::io::Result<()> {
+    std::fs::write(at, target.as_bytes())
+}
+
+/// What the link at `at` names (`NotFound` when there is none).
+#[cfg(unix)]
+fn read_link_target(at: &Path) -> std::io::Result<String> {
+    std::fs::read_link(at).map(|t| t.to_string_lossy().into_owned())
+}
+
+#[cfg(windows)]
+fn read_link_target(at: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    // A version name is short; a larger file is not a pointer this wrote,
+    // and the version check below refuses whatever the cap leaves.
+    let mut bytes = Vec::new();
+    std::fs::File::open(at)?.take(256).read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// A name no other staging in this process (or a previous one) uses.
@@ -757,8 +786,7 @@ async fn install_path(
     // Read and checked first: the switches of an id new to this daemon go
     // before anything is in place under it.
     let (m, files, src) = blocking(move || {
-        let src = src
-            .canonicalize()
+        let src = chimaera_core::paths::canonicalize(&src)
             .map_err(|e| Refusal::bad_request(format!("{}: {e}", src.display())))?;
         if !src.is_dir() {
             return Err(Refusal::bad_request(format!(
@@ -816,7 +844,7 @@ async fn install_path(
     let at_pin = pinned && super::lock_entry(&m.id).is_some_and(|l| l.version == m.version);
     // Asked once per id and capability digest: rebuilding and adding again
     // (the development loop) doesn't ask again.
-    let source_key = format!("path:{}", src.display());
+    let source_key = format!("path:{}", chimaera_core::paths::wire_path(&src));
     reload_policy(state).await;
     let admitted = super::trust::admit(
         state,
@@ -1260,7 +1288,7 @@ mod tests {
         swap_link(&root.join("liar"), CURRENT, "1.0.0").unwrap();
         // A link that names no version.
         std::fs::create_dir_all(root.join("odd")).unwrap();
-        std::os::unix::fs::symlink("../demo/0.2.0", root.join("odd/current")).unwrap();
+        write_link("../demo/0.2.0", &root.join("odd/current")).unwrap();
         // Hidden and staging names are never read.
         std::fs::create_dir_all(root.join(".tmp-x")).unwrap();
 
@@ -1390,11 +1418,12 @@ mod tests {
         assert_eq!(load(&root).origin.fault.as_deref(), Some(SUMS_MISMATCH));
 
         std::fs::remove_file(v.join(SUMS)).unwrap();
-        std::fs::write(v.join(LOCAL_PATH), "/home/me/demo\n").unwrap();
-        assert_eq!(
-            load(&root).origin.local_path,
-            Some(PathBuf::from("/home/me/demo"))
-        );
+        #[cfg(unix)]
+        let local = "/home/me/demo";
+        #[cfg(windows)]
+        let local = "C:/Users/me/demo";
+        std::fs::write(v.join(LOCAL_PATH), format!("{local}\n")).unwrap();
+        assert_eq!(load(&root).origin.local_path, Some(PathBuf::from(local)));
         let _ = std::fs::remove_dir_all(root);
     }
 

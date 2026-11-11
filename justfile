@@ -25,6 +25,13 @@ check: plugins
     # nobody committed. CI runs the same tests in check mode instead.
     test -z "$(git status --porcelain -- web-ui/src/lib/net/fixtures/wire)" || { echo "wire fixtures changed: review the diff (a daemon↔UI contract change), run the web-ui tests, and commit web-ui/src/lib/net/fixtures/wire"; git status --short -- web-ui/src/lib/net/fixtures/wire; exit 1; }
 
+# Windows compile check from a Mac/Linux box (no tests; CI's `windows` job is the
+# real gate). One-time setup: `brew install mingw-w64` and
+# `rustup target add x86_64-pc-windows-gnu`, then export
+# CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc
+win-check:
+    cargo check --target x86_64-pc-windows-gnu --workspace --all-targets
+
 fmt:
     cargo fmt --all
     cargo fmt --all --manifest-path plugins/Cargo.toml

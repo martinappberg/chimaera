@@ -195,3 +195,24 @@ describe("chipLabels", () => {
     expect(chipLabels([])).toEqual(new Map());
   });
 });
+
+describe("Windows-host paths", () => {
+  it("mentions drive paths in wire form, URLs still skipped", () => {
+    expect(
+      artifactMentions([
+        "Saved C:/Users/me/proj/figs/umap.png and C:\\Users\\me\\proj\\report.html; see https://x.org/a.png",
+      ]),
+    ).toEqual(["C:/Users/me/proj/figs/umap.png", "C:/Users/me/proj/report.html"]);
+    expect(artifactMentions(["file:///C:/x/a.png"])).toEqual([]);
+  });
+
+  it("matches a drive path exactly and a relative name by suffix", () => {
+    expect(namesFile("figs/umap.png", "C:/proj/figs/umap.png")).toBe(true);
+    expect(namesFile("C:/proj/figs/umap.png", "C:/proj/figs/umap.png")).toBe(true);
+    expect(namesFile("C:/other/umap.png", "C:/proj/umap.png")).toBe(false);
+  });
+
+  it("embeds a drive path from prose", () => {
+    expect(proseEmbedTargets(["![u](C:/proj/figs/u.png)"])).toEqual(["C:/proj/figs/u.png"]);
+  });
+});

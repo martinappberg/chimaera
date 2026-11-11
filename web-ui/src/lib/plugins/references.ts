@@ -10,6 +10,7 @@
  */
 import { registerReferenceSource, type RefShape, type RefSource, type RefSpan, type RefTarget } from "../shared/references";
 import { openPath } from "../shared/openPath";
+import { isAbsolute, joinPath } from "../shared/paths";
 import { fetchSurface, onPlatformFrame, openPluginView, type SurfaceItem } from "./platform";
 import { workspacePlugins } from "./store";
 
@@ -85,7 +86,7 @@ export function pluginSource(refs: PluginRefs, name: string, root: string | null
     note: [r.id, r.kind, name].filter((x, i, all) => all.indexOf(x) === i).join(" · "),
     open: (from) => {
       if (r.span !== undefined) {
-        const path = r.span.path.startsWith("/") ? r.span.path : root !== null ? `${root}/${r.span.path}` : null;
+        const path = isAbsolute(r.span.path) ? r.span.path : root !== null ? joinPath(root, r.span.path) : null;
         if (path === null) return;
         const endLine = r.span.end_line > r.span.line ? r.span.end_line : undefined;
         openPath(path, "file", {

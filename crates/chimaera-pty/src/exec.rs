@@ -127,17 +127,75 @@ fn validate(command: &str) -> Result<(), ExecError> {
     Ok(())
 }
 
+/// The language a session's shell reads, which picks the sentinel line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShellKind {
+    /// sh, bash, zsh, fish, and anything unrecognized.
+    Posix,
+    /// Windows PowerShell 5.1 or PowerShell 7.
+    PowerShell,
+    /// cmd.exe.
+    Cmd,
+}
+
+impl ShellKind {
+    /// Classify a session's program. Unix sessions are always POSIX (a
+    /// `pwsh` login shell there keeps the behavior it always had).
+    pub(crate) fn of(program: &str) -> ShellKind {
+        if !cfg!(windows) {
+            return ShellKind::Posix;
+        }
+        let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+        let name = name.to_ascii_lowercase();
+        match name.strip_suffix(".exe").unwrap_or(&name) {
+            "powershell" | "pwsh" => ShellKind::PowerShell,
+            "cmd" => ShellKind::Cmd,
+            _ => ShellKind::Posix,
+        }
+    }
+}
+
 /// The sentinel wrapper: emit our own 133;C/D marks around the command from
-/// whatever POSIX-ish shell is on the other side. Runs in the current shell
-/// (no subshell), so `cd`/`export`/`module load` keep their effect.
-fn sentinel_line(command: &str) -> String {
-    format!("printf '\\033]133;C\\007'; {command}; printf '\\033]133;D;%s\\007' \"$?\"\r")
+/// whatever shell is on the other side. Runs in the current shell (no
+/// subshell), so `cd`/`export`/`module load` keep their effect.
+fn sentinel_line(command: &str, shell: ShellKind) -> String {
+    match shell {
+        ShellKind::Posix => {
+            format!("printf '\\033]133;C\\007'; {command}; printf '\\033]133;D;%s\\007' \"$?\"\r")
+        }
+        // `$?` is false after a failed cmdlet or a native nonzero exit;
+        // `$LASTEXITCODE` carries the native code but goes stale across
+        // cmdlets, so it only counts when this command changed it.
+        ShellKind::PowerShell => format!(
+            "$__chimaera_lec = $global:LASTEXITCODE; \
+             [Console]::Write(\"$([char]27)]133;C$([char]7)\"); {command}; \
+             $__chimaera_ok = $?; \
+             [Console]::Write(\"$([char]27)]133;D;$(if ($__chimaera_ok) {{ 0 }} \
+             elseif ($global:LASTEXITCODE -and $global:LASTEXITCODE -ne $__chimaera_lec) \
+             {{ $global:LASTEXITCODE }} else {{ 1 }})$([char]7)\")\r"
+        ),
+        // cmd.exe cannot type an ESC (ConPTY parses it as a key), so Windows
+        // PowerShell, always present in System32, writes the marks. Its
+        // payload stays unquoted because `^` escapes nothing inside quotes:
+        // `call` re-expands `%^errorlevel%` after the command ran, and
+        // `[char]59` stands in for `;`, which cmd splits arguments on.
+        ShellKind::Cmd => {
+            let ps = "%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe \
+                      -NoLogo -NoProfile -NonInteractive -Command";
+            format!(
+                "{ps} [Console]::Write([string][char]27+']133'+[char]59+'C'+[char]7) & \
+                 {command} & call {ps} \
+                 [Console]::Write([string][char]27+']133'+[char]59+'D'+[char]59+'%^errorlevel%'+[char]7)\r"
+            )
+        }
+    }
 }
 
 pub(crate) async fn exec(
     marks: Arc<Marks>,
     input: tokio::sync::mpsc::Sender<Bytes>,
     exec_lock: Arc<tokio::sync::Mutex<()>>,
+    shell: ShellKind,
     opts: ExecOptions,
 ) -> Result<ExecOutcome, ExecError> {
     validate(&opts.command)?;
@@ -153,7 +211,7 @@ pub(crate) async fn exec(
     let _guard = exec_lock.lock().await;
 
     let queue_deadline = start + opts.queue_timeout;
-    let mode = wait_ready(&marks, &opts, start, queue_deadline).await?;
+    let (mode, over_running) = wait_ready(&marks, &opts, start, queue_deadline).await?;
     if mode == ExecMode::Sentinel {
         wait_quiet(&marks, queue_deadline).await?;
     }
@@ -162,7 +220,10 @@ pub(crate) async fn exec(
     let token = marks.expect_agent_command(opts.command.clone(), mode == ExecMode::Sentinel);
     let line = match mode {
         ExecMode::Integrated => format!("{}\r", opts.command),
-        ExecMode::Sentinel => sentinel_line(&opts.command),
+        // Typing over a running command reaches the shell that command
+        // forwards to (ssh and friends), a POSIX shell elsewhere.
+        ExecMode::Sentinel if over_running => sentinel_line(&opts.command, ShellKind::Posix),
+        ExecMode::Sentinel => sentinel_line(&opts.command, shell),
     };
     if input.send(Bytes::from(line)).await.is_err() {
         marks.clear_agent_expect(token);
@@ -226,13 +287,15 @@ fn never_started(marks: &Marks, mode: ExecMode, window: Duration) -> ExecError {
 /// Wait until the shell can accept a command, deciding the mode:
 /// `ready` -> integrated (sentinel if this shell's command-start marks are
 /// known-broken); never-integrated (after a boot grace) -> sentinel;
-/// stuck `running` -> sentinel only when the caller allows it.
+/// stuck `running` -> sentinel only when the caller allows it (flagged by
+/// the second field: the keystrokes then reach whatever the foreground
+/// forwards them to, not this session's shell).
 async fn wait_ready(
     marks: &Marks,
     opts: &ExecOptions,
     start: Instant,
     queue_deadline: Instant,
-) -> Result<ExecMode, ExecError> {
+) -> Result<(ExecMode, bool), ExecError> {
     let mut phase_rx = marks.phase_watch();
     let unknown_grace = start + UNKNOWN_GRACE.min(opts.queue_timeout);
     loop {
@@ -241,21 +304,21 @@ async fn wait_ready(
         match phase {
             ShellPhase::Ready => {
                 return Ok(if marks.integration_start_broken() {
-                    ExecMode::Sentinel
+                    (ExecMode::Sentinel, false)
                 } else {
-                    ExecMode::Integrated
+                    (ExecMode::Integrated, false)
                 });
             }
             ShellPhase::Unknown => {
                 if now >= unknown_grace {
-                    return Ok(ExecMode::Sentinel);
+                    return Ok((ExecMode::Sentinel, false));
                 }
                 let _ = tokio::time::timeout_at(unknown_grace, phase_rx.changed()).await;
             }
             ShellPhase::Running => {
                 if now >= queue_deadline {
                     return if opts.allow_sentinel_over_running {
-                        Ok(ExecMode::Sentinel)
+                        Ok((ExecMode::Sentinel, true))
                     } else {
                         Err(ExecError::Busy(
                             "a command is running in this terminal (queue timeout elapsed)".into(),
@@ -313,9 +376,45 @@ mod tests {
 
     #[test]
     fn sentinel_line_wraps_with_marks() {
-        let line = sentinel_line("module load samtools");
+        let line = sentinel_line("module load samtools", ShellKind::Posix);
         assert!(line.starts_with("printf '\\033]133;C\\007'; module load samtools;"));
         assert!(line.ends_with("\"$?\"\r"));
+    }
+
+    #[test]
+    fn sentinel_line_per_shell_kind() {
+        let ps = sentinel_line("Get-Date", ShellKind::PowerShell);
+        assert!(ps.contains("]133;C$([char]7)\"); Get-Date; $__chimaera_ok = $?;"));
+        assert!(ps.contains("]133;D;"));
+        assert!(ps.ends_with(")\r"));
+        assert!(!ps.contains('\n'));
+        let cmd = sentinel_line("dir", ShellKind::Cmd);
+        assert!(cmd.contains("& dir & call "));
+        assert!(cmd.contains("%^errorlevel%"));
+        assert!(!cmd.contains('"'), "cmd sentinel must not quote: {cmd}");
+        assert!(!cmd.contains('\n'));
+    }
+
+    #[test]
+    fn shell_kind_classification() {
+        assert_eq!(ShellKind::of("/bin/bash"), ShellKind::Posix);
+        let windows = cfg!(windows);
+        for (program, kind) in [
+            (
+                "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+                ShellKind::PowerShell,
+            ),
+            ("pwsh.exe", ShellKind::PowerShell),
+            (
+                "C:/Program Files/PowerShell/7/PWSH.EXE",
+                ShellKind::PowerShell,
+            ),
+            ("C:\\Windows\\system32\\cmd.exe", ShellKind::Cmd),
+            ("bash.exe", ShellKind::Posix),
+        ] {
+            let expected = if windows { kind } else { ShellKind::Posix };
+            assert_eq!(ShellKind::of(program), expected, "{program}");
+        }
     }
 
     /// A shell that shows prompt marks but never emits 133;C for typed
@@ -339,16 +438,28 @@ mod tests {
 
         // First exec: integrated (phase ready), types the plain command,
         // no 133;C ever arrives -> NeverStarted + the session remembers.
-        let err = exec(marks.clone(), tx.clone(), lock.clone(), opts.clone())
-            .await
-            .unwrap_err();
+        let err = exec(
+            marks.clone(),
+            tx.clone(),
+            lock.clone(),
+            ShellKind::Posix,
+            opts.clone(),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, ExecError::NeverStarted(_)));
         assert_eq!(rx.recv().await.unwrap(), Bytes::from("echo hi\r"));
         assert!(marks.integration_start_broken());
 
         // Second exec on the same session: still phase ready, but typed
         // sentinel-wrapped; completes off its own printf'd marks.
-        let task = tokio::spawn(exec(marks.clone(), tx.clone(), lock.clone(), opts));
+        let task = tokio::spawn(exec(
+            marks.clone(),
+            tx.clone(),
+            lock.clone(),
+            ShellKind::Posix,
+            opts,
+        ));
         let typed = rx.recv().await.unwrap();
         let line = String::from_utf8(typed.to_vec()).unwrap();
         assert!(line.starts_with("printf"), "expected sentinel line: {line}");

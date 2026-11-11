@@ -172,11 +172,11 @@ pub(crate) async fn repos(
                 .iter()
                 .filter(|t| **t != repo.toplevel && repo.toplevel.starts_with(t))
                 .max_by_key(|t| t.as_os_str().len())
-                .map(|t| t.to_string_lossy().into_owned());
+                .map(|t| chimaera_core::paths::wire_path(t));
             let rel = match kind {
                 super::repos::RepoKind::Enclosing => None,
                 _ => repo.toplevel.strip_prefix(&ws.root).ok().map(|r| {
-                    let r = r.to_string_lossy().into_owned();
+                    let r = chimaera_core::paths::wire_path(r);
                     if r.is_empty() {
                         ".".to_string()
                     } else {
@@ -185,7 +185,7 @@ pub(crate) async fn repos(
                 }),
             };
             json!({
-                "path": repo.toplevel.to_string_lossy(),
+                "path": chimaera_core::paths::wire_path(&repo.toplevel),
                 "rel": rel,
                 "kind": kind.as_str(),
                 "submodule": *kind == super::repos::RepoKind::Submodule,
@@ -351,9 +351,11 @@ pub(crate) async fn worktrees(
         Ok(list) => {
             let managed_root = {
                 let root = state.worktrees_root.clone();
-                tokio::task::spawn_blocking(move || std::fs::canonicalize(&root).unwrap_or(root))
-                    .await
-                    .unwrap_or_else(|_| state.worktrees_root.clone())
+                tokio::task::spawn_blocking(move || {
+                    chimaera_core::paths::canonicalize(&root).unwrap_or(root)
+                })
+                .await
+                .unwrap_or_else(|_| state.worktrees_root.clone())
             };
             // Against the main checkout's branch, per other worktree (a
             // bounded handful per refresh): how far ahead/behind it is, and
@@ -437,7 +439,7 @@ pub(crate) async fn worktrees(
                 .zip(vs_main)
                 .map(|((w, merged), counts)| {
                     json!({
-                        "path": w.path.to_string_lossy(),
+                        "path": chimaera_core::paths::wire_path(&w.path),
                         "branch": w.branch,
                         "head": w.head,
                         "detached": w.detached,
@@ -731,10 +733,10 @@ fn is_binary(bytes: &[u8]) -> bool {
 /// and re-attaching the file name, and finally to the raw path.
 pub(super) fn repo_relative(toplevel: &Path, abs: &str) -> Option<String> {
     let raw = Path::new(abs);
-    let resolved = std::fs::canonicalize(raw).ok().or_else(|| {
+    let resolved = chimaera_core::paths::canonicalize(raw).ok().or_else(|| {
         let parent = raw.parent()?;
         let name = raw.file_name()?;
-        Some(std::fs::canonicalize(parent).ok()?.join(name))
+        Some(chimaera_core::paths::canonicalize(parent).ok()?.join(name))
     });
     let candidate = resolved.as_deref().unwrap_or(raw);
     let rel = candidate.strip_prefix(toplevel).ok()?;
@@ -744,7 +746,7 @@ pub(super) fn repo_relative(toplevel: &Path, abs: &str) -> Option<String> {
     {
         return None;
     }
-    Some(rel.to_string_lossy().into_owned())
+    Some(chimaera_core::paths::wire_path(rel))
 }
 
 #[cfg(test)]

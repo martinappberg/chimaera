@@ -7,9 +7,8 @@
 //! duplex pipe, deflate window, and entry-capped traversal stack; nothing is
 //! spooled to disk.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs::{File, Metadata};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -81,7 +80,7 @@ impl ZipPathBudget {
     }
 
     fn reserve(&mut self, path: &FsPath) -> anyhow::Result<()> {
-        let bytes = path.as_os_str().as_bytes().len();
+        let bytes = path.as_os_str().as_encoded_bytes().len();
         let Some(next) = self.used.checked_add(bytes) else {
             anyhow::bail!("zip traversal path budget overflow");
         };
@@ -96,7 +95,7 @@ impl ZipPathBudget {
     }
 
     fn release(&mut self, path: &FsPath) {
-        self.used -= path.as_os_str().as_bytes().len();
+        self.used -= path.as_os_str().as_encoded_bytes().len();
     }
 }
 
@@ -304,15 +303,7 @@ enum OpenedTicketTarget {
 /// a plain download, and a folder walk inherits this already-anchored root.
 async fn open_ticket_target(path: PathBuf) -> anyhow::Result<OpenedTicketTarget> {
     tokio::task::spawn_blocking(move || {
-        let fd = rustix::fs::open(
-            &path,
-            rustix::fs::OFlags::RDONLY
-                | rustix::fs::OFlags::NOFOLLOW
-                | rustix::fs::OFlags::CLOEXEC
-                | rustix::fs::OFlags::NONBLOCK,
-            rustix::fs::Mode::empty(),
-        )?;
-        let file = File::from(fd);
+        let file = open_nofollow(&path, Beneath::Any)?;
         let metadata = file.metadata()?;
         if metadata.is_dir() {
             Ok(OpenedTicketTarget::Directory(Arc::new(file)))
@@ -339,41 +330,61 @@ async fn list_zip_directory(
     remaining: usize,
 ) -> anyhow::Result<Option<(Metadata, Vec<OsString>)>> {
     tokio::task::spawn_blocking(move || {
-        let directory = match open_beneath(
-            &root,
-            &relative,
-            rustix::fs::OFlags::RDONLY
-                | rustix::fs::OFlags::DIRECTORY
-                | rustix::fs::OFlags::NOFOLLOW
-                | rustix::fs::OFlags::CLOEXEC,
-        ) {
+        let directory = match open_beneath(&root, &relative, Beneath::Dir) {
             Ok(directory) => directory,
             Err(_) => return Ok(None),
         };
         let metadata = directory.metadata()?;
         let mut names = Vec::new();
         let mut retained_name_bytes = 0;
-        let mut listing = match rustix::fs::Dir::read_from(&directory) {
-            Ok(listing) => listing,
-            Err(_) => return Ok(None),
-        };
-        while let Some(entry) = listing.read() {
-            let Ok(entry) = entry else {
-                break; // unreadable remainder: preserve the usable prefix
+        #[cfg(unix)]
+        {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            let mut listing = match rustix::fs::Dir::read_from(&directory) {
+                Ok(listing) => listing,
+                Err(_) => return Ok(None),
             };
-            let bytes = entry.file_name().to_bytes();
-            if bytes == b"." || bytes == b".." {
-                continue;
+            while let Some(entry) = listing.read() {
+                let Ok(entry) = entry else {
+                    break; // unreadable remainder: preserve the usable prefix
+                };
+                let bytes = entry.file_name().to_bytes();
+                if bytes == b"." || bytes == b".." {
+                    continue;
+                }
+                if names.len() >= remaining {
+                    anyhow::bail!("more than {MAX_ZIP_ENTRIES} entries — refusing to zip");
+                }
+                charge_directory_name_bytes(
+                    &mut retained_name_bytes,
+                    bytes.len(),
+                    MAX_ZIP_DIRECTORY_NAME_BYTES,
+                )?;
+                names.push(OsStr::from_bytes(bytes).to_os_string());
             }
-            if names.len() >= remaining {
-                anyhow::bail!("more than {MAX_ZIP_ENTRIES} entries — refusing to zip");
+        }
+        #[cfg(windows)]
+        {
+            let listing = match cap_dir(&directory).and_then(|dir| dir.entries()) {
+                Ok(listing) => listing,
+                Err(_) => return Ok(None),
+            };
+            for entry in listing {
+                let Ok(entry) = entry else {
+                    break; // unreadable remainder: preserve the usable prefix
+                };
+                let name = entry.file_name();
+                if names.len() >= remaining {
+                    anyhow::bail!("more than {MAX_ZIP_ENTRIES} entries — refusing to zip");
+                }
+                charge_directory_name_bytes(
+                    &mut retained_name_bytes,
+                    name.as_encoded_bytes().len(),
+                    MAX_ZIP_DIRECTORY_NAME_BYTES,
+                )?;
+                names.push(name);
             }
-            charge_directory_name_bytes(
-                &mut retained_name_bytes,
-                bytes.len(),
-                MAX_ZIP_DIRECTORY_NAME_BYTES,
-            )?;
-            names.push(OsStr::from_bytes(bytes).to_os_string());
         }
         Ok(Some((metadata, names)))
     })
@@ -389,14 +400,7 @@ async fn open_zip_entry(
     relative: PathBuf,
 ) -> anyhow::Result<Option<OpenedZipEntry>> {
     tokio::task::spawn_blocking(move || {
-        let file = match open_beneath(
-            &root,
-            &relative,
-            rustix::fs::OFlags::RDONLY
-                | rustix::fs::OFlags::NOFOLLOW
-                | rustix::fs::OFlags::CLOEXEC
-                | rustix::fs::OFlags::NONBLOCK,
-        ) {
+        let file = match open_beneath(&root, &relative, Beneath::Any) {
             Ok(file) => file,
             Err(_) => return Ok(None),
         };
@@ -414,40 +418,167 @@ async fn open_zip_entry(
     .map_err(|e| anyhow::anyhow!("zip entry task failed: {e}"))?
 }
 
+/// What the last component of [`open_beneath`] / [`open_nofollow`] must be.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Beneath {
+    /// A directory.
+    Dir,
+    /// Anything, opened read-only (non-blocking on Unix, so a FIFO planted
+    /// in the walk cannot park the worker); callers classify it by its
+    /// metadata.
+    Any,
+}
+
+#[cfg(unix)]
+impl Beneath {
+    fn flags(self) -> rustix::fs::OFlags {
+        use rustix::fs::OFlags;
+        match self {
+            Beneath::Dir => OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Beneath::Any => OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        }
+    }
+}
+
+/// Open `path` itself, refusing a link (symlink, or on Windows a junction
+/// or any other name-surrogate reparse point) at its last component; the
+/// components before it resolve as usual.
+pub(crate) fn open_nofollow(path: &FsPath, kind: Beneath) -> std::io::Result<File> {
+    #[cfg(unix)]
+    {
+        Ok(File::from(rustix::fs::open(
+            path,
+            kind.flags(),
+            rustix::fs::Mode::empty(),
+        )?))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+        // OPEN_REPARSE_POINT opens a link itself instead of its target, so
+        // the metadata check below sees it; BACKUP_SEMANTICS lets a
+        // directory open at all.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?;
+        refuse_links(file, kind)
+    }
+}
+
+/// A directory opened by path, following links as `File::open` does: the
+/// root a confined walk starts from. Windows needs backup semantics to open
+/// a directory at all.
+pub(crate) fn open_dir_path(path: &FsPath) -> std::io::Result<File> {
+    #[cfg(unix)]
+    {
+        File::open(path)
+    }
+    #[cfg(windows)]
+    {
+        cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority())
+            .map(cap_std::fs::Dir::into_std_file)
+    }
+}
+
+/// `dir` (an open directory) as a cap-std directory: every path through it
+/// resolves beneath it, and a link that would leave it is an error.
+#[cfg(windows)]
+pub(crate) fn cap_dir(dir: &File) -> std::io::Result<cap_std::fs::Dir> {
+    Ok(cap_std::fs::Dir::from_std_file(dir.try_clone()?))
+}
+
+/// The last check of a Windows no-follow open: a handle opened on a link
+/// itself is refused, and `Dir` must be a directory.
+#[cfg(windows)]
+fn refuse_links(file: File, kind: Beneath) -> std::io::Result<File> {
+    let meta = file.metadata()?;
+    if meta.file_type().is_symlink() {
+        return Err(std::io::Error::other(
+            "a symbolic link or junction (links are never followed here)",
+        ));
+    }
+    if kind == Beneath::Dir && !meta.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            "not a directory",
+        ));
+    }
+    Ok(file)
+}
+
 /// Open `relative` by walking from an already-open root descriptor. Every
-/// intermediate and final component is `O_NOFOLLOW`; no path lookup is ever
-/// restarted from the process cwd after the root is anchored.
-pub(crate) fn open_beneath(
-    root: &File,
-    relative: &FsPath,
-    final_flags: rustix::fs::OFlags,
-) -> std::io::Result<File> {
+/// intermediate and final component is no-follow (`O_NOFOLLOW`; on Windows
+/// a cap-std open that refuses junctions and other reparse points); no
+/// path lookup is ever restarted from the process cwd after the root is
+/// anchored.
+pub(crate) fn open_beneath(root: &File, relative: &FsPath, kind: Beneath) -> std::io::Result<File> {
     if relative.as_os_str().is_empty() {
         return root.try_clone();
     }
-    let mut directory = root.try_clone()?;
-    let mut components = relative.components().peekable();
-    while let Some(component) = components.next() {
-        let Component::Normal(name) = component else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "zip path contains a non-normal component",
-            ));
-        };
-        let flags = if components.peek().is_none() {
-            final_flags
-        } else {
-            rustix::fs::OFlags::RDONLY
-                | rustix::fs::OFlags::DIRECTORY
-                | rustix::fs::OFlags::NOFOLLOW
-                | rustix::fs::OFlags::CLOEXEC
-        };
-        directory = File::from(
-            rustix::fs::openat(&directory, name, flags, rustix::fs::Mode::empty())
-                .map_err(std::io::Error::from)?,
-        );
+    #[cfg(unix)]
+    {
+        let mut directory = root.try_clone()?;
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            let Component::Normal(name) = component else {
+                return Err(non_normal());
+            };
+            let flags = if components.peek().is_none() {
+                kind.flags()
+            } else {
+                Beneath::Dir.flags()
+            };
+            directory = File::from(
+                rustix::fs::openat(&directory, name, flags, rustix::fs::Mode::empty())
+                    .map_err(std::io::Error::from)?,
+            );
+        }
+        Ok(directory)
     }
-    Ok(directory)
+    #[cfg(windows)]
+    {
+        use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+        let mut directory = cap_dir(root)?;
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            let Component::Normal(name) = component else {
+                return Err(non_normal());
+            };
+            if components.peek().is_some() {
+                directory = directory.open_dir_nofollow(name)?;
+                continue;
+            }
+            let file = match kind {
+                Beneath::Dir => directory.open_dir_nofollow(name)?.into_std_file(),
+                // A file open refuses a directory on Windows; retry as one,
+                // keeping the first error for a name that is neither.
+                Beneath::Any => {
+                    let mut options = cap_std::fs::OpenOptions::new();
+                    options.read(true).follow(FollowSymlinks::No);
+                    match directory.open_with(name, &options) {
+                        Ok(file) => file.into_std(),
+                        Err(err) => match directory.open_dir_nofollow(name) {
+                            Ok(sub) => sub.into_std_file(),
+                            Err(_) => return Err(err),
+                        },
+                    }
+                }
+            };
+            return refuse_links(file, kind);
+        }
+        Err(non_normal())
+    }
+}
+
+fn non_normal() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "zip path contains a non-normal component",
+    )
 }
 
 /// One filesystem name as a safe cross-platform ZIP path component. ZIP uses
@@ -480,9 +611,10 @@ fn zip_entry_name(root_name: &str, relative: &std::path::Path, directory: bool) 
 }
 
 /// The daemon host's current UTC offset in seconds, via `date +%z` (POSIX;
-/// prints e.g. `-0700`). std exposes no timezone and the workspace stays
-/// unsafe-free, so a subprocess it is — one per folder download, noise next
-/// to streaming the archive. Falls back to UTC (0) if `date` misbehaves.
+/// prints e.g. `-0700`). std exposes no timezone, so a subprocess it is —
+/// one per folder download, noise next to streaming the archive. Falls back
+/// to UTC (0) if `date` misbehaves.
+#[cfg(unix)]
 async fn local_utc_offset() -> i64 {
     match tokio::process::Command::new("date")
         .arg("+%z")
@@ -496,8 +628,33 @@ async fn local_utc_offset() -> i64 {
     }
 }
 
+/// The daemon host's current UTC offset in seconds, from the system time
+/// zone and whether daylight time is in effect now. UTC (0) if unknown.
+#[cfg(windows)]
+async fn local_utc_offset() -> i64 {
+    use windows_sys::Win32::System::Time::{
+        GetTimeZoneInformation, TIME_ZONE_ID_INVALID, TIME_ZONE_INFORMATION,
+    };
+    // SystemServices' names for these; not worth that feature for two values.
+    const TIME_ZONE_ID_STANDARD: u32 = 1;
+    const TIME_ZONE_ID_DAYLIGHT: u32 = 2;
+    // SAFETY: TIME_ZONE_INFORMATION is plain data (integers and u16 arrays),
+    // valid all-zero, and the call only writes into it.
+    let mut tz: TIME_ZONE_INFORMATION = unsafe { std::mem::zeroed() };
+    let id = unsafe { GetTimeZoneInformation(&mut tz) };
+    // Bias is minutes west of UTC (UTC = local + bias).
+    let bias = match id {
+        TIME_ZONE_ID_INVALID => return 0,
+        TIME_ZONE_ID_DAYLIGHT => tz.Bias + tz.DaylightBias,
+        TIME_ZONE_ID_STANDARD => tz.Bias + tz.StandardBias,
+        _ => tz.Bias,
+    };
+    -i64::from(bias) * 60
+}
+
 /// Parse a `[+-]HHMM` (or `[+-]HH:MM`) UTC offset into seconds; 0 on
 /// anything unexpected.
+#[cfg(any(unix, test))]
 fn parse_utc_offset(s: &str) -> i64 {
     let (sign, rest) = match s.as_bytes().first() {
         Some(b'+') => (1, &s[1..]),
@@ -517,15 +674,21 @@ fn parse_utc_offset(s: &str) -> i64 {
 /// the writer's defaults extract as 1980-dated, mode-000 files (Info-ZIP
 /// applies the zeroed attribute bits verbatim). The full st_mode goes in —
 /// type bits like Info-ZIP writes them, so the executable bit survives on
-/// scripts; `fallback` covers an unreadable metadata.
+/// scripts; `fallback` covers an unreadable metadata, and every entry on
+/// Windows, which has no mode to carry.
 fn stamp(
     builder: ZipEntryBuilder,
     meta: Option<&std::fs::Metadata>,
     utc_offset: i64,
     fallback: u32,
 ) -> ZipEntryBuilder {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = meta.map(|m| m.permissions().mode()).unwrap_or(fallback);
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        meta.map(|m| m.permissions().mode()).unwrap_or(fallback)
+    };
+    #[cfg(windows)]
+    let mode = fallback;
     let builder = builder
         .attribute_compatibility(AttributeCompatibility::Unix)
         .unix_permissions((mode & 0xFFFF) as u16);
@@ -672,13 +835,19 @@ mod tests {
 
     #[test]
     fn zip_entry_names_cannot_encode_windows_traversal_or_drive_paths() {
+        // On Unix `\` is a filename byte; on Windows it separates, and the
+        // `..` it makes is dropped like any non-normal component.
         assert_eq!(
             zip_entry_name(
                 &safe_zip_component(std::ffi::OsStr::new("C:")),
                 std::path::Path::new(r"..\startup.cmd"),
                 false,
             ),
-            "C_/.._startup.cmd"
+            if cfg!(windows) {
+                "C_/startup.cmd"
+            } else {
+                "C_/.._startup.cmd"
+            }
         );
         assert_eq!(
             zip_entry_name("folder", std::path::Path::new("sub/file.txt"), false),
@@ -728,6 +897,7 @@ mod tests {
         assert!(err.to_string().contains("8 retained bytes"), "{err}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn descriptor_walk_cannot_escape_after_root_path_is_swapped() {
         let nonce = SystemTime::now()
@@ -760,12 +930,86 @@ mod tests {
         std::fs::rename(&root, &anchored).unwrap();
         std::os::unix::fs::symlink(&outside, &root).unwrap();
 
-        let flags =
-            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC;
-        assert!(open_beneath(&root_fd, FsPath::new("safe.txt"), flags).is_ok());
-        assert!(open_beneath(&root_fd, FsPath::new("secret.txt"), flags).is_err());
+        assert!(open_beneath(&root_fd, FsPath::new("safe.txt"), Beneath::Any).is_ok());
+        assert!(open_beneath(&root_fd, FsPath::new("secret.txt"), Beneath::Any).is_err());
 
         std::fs::remove_file(&root).unwrap();
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A junction is Windows' unprivileged directory link: one inside the
+    /// root that points out is never walked through, nor opened itself.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_junction_never_leads_out_of_the_root() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "chimaera-zip-junction-{}-{nonce}",
+            std::process::id()
+        ));
+        let root = base.join("root");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(root.join("sub/safe.txt"), "safe").unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+        junction::create(&outside, root.join("out")).unwrap();
+        assert!(
+            root.join("out/secret.txt").exists(),
+            "the junction resolves"
+        );
+
+        let root_fd = open_dir_path(&root).unwrap();
+        let ok = open_beneath(&root_fd, FsPath::new("sub/safe.txt"), Beneath::Any).unwrap();
+        assert!(ok.metadata().unwrap().is_file());
+        let sub = open_beneath(&root_fd, FsPath::new("sub"), Beneath::Any).unwrap();
+        assert!(
+            sub.metadata().unwrap().is_dir(),
+            "Any opens a directory too"
+        );
+        for (rel, kind) in [
+            ("out/secret.txt", Beneath::Any),
+            ("out", Beneath::Any),
+            ("out", Beneath::Dir),
+            ("sub/safe.txt", Beneath::Dir),
+        ] {
+            assert!(
+                open_beneath(&root_fd, FsPath::new(rel), kind).is_err(),
+                "{rel} as {kind:?}"
+            );
+        }
+        assert!(open_nofollow(&root.join("out"), Beneath::Dir).is_err());
+        assert!(open_nofollow(&root.join("sub"), Beneath::Dir).is_ok());
+
+        // The Unix swap attack can't start here: Windows refuses to rename
+        // a directory while a handle to it is open.
+        let anchored = open_nofollow(&root.join("sub"), Beneath::Dir).unwrap();
+        assert!(std::fs::rename(root.join("sub"), root.join("moved")).is_err());
+        assert!(open_beneath(&anchored, FsPath::new("safe.txt"), Beneath::Any).is_ok());
+        drop(anchored);
+
+        // The zip walk lists the junction but never descends into it.
+        let names =
+            list_zip_directory(Arc::new(open_dir_path(&root).unwrap()), PathBuf::new(), 100)
+                .await
+                .unwrap()
+                .unwrap()
+                .1;
+        assert!(names.iter().any(|n| n == "out"), "{names:?}");
+        let entry = open_zip_entry(
+            Arc::new(open_dir_path(&root).unwrap()),
+            PathBuf::from("out"),
+        )
+        .await
+        .unwrap();
+        assert!(entry.is_none(), "a junction is skipped like a symlink");
+
+        assert!(outside.join("secret.txt").exists());
+        // Windows won't remove a folder something still holds open.
+        drop((ok, sub, root_fd));
         std::fs::remove_dir_all(&base).unwrap();
     }
 

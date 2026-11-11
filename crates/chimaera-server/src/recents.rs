@@ -84,7 +84,7 @@ impl RecentEntry {
             "resume": self.resume,
             "last_active": self.last_active,
             "ui": self.ui,
-            "worktree": worktree,
+            "worktree": worktree.map(|w| chimaera_core::paths::wire_path(w)),
         })
     }
 

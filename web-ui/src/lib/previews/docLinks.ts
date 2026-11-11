@@ -13,6 +13,7 @@
 
 import { writable } from "svelte/store";
 import { dirname, fsMarkdown, fsValidate, resolveDocPath, viewKindFor } from "./files";
+import { isRoot, trimSlash } from "../shared/paths";
 import { openPath } from "../shared/openPath";
 import { parseLocator } from "../shared/locator";
 import { requestReveal, type Reveal } from "../shared/reveal";
@@ -200,8 +201,8 @@ async function followPath(
   // file, so no diff-prefix strip or index guess may rescue a broken one —
   // unless it is a wikilink, whose name is the whole point.
   const candidates = [rel];
-  if (rel.startsWith("/") && host.wsRoot !== null && host.wsRoot !== "/") {
-    candidates.push(`${host.wsRoot.replace(/\/+$/, "")}${rel}`);
+  if (rel.startsWith("/") && host.wsRoot !== null && !isRoot(host.wsRoot)) {
+    candidates.push(`${trimSlash(host.wsRoot)}${rel}`);
   }
   let res: Awaited<ReturnType<typeof fsValidate>>;
   try {

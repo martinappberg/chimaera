@@ -51,7 +51,10 @@ pub(crate) fn pty_ready(info: &chimaera_pty::SessionInfo, cwd_current: &std::pat
         _ => serde_json::Map::new(),
     };
     ready.insert("type".to_string(), json!("ready"));
-    ready.insert("cwd_current".to_string(), json!(cwd_current));
+    ready.insert(
+        "cwd_current".to_string(),
+        json!(chimaera_core::paths::wire_path(cwd_current)),
+    );
     Value::Object(ready)
 }
 

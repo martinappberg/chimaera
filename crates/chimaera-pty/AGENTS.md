@@ -20,7 +20,7 @@ has subtle repaint invariants — read the architecture guide before touching th
 | File | What it owns |
 |---|---|
 | `lib.rs` | `SessionManager`: the session registry + `attach` (snapshot stream + live receivers) / `attach_quiet` (subscribe only, no snapshot — the parked attach), `resize`, `kill_all`. The crate's public surface for `chimaera-server`. |
-| `session.rs` | `Session`: PTY spawn, the output→`Term` mirror, `resize`, the wait/last-words reaper, the bounded output broadcast (`OUTPUT_CHANNEL_CAPACITY`). |
+| `session.rs` | `Session`: PTY spawn (ConPTY on Windows via portable-pty: the daemon answers ConPTY's startup cursor query while no client is attached, the child tree is a kill-on-close job, the shell takes Ctrl+C even when the daemon was started ignoring it (`proc::take_ctrl_c` before each spawn), the title is the program name; `ShellKind` sentinels pick integrated vs sentinel exec — PowerShell integrated, `cmd.exe` sentinel), the output→`Term` mirror, `resize`, the wait/last-words reaper, the bounded output broadcast (`OUTPUT_CHANNEL_CAPACITY`). |
 | `snapshot.rs` | `render_snapshot` — rebuilds the terminal as an escape stream (SGR minimization + private-mode/cursor/title restoration). `screen_text` for text scrapes. |
 | `marks.rs` | The OSC 133/633/7 marks scanner → shell phase + a bounded command journal. Most methods are exec-internal correlation; the server uses `phase()`/`journal()`. |
 | `exec.rs` | The exec engine that types agent commands into a live shell (integrated or sentinel mode) and correlates completion via marks. |
@@ -44,6 +44,6 @@ has subtle repaint invariants — read the architecture guide before touching th
   paths wrap them in `spawn_blocking` (the daemon's MCP screen-text scrape, the last holdout, now goes through `mcp.rs::screen_text_blocking`).
 - **Known accepted gap:** a resync while on the alternate screen can't restore the
   primary screen's scrollback.
-- Leaf crate: depends on nothing else in the workspace. `serde::Serialize` on the
+- Depends only on `chimaera-core` (login shell, process trees, wire paths). `serde::Serialize` on the
   metadata types (`SessionInfo`, `SessionEvent`, `ExecOutcome`, …) is a benign wire
   convenience — but note those types ARE the daemon↔UI contract (see the server map).

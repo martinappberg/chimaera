@@ -60,7 +60,7 @@ impl GitBinary {
     pub(super) fn json(&self) -> serde_json::Value {
         json!({
             "ok": self.adequate,
-            "path": self.path.to_string_lossy(),
+            "path": chimaera_core::paths::wire_path(&self.path),
             "source": self.source.as_str(),
             "version": self.version_str(),
             "raw": self.raw,
@@ -100,6 +100,34 @@ pub(super) async fn resolve_git_binary(configured: Option<String>) -> GitBinary 
 /// `.bashrc`/`.zshrc`) has applied. `-ilc` and the passwd-backed
 /// [`chimaera_core::login_shell`] mirror the launcher's resolution so a
 /// GUI-launched daemon resolves git the same way a terminal would.
+///
+/// Windows has no login shell to ask: Git for Windows is found on the
+/// daemon's PATH (`git.exe`, its installer adds `Git\cmd`), else in its
+/// default machine-wide or per-user install folder.
+#[cfg(windows)]
+async fn login_shell_git() -> Option<PathBuf> {
+    tokio::task::spawn_blocking(|| {
+        chimaera_core::paths::find_on_path("git", None)
+            .filter(|p| p.is_absolute())
+            .or_else(|| {
+                let base = |var: &str| std::env::var_os(var).map(PathBuf::from);
+                [
+                    base("ProgramFiles").map(|p| p.join("Git")),
+                    base("ProgramW6432").map(|p| p.join("Git")),
+                    base("LOCALAPPDATA").map(|p| p.join("Programs").join("Git")),
+                ]
+                .into_iter()
+                .flatten()
+                .map(|git| git.join("cmd").join("git.exe"))
+                .find(|p| p.is_file())
+            })
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+#[cfg(not(windows))]
 async fn login_shell_git() -> Option<PathBuf> {
     let shell = chimaera_core::login_shell();
     let output = tokio::process::Command::new(&shell)
@@ -127,11 +155,11 @@ async fn login_shell_git() -> Option<PathBuf> {
 
 /// First non-empty line of `<bin> --version`, or `None` if it cannot run.
 async fn probe_git_version(bin: &Path) -> Option<String> {
-    let output = tokio::process::Command::new(bin)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .output();
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.arg("--version").stdin(Stdio::null()).kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(chimaera_core::CREATE_NO_WINDOW);
+    let output = cmd.output();
     let out = tokio::time::timeout(Duration::from_secs(2), output)
         .await
         .ok()?

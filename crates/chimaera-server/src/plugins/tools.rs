@@ -18,6 +18,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use chimaera_core::paths::wire_path;
 use serde_json::{json, Value};
 
 use super::Manifest;
@@ -185,7 +186,7 @@ pub(crate) fn answer_content(dir: &Path, text: &str) -> Vec<Value> {
             Ok((mime, data)) => {
                 shown += 1;
                 bytes_total += data.len();
-                pending.push_str(&format!("![{alt}]({}){eol}", abs.display()));
+                pending.push_str(&format!("![{alt}]({}){eol}", wire_path(&abs)));
                 flush(&mut pending, &mut content);
                 content.push(json!({
                     "type": "image",
@@ -194,7 +195,10 @@ pub(crate) fn answer_content(dir: &Path, text: &str) -> Vec<Value> {
                 }));
             }
             Err(why) => {
-                pending.push_str(&format!("{alt}: {} (not shown: {why}){eol}", abs.display()));
+                pending.push_str(&format!(
+                    "{alt}: {} (not shown: {why}){eol}",
+                    wire_path(&abs)
+                ));
             }
         }
     }
@@ -244,7 +248,7 @@ mod tests {
         assert_eq!(content.len(), 3, "{content:?}");
         let caption = content[0]["text"].as_str().unwrap();
         assert!(caption.starts_with("Slide 1:\n![slide 1]("), "{caption}");
-        assert!(caption.contains(&dir.join("shots/s1.png").display().to_string()));
+        assert!(caption.contains(&wire_path(&dir.join("shots/s1.png"))));
         assert_eq!(content[1]["type"], "image");
         assert_eq!(content[1]["mimeType"], "image/png");
         use base64::Engine as _;
@@ -255,6 +259,8 @@ mod tests {
         assert_eq!(content[2], json!({"type": "text", "text": "looks fine"}));
     }
 
+    // Symlinks need privileges on Windows.
+    #[cfg(unix)]
     #[test]
     fn a_picture_that_cannot_be_shown_stays_a_line_saying_why() {
         let dir = temp("refused");

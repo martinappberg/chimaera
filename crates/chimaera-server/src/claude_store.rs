@@ -353,4 +353,32 @@ mod tests {
         }
         std::fs::remove_dir_all(&base).ok();
     }
+
+    /// A Windows cwd, native or in the wire's `/` form, names the folder
+    /// Claude Code itself uses (`C:\w\proj` → `C--w-proj`), its own
+    /// worktrees included, and a sibling repository never matches.
+    #[test]
+    fn windows_cwds_find_claudes_project_folders() {
+        let base = scratch("win");
+        let store = base.join("projects");
+        let at_root = put(&store.join("C--w-proj"), "c1");
+        for cwd in [r"C:\w\proj", "C:/w/proj"] {
+            assert_eq!(
+                find_blocking(&store, "c1", &[], &[PathBuf::from(cwd)]),
+                Some(at_root.clone()),
+                "{cwd}"
+            );
+        }
+        let entered = put(&store.join("C--w-proj--claude-worktrees-fix-it"), "c2");
+        put(&store.join("C--w-proj-pro--claude-worktrees-fix-it"), "c3");
+        assert_eq!(
+            find_blocking(&store, "c2", &[], &[PathBuf::from("C:/w/proj")]),
+            Some(entered)
+        );
+        assert_eq!(
+            find_blocking(&store, "c3", &[], &[PathBuf::from(r"C:\w\proj")]),
+            None
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
 }

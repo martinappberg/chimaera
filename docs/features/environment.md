@@ -15,6 +15,9 @@ route + per-session materialization) and `crates/chimaera-core/src/shellint.rs`
 `GET/PUT/PATCH /api/v1/environment` (bearer-authed) and the optional `prelude` field on
 `POST /api/v1/sessions`.
 
+**On Windows**, preludes do not run: they are POSIX shell snippets and Windows sessions have no
+login shell to run them in.
+
 ## The prelude model
 
 - **What & when.** Three scopes that **concatenate** (never override), in order: **host**

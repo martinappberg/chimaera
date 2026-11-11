@@ -27,6 +27,7 @@
 //! at once ([`BrowserError::Gone`]). No std lock is held across an await.
 
 use std::collections::{HashMap, VecDeque};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -109,6 +110,11 @@ const GET_ONE: &str = "Ask the user to get one: in Extensions → Plugins, insta
 /// After a plugin's browser that isn't ready yet: the user's other ways.
 const OR_OWN: &str = "Or the user can set browser.path in Chimaera's settings to a Chrome or \
      Chromium on this host, or connect the Chimaera app.";
+/// Windows: the DevTools pipe here is fds 3 and 4 and teardown is a process
+/// group, both POSIX; the Windows app has no pane views for the app engine.
+const NOT_ON_WINDOWS: &str = "The headless browser doesn't run on Windows yet, and the Windows \
+     app has no browser panes for agents. Use the browser tools from a workspace on a Linux or \
+     macOS host.";
 /// Executable names looked up on PATH, in order.
 const PATH_NAMES: [&str; 6] = [
     "google-chrome",
@@ -197,6 +203,9 @@ impl Chromium {
     }
 
     async fn check(&self, state: &AppState, ws: Option<&str>) -> Result<PathBuf, Unavailable> {
+        if cfg!(windows) {
+            return Err(Unavailable::NoEngine(NOT_ON_WINDOWS.to_string()));
+        }
         if state.compute.is_login_node() {
             return Err(Unavailable::Refused(
                 "This daemon runs on a cluster login node, where Chimaera never starts a browser. \
@@ -547,9 +556,9 @@ fn find_browser(
         let candidate = if !raw.contains('/') {
             std::env::split_paths(path_var)
                 .map(|d| d.join(raw))
-                .find(|p| is_executable(p))
+                .find(|p| chimaera_core::paths::is_executable(p))
         } else {
-            resolve_app_bundle(&expanded).filter(|p| is_executable(p))
+            resolve_app_bundle(&expanded).filter(|p| chimaera_core::paths::is_executable(p))
         };
         return candidate.ok_or_else(|| {
             format!(
@@ -561,7 +570,7 @@ fn find_browser(
     for dir in std::env::split_paths(path_var) {
         for name in PATH_NAMES {
             let p = dir.join(name);
-            if is_executable(&p) {
+            if chimaera_core::paths::is_executable(&p) {
                 return Ok(p);
             }
         }
@@ -575,7 +584,7 @@ fn find_browser(
         for root in roots {
             for bundle in MAC_BUNDLES {
                 let p = root.join(bundle);
-                if is_executable(&p) {
+                if chimaera_core::paths::is_executable(&p) {
                     return Ok(p);
                 }
             }
@@ -611,11 +620,6 @@ fn resolve_app_bundle(p: &Path) -> Option<PathBuf> {
             .find(|p| p.is_file());
     }
     Some(p.to_path_buf())
-}
-
-fn is_executable(p: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 /// Refuses a profile parent on a network filesystem: Chrome's profile is a
@@ -694,46 +698,13 @@ impl Browser {
     }
 
     async fn spawn(exe: &Path, profile: &Path) -> Result<Arc<Browser>, BrowserError> {
-        let io = |what: &str, e: std::io::Error| {
-            BrowserError::Engine(format!(
-                "Couldn't start the headless browser ({what}: {e})."
-            ))
-        };
-        // fd 3 in the child reads what we write; fd 4 in the child writes
-        // what we read.
-        let (child_in, our_out) = cloexec_pipe().map_err(|e| io("pipe", e))?;
-        let (our_in, child_out) = cloexec_pipe().map_err(|e| io("pipe", e))?;
         let mut cmd = tokio::process::Command::new(exe);
         cmd.args(launch_args(profile))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
-            .process_group(0)
             .kill_on_drop(true);
-        let (r, w) = (child_in.as_raw_fd(), child_out.as_raw_fd());
-        // SAFETY: only async-signal-safe libc calls between fork and exec.
-        // Both fds are first copied above 10 so the dup2 onto 3 and 4 can't
-        // clobber one another; dup2 clears close-on-exec on 3 and 4 only.
-        unsafe {
-            cmd.pre_exec(move || {
-                use nix::libc;
-                let a = libc::fcntl(r, libc::F_DUPFD_CLOEXEC, 10);
-                let b = libc::fcntl(w, libc::F_DUPFD_CLOEXEC, 10);
-                if a < 0 || b < 0 || libc::dup2(a, 3) < 0 || libc::dup2(b, 4) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let mut child = cmd.spawn().map_err(|e| {
-            BrowserError::Engine(format!(
-                "Couldn't start {} ({e}). Check that browser.path points at a working Chrome or \
-                 Chromium executable.",
-                exe.display()
-            ))
-        })?;
-        drop(child_in);
-        drop(child_out);
+        let (mut child, reader, writer) = start_with_pipe(cmd, exe)?;
         let pgid = child.id().map(|p| p as i32).unwrap_or(0);
 
         let stderr = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL)));
@@ -765,10 +736,7 @@ impl Browser {
                 // can't be reused while any member lives, so this reaches
                 // only leftovers (or nothing).
                 if pgid > 0 {
-                    let _ = nix::sys::signal::killpg(
-                        nix::unistd::Pid::from_raw(pgid),
-                        nix::sys::signal::Signal::SIGKILL,
-                    );
+                    kill_group(pgid);
                 }
                 let _ = exited_tx.send(true);
                 let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(profile)).await;
@@ -776,10 +744,6 @@ impl Browser {
             });
         }
 
-        let reader =
-            tokio::net::unix::pipe::Receiver::from_owned_fd(our_in).map_err(|e| io("pipe", e))?;
-        let writer =
-            tokio::net::unix::pipe::Sender::from_owned_fd(our_out).map_err(|e| io("pipe", e))?;
         let (to_popups, popups_rx) = mpsc::channel(POPUP_QUEUE);
         let router = Arc::new(Router {
             conn: OnceLock::new(),
@@ -895,10 +859,7 @@ impl Browser {
     /// SIGKILL the whole group, now.
     fn kill(&self) {
         if self.pgid > 0 && !*self.exited.borrow() {
-            let _ = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(self.pgid),
-                nix::sys::signal::Signal::SIGKILL,
-            );
+            kill_group(self.pgid);
         }
         self.alive.store(false, Ordering::Release);
     }
@@ -1097,10 +1058,90 @@ fn launch_args(profile: &Path) -> Vec<String> {
     args
 }
 
+/// The browser's end of the DevTools pipe as we hold it: what it writes, what
+/// it reads.
+#[cfg(unix)]
+type PipeIn = tokio::net::unix::pipe::Receiver;
+#[cfg(unix)]
+type PipeOut = tokio::net::unix::pipe::Sender;
+// Never constructed: `start_with_pipe` refuses on Windows.
+#[cfg(not(unix))]
+type PipeIn = tokio::io::Empty;
+#[cfg(not(unix))]
+type PipeOut = tokio::io::Sink;
+
+/// Start the browser in a process group of its own with the DevTools pipe
+/// on its fds 3 and 4, and our ends of that pipe.
+#[cfg(unix)]
+fn start_with_pipe(
+    mut cmd: tokio::process::Command,
+    exe: &Path,
+) -> Result<(tokio::process::Child, PipeIn, PipeOut), BrowserError> {
+    let io = |what: &str, e: std::io::Error| {
+        BrowserError::Engine(format!(
+            "Couldn't start the headless browser ({what}: {e})."
+        ))
+    };
+    // fd 3 in the child reads what we write; fd 4 in the child writes
+    // what we read.
+    let (child_in, our_out) = cloexec_pipe().map_err(|e| io("pipe", e))?;
+    let (our_in, child_out) = cloexec_pipe().map_err(|e| io("pipe", e))?;
+    cmd.process_group(0);
+    let (r, w) = (child_in.as_raw_fd(), child_out.as_raw_fd());
+    // SAFETY: only async-signal-safe libc calls between fork and exec.
+    // Both fds are first copied above 10 so the dup2 onto 3 and 4 can't
+    // clobber one another; dup2 clears close-on-exec on 3 and 4 only.
+    unsafe {
+        cmd.pre_exec(move || {
+            use nix::libc;
+            let a = libc::fcntl(r, libc::F_DUPFD_CLOEXEC, 10);
+            let b = libc::fcntl(w, libc::F_DUPFD_CLOEXEC, 10);
+            if a < 0 || b < 0 || libc::dup2(a, 3) < 0 || libc::dup2(b, 4) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = cmd.spawn().map_err(|e| {
+        BrowserError::Engine(format!(
+            "Couldn't start {} ({e}). Check that browser.path points at a working Chrome or \
+             Chromium executable.",
+            exe.display()
+        ))
+    })?;
+    drop(child_in);
+    drop(child_out);
+    let reader = PipeIn::from_owned_fd(our_in).map_err(|e| io("pipe", e))?;
+    let writer = PipeOut::from_owned_fd(our_out).map_err(|e| io("pipe", e))?;
+    Ok((child, reader, writer))
+}
+
+/// Chromium on Windows takes the DevTools pipe as inherited handles
+/// (`--remote-debugging-io-pipes`), not fds 3 and 4, and that isn't built;
+/// [`Chromium::check`] refuses before a launch gets here.
+#[cfg(not(unix))]
+fn start_with_pipe(
+    _cmd: tokio::process::Command,
+    _exe: &Path,
+) -> Result<(tokio::process::Child, PipeIn, PipeOut), BrowserError> {
+    Err(BrowserError::NoEngine(NOT_ON_WINDOWS.to_string()))
+}
+
+/// SIGKILL process group `pgid`: the browser and whatever it left behind.
+fn kill_group(pgid: i32) {
+    #[cfg(unix)]
+    let _ = nix::sys::signal::killpg(
+        nix::unistd::Pid::from_raw(pgid),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+    // No browser starts on Windows (`start_with_pipe`).
+    #[cfg(not(unix))]
+    let _ = pgid;
+}
+
 /// A fresh 0700 profile dir under the node-local runtime dir.
 fn make_profile() -> Result<PathBuf, String> {
     use std::hash::{BuildHasher, Hasher};
-    use std::os::unix::fs::DirBuilderExt;
     let base = chimaera_core::runtime_dir();
     profile_fs_ok(&base)?;
     for _ in 0..8 {
@@ -1113,7 +1154,11 @@ fn make_profile() -> Result<PathBuf, String> {
         );
         h.write_u32(std::process::id());
         let dir = base.join(format!("browser-{:016x}", h.finish()));
-        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        match builder.create(&dir) {
             Ok(()) => return Ok(dir),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => {
@@ -1127,6 +1172,7 @@ fn make_profile() -> Result<PathBuf, String> {
     Err("Couldn't pick a free browser profile name.".to_string())
 }
 
+#[cfg(unix)]
 fn cloexec_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
@@ -3088,7 +3134,8 @@ fn http_target(url: &str) -> Option<(String, u16)> {
     (!host.is_empty()).then_some((host, port))
 }
 
-#[cfg(test)]
+// A real browser, launched the POSIX way (see `start_with_pipe`).
+#[cfg(all(test, unix))]
 mod live_tests;
 #[cfg(test)]
 mod tests;

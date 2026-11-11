@@ -8,20 +8,28 @@
 //! wrong checksum installs nothing; an agent's tool waits for its job; and
 //! switching the plugin off, or a hard block, stops its jobs.
 
+// Most of these tests drive the fixture's POSIX programs and tool, so the
+// helpers only they use are Unix-only with them.
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+#[cfg(unix)]
 use super::plugin_updates::FakeReleases;
 use super::support::*;
-use crate::{lock, AppState};
+#[cfg(unix)]
+use crate::lock;
+use crate::AppState;
 
 const PID: &str = "test-privileged";
 
 /// The tests that point the process-wide download override at their own
 /// server run one at a time (in parallel, one would fetch from the other's
 /// server after it stopped).
+#[cfg(unix)]
 static TOOL_DOWNLOADS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+#[cfg(unix)]
 const TOOL: &[u8] = include_bytes!("../../../../plugins/test-privileged/fixture-tool-1.0.0.tar.gz");
 
 async fn switch(state: &Arc<AppState>, ws: &str, on: bool) {
@@ -64,6 +72,7 @@ async fn act(
     }
 }
 
+#[cfg(unix)]
 async fn query(state: &Arc<AppState>, ws: &str, name: &str, args: Value) -> Value {
     let (status, body) = request(
         state,
@@ -80,6 +89,7 @@ async fn query(state: &Arc<AppState>, ws: &str, name: &str, args: Value) -> Valu
 }
 
 /// Wait (≤ `limit`) for the fixture to record `finished <id> …`.
+#[cfg(unix)]
 async fn finished(state: &Arc<AppState>, ws: &str, id: &str, limit: Duration) -> String {
     let started = Instant::now();
     loop {
@@ -121,6 +131,7 @@ async fn a_plugin_that_runs_programs_is_privileged_and_says_so() {
     );
 }
 
+#[cfg(unix)] // the fixture's programs and tool are POSIX stand-ins
 #[tokio::test]
 async fn a_declared_program_runs_as_a_job_and_the_plugin_hears_it_end() {
     let (state, ws) = jobs_workspace("jobs-echo").await;
@@ -186,6 +197,7 @@ async fn what_a_job_may_not_do_is_refused_before_it_runs() {
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_job_past_its_time_loses_its_whole_process_group() {
     let (state, ws) = jobs_workspace("jobs-timeout").await;
@@ -216,6 +228,7 @@ async fn a_job_past_its_time_loses_its_whole_process_group() {
 }
 
 /// The newest activity entry of `kind` (it lands just after the job ends).
+#[cfg(unix)]
 async fn activity(state: &Arc<AppState>, kind: &str) -> Value {
     let started = Instant::now();
     loop {
@@ -231,6 +244,7 @@ async fn activity(state: &Arc<AppState>, kind: &str) -> Value {
     }
 }
 
+#[cfg(unix)]
 /// Whether `pid` still runs. A killed child whose parent died first is
 /// reparented to init and stays a zombie until init reaps it (a container's
 /// init may never do so), which `kill(pid, 0)` still finds.
@@ -246,6 +260,7 @@ fn running(pid: i32) -> bool {
     !stat.is_empty() && !stat.starts_with('Z')
 }
 
+#[cfg(unix)] // the fixture's programs and tool are POSIX stand-ins
 #[tokio::test]
 async fn the_queue_runs_one_per_plugin_and_caps_the_waiting() {
     let (state, ws) = jobs_workspace("jobs-queue").await;
@@ -282,6 +297,7 @@ async fn the_queue_runs_one_per_plugin_and_caps_the_waiting() {
         .is_done());
 }
 
+#[cfg(unix)] // the fixture's programs and tool are POSIX stand-ins
 #[tokio::test]
 async fn a_hard_block_stops_a_running_job_at_once() {
     use crate::plugins::revoke::{Entry, Level};
@@ -332,6 +348,7 @@ async fn a_hard_block_stops_a_running_job_at_once() {
     );
 }
 
+#[cfg(unix)] // the fixture's programs and tool are POSIX stand-ins
 #[tokio::test]
 async fn a_tool_downloads_checks_unpacks_sets_up_and_runs() {
     let _one = TOOL_DOWNLOADS.lock().await;
@@ -401,6 +418,7 @@ async fn a_tool_downloads_checks_unpacks_sets_up_and_runs() {
     assert!(!dir.exists());
 }
 
+#[cfg(unix)] // the fixture's programs and tool are POSIX stand-ins
 #[tokio::test]
 async fn a_download_that_is_not_the_declared_file_installs_nothing() {
     let _one = TOOL_DOWNLOADS.lock().await;
@@ -430,6 +448,7 @@ async fn a_download_that_is_not_the_declared_file_installs_nothing() {
     assert!(!dir.join("1.0.0").exists());
 }
 
+#[cfg(unix)] // the fixture's programs and tool are POSIX stand-ins
 #[tokio::test]
 async fn an_agents_tool_waits_for_its_job_and_gets_the_final_answer() {
     crate::plugins::test_catalog::privileged();
@@ -446,6 +465,7 @@ async fn an_agents_tool_waits_for_its_job_and_gets_the_final_answer() {
     state.sessions.kill(&sid).ok();
 }
 
+#[cfg(unix)] // the fixture's programs and tool are POSIX stand-ins
 #[tokio::test]
 async fn a_tool_answer_shows_pictures_from_its_own_output_folder() {
     crate::plugins::test_catalog::privileged();
@@ -486,6 +506,7 @@ async fn a_tool_answer_shows_pictures_from_its_own_output_folder() {
     state.sessions.kill(&sid).ok();
 }
 
+#[cfg(unix)] // the fixture's programs and tool are POSIX stand-ins
 #[tokio::test]
 async fn a_tools_folder_setting_moves_where_tools_install() {
     let _one = TOOL_DOWNLOADS.lock().await;
@@ -549,6 +570,7 @@ async fn a_job_starts_only_for_the_current_build_where_it_is_on() {
 
 /// An update whose build no longer declares a program stops that program's
 /// running job; a job of a program it still declares keeps going (D6).
+#[cfg(unix)] // the fixture's programs and tool are POSIX stand-ins
 #[tokio::test]
 async fn an_update_that_drops_a_program_stops_its_jobs() {
     let state = test_state();
@@ -608,6 +630,7 @@ async fn an_update_that_drops_a_program_stops_its_jobs() {
     switch(&state, &ws, false).await;
 }
 
+#[cfg(unix)]
 /// A tool's setup step is reachable like a job: a block, an untrust or a
 /// remove (`cancel_where`) stops its process group, and a build that is no
 /// longer current never starts one (D7).
@@ -673,6 +696,8 @@ async fn a_tool_setup_step_stops_with_its_plugin() {
 /// A slow login shell: the job start inside a guest call is abandoned at
 /// the call's budget, yet the capture finishes and is cached, so a later
 /// start finds it (D8).
+// Windows captures no login shell: a job gets the daemon's own environment.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_login_environment_capture_outlives_a_caller_that_gave_up() {
     let state = test_state();
@@ -708,7 +733,9 @@ async fn a_login_environment_capture_outlives_a_caller_that_gave_up() {
 
 /// A plugin that names one of its tools' programs as `provides.browser`
 /// (the privileged fixture's component under another manifest).
+#[cfg(unix)]
 const BROWSER_PID: &str = "test-browser";
+#[cfg(unix)]
 fn browser_manifest() -> String {
     let artifacts: String = crate::plugins::platform::PLATFORMS
         .iter()
@@ -734,6 +761,7 @@ fn browser_manifest() -> String {
 /// `provides.browser`: refused unless a tool installs the program; on the
 /// card's Can list; offered to the Chromium engine only where the plugin is
 /// switched on and its tool is installed, and each missing step is named.
+#[cfg(unix)] // the fixture's programs and tool are POSIX stand-ins
 #[tokio::test]
 async fn a_plugin_tool_supplies_the_agent_browser_where_it_is_on() {
     use crate::plugins::browser::{offer, Offer};

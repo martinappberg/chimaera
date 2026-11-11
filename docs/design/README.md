@@ -38,7 +38,7 @@ It covers feature boundaries, architecture, tests, agent guidance, and worktree 
 | Git and history | [Git and session history](git-and-session-history-plan.md) | [Git](../features/git.md), [session history](../features/session-history.md) |
 | Extensions | [Plugin system](plugin-system-plan.md), [extension platform](plugin-platform-plan.md), [Mod compatibility](mods-extension-compatibility.md), [LaTeX workflows](latex-reports-plan.md) | [Plugins](../features/plugins.md), [extension authoring](../agent-guides/plugins.md) |
 | Remote and compute | [Remote performance](perf-remote-plan.md), [cluster workspaces](hpc-portal-plan.md) | [Remote connections](../features/remote-connect.md), [compute](../features/compute.md) |
-| Windows | [Windows and WSL](windows-wsl-plan.md) | [Native app](../features/native-app.md) |
+| Windows | [Windows (WSL plan, superseded)](windows-wsl-plan.md) | [Native app](../features/native-app.md) |
 
 For ongoing implementation work, use the [architecture guide](../agent-guides/architecture.md)
 and [agent integration guide](../agent-guides/agent-integrations.md).
