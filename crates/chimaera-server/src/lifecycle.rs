@@ -81,6 +81,12 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         }
     }
 
+    // Past the one-daemon refusal, no live daemon's sessions own the agents
+    // runtime files; Windows clears the stale ones here, since its OS never
+    // does. Before the ledger restores anything: a restored session then
+    // writes its files anew instead of losing them mid-sweep.
+    crate::agents::sweep_runtime_files_at_start().await;
+
     // A predecessor left a fresh handoff (its graceful stop, or the record it
     // kept current until it crashed): rebind its port with its token so ssh
     // forwards stay valid and every client heals with a plain reconnect — the

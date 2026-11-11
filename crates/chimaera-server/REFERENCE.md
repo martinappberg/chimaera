@@ -100,6 +100,8 @@ The pure state core: `AgentKind`/`AgentState`/`AgentRecord` + the hook→state /
 
 The agent glue over `agent_state`: hook ingest, settings/mcp writers, the transcript watcher.
 
+The per-session files (`{id}-settings.json`, `-mcp.json`, `-fork-context.txt`, `-statusline.sh|ps1|hdr|stamp`) live in `runtime_dir()/agents`, which the OS scrubs on Unix. Nothing scrubs it on Windows, so `run()` awaits `sweep_runtime_files_at_start` after its one-daemon refusal and before the ledger restores: off the reactor, at most 20,000 entries, it removes a session's whole set once every file in it is 3 days untouched (a respawn reuses settings + MCP config when both exist, so a partial set would leave a session without its statusline). Unknown names, folders and files it can't delete stay. Unix skips it.
+
 ## spawn.rs
 
 PTY session spawn (the Tier-A TUI path), theme injection.

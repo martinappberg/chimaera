@@ -43,8 +43,9 @@ pub(crate) fn fresh_agent_key() -> String {
 }
 
 /// The runtime directory holding per-agent `--settings` / `--mcp-config`
-/// files. Hot state (scrubbed from `$XDG_RUNTIME_DIR`); reconstructed on
-/// respawn when absent.
+/// files. Hot state (scrubbed from `$XDG_RUNTIME_DIR` by the OS; on Windows
+/// by [`sweep_runtime_files_at_start`]); reconstructed on respawn when
+/// absent.
 fn agents_runtime_dir() -> PathBuf {
     chimaera_core::runtime_dir().join("agents")
 }
@@ -152,6 +153,121 @@ pub(crate) fn statusline_script_path(session_id: &str) -> PathBuf {
 /// the secret as an argument. Same runtime dir / lifecycle as the script.
 pub(crate) fn statusline_header_path(session_id: &str) -> PathBuf {
     agents_runtime_dir().join(format!("{session_id}-statusline.hdr"))
+}
+
+/// What follows `{session_id}` in each file name the paths above make (the
+/// stamp is the statusline script's own throttle file).
+const RUNTIME_FILE_SUFFIXES: [&str; 7] = [
+    "-settings.json",
+    "-mcp.json",
+    "-fork-context.txt",
+    "-statusline.sh",
+    "-statusline.ps1",
+    "-statusline.hdr",
+    "-statusline.stamp",
+];
+
+/// The session a runtime file name belongs to, if it is one of ours.
+pub(crate) fn runtime_file_session(name: &str) -> Option<&str> {
+    RUNTIME_FILE_SUFFIXES
+        .iter()
+        .find_map(|suffix| name.strip_suffix(suffix))
+        .filter(|id| !id.is_empty())
+}
+
+/// Whether the daemon clears the agents runtime dir itself at start. The OS
+/// scrubs the Unix one (`$XDG_RUNTIME_DIR`, `/tmp`); nothing scrubs the
+/// Windows one (`%LOCALAPPDATA%\chimaera\run`), where every session would
+/// leave its files for good.
+const SWEEP_AT_START: bool = cfg!(windows);
+
+/// How long a session's runtime files sit untouched before the startup
+/// sweep takes them.
+pub(crate) const STALE_RUNTIME_FILE_AGE: Duration = Duration::from_secs(3 * 24 * 60 * 60);
+
+/// The most directory entries one sweep reads: a bound for a pathological
+/// folder, far above what days of sessions leave. Past it a session's set
+/// may be seen only in part; the next start goes on from there.
+const SWEEP_MAX_ENTRIES: usize = 20_000;
+
+/// Clear what earlier daemons' sessions left in the agents runtime dir,
+/// where the OS never will ([`SWEEP_AT_START`]). Awaited before the ledger
+/// restores sessions, so a restored session finds its files either kept or
+/// gone (and writes them anew), never removed under it.
+pub(crate) async fn sweep_runtime_files_at_start() {
+    if !SWEEP_AT_START {
+        return;
+    }
+    let swept = tokio::task::spawn_blocking(|| {
+        sweep_stale_runtime_files(
+            &agents_runtime_dir(),
+            STALE_RUNTIME_FILE_AGE,
+            std::time::SystemTime::now(),
+        )
+    })
+    .await;
+    match swept {
+        Ok(0) => {}
+        Ok(removed) => tracing::info!(removed, "removed stale agent runtime files"),
+        Err(error) => tracing::warn!(%error, "the agent runtime sweep failed"),
+    }
+}
+
+/// Remove the runtime files in `dir` of every session none of whose files
+/// changed within `max_age` of `now`; returns how many went. A session's
+/// files go together: a respawn reuses the settings and MCP config when both
+/// are there, so a refreshed settings file kept beside a removed statusline
+/// script would leave the session without its statusline. Names that aren't
+/// [`runtime_file_session`]'s, and anything that isn't a plain file, stay.
+/// A file that can't be removed (on Windows, one open without delete
+/// sharing) is left for the next start.
+pub(crate) fn sweep_stale_runtime_files(
+    dir: &std::path::Path,
+    max_age: Duration,
+    now: std::time::SystemTime,
+) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    // Per session: its files, and whether any of them is recent. An mtime
+    // that can't be read or lies ahead of `now` counts as recent.
+    let mut sessions: std::collections::HashMap<String, (Vec<PathBuf>, bool)> =
+        std::collections::HashMap::new();
+    for entry in entries.take(SWEEP_MAX_ENTRIES).flatten() {
+        let name = entry.file_name();
+        let Some(id) = name.to_str().and_then(runtime_file_session) else {
+            continue;
+        };
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let recent = meta
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_none_or(|age| age < max_age);
+        let (files, any_recent) = sessions.entry(id.to_owned()).or_default();
+        files.push(entry.path());
+        *any_recent |= recent;
+    }
+    let mut removed = 0;
+    for path in sessions
+        .into_values()
+        .filter(|(_, any_recent)| !any_recent)
+        .flat_map(|(files, _)| files)
+    {
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::debug!(%error, path = %path.display(), "stale runtime file left in place");
+            }
+        }
+    }
+    removed
 }
 
 /// What a Claude session's generated `--settings` file says about

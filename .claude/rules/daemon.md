@@ -18,7 +18,11 @@ criterion in every placement. Depth + module map:
   size-capped JSONL under `~/.chimaera`; small whole-file state (settings, env
   profiles, the editor draft mirror) is capped JSON rewritten atomically (temp +
   rename), never edited in place. Hot state (`$XDG_RUNTIME_DIR`/`/tmp`) is
-  reconstructible — it gets night-scrubbed; never assume it survives.
+  reconstructible — it gets night-scrubbed; never assume it survives. Nothing
+  scrubs the Windows runtime dir (`%LOCALAPPDATA%\chimaera\run`), so the daemon
+  sweeps stale per-session agent files there at start, before restore
+  (`agents::sweep_runtime_files_at_start`); per-session files elsewhere in it
+  need their own cleanup.
 - **No blocking fs on the async reactor.** Wrap journal reads/copies/canonicalize in
   `spawn_blocking`. Never hold a `std::sync::Mutex` guard across an `.await`.
 - **Auth every new route.** Pick one authority class in `router.rs`; don't add another:
