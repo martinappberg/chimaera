@@ -161,12 +161,8 @@ fn target_path(raw: &str) -> Option<String> {
         .unwrap_or(t);
     let t = t.split_once('#').map_or(t, |(path, _)| path);
     let t = t.split_once('?').map_or(t, |(path, _)| path);
-    let t = if let Some(rest) = strip_file_scheme(t) {
-        // `file:///C:/x` names `C:/x`.
-        match rest.strip_prefix('/') {
-            Some(drive) if cfg!(windows) && is_drive_path(drive) => drive,
-            _ => rest,
-        }
+    let t = if let Some(rest) = file_url_local(t) {
+        rest
     } else if (has_scheme(t) && !(cfg!(windows) && is_drive_path(t))) || t.starts_with("//") {
         return None;
     } else {
@@ -191,6 +187,16 @@ pub(crate) fn strip_file_scheme(t: &str) -> Option<&str> {
             .strip_prefix("localhost")
             .filter(|p| p.starts_with('/')),
     }
+}
+
+/// The local path a `file:` URL names, still percent-encoded: `/abs`, and on
+/// Windows `file:///C:/x` → `C:/x`. `None` for anything else.
+pub(crate) fn file_url_local(t: &str) -> Option<&str> {
+    let rest = strip_file_scheme(t)?;
+    Some(match rest.strip_prefix('/') {
+        Some(drive) if cfg!(windows) && is_drive_path(drive) => drive,
+        _ => rest,
+    })
 }
 
 /// `C:/x` or `C:\x`: on Windows a path, not a one-letter URL scheme.

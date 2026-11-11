@@ -494,6 +494,10 @@ mod tests {
         assert_eq!(initial.files, [file.to_string_lossy()]);
         assert_eq!(initial.dirs, [root.0.to_string_lossy()]);
 
+        // Windows stamps file times from a ~15.6 ms clock tick: a directory
+        // changed again inside the same tick keeps its mtime (the listing
+        // backstop catches that), so step past it.
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         // The path was already changed before this second write. Unlike git
         // porcelain status, the metadata fingerprint still moves.
         std::fs::write(&file, b"second-and-longer").unwrap();
