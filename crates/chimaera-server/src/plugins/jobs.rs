@@ -1476,6 +1476,8 @@ pub(crate) async fn cancel_route(
 mod tests {
     use super::*;
 
+    // A Unix executable in an app bundle's folder.
+    #[cfg(unix)]
     #[test]
     fn a_programs_usual_folder_is_searched_as_a_path() {
         use std::os::unix::fs::PermissionsExt;

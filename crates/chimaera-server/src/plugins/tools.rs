@@ -255,6 +255,8 @@ mod tests {
         assert_eq!(content[2], json!({"type": "text", "text": "looks fine"}));
     }
 
+    // Symlinks need privileges on Windows.
+    #[cfg(unix)]
     #[test]
     fn a_picture_that_cannot_be_shown_stays_a_line_saying_why() {
         let dir = temp("refused");

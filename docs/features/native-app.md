@@ -295,7 +295,8 @@ app-build` (never the root `cargo`).
 - **Not on Windows yet.** Chimaera-managed agent runtime installs (the action shows the vendor's
   PowerShell command), agent-plugin installs from Extensions, environment preludes (POSIX
   snippets), the Claude MCP connector sign-in through a PTY (use `/mcp` in a Claude session), a
-  per-file size limit for plugin jobs, and code signing. `connect` has no long-lived ssh
+  per-file size limit for plugin jobs, the [agent browser](agent-browser.md) (its tools refuse and
+  say why), and code signing. `connect` has no long-lived ssh
   connection per host. The site's Windows download stays labeled beta until a real-hardware pass.
 - **Where it lives.** `daemon.rs` (spawn/adopt, shared with the other platforms), `update.rs`,
   `chimaera_core::proc` and `paths`, `chimaera_remote` (ssh options), CI `windows` job

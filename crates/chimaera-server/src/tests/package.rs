@@ -4,7 +4,6 @@
 //! byte-for-byte guarantees are unit-tested in `fs/zip_splice.rs`.
 
 use std::io::{Cursor, Read, Write};
-use std::os::unix::fs::MetadataExt;
 
 use super::support::*;
 use crate::fs::sha256_hex;
@@ -380,12 +379,17 @@ async fn fs_file_stream_writes_chains_and_conflicts() {
         header_str(&headers, "x-content-hash"),
         sha256_hex(b"second")
     );
-    let ino = std::fs::metadata(&path).unwrap().ino();
+    #[cfg(unix)]
+    let ino = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&path).unwrap());
 
     // A lost reply's retry: the disk already holds the body.
     let (status, _, _) = put(&state, &stream_uri(&path, &expect), b"second".to_vec()).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    assert_eq!(std::fs::metadata(&path).unwrap().ino(), ino);
+    #[cfg(unix)]
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&path).unwrap()),
+        ino
+    );
 
     let (status, headers, body) = put(&state, &stream_uri(&path, &expect), b"third".to_vec()).await;
     assert_eq!(status, StatusCode::CONFLICT);
@@ -409,8 +413,11 @@ async fn fs_file_stream_writes_chains_and_conflicts() {
 
 /// A hard-linked target is rewritten in place by both routes, so every
 /// name sees the save.
+// Windows saves always rename (`fs::hard_linked`).
+#[cfg(unix)]
 #[tokio::test]
 async fn big_writes_rewrite_hard_links_in_place() {
+    use std::os::unix::fs::MetadataExt;
     let state = test_state();
     let root = test_dir("big-hardlink");
     let path = root.join("deck.pptx");

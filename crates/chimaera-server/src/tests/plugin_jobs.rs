@@ -506,6 +506,7 @@ async fn a_tool_answer_shows_pictures_from_its_own_output_folder() {
     state.sessions.kill(&sid).ok();
 }
 
+#[cfg(unix)] // the fixture's programs and tool are POSIX stand-ins
 #[tokio::test]
 async fn a_tools_folder_setting_moves_where_tools_install() {
     let _one = TOOL_DOWNLOADS.lock().await;
@@ -732,7 +733,9 @@ async fn a_login_environment_capture_outlives_a_caller_that_gave_up() {
 
 /// A plugin that names one of its tools' programs as `provides.browser`
 /// (the privileged fixture's component under another manifest).
+#[cfg(unix)]
 const BROWSER_PID: &str = "test-browser";
+#[cfg(unix)]
 fn browser_manifest() -> String {
     let artifacts: String = crate::plugins::platform::PLATFORMS
         .iter()
@@ -758,6 +761,7 @@ fn browser_manifest() -> String {
 /// `provides.browser`: refused unless a tool installs the program; on the
 /// card's Can list; offered to the Chromium engine only where the plugin is
 /// switched on and its tool is installed, and each missing step is named.
+#[cfg(unix)] // the fixture's programs and tool are POSIX stand-ins
 #[tokio::test]
 async fn a_plugin_tool_supplies_the_agent_browser_where_it_is_on() {
     use crate::plugins::browser::{offer, Offer};
