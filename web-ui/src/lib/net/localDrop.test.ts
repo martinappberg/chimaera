@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { pairDroppedPaths, routeDrop, type DroppedItem, type DroppedPath } from "./localDrop";
+import { decodeDroppedPaths, pairDroppedPaths, routeDrop, type DroppedItem, type DroppedPath } from "./localDrop";
 
 const file = (name: string, size: number): DroppedItem => ({ name, size, dir: false });
 const at = (path: string, size: number, dir = false): DroppedPath => ({
@@ -7,6 +7,17 @@ const at = (path: string, size: number, dir = false): DroppedPath => ({
   name: path.slice(path.lastIndexOf("/") + 1),
   size,
   dir,
+});
+
+describe("decodeDroppedPaths", () => {
+  it("keeps well-formed entries and drops the rest", () => {
+    const good = { path: "/home/u/a.png", name: "a.png", size: 10, dir: false };
+    expect(decodeDroppedPaths([good, { path: "/x", name: "x" }, null, "str", { ...good, size: "10" }])).toEqual([good]);
+  });
+
+  it("reads anything that is not a list as nothing reported", () => {
+    for (const raw of [null, undefined, "paths", { path: "/a" }, 3]) expect(decodeDroppedPaths(raw)).toEqual([]);
+  });
 });
 
 describe("pairDroppedPaths", () => {

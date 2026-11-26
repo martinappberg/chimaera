@@ -42,7 +42,7 @@ daemon  ──WS /ws/chat/{id}──▶  chatWs.ts (ChatSocket)
 | `RewindDialog`, `ForkDialog`, `AgentMessageMeta` | Rewind, fork, message actions. |
 | `McpPanel`, `UsagePanel`, `UsageMeter` | `/mcp`, `/usage` and the usage meter (its popover also holds a Claude chat's Auto-compact switch: `store.autoCompact` from the `auto_compact` read-back, `set_auto_compact` capability; `store.autoCompactDisabledBy` disables it, reading Off, "set off by <var>"; `store.contextCompactAt`, the `context_usage` event's `auto_compact_at`, draws a notch on the Context bar and "Auto-compact at N%", hidden while it is off; a Codex chat shows the line without a switch). |
 | `ArtifactGallery`, `artifacts.ts`, `embeds.ts`, `FileChip`, `ProseChip`, `hoverTargets.ts` | Embeds, written files, hover previews. |
-| `paths.ts`, `UserText` | Path links; the user-message bubble. |
+| `paths.ts`, `linkContext.ts`, `UserText` | Path links (App registers their context through the `linkContext.ts` leaf); the user-message bubble. |
 | `runCommand.ts` | Run buttons on settled shell fences: which fences, the typed text; App picks the terminal. |
 | `ChatFind`, `chatFind.ts`, `quoteSelection.ts` | Find in chat; quote a selection. |
 | `nativeUi.ts`, `mods.svelte.ts`, `Mod*.svelte`, `modClient.ts`, `nativeComposer.ts` | [Claude Mods](REFERENCE.md#claude-mods): never journaled or replayed. |
@@ -70,6 +70,7 @@ daemon  ──WS /ws/chat/{id}──▶  chatWs.ts (ChatSocket)
 - **Keep floating chrome off `.column`** ([quote](REFERENCE.md#copy-and-quote-selection)).
 - **`ForkDialog` is pane-local, not a window modal:** no focus trap, so App's chords stay live; Escape anywhere in its pane or a press outside it in its pane cancels, and that Escape never reaches the composer's interrupt ([ui-contracts §3](../../../../docs/agent-guides/ui-contracts.md#3-focus-escape-and-keyboard-navigation)).
 - **Never infer controls from the agent's brand** ([capabilities](REFERENCE.md#session-capabilities)).
+- **App imports only leaves from here.** App sits in the always-loaded entry, which the build caps at 500 kB (`vite.config.ts`). A registry App fills (`linkContext.ts`, `composerBus.ts`) must not live in a module that carries the chat's logic: importing `paths.ts` for one setter cost 8 kB.
 - **Mutate `$state` only in store methods, tear down every `$effect` timer, use theme tokens, share chrome instead of re-pasting it per card** ([conventions](REFERENCE.md#runes-and-ui-conventions)).
 
 ## Adding to the chat UI

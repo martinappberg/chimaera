@@ -10,7 +10,6 @@
 
 import { writable } from "svelte/store";
 import { getHostLabel, getJobContext, getToken } from "./api";
-import type { DroppedPath } from "./localDrop";
 import type { Workspace } from "../workspace/sessions";
 
 interface TauriGlobal {
@@ -341,27 +340,16 @@ export function referencesLocalDrops(): boolean {
 }
 
 /**
- * Where the files of the OS drag that just ended on this window live (see
- * `localDrop.ts`): the shell's reading of the system drag pasteboard. Empty
- * in a browser, on a remote window, off macOS, and on any shell error or
- * malformed answer, so a caller that gets nothing uploads as before.
+ * Where the files of the OS drag that just ended on this window live: the
+ * shell's reading of the system drag pasteboard, as it answered (decoded by
+ * `localDrop.ts::decodeDroppedPaths`, which loads with the first drop).
+ * Null in a browser, on a remote window, off macOS and on any shell error,
+ * so a caller that gets nothing uploads as before.
  */
-export async function droppedPaths(): Promise<DroppedPath[]> {
+export async function droppedPaths(): Promise<unknown> {
   const t = tauri();
-  if (t === null || !referencesLocalDrops()) return [];
-  try {
-    const raw = await t.core.invoke<unknown>("dropped_paths");
-    if (!Array.isArray(raw)) return [];
-    return raw.flatMap((r: unknown): DroppedPath[] => {
-      if (typeof r !== "object" || r === null) return [];
-      const { path, name, size, dir } = r as Record<string, unknown>;
-      return typeof path === "string" && typeof name === "string" && typeof size === "number" && typeof dir === "boolean"
-        ? [{ path, name, size, dir }]
-        : [];
-    });
-  } catch {
-    return [];
-  }
+  if (t === null || !referencesLocalDrops()) return null;
+  return t.core.invoke<unknown>("dropped_paths").catch(() => null);
 }
 
 /** Show a file or folder in the OS file manager. Only where `hasLocalFiles()`. */

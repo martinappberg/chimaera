@@ -6,7 +6,7 @@
  *
  * The file already lives on the workspace host, so a reference is its path
  * typed as a mention: nothing is uploaded or copied. App owns drags and the
- * typing into an agent's input, and registers both (`setFileHandleHost`);
+ * typing into an agent's input, and registers both (`fileHandleHost.ts`);
  * every surface attaches `fileHandle`. Same module-handler pattern as
  * `openPath.ts`.
  *
@@ -19,26 +19,9 @@
 import type { Attachment } from "svelte/attachments";
 import { revealEntries } from "../net/native";
 import { contextMenu, type ContextMenuEntry } from "./contextMenu.svelte";
+import { fileHandleHost } from "./fileHandleHost";
 import { openPath, pathPaneFrom, type PathKind } from "./openPath";
 import { OPEN_BESIDE } from "./urlOpen";
-
-export interface FileHandleHost {
-  /** Begin a pointer drag of the file from `e` (a pointerdown). A release
-   *  before the drag threshold is left to the element's own click. */
-  drag(e: PointerEvent, path: string, kind: PathKind): void;
-  /** Whether `reference` has somewhere to type: the chat `sessionId` while
-   *  it lives, or (null) the window's reference target. */
-  canReference(sessionId: string | null): boolean;
-  /** Type the file's mention into that input, never sending. */
-  reference(path: string, kind: PathKind, sessionId: string | null): void;
-}
-
-let host: FileHandleHost | null = null;
-
-/** App-level wiring (null unregisters). */
-export function setFileHandleHost(next: FileHandleHost | null): void {
-  host = next;
-}
 
 export interface HandledFile {
   /** Absolute, already resolved on the workspace host. */
@@ -87,13 +70,14 @@ export function fileMenuEntries(
  *  (outside a chat) the window has a reference target. */
 export function canReferenceFile(el: Element | null): boolean {
   const scope = referenceScope(el);
-  return scope !== undefined && host?.canReference(scope) === true;
+  return scope !== undefined && fileHandleHost()?.canReference(scope) === true;
 }
 
 /** Type `file`'s mention into the chat `el` is shown in (or the window's
  *  reference target). False when nothing can take it. */
 export function referenceHandledFile(file: HandledFile, el: Element | null): boolean {
   const scope = referenceScope(el);
+  const host = fileHandleHost();
   if (host === null || scope === undefined || !host.canReference(scope)) return false;
   host.reference(file.path, file.kind ?? "file", scope);
   return true;
@@ -126,6 +110,7 @@ export function fileHandle(get: () => HandledFile | null): Attachment<HTMLElemen
   return (el) => {
     const onPointerDown = (e: PointerEvent) => {
       const file = get();
+      const host = fileHandleHost();
       // A mouse only: a finger on a figure is scrolling the transcript.
       if (file === null || host === null || e.button !== 0 || e.pointerType !== "mouse") return;
       host.drag(e, file.path, file.kind ?? "file");

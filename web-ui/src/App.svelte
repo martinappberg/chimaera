@@ -194,10 +194,9 @@
   } from "./lib/layout/layout";
   import type { LinkContext } from "./lib/shared/fileRef";
   import { openPath, setPathOpener, type OpenPathOptions, type PathKind } from "./lib/shared/openPath";
-  import { setFileHandleHost } from "./lib/shared/fileHandle";
-  import { pairDroppedPaths, routeDrop, type DroppedPath } from "./lib/net/localDrop";
+  import { setFileHandleHost } from "./lib/shared/fileHandleHost";
   import type { Reveal } from "./lib/shared/reveal";
-  import { setChatLinkContext } from "./lib/chat/paths";
+  import { setChatLinkContext } from "./lib/chat/linkContext";
   import type { UrlTarget } from "./lib/terminal/urlLinks";
   import { setUrlPaneOpener, urlMenuEntries } from "./lib/shared/urlOpen";
   import { basename, fileTabTitles, fsProbe, viewKindFor } from "./lib/previews/files";
@@ -1789,11 +1788,13 @@
   async function dropFilesOnSession(
     sessionId: string,
     picked: { file: File | null; dir: boolean }[],
-    reported: Promise<DroppedPath[]> | null = null,
+    reported: Promise<unknown> | null = null,
   ): Promise<void> {
     const items = picked.map(({ file, dir }) => ({ name: file?.name ?? "", size: file?.size ?? 0, dir }));
     const local = reported !== null;
-    const paths = pairDroppedPaths(items, local ? await reported : []);
+    // Loaded at the first drop, like the rest of what only a drop needs.
+    const { decodeDroppedPaths, pairDroppedPaths, routeDrop } = await import("./lib/net/localDrop");
+    const paths = pairDroppedPaths(items, decodeDroppedPaths(local ? await reported : null));
     let accepted = 0;
     for (const [i, { file, dir }] of picked.entries()) {
       const route = routeDrop(items[i], paths[i], local);

@@ -94,7 +94,8 @@ selection references (see [terminals.md](terminals.md)).
 - **Where it lives.** `shared/fileHandle.ts`: the `fileHandle` attachment (a pointer drag and a
   context menu on one element), `fileMenuEntries` (the rows, pure), `referenceScope` (which chat a
   surface belongs to, read from the composer's `data-chat-session`), and the host App registers
-  (`setFileHandleHost`: `beginDrag` with a file tab and no file-transfer source, and
+  (`shared/fileHandleHost.ts` `setFileHandleHost`, a leaf so the handle's menu and listeners stay
+  out of the always-loaded bundle: `beginDrag` with a file tab and no file-transfer source, and
   `referencePathIn`). Attached by `AttachmentStrip` (sent tiles), `FileChip` (the turn-end line and
   prose document chips), `UserText` (resolved mention chips), and `EmbedCard` (its name, and an
   image or PDF body; text bodies stay selectable). A prose file link gets the menu row from

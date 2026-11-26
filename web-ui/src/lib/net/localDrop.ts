@@ -5,7 +5,7 @@
  *
  * A web view never tells the page where a dropped file lives (`File` has a
  * name and bytes, no path), so the native shell reports the paths of the
- * drag that just ended (`native.ts::droppedPaths`). That report is the
+ * drag that just ended (`native.ts::droppedPaths`, decoded here). That report is the
  * system's drag pasteboard, not this drop's own data, so nothing in it is
  * trusted by position: each dropped item takes a reported path only when
  * the name, the kind and (for a file) the size agree. An item without one
@@ -20,6 +20,19 @@ export interface DroppedPath {
   /** Bytes; 0 for a folder. */
   size: number;
   dir: boolean;
+}
+
+/** The shell's answer as entries, dropping whatever is not one: it crossed
+ *  a process boundary, and a malformed answer must mean "upload". */
+export function decodeDroppedPaths(raw: unknown): DroppedPath[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.flatMap((r: unknown): DroppedPath[] => {
+    if (typeof r !== "object" || r === null) return [];
+    const { path, name, size, dir } = r as Record<string, unknown>;
+    return typeof path === "string" && typeof name === "string" && typeof size === "number" && typeof dir === "boolean"
+      ? [{ path, name, size, dir }]
+      : [];
+  });
 }
 
 /** What the drop event itself says about one dropped item. */
