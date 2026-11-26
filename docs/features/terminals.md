@@ -19,7 +19,8 @@ pipe), `POST /api/v1/sessions` (spawn), `POST /api/v1/sessions/{id}/exec`,
 - **What & when.** Every terminal is a long-lived daemon child. Reopen a window/tab and the
   terminal is exactly where it was; run with zero attached clients and it keeps going.
 - **How it's used.** The server calls `SessionManager::spawn(SpawnOpts{cwd,name,cols,rows,
-  command,id,env,…})` (`command:None` = the user's interactive shell). The browser opens
+  command,id,env,…})` (`command:None` = the user's interactive shell: interactive, not login,
+  so zsh reads `.zshrc` and not `.zprofile`, bash `.bashrc` and not `.bash_profile`). The browser opens
   `GET /ws/sessions/{id}`: first frame `{type:auth,token,cols,rows,parked?}` → `ready` → a
   binary **snapshot** → the live byte stream. A `parked:true` auth (a hidden pooled terminal
   reconnecting) gets `ready` only — no snapshot, no stream, and its dims are NOT adopted —

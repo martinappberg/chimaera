@@ -139,6 +139,10 @@ impl ProbePrelude {
         .await
         .ok()
         .flatten();
+        // Every probe holds one of these before it builds its command, so
+        // this is where the login shell's environment is made ready for
+        // `base_command`.
+        crate::shell_env::ready().await;
         ProbePrelude(path)
     }
 
@@ -186,11 +190,14 @@ pub(crate) fn base_command(
     // A probe reads; it never updates an install. agy's updater would
     // otherwise spawn from a `/usage` read and overwrite the binary it was
     // started from (a managed activation link included), whoever owns it.
-    let env: Vec<(String, String)> = prelude
+    let mut env: Vec<(String, String)> = prelude
         .map(|path| ("CHIMAERA_PRELUDE".to_string(), path.display().to_string()))
         .into_iter()
         .chain([crate::runtimes::agy_no_self_update()])
         .collect();
+    // The same rc exports a chat gets (`CLAUDE_CONFIG_DIR`, a proxy): a probe
+    // that read a different environment would answer for a different install.
+    crate::shell_env::overlay_current(&mut env);
     for name in crate::api::spawn_env_remove(&env) {
         cmd.env_remove(name);
     }
@@ -823,6 +830,8 @@ pub(crate) struct ProbeQuery {
 
 pub(crate) async fn refresh_probes(state: &AppState) {
     state.probes.invalidate();
+    // "Check again" covers what the user's rc files export too.
+    crate::shell_env::invalidate();
     // "Check again" means the agents too: a cached detection miss must not
     // outlive the user's explicit ask.
     crate::launcher::forget_misses(state);

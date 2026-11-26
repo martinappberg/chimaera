@@ -930,7 +930,8 @@ async fn switch_to_pty(
         recipe.prelude.as_deref(),
         startup.as_deref(),
     );
-    let env = crate::api::session_env(state, id, &recipe.theme, prelude.as_deref());
+    let mut env = crate::api::session_env(state, id, &recipe.theme, prelude.as_deref());
+    crate::shell_env::overlay(&mut env).await;
     let env_remove = crate::api::spawn_env_remove(&env);
     let opts = chimaera_pty::SpawnOpts {
         cwd: recipe.workspace_root,
@@ -3799,10 +3800,6 @@ pub(crate) async fn spawn_chat_session(
         startup.as_deref(),
     );
     spec.env = crate::api::session_env(state, &id, &recipe.theme, prelude.as_deref());
-    // Strip the daemon's own launcher context (same set the PTY path removes)
-    // so a chimaera launched from inside an agent can't leak that context into
-    // the chat agent it spawns.
-    spec.env_remove = crate::api::spawn_env_remove(&spec.env);
     spec.pinned_native_id = pinned;
     if recipe.kind.is_acp() {
         if let Some(key) = crate::lock(&state.agents).get(&id).map(|r| r.key.clone()) {
@@ -3840,6 +3837,15 @@ pub(crate) async fn spawn_chat_session(
             "1".to_string(),
         ));
     }
+    // Last, so everything set above wins: what the user's rc files export
+    // (the login wrap reads the profile only).
+    crate::shell_env::overlay(&mut spec.env).await;
+    // Strip the daemon's own launcher context (same set the PTY path removes)
+    // so a chimaera launched from inside an agent can't leak that context into
+    // the chat agent it spawns. Built once every add is in: the two must stay
+    // disjoint — this transport applies removes last, and a `CLAUDE_CODE_*`
+    // the spawn or the user's rc sets must survive it.
+    spec.env_remove = crate::api::spawn_env_remove(&spec.env);
     // The codex Mastermind's harness gating: its app-server elicits EVERY
     // MCP tool call (approval-mode config is parsed but ignored on that
     // surface — live-probed, PROTOCOL.md Pass 16), so the user's recorded

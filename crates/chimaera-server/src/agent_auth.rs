@@ -885,6 +885,7 @@ async fn run_login(
             }
         }
     }
+    crate::shell_env::overlay(&mut env).await;
     let remove = crate::api::spawn_env_remove(&env);
     let argv = crate::launcher::wrap_login_shell(&crate::launcher::login_shell(), marked(argv));
     let mut command = operation::command(&argv, &cwd, env, remove);

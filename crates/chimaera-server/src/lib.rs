@@ -47,6 +47,7 @@ mod runtime_retention;
 mod runtimes;
 mod session_view;
 mod settings;
+mod shell_env;
 mod spawn;
 mod state;
 mod subagents;
