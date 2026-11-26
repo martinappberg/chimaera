@@ -467,7 +467,8 @@ unused week reads 0%); an
   `failureText.ts`). An `API Error: <status> <json>` reason reads as the API's own
   `error.message` and the status ("Turn failed · invalid x-api-key (401)"); a long or multi-line
   reason shows its first line, clipped; either way the whole text (the API body laid out, its
-  request id included) is one click away in a framed panel with a copy button. A short plain
+  request id included) is one click away in a framed panel with a copy button. On a very
+  narrow row the headline moves under the lead rather than shrinking away. A short plain
   reason is shown whole, with nothing to open, and a bare "turn failed" stays the two words.
   Other error lines (a fork or rename that failed, "message not sent — reconnecting", a fatal
   startup error) use the same row without the lead. The headline is the agent's or the API's
@@ -625,7 +626,8 @@ unused week reads 0%); an
   the prose face and its subject in mono ("Read  calc.py"); a command shows only the command
   (or Claude's description, then the command), with the driver's own title on hover. The status
   slot says nothing for a call that ran fine — a running call shows a live dot, a failed or denied
-  one a red dot (and a soft red rail), the rest a chevron under the pointer. Opened, a framed
+  one a red dot and a red-tinted icon, the rest a chevron under the pointer; a finished edit
+  shows its own "+4 −1" at the right of the row, so an opened group shows where its total comes from. Opened, a framed
   panel holds the whole command when the head clipped it, the call's arguments
   (`toolArgs.ts`: what the title, locations and diff do not already show), then its output or
   line diff; a finished command with nothing to print says "no output", and a row with nothing
@@ -636,7 +638,8 @@ unused week reads 0%); an
   expandable on demand; the summary badge (`failed` / `recovered`) carries the verdict while
   the sentence stays in the muted activity tone, so live activity and history never turn into a
   wall of command rows. When the run's finished edits changed files, the line ends with the size
-  of the change, "+54 −3" in the added and removed colours (`toolChangeSize` in `toolLabels.ts`,
+  of the change, "+54 −3" in the added and removed colours (`ChangeSize.svelte`: the one `--git-added` /
+  `--git-deleted` pair a diff's header uses too, held to 4.5:1 in every theme; `toolChangeSize` in `toolLabels.ts`,
   summed over the run's diff and batch-of-diff results, each diff computed once and cached on its
   content); a running, waiting or failed edit adds nothing, and a run with no change shows none.
   Settled folds show the same figure. A failure is `recovered`
@@ -836,7 +839,8 @@ unused week reads 0%); an
   every question has an answer, and a lone single-choice question is answered by the pick
   itself. The card answers to its own width (a narrow split, a phone), and key hints are not
   drawn where there is no keyboard. One answer is sent per card. Once answered it stays in the transcript as a quiet row per question — what
-  was asked, what was chosen — that expands to the options not taken. Selections are keyed by
+  was asked, what was chosen — starting at the column's edge like the activity lines, with
+  the chevron trailing the first row; it expands to the options not taken. Selections are keyed by
   question/option **index**, not by model-authored id/label (those are untrusted and can collide).
   A codex question carrying `autoResolutionMs` shows a live "skips in Ns" countdown, then auto-skips
   at the driver deadline (empty answers — the official client's behavior) with a visible "question

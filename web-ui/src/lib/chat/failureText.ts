@@ -16,6 +16,13 @@ export interface FailureText {
   detail: string | null;
 }
 
+/** What a failed turn's row says before the agent's reason. */
+export const TURN_FAILED_LEAD = "Turn failed";
+
+/** Below this many characters of row width (FailureRow's 240px container
+ *  query), the headline moves under the lead instead of shrinking away. */
+export const STACK_BELOW_CHARS = 32;
+
 /** A plain reason up to this long is shown whole; a longer one is clipped. */
 export const HEADLINE_MAX = 120;
 
@@ -92,4 +99,16 @@ export function failureText(reason: string): FailureText {
   const firstLine = text.split("\n")[0].trim();
   if (firstLine === text && text.length <= HEADLINE_MAX) return { headline: text, detail: null };
   return { headline: clip(firstLine, HEADLINE_MAX), detail: text };
+}
+
+/** The lines a failure row takes at `charsPerLine`, for the transcript's
+ *  height model: a clipped headline is one line (two when a narrow row puts
+ *  it under the lead); a whole one wraps like text in the room it has. */
+export function failureLines(reason: string, led: boolean, charsPerLine: number): number {
+  const { headline, detail } = failureText(reason);
+  const stacked = led && headline !== "" && charsPerLine < STACK_BELOW_CHARS;
+  const measure = Math.max(8, charsPerLine - 2);
+  if (detail !== null) return stacked ? 2 : 1;
+  const beside = stacked || !led ? 0 : TURN_FAILED_LEAD.length + 3;
+  return (stacked ? 1 : 0) + Math.max(1, Math.ceil(headline.length / Math.max(8, measure - beside)));
 }

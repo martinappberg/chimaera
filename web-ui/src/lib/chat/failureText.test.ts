@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { failureText, HEADLINE_MAX } from "./failureText";
+import { failureLines, failureText, HEADLINE_MAX } from "./failureText";
 
 describe("failureText", () => {
   it("reads an API error as the API's own message and its status", () => {
@@ -61,5 +61,25 @@ describe("failureText", () => {
   it("gives no headline for no reason", () => {
     expect(failureText("")).toEqual({ headline: "", detail: null });
     expect(failureText("   ")).toEqual({ headline: "", detail: null });
+  });
+});
+
+describe("failureLines", () => {
+  const api = `API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"},"request_id":"req_${"x".repeat(400)}"}`;
+
+  it("is one line for a clipped headline, however long the text behind it", () => {
+    expect(failureLines(api, true, 80)).toBe(1);
+    expect(failureLines("x ".repeat(400), false, 80)).toBe(1);
+  });
+
+  it("is two when a narrow row puts the headline under its lead", () => {
+    expect(failureLines(api, true, 24)).toBe(2);
+  });
+
+  it("wraps a whole short reason like text, in the room beside its lead", () => {
+    // 57 characters in the 24 left beside "Turn failed · " at 40.
+    expect(failureLines("Claude usage limit reached. Your limit will reset at 3pm.", true, 40)).toBe(3);
+    expect(failureLines("Claude usage limit reached. Your limit will reset at 3pm.", false, 40)).toBe(2);
+    expect(failureLines("", true, 40)).toBe(1);
   });
 });

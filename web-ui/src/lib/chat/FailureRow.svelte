@@ -48,9 +48,10 @@
 
 {#snippet words()}
   <span class="mark" aria-hidden="true"></span>
-  {#if lead !== null}<span class="lead">{lead}</span>{/if}
-  {#if lead !== null && shaped.headline !== ""}<span class="sep" aria-hidden="true">·</span>{/if}
-  {#if shaped.headline !== ""}<span class="headline" class:first={lead === null}>{shaped.headline}</span>{/if}
+  <span class="words">
+    {#if lead !== null}<span class="lead">{lead}{#if shaped.headline !== ""}<span class="sep" aria-hidden="true">·</span>{/if}</span>{/if}
+    {#if shaped.headline !== ""}<span class="headline" class:first={lead === null}>{shaped.headline}</span>{/if}
+  </span>
 {/snippet}
 
 <div class="failure" data-block-index={sourceIndex} data-block-uid={sourceUid}>
@@ -100,6 +101,7 @@
 
 <style>
   .failure {
+    container-type: inline-size;
     padding: 4px 0;
     font-size: var(--text-sm);
   }
@@ -151,15 +153,39 @@
   .headline.first {
     color: var(--fg);
   }
-  .lead,
-  .sep {
+  /* Lead and headline share one box; on a row too narrow to give the
+     headline room beside the lead, it moves under the lead (not under the
+     mark) instead of shrinking away. */
+  .words {
+    flex: 0 1 auto;
+    min-width: 0;
+    display: flex;
+    align-items: baseline;
+    column-gap: 7px;
+  }
+  /* Keep in step with STACK_BELOW_CHARS (failureText.ts). */
+  @container (max-width: 240px) {
+    .words {
+      flex-direction: column;
+      align-items: flex-start;
+    }
+    .words > .headline {
+      max-width: 100%;
+    }
+    .sep {
+      display: none;
+    }
+  }
+  .lead {
     flex: none;
     white-space: nowrap;
   }
   .sep {
+    margin-left: 7px;
     color: color-mix(in srgb, var(--muted) 60%, transparent);
   }
   .headline {
+    flex: 0 1 auto;
     min-width: 0;
     overflow-wrap: anywhere;
   }

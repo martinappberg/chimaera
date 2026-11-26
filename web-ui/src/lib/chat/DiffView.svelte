@@ -5,6 +5,7 @@
    * approval card, so an edit reads the same before and after it is allowed.
    */
   import type { ToolContent } from "./store.svelte";
+  import ChangeSize from "./ChangeSize.svelte";
   import { diffLines, diffStat } from "./lineDiff";
 
   interface Props {
@@ -33,8 +34,7 @@
       {:else}
         <span class="diff-path static">{label?.(diff.path) ?? diff.path}</span>
       {/if}
-      {#if stat.added > 0}<span class="stat add">+{stat.added}</span>{/if}
-      {#if stat.removed > 0}<span class="stat del">−{stat.removed}</span>{/if}
+      {#if stat.added + stat.removed > 0}<ChangeSize added={stat.added} removed={stat.removed} />{/if}
     </div>
   {/if}
   <div class="lines">
@@ -81,17 +81,6 @@
   }
   button.diff-path:hover {
     text-decoration: underline;
-  }
-  .stat {
-    flex: none;
-    font-size: var(--text-xs);
-    font-variant-numeric: tabular-nums;
-  }
-  .stat.add {
-    color: var(--accent-text);
-  }
-  .stat.del {
-    color: var(--err);
   }
   .lines {
     border-radius: 4px;

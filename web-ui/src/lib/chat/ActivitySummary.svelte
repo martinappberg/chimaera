@@ -1,5 +1,6 @@
 <script lang="ts">
   import Chevron from "../shared/Chevron.svelte";
+  import ChangeSize from "./ChangeSize.svelte";
 
   /**
    * The one-line disclosure every collapsible activity line shares (a tool
@@ -58,11 +59,7 @@
   {/if}
   <span class="label">{label}</span>
   {#if change !== null}
-    <span class="change" aria-label={`${change.added} lines added, ${change.removed} removed`}
-      >{#if change.added > 0}<span class="add">+{change.added}</span>{/if}{#if change.removed > 0}<span
-          class="del">−{change.removed}</span
-        >{/if}</span
-    >
+    <ChangeSize added={change.added} removed={change.removed} />
   {/if}
   {#if elapsed !== null}
     <span class="elapsed">{elapsed}</span>
@@ -109,20 +106,6 @@
   }
   .summary:hover :global(.chev) {
     opacity: 1;
-  }
-  /* The change size: the diff colours DiffView uses, figures that keep
-     their width as a run streams. */
-  .change {
-    flex: none;
-    display: inline-flex;
-    gap: 5px;
-    font-variant-numeric: tabular-nums;
-  }
-  .change .add {
-    color: var(--git-added);
-  }
-  .change .del {
-    color: var(--git-deleted);
   }
   .label {
     min-width: 0;

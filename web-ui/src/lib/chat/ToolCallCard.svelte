@@ -7,7 +7,8 @@
   import ModelChip from "./ModelChip.svelte";
   import { argRows } from "./toolArgs";
   import ToolGlyph from "./ToolGlyph.svelte";
-  import { readableToolTitle, toolDescription, toolTitleParts } from "./toolLabels";
+  import ChangeSize from "./ChangeSize.svelte";
+  import { readableToolTitle, toolChangeSize, toolDescription, toolTitleParts } from "./toolLabels";
 
   interface Props {
     block: Extract<ChatBlock, { kind: "tool" }>;
@@ -79,6 +80,9 @@
   const commandDetail = $derived(
     command !== null && (described !== null || command !== shownTitle || command.length > 72 || command.includes("\n")),
   );
+  /** "+4 −1": what this call's finished edit changed (the group line's
+   *  helper and cache, so the rows add up to the line's total). */
+  const change = $derived(toolChangeSize([block]));
   /** What the agent passed, for calls whose title is only a name. */
   const args = $derived(argRows(block.nativeInput, block.locations));
   /** Every call that has anything to say opens: its command, its arguments,
@@ -214,6 +218,9 @@
         <span class="live">{liveLine}</span>
       {/if}
     </button>
+    {#if change !== null}
+      <ChangeSize added={change.added} removed={change.removed} />
+    {/if}
     {#if running && block.tool !== "agent" && onBackground !== undefined}
       <!-- Ctrl-B parity: the tool keeps running while the agent moves on;
            an honest "could not be backgrounded" notice covers refusals. -->
@@ -404,8 +411,8 @@
 
 <style>
   /* A row inside a ToolGroup — the group draws the container, so the row is
-     borderless and quiet. A failed/denied row gets a soft left rail so the
-     error stands out in a long list. */
+     borderless and quiet. A failed/denied row says so with its red dot and
+     tinted icon, nothing louder. */
   .tool {
     overflow: hidden;
     /* The opened body answers to the row's own width. */
@@ -617,10 +624,6 @@
     .chev {
       transition: none;
     }
-  }
-  .failed,
-  .denied {
-    box-shadow: inset 2px 0 0 color-mix(in srgb, var(--err) 60%, transparent);
   }
   /* The opened row: one framed panel under the row's words (past its
      mark), holding what was asked and what came back. */

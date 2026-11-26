@@ -103,6 +103,7 @@
   import { hookNotice } from "./hookNotice";
   import HookRow from "./HookRow.svelte";
   import FailureRow from "./FailureRow.svelte";
+  import { TURN_FAILED_LEAD } from "./failureText";
   import SameFileNotice from "../workspace/SameFileNotice.svelte";
   import ModsWorkbench from "./ModsWorkbench.svelte";
   import ModSite from "./ModSite.svelte";
@@ -3557,7 +3558,7 @@
                its own words. Both: a mark, a short headline, the raw text a
                click away. -->
           <FailureRow
-            lead={item.block.reason !== undefined ? "Turn failed" : null}
+            lead={item.block.reason !== undefined ? TURN_FAILED_LEAD : null}
             text={item.block.reason ?? item.block.text}
             sourceIndex={item.index}
             sourceUid={item.block.uid}

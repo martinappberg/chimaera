@@ -10,6 +10,7 @@
    * chosen labels highlighted, no controls), so an answered question stays
    * visible instead of vanishing.
    */
+  import Chevron from "../shared/Chevron.svelte";
   import { mayTakeFocus } from "./promptFocus";
   import { askedParts, askedText, optionLabel } from "./questionText";
   import type { PendingQuestion } from "./store.svelte";
@@ -215,27 +216,22 @@
       aria-expanded={open}
       title={open ? "collapse" : "show the options"}
     >
-      <svg class="chev" class:open viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
-        <path
-          d="M5 3l6 5-6 5"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="1.6"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-        />
-      </svg>
       <span class="q-pairs">
         {#each request.questions as q, qi (qi)}
           <span class="q-pair">
             <span class="q-asked" title={askedText(q.question)}>{@render inline(q.question, false)}</span>
-            <span class="q-collapse-answer" class:none={chosen(q.id).length === 0}
-              >{chosen(q.id).length === 0
-                ? "not answered"
-                : chosen(q.id)
-                    .map((label) => askedText(optionLabel(label).text))
-                    .join(", ")}</span
-            >
+            <!-- The answer, and on the first line only the chevron trailing
+                 it, as every activity line carries its own. -->
+            <span class="q-tail">
+              <span class="q-collapse-answer" class:none={chosen(q.id).length === 0}
+                >{chosen(q.id).length === 0
+                  ? "not answered"
+                  : chosen(q.id)
+                      .map((label) => askedText(optionLabel(label).text))
+                      .join(", ")}</span
+              >
+              {#if qi === 0}<Chevron {open} />{/if}
+            </span>
           </span>
         {/each}
       </span>
@@ -360,10 +356,11 @@
     border-color: var(--focus-ring);
   }
   /* History face: quiet — the accent tint belongs to the live ask only. */
+  /* No border box at all, so its words sit on the column's edge. */
   .question.answered {
-    border-color: transparent;
+    border-width: 0;
     background: none;
-    padding: 2px 0;
+    padding: 3px 0;
     animation: none;
   }
   .question:not(.visible) {
@@ -645,32 +642,39 @@
   }
   /* The buttons are the shared .opt / .opt.primary (app.css). */
 
-  /* Collapsed answered header: a quiet toggle showing what was chosen. */
+  /* Collapsed answered header: a quiet toggle showing what was chosen. Its
+     words start at the column's edge like every activity line, the hover
+     tint reaching 6px past them, the chevron trailing the first line. */
   .q-collapse {
     display: flex;
     align-items: baseline;
-    gap: 8px;
-    width: 100%;
+    width: fit-content;
+    max-width: calc(100% + 12px);
     background: none;
     border: none;
-    padding: 0;
-    margin: 0;
+    border-radius: 6px;
+    padding: 2px 6px;
+    margin: -2px -6px;
     color: var(--fg);
     font: inherit;
     font-size: var(--text-sm);
     cursor: pointer;
     text-align: left;
+    transition: background-color 0.12s ease;
   }
-  .q-collapse .chev {
-    flex: none;
-    color: var(--muted);
-    transition: transform 0.12s ease;
+  .q-collapse:hover,
+  .q-collapse:focus-visible {
+    background: var(--hover-tint);
   }
-  .q-collapse .chev.open {
-    transform: rotate(90deg);
+  .q-collapse :global(.chev) {
+    align-self: center;
+    opacity: 0.55;
+  }
+  .q-collapse:hover :global(.chev) {
+    opacity: 1;
   }
   .q-pairs {
-    flex: 1;
+    flex: 0 1 auto;
     min-width: 0;
     display: flex;
     flex-direction: column;
@@ -691,9 +695,16 @@
     white-space: nowrap;
     color: var(--muted);
   }
-  .q-collapse-answer {
+  .q-tail {
     flex: none;
+    display: inline-flex;
+    align-items: baseline;
+    gap: 6px;
     max-width: 60%;
+    min-width: 0;
+  }
+  .q-collapse-answer {
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -739,6 +750,9 @@
       flex-direction: column;
       gap: 0;
     }
+    .q-tail {
+      max-width: 100%;
+    }
     .q-asked,
     .q-collapse-answer {
       max-width: 100%;
@@ -759,7 +773,7 @@
     }
   }
   @media (prefers-reduced-motion: reduce) {
-    .q-collapse .chev,
+    .q-collapse,
     .q-opt,
     .q-key,
     .q-check,
