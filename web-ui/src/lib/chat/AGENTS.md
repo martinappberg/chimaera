@@ -32,13 +32,14 @@ daemon  ──WS /ws/chat/{id}──▶  chatWs.ts (ChatSocket)
 | `uploadTokens.ts`, `uploadChips.ts`, `ComposerMentions`, `terminalMentions.ts` | Atomic mention tokens in the draft. |
 | `voice*.ts`, `VoiceMeter` | Voice dictation. |
 | `images.ts`, `AttachmentStrip`, `ImagePreview` | Image attachments and tiles. |
-| `ToolCallCard`, `ToolGroup`, `toolLabels.ts` | Tool calls and their one-line labels. |
+| `ToolCallCard`, `ToolGroup`, `toolLabels.ts`, `toolArgs.ts` | Tool calls, their one-line labels, and what an opened row lists. |
+| `DiffView`, `lineDiff.ts` | One file's change as changed lines; shared by edit rows and the approval card. |
 | `Activity*`, `activityFold.ts`, `FinishedFold`, `FinishedRow` | Folds of settled activity. |
 | `ThoughtRow`, `thoughtText.ts`, `HookRow`, `hookNotice.ts`, `statusWord.ts` | Thought and hook lines; status word. |
 | `AgentsTray`, `BackgroundTray`, `PlanCard`, `AheadCard`, `WorkStrip`, `workStrip.ts` | Pinned work cards; one shared inventory folds three kinds (including tasks) into a labelled strip; Running groups background agents and commands behind an activity icon. Idle tasks fold without adding a status label or refresh action; task tools own completion. |
 | `subagent*.ts`, `SubagentBanner`, `SubagentChip`, `ModelChip` | A subagent as a read-only chat. |
 | `AgentMessageCards`, `agentMessages.ts`, `WakeRequestBar` | Other agents' messages and wake requests. |
-| `PermissionCard`, `QuestionCard`, `PlanApprovalCard`, `Elicitation*` | Answers to the agent. |
+| `PermissionCard`, `approval.ts`, `QuestionCard`, `PlanApprovalCard`, `Elicitation*` | Answers to the agent; an approval shows its command or diff, read from the tool row it points at. |
 | `RewindDialog`, `ForkDialog`, `AgentMessageMeta` | Rewind, fork, message actions. |
 | `McpPanel`, `UsagePanel`, `UsageMeter` | `/mcp`, `/usage` and the usage meter (its popover also holds a Claude chat's Auto-compact switch: `store.autoCompact` from the `auto_compact` read-back, `set_auto_compact` capability; `store.autoCompactDisabledBy` disables it, reading Off, "set off by <var>"; `store.contextCompactAt`, the `context_usage` event's `auto_compact_at`, draws a notch on the Context bar and "Auto-compact at N%", hidden while it is off; a Codex chat shows the line without a switch). |
 | `ArtifactGallery`, `artifacts.ts`, `embeds.ts`, `FileChip`, `ProseChip`, `hoverTargets.ts` | Embeds, written files, hover previews. |
@@ -62,6 +63,7 @@ daemon  ──WS /ws/chat/{id}──▶  chatWs.ts (ChatSocket)
 - **Render agent output only through `Markdown.svelte`'s sanitizer** ([render](REFERENCE.md#render-and-sanitizer-invariants)).
 - **Streaming is never more permissive than settle** ([pipeline](REFERENCE.md#the-streaming-render-pipeline)).
 - **Trust the daemon's seq: a gap heals by replay, and fork points are event-backed** ([reducer](REFERENCE.md#reducer-invariants)).
+- **A permission decision is recorded on its tool row, not as a transcript line** (`decision` on the block; a line only when no row exists), so approved calls fold as one run.
 - **A queued send becomes a block only once read, and agents' messages are cards** ([reducer](REFERENCE.md#reducer-invariants)).
 - **The reducer's vocabulary is pinned by daemon-written fixtures.** `net/fixtures/wire/chat-events.json` (every `AgentEvent` variant, written by chimaera-agent's wire test) goes through `ChatStore.apply` in `net/wireFixtures.test.ts`, which expects `store.unhandledEventTypes` to stay empty — a type the reducer ignores on purpose is an explicit `case`, never the `default:`.
 - **Never lose a user action to a closed socket; hiding a chat never stops its agent** ([transport](REFERENCE.md#transport-invariants)).

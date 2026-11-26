@@ -64,18 +64,9 @@
   function chosen(qid: string): string[] {
     return answered?.[qid] ?? [];
   }
-  /** The answered card folds into history collapsed — a one-line summary of
-   *  what was chosen is what matters when scanning back; click to expand the
-   *  full options. */
+  /** The answered card folds into history as what was asked and what was
+   *  chosen, a line per question; click to expand the options not taken. */
   let open = $state(false);
-  const answerSummary = $derived(
-    unanswered
-      ? "not answered"
-      : request.questions
-          .map((q) => chosen(q.id).join(", "))
-          .filter((s) => s.length > 0)
-          .join(" · "),
-  );
   /** Free-text answers ride as labels; anything chosen that is not one of
    *  the offered options renders as its own chip. */
   function freeText(qid: string, options: { label: string }[]): string[] {
@@ -105,6 +96,47 @@
     ),
   );
 
+  /** One question, one choice: picking it IS the answer — no second press.
+   *  Anything richer (several questions, a multi-select) collects first. */
+  const instant = $derived(request.questions.length === 1 && !request.questions[0].multiSelect);
+  function choose(qi: number, oi: number, multi: boolean) {
+    toggle(qi, oi, multi);
+    if (instant) submit();
+  }
+
+  /** Options with something to say about themselves read as a list, one per
+   *  line with its description; bare labels stay compact chips. */
+  const described = (q: { options: { description: string }[] }) => q.options.some((o) => o.description !== "");
+
+  let cardEl = $state<HTMLDivElement | null>(null);
+  // Like the permission prompt: the ask takes the keyboard on arrival.
+  // preventScroll keeps ChatView's own stick-to-bottom contract.
+  $effect(() => {
+    if (visible && !readOnly) cardEl?.focus({ preventScroll: true });
+  });
+  /** 1–9 pick an option of the first question still open (the only one, for
+   *  an instant card); Enter sends a complete answer. Typing in "other…"
+   *  is never read as a shortcut. */
+  function onKeydown(e: KeyboardEvent) {
+    if (readOnly || e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.target instanceof HTMLInputElement) return;
+    if (e.key === "Enter" && e.target === e.currentTarget && complete) {
+      e.preventDefault();
+      submit();
+      return;
+    }
+    if (!/^[1-9]$/.test(e.key)) return;
+    const qi = Math.max(
+      0,
+      request.questions.findIndex((q, i) => q.multiSelect || (picked[i] ?? []).length === 0),
+    );
+    const q = request.questions[qi];
+    const oi = Number(e.key) - 1;
+    if (q === undefined || oi >= q.options.length) return;
+    e.preventDefault();
+    choose(qi, oi, q.multiSelect);
+  }
+
   function submit() {
     const answers: Record<string, string[]> = {};
     request.questions.forEach((q, qi) => {
@@ -116,21 +148,28 @@
   }
 </script>
 
+<!-- Focusable so 1–9 / Enter answer without the mouse; the buttons remain
+     the accessible path. -->
+<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 <div
   class="question"
   class:answered={readOnly}
   class:visible
   role="group"
   aria-label={readOnly ? "answered question" : "the agent has a question"}
+  tabindex={readOnly ? undefined : 0}
+  bind:this={cardEl}
+  onkeydown={onKeydown}
 >
   {#if readOnly}
-    <!-- History face: collapsed to a one-line answer summary; expand for the
-         full options (chosen lit, the road not taken dimmed). -->
+    <!-- History face: what was asked and what was answered, a line each;
+         expand for the full options (chosen lit, the road not taken dimmed). -->
     <button
       class="q-collapse"
       onclick={() => (open = !open)}
       aria-expanded={open}
-      title={open ? "collapse" : "expand"}
+      title={open ? "collapse" : "show the options"}
     >
       <svg class="chev" class:open viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
         <path
@@ -142,19 +181,26 @@
           stroke-linejoin="round"
         />
       </svg>
-      <span class="q-collapse-label">answered</span>
-      <span class="q-collapse-answer" class:none={unanswered}>{answerSummary}</span>
+      <span class="q-pairs">
+        {#each request.questions as q, qi (qi)}
+          <span class="q-pair">
+            <span class="q-asked">{q.question}</span>
+            <span class="q-collapse-answer" class:none={chosen(q.id).length === 0}
+              >{chosen(q.id).length === 0 ? "not answered" : chosen(q.id).join(", ")}</span
+            >
+          </span>
+        {/each}
+      </span>
     </button>
     {#if open}
       {#each request.questions as q, qi (qi)}
         <div class="q">
-          {#if q.header.length > 0}
-            <span class="q-header">{q.header}</span>
+          {#if request.questions.length > 1}
+            <div class="q-text">{q.question}</div>
           {/if}
-          <div class="q-text">{q.question}</div>
           <div class="q-options">
             {#each q.options as opt, oi (oi)}
-              <span class="q-opt static" class:on={chosen(q.id).includes(opt.label)}>
+              <span class="q-opt static" class:on={chosen(q.id).includes(opt.label)} title={opt.description}>
                 {opt.label}
               </span>
             {/each}
@@ -171,26 +217,33 @@
   {:else}
     {#each request.questions as q, qi (qi)}
       <div class="q">
-        {#if q.header.length > 0}
-          <span class="q-header">{q.header}</span>
-        {/if}
+        <div class="q-head">
+          {#if q.header.length > 0}
+            <span class="q-header">{q.header}</span>
+          {/if}
+          {#if q.multiSelect}
+            <span class="q-hint">choose any</span>
+          {/if}
+        </div>
         <div class="q-text">{q.question}</div>
-        <div class="q-options">
+        <div class="q-options" class:list={described(q)}>
           {#each q.options as opt, oi (oi)}
             <button
               class="q-opt"
               class:on={(picked[qi] ?? []).includes(oi)}
-              title={opt.description}
               aria-pressed={(picked[qi] ?? []).includes(oi)}
-              onclick={() => toggle(qi, oi, q.multiSelect)}
+              onclick={() => choose(qi, oi, q.multiSelect)}
             >
-              {opt.label}
+              {#if oi < 9}<kbd>{oi + 1}</kbd>{/if}
+              <span class="q-label">{opt.label}</span>
+              {#if opt.description !== ""}<span class="q-desc">{opt.description}</span>{/if}
             </button>
           {/each}
         </div>
         <input
           class="q-other"
           placeholder="other…"
+          aria-label="another answer"
           bind:value={other[qi]}
           onkeydown={(e) => {
             if (e.key === "Enter" && complete) {
@@ -201,14 +254,18 @@
         />
       </div>
     {/each}
-    <div class="q-actions">
-      {#if countdown !== null}
-        <span class="deadline" class:passed={deadlinePassed} aria-live="polite">
-          {deadlinePassed ? "auto-skip pending…" : `skips in ${countdown}s`}
-        </span>
-      {/if}
-      <button class="opt primary" disabled={!complete} onclick={submit}>answer</button>
-    </div>
+    {#if !instant || countdown !== null}
+      <div class="q-actions">
+        {#if countdown !== null}
+          <span class="deadline" class:passed={deadlinePassed} aria-live="polite">
+            {deadlinePassed ? "auto-skip pending…" : `skips in ${countdown}s`}
+          </span>
+        {/if}
+        {#if !instant}
+          <button class="opt primary" disabled={!complete} onclick={submit}>answer<kbd>↵</kbd></button>
+        {/if}
+      </div>
+    {/if}
   {/if}
 </div>
 
@@ -223,8 +280,9 @@
   }
   /* History face: quiet — the accent tint belongs to the live ask only. */
   .question.answered {
-    border-color: var(--edge);
-    background: color-mix(in srgb, var(--fg) 2%, transparent);
+    border-color: transparent;
+    background: none;
+    padding: 2px 0;
     animation: none;
   }
   .question:not(.visible) {
@@ -239,6 +297,55 @@
     margin-top: 12px;
     padding-top: 10px;
     border-top: 1px solid color-mix(in srgb, var(--edge) 60%, transparent);
+  }
+  .question {
+    outline: none;
+  }
+  .question:focus-visible {
+    box-shadow: 0 0 0 2px var(--focus-ring);
+  }
+  .q-head {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+  }
+  .q-head:empty {
+    display: none;
+  }
+  .q-hint {
+    color: var(--muted);
+    font-size: var(--text-xs);
+  }
+  kbd {
+    font: inherit;
+    font-size: var(--text-xs);
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .opt kbd {
+    margin-left: 7px;
+  }
+  /* Options that describe themselves: one per line, the label leading. */
+  .q-options.list {
+    flex-direction: column;
+    flex-wrap: nowrap;
+    gap: 4px;
+  }
+  .q-opt {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 8px;
+  }
+  .q-options.list .q-opt {
+    display: flex;
+    padding: 5px 10px;
+  }
+  .q-label {
+    flex: none;
+  }
+  .q-desc {
+    min-width: 0;
+    color: var(--muted);
   }
   .q-header {
     display: inline-block;
@@ -296,7 +403,7 @@
   /* Collapsed answered header: a quiet toggle showing what was chosen. */
   .q-collapse {
     display: flex;
-    align-items: center;
+    align-items: baseline;
     gap: 8px;
     width: 100%;
     background: none;
@@ -317,16 +424,31 @@
   .q-collapse .chev.open {
     transform: rotate(90deg);
   }
-  .q-collapse-label {
-    flex: none;
-    color: var(--muted);
-    font-size: var(--text-xs);
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-  }
-  .q-collapse-answer {
+  .q-pairs {
     flex: 1;
     min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .q-pair {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    min-width: 0;
+  }
+  /* The question yields first: the answer is what a scan back is after. */
+  .q-asked {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--muted);
+  }
+  .q-collapse-answer {
+    flex: none;
+    max-width: 60%;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;

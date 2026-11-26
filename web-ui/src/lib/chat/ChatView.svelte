@@ -3606,6 +3606,9 @@
       {:else}
         <PermissionCard
           {request}
+          tool={request.toolCallId !== null ? store.toolBlock(request.toolCallId) : null}
+          pathLabel={(path) => prosePaths?.label(path) ?? path}
+          onOpenPath={(path, e) => openProsePath(path, "file", { split: e.metaKey || e.ctrlKey })}
           canFeedback={supports("permission_feedback")}
           canChooseDestination={supports("permission_destination")}
           {visible}
@@ -3865,7 +3868,13 @@
   {/snippet}
 
   {#snippet planCard(embedded: boolean)}
-    <PlanCard entries={pinnedPlan} running={agentBusy && planTouched} {visible} {embedded} />
+    <PlanCard
+      entries={pinnedPlan}
+      running={agentBusy && planTouched}
+      doing={store.activity?.kind === "tool" ? store.activity.detail : null}
+      {visible}
+      {embedded}
+    />
   {/snippet}
 
   {#if workFolded && pinnedWork.length >= 2}

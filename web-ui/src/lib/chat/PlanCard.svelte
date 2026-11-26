@@ -18,9 +18,9 @@
 
   /**
    * The agent's plan as a card above the composer — one row per step, a
-   * checkbox that says its state without colour (check: done; dash:
-   * in progress; empty: waiting), the current step in the
-   * foreground, finished steps quiet. Every runtime's plan arrives as the
+   * mark that says its state by shape, not colour (a filled check: done; a
+   * turning arc: in progress; a dashed ring: waiting), the current step in
+   * the foreground, finished steps quiet. Every runtime's plan arrives as the
    * same level-set (`store.plan`), so this card is the same for all of them.
    * Rows update in place (keyed by the agent's id, else position) and the
    * card never reorders. Idle plans fold to one line; unfinished steps remain
@@ -36,9 +36,12 @@
     visible?: boolean;
     /** The work strip owns the header and disclosure. */
     embedded?: boolean;
+    /** What the agent is doing this moment (the running call's title): it
+     *  rides the line of the step in progress, so a long step shows life. */
+    doing?: string | null;
   }
 
-  let { entries, running, visible = true, embedded = false }: Props = $props();
+  let { entries, running, visible = true, embedded = false, doing = null }: Props = $props();
 
   const progress = $derived(planProgress(entries));
   const autoFolded = $derived(planFolds(entries, running));
@@ -155,11 +158,13 @@
 {#snippet checkbox(mark: StepMark)}
   <svg class="mark {mark}" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
     {#if mark === "done"}
-      <rect x="1.5" y="1.5" width="13" height="13" rx="2.5" class="fill" in:fillIn />
-      <path d="M4.9 8.3l2.1 2.1 4.1-4.5" class="tick" in:drawTick />
+      <circle cx="8" cy="8" r="6.5" class="fill" in:fillIn />
+      <path d="M5 8.3l2.1 2.1 4-4.4" class="tick" in:drawTick />
+    {:else if mark === "current"}
+      <circle cx="8" cy="8" r="5.75" class="track" />
+      <path d="M8 2.25a5.75 5.75 0 0 1 5.75 5.75" class="arc" />
     {:else}
-      <rect x="1.75" y="1.75" width="12.5" height="12.5" rx="2.5" class="ring" />
-      {#if mark === "current"}<path d="M5 8h6" class="dash" />{/if}
+      <circle cx="8" cy="8" r="5.75" class="ring" />
     {/if}
   </svg>
 {/snippet}
@@ -200,6 +205,7 @@
             <span class="line">
               <span class="text">{stepText(entry, running)}</span>
               <span class="sr-only">({MARK_WORD[mark]})</span>
+              {#if mark === "current" && running && doing}<span class="doing">{doing}</span>{/if}
               {#if entry.owner}<span class="owner">@{entry.owner}</span>{/if}
               {#if mark === "blocked"}
                 <span class="aside">after {entry.blockedBy.map((id) => `#${id}`).join(", ")}</span>
@@ -306,27 +312,54 @@
     flex: none;
     margin-top: 2px;
   }
-  .mark .ring {
+  .mark .ring,
+  .mark .track,
+  .mark .arc {
     fill: none;
     stroke: currentColor;
     stroke-width: 1.4;
   }
-  .mark .dash {
-    stroke: currentColor;
-    stroke-width: 1.6;
-    stroke-linecap: round;
-  }
-  .plan-card:not(.inactive) .mark.current .ring {
-    stroke: var(--fg);
-    stroke-width: 1.6;
-  }
   /* Waiting reads as an outline still to be drawn. */
+  .mark.todo .ring,
   .mark.blocked .ring {
     stroke: var(--muted);
-    stroke-dasharray: 2.6 2.3;
+    stroke-dasharray: 2.5 2.1;
   }
+  .mark.blocked .ring {
+    opacity: 0.6;
+  }
+  /* In progress: the one mark that moves, and the card's only accent — the
+     eye lands on what is running. Still (a part-drawn ring) once the turn
+     stops, under reduced motion, and while nobody can see it. */
+  .mark.current .track {
+    stroke: color-mix(in srgb, var(--muted) 45%, transparent);
+  }
+  .mark.current .arc {
+    stroke: var(--muted);
+    stroke-width: 1.6;
+    stroke-linecap: round;
+    transform-origin: 8px 8px;
+  }
+  .plan-card.visible:not(.inactive) .mark.current .arc {
+    stroke: var(--accent);
+    animation: plan-turn 0.9s linear infinite;
+  }
+  :global(html.app-hidden) .plan-card .mark.current .arc {
+    animation-play-state: paused;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .plan-card.visible:not(.inactive) .mark.current .arc {
+      animation: none;
+    }
+  }
+  @keyframes plan-turn {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  /* Done is settled, so it is neutral: a filled disc, the tick cut out. */
   .mark.done .fill {
-    fill: var(--accent);
+    fill: color-mix(in srgb, var(--fg) 50%, var(--bg));
     transform-box: fill-box;
     transform-origin: center;
   }
@@ -361,6 +394,22 @@
   }
   .detail {
     color: var(--muted);
+    font-size: var(--text-xs);
+    font-weight: normal;
+  }
+  /* On the step's own line, never under it: calls start and end many times
+     a step, and the card must not change height with each. */
+  .text {
+    flex: 0 1 auto;
+  }
+  .doing {
+    flex: 1 1 0;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--muted);
+    font-family: var(--mono, monospace);
     font-size: var(--text-xs);
     font-weight: normal;
   }

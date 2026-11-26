@@ -433,7 +433,9 @@ export function toolDescription(t: { tool: string; nativeInput?: unknown }): str
   if (t.tool !== "execute") return null;
   const input = t.nativeInput;
   if (typeof input !== "object" || input === null) return null;
-  const raw = (input as { description?: unknown }).description;
+  // claude Bash says `description`; Antigravity's run_command, `toolSummary`.
+  const said = input as { description?: unknown; toolSummary?: unknown };
+  const raw = typeof said.description === "string" ? said.description : said.toolSummary;
   if (typeof raw !== "string") return null;
   const line = raw.replace(/\s+/g, " ").trim();
   if (line === "") return null;

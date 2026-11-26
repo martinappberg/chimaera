@@ -398,7 +398,7 @@ unused week reads 0%); an
     "Continuing toward the goal", or "Resumed on its own" when nothing names it — unless a
     finished row already shows why. Loops and goals (their pinned Ahead card, the goal's own
     lines, the folded work strip) are their own page: [loops-and-goals.md](loops-and-goals.md).
-  - **Folded runs** — once anything follows them (a reply, a finished-work line, a permission decision, a message sent mid-turn), two or more thought and
+  - **Folded runs** — once anything follows them (a reply, a finished-work line, an answered question, a message sent mid-turn), two or more thought and
     tool lines in a row fold into one line — "Thought, ran 6 commands, read 2 files ›" — that
     expands to the original rows. The trailing run stays open while the agent works, so live
     progress is always in view, and so does a run whose last calls are still running when a
@@ -607,7 +607,10 @@ unused week reads 0%); an
 ## Tool cards, permissions & questions
 
 - **Tool cards + grouping.** Each tool call is a collapsible card (title, glyph, status dot,
-  output/diff, a `↗` to open what it touched — with a count and a compact list when it touched
+  and — opened — the whole command when the title clipped it, the call's arguments
+  (`toolArgs.ts`: what the title, locations and diff do not already show), then its output or
+  line diff; a finished command with nothing to print says "no output", and a row with nothing
+  to open opens the file it touched; a `↗` to open what it touched — with a count and a compact list when it touched
   several; each location resolves against the session first, so a relative Grep/Glob `path` or
   Codex change opens, and a directory opens in the Finder). Consecutive calls condense into a
   group ("6 commands · 2 files"). Groups are collapsed by default, including while work is running, and remain
@@ -752,11 +755,20 @@ unused week reads 0%); an
   `commandActions` are all read/list/search renders as a Read/Search row ("Read a.rs, b.rs"). No per-agent stop for codex (no
   such client RPC on the wire) — the tray's ■ stays claude-only. Wire facts: PROTOCOL.md Passes 16
   and 27.
-- **Permission prompts.** A warning card ("<tool> wants to run") with a JSON-input preview and
-  allow-once / always / reject options, plus a destination cycler for "always" rules (this project
-  just-you / all projects / this project shared / this session, persisted in localStorage). The card
-  captures focus on arrival; Enter = first allow-once, Esc = first reject (or closes the feedback
-  row first when it's open).
+- **Permission prompts.** A warning card that shows what is being approved, not its arguments: a
+  command as the command it will run (led by the agent's own description when it gave one), an
+  edit as the file's name and a line diff — changed lines with a little context, unchanged
+  stretches folded, the same `DiffView` an opened edit row draws. The subject is read from the
+  tool row the request points at (its whole command, its ACP `diff`), else from the request's
+  arguments in each agent's own names (`approval.ts`); anything else names the call, and
+  `details` shows the raw arguments for every request. Options come in one order on every card —
+  allow once, allow and remember, deny (`orderedOptions`; labels stay the agent's own) — with a
+  destination cycler for Claude's "always" rules (this project just-you / all projects / this
+  project shared / this session, persisted in localStorage). The card captures focus on arrival;
+  Enter = allow once, Esc = deny (or closes the feedback row first when it's open), and the two
+  buttons say so. The decision is recorded on the call's own row — "allowed", "always allowed",
+  "denied", "not answered" — never as a line of its own, so a run of approved calls folds as one
+  run; a request with no row (a plan approval) still leaves its one line.
 - **Deny with feedback.** Every permission card has a "deny with feedback…" affordance: the typed
   reason rides the deny so the agent reacts to it instead of aborting. Claude: the reason is
   appended to the deny directive with `interrupt:false` — the tool errors but the turn runs on;
@@ -779,7 +791,13 @@ unused week reads 0%); an
   stay inside the compact tool history, while genuine or unrecognized guardian warnings remain
   visible as transcript notices.
 - **Structured questions.** The agent's multiple-choice/free-text questions (claude
-  `AskUserQuestion` / codex `requestUserInput`) render as a card. Selections are keyed by
+  `AskUserQuestion` / codex `requestUserInput` / Antigravity's `ask_question`) render as one card
+  for every agent. Options that describe themselves list one per line, label then description;
+  bare labels stay chips; a multi-select says "choose any"; every question takes a typed answer
+  ("other…"). The card takes the keyboard on arrival: 1–9 pick an option of the first question
+  still open, Enter sends a complete answer, and a lone single-choice question is answered by
+  the pick itself. Once answered it stays in the transcript as a quiet row per question — what
+  was asked, what was chosen — that expands to the options not taken. Selections are keyed by
   question/option **index**, not by model-authored id/label (those are untrusted and can collide).
   A codex question carrying `autoResolutionMs` shows a live "skips in Ns" countdown, then auto-skips
   at the driver deadline (empty answers — the official client's behavior) with a visible "question

@@ -177,6 +177,9 @@ export interface PermissionOption {
   kind: "allow_once" | "allow_always" | "reject_once" | "reject_always";
 }
 
+/** How a tool's permission prompt ended (`ChatBlock` tool rows). */
+export type ToolDecision = "allowed" | "always" | "denied" | "lapsed";
+
 export interface PendingPermission {
   requestId: string;
   toolCallId: string | null;
@@ -379,6 +382,13 @@ export type ChatBlock = BlockIdentity &
        *  (claude `allow_*`, codex `accept*`) — distinct from a plain completion
        *  so the card can read "allowed" rather than dumping the command. */
       allowed: boolean;
+      /** How this call's permission prompt ended, in the user's terms: the
+       *  row's own mark is the transcript's record of it (no separate line).
+       *  `always` = an allow that also saved a rule; `lapsed` = the prompt
+       *  went away unanswered (cancelled, expired). Absent: never asked. */
+      decision?: ToolDecision;
+      /** The option's label as the agent worded it ("Allow Always (risky)"). */
+      decisionLabel?: string;
       /** Live output streamed ahead of the authoritative result. */
       streaming: boolean;
       /** Process-owned work that may outlive its parent turn (Codex collab
@@ -1776,21 +1786,22 @@ export class ChatStore {
         // keeps their prior "not allowed" (denied) treatment unchanged.
         const kind = req?.options.find((o) => o.id === option)?.kind ?? null;
         const allowed = kind !== null ? kind.startsWith("allow") : option.startsWith("allow");
-        if (req !== undefined) {
-          // Fold the decision into history as a quiet row — the card itself
-          // is overlay-only, and "what did I allow?" must survive a reload.
-          const label =
-            req.options.find((o) => o.id === option)?.label ??
-            (option === "cancelled" || option === "expired" ? "no longer active" : option);
+        const lapsed = kind === null && (option === "cancelled" || option === "expired");
+        const label =
+          req?.options.find((o) => o.id === option)?.label ?? (lapsed ? "no longer active" : option);
+        const row = req?.toolCallId != null ? this.toolBlock(req.toolCallId) : null;
+        if (row !== null) {
+          // The call's own row is the record of the decision — "what did I
+          // allow?" survives a reload there, and a run of approved calls
+          // stays one run instead of a line per answer.
+          if (allowed) row.allowed = true;
+          else row.denied = true;
+          row.decision = lapsed ? "lapsed" : !allowed ? "denied" : kind === "allow_always" ? "always" : "allowed";
+          row.decisionLabel = label;
+          this.touchTranscript();
+        } else if (req !== undefined) {
+          // No row to carry it (a plan approval, a hidden call): a quiet line.
           this.notice(decisionLine(req.title, label), "info");
-        }
-        if (req?.toolCallId != null) {
-          const idx = this.toolIndex.get(req.toolCallId);
-          const block = idx !== undefined ? this.blocks[idx] : undefined;
-          if (block !== undefined && block.kind === "tool") {
-            if (allowed) block.allowed = true;
-            else block.denied = true;
-          }
         }
         break;
       }
@@ -2320,6 +2331,13 @@ export class ChatStore {
 
   /** Also the client's own channel for local notices (usage summaries,
    *  intercepted commands) — they are NOT journaled, deliberately. */
+  /** The transcript row of a tool call, or null (never drawn, or trimmed). */
+  toolBlock(id: string): Extract<ChatBlock, { kind: "tool" }> | null {
+    const idx = this.toolIndex.get(id);
+    const block = idx !== undefined ? this.blocks[idx] : undefined;
+    return block !== undefined && block.kind === "tool" ? block : null;
+  }
+
   notice(text: string, tone: "info" | "error", signIn = false): void {
     // `signIn`: the daemon classified this error as a missing login
     // (`sign_in` on the event) — the view shows the agent's sign-in instead.
@@ -2348,7 +2366,14 @@ export class ChatStore {
     this.questions = [];
     this.elicitations = [];
     for (const p of this.pending) {
-      this.notice(decisionLine(p.title, "no longer active"), "info");
+      const row = p.toolCallId != null ? this.toolBlock(p.toolCallId) : null;
+      if (row !== null) {
+        row.denied = true;
+        row.decision = "lapsed";
+        row.decisionLabel = "no longer active";
+      } else {
+        this.notice(decisionLine(p.title, "no longer active"), "info");
+      }
     }
     this.pending = [];
   }

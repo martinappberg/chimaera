@@ -601,13 +601,41 @@ describe("ChatStore pending-send ordering", () => {
     expect(tool).toMatchObject({ kind: "tool", denied: true, allowed: false });
   });
 
-  it("records a decision as one line, however long the agent's title", () => {
+  it("keeps a decision on the call's own row, with no line of its own", () => {
     const store = fold([
       { type: "tool_call", id: "c1", kind: "execute", title: "python3", status: "in_progress" },
       {
         type: "permission_request",
         request_id: "r1",
         tool_call_id: "c1",
+        title: "python3",
+        options: [
+          { id: "always", label: "Allow Always (risky)", kind: "allow_always" },
+          { id: "once", label: "Allow", kind: "allow_once" },
+        ],
+      },
+      { type: "permission_resolved", request_id: "r1", option_id: "always" },
+      { type: "tool_call", id: "c2", kind: "edit", title: "Edit a.py", status: "pending" },
+      {
+        type: "permission_request",
+        request_id: "r2",
+        tool_call_id: "c2",
+        title: "Edit a.py",
+        options: [{ id: "once", label: "Allow", kind: "allow_once" }],
+      },
+      { type: "permission_resolved", request_id: "r2", option_id: "cancelled" },
+    ]);
+    expect(store.blocks.some((b) => b.kind === "notice")).toBe(false);
+    const [first, second] = store.blocks.filter((b) => b.kind === "tool");
+    expect(first).toMatchObject({ allowed: true, decision: "always", decisionLabel: "Allow Always (risky)" });
+    expect(second).toMatchObject({ denied: true, decision: "lapsed" });
+  });
+
+  it("records a decision with no row as one line, however long the agent's title", () => {
+    const store = fold([
+      {
+        type: "permission_request",
+        request_id: "r1",
         title: "Execute `python3 -c '\nimport json\n… [982 bytes omitted] …\n",
         options: [{ id: "allow-once", label: "Yes, proceed", kind: "allow_once" }],
       },
