@@ -670,9 +670,10 @@ const DEFS = {
   "editor.wordWrap": {
     title: "Word Wrap",
     category: "Editor",
-    description: "Wrap long lines instead of scrolling horizontally.",
+    description:
+      "Wrap long lines to the pane instead of scrolling sideways, in every editor, diff and comparison. A wrapped line continues under its own indentation.",
     type: "boolean",
-    default: false,
+    default: true,
     scope: "client",
   },
   "editor.tabSize": {
