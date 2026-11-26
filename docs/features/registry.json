@@ -217,6 +217,7 @@
       "page": "docs/features/agents.md",
       "paths": [
         "crates/chimaera-server/src/launcher.rs",
+        "crates/chimaera-server/src/shell_env.rs",
         "crates/chimaera-server/src/runtimes.rs",
         "crates/chimaera-server/src/doc_check.rs",
         "crates/chimaera-server/src/agent_docs.rs",
@@ -238,6 +239,40 @@
       ],
       "checks": [
         "cargo test -p chimaera-server",
+        "npm --prefix web-ui run check",
+        "npm --prefix web-ui run test"
+      ]
+    },
+    {
+      "id": "agent-browser",
+      "name": "Agent browser (agents see and drive pages)",
+      "page": "docs/features/agent-browser.md",
+      "paths": [
+        "crates/chimaera-server/src/agent_browser/**",
+        "crates/chimaera-server/src/tests/agent_browser.rs",
+        "crates/chimaera-app/src/shell/native_view/drive.rs",
+        "crates/chimaera-app/src/shell/native_view/mac/agent.rs",
+        "crates/chimaera-core/src/pane_agent.js",
+        "web-ui/src/lib/browser/agentBrowser.ts",
+        "web-ui/src/lib/browser/agentBrowserRuntime.ts",
+        "web-ui/src/lib/net/browserWire.ts"
+      ],
+      "maps": [
+        "crates/chimaera-server/AGENTS.md",
+        "crates/chimaera-app/AGENTS.md",
+        "crates/chimaera-core/AGENTS.md",
+        "web-ui/src/lib/browser/AGENTS.md",
+        "web-ui/src/lib/net/AGENTS.md"
+      ],
+      "rules": [
+        ".claude/rules/daemon.md",
+        ".claude/rules/native-app.md",
+        ".claude/rules/web-ui.md"
+      ],
+      "checks": [
+        "cargo test -p chimaera-server agent_browser",
+        "just browser-smoke",
+        "just app-check",
         "npm --prefix web-ui run check",
         "npm --prefix web-ui run test"
       ]
@@ -397,7 +432,9 @@
       "page": "docs/features/drag-drop-and-uploads.md",
       "paths": [
         "crates/chimaera-server/src/upload.rs",
+        "crates/chimaera-server/src/upload/chunked.rs",
         "web-ui/src/lib/net/uploads.ts",
+        "web-ui/src/lib/net/chunkedUpload.ts",
         "web-ui/src/lib/chat/images.ts",
         "web-ui/src/lib/shared/reference.ts"
       ],
@@ -447,6 +484,8 @@
       "paths": [
         "web-ui/src/lib/previews/**",
         "crates/chimaera-server/src/fs.rs",
+        "crates/chimaera-server/src/fs/**",
+        "crates/chimaera-app/src/shell/office.rs",
         "crates/chimaera-server/src/notebook.rs",
         "web-ui/src/lib/workspace/FileTree.svelte"
       ],
@@ -578,6 +617,7 @@
         "crates/chimaera-app/src/**",
         "web-ui/src/lib/net/native.ts",
         "web-ui/src/lib/workspace/UpdateToast.svelte",
+    "web-ui/src/lib/workspace/WindowNameCard.svelte",
         "web-ui/src/lib/workspace/update.svelte.ts"
       ],
       "maps": [
@@ -745,6 +785,8 @@
       "page": "docs/features/terminals.md",
       "paths": [
         "crates/chimaera-pty/src/**",
+        "crates/chimaera-core/src/shellint.rs",
+        "crates/chimaera-core/src/shellint/**",
         "web-ui/src/lib/terminal/**",
         "crates/chimaera-server/src/exec.rs",
         "crates/chimaera-server/src/api/exec.rs",
@@ -753,6 +795,7 @@
       "maps": [
         "crates/chimaera-server/AGENTS.md",
         "crates/chimaera-pty/AGENTS.md",
+        "crates/chimaera-core/AGENTS.md",
         "web-ui/src/lib/net/AGENTS.md",
         "web-ui/src/lib/terminal/AGENTS.md"
       ],
@@ -764,6 +807,7 @@
       "checks": [
         "cargo test -p chimaera-server",
         "cargo test -p chimaera-pty",
+        "cargo test -p chimaera-core",
         "npm --prefix web-ui run check",
         "npm --prefix web-ui run test"
       ]

@@ -76,8 +76,9 @@ on the per-session MCP endpoint ([linked-terminals.md](linked-terminals.md#the-m
   - **Codex chat, mid-turn:** `send_if_running` — steered into the running turn (a queued
     user message with `origin: "agent"`), read (`sent`) at its next step. While the agent
     waits on its spawned agents (`wait`), the steer ends that wait at once: it reads and
-    answers, then waits again. One that misses its turn settles `dropped` and goes back to
-    the inbox; it never opens a turn.
+    answers, then waits again. One that misses its turn settles `dropped` at that turn's end
+    (even while the user's own waiting input is held) and goes back to the inbox — its card
+    reads "not delivered — still in this agent's inbox"; it never opens a turn.
   - **Antigravity, Grok and Cursor chats, mid-turn:** messages stay in the inbox. Unread direct
     messages meet the wake policy after the current turn; these agents do not support
     Codex steering.

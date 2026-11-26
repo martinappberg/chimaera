@@ -134,7 +134,7 @@ impl SettingsStore {
     /// Replace the whole map and persist (pretty-printed, atomic rename).
     /// Blocking, under the caller's lock: the route goes through
     /// [`put_settings`] instead.
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn put(&mut self, map: Map) -> anyhow::Result<()> {
         let body = encode(&map).map_err(|err| match err {
             WriteError::TooLarge => anyhow::anyhow!("settings exceed {MAX_SETTINGS_BYTES} bytes"),
@@ -274,6 +274,14 @@ impl SettingsStore {
     pub(crate) fn agent_path(&self, kind: crate::agents::AgentKind) -> Option<String> {
         let key = format!("agents.{}.path", kind.as_str());
         let s = self.map.get(&key)?.as_str()?.trim();
+        (!s.is_empty()).then(|| s.to_string())
+    }
+
+    /// Daemon-consumed key: the Chrome or Chromium the agent browser's
+    /// Chromium engine launches (`browser.path`). `None` (unset or blank)
+    /// means "find a system Chrome/Chromium" (`agent_browser::chromium`).
+    pub(crate) fn browser_path(&self) -> Option<String> {
+        let s = self.map.get("browser.path")?.as_str()?.trim();
         (!s.is_empty()).then(|| s.to_string())
     }
 

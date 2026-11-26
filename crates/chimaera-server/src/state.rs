@@ -112,6 +112,15 @@ pub(crate) struct AppState {
     /// terminal session id -> agent session id: the linked-terminal edges
     /// (one agent per terminal; see the `links` module).
     pub(crate) links: Mutex<HashMap<String, String>>,
+    /// browser tab id -> the agent it is shared with + its page id (see the
+    /// `links` module; memory only, like terminal links).
+    pub(crate) browser_links: Mutex<HashMap<String, crate::links::BrowserLink>>,
+    /// The agent browser (`agent_browser`): the window request channel,
+    /// agents' pages, and the Chromium engine.
+    pub(crate) browsers: crate::agent_browser::Browsers,
+    /// `/ws/events` sockets upgraded but not yet authenticated (`ws.rs`
+    /// bounds them: each may send one large frame before auth).
+    pub(crate) events_preauth: std::sync::atomic::AtomicUsize,
     /// Short-lived raw-access tickets for /raw/{ticket} (in-memory only).
     pub(crate) tickets: Mutex<fs::TicketStore>,
     /// Browser-pane proxy sessions (/proxy/{id} targets; in-memory only —
@@ -201,6 +210,9 @@ pub(crate) struct AppState {
     /// night-scrubbed on HPC. Size-capped per file and per session (`upload`),
     /// pruned when the session ends and at boot.
     pub(crate) uploads_root: PathBuf,
+    /// Uploads the web UI has open piece by piece (`upload::chunked`): each
+    /// one's temp file, committed offset and writer seat. Per process.
+    pub(crate) chunked_uploads: crate::upload::chunked::Uploads,
     /// Draft mirror (`~/.chimaera/drafts/`): unsaved editor text mirrored by
     /// the client so a window on another origin can recover it. Capped and
     /// evicted in `drafts`.
@@ -345,6 +357,9 @@ impl AppState {
             current_cwds: Mutex::new(HashMap::new()),
             exec_status: Mutex::new(HashMap::new()),
             links: Mutex::new(HashMap::new()),
+            browser_links: Mutex::new(HashMap::new()),
+            browsers: crate::agent_browser::Browsers::new(),
+            events_preauth: std::sync::atomic::AtomicUsize::new(0),
             tickets: Mutex::new(fs::TicketStore::default()),
             proxies: Mutex::new(proxy::ProxyStore::default()),
             quickopen: Mutex::new(quickopen::QuickOpenCache::default()),
@@ -367,6 +382,7 @@ impl AppState {
             worktrees_root_real: real_path(&data_dir.join("worktrees")),
             shims_dir: data_dir.join("shims"),
             uploads_root: data_dir.join("uploads"),
+            chunked_uploads: Default::default(),
             drafts_root: data_dir.join("drafts"),
             fs_touched: tokio::sync::broadcast::channel(crate::fs_watch::TOUCHED_CAPACITY).0,
             installs: Mutex::new(HashMap::new()),

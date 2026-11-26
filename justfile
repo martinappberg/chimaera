@@ -52,6 +52,12 @@ chat-mods-smoke:
 chat-smoke-acp:
     cargo test -p chimaera-agent --test acp_live -- --ignored --test-threads=1 --nocapture
 
+# CHIMAERA_TEST_CHROMIUM names a Chrome, Chromium or chrome-headless-shell executable.
+# Drives the agent browser's Chromium engine against it; no network, no billing.
+browser-smoke:
+    test -n "${CHIMAERA_TEST_CHROMIUM:-}" || { echo "browser-smoke: set CHIMAERA_TEST_CHROMIUM to a Chrome, Chromium or chrome-headless-shell executable"; exit 1; }
+    cargo test -p chimaera-server --lib agent_browser::chromium::live_tests -- --ignored --nocapture
+
 # Run the daemon locally (foreground)
 serve: ui
     cargo run -p chimaera -- serve

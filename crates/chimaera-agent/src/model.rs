@@ -110,9 +110,16 @@ pub const WF_AGENT_LABEL_MAX: usize = 120;
 pub const PREVIEW_TOTAL_BUDGET: usize = 64 * 1024;
 /// Agent-provided composer catalog bound. Codex skills and Claude commands
 /// are filesystem/plugin influenced and the complete Init event is journaled.
-/// These maxima keep even a fully saturated catalog comfortably below the
-/// journal's 256 KiB line cap.
-pub const SLASH_COMMANDS_CAP: usize = 64;
+/// The count alone no longer bounds the event (256 full rows with skill
+/// paths would pass the journal's 256 KiB line cap), so [`cap_slash_catalog`]
+/// also holds the serialized rows to [`SLASH_CATALOG_BUDGET`]. Claude 2.1.332
+/// lists 86 commands on an ordinary account, before any MCP-server skill;
+/// the earlier cap of 64 cut `/insights`, `/recap`, `/goal` and the rest of
+/// the tail off the end.
+pub const SLASH_COMMANDS_CAP: usize = 256;
+/// Serialized-size budget for one catalog's rows, well under the journal's
+/// 256 KiB line cap beside the models and modes the same event carries.
+pub const SLASH_CATALOG_BUDGET: usize = 96 * 1024;
 pub const SLASH_NAME_MAX: usize = 128;
 pub const SLASH_DESCRIPTION_MAX: usize = 320;
 pub const SKILL_PATH_MAX: usize = 1024;
@@ -578,9 +585,15 @@ pub enum AgentEvent {
     },
     /// Journal head marker after compaction: entries before this were dropped.
     Truncated,
-    /// The session moved between chat and terminal mode (the toggle).
+    /// The session moved between chat and terminal mode (the toggle), or
+    /// its process started again in place.
     ModeSwitch {
         to: SessionUi,
+        /// The process started again for a new sign-in: what the old one
+        /// said about its account (the usage limits, a limit reached) is no
+        /// longer about this conversation.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        sign_in: bool,
     },
     /// Boundary between a copied source-journal prefix and the destination
     /// session's own events. A portable handoff's old native ids are display
@@ -994,8 +1007,14 @@ pub struct ScheduledJob {
     /// the driver after each run, keeping the agent's jitter).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_at_ms: Option<u64>,
-    /// When the driver first saw it — a recurring job expires 7 days on.
+    /// When the driver first saw it.
     pub created_at_ms: u64,
+    /// When a recurring job ends, where the agent said how long it lasts:
+    /// claude 2.1.330's `CronCreate` result carries `maxAgeMs` (30 days).
+    /// Absent on an older CLI and on a job first seen in a listing, which
+    /// names no lifetime: such a job ends 7 days after `created_at_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
 }
 
 /// A goal as it stands (`AgentEvent::Goal.goal`).
@@ -1698,6 +1717,29 @@ pub struct McpServerInfo {
     pub tools: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// Bound a composer catalog at construction: at most [`SLASH_COMMANDS_CAP`]
+/// rows and [`SLASH_CATALOG_BUDGET`] serialized bytes, keeping the agent's
+/// own order. Rows are dropped whole from the end; a cut name or path would
+/// invoke something else.
+pub fn cap_slash_catalog(rows: impl IntoIterator<Item = SlashCommand>) -> Vec<SlashCommand> {
+    let mut kept = Vec::new();
+    let mut bytes = 0usize;
+    for row in rows {
+        if kept.len() == SLASH_COMMANDS_CAP {
+            break;
+        }
+        // The serialized length, so a description full of characters JSON
+        // escapes cannot pass the budget at six bytes each.
+        let size = serde_json::to_string(&row).map_or(usize::MAX, |json| json.len() + 1);
+        if size > SLASH_CATALOG_BUDGET.saturating_sub(bytes) {
+            break;
+        }
+        bytes += size;
+        kept.push(row);
+    }
+    kept
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -2677,5 +2719,59 @@ mod sign_in_tests {
         ] {
             assert!(!sign_in_failure(text), "{text}");
         }
+    }
+}
+
+#[cfg(test)]
+mod slash_catalog_tests {
+    use super::{
+        cap_slash_catalog, SlashCommand, SKILL_PATH_MAX, SLASH_CATALOG_BUDGET, SLASH_COMMANDS_CAP,
+        SLASH_DESCRIPTION_MAX,
+    };
+
+    fn row(i: usize, description: &str, path: Option<String>) -> SlashCommand {
+        SlashCommand {
+            name: format!("command-{i}"),
+            description: description.to_string(),
+            skill_path: path,
+        }
+    }
+
+    #[test]
+    fn a_catalog_is_cut_by_count_and_by_serialized_size() {
+        // Short rows: the count is the bound, and the order is the agent's.
+        let short =
+            cap_slash_catalog((0..SLASH_COMMANDS_CAP + 10).map(|i| row(i, "does a thing", None)));
+        assert_eq!(short.len(), SLASH_COMMANDS_CAP);
+        assert_eq!(short[0].name, "command-0");
+        assert_eq!(
+            short.last().unwrap().name,
+            format!("command-{}", SLASH_COMMANDS_CAP - 1)
+        );
+
+        // Full rows with skill paths: the size is the bound, rows stay whole.
+        let full = cap_slash_catalog((0..SLASH_COMMANDS_CAP).map(|i| {
+            row(
+                i,
+                &"x".repeat(SLASH_DESCRIPTION_MAX),
+                Some("p".repeat(SKILL_PATH_MAX)),
+            )
+        }));
+        assert!(
+            full.len() < SLASH_COMMANDS_CAP && full.len() > 32,
+            "{}",
+            full.len()
+        );
+        assert!(serde_json::to_string(&full).unwrap().len() <= SLASH_CATALOG_BUDGET);
+        assert!(full
+            .iter()
+            .all(|c| c.skill_path.as_ref().unwrap().len() == SKILL_PATH_MAX));
+
+        // Characters JSON escapes at six bytes each count as written.
+        let escaped = cap_slash_catalog(
+            (0..SLASH_COMMANDS_CAP).map(|i| row(i, &"\u{1}".repeat(SLASH_DESCRIPTION_MAX), None)),
+        );
+        assert!(serde_json::to_string(&escaped).unwrap().len() <= SLASH_CATALOG_BUDGET);
+        assert!(escaped.len() < SLASH_COMMANDS_CAP);
     }
 }

@@ -180,6 +180,14 @@ export interface BrowserTab {
    * attribution must stay true. Optional and additive in the saved layout.
    */
   openedBy?: string;
+  /**
+   * Transient, never persisted: the id of a live pane view this tab takes
+   * on when its view mounts (an agent's own page handed to the user, #273),
+   * so the page carries on in place instead of loading again. Read once by
+   * the tab's view; left in place after (a later mount finds the adoption
+   * done and makes its own view).
+   */
+  adopt?: string;
 }
 export type Tab =
   | TerminalTab
@@ -1024,6 +1032,32 @@ export function adjacentPane(l: Layout, paneId: string): string | null {
     if (moved.focusedPaneId !== paneId) return moved.focusedPaneId;
   }
   return null;
+}
+
+/**
+ * Focus the pane "beside" `paneId` — where an open-beside gesture (⌘/Ctrl-
+ * click, middle click, "Open Beside") lands: the nearest neighbor, else a
+ * fresh split to the right. Reusing the neighbor keeps a link-heavy flow to
+ * two panes instead of a new split per click, and keeps it under MAX_PANES
+ * (at the cap a neighbor always exists). A zoom clears: both should show.
+ */
+export function focusBeside(l: Layout, paneId: string): Layout {
+  if (findPane(l.root, paneId) === null) return l;
+  const shown: Layout = l.zoomedPaneId === null ? l : { ...l, zoomedPaneId: null };
+  const neighbor = adjacentPane(shown, paneId);
+  return neighbor !== null ? focusPane(shown, neighbor) : splitPane(shown, paneId, "row");
+}
+
+/**
+ * Whether a plain click from `paneId` should land beside it rather than in
+ * it: the pane shows a session (a chat or a terminal) and has a neighbor.
+ * A file or app opened from a conversation then sits next to it instead of
+ * covering it; with no neighbor it opens in the session's pane as before.
+ */
+export function opensBesideSession(l: Layout, paneId: string): boolean {
+  const p = findPane(l.root, paneId);
+  const active = p?.tabs[p.active];
+  return active?.surface === "terminal" && l.zoomedPaneId === null && adjacentPane(l, paneId) !== null;
 }
 
 export function toggleZoom(l: Layout): Layout {

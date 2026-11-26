@@ -288,6 +288,7 @@ pub(super) fn open_shell_window(
                 || daemon_navigation_allowed(&navigation_app, &navigation_label, url)
         })
         .on_page_load(move |_window, payload| {
+            super::native_view::owner_page_load(&page_load_app, &page_load_label, payload.event());
             if !matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
                 || !daemon_navigation_allowed(&page_load_app, &page_load_label, payload.url())
             {

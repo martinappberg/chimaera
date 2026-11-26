@@ -1910,6 +1910,7 @@ async fn codex_collab_subagent_surface() {
     let mut agent_thread = String::new();
     let mut saw_foreign_frame = false;
     let mut saw_foreign_turn_end = false;
+    let mut saw_completed_marker = false;
     let mut child_last_phase = Value::Null;
     loop {
         let frame = chat
@@ -1930,15 +1931,14 @@ async fn codex_collab_subagent_surface() {
                     assert_ne!(agent_thread, thread_id, "a subagent is its own thread");
                     assert!(item["agentPath"].is_string(), "agentPath names the agent");
                 }
-                // The finish marker (0.153+) trails the agent thread's own
-                // turn end — the driver closes the row (and journals its
-                // one SubagentFinished) on that turn end and treats the
-                // marker as a no-op, so the order is load-bearing.
+                // The finish marker (0.153+) and the agent thread's own turn
+                // end come in either order: through 0.162.1 the turn end
+                // landed before the marker's `item/completed`, 0.164.0 sends
+                // both marker frames first (Pass 43; Pass 58). The driver closes
+                // the row on whichever names the finish while no turn of the
+                // agent's is known to be running, so neither order matters.
                 if item["kind"] == "completed" {
-                    assert!(
-                        saw_foreign_turn_end,
-                        "the completed marker arrived before the subagent's turn end"
-                    );
+                    saw_completed_marker = true;
                 }
             }
             // The subagent's own transcript multiplexes onto this connection.
@@ -1978,6 +1978,10 @@ async fn codex_collab_subagent_surface() {
     assert!(
         saw_foreign_turn_end,
         "the subagent's own turn/completed arrived (threadId-scoped)"
+    );
+    assert!(
+        saw_completed_marker,
+        "the parent thread carried the subagent's finish marker"
     );
     assert_ne!(
         child_last_phase,
@@ -2722,6 +2726,165 @@ async fn driver_codex_send_if_running_joins_the_turn_or_drops() {
         "the steered message reached the model: {prose}"
     );
     manager.kill("s-codex-sir");
+}
+
+/// #355 (PROTOCOL.md Pass 60): with instant steering, A is read at once but
+/// not answered while the command runs; B waits; C is for after the turn.
+/// Send now must get A and B answered together in the turn it opens, and C
+/// after that, whichever of B's paths (unread re-drive, or read by the time
+/// the interrupt landed) the run takes.
+#[tokio::test]
+#[ignore = "live: spawns real codex via the driver, needs auth, bills a few small turns"]
+async fn driver_codex_send_now_answers_every_waiting_message() {
+    use chimaera_agent::codex::CodexAdapter;
+    use std::sync::Arc;
+
+    let dir = tmpdir();
+    let manager = Arc::new(ChatManager::new(
+        dir.path().join("chat"),
+        Box::new(|_, _| {}),
+        Box::new(|_, _| {}),
+    ));
+    let mut spec = SpawnSpec::new(
+        "s-codex-sendnow",
+        vec!["codex".into(), "app-server".into()],
+        dir.path().to_path_buf(),
+    );
+    spec.initial_model = Some("gpt-5.6-luna".into());
+    manager.spawn(&CodexAdapter, spec).expect("spawn driver");
+    let mut rx = manager.attach("s-codex-sendnow", 0).expect("attach").live;
+    let text = |t: &str| vec![ContentBlock::Text { text: t.into() }];
+    manager
+        .command(
+            "s-codex-sendnow",
+            AgentCommand::Send {
+                blocks: text(
+                    "Run exactly this shell command once, in the foreground, and wait for it: \
+                     python3 -c 'import time; time.sleep(30); print(\"slept\")' . When it \
+                     finishes, reply with just the word OPENER.",
+                ),
+            },
+        )
+        .await
+        .expect("send");
+
+    let (mut a, mut b, mut c) = (None::<String>, None::<String>, None::<String>);
+    let mut a_read = false;
+    let mut pressed = false;
+    let mut turns_after_abort: Vec<String> = Vec::new();
+    let mut aborted = false;
+    let mut prose = String::new();
+    let deadline = tokio::time::Instant::now() + TURN * 3;
+    loop {
+        let entry = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .expect("timed out waiting for the Send now turns")
+            .expect("broadcast closed");
+        match &entry.ev {
+            AgentEvent::ToolCall { .. } if a.is_none() => {
+                // A beat after the command starts, so the model is waiting.
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                manager
+                    .command(
+                        "s-codex-sendnow",
+                        AgentCommand::Send {
+                            blocks: text("Separate question A: what is 17+25? Answer on its own line as A=<number>."),
+                        },
+                    )
+                    .await
+                    .expect("send A");
+                a = Some(String::new());
+            }
+            AgentEvent::PermissionRequest {
+                request_id,
+                options,
+                ..
+            } => {
+                let option = options.first().expect("an option").id.clone();
+                manager
+                    .command(
+                        "s-codex-sendnow",
+                        AgentCommand::Permission {
+                            request_id: request_id.clone(),
+                            option_id: option,
+                            destination: None,
+                            feedback: None,
+                        },
+                    )
+                    .await
+                    .expect("allow");
+            }
+            AgentEvent::UserMessage {
+                id: Some(id),
+                text: t,
+                ..
+            } => {
+                if t.starts_with("Separate question A") {
+                    a = Some(id.clone());
+                } else if t.starts_with("Separate question C") {
+                    c = Some(id.clone());
+                    manager
+                        .command(
+                            "s-codex-sendnow",
+                            AgentCommand::Send {
+                                blocks: text("Separate question B: what is 9*7? Answer on its own line as B=<number>."),
+                            },
+                        )
+                        .await
+                        .expect("send B");
+                } else if t.starts_with("Separate question B") {
+                    b = Some(id.clone());
+                    // At once, while B still waits: the stack's one control
+                    // names the oldest next-step message.
+                    manager
+                        .command("s-codex-sendnow", AgentCommand::SendNow { id: id.clone() })
+                        .await
+                        .expect("send now");
+                    pressed = true;
+                }
+            }
+            AgentEvent::UserMessageUpdate { id, state } if a.as_deref() == Some(id.as_str()) => {
+                assert_eq!(*state, UserMessageState::Sent);
+                if !a_read {
+                    a_read = true;
+                    manager
+                        .command(
+                            "s-codex-sendnow",
+                            AgentCommand::SendAfterTurn {
+                                blocks: text(
+                                    "Separate question C: what is 100-1? Answer as C=<number>.",
+                                ),
+                            },
+                        )
+                        .await
+                        .expect("send C");
+                }
+            }
+            AgentEvent::MessageChunk { text, .. } => prose.push_str(text),
+            AgentEvent::TurnAborted { .. } if pressed && !aborted => {
+                aborted = true;
+                prose.clear();
+            }
+            AgentEvent::TurnCompleted { .. } if aborted => {
+                turns_after_abort.push(std::mem::take(&mut prose));
+                if turns_after_abort.iter().any(|t| t.contains("C=99")) {
+                    break;
+                }
+            }
+            AgentEvent::TurnCompleted { .. } if !pressed => {
+                panic!("the opening turn ended before Send now: {prose}");
+            }
+            _ => {}
+        }
+    }
+    eprintln!("turns after Send now: {turns_after_abort:?}");
+    assert!(a_read && pressed && aborted && b.is_some() && c.is_some());
+    let first = &turns_after_abort[0];
+    assert!(
+        first.contains("A=42") && first.contains("B=63"),
+        "the turn Send now opened answered both A and B: {turns_after_abort:?}"
+    );
+    manager.kill("s-codex-sendnow");
 }
 
 /// Instant input is a launch feature, not a new turn/steer shape. The driver

@@ -757,10 +757,10 @@ export function beginFind(id: string, results: (index: number, count: number) =>
 }
 
 /**
- * Type `text` into the session's live socket (context bridge references).
- * Returns false when the session has no pooled entry or its socket is down —
- * the caller falls back to a one-shot socket. Callers guarantee `text`
- * carries no newline (never submits).
+ * Type `text` into the session's live socket (context bridge references, a
+ * chat's Run button). Returns false when the session has no pooled entry or
+ * its socket is down — the caller falls back to a one-shot socket. Sent as
+ * given: only a Run click's text ends in Enter.
  */
 export function sendText(id: string, text: string): boolean {
   const entry = pool.get(id);

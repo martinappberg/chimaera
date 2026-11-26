@@ -1,4 +1,5 @@
 mod agent_auth;
+mod agent_browser;
 mod agent_docs;
 mod agent_probe;
 mod agent_setup;
@@ -46,6 +47,7 @@ mod runtime_retention;
 mod runtimes;
 mod session_view;
 mod settings;
+mod shell_env;
 mod spawn;
 mod state;
 mod subagents;

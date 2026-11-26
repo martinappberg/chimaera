@@ -15,9 +15,12 @@
 # bytes; the manifest's id, version and [release] github against this file),
 # rewrites the entry — version, the two sha256s, and `name` / `summary` from
 # the release's plugin.toml — and opens a `fix:` PR, which CI (these same
-# releases, downloaded and installed) gates. `tier` and `caps` are what the
-# maintainers approved the plugin to do (`chimaera plugin caps plugin.toml`
-# prints both): a sandboxed plugin keeps its badge on an update only while
+# releases, downloaded and installed) gates. `category` is the Extensions
+# page's group for the plugin (writing, presentations, data, knowledge or
+# agents): the maintainers' call, which a bump never touches. `tier` and
+# `caps` are what the maintainers approved the plugin to do
+# (`chimaera plugin caps plugin.toml` prints both): a sandboxed plugin
+# keeps its badge on an update only while
 # its capability digest is this one, and a privileged plugin (one that runs
 # or downloads programs) is verified only at the pinned version. So the PR
 # auto-merges only when the release is sandboxed and asks for nothing new;
@@ -34,6 +37,7 @@
 id = "mycelium"
 name = "Mycelium"
 summary = "Project memory your agents record as they work — findings, decisions, learnings."
+category = "knowledge"
 version = "0.2.1"
 repo = "martinappberg/chimaera-plugin-mycelium"
 sha256_wasm = "0e84277246d16243f312fb5b04df6c1db6d2d1412a0c4a5d84f14cda5ff45359"
@@ -45,6 +49,7 @@ caps = "4ac70a95ec5d441f9ca6a0164222e74ede596e176853d1751d80cdaf862b0ec5"
 id = "latex"
 name = "LaTeX"
 summary = "Build .tex to PDF beside the source with latexmk, errors as editor marks, compile_latex for agents, and TeX Live on one click."
+category = "writing"
 version = "0.1.1"
 repo = "martinappberg/chimaera-plugin-latex"
 sha256_wasm = "8f83c41abf28d168542b904cd2f4cb8a4b42f8cc8a03136679601cf5c39f676b"
@@ -56,9 +61,34 @@ caps = "39ded32b020795e0980da149e79b2c14c899fca2a764b5b85883dd755c1b3f0e"
 id = "typst"
 name = "Typst"
 summary = "Build .typ to PDF beside the source, with errors as editor marks, compile_typst for agents, and Typst on one click."
+category = "writing"
 version = "0.1.0"
 repo = "martinappberg/chimaera-plugin-typst"
 sha256_wasm = "9a41ea42caa57ef7613d98f07749e3a89f7c5508d7bce87b774dfb967497c8e3"
 sha256_toml = "d79107af0955a755eaa01b8030abd274e5949104a54f3d00d94e4824a4a2d004"
 tier = "privileged"
 caps = "3030956b9321bdbfd2a11652164338a86d57b62ae83b04f1f3a6ce0a83130f07"
+
+[[plugin]]
+id = "pptx"
+name = "PowerPoint"
+summary = "Agents see their slides, build on curated themes, and fix what the deck checker finds."
+category = "presentations"
+version = "0.1.0"
+repo = "martinappberg/chimaera-plugin-pptx"
+sha256_wasm = "5837fb6352ea99e5aa97970c9d14d4cf46ba53a55c3c6d0a973a9a1aef2d5d48"
+sha256_toml = "76b5581d07c4b09cb02ff37ba66f6a0df0c5b99912971ef565bf63cdfee4ee31"
+tier = "privileged"
+caps = "b2133ff434f7b3b75c3444f9313ffb55391e18523a48285f6e63945229255c10"
+
+[[plugin]]
+id = "chromium"
+name = "Chromium"
+summary = "A headless Chromium for agents' browser tools on a host with no Chrome, downloaded only when you click Install."
+category = "agents"
+version = "0.1.0"
+repo = "martinappberg/chimaera-plugin-chromium"
+sha256_wasm = "dce3557fb97092d60aa993bc58cde31224a9684c7c0e6ca2023c2feb5e6b6f3b"
+sha256_toml = "f93825344ff752be17dbff84946b24fd88e510acf48c944524c986e797ef8bfd"
+tier = "privileged"
+caps = "02bdf423845a47fb262c73114fa0a03d59d93aaca1472519d168ee75f463c533"

@@ -98,6 +98,9 @@
     voiceTerms?: string[];
     imageInput?: boolean;
     onNativeEdit?: (request: UiRecord) => Promise<UiRecord>;
+    /** ↑ in an empty composer: take the waiting messages back to edit them
+     *  (the agents' own clients do the same). True = there were some. */
+    onRecallWaiting?: () => boolean;
   }
 
   let {
@@ -124,6 +127,7 @@
     voiceTerms = [],
     imageInput = true,
     onNativeEdit,
+    onRecallWaiting,
   }: Props = $props();
 
   const uid = $props.id();
@@ -956,6 +960,16 @@
     if (e.key === "Tab" && e.shiftKey) {
       e.preventDefault();
       onCycleMode();
+      return;
+    }
+    if (
+      e.key === "ArrowUp" &&
+      !e.shiftKey && !e.altKey && !e.metaKey && !e.ctrlKey &&
+      draft.length === 0 &&
+      images.length === 0 &&
+      onRecallWaiting?.() === true
+    ) {
+      e.preventDefault();
       return;
     }
     // Also only reached with no popover open — there Enter, with or without

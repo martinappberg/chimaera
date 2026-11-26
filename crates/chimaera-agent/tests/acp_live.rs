@@ -4,7 +4,10 @@ use chimaera_agent::{
     acp::{AcpAdapter, ANTIGRAVITY, CURSOR, GROK},
     driver::SpawnSpec,
     journal::SeqEvent,
-    model::{AgentCommand, AgentEvent, ContentBlock, PermissionOptionKind, UserMessageState},
+    model::{
+        AgentCommand, AgentEvent, ContentBlock, PermissionOptionKind, ToolContent, ToolStatus,
+        UserMessageState,
+    },
     ChatManager,
 };
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -152,12 +155,138 @@ async fn exercise(adapter: AcpAdapter, env: &str, args: &[&str]) {
         "resume lost context: {reply}"
     );
     exercise_controls(&manager, &mut rx, dir.path(), adapter).await;
+    exercise_shell_output(&manager, &mut rx).await;
+    if adapter.kind == ANTIGRAVITY.kind {
+        exercise_combined_model_id(&manager, &mut rx).await;
+    }
     manager.kill("acp");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while manager.get("acp").unwrap().alive {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(tokio::time::Instant::now() < deadline);
     }
+}
+
+/// A finished shell call draws its output whichever field the agent puts it
+/// in: Grok's `content`, agy's `rawOutput.combinedOutput`, Cursor's
+/// `rawOutput.stdout` (Pass 61).
+async fn exercise_shell_output(
+    manager: &ChatManager,
+    rx: &mut tokio::sync::broadcast::Receiver<Arc<SeqEvent>>,
+) {
+    send(
+        manager,
+        "Use your shell tool to run exactly: echo chimaera-shell-marker . Do not delegate. Then reply with only done.",
+    )
+    .await;
+    let output = loop {
+        let e = until(rx, |e| {
+            matches!(
+                e,
+                AgentEvent::PermissionRequest { .. }
+                    | AgentEvent::ToolCallUpdate {
+                        status: ToolStatus::Completed,
+                        content: Some(ToolContent::Output { .. }),
+                        ..
+                    }
+                    | AgentEvent::TurnCompleted { .. }
+                    | AgentEvent::TurnAborted { .. }
+            )
+        })
+        .await;
+        match e {
+            AgentEvent::PermissionRequest {
+                request_id,
+                options,
+                ..
+            } => {
+                let option_id = options
+                    .iter()
+                    .find(|o| o.kind == PermissionOptionKind::AllowOnce)
+                    .unwrap()
+                    .id
+                    .clone();
+                manager
+                    .command(
+                        "acp",
+                        AgentCommand::Permission {
+                            request_id,
+                            option_id,
+                            feedback: None,
+                            destination: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            AgentEvent::ToolCallUpdate {
+                content: Some(ToolContent::Output { text, .. }),
+                ..
+            } if text.contains("chimaera-shell-marker") => break text,
+            AgentEvent::ToolCallUpdate { .. } => {}
+            other => panic!("the shell call drew no output: {other:?}"),
+        }
+    };
+    assert!(output.contains("chimaera-shell-marker"), "{output}");
+    until(rx, |e| {
+        matches!(
+            e,
+            AgentEvent::TurnCompleted { .. } | AgentEvent::TurnAborted { .. }
+        )
+    })
+    .await;
+}
+
+/// agy-acp 1.2.1 offered effort-suffixed model ids; 1.4.5 offers the model
+/// family plus a thinking level. A remembered combined id is sent as both,
+/// with no notice (Pass 61). No turn, no billing.
+async fn exercise_combined_model_id(
+    manager: &ChatManager,
+    rx: &mut tokio::sync::broadcast::Receiver<Arc<SeqEvent>>,
+) {
+    let model = manager.get("acp").unwrap().model.unwrap();
+    // 1.2.1's catalog is the combined ids themselves: nothing to split.
+    if ["-low", "-medium", "-high"]
+        .iter()
+        .any(|level| model.ends_with(level))
+    {
+        return;
+    }
+    manager
+        .command(
+            "acp",
+            AgentCommand::SetModel {
+                model_id: format!("{model}-low"),
+            },
+        )
+        .await
+        .unwrap();
+    let switched = until(rx, |e| {
+        matches!(
+            e,
+            AgentEvent::ModelSwitched { .. } | AgentEvent::Notice { .. }
+        )
+    })
+    .await;
+    assert!(
+        matches!(&switched, AgentEvent::ModelSwitched { to, .. } if to == &model),
+        "{switched:?}"
+    );
+    let effort = until(rx, |e| {
+        matches!(
+            e,
+            AgentEvent::EffortState {
+                effort: Some(_),
+                chosen: true,
+                ..
+            } | AgentEvent::Notice { .. }
+        )
+    })
+    .await;
+    assert!(
+        matches!(&effort, AgentEvent::EffortState { effort: Some(level), .. } if level == "low"),
+        "{effort:?}"
+    );
 }
 
 async fn until(

@@ -320,8 +320,9 @@ export class SessionSocket {
  * Type `text` into a session that has no pooled terminal attached (context
  * bridge fallback): open a one-shot socket, send the input once the server
  * is provably ready (the snapshot binary frame has arrived), and close.
- * The text is raw input — callers guarantee it carries no newline, so this
- * can never submit anything.
+ * The text is raw input, sent as given: a context-bridge reference carries
+ * no newline and so never submits; a chat's Run button ends in Enter on
+ * purpose (`chat/runCommand.ts`).
  */
 export function typeIntoDetachedSession(sessionId: string, text: string): void {
   let sent = false;

@@ -42,10 +42,20 @@
      *  to the renderers that defer or pause parked work; unset outside a
      *  Pane, where they watch their layer themselves. */
     visible?: boolean;
+    /** A press inside a view this pane can't hear (an HTML page in its own
+     *  native view): focus the pane. */
+    onFocusRequest?: () => void;
   }
 
-  let { path, wsRoot = null, fontSize = undefined, plugins = true, pathBar = true, visible = undefined }: Props =
-    $props();
+  let {
+    path,
+    wsRoot = null,
+    fontSize = undefined,
+    plugins = true,
+    pathBar = true,
+    visible = undefined,
+    onFocusRequest = undefined,
+  }: Props = $props();
 
   const kind = $derived(viewKindFor(path));
 
@@ -93,7 +103,7 @@
     fontSize?: number;
     wsRoot?: string | null;
   }> | null>(null);
-  let HtmlView = $state<Component<{ path: string }> | null>(null);
+  let HtmlView = $state<Component<{ path: string; visible?: boolean; onFocusRequest?: () => void }> | null>(null);
   let XlsxView = $state<Component<{ path: string }> | null>(null);
   let PdfView = $state<Component<{ path: string; visible?: boolean }> | null>(null);
   let NotebookView = $state<Component<{ path: string; wsRoot?: string | null; visible?: boolean }> | null>(
@@ -380,7 +390,7 @@
         {/if}
       {:else if kind === "html"}
         {#if HtmlView !== null}
-          <HtmlView {path} />
+          <HtmlView {path} {visible} {onFocusRequest} />
         {:else}
           {@render lazyFallback()}
         {/if}

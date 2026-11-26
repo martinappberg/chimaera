@@ -61,7 +61,9 @@ switch wins for its conversation) and `agents.autoCompactAt` (Agent default or 5
 `agents.communication.wakes` and `agents.communication.freeSubagents` — as ordinary
 `SettingRow`s under their own subheading (`SettingsView`, every
 `agents.communication.*` row). The schema has no "show only when" yet, so the
-wakes row always shows.
+wakes row always shows. A **Browser** block (`browser.path`, the Chrome or Chromium the
+[agent browser](../../../../docs/features/agent-browser.md) launches when no app window is connected; empty finds one on the host, else a plugin's, such as the Chromium plugin's download)
+sits between Context and Agent communication; `SettingsView` picks it out by id (`isBrowserDef`).
 
 ## File map
 

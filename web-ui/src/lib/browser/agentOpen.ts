@@ -10,6 +10,7 @@
  */
 
 import {
+  type BrowserTab,
   type Layout,
   type Tab,
   MAX_PANES,
@@ -133,6 +134,12 @@ export function shouldActOnAgentBrowserOpen(open: AgentBrowserOpen, view: Window
  * to the calling session (`openedBy`), so its chrome can say who opened it.
  */
 export function placeAgentBrowser(l: Layout, open: AgentBrowserOpen): Layout {
+  return placeAgentBrowserTab(l, open).layout;
+}
+
+/** `placeAgentBrowser`, also naming the tab that now shows the page (a
+ *  re-pointed one or a fresh one). */
+export function placeAgentBrowserTab(l: Layout, open: AgentBrowserOpen): { layout: Layout; tabId: string } {
   const focused = l.focusedPaneId;
   const anchor = sessionPaneId(l, open.sessionId) ?? focused;
   const covers = (paneId: string) => paneId === anchor || paneId === focused;
@@ -149,7 +156,7 @@ export function placeAgentBrowser(l: Layout, open: AgentBrowserOpen): Layout {
     // The latest opener wins: the pane now shows what THIS agent asked for.
     next = setBrowserOpener(setBrowserPath(next, existing.id, open.path), existing.id, open.sessionId);
     if (p.active === index || !covers(p.id)) {
-      return restoreFocus(activateTab(next, p.id, index), l);
+      return { layout: restoreFocus(activateTab(next, p.id, index), l), tabId: existing.id };
     }
     // Showing it in place would hide what the user is looking at: move it.
     next = detachTab(next, p.id, index);
@@ -157,7 +164,53 @@ export function placeAgentBrowser(l: Layout, open: AgentBrowserOpen): Layout {
     break;
   }
   tab ??= freshBrowserTab(open.host, open.port, open.path, open.sessionId);
+  return { layout: placeBeside(next, tab, anchor, covers, l), tabId: tab.id };
+}
 
+/**
+ * One page per agent (#273): a pane an agent opens with `open_browser` is
+ * shared with it, so its browser tools drive the page the user watches —
+ * marker, cursor, take-over — instead of a hidden duplicate fighting it
+ * (a single-editor app like marimo would). Only where a pane view can be
+ * driven (`paneViews`: the app); the iframe fallback shares nothing. A
+ * re-pointed tab goes to its latest opener.
+ */
+export function agentOpenShare(
+  tabId: string,
+  open: AgentBrowserOpen,
+  paneViews: boolean,
+): { tab: string; agent: string } | null {
+  return paneViews ? { tab: tabId, agent: open.sessionId } : null;
+}
+
+/**
+ * Hand-over (the agent browser's `browser_show`): the agent's own page
+ * opens as a NEW tab adopting its live view (`adopt`), placed like an
+ * agent-opened pane (steps 2–4 above) — never a re-point of an existing
+ * tab, whose view is a different page. The tab is credited to the agent.
+ */
+export function placeHandover(
+  l: Layout,
+  h: { sessionId: string; host: string; port: number; path: string; view: string },
+): { layout: Layout; tabId: string } {
+  const focused = l.focusedPaneId;
+  const anchor = sessionPaneId(l, h.sessionId) ?? focused;
+  const covers = (paneId: string) => paneId === anchor || paneId === focused;
+  const tab: BrowserTab = { ...freshBrowserTab(h.host, h.port, h.path, h.sessionId), adopt: h.view };
+  return { layout: placeBeside(l, tab, anchor, covers, l), tabId: tab.id };
+}
+
+/** Steps 2–4 of `placeAgentBrowser`: put `tab` in a browser pane that
+ *  covers nothing, an empty pane, a split beside `anchor`, or a neighbour;
+ *  focus goes back to where it was in `before`. */
+function placeBeside(
+  l: Layout,
+  tab: Tab,
+  anchor: string,
+  covers: (paneId: string) => boolean,
+  before: Layout,
+): Layout {
+  let next = l;
   const all = panes(next.root);
   // An empty pane shows nothing to cover — the anchor or the user's own
   // included — so it is taken before a split leaves it sitting empty.
@@ -178,7 +231,7 @@ export function placeAgentBrowser(l: Layout, open: AgentBrowserOpen): Layout {
         : (panes(next.root).find((p) => !covers(p.id))?.id ?? anchor);
     next = openTab(focusPane(next, beside), tab);
   }
-  return restoreFocus(next, l);
+  return restoreFocus(next, before);
 }
 
 /**

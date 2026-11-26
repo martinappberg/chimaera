@@ -6,6 +6,13 @@ import type { Notice } from "../workspace/notices";
 import type { PlatformFrame } from "../plugins/platform";
 import { parseAgentBrowserOpen, type AgentBrowserOpen } from "../browser/agentOpen";
 import { parseUpdateStatus, type UpdateStatus } from "../workspace/update.svelte";
+import {
+  decodeBrowserLinks,
+  decodeBrowserRequest,
+  type BrowserClientMessage,
+  type BrowserLink,
+  type BrowserRequest,
+} from "./browserWire";
 
 const INITIAL_BACKOFF_MS = 500;
 const MAX_BACKOFF_MS = 10_000;
@@ -13,9 +20,11 @@ const MAX_BACKOFF_MS = 10_000;
 export interface EventsSocketHandlers {
   /**
    * Full session-list snapshot pushed by the daemon; `links` rides the same
-   * frame (undefined from a daemon predating linked terminals).
+   * frame (undefined from a daemon predating linked terminals), and so do
+   * `browserLinks`, the browser tabs shared with agents (undefined from a
+   * daemon predating the agent browser).
    */
-  onSessions(sessions: Session[], links?: Link[]): void;
+  onSessions(sessions: Session[], links?: Link[], browserLinks?: BrowserLink[]): void;
   /**
    * Full settings map (settings.json ground truth), pushed after auth and
    * again whenever it changes — a PUT from any window or a hand-edit of the
@@ -85,6 +94,13 @@ export interface EventsSocketHandlers {
    */
   onBrowserOpen?(open: AgentBrowserOpen): void;
   /**
+   * The agent browser asks this window to act on a page (open, drive,
+   * hand over…). Sent to ONE chosen window, never replayed; every request
+   * wants exactly one `browser_reply` through `send`
+   * (`browser/agentBrowser.ts`).
+   */
+  onBrowserRequest?(req: BrowserRequest): void;
+  /**
    * Connection state. While false the caller should fall back to polling;
    * fired only on transitions.
    */
@@ -101,6 +117,7 @@ interface ServerEventFrame {
   type: string;
   sessions?: Session[];
   links?: Link[];
+  browser_links?: unknown;
   settings?: Record<string, unknown>;
   epochs?: Record<string, number>;
   /** The git frame's per-repository epochs (workspace → top level → epoch). */
@@ -142,6 +159,9 @@ export class EventsSocket {
   private watchedFiles: string[] = [];
   private watchedDirs: string[] = [];
   private watchedRepos: string[] = [];
+  /** The agent browser's latest hello: re-sent after every (re)auth, so a
+   *  daemon that restarted learns this window again without a change. */
+  private hello: BrowserClientMessage | null = null;
 
   constructor(private readonly handlers: EventsSocketHandlers) {
     // Reconnect delays take the slow tier while the document is hidden
@@ -211,6 +231,24 @@ export class EventsSocket {
     this.sendWatch();
   }
 
+  /**
+   * A client message on this socket (the agent browser's replies and
+   * events). False when the socket is not open: the message is dropped, not
+   * queued — the daemon fails whatever was waiting on a socket that closed.
+   */
+  send(msg: BrowserClientMessage): boolean {
+    if (this.ws?.readyState !== WebSocket.OPEN) return false;
+    this.ws.send(JSON.stringify(msg));
+    return true;
+  }
+
+  /** Keep `msg` as this window's `browser_hello`: sent now when open, and
+   *  again after every (re)auth. */
+  setHello(msg: BrowserClientMessage | null): void {
+    this.hello = msg;
+    if (msg !== null) this.send(msg);
+  }
+
   private sendWatch(): void {
     if (this.ws?.readyState !== WebSocket.OPEN) return;
     this.ws.send(
@@ -234,6 +272,7 @@ export class EventsSocket {
       ws.send(JSON.stringify({ type: "auth", token: getToken() ?? "" }));
       // Re-assert interest: a reconnect starts a fresh watcher registration.
       this.sendWatch();
+      if (this.hello !== null) this.send(this.hello);
     };
 
     ws.onmessage = (ev: MessageEvent) => {
@@ -250,6 +289,7 @@ export class EventsSocket {
         this.handlers.onSessions(
           msg.sessions,
           Array.isArray(msg.links) ? msg.links : undefined,
+          decodeBrowserLinks(msg.browser_links),
         );
       } else if (
         msg.type === "settings" &&
@@ -313,6 +353,9 @@ export class EventsSocket {
       } else if (msg.type === "browser_open") {
         const open = parseAgentBrowserOpen(msg);
         if (open !== null) this.handlers.onBrowserOpen?.(open);
+      } else if (msg.type === "browser_request") {
+        const req = decodeBrowserRequest(msg);
+        if (req !== null) this.handlers.onBrowserRequest?.(req);
       } else if (msg.type === "error") {
         // Bad auth or a server-side failure; give up and surface it (the
         // app shows the blocking re-auth overlay on "unauthorized").

@@ -33,10 +33,8 @@
       let parser;
       if (lang) parser = await parserFor(lang);
       else {
-        const [{ LanguageDescription }, { languages }] = await Promise.all([
-          import("@codemirror/language"), import("../previews/languages"),
-        ]);
-        const description = LanguageDescription.matchFilename(languages, filename ?? "");
+        const { languageFor } = await import("../previews/languages");
+        const description = languageFor(filename ?? "", text);
         parser = description ? (await description.load()).language.parser : null;
       }
       if (stale || !parser) return;

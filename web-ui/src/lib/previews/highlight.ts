@@ -1,14 +1,13 @@
 /**
  * Static syntax highlighting for read-only code blocks (notebook cells):
- * the language parsers CodeMirror already ships, and Typst (`languages.ts`,
- * each loaded on first use), run once over the text, and the result is built
+ * the language a cell or fence names (`languages.ts` `languageNamed`, each
+ * grammar loaded on first use), run once over the text, and the result is built
  * as text nodes and classed spans. The classes map onto the same `--syn-*`
  * tokens and tag groups as the editor's highlight style (`cm.ts`), so a cell
  * reads like the same code opened in a tab.
  */
 
-import { LanguageDescription } from "@codemirror/language";
-import { languages } from "./languages";
+import { languageNamed } from "./languages";
 import { highlightCode, tagHighlighter, tags as t } from "@lezer/highlight";
 import type { Parser } from "@lezer/common";
 
@@ -31,8 +30,7 @@ export function parserFor(name: string | null): Promise<Parser | null> {
   const key = (name ?? "").toLowerCase();
   let p = parsers.get(key);
   if (p === undefined) {
-    const alias = key === "ipython" || key === "ipython3" ? "python" : key;
-    const desc = alias === "" ? null : LanguageDescription.matchLanguageName(languages, alias, true);
+    const desc = languageNamed(key);
     p =
       desc === null
         ? Promise.resolve(null)

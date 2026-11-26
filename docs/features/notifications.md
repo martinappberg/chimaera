@@ -78,7 +78,7 @@ and in `App.svelte` the view reporting + `focusFromNotification`.
   elicitations), the ACP chats (Antigravity, Grok, Cursor) via the same `mcp_auto_approve`,
   answered by the ACP driver at the permission request in each agent's live-captured shape
   (PROTOCOL.md Pass 45).
-  `ALWAYS_ALLOWED_TOOLS` also holds the read-only document tools, `open_browser` and `update_plan`. Rate-limited per session (one per 5s, 20 per hour; the refusal text tells the
+  `ALWAYS_ALLOWED_TOOLS` also holds the read-only document tools, `open_browser`, `update_plan` and the agent browser's read and own-page tools. Rate-limited per session (one per 5s, 20 per hour; the refusal text tells the
   agent why). An agent message supersedes the automatic `done`/`input` notice for the same
   session for 2 minutes, so "notify me when done" pings once, in the agent's words. With
   "Messages from Agents" off, the tool answers that the user turned it off.

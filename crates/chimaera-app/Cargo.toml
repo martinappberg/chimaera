@@ -50,6 +50,10 @@ arboard = { version = "3.6", default-features = false }
 # has nowhere else to go. Same crate the CLI uses to open the UI.
 open = "5"
 ureq = { version = "3", features = ["json"] }
+# The "open in PowerPoint" round trip's content hashes (the daemon's
+# `X-Content-Hash`/`expect_hash` are SHA-256); already in the tree through
+# chimaera-remote, same version.
+sha2 = "0.11"
 urlencoding = "2"
 
 chimaera-core = { path = "../chimaera-core" }
@@ -70,8 +74,18 @@ nix = { version = "0.31", features = ["signal"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 block2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSArray", "NSError", "NSBundle", "NSObject", "NSDictionary"] }
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSDockTile", "NSResponder"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSArray", "NSError", "NSBundle", "NSObject", "NSDictionary", "NSData", "NSGeometry", "NSURL", "NSURLRequest", "NSValue", "NSProcessInfo", "NSDate"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "block2", "NSApplication", "NSDockTile", "NSResponder", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSView", "NSEvent", "NSGraphicsContext", "NSWindow", "NSTrackingArea", "NSScreen", "objc2-core-graphics"] }
+# Pane views (`shell/native_view/mac.rs`): a WKWebView the shell owns, its
+# delegates, the bridge's content world, message handler and user script,
+# snapshots and calls into the world. The same objc2-web-kit wry links.
+objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "objc2-app-kit", "block2", "WKWebView", "WKWebViewConfiguration", "WKUserContentController", "WKUserScript", "WKContentWorld", "WKScriptMessage", "WKScriptMessageHandler", "WKSnapshotConfiguration", "WKFrameInfo", "WKNavigation", "WKNavigationAction", "WKNavigationDelegate", "WKUIDelegate", "WKWindowFeatures", "objc2-core-foundation"] }
+# Agent driving (`native_view_drive`): a CGEvent pixel wheel turned into the
+# NSEvent a view's `scrollWheel:` takes, and snapshots read back as CGImages.
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGEvent", "CGEventTypes", "CGImage", "CGWindow"] }
+# Mission Control detection (`shell/mission_control.rs`): the window list it reads (a CFArray keyed by CFStrings).
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFArray", "CFString"] }
+base64 = "0.22"
 objc2-user-notifications = { version = "0.3", default-features = false, features = ["std", "bitflags", "block2", "UNUserNotificationCenter", "UNNotification", "UNNotificationContent", "UNNotificationRequest", "UNNotificationResponse", "UNNotificationSound", "UNNotificationSettings", "UNNotificationTrigger"] }
 
 # Linux/Windows notifications (freedesktop D-Bus / WinRT toasts). macOS goes

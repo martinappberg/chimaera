@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { hintsActive, initChordHints, paneHintsActive } from "./chordHints.svelte";
+import { hintsActive, initChordHints, paneHintsActive, ARM_DELAY_MS } from "./chordHints.svelte";
 import type { ModifierSetting } from "./keys";
 
 const preferences = vi.hoisted(() => ({ modifier: "cmd" as ModifierSetting }));
@@ -34,7 +34,7 @@ describe("held modifier discovery", () => {
 
   it("waits for a deliberate hold and clears as soon as a shortcut commits", () => {
     press("Meta", { metaKey: true });
-    vi.advanceTimersByTime(379);
+    vi.advanceTimersByTime(ARM_DELAY_MS - 1);
     expect(hintsActive()).toBe(false);
     vi.advanceTimersByTime(1);
     expect(hintsActive()).toBe(true);
@@ -46,7 +46,7 @@ describe("held modifier discovery", () => {
   it("reveals move destinations under the configured second layer", () => {
     preferences.modifier = "ctrl-shift";
     press("Shift", { ctrlKey: true, shiftKey: true });
-    vi.advanceTimersByTime(380);
+    vi.advanceTimersByTime(ARM_DELAY_MS);
     expect(hintsActive()).toBe(true);
     press("Alt", { ctrlKey: true, shiftKey: true, altKey: true });
     expect(hintsActive()).toBe(false);
@@ -57,12 +57,12 @@ describe("held modifier discovery", () => {
 
   it("shows Cmd+Control move hints without claiming Cmd+Shift screenshot chords", () => {
     press("Meta", { metaKey: true });
-    vi.advanceTimersByTime(380);
+    vi.advanceTimersByTime(ARM_DELAY_MS);
     press("Control", { metaKey: true, ctrlKey: true });
     expect(hintsActive()).toBe(false);
     expect(paneHintsActive()).toBe(true);
     press("Shift", { metaKey: true, shiftKey: true });
-    vi.advanceTimersByTime(380);
+    vi.advanceTimersByTime(ARM_DELAY_MS);
     expect(hintsActive()).toBe(false);
     expect(paneHintsActive()).toBe(false);
   });
@@ -70,15 +70,15 @@ describe("held modifier discovery", () => {
   it("cancels pending and visible hints on blur, hiding and teardown", () => {
     press("Meta", { metaKey: true });
     keys.dispatchEvent(new Event("blur"));
-    vi.advanceTimersByTime(380);
+    vi.advanceTimersByTime(ARM_DELAY_MS);
     expect(hintsActive()).toBe(false);
     press("Meta", { metaKey: true });
-    vi.advanceTimersByTime(380);
+    vi.advanceTimersByTime(ARM_DELAY_MS);
     visibility.dispatchEvent(new Event("visibilitychange"));
     expect(hintsActive()).toBe(false);
     press("Meta", { metaKey: true });
     stop();
-    vi.advanceTimersByTime(380);
+    vi.advanceTimersByTime(ARM_DELAY_MS);
     expect(hintsActive()).toBe(false);
   });
 });

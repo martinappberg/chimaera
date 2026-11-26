@@ -18,8 +18,7 @@
  * and the daemon writes nothing; the result downloads through the browser.
  */
 import type { Parser } from "@lezer/common";
-import { LanguageDescription } from "@codemirror/language";
-import { languages } from "../languages";
+import { languageNamed } from "../languages";
 import { highlightCode } from "@lezer/highlight";
 import { codeHighlight } from "../cm";
 import { basename, dirname, humanSize, safeDecodeUri, tableHeaderRow } from "../files";
@@ -115,7 +114,7 @@ function paint(code: HTMLElement, parser: Parser, text: string): void {
 
 async function highlightFence(f: Fence): Promise<void> {
   if (f.text.length > HIGHLIGHT_MAX) return;
-  const desc = LanguageDescription.matchLanguageName(languages, f.lang, true);
+  const desc = languageNamed(f.lang);
   if (desc === null) return;
   if (desc.support === undefined) {
     try {

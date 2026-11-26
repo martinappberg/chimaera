@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { chordDigit, matchChord, paneMoveChord, parseChord } from "./keys";
+import { chordDigit, fontChord, isMac, matchChord, paneMoveChord, parseChord } from "./keys";
 
 function digit(modifiers: Partial<KeyboardEvent>): KeyboardEvent {
   return { code: "Digit2", key: "@", metaKey: false, ctrlKey: false, altKey: false, shiftKey: false, ...modifiers } as KeyboardEvent;
@@ -133,5 +133,36 @@ describe("host-specific pane-tab defaults", () => {
     const { ACTION_BY_ID } = await import("./keys");
     expect(ACTION_BY_ID.get("cyclePrev")?.def).toBe("Ctrl+Shift+Tab");
     expect(ACTION_BY_ID.get("cycleNext")?.def).toBe("Ctrl+Tab");
+  });
+});
+
+describe("font / zoom chords match the character typed", () => {
+  const ev = (key: string, code: string, mods: Partial<KeyboardEvent>) =>
+    ({ key, code, metaKey: false, ctrlKey: false, altKey: false, shiftKey: false, ...mods }) as KeyboardEvent;
+  const press = (key: string, code: string, shiftKey = false) =>
+    fontChord(ev(key, code, { shiftKey, metaKey: isMac, ctrlKey: !isMac }));
+
+  it("steps on a US layout", () => {
+    expect(press("=", "Equal")).toBe(1);
+    expect(press("+", "Equal", true)).toBe(1);
+    expect(press("-", "Minus")).toBe(-1);
+    expect(press("0", "Digit0")).toBe(0);
+  });
+
+  it("steps the right way on a Swedish layout ('+' sits on the US '-' key)", () => {
+    expect(press("+", "Minus")).toBe(1);
+    expect(press("-", "Slash")).toBe(-1);
+  });
+
+  it("takes the keypad keys, and 0 by place where digits need Shift", () => {
+    expect(press("+", "NumpadAdd")).toBe(1);
+    expect(press("=", "NumpadEqual")).toBe(1);
+    expect(press("-", "NumpadSubtract")).toBe(-1);
+    expect(press("à", "Digit0")).toBe(0);
+  });
+
+  it("ignores other keys and the wrong modifier", () => {
+    expect(press("´", "Equal")).toBeNull();
+    expect(fontChord(ev("+", "Minus", {}))).toBeNull();
   });
 });

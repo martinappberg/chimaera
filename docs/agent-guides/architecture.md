@@ -957,10 +957,10 @@ hook's `additionalContext`, a chat send or steer, a billed wake. One switch
 *Added 2026-09-26. Plan: [plugin-system-plan.md](../design/plugin-system-plan.md); what users see:
 [features/plugins.md](../features/plugins.md); authoring: [plugins.md](plugins.md).*
 
-Opt-in capabilities beyond the core (Mycelium's Knowledge reader, LaTeX, Typst) are **workbench
+Opt-in capabilities beyond the core (Mycelium's Knowledge reader, LaTeX, Typst, PowerPoint) are **workbench
 plugins**, with their feature logic in separate repositories. API 0.2 implements
 semantic screens, declared native programs, downloaded tools, output folders,
-settings and durable plugin state. LaTeX and Typst use that platform:
+settings and durable plugin state. LaTeX, Typst and PowerPoint use that platform:
 [plugin-platform-plan.md](../design/plugin-platform-plan.md),
 [latex-reports-plan.md](../design/latex-reports-plan.md). A plugin is a
 Rust crate compiled to one portable WebAssembly component (`plugin.wasm`, `wasm32-wasip2`)
@@ -1160,8 +1160,9 @@ per-session setup your dotfiles don't do* — the things nobody puts in an rc.
   profile is a host/workspace default) as settings keys; a settings **Environment** category
   edits them (bespoke panel, the `AgentsSettings` special-case pattern).
 - **One injection seam, two hooks that already exist.** Write the effective prelude to a
-  per-session file and export `CHIMAERA_PRELUDE`; the shell-integration rc sources it *after*
-  the user's rc (`shellint`), and the agent login-wrapper sources it before `exec`
+  per-session file and export `CHIMAERA_PRELUDE`; the shell-integration startup sources it
+  *after* the user's profile and rc (`shellint`; a terminal is a login shell), and the agent
+  login-wrapper sources it before `exec`
   (`wrap_login_shell`). Env vars ride the existing `SpawnOpts.env` overlay (`session_env`). Both
   terminal and agent spawns already funnel through these, so the prelude applies uniformly.
   Preludes run once per real spawn, **not on reconnect** (reconnect reuses the live PTY — no

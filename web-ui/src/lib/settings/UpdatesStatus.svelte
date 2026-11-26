@@ -25,7 +25,12 @@
     relativeAge,
     versionNumber,
   } from "../workspace/launcher";
-  import { applyAppStatus, checkForUpdates, updateState } from "../workspace/update.svelte";
+  import {
+    applyAppStatus,
+    checkForUpdates,
+    updateInJob,
+    updateState,
+  } from "../workspace/update.svelte";
   import { agentUpdateStatus } from "./agentStatus";
   import { getSetting } from "./store.svelte";
 
@@ -155,6 +160,7 @@
 
   const daemonLine = $derived.by((): Line => {
     const scope = updateState.scope;
+    const job = updateState.job;
     const where = scope === null ? null : scope.split("#")[0];
     // In a browser the daemon IS chimaera; in the app it sits beside the app line.
     const name = where !== null ? `daemon on ${where}` : native ? "local daemon" : "chimaera";
@@ -172,9 +178,15 @@
         tone: "new",
         sub: "restart it into the app's build — layouts and sessions come back; running terminal programs restart",
         action:
-          scope === null
+          scope === null || where === null
             ? { label: "restart daemon", run: updateLocalDaemon }
-            : { label: `update ${where}`, run: () => connectHost(scope, true) },
+            : job !== null
+              ? // A job window's scope is its tunnel key, no ssh host.
+                {
+                  label: job.cws !== null ? "update in this job" : "continue in a new job",
+                  run: () => updateInJob(where, scope, job).then(() => {}),
+                }
+              : { label: `update ${where}`, run: () => connectHost(scope, true) },
       };
     }
     if (d.dev) {

@@ -13,10 +13,9 @@
   import { EditorState, StateEffect } from "@codemirror/state";
   import { EditorView, highlightSpecialChars, lineNumbers } from "@codemirror/view";
   import { MergeView } from "@codemirror/merge";
-  import { LanguageDescription, syntaxHighlighting } from "@codemirror/language";
-  import { languages } from "./languages";
+  import { syntaxHighlighting } from "@codemirror/language";
+  import { languageFor } from "./languages";
   import { codeHighlight, makeCodeTheme } from "./cm";
-  import { basename } from "./files";
   import { getSetting } from "../settings/store.svelte";
 
   interface Props {
@@ -60,7 +59,7 @@
       gutter: true,
     });
     let live = true;
-    const desc = LanguageDescription.matchFilename(languages, basename(path));
+    const desc = languageFor(path, a);
     if (desc !== null) {
       void desc
         .load()

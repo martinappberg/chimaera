@@ -52,7 +52,7 @@ import {
   type Transaction,
 } from "@codemirror/state";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
-import { languages } from "./languages";
+import { languageNamed } from "./languages";
 import type { SyntaxNode, SyntaxNodeRef, Tree } from "@lezer/common";
 import { lastRawTicketUrl, rawTicketUrl, resolveDocPath, safeDecodeUri } from "./files";
 import { placeOffset } from "./mdDoc";
@@ -105,7 +105,8 @@ export { enterAtPoint, onScrollbarBand, setLivePropsCollapsed, setLiveTheme } fr
  */
 export const markdownLanguageExt: Extension = markdown({
   base: markdownLanguage,
-  codeLanguages: languages,
+  // A function, not the list: ```py and ```console resolve too.
+  codeLanguages: (info) => languageNamed(info),
   extensions: docExtensions,
 });
 

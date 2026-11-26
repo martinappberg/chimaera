@@ -11,6 +11,7 @@ import {
   plainRelative,
   resolvePlace,
   offersFor,
+  pluginViewIcon,
   pluginViewTitle,
   sizeWords,
   viewsIn,
@@ -207,6 +208,13 @@ describe("what a plugin draws where", () => {
   it("names a tab by its view's title", () => {
     expect(pluginViewTitle([plugin("latex")], "latex", "board")).toBe("Board");
     expect(pluginViewTitle([], "latex", "board")).toBe("board");
+  });
+
+  it("gives a tab the icon its view names, and nothing for a name outside the set", () => {
+    expect(pluginViewIcon([plugin("latex")], "latex", "board")).toEqual(expect.arrayContaining([expect.stringMatching(/^M/)]));
+    expect(pluginViewIcon([plugin("latex")], "latex", "doc")).toBeNull();
+    expect(pluginViewIcon([plugin("latex", true, normalizePlatform({ views: [{ id: "v", title: "V", slot: "tab", icon: "toString" }] }))], "latex", "v")).toBeNull();
+    expect(pluginViewIcon(undefined, "latex", "board")).toBeNull();
   });
 
   it("says sizes in words", () => {

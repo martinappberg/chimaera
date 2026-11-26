@@ -59,6 +59,9 @@ pub type ExitHook = Box<dyn Fn(&str, &DriverExit) + Send + Sync>;
 const SUBAGENT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const CMD_QUEUE: usize = 32;
 const EVENT_QUEUE: usize = 256;
+// A fresh driver's queue takes the process-start resets (`ChatManager::spawn`)
+// with `try_send`: three level-sets plus every stranded waiting message.
+const _: () = assert!(3 + journal::WAITING_CAP <= EVENT_QUEUE);
 const BROADCAST_QUEUE: usize = 256;
 /// Bulk Send payload retained across the manager channel and either driver's
 /// pending FIFO. This is deliberately far below the daemon's ~150 MiB RSS
@@ -1001,6 +1004,20 @@ impl ChatManager {
                 ended: None,
             })
             .expect("fresh driver event queue has room for lifecycle reset");
+        // And for messages still waiting: each lived in the old process's
+        // queue (or its driver's hold), which died with it, and the new
+        // driver ignores an id it never minted — its bubble would wait
+        // forever, Send now doing nothing. A driver's own teardown drops
+        // them, so only a process that could not run it (a hard stop)
+        // leaves any here.
+        for id in journal.reopened().waiting {
+            ev_tx
+                .try_send(AgentEvent::UserMessageUpdate {
+                    id,
+                    state: model::UserMessageState::Dropped,
+                })
+                .expect("fresh driver event queue has room for lifecycle reset");
+        }
 
         let info = ChatInfo {
             id: id.clone(),

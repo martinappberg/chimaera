@@ -821,6 +821,7 @@ fn loop_and_goal_wire_shapes_are_additive() {
                 recurring: true,
                 next_at_ms: None,
                 created_at_ms: 1,
+                expires_at_ms: None,
             }],
         })
         .unwrap(),
@@ -1526,6 +1527,7 @@ fn chat_events_fixture() {
             "the session moved to a terminal",
             AgentEvent::ModeSwitch {
                 to: SessionUi::Term,
+                sign_in: false,
             },
         ),
         (
@@ -1707,6 +1709,7 @@ fn chat_events_fixture() {
                     recurring: true,
                     next_at_ms: Some(1_700_000_600_000),
                     created_at_ms: 1_700_000_000_000,
+                    expires_at_ms: Some(1_702_592_000_000),
                 }],
             },
         ),
@@ -1750,6 +1753,14 @@ fn chat_events_fixture() {
                 kind: "job".into(),
                 detail: Some("post the graph".into()),
                 schedule: Some("Every 10 minutes".into()),
+            },
+        ),
+        (
+            "mode_switch_sign_in",
+            "the chat's process started again for a new sign-in",
+            AgentEvent::ModeSwitch {
+                to: SessionUi::Chat,
+                sign_in: true,
             },
         ),
     ];

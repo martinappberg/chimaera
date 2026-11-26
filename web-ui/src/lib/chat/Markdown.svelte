@@ -40,6 +40,7 @@
 <script lang="ts">
   import { copyText } from "../shared/clipboard";
   import { copyLabel, copyPayload, decorateCopyTargets } from "../shared/copyDecor";
+  import { decorateRunTargets, isRunButton, runCommandKey, runPayload, type RunCommand } from "./runCommand";
   import { markScrollRegions, watchWidth } from "../shared/scrollRegion";
   import { getSetting } from "../settings/store.svelte";
   import { advanceSegments, type SegmenterState } from "./streamSegments";
@@ -56,10 +57,10 @@
     type Resolution,
   } from "./paths";
   import { extractFileRefs, parseFileRef, revealOf, type FileRef, type FoundRef } from "../shared/fileRef";
-  import { activateUrl, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
+  import { activateUrl, isWebUrl, OPEN_BESIDE, urlMenuEntries } from "../shared/urlOpen";
   import { contextMenu } from "../shared/contextMenu.svelte";
   import { safeDecodeUri } from "../previews/files";
-  import { mount, unmount, untrack } from "svelte";
+  import { getContext, mount, unmount, untrack } from "svelte";
   import { parseSizeHint, splitTarget } from "../shared/embed/embed";
   import { mountEmbed } from "../shared/embed/mount.svelte";
   import type { EmbedResolver } from "./embeds";
@@ -109,6 +110,10 @@
     embeds,
     hoverTargets,
   }: Props = $props();
+
+  /** A chat's "run this block in a terminal" (ChatView's context); absent
+   *  everywhere else, so no other surface grows Run buttons. */
+  const runCommand = getContext<RunCommand | undefined>(runCommandKey);
 
   /** Ids to chips (knowledge entries and any other reference source):
    *  only with a hover registry to hold them, on settled content. */
@@ -422,6 +427,14 @@
     // allowlist keeps the `hidden` attribute (and class names like our own
     // .rw-hidden are forgeable), so textContent could smuggle invisible text
     // into the payload; innerText copies exactly what is rendered.
+    // Run: only a button runCommand.ts made (agent HTML can forge the
+    // class), with copy's live-DOM payload rule (runCommand.ts header).
+    const runBtn = target?.closest?.("button.md-run");
+    if (runBtn instanceof HTMLElement && runCommand !== undefined && isRunButton(runBtn)) {
+      const command = runPayload(runBtn);
+      if (command.length > 0) runCommand(command);
+      return;
+    }
     const copyBtn = target?.closest?.("button.md-copy");
     if (copyBtn instanceof HTMLElement) {
       const code = copyPayload(copyBtn);
@@ -469,9 +482,50 @@
     }
   }
 
-  /** Right-click a rendered link: Chimaera / Browser / Copy. */
+  /** A file link this message can open: a stamped path, or a local-path
+   *  anchor that never validated (a click retries it). */
+  function fileLinkAt(target: Element | null): { node: Element; stamped: boolean } | null {
+    const node = target?.closest?.(".md-path");
+    if (node !== null && node !== undefined && stamps.has(node)) return { node, stamped: true };
+    const local = target?.closest?.("a.md-local");
+    return local !== null && local !== undefined ? { node: local, stamped: false } : null;
+  }
+
+  function openFileLink(link: { node: Element; stamped: boolean }, e: MouseEvent, split: boolean) {
+    if (link.stamped) activatePath(link.node, e, split);
+    else retryLocal(link.node, e, split);
+  }
+
+  /** A middle click opens a link beside, like ⌘/Ctrl-click. */
+  function onAuxClick(e: MouseEvent) {
+    if (e.button !== 1) return;
+    const target = e.target as Element | null;
+    const link = fileLinkAt(target);
+    if (link !== null) {
+      e.preventDefault();
+      openFileLink(link, e, true);
+      return;
+    }
+    const web = target?.closest?.("a[href]");
+    const href = web?.getAttribute("href") ?? "";
+    if (web !== null && web !== undefined && isWebUrl(href)) {
+      e.preventDefault();
+      activateUrl(href, true);
+    }
+  }
+
+  /** Right-click a rendered link: a file link opens here or beside; a web
+   *  link offers Chimaera / Browser / Copy. */
   function onContextMenu(e: MouseEvent) {
     const target = e.target as Element | null;
+    const link = fileLinkAt(target);
+    if (link !== null) {
+      contextMenu.openAt(e, [
+        { label: "Open", onSelect: () => openFileLink(link, e, false) },
+        { label: OPEN_BESIDE, onSelect: () => openFileLink(link, e, true) },
+      ]);
+      return;
+    }
     const web = target?.closest?.("a[href]");
     const href = web?.getAttribute("href") ?? "";
     if (web === null || web === undefined || !isWebUrl(href)) return;
@@ -497,11 +551,11 @@
    *  in a split), a directory in the Finder, an ambiguous name via a menu
    *  of its matches — as the daemon answers NOW (the stamp may predate a
    *  move or a delete). A reference that is gone loses its affordance. */
-  function activatePath(node: Element, e: MouseEvent | KeyboardEvent) {
+  function activatePath(node: Element, e: MouseEvent | KeyboardEvent, split = e.metaKey || e.ctrlKey) {
     const stamp = stamps.get(node);
     if (stamp === undefined || onOpenPath === undefined) return;
     const opts = {
-      split: e.metaKey || e.ctrlKey,
+      split,
       reveal: revealOf(stamp.ref),
       at: menuPoint(e, node),
       label: (p: string) => resolvePaths?.label(p) ?? p,
@@ -515,12 +569,12 @@
 
   /** A local link with no standing answer: resolve it now (a click always
    *  retries a miss) and open it if it resolves. */
-  function retryLocal(a: Element, e: MouseEvent) {
+  function retryLocal(a: Element, e: MouseEvent, split = e.metaKey || e.ctrlKey) {
     const ref = hrefRef(a.getAttribute("href") ?? "");
     const resolver = resolvePaths;
     const open = onOpenPath;
     if (ref === null || open === undefined || resolver === undefined) return;
-    const opts = { split: e.metaKey || e.ctrlKey, reveal: revealOf(ref), at: menuPoint(e, a) };
+    const opts = { split, reveal: revealOf(ref), at: menuPoint(e, a) };
     void resolver.resolveNow(ref.path).then((res) => {
       if (res === undefined || res.state === "miss") return;
       if (a.isConnected) markPath(a, ref.path, ref, res); // it links from now on
@@ -970,6 +1024,8 @@
     if (current === lastSettledHtml) return;
     lastSettledHtml = current;
     decorateCopyTargets(el);
+    // Settled only: a block still streaming may be half a command.
+    if (runCommand !== undefined) decorateRunTargets(el);
     stampPaths(el);
     linkRefs(el);
     markTableRegions(el);
@@ -1060,6 +1116,7 @@
   onclick={onClick}
   onkeydown={onKeydown}
   oncontextmenu={onContextMenu}
+  onauxclick={onAuxClick}
   onpointerenter={onPointerEnter}
 >
   {#if streaming}
@@ -1223,6 +1280,31 @@
     transition:
       opacity 0.12s ease,
       color 0.12s ease;
+  }
+  .md :global(.md-run) {
+    position: absolute;
+    top: 5px;
+    right: 31px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 4px;
+    background: color-mix(in srgb, var(--term-bg) 82%, transparent);
+    border: 1px solid var(--edge);
+    border-radius: 5px;
+    color: var(--muted);
+    cursor: pointer;
+    opacity: 0;
+    transition:
+      opacity 0.12s ease,
+      color 0.12s ease;
+  }
+  .md :global(pre:hover .md-run),
+  .md :global(.md-run:focus-visible) {
+    opacity: 1;
+  }
+  .md :global(.md-run:hover) {
+    color: var(--accent);
   }
   .md :global(pre:hover .md-copy),
   .md :global(blockquote:hover > .md-copy),

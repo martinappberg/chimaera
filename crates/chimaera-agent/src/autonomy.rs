@@ -19,7 +19,9 @@ use crate::model::{
 /// Calls awaiting their result. Each is one model step's tool call, so a
 /// handful at most; the bound only stops a hostile stream from growing it.
 const PENDING_CAP: usize = 16;
-/// Claude expires a recurring session job 7 days after it was made.
+/// How long a recurring session job lasts when its `CronCreate` result named
+/// no `maxAgeMs`: 7 days, Claude's lifetime before 2.1.330 and still its
+/// default for a job that carries none (2.1.330 on gives new jobs 30 days).
 const RECURRING_LIFETIME_MS: u64 = 7 * 24 * 3600 * 1000;
 /// How early a fire may come: a wakeup fired ~3 s before `scheduledFor`
 /// live, and a recurring job's jitter only delays it; Claude lets a one-shot
@@ -178,6 +180,7 @@ impl ScheduleTracker {
                 recurring,
             } => {
                 let id = result["id"].as_str().filter(|id| !id.is_empty())?;
+                let recurring = result["recurring"].as_bool().unwrap_or(recurring);
                 let job = ScheduledJob {
                     id: truncate_label(id, 64),
                     cron,
@@ -186,9 +189,12 @@ impl ScheduleTracker {
                         SCHEDULE_TEXT_MAX,
                     ),
                     prompt,
-                    recurring: result["recurring"].as_bool().unwrap_or(recurring),
+                    recurring,
                     next_at_ms: as_ms(&result["nextFireAt"]),
                     created_at_ms: now_ms,
+                    expires_at_ms: as_ms(&result["maxAgeMs"])
+                        .filter(|_| recurring)
+                        .map(|age| now_ms.saturating_add(age)),
                 };
                 self.jobs.retain(|j| j.job.id != job.id);
                 if self.jobs.len() >= SCHEDULE_JOBS_CAP {
@@ -226,6 +232,9 @@ impl ScheduleTracker {
                         recurring: entry["recurring"].as_bool().unwrap_or(false),
                         next_at_ms: as_ms(&entry["nextFireAt"]),
                         created_at_ms: known.map_or(now_ms, |j| j.job.created_at_ms),
+                        // A listing names no lifetime; keep the one learned
+                        // when the job was made.
+                        expires_at_ms: known.and_then(|j| j.job.expires_at_ms),
                     };
                     jobs.push(match known {
                         // Keep the jitter learned at creation: a listed
@@ -373,7 +382,11 @@ impl ScheduleTracker {
 
     fn expire(&mut self, now_ms: u64) {
         self.jobs.retain(|j| {
-            !j.job.recurring || now_ms.saturating_sub(j.job.created_at_ms) < RECURRING_LIFETIME_MS
+            let ends = j
+                .job
+                .expires_at_ms
+                .unwrap_or(j.job.created_at_ms.saturating_add(RECURRING_LIFETIME_MS));
+            !j.job.recurring || now_ms < ends
         });
     }
 
@@ -788,6 +801,51 @@ mod tests {
         assert_eq!(jobs[0].next_at_ms, Some(1_792_108_948_368));
     }
 
+    /// Live 2.1.332: `CronCreate` names the job's lifetime, `CronList` does
+    /// not, and a one-shot job has none.
+    #[test]
+    fn a_job_ends_when_its_create_result_says() {
+        let mut t = ScheduleTracker::default();
+        t.on_tool_use(
+            "c1",
+            "CronCreate",
+            &json!({"cron": "*/5 * * * *", "prompt": "say tick", "recurring": true}),
+        );
+        let made = json!({"id": "5aed2bd5", "humanSchedule": "Every 5 minutes",
+            "recurring": true, "durable": false, "nextFireAt": T0 + 300_000,
+            "maxAgeMs": 2_592_000_000u64});
+        let Some(AgentEvent::Schedule { jobs, .. }) =
+            t.on_tool_result("c1", false, Some(&made), T0)
+        else {
+            panic!("schedule");
+        };
+        assert_eq!(jobs[0].expires_at_ms, Some(T0 + 2_592_000_000));
+
+        t.on_tool_use("l", "CronList", &json!({}));
+        let listed = json!({"jobs": [{"id": "5aed2bd5", "cron": "*/5 * * * *",
+            "humanSchedule": "Every 5 minutes", "prompt": "say tick", "recurring": true,
+            "durable": false, "nextFireAt": T0 + 300_000}]});
+        t.on_tool_result("l", false, Some(&listed), T0 + 1000);
+        assert_eq!(t.jobs()[0].expires_at_ms, Some(T0 + 2_592_000_000));
+
+        t.on_tool_use(
+            "c2",
+            "CronCreate",
+            &json!({"cron": "30 14 * * *", "prompt": "once"}),
+        );
+        let once = json!({"id": "one", "humanSchedule": "Today at 2:30 PM", "recurring": false,
+            "nextFireAt": T0 + 1000, "maxAgeMs": 2_592_000_000u64});
+        t.on_tool_result("c2", false, Some(&once), T0);
+        assert_eq!(
+            t.jobs()
+                .iter()
+                .find(|j| j.id == "one")
+                .unwrap()
+                .expires_at_ms,
+            None
+        );
+    }
+
     #[test]
     fn delete_and_list_keep_the_set_level() {
         let mut t = ScheduleTracker::default();
@@ -850,10 +908,28 @@ mod tests {
                 recurring: true,
                 next_at_ms: Some(crate::now_ms() + 60_000),
                 created_at_ms: crate::now_ms() - week - 1,
+                expires_at_ms: None,
             }],
             crate::now_ms(),
         );
         assert!(t.is_empty(), "past its 7 days");
+        // A job whose result named its lifetime (2.1.330: 30 days) outlives
+        // the old week, and ends when that lifetime does.
+        let month = 30 * 24 * 3600 * 1000;
+        let job = |made_ago: u64| ScheduledJob {
+            id: "new".into(),
+            cron: "0 * * * *".into(),
+            schedule: "Every hour".into(),
+            prompt: "p".into(),
+            recurring: true,
+            next_at_ms: Some(crate::now_ms() + 60_000),
+            created_at_ms: crate::now_ms() - made_ago,
+            expires_at_ms: Some(crate::now_ms() - made_ago + month),
+        };
+        t.seed(vec![job(week + 1)], crate::now_ms());
+        assert!(!t.is_empty(), "eight days into its thirty");
+        t.seed(vec![job(month + 1)], crate::now_ms());
+        assert!(t.is_empty(), "past its 30 days");
     }
 
     #[test]

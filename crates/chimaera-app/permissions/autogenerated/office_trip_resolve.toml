@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-office-trip-resolve"
+description = "Enables the office_trip_resolve command without any pre-configured scope."
+commands.allow = ["office_trip_resolve"]
+
+[[permission]]
+identifier = "deny-office-trip-resolve"
+description = "Denies the office_trip_resolve command without any pre-configured scope."
+commands.deny = ["office_trip_resolve"]

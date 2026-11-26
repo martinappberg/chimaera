@@ -25,7 +25,11 @@ mod cluster;
 mod commands;
 mod connect;
 mod drag;
+#[cfg(target_os = "macos")]
+mod mission_control;
+mod native_view;
 pub(crate) mod notices;
+mod office;
 #[cfg(target_os = "macos")]
 mod print_frame;
 mod restore;
@@ -307,6 +311,17 @@ impl WindowScope {
             navigation_pending: false,
             detached: false,
             visible: Vec::new(),
+        }
+    }
+
+    /// A compute window's login host (its `alias` is then the per-job tunnel
+    /// key). From the typed scope `new_compute` recorded, never parsed.
+    pub(crate) fn compute_login(&self) -> Option<&str> {
+        match &self.askpass_scope {
+            AskpassScope::Host(login) if self.alias.as_deref() != Some(login.as_str()) => {
+                Some(login)
+            }
+            _ => None,
         }
     }
 
@@ -613,8 +628,13 @@ pub(super) fn authorize_daemon_origin(
     }
 
     let sequence = DAEMON_CAPABILITY_SEQ.fetch_add(1, Ordering::Relaxed);
+    // Scoped to the window's own web view (a `WebviewWindow`'s web view
+    // shares its label), not the whole window: Tauri grants a window-scoped
+    // capability to every web view in it. Defence in depth — pane views
+    // (`native_view.rs`) are plain WKWebViews with no IPC at all, but any
+    // future Tauri web view added to a window must not inherit the grants.
     let mut capability = CapabilityBuilder::new(format!("daemon-ui-{window_label}-{sequence}"))
-        .window(window_label)
+        .webview(window_label)
         .local(false)
         .remote(format!("http://127.0.0.1:{port}/*"));
     for permission in DAEMON_UI_CORE_PERMISSIONS
@@ -1076,6 +1096,8 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
         // Before any window opens: the watchers start polling right away,
         // and a window's first scope report may already owe it a focus.
         notices::start(handle);
+        // Resumes the persisted PowerPoint round trips.
+        office::start(handle);
     }
     // Reopen last session's windows. Restore itself registers a home surface
     // before launching any remote ssh that may need askpass, and also covers
@@ -1188,6 +1210,17 @@ pub fn run() {
             commands::copy_file_to_clipboard,
             commands::reveal_in_file_manager,
             commands::open_external,
+            office::office_open,
+            office::office_trip,
+            office::office_trip_resolve,
+            native_view::native_view_show,
+            native_view::native_view_place,
+            native_view::native_view_close,
+            native_view::native_view_snapshot,
+            native_view::native_view_chip,
+            native_view::native_view_region,
+            native_view::native_view_nav,
+            native_view::native_view_drive,
             commands::answer_askpass,
             commands::list_askpass,
             commands::cache_appearance,
@@ -1222,6 +1255,7 @@ pub fn run() {
                 // teardown destroys every window and forgetting them would
                 // defeat restore.
                 tauri::WindowEvent::Destroyed => {
+                    native_view::close_owned(window.app_handle(), window.label());
                     lock(&shell.allowed_daemon_ports).remove(window.label());
                     let mut last_focused = lock(&shell.last_focused_window);
                     if last_focused.as_deref() == Some(window.label()) {
@@ -1322,6 +1356,9 @@ pub fn run() {
             // through this AppKit delegate hook (see `unsaved`).
             #[cfg(target_os = "macos")]
             unsaved::install_os_quit_hook(&handle);
+            // The page names its window large while Mission Control is open.
+            #[cfg(target_os = "macos")]
+            mission_control::install(&handle);
             // The menu-bar / system-tray status item. Installed before the
             // daemon is up (its click handlers read Shell.local, populated by
             // runtime); non-fatal if the platform tray is unavailable.
@@ -1330,6 +1367,7 @@ pub fn run() {
             }
             // Route ssh auth prompts (password / 2FA) to the UI. Managed
             // before the listener starts so an early prompt finds the state.
+            app.manage(native_view::NativeViews::default());
             app.manage(crate::askpass::Askpass::default());
             if let Err(e) = crate::askpass::install(&handle) {
                 // Non-fatal: hosts with key/agent auth still connect; only
@@ -1627,5 +1665,15 @@ mod origin_tests {
         assert!(compute.allows_askpass(Some("cluster")));
         assert!(!compute.allows_askpass(Some("cluster#job123")));
         assert_eq!(compute.appearance_alias(), Some("cluster"));
+
+        // Only a compute scope routes an update to its job: a lookalike
+        // ordinary alias, a remote home and a local window never do.
+        assert_eq!(compute.compute_login(), Some("cluster"));
+        assert_eq!(colliding_remote.compute_login(), None);
+        assert_eq!(remote_home.compute_login(), None);
+        assert_eq!(
+            WindowScope::new(None, None, "local".into()).compute_login(),
+            None
+        );
     }
 }

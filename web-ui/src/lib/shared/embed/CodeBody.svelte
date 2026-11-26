@@ -98,13 +98,11 @@
     el.textContent = t;
     let stale = false;
     void (async () => {
-      const [{ LanguageDescription }, { languages }, { renderCode }] = await Promise.all([
-        import("@codemirror/language"),
+      const [{ languageFor }, { renderCode }] = await Promise.all([
         import("../../previews/languages"),
         import("../../previews/highlight"),
       ]);
-      const name = p.slice(p.lastIndexOf("/") + 1);
-      const desc = LanguageDescription.matchFilename(languages, name);
+      const desc = languageFor(p, t);
       if (desc === null) return;
       const support = await desc.load();
       if (!stale) renderCode(el, t, support.language.parser);

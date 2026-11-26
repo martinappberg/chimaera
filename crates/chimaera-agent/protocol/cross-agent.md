@@ -93,6 +93,7 @@ Recorded 2026-07-11 (Pass 11, claude 2.1.206 / codex 0.142.5; the `was_active` g
 - Resurrection restores the bridge and ultracode through the spawn. When work was cut off, it sends the agent one message listing the tasks with kinds, labels and ids; the echo carries `UserMessage.origin: "restart"`. The default wording asks the agent to restart each task "the same way you started it, unless it is clearly no longer needed (say which you skipped)"; a softer wording got no restart (Pass 32, claude 2.1.283).
 - A lost wakeup counts as interrupted work: the pick-up message names it ("…due in 6 minutes" / "which came due 2 minutes ago") and asks the agent to reschedule it with ScheduleWakeup (Pass 47).
 - Claude's jobs and goal seed the new driver (`SpawnSpec.carried_jobs`, `carried_goal`) only when the spawn resumes the conversation (`SpawnSpec.resumes`). A Claude respawn the ledger did not seed (a view switch, a relaunch, a reopen) falls back to the journal's last `Goal` and `Schedule` (`Journal::reopened`). The manager journals `Schedule {jobs}` and `Goal` at every spawn ahead of the driver's events; Codex re-reads its thread's goal (Pass 47).
+- A message still waiting when the old process died without its teardown (a hard daemon stop: crash, SIGKILL, power loss, a cluster job ending) is settled `dropped` at the next spawn, ahead of the driver's events (`Journal::reopened().waiting`): the queue it waited in died with that process, and the new driver ignores an id it never minted, so before this the bubble read "next step" on an idle chat forever and Send now did nothing (Pass 57).
 - A pick-up is withheld when the chat's last one (`pickup_at_ms`) went out less than 10 minutes earlier, so a crash loop cannot start a billed turn per crash. `chat.resumeAfterRestart` off sends no message (Pass 32).
 - The turn-end "done" notice is held while anything is scheduled, so a loop's notice is its last tick's (Pass 47).
 
@@ -156,10 +157,12 @@ The latest full results, per gate. Earlier results are in [passes.md](passes.md)
 
 | Gate | Result | Versions | Date |
 |---|---|---|---|
-| `just chat-smoke` | 31/31 | claude 2.1.300, codex 0.162.1 | 2026-10-14 (Pass 44) |
-| `just chat-mods-smoke` | 1/1 | claude 2.1.310 | 2026-10-23 (Pass 52) |
-| `just chat-smoke-acp` | passed | grok 1.0.46, agy-acp 1.2.1, cursor-agent 2026.10.14-941492e | 2026-10-15 (Pass 45) |
+| `just chat-smoke` | 44/44 | claude 2.1.332, codex 0.172.0 | 2026-11-26 (Pass 63) |
+| `just chat-mods-smoke` | 1/1 | claude 2.1.332 | 2026-11-26 (Pass 63) |
+| `just chat-smoke-acp` | 3/3 | grok 1.0.70, agy-acp 1.4.5, cursor-agent 2026.10.22-27dcf5f | 2026-11-04 (Pass 59) |
 
+- Pass 63 ran `just chat-smoke` on claude 2.1.332 and codex 0.172.0 (both from throwaway npm prefixes) and moved those two pins; no case needed a rerun.
+- Pass 59 ran every gate on the newest release of all five agents and moved every pin. Live handshakes there took 10–20 s against the suite's 20 s `HANDSHAKE` budget, because the suite loads the user's own MCP servers and SessionStart hooks (no `--strict-mcp-config`); an `initialize` or `thread/start` timeout passed on its own rerun each time. Rerun a handshake timeout alone, with no other probe on the same account, before calling it drift.
 - Pass 52 ran the Claude half of `just chat-smoke` (21/21) on claude 2.1.310 and moved the Claude pin there; the codex half stays at its own pin.
 - Pass 46 ran the codex half of `just chat-smoke` and Pass 47 added three live cases (`claude_wakeup_fires_as_a_named_turn`, `claude_goal_sets_and_clears`, `codex_goal_sets_pauses_and_clears`) on the same pins.
 - A full `just chat-smoke` repeats the complete approval, queue, background task, fork, rollback, compaction and driver lifecycle suite, not only an echo prompt (2026-10-01).

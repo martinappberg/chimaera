@@ -195,7 +195,7 @@ async fn live_daemons(app: &AppHandle) -> Vec<Key> {
 
 /// The daemon's current loopback port + token (both move on reconnect, so
 /// they are re-read before every poll), or `None` once it is gone.
-async fn endpoint(app: &AppHandle, key: &Key) -> Option<(u16, String)> {
+pub(super) async fn endpoint(app: &AppHandle, key: &Key) -> Option<(u16, String)> {
     let shell = app.try_state::<Shell>()?;
     match key {
         None => {

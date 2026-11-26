@@ -120,6 +120,12 @@ describe("host-status decision", () => {
       { kind: "healed", port: 43000, token: "own", moved: true },
     ],
     [
+      "a job window re-homes onto a reopened workspace's new token",
+      ev({ alias: "devbox#job42~ws1", status: "connected", local_port: 43000, token: "fresh" }),
+      job,
+      { kind: "healed", port: 43000, token: "fresh", moved: true },
+    ],
+    [
       "a login window's tokenless connected does not invent a token",
       ev({ status: "connected", local_port: 41000 }),
       login,

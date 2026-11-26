@@ -99,6 +99,64 @@ describe("ChatStore block-boundary normalization", () => {
   });
 });
 
+describe("a limit the agent reports as reached", () => {
+  const REACHED = {
+    type: "rate_limit",
+    utilization: 100,
+    label: "session limit",
+    resets_at: "1795726433",
+    limit_reached: true,
+    windows: [
+      { label: "session limit", utilization: 100, resets_at: "1795726433" },
+      { label: "weekly limit", utilization: 41 },
+    ],
+  };
+  const REFUSED_TURN: Record<string, unknown>[] = [
+    { type: "user_message", text: "summarize the README", id: "u1" },
+    { type: "turn_started", turn_id: "t1" },
+    REACHED,
+    { type: "turn_aborted", turn_id: "t1", reason: "the agent's own words" },
+  ];
+
+  it("is the chat's limit state until the agent says otherwise", () => {
+    const store = fold(REFUSED_TURN);
+    expect(store.rateLimit).toMatchObject({ limitReached: true, label: "session limit", resetsAt: "1795726433" });
+    // The agent's words stay in the transcript as the turn's failure.
+    expect(store.blocks.at(-1)).toMatchObject({ kind: "notice", tone: "error", text: "turn failed: the agent's own words" });
+    // The next request that goes through reports the window as allowed.
+    store.apply({ seq: 99, ts: 99, ev: { ...REACHED, utilization: 100, limit_reached: false } } as SeqEvent);
+    expect(store.rateLimit?.limitReached).toBe(false);
+  });
+
+  it("survives the process ending and an ordinary restart of it", () => {
+    // A view toggle or a relaunch on the same login: the account is the same.
+    const store = fold([...REFUSED_TURN, { type: "exited" }, { type: "mode_switch", to: "chat" }, { type: "init" }]);
+    expect(store.rateLimit?.limitReached).toBe(true);
+    expect(store.blocks.at(-1)).toMatchObject({ kind: "notice", text: "continued in chat" });
+  });
+
+  it("is dropped when the chat starts again for a new sign-in", () => {
+    const store = fold([
+      ...REFUSED_TURN,
+      { type: "exited" },
+      { type: "mode_switch", to: "chat", sign_in: true },
+      { type: "init" },
+    ]);
+    // Nothing of the old account's windows is shown as this login's.
+    expect(store.rateLimit).toBeNull();
+    expect(store.exited).toBeNull();
+    expect(store.blocks.at(-1)).toMatchObject({ kind: "notice", tone: "info", text: "continued on the new sign-in" });
+    // The new process reports its own account at its first request.
+    store.apply({ seq: 50, ts: 50, ev: { type: "rate_limit", utilization: 7, label: "session limit" } } as SeqEvent);
+    expect(store.rateLimit).toMatchObject({ limitReached: false, utilization: 7 });
+  });
+
+  it("returns when the new login is at its limit too", () => {
+    const store = fold([...REFUSED_TURN, { type: "exited" }, { type: "mode_switch", to: "chat", sign_in: true }, { type: "init" }, ...REFUSED_TURN.map((ev) => (ev.id === "u1" ? { ...ev, id: "u2" } : ev))]);
+    expect(store.rateLimit?.limitReached).toBe(true);
+  });
+});
+
 describe("ChatStore transcript activity", () => {
   it("separates visible conversation changes from control telemetry", () => {
     const store = new ChatStore();
@@ -415,6 +473,56 @@ describe("ChatStore pending-send ordering", () => {
     expect(store.blocks.some((b) => b.kind === "user")).toBe(false);
     // The agent's message is untouched (never split).
     expect(store.blocks.filter((b) => b.kind === "message")).toHaveLength(1);
+  });
+
+  it("an edit returns a withdrawn message's words to the view that asked, once", () => {
+    const store = fold([
+      { type: "turn_started", turn_id: "t1" },
+      { type: "user_message", text: "first", id: "q1", queued: true },
+      { type: "user_message", text: "second", id: "q2", queued: true, attachment_paths: ["/tmp/a.png"] },
+      { type: "user_message", text: "third", id: "q3", queued: true },
+    ]);
+    const view = {};
+    const other = {};
+    store.requestEdit(["q1", "q2", "q3"], view);
+    let seq = 100;
+    const apply = (ev: Record<string, unknown>) => store.apply({ seq: seq++, ts: 0, ev } as SeqEvent);
+    apply({ type: "user_message_update", id: "q1", state: "cancelled" });
+    // Read before the withdrawal landed: sent, and never handed back.
+    apply({ type: "user_message_update", id: "q2", state: "sent" });
+    apply({ type: "user_message_update", id: "q3", state: "cancelled" });
+    expect(store.takeEdited(other)).toEqual([]);
+    const back = store.takeEdited(view);
+    expect(back.map((b) => [b.id, b.text])).toEqual([
+      ["q1", "first"],
+      ["q3", "third"],
+    ]);
+    expect(store.takeEdited(view)).toEqual([]);
+    expect(store.pendingSends).toHaveLength(0);
+    expect(store.blocks.filter((b) => b.kind === "user")).toHaveLength(1);
+  });
+
+  it("a view that closes before the withdrawal lands hands its edit to the next view", () => {
+    const store = fold([
+      { type: "turn_started", turn_id: "t1" },
+      { type: "user_message", text: "keep me", id: "q1", queued: true },
+    ]);
+    const closing = {};
+    const next = {};
+    store.requestEdit(["q1"], closing);
+    store.releaseEdits(closing);
+    store.apply({ seq: 50, ts: 0, ev: { type: "user_message_update", id: "q1", state: "cancelled" } } as SeqEvent);
+    expect(store.takeEdited(next).map((b) => b.text)).toEqual(["keep me"]);
+    expect(store.edited).toEqual([]);
+  });
+
+  it("a cancel nobody asked to edit returns nothing", () => {
+    const store = fold([
+      { type: "turn_started", turn_id: "t1" },
+      { type: "user_message", text: "oops", id: "q1", queued: true },
+      { type: "user_message_update", id: "q1", state: "cancelled" },
+    ]);
+    expect(store.edited).toEqual([]);
   });
 
   it("a dropped send stays in the stack as not-delivered, never in the transcript", () => {

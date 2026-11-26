@@ -34,23 +34,22 @@ use crate::driver::{
 };
 use crate::elicitation::{Elicitation, ElicitationAction, ELICITATION_PENDING};
 use crate::model::{
-    cap_head_tail, cap_output, clip_command, fmt_elapsed_secs, fmt_tokens, truncate_label,
-    AgentCommand, AgentEvent, BackgroundTask, BackgroundTaskClose, ChunkKind, Coalescer,
-    CompactionPhase, CompactionTrigger, ContentBlock, ModeInfo, PermissionOption,
+    cap_head_tail, cap_output, cap_slash_catalog, clip_command, fmt_elapsed_secs, fmt_tokens,
+    truncate_label, AgentCommand, AgentEvent, BackgroundTask, BackgroundTaskClose, ChunkKind,
+    Coalescer, CompactionPhase, CompactionTrigger, ContentBlock, ModeInfo, PermissionOption,
     PermissionOptionKind, PlanEntry, PlanStatus, SlashCommand, ToolContent, ToolKind, ToolStatus,
     Usage, UsageWindow, UserMessageState, WorkflowAgent, BG_LABEL_MAX, BG_PATH_MAX, BG_TASKS_CAP,
     COMMAND_ID_MAX, DIFF_FILE_BUDGET, DIFF_TURN_BUDGET, PLAN_BLOCKED_CAP, PLAN_DESC_MAX,
-    PLAN_LABEL_MAX, PLAN_TASKS_CAP, SLASH_COMMANDS_CAP, SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX,
-    STATUS_DETAIL_MAX, SUBAGENT_RESULT_MAX, TOOL_SUMMARY_IDS_CAP, TOOL_SUMMARY_MAX,
-    UNHANDLED_REQUESTS_CAP, UNHANDLED_REQUEST_NAME_MAX, WF_AGENTS_CAP, WF_AGENTS_SET_BUDGET,
-    WF_AGENT_LABEL_MAX,
+    PLAN_LABEL_MAX, PLAN_TASKS_CAP, SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX, STATUS_DETAIL_MAX,
+    SUBAGENT_RESULT_MAX, TOOL_SUMMARY_IDS_CAP, TOOL_SUMMARY_MAX, UNHANDLED_REQUESTS_CAP,
+    UNHANDLED_REQUEST_NAME_MAX, WF_AGENTS_CAP, WF_AGENTS_SET_BUDGET, WF_AGENT_LABEL_MAX,
 };
 use crate::model::{RemoteControlSnapshot, RemoteControlState};
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 
-/// CLI version these frame shapes were verified against (2026-10-23, the
-/// Claude part of chat-smoke 21/21 + chat-mods-smoke; PROTOCOL.md Pass 52).
-pub const TESTED_CLAUDE_VERSION: &str = "2.1.310";
+/// CLI version these frame shapes were verified against (2026-11-04, the
+/// Claude part of chat-smoke + chat-mods-smoke; PROTOCOL.md Pass 59).
+pub const TESTED_CLAUDE_VERSION: &str = "2.1.332";
 
 /// The environment variable that lowers Claude Code's auto-compact
 /// threshold to a percentage of its window (PROTOCOL.md Pass 55). Chimaera
@@ -201,6 +200,92 @@ fn queued_message_frame(uuid: &str, content: Value, priority: &str, requeue: boo
         frame["requeue_if_interrupted_within_ms"] = json!(REQUEUE_WINDOW_MS);
     }
     frame
+}
+
+/// The composer catalog from the CLI's command list: the `initialize`
+/// response's `commands`, or a later `system/commands_changed` push, which
+/// replaces it. Names are kept whole or dropped (a cut name would invoke
+/// something else; one with a control character is not a name, and an MCP
+/// server chooses its prompts' and skills' names), duplicates fold
+/// case-insensitively, and the rows are bounded by [`cap_slash_catalog`].
+fn claude_slash_commands(list: &Value) -> Vec<SlashCommand> {
+    let mut seen = HashSet::new();
+    cap_slash_catalog(list.as_array().into_iter().flatten().filter_map(|c| {
+        let name = c["name"].as_str()?;
+        if name.is_empty()
+            || name.len() > SLASH_NAME_MAX
+            || name.chars().any(char::is_control)
+            || !seen.insert(name.to_ascii_lowercase())
+        {
+            return None;
+        }
+        Some(SlashCommand {
+            name: name.to_string(),
+            description: truncate_label(
+                c["description"].as_str().unwrap_or_default(),
+                SLASH_DESCRIPTION_MAX.saturating_sub('…'.len_utf8()),
+            ),
+            skill_path: None,
+        })
+    }))
+}
+
+/// One Notice for the plugins `system/init.plugin_errors` says did not load
+/// (2.1.323 lists the ones managed settings enable too): `[{plugin, type,
+/// message, path?}]`, where `plugin` is `name@marketplace` or a positional
+/// `inline[N]` tag for a `--plugin-dir` entry, whose `path` then names it.
+/// `None` when the list is absent or names nothing.
+fn plugin_errors_notice(errors: &Value) -> Option<String> {
+    let rows: Vec<String> = errors
+        .as_array()?
+        .iter()
+        .take(8)
+        .filter_map(|e| {
+            let name = e["path"]
+                .as_str()
+                .or_else(|| e["plugin"].as_str())
+                .filter(|name| !name.is_empty())?;
+            let name = truncate_label(name, 120);
+            Some(match e["message"].as_str().filter(|m| !m.is_empty()) {
+                Some(m) => format!("{name} ({})", truncate_label(m, 160)),
+                None => name,
+            })
+        })
+        .collect();
+    (!rows.is_empty()).then(|| format!("Plugin not loaded: {}", rows.join(", ")))
+}
+
+/// The one line for `system/session_writes_lost {error_code, lost}`
+/// (2.1.317): what the CLI could not save, and why. `None` when it names
+/// nothing it lost; a kind this driver does not know still says so.
+fn writes_lost_notice(frame: &Value) -> Option<String> {
+    let lost: Vec<&str> = frame["lost"]
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    if lost.is_empty() {
+        return None;
+    }
+    let transcript = lost.contains(&"transcript");
+    let what = match (transcript, lost.contains(&"global_config")) {
+        (true, true) => "this conversation or ~/.claude.json",
+        (true, false) => "this conversation",
+        (false, true) => "~/.claude.json",
+        (false, false) => "some of its files",
+    };
+    let why = match frame["error_code"].as_str() {
+        Some("ENOSPC") => "the disk is full".to_string(),
+        Some("EDQUOT") => "the disk quota is used up".to_string(),
+        Some(code) if !code.is_empty() => truncate_label(code, 40),
+        _ => "a write failed".to_string(),
+    };
+    let after = if transcript {
+        " Reopening it may miss the latest turns."
+    } else {
+        ""
+    };
+    Some(format!("Claude couldn't save {what}: {why}.{after}"))
 }
 
 /// A waiting message the CLI has just taken in, which a Stop can still put
@@ -1157,6 +1242,11 @@ struct ClaudeMapper {
     /// it, so its absence names that variable as the one holding
     /// auto-compact off (else `DISABLE_AUTO_COMPACT`).
     compact_offered: bool,
+    /// The `mcp_server_errors` / `plugin_errors` lines already shown. `init`
+    /// comes again at every turn start and repeats both lists, so each line
+    /// is said once and again only when it changes.
+    mcp_errors_shown: Option<String>,
+    plugin_errors_shown: Option<String>,
     /// The last auto-compact state journaled (latest-wins dedupe).
     auto_compact: Option<(bool, Option<&'static str>)>,
     /// Remote Control offer flags from the initialize response (see
@@ -1186,6 +1276,12 @@ struct ClaudeMapper {
     /// (a subset of `awaiting_read`; one put back leaves, as the CLI puts a
     /// message back at most once).
     requeue_armed: HashSet<String>,
+    /// Waiting messages whose ✕ the CLI answered `cancelled: false` while
+    /// they still waited here: it had read them but not yet queued them
+    /// (held behind a model change or start-up work). Live 2.1.318 runs such
+    /// a message once it queues, so its `queued` frame sends the cancel
+    /// again (PROTOCOL.md Pass 59). A subset of `awaiting_read`.
+    held_cancels: HashSet<String>,
     /// The last waiting message the CLI took in since the model last spoke,
     /// while a Stop can still put it back. Only the last can be (the CLI's
     /// rule), so a newer one releases it.
@@ -1212,32 +1308,7 @@ impl ClaudeMapper {
         let compact_offered = commands_catalog["commands"]
             .as_array()
             .is_none_or(|cmds| cmds.iter().any(|c| c["name"] == "compact"));
-        let mut seen_commands = HashSet::new();
-        let slash_commands = commands_catalog["commands"]
-            .as_array()
-            .map(|cmds| {
-                cmds.iter()
-                    .filter_map(|c| {
-                        let name = c["name"].as_str()?;
-                        if name.is_empty()
-                            || name.len() > SLASH_NAME_MAX
-                            || !seen_commands.insert(name.to_ascii_lowercase())
-                        {
-                            return None;
-                        }
-                        Some(SlashCommand {
-                            name: name.to_string(),
-                            description: truncate_label(
-                                c["description"].as_str().unwrap_or_default(),
-                                SLASH_DESCRIPTION_MAX.saturating_sub('…'.len_utf8()),
-                            ),
-                            skill_path: None,
-                        })
-                    })
-                    .take(SLASH_COMMANDS_CAP)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let slash_commands = claude_slash_commands(&commands_catalog["commands"]);
         // The initialize response IS the account model catalog: `value` is
         // what set_model accepts; supportedEffortLevels feeds the effort
         // menu (absent = the model has no effort knob, e.g. haiku).
@@ -1355,6 +1426,8 @@ impl ClaudeMapper {
             auto_compact_read: 0,
             auto_compact_env: None,
             compact_offered,
+            mcp_errors_shown: None,
+            plugin_errors_shown: None,
             auto_compact: None,
             remote_control_available,
             remote_control_auto_enable,
@@ -1366,6 +1439,7 @@ impl ClaudeMapper {
             wakeup_source_capable: false,
             requeue_capable: false,
             requeue_armed: HashSet::new(),
+            held_cancels: HashSet::new(),
             taken: None,
             turn_messages: Vec::new(),
             next_ctl: 0,
@@ -1872,15 +1946,57 @@ impl ClaudeMapper {
                         })
                         .collect();
                     if !names.is_empty() {
-                        self.flush_prose(step);
-                        step.events.push(AgentEvent::Notice {
-                            text: format!("MCP server config skipped: {}", names.join(", ")),
-                        });
+                        let text = format!("MCP server config skipped: {}", names.join(", "));
+                        if self.mcp_errors_shown.as_deref() != Some(text.as_str()) {
+                            self.flush_prose(step);
+                            step.events.push(AgentEvent::Notice { text: text.clone() });
+                            self.mcp_errors_shown = Some(text);
+                        }
                     }
+                } else {
+                    // Gone: the same trouble coming back is said again.
+                    self.mcp_errors_shown = None;
+                }
+                // Plugins that did not load (2.1.323 adds the ones managed
+                // settings enable; a `--plugin-dir` miss was listed before).
+                // The CLI starts without them and says nothing else.
+                match plugin_errors_notice(&frame["plugin_errors"]) {
+                    Some(text) if self.plugin_errors_shown.as_deref() != Some(text.as_str()) => {
+                        self.flush_prose(step);
+                        step.events.push(AgentEvent::Notice { text: text.clone() });
+                        self.plugin_errors_shown = Some(text);
+                    }
+                    Some(_) => {}
+                    None => self.plugin_errors_shown = None,
+                }
+            }
+            // The whole command list again, after a mid-session change: MCP
+            // servers that connected after `initialize` (their prompts, and
+            // from 2.1.332 their skills as `server:skill`), skills found as
+            // the agent works in a subfolder. The schema says to replace the
+            // cached list. Journaled only when it differs: `Catalog` carries
+            // the full set. A frame without the list changes nothing.
+            Some("commands_changed") if frame["commands"].is_array() => {
+                let commands = claude_slash_commands(&frame["commands"]);
+                if commands != self.slash_commands {
+                    self.slash_commands = commands;
+                    step.events.push(AgentEvent::Catalog {
+                        models: self.models.clone(),
+                        modes: claude_modes(),
+                        slash_commands: self.slash_commands.clone(),
+                    });
                 }
             }
             // Remote Control bridge lifecycle (2.1.259).
             Some("bridge_state") => self.on_bridge_state(frame, step),
+            // 2.1.317: sent once, as the CLI exits, when a full disk or quota
+            // lost its writes. A lost transcript means a reopen misses turns.
+            Some("session_writes_lost") => {
+                if let Some(text) = writes_lost_notice(frame) {
+                    self.flush_prose(step);
+                    step.events.push(AgentEvent::Notice { text });
+                }
+            }
             // The CLI's own host-facing notices (`level`: info shows only in
             // transcript mode there; notice/suggestion/warning are visible).
             // Hook "says:" lines, model-switch notices, … ride this frame.
@@ -4122,6 +4238,12 @@ impl ClaudeMapper {
                 } else if taken {
                     // The turn has it; the CLI will not put it back now.
                     self.release_taken(step);
+                } else if self.awaiting_read.contains(&id) {
+                    // Read but not yet queued: the CLI will queue it, and
+                    // run it, once what holds it is done. Ask again then.
+                    let waiting = &self.awaiting_read;
+                    self.held_cancels.retain(|h| waiting.contains(h));
+                    self.held_cancels.insert(id);
                 }
             }
             PendingControl::ApplyFlags {
@@ -4190,6 +4312,7 @@ impl ClaudeMapper {
                 if let Some(pos) = self.awaiting_read.iter().position(|q| q == id) {
                     let id = self.awaiting_read.remove(pos).expect("position exists");
                     self.requeue_armed.remove(&id);
+                    self.held_cancels.remove(&id);
                     step.events.push(AgentEvent::UserMessageUpdate {
                         id,
                         state: UserMessageState::Sent,
@@ -4412,6 +4535,12 @@ impl ClaudeMapper {
             }
             return;
         };
+        if frame["state"] == "queued" {
+            if self.held_cancels.remove(id) {
+                self.cancel_queued(id.to_string(), step);
+            }
+            return;
+        }
         let state = match frame["state"].as_str() {
             Some("started" | "completed") => UserMessageState::Sent,
             // Withdrawn by our ✕ (its `cancel_async_message` is still in
@@ -4419,10 +4548,11 @@ impl ClaudeMapper {
             // not ask for — the CLI sweeping its queue — is not the user
             // taking it back: the message was never delivered, so say so.
             Some("cancelled") => {
-                let ours = self
-                    .pending_controls
-                    .values()
-                    .any(|p| matches!(p, PendingControl::CancelQueued(q) if q == id));
+                let ours = self.held_cancels.contains(id)
+                    || self
+                        .pending_controls
+                        .values()
+                        .any(|p| matches!(p, PendingControl::CancelQueued(q) if q == id));
                 if ours {
                     UserMessageState::Cancelled
                 } else {
@@ -4433,6 +4563,7 @@ impl ClaudeMapper {
             _ => return,
         };
         let id = self.awaiting_read.remove(pos).expect("position exists");
+        self.held_cancels.remove(&id);
         if state != UserMessageState::Sent {
             self.requeue_armed.remove(&id);
             step.events
@@ -5126,13 +5257,7 @@ impl ClaudeMapper {
                 if self.awaiting_read.contains(&id)
                     || self.taken.as_ref().is_some_and(|t| t.id == id)
                 {
-                    let ctl = self.ctl_id();
-                    self.pending_controls
-                        .insert(ctl.clone(), PendingControl::CancelQueued(id.clone()));
-                    step.outbound.push(control_request_frame(
-                        &ctl,
-                        json!({ "subtype": "cancel_async_message", "message_uuid": id }),
-                    ));
+                    self.cancel_queued(id, &mut step);
                 } else {
                     self.queued_sends.retain(|(q, _, _)| q != &id);
                     step.events.push(AgentEvent::UserMessageUpdate {
@@ -5150,6 +5275,15 @@ impl ClaudeMapper {
             // as a duplicate, and a fresh one would orphan the bubble's
             // rewind key. Already read (or nothing running): nothing to do.
             AgentCommand::SendNow { id } => {
+                // The pressed message may be the one the CLI is taking in
+                // right now (`Taken`: its bubble still waits for up to the
+                // requeue window). Send now acts on everything waiting
+                // whichever message it names (2.1.318 schema), so it names
+                // the next one still in the CLI's queue instead.
+                let id = match self.awaiting_read.front() {
+                    Some(next) if self.taken.as_ref().is_some_and(|t| t.id == id) => next.clone(),
+                    _ => id,
+                };
                 let at_cli = self.awaiting_read.contains(&id);
                 let waiting = at_cli || self.queued_sends.iter().any(|(q, _, _)| *q == id);
                 // A turn that is starting (a waiting batch was just read) is
@@ -5219,6 +5353,16 @@ impl ClaudeMapper {
             }
         }
         step
+    }
+
+    /// Withdraw a message from the CLI's queue (`cancel_async_message`); it
+    /// resolves on the answer or its `cancelled` lifecycle frame.
+    fn cancel_queued(&mut self, id: String, step: &mut DriverStep) {
+        let ctl = self.ctl_id();
+        let request = json!({ "subtype": "cancel_async_message", "message_uuid": id });
+        self.pending_controls
+            .insert(ctl.clone(), PendingControl::CancelQueued(id));
+        step.outbound.push(control_request_frame(&ctl, request));
     }
 
     fn interrupt(&mut self, step: &mut DriverStep) {
@@ -5304,6 +5448,7 @@ impl ClaudeMapper {
         // A hard kill mid-queue must not strand a waiting message as "queued"
         // forever on replay — drop what the agent never read: the CLI's queue
         // died with it, and a held message was never even written.
+        self.held_cancels.clear();
         for id in std::mem::take(&mut self.awaiting_read) {
             events.push(AgentEvent::UserMessageUpdate {
                 id,
@@ -6634,7 +6779,7 @@ pub(crate) mod tests {
 
     #[test]
     fn slash_catalog_is_bounded_at_construction() {
-        let mut commands: Vec<Value> = (0..=SLASH_COMMANDS_CAP)
+        let mut commands: Vec<Value> = (0..=crate::model::SLASH_COMMANDS_CAP)
             .map(|i| {
                 json!({
                     "name": format!("command-{i}"),
@@ -6648,7 +6793,10 @@ pub(crate) mod tests {
         );
         let mapper = ClaudeMapper::new(None, None, &json!({ "commands": commands }));
 
-        assert_eq!(mapper.slash_commands.len(), SLASH_COMMANDS_CAP);
+        assert_eq!(
+            mapper.slash_commands.len(),
+            crate::model::SLASH_COMMANDS_CAP
+        );
         assert_eq!(
             mapper
                 .slash_commands
@@ -7184,6 +7332,98 @@ pub(crate) mod tests {
         ));
     }
 
+    /// Live 2.1.318 (Pass 59): ✕ on a message sent right after a model
+    /// change answers `cancelled: false` while the CLI still holds it behind
+    /// the model check; once that ends, the message queues and runs anyway.
+    /// Its `queued` frame sends the cancel again, which withdraws it.
+    #[test]
+    fn a_held_message_is_cancelled_once_it_queues() {
+        let mut m = native_mapper_mid_turn();
+        let (b, _) = send_text(&mut m, "B", false);
+        let step = m.on_command(AgentCommand::CancelQueued { id: b.clone() });
+        let ctl = step.outbound[0]["request_id"].as_str().unwrap().to_string();
+        let step = m.on_frame(&json!({
+            "type": "control_response",
+            "response": { "subtype": "success", "request_id": ctl,
+                          "response": { "cancelled": false } },
+        }));
+        assert!(step.events.is_empty() && step.outbound.is_empty());
+        let step = m.on_frame(&lifecycle(&b, "queued"));
+        assert!(step.events.is_empty());
+        assert_eq!(
+            step.outbound[0]["request"],
+            json!({ "subtype": "cancel_async_message", "message_uuid": b })
+        );
+        let retry = step.outbound[0]["request_id"].as_str().unwrap().to_string();
+        let step = m.on_frame(&lifecycle(&b, "cancelled"));
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::UserMessageUpdate {
+                id: b.clone(),
+                state: UserMessageState::Cancelled,
+            }]
+        );
+        let step = m.on_frame(&json!({
+            "type": "control_response",
+            "response": { "subtype": "success", "request_id": retry,
+                          "response": { "cancelled": true } },
+        }));
+        assert!(step.events.is_empty(), "already resolved");
+        assert!(m.held_cancels.is_empty());
+
+        // Only once: a second `queued` (a Stop putting it back) after the
+        // retry sends nothing more.
+        let (c, _) = send_text(&mut m, "C", false);
+        let step = m.on_command(AgentCommand::CancelQueued { id: c.clone() });
+        let ctl = step.outbound[0]["request_id"].as_str().unwrap().to_string();
+        m.on_frame(&json!({
+            "type": "control_response",
+            "response": { "subtype": "success", "request_id": ctl,
+                          "response": { "cancelled": false } },
+        }));
+        assert_eq!(m.on_frame(&lifecycle(&c, "queued")).outbound.len(), 1);
+        assert!(m.on_frame(&lifecycle(&c, "queued")).outbound.is_empty());
+    }
+
+    /// 2.1.317 `system/session_writes_lost`: one Notice naming what the CLI
+    /// could not save, and why.
+    #[test]
+    fn lost_session_writes_become_one_notice() {
+        let mut m = native_mapper_mid_turn();
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "session_writes_lost",
+            "error_code": "EDQUOT", "lost": ["transcript", "global_config"],
+            "transcript_session_ids": ["native-1"],
+        }));
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::Notice {
+                text: "Claude couldn't save this conversation or ~/.claude.json: \
+                       the disk quota is used up. Reopening it may miss the latest turns."
+                    .into(),
+            }]
+        );
+        let notice = |frame: Value| match &m_notice(frame)[..] {
+            [AgentEvent::Notice { text }] => Some(text.clone()),
+            _ => None,
+        };
+        assert_eq!(
+            notice(json!({ "error_code": "ENOSPC", "lost": ["global_config"] })).as_deref(),
+            Some("Claude couldn't save ~/.claude.json: the disk is full.")
+        );
+        assert_eq!(
+            notice(json!({ "error_code": "EIO", "lost": ["memory"] })).as_deref(),
+            Some("Claude couldn't save some of its files: EIO.")
+        );
+        assert_eq!(notice(json!({ "error_code": "ENOSPC", "lost": [] })), None);
+    }
+
+    fn m_notice(mut frame: Value) -> Vec<AgentEvent> {
+        frame["type"] = json!("system");
+        frame["subtype"] = json!("session_writes_lost");
+        native_mapper_mid_turn().on_frame(&frame).events
+    }
+
     /// Live 2.1.289: a plain interrupt killed a running background agent for
     /// good (SendMessage: "was stopped by the user and won't be resumed");
     /// `interrupt {send_now, message_uuid}` stopped the turn and left it
@@ -7323,6 +7563,30 @@ pub(crate) mod tests {
             "subtype": "success", "request_id": ctl,
             "response": {"still_queued": [], "turn": "stopped"}}}));
         assert!(sent(&step, &d));
+    }
+
+    /// #355: Send now pressed on the message the CLI is taking in right now
+    /// (held `Taken`, its bubble still waiting) names the next one still
+    /// queued; the CLI's send-now acts on everything waiting either way.
+    /// Nothing else waiting: it is being read, so nothing is sent.
+    #[test]
+    fn send_now_on_a_taken_message_names_the_next_one_waiting() {
+        let (mut m, _a) = requeue_mapper_mid_turn();
+        let (b, _) = send_text(&mut m, "B", false);
+        let (c, _) = send_text(&mut m, "C", false);
+        m.on_frame(&lifecycle(&b, "started"));
+        assert!(m.taken.as_ref().is_some_and(|t| t.id == b));
+        let step = m.on_command(AgentCommand::SendNow { id: b.clone() });
+        assert_eq!(
+            step.outbound[0]["request"],
+            json!({ "subtype": "interrupt", "send_now": true, "message_uuid": c })
+        );
+
+        let (mut m, _a) = requeue_mapper_mid_turn();
+        let (b, _) = send_text(&mut m, "B", false);
+        m.on_frame(&lifecycle(&b, "started"));
+        let step = m.on_command(AgentCommand::SendNow { id: b });
+        assert!(step.outbound.is_empty(), "{:?}", step.outbound);
     }
 
     /// Live 2.1.310: a Stop naming a turn that already ended answered
@@ -11920,6 +12184,178 @@ pub(crate) mod tests {
                     .into()
             }
         );
+    }
+
+    /// `init` comes again at every turn start with the same lists: each
+    /// line is said once, and again only when it changes.
+    #[test]
+    fn init_error_lists_are_not_repeated_every_turn() {
+        let mut m = mapper();
+        // Live 2.1.332 (`--plugin-dir` naming a missing folder).
+        let init = |errors: Value| {
+            json!({
+                "type": "system", "subtype": "init", "session_id": "native-9",
+                "model": "claude-haiku-5-5", "permissionMode": "default",
+                "mcp_server_errors": [{ "name": "broken", "message": "no type" }],
+                "plugin_errors": errors,
+            })
+        };
+        let missing = json!([{
+            "plugin": "inline[0]", "type": "path-not-found",
+            "message": "Path not found: /nonexistent/chimaera-probe-plugin",
+            "path": "/nonexistent/chimaera-probe-plugin",
+        }]);
+        let notices = |step: &DriverStep| -> Vec<String> {
+            step.events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::Notice { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            notices(&m.on_frame(&init(missing.clone()))),
+            [
+                "MCP server config skipped: broken (no type)",
+                "Plugin not loaded: /nonexistent/chimaera-probe-plugin \
+                 (Path not found: /nonexistent/chimaera-probe-plugin)",
+            ]
+        );
+        assert!(notices(&m.on_frame(&init(missing))).is_empty());
+        // A managed-settings plugin (2.1.323) has no path: its name is shown.
+        let step = m.on_frame(&init(json!([
+            { "plugin": "linter@corp", "type": "not-cached", "message": "not installed" },
+            { "type": "nameless" },
+        ])));
+        assert_eq!(
+            notices(&step),
+            ["Plugin not loaded: linter@corp (not installed)"]
+        );
+        // Gone, then back with the same words: said again.
+        let clean = json!({
+            "type": "system", "subtype": "init", "session_id": "native-9",
+            "model": "claude-haiku-5-5", "permissionMode": "default",
+        });
+        assert!(notices(&m.on_frame(&clean)).is_empty());
+        assert_eq!(
+            notices(&m.on_frame(&init(
+                json!([{ "plugin": "linter@corp", "message": "not installed" }])
+            ))),
+            [
+                "MCP server config skipped: broken (no type)",
+                "Plugin not loaded: linter@corp (not installed)",
+            ]
+        );
+        assert!(plugin_errors_notice(&json!([])).is_none());
+        assert!(plugin_errors_notice(&Value::Null).is_none());
+    }
+
+    /// `system/commands_changed` (live 2.1.332: 1.4 s after spawn, once the
+    /// MCP servers had connected) replaces the catalog `initialize` gave.
+    #[test]
+    fn commands_changed_replaces_the_catalog() {
+        let mut m = ClaudeMapper::new(
+            None,
+            None,
+            &json!({ "commands": [{ "name": "goal", "description": "Set a goal" }] }),
+        );
+        let pushed = json!({
+            "type": "system", "subtype": "commands_changed",
+            "commands": [
+                { "name": "goal", "description": "Set a goal", "argumentHint": "" },
+                { "name": "claude.ai Example:summarize_paper (MCP)",
+                  "description": "Generate a prompt to summarize a paper", "argumentHint": "" },
+                { "name": "notes:summarize", "description": "A skill an MCP server serves" },
+            ],
+            "uuid": "u-1", "session_id": "native-9",
+        });
+        let step = m.on_frame(&pushed);
+        let [AgentEvent::Catalog {
+            slash_commands,
+            modes,
+            ..
+        }] = step.events.as_slice()
+        else {
+            panic!("one Catalog, got {:?}", step.events);
+        };
+        assert_eq!(
+            slash_commands
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "goal",
+                "claude.ai Example:summarize_paper (MCP)",
+                "notes:summarize"
+            ]
+        );
+        assert_eq!(modes, &claude_modes());
+        assert!(!m.turn_active, "a catalog push opens no turn");
+        // The same list again says nothing; the next `init` carries it.
+        assert!(m.on_frame(&pushed).events.is_empty());
+        // A frame without the list, or with a name that is not one, leaves
+        // the catalog as it was.
+        for frame in [
+            json!({ "type": "system", "subtype": "commands_changed" }),
+            json!({ "type": "system", "subtype": "commands_changed", "commands": null }),
+        ] {
+            assert!(m.on_frame(&frame).events.is_empty());
+        }
+        assert_eq!(m.slash_commands.len(), 3);
+        assert!(
+            claude_slash_commands(&json!([{ "name": "two\nlines" }, { "name": "ok" }]))
+                .iter()
+                .map(|c| c.name.as_str())
+                .eq(["ok"])
+        );
+        let init = m.on_frame(&json!({
+            "type": "system", "subtype": "init", "session_id": "native-9",
+            "model": "claude-haiku-5-5", "permissionMode": "default",
+        }));
+        assert!(matches!(
+            &init.events[0],
+            AgentEvent::Init { slash_commands, .. } if slash_commands.len() == 3
+        ));
+    }
+
+    /// The 30-second progress heartbeat while a hook runs (2.1.323; live
+    /// 2.1.332 with a 7 s PreToolUse hook and a 5 s Stop hook) is a
+    /// `tool_progress` frame attributed to the tool call, or for Stop to an
+    /// id no row has. It draws nothing and names no subagent.
+    #[test]
+    fn hook_heartbeats_are_silent() {
+        let mut m = mapper();
+        m.turn_active = true;
+        for frame in [
+            json!({
+                "type": "tool_progress",
+                "tool_use_id": "hook-PreToolUse-toolu_01CYVEPdsPHeYZF5U4nMLBEd-heartbeat-0",
+                "tool_name": "PreToolUse",
+                "parent_tool_use_id": "toolu_01CYVEPdsPHeYZF5U4nMLBEd",
+                "elapsed_time_seconds": 2, "heartbeat": true,
+                "uuid": "54797476-e15f-4a87-8a18-588107152a9e", "session_id": "native-9",
+            }),
+            json!({
+                "type": "tool_progress",
+                "tool_use_id": "hook-Stop-c6ee3b2b-8243-4e03-b7ac-35a66aa251f8-heartbeat-0",
+                "tool_name": "Stop",
+                "parent_tool_use_id": "c6ee3b2b-8243-4e03-b7ac-35a66aa251f8",
+                "elapsed_time_seconds": 2, "heartbeat": true,
+                "uuid": "0d0e2f3a-0000-4000-8000-000000000001", "session_id": "native-9",
+            }),
+            // A tool's own heartbeat carries no parent.
+            json!({
+                "type": "tool_progress", "tool_use_id": "toolu_02-heartbeat-0",
+                "tool_name": "Bash", "parent_tool_use_id": null,
+                "elapsed_time_seconds": 30, "heartbeat": true,
+            }),
+        ] {
+            let step = m.on_frame(&frame);
+            assert!(step.events.is_empty(), "{frame}: {:?}", step.events);
+            assert!(step.outbound.is_empty());
+        }
+        assert!(m.turn_active);
     }
 
     #[test]

@@ -162,7 +162,21 @@ pub(super) async fn connect_host(
     update_daemon: Option<bool>,
 ) -> Result<HostState, String> {
     super::require_target(&app, window.label(), Some(&alias))?;
-    do_connect(&app, alias, update_daemon.unwrap_or(false)).await
+    let update_daemon = update_daemon.unwrap_or(false);
+    // A job window's key is no ssh host. Every build's update toast sends it
+    // here (an outdated job's window runs that job's older UI), so the update
+    // restarts the workspace in its job instead of reconnecting.
+    if update_daemon {
+        let scope = super::caller_scope(&app, window.label())?;
+        if let Some(login) = scope
+            .compute_login()
+            .filter(|_| scope.alias.as_deref() == Some(alias.as_str()))
+        {
+            let port = super::cluster::update_job_workspace(&app, login, &alias).await?;
+            return Ok(HostState::compute(alias, port));
+        }
+    }
+    do_connect(&app, alias, update_daemon).await
 }
 
 #[tauri::command]
@@ -1302,7 +1316,7 @@ pub(super) fn write_clipboard(app: AppHandle, text: String) -> Result<(), String
 /// paths are this machine's; a remote page's would name whatever happens to
 /// sit at that path here). Windows pages name paths in wire form
 /// (`C:/x/y`); the shell hands the OS its native backslash form.
-fn local_file_path(path: &str) -> Result<std::path::PathBuf, String> {
+pub(super) fn local_file_path(path: &str) -> Result<std::path::PathBuf, String> {
     #[cfg(windows)]
     let path = &path.replace('/', "\\");
     existing_absolute_path(path)

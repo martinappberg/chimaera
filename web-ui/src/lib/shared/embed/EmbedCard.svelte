@@ -329,7 +329,7 @@
   {:else if kind === "table" || kind === "xlsx"}
     <TableBody path={hit.path} version={hit.version} {kind} {frag} {compact} active={near} />
   {:else if kind === "html"}
-    <HtmlBody {url} title={name} {compact} active={near} />
+    <HtmlBody {url} title={name} {compact} active={near} visible={onScreen} />
   {:else if kind === "video" || kind === "audio"}
     <MediaBody {url} {kind} time={frag.at?.time} {compact} active={near} onDownload={remote ? download : undefined} />
   {:else if kind === "notebook"}

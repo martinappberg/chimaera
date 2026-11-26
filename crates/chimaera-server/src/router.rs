@@ -268,6 +268,13 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/sessions/{id}/fork", post(chat::fork_session))
         .route("/sessions/{id}/git", get(git::session_git))
         .route("/links", get(links::list_links).put(links::put_link))
+        // Browser tabs shared with an agent's browser tools (before the
+        // terminal route: `browser` is never a terminal id).
+        .route(
+            "/links/browser",
+            get(links::list_browser_links).put(links::put_browser_link),
+        )
+        .route("/links/browser/{tab}", delete(links::delete_browser_link))
         .route("/links/{terminal_id}", delete(links::delete_link))
         .route("/agents", get(launcher::list_agents))
         .route(
@@ -337,6 +344,22 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/fs/dirs", get(fs::dirs))
         .route("/fs/list", get(fs::list))
         .route("/fs/file", get(fs::file).put(fs::put_file))
+        // A whole file too big to buffer (the app's "open in PowerPoint"
+        // round trip), streamed to disk under its own cap; the limit is
+        // lifted on this route only.
+        .route(
+            "/fs/file/stream",
+            put(fs::put_file_stream).layer(axum::extract::DefaultBodyLimit::max(
+                fs::MAX_PACKAGE_BYTES as usize + 64 * 1024,
+            )),
+        )
+        // An Office package edit: only the changed parts travel (`fs/zip_splice.rs`).
+        .route(
+            "/fs/package",
+            post(fs::post_package).layer(axum::extract::DefaultBodyLimit::max(
+                fs::MAX_PACKAGE_BODY_BYTES,
+            )),
+        )
         .route("/fs/markdown", get(fs::markdown))
         .route("/fs/table", get(fs::table))
         .route("/fs/xlsx", get(fs::xlsx))
@@ -377,6 +400,20 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
                 upload::MAX_DIR_UPLOAD_BYTES as usize + 64 * 1024,
             )),
         )
+        // The chunked, resumable transport the web UI uploads with
+        // (`upload::chunked`): a piece is at most `MAX_CHUNK_BYTES` and
+        // streams to disk, so the override only lifts the buffered default.
+        .route("/uploads", post(upload::chunked::begin))
+        .route(
+            "/uploads/{id}",
+            get(upload::chunked::status)
+                .put(upload::chunked::chunk)
+                .delete(upload::chunked::cancel)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    upload::chunked::MAX_CHUNK_BYTES as usize + 64 * 1024,
+                )),
+        )
+        .route("/uploads/{id}/finish", post(upload::chunked::finish))
         .route("/compute", get(compute::get_compute))
         // A cluster workspace job's own stop (scancel of SLURM_JOB_ID); 404
         // on any daemon not running inside a Slurm job.

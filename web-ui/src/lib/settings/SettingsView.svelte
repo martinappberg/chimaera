@@ -162,6 +162,8 @@
   const isCommsDef = (d: SettingDef) => d.id.startsWith("agents.communication.");
   /** Agent-wide session behavior: a titled block of its own. */
   const isContextDef = (d: SettingDef) => d.id === "agents.autoCompact" || d.id === "agents.autoCompactAt";
+  /** The agent browser's own block. */
+  const isBrowserDef = (d: SettingDef) => d.id === "browser.path";
 
   // A section asked for from elsewhere (Quick Open "Usage", the dashboard's
   // cost line): clear any search that hides it, then scroll there once shown.
@@ -208,9 +210,9 @@
     { label: "Focus pane 1–9", chord: `${activeModLabel()}1–9` },
     { label: "Move active tab to pane 1–9", chord: `${paneMoveHint(1)}–9` },
     { label: "Reference selection in agent", chord: PINNED.reference },
-    { label: "Terminal text larger", chord: PINNED.fontPlus },
-    { label: "Terminal text smaller", chord: PINNED.fontMinus },
-    { label: "Terminal text reset", chord: PINNED.fontReset },
+    { label: "Larger text, zoom in", chord: PINNED.fontPlus },
+    { label: "Smaller text, zoom out", chord: PINNED.fontMinus },
+    { label: "Reset text size or zoom", chord: PINNED.fontReset },
   ]);
 
   /**
@@ -311,8 +313,9 @@
                  ordinary schema rows. -->
             {@const comms = group.defs.filter(isCommsDef)}
             {@const context = group.defs.filter(isContextDef)}
+            {@const browser = group.defs.filter(isBrowserDef)}
             <section data-section={group.category}>
-              {#if q === "" || group.defs.some((d) => !isCommsDef(d) && !isContextDef(d))}
+              {#if q === "" || group.defs.some((d) => !isCommsDef(d) && !isContextDef(d) && !isBrowserDef(d))}
                 <AgentsSettings visible={tabVisible} />
               {:else}
                 <h2 class="cat">{group.category}</h2>
@@ -320,6 +323,12 @@
               {#if context.length > 0}
                 <h3 class="subcat">Context</h3>
                 {#each context as def (def.id)}
+                  <SettingRow {def} />
+                {/each}
+              {/if}
+              {#if browser.length > 0}
+                <h3 class="subcat">Browser</h3>
+                {#each browser as def (def.id)}
                   <SettingRow {def} />
                 {/each}
               {/if}

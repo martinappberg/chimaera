@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-office-open"
+description = "Enables the office_open command without any pre-configured scope."
+commands.allow = ["office_open"]
+
+[[permission]]
+identifier = "deny-office-open"
+description = "Denies the office_open command without any pre-configured scope."
+commands.deny = ["office_open"]

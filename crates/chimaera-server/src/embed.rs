@@ -161,12 +161,8 @@ fn target_path(raw: &str) -> Option<String> {
         .unwrap_or(t);
     let t = t.split_once('#').map_or(t, |(path, _)| path);
     let t = t.split_once('?').map_or(t, |(path, _)| path);
-    let t = if let Some(rest) = strip_file_scheme(t) {
-        // `file:///C:/x` names `C:/x`.
-        match rest.strip_prefix('/') {
-            Some(drive) if cfg!(windows) && is_drive_path(drive) => drive,
-            _ => rest,
-        }
+    let t = if let Some(rest) = file_url_local(t) {
+        rest
     } else if (has_scheme(t) && !(cfg!(windows) && is_drive_path(t))) || t.starts_with("//") {
         return None;
     } else {
@@ -178,7 +174,7 @@ fn target_path(raw: &str) -> Option<String> {
 
 /// `file:///abs` and `file://localhost/abs` as `/abs`; any other host is
 /// not this machine.
-fn strip_file_scheme(t: &str) -> Option<&str> {
+pub(crate) fn strip_file_scheme(t: &str) -> Option<&str> {
     let head = t.get(..5)?;
     if !head.eq_ignore_ascii_case("file:") {
         return None;
@@ -191,6 +187,16 @@ fn strip_file_scheme(t: &str) -> Option<&str> {
             .strip_prefix("localhost")
             .filter(|p| p.starts_with('/')),
     }
+}
+
+/// The local path a `file:` URL names, still percent-encoded: `/abs`, and on
+/// Windows `file:///C:/x` → `C:/x`. `None` for anything else.
+pub(crate) fn file_url_local(t: &str) -> Option<&str> {
+    let rest = strip_file_scheme(t)?;
+    Some(match rest.strip_prefix('/') {
+        Some(drive) if cfg!(windows) && is_drive_path(drive) => drive,
+        _ => rest,
+    })
 }
 
 /// `C:/x` or `C:\x`: on Windows a path, not a one-letter URL scheme.
@@ -210,7 +216,7 @@ fn has_scheme(t: &str) -> bool {
 }
 
 /// `%XX` escapes decoded; the input as-is when the result is not UTF-8.
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     if !s.contains('%') {
         return s.to_string();
     }

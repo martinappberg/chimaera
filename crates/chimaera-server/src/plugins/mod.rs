@@ -53,6 +53,7 @@ use serde_json::{json, Value};
 use crate::AppState;
 
 pub(crate) mod activity;
+pub(crate) mod browser;
 pub mod capabilities;
 pub(crate) mod files;
 pub(crate) mod hostfns;
@@ -98,6 +99,19 @@ pub(crate) struct DistTest;
 /// binary carries.
 const LOCK: &str = include_str!("../../../../plugins/plugins.lock");
 
+/// The groups the Extensions page sorts plugins into, in the order it shows
+/// them (the page's words for each: `web-ui/src/lib/plugins/categories.ts`).
+/// A first-party plugin's category is the lock's; any other plugin names
+/// one in its manifest. A plugin with none, or with a name this daemon
+/// doesn't know (a newer plugin on an older daemon), is listed under Other.
+pub(crate) const CATEGORIES: &[&str] = &["writing", "presentations", "data", "knowledge", "agents"];
+
+/// The category a plugin named, if it is one of ours.
+pub(crate) fn category(named: Option<&str>) -> Option<&'static str> {
+    let named = named?.trim();
+    CATEGORIES.iter().copied().find(|c| *c == named)
+}
+
 /// One `[[plugin]]` of the lock.
 #[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
@@ -106,6 +120,9 @@ pub(crate) struct Locked {
     /// What the card shows before any copy is installed.
     pub(crate) name: String,
     pub(crate) summary: String,
+    /// The Extensions page's group for it (one of `CATEGORIES`): the
+    /// maintainers' call, so a release never moves it.
+    pub(crate) category: String,
     /// The release Install fetches (`v<version>`).
     pub(crate) version: String,
     /// `owner/repo`: where it is released, and what an installed copy's
@@ -148,6 +165,13 @@ pub(crate) fn parse_lock(text: &str) -> Result<Vec<Locked>, String> {
         }
         if l.name.trim().is_empty() || l.summary.trim().is_empty() {
             return Err(format!("plugins.lock: {id}: name and summary are required"));
+        }
+        if category(Some(&l.category)) != Some(l.category.as_str()) {
+            return Err(format!(
+                "plugins.lock: {id}: category {:?} is not one of {}",
+                l.category,
+                CATEGORIES.join(", ")
+            ));
         }
         for sha in [&l.sha256_wasm, &l.sha256_toml, &l.caps] {
             if sha.len() != 64 || !sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
@@ -204,6 +228,11 @@ pub(crate) struct Manifest {
     pub(crate) description: Option<String>,
     #[serde(default)]
     pub(crate) homepage: Option<String>,
+    /// The Extensions page's group for it (one of `CATEGORIES`). Optional,
+    /// and never a reason to refuse a manifest: an unknown name lists the
+    /// plugin under Other.
+    #[serde(default)]
+    pub(crate) category: Option<String>,
     /// The WIT version the component targets (`"0.1"`); a gate.
     pub(crate) api: String,
     #[serde(default)]
@@ -418,6 +447,12 @@ pub(crate) struct Provides {
     /// did not declare, so a hook never instantiates a plugin that ignores it.
     #[serde(default)]
     pub(crate) events: Vec<EventKind>,
+    /// A browser for the agent browser's Chromium engine (0.2): the name of
+    /// one of its `[[programs]]` that one of its `[[tools]]` installs. Used
+    /// only where the plugin is active, and only when the host has no Chrome
+    /// or Chromium of its own (`browser`).
+    #[serde(default)]
+    pub(crate) browser: Option<String>,
 }
 
 impl Provides {
@@ -598,6 +633,15 @@ pub(crate) fn validate(m: &Manifest) -> Result<(), String> {
         }
     }
     platform::validate(m)?;
+    // A 0.1 manifest can't declare [[tools]] (refused above), so this also
+    // keeps provides.browser to 0.2.
+    if let Some(program) = &m.provides.browser {
+        if !m.tools.iter().any(|t| t.programs.contains(program)) {
+            return Err(format!(
+                "provides.browser {program:?} must be a program one of its [[tools]] installs"
+            ));
+        }
+    }
     if let Some(release) = &m.release {
         if !valid_github(&release.github) {
             return Err(format!(
@@ -1218,11 +1262,17 @@ fn manifest_fields(m: &Manifest) -> Value {
         "summary": m.summary,
         "description": text_or_null(m.description.as_deref()),
         "homepage": m.homepage,
+        // Where the Extensions page lists it: the lock's word for one of
+        // Chimaera's own plugins, whatever copy is installed.
+        "category": lock_entry(&m.id)
+            .map(|l| l.category.as_str())
+            .or(category(m.category.as_deref())),
         "adds": {"ui": m.adds.ui, "agents": m.adds.agents},
         "provides": {
             "knowledge": m.provides.knowledge,
             "mcp_tools": m.provides.mcp_tools,
             "views": m.provides.views,
+            "browser": m.provides.browser,
         },
         "setup": m.setup.as_ref().map(|s| json!({"prompt": s.prompt})),
         "detect": m.detect.any,
@@ -1260,6 +1310,7 @@ pub(crate) fn available_json(l: &Locked) -> Value {
         "summary": l.summary,
         "description": null,
         "homepage": null,
+        "category": l.category,
         "adds": {"ui": [], "agents": []},
         "provides": {"knowledge": null, "mcp_tools": [], "views": []},
         "setup": null,
@@ -1679,7 +1730,8 @@ pub(crate) async fn install_requirement(
                 .into_response();
         }
     };
-    let env = crate::api::session_env(&state, &session_id, "dark", prelude.as_deref());
+    let mut env = crate::api::session_env(&state, &session_id, "dark", prelude.as_deref());
+    crate::shell_env::overlay(&mut env).await;
     let env_remove = crate::api::spawn_env_remove(&env);
     // The agent's plugin manager runs a bare `git`; the Git binary path
     // setting's goes first on its PATH, after the login shell and the
@@ -1889,7 +1941,8 @@ mod tests {
         // What parse_lock refuses.
         let entry = |extra: &str| {
             format!(
-                "[[plugin]]\nid = \"x\"\nname = \"X\"\nsummary = \"x\"\nversion = \"0.1.0\"\n\
+                "[[plugin]]\nid = \"x\"\nname = \"X\"\nsummary = \"x\"\ncategory = \"writing\"\n\
+                 version = \"0.1.0\"\n\
                  repo = \"a/b\"\nsha256_wasm = \"{0}\"\nsha256_toml = \"{0}\"\n\
                  tier = \"sandboxed\"\ncaps = \"{0}\"\n{extra}",
                 "a".repeat(64)
@@ -1906,6 +1959,7 @@ mod tests {
             ("version = \"0.1.0\"", "version = \"0.1\""),
             ("repo = \"a/b\"", "repo = \"../b\""),
             ("summary = \"x\"", "summary = \" \""),
+            ("category = \"writing\"", "category = \"misc\""),
             ("tier = \"sandboxed\"", "tier = \"trusted\""),
         ] {
             assert!(
@@ -2186,6 +2240,32 @@ id = "future-kit"
 
     fn demo(extra: &str) -> Result<Manifest, String> {
         parse_manifest(&format!("{BASE}{extra}"))
+    }
+
+    #[test]
+    fn a_plugin_is_listed_under_its_category() {
+        // A plugin outside the lock names its own; a name this daemon
+        // doesn't know lists it under Other rather than refusing it.
+        let named = |extra: &str| {
+            let m = demo(&format!("version = \"0.1.0\"\napi = \"0.1\"\n{extra}")).unwrap();
+            manifest_fields(&m)["category"].clone()
+        };
+        assert_eq!(named("category = \"data\"\n"), "data");
+        assert_eq!(named("category = \" data \"\n"), "data");
+        assert!(named("category = \"games\"\n").is_null());
+        assert!(named("").is_null());
+        // One of Chimaera's own is where the lock puts it, installed or not
+        // and whatever its manifest says.
+        for l in lock_entries() {
+            assert_eq!(category(Some(&l.category)), Some(l.category.as_str()));
+            assert_eq!(available_json(l)["category"], l.category.as_str());
+        }
+        let latex = parse_manifest(
+            "id = \"latex\"\nname = \"LaTeX\"\nsummary = \"x\"\nversion = \"0.1.0\"\n\
+             api = \"0.1\"\ncategory = \"data\"\n",
+        )
+        .unwrap();
+        assert_eq!(manifest_fields(&latex)["category"], "writing");
     }
 
     #[test]

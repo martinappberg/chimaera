@@ -81,7 +81,8 @@ async fn shell_display_name_uses_workspace_relative_cwd() {
 /// End-to-end shell integration: a real bash spawned the way
 /// create_session spawns it (integration injected, hermetic HOME) must
 /// reach phase `ready` and populate the command journal with command
-/// text, output, and exit codes.
+/// text, output, and exit codes. The terminal is a login shell, so what
+/// the profile and the rc export are both there, each read once.
 #[tokio::test]
 async fn integrated_shell_populates_command_journal() {
     use chimaera_pty::ShellPhase;
@@ -89,6 +90,16 @@ async fn integrated_shell_populates_command_journal() {
     let state = test_state();
     let base = test_dir("shellint-base");
     let home = test_dir("shellint-home");
+    std::fs::write(
+        home.join(".bash_profile"),
+        "[ -f ~/.bashrc ] && . ~/.bashrc\nexport CHIMAERA_TEST_STARTUP=\"${CHIMAERA_TEST_STARTUP:-}+profile\"\n",
+    )
+    .expect("write profile");
+    std::fs::write(
+        home.join(".bashrc"),
+        "export CHIMAERA_TEST_STARTUP=\"${CHIMAERA_TEST_STARTUP:-}+rc\"\n",
+    )
+    .expect("write rc");
     let launch = chimaera_core::shellint::shell_launch_for("/bin/bash", &base).expect("launch");
     let mut env = launch.env;
     env.push(("HOME".to_string(), home.to_string_lossy().into_owned()));
@@ -120,16 +131,18 @@ async fn integrated_shell_populates_command_journal() {
 
     let att = state.sessions.attach(&info.id).expect("attach");
     att.input
-        .send(bytes::Bytes::from("echo integration-works\n"))
+        .send(bytes::Bytes::from(
+            "echo integration-works$CHIMAERA_TEST_STARTUP\n",
+        ))
         .await
         .expect("send command");
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
     let entry = loop {
-        let done = marks
-            .journal(10)
-            .into_iter()
-            .find(|e| !e.running && e.command.as_deref() == Some("echo integration-works"));
+        let done = marks.journal(10).into_iter().find(|e| {
+            !e.running
+                && e.command.as_deref() == Some("echo integration-works$CHIMAERA_TEST_STARTUP")
+        });
         if let Some(entry) = done {
             break entry;
         }
@@ -141,7 +154,10 @@ async fn integrated_shell_populates_command_journal() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     };
     assert_eq!(entry.exit_code, Some(0), "{entry:?}");
-    assert!(entry.output.contains("integration-works"), "{entry:?}");
+    assert!(
+        entry.output.contains("integration-works+rc+profile"),
+        "{entry:?}"
+    );
     assert_eq!(entry.source, chimaera_pty::CommandSource::User);
 
     state.sessions.kill(&info.id).ok();

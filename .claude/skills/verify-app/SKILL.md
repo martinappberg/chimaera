@@ -37,12 +37,46 @@ no scenario covers, write one. Name the new scenario in the evidence.
 ## 3. Drive the real flow
 
 Bring up the dev loop (see the **develop** skill), then exercise the *actual*
-path you changed. When available, use the browser-pane tooling to observe:
-`read_page` for structure/content, `read_console_messages` + `preview_logs` for
-errors, `read_network_requests` for API/WS traffic, a screenshot for proof.
+path you changed. Pick the first observation tool your session has.
 
-If those tools are absent, use the develop skill's manual isolated launcher,
-daemon terminal output, and the available browser or native-app inspection tools.
+**a. The agent browser, when you run inside Chimaera.** A session that Chimaera
+launched has the chimaera MCP server's `browser_*` tools (in Claude Code:
+`mcp__chimaera__browser_*`). Use them for UI checks instead of ad-hoc headless
+Chrome or Playwright scripts ([agent browser](../../../docs/features/agent-browser.md)):
+
+1. `browser_navigate {url}` opens the page in your own off-screen page. Only
+   loopback, this host and nodes of the user's running jobs load. Read the
+   result's first line: it names the engine (`app` or `chromium`).
+2. `browser_snapshot` reads the page as text with `[eN]` refs. It is the cheap
+   default; take one after each step.
+3. `browser_click {ref}`, `browser_type {text, ref, submit}`, `browser_press
+   {key}` and `browser_select {ref, value}` drive it with real input. Use
+   `browser_wait` for text, a selector or network idle before you read again.
+4. `browser_console` and `browser_network` give the errors, failed requests
+   and slow requests since your last call. Run both before you claim a pass.
+5. `browser_screenshot` (a `ref` for one element) is the proof for the PR.
+   `browser_inspect` gives computed styles and the box; `browser_eval` runs a
+   script for what nothing else answers.
+6. To show the user the result, call `browser_show`. Else call `browser_close`.
+
+Know the limits before you trust a result. A native `<select>` takes
+`browser_select`, never a click. There is no right-click, no HTML5
+drag-and-drop and no file upload. A `· throttled` result means the app window
+is minimized or hidden, so timers run slowly. The app engine loads pages
+through the hosting daemon's proxy, which never forwards an absolute `/api/v1`
+or `/ws/` request. So Chimaera's own workbench (the isolated preview) is
+expected to break on the app engine (found by reading the code, not yet seen
+live). If the snapshot shows the workbench cannot connect, fall back to (b) or
+(c) for the workbench itself. The agent browser still fits the web apps the
+change serves, such as a proxied app or a preview's page.
+
+**b. The browser-pane tooling** (a desktop session with preview tools):
+`read_page` for structure/content, `read_console_messages` + `preview_logs`
+for errors, `read_network_requests` for API/WS traffic, a screenshot for proof.
+
+**c. Neither.** Use the develop skill's manual isolated launcher, daemon
+terminal output, and the available browser or native-app inspection tools.
+
 Report any visual or network surface your session could not inspect.
 
 **In a Claude cloud session** (`CLAUDE_CODE_REMOTE=true`) there is no preview
@@ -72,6 +106,12 @@ Match the exercise to what you touched:
   (needs-attention / finished / errored) derive from protocol events in chat
   and Claude hooks in its TUI, and that a linked terminal grant is scoped and
   audited in scrollback.
+- **Agent browser** — in the macOS app, have an agent navigate, snapshot, click
+  and type in a local web app and read its console. Share a pane by its chain
+  link, act in it, and confirm that the agent's next act tool says "Paused".
+  `browser_show` must not reload the page. With no app window on the
+  workspace, the Chromium engine answers or refuses with the fix;
+  `just browser-smoke` drives it against a real browser.
 - **Reconnect** — reload and reattach from another machine/tab. Chat sockets
   (`/ws/chat/{id}`) replay the seq-numbered gap; the session-list bus
   (`/ws/events`) sends the current full roster; PTY sockets rebuild the screen

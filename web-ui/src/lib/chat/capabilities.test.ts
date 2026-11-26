@@ -51,6 +51,17 @@ describe("shared provider catalogs", () => {
     expect(store.models).toEqual([]);
     expect(store.modelCatalogReceived).toBe(true);
   });
+  it("keeps a slash catalog longer than the models and modes bound", () => {
+    // Claude 2.1.332 lists 86 commands, `/recap` and `/goal` past the 64th.
+    const store = new ChatStore();
+    const commands = (n: number) => Array.from({ length: n }, (_, i) => ({ name: `command-${i}` }));
+    store.apply({ seq: 1, ts: 1, ev: { type: "init", slash_commands: [...commands(85), { name: "goal" }] } });
+    expect(store.slashCommands).toHaveLength(86);
+    expect(store.slashCommands.at(-1)?.name).toBe("goal");
+    store.apply({ seq: 2, ts: 2, ev: { type: "catalog", slash_commands: commands(300), models: commands(300).map((c) => ({ id: c.name })) } });
+    expect(store.slashCommands).toHaveLength(256);
+    expect(store.models).toHaveLength(64);
+  });
   it("clears readiness and capabilities when a replaced journal restarts replay", () => {
     const store = new ChatStore();
     store.apply({ seq: 10, ts: 10, ev: { type: "init" } });

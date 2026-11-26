@@ -1,3 +1,4 @@
+mod agent_browser;
 // Every agent-probe test drives sh stand-ins for the agent CLIs.
 #[cfg(unix)]
 mod agent_probe;
@@ -25,6 +26,7 @@ mod mastermind;
 mod mcp;
 mod notebook;
 mod notices;
+mod package;
 mod plugin_host;
 mod plugin_jobs;
 mod plugin_platform;
@@ -44,6 +46,7 @@ mod shell;
 mod subagents;
 mod support;
 mod upload;
+mod upload_chunked;
 mod validate;
 mod view_state;
 mod voice;

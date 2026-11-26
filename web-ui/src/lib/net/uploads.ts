@@ -1,9 +1,13 @@
 /**
- * Session-scoped uploads: the client half of POST /sessions/{id}/upload.
- * OS-desktop drops and terminal image pastes stream a file to the daemon
- * that OWNS the session (for remote windows the fetch rides the ssh tunnel,
- * so the file lands on the remote host), then the returned absolute path is
- * inserted into that session's input.
+ * Uploads: OS-desktop drops and terminal image pastes send a file to the
+ * daemon that OWNS the session (for remote windows the requests ride the
+ * ssh tunnel, so the file lands on the remote host), then the returned
+ * absolute path is inserted into that session's input. A drop onto a
+ * file-manager folder lands the file in that folder instead.
+ *
+ * The bytes move through `chunkedUpload.ts` (one piece at a time, resumed
+ * after a dropped link, verified before the daemon publishes the file); this
+ * module owns what the workbench sees of it.
  *
  * The path INSERTION is registered by App (same one-handler pattern as
  * reference.ts): only App knows session kinds, cwds, and the chat-composer
@@ -13,15 +17,9 @@
 
 import { writable } from "svelte/store";
 import type { ImageAttachment } from "../chat/images";
-import { getToken, notifyUnauthorized } from "./api";
+import { uploadChunked, type UploadDestination, type UploadResult } from "./chunkedUpload";
 
-export interface UploadResult {
-  /** Absolute path on the host that owns the session. */
-  path: string;
-  /** Final (possibly dedupe-prefixed) filename. */
-  name: string;
-  size: number;
-}
+export type { UploadResult } from "./chunkedUpload";
 
 export interface UploadJob {
   id: number;
@@ -72,109 +70,68 @@ export function reportUploadError(message: string): void {
 }
 
 export interface UploadProgress {
+  /** 0…1 of the file the host has confirmed. */
   onProgress?: (progress: number) => void;
   onCancelReady?: (cancel: () => void) => void;
+  /** true while the upload waits for the connection to come back. */
+  onWaiting?: (waiting: boolean) => void;
 }
 
-const UPLOAD_STALL_MS = 120_000;
-
-/** Native Blob upload with progress and a no-progress deadline. XHR sends the
- * Blob without copying it into JavaScript memory, works in WKWebView and the
- * browser, and exposes upload progress that fetch still does not. */
-function postBlob(path: string, blob: Blob, progress: UploadProgress = {}): Promise<UploadResult> {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    let stallTimer: ReturnType<typeof setTimeout> | null = null;
-    let settled = false;
-
-    const clearStall = () => {
-      if (stallTimer !== null) clearTimeout(stallTimer);
-      stallTimer = null;
-    };
-    const fail = (message: string) => {
-      if (settled) return;
-      settled = true;
-      clearStall();
-      reject(new Error(message));
-    };
-    const armStall = () => {
-      if (settled) return;
-      clearStall();
-      stallTimer = setTimeout(() => {
-        fail("upload stopped making progress — the SSH tunnel or destination filesystem may be unavailable");
-        xhr.abort();
-      }, UPLOAD_STALL_MS);
-    };
-    const errorMessage = (): string => {
-      let message = `upload failed (${xhr.status})`;
-      try {
-        const body = JSON.parse(xhr.responseText) as { error?: string };
-        if (typeof body.error === "string") message = body.error;
-      } catch {
-        // Non-JSON response: keep the status message.
-      }
-      return message;
-    };
-
-    xhr.open("POST", `/api/v1${path}`);
-    const token = getToken();
-    if (token !== null) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
-    xhr.upload.onprogress = (event) => {
-      armStall();
-      const total = event.lengthComputable && event.total > 0 ? event.total : blob.size;
-      if (total > 0) progress.onProgress?.(Math.min(0.99, event.loaded / total));
-    };
-    xhr.upload.onload = armStall;
-    xhr.onreadystatechange = () => {
-      if (xhr.readyState >= XMLHttpRequest.HEADERS_RECEIVED) armStall();
-    };
-    xhr.onerror = () => fail("upload connection failed");
-    xhr.onabort = () => fail("upload cancelled");
-    xhr.onload = () => {
-      if (settled) return;
-      clearStall();
-      if (xhr.status === 401) notifyUnauthorized();
-      if (xhr.status < 200 || xhr.status >= 300) {
-        fail(errorMessage());
-        return;
-      }
-      try {
-        const result = JSON.parse(xhr.responseText) as UploadResult;
-        settled = true;
-        progress.onProgress?.(1);
-        resolve(result);
-      } catch {
-        fail("upload completed but the host returned an invalid response");
-      }
-    };
-    progress.onCancelReady?.(() => xhr.abort());
-    progress.onProgress?.(0);
-    armStall();
-    xhr.send(blob);
+/** Send `blob` through the chunked transport, wiring the caller's cancel. */
+function send(
+  destination: UploadDestination,
+  blob: Blob,
+  name: string,
+  progress: UploadProgress,
+): Promise<UploadResult> {
+  const controller = new AbortController();
+  progress.onCancelReady?.(() => controller.abort());
+  return uploadChunked(destination, blob, name, {
+    onProgress: progress.onProgress,
+    onWaiting: progress.onWaiting,
+    signal: controller.signal,
   });
 }
 
-/** POST the blob to the session's upload route. */
+/** Upload the blob to the session's landing pad on its host. */
 export async function uploadToSession(
   sessionId: string,
   blob: Blob,
   name: string,
   progress: UploadProgress = {},
 ): Promise<UploadResult> {
-  return postBlob(`/sessions/${sessionId}/upload?name=${encodeURIComponent(name)}`, blob, progress);
+  return send({ session: sessionId }, blob, name, progress);
 }
 
-/** POST the blob to the folder-upload route (an OS-desktop drop onto a Finder
- *  pane or the FILES tree lands in `dir`). Streams the body; returns the
- *  daemon-absolute path it landed at. */
+/** Upload the blob into `dir` on the host (an OS-desktop drop onto a Finder
+ *  pane or the FILES tree); returns the daemon-absolute path it landed at. */
 export async function uploadToDir(
   dir: string,
   blob: Blob,
   name: string,
   progress: UploadProgress = {},
 ): Promise<UploadResult> {
-  const q = `dir=${encodeURIComponent(dir)}&name=${encodeURIComponent(name)}`;
-  return postBlob(`/fs/upload?${q}`, blob, progress);
+  return send({ dir }, blob, name, progress);
+}
+
+/** What leads a job's chip while its upload waits for the link. In front of
+ *  the label, because the chip cuts a long line at its end. */
+const WAITING_PREFIX = "Waiting for the connection · ";
+
+/** The chip-side half of an upload's callbacks: progress, cancel, and the
+ *  label's waiting note. */
+function jobReporter(id: number, label: string, onCancel: () => void): UploadProgress {
+  return {
+    onProgress: (progress) => updateJob(id, { progress }),
+    onCancelReady: (cancel) =>
+      updateJob(id, {
+        cancel: () => {
+          onCancel();
+          cancel();
+        },
+      }),
+    onWaiting: (waiting) => updateJob(id, { name: waiting ? `${WAITING_PREFIX}${label}` : label }),
+  };
 }
 
 /**
@@ -193,16 +150,9 @@ export async function trackFileOp<T>(
     ...jobs,
     { id, name: label, error: null, progress: null, cancel: null },
   ]);
-  const reporter: UploadProgress = {
-    onProgress: (progress) => updateJob(id, { progress }),
-    onCancelReady: (cancel) =>
-      updateJob(id, {
-        cancel: () => {
-          cancelled = true;
-          cancel();
-        },
-      }),
-  };
+  const reporter = jobReporter(id, label, () => {
+    cancelled = true;
+  });
   try {
     const result = await run(reporter);
     finishJob(id, null);
@@ -240,21 +190,17 @@ export async function uploadAndInsert(
 ): Promise<void> {
   const id = ++jobSeq;
   let cancelled = false;
-  uploadJobs.update((jobs) => [
-    ...jobs,
-    { id, name: `Uploading ${name}…`, error: null, progress: 0, cancel: null },
-  ]);
+  const label = `Uploading ${name}…`;
+  uploadJobs.update((jobs) => [...jobs, { id, name: label, error: null, progress: 0, cancel: null }]);
   try {
-    const result = await uploadToSession(sessionId, blob, name, {
-      onProgress: (progress) => updateJob(id, { progress }),
-      onCancelReady: (cancel) =>
-        updateJob(id, {
-          cancel: () => {
-            cancelled = true;
-            cancel();
-          },
-        }),
-    });
+    const result = await uploadToSession(
+      sessionId,
+      blob,
+      name,
+      jobReporter(id, label, () => {
+        cancelled = true;
+      }),
+    );
     finishJob(id, null);
     pathInserter?.(sessionId, result.path, image);
   } catch (e) {
