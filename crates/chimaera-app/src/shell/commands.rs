@@ -1367,6 +1367,118 @@ pub(super) async fn copy_file_to_clipboard(
     .map_err(|e| e.to_string())?
 }
 
+/// One file or folder of the OS drag that just ended on a window.
+#[derive(Serialize)]
+pub(super) struct DroppedPath {
+    path: String,
+    /// The last path segment, as the page's `File.name` reads it.
+    name: String,
+    /// Bytes; 0 for a folder. With `name`, how the page pairs this entry
+    /// with the `File` it was handed.
+    size: u64,
+    dir: bool,
+}
+
+/// The most entries one drop reports (the page accepts 8 files a drop).
+const DROPPED_PATHS_MAX: usize = 32;
+
+/// Where the files of the OS drag that just ended on this window live.
+///
+/// The page handles OS drops itself (`restore.rs` turns Tauri's own handler
+/// off so the DOM events reach it), and a web view withholds a dropped
+/// file's location from the page: a `File` carries a name and bytes, never a
+/// path. On a remote window that is all the page needs, because it uploads
+/// the bytes to the host. On a local window the file is already on the
+/// daemon's machine, so the page asks here and references the file where it
+/// is instead of copying it into the workspace.
+///
+/// macOS only: AppKit keeps the drag pasteboard's contents after a drop
+/// until the next drag begins. Elsewhere the answer is empty and the page
+/// uploads, as before. The pasteboard is the system's, so it may describe a
+/// drag that was not this drop (one synthesized by a page, say): the page
+/// pairs each entry with its `File` by name and size and uploads what it
+/// cannot pair. Local windows only (`require_local`): a remote host's page
+/// has no claim on this machine's file names.
+#[tauri::command]
+pub(super) async fn dropped_paths(
+    webview: tauri::WebviewWindow,
+) -> Result<Vec<DroppedPath>, String> {
+    super::require_local(webview.app_handle(), webview.label())?;
+    let paths = drag_pasteboard_paths();
+    tauri::async_runtime::spawn_blocking(move || {
+        paths
+            .into_iter()
+            .take(DROPPED_PATHS_MAX)
+            .filter_map(dropped_path)
+            .collect()
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// A dragged entry this process can read, described for the page. `None`
+/// for one that is not an absolute path to something there (a promised
+/// file, a URL), and for one that is there but does not open: macOS guards
+/// Downloads, Desktop and Documents per app, and a file in a folder the app
+/// was not allowed into stats fine and then refuses to open. The agents the
+/// daemon starts answer to the same grant, so a path that does not open here
+/// would be a reference the agent cannot read; unreported, the page uploads
+/// the bytes the drop handed it instead. (The open is also what makes macOS
+/// ask for that folder the first time.)
+fn dropped_path(path: std::path::PathBuf) -> Option<DroppedPath> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let meta = std::fs::metadata(&path).ok()?;
+    let name = path.file_name()?.to_str()?.to_string();
+    let dir = meta.is_dir();
+    let readable = if dir {
+        std::fs::read_dir(&path).is_ok()
+    } else {
+        std::fs::File::open(&path).is_ok()
+    };
+    if !readable {
+        return None;
+    }
+    Some(DroppedPath {
+        path: path.to_str()?.to_string(),
+        name,
+        size: if dir { 0 } else { meta.len() },
+        dir,
+    })
+}
+
+/// The file URLs on AppKit's drag pasteboard, as paths.
+#[cfg(target_os = "macos")]
+fn drag_pasteboard_paths() -> Vec<std::path::PathBuf> {
+    use objc2_app_kit::{NSPasteboard, NSPasteboardNameDrag, NSPasteboardTypeFileURL};
+    use objc2_foundation::NSURL;
+
+    // SAFETY: both are AppKit's own immutable string constants.
+    let (name, file_url) = unsafe { (NSPasteboardNameDrag, NSPasteboardTypeFileURL) };
+    let Some(items) = NSPasteboard::pasteboardWithName(name).pasteboardItems() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let text = item.stringForType(file_url)?;
+            let url = NSURL::URLWithString(&text)?;
+            if !url.isFileURL() {
+                return None;
+            }
+            // `path` resolves a file-reference URL (`file:///.file/id=…`,
+            // what Finder puts on the pasteboard) to where the file is.
+            Some(std::path::PathBuf::from(url.path()?.to_string()))
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn drag_pasteboard_paths() -> Vec<std::path::PathBuf> {
+    Vec::new()
+}
+
 /// Show a file or folder in the platform's file manager, selected in its
 /// parent folder (macOS Finder; a Linux file manager that speaks the
 /// freedesktop `FileManager1` interface, else the parent folder just opens).
@@ -1600,7 +1712,7 @@ pub(super) async fn wsl_setup_daemon(app: AppHandle, distro: Option<String>) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{existing_absolute_path, report_can_reclaim_local_home};
+    use super::{dropped_path, existing_absolute_path, report_can_reclaim_local_home};
 
     #[test]
     fn a_file_handed_to_the_os_must_be_an_existing_absolute_path() {
@@ -1613,6 +1725,41 @@ mod tests {
         assert!(
             existing_absolute_path(dir.join("chimaera-no-such-file").to_str().unwrap()).is_err()
         );
+    }
+
+    #[test]
+    fn a_dropped_entry_is_reported_only_when_it_is_there_and_opens() {
+        let dir = std::env::temp_dir().join(format!("chimaera-dropped-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("raw data")).unwrap();
+        let file = dir.join("meeting notes.txt");
+        std::fs::write(&file, b"hello drop\n").unwrap();
+
+        let got = dropped_path(file.clone()).expect("a readable file is reported");
+        assert_eq!(got.path, file.to_str().unwrap());
+        assert_eq!(got.name, "meeting notes.txt");
+        assert_eq!((got.size, got.dir), (11, false));
+
+        let folder = dropped_path(dir.join("raw data")).expect("a folder is reported");
+        assert_eq!(
+            (folder.name.as_str(), folder.size, folder.dir),
+            ("raw data", 0, true)
+        );
+
+        // Not this drop's to reference: no such entry, or not a place at all.
+        assert!(dropped_path(dir.join("gone.txt")).is_none());
+        assert!(dropped_path("meeting notes.txt".into()).is_none());
+
+        // There, but it does not open: the page uploads instead.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Root opens anything; the check is meaningless under it.
+            if std::fs::File::open(&file).is_err() {
+                assert!(dropped_path(file.clone()).is_none());
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

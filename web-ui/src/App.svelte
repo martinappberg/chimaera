@@ -194,8 +194,9 @@
   } from "./lib/layout/layout";
   import type { LinkContext } from "./lib/shared/fileRef";
   import { openPath, setPathOpener, type OpenPathOptions, type PathKind } from "./lib/shared/openPath";
+  import { setFileHandleHost } from "./lib/shared/fileHandleHost";
   import type { Reveal } from "./lib/shared/reveal";
-  import { setChatLinkContext } from "./lib/chat/paths";
+  import { setChatLinkContext } from "./lib/chat/linkContext";
   import type { UrlTarget } from "./lib/terminal/urlLinks";
   import { setUrlPaneOpener, urlMenuEntries } from "./lib/shared/urlOpen";
   import { basename, fileTabTitles, fsProbe, viewKindFor } from "./lib/previews/files";
@@ -295,9 +296,11 @@
   import {
     askpassActive,
     closeThisWindow,
+    droppedPaths,
     isNativeShell,
     onMissionControl,
     onFocusSession,
+    referencesLocalDrops,
     onMenu,
     onUnsavedPrompt,
     openWindow,
@@ -1279,6 +1282,25 @@
     // wherever the link was; chat resolves against the same per-session
     // context as terminal links.
     setPathOpener(openPathInLayout);
+    // A file shown on a surface (a chat attachment, an embed card, a chip)
+    // drags like a FILES-tree row, minus the file transfer: a figure in a
+    // transcript is referenced or opened, never moved by a stray drop.
+    setFileHandleHost({
+      drag: (e, path, kind) =>
+        beginDrag(e, kind === "dir" ? freshFinderTab(path) : { surface: "file", path }, () => {}, false, null),
+      canReference: (sessionId) => fileReferenceTarget(sessionId) !== null,
+      reference: (path, kind, sessionId) => {
+        const target = fileReferenceTarget(sessionId);
+        if (target === null) return;
+        // Outside a chat the target may be open nowhere, and a reference
+        // never lands out of sight (`referenceSelection`'s rule).
+        if (sessionId === null && sessionPaneId(layout, target.id) === null) {
+          layout = splitPane(layout, layout.focusedPaneId, "row");
+          layout = openSession(layout, target.id);
+        }
+        referencePathIn(target.id, path, kind);
+      },
+    });
     setViewOpener(openPluginViewSurface);
     setSameFileOpener(openSess);
     setChatLinkContext(linkContext);
@@ -1438,6 +1460,7 @@
       setGitOpener(null);
       setUploadPathInserter(null);
       setPathOpener(null);
+      setFileHandleHost(null);
       setViewOpener(null);
       setSameFileOpener(null);
       recentsRail.dispose();
@@ -1590,7 +1613,13 @@
     if (p === null) return;
     const active = p.tabs[p.active];
     if (active === undefined || active.surface !== "terminal") return;
-    const s = sessionsById.get(active.sessionId);
+    referencePathIn(active.sessionId, path, kind);
+  }
+
+  /** Type `path`'s reference into a live session's input (the composition
+   *  `referenceFileDrop` documents), never sending. */
+  function referencePathIn(sessionId: string, path: string, kind: "file" | "dir", image?: ImageAttachment): void {
+    const s = sessionsById.get(sessionId);
     if (s === undefined || !s.alive) return;
     const root = workspace?.root;
     const rel = root !== undefined ? workspaceRelative(path, root) : path;
@@ -1598,7 +1627,15 @@
       s.kind === "agent"
         ? composeAgentPathReference(kind === "dir" ? `${rel}/` : rel)
         : composeShellPathReference(path, s.cwd_current ?? s.cwd);
-    typeIntoSession(active.sessionId, text);
+    typeIntoSession(sessionId, text, image);
+  }
+
+  /** Where a file shown on a surface is referenced from its right-click
+   *  menu: the chat it is shown in, else the window's reference target. */
+  function fileReferenceTarget(sessionId: string | null): Session | null {
+    if (sessionId === null) return refTargetSession;
+    const s = sessionsById.get(sessionId);
+    return s !== undefined && s.alive ? s : null;
   }
 
   // --- OS-desktop file drops: upload to the session's host, then reference ---
@@ -1713,7 +1750,9 @@
     const paneId = paneIdAt(e.clientX, e.clientY);
     const s = paneId !== null ? osDropSession(paneId) : null;
     if (s === null) return;
-    void dropFilesOnSession(s.id, picked);
+    // Asked now, while the drag that just ended is still the system's last:
+    // on this computer's own daemon the files are referenced where they are.
+    void dropFilesOnSession(s.id, picked, referencesLocalDrops() ? droppedPaths() : null);
   }
 
   /** Upload each dropped file INTO `dir` (a file-manager folder target), then
@@ -1749,19 +1788,40 @@
   async function dropFilesOnSession(
     sessionId: string,
     picked: { file: File | null; dir: boolean }[],
+    reported: Promise<unknown> | null = null,
   ): Promise<void> {
+    const items = picked.map(({ file, dir }) => ({ name: file?.name ?? "", size: file?.size ?? 0, dir }));
+    const local = reported !== null;
+    // Loaded at the first drop, like the rest of what only a drop needs.
+    const { decodeDroppedPaths, pairDroppedPaths, routeDrop } = await import("./lib/net/localDrop");
+    const paths = pairDroppedPaths(items, decodeDroppedPaths(local ? await reported : null));
     let accepted = 0;
-    for (const { file, dir } of picked) {
-      if (dir) {
+    for (const [i, { file, dir }] of picked.entries()) {
+      const route = routeDrop(items[i], paths[i], local);
+      if (route.how === "upload" && file === null) continue;
+      // One cap for the gesture, whichever way each file goes.
+      if (route.how !== "refuse" && accepted >= OS_DROP_MAX_FILES) {
+        reportUploadError(`${items[i].name}: skipped (max ${OS_DROP_MAX_FILES} files per drop)`);
+        continue;
+      }
+      if (route.how === "reference") {
+        accepted += 1;
+        // Already on this computer: nothing is copied. A picture still
+        // rides along as pixels in a chat, as an uploaded one does.
+        const s = sessionsById.get(sessionId);
+        const image =
+          !dir && file !== null && s?.ui === "chat" && file.type.startsWith("image/")
+            ? ((await imageToAttachment(file)) ?? undefined)
+            : undefined;
+        referencePathIn(sessionId, route.path, route.kind, image);
+        continue;
+      }
+      if (route.how === "refuse") {
         // Folder uploads need recursive traversal — out of scope for v1.
         reportUploadError(`${file?.name ?? "folder"}: drop files, not folders`);
         continue;
       }
       if (file === null) continue;
-      if (accepted >= OS_DROP_MAX_FILES) {
-        reportUploadError(`${file.name}: skipped (max ${OS_DROP_MAX_FILES} files per drop)`);
-        continue;
-      }
       accepted += 1;
       // An image dropped on a CHAT pane also attaches its pixels, so the
       // model sees it immediately; the uploaded path stays the durable,
@@ -4044,7 +4104,9 @@
     // socket otherwise — the reference lands even in a cold agent pane.
     typeIntoSession(agentId, `${termReference(terminalId)} `);
     revealSession(terminalId, agentPaneId);
-    pool.focusTerminal(agentId);
+    // Revealing the terminal focused its pane; the keys go back to the agent
+    // (a chat's composer follows its pane's focus, a TUI its terminal's).
+    openSess(agentId);
   }
 
   /**
