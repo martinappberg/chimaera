@@ -673,6 +673,11 @@ pub(crate) async fn start(
     // A repeated POST after a lost response observes the same operation; a
     // second window joins the running one instead of starting a competitor.
     if let Some(p) = state.agent_auth.operations.joinable(kind, &body.request_id) {
+        // A chat that joins a login still under way waits on it like the
+        // chat that started it. A finished one has nothing left to wait on.
+        if p.running() {
+            mark_waiting(&state, kind, body.session_id.as_deref());
+        }
         return no_store(Json(p).into_response());
     }
     let Some(workspace) = lock(&state.workspaces).get(&body.workspace_id) else {
@@ -689,13 +694,7 @@ pub(crate) async fn start(
             "Finish installing or updating this agent first.",
         );
     }
-    if let Some(session) = body.session_id.as_deref() {
-        if let Some(record) = lock(&state.agents).get_mut(session) {
-            if record.kind == kind {
-                record.signed_out_at_start = true;
-            }
-        }
-    }
+    mark_waiting(&state, kind, body.session_id.as_deref());
     let detection = crate::launcher::detect(&state, kind, false).await;
     let bin = match detection.path {
         Ok(bin) => bin,
@@ -724,6 +723,17 @@ pub(crate) async fn start(
         }
     };
     no_store(start_operation(state, kind, body, launch).await)
+}
+
+/// The chat a sign-in was asked from (`/login`) waits on it: the login that
+/// lands relaunches it in place (`chat::relaunch_after_sign_in`).
+fn mark_waiting(state: &AppState, kind: AgentKind, session: Option<&str>) {
+    let Some(session) = session else { return };
+    if let Some(record) = lock(&state.agents).get_mut(session) {
+        if record.kind == kind {
+            record.signed_out_at_start = true;
+        }
+    }
 }
 
 /// What a sign-in runs (one shape today; tests script it).
@@ -885,6 +895,7 @@ async fn run_login(
             }
         }
     }
+    crate::shell_env::overlay(&mut env).await;
     let remove = crate::api::spawn_env_remove(&env);
     let argv = crate::launcher::wrap_login_shell(&crate::launcher::login_shell(), marked(argv));
     let mut command = operation::command(&argv, &cwd, env, remove);

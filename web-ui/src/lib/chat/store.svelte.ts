@@ -1980,7 +1980,15 @@ export class ChatStore {
         this.notice("earlier history was trimmed (the agent's own transcript keeps it)", "info");
         break;
       case "mode_switch":
-        this.notice(ev.to === "term" ? "continued in terminal" : "continued in chat", "info");
+        if (ev.sign_in === true) {
+          // The daemon started the process again for a new sign-in: what the
+          // old one said about its account (the plan windows, a limit
+          // reached) is not this login's. The new one reports its own.
+          this.rateLimit = null;
+          this.notice("continued on the new sign-in", "info");
+        } else {
+          this.notice(ev.to === "term" ? "continued in terminal" : "continued in chat", "info");
+        }
         // The process death right before this marker was the toggle's
         // mechanism, not a conversation ending.
         this.exited = null;

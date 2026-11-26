@@ -421,6 +421,19 @@ fn hash_for_resolution(trip: &Trip, watch: &mut Watch, disk: &dyn Disk) -> Resul
     Ok(hash)
 }
 
+/// Whether a 409 is this very save already on the host: the file there has
+/// the hash of the working copy being sent. An upload that arrived whose
+/// answer was lost (a tunnel dropped under a long transfer, a timeout with
+/// the last bytes still in flight) leaves the host on the new version while
+/// the trip still expects the old one, so the retry is refused — but nothing
+/// differs, and calling it a conflict would ask the person to choose between
+/// two identical decks.
+fn host_has(theirs: &Option<String>, ours: &str) -> bool {
+    theirs
+        .as_deref()
+        .is_some_and(|theirs| theirs.eq_ignore_ascii_case(ours))
+}
+
 fn saved(trip: &mut Trip, hash: String, now_ms: u64) {
     trip.base_hash.clone_from(&hash);
     trip.last_local_hash = hash;
@@ -493,6 +506,9 @@ pub(crate) fn step(
     uploading(trip);
     match net.upload(&trip.remote_path, Some(&expect), &trip.local_path, &hash) {
         Ok(Sent::Saved { hash }) => saved(trip, hash, now_ms),
+        Ok(Sent::Conflict { hash: theirs }) if host_has(&theirs, &hash) => {
+            saved(trip, hash, now_ms);
+        }
         Ok(Sent::Conflict { hash }) => {
             trip.state = TripState::Conflict;
             trip.message = None;
@@ -533,6 +549,10 @@ pub(crate) fn overwrite(
     let hash = hash_for_resolution(trip, watch, disk)?;
     match net.upload(&trip.remote_path, Some(&expect), &trip.local_path, &hash) {
         Ok(Sent::Saved { hash }) => {
+            saved(trip, hash, now_ms);
+            Ok(())
+        }
+        Ok(Sent::Conflict { hash: theirs }) if host_has(&theirs, &hash) => {
             saved(trip, hash, now_ms);
             Ok(())
         }
@@ -2000,6 +2020,51 @@ mod tests {
         // A working copy that's gone holds nothing.
         *disk.fp.borrow_mut() = None;
         assert_eq!(may_finish(&trip, &mut watch, &disk), Ok(()));
+    }
+
+    /// A long upload that arrived but whose answer was lost: the retry goes
+    /// out under the old precondition and the host refuses it, holding the
+    /// very bytes being sent. That is a save, not a conflict.
+    #[test]
+    fn a_retry_the_host_already_has_is_a_save_not_a_conflict() {
+        let (mut trip, mut watch) = opened();
+        let disk = FakeDisk::new();
+        let host = FakeHost::default();
+        disk.save(2, 'b');
+        tick(&mut trip, &mut watch, &disk, &host);
+        host.answer(Err(Failure::Unreachable("couldn't reach host-a".into())));
+        tick(&mut trip, &mut watch, &disk, &host);
+        assert_eq!(trip.state, TripState::Error);
+        assert_eq!(trip.base_hash, h('a'));
+
+        host.answer(Ok(Sent::Conflict { hash: Some(h('b')) }));
+        assert!(tick(&mut trip, &mut watch, &disk, &host).0);
+        assert_eq!(host.uploads.borrow().len(), 2);
+        assert_eq!(trip.state, TripState::Watching);
+        assert_eq!(trip.conflict_hash, None);
+        assert_eq!(
+            (trip.base_hash.clone(), trip.last_local_hash.clone()),
+            (h('b'), h('b')),
+            "the host's version is the base for the next save"
+        );
+        // The next save goes out under it, and "done" is allowed.
+        may_finish(&trip, &mut watch, &disk).unwrap();
+        disk.save(3, 'c');
+        tick(&mut trip, &mut watch, &disk, &host);
+        tick(&mut trip, &mut watch, &disk, &host);
+        assert_eq!(host.uploads.borrow().last().unwrap().1, Some(h('b')));
+
+        // A host that really moved on is still a conflict.
+        disk.save(4, 'd');
+        tick(&mut trip, &mut watch, &disk, &host);
+        host.answer(Ok(Sent::Conflict { hash: Some(h('z')) }));
+        tick(&mut trip, &mut watch, &disk, &host);
+        assert_eq!(trip.state, TripState::Conflict);
+        // … and an "overwrite" whose first try landed unanswered resolves.
+        host.answer(Ok(Sent::Conflict { hash: Some(h('d')) }));
+        overwrite(&mut trip, &mut watch, &disk, &host, 9).unwrap();
+        assert_eq!(trip.state, TripState::Watching);
+        assert_eq!(trip.base_hash, h('d'));
     }
 
     #[test]

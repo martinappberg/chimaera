@@ -650,6 +650,16 @@ fn apply_chat_event(state: &Arc<AppState>, id: &str, ev: &AgentEvent) {
     if let Some(next) = next {
         record.state = next;
     }
+    // Latest wins, like the header chip: the next request that goes through
+    // reports the limit as no longer reached.
+    if let AgentEvent::RateLimit {
+        limit_reached,
+        resets_at,
+        ..
+    } = ev
+    {
+        record.note_limit(*limit_reached, resets_at.as_deref());
+    }
     note_for_notices(record, ev);
     // Turn end clears the hook-fed activity fields. Tool-adjacent hooks DO
     // fire during claude chat sessions (the files_touched channel) and
@@ -928,7 +938,8 @@ async fn switch_to_pty(
         recipe.prelude.as_deref(),
         startup.as_deref(),
     );
-    let env = crate::api::session_env(state, id, &recipe.theme, prelude.as_deref());
+    let mut env = crate::api::session_env(state, id, &recipe.theme, prelude.as_deref());
+    crate::shell_env::overlay(&mut env).await;
     let env_remove = crate::api::spawn_env_remove(&env);
     let opts = chimaera_pty::SpawnOpts {
         cwd: recipe.workspace_root,
@@ -1679,20 +1690,24 @@ pub(crate) async fn switch_view(
 
 /// A sign-in landed for `kind`: start every chat of it that waited on a
 /// login again, in place — the ones that died at startup for want of one,
-/// the live ones started while the CLI said signed out, and the one the
-/// sign-in was asked from (their process never reloads credentials). The
-/// same respawn as the view route's `relaunch`. A chat mid-turn is not
-/// interrupted: it relaunches when that turn ends. Bounded: at most 8 per
-/// sign-in.
+/// the live ones started while the CLI said signed out, the ones whose
+/// agent says its account's limit is reached (the new login may be another
+/// account), and the one the sign-in was asked from (their process never
+/// reloads credentials). The same respawn as the view route's `relaunch`,
+/// marked in the journal as a sign-in's. A chat mid-turn is not interrupted:
+/// it relaunches when that turn ends. Bounded: at most 8 per sign-in.
 pub(crate) async fn relaunch_after_sign_in(state: Arc<AppState>, kind: AgentKind) -> usize {
     // Only chats the registry still knows (dead or alive) count toward the
     // cap; a retired record has nothing to start and is unmarked.
     let mut waiting = Vec::new();
     {
+        let now_secs = crate::timeline::now_ms() / 1000;
         let mut agents = crate::lock(&state.agents);
         let marked: Vec<String> = agents
             .iter()
-            .filter(|(_, r)| r.kind == kind && r.signed_out_at_start)
+            .filter(|(_, r)| {
+                r.kind == kind && (r.signed_out_at_start || r.stalled_at_limit(now_secs))
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for id in marked {
@@ -1702,6 +1717,7 @@ pub(crate) async fn relaunch_after_sign_in(state: Arc<AppState>, kind: AgentKind
                 }
             } else if let Some(record) = agents.get_mut(&id) {
                 record.signed_out_at_start = false;
+                record.note_limit(false, None);
             }
         }
     }
@@ -1710,10 +1726,14 @@ pub(crate) async fn relaunch_after_sign_in(state: Arc<AppState>, kind: AgentKind
         if mid_turn(&state, &id) {
             if let Some(record) = crate::lock(&state.agents).get_mut(&id) {
                 record.signed_out_at_start = false;
+                record.note_limit(false, None);
                 record.relaunch_after_turn = true;
             }
             tracing::info!(%id, "chat relaunches after its turn, for the new sign-in");
             continue;
+        }
+        if let Some(record) = crate::lock(&state.agents).get_mut(&id) {
+            record.relaunch_for_sign_in = true;
         }
         match relaunch_chat(&state, &id).await {
             Ok(()) => {
@@ -1725,8 +1745,12 @@ pub(crate) async fn relaunch_after_sign_in(state: Arc<AppState>, kind: AgentKind
                 tracing::info!(%id, %why, "chat not relaunched after sign-in");
             }
         }
+        // Whatever the relaunch did, nothing of this landing is left to
+        // carry: a refused one must not mark a later, unrelated respawn.
         if let Some(record) = crate::lock(&state.agents).get_mut(&id) {
             record.signed_out_at_start = false;
+            record.note_limit(false, None);
+            record.relaunch_for_sign_in = false;
         }
     }
     relaunched
@@ -1763,9 +1787,15 @@ fn relaunch_after_turn(state: &Arc<AppState>, id: &str) {
             }
             return;
         }
+        if let Some(record) = crate::lock(&state.agents).get_mut(&id) {
+            record.relaunch_for_sign_in = true;
+        }
         match relaunch_chat(&state, &id).await {
             Ok(()) => tracing::info!(%id, "chat relaunched after its turn, for the new sign-in"),
             Err(why) => tracing::info!(%id, %why, "chat not relaunched after its turn"),
+        }
+        if let Some(record) = crate::lock(&state.agents).get_mut(&id) {
+            record.relaunch_for_sign_in = false;
         }
     });
 }
@@ -1903,6 +1933,13 @@ async fn perform_switch(
         seed_view_switch_history(state, id, &recipe).await;
     }
 
+    // A relaunch for a new sign-in says so in its marker (one-shot, set by
+    // the sign-in's own relaunch): what the old process said about its
+    // account stops applying to the conversation.
+    let sign_in = relaunch
+        && crate::lock(&state.agents)
+            .get_mut(id)
+            .is_some_and(|r| std::mem::take(&mut r.relaunch_for_sign_in));
     // Stamp the transition in the journal while no live Journal owns the
     // file: replayers then read "continued in terminal/chat" instead of a
     // bare process exit (and the chat store clears its exited banner).
@@ -1915,6 +1952,7 @@ async fn perform_switch(
             } else {
                 chimaera_agent::model::SessionUi::Term
             },
+            sign_in,
         },
     )
     .await
@@ -2030,6 +2068,7 @@ fn control_only_switch_journal(path: &std::path::Path) -> bool {
         match entry.ev {
             AgentEvent::ModeSwitch {
                 to: chimaera_agent::model::SessionUi::Chat,
+                ..
             } => saw_chat_switch = true,
             AgentEvent::ModeSwitch { .. }
             | AgentEvent::StartupProgress { .. }
@@ -3787,10 +3826,6 @@ pub(crate) async fn spawn_chat_session(
         startup.as_deref(),
     );
     spec.env = crate::api::session_env(state, &id, &recipe.theme, prelude.as_deref());
-    // Strip the daemon's own launcher context (same set the PTY path removes)
-    // so a chimaera launched from inside an agent can't leak that context into
-    // the chat agent it spawns.
-    spec.env_remove = crate::api::spawn_env_remove(&spec.env);
     spec.pinned_native_id = pinned;
     if recipe.kind.is_acp() {
         if let Some(key) = crate::lock(&state.agents).get(&id).map(|r| r.key.clone()) {
@@ -3828,6 +3863,15 @@ pub(crate) async fn spawn_chat_session(
             "1".to_string(),
         ));
     }
+    // Last, so everything set above wins: what the user's rc files export
+    // (the login wrap reads the profile only).
+    crate::shell_env::overlay(&mut spec.env).await;
+    // Strip the daemon's own launcher context (same set the PTY path removes)
+    // so a chimaera launched from inside an agent can't leak that context into
+    // the chat agent it spawns. Built once every add is in: the two must stay
+    // disjoint — this transport applies removes last, and a `CLAUDE_CODE_*`
+    // the spawn or the user's rc sets must survive it.
+    spec.env_remove = crate::api::spawn_env_remove(&spec.env);
     // The codex Mastermind's harness gating: its app-server elicits EVERY
     // MCP tool call (approval-mode config is parsed but ignored on that
     // surface — live-probed, PROTOCOL.md Pass 16), so the user's recorded
@@ -5873,6 +5917,7 @@ mod tests {
                 &[
                     AgentEvent::ModeSwitch {
                         to: chimaera_agent::model::SessionUi::Chat,
+                        sign_in: false,
                     },
                     AgentEvent::StartupProgress {
                         detail: "Running startup hooks…".into(),
@@ -5924,6 +5969,7 @@ mod tests {
             target_id,
             AgentEvent::ModeSwitch {
                 to: chimaera_agent::model::SessionUi::Chat,
+                sign_in: false,
             },
         )
         .await
@@ -5948,6 +5994,7 @@ mod tests {
             &entries.last().unwrap().ev,
             AgentEvent::ModeSwitch {
                 to: chimaera_agent::model::SessionUi::Chat,
+                ..
             }
         ));
         assert_eq!(

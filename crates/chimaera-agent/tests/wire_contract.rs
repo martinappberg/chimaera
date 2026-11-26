@@ -1527,6 +1527,7 @@ fn chat_events_fixture() {
             "the session moved to a terminal",
             AgentEvent::ModeSwitch {
                 to: SessionUi::Term,
+                sign_in: false,
             },
         ),
         (
@@ -1752,6 +1753,14 @@ fn chat_events_fixture() {
                 kind: "job".into(),
                 detail: Some("post the graph".into()),
                 schedule: Some("Every 10 minutes".into()),
+            },
+        ),
+        (
+            "mode_switch_sign_in",
+            "the chat's process started again for a new sign-in",
+            AgentEvent::ModeSwitch {
+                to: SessionUi::Chat,
+                sign_in: true,
             },
         ),
     ];

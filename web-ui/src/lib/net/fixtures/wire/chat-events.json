@@ -1237,6 +1237,19 @@
       },
       "name": "turn_cause",
       "note": "what resumed the agent on its own"
+    },
+    {
+      "frame": {
+        "ev": {
+          "sign_in": true,
+          "to": "chat",
+          "type": "mode_switch"
+        },
+        "seq": 70,
+        "ts": 1700000000069
+      },
+      "name": "mode_switch_sign_in",
+      "note": "the chat's process started again for a new sign-in"
     }
   ],
   "family": "chat-events",

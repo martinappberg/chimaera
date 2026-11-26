@@ -198,6 +198,24 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   credentials. **Chat options → Sign in to {agent}…** does the same in every state, including a
   chat that ended or failed to start, whose composer can no longer take `/login`. Claude's native `/login` remains in its terminal view (the
   [view switch](#view-switch-rewind-and-branch)) for anyone who prefers it.
+- **A limit reached — wait, or another account.** When the agent's own telemetry says the
+  account's limit is reached (`rate_limit` with `limit_reached`: Claude's `rejected` window, Codex's
+  refused usage, Grok's spent credit period), one quiet line sits at the transcript's tail, a
+  notice's weight and never a card: what was hit, in the agent's words, and when it resets
+  ("Session limit reached · resets in 2h 14m"), and beside it a muted text link, **Use another
+  account** — the same sign-in card as `/login`, started at once. Waiting is the default and the
+  agent may have ways of its own (a reset, extra usage), so the link is never a call to action. The
+  agent's own failure text stays above it as the turn's error. The login that lands starts the
+  chat again in place (the conversation resumes by its native id, the composer's draft stays), a
+  "continued on the new sign-in" line marks it, and the old account's limit and plan windows leave
+  the header until the new process reports its own; a login that turns out to be the same account
+  brings the line back at its next refused turn. Every other chat of that agent stalled at its
+  limit starts again with it. The line shows only where the agent's sign-in can replace the
+  account (the catalog row's `sign_in` descriptor, `relogin` not false — never the agent's name);
+  elsewhere the header's usage meter is the whole story. A reset time that has passed drops out of
+  the line, and the line stays until the agent's next request says the limit is over. Not
+  recorded, so not relied on: what each CLI's refused turn itself says (see the usage sections of
+  the [protocol notes](../../crates/chimaera-agent/PROTOCOL.md)).
 - **Voice dictation — the mic button.** Every chat composer has a mic beside
   send (on by default; shown only where the daemon's host can dictate — `GET /api/v1/voice`,
   asked once per window and again after a login failure). Click it and speak: the words fill the

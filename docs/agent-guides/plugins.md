@@ -263,6 +263,7 @@ version = "0.1.1"               # the plugin's own, MAJOR.MINOR.PATCH; must equa
 summary = "Project memory your agents record as they work — findings, decisions, learnings."
 description = "Mycelium is the Arjun Raj lab's living-repository framework: …"   # optional: a few plain sentences
 homepage = "https://github.com/arjunrajlaboratory/mycelium"   # optional; the card's name links here
+category = "knowledge"          # optional; the Extensions page's group: writing | presentations | data | knowledge | agents
 api = "0.1"                     # the chimaera:plugin WIT version it targets (MAJOR.MINOR): "0.1" or "0.2"
 
 [detect]                        # workspace-relative; ANY present ⇒ detected
@@ -311,6 +312,7 @@ What each part does, and what exists today:
 
 | Part | What it does | Where the host reads it |
 |---|---|---|
+| `category` | the group the Extensions page lists the plugin under: `writing`, `presentations`, `data`, `knowledge` or `agents`; without one, or with a name the daemon doesn't know, it is listed under Other. A first-party plugin's group is the lock's, whatever its manifest says. A daemon older than this key refuses a manifest that has it, so a plugin that sets it also sets `[requires] chimaera` | `plugins::category`, `manifest_fields` |
 | `id`, `name`, `summary`, `homepage` | the card; `id` names a directory and a URL segment, so it is charset-gated (and `install` / `preview`, routes' own segments, are taken); the name links to `homepage` (an http(s) URL; opened in the system browser) | `plugins::validate`, `manifest_json` |
 | `description` | optional: a few plain sentences from the author — what the plugin is and why a person would switch it on — shown under the summary, clamped to two lines with "more"; blank is omitted (`description: null` on the wire) | `manifest_json` |
 | `version`, `api` | which build runs, and the WIT it needs; `api` is a gate | `plugins::gate`, `resolve` |
@@ -799,6 +801,7 @@ events = ["file-saved", "file-changed", "settings-changed", "switched-on", "swit
 id = "document"
 title = "Document"         # required: every view has a name
 slot = "file"
+icon = "book"              # optional: a tab view's glyph, a name from the `icon` node's set
 
 [[files]]                  # files matching `match` open in `view` (Text one click away)
 match = ["*.tex", "*.ltx"] # a pattern without `/` matches the name anywhere; `**` spans folders
@@ -867,15 +870,16 @@ daemon log).
 | `keyvalue` | **`items`**: `[{key, value, tone?}]` |
 | `badge` | **`text`**, `tone` |
 | `status` | **`text`**, `state` (`idle busy ok warn bad`: a spinner for busy, a check for ok), `detail` (muted, beside it) — one pill for a process's state, a build's |
-| `icon` | **`name`** (`check x alert info clock file folder play stop refresh download external grid list book bolt settings search`), `label`, `tone` |
+| `icon` | **`name`** (`check x alert info clock file folder play stop refresh download external grid list book bolt settings search slides`), `label`, `tone` |
 | `progress` | `value` (0–1; absent: indeterminate), `label` |
 | `empty` | **`title`**, `text`, `action` `{label, action, payload}` |
 | `callout` | **`text`**, `title`, `tone`, `actions` (buttons beside it: a notice with its fix) |
-| `list` | **`items`**: `[{title, subtitle?, badges?, actions?: [nodes], action?, payload?, file?, line?}]`; `more` `{query, args}` pages through `query` (it answers `{items, more?}`) |
+| `list` | **`items`**: `[{title, subtitle?, badges?, actions?: [nodes], action?, payload?, file?, line?}]`; `more` `{query, args}` pages through `query` (it answers `{items, more?}`). A row's title runs its `action`, or without one opens its `file`; with both, the title runs the action and the subtitle opens the file |
 | `table` | **`columns`** `[{key, title, align?}]`, **`rows`** `[{<key>: text}]`; `more` as for a list (`{rows, more?}`) |
 | `file` | **`path`** (a workspace path or `output:<path>`), `label`, `line` — a card that opens it |
 | `link` | **`text`**; `href` (http/https, opens outside) or `file` + `line` |
 | `image` | **`src`**, **`alt`** |
+| `slides` | **`slides`**: `[{title, builds: [{src, notes?, clip?}], hidden?, notes?, file?, line?, tag?}]` (a build is a picture: a workspace path or `output:<path>`; ≤ 600 slides, 40 builds each; a build's `clip` `{src, loop?, auto?, rate?}` is the video that ends on that picture: the show plays it when a click moves on to the build and holds its last frame, `loop` plays it round until the next click, `auto` moves on when it ends); `id` (names the deck: two windows on it keep step in a show), `start` (the title of the slide to open on, the first of that title when titles repeat; a new `startKey` opens on it again, for a "show this slide" action), `width` + `height` (the slides' shape, 16:9 without), `label` — a deck of pictures you rendered, in the app's slide viewer: the picture in the image viewer (zoom, the area tool that points an agent at part of a slide), a thumbnail strip, keys that walk a slide's builds and then the slides, **@** (the slide's `file` and `line` to an agent), **present** (full screen, a click a build, `hidden` slides skipped) and **presenter** (this slide, the next click, the notes, a timer). Paging is the viewer's own: no action comes back to you. It keeps its place by `title` when you draw again |
 | `button` | **`label`**, **`action`**, `payload`, `tone`, `icon`, `disabled`, `title` (its tooltip) |
 | `toggle` | **`label`**, **`name`**, `value`, `action` (sends `{value}` beside the payload) |
 | `select` | **`label`**, **`name`**, **`options`** (`[{value, label}]` or strings), `value`, `action` |
@@ -905,7 +909,7 @@ claimed file; the view owns the pane: the root stack's last child grows to its
 height, and an `editor` or `pdf` first in a split pane, a stack or a tab fills
 it — an embedded viewer shows no path bar), `status` (a chip in a claimed file's bar), `card` (inside its
 Extensions card). Any other view takes the same layout when its tree says
-`"fill": true` beside `ui` and `root` (a tab whose split puts an `image` or `pdf`
+`"fill": true` beside `ui` and `root` (a tab whose split puts an `image`, `slides` or `pdf`
 first in a pane: the PowerPoint plugin's Slides and Themes); otherwise a viewer
 keeps its fixed box. The UI renders only on open, on an action, and on
 `invalidate`; nothing polls.

@@ -15,13 +15,14 @@ Orientation for coding agents. This crate is the daemon: every HTTP route, every
 | `claude_store.rs`, `goal_outcome.rs` | Where a Claude transcript lives; how a `/goal` ended. |
 | `operation.rs`, `agent_setup.rs`, `agent_auth.rs` | Per-agent bounded jobs: installs, sign-in. |
 | `launcher.rs` | argv assembly, binary detection and resolution, role prompts. |
+| `shell_env.rs` | The interactive login shell's environment, captured once per process and laid over every agent spawn ([reference](REFERENCE.md#shell_envrs)). Its values are secrets: never log them. |
 | `agent_state.rs`, `agents.rs`, `spawn.rs` | Pure agent state; hook ingest and writers (the per-session Claude `--settings` file also carries `autoCompactEnabled`: the reopened conversation's pick, else `agents.autoCompact` On/Off, and `env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` from `agents.autoCompactAt`, via `chat::claude_compaction` → `agents::Compaction`; `refresh_settings_compaction` brings a reused file up to date); PTY spawn (a Codex TUI gets the threshold as `-c model_post_turn_compact_threshold_percent`, `launcher::push_codex_compact_at`). |
 | `git/` | Read-only git: repositories, session tracker, diffs, history. |
 | `fs.rs` + `fs/`, `embed.rs`, `notebook.rs` | Filesystem service and previews (`fs/row_index.rs`: table row offsets; `fs/zip_splice.rs`: byte-exact Office package edits for `fs/package`); link targets; notebook pages. |
 | `fs_watch.rs`, `doc_check.rs`, `drafts.rs`, `agent_docs.rs` | Disk monitor; dialect checker; draft mirror; "teach agents" docs. |
 | `proxy.rs`, `browser_open.rs` | Browser-pane reverse proxy; the agent `open_browser` tool. |
 | `agent_browser/` | The agent browser's `browser_*` MCP tools (`tools.rs`) over two engines: the app engine drives a pane view in a connected app window through the `/ws/events` request channel (`app_engine.rs`, `channel.rs`), the Chromium engine a headless browser over `--remote-debugging-pipe` (`chromium.rs`, `cdp.rs`); a file on the host opens as a ticketed `/raw/` page (`file_page.rs`); pages, shared panes, take-over and the reaper in `mod.rs` ([reference](REFERENCE.md#agent_browser), [feature](../../docs/features/agent-browser.md)). |
-| `download.rs`, `upload.rs`, `voice/` | Ticketed downloads; streamed uploads; dictation relay. |
+| `download.rs`, `upload.rs` + `upload/chunked.rs`, `voice/` | Ticketed downloads; streamed uploads (the one-request routes, and the chunked, resumable transport the UI uses: [reference](REFERENCE.md#uploadrs)); dictation relay. |
 | `notices.rs`, `update.rs` | The notice feed; the self-update reporter. |
 | `runtimes.rs`, `runtime_retention.rs`, `agent_updates.rs` | Managed agent runtimes, their cleanup, release awareness. |
 | `environment.rs`, `compute.rs` | Environment preludes; Slurm awareness and `/compute`. |

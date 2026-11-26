@@ -585,9 +585,15 @@ pub enum AgentEvent {
     },
     /// Journal head marker after compaction: entries before this were dropped.
     Truncated,
-    /// The session moved between chat and terminal mode (the toggle).
+    /// The session moved between chat and terminal mode (the toggle), or
+    /// its process started again in place.
     ModeSwitch {
         to: SessionUi,
+        /// The process started again for a new sign-in: what the old one
+        /// said about its account (the usage limits, a limit reached) is no
+        /// longer about this conversation.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        sign_in: bool,
     },
     /// Boundary between a copied source-journal prefix and the destination
     /// session's own events. A portable handoff's old native ids are display
