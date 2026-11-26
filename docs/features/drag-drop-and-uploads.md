@@ -106,7 +106,7 @@ selection references (see [terminals.md](terminals.md)).
   Release to upload each file and type its returned path. An
   in-flight upload shows progress plus a cancel action in a quiet chip bottom-center; the
   percentage counts bytes the host has confirmed. If the connection drops, the chip reads
-  "waiting for the connection" and the upload goes on from where the host stands once it is back;
+  "Waiting for the connection" and the upload goes on from where the host stands once it is back;
   after two minutes without a byte getting through it fails and says how far it got. A file the
   host cannot take (too big for the destination, no room on its disk) is refused before anything is
   sent, with the reason. A failed or cancelled upload leaves nothing on the host. Dropping an **image**

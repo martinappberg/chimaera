@@ -114,8 +114,9 @@ export async function uploadToDir(
   return send({ dir }, blob, name, progress);
 }
 
-/** What a job's chip reads while its upload waits for the link. */
-const WAITING_SUFFIX = " waiting for the connection";
+/** What leads a job's chip while its upload waits for the link. In front of
+ *  the label, because the chip cuts a long line at its end. */
+const WAITING_PREFIX = "Waiting for the connection · ";
 
 /** The chip-side half of an upload's callbacks: progress, cancel, and the
  *  label's waiting note. */
@@ -129,7 +130,7 @@ function jobReporter(id: number, label: string, onCancel: () => void): UploadPro
           cancel();
         },
       }),
-    onWaiting: (waiting) => updateJob(id, { name: waiting ? `${label}${WAITING_SUFFIX}` : label }),
+    onWaiting: (waiting) => updateJob(id, { name: waiting ? `${WAITING_PREFIX}${label}` : label }),
   };
 }
 

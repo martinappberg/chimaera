@@ -201,6 +201,9 @@ describe("the chunked upload transport", () => {
     expect(await sum(host.landed!)).toBe(await sum(source));
     expect(host.maxInFlight).toBe(1);
     expect(host.chunks().length).toBeGreaterThan(3);
+    // With the answer in hand it tells the host to forget the upload.
+    expect(host.seen.at(-1)!.kind).toBe("cancel");
+    expect(host.uploads.size).toBe(0);
     // Each step is what the host confirmed: never ahead, never backwards.
     expect(progress[0]).toBe(0);
     expect(progress.at(-1)).toBe(1);

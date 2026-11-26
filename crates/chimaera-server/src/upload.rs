@@ -268,6 +268,10 @@ pub(super) fn session_known(state: &AppState, id: &str) -> bool {
 /// clobber. The exists→rename window is racy only against the same user
 /// re-dropping the same name in the same instant — an accepted,
 /// self-inflicted overwrite. A refusal has already removed `tmp`.
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err is the HTTP response the handler returns as it is"
+)]
 pub(super) async fn publish_in_session(
     dir: &Path,
     tmp: &Path,
@@ -309,6 +313,10 @@ pub(super) async fn publish_in_session(
 /// Give a finished folder upload its final name: the user's own name, or a
 /// " copy" sibling when that is taken — never a clobber. A refusal has
 /// already removed `tmp`.
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err is the HTTP response the handler returns as it is"
+)]
 pub(super) async fn publish_in_dir(
     dir: &Path,
     tmp: &Path,
@@ -356,6 +364,10 @@ pub(super) async fn publish_in_dir(
 
 /// The directory a folder upload names, canonical, or the 400 that says why
 /// it cannot take a file.
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err is the HTTP response the handler returns as it is"
+)]
 pub(super) async fn resolve_upload_dir(raw: &str) -> Result<PathBuf, Response> {
     let refuse = |message: String| {
         (StatusCode::BAD_REQUEST, Json(json!({"error": message}))).into_response()

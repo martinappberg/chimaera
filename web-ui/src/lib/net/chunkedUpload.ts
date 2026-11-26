@@ -98,7 +98,9 @@ export class UploadCancelled extends Error {
 }
 
 /** Run `request` with a deadline and the caller's cancel signal, without
- *  `AbortSignal.any` (older WebKit web views lack it). */
+ *  `AbortSignal.any` (older WebKit web views lack it). The answer's body is
+ *  read inside the same deadline: a link that dies between the headers and
+ *  the (tiny) body must fail the attempt, not hang it. */
 async function requestWithDeadline(
   path: string,
   init: RequestInit,
@@ -111,7 +113,9 @@ async function requestWithDeadline(
   signal?.addEventListener("abort", onAbort, { once: true });
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await api(path, { ...init, signal: controller.signal });
+    const res = await api(path, { ...init, signal: controller.signal });
+    const body = await res.text();
+    return new Response(body.length > 0 ? body : null, { status: res.status, headers: res.headers });
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener("abort", onAbort);
@@ -422,6 +426,9 @@ export async function uploadChunked(
       const result = await pass();
       if (result !== false) {
         options.onProgress?.(1);
+        // The answer is in hand: the daemon need not keep it for a retry.
+        discard(id);
+        id = null;
         return result;
       }
       id = null;

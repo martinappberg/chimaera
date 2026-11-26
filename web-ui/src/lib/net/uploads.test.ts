@@ -89,6 +89,7 @@ describe("uploads", () => {
       "POST /api/v1/uploads",
       "PUT /api/v1/uploads/up1?offset=0",
       "POST /api/v1/uploads/up1/finish",
+      "DELETE /api/v1/uploads/up1",
     ]);
     expect(progress).toEqual([0, 0.99, 1]);
   });
@@ -128,7 +129,7 @@ describe("uploads", () => {
       stop();
       expect(names).toEqual([
         "Uploading data.bin…",
-        "Uploading data.bin… waiting for the connection",
+        "Waiting for the connection · Uploading data.bin…",
         "Uploading data.bin…",
       ]);
     } finally {

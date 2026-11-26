@@ -548,6 +548,42 @@ async fn a_session_upload_lands_mention_safe_within_the_session_caps() {
     assert!(!state.uploads_root.join("nope").exists());
 }
 
+/// Only uploads still in progress count against the limit: a run of small
+/// drops (each finished, its answer kept a while for a retried `finish`)
+/// must not lock the next one out.
+#[tokio::test]
+async fn finished_uploads_do_not_use_up_the_open_upload_limit() {
+    let state = test_state();
+    let dest = test_dir("chunked-many");
+    let source = pattern(1024);
+    for n in 0..80 {
+        let id = begin_in_dir(&state, &dest, &format!("f{n}.bin"), source.len()).await;
+        let (status, _) = put(&state, &id, 0, &source).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = finish(&state, &id, Some(&chain_of(&[&source]))).await;
+        assert_eq!(status, StatusCode::OK, "upload {n}: {body}");
+    }
+    assert_eq!(names(&dest).len(), 80);
+    assert!(
+        state.chunked_uploads.open_count() <= 64,
+        "kept answers stay bounded"
+    );
+
+    // Uploads left open do reach it, and the refusal says so.
+    let mut open = Vec::new();
+    let refused = loop {
+        let (status, body) =
+            begin(&state, json!({"dir": dest, "name": "open.bin", "size": 10})).await;
+        if status != StatusCode::OK {
+            break (status, body);
+        }
+        open.push(body["id"].as_str().unwrap().to_string());
+        assert!(open.len() <= 32, "more than the limit were opened");
+    };
+    assert_eq!(open.len(), 32);
+    assert_eq!(refused.0, StatusCode::TOO_MANY_REQUESTS, "{}", refused.1);
+}
+
 #[tokio::test]
 async fn chunked_upload_routes_require_auth_and_one_destination() {
     let state = test_state();

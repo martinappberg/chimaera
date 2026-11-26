@@ -88,6 +88,9 @@ const CHUNK_IDLE: Duration = Duration::from_secs(60);
 /// quota on a network filesystem surfaces while the upload runs and the
 /// final sync is short.
 const SYNC_EVERY_BYTES: u64 = 64 * 1024 * 1024;
+/// Finished uploads' answers kept at once; past it they are all dropped (the
+/// client forgets one itself as soon as it has the answer).
+const MAX_FINISHED_KEPT: usize = 64;
 const REAP_TICK: Duration = Duration::from_secs(60);
 
 /// Every open upload, by id. Per process: a restarted daemon has none, and
@@ -127,6 +130,8 @@ struct Upload {
     marker: PathBuf,
     /// Bytes committed: what `GET` answers without waiting for the writer.
     committed: AtomicU64,
+    /// Published: only its answer is kept, for a `finish` asked again.
+    done: std::sync::atomic::AtomicBool,
     /// Bumped by every request that wants the writer's seat. The latest one
     /// wins: a piece still being read for a connection its client gave up on
     /// yields as soon as it sees a newer turn.
@@ -273,6 +278,27 @@ pub(crate) struct Begin {
 /// left on the destination filesystem (507), the number of open uploads
 /// (429).
 pub(crate) async fn begin(State(state): State<Arc<AppState>>, Json(req): Json<Begin>) -> Response {
+    to_completion(begin_upload(state, req)).await
+}
+
+/// Run a handler's work as its own task, so a request that goes away
+/// mid-way (the link dropped, the client timed out) cannot stop it between
+/// two steps that belong together: registering an upload and opening its
+/// file, renaming a file into place and recording that it was published.
+/// A piece's own handler is not run this way: it must stop with its request.
+async fn to_completion(
+    work: impl std::future::Future<Output = Response> + Send + 'static,
+) -> Response {
+    tokio::spawn(work).await.unwrap_or_else(|err| {
+        tracing::error!(%err, "an upload task failed");
+        refuse(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the upload failed on the host",
+        )
+    })
+}
+
+async fn begin_upload(state: Arc<AppState>, req: Begin) -> Response {
     let Some(name) = sanitize_name(req.name.as_deref().unwrap_or("upload.bin")) else {
         return refuse(StatusCode::BAD_REQUEST, "invalid file name");
     };
@@ -281,16 +307,16 @@ pub(crate) async fn begin(State(state): State<Arc<AppState>>, Json(req): Json<Be
             if !session_known(&state, &id) {
                 return refuse(StatusCode::NOT_FOUND, format!("unknown session {id}"));
             }
-            let name = mention_safe_name(&name);
             let dir = state.uploads_root.join(&id);
             if let Err(err) = tokio::fs::create_dir_all(&dir).await {
                 return super::internal(&dir, "failed to create uploads dir", &err.into());
             }
             let (existing, count) = dir_usage(&dir).await;
+            // A refusal names the file as the user knows it, not as it lands.
             if let Some(refusal) = session_refusal(&name, Some(req.size), existing, count) {
                 return refusal;
             }
-            (Dest::Session(id), dir, name)
+            (Dest::Session(id), dir, mention_safe_name(&name))
         }
         (None, Some(raw)) => {
             if req.size > MAX_UPLOAD_BYTES {
@@ -345,6 +371,7 @@ pub(crate) async fn begin(State(state): State<Arc<AppState>>, Json(req): Json<Be
         tmp: tmp.clone(),
         marker: marker.clone(),
         committed: AtomicU64::new(0),
+        done: std::sync::atomic::AtomicBool::new(false),
         turn: tokio::sync::watch::Sender::new(0),
         seat: tokio::sync::Mutex::new(Seat {
             file: None,
@@ -361,7 +388,24 @@ pub(crate) async fn begin(State(state): State<Arc<AppState>>, Json(req): Json<Be
     let mut seat = upload.seat.lock().await;
     let spawn_reaper = {
         let mut registry = crate::lock(&state.chunked_uploads.registry);
-        if registry.entries.len() >= MAX_OPEN_UPLOADS {
+        // Finished uploads are only answers kept for a retry: they take no
+        // slot, and go first when there are many of them.
+        let finished = registry
+            .entries
+            .values()
+            .filter(|upload| upload.done.load(Ordering::SeqCst))
+            .count();
+        if finished >= MAX_FINISHED_KEPT {
+            registry
+                .entries
+                .retain(|_, upload| !upload.done.load(Ordering::SeqCst));
+        }
+        let open = registry
+            .entries
+            .values()
+            .filter(|upload| !upload.done.load(Ordering::SeqCst))
+            .count();
+        if open >= MAX_OPEN_UPLOADS {
             return refuse(
                 StatusCode::TOO_MANY_REQUESTS,
                 "too many uploads are in progress on this host; try again when one finishes",
@@ -416,7 +460,7 @@ pub(crate) async fn status(
     Json(json!({
         "offset": offset,
         "size": upload.size,
-        "done": upload.seat.try_lock().is_ok_and(|seat| seat.outcome.is_some()),
+        "done": upload.done.load(Ordering::SeqCst),
     }))
     .into_response()
 }
@@ -494,6 +538,10 @@ pub(crate) async fn chunk(
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err is the HTTP response the handler returns as it is"
+)]
 async fn write_chunk(
     state: &AppState,
     upload: &Upload,
@@ -659,12 +707,12 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn parse_sha256(hex: &str) -> Option<[u8; 32]> {
-    let hex = hex.trim().as_bytes();
-    if hex.len() != 64 {
+    let (pairs, rest) = hex.trim().as_bytes().as_chunks::<2>();
+    if pairs.len() != 32 || !rest.is_empty() {
         return None;
     }
     let mut out = [0u8; 32];
-    for (byte, pair) in out.iter_mut().zip(hex.chunks_exact(2)) {
+    for (byte, pair) in out.iter_mut().zip(pairs) {
         let pair = std::str::from_utf8(pair).ok()?;
         *byte = u8::from_str_radix(pair, 16).ok()?;
     }
@@ -690,11 +738,15 @@ pub(crate) async fn finish(
     UrlPath(id): UrlPath<String>,
     body: Option<Json<Finish>>,
 ) -> Response {
+    let chain = body.and_then(|Json(finish)| finish.chain);
+    to_completion(finish_upload(state, id, chain)).await
+}
+
+async fn finish_upload(state: Arc<AppState>, id: String, chain: Option<String>) -> Response {
     let Some(upload) = state.chunked_uploads.get(&id) else {
         return unknown_upload();
     };
     upload.touch();
-    let chain = body.and_then(|Json(finish)| finish.chain);
     let (_, mut guard) = upload.take_seat().await;
     let seat = &mut *guard;
     if let Some(outcome) = &seat.outcome {
@@ -793,6 +845,7 @@ pub(crate) async fn finish(
         "size": upload.size,
     });
     seat.outcome = Some(outcome.clone());
+    upload.done.store(true, Ordering::SeqCst);
     upload.touch();
     let _ = tokio::fs::remove_file(&upload.marker).await;
     if let Dest::Dir(raw) = &upload.dest {
@@ -809,24 +862,30 @@ pub(crate) async fn cancel(
     State(state): State<Arc<AppState>>,
     UrlPath(id): UrlPath<String>,
 ) -> Response {
-    if let Some(upload) = state.chunked_uploads.get(&id) {
-        let (_, mut seat) = upload.take_seat().await;
-        if seat.outcome.is_some() {
-            state.chunked_uploads.remove(&id);
-        } else {
-            abandon(&state, &id, &upload, &mut seat).await;
+    to_completion(async move {
+        if let Some(upload) = state.chunked_uploads.get(&id) {
+            let (_, mut seat) = upload.take_seat().await;
+            if seat.outcome.is_some() {
+                state.chunked_uploads.remove(&id);
+            } else {
+                abandon(&state, &id, &upload, &mut seat).await;
+            }
         }
-    }
-    StatusCode::NO_CONTENT.into_response()
+        StatusCode::NO_CONTENT.into_response()
+    })
+    .await
 }
 
 /// End an upload that will not be published: close and remove its temp
 /// file, its record, and its registry entry. Caller holds the seat.
 async fn abandon(state: &AppState, id: &str, upload: &Upload, seat: &mut Seat) {
+    // The entry goes last: if this is cut short, the upload is still listed
+    // (with no file, so every request gets 404) and the reaper finishes the
+    // job, instead of a temp file nothing points at.
     seat.file = None;
-    state.chunked_uploads.remove(id);
     let _ = tokio::fs::remove_file(&upload.tmp).await;
     let _ = tokio::fs::remove_file(&upload.marker).await;
+    state.chunked_uploads.remove(id);
 }
 
 /// Abandon uploads nobody touched for [`IDLE_EXPIRY`] and forget finished
