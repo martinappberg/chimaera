@@ -148,6 +148,12 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   does. So reloads, other windows and replay show the pictures too. The journal still never holds
   the bytes. Old journals, Remote Control messages and seeded history carry only a count and keep
   the "N images" line; a copy gone with its session's uploads shows a dashed empty tile.
+- **Referencing what the chat shows.** A sent picture's tile, an embedded figure, a file on the
+  "Written this turn" line and a file mention chip drag onto the composer, or offer **Reference
+  in chat** on right-click, and become a mention of that same file in the draft: nothing is
+  opened, nothing is uploaded again. A tab dragged onto the composer is referenced and stays where
+  it was. In the native app on the daemon's own computer, a file dropped from the desktop is
+  referenced where it is. All of it: [drag-drop-and-uploads.md](drag-drop-and-uploads.md#a-file-a-chat-already-shows).
 - **Long drafts.** The composer grows upward with wrapped text to a pane-conscious cap, then scrolls
   internally. Its subtle top-edge grip can expand or contract it manually (drag for a precise size;
   click to toggle expanded/content-fit; Up/Down resize from the keyboard and Home returns to

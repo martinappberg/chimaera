@@ -15,8 +15,9 @@
   import { dirtyFiles } from "../shared/editing";
   import { sessionLabel, type Session } from "../workspace/sessions";
   import type { DropSpot, LayoutCtrl } from "./dnd";
-  import { registerPane, unregisterPane, zoneWord } from "./dnd";
+  import { paneBandFraction, registerPane, REF_BAND_FRAC, unregisterPane, zoneWord } from "./dnd";
   import { dirLabel } from "../previews/files";
+  import { referencesLocalDrops } from "../net/native";
   import { agentHue, type LinkCtrl } from "../workspace/agentLinks";
   import { activeModLabel, keyHint, keyHintSuffix, paneFocusHint, paneMoveHint } from "../shared/keybindings";
   import PaneTabs from "./PaneTabs.svelte";
@@ -122,7 +123,14 @@
   );
   /** This pane's bottom band is reserved for the current drag: the center
    *  (adopt) preview stops above it instead of flashing the full pane. */
+  /** This window's files are this computer's: an OS drop is referenced in
+   *  place, not uploaded (constant for the window's life). */
+  const localFiles = referencesLocalDrops();
   const bandArmed = $derived(bandPanes.has(node.id));
+  /** The band's share of this pane for the current drag, as the hit-test
+   *  reads it: measured once when the drag arms it (the input area does not
+   *  change height under a drag), so the wash and the target cannot differ. */
+  const bandShare = $derived(bandArmed ? paneBandFraction(node.id) : REF_BAND_FRAC);
   /** When this pane IS an agent session: its own hue (link band tint). */
   const ownAgentHue = $derived.by(() => {
     if (activeTab === null || activeTab.surface !== "terminal") return null;
@@ -757,14 +765,14 @@
          "split right" from "add as tab" at a glance. Every drop wash here is
          `data-overlay`: a pane view (a native page drawn above the DOM)
          stands down for it, under a still of its page, like for a menu. -->
-    <div data-overlay class="drop drop-{zone}" class:banded={bandArmed}>
+    <div data-overlay class="drop drop-{zone}" class:banded={bandArmed} style:--band="{bandShare * 100}%">
       <span class="drop-chip">{zoneWord(zone)}</span>
     </div>
   {:else if linkBand}
     <!-- Distinct from the split/adopt zones: a labeled, dashed band over the
          agent's input area. Dropping links the terminal and types its
          @term: reference into the composer (never submits). -->
-    <div data-overlay class="drop-link" class:hued={ownAgentHue !== null} style:--band-hue={ownAgentHue}>
+    <div data-overlay class="drop-link" class:hued={ownAgentHue !== null} style:--band-hue={ownAgentHue} style:--band="{bandShare * 100}%">
       <span class="drop-chip">link to {activeSessionName ?? "this agent"}</span>
     </div>
   {:else if linkPane}
@@ -778,7 +786,7 @@
   {#if refBand}
     <!-- Drag-to-reference: types the path into this session's input, never
          opens a tab, never submits. Visibly distinct from the adopt zone. -->
-    <div data-overlay class="drop-ref">
+    <div data-overlay class="drop-ref" style:--band="{bandShare * 100}%">
       <span class="drop-chip"
         ><span class="drop-ref-at">@</span> reference in {activeSessionName ?? "this session"}</span
       >
@@ -787,10 +795,12 @@
 
   {#if uploadPane}
     <!-- OS-desktop drop: uploads to the session's host, then types the
-         path — same "@ reference" grammar, whole pane as the target. -->
+         path — same "@ reference" grammar, whole pane as the target. On
+         this computer's own daemon the file is referenced where it is
+         (net/localDrop.ts), so the wash promises no upload. -->
     <div data-overlay class="drop-upload">
       <span class="drop-chip"
-        ><span class="drop-ref-at">@</span> upload &amp; reference in {activeSessionName ??
+        ><span class="drop-ref-at">@</span> {localFiles ? "" : "upload & "}reference in {activeSessionName ??
           "this session"}</span
       >
     </div>
@@ -1077,12 +1087,13 @@
     inset: 0;
   }
 
-  /* Drag-to-reference band over the input area (~22%, matching the dnd
-     hit-test): dashed + labeled so it can't be mistaken for adopt-as-tab. */
+  /* Drag-to-reference band over the input area (`--band`: the share the dnd
+     hit-test uses, ~22% or the whole composer when that is taller): dashed +
+     labeled so it can't be mistaken for adopt-as-tab. */
   .drop-ref {
     position: absolute;
     z-index: 7;
-    inset: 78% 0 0 0;
+    inset: calc(100% - var(--band, 22%)) 0 0 0;
     margin: 3px;
     display: flex;
     align-items: center;
@@ -1113,7 +1124,7 @@
   /* While a bottom band is armed for this drag, the adopt-as-tab preview
      stops above it — the band region is reserved, never flashed over. */
   .drop-center.banded {
-    inset: 0 0 22% 0;
+    inset: 0 0 var(--band, 22%) 0;
   }
 
   /* The link band: same quiet recipe as the "@ reference" band (one band
@@ -1121,7 +1132,7 @@
   .drop-link {
     position: absolute;
     z-index: 7;
-    inset: 78% 0 0 0;
+    inset: calc(100% - var(--band, 22%)) 0 0 0;
     margin: 3px;
     display: flex;
     align-items: center;

@@ -45,21 +45,10 @@ export interface ValidateAnswer {
 export type OpenPathFn = (path: string, kind: PathKind, opts?: OpenPathOptions) => void;
 
 // --- the resolution context App registers ---------------------------------------
+// The registry itself is `linkContext.ts`: App imports that leaf, so this
+// module stays out of the always-loaded entry.
 
-type ContextLookup = (sessionId: string) => LinkContext;
-let contextLookup: ContextLookup | null = null;
-
-/** App-level wiring: the same per-session context the terminal link
- *  provider uses (live cwd, spawn cwd, workspace root, workspace id). Null
- *  unregisters. */
-export function setChatLinkContext(fn: ContextLookup | null): void {
-  contextLookup = fn;
-}
-
-/** The registered context for a session, or null (tests, a detached view). */
-export function chatLinkContext(sessionId: string): LinkContext | null {
-  return contextLookup?.(sessionId) ?? null;
-}
+export { chatLinkContext, setChatLinkContext } from "./linkContext";
 
 // --- candidates a rendered element offers ------------------------------------------
 

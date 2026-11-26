@@ -11,7 +11,9 @@
  *   or pasting against its end puts a space first, and deleting the space
  *   that keeps it apart from the next word does nothing (`keepsTokens`);
  * - settles, after the fact, the rare edit it could not shape (a word or
- *   line deletion that reached into one, an IME commit) — `settleEdit`;
+ *   line deletion that reached into one, an IME commit) — `settleEdit` —
+ *   and undoes a system substitution inside one (smart quotes, a spelling
+ *   correction), which would otherwise break the chip under the user;
  * - copies and cuts the whole mention, and shows a pasted whole mention of
  *   a landing-pad file short again.
  *
@@ -35,18 +37,22 @@ import {
 } from "./uploadTokens";
 
 /** Replace `el.value[from, to)` with `text` as a user edit would (native
- *  undo keeps it); a field without `execCommand` still gets the text. */
-function replaceRange(el: HTMLTextAreaElement, from: number, to: number, text: string): void {
+ *  undo keeps it); a field without `execCommand` still gets the text.
+ *  `typed: false` writes it without the editing machinery: text that goes
+ *  back in to undo a system substitution must not be substituted again
+ *  (typing a straight quote is what smart quotes rewrite). */
+function replaceRange(el: HTMLTextAreaElement, from: number, to: number, text: string, typed = true): void {
   el.setSelectionRange(from, to);
   const done =
-    text.length > 0 ? document.execCommand("insertText", false, text) : from === to || document.execCommand("delete");
+    typed &&
+    (text.length > 0 ? document.execCommand("insertText", false, text) : from === to || document.execCommand("delete"));
   if (done) return;
   el.setRangeText(text, from, to, "end");
   el.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
 /** Rewrite the field from `current` to `next`, touching only what differs. */
-function rewrite(el: HTMLTextAreaElement, current: string, next: string): void {
+function rewrite(el: HTMLTextAreaElement, current: string, next: string, typed = true): void {
   let head = 0;
   while (head < current.length && head < next.length && current[head] === next[head]) head++;
   let tail = 0;
@@ -57,7 +63,7 @@ function rewrite(el: HTMLTextAreaElement, current: string, next: string): void {
   ) {
     tail++;
   }
-  replaceRange(el, head, current.length - tail, next.slice(head, next.length - tail));
+  replaceRange(el, head, current.length - tail, next.slice(head, next.length - tail), typed);
 }
 
 /**
@@ -75,6 +81,10 @@ export function uploadChips(
     /** The field as it was before the edit in flight (set at `beforeinput`,
      *  or at composition start for the whole composition). */
     let base: string | null = null;
+    /** The edit in flight is the browser's own replacement of some text. */
+    let replacing = false;
+    /** The selection the edit in flight started from. */
+    let selected: [number, number] | null = null;
     let composing = false;
     let settling = false;
     let pointerDown = false;
@@ -92,14 +102,14 @@ export function uploadChips(
       moved();
     }
 
-    function settle(before: string): void {
+    function settle(before: string, replacement = false, from: [number, number] | null = null): void {
       if (settling) return;
       const after = el.value;
-      const fix = settleEdit(before, after, el.selectionStart, tokens);
+      const fix = settleEdit(before, after, el.selectionStart, tokens, replacement, from);
       if (fix === null) return;
       settling = true;
       try {
-        rewrite(el, after, fix.text);
+        rewrite(el, after, fix.text, fix.restored !== true);
         el.setSelectionRange(fix.caret, fix.caret);
       } finally {
         settling = false;
@@ -156,6 +166,8 @@ export function uploadChips(
     function onBeforeInput(e: InputEvent): void {
       if (composing || settling) return;
       base = el.value;
+      replacing = e.inputType === "insertReplacementText";
+      selected = [el.selectionStart, el.selectionEnd];
       // Typing against a short form's end: a space first, in the same edit.
       if (e.inputType !== "insertText" || e.isComposing || e.data === null || tokens.size === 0) return;
       const start = el.selectionStart;
@@ -177,7 +189,7 @@ export function uploadChips(
       if (composing || (e as InputEvent).isComposing || settling || base === null) return;
       const before = base;
       base = null;
-      settle(before);
+      settle(before, replacing, selected);
     }
 
     function onCompositionStart(): void {

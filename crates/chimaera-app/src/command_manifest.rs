@@ -57,6 +57,7 @@ pub const DAEMON_UI_COMMANDS: &[&str] = &[
     "shell_build",
     "write_clipboard",
     "copy_file_to_clipboard",
+    "dropped_paths",
     "reveal_in_file_manager",
     "open_external",
     "office_open",
@@ -163,6 +164,7 @@ pub const COMMAND_AUTHORITY: &[(&str, Authority)] = &[
     ("shell_build", Authority::AnyWindow),
     ("write_clipboard", Authority::AnyWindow),
     ("copy_file_to_clipboard", Authority::LocalOnly),
+    ("dropped_paths", Authority::LocalOnly),
     ("reveal_in_file_manager", Authority::LocalOnly),
     ("open_external", Authority::AnyWindow),
     // The host is the caller's own scope, never an argument: a page acts

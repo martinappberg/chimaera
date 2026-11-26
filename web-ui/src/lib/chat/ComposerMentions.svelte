@@ -164,7 +164,7 @@
           const right = r.left - row.left > row.width / 2;
           hovered = {
             index,
-            name: pathOf(run.text).replace(/^term:/, "").replace(/^"(.*)"$/, "$1"),
+            name: pathOf(run.text).replace(/^term:/, "").replace(/^["\u201c](.*)["\u201d]$/, "$1"),
             path: pathOf(run.upload),
             side: right ? "right" : "left",
             x: right ? Math.max(0, row.right - r.right) : Math.max(0, r.left - row.left),
