@@ -48,6 +48,19 @@ async fn chat(state: &Arc<AppState>, ws: &str, label: &str) -> (String, String) 
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let sid = body["id"].as_str().unwrap().to_string();
+    // Past the handshake's `Init`: it settles a record that says Running
+    // with no turn in flight, so a state a test sets before it lands is
+    // overwritten (`chat::apply_chat_event`).
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while lock(&state.agents)
+            .get(&sid)
+            .is_some_and(|r| r.state == agent_state::AgentState::Unknown)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the fake's Init lands");
     let key = lock(&state.agents).get(&sid).unwrap().key.clone();
     (sid, key)
 }

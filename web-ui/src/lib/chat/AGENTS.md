@@ -27,7 +27,7 @@ daemon  ──WS /ws/chat/{id}──▶  chatWs.ts (ChatSocket)
 | `transcriptWindow.ts`, `readingAnchor.ts`, `heightModel.ts` | Window math, reading anchor, row heights. |
 | `Markdown`, `streamSegments.ts`, `revealLedger.ts`, `tables.ts`, `markedExtensions.ts`, `MathText`, `math.ts` | Sanitized prose and math, streamed. A file link opens here or beside (⌘/Ctrl-click, a middle click, its right-click menu); the layout decides where ([open beside](../../../../docs/features/workbench.md#splitting-tabs--drag-and-drop)). |
 | `ChatHeader`, `ModelPicker`, `EffortPopover`, `capabilities.ts` | Header controls from capabilities. |
-| `Composer`, `composer.ts`, `composerHeight.ts`, `composerBus.ts`, `drafts.ts` | Input, slash completion, inserts, drafts; one context row for branch/worktree, linked terminals and notices, only when populated; terminal completion opens through `@term`, with no permanent launcher. |
+| `Composer`, `composer.ts`, `composerHeight.ts`, `composerBus.ts`, `drafts.ts` | Input, slash completion, inserts, drafts; one context row for branch/worktree, linked terminals and notices, only when populated; terminal completion opens through `@term`, with no permanent launcher. The agent's slash catalog is kept to 256 rows (`store.svelte.ts`, the daemon's `SLASH_COMMANDS_CAP`); models and modes stay at 64. |
 | `stopConfirm.ts` + `StopNote.svelte` | Esc / Stop / Clear goal ask once ("Also stops 2 subagents · Esc again to stop") when that action also ends background subagents or workflows, the line above the control pressed and worded by the real gesture; otherwise they act at once. |
 | `uploadTokens.ts`, `uploadChips.ts`, `ComposerMentions`, `terminalMentions.ts` | Atomic mention tokens in the draft. |
 | `voice*.ts`, `VoiceMeter` | Voice dictation. |
@@ -35,7 +35,7 @@ daemon  ──WS /ws/chat/{id}──▶  chatWs.ts (ChatSocket)
 | `ToolCallCard`, `ToolGroup`, `toolLabels.ts`, `agentNames.ts` | Tool calls and their one-line labels; `agentNames.ts` holds the id → name lookup App sets, apart so the always-loaded entry doesn't carry the labels. |
 | `Activity*`, `activityFold.ts`, `FinishedFold`, `FinishedRow` | Folds of settled activity. |
 | `ThoughtRow`, `thoughtText.ts`, `HookRow`, `hookNotice.ts`, `statusWord.ts` | Thought and hook lines; status word. |
-| `AgentsTray`, `BackgroundTray`, `PlanCard`, `AheadCard`, `WorkStrip`, `workStrip.ts` | Pinned work cards; one shared inventory folds three kinds (including tasks) into a labelled strip; Running groups background agents and commands behind an activity icon. Idle tasks fold without adding a status label or refresh action; task tools own completion. |
+| `AgentsTray`, `BackgroundTray`, `PlanCard`, `AheadCard`, `WorkStrip`, `workStrip.ts` | Pinned work cards; one shared inventory folds three kinds (including tasks) into a labelled strip; Running groups background agents and commands behind an activity icon. Idle tasks fold without adding a status label or refresh action; task tools own completion. A recurring job's "ends" date is the agent's own (`ahead.ts` `jobEndsAtMs`: `expires_at_ms`, else 7 days from creation). |
 | `subagent*.ts`, `SubagentBanner`, `SubagentChip`, `ModelChip` | A subagent as a read-only chat. |
 | `AgentMessageCards`, `agentMessages.ts`, `WakeRequestBar` | Other agents' messages and wake requests. |
 | `PermissionCard`, `QuestionCard`, `PlanApprovalCard`, `Elicitation*` | Answers to the agent. |
