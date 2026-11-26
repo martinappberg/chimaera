@@ -78,7 +78,8 @@ export interface DragPayload {
   label: string;
   /**
    * What this payload can REFERENCE: an absolute path (file previews,
-   * Finder/dir drags) or a commit's sha (history rows, commit tabs). Its
+   * Finder/dir drags), a commit's sha (history rows, commit tabs), or an
+   * agent's session id (its tab or rail row, over another agent). Its
    * presence is what arms the "@ reference" band — payloads opt in
    * explicitly instead of dnd hard-coding surfaces; dnd never reads it.
    */

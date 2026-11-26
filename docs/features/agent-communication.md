@@ -50,6 +50,36 @@ on the per-session MCP endpoint ([linked-terminals.md](linked-terminals.md#the-m
   write a file and send its path); 10 posts per session per minute (shared with plugins'
   Timeline appends).
 
+## Referencing an agent in a message
+
+- **What & when.** Name another agent of the workspace in what you write to an agent ("ask
+  @analyst what it found"), and have the name mean exactly one session. The reference travels as
+  `@agent:<session id>`, the id the agents' own tools address each other by, and reads as that
+  agent's name wherever a person sees it. An agent may write the same tag in its reply ("I sent
+  your message to @agent:s-…"); it is offered to agents, not required of them.
+- **How it's used.** In a chat's composer, type `@agent` and pick from the workspace's other live
+  agents (name, glyph, what each is doing), or drag an agent's tab or rail row onto the chat: the
+  pane's **"@ reference in ⟨session⟩"** band lights, as for a file. The draft shows a chip,
+  `@agent:“analyst”`, one unit like a linked terminal's. The sent message shows the agent's glyph
+  and name; a click opens that agent where it is already open, else beside the chat. In an agent's
+  reply, `@agent:<id>` and a bare session id of a workspace agent read as the same tag (an id put
+  in backticks too; an id inside a longer code span stays as written).
+- **Where it lives.** UI `chat/agentMentions.ts` (the grammar, `mentionedAgent`,
+  `collapseAgentMentions`, the picker's `agentMatches`, and the reference source for prose,
+  `agentTagTargets`), `chat/agentRoster.ts` (the leaf App fills: `mentionableAgents`,
+  `setAgentOpener`), `Composer.svelte` (the picker), `UserText.svelte` (the sent chip),
+  `shared/references.ts` (a target's `label` and `icon` make its chip a tag), `layout/dragStart.ts`
+  + `App.svelte` (`agentRefTargetsFor`, `referenceAgentDrop`). Daemon `comms.rs`: one sentence in
+  the instruction paragraph, the `to` / `agent` argument descriptions, and `mention_target`, which
+  lets `message_agent` and `read_agent` take the mention as it was written.
+- **Key behaviors.** Only an id is shortened to a chip; a name typed by hand (`@agent:analyst`)
+  stays text for the receiving agent to resolve, and is never taken for an earlier pick. The chip
+  is recognized by its text, so undo and paste bring it back whole; the send, a copy and the saved
+  draft carry the id. An agent is never offered itself, and the band never lights on the dragged
+  agent's own pane or on a shell. A reference grants nothing and links nothing: the tools are
+  workspace-wide already. With the feature switched off the tag is still typed and shown; the
+  agent just has no tools to act on it. No wire change.
+
 ## Delivery: how a message arrives
 
 - **What & when.** A message is first a Timeline `note` whose `delivery` field is set (a
@@ -235,6 +265,18 @@ pre-approved call), waited again, and its subagent finished on schedule.
 > skill when a `feat:` ships in this area. **Never** inferred from code. Everything above
 > this line is derived and may be regenerated; everything below is deliberate and must not
 > be "helpfully" changed without asking.
+
+### Referencing an agent in a message — why it exists
+_Captured 2026-11-26 from the maintainer's messages while it was built. The questionnaire was not
+run: how settled it is and what must not change are **pending**._
+
+- **Problem it solves (verbatim):** "Also nice if one could reference other agents in chat (because
+  Chimaera can do this natively) but like their id becomes translatable correctly in the UI to the
+  chat (in some nice way, like the terminals) and that we can also drag and drop them when needed".
+- **Agents too (verbatim):** "when agents also mention another agent they should link them in the
+  same way (and the tag should show in their transcript too)", and: "they are not forced to do so
+  but if they say like 'I sent your message to bla bla agent' they could use that".
+- **Pending:** which parts are promises and which are free to change.
 
 ### Agent communication — why it exists
 _Captured 2026-09-29/30 from the maintainer, in the design conversation that produced it._

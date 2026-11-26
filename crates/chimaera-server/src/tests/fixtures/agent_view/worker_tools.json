@@ -625,7 +625,7 @@
         "additionalProperties": false,
         "properties": {
           "agent": {
-            "description": "The agent's id (from workspace_agents)",
+            "description": "The agent's id (from workspace_agents, or the ID of an @agent:ID the user wrote)",
             "type": "string"
           },
           "lines": {
@@ -658,7 +658,7 @@
             "type": "string"
           },
           "to": {
-            "description": "An agent's id (from workspace_agents), \"mastermind\", or \"everyone\"",
+            "description": "An agent's id (from workspace_agents, or the ID of an @agent:ID the user wrote), \"mastermind\", or \"everyone\"",
             "type": "string"
           }
         },

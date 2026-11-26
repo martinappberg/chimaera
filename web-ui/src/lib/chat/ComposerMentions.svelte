@@ -12,6 +12,8 @@
    * above the pill — the long location on demand, never in the sentence.
    */
   import TerminalIcon from "../shared/TerminalIcon.svelte";
+  import SessionGlyph from "../shared/SessionGlyph.svelte";
+  import { mentionableAgents } from "./agentMentions";
   import FileIcon from "../shared/FileIcon.svelte";
   import { extractFileRefs } from "../shared/fileRef";
   import { tokenSpans, type UploadTokens } from "./uploadTokens";
@@ -133,6 +135,11 @@
   }
   let hovered = $state<Hover | null>(null);
 
+  /** The glyph of the agent an `agent:<id>` tip names. */
+  function agentKindOf(path: string): string | null {
+    return $mentionableAgents.find((a) => a.id === path.slice("agent:".length))?.agentKind ?? null;
+  }
+
   /** The whole mention's path, without its `@` and quotes. */
   function pathOf(mention: string): string {
     const body = mention.slice(1);
@@ -164,7 +171,7 @@
           const right = r.left - row.left > row.width / 2;
           hovered = {
             index,
-            name: pathOf(run.text).replace(/^term:/, "").replace(/^["\u201c](.*)["\u201d]$/, "$1"),
+            name: pathOf(run.text).replace(/^(?:term|agent):/, "").replace(/^["\u201c](.*)["\u201d]$/, "$1"),
             path: pathOf(run.upload),
             side: right ? "right" : "left",
             x: right ? Math.max(0, row.right - r.right) : Math.max(0, r.left - row.left),
@@ -210,7 +217,7 @@
       style:right={hovered.side === "right" ? `${hovered.x}px` : undefined}
       style:bottom="{hovered.bottom}px"
     >
-      <span class="tip-name">{#if hovered.path.startsWith("term:")}<TerminalIcon size={12} />{:else}<FileIcon path={hovered.name} size={12} />{/if}{hovered.name}</span>
+      <span class="tip-name">{#if hovered.path.startsWith("term:")}<TerminalIcon size={12} />{:else if hovered.path.startsWith("agent:")}<SessionGlyph kind="agent" agentKind={agentKindOf(hovered.path)} size={12} />{:else}<FileIcon path={hovered.name} size={12} />{/if}{hovered.name}</span>
       <span class="tip-path">{hovered.path}</span>
     </div>
   {/key}

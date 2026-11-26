@@ -749,6 +749,36 @@ body.dragging {
 .kchip:hover {
   border-bottom-style: solid;
 }
+/* A tag: an id shown as the name it stands for (an agent's `@agent:` id as
+   that agent), the pill a mention wears in the user's own message
+   (chat/UserText `.chip`), so the same agent reads the same on both sides
+   of a conversation. Hover changes ink only, never the box. */
+.kchip.ktag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  vertical-align: bottom;
+  padding: 0 5px 0 4px;
+  border-bottom: none;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: inherit;
+  font-family: inherit;
+  font-size: 0.95em;
+  transition:
+    color 0.12s ease,
+    background-color 0.12s ease;
+}
+.kchip.ktag:hover {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
+}
+.kchip.ktag svg {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  color: var(--muted);
+}
 .kchip:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;

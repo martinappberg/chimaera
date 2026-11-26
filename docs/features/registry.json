@@ -192,6 +192,8 @@
         "crates/chimaera-server/src/comms.rs",
         "web-ui/src/lib/workspace/comms.svelte.ts",
         "web-ui/src/lib/chat/agentMessages.ts",
+        "web-ui/src/lib/chat/agentMentions.ts",
+        "web-ui/src/lib/chat/agentRoster.ts",
         "web-ui/src/lib/chat/AgentMessageCards.svelte",
         "web-ui/src/lib/dashboard/WakeRequestCard.svelte"
       ],
