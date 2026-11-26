@@ -1336,6 +1336,7 @@ mod tests {
                 recurring: true,
                 next_at_ms: Some(1_790_000_600_000),
                 created_at_ms: 1_790_000_000_000,
+                expires_at_ms: None,
             }],
             goal: Some(chimaera_agent::CarriedGoal {
                 objective: "all api tests pass".into(),

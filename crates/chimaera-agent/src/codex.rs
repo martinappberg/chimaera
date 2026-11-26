@@ -37,7 +37,7 @@ use crate::ndjson::JsonlChild;
 /// CLI version these frame shapes were verified against (2026-11-04, the
 /// codex chat-smoke cases 15/15 incl. both multi-agent runtimes through the
 /// driver + generated-schema diff from 0.164.0; PROTOCOL.md Pass 59).
-pub const TESTED_CODEX_VERSION: &str = "0.166.0";
+pub const TESTED_CODEX_VERSION: &str = "0.172.0";
 
 /// The collab `wait` row's title. The main-thread fold (`lib.rs`) reads it
 /// as "waiting on a subagent": a steer ends that wait at once (0.162.1, live,
@@ -787,7 +787,7 @@ fn parse_codex_skills(list: &Value) -> Vec<SlashCommand> {
             break;
         }
     }
-    commands
+    crate::model::cap_slash_catalog(commands)
 }
 
 fn configured_effort(result: &Value) -> Option<String> {
@@ -14639,6 +14639,75 @@ mod tests {
             e,
             AgentEvent::TurnAborted { reason, .. } if reason == "turn failed"
         )));
+    }
+
+    /// The `CodexErrorInfo` values 0.169.0–0.172.0 added, in the frames a
+    /// scripted provider made 0.172.0 send: each is terminal on the first
+    /// try (`willRetry: false`, then a failed turn carrying the same error).
+    /// The three spend-limit sentences are codex's own and name the scope;
+    /// the hook and policy errors carry whatever the provider said (the
+    /// words here stand in for it). Each is shown once, as it comes, and
+    /// the turn ends.
+    #[test]
+    fn spend_limit_and_policy_errors_end_the_turn_with_their_own_words() {
+        for (info, message) in [
+            (
+                "projectSpendLimitExceeded",
+                "Your API project has reached its spend limit.",
+            ),
+            (
+                "organizationSpendLimitExceeded",
+                "Your API organization has reached its spend limit.",
+            ),
+            (
+                "apiKeySpendLimitExceeded",
+                "Your API key has reached its spend limit.",
+            ),
+            (
+                "inferenceHookDenied",
+                "Blocked by the workspace inference hook.",
+            ),
+            ("bioPolicy", "This request was blocked by a usage policy."),
+        ] {
+            let error = json!({ "message": message, "codexErrorInfo": info,
+                "additionalDetails": null, "misalignment": null });
+            let mut m = mapper();
+            active_turn(&mut m);
+            let step = m.on_frame(&json!({
+                "method": "error",
+                "params": { "error": error, "willRetry": false,
+                            "threadId": "thr-1", "turnId": "turn-A" },
+            }));
+            assert_eq!(
+                step.events,
+                [AgentEvent::Error {
+                    message: message.into(),
+                    fatal: false,
+                    sign_in: false
+                }],
+                "{info}"
+            );
+            let step = m.on_frame(&json!({
+                "method": "turn/completed",
+                "params": { "threadId": "thr-1",
+                            "turn": { "id": "turn-A", "status": "failed", "error": error } },
+            }));
+            let aborts: Vec<_> = step
+                .events
+                .iter()
+                .filter(|e| matches!(e, AgentEvent::TurnAborted { .. }))
+                .collect();
+            assert!(
+                matches!(
+                    aborts.as_slice(),
+                    [AgentEvent::TurnAborted { interrupted: false, reason, .. }]
+                        if reason == "turn failed"
+                ),
+                "{info}: {:?}",
+                step.events
+            );
+            assert!(!m.turn_active, "{info}");
+        }
     }
 
     fn usage_frame(thread: &str, turn: &str, total_out: u64, last_out: u64) -> Value {

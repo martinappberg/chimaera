@@ -38,7 +38,8 @@ Claude Code 2.1.277+ reads `AGENTS.md` as a fallback when `CLAUDE.md` is absent.
 Existing explicit `CLAUDE.md` → `AGENTS.md` bridges remain useful for older
 runtimes and Claude-specific additions; Chimaera does not rewrite them at launch.
 Before the first live model catalog arrives, Codex's curated fallback starts with
-GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
+GPT-6.2 Sol and GPT-6.2 Astra (the catalog default from Codex 0.171.0), then GPT-6.1 Sol,
+which the free plans still have. Once available, the host's account-specific catalog replaces it.
 
 ## Launching an agent
 
