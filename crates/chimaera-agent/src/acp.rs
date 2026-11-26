@@ -1656,14 +1656,13 @@ impl Mapper for AcpMapper {
                 });
             }
             "available_commands_update" => {
-                self.commands = unique_rows(&update["availableCommands"], "name")
-                    .take(SLASH_COMMANDS_CAP)
-                    .map(|c| SlashCommand {
+                self.commands = crate::model::cap_slash_catalog(
+                    unique_rows(&update["availableCommands"], "name").map(|c| SlashCommand {
                         name: small(&c["name"]),
                         description: small(&c["description"]),
                         skill_path: None,
-                    })
-                    .collect();
+                    }),
+                );
                 if self.grok_modes {
                     self.list_grok_modes(&mut step);
                     self.resume(&mut step);

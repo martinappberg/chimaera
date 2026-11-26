@@ -1943,3 +1943,124 @@ The same day's drift pass probed the newest Grok Build, Antigravity and Cursor r
 ### Gate (Pass 61)
 
 - Hermetic, new: `acp.rs` `grok_billing_without_a_percent_reads_an_unused_period`, `a_combined_model_id_restores_as_model_and_thinking_level`, `shell_output_comes_from_raw_output_when_content_is_absent` (all from the logged frames); `runtimes.rs` `shim_turns_off_self_update_for_the_managed_agy_only`, `only_a_managed_agy_spawn_turns_off_self_update`; `agent_probe.rs` `probes_never_start_an_agent_self_update`; `runtime_retention.rs` `a_self_updated_activation_keeps_every_package`.
+
+## Pass 63 (2026-11-26 — live probes claude 2.1.332, codex 0.172.0): drift pass for the two native drivers. Both pins moved; four Claude mappings ADOPTED, one Codex list updated.
+
+Claude Code 2.1.318 → 2.1.332 (npm `latest`; `stable` is 2.1.326; 2.1.320 and 2.1.324 have no changelog section and 2.1.322 is one line) and Codex 0.166.0 → 0.172.0 (npm and GitHub latest). The maintainer also asked that anything new in either range be supported, so the changelogs were read whole for features a host should handle, not only for breakage.
+
+**Method.** Both versions were installed into throwaway npm prefixes (`npm install --prefix <scratch> @anthropic-ai/claude-code@2.1.332` / `@openai/codex@0.172.0`), first on `PATH` for the suite; the maintainer's own installs (claude 2.1.331, codex 0.164.0) were never touched. Every `CLAUDE*`, `ANTHROPIC_*`, `OPENAI_*` and `CODEX_*` variable was scrubbed from the environment. `~/.claude/settings.json` hashed the same before and after. Probes:
+
+- Claude 2.1.332, raw stream-json client with the driver's flags and frames, every frame logged. No turn: `initialize`, `apply_flag_settings` with a valid and two invalid values, `get_settings`. Eight billed haiku turns in five runs: a 7 s `PreToolUse` and a 5 s `Stop` command hook with `CLAUDE_CODE_HOOK_HEARTBEAT_INTERVAL_MS=2000` and `--plugin-dir` naming a missing folder; a foreground 10 s command with a plain and an `isSynthetic: true` message sent mid-turn (`priority: "next"`), then an `isSynthetic` turn opener, once with telemetry on and once with `DISABLE_TELEMETRY=1`, with the native transcript read afterwards; `CronCreate` / `CronList` / `CronDelete`; two plain turns around the `commands_changed` push. The binaries' literal sets (`*_vN` tokens, subtypes) of 2.1.319 (the oldest on disk) and 2.1.332 were diffed, and the schema text for `tool_progress`, `hook_progress`, `plugin_errors`, `commands_changed` and the stdin `user` frame read out of the 2.1.332 binary.
+- Codex 0.172.0: `generate-ts` (stable and `--experimental`) diffed against 0.164.0, the oldest-to-newest span on disk (Pass 59 found 0.164.0 → 0.166.0 additive). No turn, on the real account: `initialize`, `model/list`, `thread/start` with no model, `thread/settings/update` with an unlisted model. Not billed: the real app-server on an isolated `CODEX_HOME` against a scripted local Responses provider that answers each new error code. The release notes rust-v0.167.0 … rust-v0.172.0 and about 150 of the PRs they cite.
+
+### Findings: Claude Code 2.1.332
+
+- **No drift in anything the driver maps.** `just chat-smoke` passed on the unchanged driver. The `initialize` response adds four keys and its catalog has 86 entries; `system/init.capabilities` grows 14 → 23 and the four tokens the driver keys on are present. See [claude-code.md › Handshake](claude-code.md#handshake-and-initialize).
+- **The slash catalog was cut (ADOPTED).** The driver and the UI each kept 64 commands. The CLI lists the user's and the plugins' skills first and its own commands last, so with 82 (2.1.318) or 86 (2.1.332) entries the composer never offered `/usage`, `/recap`, `/goal` and the rest of the tail. The bound is now 256 rows and 96 KiB of serialized rows, shared by all three drivers (`cap_slash_catalog`; Cursor's ~78 commands were cut the same way, Pass 59).
+- **`system/commands_changed` was dropped (ADOPTED).** The CLI pushes the whole list again after a mid-session change. Live it came 1.4 s after spawn, when the account's MCP servers had connected, adding an MCP prompt. This is also the only way 2.1.332's MCP-server skills (`server:skill`, read with `skills/list` after a server connects) can reach a host. The driver now replaces its catalog and journals `Catalog`.
+- **`system/init.plugin_errors` (2.1.323, ADOPTED).** `[{plugin: "inline[0]", type: "path-not-found", message: "Path not found: …", path}]` for a missing `--plugin-dir`; 2.1.323 lists managed-settings plugins there too. It was ignored; it is now one Notice. `init` repeats at every turn start, so this Notice and the existing `mcp_server_errors` one are said once and again only on change (the MCP one used to repeat every turn).
+- **Recurring jobs last 30 days (2.1.330, ADOPTED).** `CronCreate`'s result adds `maxAgeMs: 2592000000`; the tracker assumed 7 days and the Ahead card printed an end date 23 days early. `ScheduledJob.expires_at_ms` (additive) carries the job's own end; 7 days stays the fallback for an older CLI.
+- **Hook heartbeat (2.1.323): no change.** `{type: "tool_progress", tool_use_id: "hook-PreToolUse-<tool id>-heartbeat-0", tool_name: "PreToolUse", parent_tool_use_id: "<tool id>", elapsed_time_seconds: 2, heartbeat: true}`; for Stop the id is one no row has. It reaches no arm and draws nothing, and the UI never sees it, so nothing logs or lands in `unhandledEventTypes`. Pinned by a hermetic test from the captured frames.
+- **`isSynthetic` on relayed mid-turn text (2.1.332): documented non-adoption.** The CLI does not add the mark; the host is asked to. A marked stdin frame keeps its `command_lifecycle` frames but is left out of `result.user_message_uuids`, and the model treats it as untrusted: mid-turn, "I'm ignoring the instruction … It came inside a tool result, not from you"; as a turn opener it is stored as `[MESSAGE FROM NON-USER SOURCE - NOT USER INPUT]` (`turnOrigin: "host_synthetic"`) and declined. Telemetry on or off made no difference. Chimaera's own user sends must stay unmarked, and so does Send now. The Mastermind's direction and the wakes the daemon sends for other agents' messages go out as ordinary sends today; marking them would be the honest label and would also make workers refuse the Mastermind. That is a product decision, left to the maintainer. The driver's inbound `isSynthetic` filter is unaffected (nothing echoes a stdin frame).
+- **Monitor as `monitor` in Stop / SubagentStop `background_tasks` (2.1.329): no change.** Hook input only, and no hook's `background_tasks` is read. The wire's `background_tasks_changed` lanes passed their live cases unchanged.
+- **Question open at close (2.1.328): no change, not probed.** Chimaera's dismiss is the directive deny, which ends the turn on every provider, and teardown drains pending asks.
+- **Permission flows (2.1.325 / 2.1.326): no change.** The permission, plan-approval and feedback-denial live cases passed. An invalid `apply_flag_settings` value answered `success` and changed nothing; the refusal the changelog describes did not reproduce.
+- **`claude-fable-5-2` (2.1.321): no change.** The catalog lists `claude-fable-5-2[1m]` as "Fable"; the daemon's fallback list uses the `fable` alias. The "Fable 5" wording in the overage dialog and limit label still fits.
+- New, not adopted: `update_queued_message_v1` (edit a waiting message in place; behind a server flag that is off here, so the ✎ flow keeps withdrawing and resending), the `late_allow_not_run`, `shell_cwd`, `ui_notify` and `voice_call_talk` subtypes, Code Mode, `permissions.denyInsteadOfPrompting`.
+
+### Changelog review: Claude Code 2.1.319–2.1.332
+
+Entries that matter to a host driving the CLI structurally. Rows without "live" are from the changelog and the repo, not a probe.
+
+| Version | Change | Chimaera today | Recommendation |
+|---|---|---|---|
+| 2.1.332 | Mid-turn SDK messages count as the user's; "mark relayed text `isSynthetic: true`" | Agent and Mastermind sends go unmarked | **Not adopted** (live, above); a product decision |
+| 2.1.332 | Skills from MCP servers as `server:skill` | Catalog was fixed at `initialize` and cut at 64 | **Adopted**: `commands_changed`, larger bound |
+| 2.1.332 | A foreground fork's Agent call no longer reads finished at fork start (headless) | Rows from the Agent tool frames | Ignore (benefits) |
+| 2.1.332 | "Always deliver" for held messages from other sessions | `peer_message_hold` tolerated, unmapped | Adopt later: capture how a `-p` host is asked |
+| 2.1.332 | Usage limit no longer reported reached after it reset | `rate_limit_event` mapped | Ignore (benefits) |
+| 2.1.331 / 2.1.330 | Shorter sign-in links; `CLAUDE_CODE_FULL_SIGN_IN_LINK=1` | The sign-in card keeps only links on known hosts | Adopt later: check the short link's host against the card's list |
+| 2.1.330 | Recurring tasks and `/loop` run 30 days | Assumed 7 | **Adopted** (live `maxAgeMs`) |
+| 2.1.330 | `easel` mod draws charts | `ui_placed` rows are not drawn | Adopt later (Mods parity) |
+| 2.1.329 | Monitor is `monitor` in Stop hook `background_tasks`; one background count in `/tasks` | Hook list not read; the tray counts the wire set | Ignore |
+| 2.1.329 | Durable scheduled tasks need rescheduling in a new session | Every job treated as session-only | Ignore |
+| 2.1.328 | `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`; one 10-minute wait with `CLAUDE_CODE_FORK_SUBAGENT=0` | `FORK_SUBAGENT` never set | Ignore |
+| 2.1.328 | `CLAUDE_CODE_DISABLE_DEFERRED_TOOL_RESUME` | Chimaera's hooks never defer | Ignore |
+| 2.1.328 | The turn ends when a session closes with a question open (third-party or telemetry off) | Dismiss is the directive deny | Ignore; not probed |
+| 2.1.328 | Send now no longer tells Claude a stopped web search found nothing | `interrupt {send_now}` | Ignore (benefits) |
+| 2.1.327 | A resent message with the same uuid no longer loses stored messages (headless) | uuids are minted per send | Ignore (benefits) |
+| 2.1.326 | A command an approver rewrites stays sandboxed | The allow echoes `updatedInput` verbatim | Ignore |
+| 2.1.325 | An invalid `applyFlagSettings` value is refused instead of wiping earlier ones | Three `apply_flag_settings` call sites | Ignore: not reproduced live; a refusal already shows |
+| 2.1.325 | Sandboxed Bash follows the normal permission flow; "Always allow" offered only when it would apply | Generic `can_use_tool` card, keyed on `permission_suggestions` | Ignore (more cards for sandbox users) |
+| 2.1.323 | 30-second hook progress heartbeat | `tool_progress` unhandled | Ignore (live: silent); could later feed a "running hook" status |
+| 2.1.323 | `init.plugin_errors` lists managed-settings plugin load errors | Not read | **Adopted** |
+| 2.1.323 | Code Mode (opt-in: Claude writes scripts that call its tools) | One row per `tool_use` | Adopt later: capture a Code Mode turn first |
+| 2.1.323 | `PreCompact` / `PostCompact` hooks carry the subagent's identity | The daemon skips context for subagent hooks | Ignore (benefits) |
+| 2.1.321 | `claude-fable-5-2`; saved Fable 5.1 picks move to `fable` | `fable` alias in the fallback list | Ignore; a remembered `claude-fable-5-1[1m]` stays as the user picked it |
+| 2.1.321 | `-p` background commands are stopped after 10 minutes, not 30 | claude-code.md cites 30 from source | Adopt later: time one `run_in_background` command to its stop |
+| 2.1.319 | A self-paced `/loop` ends when a turn finishes without rescheduling | The tracker tolerates an unnamed keepalive fire | Ignore; doc line updated |
+| 2.1.319 | `permissions.denyInsteadOfPrompting` | Not set | Adopt later: unattended chats that should not wait on a card |
+| 2.1.319 | PostToolUse hooks still run on calls that finish after a new message interrupts | Agent messages ride PostToolUse context | Adopt later: confirm context injected after a Send now is read |
+| binary | `update_queued_message_v1` | ✎ withdraws and resends | Adopt later, when the flag is on |
+
+### Findings: Codex 0.172.0
+
+- **No drift in anything the driver maps.** `just chat-smoke` passed on the unchanged driver. Against 0.164.0, `ServerNotification` adds two methods, `ServerRequest` loses one and gains none, `ClientNotification` is unchanged, every method the driver sends is present, and `ThreadItem` has no new item type.
+- **`currentTime/read` removed (0.171.0): no change.** Nothing replaces it; the driver's answer stays for older binaries.
+- **New error variants: no mapper change.** `inferenceHookDenied`, `bioPolicy` and the three `*SpendLimitExceeded` values each arrive as `error {willRetry: false}` with a message that already names the scope ("Your API project has reached its spend limit."), then a failed turn. The driver does not classify by `codexErrorInfo`; it shows the message once and ends the turn, which is what these need. Pinned by a hermetic test from the captured frames. See [codex.md › Turn lifecycle](codex.md#turn-lifecycle).
+- **GPT-6.2 Sol is the catalog default (0.171.0): fallback list updated.** Live `model/list` leads with `gpt-6.2-sol` (`isDefault`) and `gpt-6.2-astra`, both `multiAgentVersion: "v2"`; `gpt-5.6-luna` is the one `v1` model left, so both collab runtimes are still exercised by the live suite. The account's own `thread/start` default was still `gpt-6.1-sol`. `launcher.rs` lists the 6.2 models first for a host with no handshake yet.
+- **`features.multi_agent` deprecated (0.168.0): no change.** The `configWarning` is raised only for a `config.toml` that sets the key; chimaera passes only `features.instant_interrupt`.
+- **Thread cwd / workspace roots (0.172.0): no change.** Same JSON; the driver reads `thread.id`, `model` and `reasoningEffort` from `thread/start`.
+- **Approval and interrupt fixes (0.167.0–0.172.0): no change.** The reviewer the driver sends with every mode survives a model switch (#59893); late turn ends no longer cancel a newer turn's approvals (#61801). The steer, Send now and interrupt live cases passed, so the Pass 54, 56 and 60 workarounds stay.
+- New, not adopted: `humanCommand` approvals behind the `requiredHumanApproval` capability, `agentMessage.moderation`, `thread/prepareApprovedPlan`, `modelProvider/*`, `_meta.tool_name` / `tool_annotations` on MCP approval elicitations.
+
+### Release notes: Codex 0.167.0–0.172.0
+
+| Version | PR | Change | Chimaera today | Recommendation |
+|---|---|---|---|---|
+| 0.172 | #62329 | Spend-limit errors by scope, non-retryable; usage-limit handling also for goals and compaction | Message shown, turn aborted | Ignore (live: readable as it comes) |
+| 0.172 | #62375–#62377 | Thread `cwd` and workspace roots as server-native strings, same JSON | Not read | Ignore |
+| 0.172 | #62360 | Per-tool `approvals_reviewer` for app tools | Thread-level reviewer per mode | Ignore |
+| 0.172 | #62366 | Optional stdio MCP servers start at first call | Handshakes near the 20 s budget came from these | Ignore (benefits) |
+| 0.171 | #61382 | `currentTime/read` removed | Answered for older binaries | Ignore |
+| 0.171 | #62106 | `gpt-6.2-sol` (default) and `gpt-6.2-astra` | Fallback list led with 6.1 Sol | **Adopted** (`launcher.rs`) |
+| 0.171 | #62176 | `bioPolicy` (was `other`) | Message shown | Ignore |
+| 0.171 | #62066 | `turn/interrupt` answers when its turn ends; two new errors at listener shutdown | An interrupt error other than "no active turn" is shown | Adopt later: treat the two shutdown messages as benign, once seen live |
+| 0.171 | #61801, #61841 | Late turn ends no longer cancel newer approvals; late command items close `declined` | Watchdog and turn adoption (Pass 56) | Ignore (benefits); keep the workarounds |
+| 0.171 | #61186 | `plan` item ids are unique after completion | `item/plan/delta` keys on `itemId` | Ignore (benefits) |
+| 0.170 | #60904 | `agentMessage.moderation` with `display.mode: show / hide / block` | Text rendered as it comes | Adopt later: honor `hide` / `block`, once a live frame shows one |
+| 0.169 | #60511 | `inferenceHookDenied`, terminal | Message shown | Ignore |
+| 0.169 | #60655 | `thread/settings/update` waits for acceptance; `environments` on settings | The error branch and the read-back | Ignore (live: an unlisted model is still accepted) |
+| 0.169 | #59893, #59272 | Reviewer recomputed on a model switch; requested and effective reviewer kept apart | Explicit reviewer with every mode | Ignore |
+| 0.169 | #60487 | `untrusted_as_tool_output` on by default | Agent messages steer as user input | Adopt later: named `additionalContext` for other agents' messages (Pass 59's row, now unblocked) |
+| 0.169 | #59768 | `plugin_discovery_prefetch` removed; no startup plugin prefetch | Pass 59 row "adopt later, version-gated" | Ignore: moot |
+| 0.169 | #60763 | `thread/prepareApprovedPlan` (experimental) | Plan mode has no clear-and-implement | Adopt later |
+| 0.168 | #59479 | `features.multi_agent` deprecated for `[agents].enabled` | Never passed | Ignore |
+| 0.168 | #58877, #58998 | A steer accepted during the final flush resumes sampling in the same turn | Pass 54's owed answer turn, Pass 60's re-drive | Ignore (benefits); keep the workarounds |
+| 0.168 | #58845, #58876 | `modelProvider/list`, `modelProvider/config/write` | One provider | Adopt later (custom gateways) |
+| 0.167 | #58045 | `humanCommand` approvals, only for a client declaring `requiredHumanApproval` | Not declared: such a command is rejected | Adopt later (managed `prompt-user` rules) |
+| 0.167 | #58161 | MCP approval elicitation `_meta` carries `tool_name` and `tool_annotations` | Tool name parsed from the message text | Adopt later: capture one frame, then cross-check the parsed name |
+| 0.167 | #58350, #58351 | Network approval prompts resolved through `serverRequest/resolved` | That frame closes cards | Ignore (benefits) |
+
+### ADOPTED
+
+- `model.rs`: `SLASH_COMMANDS_CAP` 64 → 256 with `SLASH_CATALOG_BUDGET` (96 KiB serialized) and `cap_slash_catalog`, used by `claude.rs`, `codex.rs` and `acp.rs`; `ScheduledJob.expires_at_ms` (additive on the wire).
+- `claude.rs`: `system/commands_changed` → the catalog is replaced and `Catalog` journaled when it differs; `system/init.plugin_errors` → one Notice; both init error Notices said once per text.
+- `autonomy.rs`: a job's end comes from `CronCreate`'s `maxAgeMs`, kept across `CronList`; 7 days when absent.
+- `launcher.rs`: GPT-6.2 Sol and GPT-6.2 Astra lead the Codex fallback list.
+- UI: the slash catalog keeps 256 rows (models and modes stay at 64); the Ahead card's "ends" date uses the job's own end (`jobEndsAtMs`).
+
+### Unverified
+
+- That the CLI runs an MCP prompt or an MCP-server skill sent as `/<catalog name>`: no server that serves skills was available, and the one prompt in the list was sent before the push that named it.
+- The question-open ending, the 10-minute background ceiling, a held peer message's "Always deliver", Code Mode frames, `humanCommand`, and `agentMessage.moderation`: none could be provoked cheaply; each is a row above.
+- The Claude diff base was 2.1.319 for binary literals (2.1.318 is no longer on disk) and the Codex schema base 0.164.0; frame key sets were compared with the Pass 59 record, not a fresh old-version capture.
+
+### Gate (Pass 63)
+
+- Hermetic, new: `claude.rs` `commands_changed_replaces_the_catalog`, `init_error_lists_are_not_repeated_every_turn`, `hook_heartbeats_are_silent`; `model.rs` `a_catalog_is_cut_by_count_and_by_serialized_size`; `autonomy.rs` `a_job_ends_when_its_create_result_says` (and the 30-day arm of the expiry test); `codex.rs` `spend_limit_and_policy_errors_end_the_turn_with_their_own_words`; UI `keeps a slash catalog longer than the models and modes bound`, `ends a recurring job when the agent says, else a week after it was made`. `launcher.rs` `curated_lists_cover_every_agent` lists the 6.2 models.
+- `just chat-smoke`: 44/44 on claude 2.1.332 and codex 0.172.0 with the driver as it was at the old pins, no reruns (855 s). Run again on the final tree, after the mapper changes: 44/44, no reruns (866 s).
+- `just chat-mods-smoke`: 1/1 on claude 2.1.332.
+- `just check`: fmt, clippy and every test green (the daemon workspace and the plugins workspace); its last step, which refuses an uncommitted wire fixture, flagged `chat-events.json` for the new `expires_at_ms` until the fixture was committed with the client change. `npm --prefix web-ui run check` (0 errors) and `run test` (3212 passed).
+- Live UI (isolated daemon on this branch, the real claude 2.1.332, no turn sent): a fresh Claude chat's composer offered `/goal` and `/xlsx` (the 86th and last catalog entry), and `/claude` listed `claude.ai bioRxiv:analyze_preprint (MCP)`, which only the `commands_changed` push carries.
+- Pins moved: `TESTED_CLAUDE_VERSION` 2.1.332, `TESTED_CODEX_VERSION` 0.172.0.

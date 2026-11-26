@@ -57,8 +57,12 @@ pub(crate) fn models(kind: AgentKind) -> &'static [(&'static str, &'static str)]
             ("haiku", "Haiku"),
         ],
         // Fresh-launch fallback; the account's model/list replaces it after
-        // a handshake. GPT-6.1 Sol is the September 2026 workhorse default.
+        // a handshake. GPT-6.2 Sol is the catalog default from codex 0.171.0
+        // (`isDefault` in a live 0.172.0 `model/list`); the 6.2 models are not
+        // on the free plans, so GPT-6.1 Sol stays listed right after them.
         AgentKind::Codex => &[
+            ("gpt-6.2-sol", "GPT-6.2 Sol"),
+            ("gpt-6.2-astra", "GPT-6.2 Astra"),
             ("gpt-6.1-sol", "GPT-6.1 Sol"),
             ("gpt-6-astra", "GPT-6 Astra"),
             ("gpt-6.1-terra", "GPT-6.1 Terra"),
@@ -2751,7 +2755,7 @@ mod tests {
         assert!(!is_outdated(AgentKind::Claude, Some("0.1.99")));
         // The curated FALLBACK lists (the live Init catalog wins once seen):
         // claude's family aliases, which the CLI resolves itself; codex's
-        // model/list ids (0.166.0), which thread/start accepts verbatim.
+        // model/list ids (0.172.0), which thread/start accepts verbatim.
         assert_eq!(
             models(AgentKind::Claude),
             [
@@ -2764,6 +2768,8 @@ mod tests {
         assert_eq!(
             models(AgentKind::Codex),
             [
+                ("gpt-6.2-sol", "GPT-6.2 Sol"),
+                ("gpt-6.2-astra", "GPT-6.2 Astra"),
                 ("gpt-6.1-sol", "GPT-6.1 Sol"),
                 ("gpt-6-astra", "GPT-6 Astra"),
                 ("gpt-6.1-terra", "GPT-6.1 Terra"),

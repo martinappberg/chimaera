@@ -34,23 +34,22 @@ use crate::driver::{
 };
 use crate::elicitation::{Elicitation, ElicitationAction, ELICITATION_PENDING};
 use crate::model::{
-    cap_head_tail, cap_output, clip_command, fmt_elapsed_secs, fmt_tokens, truncate_label,
-    AgentCommand, AgentEvent, BackgroundTask, BackgroundTaskClose, ChunkKind, Coalescer,
-    CompactionPhase, CompactionTrigger, ContentBlock, ModeInfo, PermissionOption,
+    cap_head_tail, cap_output, cap_slash_catalog, clip_command, fmt_elapsed_secs, fmt_tokens,
+    truncate_label, AgentCommand, AgentEvent, BackgroundTask, BackgroundTaskClose, ChunkKind,
+    Coalescer, CompactionPhase, CompactionTrigger, ContentBlock, ModeInfo, PermissionOption,
     PermissionOptionKind, PlanEntry, PlanStatus, SlashCommand, ToolContent, ToolKind, ToolStatus,
     Usage, UsageWindow, UserMessageState, WorkflowAgent, BG_LABEL_MAX, BG_PATH_MAX, BG_TASKS_CAP,
     COMMAND_ID_MAX, DIFF_FILE_BUDGET, DIFF_TURN_BUDGET, PLAN_BLOCKED_CAP, PLAN_DESC_MAX,
-    PLAN_LABEL_MAX, PLAN_TASKS_CAP, SLASH_COMMANDS_CAP, SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX,
-    STATUS_DETAIL_MAX, SUBAGENT_RESULT_MAX, TOOL_SUMMARY_IDS_CAP, TOOL_SUMMARY_MAX,
-    UNHANDLED_REQUESTS_CAP, UNHANDLED_REQUEST_NAME_MAX, WF_AGENTS_CAP, WF_AGENTS_SET_BUDGET,
-    WF_AGENT_LABEL_MAX,
+    PLAN_LABEL_MAX, PLAN_TASKS_CAP, SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX, STATUS_DETAIL_MAX,
+    SUBAGENT_RESULT_MAX, TOOL_SUMMARY_IDS_CAP, TOOL_SUMMARY_MAX, UNHANDLED_REQUESTS_CAP,
+    UNHANDLED_REQUEST_NAME_MAX, WF_AGENTS_CAP, WF_AGENTS_SET_BUDGET, WF_AGENT_LABEL_MAX,
 };
 use crate::model::{RemoteControlSnapshot, RemoteControlState};
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 
 /// CLI version these frame shapes were verified against (2026-11-04, the
 /// Claude part of chat-smoke + chat-mods-smoke; PROTOCOL.md Pass 59).
-pub const TESTED_CLAUDE_VERSION: &str = "2.1.318";
+pub const TESTED_CLAUDE_VERSION: &str = "2.1.332";
 
 /// The environment variable that lowers Claude Code's auto-compact
 /// threshold to a percentage of its window (PROTOCOL.md Pass 55). Chimaera
@@ -201,6 +200,55 @@ fn queued_message_frame(uuid: &str, content: Value, priority: &str, requeue: boo
         frame["requeue_if_interrupted_within_ms"] = json!(REQUEUE_WINDOW_MS);
     }
     frame
+}
+
+/// The composer catalog from the CLI's command list: the `initialize`
+/// response's `commands`, or a later `system/commands_changed` push, which
+/// replaces it. Names are kept whole or dropped (a cut name would invoke
+/// something else), duplicates fold case-insensitively, and the rows are
+/// bounded by [`cap_slash_catalog`].
+fn claude_slash_commands(list: &Value) -> Vec<SlashCommand> {
+    let mut seen = HashSet::new();
+    cap_slash_catalog(list.as_array().into_iter().flatten().filter_map(|c| {
+        let name = c["name"].as_str()?;
+        if name.is_empty() || name.len() > SLASH_NAME_MAX || !seen.insert(name.to_ascii_lowercase())
+        {
+            return None;
+        }
+        Some(SlashCommand {
+            name: name.to_string(),
+            description: truncate_label(
+                c["description"].as_str().unwrap_or_default(),
+                SLASH_DESCRIPTION_MAX.saturating_sub('…'.len_utf8()),
+            ),
+            skill_path: None,
+        })
+    }))
+}
+
+/// One Notice for the plugins `system/init.plugin_errors` says did not load
+/// (2.1.323 lists the ones managed settings enable too): `[{plugin, type,
+/// message, path?}]`, where `plugin` is `name@marketplace` or a positional
+/// `inline[N]` tag for a `--plugin-dir` entry, whose `path` then names it.
+/// `None` when the list is absent or names nothing.
+fn plugin_errors_notice(errors: &Value) -> Option<String> {
+    let rows: Vec<String> = errors
+        .as_array()?
+        .iter()
+        .take(8)
+        .filter_map(|e| {
+            let name = e["path"]
+                .as_str()
+                .or_else(|| e["plugin"].as_str())
+                .filter(|name| !name.is_empty())?;
+            let name = truncate_label(name, 120);
+            Some(match e["message"].as_str().filter(|m| !m.is_empty()) {
+                Some(m) => format!("{name} ({})", truncate_label(m, 160)),
+                None => name,
+            })
+        })
+        .collect();
+    (!rows.is_empty()).then(|| format!("Plugin not loaded: {}", rows.join(", ")))
 }
 
 /// The one line for `system/session_writes_lost {error_code, lost}`
@@ -1190,6 +1238,11 @@ struct ClaudeMapper {
     /// it, so its absence names that variable as the one holding
     /// auto-compact off (else `DISABLE_AUTO_COMPACT`).
     compact_offered: bool,
+    /// The `mcp_server_errors` / `plugin_errors` lines already shown. `init`
+    /// comes again at every turn start and repeats both lists, so each line
+    /// is said once and again only when it changes.
+    mcp_errors_shown: Option<String>,
+    plugin_errors_shown: Option<String>,
     /// The last auto-compact state journaled (latest-wins dedupe).
     auto_compact: Option<(bool, Option<&'static str>)>,
     /// Remote Control offer flags from the initialize response (see
@@ -1251,32 +1304,7 @@ impl ClaudeMapper {
         let compact_offered = commands_catalog["commands"]
             .as_array()
             .is_none_or(|cmds| cmds.iter().any(|c| c["name"] == "compact"));
-        let mut seen_commands = HashSet::new();
-        let slash_commands = commands_catalog["commands"]
-            .as_array()
-            .map(|cmds| {
-                cmds.iter()
-                    .filter_map(|c| {
-                        let name = c["name"].as_str()?;
-                        if name.is_empty()
-                            || name.len() > SLASH_NAME_MAX
-                            || !seen_commands.insert(name.to_ascii_lowercase())
-                        {
-                            return None;
-                        }
-                        Some(SlashCommand {
-                            name: name.to_string(),
-                            description: truncate_label(
-                                c["description"].as_str().unwrap_or_default(),
-                                SLASH_DESCRIPTION_MAX.saturating_sub('…'.len_utf8()),
-                            ),
-                            skill_path: None,
-                        })
-                    })
-                    .take(SLASH_COMMANDS_CAP)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let slash_commands = claude_slash_commands(&commands_catalog["commands"]);
         // The initialize response IS the account model catalog: `value` is
         // what set_model accepts; supportedEffortLevels feeds the effort
         // menu (absent = the model has no effort knob, e.g. haiku).
@@ -1394,6 +1422,8 @@ impl ClaudeMapper {
             auto_compact_read: 0,
             auto_compact_env: None,
             compact_offered,
+            mcp_errors_shown: None,
+            plugin_errors_shown: None,
             auto_compact: None,
             remote_control_available,
             remote_control_auto_enable,
@@ -1912,11 +1942,40 @@ impl ClaudeMapper {
                         })
                         .collect();
                     if !names.is_empty() {
-                        self.flush_prose(step);
-                        step.events.push(AgentEvent::Notice {
-                            text: format!("MCP server config skipped: {}", names.join(", ")),
-                        });
+                        let text = format!("MCP server config skipped: {}", names.join(", "));
+                        if self.mcp_errors_shown.as_deref() != Some(text.as_str()) {
+                            self.flush_prose(step);
+                            step.events.push(AgentEvent::Notice { text: text.clone() });
+                            self.mcp_errors_shown = Some(text);
+                        }
                     }
+                }
+                // Plugins that did not load (2.1.323 adds the ones managed
+                // settings enable; a `--plugin-dir` miss was listed before).
+                // The CLI starts without them and says nothing else.
+                if let Some(text) = plugin_errors_notice(&frame["plugin_errors"]) {
+                    if self.plugin_errors_shown.as_deref() != Some(text.as_str()) {
+                        self.flush_prose(step);
+                        step.events.push(AgentEvent::Notice { text: text.clone() });
+                        self.plugin_errors_shown = Some(text);
+                    }
+                }
+            }
+            // The whole command list again, after a mid-session change: MCP
+            // servers that connected after `initialize` (their prompts, and
+            // from 2.1.332 their skills as `server:skill`), skills found as
+            // the agent works in a subfolder. The schema says to replace the
+            // cached list. Journaled only when it differs: `Catalog` carries
+            // the full set.
+            Some("commands_changed") => {
+                let commands = claude_slash_commands(&frame["commands"]);
+                if commands != self.slash_commands {
+                    self.slash_commands = commands;
+                    step.events.push(AgentEvent::Catalog {
+                        models: self.models.clone(),
+                        modes: claude_modes(),
+                        slash_commands: self.slash_commands.clone(),
+                    });
                 }
             }
             // Remote Control bridge lifecycle (2.1.259).
@@ -6711,7 +6770,7 @@ pub(crate) mod tests {
 
     #[test]
     fn slash_catalog_is_bounded_at_construction() {
-        let mut commands: Vec<Value> = (0..=SLASH_COMMANDS_CAP)
+        let mut commands: Vec<Value> = (0..=crate::model::SLASH_COMMANDS_CAP)
             .map(|i| {
                 json!({
                     "name": format!("command-{i}"),
@@ -6725,7 +6784,10 @@ pub(crate) mod tests {
         );
         let mapper = ClaudeMapper::new(None, None, &json!({ "commands": commands }));
 
-        assert_eq!(mapper.slash_commands.len(), SLASH_COMMANDS_CAP);
+        assert_eq!(
+            mapper.slash_commands.len(),
+            crate::model::SLASH_COMMANDS_CAP
+        );
         assert_eq!(
             mapper
                 .slash_commands
@@ -12113,6 +12175,148 @@ pub(crate) mod tests {
                     .into()
             }
         );
+    }
+
+    /// `init` comes again at every turn start with the same lists: each
+    /// line is said once, and again only when it changes.
+    #[test]
+    fn init_error_lists_are_not_repeated_every_turn() {
+        let mut m = mapper();
+        // Live 2.1.332 (`--plugin-dir` naming a missing folder).
+        let init = |errors: Value| {
+            json!({
+                "type": "system", "subtype": "init", "session_id": "native-9",
+                "model": "claude-haiku-5-5", "permissionMode": "default",
+                "mcp_server_errors": [{ "name": "broken", "message": "no type" }],
+                "plugin_errors": errors,
+            })
+        };
+        let missing = json!([{
+            "plugin": "inline[0]", "type": "path-not-found",
+            "message": "Path not found: /nonexistent/chimaera-probe-plugin",
+            "path": "/nonexistent/chimaera-probe-plugin",
+        }]);
+        let notices = |step: &DriverStep| -> Vec<String> {
+            step.events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::Notice { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            notices(&m.on_frame(&init(missing.clone()))),
+            [
+                "MCP server config skipped: broken (no type)",
+                "Plugin not loaded: /nonexistent/chimaera-probe-plugin \
+                 (Path not found: /nonexistent/chimaera-probe-plugin)",
+            ]
+        );
+        assert!(notices(&m.on_frame(&init(missing))).is_empty());
+        // A managed-settings plugin (2.1.323) has no path: its name is shown.
+        let step = m.on_frame(&init(json!([
+            { "plugin": "linter@corp", "type": "not-cached", "message": "not installed" },
+            { "type": "nameless" },
+        ])));
+        assert_eq!(
+            notices(&step),
+            ["Plugin not loaded: linter@corp (not installed)"]
+        );
+        assert!(plugin_errors_notice(&json!([])).is_none());
+        assert!(plugin_errors_notice(&Value::Null).is_none());
+    }
+
+    /// `system/commands_changed` (live 2.1.332: 1.4 s after spawn, once the
+    /// MCP servers had connected) replaces the catalog `initialize` gave.
+    #[test]
+    fn commands_changed_replaces_the_catalog() {
+        let mut m = ClaudeMapper::new(
+            None,
+            None,
+            &json!({ "commands": [{ "name": "goal", "description": "Set a goal" }] }),
+        );
+        let pushed = json!({
+            "type": "system", "subtype": "commands_changed",
+            "commands": [
+                { "name": "goal", "description": "Set a goal", "argumentHint": "" },
+                { "name": "claude.ai bioRxiv:analyze_preprint (MCP)",
+                  "description": "Generate a prompt to analyze a preprint", "argumentHint": "" },
+                { "name": "notes:summarize", "description": "A skill an MCP server serves" },
+            ],
+            "uuid": "u-1", "session_id": "native-9",
+        });
+        let step = m.on_frame(&pushed);
+        let [AgentEvent::Catalog {
+            slash_commands,
+            modes,
+            ..
+        }] = step.events.as_slice()
+        else {
+            panic!("one Catalog, got {:?}", step.events);
+        };
+        assert_eq!(
+            slash_commands
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "goal",
+                "claude.ai bioRxiv:analyze_preprint (MCP)",
+                "notes:summarize"
+            ]
+        );
+        assert_eq!(modes, &claude_modes());
+        assert!(!m.turn_active, "a catalog push opens no turn");
+        // The same list again says nothing; the next `init` carries it.
+        assert!(m.on_frame(&pushed).events.is_empty());
+        let init = m.on_frame(&json!({
+            "type": "system", "subtype": "init", "session_id": "native-9",
+            "model": "claude-haiku-5-5", "permissionMode": "default",
+        }));
+        assert!(matches!(
+            &init.events[0],
+            AgentEvent::Init { slash_commands, .. } if slash_commands.len() == 3
+        ));
+    }
+
+    /// The 30-second progress heartbeat while a hook runs (2.1.323; live
+    /// 2.1.332 with a 7 s PreToolUse hook and a 5 s Stop hook) is a
+    /// `tool_progress` frame attributed to the tool call, or for Stop to an
+    /// id no row has. It draws nothing and names no subagent.
+    #[test]
+    fn hook_heartbeats_are_silent() {
+        let mut m = mapper();
+        m.turn_active = true;
+        for frame in [
+            json!({
+                "type": "tool_progress",
+                "tool_use_id": "hook-PreToolUse-toolu_01CYVEPdsPHeYZF5U4nMLBEd-heartbeat-0",
+                "tool_name": "PreToolUse",
+                "parent_tool_use_id": "toolu_01CYVEPdsPHeYZF5U4nMLBEd",
+                "elapsed_time_seconds": 2, "heartbeat": true,
+                "uuid": "54797476-e15f-4a87-8a18-588107152a9e", "session_id": "native-9",
+            }),
+            json!({
+                "type": "tool_progress",
+                "tool_use_id": "hook-Stop-c6ee3b2b-8243-4e03-b7ac-35a66aa251f8-heartbeat-0",
+                "tool_name": "Stop",
+                "parent_tool_use_id": "c6ee3b2b-8243-4e03-b7ac-35a66aa251f8",
+                "elapsed_time_seconds": 2, "heartbeat": true,
+                "uuid": "0d0e2f3a-0000-4000-8000-000000000001", "session_id": "native-9",
+            }),
+            // A tool's own heartbeat carries no parent.
+            json!({
+                "type": "tool_progress", "tool_use_id": "toolu_02-heartbeat-0",
+                "tool_name": "Bash", "parent_tool_use_id": null,
+                "elapsed_time_seconds": 30, "heartbeat": true,
+            }),
+        ] {
+            let step = m.on_frame(&frame);
+            assert!(step.events.is_empty(), "{frame}: {:?}", step.events);
+            assert!(step.outbound.is_empty());
+        }
+        assert!(m.turn_active);
     }
 
     #[test]
