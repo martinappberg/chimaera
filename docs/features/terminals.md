@@ -54,19 +54,22 @@ pipe), `POST /api/v1/sessions` (spawn), `POST /api/v1/sessions/{id}/exec`,
   - **zsh** starts with `-l` behind the `ZDOTDIR` shim, which forwards `.zshenv`, `.zprofile`,
     `.zshrc`, `.zlogin` and `.zlogout` to the user's own, in zsh's own order. The shim dir and
     the prelude run at the end of `.zlogin`, the last file a login zsh reads; the `.zshrc` shim
-    runs them itself only for a zsh that is not login (one typed in the terminal, an rc that
-    re-execs) or whose rc re-homed `ZDOTDIR`.
+    runs them itself only for a zsh that is not login (one typed in the terminal) or whose rc
+    re-homed `ZDOTDIR`.
   - **bash** ignores `--init-file` under `--login`, so it starts interactive with the init file
     and the init file reads what a login bash reads: `/etc/profile`, then the first readable of
     `~/.bash_profile`, `~/.bash_login`, `~/.profile`. `~/.bashrc` follows unless that profile
     already sourced it, so it runs once. That is read off the profile's text: a `.` or `source`
-    of a path ending in `/.bashrc`, outside a comment, in the profile or in the `~/.profile` it
-    sources. A mention that sources nothing (an alias, a comment, `/etc/bashrc`, `~/.bashrc.d`)
-    does not count, because the wrong guesses are not equal: an rc read twice is what a shell
-    opened inside a login session does, an rc never read is a terminal without its aliases.
-    Two things a real login bash has and this one lacks: `shopt login_shell` stays off (where
-    `/etc/bashrc` re-reads `/etc/profile.d` for a shell that is not login, those scripts run
-    twice, as in any nested bash), and `~/.bash_logout` is not run.
+    of a path ending in `/.bashrc`, outside a comment and outside a quoted string, in the
+    profile or in the `~/.profile` it sources. A mention that sources nothing (an alias, a
+    comment, an `echo` of a tip, `/etc/bashrc`, `~/.bashrc.d`) does not count, because the wrong
+    guesses are not equal: an rc read twice is what a shell opened inside a login session does,
+    an rc never read is a terminal without its aliases. Text cannot tell a `source` on a branch
+    the profile does not take; that rc is then not read. Where this differs from a real login
+    bash: `shopt login_shell` stays off (where `/etc/bashrc` re-reads `/etc/profile.d` for a
+    shell that is not login, those scripts run twice, as in any nested bash); bash has already
+    read its system rc where it is built with one (Debian's `/etc/bash.bashrc`), and
+    `/etc/profile` reads it again; `~/.bash_logout` is not run.
   - **PATH.** A login profile reorders the `PATH` the spawn started with (`path_helper` puts the
     system directories first, which would leave the shim dir last), so the shim dir
     (`CHIMAERA_SHIMS`) is moved back to the front after the startup files, listed once. Nothing
@@ -77,10 +80,11 @@ pipe), `POST /api/v1/sessions` (spawn), `POST /api/v1/sessions/{id}/exec`,
     the system directories ahead of anything that shell had prepended by hand (an activated
     virtualenv).
   - **A profile that replaces the shell** (`exec zsh` in `.bash_profile` on a host where the
-    login shell can't be changed, `exec tmux` at login) now does so in a terminal too, as it
-    does over ssh; what it starts has no shell integration, so `exec` falls back to sentinel
-    mode and the prelude does not run. A profile can tell a Chimaera terminal by
-    `CHIMAERA_SESSION`.
+    login shell can't be changed, `exec tmux` or `exec zsh -l` in `.zprofile`) now does so in
+    a terminal too, as it does over ssh; what it starts has no shell integration, the shim dir
+    is not moved to the front, `exec` falls back to sentinel mode and the prelude does not
+    run. The same was already true of an rc that `exec`s. A profile can tell a Chimaera
+    terminal by `CHIMAERA_SESSION`.
   - **fish** is unchanged, not login: it has no profile file (every fish reads `config.fish`),
     so only code under `status is-login` and fish's own import of macOS `/etc/paths` are left
     out. Other shells start plain.
