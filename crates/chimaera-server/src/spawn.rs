@@ -277,7 +277,10 @@ pub(crate) async fn spawn_session(
             }
             // Login-shell wrap: agents must see the user's terminal environment
             // (exported API keys, nvm PATHs) — the daemon's own env never
-            // sourced their profile.
+            // sourced their profile. The wrap is login-only, so what the
+            // interactive rc exports comes from the captured environment.
+            crate::shell_env::overlay(&mut opts.env).await;
+            opts.env_remove = crate::api::spawn_env_remove(&opts.env);
             opts.command = Some(crate::launcher::wrap_login_shell(
                 &crate::launcher::login_shell(),
                 argv,

@@ -1677,7 +1677,8 @@ pub(crate) async fn install_requirement(
                 .into_response();
         }
     };
-    let env = crate::api::session_env(&state, &session_id, "dark", prelude.as_deref());
+    let mut env = crate::api::session_env(&state, &session_id, "dark", prelude.as_deref());
+    crate::shell_env::overlay(&mut env).await;
     let env_remove = crate::api::spawn_env_remove(&env);
     // The agent's plugin manager runs a bare `git`; the Git binary path
     // setting's goes first on its PATH, after the login shell and the

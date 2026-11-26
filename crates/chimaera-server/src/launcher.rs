@@ -293,6 +293,9 @@ pub(crate) async fn detect_for_catalog(
 /// with the patient login-shell budget: on a loaded host a shell that needs
 /// more than the spawn budget still answers instead of failing the check.
 pub(crate) async fn verify(state: &AppState, kind: AgentKind) -> AgentDetection {
+    // Looking again covers what the rc files export, not only where the
+    // executable is: an installer may just have written both.
+    crate::shell_env::invalidate();
     detect_inner(state, kind, true, false, SHELL_PROBE_PATIENT).await
 }
 
@@ -587,7 +590,7 @@ impl From<&str> for ShellProbeError {
 
 /// Kill rc children as well as the shell on timeout or cancellation. The
 /// guard drops before the child is reaped, while its process-group id is owned.
-struct ShellProbeGroup(Option<nix::unistd::Pid>);
+pub(crate) struct ShellProbeGroup(pub(crate) Option<nix::unistd::Pid>);
 
 impl Drop for ShellProbeGroup {
     fn drop(&mut self) {
@@ -790,6 +793,12 @@ impl ShellProbes {
                         let bins = AgentKind::ALL.map(AgentKind::path_bin);
                         let answers = probe_login_shell_all(&shell, &bins, budget).await;
                         finished.store(true, Ordering::Release);
+                        // The shell works: read its environment for agents now,
+                        // after this probe rather than beside it, so the first
+                        // agent started doesn't wait for a second rc run.
+                        if answers.is_ok() {
+                            tokio::spawn(crate::shell_env::ready());
+                        }
                         answers
                     });
                     let flight = async move {
@@ -1545,6 +1554,12 @@ fn toml_basic_string(s: &str) -> String {
 /// demoted the shim dir from front to position 16 — so the front slot is
 /// reclaimed after the profile has run. A duplicate entry further back is
 /// harmless.
+///
+/// Before that the script restores `$CHIMAERA_SHELL_PATH` when the spawn set
+/// it: the PATH of the user's interactive login shell (`shell_env`), which
+/// has what `.zshrc`/`.bashrc` add and this login-only shell never read, in
+/// the order a terminal has it. It is unset before the exec, so no agent
+/// inherits it.
 /// Both scripts also run the user's environment prelude (when the spawn
 /// set `CHIMAERA_PRELUDE`) before the exec — after `-l` sourced the login
 /// profile, so `module load`/`conda activate` behave exactly as typed into
@@ -1560,7 +1575,11 @@ fn toml_basic_string(s: &str) -> String {
 pub(crate) fn wrap_login_shell(shell: &str, argv: Vec<String>) -> Vec<String> {
     let script = if shell.rsplit('/').next() == Some("fish") {
         // fish has no `$0`/`$@`; -c puts trailing args in $argv instead.
-        r#"test -n "$CHIMAERA_SHIMS"; and set -gx PATH $CHIMAERA_SHIMS $PATH
+        r#"if set -q CHIMAERA_SHELL_PATH; and test -n "$CHIMAERA_SHELL_PATH"
+    set -gx PATH (string split : -- $CHIMAERA_SHELL_PATH)
+end
+set -e CHIMAERA_SHELL_PATH
+test -n "$CHIMAERA_SHIMS"; and set -gx PATH $CHIMAERA_SHIMS $PATH
 if set -q CHIMAERA_PRELUDE; and not set -q CHIMAERA_PRELUDE_DONE; and test -r "$CHIMAERA_PRELUDE"; and command -sq bash
     set -gx CHIMAERA_PRELUDE_DONE 1
     exec bash -lc '. "$CHIMAERA_PRELUDE"; exec "$@"' bash $argv
@@ -1569,7 +1588,9 @@ exec $argv"#
             .to_string()
     } else {
         format!(
-            r#"if [ -n "${{CHIMAERA_SHIMS:-}}" ]; then PATH="$CHIMAERA_SHIMS:$PATH"; export PATH; fi
+            r#"if [ -n "${{CHIMAERA_SHELL_PATH:-}}" ]; then PATH="$CHIMAERA_SHELL_PATH"; export PATH; fi
+unset CHIMAERA_SHELL_PATH
+if [ -n "${{CHIMAERA_SHIMS:-}}" ]; then PATH="$CHIMAERA_SHIMS:$PATH"; export PATH; fi
 {}exec "$0" "$@""#,
             chimaera_core::shellint::PRELUDE_SNIPPET_POSIX
         )
@@ -2251,6 +2272,14 @@ mod tests {
             "{script}"
         );
         assert!(script.ends_with(r#"exec "$0" "$@""#), "{script}");
+        // The interactive shell's PATH is restored after the profile ran and
+        // before the shims claim the front; the handle never reaches the agent.
+        let restore = script
+            .find(r#"PATH="$CHIMAERA_SHELL_PATH""#)
+            .expect("restore");
+        let unset = script.find("unset CHIMAERA_SHELL_PATH").expect("unset");
+        let shims = script.find(r#"PATH="$CHIMAERA_SHIMS:$PATH""#).unwrap();
+        assert!(restore < unset && unset < shims, "{script}");
         // The guarded prelude block (the core snippet verbatim) runs before
         // the exec hands over to the agent.
         assert!(
@@ -2275,6 +2304,13 @@ mod tests {
             "{script}"
         );
         assert!(script.ends_with("exec $argv"), "{script}");
+        assert!(
+            script.find("set -gx PATH (string split : -- $CHIMAERA_SHELL_PATH)")
+                < script.find("set -e CHIMAERA_SHELL_PATH")
+                && script.find("set -e CHIMAERA_SHELL_PATH")
+                    < script.find("set -gx PATH $CHIMAERA_SHIMS $PATH"),
+            "{script}"
+        );
         // Prelude path: a guarded bash trampoline (fish can't source POSIX);
         // no bash → fall through to the plain exec.
         assert!(script.contains("command -sq bash"), "{script}");
@@ -2283,6 +2319,53 @@ mod tests {
             "{script}"
         );
         assert_eq!(cmd[3..], ["/usr/bin/claude"]);
+    }
+
+    /// Through a real login shell: the profile runs first (on macOS it puts
+    /// the system directories in front), then the wrap puts back the PATH the
+    /// interactive shell had, shims first, and drops its handle.
+    #[tokio::test]
+    async fn the_wrap_restores_the_interactive_path_after_the_profile() {
+        let home = std::env::temp_dir().join(format!(
+            "chimaera-wrap-{}-{}",
+            std::process::id(),
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let run = |env: Vec<(&'static str, &'static str)>| {
+            let argv = wrap_login_shell("/bin/sh", vec!["/usr/bin/env".to_string()]);
+            let home = home.clone();
+            async move {
+                let out = tokio::process::Command::new(&argv[0])
+                    .args(&argv[1..])
+                    .env_clear()
+                    .env("HOME", &home)
+                    .env("PATH", "/usr/bin:/bin")
+                    .envs(env)
+                    .output()
+                    .await
+                    .unwrap();
+                String::from_utf8_lossy(&out.stdout).into_owned()
+            }
+        };
+        let out = run(vec![
+            ("CHIMAERA_SHELL_PATH", "/home/u/.nvm/bin:/usr/bin:/bin"),
+            ("CHIMAERA_SHIMS", "/data/shims"),
+        ])
+        .await;
+        assert!(
+            out.lines()
+                .any(|l| l == "PATH=/data/shims:/home/u/.nvm/bin:/usr/bin:/bin"),
+            "{out}"
+        );
+        assert!(!out.contains("CHIMAERA_SHELL_PATH"), "{out}");
+        // Without a capture the wrap behaves as it always did.
+        let out = run(vec![("CHIMAERA_SHIMS", "/data/shims")]).await;
+        assert!(
+            out.lines().any(|l| l.starts_with("PATH=/data/shims:")),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// Every chat spawn carries the host frame in one `--append-system-prompt`;
