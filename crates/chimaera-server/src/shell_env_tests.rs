@@ -55,7 +55,11 @@ fn values_keep_newlines_equals_signs_and_marker_lookalikes() {
 #[test]
 fn entries_that_are_not_variables_are_skipped() {
     let mut bytes = format!("\n{START}\n").into_bytes();
-    bytes.extend_from_slice(b"GOOD=1\0no-equals-sign\0=no-name\0BAD=\xff\xfe\0ALSO=2\0");
+    // The fourth is a background job's `echo ready` landing mid-dump: its
+    // words would otherwise become part of the next variable's name.
+    bytes.extend_from_slice(
+        b"GOOD=1\0no-equals-sign\0=no-name\0ready\nEDITOR=vim\0BAD=\xff\xfe\0ALSO=2\0",
+    );
     bytes.extend_from_slice(format!("\n{END}\n").as_bytes());
     assert_eq!(
         parse_capture(&bytes, START, END).unwrap(),
@@ -225,6 +229,19 @@ fn the_captured_path_rides_beside_path_for_the_wrap_to_restore() {
         "/run/no-browser:/home/u/.nvm/bin:/opt/homebrew/bin:/usr/bin:/bin"
     );
 
+    // A daemon with no PATH of its own: every session starts with the system
+    // default, which is not something this spawn added and must not jump in
+    // front of the user's directories.
+    let mut env = pairs(&[
+        (
+            "PATH",
+            "/data/shims:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        ),
+        ("CHIMAERA_SHIMS", "/data/shims"),
+    ]);
+    shell_env(&[], Some("/home/u/.pyenv/shims:/usr/bin:/bin")).overlay(&mut env, "");
+    assert_eq!(env[2].1, "/home/u/.pyenv/shims:/usr/bin:/bin");
+
     // A probe command sets no PATH at all.
     let mut env = Vec::new();
     captured.overlay(&mut env, "/usr/bin:/bin");
@@ -380,20 +397,50 @@ async fn bash_sources_bashrc_once_when_the_profile_already_does() {
     if !std::path::Path::new("/bin/bash").exists() {
         return;
     }
-    let home = Home::new();
-    home.write(
-        ".bash_profile",
+    // The shapes the stock profiles use.
+    for profile in [
         "if [ -f ~/.bashrc ]; then . ~/.bashrc; fi\n",
-    );
-    home.write(
-        ".bashrc",
-        "echo sourced >> \"$HOME/rc-runs\"\nexport FROM_BASHRC=rc\n",
-    );
-    let env = capture(&home.source("/bin/bash"), TEST_BUDGET)
-        .await
-        .unwrap();
-    assert_eq!(value(&env, "FROM_BASHRC"), Some("rc"));
-    assert_eq!(home.lines("rc-runs"), 1);
+        "if [ -n \"$BASH_VERSION\" ]; then\n    . \"$HOME/.bashrc\"\nfi\n",
+        "cd; source .bashrc\n",
+    ] {
+        let home = Home::new();
+        home.write(".bash_profile", profile);
+        home.write(
+            ".bashrc",
+            "echo sourced >> \"$HOME/rc-runs\"\nexport FROM_BASHRC=rc\n",
+        );
+        let env = capture(&home.source("/bin/bash"), TEST_BUDGET)
+            .await
+            .unwrap();
+        assert_eq!(value(&env, "FROM_BASHRC"), Some("rc"), "{profile}");
+        assert_eq!(home.lines("rc-runs"), 1, "{profile}");
+    }
+}
+
+/// The profile naming some other file must not count as sourcing `~/.bashrc`.
+#[tokio::test]
+async fn bash_is_not_fooled_by_a_profile_that_names_another_bashrc() {
+    if !std::path::Path::new("/bin/bash").exists() {
+        return;
+    }
+    for profile in [
+        "[ -f /etc/bashrc-absent ] && . /etc/bashrc-absent\n",
+        "[ -f /etc/bash.bashrc-absent ] && . /etc/bash.bashrc-absent\n",
+        "for f in ~/.bashrc.d/*; do [ -r \"$f\" ] && . \"$f\"; done\n",
+        "[ -f ~/.bashrc_local ] && . ~/.bashrc_local\n",
+    ] {
+        let home = Home::new();
+        home.write(".bash_profile", profile);
+        home.write(
+            ".bashrc",
+            "echo sourced >> \"$HOME/rc-runs\"\nexport FROM_BASHRC=rc\n",
+        );
+        let env = capture(&home.source("/bin/bash"), TEST_BUDGET)
+            .await
+            .unwrap();
+        assert_eq!(value(&env, "FROM_BASHRC"), Some("rc"), "{profile}");
+        assert_eq!(home.lines("rc-runs"), 1, "{profile}");
+    }
 }
 
 #[tokio::test]

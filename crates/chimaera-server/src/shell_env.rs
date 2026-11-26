@@ -15,7 +15,11 @@
 //! The capture lives as long as the startup files it read: each spawn stats
 //! them and a changed one is read again, so an export added to `~/.zshrc`
 //! reaches the next agent. A file they source can't be seen that way; the
-//! explicit re-checks ([`invalidate`]) and a daemon restart cover it.
+//! explicit re-checks ([`invalidate`]) and a daemon restart cover it. It has
+//! no maximum age on purpose: reading again on a timer would re-run whatever
+//! else the rc does (a keychain prompt, an agent it starts) with nobody
+//! asking. The price is that a value the rc computes at startup, such as a
+//! short-lived token, is as old as the capture.
 //!
 //! One capture serves the whole process: it is a fact about this process's
 //! environment and the user's files, and the probe commands that need it
@@ -112,8 +116,9 @@ impl ShellEnv {
     /// environment is in place and reorders it (macOS `path_helper` moves the
     /// system directories to the front). The wrap restores the captured order
     /// from [`SHELL_PATH_ENV`] afterwards. Directories the spawn itself put
-    /// on PATH (anything that is neither the shim dir, which the wrap
-    /// prepends, nor part of `daemon_path`) keep their place in front.
+    /// on PATH — anything beyond what every session starts with
+    /// (`api::spawn_path`: the shim dir, which the wrap prepends, then
+    /// `daemon_path` or the system default) — keep their place in front.
     fn overlay(&self, env: &mut Vec<(String, String)>, daemon_path: &str) {
         for (name, value) in &self.vars {
             if !env.iter().any(|(k, _)| k == name) {
@@ -127,14 +132,14 @@ impl ShellEnv {
             return;
         }
         let value_of = |name: &str| env.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
-        let shims = value_of("CHIMAERA_SHIMS").unwrap_or_default();
+        let every_session =
+            crate::api::spawn_path(value_of("CHIMAERA_SHIMS").unwrap_or_default(), daemon_path);
         let mut entries: Vec<&str> = value_of("PATH")
             .unwrap_or_default()
             .split(':')
             .filter(|dir| {
                 !dir.is_empty()
-                    && *dir != shims
-                    && !daemon_path.split(':').any(|d| d == *dir)
+                    && !every_session.split(':').any(|d| d == *dir)
                     && !path.split(':').any(|d| d == *dir)
             })
             .collect();
@@ -177,10 +182,12 @@ fn shell_name(shell: &str) -> &str {
 /// A login bash reads only the profile; a terminal reads `~/.bashrc`. So the
 /// capture sources it, unless the profile bash just read already names it
 /// (the stock ones do), which keeps a slow rc from running twice inside one
-/// budget. A wrong guess is mild either way: sourced twice is what a terminal
-/// opened inside a login session does, not at all is how agents started
-/// before the capture existed.
-const BASHRC_STEP: &str = r#"for __chimaera_p in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do [ -r "$__chimaera_p" ] && break; __chimaera_p=; done; if [ -r "$HOME/.bashrc" ] && ! { [ -n "$__chimaera_p" ] && command grep -q '^[^#]*bashrc' "$__chimaera_p"; }; then . "$HOME/.bashrc"; fi; unset __chimaera_p; "#;
+/// budget. The match is the file name `.bashrc` outside a comment, whole:
+/// `/etc/bashrc`, `/etc/bash.bashrc` and `~/.bashrc.d` are other files. A
+/// wrong guess is mild either way: sourced twice is what a terminal opened
+/// inside a login session does, not at all is how agents started before the
+/// capture existed.
+const BASHRC_STEP: &str = r#"for __chimaera_p in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do [ -r "$__chimaera_p" ] && break; __chimaera_p=; done; if [ -r "$HOME/.bashrc" ] && ! { [ -n "$__chimaera_p" ] && command grep -Eq '^[^#]*[^[:alnum:]]\.bashrc([^[:alnum:]_.-]|$)' "$__chimaera_p"; }; then . "$HOME/.bashrc"; fi; unset __chimaera_p; "#;
 
 /// The `-c` text: the environment, NUL-separated, between two nonce lines so
 /// nothing a startup file prints can be mistaken for it. Semicolons, `printf`
@@ -201,7 +208,9 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// The variables between the markers. Everything before the start line is
 /// startup chatter and ignored; values keep their newlines (NUL separates
 /// entries). An entry that isn't UTF-8 or has no name is skipped: a spawn's
-/// environment is a list of strings.
+/// environment is a list of strings. So is one whose name holds whitespace
+/// or a control character: that is a background job's output landing in the
+/// middle of the dump, not a variable.
 fn parse_capture(
     bytes: &[u8],
     start: &str,
@@ -230,7 +239,9 @@ fn parse_capture(
         .split(|b| *b == 0)
         .filter_map(|entry| std::str::from_utf8(entry).ok())
         .filter_map(|entry| entry.split_once('='))
-        .filter(|(name, _)| !name.is_empty())
+        .filter(|(name, _)| {
+            !name.is_empty() && !name.chars().any(|c| c.is_whitespace() || c.is_control())
+        })
         .map(|(name, value)| (name.to_string(), value.to_string()))
         .collect())
 }
@@ -435,7 +446,12 @@ impl ShellEnvCache {
     /// any number of spawns at once share one shell.
     async fn ready(self: &Arc<Self>, source: Source, wait: Duration, budget: Duration) {
         let zdotdir = self.current().and_then(|env| env.zdotdir.clone());
-        let stamp = startup_stamp(&source, zdotdir.clone()).await;
+        // Under the same bound as the wait: a stalled home directory must
+        // not hold a spawn here. What is captured stays in use meanwhile.
+        let Ok(stamp) = tokio::time::timeout(wait, startup_stamp(&source, zdotdir.clone())).await
+        else {
+            return;
+        };
         let (id, flight) = {
             let mut inner = crate::lock(&self.inner);
             if let Some(running) = &inner.flight {
@@ -547,8 +563,10 @@ pub(crate) async fn overlay(env: &mut Vec<(String, String)>) {
     overlay_current(env);
 }
 
-/// The user asked to look again (Extensions' re-check, the launcher's
-/// refresh, a detection retry): the next spawn reads the shell afresh.
+/// The user asked to look again (Extensions' re-check, a detection retry,
+/// the check after an install): the next spawn reads the shell afresh. Not
+/// for the catalog's routine `?refresh=true`, which the launcher sends every
+/// time it opens.
 pub(crate) fn invalidate() {
     CACHE.invalidate();
 }

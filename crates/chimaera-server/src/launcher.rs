@@ -988,9 +988,6 @@ pub(crate) async fn list_agents(
     State(state): State<Arc<AppState>>,
     Query(query): Query<AgentsQuery>,
 ) -> Json<serde_json::Value> {
-    if query.refresh {
-        crate::shell_env::invalidate();
-    }
     // Detect concurrently: three login shells plus version probes on a cold
     // cache would otherwise serialize into a visible popover delay. The
     // optional upstream check rides the same await.

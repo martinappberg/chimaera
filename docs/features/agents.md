@@ -82,7 +82,7 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   came from (the app's bare launchd environment, a terminal, `chimaera serve` over ssh).
 - **How it's used.** Nothing to do: `export OPENAI_API_KEY=…` or a PATH line in an rc file reaches
   the next agent started. An edited startup file is read again at the next agent start; a change
-  in a file the rc *sources* needs the launcher's refresh, Extensions' re-check, or a daemon
+  in a file the rc *sources* needs Extensions' re-check, a detection Retry, or a daemon
   restart.
 - **Where it lives.** `shell_env.rs` (the capture, its cache, `overlay`), `launcher.rs`
   (`wrap_login_shell`), `api/env.rs` (`session_env`, `spawn_env_remove`). Callers: `spawn.rs`,
@@ -95,7 +95,7 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
      may be slow or `exec` something, and `-i` without a terminal warns about job control.
   2. **One interactive login shell is asked for its environment, apart from any spawn**
      (`$SHELL -ilc 'env -0'` between two nonce lines, so nothing a startup file prints is taken
-     for a variable; own process group, stdin and stderr closed, output capped at 512 KiB). What
+     for a variable; own process group, no stdin, stderr discarded, output capped at 512 KiB). What
      the startup files added or changed relative to the daemon's own environment is laid over
      the spawn's. A login bash reads only the profile, so for bash the capture also sources
      `~/.bashrc` unless the profile already names it.
@@ -119,8 +119,11 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   **Bounds.** One capture serves the process; spawns arriving together share one shell
   (never one per spawn). It stands until a startup file's mtime or size changes (`.zshenv`,
   `.zprofile`, `.zshrc`, `.zlogin` under `$HOME` and `ZDOTDIR`; `.bash_profile`, `.bash_login`,
-  `.profile`, `.bashrc`; `config.fish`) or an explicit re-check (`GET /agents?refresh=true`,
-  `POST /agents/{id}/detect`, Extensions' re-check). A spawn waits at most 6 s for it and starts
+  `.profile`, `.bashrc`; `config.fish`) or an explicit re-check (`POST /agents/{id}/detect`,
+  the check after an install, Extensions' re-check; not the catalog's `?refresh=true`, which
+  the launcher sends each time it opens). It has no maximum age, so a value an rc computes at
+  shell start (a short-lived token) is as old as the capture: reading again on a timer would
+  re-run the rc's other side effects unasked. A spawn waits at most 6 s for it and starts
   without it otherwise; the shell itself gets 30 s, so a slow rc still serves the next agent. A
   failed capture (timeout, over the cap, no markers, an `env` without `-0`) leaves agents
   exactly as before it existed, keeps the last good capture, logs one line naming the shell and
