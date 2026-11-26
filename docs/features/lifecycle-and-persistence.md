@@ -41,6 +41,10 @@ PTY snapshot-on-attach ([terminals.md](terminals.md)) and the chat seq-journal g
   into Recents; a row resumes when its native handle was captured, otherwise its tooltip honestly
   says that this specific row must start fresh. A finished Codex chat carries its `ChatInfo` thread id
   into Recents before the chat registry entry is removed.
+  Before it brings agents back, the daemon looks for their binaries once with a patient
+  login-shell budget (75 s, `launcher::warm_for_restore`): a shell that is slow right after a
+  restart no longer retires every chat through a 6 s check each. A shell that does not answer
+  even then retires them, as before.
 - **How it's used.** No route — this is boot/shutdown lifecycle, gated by `daemon.restoreSessions`
   (default true). The daemon keeps a **handoff** (port + token) current while it serves — written at
   listen time, refreshed every 30 s, and written again at a graceful stop — so a successor daemon

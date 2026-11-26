@@ -778,6 +778,30 @@ pub(crate) async fn restore(state: &Arc<AppState>, boot: BootLedger) {
     let restore = crate::lock(&state.settings).restore_sessions();
     let mut respawned = 0usize;
     let mut retired = 0usize;
+    // One patient look for the agents about to come back, started now and
+    // awaited at the first agent: a login shell that is slow right after a
+    // restart (everything starts at once, or an rc tool is waiting on its own
+    // lock) must not retire every chat through a 6 s check each.
+    let mut warm = {
+        let mut kinds = Vec::new();
+        for entry in &boot.sessions {
+            let Some(agent) = &entry.agent else { continue };
+            let known = crate::lock(&state.workspaces)
+                .get(&entry.workspace_id)
+                .is_some();
+            if matches!(plan_restore(entry, restore, known), RestorePlan::Respawn)
+                && !kinds.contains(&agent.kind)
+            {
+                kinds.push(agent.kind);
+            }
+        }
+        (!kinds.is_empty()).then(|| {
+            let state = state.clone();
+            tokio::spawn(async move { crate::launcher::warm_for_restore(&state, kinds).await })
+        })
+    };
+    // The kinds that look could not be asked about, once it has been awaited.
+    let mut unanswered: Vec<AgentKind> = Vec::new();
     for (done, entry) in boot.sessions.iter().enumerate() {
         // The rest stay pending: the stop's write carries them to the next
         // boot verbatim, and nothing spawns after the stop ends the chats.
@@ -793,7 +817,22 @@ pub(crate) async fn restore(state: &Arc<AppState>, boot: BootLedger) {
         let settled = match plan {
             RestorePlan::Respawn => {
                 let workspace = workspace.expect("plan requires a workspace");
-                match respawn(state, entry, workspace).await {
+                if entry.agent.is_some() {
+                    if let Some(warm) = warm.take() {
+                        unanswered = warm.await.unwrap_or_default();
+                    }
+                }
+                // The shell did not answer for this agent within the restore
+                // budget: asking again per session would be a 6 s shell each,
+                // with the roster held back meanwhile, for the same outcome.
+                let asked = match &entry.agent {
+                    Some(agent) if unanswered.contains(&agent.kind) => Err(anyhow::anyhow!(
+                        "the login shell did not answer for {} within the restore budget",
+                        agent.kind.as_str()
+                    )),
+                    _ => respawn(state, entry, workspace).await,
+                };
+                match asked {
                     // Landed as the stop began: kept pending as well, so the
                     // stop's write keeps what its process owes (`merge_pending`).
                     Ok(()) => {

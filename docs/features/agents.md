@@ -61,6 +61,14 @@ which the free plans still have. Once available, the host's account-specific cat
   than 6 seconds to start.") and every surface reads it as *couldn't check* with a Retry, never as
   not installed with an Install. Retry is `POST /api/v1/agents/{id}/detect`: the same resolution
   with a 30 s shell budget (`launcher::verify`; spawns keep 6 s), answering what the row will say.
+  A shell that ran out of time is hung up on and given a second to clean up before it is killed,
+  so a tool the rc runs behind a lock file (`pyenv init` → `pyenv rehash`) releases it; killed
+  outright, the lock stayed and every later shell start waited out pyenv's own 60 s. After a
+  restart the daemon looks for the agents it is about to bring back once, with a 75 s budget,
+  so a shell that is slow just then does not retire the chats (one it still cannot ask retires
+  them as before, without a further shell per chat). The shell is started with the signals that
+  end it at their defaults, because a detached daemon (a remote host, WSL) ignores the hang-up
+  and its children would inherit that.
   One login shell answers for every agent at once, and detections running together share it
   (`launcher::ShellProbes`), so a catalog read starts one shell rather than one per agent.
   A runnable explicit path wins without probing the shell; a

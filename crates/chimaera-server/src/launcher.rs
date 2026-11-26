@@ -293,6 +293,24 @@ pub(crate) async fn detect_for_catalog(
     detect_inner(state, kind, refresh, true, SHELL_PROBE_TIMEOUT).await
 }
 
+/// Find the agents a restart is about to bring back, once, with the restore
+/// budget, so each session's own detection is a cache hit. All kinds share
+/// one login shell (the probe flight), started beside the first sessions
+/// rather than ahead of them. Returns the kinds the shell could not be asked
+/// about even so: their sessions are not worth another shell each.
+pub(crate) async fn warm_for_restore(state: &AppState, kinds: Vec<AgentKind>) -> Vec<AgentKind> {
+    let found = futures::future::join_all(kinds.iter().map(|kind| async move {
+        detect_inner(state, *kind, true, false, SHELL_PROBE_RESTORE).await
+    }))
+    .await;
+    kinds
+        .into_iter()
+        .zip(found)
+        .filter(|(_, detection)| detection.unchecked.is_some())
+        .map(|(kind, _)| kind)
+        .collect()
+}
+
 /// A refresh someone is waiting on — the check after an install, a Retry —
 /// with the patient login-shell budget: on a loaded host a shell that needs
 /// more than the spawn budget still answers instead of failing the check.
@@ -563,6 +581,13 @@ const SHELL_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
 /// The budget for a check someone is waiting on ([`verify`]): a loaded host
 /// can take longer than a spawn's budget to start an interactive zsh.
 const SHELL_PROBE_PATIENT: Duration = Duration::from_secs(30);
+/// The budget a restart's session restore asks with. Nobody is watching a
+/// spinner, and giving up early is costly: every chat whose agent could not
+/// be found is retired. Longer than the minute a version manager's own lock
+/// wait takes (pyenv rehash: 60 s), so a shell that is merely stuck behind
+/// one answers within it; no longer than that, because the roster is held
+/// back while a restore runs.
+const SHELL_PROBE_RESTORE: Duration = Duration::from_secs(75);
 const SHELL_PROBE_OUTPUT_CAP: u64 = 64 * 1024;
 
 /// A login shell that couldn't answer `command -v`: `reason` for the logs,
@@ -592,14 +617,79 @@ impl From<&str> for ShellProbeError {
     }
 }
 
-/// Kill rc children as well as the shell on timeout or cancellation. The
-/// guard drops before the child is reaped, while its process-group id is owned.
+/// How long a login shell we stopped waiting for gets to clean up before it
+/// is killed.
+const SHELL_END_GRACE: Duration = Duration::from_millis(1000);
+
+/// Hang up on the rc's children as well as the shell when the wait for it is
+/// cancelled (a daemon stopping with a check in flight, most of all). The
+/// guard drops before the child is reaped, while its process-group id is
+/// owned. HUP and nothing after it: there is no one left to hold the child
+/// through a grace, and an outright SIGKILL here is how an rc tool's lock
+/// was left behind for the next start to wait on. A shell that ran out of
+/// time goes through [`end_shell_group`], which does follow up.
 pub(crate) struct ShellProbeGroup(pub(crate) Option<nix::unistd::Pid>);
+
+/// Start a login shell with the signals that end it at their defaults. A
+/// daemon started detached ignores SIGHUP (`serve --daemonize`, a WSL daemon
+/// under `nohup`), an ignored signal stays ignored across fork and exec, and
+/// a shell or script that starts with one ignored can neither die of it nor
+/// trap it: the hang-up in [`end_shell_group`] would do nothing on exactly
+/// the remote hosts whose rc files are slowest.
+pub(crate) fn default_signals(cmd: &mut tokio::process::Command) {
+    // SAFETY: the closure runs between fork and exec and makes only
+    // async-signal-safe calls (sigaction through `signal`).
+    unsafe {
+        cmd.pre_exec(|| {
+            use nix::sys::signal::{signal, SigHandler, Signal};
+            for sig in [
+                Signal::SIGHUP,
+                Signal::SIGTERM,
+                Signal::SIGINT,
+                Signal::SIGQUIT,
+            ] {
+                let _ = signal(sig, SigHandler::SigDfl);
+            }
+            Ok(())
+        });
+    }
+}
+
+/// End a login shell we stopped waiting for, rc children included, without
+/// leaving their locks behind. An rc file runs version managers that guard
+/// their work with a lock file and remove it on exit (`pyenv init` runs
+/// `pyenv rehash`, which holds `~/.pyenv/shims/.pyenv-shim`). SIGKILL skips
+/// that cleanup, and every later shell start then waits out the tool's own
+/// lock timeout (pyenv: 60 s): one slow start became a minute in which no
+/// check could succeed and a restart's chats were retired. So the group is
+/// hung up on first, given [`SHELL_END_GRACE`], and only then killed. HUP
+/// alone, once: it ends an interactive shell and anything with the default
+/// disposition, and a script's exit trap runs on it; a second signal sent
+/// straight after (TERM, say) can land inside that trap and cut the cleanup
+/// short (seen with bash 3.2, macOS's `/bin/bash`).
+///
+/// `child` is held unreaped for the grace: its zombie keeps the group id
+/// ours, so the late SIGKILL can never land on a recycled id.
+pub(crate) fn end_shell_group(mut group: ShellProbeGroup, child: tokio::process::Child) {
+    use nix::sys::signal::{killpg, Signal};
+    let Some(pgid) = group.0.take() else {
+        return; // Already reaped: nothing left that is ours to signal.
+    };
+    let _ = killpg(pgid, Signal::SIGHUP);
+    tokio::spawn(async move {
+        let mut child = child;
+        tokio::time::sleep(SHELL_END_GRACE).await;
+        let _ = killpg(pgid, Signal::SIGKILL);
+        // Do not extend anyone's deadline on a process stuck in
+        // uninterruptible filesystem IO: this task waits, no caller does.
+        let _ = child.wait().await;
+    });
+}
 
 impl Drop for ShellProbeGroup {
     fn drop(&mut self) {
         if let Some(group) = self.0 {
-            let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
+            let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGHUP);
         }
     }
 }
@@ -649,21 +739,22 @@ async fn probe_login_shell_all(shell: &str, bins: &[&str], timeout: Duration) ->
             " command -v {bin} || true; printf '\\n{after}\\n';"
         ));
     }
-    let mut child = tokio::process::Command::new(shell)
+    let mut command = tokio::process::Command::new(shell);
+    command
         .arg("-ilc")
         .arg(script)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .process_group(0)
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| {
-            ShellProbeError::new(
-                format!("could not start login shell `{shell}`: {e}"),
-                format!("Your login shell ({shell}) couldn't start: {e}."),
-            )
-        })?;
+        .kill_on_drop(true);
+    default_signals(&mut command);
+    let mut child = command.spawn().map_err(|e| {
+        ShellProbeError::new(
+            format!("could not start login shell `{shell}`: {e}"),
+            format!("Your login shell ({shell}) couldn't start: {e}."),
+        )
+    })?;
     let mut group = ShellProbeGroup(child.id().map(|pid| nix::unistd::Pid::from_raw(pid as i32)));
     let stdout = child.stdout.take().expect("piped stdout");
     let work = async {
@@ -745,9 +836,9 @@ async fn probe_login_shell_all(shell: &str, bins: &[&str], timeout: Duration) ->
             ))
         });
     if group.0.is_some() {
-        drop(group);
-        // Tokio reaps a dropped kill_on_drop child. Do not extend the probe's
-        // deadline waiting for a process stuck in uninterruptible filesystem IO.
+        // Out of time, or its output was unusable: end it without leaving an
+        // rc tool's lock behind. Nobody waits for that (see the function).
+        end_shell_group(group, child);
     }
     result
 }
