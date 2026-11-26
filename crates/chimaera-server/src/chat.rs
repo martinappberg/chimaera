@@ -712,6 +712,8 @@ fn apply_chat_event(state: &Arc<AppState>, id: &str, ev: &AgentEvent) {
 
 /// Settle the driver's exit without changing the user's chosen surface.
 async fn handle_chat_exit(state: &Arc<AppState>, id: &str, exit: DriverExit) {
+    // What `update_plan`'s `advance` steps from belongs to this process.
+    crate::mcp::forget_plan(id);
     // A daemon stop ends every live driver on purpose (`stop_all_for_exit`,
     // after the ledger's final flush): those sessions resurrect on the next
     // boot, so nothing here may retire, degrade or reroute them. A dead entry
@@ -3630,7 +3632,17 @@ pub(crate) async fn spawn_chat_session(
     recipe: ChatRecipe,
     pinned_override: Option<String>,
 ) -> anyhow::Result<ChatInfo> {
-    let chat_bin = crate::launcher::chat_executable(state, recipe.kind, &recipe.bin).await?;
+    let chat_bin = crate::launcher::chat_executable(
+        state,
+        recipe.kind,
+        &recipe.bin,
+        recipe.version.as_deref(),
+    )
+    .await?;
+    // Which Antigravity server answers: the agy CLI's own `agy acp` is a
+    // different server from the standalone `.par`, with its own pin.
+    let agy_cli = recipe.kind == AgentKind::Antigravity
+        && !chimaera_agent::acp::is_agy_standalone_server(&chat_bin);
     // Where it runs, on the record: the exit path retires it into Recents
     // after the chat registry has let go, and a worktree's conversation
     // must reopen in that worktree.
@@ -3924,7 +3936,9 @@ pub(crate) async fn spawn_chat_session(
     // harness journals it on Init and warns (non-fatally) when it drifts from
     // the driver's tested pin. `None` when the probe failed — the harness then
     // simply skips the drift check.
-    spec.agent_version = if recipe.kind == AgentKind::Antigravity {
+    // The standalone Antigravity server's version is not the terminal agy's,
+    // so it journals none; `agy acp` IS the terminal agy, at its version.
+    spec.agent_version = if recipe.kind == AgentKind::Antigravity && !agy_cli {
         None
     } else {
         recipe.version.clone()
@@ -3976,10 +3990,14 @@ pub(crate) async fn spawn_chat_session(
             ..recipe.clone()
         },
     );
-    let adapter = recipe
-        .kind
-        .chat_adapter()
-        .ok_or_else(|| anyhow::anyhow!("no chat adapter registered"))?;
+    let adapter: &'static dyn chimaera_agent::driver::AgentAdapter = if agy_cli {
+        &chimaera_agent::acp::ANTIGRAVITY_CLI
+    } else {
+        recipe
+            .kind
+            .chat_adapter()
+            .ok_or_else(|| anyhow::anyhow!("no chat adapter registered"))?
+    };
     let info = state.chat.spawn(adapter, spec);
     if info.is_err() {
         crate::lock(&state.chat_recipes).remove(&id);
@@ -6153,6 +6171,20 @@ mod tests {
             ),
             ["/x/cursor-agent", "acp"]
         );
+        // The agy CLI serves ACP as `agy acp`; the standalone server, bare.
+        assert_eq!(
+            crate::launcher::build_acp_chat_command(
+                AgentKind::Antigravity,
+                std::path::Path::new("/x/agy/1.5.15/bin/agy")
+            ),
+            ["/x/agy/1.5.15/bin/agy", "acp"]
+        );
+        let par = crate::launcher::build_acp_chat_command(
+            AgentKind::Antigravity,
+            std::path::Path::new("/x/chat/1.4.5/agy_acp_server.par"),
+        );
+        assert_eq!(par[0], "/x/chat/1.4.5/agy_acp_server.par");
+        assert!(!par.contains(&"acp".to_string()));
     }
 
     #[test]

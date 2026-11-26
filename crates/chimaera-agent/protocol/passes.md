@@ -1943,3 +1943,37 @@ The same day's drift pass probed the newest Grok Build, Antigravity and Cursor r
 ### Gate (Pass 61)
 
 - Hermetic, new: `acp.rs` `grok_billing_without_a_percent_reads_an_unused_period`, `a_combined_model_id_restores_as_model_and_thinking_level`, `shell_output_comes_from_raw_output_when_content_is_absent` (all from the logged frames); `runtimes.rs` `shim_turns_off_self_update_for_the_managed_agy_only`, `only_a_managed_agy_spawn_turns_off_self_update`; `agent_probe.rs` `probes_never_start_an_agent_self_update`; `runtime_retention.rs` `a_self_updated_activation_keeps_every_package`.
+
+## Pass 62 — 2026-11-26: Antigravity chats first-class (agy 1.5.12 `agy acp`, agy-acp 1.4.5)
+
+Raw ACP probes logged every frame from `agy acp` (CLI 1.5.12) and the standalone agy-acp-server 1.4.5 on one free-tier account: tools, questions, plan mode, a subagent, an MCP stand-in, and two mid-turn prompts. Facts are in [acp.md](acp.md).
+
+### Findings
+
+- **Questions.** `agy acp` asks with `elicitation/create` (a `q<N>` / `q<N>_other` form) only when the client advertises `clientCapabilities.elicitation.form`; otherwise the question is printed as chat text and the turn ends. The standalone 1.4.5 asks with a permission request (`toolCallId: "interaction_<hex>"`, no `kind`, the answers as `allow_once` options), which chat drew as an approval card.
+- **Approvals without context.** `agy acp`'s edit diff rides only the permission request's `toolCall.content`; its row had none.
+- **Rows.** Both servers title rows in their own words ("File notes.txt" for a read and an edit, "File ../../../…" outside the workspace, "Run invoke_subagent", "Running view_file", "Run edit_file?"); `agy acp` adds a non-spec `name` and `rawInput.toolSummary`. Its shell output opens with a "Created At / Completed At / Command exited with code N / Command output:" preamble and keeps `\r\n`; `rawOutput.exit_code` holds the code.
+- **Mid-turn prompts.** A second `session/prompt` during a running shell command made the first answer `end_turn` at once and the turn continued under the second, which answered last with the new text. During an open permission it was refused at once (`-32603 … waiting for a permission or question answer`).
+- **MCP.** The stdin `mcpServers` http entry works without `--process-per-session`, despite the help text. Calls are `name: "mcp_<server>_<tool>"`, title `Run <name>`, no `_meta` (unlike agy-acp's `_meta.mcp`), with an injected `toolSummary` argument.
+- **1.5.12 ends a turn under a running subagent** (`invoke_subagent` completes, `end_turn`); upstream fixed it in 1.5.15.
+- `session/resume` (advertised), allow/deny, Stop during an approval, queue cancel and `set_config_option` read-back (model, and `thought_level` through a combined model id) held in the live run.
+
+### Adopted
+
+- `acp::ANTIGRAVITY_CLI` (`TESTED_AGY_CLI_VERSION` = 1.5.12; `elicitation` and `steers` on). The launcher runs `<agy> acp` when `agents.agy.chatPath` names an agy binary or, with none, when the terminal agy's cached version is ≥ 1.5.15 (`AGY_CLI_CHAT_MIN`: the subagent turn-end fix per agy's changelog, not verified here; 1.5.12 was verified through an explicit chatPath, and a pre-release version counts as too old); the standalone server otherwise, as before. `is_agy_standalone_server` tells them apart by file name, so a wrapper around the `.par` must keep its name; the journaled version is the terminal agy's under `agy acp`, which logs the expected drift line against 1.5.12 until the pin moves.
+- Questions → `QuestionRequest` / `Answer` / `QuestionResolved` for both servers (`form_questions`, `choice_question`); free text rides `q<N>_other`, or, on 1.4.5, cancels and follows as the next prompt with no bubble. Other forms → `ElicitationRequest` via the shared normalizer, else `decline`. Open questions are cancelled on interrupt and at turn end, resolved at exit. Antigravity chats list `answer`.
+- Hidden rows: `ask_question`, 1.4.5's `interaction_*` call, and chimaera's `update_plan` in both servers' MCP shapes (the daemon now offers that tool to Antigravity chats).
+- A permission request's content the row lacks goes to the row first (`ToolCallUpdate` at the row's own status), for Antigravity only (both servers).
+- Antigravity rows: `Read:` / `Edit:` / `Write: <file>`, `Agent: <Role>` (kind `agent`), execute rows' `ToolCall.command`, `ToolRenderData {name, input}` on every row; the shell preamble cut, `\r\n` → `\n`; a non-zero `exit_code` is `failed`, matching codex's rows.
+- `agy acp` pre-approval reads `mcp_<consented server>_<tool>` with the exact title.
+- Steering on `agy acp` (`can_steer`, `Pending::Steer`): a Send mid-turn goes at once when nothing is open; a refusal or cancel waits for the turn's end, joined with what queued behind it (`SendIfRunning`: `dropped`). A typed 1.4.5 answer goes with a Stopped turn.
+
+### Not adopted (recorded for later)
+
+- Advertising `elicitation.form` to the standalone server, Grok or Cursor: their reaction is unprobed.
+- Send now through a steer instead of cancel-and-join on `agy acp`.
+
+### Gate (Pass 62)
+
+- Hermetic, new in `acp.rs`: `agy_form_questions_become_a_question_card_and_answer_by_const`, `open_agy_questions_are_cancelled_by_interrupt_turn_end_and_exit`, `other_agy_forms_use_the_form_card_or_are_declined`, `standalone_interaction_is_a_question_and_free_text_follows_as_a_prompt`, `antigravity_rows_name_their_file_role_or_tool`, `agy_question_and_plan_calls_draw_no_row`, `agy_acp_mcp_calls_are_pre_approved_in_their_own_shape`, `agy_shell_output_loses_its_preamble_and_a_nonzero_exit_fails`, `a_permission_carrying_the_change_puts_it_on_the_row_first`, `agy_acp_steers_a_running_turn_and_falls_back_to_the_queue`, `antigravity_servers_are_told_apart_by_name_and_version`; server: the `build_acp_chat_command` argv cases.
+- Live: `CHIMAERA_TEST_AGY_ACP=~/.chimaera/agents/bin/agy cargo test -p chimaera-agent --test acp_live antigravity -- --ignored` passed on agy 1.5.12 (`agy acp`), with the new question and steer turns. The standalone 1.4.5 paths are covered from its captured frames only.

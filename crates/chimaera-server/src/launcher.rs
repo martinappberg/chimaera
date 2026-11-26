@@ -987,7 +987,11 @@ pub(crate) async fn list_agents(
         async move {
             let detection = detect_for_catalog(&state, kind, query.refresh).await;
             let chat_ready = match &detection.path {
-                Ok(bin) if kind.chat_capable() => chat_executable(&state, kind, bin).await.is_ok(),
+                Ok(bin) if kind.chat_capable() => {
+                    chat_executable(&state, kind, bin, detection.version.as_deref())
+                        .await
+                        .is_ok()
+                }
                 _ => false,
             };
             // Whether the CLI says it is signed in here: the cached verdict
@@ -1809,10 +1813,17 @@ fn first_prompt_text(value: &serde_json::Value) -> Option<String> {
 
 /// Some harnesses ship distinct interactive and structured executables. The
 /// picker still presents one agent; only runtime discovery knows this detail.
+///
+/// Antigravity: an explicit `agents.agy.chatPath` wins (a standalone `.par`
+/// or an agy CLI). Otherwise the terminal agy's own `agy acp` serves chat once
+/// its probed `version` (the cached detection, no new spawn) reaches
+/// `AGY_CLI_CHAT_MIN`; before that, `agy acp` ended a turn under a running
+/// subagent, so the standalone `agy-acp-server` the installer fetched does.
 pub(crate) async fn chat_executable(
     state: &AppState,
     kind: AgentKind,
     terminal: &Path,
+    version: Option<&str>,
 ) -> anyhow::Result<PathBuf> {
     if kind != AgentKind::Antigravity {
         return Ok(terminal.to_path_buf());
@@ -1829,6 +1840,12 @@ pub(crate) async fn chat_executable(
             "Antigravity chat executable is not runnable"
         );
         return Ok(tokio::fs::canonicalize(path).await?);
+    }
+    if version.is_some_and(|v| {
+        chimaera_agent::acp::agy_version_at_least(v, chimaera_agent::acp::AGY_CLI_CHAT_MIN)
+    }) && is_executable(terminal)
+    {
+        return Ok(tokio::fs::canonicalize(terminal).await?);
     }
     if let Some(path) = managed_fallback(
         "agy-acp",
@@ -1853,6 +1870,13 @@ pub(crate) fn build_acp_chat_command(kind: AgentKind, bin: &Path) -> Vec<String>
         // `cursor-agent acp` (hidden from the top-level --help, listed by
         // `cursor-agent acp --help`): ACP v1 over stdio.
         AgentKind::Cursor => argv.push("acp".into()),
+        // The standalone server takes no subcommand (`--uid=` keeps it off
+        // a Linux uid check); the agy CLI serves ACP as `agy acp`. MCP from
+        // the stdin `mcpServers` entry reaches both without
+        // `--process-per-session` (Pass 62).
+        AgentKind::Antigravity if !chimaera_agent::acp::is_agy_standalone_server(bin) => {
+            argv.push("acp".into());
+        }
         AgentKind::Antigravity => {
             if cfg!(target_os = "linux") {
                 argv.push("--uid=".into());
