@@ -3554,8 +3554,10 @@
         <div
           class="notice"
           class:error={item.block.tone === "error"}
+          class:stop={item.block.stop === true}
           data-block-index={item.index}
-          data-block-uid={item.block.uid}>{item.block.text}</div
+          data-block-uid={item.block.uid}
+          >{#if item.block.stop === true}<span class="stop-mark" aria-hidden="true"></span>{/if}{item.block.text}</div
         >
         {/if}
       {:else if item.block.kind === "turn_end"}
@@ -3625,7 +3627,12 @@
     {/each}
 
     {#each pinnedQuestions as request (request.requestId)}
-      <QuestionCard {request} {visible} onAnswer={(answers) => answer(request.requestId, answers)} />
+      <QuestionCard
+        {request}
+        {visible}
+        onAnswer={(answers) => answer(request.requestId, answers)}
+        onOpenPath={(path, e) => openProsePath(path, "file", { split: e.metaKey || e.ctrlKey })}
+      />
     {/each}
 
     {#each pinnedElicitations as request (request.requestId)}
@@ -4369,6 +4376,22 @@
   }
   .notice.error {
     color: var(--err);
+  }
+  /* A turn the user stopped: where the work ends, in the rows' own voice —
+     at their edge with a stop mark, not a word adrift mid-column. */
+  .notice.stop {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    text-align: left;
+    padding: 4px 0;
+  }
+  .stop-mark {
+    flex: none;
+    width: 7px;
+    height: 7px;
+    border-radius: 2px;
+    background: color-mix(in srgb, var(--muted) 80%, transparent);
   }
   .runtime-error {
     max-width: 64ch;

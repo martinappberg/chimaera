@@ -459,7 +459,7 @@ unused week reads 0%); an
 - **Stopping.** Esc (or the header stop chip) interrupts the running turn. A deliberate stop is
   not a failure: the abort event carries a structural `interrupted` flag set by the driver that
   issued the interrupt (claude's result string is free text and never said so), the transcript
-  shows a muted "stopped" notice, dangling subagents settle neutrally instead of turning their
+  shows a quiet "Stopped" line with a stop mark at the rows' edge, dangling subagents settle neutrally instead of turning their
   tool group red, and the session rail reads finished — error-red `turn failed`, failed tool rows,
   and the Errored rail state are reserved for genuine failures.
   If Codex has not confirmed receipt of the opening message when stopped, a brief
@@ -801,12 +801,20 @@ unused week reads 0%); an
   PROTOCOL.md Pass 62): the CLI's own server sends an ACP `elicitation/create` form (single and
   multiple choice, plus a typed answer), the standalone server a permission request whose options
   are the answers — there a typed answer has no channel, so it withdraws the question and goes
-  out as your next message. A question's markdown links read as their labels. Options that describe themselves list one per line, label then description;
-  bare labels stay chips; a multi-select says "choose any"; every question takes a typed answer
-  ("other…"). The card takes the keyboard on arrival: 1–9 pick an option of the question the keys
-  are on (its options show their digits; a single choice moves the keys to the next question,
-  Enter moves them past a multi-select), Enter on the last question sends a complete answer, and
-  a lone single-choice question is answered by the pick itself. One answer is sent per card. Once answered it stays in the transcript as a quiet row per question — what
+  out as your next message. The question's own markdown draws inline (`questionText.ts`): code
+  spans, bold, and links — a `file:` link opens the file it names, any other link reads as its
+  label. The options are one list, a line each (label, then its description beneath), each
+  line's key at its end; a multi-select line has a box that fills and the card says "choose
+  any". An option the agent marked "(Recommended)" shows the label without the marker and a
+  "recommended" tag; the answer sent back is the agent's own label. The list's last line is the
+  typed answer ("Something else…"); on a single choice, typing replaces a pick and a pick
+  replaces what was typed. Several questions are asked one at a time: steps above the question
+  (each question's `header`, ticked once answered) say where the others stand and jump between
+  them. The card takes the keyboard on arrival: 1–9 pick an option of the question showing, a
+  single choice moves on to the next question still open, Enter moves on too and sends once
+  every question has an answer, and a lone single-choice question is answered by the pick
+  itself. The card answers to its own width (a narrow split, a phone), and key hints are not
+  drawn where there is no keyboard. One answer is sent per card. Once answered it stays in the transcript as a quiet row per question — what
   was asked, what was chosen — that expands to the options not taken. Selections are keyed by
   question/option **index**, not by model-authored id/label (those are untrusted and can collide).
   A codex question carrying `autoResolutionMs` shows a live "skips in Ns" countdown, then auto-skips

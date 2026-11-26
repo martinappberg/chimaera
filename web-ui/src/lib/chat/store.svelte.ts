@@ -410,7 +410,14 @@ export type ChatBlock = BlockIdentity &
        *  turn-end gallery scans for the files a script wrote. */
       command: string | null;
     }
-  | { kind: "notice"; text: string; tone: "info" | "error"; signIn?: boolean }
+  | {
+      kind: "notice";
+      text: string;
+      tone: "info" | "error";
+      signIn?: boolean;
+      /** The user stopped the turn here; drawn as a stop mark. */
+      stop?: boolean;
+    }
   | {
       /** A turn nobody typed: the agent woke on its own — a monitor event, a
        *  scheduled wake-up, work it left running. The wire never carries the
@@ -1975,12 +1982,12 @@ export class ChatStore {
         // wire's `interrupted` flag is the drivers' structural signal
         // (claude's free-text result string never reliably said so); the
         // reason regex survives only for pre-flag journal replays. Render a
-        // calm muted "stopped", keep --err for real failures. Both drivers'
+        // calm stop mark, keep --err for real failures. Both drivers'
         // fallback reason is literally "turn failed", so don't prefix it
         // into "turn failed: turn failed".
         const reason = ev.reason as string;
         if (ev.interrupted === true || /interrupt/i.test(reason)) {
-          this.notice("stopped", "info");
+          this.blocks.push(this.stamp({ kind: "notice", text: "Stopped", tone: "info", stop: true }));
         } else {
           this.notice(reason === "turn failed" ? "turn failed" : `turn failed: ${reason}`, "error");
         }

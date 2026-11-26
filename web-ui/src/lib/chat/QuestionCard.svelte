@@ -11,7 +11,7 @@
    * visible instead of vanishing.
    */
   import { mayTakeFocus } from "./promptFocus";
-  import { askedText } from "./questionText";
+  import { askedParts, askedText, optionLabel } from "./questionText";
   import type { PendingQuestion } from "./store.svelte";
 
   interface Props {
@@ -24,9 +24,11 @@
     answered?: Record<string, string[]> | null;
     /** False while the owning retained chat tab is hidden. */
     visible?: boolean;
+    /** Open a file the question links to. */
+    onOpenPath?: (path: string, e: MouseEvent) => void;
   }
 
-  let { request, onAnswer, answered = null, visible = true }: Props = $props();
+  let { request, onAnswer, answered = null, visible = true, onOpenPath }: Props = $props();
 
   const readOnly = $derived(answered !== null);
   let remainingMs = $state<number | null>(null);
@@ -94,33 +96,49 @@
     }
   }
 
-  const complete = $derived(
-    request.questions.every(
-      (_q, qi) => (picked[qi] ?? []).length > 0 || (other[qi] ?? "").trim().length > 0,
-    ),
-  );
+  const has = (qi: number) => (picked[qi] ?? []).length > 0 || (other[qi] ?? "").trim().length > 0;
+  const complete = $derived(request.questions.every((_q, qi) => has(qi)));
+  const last = $derived(request.questions.length - 1);
 
   /** One question, one choice: picking it IS the answer — no second press.
    *  Anything richer (several questions, a multi-select) collects first. */
   const instant = $derived(request.questions.length === 1 && !request.questions[0].multiSelect);
-  /** The question the number keys act on; its options alone show their
-   *  digit. A single choice moves on to the next question, a multi-select
-   *  keeps the keys until Enter. */
+  /** Several questions are asked one at a time: the card shows the one the
+   *  keys are on, the steps above it say where the others stand. */
   let cursor = $state(0);
+  const at = $derived(Math.max(0, Math.min(cursor, last)));
+  const current = $derived(request.questions[at]);
+
+  function goTo(qi: number) {
+    cursor = qi;
+    // The control just used may belong to the question leaving the card:
+    // the keys stay with the card.
+    cardEl?.focus({ preventScroll: true });
+  }
+  /** The question to go to next: the first still open after this one, else
+   *  the first open before it; -1 when no other is open. */
+  const nextOpen = $derived.by(() => {
+    const open = request.questions.map((_q, qi) => qi !== at && !has(qi));
+    const later = open.indexOf(true, at + 1);
+    return later !== -1 ? later : open.indexOf(true);
+  });
   function choose(qi: number, oi: number, multi: boolean) {
     toggle(qi, oi, multi);
-    if (instant) {
-      // The pick is the whole answer: text left in "other…" does not ride.
-      other = {};
-      submit();
-      return;
-    }
-    cursor = multi ? qi : Math.min(qi + 1, request.questions.length - 1);
+    if (multi) return;
+    // One choice: a pick replaces whatever was typed instead.
+    other[qi] = "";
+    if (instant) submit();
+    else if (nextOpen !== -1) goTo(nextOpen);
   }
-
-  /** Options with something to say about themselves read as a list, one per
-   *  line with its description; bare labels stay compact chips. */
-  const described = (q: { options: { description: string }[] }) => q.options.some((o) => o.description !== "");
+  /** Enter: send once every question has an answer; until then, on to the
+   *  next one still open. */
+  function advance() {
+    if (complete) submit();
+    else if (nextOpen !== -1) goTo(nextOpen);
+  }
+  function typed(qi: number, multi: boolean) {
+    if (!multi && (other[qi] ?? "").trim().length > 0) picked[qi] = [];
+  }
 
   let cardEl = $state<HTMLDivElement | null>(null);
   // Like the permission prompt: the ask takes the keyboard on arrival.
@@ -128,29 +146,21 @@
   $effect(() => {
     if (visible && !readOnly && cardEl !== null && mayTakeFocus(cardEl)) cardEl.focus({ preventScroll: true });
   });
-  /** 1–9 pick an option of the question the keys are on; Enter moves past a
-   *  multi-select, and sends the answer once it is complete and the keys are
-   *  on the last question. Typing in "other…" is never read as a shortcut. */
+  /** 1–9 pick an option of the question showing; Enter moves on, and sends
+   *  once all are answered. Typing in the text field is never a shortcut. */
   function onKeydown(e: KeyboardEvent) {
     if (readOnly || e.metaKey || e.ctrlKey || e.altKey) return;
     if (e.target instanceof HTMLInputElement) return;
-    const qi = Math.min(cursor, request.questions.length - 1);
     if (e.key === "Enter" && e.target === e.currentTarget) {
-      if (qi < request.questions.length - 1) {
-        e.preventDefault();
-        cursor = qi + 1;
-      } else if (complete) {
-        e.preventDefault();
-        submit();
-      }
+      e.preventDefault();
+      advance();
       return;
     }
-    if (!/^[1-9]$/.test(e.key)) return;
-    const q = request.questions[qi];
+    if (!/^[1-9]$/.test(e.key) || current === undefined) return;
     const oi = Number(e.key) - 1;
-    if (q === undefined || oi >= q.options.length) return;
+    if (oi >= current.options.length) return;
     e.preventDefault();
-    choose(qi, oi, q.multiSelect);
+    choose(at, oi, current.multiSelect);
   }
 
   /** One answer per card: a second key or click before the daemon's
@@ -169,6 +179,18 @@
     if (onAnswer?.(answers) === false) sent = false;
   }
 </script>
+
+<!-- No whitespace between parts: each already carries its own. -->
+{#snippet inline(text: string, links: boolean)}
+  <!-- prettier-ignore -->
+  {#each askedParts(text) as part, pi (pi)}{#if part.kind === "code"}<code>{part.text}</code>{:else if part.kind === "strong"}<strong>{part.text}</strong>{:else if part.kind === "file" && links && onOpenPath !== undefined}{@const path = part.path}<button class="q-file" title={path} onclick={(e) => onOpenPath(path, e)}>{part.text}</button>{:else}{part.text}{/if}{/each}
+{/snippet}
+
+{#snippet tick()}
+  <svg viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
+    <path d="M3.5 8.5l3 3 6-7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+  </svg>
+{/snippet}
 
 <!-- Focusable so 1–9 / Enter answer without the mouse; the buttons remain
      the accessible path. -->
@@ -206,9 +228,13 @@
       <span class="q-pairs">
         {#each request.questions as q, qi (qi)}
           <span class="q-pair">
-            <span class="q-asked">{askedText(q.question)}</span>
+            <span class="q-asked" title={askedText(q.question)}>{@render inline(q.question, false)}</span>
             <span class="q-collapse-answer" class:none={chosen(q.id).length === 0}
-              >{chosen(q.id).length === 0 ? "not answered" : chosen(q.id).join(", ")}</span
+              >{chosen(q.id).length === 0
+                ? "not answered"
+                : chosen(q.id)
+                    .map((label) => askedText(optionLabel(label).text))
+                    .join(", ")}</span
             >
           </span>
         {/each}
@@ -216,18 +242,18 @@
     </button>
     {#if open}
       {#each request.questions as q, qi (qi)}
-        <div class="q">
+        <div class="q-past">
           {#if request.questions.length > 1}
-            <div class="q-text">{askedText(q.question)}</div>
+            <div class="q-text">{@render inline(q.question, false)}</div>
           {/if}
-          <div class="q-options">
+          <div class="q-chips">
             {#each q.options as opt, oi (oi)}
-              <span class="q-opt static" class:on={chosen(q.id).includes(opt.label)} title={opt.description}>
-                {opt.label}
+              <span class="q-chip" class:on={chosen(q.id).includes(opt.label)} title={opt.description}>
+                {@render inline(optionLabel(opt.label).text, false)}
               </span>
             {/each}
             {#each freeText(q.id, q.options) as free (free)}
-              <span class="q-opt static on">{free}</span>
+              <span class="q-chip on">{free}</span>
             {/each}
           </div>
         </div>
@@ -236,55 +262,82 @@
         <div class="q-note">no longer active — not answered</div>
       {/if}
     {/if}
-  {:else}
-    {#each request.questions as q, qi (qi)}
-      <div class="q">
-        <div class="q-head">
-          {#if q.header.length > 0}
-            <span class="q-header">{q.header}</span>
+  {:else if current !== undefined}
+    {#if request.questions.length > 1}
+      <!-- One question at a time; the steps say where the others stand. -->
+      <div class="q-steps">
+        {#each request.questions as q, qi (qi)}
+          <button
+            class="q-step"
+            class:current={qi === at}
+            class:done={has(qi)}
+            aria-current={qi === at ? "step" : undefined}
+            aria-label={`question ${qi + 1}${has(qi) ? ", answered" : ""}`}
+            onclick={() => goTo(qi)}
+          >
+            <span class="q-step-mark">{#if has(qi)}{@render tick()}{:else}{qi + 1}{/if}</span>
+            {#if q.header.length > 0}<span class="q-step-name">{q.header}</span>{/if}
+          </button>
+        {/each}
+      </div>
+    {:else if current.header.length > 0}
+      <div class="q-head"><span class="q-header">{current.header}</span></div>
+    {/if}
+    <div class="q-text">{@render inline(current.question, true)}</div>
+    <div class="q-options">
+      {#each current.options as opt, oi (oi)}
+        {@const shown = optionLabel(opt.label)}
+        {@const on = (picked[at] ?? []).includes(oi)}
+        <button class="q-opt" class:on aria-pressed={on} onclick={() => choose(at, oi, current.multiSelect)}>
+          {#if current.multiSelect}
+            <span class="q-check" class:on aria-hidden="true">{#if on}{@render tick()}{/if}</span>
           {/if}
-          {#if q.multiSelect}
-            <span class="q-hint">choose any</span>
+          <span class="q-body">
+            <span class="q-line">
+              <span class="q-label">{@render inline(shown.text, false)}</span>
+              {#if shown.recommended}<span class="q-rec">recommended</span>{/if}
+            </span>
+            {#if opt.description !== ""}<span class="q-desc">{@render inline(opt.description, false)}</span>{/if}
+          </span>
+          {#if on && !current.multiSelect}
+            <span class="q-key on" aria-hidden="true">{@render tick()}</span>
+          {:else if oi < 9}
+            <kbd class="q-key">{oi + 1}</kbd>
           {/if}
-        </div>
-        <div class="q-text">{askedText(q.question)}</div>
-        <div class="q-options" class:list={described(q)}>
-          {#each q.options as opt, oi (oi)}
-            <button
-              class="q-opt"
-              class:on={(picked[qi] ?? []).includes(oi)}
-              aria-pressed={(picked[qi] ?? []).includes(oi)}
-              onclick={() => choose(qi, oi, q.multiSelect)}
-            >
-              {#if oi < 9}<kbd class:off={qi !== Math.min(cursor, request.questions.length - 1)}>{oi + 1}</kbd>{/if}
-              <span class="q-label">{opt.label}</span>
-              {#if opt.description !== ""}<span class="q-desc">{opt.description}</span>{/if}
-            </button>
-          {/each}
-        </div>
+        </button>
+      {/each}
+      <!-- The answer that is not on the list is the list's last row. -->
+      <label class="q-other">
         <input
-          class="q-other"
-          placeholder="other…"
+          placeholder="Something else…"
           aria-label="another answer"
-          bind:value={other[qi]}
+          bind:value={other[at]}
+          oninput={() => typed(at, current.multiSelect)}
           onkeydown={(e) => {
-            if (e.key === "Enter" && complete) {
+            if (e.key === "Enter" && !e.isComposing && has(at)) {
               e.preventDefault();
-              submit();
+              advance();
             }
           }}
         />
-      </div>
-    {/each}
+        <kbd class="q-key" class:idle={(other[at] ?? "").trim().length === 0} aria-hidden="true">↵</kbd>
+      </label>
+    </div>
     {#if !instant || countdown !== null}
       <div class="q-actions">
         {#if countdown !== null}
           <span class="deadline" class:passed={deadlinePassed} aria-live="polite">
             {deadlinePassed ? "auto-skip pending…" : `skips in ${countdown}s`}
           </span>
+        {:else if current.multiSelect}
+          <span class="q-hint">choose any</span>
         {/if}
         {#if !instant}
-          <button class="opt primary" disabled={!complete} onclick={submit}>answer<kbd>↵</kbd></button>
+          {#if complete || nextOpen === -1}
+            <button class="opt primary" disabled={!complete} onclick={submit}>answer<kbd>↵</kbd></button>
+          {:else}
+            <button class="opt" onclick={advance}>next<kbd>↵</kbd></button>
+          {/if}
         {/if}
       </div>
     {/if}
@@ -293,12 +346,18 @@
 
 <style>
   .question {
-    border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--edge));
-    background: color-mix(in srgb, var(--accent) 5%, transparent);
-    border-radius: 8px;
-    padding: 10px 12px;
+    border: 1px solid color-mix(in srgb, var(--accent) 38%, var(--edge));
+    background: color-mix(in srgb, var(--accent) 4%, transparent);
+    border-radius: 10px;
+    padding: 12px;
     margin: 6px 0;
+    outline: none;
+    /* The card answers to its own width (a narrow split, a phone). */
+    container-type: inline-size;
     animation: rise 0.15s ease; /* @keyframes rise lives in app.css */
+  }
+  .question:focus-visible {
+    border-color: var(--focus-ring);
   }
   /* History face: quiet — the accent tint belongs to the live ask only. */
   .question.answered {
@@ -315,28 +374,195 @@
       animation: none;
     }
   }
-  .q + .q {
-    margin-top: 12px;
-    padding-top: 10px;
+
+  /* Steps: one per question, the current one lit, answered ones ticked. */
+  .q-steps {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin: 0 0 10px;
+  }
+  .q-step {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font: inherit;
+    font-size: var(--text-xs);
+    color: var(--muted);
+    background: none;
+    border: 1px solid transparent;
+    border-radius: 999px;
+    padding: 2px 9px 2px 3px;
+    cursor: pointer;
+    transition:
+      color 0.12s ease,
+      background-color 0.12s ease;
+  }
+  .q-step:hover {
+    color: var(--fg);
+  }
+  .q-step.current {
+    color: var(--fg);
+    font-weight: 500;
+    background: color-mix(in srgb, var(--fg) 9%, transparent);
+  }
+  .q-step-mark {
+    display: inline-grid;
+    place-items: center;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    border: 1px solid color-mix(in srgb, var(--muted) 55%, transparent);
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+  }
+  /* A step with no name is its number alone. */
+  .q-step-mark:last-child {
+    margin-right: -6px;
+  }
+  .q-step.done .q-step-mark {
+    border-color: transparent;
+    background: color-mix(in srgb, var(--accent) 75%, transparent);
+    color: var(--bg);
+  }
+
+  .q-head {
+    margin: 0 2px 6px;
+  }
+  .q-header {
+    font-size: var(--text-xs);
+    color: var(--accent-text, var(--accent));
+    letter-spacing: 0.02em;
+  }
+  .q-text {
+    font-size: var(--text-md);
+    font-weight: 500;
+    line-height: 1.45;
+    margin: 0 2px 10px;
+    overflow-wrap: anywhere;
+  }
+  code {
+    font-family: var(--mono);
+    font-size: 0.92em;
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: color-mix(in srgb, var(--fg) 8%, transparent);
+  }
+  strong {
+    font-weight: 600;
+  }
+  /* A file the question names: opens like any path in the chat. */
+  .q-file {
+    font: inherit;
+    color: inherit;
+    background: none;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    text-decoration: underline;
+    text-decoration-color: color-mix(in srgb, var(--muted) 60%, transparent);
+    text-underline-offset: 3px;
+    transition: text-decoration-color 0.12s ease;
+  }
+  .q-file:hover {
+    text-decoration-color: var(--accent);
+  }
+
+  /* The options: one list, a line each, the whole line the target and its
+     key at the end. The free-text answer is the list's last line. */
+  .q-options {
+    display: flex;
+    flex-direction: column;
+    border: 1px solid color-mix(in srgb, var(--edge) 85%, transparent);
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--bg) 55%, transparent);
+    overflow: hidden;
+  }
+  .q-opt,
+  .q-other {
+    box-sizing: border-box;
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    width: 100%;
+    min-height: 34px;
+    padding: 7px 9px 7px 12px;
+    font: inherit;
+    font-size: var(--text-sm);
+    color: var(--fg);
+    text-align: left;
+    background: none;
+    border: none;
+    border-radius: 0;
+    transition: background-color 0.12s ease;
+  }
+  .q-opt + .q-opt,
+  .q-opt + .q-other {
     border-top: 1px solid color-mix(in srgb, var(--edge) 60%, transparent);
   }
-  .question {
+  .q-opt {
+    cursor: pointer;
+  }
+  .q-opt:hover {
+    background: var(--row-hover, color-mix(in srgb, var(--fg) 5%, transparent));
+  }
+  .q-opt:focus-visible {
     outline: none;
+    box-shadow: inset 0 0 0 1.5px var(--focus-ring);
   }
-  .question:focus-visible {
-    box-shadow: 0 0 0 2px var(--focus-ring);
+  .q-opt.on,
+  .q-opt.on:hover {
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
   }
-  .q-head {
+  .q-body {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    line-height: 1.45;
+  }
+  .q-line {
     display: flex;
     align-items: baseline;
-    gap: 8px;
+    flex-wrap: wrap;
+    column-gap: 8px;
   }
-  .q-head:empty {
-    display: none;
+  .q-label {
+    overflow-wrap: anywhere;
   }
-  .q-hint {
+  .q-rec {
+    font-size: var(--text-xs);
+    line-height: 1.5;
+    padding: 0 7px;
+    border-radius: 999px;
+    color: var(--accent-text, var(--accent));
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+  }
+  .q-desc {
     color: var(--muted);
     font-size: var(--text-xs);
+    overflow-wrap: anywhere;
+  }
+  /* Multi-select: a box that fills. */
+  .q-check {
+    flex: none;
+    display: inline-grid;
+    place-items: center;
+    width: 15px;
+    height: 15px;
+    margin-top: 2px;
+    border-radius: 4px;
+    border: 1px solid color-mix(in srgb, var(--muted) 70%, transparent);
+    color: var(--bg);
+    transition:
+      background-color 0.12s ease,
+      border-color 0.12s ease;
+  }
+  .q-check.on {
+    background: var(--accent);
+    border-color: var(--accent);
   }
   kbd {
     font: inherit;
@@ -344,89 +570,81 @@
     color: var(--muted);
     font-variant-numeric: tabular-nums;
   }
+  /* The key that picks the line; on a chosen single choice, its tick. */
+  .q-key {
+    flex: none;
+    display: inline-grid;
+    place-items: center;
+    min-width: 18px;
+    height: 18px;
+    margin-top: 1px;
+    box-sizing: border-box;
+    border-radius: 5px;
+    border: 1px solid color-mix(in srgb, var(--edge) 90%, transparent);
+    line-height: 1;
+    transition: opacity 0.12s ease;
+  }
+  .q-key.on {
+    border-color: transparent;
+    background: var(--accent);
+    color: var(--bg);
+  }
+  /* Enter shows once there is something to send; its place is kept. */
+  .q-key.idle {
+    opacity: 0;
+  }
   .opt kbd {
     margin-left: 7px;
   }
-  /* The digits belong to one question at a time; the others keep the
-     column (no shift as the keys move on) but not the hint. */
-  kbd.off {
-    visibility: hidden;
+  .q-other {
+    align-items: center;
+    cursor: text;
   }
-  /* Options that describe themselves: one per line, the label leading. */
-  .q-options.list {
-    flex-direction: column;
-    flex-wrap: nowrap;
-    gap: 4px;
-  }
-  .q-opt {
-    display: inline-flex;
-    align-items: baseline;
-    gap: 8px;
-  }
-  .q-options.list .q-opt {
-    display: flex;
-    padding: 5px 10px;
-  }
-  .q-label {
-    flex: none;
-  }
-  .q-desc {
+  .q-other input {
+    flex: 1;
     min-width: 0;
+    padding: 0;
+    font: inherit;
+    color: inherit;
+    background: none;
+    border: none;
+    outline: none;
+  }
+  .q-other input::placeholder {
     color: var(--muted);
   }
-  .q-header {
-    display: inline-block;
-    font-size: var(--text-xs);
-    color: var(--accent);
-    border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--edge));
-    border-radius: 999px;
-    padding: 0 8px;
-    margin-bottom: 4px;
+  .q-other:focus-within {
+    box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--accent) 60%, var(--edge));
   }
-  .q-text {
-    font-size: var(--text-md);
-    margin-bottom: 8px;
+  /* No keyboard, no key hints. */
+  @media (hover: none) {
+    .q-opt kbd.q-key,
+    .q-other .q-key {
+      display: none;
+    }
   }
-  .q-options {
+
+  .q-actions {
     display: flex;
     flex-wrap: wrap;
-    gap: 6px;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 6px 10px;
+    margin-top: 10px;
   }
-  .q-opt {
-    font: inherit;
-    font-size: var(--text-sm);
-    padding: 3px 12px;
-    border-radius: 6px;
-    border: 1px solid var(--edge);
-    background: none;
-    color: var(--fg);
-    cursor: pointer;
-    text-align: left;
-    transition:
-      border-color 0.12s ease,
-      background-color 0.12s ease;
-  }
-  .q-opt:hover {
-    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
-  }
-  .q-opt.on {
-    background: color-mix(in srgb, var(--accent) 18%, transparent);
-    border-color: color-mix(in srgb, var(--accent) 60%, var(--edge));
-  }
-  /* Read-only chips: same shapes, no affordance; unchosen options dim. */
-  .q-opt.static {
-    cursor: default;
-    display: inline-block;
-  }
-  .q-opt.static:not(.on) {
+  .q-hint,
+  .deadline {
+    margin-right: auto;
+    padding-left: 4px;
     color: var(--muted);
-    border-color: color-mix(in srgb, var(--edge) 60%, transparent);
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
   }
-  .q-note {
-    margin-top: 8px;
-    color: var(--muted);
-    font-size: var(--text-sm);
+  .deadline.passed {
+    color: var(--warn);
   }
+  /* The buttons are the shared .opt / .opt.primary (app.css). */
+
   /* Collapsed answered header: a quiet toggle showing what was chosen. */
   .q-collapse {
     display: flex;
@@ -484,44 +702,69 @@
     color: var(--muted);
     font-style: italic;
   }
-  .question.answered .q:first-of-type {
+  /* Opened: every option as a chip, the chosen lit, the rest dimmed. */
+  .q-past {
     margin-top: 10px;
   }
+  .q-past .q-text {
+    margin: 0 0 6px;
+    font-size: var(--text-sm);
+    color: var(--muted);
+  }
+  .q-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .q-chip {
+    font-size: var(--text-sm);
+    padding: 2px 10px;
+    border-radius: 6px;
+    border: 1px solid color-mix(in srgb, var(--edge) 60%, transparent);
+    color: var(--muted);
+  }
+  .q-chip.on {
+    color: var(--fg);
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
+  }
+  .q-note {
+    margin-top: 8px;
+    color: var(--muted);
+    font-size: var(--text-sm);
+  }
+  /* Narrow: an answered question sits above its answer, both in full. */
+  @container (max-width: 420px) {
+    .q-pair {
+      flex-direction: column;
+      gap: 0;
+    }
+    .q-asked,
+    .q-collapse-answer {
+      max-width: 100%;
+      white-space: normal;
+      overflow-wrap: anywhere;
+    }
+  }
+  /* Very narrow: the words get the room the key hints took. */
+  @container (max-width: 250px) {
+    .q-opt,
+    .q-other {
+      gap: 8px;
+      padding: 7px 8px;
+    }
+    .q-opt kbd.q-key,
+    .q-other .q-key {
+      display: none;
+    }
+  }
   @media (prefers-reduced-motion: reduce) {
-    .q-collapse .chev {
+    .q-collapse .chev,
+    .q-opt,
+    .q-key,
+    .q-check,
+    .q-step {
       transition: none;
     }
   }
-  .q-other {
-    margin-top: 8px;
-    width: 100%;
-    background: color-mix(in srgb, var(--fg) 4%, transparent);
-    border: 1px solid var(--edge);
-    border-radius: 6px;
-    padding: 4px 10px;
-    color: var(--fg);
-    font: inherit;
-    font-size: var(--text-sm);
-  }
-  .q-other:focus {
-    outline: none;
-    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
-  }
-  .q-actions {
-    display: flex;
-    align-items: center;
-    justify-content: flex-end;
-    gap: 10px;
-    margin-top: 10px;
-  }
-  .deadline {
-    margin-right: auto;
-    color: var(--muted);
-    font-size: var(--text-xs);
-    font-variant-numeric: tabular-nums;
-  }
-  .deadline.passed {
-    color: var(--warn);
-  }
-  /* The answer button is the shared .opt.primary (app.css). */
 </style>
