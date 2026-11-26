@@ -928,7 +928,8 @@ async fn switch_to_pty(
         recipe.prelude.as_deref(),
         startup.as_deref(),
     );
-    let env = crate::api::session_env(state, id, &recipe.theme, prelude.as_deref());
+    let mut env = crate::api::session_env(state, id, &recipe.theme, prelude.as_deref());
+    crate::shell_env::overlay(&mut env).await;
     let env_remove = crate::api::spawn_env_remove(&env);
     let opts = chimaera_pty::SpawnOpts {
         cwd: recipe.workspace_root,
@@ -3828,6 +3829,12 @@ pub(crate) async fn spawn_chat_session(
             "1".to_string(),
         ));
     }
+    // Last, so everything set above wins: what the user's rc files export
+    // (the login wrap reads the profile only). The remove-list is rebuilt
+    // because it must stay disjoint from the adds — this transport applies
+    // removes last, and a `CLAUDE_CODE_*` the rc sets must survive it.
+    crate::shell_env::overlay(&mut spec.env).await;
+    spec.env_remove = crate::api::spawn_env_remove(&spec.env);
     // The codex Mastermind's harness gating: its app-server elicits EVERY
     // MCP tool call (approval-mode config is parsed but ignored on that
     // surface — live-probed, PROTOCOL.md Pass 16), so the user's recorded

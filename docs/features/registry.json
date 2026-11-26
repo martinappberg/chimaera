@@ -217,6 +217,7 @@
       "page": "docs/features/agents.md",
       "paths": [
         "crates/chimaera-server/src/launcher.rs",
+        "crates/chimaera-server/src/shell_env.rs",
         "crates/chimaera-server/src/runtimes.rs",
         "crates/chimaera-server/src/doc_check.rs",
         "crates/chimaera-server/src/agent_docs.rs",

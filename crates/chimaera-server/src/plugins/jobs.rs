@@ -531,11 +531,13 @@ async fn capture_env(
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .process_group(0);
-    let env: Vec<(String, String)> = prelude
+    let mut env: Vec<(String, String)> = prelude
         .as_ref()
         .map(|p| ("CHIMAERA_PRELUDE".to_string(), p.display().to_string()))
         .into_iter()
         .collect();
+    // A job's tools resolve the way an agent's do: with what the rc exports.
+    crate::shell_env::overlay(&mut env).await;
     for name in crate::api::spawn_env_remove(&env) {
         cmd.env_remove(name);
     }

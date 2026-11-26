@@ -43,6 +43,9 @@ pub(crate) fn spawn_env_remove(env: &[(String, String)]) -> Vec<String> {
     let mut names = launcher_context_env();
     names.push("CHIMAERA_PRELUDE".to_string());
     names.push("CHIMAERA_PRELUDE_DONE".to_string());
+    // The login wrap unsets it before exec'ing an agent; scrubbed all the
+    // same, so a stale one can never replace a session's PATH.
+    names.push(crate::shell_env::SHELL_PATH_ENV.to_string());
     names.retain(|n| !env.iter().any(|(k, _)| k == n));
     names
 }
