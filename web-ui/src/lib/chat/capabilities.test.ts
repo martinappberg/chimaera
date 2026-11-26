@@ -52,7 +52,7 @@ describe("shared provider catalogs", () => {
     expect(store.modelCatalogReceived).toBe(true);
   });
   it("keeps a slash catalog longer than the models and modes bound", () => {
-    // Claude 2.1.332 lists 86 commands, `/goal` and `/usage` past the 64th.
+    // Claude 2.1.332 lists 86 commands, `/recap` and `/goal` past the 64th.
     const store = new ChatStore();
     const commands = (n: number) => Array.from({ length: n }, (_, i) => ({ name: `command-${i}` }));
     store.apply({ seq: 1, ts: 1, ev: { type: "init", slash_commands: [...commands(85), { name: "goal" }] } });

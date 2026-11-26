@@ -159,7 +159,7 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   `/` → slash-command popover (native chimaera pickers first, then the CLI's
   own commands and Codex's enabled skills; Claude's list is replaced whenever the CLI pushes a
   new one, so prompts and skills from MCP servers that connect after start appear, and up to 256
-  commands are kept, where 64 used to cut `/goal` and `/usage` off a long list); `@name` → fuzzy file/dir quick-open; `@term:` → workspace-terminal grants (see
+  commands are kept, where 64 used to cut `/goal` and `/recap` off a long list); `@name` → fuzzy file/dir quick-open; `@term:` → workspace-terminal grants (see
   [linked-terminals.md](linked-terminals.md)). `/rename <name>` pins a session name. `/compact`
   is native for codex (`thread/compact/start`; the compaction runs as its own turn) — claude's
   `/compact` rides its own CLI catalog as prompt text. Manual and automatic compaction on either

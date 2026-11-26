@@ -205,13 +205,17 @@ fn queued_message_frame(uuid: &str, content: Value, priority: &str, requeue: boo
 /// The composer catalog from the CLI's command list: the `initialize`
 /// response's `commands`, or a later `system/commands_changed` push, which
 /// replaces it. Names are kept whole or dropped (a cut name would invoke
-/// something else), duplicates fold case-insensitively, and the rows are
-/// bounded by [`cap_slash_catalog`].
+/// something else; one with a control character is not a name, and an MCP
+/// server chooses its prompts' and skills' names), duplicates fold
+/// case-insensitively, and the rows are bounded by [`cap_slash_catalog`].
 fn claude_slash_commands(list: &Value) -> Vec<SlashCommand> {
     let mut seen = HashSet::new();
     cap_slash_catalog(list.as_array().into_iter().flatten().filter_map(|c| {
         let name = c["name"].as_str()?;
-        if name.is_empty() || name.len() > SLASH_NAME_MAX || !seen.insert(name.to_ascii_lowercase())
+        if name.is_empty()
+            || name.len() > SLASH_NAME_MAX
+            || name.chars().any(char::is_control)
+            || !seen.insert(name.to_ascii_lowercase())
         {
             return None;
         }
@@ -1949,16 +1953,21 @@ impl ClaudeMapper {
                             self.mcp_errors_shown = Some(text);
                         }
                     }
+                } else {
+                    // Gone: the same trouble coming back is said again.
+                    self.mcp_errors_shown = None;
                 }
                 // Plugins that did not load (2.1.323 adds the ones managed
                 // settings enable; a `--plugin-dir` miss was listed before).
                 // The CLI starts without them and says nothing else.
-                if let Some(text) = plugin_errors_notice(&frame["plugin_errors"]) {
-                    if self.plugin_errors_shown.as_deref() != Some(text.as_str()) {
+                match plugin_errors_notice(&frame["plugin_errors"]) {
+                    Some(text) if self.plugin_errors_shown.as_deref() != Some(text.as_str()) => {
                         self.flush_prose(step);
                         step.events.push(AgentEvent::Notice { text: text.clone() });
                         self.plugin_errors_shown = Some(text);
                     }
+                    Some(_) => {}
+                    None => self.plugin_errors_shown = None,
                 }
             }
             // The whole command list again, after a mid-session change: MCP
@@ -1966,8 +1975,8 @@ impl ClaudeMapper {
             // from 2.1.332 their skills as `server:skill`), skills found as
             // the agent works in a subfolder. The schema says to replace the
             // cached list. Journaled only when it differs: `Catalog` carries
-            // the full set.
-            Some("commands_changed") => {
+            // the full set. A frame without the list changes nothing.
+            Some("commands_changed") if frame["commands"].is_array() => {
                 let commands = claude_slash_commands(&frame["commands"]);
                 if commands != self.slash_commands {
                     self.slash_commands = commands;
@@ -12223,6 +12232,21 @@ pub(crate) mod tests {
             notices(&step),
             ["Plugin not loaded: linter@corp (not installed)"]
         );
+        // Gone, then back with the same words: said again.
+        let clean = json!({
+            "type": "system", "subtype": "init", "session_id": "native-9",
+            "model": "claude-haiku-5-5", "permissionMode": "default",
+        });
+        assert!(notices(&m.on_frame(&clean)).is_empty());
+        assert_eq!(
+            notices(&m.on_frame(&init(
+                json!([{ "plugin": "linter@corp", "message": "not installed" }])
+            ))),
+            [
+                "MCP server config skipped: broken (no type)",
+                "Plugin not loaded: linter@corp (not installed)",
+            ]
+        );
         assert!(plugin_errors_notice(&json!([])).is_none());
         assert!(plugin_errors_notice(&Value::Null).is_none());
     }
@@ -12240,8 +12264,8 @@ pub(crate) mod tests {
             "type": "system", "subtype": "commands_changed",
             "commands": [
                 { "name": "goal", "description": "Set a goal", "argumentHint": "" },
-                { "name": "claude.ai bioRxiv:analyze_preprint (MCP)",
-                  "description": "Generate a prompt to analyze a preprint", "argumentHint": "" },
+                { "name": "claude.ai Example:summarize_paper (MCP)",
+                  "description": "Generate a prompt to summarize a paper", "argumentHint": "" },
                 { "name": "notes:summarize", "description": "A skill an MCP server serves" },
             ],
             "uuid": "u-1", "session_id": "native-9",
@@ -12262,7 +12286,7 @@ pub(crate) mod tests {
                 .collect::<Vec<_>>(),
             [
                 "goal",
-                "claude.ai bioRxiv:analyze_preprint (MCP)",
+                "claude.ai Example:summarize_paper (MCP)",
                 "notes:summarize"
             ]
         );
@@ -12270,6 +12294,21 @@ pub(crate) mod tests {
         assert!(!m.turn_active, "a catalog push opens no turn");
         // The same list again says nothing; the next `init` carries it.
         assert!(m.on_frame(&pushed).events.is_empty());
+        // A frame without the list, or with a name that is not one, leaves
+        // the catalog as it was.
+        for frame in [
+            json!({ "type": "system", "subtype": "commands_changed" }),
+            json!({ "type": "system", "subtype": "commands_changed", "commands": null }),
+        ] {
+            assert!(m.on_frame(&frame).events.is_empty());
+        }
+        assert_eq!(m.slash_commands.len(), 3);
+        assert!(
+            claude_slash_commands(&json!([{ "name": "two\nlines" }, { "name": "ok" }]))
+                .iter()
+                .map(|c| c.name.as_str())
+                .eq(["ok"])
+        );
         let init = m.on_frame(&json!({
             "type": "system", "subtype": "init", "session_id": "native-9",
             "model": "claude-haiku-5-5", "permissionMode": "default",

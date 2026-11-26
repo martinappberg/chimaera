@@ -14641,11 +14641,13 @@ mod tests {
         )));
     }
 
-    /// The `CodexErrorInfo` values 0.169.0–0.172.0 added, as a scripted
-    /// provider made 0.172.0 send them: each is terminal on the first try
-    /// (`willRetry: false`, then a failed turn carrying the same error) and
-    /// its message already names the scope, so it is shown once, as it
-    /// comes, and the turn ends.
+    /// The `CodexErrorInfo` values 0.169.0–0.172.0 added, in the frames a
+    /// scripted provider made 0.172.0 send: each is terminal on the first
+    /// try (`willRetry: false`, then a failed turn carrying the same error).
+    /// The three spend-limit sentences are codex's own and name the scope;
+    /// the hook and policy errors carry whatever the provider said (the
+    /// words here stand in for it). Each is shown once, as it comes, and
+    /// the turn ends.
     #[test]
     fn spend_limit_and_policy_errors_end_the_turn_with_their_own_words() {
         for (info, message) in [

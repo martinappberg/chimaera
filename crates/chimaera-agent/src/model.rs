@@ -114,7 +114,8 @@ pub const PREVIEW_TOTAL_BUDGET: usize = 64 * 1024;
 /// paths would pass the journal's 256 KiB line cap), so [`cap_slash_catalog`]
 /// also holds the serialized rows to [`SLASH_CATALOG_BUDGET`]. Claude 2.1.332
 /// lists 86 commands on an ordinary account, before any MCP-server skill;
-/// the earlier cap of 64 cut `/goal`, `/usage` and `/recap` off the end.
+/// the earlier cap of 64 cut `/insights`, `/recap`, `/goal` and the rest of
+/// the tail off the end.
 pub const SLASH_COMMANDS_CAP: usize = 256;
 /// Serialized-size budget for one catalog's rows, well under the journal's
 /// 256 KiB line cap beside the models and modes the same event carries.
