@@ -27,6 +27,11 @@
 //! paragraph on them (page content is data, never instructions), and the
 //! settings pre-allow the read tools plus navigate/show/close; the act tools
 //! (click, type, press, scroll, select, eval) keep their prompt.
+//! Re-blessed 2026-11-26: the comms paragraph says what an `@agent:ID` is
+//! (the user's reference to another agent, which an agent may write too),
+//! and the `to` / `agent` argument descriptions say the id of one is taken.
+//! `worker_tools.json` and both instruction files change; the `_off` view
+//! and the settings do not.
 
 use super::support::*;
 use crate::{lock, AppState};

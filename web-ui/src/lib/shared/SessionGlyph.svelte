@@ -1,3 +1,24 @@
+<script lang="ts" module>
+  const PATHS: Record<string, string> = {
+    shell: "M3 4.5L6.5 8 3 11.5M8.5 12h4.5",
+    claude: "M8 2.5l1.4 3.6 3.6 1.4-3.6 1.4L8 12.5 6.6 8.9 3 7.5l3.6-1.4z",
+    codex: "M6.4 4.8L3.6 8l2.8 3.2M9.6 4.8L12.4 8l-2.8 3.2",
+    agy: "M8 5.1m-1.5 0a1.5 1.5 0 1 0 3 0a1.5 1.5 0 1 0-3 0M3.7 11.4q4.3-3.1 8.6 0",
+    grok: "M4 12L12 4M4 4h4M8 12h4",
+    cursor: "M3.5 2.5v10l2.7-2.4 2 3.4 2-1.2-2-3.3 3.6-.5z",
+    agent: "M8 3a5 5 0 1 0 0 10 5 5 0 0 0 0-10M5.5 7h.01M10.5 7h.01M6 10h4",
+    gemini: "M8 3.2l4.8 8.6H3.2z",
+  };
+
+  /** A session's mark as plain geometry (a 16×16 stroked path), for the one
+   *  place that builds DOM by hand: an id chip in rendered prose
+   *  (`references.ts` `linkReferences`). Everything else mounts the component. */
+  export function sessionGlyph(kind: "shell" | "agent", agentKind: string | null = null): { d: string; stroke: number } {
+    const which = kind === "shell" ? "shell" : agentKind !== null && agentKind in PATHS ? agentKind : "agent";
+    return { d: PATHS[which], stroke: which === "claude" ? 1.3 : 1.5 };
+  }
+</script>
+
 <script lang="ts">
   /**
    * The session-type glyph set, one component everywhere a session shows a
@@ -51,20 +72,7 @@
     backgrounded = false,
   }: Props = $props();
 
-  const PATHS: Record<string, string> = {
-    shell: "M3 4.5L6.5 8 3 11.5M8.5 12h4.5",
-    claude: "M8 2.5l1.4 3.6 3.6 1.4-3.6 1.4L8 12.5 6.6 8.9 3 7.5l3.6-1.4z",
-    codex: "M6.4 4.8L3.6 8l2.8 3.2M9.6 4.8L12.4 8l-2.8 3.2",
-    agy: "M8 5.1m-1.5 0a1.5 1.5 0 1 0 3 0a1.5 1.5 0 1 0-3 0M3.7 11.4q4.3-3.1 8.6 0",
-    grok: "M4 12L12 4M4 4h4M8 12h4",
-    cursor: "M3.5 2.5v10l2.7-2.4 2 3.4 2-1.2-2-3.3 3.6-.5z",
-    agent: "M8 3a5 5 0 1 0 0 10 5 5 0 0 0 0-10M5.5 7h.01M10.5 7h.01M6 10h4",
-    gemini: "M8 3.2l4.8 8.6H3.2z",
-  };
-
-  const which = $derived(
-    kind === "shell" ? "shell" : (agentKind !== null && agentKind in PATHS ? agentKind : "agent"),
-  );
+  const glyph = $derived(sessionGlyph(kind, agentKind));
 </script>
 
 <svg
@@ -79,10 +87,10 @@
     <title>{title}</title>
   {/if}
   <path
-    d={PATHS[which]}
+    d={glyph.d}
     fill="none"
     stroke="currentColor"
-    stroke-width={which === "claude" ? 1.3 : 1.5}
+    stroke-width={glyph.stroke}
     stroke-linecap="round"
     stroke-linejoin="round"
   />

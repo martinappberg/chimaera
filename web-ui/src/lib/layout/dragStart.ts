@@ -49,6 +49,11 @@ export interface DragStartHost {
   linkSessionsFor(tab: Tab, linkIntent: boolean): ReadonlySet<string> | undefined;
   referenceFileDrop(paneId: string, path: string, kind: "file" | "dir"): void;
   referenceCommitDrop(paneId: string, tab: Tab): void;
+  /** Panes where a drag of the agent session `tab` is referenced (another
+   *  live agent's), or undefined when `tab` is not a live agent. */
+  agentRefTargetsFor(tab: Tab): ReadonlySet<string> | undefined;
+  /** Type the dragged agent's `@agent:` reference into the agent `paneId` shows. */
+  referenceAgentDrop(paneId: string, agentId: string): void;
   linkByDrop(terminalId: string, agentPaneId: string): void;
   linkBySession(terminalId: string, agentId: string): void;
   /** Share a browser tab with an agent (its chain dropped on the agent). */
@@ -119,17 +124,24 @@ export function createDragStart(host: DragStartHost): DragStart {
     // (file previews and Finder/dir payloads), link targets for shell-
     // terminal drags. Drives the partitioned zone previews (the band region
     // is reserved, never flashed over).
+    // An agent dragged over another agent is referenced there (`@agent:`),
+    // as a file is: the same band, armed on those panes only.
+    const agentRefs = linkIntent ? undefined : host.agentRefTargetsFor(tab);
     const refPath =
       tab.surface === "file" || tab.surface === "finder"
         ? tab.path
         : tab.surface === "gitx" && tab.view === "commit"
           ? tab.sha
-          : undefined;
+          : agentRefs !== undefined && tab.surface === "terminal"
+            ? tab.sessionId
+            : undefined;
     const armed = new Set<string>();
     const linkTargets = host.linkTargetsFor(tab, linkIntent);
     const linkSessions = host.linkSessionsFor(tab, linkIntent);
     if (linkTargets !== undefined) for (const id of linkTargets.keys()) armed.add(id);
-    if (refPath !== undefined) {
+    if (agentRefs !== undefined) {
+      for (const id of agentRefs) armed.add(id);
+    } else if (refPath !== undefined) {
       for (const p of panes(host.getLayout().root)) {
         const a = p.tabs[p.active];
         if (a !== undefined && a.surface === "terminal" && host.sessionAlive(a.sessionId)) {
@@ -153,6 +165,7 @@ export function createDragStart(host: DragStartHost): DragStart {
             if (tab.surface === "file") host.referenceFileDrop(spot.paneId, tab.path, "file");
             else if (tab.surface === "finder") host.referenceFileDrop(spot.paneId, tab.path, "dir");
             else if (tab.surface === "gitx") host.referenceCommitDrop(spot.paneId, tab);
+            else if (tab.surface === "terminal") host.referenceAgentDrop(spot.paneId, tab.sessionId);
             return;
           }
           if (spot.kind === "link") {
@@ -211,6 +224,7 @@ export function createDragStart(host: DragStartHost): DragStart {
         // The "@ reference" band exists over panes showing a LIVE session
         // (dnd only consults this for file drags).
         acceptsRef: (paneId) => {
+          if (agentRefs !== undefined) return agentRefs.has(paneId);
           const p = findPane(host.getLayout().root, paneId);
           if (p === null) return false;
           const a = p.tabs[p.active];

@@ -35,6 +35,8 @@
     displayName,
     sessionLabel,
     dotState,
+    dotTitle,
+    agentKind,
     isBusy,
     listSessions,
     listWorkspaces,
@@ -195,6 +197,13 @@
   import type { LinkContext } from "./lib/shared/fileRef";
   import { openPath, setPathOpener, type OpenPathOptions, type PathKind } from "./lib/shared/openPath";
   import { setFileHandleHost } from "./lib/shared/fileHandleHost";
+  import {
+    agentRefPanes,
+    agentReference,
+    mentionableAgents,
+    setAgentOpener,
+    type AgentOption,
+  } from "./lib/chat/agentRoster";
   import type { Reveal } from "./lib/shared/reveal";
   import { setChatLinkContext } from "./lib/chat/linkContext";
   import type { UrlTarget } from "./lib/terminal/urlLinks";
@@ -639,6 +648,8 @@
     linkBrowser: (tabId, agentId) => linkBrowserTo(tabId, agentId),
     referenceFileDrop: (paneId, path, kind) => referenceFileDrop(paneId, path, kind),
     referenceCommitDrop: (paneId, tab) => referenceCommitDrop(paneId, tab),
+    agentRefTargetsFor: (tab) => agentRefTargetsFor(tab),
+    referenceAgentDrop: (paneId, agentId) => referenceAgentDrop(paneId, agentId),
     linkByDrop: (terminalId, agentPaneId) => linkByDrop(terminalId, agentPaneId),
     linkBySession: (terminalId, agentId) => linkBySession(terminalId, agentId),
     focusTerminal: (sid) => pool.focusTerminal(sid),
@@ -1120,6 +1131,31 @@
     return names;
   });
 
+  // Who a chat can mention as `@agent:` (chat/agentMentions.ts): this
+  // window's workspace's agent sessions, under the names their tabs wear.
+  // Written only when something a chip or the picker shows changed, so a
+  // sessions frame that moved nothing here re-renders no composer. A pre
+  // effect: a composer mounted by the same update reads the roster while it
+  // initializes (its saved draft's ids become chips then, once).
+  let mentionableKey = "";
+  $effect.pre(() => {
+    const list: AgentOption[] = sessions
+      .filter((s) => s.kind === "agent" && s.workspace_id === activeWsId)
+      .map((s) => ({
+        id: s.id,
+        name: displayNames.get(s.id) ?? displayName(s),
+        agentKind: agentKind(s),
+        workspaceId: s.workspace_id,
+        alive: s.alive,
+        status: dotTitle(s),
+        cwd: s.cwd_current ?? s.cwd,
+      }));
+    const key = JSON.stringify(list);
+    if (key === mentionableKey) return;
+    mentionableKey = key;
+    mentionableAgents.set(list);
+  });
+
   // The health poll, then its kick on every events up/down transition (the
   // kick reads the handle the poll effect assigns; net/connection.svelte.ts).
   conn.trackHealth();
@@ -1304,6 +1340,16 @@
     setViewOpener(openPluginViewSurface);
     setSameFileOpener(openSess);
     setChatLinkContext(linkContext);
+    // An agent named in a message: shown where it is already open, else
+    // beside the chat that names it (the one open-beside rule), so the
+    // message being read stays on screen.
+    setAgentOpener((id, fromPane) => {
+      // A chip pressed in a pane focused that pane: with no pane named, it
+      // is the one to open beside.
+      const from = fromPane ?? layout.focusedPaneId;
+      if (sessionPaneId(layout, id) === null) layout = focusBeside(layout, from);
+      openSess(id);
+    });
     setReferenceHandler(referenceSelection);
     setCommitReferenceHandler(referenceCommitNow);
     setGitOpener((tab) => openGitFromPane(layout.focusedPaneId, tab, false));
@@ -1465,6 +1511,7 @@
       setSameFileOpener(null);
       recentsRail.dispose();
       setChatLinkContext(null);
+      setAgentOpener(null);
       detachAgentBrowser();
       events.close();
       pool.disposePool();
@@ -1628,6 +1675,28 @@
         ? composeAgentPathReference(kind === "dir" ? `${rel}/` : rel)
         : composeShellPathReference(path, s.cwd_current ?? s.cwd);
     typeIntoSession(sessionId, text, image);
+  }
+
+  /** Panes a drag of the agent `tab` is referenced in (`agentRefPanes`):
+   *  undefined for any other payload. */
+  function agentRefTargetsFor(tab: Tab): ReadonlySet<string> | undefined {
+    if (tab.surface !== "terminal") return undefined;
+    const shown = panes(layout.root).flatMap((p) => {
+      const active = p.tabs[p.active];
+      return active !== undefined && active.surface === "terminal" ? [{ paneId: p.id, sessionId: active.sessionId }] : [];
+    });
+    return agentRefPanes(tab.sessionId, shown, get(mentionableAgents));
+  }
+
+  /** An agent dropped on another agent's reference band: its `@agent:` id is
+   *  typed there, never sent. Neither pane is rearranged. */
+  function referenceAgentDrop(paneId: string, agentId: string): void {
+    const p = findPane(layout.root, paneId);
+    const active = p?.tabs[p.active];
+    if (active === undefined || active.surface !== "terminal" || active.sessionId === agentId) return;
+    const target = sessionsById.get(active.sessionId);
+    if (target === undefined || target.kind !== "agent" || !target.alive) return;
+    typeIntoSession(target.id, `${agentReference(agentId)} `);
   }
 
   /** Where a file shown on a surface is referenced from its right-click

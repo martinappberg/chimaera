@@ -1,5 +1,7 @@
 <script lang="ts">
   import { terminalMentions, mentionedTerminal, terminalLabel, type TerminalOption } from "./terminalMentions";
+  import { agentLabel, agentMentions, mentionableAgents, mentionedAgent, openAgent } from "./agentMentions";
+  import SessionGlyph from "../shared/SessionGlyph.svelte";
   import TerminalIcon from "../shared/TerminalIcon.svelte";
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
@@ -28,7 +30,9 @@
    * the receipt that the tag landed, which a long path would wrap and
    * break; a desktop drop's machine-made landing-pad path never shows at
    * all. The mention's whole text stays in its tooltip, in a copy, and in
-   * what the agent got. A path written without `@` stays as written. A
+   * what the agent got. A path written without `@` stays as written. An
+   * `@agent:` reference reads as that agent's chip (its glyph and name, the
+   * id in the tooltip and in a copy) and opens it. A
    * quoted passage (`>`-led lines, as the transcript's quote chip writes
    * them) reads muted, markers kept, so the words about it stand apart.
    */
@@ -46,6 +50,8 @@
     /** Verbatim text: a plain run, or exactly the reference's span. */
     text: string;
     terminal?: string;
+    /** An `@agent:` reference's target (an id, or a typed name). */
+    agent?: string;
     ref: FileRef | null;
     mention: boolean;
     math: { source: string; display: boolean } | null;
@@ -66,10 +72,23 @@
   }
 
   function appendPlain(out: Token[], run: string, quote: boolean) {
+    // Session references first, in the order written; files in between.
+    const sessions = [
+      ...terminalMentions(run).map((m) => ({ ...m, kind: "terminal" as const })),
+      ...agentMentions(run).map((m) => ({ ...m, kind: "agent" as const })),
+    ].sort((a, b) => a.start - b.start);
     let last = 0;
-    for (const mention of terminalMentions(run)) {
+    for (const mention of sessions) {
+      if (mention.start < last) continue;
       appendFiles(out, run.slice(last, mention.start), quote);
-      out.push({ text: run.slice(mention.start, mention.end), terminal: mention.target, ref: null, mention: true, math: null, quote });
+      out.push({
+        text: run.slice(mention.start, mention.end),
+        [mention.kind]: mention.target,
+        ref: null,
+        mention: true,
+        math: null,
+        quote,
+      });
       last = mention.end;
     }
     appendFiles(out, run.slice(last), quote);
@@ -200,7 +219,7 @@
      newline/indent between blocks would render as literal extra spacing. -->
 <!-- prettier-ignore -->
 <span class="usertext" bind:this={root} oncopy={onCopy}
-  >{#snippet chip(t: Token, label: string, res: Resolution | undefined)}{#if isDir(t, res)}<FolderIcon size={12} />{:else}<FileIcon path={t.ref?.path ?? label} size={12} />{/if}<span class="chip-name">{label}</span>{/snippet}{#each tokens as t, i (i)}{@const res = resFor(t)}{@const label = chipLabel(t)}{@const terminal = t.terminal === undefined ? undefined : mentionedTerminal(t.terminal, terminals)}{#if t.terminal !== undefined}{#if terminal && onOpenTerminal}<button class="chip" class:quote={t.quote} title={[terminal.cwd, t.text, "Open terminal"].filter(Boolean).join(" · ")} data-full={t.text} onclick={() => onOpenTerminal?.(terminal.id)}><TerminalIcon size={12} /><span class="chip-name">{terminalLabel(terminal, terminals)}</span></button>{:else}<span class="chip inert" class:quote={t.quote} title={terminal ? [terminal.cwd, t.text].filter(Boolean).join(" · ") : `${t.text} · terminal unavailable or ambiguous`} data-full={t.text}><TerminalIcon size={12} /><span class="chip-name">{terminal ? terminalLabel(terminal, terminals) : t.terminal}</span></span>{/if}{:else if t.math !== null}<MathText source={t.math.source} display={t.math.display} />{:else if label !== null && res !== undefined}<button
+  >{#snippet chip(t: Token, label: string, res: Resolution | undefined)}{#if isDir(t, res)}<FolderIcon size={12} />{:else}<FileIcon path={t.ref?.path ?? label} size={12} />{/if}<span class="chip-name">{label}</span>{/snippet}{#each tokens as t, i (i)}{@const res = resFor(t)}{@const label = chipLabel(t)}{@const terminal = t.terminal === undefined ? undefined : mentionedTerminal(t.terminal, terminals)}{#if t.terminal !== undefined}{#if terminal && onOpenTerminal}<button class="chip" class:quote={t.quote} title={[terminal.cwd, t.text, "Open terminal"].filter(Boolean).join(" · ")} data-full={t.text} onclick={() => onOpenTerminal?.(terminal.id)}><TerminalIcon size={12} /><span class="chip-name">{terminalLabel(terminal, terminals)}</span></button>{:else}<span class="chip inert" class:quote={t.quote} title={terminal ? [terminal.cwd, t.text].filter(Boolean).join(" · ") : `${t.text} · terminal unavailable or ambiguous`} data-full={t.text}><TerminalIcon size={12} /><span class="chip-name">{terminal ? terminalLabel(terminal, terminals) : t.terminal}</span></span>{/if}{:else if t.agent !== undefined}{@const agent = mentionedAgent(t.agent, $mentionableAgents)}{#if agent}<button class="chip" class:quote={t.quote} title={[agent.status, t.text, "Open agent"].filter(Boolean).join(" · ")} data-full={t.text} onclick={(e) => void openAgent(agent.id, e.currentTarget)}><SessionGlyph kind="agent" agentKind={agent.agentKind} size={12} /><span class="chip-name">{agentLabel(agent, $mentionableAgents)}</span></button>{:else}<span class="chip inert" class:quote={t.quote} title={`${t.text} · no such agent here`} data-full={t.text}><SessionGlyph kind="agent" size={12} /><span class="chip-name">{t.agent}</span></span>{/if}{:else if t.math !== null}<MathText source={t.math.source} display={t.math.display} />{:else if label !== null && res !== undefined}<button
         class="chip"
         class:quote={t.quote}
         class:ambiguous={res.state === "ambiguous"}
