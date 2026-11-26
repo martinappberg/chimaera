@@ -641,7 +641,10 @@ unused week reads 0%); an
   of the change, "+54 −3" in the added and removed colours (`ChangeSize.svelte`: the one `--git-added` /
   `--git-deleted` pair a diff's header uses too, held to 4.5:1 in every theme; `toolChangeSize` in `toolLabels.ts`,
   summed over the run's diff and batch-of-diff results, each diff computed once and cached on its
-  content); a running, waiting or failed edit adds nothing, and a run with no change shows none.
+  content); a running, waiting, failed or denied edit adds nothing, and a run with no change shows none.
+  Only an exact figure is shown: a diff cut to fit (`truncated`) or one with no old text (Claude's
+  `Write` replacing a file whole, Codex's file change, which carries its hunks in the new text) is
+  left out of both the row's figure and the run's, so the line counts the edits it can measure.
   Settled folds show the same figure. A failure is `recovered`
   once a later call in the same turn made up for it — any later successful command for a failed
   command (a retry rarely repeats the exact line), the same file (else the same title) for other
@@ -825,7 +828,10 @@ unused week reads 0%); an
   PROTOCOL.md Pass 62): the CLI's own server sends an ACP `elicitation/create` form (single and
   multiple choice, plus a typed answer), the standalone server a permission request whose options
   are the answers — there a typed answer has no channel, so it withdraws the question and goes
-  out as your next message. The question's own markdown draws inline (`questionText.ts`): code
+  out as your next message. The CLI's form follows the same rule for a question without a
+  free-text field: typed text alone skips it (withdrawing the form when nothing else was
+  answered) and goes out as your next message; beside a pick there, the text is not sent. The
+  answered row shows only what reached the agent. The question's own markdown draws inline (`questionText.ts`): code
   spans, bold, and links — a `file:` link opens the file it names, any other link reads as its
   label. The options are one list, a line each (label, then its description beneath), each
   line's key at its end; a multi-select line has a box that fills and the card says "choose
@@ -838,7 +844,10 @@ unused week reads 0%); an
   single choice moves on to the next question still open, Enter moves on too and sends once
   every question has an answer, and a lone single-choice question is answered by the pick
   itself. The card answers to its own width (a narrow split, a phone), and key hints are not
-  drawn where there is no keyboard. One answer is sent per card. Once answered it stays in the transcript as a quiet row per question — what
+  drawn where there is no keyboard. After a pick, by key or click, the keys stay with the card, and
+  Enter on a focused option moves on rather than pressing it again (Space still toggles it). One
+  answer is sent per card; a card still open after a reconnect has replayed the journal to its
+  head never reached the agent, and answers again. Once answered it stays in the transcript as a quiet row per question — what
   was asked, what was chosen — starting at the column's edge like the activity lines, with
   the chevron trailing the first row; it expands to the options not taken. Selections are keyed by
   question/option **index**, not by model-authored id/label (those are untrusted and can collide).

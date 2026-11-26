@@ -27,9 +27,12 @@
     visible?: boolean;
     /** Open a file the question links to. */
     onOpenPath?: (path: string, e: MouseEvent) => void;
+    /** The store's {@link ChatStore.liveEpoch}: it moves once a reconnect
+     *  has replayed the journal up to its head. */
+    epoch?: number;
   }
 
-  let { request, onAnswer, answered = null, visible = true, onOpenPath }: Props = $props();
+  let { request, onAnswer, answered = null, visible = true, onOpenPath, epoch = 0 }: Props = $props();
 
   const readOnly = $derived(answered !== null);
   let remainingMs = $state<number | null>(null);
@@ -125,6 +128,9 @@
   });
   function choose(qi: number, oi: number, multi: boolean) {
     toggle(qi, oi, multi);
+    // After any pick the keys belong to the card: a clicked option keeps
+    // focus (Chromium, Firefox), and Enter would press it again.
+    cardEl?.focus({ preventScroll: true });
     if (multi) return;
     // One choice: a pick replaces whatever was typed instead.
     other[qi] = "";
@@ -152,7 +158,10 @@
   function onKeydown(e: KeyboardEvent) {
     if (readOnly || e.metaKey || e.ctrlKey || e.altKey) return;
     if (e.target instanceof HTMLInputElement) return;
-    if (e.key === "Enter" && e.target === e.currentTarget) {
+    // Enter on an option moves on rather than pressing it (Space still
+    // toggles it: the buttons stay the accessible path).
+    const onOption = e.target instanceof HTMLButtonElement && e.target.classList.contains("q-opt");
+    if (e.key === "Enter" && (e.target === e.currentTarget || onOption)) {
       e.preventDefault();
       advance();
       return;
@@ -165,11 +174,14 @@
   }
 
   /** One answer per card: a second key or click before the daemon's
-   *  `question_resolved` lands must not send another. */
-  let sent = false;
+   *  `question_resolved` lands must not send another. The latch holds for
+   *  the connection it was sent on: once a reconnect has replayed the
+   *  journal to its head (`epoch` moved) and the card is still here, the
+   *  daemon never took the answer, and the card answers again. */
+  let sentAt: number | null = null;
   function submit() {
-    if (sent) return;
-    sent = true;
+    if (sentAt !== null && sentAt === epoch) return;
+    sentAt = epoch;
     const answers: Record<string, string[]> = {};
     request.questions.forEach((q, qi) => {
       const own = (picked[qi] ?? []).map((oi) => q.options[oi]?.label).filter((l) => l != null);
@@ -177,7 +189,7 @@
       answers[q.id] = free.length > 0 ? [...own, free] : own;
     });
     // Never lose the answer to a closed socket: an unsent one unlatches.
-    if (onAnswer?.(answers) === false) sent = false;
+    if (onAnswer?.(answers) === false) sentAt = null;
   }
 </script>
 

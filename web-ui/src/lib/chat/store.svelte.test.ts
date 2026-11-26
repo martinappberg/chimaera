@@ -879,6 +879,35 @@ describe("ChatStore pending-send ordering", () => {
     expect(journalFatal.fatalError).toBe("driver protocol error");
   });
 
+  it("moves the live epoch once a connection's replay reaches the head", () => {
+    const session = {
+      id: "s1",
+      agent: "claude",
+      alive: true,
+      exit_status: null,
+      native_session_id: null,
+      model: null,
+      current_mode: null,
+      pending_permission: false,
+    };
+    const store = fold([{ type: "turn_started", turn_id: "t1" }]);
+    const before = store.liveEpoch;
+    // Caught up on arrival: the epoch moves at once.
+    store.onReady(session, 1, 1);
+    expect(store.liveEpoch).toBe(before + 1);
+    // A reconnect with a gap: only once the gap has replayed.
+    store.onDisconnected();
+    store.onReady(session, 1, 3);
+    expect(store.liveEpoch).toBe(before + 1);
+    store.apply({ seq: 2, ts: 2, ev: { type: "turn_ended", turn_id: "t1" } } as SeqEvent);
+    expect(store.liveEpoch).toBe(before + 1);
+    store.apply({ seq: 3, ts: 3, ev: { type: "turn_started", turn_id: "t2" } } as SeqEvent);
+    expect(store.liveEpoch).toBe(before + 2);
+    // Live frames past the head never move it.
+    store.apply({ seq: 4, ts: 4, ev: { type: "turn_ended", turn_id: "t2" } } as SeqEvent, true);
+    expect(store.liveEpoch).toBe(before + 2);
+  });
+
   it("re-arms the thinking push on a fresh driver init", () => {
     // The pooled thinking preference must be re-pushed to each new driver
     // process (a fresh CLI defaults thinking off) — `init` resets the flag.

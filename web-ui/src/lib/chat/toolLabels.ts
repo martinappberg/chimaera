@@ -237,13 +237,20 @@ export interface ToolTitleParts {
 /** Kinds whose detail is literal text rather than a sentence. */
 const LITERAL_KINDS = new Set(["execute", "read", "edit", "search", "fetch", "delete", "move"]);
 
+/** The shell tools a driver names in a command's title: Claude titles
+ *  `Bash` / `PowerShell` calls "Bash: <command>". Codex and the ACP agents
+ *  title a command with the command itself. */
+const SHELL_TITLE_NAMES = new Set(["Bash", "PowerShell"]);
+
 /**
  * Drivers title a call "Tool: detail" ("Read: calc.py", "Bash: git status").
  * The head draws the two halves apart, and a command without its tool's
  * name: the row's mark already says it ran in a shell, and the driver's
  * whole title stays on hover. Only a title that leads with the call's own
  * name, or with one capitalised word, splits: a command that merely
- * contains ": " ("echo a: b") is left whole.
+ * contains ": " ("echo a: b") is left whole. A command row splits only on
+ * its own tool's name (or a known shell tool's), since a raw command may
+ * itself start "Note: …".
  */
 export function toolTitleParts(t: { tool: string; title: string; nativeName?: string }, shown: string): ToolTitleParts {
   // Reworded for reading (agent communication, the browser): one sentence.
@@ -257,7 +264,7 @@ export function toolTitleParts(t: { tool: string; title: string; nativeName?: st
     detail = shown.slice(native.length + 2);
   } else {
     const m = /^([A-Z][A-Za-z]{1,19}): (\S[\s\S]*)$/.exec(shown);
-    if (m !== null) [, name, detail] = m;
+    if (m !== null && (t.tool !== "execute" || (native === "" && SHELL_TITLE_NAMES.has(m[1])))) [, name, detail] = m;
   }
   if (name === null) return { name: null, detail: shown, mono: t.tool === "execute" };
   return { name: t.tool === "execute" ? null : name, detail, mono };
@@ -544,41 +551,51 @@ export interface DiffContent {
   kind: string;
   old_text?: string | null;
   new_text?: string;
+  truncated?: boolean;
   diffs?: DiffContent[];
 }
 
 /** The fields of a tool row its change size reads. */
 export interface ChangedTool {
   status: string;
+  /** The user rejected it: an ACP agent may still report it `completed`. */
+  denied?: boolean;
   content?: DiffContent | null;
 }
 
 /** One diff's size, cached on the content object: the reducer replaces a
  *  row's content whole (only streamed `output` text mutates in place), so a
  *  diff is computed once however often its group's line re-derives. */
-const statCache = new WeakMap<object, { added: number; removed: number }>();
+const statCache = new WeakMap<object, { added: number; removed: number } | null>();
 
-function diffSize(d: DiffContent): { added: number; removed: number } {
+/** Null when the diff cannot say exactly what changed: its text was cut to
+ *  fit (`truncated`), or it has no old text. A missing old text is not proof
+ *  of a new file: Claude's `Write` replaces a file whole and sends only the
+ *  new text, and Codex's update carries hunks in `new_text` alone. */
+function diffSize(d: DiffContent): { added: number; removed: number } | null {
   let stat = statCache.get(d);
   if (stat === undefined) {
-    stat = diffStat(diffLines(d.old_text ?? "", d.new_text ?? "", 0));
+    stat = d.truncated === true || d.old_text == null ? null : diffStat(diffLines(d.old_text, d.new_text ?? "", 0));
     statCache.set(d, stat);
   }
   return stat;
 }
 
 /** "+54 −3": how much a run of calls changed, summed over its finished
- *  edits (a diff, or a batch of them). A call still waiting or running, or
- *  one that failed, changed nothing yet. Null when nothing changed. */
+ *  edits (a diff, or a batch of them). A call still waiting or running, one
+ *  that failed or that the user denied, changed nothing; a diff whose size
+ *  is not exact ({@link diffSize}) is left out rather than guessed. Null
+ *  when nothing countable changed. */
 export function toolChangeSize(tools: readonly ChangedTool[]): { added: number; removed: number } | null {
   let added = 0;
   let removed = 0;
   for (const t of tools) {
-    if (t.status !== "completed" || t.content == null) continue;
+    if (t.status !== "completed" || t.denied === true || t.content == null) continue;
     const parts = t.content.kind === "diff" ? [t.content] : t.content.kind === "batch" ? (t.content.diffs ?? []) : [];
     for (const d of parts) {
       if (d.kind !== "diff") continue;
       const size = diffSize(d);
+      if (size === null) continue;
       added += size.added;
       removed += size.removed;
     }

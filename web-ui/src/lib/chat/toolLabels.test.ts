@@ -378,6 +378,15 @@ describe("toolTitleParts", () => {
     expect(parts("execute", "git commit -m 'fix: x'")).toEqual({ name: null, detail: "git commit -m 'fix: x'", mono: true });
   });
 
+  it("splits a command only on its own tool's name or a known shell tool's", () => {
+    // A raw command (Codex, ACP) that starts with a capitalised word.
+    expect(parts("execute", "Note: foo")).toEqual({ name: null, detail: "Note: foo", mono: true });
+    expect(parts("execute", "Note: foo", "run_command")).toEqual({ name: null, detail: "Note: foo", mono: true });
+    // Claude's title, from a row that predates its native name.
+    expect(parts("execute", "PowerShell: Get-ChildItem")).toEqual({ name: null, detail: "Get-ChildItem", mono: true });
+    expect(parts("execute", "Bash: ls", "run_command")).toEqual({ name: null, detail: "Bash: ls", mono: true });
+  });
+
   it("keeps an unnamed title as one line, in prose unless it is a command", () => {
     expect(parts("other", "list_issues (github)")).toEqual({ name: null, detail: "list_issues (github)", mono: false });
     expect(toolTitleParts({ tool: "other", title: "chimaera.workspace_agents" }, "Listed agents")).toEqual({
@@ -403,7 +412,7 @@ describe("toolChangeSize", () => {
         content: {
           kind: "batch",
           diffs: [
-            { kind: "diff", old_text: null, new_text: "x\ny\n" },
+            { kind: "diff", old_text: "", new_text: "x\ny\n" },
             { kind: "output", text: "not a diff" },
             { kind: "diff", old_text: "gone\n", new_text: "" },
           ],
@@ -413,9 +422,25 @@ describe("toolChangeSize", () => {
     expect(toolChangeSize(tools)).toEqual({ added: 4, removed: 2 });
   });
 
-  it("counts nothing a call has not done yet, or failed to do", () => {
+  it("counts nothing a call has not done yet, failed to do, or was denied", () => {
     expect(toolChangeSize([edit("a\n", "b\n", "in_progress"), edit("a\n", "b\n", "failed")])).toBeNull();
     expect(toolChangeSize([edit("a\n", "b\n", "pending")])).toBeNull();
+    // An ACP agent may report a rejected edit `completed`.
+    expect(toolChangeSize([{ ...edit("a\n", "b\n"), denied: true }])).toBeNull();
+  });
+
+  it("leaves out a diff whose size it cannot know exactly", () => {
+    // Cut to fit: its lines are not all there.
+    const cut = { status: "completed", content: { kind: "diff", old_text: "a\n", new_text: "b\n", truncated: true } };
+    // No old text: a whole-file write that may have replaced a file, or
+    // hunks carried in the new text alone.
+    const whole = { status: "completed", content: { kind: "diff", old_text: null, new_text: "x\ny\n" } };
+    expect(toolChangeSize([cut])).toBeNull();
+    expect(toolChangeSize([whole])).toBeNull();
+    // Beside an exact one, the run shows the exact one alone.
+    expect(toolChangeSize([cut, whole, edit("a\n", "b\n")])).toEqual({ added: 1, removed: 1 });
+    const batch = { status: "completed", content: { kind: "batch", diffs: [whole.content, edit("", "n\n").content] } };
+    expect(toolChangeSize([batch])).toEqual({ added: 1, removed: 0 });
   });
 
   it("is null without diffs or when nothing changed", () => {

@@ -99,11 +99,11 @@
    *  read a file") — see toolLabels.ts. The full list stays in the tooltip. */
   const title = $derived(toolGroupTitle(tools));
 
-  /** Elapsed while a call runs (ticking only while shown), the run's
-   *  duration once it settles. */
   /** "+54 −3": what the run's finished edits changed (each diff is
    *  computed once, cached on its content — see toolChangeSize). */
   const change = $derived(toolChangeSize(tools));
+  /** Elapsed while a call runs (ticking only while shown), the run's
+   *  duration once it settles. */
   const clock = liveClock(() => running && visible);
   // Only a shown live line follows the shared tick; a hidden tab's line
   // reads the time once and stays still.

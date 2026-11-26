@@ -57,10 +57,10 @@
   /** Only a hard failure surfaces on the fold; a recovered one is the
    *  inner group's detail. */
   const failed = $derived(toolRunHealth(tools, tail) === "failed");
-  /** The run's tool time, read the way a group line reads it. */
   /** "+54 −3": what the run's finished edits changed (each diff is
    *  computed once, cached on its content — see toolChangeSize). */
   const change = $derived(toolChangeSize(tools));
+  /** The run's tool time, read the way a group line reads it. */
   const clock = liveClock(() => running && visible);
   // Only a shown live line follows the shared tick; a hidden tab's line
   // reads the time once and stays still.

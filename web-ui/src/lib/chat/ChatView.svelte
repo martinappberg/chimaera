@@ -3643,6 +3643,7 @@
       <QuestionCard
         {request}
         {visible}
+        epoch={store.liveEpoch}
         onAnswer={(answers) => answer(request.requestId, answers)}
         onOpenPath={(path, e) => openProsePath(path, "file", { split: e.metaKey || e.ctrlKey })}
       />

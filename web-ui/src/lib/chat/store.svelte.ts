@@ -925,6 +925,13 @@ export class ChatStore {
    *  the oldest message down or eagerly load every historical artifact. */
   hydrating = $state(true);
   private replayHead = 0;
+  /** Counts the connections that have caught up: each `ready` whose replay
+   *  has reached the advertised head. A question card latches its answer
+   *  to the epoch it was sent in; one still pending after a later catch-up
+   *  never reached the daemon (its socket dropped), so it may be sent again. */
+  liveEpoch = $state(0);
+  /** A `ready` whose replay has not yet reached {@link replayHead}. */
+  private catchingUp = false;
   /** Local clock minus the daemon's journal clock, sampled only from frames
    *  the socket delivered live past the replay head (a replayed frame's `ts`
    *  is its original time, so sampling one would read its age as skew): a
@@ -979,11 +986,14 @@ export class ChatStore {
       const initial = this.hydrating || this.lastSeq === 0;
       this.replayHead = head;
       this.hydrating = initial && this.lastSeq < head;
+      this.catchingUp = this.lastSeq < head;
     } else {
       // Compatibility with a server that predates the additive head field:
       // it cannot give us a hydration boundary, so preserve the old live fold.
       this.hydrating = false;
+      this.catchingUp = false;
     }
+    if (!this.catchingUp) this.liveEpoch += 1;
     if (isRealModel(session.model)) this.model = session.model;
     if (session.current_mode !== null) this.currentMode = session.current_mode;
     if (!session.alive && this.exited === null) {
@@ -1116,6 +1126,10 @@ export class ChatStore {
     if (entry.seq <= this.lastSeq) return;
     this.lastSeq = entry.seq;
     if (this.hydrating && this.lastSeq >= this.replayHead) this.hydrating = false;
+    if (this.catchingUp && this.lastSeq >= this.replayHead) {
+      this.catchingUp = false;
+      this.liveEpoch += 1;
+    }
     if (live && entry.ts > 0 && entry.seq > this.replayHead) this.clockSkewMs = Date.now() - entry.ts;
     const ev = entry.ev;
     switch (ev.type) {
@@ -2347,8 +2361,6 @@ export class ChatStore {
     else if (!live && i !== -1) this.activeAgents.splice(i, 1);
   }
 
-  /** Also the client's own channel for local notices (usage summaries,
-   *  intercepted commands) — they are NOT journaled, deliberately. */
   /** The transcript row of a tool call, or null (never drawn, or trimmed). */
   toolBlock(id: string): Extract<ChatBlock, { kind: "tool" }> | null {
     const idx = this.toolIndex.get(id);
@@ -2356,6 +2368,8 @@ export class ChatStore {
     return block !== undefined && block.kind === "tool" ? block : null;
   }
 
+  /** Also the client's own channel for local notices (usage summaries,
+   *  intercepted commands) — they are NOT journaled, deliberately. */
   notice(text: string, tone: "info" | "error", signIn = false): void {
     // `signIn`: the daemon classified this error as a missing login
     // (`sign_in` on the event) — the view shows the agent's sign-in instead.
