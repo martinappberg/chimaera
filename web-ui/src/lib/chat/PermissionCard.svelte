@@ -1,8 +1,19 @@
 <script lang="ts">
+  import { approvalSubject, orderedOptions, type ApprovalTool } from "./approval";
+  import DiffView from "./DiffView.svelte";
+  import { mayTakeFocus } from "./promptFocus";
+  import { readableToolTitle } from "./toolLabels";
   import type { PendingPermission } from "./store.svelte";
 
   interface Props {
     request: PendingPermission;
+    /** The transcript row this request is about, when it has one: what the
+     *  card shows (the command, the change) is read from it. */
+    tool?: ApprovalTool | null;
+    /** A path as the reader should see it (workspace-relative). */
+    pathLabel?: (path: string) => string;
+    /** Open the file an edit is about. */
+    onOpenPath?: (path: string, e: MouseEvent, anchor: Element) => void;
     onDecide: (optionId: string, destination?: string, feedback?: string) => void;
     /** False while the owning retained chat tab is hidden. Hidden prompts
      *  remain mounted so typed feedback survives, but may never steal focus. */
@@ -11,8 +22,39 @@
     canChooseDestination?: boolean;
   }
 
-  let { request, onDecide, visible = true, canFeedback = true, canChooseDestination = true }: Props = $props();
+  let {
+    request,
+    tool = null,
+    pathLabel,
+    onOpenPath,
+    onDecide,
+    visible = true,
+    canFeedback = true,
+    canChooseDestination = true,
+  }: Props = $props();
   let showInput = $state(false);
+
+  /** What is being approved — the command or the change — shown outright;
+   *  the raw arguments stay one click away. */
+  const subject = $derived(approvalSubject(request.inputPreview, tool));
+  const options = $derived(orderedOptions(request.options));
+  const allowOption = $derived(options.find((o) => o.kind === "allow_once"));
+  /** The row's readable title names a call that is neither ("Read notes.txt",
+   *  an MCP tool); a request with no row keeps the agent's own title. */
+  const heading = $derived(
+    subject.kind === "command"
+      ? (subject.description ?? "Run command")
+      : subject.kind === "edit"
+        ? "Edit"
+        : tool !== null && tool.title.trim() !== ""
+          ? readableToolTitle(tool)
+          : request.title,
+  );
+  const hasRaw = $derived(
+    request.inputPreview !== null &&
+      request.inputPreview !== undefined &&
+      !(typeof request.inputPreview === "object" && Object.keys(request.inputPreview as object).length === 0),
+  );
 
   /** Deny-with-feedback: the typed reason rides the deny so the agent reacts
    *  to it instead of aborting (both drivers deliver it per their protocol). */
@@ -78,8 +120,10 @@
   // Mirror the TUI: the permission prompt captures input on arrival.
   // preventScroll keeps ChatView's stick-to-bottom-unless-reading contract —
   // its own effect (keyed on pending.length) scrolls when the user is at bottom.
+  // On arrival and whenever the tab is shown again; never out from under
+  // typing (`mayTakeFocus`).
   $effect(() => {
-    if (visible) cardEl?.focus({ preventScroll: true });
+    if (visible && cardEl !== null && mayTakeFocus(cardEl)) cardEl.focus({ preventScroll: true });
   });
 
   const preview = $derived(JSON.stringify(request.inputPreview, null, 2));
@@ -118,23 +162,44 @@
 <div class="permission" role="group" tabindex="0" bind:this={cardEl} onkeydown={onKeydown}>
   <div class="ask">
     <span class="mark">?</span>
-    <span class="label">{request.title} wants to run</span>
-    <button class="peek" onclick={() => (showInput = !showInput)}>
-      {showInput ? "hide" : "details"}
-    </button>
+    <span class="label">
+      {heading}{#if subject.kind === "edit"}{" "}
+        {#if onOpenPath !== undefined}
+          <button class="path" onclick={(e) => onOpenPath?.(subject.path, e, e.currentTarget)}
+            >{pathLabel?.(subject.path) ?? subject.path}</button
+          >
+        {:else}
+          <span class="path static">{pathLabel?.(subject.path) ?? subject.path}</span>
+        {/if}
+      {/if}
+    </span>
+    {#if hasRaw}
+      <button class="peek" aria-expanded={showInput} onclick={() => (showInput = !showInput)}>
+        {showInput ? "hide" : "details"}
+      </button>
+    {/if}
   </div>
+  {#if subject.kind === "command"}
+    <pre class="command quiet-scrollbar"><span class="prompt" aria-hidden="true">❯ </span>{subject.command}</pre>
+  {:else if subject.kind === "edit"}
+    <div class="change quiet-scrollbar">
+      {#each subject.diffs as diff, i (i)}
+        <DiffView {diff} showPath={false} />
+      {/each}
+    </div>
+  {/if}
   {#if showInput}
     <pre class="input quiet-scrollbar">{preview}</pre>
   {/if}
   <div class="actions">
-    {#each request.options as option (option.id)}
+    {#each options as option (option.id)}
       <button
         class="opt"
-        class:primary={option.kind === "allow_once"}
+        class:primary={option === allowOption}
         class:quiet={option.kind.startsWith("reject")}
         onclick={() => decide(option.id)}
       >
-        {option.label}
+        {option.label}{#if option === allowOption}<kbd>↵</kbd>{:else if option === rejectOption}<kbd>esc</kbd>{/if}
       </button>
     {/each}
     {#if canFeedback && rejectOption !== undefined}
@@ -212,6 +277,55 @@
   .label {
     flex: 1;
     min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .path {
+    background: none;
+    border: none;
+    padding: 0;
+    color: var(--accent-text);
+    font-family: var(--mono, monospace);
+    font-size: inherit;
+    cursor: pointer;
+  }
+  .path.static {
+    cursor: default;
+  }
+  button.path:hover {
+    text-decoration: underline;
+  }
+  /* The thing being approved: the command as it will run, or the change.
+     Bounded so a long script or a big edit never pushes the answer buttons
+     off the screen. */
+  .command,
+  .change {
+    margin: 8px 0 0;
+    padding: 6px 8px;
+    background: color-mix(in srgb, var(--fg) 4%, transparent);
+    border-radius: 4px;
+    max-height: 200px;
+    overflow: auto;
+  }
+  .command {
+    font-size: var(--text-sm);
+    font-family: var(--mono, monospace);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .prompt {
+    color: var(--muted);
+    user-select: none;
+  }
+  .change {
+    padding: 4px 0;
+  }
+  kbd {
+    margin-left: 7px;
+    font: inherit;
+    font-size: var(--text-xs);
+    color: var(--muted);
   }
   .peek {
     background: none;
@@ -241,6 +355,8 @@
   }
   .actions {
     display: flex;
+    flex-wrap: wrap;
+    align-items: center;
     gap: 6px;
     margin-top: 8px;
   }

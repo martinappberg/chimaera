@@ -220,6 +220,18 @@ describe("ChatStore context compaction", () => {
     expect(missingTerminalItem.compacting).toBe(false);
   });
 
+  it("keeps a failed turn's reason on its notice, none for the bare fallback", () => {
+    const notices = (reason: string) =>
+      fold([
+        { type: "turn_started", turn_id: "t1" },
+        { type: "turn_aborted", turn_id: "t1", reason },
+      ]).blocks.flatMap((b) => (b.kind === "notice" ? [{ text: b.text, tone: b.tone, reason: b.reason }] : []));
+    expect(notices("API Error: 529 {}")).toEqual([
+      { text: "turn failed: API Error: 529 {}", tone: "error", reason: "API Error: 529 {}" },
+    ]);
+    expect(notices("turn failed")).toEqual([{ text: "turn failed", tone: "error", reason: "" }]);
+  });
+
   it("names the agent's own compaction and keeps a requested one plain", () => {
     const texts = (trigger: string | undefined) =>
       fold([
@@ -659,13 +671,60 @@ describe("ChatStore pending-send ordering", () => {
     expect(tool).toMatchObject({ kind: "tool", denied: true, allowed: false });
   });
 
-  it("records a decision as one line, however long the agent's title", () => {
+  it("keeps a decision on the call's own row, with no line of its own", () => {
     const store = fold([
       { type: "tool_call", id: "c1", kind: "execute", title: "python3", status: "in_progress" },
       {
         type: "permission_request",
         request_id: "r1",
         tool_call_id: "c1",
+        title: "python3",
+        options: [
+          { id: "always", label: "Allow Always (risky)", kind: "allow_always" },
+          { id: "once", label: "Allow", kind: "allow_once" },
+        ],
+      },
+      { type: "permission_resolved", request_id: "r1", option_id: "always" },
+      { type: "tool_call", id: "c2", kind: "edit", title: "Edit a.py", status: "pending" },
+      {
+        type: "permission_request",
+        request_id: "r2",
+        tool_call_id: "c2",
+        title: "Edit a.py",
+        options: [{ id: "once", label: "Allow", kind: "allow_once" }],
+      },
+      { type: "permission_resolved", request_id: "r2", option_id: "cancelled" },
+    ]);
+    expect(store.blocks.some((b) => b.kind === "notice")).toBe(false);
+    const [first, second] = store.blocks.filter((b) => b.kind === "tool");
+    expect(first).toMatchObject({ allowed: true, decision: "always", decisionLabel: "Allow Always (risky)" });
+    // Unanswered is not refused: no denial, so no failed badge on the run.
+    expect(second).toMatchObject({ denied: false, decision: "lapsed" });
+  });
+
+  it("keeps a plan approval's own line even when its call drew a row", () => {
+    const store = fold([
+      { type: "tool_call", id: "plan", kind: "other", title: "ExitPlanMode", status: "pending" },
+      {
+        type: "permission_request",
+        request_id: "r1",
+        tool_call_id: "plan",
+        title: "ExitPlanMode",
+        plan: "## Plan",
+        options: [{ id: "keep", label: "No, keep planning", kind: "reject_once" }],
+      },
+      { type: "permission_resolved", request_id: "r1", option_id: "keep" },
+    ]);
+    expect(store.blocks.find((b) => b.kind === "notice")).toMatchObject({
+      text: "ExitPlanMode — No, keep planning",
+    });
+  });
+
+  it("records a decision with no row as one line, however long the agent's title", () => {
+    const store = fold([
+      {
+        type: "permission_request",
+        request_id: "r1",
         title: "Execute `python3 -c '\nimport json\n… [982 bytes omitted] …\n",
         options: [{ id: "allow-once", label: "Yes, proceed", kind: "allow_once" }],
       },
@@ -876,6 +935,35 @@ describe("ChatStore pending-send ordering", () => {
     ]);
     journalFatal.onReady(session, 2, 2);
     expect(journalFatal.fatalError).toBe("driver protocol error");
+  });
+
+  it("moves the live epoch once a connection's replay reaches the head", () => {
+    const session = {
+      id: "s1",
+      agent: "claude",
+      alive: true,
+      exit_status: null,
+      native_session_id: null,
+      model: null,
+      current_mode: null,
+      pending_permission: false,
+    };
+    const store = fold([{ type: "turn_started", turn_id: "t1" }]);
+    const before = store.liveEpoch;
+    // Caught up on arrival: the epoch moves at once.
+    store.onReady(session, 1, 1);
+    expect(store.liveEpoch).toBe(before + 1);
+    // A reconnect with a gap: only once the gap has replayed.
+    store.onDisconnected();
+    store.onReady(session, 1, 3);
+    expect(store.liveEpoch).toBe(before + 1);
+    store.apply({ seq: 2, ts: 2, ev: { type: "turn_ended", turn_id: "t1" } } as SeqEvent);
+    expect(store.liveEpoch).toBe(before + 1);
+    store.apply({ seq: 3, ts: 3, ev: { type: "turn_started", turn_id: "t2" } } as SeqEvent);
+    expect(store.liveEpoch).toBe(before + 2);
+    // Live frames past the head never move it.
+    store.apply({ seq: 4, ts: 4, ev: { type: "turn_ended", turn_id: "t2" } } as SeqEvent, true);
+    expect(store.liveEpoch).toBe(before + 2);
   });
 
   it("re-arms the thinking push on a fresh driver init", () => {

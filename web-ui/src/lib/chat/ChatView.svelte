@@ -104,6 +104,8 @@
   import Composer from "./Composer.svelte";
   import { hookNotice } from "./hookNotice";
   import HookRow from "./HookRow.svelte";
+  import FailureRow from "./FailureRow.svelte";
+  import { TURN_FAILED_LEAD } from "./failureText";
   import SameFileNotice from "../workspace/SameFileNotice.svelte";
   import ModsWorkbench from "./ModsWorkbench.svelte";
   import ModSite from "./ModSite.svelte";
@@ -1631,6 +1633,13 @@
     return false;
   }
 
+  /** The row an approval is about. Reads the transcript's version so a row
+   *  that lands after its request (the id index is a plain Map) is picked up. */
+  function approvalTool(toolCallId: string | null) {
+    void store.transcriptVersion;
+    return toolCallId !== null ? store.toolBlock(toolCallId) : null;
+  }
+
   function decide(requestId: string, optionId: string, destination?: string, feedback?: string) {
     // Never lose a decision to a closed socket: the card stays answerable
     // (no resolved event will arrive), so say why nothing happened.
@@ -1646,8 +1655,8 @@
     );
   }
 
-  function answer(requestId: string, answers: Record<string, string[]>) {
-    sendCommand({ type: "answer", request_id: requestId, answers }, "answer not sent");
+  function answer(requestId: string, answers: Record<string, string[]>): boolean {
+    return sendCommand({ type: "answer", request_id: requestId, answers }, "answer not sent");
   }
 
   /** Every action that interrupts the turn asks once when it would also end
@@ -3560,12 +3569,25 @@
           {/if}
         {:else if item.block.text !== store.fatalError}
         <!-- The failure a fatal banner is showing is not repeated as a line. -->
+        {#if item.block.tone === "error"}
+          <!-- A failed turn leads with what ended; any other error line is
+               its own words. Both: a mark, a short headline, the raw text a
+               click away. -->
+          <FailureRow
+            lead={item.block.reason !== undefined ? TURN_FAILED_LEAD : null}
+            text={item.block.reason ?? item.block.text}
+            sourceIndex={item.index}
+            sourceUid={item.block.uid}
+          />
+        {:else}
         <div
           class="notice"
-          class:error={item.block.tone === "error"}
+          class:stop={item.block.stop === true}
           data-block-index={item.index}
-          data-block-uid={item.block.uid}>{item.block.text}</div
+          data-block-uid={item.block.uid}
+          >{#if item.block.stop === true}<span class="stop-mark" aria-hidden="true"></span>{/if}{item.block.text}</div
         >
+        {/if}
         {/if}
       {:else if item.block.kind === "turn_end"}
         {@const block = item.block}
@@ -3622,6 +3644,9 @@
       {:else}
         <PermissionCard
           {request}
+          tool={approvalTool(request.toolCallId)}
+          pathLabel={(path) => prosePaths?.label(path) ?? path}
+          onOpenPath={(path, e) => openProsePath(path, "file", { split: e.metaKey || e.ctrlKey })}
           canFeedback={supports("permission_feedback")}
           canChooseDestination={supports("permission_destination")}
           {visible}
@@ -3631,7 +3656,13 @@
     {/each}
 
     {#each pinnedQuestions as request (request.requestId)}
-      <QuestionCard {request} {visible} onAnswer={(answers) => answer(request.requestId, answers)} />
+      <QuestionCard
+        {request}
+        {visible}
+        epoch={store.liveEpoch}
+        onAnswer={(answers) => answer(request.requestId, answers)}
+        onOpenPath={(path, e) => openProsePath(path, "file", { split: e.metaKey || e.ctrlKey })}
+      />
     {/each}
 
     {#each pinnedElicitations as request (request.requestId)}
@@ -3688,16 +3719,14 @@
     {#if store.fatalError !== null && signInNeeded}
       <!-- The startup failed because the CLI is signed out: the card is the
            whole story, the raw error stays in the journal. -->
-    {:else if store.fatalError !== null}
-      <div class="notice error" class:runtime-error={incompatibleRuntime}>
-        {#if incompatibleRuntime}
-          <strong>This agent can't start on this host</strong>
-          <p>This agent runtime needs newer Linux system libraries than this host provides. Use a compatible host or configure a compatible runtime in Settings → Agents. Reinstalling the same package will not fix this.</p>
-          <details><summary>Startup details</summary><pre>{store.fatalError}</pre></details>
-        {:else}
-          {store.fatalError}
-        {/if}
+    {:else if store.fatalError !== null && incompatibleRuntime}
+      <div class="notice error runtime-error">
+        <strong>This agent can't start on this host</strong>
+        <p>This agent runtime needs newer Linux system libraries than this host provides. Use a compatible host or configure a compatible runtime in Settings → Agents. Reinstalling the same package will not fix this.</p>
+        <details><summary>Startup details</summary><pre>{store.fatalError}</pre></details>
       </div>
+    {:else if store.fatalError !== null}
+      <FailureRow text={store.fatalError} />
     {/if}
     {#if store.degraded}
       <div class="notice">continued in terminal — this pane will switch</div>
@@ -3887,7 +3916,13 @@
   {/snippet}
 
   {#snippet planCard(embedded: boolean)}
-    <PlanCard entries={pinnedPlan} running={agentBusy && planTouched} {visible} {embedded} />
+    <PlanCard
+      entries={pinnedPlan}
+      running={agentBusy && planTouched}
+      doing={store.activity?.kind === "tool" ? store.activity.detail : null}
+      {visible}
+      {embedded}
+    />
   {/snippet}
 
   {#if workFolded && pinnedWork.length >= 2}
@@ -4378,6 +4413,22 @@
   }
   .notice.error {
     color: var(--err);
+  }
+  /* A turn the user stopped: where the work ends, in the rows' own voice —
+     at their edge with a stop mark, not a word adrift mid-column. */
+  .notice.stop {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    text-align: left;
+    padding: 4px 0;
+  }
+  .stop-mark {
+    flex: none;
+    width: 7px;
+    height: 7px;
+    border-radius: 2px;
+    background: color-mix(in srgb, var(--muted) 80%, transparent);
   }
   .runtime-error {
     max-width: 64ch;

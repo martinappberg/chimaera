@@ -18,6 +18,15 @@ pub const TESTED_GROK_VERSION: &str = "1.0.70";
 /// agy CLI (`runtimes.rs`), verified by chat-smoke-acp (Pass 59). Not the
 /// CLI's built-in `agy acp`, a different server.
 pub const TESTED_AGY_VERSION: &str = "1.4.5";
+/// The agy CLI whose own `agy acp` server was probed (PROTOCOL.md Pass 62
+/// on 1.5.12, Pass 64 on 1.5.18). Chat prefers it from [`AGY_CLI_CHAT_MIN`]
+/// (the daemon's launcher).
+pub const TESTED_AGY_CLI_VERSION: &str = "1.5.18";
+/// The first agy CLI whose `agy acp` keeps a turn open while a subagent it
+/// started still runs: 1.5.12 ended the turn first, and 1.5.15 fixed it per
+/// agy's changelog. Verified live on 1.5.18 (Pass 64: `end_turn` came after
+/// the child reported); 1.5.15–1.5.17 were not run.
+pub const AGY_CLI_CHAT_MIN: (u64, u64, u64) = (1, 5, 15);
 /// `cursor-agent --version` of the build whose `acp` server was probed
 /// (PROTOCOL.md, ACP › Cursor; Pass 59).
 pub const TESTED_CURSOR_VERSION: &str = "2026.10.22-27dcf5f";
@@ -41,6 +50,15 @@ pub struct AcpAdapter {
     /// Only an auth-shaped failure gets the words (`needs_sign_in`); a crash
     /// or transport error keeps its own message.
     pub sign_in: bool,
+    /// Advertise `clientCapabilities.elicitation.form`: `agy acp` asks its
+    /// questions as `elicitation/create` only when the client says it can
+    /// show a form, and otherwise prints them as chat text (Pass 62). Off
+    /// for every server whose reaction to it is unprobed.
+    pub elicitation: bool,
+    /// A `session/prompt` sent while a turn runs joins that turn (`agy acp`,
+    /// Pass 62): the running prompt answers `end_turn` and the work goes on
+    /// under the new request.
+    pub steers: bool,
 }
 /// Grok's own name for the mode and for the slash command that toggles it.
 const ALWAYS_APPROVE: &str = "always-approve";
@@ -51,7 +69,10 @@ pub const GROK: AcpAdapter = AcpAdapter {
     executable: "grok",
     name: "Grok Build",
     sign_in: false,
+    elicitation: false,
+    steers: false,
 };
+/// Google's standalone `agy-acp-server` (`agy_acp_server.par`).
 pub const ANTIGRAVITY: AcpAdapter = AcpAdapter {
     kind: "agy",
     tested_version: TESTED_AGY_VERSION,
@@ -59,6 +80,16 @@ pub const ANTIGRAVITY: AcpAdapter = AcpAdapter {
     executable: "agy",
     name: "Antigravity",
     sign_in: false,
+    elicitation: false,
+    steers: false,
+};
+/// The agy CLI's own server, `agy acp`: the same agent kind and frames
+/// family, its own version line, form questions and mid-turn prompts.
+pub const ANTIGRAVITY_CLI: AcpAdapter = AcpAdapter {
+    tested_version: TESTED_AGY_CLI_VERSION,
+    elicitation: true,
+    steers: true,
+    ..ANTIGRAVITY
 };
 pub const CURSOR: AcpAdapter = AcpAdapter {
     kind: "cursor",
@@ -67,7 +98,35 @@ pub const CURSOR: AcpAdapter = AcpAdapter {
     executable: "cursor-agent",
     name: "Cursor CLI",
     sign_in: true,
+    elicitation: false,
+    steers: false,
 };
+
+/// Whether an Antigravity chat executable is Google's standalone ACP server
+/// (`agy_acp_server.par`, or the managed `agy-acp` link to it) rather than the
+/// agy CLI, whose server is its `acp` subcommand. Decided by file name: both
+/// are opaque binaries, and probing one would spawn a process per launch. A
+/// wrapper script around the `.par` must keep one of these names.
+pub fn is_agy_standalone_server(bin: &std::path::Path) -> bool {
+    let name = bin.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    name.ends_with(".par") || name.starts_with("agy-acp") || name.starts_with("agy_acp")
+}
+
+/// Whether an agy CLI `--version` line names a build at least `min`: the
+/// first whole `x.y.z` token; anything unreadable, a pre-release
+/// (`1.5.15-rc1`) included, is not.
+pub fn agy_version_at_least(version: &str, min: (u64, u64, u64)) -> bool {
+    fn triple(token: &str) -> Option<(u64, u64, u64)> {
+        let mut parts = token.trim_start_matches('v').split('.');
+        let mut next = || parts.next()?.parse::<u64>().ok();
+        let version = (next()?, next()?, next()?);
+        next().is_none().then_some(version)
+    }
+    version
+        .split_whitespace()
+        .find_map(triple)
+        .is_some_and(|v| v >= min)
+}
 
 impl AgentAdapter for AcpAdapter {
     fn kind(&self) -> &'static str {
@@ -183,7 +242,12 @@ impl Driver for AcpAdapter {
         if spec.fork_at.is_some() || spec.rollback_turns.is_some() {
             return Err("This ACP adapter requires a conversation-copy fork".into());
         }
-        let init = rpc(sink, stream, 1, "initialize", json!({"protocolVersion":1,"clientInfo":{"name":"chimaera","version":env!("CARGO_PKG_VERSION")},"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false}})).await?;
+        let mut capabilities =
+            json!({"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false});
+        if self.elicitation {
+            capabilities["elicitation"] = json!({"form":{}});
+        }
+        let init = rpc(sink, stream, 1, "initialize", json!({"protocolVersion":1,"clientInfo":{"name":"chimaera","version":env!("CARGO_PKG_VERSION")},"clientCapabilities":capabilities})).await?;
         if init["protocolVersion"] != 1 {
             return Err("ACP protocol version 1 required".into());
         }
@@ -227,6 +291,8 @@ impl Driver for AcpAdapter {
         }
         let mut mapper = AcpMapper::new(native.to_owned(), &init, &session, self.kind);
         mapper.mcp_auto_approve = spec.mcp_auto_approve.clone();
+        mapper.cwd = spec.cwd.clone();
+        mapper.adopt(self);
         mapper.offer_grok_modes(self.kind);
         // ACP has no portable system-context field. Hold the bounded handoff
         // until a real user send: opening a fork must stay idle and unbilled.
@@ -265,6 +331,9 @@ struct Ask {
 }
 enum Pending {
     Prompt(String),
+    /// A prompt sent into the running turn (`AcpAdapter::steers`), whose
+    /// message is `AcpMapper::steer`.
+    Steer(String),
     /// The trailing flag is `chosen`: false for a handshake restore.
     Config(String, String, bool),
     Mode(String, bool),
@@ -289,7 +358,68 @@ struct Queued {
     /// prompt, after its blocks, in the order they were sent, and each
     /// resolves `sent` with it.
     joined: Vec<(String, Vec<ContentBlock>)>,
+    /// Typed in place of an answer the agent had no field for (see
+    /// `QuestionReply::Choice`): it is the reply on the question card, so it
+    /// goes to the agent with no bubble of its own.
+    silent: bool,
 }
+impl Queued {
+    fn new(id: String, blocks: Vec<ContentBlock>) -> Self {
+        Self {
+            id,
+            blocks,
+            joined: Vec::new(),
+            silent: false,
+        }
+    }
+}
+/// A message sent into the running turn and not yet settled.
+struct Steer {
+    item: Queued,
+    /// `SendIfRunning`: a refusal settles it `Dropped`, never a later turn.
+    if_running: bool,
+    /// The turn's earlier prompt answered `end_turn` while this one was in
+    /// flight: the agent took it, and the turn now ends with ITS answer.
+    handed_off: bool,
+}
+/// One `agy acp` form question: `q<N>` with its option consts, parallel to
+/// the [`Question`]'s options, and whether `q<N>_other` takes free text.
+struct FormQuestion {
+    consts: Vec<String>,
+    other: bool,
+    multi: bool,
+}
+enum QuestionReply {
+    /// `elicitation/create` (`agy acp`): `{action, content {qN, qN_other}}`.
+    Form(Vec<FormQuestion>),
+    /// agy-acp 1.4.5's question as a permission request: the option ids,
+    /// parallel to the one question's options. Its reply has no free-text
+    /// field.
+    Choice(Vec<String>),
+}
+struct AskedQuestion {
+    wire_id: Value,
+    reply: QuestionReply,
+    questions: Vec<Question>,
+}
+/// What an open tool row shows, so an update that renames it can re-emit
+/// its `ToolCall` whole.
+struct Row {
+    title: String,
+    kind: ToolKind,
+    locations: Vec<String>,
+    command: Option<String>,
+    /// The row already drew a diff or output: a permission request's copy
+    /// adds nothing.
+    has_content: bool,
+    /// The status the row last showed, which a copied-in change keeps.
+    status: ToolStatus,
+}
+/// The question id of agy-acp 1.4.5's single question (its options carry
+/// numeric ids of their own).
+const CHOICE_QUESTION_ID: &str = "q1";
+/// The chimaera MCP server's name in every agent's `mcpServers` entry.
+const CHIMAERA_SERVER: &str = "chimaera";
 pub struct AcpMapper {
     native: String,
     model: Option<String>,
@@ -342,10 +472,22 @@ pub struct AcpMapper {
     /// (Cursor opens every MCP call as "MCP: tool", Grok as "use_tool", and
     /// names it only on the update; PROTOCOL.md Pass 45). Dropped when the
     /// call ends or the turn does.
-    open_rows: HashMap<String, (String, ToolKind, Vec<String>)>,
+    open_rows: HashMap<String, Row>,
     /// Cursor's to-do list — `cursor/update_todos {merge: true}` upserts by
     /// id into it: (id, content, status) in the order first seen.
     todos: Vec<(String, String, String)>,
+    /// The session's working directory, which Antigravity row titles are
+    /// relative to.
+    cwd: std::path::PathBuf,
+    /// `AcpAdapter::elicitation`: `elicitation/create` is answered, not refused.
+    elicitation: bool,
+    /// `AcpAdapter::steers`.
+    steers: bool,
+    steer: Option<Steer>,
+    /// Open questions by request id (Antigravity only).
+    questions: HashMap<String, AskedQuestion>,
+    /// Open non-question forms (`agy acp`): request id → (wire id, form).
+    forms: HashMap<String, (Value, crate::elicitation::Elicitation)>,
 }
 /// A context-window reading from `used` of `size` tokens.
 fn context_usage(used: &Value, size: &Value) -> Option<AgentEvent> {
@@ -412,6 +554,136 @@ fn raw_shell_output(raw: &Value) -> Option<ToolContent> {
 fn output_content(output: &str) -> ToolContent {
     let (text, truncated) = cap_head_tail(output, 3072, 1024);
     ToolContent::Output { text, truncated }
+}
+
+/// Antigravity shell output as the command printed it: `agy acp` opens a
+/// finished call's text with "Created At: …\nCompleted At: …\nCommand exited
+/// with code N.\n\nCommand output:\n" (the two time lines absent when the
+/// command went async), and both servers keep the terminal's `\r\n`. Only
+/// that exact preamble is cut; capped text in, so the copy stays bounded.
+fn agy_shell_text(text: &str) -> String {
+    let mut rest = text;
+    for label in ["Created At: ", "Completed At: "] {
+        if let Some(line) = rest.strip_prefix(label) {
+            if let Some((_, after)) = line.split_once('\n') {
+                rest = after;
+            }
+        }
+    }
+    let body = rest
+        .strip_prefix("Command exited with code ")
+        .and_then(|r| r.split_once(".\n\nCommand output:\n"))
+        .filter(|(code, _)| {
+            let code = code.strip_prefix('-').unwrap_or(code);
+            !code.is_empty() && code.len() <= 12 && code.bytes().all(|b| b.is_ascii_digit())
+        })
+        .map(|(_, body)| body)
+        .unwrap_or(text);
+    body.replace("\r\n", "\n")
+}
+
+/// A frame's `content` list as one row content (≤ 4 blocks, capped).
+fn tool_content(content: &Value, kind: &str) -> Option<ToolContent> {
+    let mut blocks = rows(content)
+        .take(4)
+        .filter_map(|v| {
+            if v["type"] == "diff" {
+                let (new_text, truncated) =
+                    cap_head_tail(v["newText"].as_str().unwrap_or_default(), 3072, 1024);
+                Some(ToolContent::Diff {
+                    path: path(&v["path"])?,
+                    old_text: v["oldText"]
+                        .as_str()
+                        .map(|s| cap_head_tail(s, 3072, 1024).0),
+                    new_text,
+                    truncated,
+                })
+            } else if v["content"]["type"] == "text" {
+                let output = output_content(v["content"]["text"].as_str().unwrap_or_default());
+                Some(match output {
+                    ToolContent::Output { text, truncated } if kind == ANTIGRAVITY.kind => {
+                        ToolContent::Output {
+                            text: agy_shell_text(&text),
+                            truncated,
+                        }
+                    }
+                    other => other,
+                })
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    match blocks.len() {
+        0 => None,
+        1 => blocks.pop(),
+        _ => Some(ToolContent::Batch { diffs: blocks }),
+    }
+}
+
+/// The questions in an `agy acp` form (`elicitation/create`, Pass 62): every
+/// property is `q<N>` — a string with `oneOf` choices, or an array whose
+/// `items.anyOf` are the choices (multi-select) — or its free-text companion
+/// `q<N>_other`. `None` for any other shape, which is never guessed at.
+fn form_questions(schema: &Value) -> Option<(Vec<Question>, Vec<FormQuestion>)> {
+    let properties = schema["properties"].as_object()?;
+    let mut questions = Vec::new();
+    let mut form = Vec::new();
+    let mut seen = 0;
+    for n in 1..=crate::model::COMMAND_ANSWER_QUESTIONS_MAX + 1 {
+        let id = format!("q{n}");
+        let Some(field) = properties.get(&id) else {
+            break;
+        };
+        if n > crate::model::COMMAND_ANSWER_QUESTIONS_MAX {
+            return None;
+        }
+        let (choices, multi) = match field["type"].as_str()? {
+            "string" => (&field["oneOf"], false),
+            "array" => (&field["items"]["anyOf"], true),
+            _ => return None,
+        };
+        let choices = choices.as_array()?;
+        if choices.is_empty() || choices.len() > MAX_CHOICES {
+            return None;
+        }
+        let mut options = Vec::new();
+        let mut consts = Vec::new();
+        for choice in choices {
+            let value = identifier(&choice["const"])?;
+            let label = small(&choice["title"]);
+            if label.trim().is_empty() || options.iter().any(|o: &QuestionOption| o.label == label)
+            {
+                return None;
+            }
+            options.push(QuestionOption {
+                label,
+                description: choice["description"]
+                    .as_str()
+                    .map(|d| cap_head_tail(d, 256, 0).0)
+                    .unwrap_or_default(),
+            });
+            consts.push(value);
+        }
+        let other = properties.get(&format!("{id}_other"));
+        if other.is_some_and(|o| o["type"] != "string") {
+            return None;
+        }
+        seen += 1 + usize::from(other.is_some());
+        questions.push(Question {
+            id,
+            header: String::new(),
+            question: cap_head_tail(field["title"].as_str().unwrap_or_default(), 1024, 0).0,
+            options,
+            multi_select: multi,
+        });
+        form.push(FormQuestion {
+            consts,
+            other: other.is_some(),
+            multi,
+        });
+    }
+    (!questions.is_empty() && seen == properties.len()).then_some((questions, form))
 }
 
 fn text(v: &Value) -> String {
@@ -516,7 +788,17 @@ impl AcpMapper {
             hidden_calls: HashSet::new(),
             open_rows: HashMap::new(),
             todos: Vec::new(),
+            cwd: std::path::PathBuf::new(),
+            elicitation: false,
+            steers: false,
+            steer: None,
+            questions: HashMap::new(),
+            forms: HashMap::new(),
         };
+        // Both Antigravity servers ask questions (Pass 62); the others never do.
+        if kind == ANTIGRAVITY.kind {
+            mapper.caps.commands.push("answer".into());
+        }
         if !mapper.models.is_empty() {
             mapper.caps.commands.push("set_model".into());
         }
@@ -525,6 +807,16 @@ impl AcpMapper {
         }
         mapper.set_config(&session["configOptions"]);
         mapper
+    }
+    /// What the adapter itself brings to its sessions: form questions, and
+    /// mid-turn prompts with the `send_if_running` control they make real.
+    fn adopt(&mut self, adapter: &AcpAdapter) {
+        self.elicitation = adapter.elicitation;
+        self.steers = adapter.steers;
+        self.caps.commands.retain(|c| c != "send_if_running");
+        if adapter.steers {
+            self.caps.commands.push("send_if_running".into());
+        }
     }
     /// Grok 1.0.46 advertises no modes, but its `/always-approve on|off`
     /// command switches approvals mid-session without a model call
@@ -583,8 +875,123 @@ impl AcpMapper {
             .values()
             .any(|p| matches!(p, Pending::AlwaysApprove(..)))
     }
+    /// A steer still in flight after its turn ended runs as that turn's
+    /// continuation inside the agent, so nothing new may start beside it.
     fn busy(&self) -> bool {
-        self.turn.is_some() || self.switching()
+        self.turn.is_some() || self.switching() || self.steer.is_some()
+    }
+    /// Whether a message can join the running turn now: `agy acp` refuses a
+    /// prompt while a permission or a question is open (`-32603 "the running
+    /// prompt is waiting for a permission or question answer"`, Pass 62), and
+    /// one steer at a time keeps the hand-off unambiguous.
+    fn can_steer(&self) -> bool {
+        self.steers
+            && self.turn.is_some()
+            && !self.interrupted
+            && !self.switching()
+            && self.steer.is_none()
+            && self.pending.len() < MAX_PENDING
+            && self.queue.is_empty()
+            && self.asks.is_empty()
+            && self.questions.is_empty()
+            && self.forms.is_empty()
+    }
+    fn send_steer(&mut self, item: Queued, if_running: bool, step: &mut DriverStep) {
+        let Some(turn) = self.turn.clone() else {
+            return;
+        };
+        let prompt = Self::prompt_blocks(&item);
+        let before = self.pending.len();
+        self.request(
+            "session/prompt",
+            json!({"sessionId":self.native,"prompt":prompt}),
+            Pending::Steer(turn),
+            step,
+        );
+        if self.pending.len() == before {
+            // Refused for capacity: it waits for the turn's end, or misses it.
+            self.steer = Some(Steer {
+                item,
+                if_running,
+                handed_off: false,
+            });
+            self.unsteer(step);
+            return;
+        }
+        self.steer = Some(Steer {
+            item,
+            if_running,
+            handed_off: false,
+        });
+    }
+    /// A steer the agent refused or cancelled before taking it: an ordinary
+    /// message waits for the turn's end, first in line (it was sent before
+    /// anything queued after it), and whatever queued behind it goes in the
+    /// same prompt in the order sent (Pass 60's rule: a Send now that
+    /// cancelled the turn must not leave its message a turn behind); a
+    /// `SendIfRunning` missed its turn.
+    fn unsteer(&mut self, step: &mut DriverStep) {
+        let Some(steer) = self.steer.take() else {
+            return;
+        };
+        if steer.if_running {
+            step.events.push(AgentEvent::UserMessageUpdate {
+                id: steer.item.id,
+                state: UserMessageState::Dropped,
+            });
+            return;
+        }
+        let mut head = steer.item;
+        for item in self.queue.drain(..) {
+            if !item.silent {
+                head.joined.push((item.id, item.blocks));
+            }
+            head.joined.extend(item.joined);
+        }
+        self.queue.push_back(head);
+    }
+    /// The user's Stop ends what only answered the stopped turn: a typed
+    /// answer to agy-acp 1.4.5's question (`Queued::silent`) goes with it.
+    fn drop_silent(&mut self) {
+        let queue = std::mem::take(&mut self.queue);
+        for mut item in queue {
+            if !item.silent {
+                self.queue.push_back(item);
+            } else if !item.joined.is_empty() {
+                let (id, blocks) = item.joined.remove(0);
+                item.id = id;
+                item.blocks = blocks;
+                item.silent = false;
+                self.queue.push_back(item);
+            }
+        }
+    }
+    fn settle_sent(item: &Queued, step: &mut DriverStep) {
+        let head = (!item.silent).then_some(&item.id);
+        for id in head.into_iter().chain(item.joined.iter().map(|(id, _)| id)) {
+            step.events.push(AgentEvent::UserMessageUpdate {
+                id: id.clone(),
+                state: UserMessageState::Sent,
+            });
+        }
+    }
+    fn prompt_blocks(item: &Queued) -> Vec<Value> {
+        item.blocks
+            .iter()
+            .chain(item.joined.iter().flat_map(|(_, blocks)| blocks.iter()))
+            // A blank block reads to the agent as a message that came through
+            // empty (ingress strips them; this is the backstop).
+            .filter(|b| b.has_content())
+            .map(|b| match b {
+                ContentBlock::Text { text } => json!({"type":"text","text":text}),
+                ContentBlock::Image {
+                    media_type, data, ..
+                } => json!({"type":"image","mimeType":media_type,"data":data}),
+                ContentBlock::Skill { name, .. } => {
+                    json!({"type":"text","text":format!("/{name}")})
+                }
+            })
+            .collect()
     }
     fn set_grok_mode(&mut self, target: &str, chosen: bool, step: &mut DriverStep) {
         let offered = self.modes.iter().any(|m| m.id == target);
@@ -761,23 +1168,7 @@ impl AcpMapper {
             });
             return;
         }
-        let mut prompt: Vec<Value> = item
-            .blocks
-            .iter()
-            .chain(item.joined.iter().flat_map(|(_, blocks)| blocks.iter()))
-            // A blank block reads to the agent as a message that came through
-            // empty (ingress strips them; this is the backstop).
-            .filter(|b| b.has_content())
-            .map(|b| match b {
-                ContentBlock::Text { text } => json!({"type":"text","text":text}),
-                ContentBlock::Image {
-                    media_type, data, ..
-                } => json!({"type":"image","mimeType":media_type,"data":data}),
-                ContentBlock::Skill { name, .. } => {
-                    json!({"type":"text","text":format!("/{name}")})
-                }
-            })
-            .collect();
+        let mut prompt = Self::prompt_blocks(&item);
         if let Some(context) = &self.portable_context {
             prompt.insert(0, json!({"type":"text","text":context}));
         }
@@ -789,16 +1180,7 @@ impl AcpMapper {
             step,
         );
         if was_queued {
-            step.events.push(AgentEvent::UserMessageUpdate {
-                id: item.id,
-                state: UserMessageState::Sent,
-            });
-            for (id, _) in item.joined {
-                step.events.push(AgentEvent::UserMessageUpdate {
-                    id,
-                    state: UserMessageState::Sent,
-                });
-            }
+            Self::settle_sent(&item, step);
         } else {
             step.events
                 .push(Self::echo(&item.blocks, item.id, false, false));
@@ -812,6 +1194,7 @@ impl AcpMapper {
             return;
         }
         self.interrupted = true;
+        self.drop_silent();
         for (request_id, ask) in self.asks.drain() {
             step.outbound.push(json!({"jsonrpc":"2.0","id":ask.wire_id,"result":{"outcome":{"outcome":"cancelled"}}}));
             step.events.push(AgentEvent::PermissionResolved {
@@ -819,9 +1202,447 @@ impl AcpMapper {
                 option_id: "cancelled".into(),
             });
         }
+        self.withdraw_questions(true, step);
         step.outbound.push(
             json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":self.native}}),
         );
+    }
+    /// The open questions and forms resolve unanswered; `reply` sends each
+    /// its cancel (false once the process is gone).
+    fn withdraw_questions(&mut self, reply: bool, step: &mut DriverStep) {
+        for (request_id, asked) in self.questions.drain() {
+            if reply {
+                step.outbound
+                    .push(Self::question_cancel(&asked.wire_id, &asked.reply));
+            }
+            step.events.push(AgentEvent::QuestionResolved {
+                request_id,
+                answers: Default::default(),
+            });
+        }
+        for (request_id, (wire_id, _)) in self.forms.drain() {
+            if reply {
+                step.outbound
+                    .push(json!({"jsonrpc":"2.0","id":wire_id,"result":{"action":"cancel"}}));
+            }
+            step.events.push(AgentEvent::ElicitationResolved {
+                request_id,
+                action: "cancel".into(),
+            });
+        }
+    }
+    fn question_cancel(wire_id: &Value, reply: &QuestionReply) -> Value {
+        match reply {
+            QuestionReply::Form(_) => {
+                json!({"jsonrpc":"2.0","id":wire_id,"result":{"action":"cancel"}})
+            }
+            QuestionReply::Choice(_) => {
+                json!({"jsonrpc":"2.0","id":wire_id,"result":{"outcome":{"outcome":"cancelled"}}})
+            }
+        }
+    }
+    /// The user's answer, mapped back onto the reply shape the agent asked in.
+    /// Typed text with no field to carry it (a single-choice permission
+    /// request, an `agy acp` question without `q<N>_other`) withdraws or
+    /// skips that question and reaches the agent as the next prompt, named
+    /// as the answer it is; text beside a pick there is dropped. The
+    /// resolution reports only what the agent was given.
+    fn answer(
+        &mut self,
+        request_id: String,
+        answers: HashMap<String, Vec<String>>,
+        step: &mut DriverStep,
+    ) {
+        let Some(asked) = self.questions.remove(&request_id) else {
+            step.events.push(AgentEvent::QuestionResolved {
+                request_id,
+                answers: Default::default(),
+            });
+            step.events.push(AgentEvent::Notice {
+                text: "That question is no longer active. Ask again if needed.".into(),
+            });
+            return;
+        };
+        let picked = |question: &Question| -> (Vec<usize>, Option<String>) {
+            let mut chosen = Vec::new();
+            let mut typed = Vec::new();
+            for label in answers.get(&question.id).into_iter().flatten() {
+                match question.options.iter().position(|o| &o.label == label) {
+                    Some(at) if !chosen.contains(&at) => chosen.push(at),
+                    Some(_) => {}
+                    None if !label.trim().is_empty() => typed.push(label.trim()),
+                    None => {}
+                }
+            }
+            (chosen, (!typed.is_empty()).then(|| typed.join("\n")))
+        };
+        let label = |question: &Question, at: usize| question.options[at].label.clone();
+        // What the agent is given, per question id, as the card will show it.
+        let mut delivered: HashMap<String, Vec<String>> = HashMap::new();
+        // Typed answers with no field of their own: the next prompt.
+        let mut follow: Vec<(String, String)> = Vec::new();
+        match &asked.reply {
+            QuestionReply::Form(form) => {
+                let mut content = serde_json::Map::new();
+                for (question, field) in asked.questions.iter().zip(form) {
+                    let (chosen, typed) = picked(question);
+                    let consts: Vec<&String> = chosen.iter().map(|&i| &field.consts[i]).collect();
+                    let mut shown: Vec<String> = Vec::new();
+                    if field.multi && !consts.is_empty() {
+                        content.insert(question.id.clone(), json!(consts));
+                        shown.extend(chosen.iter().map(|&i| label(question, i)));
+                    } else if let Some(first) = consts.first() {
+                        content.insert(question.id.clone(), json!(first));
+                        shown.push(label(question, chosen[0]));
+                    }
+                    match typed {
+                        Some(text) if field.other => {
+                            content.insert(format!("{}_other", question.id), json!(text));
+                            shown.push(text);
+                        }
+                        Some(text) if chosen.is_empty() => {
+                            follow.push((question.id.clone(), text));
+                        }
+                        _ => {}
+                    }
+                    if !shown.is_empty() {
+                        delivered.insert(question.id.clone(), shown);
+                    }
+                }
+                if content.is_empty() {
+                    step.outbound
+                        .push(Self::question_cancel(&asked.wire_id, &asked.reply));
+                } else {
+                    step.outbound.push(json!({"jsonrpc":"2.0","id":asked.wire_id,"result":{"action":"accept","content":content}}));
+                }
+            }
+            QuestionReply::Choice(option_ids) => {
+                let Some(question) = asked.questions.first() else {
+                    return;
+                };
+                let (chosen, typed) = picked(question);
+                if let Some(&at) = chosen.first() {
+                    step.outbound.push(json!({"jsonrpc":"2.0","id":asked.wire_id,"result":{"outcome":{"outcome":"selected","optionId":option_ids[at]}}}));
+                    delivered.insert(question.id.clone(), vec![label(question, at)]);
+                } else {
+                    // The request offers only its options: free text cancels it.
+                    step.outbound
+                        .push(Self::question_cancel(&asked.wire_id, &asked.reply));
+                    if let Some(text) = typed {
+                        follow.push((question.id.clone(), text));
+                    }
+                }
+            }
+        }
+        if !follow.is_empty() {
+            if self.queue.len() >= MAX_PENDING {
+                step.events.push(AgentEvent::Notice {
+                    text: "Your typed answer could not be sent: too many messages are waiting. Send it again once the turn ends.".into(),
+                });
+            } else {
+                let text = follow
+                    .iter()
+                    .map(|(id, text)| {
+                        let asked_as = asked
+                            .questions
+                            .iter()
+                            .find(|q| &q.id == id)
+                            .map_or("", |q| q.question.as_str());
+                        format!("My answer to your question \"{asked_as}\": {text}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                // No bubble of its own: the card shows it as the reply.
+                let mut item = Queued::new(fresh_uuid(), vec![ContentBlock::Text { text }]);
+                item.silent = true;
+                self.queue.push_front(item);
+                self.resume(step);
+                for (id, text) in follow {
+                    delivered.entry(id).or_default().push(text);
+                }
+            }
+        }
+        step.events.push(AgentEvent::QuestionResolved {
+            request_id,
+            answers: delivered,
+        });
+    }
+    /// agy-acp 1.4.5 asks a question as a permission request (Pass 62): its
+    /// `toolCall` is `{toolCallId: "interaction_<hex>", title: <question>,
+    /// status, rawInput: {}}` with no `kind`, and every option — the answers,
+    /// ids "1", "2", … — is `allow_once`. Matched exactly, so no approval can
+    /// ever be read as a question.
+    fn choice_question(&self, params: &Value) -> Option<AskedQuestion> {
+        let call = &params["toolCall"];
+        if self.kind != ANTIGRAVITY.kind
+            || params["sessionId"] != self.native
+            || !call["toolCallId"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("interaction_") && id.len() <= 128)
+            || call.get("kind").is_some_and(|k| !k.is_null())
+        {
+            return None;
+        }
+        let raw = params["options"].as_array()?;
+        if raw.is_empty() || raw.len() > MAX_CHOICES {
+            return None;
+        }
+        let mut options = Vec::new();
+        let mut ids = Vec::new();
+        for o in raw {
+            let id = identifier(&o["optionId"])?;
+            let label = small(&o["name"]);
+            if o["kind"] != "allow_once"
+                || label.trim().is_empty()
+                || ids.contains(&id)
+                || options.iter().any(|x: &QuestionOption| x.label == label)
+            {
+                return None;
+            }
+            ids.push(id);
+            options.push(QuestionOption {
+                label,
+                description: String::new(),
+            });
+        }
+        let question = cap_head_tail(call["title"].as_str().unwrap_or_default(), 1024, 0).0;
+        if question.trim().is_empty() {
+            return None;
+        }
+        Some(AskedQuestion {
+            wire_id: Value::Null,
+            reply: QuestionReply::Choice(ids),
+            questions: vec![Question {
+                id: CHOICE_QUESTION_ID.into(),
+                header: String::new(),
+                question,
+                options,
+                multi_select: false,
+            }],
+        })
+    }
+    /// Show a question card, or answer it cancelled when no more fit.
+    fn ask(
+        &mut self,
+        request_id: String,
+        wire_id: Value,
+        mut asked: AskedQuestion,
+        step: &mut DriverStep,
+    ) {
+        asked.wire_id = wire_id;
+        if self.questions.len() >= MAX_PENDING || self.questions.contains_key(&request_id) {
+            step.outbound
+                .push(Self::question_cancel(&asked.wire_id, &asked.reply));
+            return;
+        }
+        step.events.push(AgentEvent::QuestionRequest {
+            request_id: request_id.clone(),
+            questions: asked.questions.clone(),
+            expires_at_ms: None,
+        });
+        self.questions.insert(request_id, asked);
+    }
+    /// `elicitation/create` (`agy acp`): its question form becomes a question
+    /// card; any other form the shared MCP-form normalizer can show becomes
+    /// a form card; the rest is declined. Always answered.
+    fn on_elicitation(&mut self, frame: &Value, step: &mut DriverStep) {
+        let params = &frame["params"];
+        let request_id = frame["id"].to_string();
+        let decline = json!({"jsonrpc":"2.0","id":frame["id"],"result":{"action":"decline"}});
+        if request_id.len() > 256 || params["sessionId"] != self.native || params["mode"] != "form"
+        {
+            step.outbound.push(decline);
+            return;
+        }
+        let schema = &params["requestedSchema"];
+        if let Some((questions, form)) = form_questions(schema) {
+            let asked = AskedQuestion {
+                wire_id: Value::Null,
+                reply: QuestionReply::Form(form),
+                questions,
+            };
+            self.ask(request_id, frame["id"].clone(), asked, step);
+            return;
+        }
+        let form = crate::elicitation::Elicitation::parse("form", schema, None);
+        if form.unsupported.is_some()
+            || self.forms.len() >= crate::elicitation::ELICITATION_PENDING
+            || self.forms.contains_key(&request_id)
+        {
+            step.outbound.push(decline);
+            return;
+        }
+        step.events.push(AgentEvent::ElicitationRequest {
+            request_id: request_id.clone(),
+            server: ANTIGRAVITY.name.into(),
+            message: truncate_label(params["message"].as_str().unwrap_or_default(), 8192),
+            elicitation: form.clone(),
+        });
+        self.forms.insert(request_id, (frame["id"].clone(), form));
+    }
+    /// Calls that draw no row: the agent's own plan bookkeeping (Cursor's
+    /// `updateTodos`, Grok's `kind: "plan"` tool), chimaera's `update_plan`
+    /// (the daemon journals that plan itself, as for claude), and an
+    /// Antigravity question, whose card is its row.
+    fn hidden_call(&self, update: &Value) -> bool {
+        if update["rawInput"]["_toolName"] == "updateTodos"
+            || update["_meta"]["x.ai/tool"]["kind"] == "plan"
+        {
+            return true;
+        }
+        if self.kind != ANTIGRAVITY.kind {
+            return false;
+        }
+        let name = update["name"].as_str().unwrap_or_default();
+        let interaction = update["toolCallId"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("interaction_"))
+            && update.get("kind").is_none_or(Value::is_null);
+        // `agy acp` names an MCP call `mcp_<server>_<tool>`; agy-acp 1.4.5
+        // carries `_meta.mcp {server, tool}` (Pass 45, Pass 62).
+        let mcp = &update["_meta"]["mcp"];
+        let plan = name == format!("mcp_{CHIMAERA_SERVER}_update_plan")
+            || (update["_meta"]["is_mcp_tool_call"] == true
+                && mcp["server"] == CHIMAERA_SERVER
+                && mcp["tool"] == "update_plan");
+        name == "ask_question" || interaction || plan
+    }
+    /// The file an Antigravity row is about, as the row should name it:
+    /// workspace-relative under the session's folder, else the file's name
+    /// (agy's own title climbs out with "../../../…").
+    fn agy_file(&self, update: &Value, locations: &[String]) -> Option<String> {
+        let input = &update["rawInput"];
+        let full = locations.first().cloned().or_else(|| {
+            ["Path", "TargetFile", "file_path", "AbsolutePath"]
+                .iter()
+                .find_map(|key| path(&input[*key]))
+        })?;
+        let full = std::path::Path::new(&full);
+        let shown = full
+            .strip_prefix(&self.cwd)
+            .ok()
+            .filter(|rel| !self.cwd.as_os_str().is_empty() && !rel.as_os_str().is_empty())
+            .map(|rel| rel.to_string_lossy().into_owned())
+            .or_else(|| full.file_name().map(|n| n.to_string_lossy().into_owned()))?;
+        Some(truncate_label(&shown, 200))
+    }
+    /// An Antigravity row's title and kind, in the `Name: detail` form the
+    /// other drivers' rows use (Pass 62): file tools name their file, a
+    /// subagent its role, a command stays its command line, and an unknown
+    /// tool keeps its own name without agy's "Run "/"Running …?" wrapper.
+    fn agy_row(
+        &self,
+        update: &Value,
+        title: String,
+        kind: ToolKind,
+        locations: &[String],
+    ) -> (String, ToolKind) {
+        let name = update["name"].as_str().unwrap_or_default();
+        let bare = title
+            .strip_prefix("Running ")
+            .or_else(|| title.strip_prefix("Run "))
+            .map(|t| t.strip_suffix('?').unwrap_or(t))
+            .filter(|t| {
+                *t == name
+                    || (!t.is_empty()
+                        && t.len() <= 64
+                        && t.bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'))
+            });
+        let tool = if name.is_empty() {
+            bare.unwrap_or_default()
+        } else {
+            name
+        };
+        if tool == "invoke_subagent" {
+            let input = &update["rawInput"];
+            let label = input["Role"]
+                .as_str()
+                .map(str::trim)
+                .filter(|r| !r.is_empty())
+                .or_else(|| input["Prompt"].as_str().and_then(|p| p.lines().next()))
+                .map(|r| truncate_label(r.trim(), 120));
+            return match label {
+                Some(label) if !label.is_empty() => (format!("Agent: {label}"), ToolKind::Agent),
+                _ => ("Agent".into(), ToolKind::Agent),
+            };
+        }
+        let verb = match kind {
+            ToolKind::Read => Some("Read"),
+            ToolKind::Edit if tool.starts_with("write") => Some("Write"),
+            ToolKind::Edit => Some("Edit"),
+            _ => None,
+        };
+        if let Some(verb) = verb {
+            if let Some(file) = self.agy_file(update, locations) {
+                return (format!("{verb}: {file}"), kind);
+            }
+        }
+        match bare {
+            Some(bare) if kind != ToolKind::Execute => (bare.to_owned(), kind),
+            _ => (title, kind),
+        }
+    }
+    /// The turn's last prompt answered: the turn ends, and whatever it held
+    /// open (approvals, questions, rows) ends with it.
+    fn end_turn(
+        &mut self,
+        turn_id: String,
+        frame: &Value,
+        error: Option<String>,
+        step: &mut DriverStep,
+    ) {
+        self.flush_into(step);
+        if let Some(reason) = error {
+            step.events.push(AgentEvent::TurnAborted {
+                turn_id,
+                reason,
+                interrupted: self.interrupted,
+            });
+        } else if frame["result"]["stopReason"] == "cancelled" {
+            step.events.push(AgentEvent::TurnAborted {
+                turn_id,
+                reason: "stopped".into(),
+                interrupted: true,
+            });
+        } else {
+            self.accept_context(step);
+            step.events.push(AgentEvent::TurnCompleted {
+                turn_id,
+                usage: Usage::default(),
+            });
+            // Free reads (no model call), live 1.0.46. Never
+            // stacked: a Grok that leaves them unanswered must
+            // not fill `pending` until prompts are refused.
+            let asking = self
+                .pending
+                .values()
+                .any(|p| matches!(p, Pending::GrokSessionInfo | Pending::GrokBilling));
+            if self.kind == GROK.kind && !asking {
+                let session = json!({"sessionId": self.native});
+                self.request(
+                    "_x.ai/session/info",
+                    session,
+                    Pending::GrokSessionInfo,
+                    step,
+                );
+                self.request("_x.ai/billing", json!({}), Pending::GrokBilling, step);
+            }
+        }
+        self.turn = None;
+        self.mcp_calls.clear();
+        self.hidden_calls.clear();
+        self.open_rows.clear();
+        for (request_id, _) in self.asks.drain() {
+            step.events.push(AgentEvent::PermissionResolved {
+                request_id,
+                option_id: "cancelled".into(),
+            });
+        }
+        // A question still open when the turn ends would hold the agent's
+        // request forever: it is answered cancelled.
+        self.withdraw_questions(true, step);
+        self.resume(step);
     }
     fn accept_context(&mut self, step: &mut DriverStep) {
         if self.turn.is_some() && self.portable_context.take().is_some() {
@@ -846,11 +1667,19 @@ impl AcpMapper {
         let (server, tool, pinned) = match self.kind {
             // agy-acp 1.2.1: `_meta {mcp: {server, tool}, is_mcp_tool_call}`,
             // title `<server>_<tool>`.
+            // `agy acp` 1.5.12: no `_meta`; `name: "mcp_<server>_<tool>"`,
+            // title `Run <name>` (Pass 62). The server half is ambiguous in
+            // the name alone (both halves may hold `_`), so only the
+            // consented server is ever read out of it.
+            k if k == ANTIGRAVITY.kind && call["_meta"]["is_mcp_tool_call"] != true => {
+                let name = identifier(&call["name"])?;
+                let server = self.mcp_auto_approve.as_ref()?.server.clone();
+                let tool = name.strip_prefix(&format!("mcp_{server}_"))?.to_owned();
+                let pinned = title == format!("Run {name}");
+                (server, tool, pinned)
+            }
             k if k == ANTIGRAVITY.kind => {
                 let meta = &call["_meta"];
-                if meta["is_mcp_tool_call"] != true {
-                    return None;
-                }
                 let server = identifier(&meta["mcp"]["server"])?;
                 let tool = identifier(&meta["mcp"]["tool"])?;
                 let pinned = title == format!("{server}_{tool}");
@@ -1080,6 +1909,7 @@ impl Mapper for AcpMapper {
     }
     fn on_command(&mut self, cmd: AgentCommand) -> DriverStep {
         let mut step = DriverStep::default();
+        let after_turn = matches!(cmd, AgentCommand::SendAfterTurn { .. });
         match cmd {
             AgentCommand::Send { blocks } | AgentCommand::SendAfterTurn { blocks } => {
                 let id = fresh_uuid();
@@ -1108,28 +1938,29 @@ impl Mapper for AcpMapper {
                     });
                     return step;
                 }
-                if self.busy() {
+                if !after_turn && self.can_steer() {
+                    step.events
+                        .push(Self::echo(&blocks, id.clone(), true, false));
+                    self.send_steer(Queued::new(id, blocks), false, &mut step);
+                } else if self.busy() {
                     step.events
                         .push(Self::echo(&blocks, id.clone(), true, true));
-                    self.queue.push_back(Queued {
-                        id,
-                        blocks,
-                        joined: Vec::new(),
-                    });
+                    self.queue.push_back(Queued::new(id, blocks));
                 } else {
-                    let item = Queued {
-                        id,
-                        blocks,
-                        joined: Vec::new(),
-                    };
-                    self.start(item, false, &mut step);
+                    self.start(Queued::new(id, blocks), false, &mut step);
                 }
             }
-            AgentCommand::SendIfRunning { id, .. } => {
-                step.events.push(AgentEvent::UserMessageUpdate {
-                    id,
-                    state: UserMessageState::Dropped,
-                })
+            AgentCommand::SendIfRunning { id, blocks } => {
+                if self.can_steer() && self.pending.len() < MAX_PENDING {
+                    step.events
+                        .push(Self::echo(&blocks, id.clone(), true, false));
+                    self.send_steer(Queued::new(id, blocks), true, &mut step);
+                } else {
+                    step.events.push(AgentEvent::UserMessageUpdate {
+                        id,
+                        state: UserMessageState::Dropped,
+                    })
+                }
             }
             AgentCommand::CancelQueued { id } => {
                 let mut found = false;
@@ -1198,6 +2029,40 @@ impl Mapper for AcpMapper {
                     });
                 }
             }
+            AgentCommand::Answer {
+                request_id,
+                answers,
+            } => self.answer(request_id, answers, &mut step),
+            AgentCommand::Elicitation {
+                request_id,
+                action,
+                content,
+            } => {
+                let Some((_, form)) = self.forms.get(&request_id) else {
+                    step.events.push(AgentEvent::ElicitationResolved {
+                        request_id,
+                        action: "expired".into(),
+                    });
+                    return step;
+                };
+                if let Err(error) = form.validate(action, &content) {
+                    step.events.push(AgentEvent::Notice {
+                        text: format!("Form not sent: {error}"),
+                    });
+                    return step;
+                }
+                let (wire_id, _) = self.forms.remove(&request_id).unwrap();
+                let mut result = json!({"action": action});
+                if action == crate::elicitation::ElicitationAction::Accept {
+                    result["content"] = content;
+                }
+                step.outbound
+                    .push(json!({"jsonrpc":"2.0","id":wire_id,"result":result}));
+                step.events.push(AgentEvent::ElicitationResolved {
+                    request_id,
+                    action: action.as_str().into(),
+                });
+            }
             AgentCommand::SetModel { model_id } => {
                 self.config_command("model", &model_id, &mut step)
             }
@@ -1220,61 +2085,37 @@ impl Mapper for AcpMapper {
             let error = frame.get("error").map(|e| text(&e["message"]));
             let model_answered = pending.changes_model();
             match pending {
-                Pending::Prompt(turn_id) => {
+                // The turn's prompt answers `end_turn` the moment a steer
+                // reaches the agent (`agy acp`, Pass 62); the work goes on
+                // under the steer's request, which ends the turn.
+                Pending::Prompt(turn_id)
+                    if error.is_none()
+                        && frame["result"]["stopReason"] == "end_turn"
+                        && self.turn.as_ref() == Some(&turn_id)
+                        && self.steer.as_ref().is_some_and(|s| !s.handed_off) =>
+                {
                     self.flush_into(&mut step);
-                    if let Some(reason) = error {
-                        step.events.push(AgentEvent::TurnAborted {
-                            turn_id,
-                            reason,
-                            interrupted: self.interrupted,
-                        });
-                    } else if frame["result"]["stopReason"] == "cancelled" {
-                        step.events.push(AgentEvent::TurnAborted {
-                            turn_id,
-                            reason: "stopped".into(),
-                            interrupted: true,
-                        });
-                    } else {
-                        self.accept_context(&mut step);
-                        step.events.push(AgentEvent::TurnCompleted {
-                            turn_id,
-                            usage: Usage::default(),
-                        });
-                        // Free reads (no model call), live 1.0.46. Never
-                        // stacked: a Grok that leaves them unanswered must
-                        // not fill `pending` until prompts are refused.
-                        let asking = self
-                            .pending
-                            .values()
-                            .any(|p| matches!(p, Pending::GrokSessionInfo | Pending::GrokBilling));
-                        if self.kind == GROK.kind && !asking {
-                            let session = json!({"sessionId": self.native});
-                            self.request(
-                                "_x.ai/session/info",
-                                session,
-                                Pending::GrokSessionInfo,
-                                &mut step,
-                            );
-                            self.request(
-                                "_x.ai/billing",
-                                json!({}),
-                                Pending::GrokBilling,
-                                &mut step,
-                            );
-                        }
+                    if let Some(steer) = &mut self.steer {
+                        steer.handed_off = true;
+                        Self::settle_sent(&steer.item, &mut step);
                     }
-                    self.turn = None;
-                    self.mcp_calls.clear();
-                    self.hidden_calls.clear();
-                    self.open_rows.clear();
-                    for (request_id, _) in self.asks.drain() {
-                        step.events.push(AgentEvent::PermissionResolved {
-                            request_id,
-                            option_id: "cancelled".into(),
-                        });
-                    }
-                    self.resume(&mut step);
                 }
+                Pending::Steer(turn_id) => {
+                    if self.steer.as_ref().is_some_and(|s| s.handed_off) {
+                        self.steer = None;
+                        self.end_turn(turn_id, frame, error, &mut step);
+                    } else if error.is_some() || frame["result"]["stopReason"] == "cancelled" {
+                        self.unsteer(&mut step);
+                        self.resume(&mut step);
+                    } else {
+                        // Answered before the turn's own prompt: taken all the same.
+                        if let Some(steer) = self.steer.take() {
+                            Self::settle_sent(&steer.item, &mut step);
+                        }
+                        self.resume(&mut step);
+                    }
+                }
+                Pending::Prompt(turn_id) => self.end_turn(turn_id, frame, error, &mut step),
                 // The command ran inside Grok when no model call was billed
                 // for it; anything else was read as an ordinary message.
                 Pending::AlwaysApprove(on, chosen) => {
@@ -1366,6 +2207,11 @@ impl Mapper for AcpMapper {
             self.flush_into(&mut step);
             let request_id = frame["id"].to_string();
             if request_id.len() > 256 {
+                step.outbound.push(json!({"jsonrpc":"2.0","id":frame["id"],"result":{"outcome":{"outcome":"cancelled"}}}));
+                return step;
+            }
+            if let Some(question) = self.choice_question(params) {
+                self.ask(request_id, frame["id"].clone(), question, &mut step);
                 return step;
             }
             let options: Vec<_> = unique_rows(&params["options"], "optionId")
@@ -1411,10 +2257,35 @@ impl Mapper for AcpMapper {
                         options: options.clone(),
                     },
                 );
+                let tool_call_id = identifier(&call["toolCallId"]);
+                let mut title = small(&call["title"]);
+                if let Some(row) = tool_call_id
+                    .as_ref()
+                    .and_then(|id| self.open_rows.get_mut(id))
+                {
+                    // What is being approved: an `agy acp` edit's diff rides
+                    // only the request, never its row (Pass 62). The row gets
+                    // it first, so the card and the row show the same change,
+                    // at the status the row already shows. Antigravity only:
+                    // the other agents' requests are unprobed for this.
+                    if self.kind == ANTIGRAVITY.kind {
+                        if !row.has_content {
+                            if let Some(content) = tool_content(&call["content"], self.kind) {
+                                row.has_content = true;
+                                step.events.push(AgentEvent::ToolCallUpdate {
+                                    id: tool_call_id.clone().unwrap_or_default(),
+                                    status: row.status,
+                                    content: Some(content),
+                                });
+                            }
+                        }
+                        title = row.title.clone();
+                    }
+                }
                 step.events.push(AgentEvent::PermissionRequest {
                     request_id,
-                    tool_call_id: identifier(&call["toolCallId"]),
-                    title: small(&call["title"]),
+                    tool_call_id,
+                    title,
                     options,
                     input_preview: cap_preview(&call["rawInput"]),
                     plan: None,
@@ -1438,6 +2309,12 @@ impl Mapper for AcpMapper {
                     .collect();
                 step.outbound.push(json!({"jsonrpc":"2.0","id":frame["id"],"result":{"outcome":{"outcome":"accepted","todos":todos}}}));
             }
+            return step;
+        }
+        if frame["method"] == "elicitation/create" && frame.get("id").is_some() && self.elicitation
+        {
+            self.flush_into(&mut step);
+            self.on_elicitation(frame, &mut step);
             return step;
         }
         if frame.get("id").is_some() {
@@ -1499,12 +2376,24 @@ impl Mapper for AcpMapper {
                 let Some(id) = identifier(&update["toolCallId"]) else {
                     return step;
                 };
-                let status = match update["status"].as_str() {
+                let agy = self.kind == ANTIGRAVITY.kind;
+                let mut status = match update["status"].as_str() {
                     Some("completed") => ToolStatus::Completed,
                     Some("failed") => ToolStatus::Failed,
                     Some("pending") => ToolStatus::Pending,
                     _ => ToolStatus::InProgress,
                 };
+                // A command that exited non-zero failed, as codex's rows say
+                // (`exitCode != 0`). Both agy servers report `exit_code`.
+                if agy
+                    && status == ToolStatus::Completed
+                    && ["exit_code", "exitCode"]
+                        .iter()
+                        .find_map(|k| update["rawOutput"][*k].as_i64())
+                        .is_some_and(|code| code != 0)
+                {
+                    status = ToolStatus::Failed;
+                }
                 let ended = matches!(status, ToolStatus::Completed | ToolStatus::Failed);
                 // Cursor's `tool_call_update` is where an MCP call names its
                 // server and tool (`rawInput {providerIdentifier, toolName}`);
@@ -1523,14 +2412,7 @@ impl Mapper for AcpMapper {
                         self.mcp_calls.remove(&id);
                     }
                 }
-                // The agent's own plan tool — Cursor's `updateTodos` (its
-                // list arrives as `cursor/update_todos`), Grok's `todo_write`
-                // (its list arrives as the `plan` update) — is the plan
-                // card's bookkeeping and draws no row, like claude's TodoWrite.
-                if update["sessionUpdate"] == "tool_call"
-                    && (update["rawInput"]["_toolName"] == "updateTodos"
-                        || update["_meta"]["x.ai/tool"]["kind"] == "plan")
-                {
+                if update["sessionUpdate"] == "tool_call" && self.hidden_call(update) {
                     if self.hidden_calls.len() < MAX_PENDING {
                         self.hidden_calls.insert(id);
                     }
@@ -1552,11 +2434,31 @@ impl Mapper for AcpMapper {
                     let kind =
                         serde_json::from_value(update["kind"].clone()).unwrap_or(ToolKind::Other);
                     let (title, locations) = (small(&update["title"]), locations());
+                    let (title, kind) = if agy {
+                        self.agy_row(update, title, kind, &locations)
+                    } else {
+                        (title, kind)
+                    };
+                    // The whole command line, for the approval card and the
+                    // turn-end gallery (both agy servers: `rawInput.CommandLine`).
+                    let command = (agy && kind == ToolKind::Execute)
+                        .then(|| update["rawInput"]["CommandLine"].as_str())
+                        .flatten()
+                        .map(clip_command);
                     if !ended
                         && (self.open_rows.len() < MAX_PENDING || self.open_rows.contains_key(&id))
                     {
-                        self.open_rows
-                            .insert(id.clone(), (title.clone(), kind, locations.clone()));
+                        self.open_rows.insert(
+                            id.clone(),
+                            Row {
+                                title: title.clone(),
+                                kind,
+                                locations: locations.clone(),
+                                command: command.clone(),
+                                has_content: false,
+                                status,
+                            },
+                        );
                     }
                     step.events.push(AgentEvent::ToolCall {
                         id: id.clone(),
@@ -1565,39 +2467,66 @@ impl Mapper for AcpMapper {
                         locations,
                         status,
                         cross_turn: false,
-                        command: None,
+                        command,
                     });
-                } else if let Some((title, kind, locations_now)) = self.open_rows.get_mut(&id) {
+                    // Every Antigravity call's arguments, whole or not at all,
+                    // so an opened row can show them (`toolSummary`, a file's
+                    // `Description`, …). Same budget as claude's.
+                    let input = &update["rawInput"];
+                    if agy
+                        && input.as_object().is_some_and(|o| !o.is_empty())
+                        && serde_json::to_vec(input).is_ok_and(|v| v.len() <= 32 * 1024)
+                    {
+                        step.events.push(AgentEvent::ToolRenderData {
+                            id: id.clone(),
+                            name: identifier(&update["name"]),
+                            input: Some(input.clone()),
+                            output: None,
+                        });
+                    }
+                } else if self.open_rows.contains_key(&id) {
                     // ACP's update replaces whichever of these it carries;
                     // the row is re-emitted (clients upsert by id, as for
                     // codex's file-change rows) only when what it shows moved.
-                    let mut moved = false;
-                    if update["title"]
+                    let renamed_title = update["title"]
                         .as_str()
-                        .is_some_and(|t| !t.trim().is_empty())
-                    {
-                        let renamed = small(&update["title"]);
-                        moved |= renamed != *title;
-                        *title = renamed;
-                    }
-                    if let Ok(renamed) = serde_json::from_value::<ToolKind>(update["kind"].clone())
-                    {
-                        moved |= renamed != *kind;
-                        *kind = renamed;
-                    }
+                        .filter(|t| !t.trim().is_empty())
+                        .map(|_| small(&update["title"]));
+                    let renamed_kind =
+                        serde_json::from_value::<ToolKind>(update["kind"].clone()).ok();
                     // An empty list never erases the paths the row showed:
                     // an edit's files are what the turn says it wrote.
-                    let renamed = locations();
-                    if !renamed.is_empty() {
-                        moved |= renamed != *locations_now;
-                        *locations_now = renamed;
-                    }
+                    let renamed_locations = locations();
+                    let row = &self.open_rows[&id];
+                    let locations_now = if renamed_locations.is_empty() {
+                        row.locations.clone()
+                    } else {
+                        renamed_locations
+                    };
+                    let (title, kind) = match (renamed_title, renamed_kind) {
+                        (None, None) => (row.title.clone(), row.kind),
+                        (title, kind) => {
+                            let title = title.unwrap_or_else(|| row.title.clone());
+                            let kind = kind.unwrap_or(row.kind);
+                            if agy {
+                                self.agy_row(update, title, kind, &locations_now)
+                            } else {
+                                (title, kind)
+                            }
+                        }
+                    };
+                    let row = self.open_rows.get_mut(&id).expect("checked above");
+                    let moved =
+                        title != row.title || kind != row.kind || locations_now != row.locations;
+                    row.title = title;
+                    row.kind = kind;
+                    row.locations = locations_now;
                     if moved {
                         step.events.push(AgentEvent::ToolCall {
                             id: id.clone(),
-                            kind: *kind,
-                            title: title.clone(),
-                            locations: locations_now.clone(),
+                            kind: row.kind,
+                            title: row.title.clone(),
+                            locations: row.locations.clone(),
                             // A re-emit never finishes the row: the update
                             // below carries the terminal status.
                             status: if ended {
@@ -1606,49 +2535,28 @@ impl Mapper for AcpMapper {
                                 status
                             },
                             cross_turn: false,
-                            command: None,
+                            command: row.command.clone(),
                         });
                     }
                 }
+                let content = tool_content(&update["content"], self.kind).or_else(|| {
+                    ended
+                        .then(|| raw_shell_output(&update["rawOutput"]))
+                        .flatten()
+                        .map(|output| match output {
+                            ToolContent::Output { text, truncated } if agy => ToolContent::Output {
+                                text: agy_shell_text(&text),
+                                truncated,
+                            },
+                            other => other,
+                        })
+                });
                 if ended {
                     self.open_rows.remove(&id);
+                } else if let Some(row) = self.open_rows.get_mut(&id) {
+                    row.has_content |= content.is_some();
+                    row.status = status;
                 }
-                let content = rows(&update["content"])
-                    .take(4)
-                    .filter_map(|v| {
-                        if v["type"] == "diff" {
-                            let (new_text, truncated) = cap_head_tail(
-                                v["newText"].as_str().unwrap_or_default(),
-                                3072,
-                                1024,
-                            );
-                            Some(ToolContent::Diff {
-                                path: path(&v["path"])?,
-                                old_text: v["oldText"]
-                                    .as_str()
-                                    .map(|s| cap_head_tail(s, 3072, 1024).0),
-                                new_text,
-                                truncated,
-                            })
-                        } else if v["content"]["type"] == "text" {
-                            Some(output_content(
-                                v["content"]["text"].as_str().unwrap_or_default(),
-                            ))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                let content = if content.is_empty() && ended {
-                    raw_shell_output(&update["rawOutput"]).into_iter().collect()
-                } else {
-                    content
-                };
-                let content = match content.len() {
-                    0 => None,
-                    1 => content.into_iter().next(),
-                    _ => Some(ToolContent::Batch { diffs: content }),
-                };
                 step.events.push(AgentEvent::ToolCallUpdate {
                     id,
                     status,
@@ -1746,10 +2654,21 @@ impl Mapper for AcpMapper {
                 option_id: "cancelled".into(),
             })
             .collect();
+        let mut step = DriverStep::default();
+        self.withdraw_questions(false, &mut step);
+        events.append(&mut step.events);
+        if let Some(steer) = self.steer.take().filter(|s| !s.handed_off) {
+            self.queue.push_front(steer.item);
+        }
         events.extend(
             self.queue
                 .drain(..)
-                .flat_map(|q| std::iter::once(q.id).chain(q.joined.into_iter().map(|(id, _)| id)))
+                .flat_map(|q| {
+                    // A silent head never had a bubble to settle.
+                    let head = (!q.silent).then_some(q.id);
+                    head.into_iter()
+                        .chain(q.joined.into_iter().map(|(id, _)| id))
+                })
                 .map(|id| AgentEvent::UserMessageUpdate {
                     id,
                     state: UserMessageState::Dropped,
@@ -3012,5 +3931,822 @@ mod tests {
             running.events.last(),
             Some(AgentEvent::ToolCallUpdate { content: None, .. })
         ));
+    }
+
+    /// An `agy acp` mapper (`ANTIGRAVITY_CLI`): forms and steers on.
+    fn agy_cli() -> AcpMapper {
+        let mut m = AcpMapper::new("session".into(), &json!({}), &json!({}), ANTIGRAVITY.kind);
+        m.cwd = "/work/ws".into();
+        m.adopt(&ANTIGRAVITY_CLI);
+        m
+    }
+    fn agy_standalone() -> AcpMapper {
+        let mut m = AcpMapper::new("session".into(), &json!({}), &json!({}), ANTIGRAVITY.kind);
+        m.cwd = "/work/ws".into();
+        m
+    }
+    /// The live `elicitation/create` of agy 1.5.12 (Pass 62): one single and
+    /// one multi-select question, each with its free-text companion.
+    fn two_questions(id: &str) -> Value {
+        json!({"jsonrpc":"2.0","id":id,"method":"elicitation/create","params":{"sessionId":"session","toolCallId":"call_1","mode":"form","message":"The agent has 2 questions.","requestedSchema":{"type":"object","properties":{
+            "q1":{"type":"string","title":"Which language should the service use?","oneOf":[{"const":"1","title":"Rust"},{"const":"2","title":"Go"}]},
+            "q1_other":{"type":"string","title":"Other","description":"Optional free-form answer to: Which language should the service use?"},
+            "q2":{"type":"array","title":"Which features do you want?","items":{"anyOf":[{"const":"1","title":"Auth"},{"const":"2","title":"Billing"},{"const":"3","title":"Search"}]}},
+            "q2_other":{"type":"string","title":"Other","description":"Optional free-form answer to: Which features do you want?"}}}}})
+    }
+    fn answer(request_id: &str, answers: &[(&str, &[&str])]) -> AgentCommand {
+        AgentCommand::Answer {
+            request_id: request_id.into(),
+            answers: answers
+                .iter()
+                .map(|(q, a)| (q.to_string(), a.iter().map(|s| s.to_string()).collect()))
+                .collect(),
+        }
+    }
+    fn question_request(step: &DriverStep) -> (String, Vec<Question>) {
+        match step.events.as_slice() {
+            [AgentEvent::QuestionRequest {
+                request_id,
+                questions,
+                expires_at_ms: None,
+            }] => (request_id.clone(), questions.clone()),
+            other => panic!("expected one QuestionRequest, got {other:?}"),
+        }
+    }
+    #[test]
+    fn agy_form_questions_become_a_question_card_and_answer_by_const() {
+        let mut m = agy_cli();
+        assert!(m.caps.commands.contains(&"answer".into()));
+        send(&mut m, "ask me");
+        let (id, questions) = question_request(&m.on_frame(&two_questions("1")));
+        assert_eq!(questions.len(), 2);
+        assert_eq!(
+            questions[0].question,
+            "Which language should the service use?"
+        );
+        assert_eq!(questions[0].options[1].label, "Go");
+        assert!(!questions[0].multi_select && questions[1].multi_select);
+        // Picks map back to the consts; a label that is no option is free text.
+        let step = m.on_command(answer(
+            &id,
+            &[("q1", &["Go"]), ("q2", &["Auth", "Search", "Vector DB"])],
+        ));
+        assert_eq!(
+            step.outbound[0],
+            json!({"jsonrpc":"2.0","id":"1","result":{"action":"accept","content":{"q1":"2","q2":["1","3"],"q2_other":"Vector DB"}}})
+        );
+        assert!(
+            matches!(&step.events[..], [AgentEvent::QuestionResolved { answers, .. }] if answers["q2"].len() == 3)
+        );
+        // Free text alone rides `q<N>_other`.
+        let (id, _) = question_request(&m.on_frame(&two_questions("2")));
+        let step = m.on_command(answer(&id, &[("q1", &["Chimaera Prime"])]));
+        assert_eq!(
+            step.outbound[0]["result"],
+            json!({"action":"accept","content":{"q1_other":"Chimaera Prime"}})
+        );
+        // Nothing chosen anywhere cancels, and the card resolves empty.
+        let (id, _) = question_request(&m.on_frame(&two_questions("3")));
+        let step = m.on_command(answer(&id, &[]));
+        assert_eq!(step.outbound[0]["result"], json!({"action":"cancel"}));
+        assert!(
+            matches!(&step.events[..], [AgentEvent::QuestionResolved { answers, .. }] if answers.is_empty())
+        );
+        // A stale answer resolves with a notice and sends nothing.
+        let step = m.on_command(answer(&id, &[("q1", &["Go"])]));
+        assert!(step.outbound.is_empty());
+        assert!(step
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Notice { .. })));
+    }
+    #[test]
+    fn open_agy_questions_are_cancelled_by_interrupt_turn_end_and_exit() {
+        let mut m = agy_cli();
+        let first = send(&mut m, "ask me");
+        m.on_frame(&two_questions("1"));
+        let step = m.on_command(AgentCommand::Interrupt);
+        assert_eq!(
+            step.outbound[0],
+            json!({"jsonrpc":"2.0","id":"1","result":{"action":"cancel"}})
+        );
+        assert_eq!(step.outbound[1]["method"], "session/cancel");
+        assert!(step.events.iter().any(
+            |e| matches!(e, AgentEvent::QuestionResolved { answers, .. } if answers.is_empty())
+        ));
+        m.on_frame(&json!({"id":first.outbound[0]["id"],"result":{"stopReason":"cancelled"}}));
+
+        let turn = send(&mut m, "again");
+        m.on_frame(&two_questions("2"));
+        let done =
+            m.on_frame(&json!({"id":turn.outbound[0]["id"],"result":{"stopReason":"end_turn"}}));
+        assert!(done
+            .outbound
+            .iter()
+            .any(|f| f["id"] == "2" && f["result"]["action"] == "cancel"));
+        assert!(m.questions.is_empty());
+
+        send(&mut m, "third");
+        m.on_frame(&two_questions("3"));
+        let events = m.drain_pending();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::QuestionResolved { .. })));
+    }
+    #[test]
+    fn other_agy_forms_use_the_form_card_or_are_declined() {
+        let mut m = agy_cli();
+        let form = |id: &str, schema: Value| json!({"jsonrpc":"2.0","id":id,"method":"elicitation/create","params":{"sessionId":"session","mode":"form","message":"Configure","requestedSchema":schema}});
+        let step = m.on_frame(&form("1", json!({"type":"object","required":["n"],"properties":{"n":{"type":"integer","minimum":0}}})));
+        let request_id = match &step.events[..] {
+            [AgentEvent::ElicitationRequest {
+                request_id, server, ..
+            }] => {
+                assert_eq!(server, "Antigravity");
+                request_id.clone()
+            }
+            other => panic!("{other:?}"),
+        };
+        let step = m.on_command(AgentCommand::Elicitation {
+            request_id,
+            action: crate::elicitation::ElicitationAction::Accept,
+            content: json!({"n": 3}),
+        });
+        assert_eq!(
+            step.outbound[0]["result"],
+            json!({"action":"accept","content":{"n":3}})
+        );
+        // A schema the normalizer cannot show, and a non-form mode: declined.
+        let step = m.on_frame(&form("2", json!({"type":"object","properties":{"x":{"type":"object","properties":{"y":{"type":"object"}}}}})));
+        let declined = |step: &DriverStep, id: &str| {
+            step.outbound == [json!({"jsonrpc":"2.0","id":id,"result":{"action":"decline"}})]
+        };
+        assert!(
+            step.events.is_empty() || declined(&step, "2"),
+            "{:?}",
+            step.events
+        );
+        let mut url = form("3", json!({}));
+        url["params"]["mode"] = json!("url");
+        assert!(declined(&m.on_frame(&url), "3"));
+        // A question shape with a stray property is not guessed at.
+        let mut odd = two_questions("4");
+        odd["params"]["requestedSchema"]["properties"]["extra"] = json!({"type":"string"});
+        let step = m.on_frame(&odd);
+        assert!(!step
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::QuestionRequest { .. })));
+        // An adapter that never advertised forms refuses them as before.
+        let mut standalone = agy_standalone();
+        let step = standalone.on_frame(&two_questions("5"));
+        assert_eq!(step.outbound[0]["error"]["code"], -32601);
+    }
+    /// agy-acp 1.4.5's question, live (Pass 62).
+    fn interaction(id: u64) -> Value {
+        json!({"jsonrpc":"2.0","id":id,"method":"session/request_permission","params":{"sessionId":"session","toolCall":{"toolCallId":"interaction_7eee9b3f","status":"pending","title":"Which color do you prefer?","rawInput":{}},
+            "options":[{"optionId":"1","name":"Red","kind":"allow_once"},{"optionId":"2","name":"Green","kind":"allow_once"},{"optionId":"3","name":"Blue","kind":"allow_once"}]}})
+    }
+    #[test]
+    fn standalone_interaction_is_a_question_and_free_text_follows_as_a_prompt() {
+        let mut m = agy_standalone();
+        let turn = send(&mut m, "ask me");
+        let row = m.on_frame(&update(json!({"sessionUpdate":"tool_call","toolCallId":"interaction_7eee9b3f","title":"Which color do you prefer?","status":"pending","rawInput":{}})));
+        assert!(
+            row.events.is_empty(),
+            "the card is the row: {:?}",
+            row.events
+        );
+        let (id, questions) = question_request(&m.on_frame(&interaction(2)));
+        assert_eq!(
+            questions[0]
+                .options
+                .iter()
+                .map(|o| o.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Red", "Green", "Blue"]
+        );
+        let step = m.on_command(answer(&id, &[("q1", &["Green"])]));
+        assert!(selected(
+            &DriverStep {
+                outbound: step.outbound.clone(),
+                ..Default::default()
+            },
+            2,
+            "2"
+        ));
+        let done = m.on_frame(&update(json!({"sessionUpdate":"tool_call_update","toolCallId":"interaction_7eee9b3f","status":"completed","rawOutput":"Response received"})));
+        assert!(done.events.is_empty());
+
+        // Free text: the request is cancelled, and the text goes as the next
+        // prompt with no bubble of its own (the card shows it).
+        let (id, _) = question_request(&m.on_frame(&interaction(3)));
+        let step = m.on_command(answer(&id, &[("q1", &["Purple"])]));
+        assert_eq!(
+            step.outbound[0]["result"],
+            json!({"outcome":{"outcome":"cancelled"}})
+        );
+        assert!(
+            matches!(&step.events[..], [AgentEvent::QuestionResolved { answers, .. }] if answers["q1"] == ["Purple"])
+        );
+        let ended =
+            m.on_frame(&json!({"id":turn.outbound[0]["id"],"result":{"stopReason":"end_turn"}}));
+        let prompt = &ended.outbound[0]["params"]["prompt"][0]["text"];
+        assert!(prompt.as_str().unwrap().contains("Purple"), "{prompt}");
+        assert!(!ended.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::UserMessage { .. } | AgentEvent::UserMessageUpdate { .. }
+        )));
+        assert!(ended
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnStarted { .. })));
+
+        // Anything short of the exact shape stays an approval.
+        let mut approval = interaction(4);
+        approval["params"]["toolCall"]["kind"] = json!("execute");
+        assert!(matches!(
+            &m.on_frame(&approval).events[..],
+            [AgentEvent::PermissionRequest { .. }]
+        ));
+        let mut mixed = interaction(5);
+        mixed["params"]["options"][2]["kind"] = json!("reject_once");
+        assert!(matches!(
+            &m.on_frame(&mixed).events[..],
+            [AgentEvent::PermissionRequest { .. }]
+        ));
+        // Grok never reads it as a question.
+        let mut grok = AcpMapper::new("session".into(), &json!({}), &json!({}), GROK.kind);
+        assert!(matches!(
+            &grok.on_frame(&interaction(6)).events[..],
+            [AgentEvent::PermissionRequest { .. }]
+        ));
+    }
+    /// An `agy acp` question whose schema has no `q1_other`: nothing carries
+    /// typed text in the form.
+    fn closed_question(id: &str) -> Value {
+        json!({"jsonrpc":"2.0","id":id,"method":"elicitation/create","params":{"sessionId":"session","toolCallId":"call_1","mode":"form","message":"The agent has 1 question.","requestedSchema":{"type":"object","properties":{
+            "q1":{"type":"string","title":"Which language should the service use?","oneOf":[{"const":"1","title":"Rust"},{"const":"2","title":"Go"}]}}}}})
+    }
+    fn resolved(step: &DriverStep) -> HashMap<String, Vec<String>> {
+        step.events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::QuestionResolved { answers, .. } => Some(answers.clone()),
+                _ => None,
+            })
+            .expect("the question resolves")
+    }
+    fn fill_queue(m: &mut AcpMapper) {
+        while m.queue.len() < MAX_PENDING {
+            m.queue.push_back(Queued::new(
+                fresh_uuid(),
+                vec![ContentBlock::Text {
+                    text: "waiting".into(),
+                }],
+            ));
+        }
+    }
+    #[test]
+    fn agy_form_typed_text_without_a_field_follows_as_a_prompt() {
+        let mut m = agy_cli();
+        let turn = send(&mut m, "ask me");
+        // Typed text alone withdraws the question and goes as the next
+        // prompt, which the card shows as the reply.
+        let (id, _) = question_request(&m.on_frame(&closed_question("1")));
+        let step = m.on_command(answer(&id, &[("q1", &["Zig"])]));
+        assert_eq!(step.outbound[0]["result"], json!({"action":"cancel"}));
+        assert_eq!(resolved(&step)["q1"], ["Zig"]);
+        let ended =
+            m.on_frame(&json!({"id":turn.outbound[0]["id"],"result":{"stopReason":"end_turn"}}));
+        let prompt = ended.outbound[0]["params"]["prompt"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(
+            prompt.contains("Which language should the service use?") && prompt.contains("Zig"),
+            "{prompt}"
+        );
+        assert!(!ended.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::UserMessage { .. } | AgentEvent::UserMessageUpdate { .. }
+        )));
+
+        // Beside a pick the text has no way in: the pick alone goes, and the
+        // card shows only the pick.
+        let (id, _) = question_request(&m.on_frame(&closed_question("2")));
+        let step = m.on_command(answer(&id, &[("q1", &["Go", "Zig"])]));
+        assert_eq!(
+            step.outbound,
+            [json!({"jsonrpc":"2.0","id":"2","result":{"action":"accept","content":{"q1":"2"}}})]
+        );
+        assert_eq!(resolved(&step)["q1"], ["Go"]);
+        assert!(m.queue.is_empty());
+
+        // A full queue cannot take the text: the question is withdrawn and
+        // resolves unanswered, with a notice.
+        let (id, _) = question_request(&m.on_frame(&closed_question("3")));
+        fill_queue(&mut m);
+        let step = m.on_command(answer(&id, &[("q1", &["Zig"])]));
+        assert_eq!(step.outbound[0]["result"], json!({"action":"cancel"}));
+        assert!(resolved(&step).is_empty());
+        assert!(step
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Notice { .. })));
+    }
+    #[test]
+    fn agy_form_reports_only_what_it_sent() {
+        let mut m = agy_cli();
+        send(&mut m, "ask me");
+        // A single-choice field takes one pick; a label repeated counts once.
+        let (id, _) = question_request(&m.on_frame(&two_questions("1")));
+        let step = m.on_command(answer(
+            &id,
+            &[("q1", &["Go", "Rust"]), ("q2", &["Auth", "Auth"])],
+        ));
+        assert_eq!(
+            step.outbound[0]["result"],
+            json!({"action":"accept","content":{"q1":"2","q2":["1"]}})
+        );
+        let answers = resolved(&step);
+        assert_eq!(answers["q1"], ["Go"]);
+        assert_eq!(answers["q2"], ["Auth"]);
+    }
+    #[test]
+    fn standalone_interaction_reports_only_what_it_sent() {
+        let mut m = agy_standalone();
+        send(&mut m, "ask me");
+        // A pick beside typed text: the pick is the reply, the text is not.
+        let (id, _) = question_request(&m.on_frame(&interaction(2)));
+        let step = m.on_command(answer(&id, &[("q1", &["Green", "Purple"])]));
+        assert_eq!(
+            step.outbound[0]["result"],
+            json!({"outcome":{"outcome":"selected","optionId":"2"}})
+        );
+        assert_eq!(resolved(&step)["q1"], ["Green"]);
+        assert!(m.queue.is_empty());
+        // Typed text a full queue cannot take resolves unanswered.
+        let (id, _) = question_request(&m.on_frame(&interaction(3)));
+        fill_queue(&mut m);
+        let step = m.on_command(answer(&id, &[("q1", &["Purple"])]));
+        assert_eq!(
+            step.outbound[0]["result"],
+            json!({"outcome":{"outcome":"cancelled"}})
+        );
+        assert!(resolved(&step).is_empty());
+        assert!(step
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Notice { .. })));
+    }
+    fn tool_row(step: &DriverStep) -> (String, ToolKind, Option<String>) {
+        step.events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::ToolCall {
+                    title,
+                    kind,
+                    command,
+                    ..
+                } => Some((title.clone(), *kind, command.clone())),
+                _ => None,
+            })
+            .expect("a ToolCall")
+    }
+    #[test]
+    fn antigravity_rows_name_their_file_role_or_tool() {
+        let mut m = agy_cli();
+        send(&mut m, "go");
+        let call = |m: &mut AcpMapper, id: &str, extra: Value| {
+            let mut u = json!({"sessionUpdate":"tool_call","toolCallId":id,"status":"in_progress"});
+            u.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            m.on_frame(&update(u))
+        };
+        let read = call(
+            &mut m,
+            "r",
+            json!({"name":"read_file","kind":"read","title":"File notes.txt","locations":[{"path":"/work/ws/sub/notes.txt"}],"rawInput":{"Path":"/work/ws/sub/notes.txt"}}),
+        );
+        assert_eq!(tool_row(&read).0, "Read: sub/notes.txt");
+        assert!(read.events.iter().any(|e| matches!(e, AgentEvent::ToolRenderData { name: Some(n), input: Some(_), .. } if n == "read_file")));
+        let edit = call(
+            &mut m,
+            "e",
+            json!({"name":"edit_file","kind":"edit","title":"File notes.txt","locations":[{"path":"/work/ws/notes.txt"}]}),
+        );
+        assert_eq!(tool_row(&edit).0, "Edit: notes.txt");
+        let outside = call(
+            &mut m,
+            "w",
+            json!({"name":"write_file","kind":"edit","title":"File ../../../../home/u/.gemini/brain/x/implementation_plan.md","locations":[{"path":"/home/u/.gemini/brain/x/implementation_plan.md"}]}),
+        );
+        assert_eq!(tool_row(&outside).0, "Write: implementation_plan.md");
+        let agent = call(
+            &mut m,
+            "a",
+            json!({"name":"invoke_subagent","kind":"other","title":"Run invoke_subagent","rawInput":{"Prompt":"Count the lines\nthen report","Role":"Line Counter","TypeName":"research"}}),
+        );
+        assert_eq!(tool_row(&agent).0, "Agent: Line Counter");
+        assert_eq!(tool_row(&agent).1, ToolKind::Agent);
+        // The kind holds when agy's update says `other` again.
+        let again = m.on_frame(&update(json!({"sessionUpdate":"tool_call_update","toolCallId":"a","name":"invoke_subagent","kind":"other","title":"Run invoke_subagent","status":"in_progress","rawInput":{"Role":"Line Counter"}})));
+        assert!(
+            !again
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolCall { .. })),
+            "{:?}",
+            again.events
+        );
+        let other = call(
+            &mut m,
+            "t",
+            json!({"name":"manage_task","kind":"other","title":"Run manage_task"}),
+        );
+        assert_eq!(tool_row(&other).0, "manage_task");
+        let shell = call(
+            &mut m,
+            "x",
+            json!({"name":"run_command","kind":"execute","title":"ls -la","rawInput":{"CommandLine":"ls -la","toolSummary":"List workspace files"}}),
+        );
+        assert_eq!(
+            tool_row(&shell),
+            ("ls -la".into(), ToolKind::Execute, Some("ls -la".into()))
+        );
+        assert!(shell.events.iter().any(|e| matches!(e, AgentEvent::ToolRenderData { input: Some(i), .. } if i["toolSummary"] == "List workspace files")));
+        // The standalone server's titles reach the same names, and its
+        // "Running edit_file" update does not rename the row back.
+        let mut s = agy_standalone();
+        send(&mut s, "go");
+        let view = call(
+            &mut s,
+            "v",
+            json!({"kind":"read","title":"Running view_file","locations":[{"path":"/work/ws/notes.txt"}],"rawInput":{"file_path":"/work/ws/notes.txt"}}),
+        );
+        assert_eq!(tool_row(&view).0, "Read: notes.txt");
+        let edit = call(
+            &mut s,
+            "s",
+            json!({"kind":"edit","title":"Run edit_file?","status":"pending","locations":[{"path":"/work/ws/notes.txt","line":4}],"rawInput":{"TargetFile":"/work/ws/notes.txt","Description":"Append zeta"}}),
+        );
+        assert_eq!(tool_row(&edit).0, "Edit: notes.txt");
+        let running = s.on_frame(&update(json!({"sessionUpdate":"tool_call_update","toolCallId":"s","kind":"edit","status":"in_progress","title":"Running edit_file","locations":[{"path":"/work/ws/notes.txt"}]})));
+        assert!(!running
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolCall { .. })));
+        // Grok and Cursor rows keep the agent's own title.
+        let mut g = AcpMapper::new("session".into(), &json!({}), &json!({}), GROK.kind);
+        send(&mut g, "go");
+        let row = call(
+            &mut g,
+            "g",
+            json!({"kind":"read","title":"Running view_file","locations":[{"path":"/work/ws/notes.txt"}]}),
+        );
+        assert_eq!(tool_row(&row).0, "Running view_file");
+        assert!(!row
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolRenderData { .. })));
+    }
+    #[test]
+    fn agy_question_and_plan_calls_draw_no_row() {
+        let mut m = agy_cli();
+        send(&mut m, "go");
+        for frame in [
+            json!({"sessionUpdate":"tool_call","toolCallId":"q","name":"ask_question","kind":"other","title":"Run ask_question","status":"in_progress","rawInput":{"questions":[]}}),
+            json!({"sessionUpdate":"tool_call","toolCallId":"p","name":"mcp_chimaera_update_plan","kind":"other","title":"Run mcp_chimaera_update_plan","status":"in_progress","rawInput":{"advance":true}}),
+            json!({"sessionUpdate":"tool_call","toolCallId":"p2","kind":"other","title":"chimaera_update_plan","status":"pending","_meta":{"mcp":{"server":"chimaera","tool":"update_plan"},"is_mcp_tool_call":true}}),
+            json!({"sessionUpdate":"tool_call_update","toolCallId":"q","status":"completed"}),
+        ] {
+            let step = m.on_frame(&update(frame));
+            assert!(step.events.is_empty(), "{:?}", step.events);
+        }
+        // Another server's update_plan, or chimaera's notify, still draws.
+        let step = m.on_frame(&update(json!({"sessionUpdate":"tool_call","toolCallId":"n","name":"mcp_chimaera_notify","kind":"other","title":"Run mcp_chimaera_notify","status":"in_progress"})));
+        assert_eq!(tool_row(&step).0, "mcp_chimaera_notify");
+    }
+    #[test]
+    fn agy_acp_mcp_calls_are_pre_approved_in_their_own_shape() {
+        let mut m = agy_cli();
+        m.mcp_auto_approve = Some(consent(Some(&["update_plan", "notify"])));
+        let options = json!([{"optionId":"allow","name":"Allow","kind":"allow_once"},{"optionId":"deny","name":"Deny","kind":"reject_once"}]);
+        let call = |name: &str, title: &str| json!({"toolCallId":"c","name":name,"kind":"other","status":"pending","title":title,"rawInput":{"text":"hi","toolSummary":"x"}});
+        assert!(selected(
+            &m.on_frame(&ask(
+                1,
+                call("mcp_chimaera_notify", "Run mcp_chimaera_notify"),
+                options.clone()
+            )),
+            1,
+            "allow"
+        ));
+        // A title that disagrees, an unlisted tool or another server asks.
+        assert!(surfaced(&m.on_frame(&ask(
+            2,
+            call("mcp_chimaera_notify", "Run something_else"),
+            options.clone()
+        ))));
+        assert!(surfaced(&m.on_frame(&ask(
+            3,
+            call("mcp_chimaera_spawn_agent", "Run mcp_chimaera_spawn_agent"),
+            options.clone()
+        ))));
+        assert!(surfaced(&m.on_frame(&ask(
+            4,
+            call("mcp_other_notify", "Run mcp_other_notify"),
+            options
+        ))));
+    }
+    #[test]
+    fn agy_shell_output_loses_its_preamble_and_a_nonzero_exit_fails() {
+        assert_eq!(agy_shell_text("Created At: 2026-11-26T02:49:32-08:00\nCompleted At: 2026-11-26T02:49:32-08:00\nCommand exited with code 0.\n\nCommand output:\ntotal 8\r\nnotes.txt\r\n"), "total 8\nnotes.txt\n");
+        assert_eq!(
+            agy_shell_text("Command exited with code 0.\n\nCommand output:\nfirst-marker\r\n"),
+            "first-marker\n"
+        );
+        // Anything else is the command's own text.
+        assert_eq!(
+            agy_shell_text("Command exited with code zero.\n\nCommand output:\nx"),
+            "Command exited with code zero.\n\nCommand output:\nx"
+        );
+        assert_eq!(
+            agy_shell_text("Created At: soon\nhello"),
+            "Created At: soon\nhello"
+        );
+        let mut m = agy_cli();
+        send(&mut m, "go");
+        m.on_frame(&update(json!({"sessionUpdate":"tool_call","toolCallId":"x","name":"run_command","kind":"execute","title":"git log","status":"in_progress","rawInput":{"CommandLine":"git log"}})));
+        let text = "Created At: a\nCompleted At: b\nCommand exited with code 128.\n\nCommand output:\nfatal: no commits\r\n";
+        let done = m.on_frame(&update(json!({"sessionUpdate":"tool_call_update","toolCallId":"x","status":"completed","kind":"execute","title":"git log","rawOutput":{"output":text,"exit_code":128},"content":[{"type":"content","content":{"type":"text","text":text}}]})));
+        assert!(
+            matches!(done.events.last(), Some(AgentEvent::ToolCallUpdate { status: ToolStatus::Failed, content: Some(ToolContent::Output { text, .. }), .. }) if text == "fatal: no commits\n"),
+            "{:?}",
+            done.events
+        );
+        // Cursor keeps its status whatever the exit code says.
+        let mut c = AcpMapper::new("session".into(), &json!({}), &json!({}), CURSOR.kind);
+        let done = c.on_frame(&update(json!({"sessionUpdate":"tool_call_update","toolCallId":"x","status":"completed","rawOutput":{"exitCode":1,"stdout":"a\r\n"}})));
+        assert!(
+            matches!(done.events.last(), Some(AgentEvent::ToolCallUpdate { status: ToolStatus::Completed, content: Some(ToolContent::Output { text, .. }), .. }) if text == "a\r\n")
+        );
+    }
+    #[test]
+    fn a_permission_carrying_the_change_puts_it_on_the_row_first() {
+        let mut m = agy_cli();
+        send(&mut m, "go");
+        m.on_frame(&update(json!({"sessionUpdate":"tool_call","toolCallId":"e","name":"edit_file","kind":"edit","title":"File notes.txt","status":"in_progress","locations":[{"path":"/work/ws/notes.txt"}]})));
+        let diff = json!([{"type":"diff","path":"/work/ws/notes.txt","oldText":"gamma","newText":"gamma\ndelta"}]);
+        let request = ask(
+            7,
+            json!({"toolCallId":"e","name":"edit_file","kind":"edit","status":"pending","title":"File notes.txt","content":diff}),
+            json!([{"optionId":"allow","name":"Allow","kind":"allow_once"},{"optionId":"deny","name":"Deny","kind":"reject_once"}]),
+        );
+        let step = m.on_frame(&request);
+        match &step.events[..] {
+            // The row's own status: a copied-in change never lowers it.
+            [AgentEvent::ToolCallUpdate {
+                id,
+                status: ToolStatus::InProgress,
+                content: Some(ToolContent::Diff { new_text, .. }),
+            }, AgentEvent::PermissionRequest {
+                tool_call_id: Some(tool),
+                title,
+                ..
+            }] => {
+                assert_eq!(
+                    (id.as_str(), tool.as_str(), title.as_str()),
+                    ("e", "e", "Edit: notes.txt")
+                );
+                assert_eq!(new_text, "gamma\ndelta");
+            }
+            other => panic!("{other:?}"),
+        }
+        // A row that already shows its change gets no copy.
+        let mut s = agy_standalone();
+        send(&mut s, "go");
+        s.on_frame(&update(json!({"sessionUpdate":"tool_call","toolCallId":"e","kind":"edit","title":"Run edit_file?","status":"pending","content":diff,"locations":[{"path":"/work/ws/notes.txt"}]})));
+        let step = s.on_frame(&request);
+        assert!(
+            matches!(&step.events[..], [AgentEvent::PermissionRequest { .. }]),
+            "{:?}",
+            step.events
+        );
+        // Grok and Cursor rows are left as they are.
+        let mut g = AcpMapper::new("session".into(), &json!({}), &json!({}), GROK.kind);
+        send(&mut g, "go");
+        g.on_frame(&update(json!({"sessionUpdate":"tool_call","toolCallId":"e","kind":"edit","title":"edit","status":"in_progress"})));
+        let step = g.on_frame(&request);
+        assert!(
+            matches!(&step.events[..], [AgentEvent::PermissionRequest { .. }]),
+            "{:?}",
+            step.events
+        );
+    }
+    #[test]
+    fn a_steer_never_wedges_and_a_cancelled_one_joins_what_waits() {
+        // At capacity the steer is not sent and waits for the turn's end.
+        let mut m = agy_cli();
+        let turn = send(&mut m, "job");
+        while m.pending.len() < MAX_PENDING {
+            let id = m.next_id;
+            m.next_id += 1;
+            m.pending.insert(id, Pending::GrokBilling);
+        }
+        assert!(!m.can_steer());
+        let mut step = DriverStep::default();
+        m.send_steer(
+            Queued::new(
+                "q".into(),
+                vec![ContentBlock::Text {
+                    text: "later".into(),
+                }],
+            ),
+            false,
+            &mut step,
+        );
+        assert!(step.outbound.is_empty());
+        assert!(
+            m.steer.is_none(),
+            "a steer that never went out must not hold the session"
+        );
+        assert_eq!(m.queue.len(), 1);
+        m.pending.retain(|_, p| !matches!(p, Pending::GrokBilling));
+        let done =
+            m.on_frame(&json!({"id":turn.outbound[0]["id"],"result":{"stopReason":"end_turn"}}));
+        assert_eq!(done.outbound[0]["params"]["prompt"][0]["text"], "later");
+
+        // Send now while a steer is unsettled: the cancelled steer and the
+        // pressed message go together, in the order sent.
+        let mut m = agy_cli();
+        let turn = send(&mut m, "job");
+        let steer = send(&mut m, "first");
+        let queued = send(&mut m, "second");
+        let pressed = match &queued.events[..] {
+            [AgentEvent::UserMessage { id: Some(id), .. }] => id.clone(),
+            other => panic!("{other:?}"),
+        };
+        let now = m.on_command(AgentCommand::SendNow { id: pressed });
+        assert!(now.outbound.iter().any(|f| f["method"] == "session/cancel"));
+        m.on_frame(&json!({"id":turn.outbound[0]["id"],"result":{"stopReason":"cancelled"}}));
+        let back =
+            m.on_frame(&json!({"id":steer.outbound[0]["id"],"result":{"stopReason":"cancelled"}}));
+        let prompt = back.outbound[0]["params"]["prompt"].as_array().unwrap();
+        let texts: Vec<_> = prompt.iter().map(|b| b["text"].as_str().unwrap()).collect();
+        assert_eq!(texts, ["first", "second"]);
+    }
+    #[test]
+    fn a_typed_answer_goes_with_a_stopped_turn_and_says_when_it_cannot_go() {
+        let mut m = agy_standalone();
+        let turn = send(&mut m, "ask me");
+        let (id, _) = question_request(&m.on_frame(&interaction(2)));
+        m.on_command(answer(&id, &[("q1", &["Purple"])]));
+        assert_eq!(m.queue.len(), 1);
+        m.on_command(AgentCommand::Interrupt);
+        assert!(
+            m.queue.is_empty(),
+            "a Stop must not bill a turn for the answer"
+        );
+        let ended =
+            m.on_frame(&json!({"id":turn.outbound[0]["id"],"result":{"stopReason":"cancelled"}}));
+        assert!(ended.outbound.is_empty());
+        // A full queue says the answer could not be sent.
+        let mut m = agy_standalone();
+        send(&mut m, "ask me");
+        for i in 0..64 {
+            send(&mut m, &format!("w{i}"));
+        }
+        let (id, _) = question_request(&m.on_frame(&interaction(3)));
+        let step = m.on_command(answer(&id, &[("q1", &["Purple"])]));
+        assert!(step.events.iter().any(
+            |e| matches!(e, AgentEvent::Notice { text } if text.contains("could not be sent"))
+        ));
+        // At exit a silent answer settles nothing it never showed.
+        let mut m = agy_standalone();
+        send(&mut m, "ask me");
+        let (id, _) = question_request(&m.on_frame(&interaction(4)));
+        m.on_command(answer(&id, &[("q1", &["Purple"])]));
+        assert!(!m
+            .drain_pending()
+            .iter()
+            .any(|e| matches!(e, AgentEvent::UserMessageUpdate { .. })));
+    }
+    #[test]
+    fn agy_acp_steers_a_running_turn_and_falls_back_to_the_queue() {
+        let mut m = agy_cli();
+        assert!(m.caps.commands.contains(&"send_if_running".into()));
+        assert!(!agy_standalone()
+            .caps
+            .commands
+            .contains(&"send_if_running".into()));
+        let turn = send(&mut m, "long job");
+        let first = turn.outbound[0]["id"].clone();
+        // Sent mid-turn: a second prompt at once, echoed waiting, not after the turn.
+        let steer = send(&mut m, "also banana");
+        assert_eq!(steer.outbound[0]["method"], "session/prompt");
+        let steer_id = steer.outbound[0]["id"].clone();
+        let id = match &steer.events[..] {
+            [AgentEvent::UserMessage {
+                id: Some(id),
+                queued: true,
+                after_turn: false,
+                ..
+            }] => id.clone(),
+            other => panic!("{other:?}"),
+        };
+        // The running prompt answers end_turn: the agent took the message.
+        let handed = m.on_frame(&json!({"id":first,"result":{"stopReason":"end_turn"}}));
+        assert!(
+            matches!(&handed.events[..], [AgentEvent::UserMessageUpdate { id: key, state: UserMessageState::Sent }] if key == &id),
+            "{:?}",
+            handed.events
+        );
+        assert!(m.turn.is_some());
+        // A second mid-turn message waits while the first steer is in flight.
+        let waiting = send(&mut m, "then this");
+        assert!(waiting.outbound.is_empty());
+        let done = m.on_frame(&json!({"id":steer_id,"result":{"stopReason":"end_turn"}}));
+        assert!(done
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnCompleted { .. })));
+        assert_eq!(done.outbound[0]["params"]["prompt"][0]["text"], "then this");
+
+        // Refused (an approval was opening): it waits for the turn's end.
+        let mut m = agy_cli();
+        let turn = send(&mut m, "job");
+        let steer = send(&mut m, "later please");
+        let refused = m.on_frame(&json!({"id":steer.outbound[0]["id"],"error":{"code":-32603,"message":"the running prompt is waiting for a permission or question answer"}}));
+        assert!(refused.events.is_empty() && refused.outbound.is_empty());
+        let ended =
+            m.on_frame(&json!({"id":turn.outbound[0]["id"],"result":{"stopReason":"end_turn"}}));
+        assert_eq!(
+            ended.outbound[0]["params"]["prompt"][0]["text"],
+            "later please"
+        );
+        // A refused SendIfRunning missed its turn.
+        let mut m = agy_cli();
+        send(&mut m, "job");
+        let step = m.on_command(AgentCommand::SendIfRunning {
+            id: "agent-1".into(),
+            blocks: vec![ContentBlock::Text { text: "hi".into() }],
+        });
+        let refused = m.on_frame(&json!({"id":step.outbound[0]["id"],"error":{"message":"busy"}}));
+        assert!(
+            matches!(&refused.events[..], [AgentEvent::UserMessageUpdate { id, state: UserMessageState::Dropped }] if id == "agent-1")
+        );
+        // While an approval is open nothing is steered; the standalone never steers.
+        let mut m = agy_cli();
+        send(&mut m, "job");
+        m.on_frame(&permission(json!(3)));
+        assert!(send(&mut m, "wait").outbound.is_empty());
+        let mut s = agy_standalone();
+        send(&mut s, "job");
+        let queued = send(&mut s, "wait");
+        assert!(queued.outbound.is_empty());
+        assert!(matches!(
+            &queued.events[..],
+            [AgentEvent::UserMessage {
+                queued: true,
+                after_turn: true,
+                ..
+            }]
+        ));
+        assert!(matches!(
+            &s.on_command(AgentCommand::SendIfRunning {
+                id: "x".into(),
+                blocks: vec![]
+            })
+            .events[..],
+            [AgentEvent::UserMessageUpdate {
+                state: UserMessageState::Dropped,
+                ..
+            }]
+        ));
+    }
+    #[test]
+    fn antigravity_servers_are_told_apart_by_name_and_version() {
+        use std::path::Path;
+        assert!(is_agy_standalone_server(Path::new(
+            "/a/1.4.5/agy_acp_server.par"
+        )));
+        assert!(is_agy_standalone_server(Path::new("/x/bin/agy-acp")));
+        assert!(!is_agy_standalone_server(Path::new("/x/bin/agy")));
+        assert!(agy_version_at_least("1.5.15", AGY_CLI_CHAT_MIN));
+        assert!(agy_version_at_least("agy 1.6.0 (abc)", AGY_CLI_CHAT_MIN));
+        assert!(!agy_version_at_least("1.5.12", AGY_CLI_CHAT_MIN));
+        assert!(!agy_version_at_least("1.5.15-rc1", AGY_CLI_CHAT_MIN));
+        assert!(!agy_version_at_least("unknown", AGY_CLI_CHAT_MIN));
+        const {
+            assert!(
+                ANTIGRAVITY_CLI.elicitation
+                    && !ANTIGRAVITY.elicitation
+                    && !GROK.elicitation
+                    && !CURSOR.elicitation
+            )
+        };
+        assert_eq!(ANTIGRAVITY_CLI.kind, ANTIGRAVITY.kind);
     }
 }

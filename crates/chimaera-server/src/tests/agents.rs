@@ -203,6 +203,98 @@ async fn only_cursor_chat_spawns_disable_the_browser_login() {
     }
 }
 
+/// A chat on the agy CLI's own `agy acp` runs the canonicalized terminal agy,
+/// past the activation shim: the chat spawn itself must switch a managed
+/// agy's updater off (it would overwrite Chimaera's install), and must leave
+/// a user's own agy its updater. The real spawn path runs a fake that
+/// records its environment.
+#[cfg(unix)] // a sh stand-in for agy behind a symlink
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agy_cli_chat_switches_off_the_updater_only_for_a_managed_agy() {
+    use std::os::unix::fs::PermissionsExt;
+    let (name, value) = runtimes::AGY_NO_SELF_UPDATE;
+    let switch = format!("{name}={value}");
+    let inherited = std::env::var_os(name).is_some();
+    for managed in [true, false] {
+        let state = test_state();
+        let dir = test_dir(&format!("agy-cli-updater-{managed}"));
+        let env_file = dir.join("env.txt");
+        // A managed install: `<root>/agy/<version>/bin/agy` behind the
+        // `<root>/bin/agy` activation symlink detection resolves.
+        let (package, bin) = if managed {
+            let package = state.managed_root.join("agy/1.5.15/bin");
+            let link_dir = state.managed_root.join("bin");
+            std::fs::create_dir_all(&link_dir).unwrap();
+            (package.clone(), link_dir.join("agy"))
+        } else {
+            (dir.join("bin"), dir.join("bin/agy"))
+        };
+        std::fs::create_dir_all(&package).unwrap();
+        let fake = package.join("agy");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nenv > '{}.tmp'\nmv '{0}.tmp' '{0}'\nexec cat >/dev/null\n",
+                env_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if managed {
+            std::os::unix::fs::symlink(&fake, &bin).unwrap();
+        }
+        let kind = agents::AgentKind::Antigravity;
+        let id = format!("s-agy-cli-{managed}");
+        crate::lock(&state.agents).insert(id.clone(), agents::AgentRecord::new("key".into(), kind));
+        crate::lock(&state.session_workspaces).insert(id.clone(), "w-test".into());
+        let recipe = chat::ChatRecipe {
+            workspace_root: dir.clone(),
+            workspace_id: "w-test".into(),
+            kind,
+            bin: bin.clone(),
+            // From AGY_CLI_CHAT_MIN, chat runs the terminal agy as `agy acp`.
+            version: Some("1.5.15".into()),
+            settings: None,
+            mcp_config: None,
+            model: None,
+            resume: None,
+            fork_at: None,
+            rollback_turns: None,
+            revert_before_turn: None,
+            remote_control: chat::RemoteControlAtStart::No,
+            carry_ultracode: false,
+            carried: Default::default(),
+            theme: "dark".into(),
+            prelude: None,
+            mastermind: None,
+            portable_context: None,
+            created_at_ms: None,
+            auto_compact: None,
+        };
+        chat::spawn_chat_session(&state, id.clone(), recipe, None)
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        let env = loop {
+            if let Ok(env) = std::fs::read_to_string(&env_file) {
+                break env;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "managed={managed}: agy acp never started"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        state.chat.kill(&id);
+        let disabled = env.lines().any(|l| l == switch);
+        if managed {
+            assert!(disabled, "a managed agy CLI chat kept its updater");
+        } else if !inherited {
+            assert!(!disabled, "a user's own agy CLI chat lost its updater");
+        }
+    }
+}
+
 #[tokio::test]
 async fn chat_handshake_failure_without_recipe_stays_visible_errored() {
     let state = test_state();

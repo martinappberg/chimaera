@@ -10,6 +10,8 @@ import {
   recordTitle,
   SAME_FILE_FRESH_MS,
   sameFileCurrent,
+  sameFileLoud,
+  SAME_FILE_LOUD_MS,
   sameFileOverlaps,
   startedByLabel,
   type SameFileWrite,
@@ -159,6 +161,15 @@ describe("same-file notice lifetime", () => {
     expect(sameFileCurrent(write("b", "/w/a", minutes(18 * 60)), now)).toBe(false);
     // Its running turn wrote it: shown however long ago, until the turn ends.
     expect(sameFileCurrent(write("b", "/w/a", minutes(120), true), now)).toBe(true);
+  });
+
+  it("keeps the warn tone only while a write is news", () => {
+    expect(sameFileLoud(write("b", "/w/a", SAME_FILE_LOUD_MS - 1), now)).toBe(true);
+    expect(sameFileLoud(write("b", "/w/a", SAME_FILE_LOUD_MS), now)).toBe(false);
+    // Still shown, just quiet.
+    expect(sameFileCurrent(write("b", "/w/a", SAME_FILE_LOUD_MS), now)).toBe(true);
+    // A running turn's write stays loud however old.
+    expect(sameFileLoud(write("b", "/w/a", minutes(120), true), now)).toBe(true);
   });
 
   it("keeps the newest current write per other session, newest first", () => {

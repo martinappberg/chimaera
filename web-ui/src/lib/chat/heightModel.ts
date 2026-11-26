@@ -1,4 +1,5 @@
 import { FINISHED_FOLD_MIN } from "./activityFold";
+import { failureLines } from "./failureText";
 import { hookNotice } from "./hookNotice";
 import type { ChatBlock } from "./store.svelte";
 
@@ -126,6 +127,11 @@ export function blockWeight(
     case "notice":
       // A hook's notice is one collapsed line (`HookRow`), whatever it says.
       if (block.tone === "info" && hookNotice(block.text)) return 1;
+      // An error line draws its headline, not its raw text (`FailureRow`):
+      // a JSON failure is one line however long the body behind it.
+      if (block.tone === "error" && block.signIn !== true) {
+        return failureLines(block.reason ?? block.text, block.reason !== undefined, charsPerLine) + 0.5;
+      }
       return textLines(block.text, charsPerLine) + 0.5;
     case "wake":
     case "goal":

@@ -251,7 +251,12 @@ which the free plans still have. Once available, the host's account-specific cat
   replaces companions a running session still needs. It installs the package rather than just the entrypoint — it spawns companions
   (`codex-code-mode-host`, bundled rg/zsh) from beside its own executable, and an entrypoint-only
   install shipped a codex whose code mode failed closed. One install/update per agent across both setup APIs (409 when another workspace holds the shared lock). Antigravity installs its complete Google chat package alongside the
-  terminal executable. Grok uses xAI’s standalone release. Cursor CLI installs the package the
+  terminal executable. Which server a chat uses is decided at launch (`launcher.rs`
+  `chat_executable`): an explicit `agents.agy.chatPath` wins (the standalone `agy_acp_server.par`
+  or an `agy` CLI — told apart by file name, so a wrapper must keep the name); otherwise the
+  CLI's own `agy acp` once the installed agy reports 1.5.15 or newer (verified on 1.5.18; it brings plan, auto and
+  accept-edits modes, native question forms and mid-turn messages); otherwise the standalone
+  server. Grok uses xAI’s standalone release. Cursor CLI installs the package the
   official installer names (see [Cursor CLI](#cursor-cli)). These two chat/runtime artifacts are
   fetched over HTTPS from the vendor; they do not publish separate checksums at these endpoints.
   Gemini CLI is retained for reading existing records, with no new managed install. Shims are written **only**
@@ -262,8 +267,8 @@ which the free plans still have. Once available, the host's account-specific cat
   install method for a bare binary behind our symlink, and claude's would install a second copy
   elsewhere, leaving the managed link stale); your own binary's `update` passes through untouched.
   agy updates itself unasked, writing the new build over the path it ran from. For a managed agy that
-  path is the activation link, so the shim, a managed agy's terminal, sign-in and extension-action
-  spawns, and every
+  path is the activation link, so the shim, a managed agy's terminal, its `agy acp` chat (started
+  from the resolved path, past the shim), sign-in and extension-action spawns, and every
   background probe run it with `AGY_CLI_DISABLE_AUTO_UPDATE=true` (`runtimes::AGY_NO_SELF_UPDATE`).
   Your own agy keeps its updater outside probes. An activation it already rewrote keeps every agy
   package until the next managed install or update restores the link (PROTOCOL.md Pass 61).

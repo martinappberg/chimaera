@@ -87,8 +87,11 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   (claude: the CLI's own queue, `priority:"next"`; codex: `turn/steer`). **⌥↩ / Alt+Enter** sends one
   for **after this turn** instead (claude `priority:"later"`; codex's next-run queue). The running
   placeholder names the chord ("add to this turn… · ⌥↩ after it ends"; Esc to stop lives on the
-  visible stop button's tooltip). ACP providers queue both send forms for the next turn; they
-  do not support mid-turn steering. `socket.send` returns `false` when the socket isn't OPEN, so the
+  visible stop button's tooltip). ACP providers queue both send forms for the next turn, with one
+  exception: an Antigravity chat served by the CLI's own server (`agy acp`) reads a message sent
+  mid-turn inside the running turn (a second prompt steers it; one sent while an approval or
+  question is open waits for the turn to end, since agy refuses a prompt then). Grok, Cursor and Antigravity's standalone
+  server have no mid-turn input. `socket.send` returns `false` when the socket isn't OPEN, so the
   draft is only cleared on an accepted send — a message during a reconnect window is preserved, not
   lost; reconnect replays the daemon-owned state.
 - **Delivery honesty + pending stack.** A waiting message is not a history block yet — it sits in a
@@ -424,7 +427,7 @@ unused week reads 0%); an
     "Continuing toward the goal", or "Resumed on its own" when nothing names it — unless a
     finished row already shows why. Loops and goals (their pinned Ahead card, the goal's own
     lines, the folded work strip) are their own page: [loops-and-goals.md](loops-and-goals.md).
-  - **Folded runs** — once anything follows them (a reply, a finished-work line, a permission decision, a message sent mid-turn), two or more thought and
+  - **Folded runs** — once anything follows them (a reply, a finished-work line, an answered question, a message sent mid-turn), two or more thought and
     tool lines in a row fold into one line — "Thought, ran 6 commands, read 2 files ›" — that
     expands to the original rows. The trailing run stays open while the agent works, so live
     progress is always in view, and so does a run whose last calls are still running when a
@@ -482,9 +485,21 @@ unused week reads 0%); an
 - **Stopping.** Esc (or the header stop chip) interrupts the running turn. A deliberate stop is
   not a failure: the abort event carries a structural `interrupted` flag set by the driver that
   issued the interrupt (claude's result string is free text and never said so), the transcript
-  shows a muted "stopped" notice, dangling subagents settle neutrally instead of turning their
-  tool group red, and the session rail reads finished — error-red `turn failed`, failed tool rows,
+  shows a quiet "Stopped" line with a stop mark at the rows' edge, dangling subagents settle neutrally instead of turning their
+  tool group red, and the session rail reads finished — the failure row, failed tool rows,
   and the Errored rail state are reserved for genuine failures.
+- **Failures.** A failed turn is one row in the same place as "Stopped": a small red mark,
+  "Turn failed", and the agent's reason as a short headline (`FailureRow.svelte`,
+  `failureText.ts`). An `API Error: <status> <json>` reason reads as the API's own
+  `error.message` and the status ("Turn failed · invalid x-api-key (401)"); a long or multi-line
+  reason shows its first line, clipped; either way the whole text (the API body laid out, its
+  request id included) is one click away in a framed panel with a copy button. On a very
+  narrow row the headline moves under the lead rather than shrinking away. A short plain
+  reason is shown whole, with nothing to open, and a bare "turn failed" stays the two words.
+  Other error lines (a fork or rename that failed, "message not sent — reconnecting", a fatal
+  startup error) use the same row without the lead. The headline is the agent's or the API's
+  words, shortened, never reworded or explained; a failure the fatal banner shows is not
+  repeated, and a sign-in refusal shows the sign-in card instead.
   If Codex has not confirmed receipt of the opening message when stopped, a brief
   notice asks you to resend it. Saying only “Keep going” cannot recover missing input.
 - **Anything that would end background subagents or workflows asks once, whatever control
@@ -632,13 +647,31 @@ unused week reads 0%); an
 
 ## Tool cards, permissions & questions
 
-- **Tool cards + grouping.** Each tool call is a collapsible card (title, glyph, status dot,
-  output/diff, a `↗` to open what it touched — with a count and a compact list when it touched
+- **Tool cards + grouping.** Each tool call is a collapsible row: a drawn icon for its kind
+  (`ToolGlyph.svelte`: read, edit, command, search, web, MCP, agent, …), then the call's name in
+  the prose face and its subject in mono ("Read  calc.py"); a command shows only the command
+  (or Claude's description, then the command), with the driver's own title on hover. The status
+  slot says nothing for a call that ran fine — a running call shows a live dot, a failed or denied
+  one a red dot and a red-tinted icon, the rest a chevron under the pointer; a finished edit
+  shows its own "+4 −1" at the right of the row, so an opened group shows where its total comes from. Opened, a framed
+  panel holds the whole command when the head clipped it, the call's arguments
+  (`toolArgs.ts`: what the title, locations and diff do not already show), then its output or
+  line diff; a finished command with nothing to print says "no output", and a row with nothing
+  to open opens the file it touched; a `↗` to open what it touched — with a count and a compact list when it touched
   several; each location resolves against the session first, so a relative Grep/Glob `path` or
   Codex change opens, and a directory opens in the Finder). Consecutive calls condense into a
-  group ("6 commands · 2 files"). Groups are collapsed by default, including while work is running, and remain
-  expandable on demand; the summary badge (`running…` / `failed` / `recovered`) carries the verdict
-  without turning live activity or history into a wall of command rows. A failure is `recovered`
+  group ("Ran 2 commands, edited a file"). Groups are collapsed by default, including while work is running, and remain
+  expandable on demand; the summary badge (`failed` / `recovered`) carries the verdict while
+  the sentence stays in the muted activity tone, so live activity and history never turn into a
+  wall of command rows. When the run's finished edits changed files, the line ends with the size
+  of the change, "+54 −3" in the added and removed colours (`ChangeSize.svelte`: the one `--git-added` /
+  `--git-deleted` pair a diff's header uses too, held to 4.5:1 in every theme; `toolChangeSize` in `toolLabels.ts`,
+  summed over the run's diff and batch-of-diff results, each diff computed once and cached on its
+  content); a running, waiting, failed or denied edit adds nothing, and a run with no change shows none.
+  Only an exact figure is shown: a diff cut to fit (`truncated`) or one with no old text (Claude's
+  `Write` replacing a file whole, Codex's file change, which carries its hunks in the new text) is
+  left out of both the row's figure and the run's, so the line counts the edits it can measure.
+  Settled folds show the same figure. A failure is `recovered`
   once a later call in the same turn made up for it — any later successful command for a failed
   command (a retry rarely repeats the exact line), the same file (else the same title) for other
   tools — even when reasoning lines split that turn into several groups. Denials never recover;
@@ -732,7 +765,7 @@ unused week reads 0%); an
   only on the live app-server connection (`thread/read`, through the driver). Antigravity, Grok
   and Cursor report no subagents on their ACP wires, so they show neither. PROTOCOL.md Pass 42.
 - **The task list is the plan card, whichever tool spells it.** Every plan source — Claude's `TodoWrite` or its incremental `TaskCreate`/`TaskUpdate`/`TaskList` family, chimaera's `update_plan`, Codex's built-in `update_plan`, an ACP agent's plan — arrives as the one `plan` level-set, and none leaves bookkeeping rows in the transcript. The Task family carries more than a checklist, so its rows can show **who owns a step** (`@name`) and **what blocks it** (a dashed checkbox and "after #1": a blocked task is still `todo`), plus a muted detail line when the task's description says more than its subject. Blockers are filtered to ones still open, so finishing a dependency visibly unblocks its dependents. The in-progress summary prefers the agent's own present-continuous `activeForm` ("Running tests"). Plans without these fields render without them.
-- **Chats are asked to keep a plan card, each in its own runtime's words.** The chimaera MCP server's `initialize` instructions ask a chat for the card on any request that edits files or runs more than one command, and the wording depends on the runtime and surface (`mcp.rs` `task_list_instructions(kind, chat)`, `plan_tool_for`). A **Claude chat** is offered chimaera's `update_plan` tool (a whole-list level-set of `{content, status}` steps that the daemon journals as the normalized `plan` event) and asked to use it: Claude Code offers no TaskCreate/TaskUpdate under `-p` (probed on 2.1.300). A **Codex chat** uses its built-in `update_plan`, explicitly enabled by the driver through `config: {"tools.update_plan.enabled": true}` on thread start, resume and fork. The native tool defaults to disabled; an app-server launch flag alone did not expose it in the live probe. No second MCP task tool is offered (PROTOCOL.md Pass 48). An **ACP chat** is told what its runtime really has (live-probed, PROTOCOL.md Pass 45) and is not offered chimaera's tool: a **Cursor chat** is pointed at its built-in TodoWrite, whose list reaches the client as `cursor/update_todos` and draws the card (`acp.rs` folds `merge: true` by id, answers the documented `accepted` outcome, and hides the agent's own `Update TODOs` rows); a **Grok chat** at its `todo_write`, which arrives as the ACP `plan` update (its `todo_write` rows are hidden too); an **Antigravity chat** is told that no plan tool reaches the card, since it has none, and asked to keep the steps in its reply. A **terminal session** of any kind gets neither: its own task list renders in the terminal. `update_plan` stays in `mcp::ALWAYS_ALLOWED_TOOLS` (Claude `permissions.allow`; Codex and the ACP chats `mcp_auto_approve`), harmless where the tool isn't listed, and the Claude driver hides its `mcp__chimaera__update_plan` call row (`claude.rs` `CHIMAERA_PLAN_TOOL`). A plan written as a file or prose draws nothing.
+- **Chats are asked to keep a plan card, each in its own runtime's words.** The chimaera MCP server's `initialize` instructions ask a chat for the card on any request that edits files or runs more than one command, and the wording depends on the runtime and surface (`mcp.rs` `task_list_instructions(kind, chat)`, `plan_tool_for`). A **Claude chat** is offered chimaera's `update_plan` tool (a whole-list level-set of `{content, status}` steps that the daemon journals as the normalized `plan` event) and asked to use it: Claude Code offers no TaskCreate/TaskUpdate under `-p` (probed on 2.1.300). A **Codex chat** uses its built-in `update_plan`, explicitly enabled by the driver through `config: {"tools.update_plan.enabled": true}` on thread start, resume and fork. The native tool defaults to disabled; an app-server launch flag alone did not expose it in the live probe. No second MCP task tool is offered (PROTOCOL.md Pass 48). `update_plan` also takes `{advance: true}` — finish the step in progress, start the next — against a bounded per-session copy of the plan, and every reply names the step now in progress and how many remain, so keeping the card current costs one small call per step. The plan paragraph leads chimaera's instructions (after any plugin paragraphs, inside their lead budget) so it always falls within the first ~4 KB Claude Code keeps. An **Antigravity chat** is offered the same `update_plan` and the same paragraph (it has no plan tool of its own; its calls draw no row). The other **ACP chats** are told what their runtime really has (live-probed, PROTOCOL.md Pass 45) and are not offered chimaera's tool: a **Cursor chat** is pointed at its built-in TodoWrite, whose list reaches the client as `cursor/update_todos` and draws the card (`acp.rs` folds `merge: true` by id, answers the documented `accepted` outcome, and hides the agent's own `Update TODOs` rows); a **Grok chat** at its `todo_write`, which arrives as the ACP `plan` update (its `todo_write` rows are hidden too). A **terminal session** of any kind gets neither: its own task list renders in the terminal. `update_plan` stays in `mcp::ALWAYS_ALLOWED_TOOLS` (Claude `permissions.allow`; Codex and the ACP chats `mcp_auto_approve`), harmless where the tool isn't listed, and the Claude driver hides its `mcp__chimaera__update_plan` call row (`claude.rs` `CHIMAERA_PLAN_TOOL`). A plan written as a file or prose draws nothing.
 - **Pre-allowed chimaera tools are silent on every chat runtime.** `mcp::ALWAYS_ALLOWED_TOOLS` (`notify`, the document tools, `open_browser`, `update_plan`, the agent browser's read tools plus `browser_navigate`/`browser_show`/`browser_close`) and an active plugin's tools raise no permission card: Claude through the generated `permissions.allow`, Codex through `SpawnSpec.mcp_auto_approve` (its app-server elicits every MCP call), and since Pass 45 the ACP chats (Antigravity, Grok, Cursor) through the same `mcp_auto_approve`, which `chat.rs` sets for them and the ACP driver answers at the `session/request_permission` with the offered allow-once option. Each agent names an MCP call in its own live-captured shape, and the driver pre-approves only an exact match — one server, a listed tool, the title agreeing with the structured fields — so a shell command, another server, an unlisted tool such as `list_terminals`, or a reworded frame still asks. The agent keeps no standing grant (never allow-always), so what runs silently is exactly the daemon's list. **Verified live (2026-10-15, Pass 45)** in this worktree's isolated daemon, one turn each asking for `notify`, `open_browser` and `list_terminals`: a Cursor chat and a Grok chat each journaled three tool rows and exactly one `permission_request` — `list_terminals` — with `notify` and `open_browser` run unasked; the same Cursor turn then drew three `plan` level-sets from its TodoWrite (`alpha`/`beta`: todo → done/todo → done/done) and a kept chat showed the card with 1/3 done, the second step in flight and no `Update TODOs` rows; Grok's `todo_write` drew its `plan` (`alpha` done, `beta` todo). An Antigravity chat (its managed package copied into the isolated daemon's own root) did the same: three rows, one ask for `list_terminals`. `just chat-smoke-acp` passed for all three (the Cursor case now asks through a shell command: Cursor applies its own file edits without a permission request, and only a command outside its allowlist asks).
 - **Pinned work.** Tasks, subagents and background work distinguish what the agent plans to do,
   who is working, and what continues in the background. Only non-empty cards render. Three or more
@@ -778,11 +811,22 @@ unused week reads 0%); an
   `commandActions` are all read/list/search renders as a Read/Search row ("Read a.rs, b.rs"). No per-agent stop for codex (no
   such client RPC on the wire) — the tray's ■ stays claude-only. Wire facts: PROTOCOL.md Passes 16
   and 27.
-- **Permission prompts.** A warning card ("<tool> wants to run") with a JSON-input preview and
-  allow-once / always / reject options, plus a destination cycler for "always" rules (this project
-  just-you / all projects / this project shared / this session, persisted in localStorage). The card
-  captures focus on arrival; Enter = first allow-once, Esc = first reject (or closes the feedback
-  row first when it's open).
+- **Permission prompts.** A warning card that shows what is being approved, not its arguments: a
+  command as the command it will run (led by the agent's own description when it gave one), an
+  edit as the file's name and a line diff — changed lines with a little context, unchanged
+  stretches folded, the same `DiffView` an opened edit row draws. The subject is read from the
+  tool row the request points at (its whole command, its ACP `diff`), else from the request's
+  arguments in each agent's own names (`approval.ts`); anything else names the call, and
+  `details` shows the raw arguments for every request. Options come in one order on every card —
+  allow once, allow and remember, deny (`orderedOptions`; labels stay the agent's own) — with a
+  destination cycler for Claude's "always" rules (this project just-you / all projects / this
+  project shared / this session, persisted in localStorage). The card captures focus on arrival —
+  unless you are typing (a draft in the composer, a terminal or editor in another pane), so a
+  keystroke meant for those never answers a prompt (`promptFocus.ts`; question cards too);
+  Enter = allow once, Esc = deny (or closes the feedback row first when it's open), and the two
+  buttons say so. The decision is recorded on the call's own row — "allowed", "always allowed",
+  "denied", "not answered" — never as a line of its own, so a run of approved calls folds as one
+  run; a request with no row (a plan approval) still leaves its one line.
 - **Deny with feedback.** Every permission card has a "deny with feedback…" affordance: the typed
   reason rides the deny so the agent reacts to it instead of aborting. Claude: the reason is
   appended to the deny directive with `interrupt:false` — the tool errors but the turn runs on;
@@ -805,7 +849,33 @@ unused week reads 0%); an
   stay inside the compact tool history, while genuine or unrecognized guardian warnings remain
   visible as transcript notices.
 - **Structured questions.** The agent's multiple-choice/free-text questions (claude
-  `AskUserQuestion` / codex `requestUserInput`) render as a card. Selections are keyed by
+  `AskUserQuestion` / codex `requestUserInput` / Antigravity's `ask_question`) render as one card
+  for every agent. Antigravity asks in two shapes, both mapped to the same card (`acp.rs`,
+  PROTOCOL.md Pass 62): the CLI's own server sends an ACP `elicitation/create` form (single and
+  multiple choice, plus a typed answer), the standalone server a permission request whose options
+  are the answers — there a typed answer has no channel, so it withdraws the question and goes
+  out as your next message. The CLI's form follows the same rule for a question without a
+  free-text field: typed text alone skips it (withdrawing the form when nothing else was
+  answered) and goes out as your next message; beside a pick there, the text is not sent. The
+  answered row shows only what reached the agent. The question's own markdown draws inline (`questionText.ts`): code
+  spans, bold, and links — a `file:` link opens the file it names, any other link reads as its
+  label. The options are one list, a line each (label, then its description beneath), each
+  line's key at its end; a multi-select line has a box that fills and the card says "choose
+  any". An option the agent marked "(Recommended)" shows the label without the marker and a
+  "recommended" tag; the answer sent back is the agent's own label. The list's last line is the
+  typed answer ("Something else…"); on a single choice, typing replaces a pick and a pick
+  replaces what was typed. Several questions are asked one at a time: steps above the question
+  (each question's `header`, ticked once answered) say where the others stand and jump between
+  them. The card takes the keyboard on arrival: 1–9 pick an option of the question showing, a
+  single choice moves on to the next question still open, Enter moves on too and sends once
+  every question has an answer, and a lone single-choice question is answered by the pick
+  itself. The card answers to its own width (a narrow split, a phone), and key hints are not
+  drawn where there is no keyboard. After a pick, by key or click, the keys stay with the card, and
+  Enter on a focused option moves on rather than pressing it again (Space still toggles it). One
+  answer is sent per card; a card still open after a reconnect has replayed the journal to its
+  head never reached the agent, and answers again. Once answered it stays in the transcript as a quiet row per question — what
+  was asked, what was chosen — starting at the column's edge like the activity lines, with
+  the chevron trailing the first row; it expands to the options not taken. Selections are keyed by
   question/option **index**, not by model-authored id/label (those are untrusted and can collide).
   A codex question carrying `autoResolutionMs` shows a live "skips in Ns" countdown, then auto-skips
   at the driver deadline (empty answers — the official client's behavior) with a visible "question
@@ -813,8 +883,8 @@ unused week reads 0%); an
   remote-daemon wall clocks can differ, so only the driver's monotonic deadline and resulting
   `QuestionResolved` close the card. The journal stores the absolute deadline so reconnect and replay
   do not restart the clock; claude's question timeouts run CLI-side.
-- **Where.** `ToolGroup.svelte`, `ToolCallCard.svelte`, `PermissionCard.svelte`,
-  `PlanApprovalCard.svelte`, `QuestionCard.svelte`, `AgentsTray.svelte`, `BackgroundTray.svelte`;
+- **Where.** `ToolGroup.svelte`, `ToolCallCard.svelte`, `ToolGlyph.svelte`, `ActivitySummary.svelte`,
+  `FailureRow.svelte` + `failureText.ts`, `PermissionCard.svelte`, `PlanApprovalCard.svelte`, `QuestionCard.svelte`, `AgentsTray.svelte`, `BackgroundTray.svelte`;
   commands `permission` (optional `destination`, `feedback`) / `answer` / `stop_task`; events
   `tool_call`(`_update`/`_output_delta`), `permission_request` (optional `plan` = the plan-approval
   marker + markdown) / `permission_resolved`, `question_request` / `question_resolved`,
@@ -1368,3 +1438,12 @@ _Captured 2026-11-04 (the maintainer, in the session that built it)._
 - **How settled it is:** the why is settled; which fences qualify, which terminal it picks and how
   the text is typed are additions, free to change if improved.
 - **Do not change (or: open to change):** open to change; nothing about the Run behavior is frozen.
+
+### Approvals, questions, tool rows and the task card that read at a glance — why it exists
+_Captured 2026-11-26 from the maintainer's own words in the session that built it; settled vs. free-to-change is still pending._
+
+- **Why (maintainer, verbatim):** "Agy is becoming MUCH more relvevant … especially AGY, such as when it asks questions or call tools etc. should be updated ? in general the whole chat UI can get a little polish there with tool calls, when checking commands etc. Think of a nice smooth UI for this that makes sense, and that it is easy to follow what is going on (but not crowded when just chatting) similar to how we have it today but polish it and make it nice."
+- **Tool rows (verbatim):** "the commands in the normal chat, like when you are inspecting what it is doing, these are sometimes not clickable, or you cant really see what is going on, in a nice way (for when you're interested)."
+- **Task list (verbatim):** "the TOOLing like the progress task list, is SO bad, like the agents really do not adhere to that for some reason ? it is kinda annoying. Especially on long running tasks. You want to see what is in progress and what it is working on." He showed Claude desktop's pinned task list (filled check, spinner, dashed ring) and said: "I also really like these cards".
+- **Antigravity sends (verbatim):** "Also AGY send now send later etc. is that working as expected ?"
+- _Settled vs. free-to-change, and what must not be "fixed": pending — not yet asked. Choices made without asking, open to change: a permission decision is recorded on its tool row instead of a transcript line; a lone single-choice question is answered by the pick itself; an arriving prompt does not take the keyboard from typing; Antigravity chat moves to `agy acp` only from agy 1.5.15._

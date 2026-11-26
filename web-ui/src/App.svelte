@@ -400,7 +400,7 @@
   import { nudgeHistory } from "./lib/workspace/history";
   import { sameFile, setSameFileOpener } from "./lib/workspace/sameFile.svelte";
   import { requestSettingsSection, settingsOpen } from "./lib/settings/jump";
-  import { setAgentNames } from "./lib/chat/agentNames";
+  import { setAgentNames } from "./lib/chat/agentNameLookup";
   import QuickOpen from "./lib/workspace/QuickOpen.svelte";
   import FileTree from "./lib/workspace/FileTree.svelte";
   import SplitTree from "./lib/layout/SplitNode.svelte";
