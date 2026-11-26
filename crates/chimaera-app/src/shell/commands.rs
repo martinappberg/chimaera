@@ -1416,8 +1416,15 @@ pub(super) async fn dropped_paths(
     .map_err(|e| e.to_string())
 }
 
-/// A dragged entry that exists, described for the page. `None` for one that
-/// is not an absolute path to something there (a promised file, a URL).
+/// A dragged entry this process can read, described for the page. `None`
+/// for one that is not an absolute path to something there (a promised
+/// file, a URL), and for one that is there but does not open: macOS guards
+/// Downloads, Desktop and Documents per app, and a file in a folder the app
+/// was not allowed into stats fine and then refuses to open. The agents the
+/// daemon starts answer to the same grant, so a path that does not open here
+/// would be a reference the agent cannot read; unreported, the page uploads
+/// the bytes the drop handed it instead. (The open is also what makes macOS
+/// ask for that folder the first time.)
 fn dropped_path(path: std::path::PathBuf) -> Option<DroppedPath> {
     if !path.is_absolute() {
         return None;
@@ -1425,6 +1432,14 @@ fn dropped_path(path: std::path::PathBuf) -> Option<DroppedPath> {
     let meta = std::fs::metadata(&path).ok()?;
     let name = path.file_name()?.to_str()?.to_string();
     let dir = meta.is_dir();
+    let readable = if dir {
+        std::fs::read_dir(&path).is_ok()
+    } else {
+        std::fs::File::open(&path).is_ok()
+    };
+    if !readable {
+        return None;
+    }
     Some(DroppedPath {
         path: path.to_str()?.to_string(),
         name,
@@ -1697,7 +1712,7 @@ pub(super) async fn wsl_setup_daemon(app: AppHandle, distro: Option<String>) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{existing_absolute_path, report_can_reclaim_local_home};
+    use super::{dropped_path, existing_absolute_path, report_can_reclaim_local_home};
 
     #[test]
     fn a_file_handed_to_the_os_must_be_an_existing_absolute_path() {
@@ -1710,6 +1725,41 @@ mod tests {
         assert!(
             existing_absolute_path(dir.join("chimaera-no-such-file").to_str().unwrap()).is_err()
         );
+    }
+
+    #[test]
+    fn a_dropped_entry_is_reported_only_when_it_is_there_and_opens() {
+        let dir = std::env::temp_dir().join(format!("chimaera-dropped-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("raw data")).unwrap();
+        let file = dir.join("meeting notes.txt");
+        std::fs::write(&file, b"hello drop\n").unwrap();
+
+        let got = dropped_path(file.clone()).expect("a readable file is reported");
+        assert_eq!(got.path, file.to_str().unwrap());
+        assert_eq!(got.name, "meeting notes.txt");
+        assert_eq!((got.size, got.dir), (11, false));
+
+        let folder = dropped_path(dir.join("raw data")).expect("a folder is reported");
+        assert_eq!(
+            (folder.name.as_str(), folder.size, folder.dir),
+            ("raw data", 0, true)
+        );
+
+        // Not this drop's to reference: no such entry, or not a place at all.
+        assert!(dropped_path(dir.join("gone.txt")).is_none());
+        assert!(dropped_path("meeting notes.txt".into()).is_none());
+
+        // There, but it does not open: the page uploads instead.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Root opens anything; the check is meaningless under it.
+            if std::fs::File::open(&file).is_err() {
+                assert!(dropped_path(file.clone()).is_none());
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

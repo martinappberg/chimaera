@@ -836,7 +836,12 @@
   }
 
   function pickTerm(t: TerminalOption) {
-    replaceToken(`${collapseMentions(termReference(t.id), draft)} `);
+    // The draft without the query being replaced, so nothing the query
+    // itself spells can read as the short form already being in the draft
+    // (which makes the pick take the longer, id-suffixed one).
+    const token = fileToken;
+    const rest = token === null ? draft : draft.slice(0, token.start) + draft.slice(token.start + token.text.length);
+    replaceToken(`${collapseMentions(termReference(t.id), rest)} `);
   }
 
   function replaceToken(replacement: string) {

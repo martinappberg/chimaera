@@ -184,6 +184,12 @@ function lostTokens(
  * browser said so itself (`insertReplacementText`), whatever shape the
  * change has; otherwise it is recognized by its shape, some of the short
  * form's own characters swapped for others.
+ *
+ * `selected`: the selection as it was before the edit, when the caller
+ * knows it. A selection that was replaced is the change itself, so nothing
+ * has to be guessed from the two texts: a short form it held whole was
+ * replaced on purpose (never restored, even by text much like its own),
+ * and what was typed over it is kept whole.
  */
 export function settleEdit(
   before: string,
@@ -191,6 +197,7 @@ export function settleEdit(
   caret: number,
   tokens: UploadTokens,
   replacement = false,
+  selected: readonly [number, number] | null = null,
 ): { text: string; caret: number; restored?: true } | null {
   const old = tokenSpans(before, tokens);
   if (old.length === 0) return null;
@@ -202,24 +209,45 @@ export function settleEdit(
   let from = 0;
   const headMax = Math.min(before.length - tail, after.length - tail);
   while (from < headMax && before[from] === after[from]) from++;
-  const oldEnd = before.length - tail;
-  const inserted = after.slice(from, after.length - tail);
+  let oldEnd = before.length - tail;
+  let inserted = after.slice(from, after.length - tail);
+  // A replaced selection says exactly what changed, where the texts alone
+  // can be read two ways (`@` typed over a selected `@plot.png` leaves its
+  // first character standing, which reads as a deletion that cut into it).
+  const took = selected !== null && selected[0] < selected[1] ? selected : null;
+  if (took !== null) {
+    const kept = before.length - took[1];
+    if (
+      after.length >= took[0] + kept &&
+      before.startsWith(after.slice(0, took[0])) &&
+      before.endsWith(after.slice(after.length - kept))
+    ) {
+      from = took[0];
+      oldEnd = took[1];
+      inserted = after.slice(from, after.length - kept);
+    }
+  }
 
   // The system rewrote part of a short form: put it back. Read off the
   // smallest change, wherever the caret is: a substitution happens beside
   // what was typed, not at it, so the caret-bounded stretch above would
   // run from the rewritten character to the caret.
+  let low = 0;
+  const lowMax = Math.min(before.length, after.length);
+  while (low < lowMax && before[low] === after[low]) low++;
   let end = 0;
-  const endMax = Math.min(before.length, after.length) - from;
+  const endMax = lowMax - low;
   while (end < endMax && before[before.length - 1 - end] === after[after.length - 1 - end]) end++;
   const wasEnd = before.length - end;
   const nowEnd = after.length - end;
   const inside = old.find((s) =>
-    wasEnd > from
-      ? s.start <= from && wasEnd <= s.end && wasEnd - from < s.end - s.start
-      : replacement && s.start < from && from < s.end,
+    wasEnd > low
+      ? s.start <= low && wasEnd <= s.end && wasEnd - low < s.end - s.start
+      : replacement && s.start < low && low < s.end,
   );
-  if (inside !== undefined && nowEnd > from) {
+  // Not one the user had selected whole: that replacement was theirs.
+  const theirs = inside !== undefined && took !== null && took[0] <= inside.start && inside.end <= took[1];
+  if (inside !== undefined && !theirs && nowEnd > low) {
     // The caret keeps its place in the text; one the rewrite left inside
     // the short form goes to its end.
     const at = caret >= nowEnd ? caret - nowEnd + wasEnd : caret;

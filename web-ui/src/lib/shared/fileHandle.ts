@@ -12,7 +12,7 @@
  *
  * Attach it to the element that takes the click (the tile's button, the
  * chip): a drag captures the pointer on the element it started from, and
- * Chromium sends the click of a captured press to that element, so a handle
+ * browsers send the click of a captured press to that element, so a handle
  * on an ancestor would take its children's clicks.
  */
 

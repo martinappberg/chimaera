@@ -83,6 +83,8 @@ export function uploadChips(
     let base: string | null = null;
     /** The edit in flight is the browser's own replacement of some text. */
     let replacing = false;
+    /** The selection the edit in flight started from. */
+    let selected: [number, number] | null = null;
     let composing = false;
     let settling = false;
     let pointerDown = false;
@@ -100,10 +102,10 @@ export function uploadChips(
       moved();
     }
 
-    function settle(before: string, replacement = false): void {
+    function settle(before: string, replacement = false, from: [number, number] | null = null): void {
       if (settling) return;
       const after = el.value;
-      const fix = settleEdit(before, after, el.selectionStart, tokens, replacement);
+      const fix = settleEdit(before, after, el.selectionStart, tokens, replacement, from);
       if (fix === null) return;
       settling = true;
       try {
@@ -165,6 +167,7 @@ export function uploadChips(
       if (composing || settling) return;
       base = el.value;
       replacing = e.inputType === "insertReplacementText";
+      selected = [el.selectionStart, el.selectionEnd];
       // Typing against a short form's end: a space first, in the same edit.
       if (e.inputType !== "insertText" || e.isComposing || e.data === null || tokens.size === 0) return;
       const start = el.selectionStart;
@@ -186,7 +189,7 @@ export function uploadChips(
       if (composing || (e as InputEvent).isComposing || settling || base === null) return;
       const before = base;
       base = null;
-      settle(before, replacing);
+      settle(before, replacing, selected);
     }
 
     function onCompositionStart(): void {

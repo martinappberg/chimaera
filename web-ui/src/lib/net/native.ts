@@ -330,6 +330,17 @@ export async function copyFileToClipboard(path: string): Promise<boolean> {
 }
 
 /**
+ * Whether an OS file drop on this window is referenced where the file is
+ * instead of uploaded (`localDrop.ts`): the window's files are this
+ * computer's, and the shell can say where a dropped one lives. That is
+ * macOS only (`dropped_paths` reads AppKit's drag pasteboard), so a Linux
+ * window uploads and must not promise otherwise.
+ */
+export function referencesLocalDrops(): boolean {
+  return hasLocalFiles() && /\bMac/.test(navigator.userAgent);
+}
+
+/**
  * Where the files of the OS drag that just ended on this window live (see
  * `localDrop.ts`): the shell's reading of the system drag pasteboard. Empty
  * in a browser, on a remote window, off macOS, and on any shell error or
@@ -337,7 +348,7 @@ export async function copyFileToClipboard(path: string): Promise<boolean> {
  */
 export async function droppedPaths(): Promise<DroppedPath[]> {
   const t = tauri();
-  if (t === null || !hasLocalFiles()) return [];
+  if (t === null || !referencesLocalDrops()) return [];
   try {
     const raw = await t.core.invoke<unknown>("dropped_paths");
     if (!Array.isArray(raw)) return [];

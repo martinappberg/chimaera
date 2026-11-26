@@ -180,8 +180,23 @@ describe("a short form is one unit", () => {
     });
   });
 
+  it("puts it back when the engine selects the part it rewrites", () => {
+    const chips: UploadTokens = new Map([['@term:"zsh"', "@term:s-1234abcd"]]);
+    // A selection inside a short form is never the user's: theirs snaps whole.
+    expect(settleEdit('@term:"zsh" h', '@term:\u201czsh" h', 13, chips, false, [6, 7])).toEqual({
+      text: '@term:"zsh" h',
+      caret: 13,
+      restored: true,
+    });
+  });
+
   it("still takes a whole one that was selected and replaced", () => {
     expect(settleEdit("see @plot.png now", "see X now", 5, tokens)).toBeNull();
+    // By text much like its own: the selection says it was replaced on purpose.
+    expect(settleEdit("see @plot.png now", "see @plan.png now", 13, tokens, false, [4, 13])).toBeNull();
+    // By its own first character: the typed `@` stays, the short form goes.
+    expect(settleEdit("@plot.png", "@", 1, tokens, false, [0, 9])).toBeNull();
+    expect(settleEdit("a @plot.png b", "a @ b", 3, tokens, false, [2, 11])).toBeNull();
   });
 
   it("leaves every other edit alone", () => {

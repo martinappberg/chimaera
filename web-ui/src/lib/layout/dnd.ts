@@ -832,10 +832,10 @@ export interface DragOptions {
 
 /**
  * An active drag's release is not a click, but the browser still makes one of
- * it: on the source that captured the pointer (Chromium) or on the nearest
- * common ancestor of the press and the release (WebKit). A source with a
- * click handler of its own (a tab activates, a rail row opens its session)
- * would then act a second time on a gesture the drop already consumed: a tab
+ * it, on the source that captured the pointer (Chromium and WebKit both, the
+ * native app's web view included: observed live). A source with a click
+ * handler of its own (a tab activates, a rail row opens its session) would
+ * then act a second time on a gesture the drop already consumed: a tab
  * dropped on the reference band was referenced AND activated, and a linked
  * terminal took the focus the link had just handed the agent. Swallow that
  * one click, for every source at once.
@@ -843,18 +843,22 @@ export interface DragOptions {
  * The click is dispatched in the release's own task, so the guard leaves on
  * the next one. A drag cancelled while the button is still down (Escape, a
  * window blur) keeps it until that press ends; the next press always ends it,
- * so a release the window never saw cannot cost a later, real click.
+ * and a click the keyboard makes (Enter or Space on a focused control:
+ * `detail` 0) passes, so a release the window never saw cannot cost a later,
+ * real click.
  */
 function swallowDragClick(released: boolean): void {
-  const swallow = (e: Event) => {
+  function swallow(e: Event): void {
+    off();
+    if ((e as MouseEvent).detail === 0) return;
     e.stopPropagation();
     e.preventDefault();
-  };
-  const off = () => {
+  }
+  function off(): void {
     window.removeEventListener("click", swallow, true);
     window.removeEventListener("pointerup", soon, true);
     window.removeEventListener("pointerdown", off, true);
-  };
+  }
   const soon = () => setTimeout(off, 0);
   window.addEventListener("click", swallow, true);
   window.addEventListener("pointerdown", off, true);

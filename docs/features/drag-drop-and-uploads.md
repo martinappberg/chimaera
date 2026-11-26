@@ -100,7 +100,7 @@ selection references (see [terminals.md](terminals.md)).
   image or PDF body; text bodies stay selectable). A prose file link gets the menu row from
   `Markdown.svelte`'s own link menu.
 - **Key behaviors.** The handle is on the element that takes the click: a drag captures the pointer
-  on its source, and Chromium sends a captured press's click to that element. Mouse only, so a
+  on its source, and browsers send a captured press's click to that element. Mouse only, so a
   finger on a figure still scrolls. A gone file is not a handle. Outside a chat (an embed card in a
   document) the menu references into the window's reference target, and has no row when there is
   none. Pure client: no wire change.
@@ -114,7 +114,7 @@ selection references (see [terminals.md](terminals.md)).
   composer therefore references; with a fixed share the top of a tall composer was the "add to
   this pane" zone.
 - **A drop is not a click.** The browser makes a click of the release that ends a drag, on the
-  element that captured the pointer. A tab dropped on the band was referenced and then activated by
+  element that captured the pointer (Chromium and the native app's WebKit alike). A tab dropped on the band was referenced and then activated by
   its own click handler, and a linked terminal's rail row took the focus the link had handed the
   agent. `dnd.ts` swallows that one click for every drag source (`swallowDragClick`); a release
   before the drag threshold is still a click.
@@ -161,7 +161,9 @@ selection references (see [terminals.md](terminals.md)).
   promised by another app) upload as before. A web view never tells the page where a dropped file
   lives, so the page asks the shell (`dropped_paths`: the system drag pasteboard, macOS only) and
   pairs each answer with its dropped `File` by name, kind and size (`net/localDrop.ts`
-  `pairDroppedPaths`, `routeDrop`); an entry it cannot pair is ignored. A drop on a
+  `pairDroppedPaths`, `routeDrop`); an entry it cannot pair is ignored. Linux has no such
+  report, so there a local drop uploads and the wash says so
+  (`native.ts::referencesLocalDrops`). A drop on a
   file-manager folder is still a copy into that folder.
 - **In a chat, a dropped file reads as its name, where you referenced it.** The composer shows the
   mention as `@Screenshot-….png` in place of the ~100-character landing-pad path, as a quiet pill
@@ -246,7 +248,10 @@ selection references (see [terminals.md](terminals.md)).
   owning daemon regardless. One addition for local windows: `shell/commands.rs::dropped_paths`
   (local-only, `require_local`) reads the file URLs of AppKit's drag pasteboard, which keeps the
   last drag's contents after the drop, so the page can reference a dropped file in place. It
-  reports each entry's path, name, size and kind, at most 32, and nothing off macOS.
+  reports each entry's path, name, size and kind, at most 32, and nothing off macOS. An entry
+  the app cannot open is not reported (a file in Downloads, Desktop or Documents before macOS
+  was told the app may read that folder: the open is what makes macOS ask), so it uploads
+  instead of becoming a reference the agent cannot read.
 
 ---
 

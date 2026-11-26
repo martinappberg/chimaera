@@ -17,7 +17,7 @@
   import type { DropSpot, LayoutCtrl } from "./dnd";
   import { paneBandFraction, registerPane, REF_BAND_FRAC, unregisterPane, zoneWord } from "./dnd";
   import { dirLabel } from "../previews/files";
-  import { hasLocalFiles } from "../net/native";
+  import { referencesLocalDrops } from "../net/native";
   import { agentHue, type LinkCtrl } from "../workspace/agentLinks";
   import { activeModLabel, keyHint, keyHintSuffix, paneFocusHint, paneMoveHint } from "../shared/keybindings";
   import PaneTabs from "./PaneTabs.svelte";
@@ -125,7 +125,7 @@
    *  (adopt) preview stops above it instead of flashing the full pane. */
   /** This window's files are this computer's: an OS drop is referenced in
    *  place, not uploaded (constant for the window's life). */
-  const localFiles = hasLocalFiles();
+  const localFiles = referencesLocalDrops();
   const bandArmed = $derived(bandPanes.has(node.id));
   /** The band's share of this pane for the current drag, as the hit-test
    *  reads it: measured once when the drag arms it (the input area does not

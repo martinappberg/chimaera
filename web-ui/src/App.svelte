@@ -298,10 +298,10 @@
     askpassActive,
     closeThisWindow,
     droppedPaths,
-    hasLocalFiles,
     isNativeShell,
     onMissionControl,
     onFocusSession,
+    referencesLocalDrops,
     onMenu,
     onUnsavedPrompt,
     openWindow,
@@ -1292,7 +1292,14 @@
       canReference: (sessionId) => fileReferenceTarget(sessionId) !== null,
       reference: (path, kind, sessionId) => {
         const target = fileReferenceTarget(sessionId);
-        if (target !== null) referencePathIn(target.id, path, kind);
+        if (target === null) return;
+        // Outside a chat the target may be open nowhere, and a reference
+        // never lands out of sight (`referenceSelection`'s rule).
+        if (sessionId === null && sessionPaneId(layout, target.id) === null) {
+          layout = splitPane(layout, layout.focusedPaneId, "row");
+          layout = openSession(layout, target.id);
+        }
+        referencePathIn(target.id, path, kind);
       },
     });
     setViewOpener(openPluginViewSurface);
@@ -1746,7 +1753,7 @@
     if (s === null) return;
     // Asked now, while the drag that just ended is still the system's last:
     // on this computer's own daemon the files are referenced where they are.
-    void dropFilesOnSession(s.id, picked, hasLocalFiles() ? droppedPaths() : null);
+    void dropFilesOnSession(s.id, picked, referencesLocalDrops() ? droppedPaths() : null);
   }
 
   /** Upload each dropped file INTO `dir` (a file-manager folder target), then
@@ -1790,6 +1797,7 @@
     let accepted = 0;
     for (const [i, { file, dir }] of picked.entries()) {
       const route = routeDrop(items[i], paths[i], local);
+      if (route.how === "upload" && file === null) continue;
       // One cap for the gesture, whichever way each file goes.
       if (route.how !== "refuse" && accepted >= OS_DROP_MAX_FILES) {
         reportUploadError(`${items[i].name}: skipped (max ${OS_DROP_MAX_FILES} files per drop)`);
