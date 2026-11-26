@@ -18,6 +18,8 @@
   import { agentCatalog, listAgents } from "../workspace/launcher";
   import { getSignIn, needsSignIn } from "../workspace/agentSignIn";
   import AgentSignInCard from "../workspace/AgentSignInCard.svelte";
+  import LimitCard from "./LimitCard.svelte";
+  import { canSwitchAccount, limitNotice } from "./limitCard";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import BranchChip from "../shared/BranchChip.svelte";
   import { openBranchChanges } from "../workspace/git";
@@ -324,6 +326,20 @@
    *  account, a limit on this one, a stale login), mid-turn, or in a chat
    *  that has ended — and the daemon relaunches the chat once it lands. */
   let signInRequested = $state(false);
+  /** The agent says the account's limit is reached (its own telemetry, not
+   *  an error's words), in a chat whose sign-in can put another account in
+   *  place: one quiet line at the transcript's tail says what was hit and
+   *  when it resets, with a link to that sign-in beside it (waiting is the
+   *  default; the link is never a call to action). The daemon starts the
+   *  chat again on the login that lands, keeping the conversation and the
+   *  draft. */
+  const limitReached = $derived(!readOnly && store.rateLimit?.limitReached === true && canSwitchAccount(catalogAgent));
+  const limitClock = liveClock(() => visible && limitReached);
+  /** The limit a landed sign-in answered: the old process's, still in the
+   *  store until the daemon's relaunch replaces it (at once, or when a
+   *  running turn ends). A new report from the agent is a new object. */
+  let limitAnswered = $state.raw<object | null>(null);
+  const limitCard = $derived(limitReached && visible && store.rateLimit !== limitAnswered ? limitNotice(store.rateLimit, limitClock.ms) : null);
   void listAgents().then((agents) => {
     const info = agents.find((a) => a.id === agentKind);
     models = info?.models ?? [];
@@ -3681,12 +3697,18 @@
       </div>
     {/if}
 
+    {#if limitCard !== null && !signInRequested && !liveSignIn}
+      <div class="limit-line">
+        <LimitCard notice={limitCard} {agentName} onSignIn={() => (signInRequested = true)} />
+      </div>
+    {/if}
     {#if (liveSignIn || (signInRequested && !(signInNeeded && !store.initialized))) && catalogAgent !== null}
       <div class="live-signin">
         <!-- The daemon relaunches a chat that waited on the login (and the
              one /login was typed in); the card only refreshes the verdict. -->
         <AgentSignInCard agent={catalogAgent} workspaceId={session.workspace_id ?? null} sessionId={session.id} framed autostart={signInRequested} onSignedIn={() => {
           signInRequested = false;
+          limitAnswered = store.rateLimit;
           void getSignIn(agentKind, true).catch(() => {});
           // The daemon never interrupts a turn for a login: it relaunches
           // this chat when the turn ends (`relaunch_after_turn`).
@@ -4385,6 +4407,9 @@
   }
   .live-signin {
     padding: 12px 0 4px;
+  }
+  .limit-line {
+    padding: 6px 0;
   }
   .notice.error {
     color: var(--err);

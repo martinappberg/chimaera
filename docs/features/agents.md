@@ -294,7 +294,13 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   and the chat says so — *Signed in — {agent} switches to it when this turn ends.* A chat that
   completed a turn no longer counts as waiting. The daemon is the one owner of that relaunch; a card only
   refreshes the verdict. `/login` typed in a chat relaunches that chat too (`session_id` on the
-  start request). No sign-in runs beside an install or update of the same agent.
+  start request), and so does every chat of that agent whose process says its account's limit is
+  reached (`AgentRecord::stalled_at_limit`: the latest `RateLimit` event, until the reset time it
+  named has passed): the login that landed may be another account, and the process holds the old
+  one. A relaunch for a sign-in is journaled as
+  `ModeSwitch {to: chat, sign_in: true}`; the chat reads it as "continued on the new sign-in" and
+  drops the old account's limit state ([the chat's limit line](chat-mode.md#composing--sending)). No
+  sign-in runs beside an install or update of the same agent.
 - **How it's used.** Signing in is never gated on a state: Settings → Agents always offers **Sign
   in** / **Sign in again**, and every chat offers it in **Chat options → Sign in to {agent}…** and
   as `/login` — signed in or not, mid-turn, idle, or ended (a chat that died on a usage limit or
@@ -364,7 +370,13 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   returns to `localhost` can only finish in a browser on the daemon's machine (every recipe here
   uses a device code or a hosted callback for that reason). The status command runs behind
   the same marker and is read from it, so a banner's words never answer it either.
-  A clean exit is never success by itself — the status command is asked again. Concurrent status probes for one agent share a run. The
+  A clean exit is never success by itself — the status command is asked again. The daemon keeps
+  an agent's last sign-in result until the next attempt. The finished attempt a card finds when it
+  opens is its history (`agentSignIn.ts` `historyAttempt` / `attemptShown` / `attemptLanded`); it
+  shows and reports everything after that, its own attempt or one finished elsewhere meanwhile.
+  Read as its own, an earlier success closed a chat's `/login` card before it started a login, so
+  a second sign-in from a chat never ran. A `/login` that finds a sign-in already running joins it
+  through the same POST, so the daemon marks that chat as waiting on it too. Concurrent status probes for one agent share a run. The
   chat view shows one line per failure: a startup error that a fatal banner shows
   is not repeated as a transcript line, and a fatal banner is not followed by *agent exited*.
 

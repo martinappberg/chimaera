@@ -99,6 +99,64 @@ describe("ChatStore block-boundary normalization", () => {
   });
 });
 
+describe("a limit the agent reports as reached", () => {
+  const REACHED = {
+    type: "rate_limit",
+    utilization: 100,
+    label: "session limit",
+    resets_at: "1795726433",
+    limit_reached: true,
+    windows: [
+      { label: "session limit", utilization: 100, resets_at: "1795726433" },
+      { label: "weekly limit", utilization: 41 },
+    ],
+  };
+  const REFUSED_TURN: Record<string, unknown>[] = [
+    { type: "user_message", text: "summarize the README", id: "u1" },
+    { type: "turn_started", turn_id: "t1" },
+    REACHED,
+    { type: "turn_aborted", turn_id: "t1", reason: "the agent's own words" },
+  ];
+
+  it("is the chat's limit state until the agent says otherwise", () => {
+    const store = fold(REFUSED_TURN);
+    expect(store.rateLimit).toMatchObject({ limitReached: true, label: "session limit", resetsAt: "1795726433" });
+    // The agent's words stay in the transcript as the turn's failure.
+    expect(store.blocks.at(-1)).toMatchObject({ kind: "notice", tone: "error", text: "turn failed: the agent's own words" });
+    // The next request that goes through reports the window as allowed.
+    store.apply({ seq: 99, ts: 99, ev: { ...REACHED, utilization: 100, limit_reached: false } } as SeqEvent);
+    expect(store.rateLimit?.limitReached).toBe(false);
+  });
+
+  it("survives the process ending and an ordinary restart of it", () => {
+    // A view toggle or a relaunch on the same login: the account is the same.
+    const store = fold([...REFUSED_TURN, { type: "exited" }, { type: "mode_switch", to: "chat" }, { type: "init" }]);
+    expect(store.rateLimit?.limitReached).toBe(true);
+    expect(store.blocks.at(-1)).toMatchObject({ kind: "notice", text: "continued in chat" });
+  });
+
+  it("is dropped when the chat starts again for a new sign-in", () => {
+    const store = fold([
+      ...REFUSED_TURN,
+      { type: "exited" },
+      { type: "mode_switch", to: "chat", sign_in: true },
+      { type: "init" },
+    ]);
+    // Nothing of the old account's windows is shown as this login's.
+    expect(store.rateLimit).toBeNull();
+    expect(store.exited).toBeNull();
+    expect(store.blocks.at(-1)).toMatchObject({ kind: "notice", tone: "info", text: "continued on the new sign-in" });
+    // The new process reports its own account at its first request.
+    store.apply({ seq: 50, ts: 50, ev: { type: "rate_limit", utilization: 7, label: "session limit" } } as SeqEvent);
+    expect(store.rateLimit).toMatchObject({ limitReached: false, utilization: 7 });
+  });
+
+  it("returns when the new login is at its limit too", () => {
+    const store = fold([...REFUSED_TURN, { type: "exited" }, { type: "mode_switch", to: "chat", sign_in: true }, { type: "init" }, ...REFUSED_TURN.map((ev) => (ev.id === "u1" ? { ...ev, id: "u2" } : ev))]);
+    expect(store.rateLimit?.limitReached).toBe(true);
+  });
+});
+
 describe("ChatStore transcript activity", () => {
   it("separates visible conversation changes from control telemetry", () => {
     const store = new ChatStore();

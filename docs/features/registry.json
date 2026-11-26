@@ -432,7 +432,9 @@
       "page": "docs/features/drag-drop-and-uploads.md",
       "paths": [
         "crates/chimaera-server/src/upload.rs",
+        "crates/chimaera-server/src/upload/chunked.rs",
         "web-ui/src/lib/net/uploads.ts",
+        "web-ui/src/lib/net/chunkedUpload.ts",
         "web-ui/src/lib/chat/images.ts",
         "web-ui/src/lib/shared/reference.ts"
       ],
