@@ -1359,7 +1359,8 @@ async fn a_landed_sign_in_relaunches_a_chat_stalled_at_its_limit() {
     // The agent's own telemetry, through the session's pump.
     let limit = |limit_reached| AgentEvent::RateLimit {
         utilization: if limit_reached { 100.0 } else { 12.0 },
-        resets_at: None,
+        // Far ahead: the limit is still in force when the sign-in lands.
+        resets_at: Some("99999999999".into()),
         label: Some("session limit".into()),
         limit_reached,
         windows: Vec::new(),
@@ -1368,15 +1369,30 @@ async fn a_landed_sign_in_relaunches_a_chat_stalled_at_its_limit() {
     // Reached, then a request that went through: latest wins, not stalled.
     state.chat.annotate(&fine, limit(true)).unwrap();
     state.chat.annotate(&fine, limit(false)).unwrap();
+    // Off the reactor: a replay that reaches the journal file waits on its
+    // writer.
+    let journal = |id: &str| {
+        let (state, id) = (state.clone(), id.to_string());
+        async move {
+            tokio::task::spawn_blocking(move || {
+                state
+                    .chat
+                    .attach(&id, 0)
+                    .map(|a| a.replay)
+                    .unwrap_or_default()
+            })
+            .await
+            .unwrap()
+        }
+    };
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
-            let seen = state.chat.attach(&fine, 0).is_ok_and(|a| {
-                a.replay
-                    .iter()
-                    .filter(|e| matches!(e.ev, AgentEvent::RateLimit { .. }))
-                    .count()
-                    == 2
-            });
+            let seen = journal(&fine)
+                .await
+                .iter()
+                .filter(|e| matches!(e.ev, AgentEvent::RateLimit { .. }))
+                .count()
+                == 2;
             if seen && lock(&state.agents).get(&stalled).unwrap().limit_reached {
                 break;
             }
@@ -1412,7 +1428,7 @@ async fn a_landed_sign_in_relaunches_a_chat_stalled_at_its_limit() {
         );
         assert!(!record.relaunch_for_sign_in, "one-shot");
     }
-    let replay = state.chat.attach(&stalled, 0).unwrap().replay;
+    let replay = journal(&stalled).await;
     assert!(
         replay.iter().any(|e| matches!(
             e.ev,
@@ -1428,11 +1444,8 @@ async fn a_landed_sign_in_relaunches_a_chat_stalled_at_its_limit() {
         untouched,
         "a chat under no limit keeps its process"
     );
-    assert!(state
-        .chat
-        .attach(&fine, 0)
-        .unwrap()
-        .replay
+    assert!(journal(&fine)
+        .await
         .iter()
         .all(|e| !matches!(e.ev, AgentEvent::ModeSwitch { .. })));
 }
@@ -1488,15 +1501,26 @@ async fn sign_in_routes_show_the_page_join_a_repeat_and_cancel() {
         page["operation"].get("output").is_none(),
         "raw output never reaches the wire"
     );
-    // A repeated click joins.
+    // A repeated click joins. Asked from a chat (`/login` while the login
+    // runs), that chat waits on the login too.
+    lock(&state.agents).insert(
+        "s-join".into(),
+        agent_state::AgentRecord::new("key".into(), agents::AgentKind::Claude),
+    );
     let (_, again) = request(
         &state,
         Method::POST,
         "/api/v1/agents/claude/sign-in",
-        Some(serde_json::json!({"workspace_id": ws, "request_id": "r-2"})),
+        Some(serde_json::json!({"workspace_id": ws, "request_id": "r-2", "session_id": "s-join"})),
     )
     .await;
     assert_eq!(again["id"], "r-1");
+    assert!(
+        lock(&state.agents)
+            .get("s-join")
+            .unwrap()
+            .signed_out_at_start
+    );
     let (_, list) = request(&state, Method::GET, "/api/v1/agents", None).await;
     let claude = list
         .as_array()

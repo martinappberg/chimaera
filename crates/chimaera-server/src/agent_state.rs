@@ -243,8 +243,12 @@ pub(crate) struct AgentRecord {
     /// The agent's own telemetry says its account's limit is reached
     /// (`RateLimit {limit_reached}`, latest wins). That process keeps the
     /// login it started with, so a sign-in landing later relaunches it in
-    /// place too (`chat::relaunch_after_sign_in`).
+    /// place too (`chat::relaunch_after_sign_in`, while
+    /// [`Self::stalled_at_limit`]).
     pub(crate) limit_reached: bool,
+    /// When that limit resets, epoch seconds, where the agent said so in
+    /// that form; `None` = unknown.
+    pub(crate) limit_resets_at: Option<u64>,
     /// One-shot: the relaunch under way is for a new sign-in, so its journal
     /// marker says so (`ModeSwitch.sign_in`). Taken by that relaunch.
     pub(crate) relaunch_for_sign_in: bool,
@@ -332,6 +336,27 @@ pub(crate) fn notice_line(text: &str) -> String {
 }
 
 impl AgentRecord {
+    /// The agent's latest word on its limits, folded from a `RateLimit`
+    /// event. `resets_at` is epoch seconds on the streamed events; any other
+    /// form (an ISO time) is kept as unknown.
+    pub(crate) fn note_limit(&mut self, limit_reached: bool, resets_at: Option<&str>) {
+        self.limit_reached = limit_reached;
+        self.limit_resets_at = resets_at
+            .filter(|_| limit_reached)
+            .and_then(|at| at.trim().parse().ok());
+    }
+
+    /// Stalled at its account's limit as far as anyone knows: the agent said
+    /// reached, and the reset it named has not passed. Past it the chat has
+    /// most likely nothing to wait for, so a sign-in landing for some other
+    /// reason must not restart it (and whatever it runs between turns); its
+    /// own `/login` still does.
+    pub(crate) fn stalled_at_limit(&self, now_secs: u64) -> bool {
+        self.limit_reached && self.limit_resets_at.is_none_or(|at| now_secs < at)
+    }
+}
+
+impl AgentRecord {
     pub(crate) fn new(key: String, kind: AgentKind) -> Self {
         AgentRecord {
             key,
@@ -348,6 +373,7 @@ impl AgentRecord {
             signed_out_at_start: false,
             relaunch_after_turn: false,
             limit_reached: false,
+            limit_resets_at: None,
             relaunch_for_sign_in: false,
             subagents: Vec::new(),
             now_line: None,
@@ -1076,6 +1102,26 @@ mod tests {
         assert_eq!(record.display_name(Some("  ")), "Fixing tests");
         record.custom_title = Some("My run".into());
         assert_eq!(record.display_name(Some("✳ git")), "My run");
+    }
+
+    #[test]
+    fn a_limit_stalls_a_chat_until_the_agent_or_its_reset_time_says_otherwise() {
+        let mut record = AgentRecord::new("key".into(), AgentKind::Claude);
+        assert!(!record.stalled_at_limit(100));
+        // Reached, with the reset the streamed events name (epoch seconds).
+        record.note_limit(true, Some("200"));
+        assert!(record.stalled_at_limit(100));
+        assert!(!record.stalled_at_limit(200), "its reset has passed");
+        // A time in another form is unknown, never "already reset".
+        record.note_limit(true, Some("2026-11-26T18:00:00Z"));
+        assert_eq!(record.limit_resets_at, None);
+        assert!(record.stalled_at_limit(u64::MAX));
+        record.note_limit(true, None);
+        assert!(record.stalled_at_limit(u64::MAX));
+        // The next request that went through: latest wins.
+        record.note_limit(false, Some("900"));
+        assert!(!record.stalled_at_limit(100));
+        assert_eq!(record.limit_resets_at, None);
     }
 
     #[test]

@@ -337,7 +337,7 @@
    *  store until the daemon's relaunch replaces it (at once, or when a
    *  running turn ends). A new report from the agent is a new object. */
   let limitAnswered = $state.raw<object | null>(null);
-  const limitCard = $derived(limitReached && store.rateLimit !== limitAnswered ? limitNotice(store.rateLimit, limitClock.ms) : null);
+  const limitCard = $derived(limitReached && visible && store.rateLimit !== limitAnswered ? limitNotice(store.rateLimit, limitClock.ms) : null);
   void listAgents().then((agents) => {
     const info = agents.find((a) => a.id === agentKind);
     models = info?.models ?? [];

@@ -11,7 +11,7 @@
   import { resolvedTheme } from "../settings/store.svelte";
   import { ApiError } from "../net/api";
   import type { AgentInfo } from "./launcher";
-  import { attemptLanded, cancelSignIn, getSignIn, sendSignInCode, shownAttempt, startSignIn, type SignInProgress, type SignInStatus } from "./agentSignIn";
+  import { attemptLanded, attemptShown, cancelSignIn, getSignIn, historyAttempt, sendSignInCode, startSignIn, type SignInProgress, type SignInStatus } from "./agentSignIn";
   import { operationRunning } from "./operations";
 
   interface Props {
@@ -43,13 +43,13 @@
   let checking = $state(false);
   let disposed = false;
   let announced: string | null = null;
-  /** The attempt this card started, or found running and shows: a finished
-   *  attempt from elsewhere (an earlier card, another window) is history,
-   *  not this card's state, and never this card's success. */
-  let ownAttempt = $state<string | null>(null);
+  /** The finished attempt the agent already had when this card first read
+   *  it (`undefined` until that read): history, not this card's state, and
+   *  never this card's success. Everything after it is shown. */
+  let history = $state<string | null | undefined>(undefined);
 
   const operation = $derived<SignInProgress | null>(
-    status?.operation && (operationRunning(status.operation) || status.operation.id === ownAttempt) ? status.operation : null,
+    history !== undefined && status?.operation && attemptShown(history, status.operation) ? status.operation : null,
   );
   const running = $derived(operationRunning(operation));
   /** Signed in, and this CLI's login can't replace the account (its
@@ -59,25 +59,32 @@
     try { return operation?.url ? new URL(operation.url).hostname : null; } catch { return null; }
   });
 
+  /** Tell the host once per landed sign-in (its own, or one finished
+   *  elsewhere since this card opened). */
+  function announce(op: SignInProgress | null): void {
+    if (history === undefined || op === null || !attemptLanded(history, op) || announced === op.id) return;
+    announced = op.id;
+    onSignedIn?.();
+  }
+
   async function check(fresh = false): Promise<void> {
     if (checking || disposed) return;
     checking = true;
     try {
       const next = await getSignIn(agent.id, fresh);
       if (disposed) return;
+      if (history === undefined) history = historyAttempt(next.operation);
       status = next;
-      if (next.operation?.id === requestId) { ownAttempt = requestId; requestId = null; }
-      ownAttempt = shownAttempt(ownAttempt, next.operation);
-      if (next.operation && attemptLanded(ownAttempt, next.operation) && announced !== next.operation.id) {
-        announced = next.operation.id;
-        onSignedIn?.();
-      }
+      if (next.operation?.id === requestId) requestId = null;
+      announce(next.operation);
     } catch (e) {
       if (!disposed) error = e instanceof Error ? e.message : "Couldn't check the sign-in.";
     } finally { checking = false; }
   }
   onMount(() => {
-    void check().then(() => { if (autostart && !running && !noSecondSignIn) void start(); });
+    // Asked to start (a chat's /login): a login already running is joined
+    // through the daemon, which then knows this chat waits on it too.
+    void check().then(() => { if (autostart && !noSecondSignIn) void start(true); });
     return () => { disposed = true; };
   });
   // Only a sign-in in progress needs the daemon again, and only while someone
@@ -88,17 +95,20 @@
     return () => clearInterval(timer);
   });
 
-  async function start(): Promise<void> {
-    if (disposed || busy || running || workspaceId === null) return;
+  async function start(join = false): Promise<void> {
+    if (disposed || busy || (running && !join) || workspaceId === null) return;
     busy = true; error = null; code = "";
     requestId ??= crypto.randomUUID();
     try {
       const next = await startSignIn(agent.id, workspaceId, requestId, resolvedTheme(), sessionId);
       if (disposed) return;
-      ownAttempt = next.id;
+      // The first read failed: what is there now is this card's to show.
+      if (history === undefined) history = null;
       status = status ? { ...status, operation: next } : null;
       if (!status) await check();
       requestId = null;
+      // A retried request can answer with its attempt already landed.
+      announce(next);
     } catch (e) {
       if (!disposed) {
         error = e instanceof Error ? e.message : "Couldn't start the sign-in.";

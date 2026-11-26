@@ -652,8 +652,13 @@ fn apply_chat_event(state: &Arc<AppState>, id: &str, ev: &AgentEvent) {
     }
     // Latest wins, like the header chip: the next request that goes through
     // reports the limit as no longer reached.
-    if let AgentEvent::RateLimit { limit_reached, .. } = ev {
-        record.limit_reached = *limit_reached;
+    if let AgentEvent::RateLimit {
+        limit_reached,
+        resets_at,
+        ..
+    } = ev
+    {
+        record.note_limit(*limit_reached, resets_at.as_deref());
     }
     note_for_notices(record, ev);
     // Turn end clears the hook-fed activity fields. Tool-adjacent hooks DO
@@ -1696,10 +1701,13 @@ pub(crate) async fn relaunch_after_sign_in(state: Arc<AppState>, kind: AgentKind
     // cap; a retired record has nothing to start and is unmarked.
     let mut waiting = Vec::new();
     {
+        let now_secs = crate::timeline::now_ms() / 1000;
         let mut agents = crate::lock(&state.agents);
         let marked: Vec<String> = agents
             .iter()
-            .filter(|(_, r)| r.kind == kind && (r.signed_out_at_start || r.limit_reached))
+            .filter(|(_, r)| {
+                r.kind == kind && (r.signed_out_at_start || r.stalled_at_limit(now_secs))
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for id in marked {
@@ -1709,7 +1717,7 @@ pub(crate) async fn relaunch_after_sign_in(state: Arc<AppState>, kind: AgentKind
                 }
             } else if let Some(record) = agents.get_mut(&id) {
                 record.signed_out_at_start = false;
-                record.limit_reached = false;
+                record.note_limit(false, None);
             }
         }
     }
@@ -1718,7 +1726,7 @@ pub(crate) async fn relaunch_after_sign_in(state: Arc<AppState>, kind: AgentKind
         if mid_turn(&state, &id) {
             if let Some(record) = crate::lock(&state.agents).get_mut(&id) {
                 record.signed_out_at_start = false;
-                record.limit_reached = false;
+                record.note_limit(false, None);
                 record.relaunch_after_turn = true;
             }
             tracing::info!(%id, "chat relaunches after its turn, for the new sign-in");
@@ -1741,7 +1749,7 @@ pub(crate) async fn relaunch_after_sign_in(state: Arc<AppState>, kind: AgentKind
         // carry: a refused one must not mark a later, unrelated respawn.
         if let Some(record) = crate::lock(&state.agents).get_mut(&id) {
             record.signed_out_at_start = false;
-            record.limit_reached = false;
+            record.note_limit(false, None);
             record.relaunch_for_sign_in = false;
         }
     }

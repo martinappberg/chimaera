@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { attemptLanded, shownAttempt } from "./agentSignIn";
+import { attemptLanded, attemptShown, historyAttempt } from "./agentSignIn";
 import type { OperationProgress } from "./operations";
 
 const op = (id: string, phase: OperationProgress["phase"]): OperationProgress => ({
@@ -11,37 +11,49 @@ const op = (id: string, phase: OperationProgress["phase"]): OperationProgress =>
   message: "",
 });
 
-describe("which sign-in attempt a card reports on", () => {
-  it("is never the daemon's kept result of an earlier sign-in", () => {
+describe("which sign-in attempts a card reports on", () => {
+  it("never the daemon's kept result of an earlier sign-in", () => {
     // A card opened by a second /login: the agent's last operation is the
-    // first sign-in, succeeded long ago. It is not this card's, so the card
-    // goes on to start a login instead of announcing "signed in" and closing.
+    // first sign-in, succeeded long ago. It is history, so the card goes on
+    // to start a login instead of announcing "signed in" and closing.
     const kept = op("first", "succeeded");
-    const own = shownAttempt(null, kept);
-    expect(own).toBeNull();
-    expect(attemptLanded(own, kept)).toBe(false);
+    const history = historyAttempt(kept);
+    expect(history).toBe("first");
+    expect(attemptShown(history, kept)).toBe(false);
+    expect(attemptLanded(history, kept)).toBe(false);
   });
 
-  it("is the attempt the card started, through to its end", () => {
-    expect(attemptLanded("mine", op("mine", "running"))).toBe(false);
-    expect(shownAttempt("mine", op("mine", "succeeded"))).toBe("mine");
-    expect(attemptLanded("mine", op("mine", "succeeded"))).toBe(true);
-    expect(attemptLanded("mine", op("mine", "failed"))).toBe(false);
-    expect(attemptLanded("mine", op("mine", "cancelled"))).toBe(false);
+  it("the attempt started after it, through to its end", () => {
+    const history = historyAttempt(op("first", "succeeded"));
+    expect(attemptShown(history, op("mine", "running"))).toBe(true);
+    expect(attemptLanded(history, op("mine", "running"))).toBe(false);
+    expect(attemptLanded(history, op("mine", "succeeded"))).toBe(true);
+    expect(attemptShown(history, op("mine", "failed"))).toBe(true);
+    expect(attemptLanded(history, op("mine", "failed"))).toBe(false);
+    expect(attemptLanded(history, op("mine", "cancelled"))).toBe(false);
   });
 
-  it("adopts a running attempt the card found and shows", () => {
+  it("a running attempt the card found is its to show", () => {
     // A second window, or a repeated click: the one operation per agent.
-    const own = shownAttempt(null, op("theirs", "running"));
-    expect(own).toBe("theirs");
-    expect(shownAttempt(own, op("theirs", "cancelling"))).toBe("theirs");
-    expect(attemptLanded(own, op("theirs", "succeeded"))).toBe(true);
+    const found = op("theirs", "running");
+    const history = historyAttempt(found);
+    expect(history).toBeNull();
+    expect(attemptShown(history, found)).toBe(true);
+    expect(attemptLanded(history, op("theirs", "succeeded"))).toBe(true);
   });
 
-  it("moves to a newer running attempt and forgets nothing without one", () => {
-    expect(shownAttempt("mine", op("newer", "running"))).toBe("newer");
-    expect(shownAttempt("mine", null)).toBe("mine");
-    expect(shownAttempt(null, undefined)).toBeNull();
-    expect(attemptLanded(null, null)).toBe(false);
+  it("a sign-in finished elsewhere since the card opened counts", () => {
+    // This card's attempt failed; the user signed in from Settings and came
+    // back to Check again.
+    const history = historyAttempt(op("old", "cancelled"));
+    expect(attemptLanded(history, op("mine", "failed"))).toBe(false);
+    expect(attemptLanded(history, op("settings", "succeeded"))).toBe(true);
+  });
+
+  it("nothing to report without an operation", () => {
+    expect(historyAttempt(null)).toBeNull();
+    expect(historyAttempt(undefined)).toBeNull();
+    expect(attemptShown(null, null)).toBe(false);
+    expect(attemptLanded(null, undefined)).toBe(false);
   });
 });
