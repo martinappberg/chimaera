@@ -32,7 +32,8 @@ daemon  ──WS /ws/chat/{id}──▶  chatWs.ts (ChatSocket)
 | `uploadTokens.ts`, `uploadChips.ts`, `ComposerMentions`, `terminalMentions.ts` | Atomic mention tokens in the draft. |
 | `voice*.ts`, `VoiceMeter` | Voice dictation. |
 | `images.ts`, `AttachmentStrip`, `ImagePreview` | Image attachments and tiles. |
-| `ToolCallCard`, `ToolGroup`, `toolLabels.ts`, `toolArgs.ts` | Tool calls, their one-line labels, and what an opened row lists. |
+| `ToolCallCard`, `ToolGlyph`, `ToolGroup`, `toolLabels.ts`, `toolArgs.ts` | Tool calls, their icons and one-line labels, a run's change size, and what an opened row lists. |
+| `FailureRow`, `failureText.ts` | A failed turn or error line: mark, short headline, the raw text one click away. |
 | `DiffView`, `lineDiff.ts` | One file's change as changed lines; shared by edit rows and the approval card. |
 | `Activity*`, `activityFold.ts`, `FinishedFold`, `FinishedRow` | Folds of settled activity. |
 | `ThoughtRow`, `thoughtText.ts`, `HookRow`, `hookNotice.ts`, `statusWord.ts` | Thought and hook lines; status word. |

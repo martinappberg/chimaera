@@ -441,6 +441,7 @@
     padding: 0 10px 0 0;
     color: var(--fg);
     font-size: var(--text-sm);
+    transition: background-color 0.12s ease;
   }
   .expand {
     flex: 1;
@@ -455,11 +456,11 @@
     font: inherit;
     text-align: left;
     cursor: pointer;
-    transition: background-color 0.12s ease;
   }
   /* fg color-mix, not --row-hover: the card sits on --term-bg, where the
-     solid row tokens tuned for --bg surfaces can clash. */
-  .expand:not(.inert):hover {
+     solid row tokens tuned for --bg surfaces can clash. The whole head
+     tints, so the row's trailing marks sit inside its hover, not past it. */
+  .head:has(> .expand:not(.inert)):hover {
     background: var(--hover-tint);
   }
   .expand.inert {

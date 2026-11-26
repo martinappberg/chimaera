@@ -7,6 +7,7 @@
  * the present tense, so a live group never claims work it has not finished.
  */
 import { formatElapsedSeconds } from "../shared/time";
+import { diffLines, diffStat } from "./lineDiff";
 
 /** The fields of a tool row the title reads. */
 export interface LabelledTool {
@@ -536,4 +537,51 @@ export function toolGroupTitle(tools: LabelledTool[]): string {
   const rest = countPhrase(tools.slice(lastLabelled + 1));
   if (labels.length === 0) return capitalize(rest);
   return rest === "" ? labels.join(" · ") : `${labels.join(" · ")} · ${rest}`;
+}
+
+/** The content fields a change size reads (`ToolContent`'s diff shape). */
+export interface DiffContent {
+  kind: string;
+  old_text?: string | null;
+  new_text?: string;
+  diffs?: DiffContent[];
+}
+
+/** The fields of a tool row its change size reads. */
+export interface ChangedTool {
+  status: string;
+  content?: DiffContent | null;
+}
+
+/** One diff's size, cached on the content object: the reducer replaces a
+ *  row's content whole (only streamed `output` text mutates in place), so a
+ *  diff is computed once however often its group's line re-derives. */
+const statCache = new WeakMap<object, { added: number; removed: number }>();
+
+function diffSize(d: DiffContent): { added: number; removed: number } {
+  let stat = statCache.get(d);
+  if (stat === undefined) {
+    stat = diffStat(diffLines(d.old_text ?? "", d.new_text ?? "", 0));
+    statCache.set(d, stat);
+  }
+  return stat;
+}
+
+/** "+54 −3": how much a run of calls changed, summed over its finished
+ *  edits (a diff, or a batch of them). A call still waiting or running, or
+ *  one that failed, changed nothing yet. Null when nothing changed. */
+export function toolChangeSize(tools: readonly ChangedTool[]): { added: number; removed: number } | null {
+  let added = 0;
+  let removed = 0;
+  for (const t of tools) {
+    if (t.status !== "completed" || t.content == null) continue;
+    const parts = t.content.kind === "diff" ? [t.content] : t.content.kind === "batch" ? (t.content.diffs ?? []) : [];
+    for (const d of parts) {
+      if (d.kind !== "diff") continue;
+      const size = diffSize(d);
+      added += size.added;
+      removed += size.removed;
+    }
+  }
+  return added + removed > 0 ? { added, removed } : null;
 }

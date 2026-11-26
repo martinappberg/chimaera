@@ -162,6 +162,18 @@ describe("ChatStore context compaction", () => {
     expect(missingTerminalItem.compacting).toBe(false);
   });
 
+  it("keeps a failed turn's reason on its notice, none for the bare fallback", () => {
+    const notices = (reason: string) =>
+      fold([
+        { type: "turn_started", turn_id: "t1" },
+        { type: "turn_aborted", turn_id: "t1", reason },
+      ]).blocks.flatMap((b) => (b.kind === "notice" ? [{ text: b.text, tone: b.tone, reason: b.reason }] : []));
+    expect(notices("API Error: 529 {}")).toEqual([
+      { text: "turn failed: API Error: 529 {}", tone: "error", reason: "API Error: 529 {}" },
+    ]);
+    expect(notices("turn failed")).toEqual([{ text: "turn failed", tone: "error", reason: "" }]);
+  });
+
   it("names the agent's own compaction and keeps a requested one plain", () => {
     const texts = (trigger: string | undefined) =>
       fold([

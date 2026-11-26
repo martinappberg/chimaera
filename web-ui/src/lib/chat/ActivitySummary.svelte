@@ -4,8 +4,10 @@
   /**
    * The one-line disclosure every collapsible activity line shares (a tool
    * group, a folded run): a muted sentence with a trailing chevron, a
-   * small working glyph while work under it runs, its elapsed (the
-   * duration once settled), a badge when it failed. A quiet line, not a
+   * small working glyph while work under it runs, how much it changed
+   * ("+54 −3"), its elapsed (the duration once settled), a badge when it
+   * failed — the badge alone carries that, the sentence stays muted. A
+   * quiet line, not a
    * card — the Claude/Codex apps render activity this way, so prose stays
    * the page's voice.
    */
@@ -18,6 +20,8 @@
     /** "1m 22s": how long the work under the line has run (live) or took
      *  (settled); null hides it (old journals, sub-second work). */
     elapsed?: string | null;
+    /** Lines its finished edits added and removed; null when none. */
+    change?: { added: number; removed: number } | null;
     /** False while a retained chat tab is hidden; pauses the live dot. */
     visible?: boolean;
     onToggle: () => void;
@@ -30,6 +34,7 @@
     running = false,
     health = null,
     elapsed = null,
+    change = null,
     visible = true,
     onToggle,
   }: Props = $props();
@@ -37,7 +42,6 @@
 
 <button
   class="summary"
-  class:failed={health === "failed"}
   class:paused={!visible}
   aria-expanded={open}
   onclick={onToggle}
@@ -53,6 +57,13 @@
     </svg>
   {/if}
   <span class="label">{label}</span>
+  {#if change !== null}
+    <span class="change" aria-label={`${change.added} lines added, ${change.removed} removed`}
+      >{#if change.added > 0}<span class="add">+{change.added}</span>{/if}{#if change.removed > 0}<span
+          class="del">−{change.removed}</span
+        >{/if}</span
+    >
+  {/if}
   {#if elapsed !== null}
     <span class="elapsed">{elapsed}</span>
   {/if}
@@ -99,8 +110,19 @@
   .summary:hover :global(.chev) {
     opacity: 1;
   }
-  .summary.failed {
-    color: color-mix(in srgb, var(--err) 80%, var(--muted));
+  /* The change size: the diff colours DiffView uses, figures that keep
+     their width as a run streams. */
+  .change {
+    flex: none;
+    display: inline-flex;
+    gap: 5px;
+    font-variant-numeric: tabular-nums;
+  }
+  .change .add {
+    color: var(--git-added);
+  }
+  .change .del {
+    color: var(--git-deleted);
   }
   .label {
     min-width: 0;

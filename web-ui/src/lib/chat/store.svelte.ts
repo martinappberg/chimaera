@@ -417,6 +417,10 @@ export type ChatBlock = BlockIdentity &
       signIn?: boolean;
       /** The user stopped the turn here; drawn as a stop mark. */
       stop?: boolean;
+      /** The turn failed here: the agent's reason as it gave it ("" when it
+       *  gave none). Drawn as a failure row (`FailureRow`); `text` keeps the
+       *  "turn failed: …" line for find and copy. */
+      reason?: string;
     }
   | {
       /** A turn nobody typed: the agent woke on its own — a monitor event, a
@@ -1989,7 +1993,10 @@ export class ChatStore {
         if (ev.interrupted === true || /interrupt/i.test(reason)) {
           this.blocks.push(this.stamp({ kind: "notice", text: "Stopped", tone: "info", stop: true }));
         } else {
-          this.notice(reason === "turn failed" ? "turn failed" : `turn failed: ${reason}`, "error");
+          const said = typeof reason !== "string" || reason === "turn failed" ? "" : reason;
+          this.blocks.push(
+            this.stamp({ kind: "notice", text: said === "" ? "turn failed" : `turn failed: ${said}`, tone: "error", reason: said }),
+          );
         }
         break;
       }

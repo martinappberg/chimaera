@@ -6,7 +6,15 @@
   import type { ChatBlock, SubagentInfo } from "./store.svelte";
   import { subagentTitle } from "./subagentView";
   import ToolCallCard from "./ToolCallCard.svelte";
-  import { isLive, spanLabel, toolGroupTitle, toolRunHealth, toolSpanMs, type TurnTail } from "./toolLabels";
+  import {
+    isLive,
+    spanLabel,
+    toolChangeSize,
+    toolGroupTitle,
+    toolRunHealth,
+    toolSpanMs,
+    type TurnTail,
+  } from "./toolLabels";
   import { liveClock } from "../shared/liveClock.svelte";
   import ModSite from "./ModSite.svelte";
   import type { ModsController } from "./mods.svelte";
@@ -93,6 +101,9 @@
 
   /** Elapsed while a call runs (ticking only while shown), the run's
    *  duration once it settles. */
+  /** "+54 −3": what the run's finished edits changed (each diff is
+   *  computed once, cached on its content — see toolChangeSize). */
+  const change = $derived(toolChangeSize(tools));
   const clock = liveClock(() => running && visible);
   // Only a shown live line follows the shared tick; a hidden tab's line
   // reads the time once and stays still.
@@ -115,6 +126,7 @@
     {running}
     {health}
     {elapsed}
+    {change}
     {visible}
     onToggle={() => (open = !open)}
   />

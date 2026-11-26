@@ -460,8 +460,19 @@ unused week reads 0%); an
   not a failure: the abort event carries a structural `interrupted` flag set by the driver that
   issued the interrupt (claude's result string is free text and never said so), the transcript
   shows a quiet "Stopped" line with a stop mark at the rows' edge, dangling subagents settle neutrally instead of turning their
-  tool group red, and the session rail reads finished — error-red `turn failed`, failed tool rows,
+  tool group red, and the session rail reads finished — the failure row, failed tool rows,
   and the Errored rail state are reserved for genuine failures.
+- **Failures.** A failed turn is one row in the same place as "Stopped": a small red mark,
+  "Turn failed", and the agent's reason as a short headline (`FailureRow.svelte`,
+  `failureText.ts`). An `API Error: <status> <json>` reason reads as the API's own
+  `error.message` and the status ("Turn failed · invalid x-api-key (401)"); a long or multi-line
+  reason shows its first line, clipped; either way the whole text (the API body laid out, its
+  request id included) is one click away in a framed panel with a copy button. A short plain
+  reason is shown whole, with nothing to open, and a bare "turn failed" stays the two words.
+  Other error lines (a fork or rename that failed, "message not sent — reconnecting", a fatal
+  startup error) use the same row without the lead. The headline is the agent's or the API's
+  words, shortened, never reworded or explained; a failure the fatal banner shows is not
+  repeated, and a sign-in refusal shows the sign-in card instead.
   If Codex has not confirmed receipt of the opening message when stopped, a brief
   notice asks you to resend it. Saying only “Keep going” cannot recover missing input.
 - **Anything that would end background subagents or workflows asks once, whatever control
@@ -609,16 +620,26 @@ unused week reads 0%); an
 
 ## Tool cards, permissions & questions
 
-- **Tool cards + grouping.** Each tool call is a collapsible card (title, glyph, status dot,
-  and — opened — the whole command when the title clipped it, the call's arguments
+- **Tool cards + grouping.** Each tool call is a collapsible row: a drawn icon for its kind
+  (`ToolGlyph.svelte`: read, edit, command, search, web, MCP, agent, …), then the call's name in
+  the prose face and its subject in mono ("Read  calc.py"); a command shows only the command
+  (or Claude's description, then the command), with the driver's own title on hover. The status
+  slot says nothing for a call that ran fine — a running call shows a live dot, a failed or denied
+  one a red dot (and a soft red rail), the rest a chevron under the pointer. Opened, a framed
+  panel holds the whole command when the head clipped it, the call's arguments
   (`toolArgs.ts`: what the title, locations and diff do not already show), then its output or
   line diff; a finished command with nothing to print says "no output", and a row with nothing
   to open opens the file it touched; a `↗` to open what it touched — with a count and a compact list when it touched
   several; each location resolves against the session first, so a relative Grep/Glob `path` or
   Codex change opens, and a directory opens in the Finder). Consecutive calls condense into a
-  group ("6 commands · 2 files"). Groups are collapsed by default, including while work is running, and remain
-  expandable on demand; the summary badge (`running…` / `failed` / `recovered`) carries the verdict
-  without turning live activity or history into a wall of command rows. A failure is `recovered`
+  group ("Ran 2 commands, edited a file"). Groups are collapsed by default, including while work is running, and remain
+  expandable on demand; the summary badge (`failed` / `recovered`) carries the verdict while
+  the sentence stays in the muted activity tone, so live activity and history never turn into a
+  wall of command rows. When the run's finished edits changed files, the line ends with the size
+  of the change, "+54 −3" in the added and removed colours (`toolChangeSize` in `toolLabels.ts`,
+  summed over the run's diff and batch-of-diff results, each diff computed once and cached on its
+  content); a running, waiting or failed edit adds nothing, and a run with no change shows none.
+  Settled folds show the same figure. A failure is `recovered`
   once a later call in the same turn made up for it — any later successful command for a failed
   command (a retry rarely repeats the exact line), the same file (else the same title) for other
   tools — even when reasoning lines split that turn into several groups. Denials never recover;
@@ -823,8 +844,8 @@ unused week reads 0%); an
   remote-daemon wall clocks can differ, so only the driver's monotonic deadline and resulting
   `QuestionResolved` close the card. The journal stores the absolute deadline so reconnect and replay
   do not restart the clock; claude's question timeouts run CLI-side.
-- **Where.** `ToolGroup.svelte`, `ToolCallCard.svelte`, `PermissionCard.svelte`,
-  `PlanApprovalCard.svelte`, `QuestionCard.svelte`, `AgentsTray.svelte`, `BackgroundTray.svelte`;
+- **Where.** `ToolGroup.svelte`, `ToolCallCard.svelte`, `ToolGlyph.svelte`, `ActivitySummary.svelte`,
+  `FailureRow.svelte` + `failureText.ts`, `PermissionCard.svelte`, `PlanApprovalCard.svelte`, `QuestionCard.svelte`, `AgentsTray.svelte`, `BackgroundTray.svelte`;
   commands `permission` (optional `destination`, `feedback`) / `answer` / `stop_task`; events
   `tool_call`(`_update`/`_output_delta`), `permission_request` (optional `plan` = the plan-approval
   marker + markdown) / `permission_resolved`, `question_request` / `question_resolved`,

@@ -102,6 +102,7 @@
   import Composer from "./Composer.svelte";
   import { hookNotice } from "./hookNotice";
   import HookRow from "./HookRow.svelte";
+  import FailureRow from "./FailureRow.svelte";
   import SameFileNotice from "../workspace/SameFileNotice.svelte";
   import ModsWorkbench from "./ModsWorkbench.svelte";
   import ModSite from "./ModSite.svelte";
@@ -3551,14 +3552,25 @@
           {/if}
         {:else if item.block.text !== store.fatalError}
         <!-- The failure a fatal banner is showing is not repeated as a line. -->
+        {#if item.block.tone === "error"}
+          <!-- A failed turn leads with what ended; any other error line is
+               its own words. Both: a mark, a short headline, the raw text a
+               click away. -->
+          <FailureRow
+            lead={item.block.reason !== undefined ? "Turn failed" : null}
+            text={item.block.reason ?? item.block.text}
+            sourceIndex={item.index}
+            sourceUid={item.block.uid}
+          />
+        {:else}
         <div
           class="notice"
-          class:error={item.block.tone === "error"}
           class:stop={item.block.stop === true}
           data-block-index={item.index}
           data-block-uid={item.block.uid}
           >{#if item.block.stop === true}<span class="stop-mark" aria-hidden="true"></span>{/if}{item.block.text}</div
         >
+        {/if}
         {/if}
       {:else if item.block.kind === "turn_end"}
         {@const block = item.block}
@@ -3683,16 +3695,14 @@
     {#if store.fatalError !== null && signInNeeded}
       <!-- The startup failed because the CLI is signed out: the card is the
            whole story, the raw error stays in the journal. -->
-    {:else if store.fatalError !== null}
-      <div class="notice error" class:runtime-error={incompatibleRuntime}>
-        {#if incompatibleRuntime}
-          <strong>This agent can't start on this host</strong>
-          <p>This agent runtime needs newer Linux system libraries than this host provides. Use a compatible host or configure a compatible runtime in Settings → Agents. Reinstalling the same package will not fix this.</p>
-          <details><summary>Startup details</summary><pre>{store.fatalError}</pre></details>
-        {:else}
-          {store.fatalError}
-        {/if}
+    {:else if store.fatalError !== null && incompatibleRuntime}
+      <div class="notice error runtime-error">
+        <strong>This agent can't start on this host</strong>
+        <p>This agent runtime needs newer Linux system libraries than this host provides. Use a compatible host or configure a compatible runtime in Settings → Agents. Reinstalling the same package will not fix this.</p>
+        <details><summary>Startup details</summary><pre>{store.fatalError}</pre></details>
       </div>
+    {:else if store.fatalError !== null}
+      <FailureRow text={store.fatalError} />
     {/if}
     {#if store.degraded}
       <div class="notice">continued in terminal — this pane will switch</div>

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   commsCall,
   commsTitle,
+  toolChangeSize,
   readableToolTitle,
   toolTitleParts,
   setAgentNames,
@@ -384,5 +385,51 @@ describe("toolTitleParts", () => {
       detail: "Listed agents",
       mono: false,
     });
+  });
+});
+
+describe("toolChangeSize", () => {
+  const edit = (old_text: string, new_text: string, status = "completed") => ({
+    status,
+    content: { kind: "diff", path: "a.ts", old_text, new_text },
+  });
+
+  it("sums the finished edits of a run, batches included", () => {
+    const tools = [
+      edit("a\nb\n", "a\nB\nc\n"),
+      { status: "completed", content: { kind: "output", text: "ok" } },
+      {
+        status: "completed",
+        content: {
+          kind: "batch",
+          diffs: [
+            { kind: "diff", old_text: null, new_text: "x\ny\n" },
+            { kind: "output", text: "not a diff" },
+            { kind: "diff", old_text: "gone\n", new_text: "" },
+          ],
+        },
+      },
+    ];
+    expect(toolChangeSize(tools)).toEqual({ added: 4, removed: 2 });
+  });
+
+  it("counts nothing a call has not done yet, or failed to do", () => {
+    expect(toolChangeSize([edit("a\n", "b\n", "in_progress"), edit("a\n", "b\n", "failed")])).toBeNull();
+    expect(toolChangeSize([edit("a\n", "b\n", "pending")])).toBeNull();
+  });
+
+  it("is null without diffs or when nothing changed", () => {
+    expect(toolChangeSize([])).toBeNull();
+    expect(toolChangeSize([{ status: "completed", content: null }])).toBeNull();
+    expect(toolChangeSize([edit("same\n", "same\n")])).toBeNull();
+  });
+
+  it("diffs a content object once", () => {
+    const tool = edit("a\n", "b\n");
+    const first = toolChangeSize([tool]);
+    // Mutating in place is not how the reducer updates a diff; the cache
+    // answers from the first read.
+    tool.content.new_text = "b\nc\n";
+    expect(toolChangeSize([tool])).toEqual(first);
   });
 });
