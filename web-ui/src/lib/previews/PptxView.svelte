@@ -33,6 +33,7 @@
   import { onDiskVersion, ownedObjectUrls, paneVisibility, useFileEntry } from "./viewLifecycle.svelte";
   import { fetchRawBytes, TooLargeError } from "./rawBytes";
   import { loadDeck, loadNotes, type Deck } from "./pptxDeck";
+  import { showEdge, showPosition, showStep } from "./slideShow";
   import { sanitizeRendered } from "./officeSafety";
   import { revealRequest, takeReveal } from "../shared/reveal";
   import { activateUrl } from "../shared/urlOpen";
@@ -304,6 +305,17 @@
     const next = Math.min(Math.max(0, i), count - 1);
     if (next !== current) clearPick();
     current = next;
+  }
+
+  /** Which slides the deck marks hidden (`show="0"`). */
+  const hiddenFlags = $derived(deck?.presentation.slides.map((sl) => sl.hidden === true) ?? []);
+  /** Where the show stands among the slides it shows. */
+  const showAt = $derived(showPosition(hiddenFlags, current));
+
+  /** One slide on or back. A show skips hidden slides, as PowerPoint's
+   *  does; browsing the deck walks every slide. */
+  function page(delta: 1 | -1): void {
+    go(presenting ? showStep(hiddenFlags, current, delta) : current + delta);
   }
 
 
@@ -1045,19 +1057,19 @@
       case "PageDown":
       case " ":
       case "Enter":
-        go(current + (e.shiftKey && e.key === " " ? -1 : 1));
+        page(e.shiftKey && e.key === " " ? -1 : 1);
         break;
       case "ArrowLeft":
       case "ArrowUp":
       case "PageUp":
       case "Backspace":
-        go(current - 1);
+        page(-1);
         break;
       case "Home":
-        go(0);
+        go(presenting ? showEdge(hiddenFlags, "first") : 0);
         break;
       case "End":
-        go(count - 1);
+        go(presenting ? showEdge(hiddenFlags, "last") : count - 1);
         break;
       case "f":
       case "F5":
@@ -1384,7 +1396,7 @@
         <ReferenceChip x={chipPos.x} y={chipPos.y} label={pickLabel} />
       {/if}
       {#if presenting}
-        <span class="present-count">{current + 1} / {count}</span>
+        <span class="present-count">{showAt.n} / {showAt.of}</span>
       {/if}
     {:else if error !== null}
       <div class="slides-error">

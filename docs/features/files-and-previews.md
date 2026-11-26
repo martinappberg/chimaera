@@ -904,7 +904,9 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   a render's set when the next render replaces it or the view unmounts.
 - **PowerPoint decks.** `.pptx` (and `.pptm`, `.ppsx`, `.potx`) open in `PptxView.svelte`,
   drawn by `@aiden0z/pptx-renderer` in the Marp viewer's chrome: arrows / PageUp / PageDown /
-  Space / Home / End page the deck, a thumbnail strip jumps, **present** goes full screen,
+  Space / Home / End page the deck, a thumbnail strip jumps, **present** goes full screen (a show
+  skips hidden slides, as PowerPoint's does, and counts only the slides it shows; browsing walks
+  every slide — `slideShow.ts`),
   `#slide=N` reveals a slide (clamped to the deck; `#slide=N&xywh=…` outlines a box on it), the
   slide's **@** and the area tool point an agent at the slide or part of it ([Pointing at part of
   a file](#pointing-at-part-of-a-file)), and **speaker notes** (read straight from the
