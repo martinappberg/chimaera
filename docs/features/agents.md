@@ -129,8 +129,12 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   exactly as before it existed, keeps the last good capture, logs one line naming the shell and
   the reason, and is retried after 10 minutes or on a change. **Values are never logged** and
   never written to disk: API keys live in rc files.
-- **Not covered.** Terminals are the mirror image and unchanged: interactive but not login
-  (see [terminals](terminals.md)), so a zsh terminal reads `.zshrc` and not `.zprofile`.
+- **Terminals need none of this.** A zsh or bash terminal is itself an interactive login shell,
+  so it reads the profile and the rc directly, once each, with nothing captured or cached
+  ([what a terminal's shell reads](terminals.md#what-a-terminals-shell-reads)). The capture is
+  not laid over a terminal: its rc would then run on top of an environment that rc already
+  produced. **Not covered:** a fish terminal is not login, so code under `status is-login`
+  reaches fish agents and not fish terminals.
 
 ## The launcher — the new-agent row & the agent menu
 

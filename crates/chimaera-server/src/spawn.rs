@@ -113,9 +113,11 @@ pub(crate) async fn spawn_session(
 
     let mut spawned_agent = None;
     match &spec.kind {
-        // Plain shells get shell integration injected (OSC 133 journal
-        // marks); a failure to materialize the scripts degrades to a plain
-        // spawn. Its env lands ON TOP of the session env (shims PATH,
+        // Plain shells start as login shells with shell integration
+        // injected (OSC 133 journal marks; the launch reads the profile, the
+        // rc, then puts the shim dir back first and runs the prelude); a
+        // failure to materialize the scripts degrades to a plain spawn. Its
+        // env lands ON TOP of the session env (shims PATH,
         // CHIMAERA_*) — the two use disjoint variable sets, so nothing is
         // clobbered.
         SpawnKind::Shell => {

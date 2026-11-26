@@ -783,6 +783,8 @@
       "page": "docs/features/terminals.md",
       "paths": [
         "crates/chimaera-pty/src/**",
+        "crates/chimaera-core/src/shellint.rs",
+        "crates/chimaera-core/src/shellint/**",
         "web-ui/src/lib/terminal/**",
         "crates/chimaera-server/src/exec.rs",
         "crates/chimaera-server/src/api/exec.rs",
@@ -791,6 +793,7 @@
       "maps": [
         "crates/chimaera-server/AGENTS.md",
         "crates/chimaera-pty/AGENTS.md",
+        "crates/chimaera-core/AGENTS.md",
         "web-ui/src/lib/net/AGENTS.md",
         "web-ui/src/lib/terminal/AGENTS.md"
       ],
@@ -802,6 +805,7 @@
       "checks": [
         "cargo test -p chimaera-server",
         "cargo test -p chimaera-pty",
+        "cargo test -p chimaera-core",
         "npm --prefix web-ui run check",
         "npm --prefix web-ui run test"
       ]
