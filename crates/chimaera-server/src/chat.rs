@@ -6105,6 +6105,7 @@ mod tests {
                 recurring: true,
                 next_at_ms: None,
                 created_at_ms: 0,
+                expires_at_ms: None,
             }],
             ..Default::default()
         };

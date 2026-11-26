@@ -9,6 +9,7 @@
   import {
     compactCount,
     goalStatusWord,
+    jobEndsAtMs,
     jobPeriodMs,
     ringFraction,
     shortDuration,
@@ -193,10 +194,10 @@
   }
   const ago = (ms: number) => (ms > 0 ? `${shortDuration(Math.max(1, (Date.now() - ms) / 1000))} ago` : "");
   const clockTime = (ms: number) => new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-  const expires = (job: ScheduledJob) =>
-    job.recurring && job.createdAtMs > 0
-      ? new Date(job.createdAtMs + 7 * 86_400_000).toLocaleDateString([], { month: "short", day: "numeric" })
-      : null;
+  const expires = (job: ScheduledJob) => {
+    const ends = jobEndsAtMs(job);
+    return ends === null ? null : new Date(ends).toLocaleDateString([], { month: "short", day: "numeric" });
+  };
 </script>
 
 {#snippet scheduleRow(row: Row)}

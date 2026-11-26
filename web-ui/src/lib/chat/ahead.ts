@@ -28,6 +28,9 @@ export interface ScheduledJob {
   recurring: boolean;
   nextAtMs: number | null;
   createdAtMs: number;
+  /** When a recurring job ends, where the agent said (Claude 2.1.330+,
+   *  30 days); null on an older CLI, whose jobs end 7 days after creation. */
+  expiresAtMs: number | null;
 }
 
 export interface GoalInfo {
@@ -87,6 +90,7 @@ export function parseSchedule(ev: Record<string, unknown>): {
       recurring: j.recurring === true,
       nextAtMs: num(j.next_at_ms),
       createdAtMs: num(j.created_at_ms) ?? 0,
+      expiresAtMs: num(j.expires_at_ms),
     });
   }
   return { wakeup, jobs };
@@ -300,4 +304,12 @@ export function cronWords(cron: string): string {
 export function scheduleWords(schedule: string, cron: string): string {
   if (schedule.trim() !== "" && schedule.trim() !== cron.trim()) return schedule;
   return cronWords(cron) || schedule;
+}
+
+/** When a recurring job ends: the agent's own lifetime for it, else Claude's
+ *  older 7 days from creation. Null for a one-shot job or an unknown start. */
+export function jobEndsAtMs(job: ScheduledJob): number | null {
+  if (!job.recurring) return null;
+  if (job.expiresAtMs !== null) return job.expiresAtMs;
+  return job.createdAtMs > 0 ? job.createdAtMs + 7 * 86_400_000 : null;
 }
