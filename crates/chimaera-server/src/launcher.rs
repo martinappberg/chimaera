@@ -2603,7 +2603,9 @@ mod tests {
 
     /// Through a real login shell: the profile runs first (on macOS it puts
     /// the system directories in front), then the wrap puts back the PATH the
-    /// interactive shell had, shims first, and drops its handle.
+    /// interactive shell had, shims first, and drops its handle. Unix only:
+    /// Windows spawns run no login-shell wrap.
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_wrap_restores_the_interactive_path_after_the_profile() {
         let home = std::env::temp_dir().join(format!(
