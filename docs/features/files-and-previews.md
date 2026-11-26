@@ -904,7 +904,9 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   a render's set when the next render replaces it or the view unmounts.
 - **PowerPoint decks.** `.pptx` (and `.pptm`, `.ppsx`, `.potx`) open in `PptxView.svelte`,
   drawn by `@aiden0z/pptx-renderer` in the Marp viewer's chrome: arrows / PageUp / PageDown /
-  Space / Home / End page the deck, a thumbnail strip jumps, **present** goes full screen,
+  Space / Home / End page the deck, a thumbnail strip jumps, **present** goes full screen (a show
+  skips hidden slides, as PowerPoint's does, and counts only the slides it shows; browsing walks
+  every slide — `slideShow.ts`),
   `#slide=N` reveals a slide (clamped to the deck; `#slide=N&xywh=…` outlines a box on it), the
   slide's **@** and the area tool point an agent at the slide or part of it ([Pointing at part of
   a file](#pointing-at-part-of-a-file)), and **speaker notes** (read straight from the
@@ -970,8 +972,10 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   working copy on this Mac opened in PowerPoint, watched, and each save uploaded with the host's
   hash from the last download or upload as the precondition (`PUT /fs/file/stream`, streamed to
   disk). If the host's file changed meanwhile, nothing is overwritten: the banner offers **save mine
-  as a copy**, **open theirs** or **overwrite**. **done** ends the trip. In a plain browser the
-  remote deck keeps its **download**.
+  as a copy**, **open theirs** or **overwrite**. A save that reached the host whose answer was lost
+  (a connection that dropped under a long upload) is not such a change: the retry is refused, but
+  the host reports the hash of the very save being sent, and the trip treats that as saved.
+  **done** ends the trip. In a plain browser the remote deck keeps its **download**.
 - **Diagram boards.** JSON Canvas (`.canvas`), Excalidraw (`.excalidraw`, `.excalidraw.json`)
   and draw.io (`.drawio`, `.dio`; `.drawio.svg` / `.drawio.png` stay images) open on one pannable
   surface, `BoardView.svelte`: drag or scroll to pan, pinch or ⌘/Ctrl+scroll to zoom at the

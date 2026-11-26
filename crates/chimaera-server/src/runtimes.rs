@@ -65,11 +65,12 @@
 //! Shims: `~/.chimaera/shims/{claude,codex,gemini,agy}` — tiny sh wrappers
 //! prepended to a chimaera session's PATH via spawn env only. Agent spawns
 //! are guaranteed to resolve them (the login-shell wrap re-prepends the dir
-//! via `$CHIMAERA_SHIMS` after profile init); plain kind-"shell" panes are
-//! BEST-EFFORT: rc-file PATH prepends commonly demote the shim dir
-//! (measured on this machine — a typed `claude` resolved ~/.local/bin,
-//! bypassing the shim) until the queued ZDOTDIR-based shell integration
-//! lands and reclaims the front slot. Each shim resolves the real binary
+//! via `$CHIMAERA_SHIMS` after profile init), and so are zsh and bash
+//! terminals: shell integration moves the dir back to the front after the
+//! startup files (`chimaera_core::shellint`), where rc-file PATH prepends
+//! used to demote it (measured on this machine — a typed `claude` resolved
+//! ~/.local/bin, bypassing the shim). A fish terminal, or one without shell
+//! integration, is still best-effort. Each shim resolves the real binary
 //! (the user's own install first, managed fallback) and injects the
 //! scheme-matched theme, gated on
 //! `CHIMAERA_SESSION` so a copied script can never theme a terminal outside

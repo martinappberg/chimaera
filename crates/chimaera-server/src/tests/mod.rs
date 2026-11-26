@@ -46,6 +46,7 @@ mod shell;
 mod subagents;
 mod support;
 mod upload;
+mod upload_chunked;
 mod validate;
 mod view_state;
 mod voice;

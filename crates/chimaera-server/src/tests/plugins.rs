@@ -620,6 +620,7 @@ async fn first_party_plugins_are_available_until_installed() {
                 "summary": l.summary,
                 "description": null,
                 "homepage": null,
+                "category": l.category,
                 "adds": {"ui": [], "agents": []},
                 "provides": {"knowledge": null, "mcp_tools": [], "views": []},
                 "setup": null,

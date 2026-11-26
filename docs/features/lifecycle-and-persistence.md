@@ -149,6 +149,11 @@ conversation. All five chat providers retain their native resume handle through 
   flushes the ledger (which now carries chats for resurrection), writes the handoff, and removes the
   manifest — it must **not** retire chats here (that would strip their workspace mapping and the
   reconciler would drop them). The *deliberate* close-all/`shutdown` above still kills chat drivers.
+- **An upload in progress does not survive a restart, and leaves nothing.** Open uploads live in the
+  daemon's memory; each has a record under `<data dir>/uploads-open/`. At boot the next daemon
+  removes the hidden temp file each record names (`upload::chunked::spawn_boot_sweep`), and the
+  window sends the file again from the start
+  ([drag-drop-and-uploads.md](drag-drop-and-uploads.md#os-desktop-file-drops)).
 
 ## Update awareness (daemon-side)
 

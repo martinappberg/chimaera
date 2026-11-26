@@ -109,7 +109,9 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   segments in the far corner (under the title when the tab is narrow) — and each segment
   scrolls on its own below it, keeping its place when you switch away and back. The **Plugins**
   segment opens with "Plugins add tools for your agents and views for you. Install one, then
-  switch it on per workspace." and shows, under **Chimaera plugins** (Chimaera's own first), a
+  switch it on per workspace." and shows, under **Chimaera plugins**, the plugins grouped by
+  category (**Writing**, **Presentations**, **Data**, **Knowledge**, **Agent tools**, then
+  **Other**; empty groups are left out, Chimaera's own first within a group), a
   card per plugin with one primary control. Its head: a two-letter tile · the name (a link to
   the plugin's `homepage`, opened in the system browser) · the check badge · version
   ([below](#versions-installs--updates)) · on the right **Install** for a plugin not on this
@@ -324,7 +326,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
 ## Versions, installs & updates
 
 - **What & when.** The daemon ships no plugin bytes. It embeds `plugins/plugins.lock`, the
-  curated list of first-party plugins (per plugin: `id`, `name`, `summary`, the pinned
+  curated list of first-party plugins (per plugin: `id`, `name`, `summary`, its `category`, the pinned
   `version`, `repo` and that release's two sha256s), and every plugin — first-party or not — is
   installed per host into `~/.chimaera/plugins`: a first-party one from its own repository at
   the version the lock pins, a third-party one from its latest release (or a tag), a local build
@@ -676,6 +678,20 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   - A screen is data: semantic props only (tone, size, icon names), so light, dark and the
     brand hold; markdown goes through chat's sanitizer; links open outside; images and files
     come from the workspace or the plugin's output folder only.
+  - A deck a plugin rendered (the `slides` node: pictures, one or more builds a slide) draws in
+    the slide viewers' chrome (`ui/DeckNode.svelte`): the picture in the image viewer with its
+    area tool, a thumbnail strip, keys that walk a slide's builds and then the slides, **@** for
+    the slide's code, **present** (full screen, opening the slide at its first build, a click a
+    build, hidden slides skipped, as in the
+    PowerPoint viewer: `previews/slideShow.ts`) and **presenter** (this slide, the next click,
+    the notes, a timer). Open the deck in two windows and they keep step while either is in the
+    show: the show on the projector, the presenter's view on the laptop. Paging never calls the
+    plugin; the place survives a re-render by the slide's title. A build may carry a `clip`
+    (its animation, a video ending on its picture): the show plays it when a click moves on to
+    that build and holds the last frame, with the next click's clip fetched ahead; a step back
+    shows the picture; browsing plays it from the bar's play button.
+  - A plugin's tab wears its own glyph when its view names one (`[[views]] icon`, from the same
+    set screens draw icons from, `ui/icons.ts`); without one it wears the Extensions glyph.
   - Code excerpts share the bounded, syntax-highlighted `ExtensionCode` renderer with
     Claude Mods. The existing `ui/1` format, named actions and WASM capabilities stay
     unchanged; [portable Mod authoring](../design/mods-extension-compatibility.md) is a
@@ -965,3 +981,21 @@ _Captured 2026-11-04 from the maintainer's decisions on the
   change); `[[programs]] also` finds macOS's LibreOffice without PATH setup; no one-click
   LibreOffice yet (host unpackers for app images next); the plugin is named "PowerPoint".
 - **Do not change (or: open to change):** _pending capture._
+
+### Decks a plugin renders, a show's rules, and categories — why they exist
+_Captured 2026-11-26 from the maintainer's words in the chat that built them; the questionnaire's
+questions on promises and what must not change were not asked._
+
+- **Problem it solves (decks from plugins):** "one can open and reference Manimble slides
+  directly in chimaera (and draw etc.). Don't need to build out their full functionality I
+  guess, just similar to how the pptx is".
+- **Hidden slides and the presenter view:** "More nice thing in both pptx and fo manimble if we
+  can do is hidden slides, like if you are presenting, hidden slides should not be shown. Maybe
+  we can actually also do a presenter view here somehow (in the plugins) if not too difficult ?"
+- **General, not one plugin's:** "The chimaera specific things we changed are general right and
+  not focused on Manimble ? since this is an extension". The deck viewer, a tab's icon and the
+  categories are the platform's; what is Manimble's lives in its plugin.
+- **Categories:** "the extensions on the extension page should have some sort of category I
+  think ? so we can sort them and show them where they should be, and we should fix all
+  extensions to adhere to this category. Just some nice UI / UX and simple grouping".
+- **How settled it is / do not change:** _pending capture._

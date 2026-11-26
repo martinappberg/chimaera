@@ -437,6 +437,9 @@ Recurring reasons:
 | `lib/plugins/ActivityDialog.svelte:51` | click_events_have_key_events | keep (trimmed) | Dialog panel. |
 | `lib/plugins/AttachSheet.svelte:313` | click_events_have_key_events | keep (trimmed) | Dialog panel. |
 | `lib/plugins/TrustDialog.svelte:53` | click_events_have_key_events | keep (trimmed) | Dialog panel. |
+| `lib/plugins/ui/DeckNode.svelte:468` | no_noninteractive_tabindex, no_noninteractive_element_interactions | keep (added 2026-11-26) | A plugin deck's viewer takes paging keys, as the slide stages do. |
+| `lib/plugins/ui/DeckNode.svelte:561`, `:603` | media_has_caption | keep (added 2026-11-26) | A build's animation: silent, and the build's picture carries the alt text. |
+| `lib/plugins/ui/DeckNode.svelte:594` | no_noninteractive_tabindex, no_noninteractive_element_interactions | keep (added 2026-11-26) | The show: a click is the clicker, and it has `onkeydown`, so no `click_events_have_key_events`. |
 | `lib/plugins/ui/UiNode.svelte:416` | no_noninteractive_tabindex | keep | Scroll region (capped code block). |
 | `lib/previews/BoardView.svelte:498` | no_noninteractive_tabindex | keep | `role="application"` pan and zoom surface. |
 | `lib/previews/BoardView.svelte:499` | no_noninteractive_element_interactions | keep | Same surface. |

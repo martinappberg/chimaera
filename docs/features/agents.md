@@ -74,6 +74,69 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   `codex resume <thread-id>`. Chat is gated to
   `chat_capable()` agents: Claude, Codex, Antigravity, Grok Build and Cursor CLI. Gemini CLI remains readable in old records but is retired from the new-agent catalog.
 
+## The environment an agent starts with
+
+- **What & when.** An agent (TUI or chat), and every command its tools run, gets what a terminal
+  the user opens would have: the variables and PATH their shell startup files set, the
+  interactive rc included (`~/.zshrc`, `~/.bashrc`, fish's `config.fish`) — wherever the daemon
+  came from (the app's bare launchd environment, a terminal, `chimaera serve` over ssh).
+- **How it's used.** Nothing to do: `export OPENAI_API_KEY=…` or a PATH line in an rc file reaches
+  the next agent started. An edited startup file is read again at the next agent start; a change
+  in a file the rc *sources* needs Extensions' re-check, a detection Retry, or a daemon
+  restart. On Windows there are no rc files: user and system variables live in the registry,
+  which the daemon's own environment already carries, so nothing is captured.
+- **Where it lives.** `shell_env.rs` (the capture, its cache, `overlay`), `launcher.rs`
+  (`wrap_login_shell`), `api/env.rs` (`session_env`, `spawn_env_remove`). Callers: `spawn.rs`,
+  `chat.rs`, `agent_auth.rs`, `agent_probe.rs` (`base_command`), `agent_probe/actions.rs`,
+  `plugins/mod.rs`, `plugins/jobs.rs`.
+- **Key behaviors.** Two steps, because neither is enough alone:
+  1. **The spawn runs through the login shell, non-interactively** (`$SHELL -lc`,
+     `wrap_login_shell`): the profile is read (`.zprofile`, `.bash_profile`), the rc is not. It
+     can't be made interactive: a chat agent speaks NDJSON on stdout and an rc may print, an rc
+     may be slow or `exec` something, and `-i` without a terminal warns about job control.
+  2. **One interactive login shell is asked for its environment, apart from any spawn**
+     (`$SHELL -ilc 'env -0'` between two nonce lines, so nothing a startup file prints is taken
+     for a variable; own process group, no stdin, stderr discarded, output capped at 512 KiB). What
+     the startup files added or changed relative to the daemon's own environment is laid over
+     the spawn's. A login bash reads only the profile, so for bash the capture also sources
+     `~/.bashrc` unless the profile already names it.
+
+  **Precedence**, highest first: what the spawn sets itself (`CHIMAERA_*`, the Codex MCP key,
+  `AGY_CLI_DISABLE_AUTO_UPDATE`, a sign-in's `BROWSER`/`NO_OPEN_BROWSER`) → the capture → the
+  daemon's inherited environment. Never taken from the capture: `CHIMAERA_*`, the capturing
+  shell's own `PWD`/`OLDPWD`/`SHLVL`/`_`, and the terminal (`TERM`, `COLUMNS`, `LINES`, `TTY`,
+  `GPG_TTY`; it had none). The launcher-context scrub still wins over what the daemon inherited:
+  the capturing shell starts without those names, so a `CLAUDE_CODE_*` that comes back is one
+  the user's own startup files set, and it arrives (`spawn_env_remove` keeps its remove-list
+  disjoint from the adds). One limit: the profile runs again at the spawn, after the overlay, so
+  a variable that both the profile and the rc set differently ends with the profile's value.
+
+  **PATH** is restored rather than overlaid: the login profile reorders whatever PATH the spawn
+  starts with (macOS `path_helper` puts the system directories first), so the captured PATH
+  rides as `CHIMAERA_SHELL_PATH` and the wrap puts it back after the profile, then prepends the
+  shim dir, then runs the [environment prelude](environment.md), and unsets the handle before
+  `exec` — no agent sees it.
+
+  **Bounds.** One capture serves the process; spawns arriving together share one shell
+  (never one per spawn). It stands until a startup file's mtime or size changes (`.zshenv`,
+  `.zprofile`, `.zshrc`, `.zlogin` under `$HOME` and `ZDOTDIR`; `.bash_profile`, `.bash_login`,
+  `.profile`, `.bashrc`; `config.fish`) or an explicit re-check (`POST /agents/{id}/detect`,
+  the check after an install, Extensions' re-check; not the catalog's `?refresh=true`, which
+  the launcher sends each time it opens). It has no maximum age, so a value an rc computes at
+  shell start (a short-lived token) is as old as the capture: reading again on a timer would
+  re-run the rc's other side effects unasked. A spawn waits at most 6 s for it and starts
+  without it otherwise; the shell itself gets 30 s, so a slow rc still serves the next agent. A
+  failed capture (timeout, over the cap, no markers, an `env` without `-0`) leaves agents
+  exactly as before it existed, keeps the last good capture, logs one line naming the shell and
+  the reason, and is retried after 10 minutes or on a change. **Values are never logged** and
+  never written to disk: API keys live in rc files.
+- **Terminals need none of this.** A zsh or bash terminal is itself an interactive login shell,
+  so it reads the profile and the rc directly, once each, with nothing captured or cached
+  ([what a terminal's shell reads](terminals.md#what-a-terminals-shell-reads)). The capture is
+  not laid over a terminal: its rc would then run on top of an environment that rc already
+  produced. **Not covered:** a fish terminal is not login, so code under `status is-login`
+  reaches fish agents and not fish terminals.
+
 ## The launcher — the new-agent row & the agent menu
 
 - **Agent icons.** Shared session icons identify each runtime in the launcher, tabs and rail.
@@ -227,7 +290,13 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   and the chat says so — *Signed in — {agent} switches to it when this turn ends.* A chat that
   completed a turn no longer counts as waiting. The daemon is the one owner of that relaunch; a card only
   refreshes the verdict. `/login` typed in a chat relaunches that chat too (`session_id` on the
-  start request). No sign-in runs beside an install or update of the same agent.
+  start request), and so does every chat of that agent whose process says its account's limit is
+  reached (`AgentRecord::stalled_at_limit`: the latest `RateLimit` event, until the reset time it
+  named has passed): the login that landed may be another account, and the process holds the old
+  one. A relaunch for a sign-in is journaled as
+  `ModeSwitch {to: chat, sign_in: true}`; the chat reads it as "continued on the new sign-in" and
+  drops the old account's limit state ([the chat's limit line](chat-mode.md#composing--sending)). No
+  sign-in runs beside an install or update of the same agent.
 - **How it's used.** Signing in is never gated on a state: Settings → Agents always offers **Sign
   in** / **Sign in again**, and every chat offers it in **Chat options → Sign in to {agent}…** and
   as `/login` — signed in or not, mid-turn, idle, or ended (a chat that died on a usage limit or
@@ -297,7 +366,13 @@ GPT-6.1 Sol. Once available, the host's account-specific catalog replaces it.
   returns to `localhost` can only finish in a browser on the daemon's machine (every recipe here
   uses a device code or a hosted callback for that reason). The status command runs behind
   the same marker and is read from it, so a banner's words never answer it either.
-  A clean exit is never success by itself — the status command is asked again. Concurrent status probes for one agent share a run. The
+  A clean exit is never success by itself — the status command is asked again. The daemon keeps
+  an agent's last sign-in result until the next attempt. The finished attempt a card finds when it
+  opens is its history (`agentSignIn.ts` `historyAttempt` / `attemptShown` / `attemptLanded`); it
+  shows and reports everything after that, its own attempt or one finished elsewhere meanwhile.
+  Read as its own, an earlier success closed a chat's `/login` card before it started a login, so
+  a second sign-in from a chat never ran. A `/login` that finds a sign-in already running joins it
+  through the same POST, so the daemon marks that chat as waiting on it too. Concurrent status probes for one agent share a run. The
   chat view shows one line per failure: a startup error that a fatal banner shows
   is not repeated as a transcript line, and a fatal banner is not followed by *agent exited*.
 

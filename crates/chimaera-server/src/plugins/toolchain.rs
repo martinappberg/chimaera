@@ -179,7 +179,7 @@ fn unpack_limit(free: Option<u64>) -> u64 {
 
 /// Bytes free to this user on the filesystem holding `dir` (blocking).
 #[cfg(unix)]
-fn free_bytes(dir: &Path) -> Option<u64> {
+pub(crate) fn free_bytes(dir: &Path) -> Option<u64> {
     let st = rustix::fs::statvfs(dir).ok()?;
     Some(st.f_bavail.saturating_mul(st.f_frsize))
 }
@@ -187,7 +187,7 @@ fn free_bytes(dir: &Path) -> Option<u64> {
 /// Bytes free to this user (quotas applied) on the volume holding `dir`
 /// (blocking).
 #[cfg(windows)]
-fn free_bytes(dir: &Path) -> Option<u64> {
+pub(crate) fn free_bytes(dir: &Path) -> Option<u64> {
     use std::os::windows::ffi::OsStrExt;
     let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
     let mut avail = 0u64;

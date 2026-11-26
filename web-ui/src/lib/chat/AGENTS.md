@@ -32,7 +32,7 @@ daemon  ──WS /ws/chat/{id}──▶  chatWs.ts (ChatSocket)
 | `uploadTokens.ts`, `uploadChips.ts`, `ComposerMentions`, `terminalMentions.ts` | Atomic mention tokens in the draft. |
 | `voice*.ts`, `VoiceMeter` | Voice dictation. |
 | `images.ts`, `AttachmentStrip`, `ImagePreview` | Image attachments and tiles. |
-| `ToolCallCard`, `ToolGroup`, `toolLabels.ts` | Tool calls and their one-line labels. |
+| `ToolCallCard`, `ToolGroup`, `toolLabels.ts`, `agentNames.ts` | Tool calls and their one-line labels; `agentNames.ts` holds the id → name lookup App sets, apart so the always-loaded entry doesn't carry the labels. |
 | `Activity*`, `activityFold.ts`, `FinishedFold`, `FinishedRow` | Folds of settled activity. |
 | `ThoughtRow`, `thoughtText.ts`, `HookRow`, `hookNotice.ts`, `statusWord.ts` | Thought and hook lines; status word. |
 | `AgentsTray`, `BackgroundTray`, `PlanCard`, `AheadCard`, `WorkStrip`, `workStrip.ts` | Pinned work cards; one shared inventory folds three kinds (including tasks) into a labelled strip; Running groups background agents and commands behind an activity icon. Idle tasks fold without adding a status label or refresh action; task tools own completion. |
@@ -41,6 +41,7 @@ daemon  ──WS /ws/chat/{id}──▶  chatWs.ts (ChatSocket)
 | `PermissionCard`, `QuestionCard`, `PlanApprovalCard`, `Elicitation*` | Answers to the agent. |
 | `RewindDialog`, `ForkDialog`, `AgentMessageMeta` | Rewind, fork, message actions. |
 | `McpPanel`, `UsagePanel`, `UsageMeter` | `/mcp`, `/usage` and the usage meter (its popover also holds a Claude chat's Auto-compact switch: `store.autoCompact` from the `auto_compact` read-back, `set_auto_compact` capability; `store.autoCompactDisabledBy` disables it, reading Off, "set off by <var>"; `store.contextCompactAt`, the `context_usage` event's `auto_compact_at`, draws a notch on the Context bar and "Auto-compact at N%", hidden while it is off; a Codex chat shows the line without a switch). |
+| `LimitCard`, `limitCard.ts` | The transcript-tail line while the agent reports the account's limit as reached (`store.rateLimit.limitReached`): what was hit and when it resets, as a quiet notice with a muted link to the sign-in for another account (never a call to action); only where `canSwitchAccount` (the catalog row's `sign_in` descriptor) holds. A `mode_switch` with `sign_in` drops the old account's limit state. |
 | `ArtifactGallery`, `artifacts.ts`, `embeds.ts`, `FileChip`, `ProseChip`, `hoverTargets.ts` | Embeds, written files, hover previews. |
 | `paths.ts`, `UserText` | Path links; the user-message bubble. |
 | `runCommand.ts` | Run buttons on settled shell fences: which fences, the typed text; App picks the terminal. |

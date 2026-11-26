@@ -26,7 +26,9 @@ trees end with their session or the daemon (kill-on-close job), the analogue of 
 - **What & when.** Every terminal is a long-lived daemon child. Reopen a window/tab and the
   terminal is exactly where it was; run with zero attached clients and it keeps going.
 - **How it's used.** The server calls `SessionManager::spawn(SpawnOpts{cwd,name,cols,rows,
-  command,id,env,…})` (`command:None` = the user's interactive shell). The browser opens
+  command,id,env,…})`; a plain terminal gets the argv of `shellint::shell_launch`, the user's
+  shell as a login shell with shell integration (see
+  [what a terminal's shell reads](#what-a-terminals-shell-reads)). The browser opens
   `GET /ws/sessions/{id}`: first frame `{type:auth,token,cols,rows,parked?}` → `ready` → a
   binary **snapshot** → the live byte stream. A `parked:true` auth (a hidden pooled terminal
   reconnecting) gets `ready` only — no snapshot, no stream, and its dims are NOT adopted —
@@ -42,6 +44,60 @@ trees end with their session or the daemon (kill-on-close job), the analogue of 
   restore the *primary* screen's scrollback. Default scrollback 10,000 lines
   (`daemon.scrollbackLines`). Exited children unregister themselves (tmux semantics).
   `SessionInfo` **is** the daemon↔UI wire contract — don't drift its shape.
+
+## What a terminal's shell reads
+
+- **What & when.** A zsh or bash terminal is an interactive **login** shell, as in Terminal.app,
+  iTerm and tmux: it reads the login profile and then the interactive rc, so what the profile
+  sets (Homebrew's `brew shellenv`, macOS `path_helper` and `/etc/paths.d`, a `PATH` line in
+  `.zprofile` or `.bash_profile`) is there. It has to run in the terminal: the daemon's own
+  environment is often one no profile ever ran in (launchd under the native app,
+  `chimaera serve` over ssh, a batch job).
+- **How it's used.** Nothing to do. Order, both shells: profile → rc → shell integration → the
+  shim dir back in front of `PATH` → the [environment prelude](environment.md), once.
+- **Where it lives.** `chimaera-core/src/shellint.rs` (`shell_launch_for`, `BASH_INIT`,
+  `SHIMS_SNIPPET_POSIX`, the zsh `ZDOTDIR` shim), called by `spawn.rs`.
+- **Key behaviors.**
+  - **zsh** starts with `-l` behind the `ZDOTDIR` shim, which forwards `.zshenv`, `.zprofile`,
+    `.zshrc`, `.zlogin` and `.zlogout` to the user's own, in zsh's own order. The shim dir and
+    the prelude run at the end of `.zlogin`, the last file a login zsh reads; the `.zshrc` shim
+    runs them itself only for a zsh that is not login (one typed in the terminal) or whose rc
+    re-homed `ZDOTDIR`.
+  - **bash** ignores `--init-file` under `--login`, so it starts interactive with the init file
+    and the init file reads what a login bash reads: `/etc/profile`, then the first readable of
+    `~/.bash_profile`, `~/.bash_login`, `~/.profile`. `~/.bashrc` follows unless that profile
+    already sourced it, so it runs once. That is read off the profile's text: a `.` or `source`
+    of a path ending in `/.bashrc`, outside a comment and outside a quoted string, in the
+    profile or in the `~/.profile` it sources. A mention that sources nothing (an alias, a
+    comment, an `echo` of a tip, `/etc/bashrc`, `~/.bashrc.d`) does not count, because the wrong
+    guesses are not equal: an rc read twice is what a shell opened inside a login session does,
+    an rc never read is a terminal without its aliases. Text cannot tell a `source` on a branch
+    the profile does not take; that rc is then not read. Where this differs from a real login
+    bash: `shopt login_shell` stays off (where `/etc/bashrc` re-reads `/etc/profile.d` for a
+    shell that is not login, those scripts run twice, as in any nested bash); bash has already
+    read its system rc where it is built with one (Debian's `/etc/bash.bashrc`), and
+    `/etc/profile` reads it again; `~/.bash_logout` is not run.
+  - **PATH.** A login profile reorders the `PATH` the spawn started with (`path_helper` puts the
+    system directories first, which would leave the shim dir last), so the shim dir
+    (`CHIMAERA_SHIMS`) is moved back to the front after the startup files, listed once. Nothing
+    else moves: the rest is the order Terminal.app gives.
+  - **A daemon started from a shell** (a dev loop, `chimaera serve` typed in a terminal) already
+    carries what the profile set, and each terminal runs the profile again on top, as a tmux
+    pane does: a profile's `PATH=…:$PATH` line is listed twice, and on macOS `path_helper` moves
+    the system directories ahead of anything that shell had prepended by hand (an activated
+    virtualenv).
+  - **A profile that replaces the shell** (`exec zsh` in `.bash_profile` on a host where the
+    login shell can't be changed, `exec tmux` or `exec zsh -l` in `.zprofile`) now does so in
+    a terminal too, as it does over ssh; what it starts has no shell integration, the shim dir
+    is not moved to the front, `exec` falls back to sentinel mode and the prelude does not
+    run. The same was already true of an rc that `exec`s. A profile can tell a Chimaera
+    terminal by `CHIMAERA_SESSION`.
+  - **fish** is unchanged, not login: it has no profile file (every fish reads `config.fish`),
+    so only code under `status is-login` and fish's own import of macOS `/etc/paths` are left
+    out. Other shells start plain.
+  - Agents get the same files the other way round: a login shell that is not interactive, plus
+    the interactive shell's environment captured once
+    ([what an agent starts with](agents.md#the-environment-an-agent-starts-with)).
 
 ## Reconnect, resize & resync
 

@@ -7,6 +7,7 @@
  * the present tense, so a live group never claims work it has not finished.
  */
 import { formatElapsedSeconds } from "../shared/time";
+import { agentName } from "./agentNames";
 
 /** The fields of a tool row the title reads. */
 export interface LabelledTool {
@@ -121,14 +122,6 @@ export function commsCall(title: string, input?: Record<string, unknown> | null)
     return { verb, target };
   }
   return null;
-}
-
-/** Names the app knows for session ids (set once from the live roster):
- *  an agent passes an id to message or read another, and the card should say
- *  the name the user sees. Ids it doesn't know stay ids. */
-let agentName: (id: string) => string | null = () => null;
-export function setAgentNames(resolve: (id: string) => string | null): void {
-  agentName = resolve;
 }
 
 /** A recipient as a sentence says it: the two reserved addresses in words,

@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
+import { setAgentNames } from "./agentNames";
 import {
   commsCall,
   commsTitle,
   readableToolTitle,
-  setAgentNames,
   spanLabel,
   toolDescription,
   toolGroupTitle,

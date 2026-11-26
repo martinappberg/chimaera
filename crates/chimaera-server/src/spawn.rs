@@ -113,9 +113,11 @@ pub(crate) async fn spawn_session(
 
     let mut spawned_agent = None;
     match &spec.kind {
-        // Plain shells get shell integration injected (OSC 133 journal
-        // marks); a failure to materialize the scripts degrades to a plain
-        // spawn. Its env lands ON TOP of the session env (shims PATH,
+        // Plain shells start as login shells with shell integration
+        // injected (OSC 133 journal marks; the launch reads the profile, the
+        // rc, then puts the shim dir back first and runs the prelude); a
+        // failure to materialize the scripts degrades to a plain spawn. Its
+        // env lands ON TOP of the session env (shims PATH,
         // CHIMAERA_*) — the two use disjoint variable sets, so nothing is
         // clobbered.
         SpawnKind::Shell => {
@@ -277,7 +279,10 @@ pub(crate) async fn spawn_session(
             }
             // Login-shell wrap: agents must see the user's terminal environment
             // (exported API keys, nvm PATHs) — the daemon's own env never
-            // sourced their profile.
+            // sourced their profile. The wrap is login-only, so what the
+            // interactive rc exports comes from the captured environment.
+            crate::shell_env::overlay(&mut opts.env).await;
+            opts.env_remove = crate::api::spawn_env_remove(&opts.env);
             opts.command = Some(crate::launcher::wrap_login_shell(
                 &crate::launcher::login_shell(),
                 argv,

@@ -400,6 +400,20 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
                 upload::MAX_DIR_UPLOAD_BYTES as usize + 64 * 1024,
             )),
         )
+        // The chunked, resumable transport the web UI uploads with
+        // (`upload::chunked`): a piece is at most `MAX_CHUNK_BYTES` and
+        // streams to disk, so the override only lifts the buffered default.
+        .route("/uploads", post(upload::chunked::begin))
+        .route(
+            "/uploads/{id}",
+            get(upload::chunked::status)
+                .put(upload::chunked::chunk)
+                .delete(upload::chunked::cancel)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    upload::chunked::MAX_CHUNK_BYTES as usize + 64 * 1024,
+                )),
+        )
+        .route("/uploads/{id}/finish", post(upload::chunked::finish))
         .route("/compute", get(compute::get_compute))
         // A cluster workspace job's own stop (scancel of SLURM_JOB_ID); 404
         // on any daemon not running inside a Slurm job.

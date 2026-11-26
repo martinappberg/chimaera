@@ -13,6 +13,7 @@
 import { api, ApiError } from "../net/api";
 import { isAbsolute, joinPath, relativeTo } from "../shared/paths";
 import type { WorkspacePlugin } from "./store";
+import { pluginIcon } from "./ui/icons";
 
 export type Slot = "tab" | "panel" | "file" | "status" | "card";
 
@@ -720,4 +721,14 @@ export function openPluginView(plugin: string, view: string): boolean {
 export function pluginViewTitle(plugins: readonly WorkspacePlugin[] | undefined, plugin: string, view: string): string {
   const p = plugins?.find((x) => x.id === plugin);
   return p?.platform.views.find((v) => v.id === view)?.title ?? view;
+}
+
+/**
+ * A plugin tab's own glyph: the paths of the icon its view names
+ * (`[[views]] icon`), or null — no icon, or a name outside the set — where
+ * the tab draws the Extensions glyph.
+ */
+export function pluginViewIcon(plugins: readonly WorkspacePlugin[] | undefined, plugin: string, view: string): string[] | null {
+  const p = plugins?.find((x) => x.id === plugin);
+  return pluginIcon(p?.platform.views.find((v) => v.id === view)?.icon);
 }

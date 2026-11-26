@@ -39,7 +39,7 @@ const API = "https://api.github.com";
 const WASM_MAX = 16 * 1024 * 1024;
 const TOML_MAX = 64 * 1024;
 const SUMS_MAX = 4 * 1024;
-const LOCK_KEYS = ["id", "name", "summary", "version", "repo", "sha256_wasm", "sha256_toml", "tier", "caps"];
+const LOCK_KEYS = ["id", "name", "summary", "category", "version", "repo", "sha256_wasm", "sha256_toml", "tier", "caps"];
 /** Tables of a plugin.toml that say nothing about what it can do. */
 const WORDS_ONLY = new Set(["adds", "release", "detect"]);
 const VERSION_RE = /^[0-9]+\.[0-9]+\.[0-9]+$/;
