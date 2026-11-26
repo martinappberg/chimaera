@@ -84,7 +84,7 @@ describe("places", () => {
 
 describe("sync", () => {
   it("names a channel per workspace, plugin and deck", () => {
-    expect(syncName("w-1", "manimble", "deck-a")).toBe("chimaera-deck:w-1:manimble:deck-a");
+    expect(syncName("w-1", "decks", "deck-a")).toBe("chimaera-deck:w-1:decks:deck-a");
   });
   it("reads only well-formed messages", () => {
     expect(readSync({ kind: "at", from: "a", title: "Plan", build: 1 })).toEqual({ kind: "at", from: "a", title: "Plan", build: 1 });

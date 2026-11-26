@@ -109,7 +109,9 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   segments in the far corner (under the title when the tab is narrow) — and each segment
   scrolls on its own below it, keeping its place when you switch away and back. The **Plugins**
   segment opens with "Plugins add tools for your agents and views for you. Install one, then
-  switch it on per workspace." and shows, under **Chimaera plugins** (Chimaera's own first), a
+  switch it on per workspace." and shows, under **Chimaera plugins**, the plugins grouped by
+  category (**Writing**, **Presentations**, **Data**, **Knowledge**, **Agent tools**, then
+  **Other**; empty groups are left out, Chimaera's own first within a group), a
   card per plugin with one primary control. Its head: a two-letter tile · the name (a link to
   the plugin's `homepage`, opened in the system browser) · the check badge · version
   ([below](#versions-installs--updates)) · on the right **Install** for a plugin not on this
@@ -324,7 +326,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
 ## Versions, installs & updates
 
 - **What & when.** The daemon ships no plugin bytes. It embeds `plugins/plugins.lock`, the
-  curated list of first-party plugins (per plugin: `id`, `name`, `summary`, the pinned
+  curated list of first-party plugins (per plugin: `id`, `name`, `summary`, its `category`, the pinned
   `version`, `repo` and that release's two sha256s), and every plugin — first-party or not — is
   installed per host into `~/.chimaera/plugins`: a first-party one from its own repository at
   the version the lock pins, a third-party one from its latest release (or a tag), a local build

@@ -15,6 +15,7 @@
   import { installedOutcome, type Outcome } from "./installCopy";
   import AgentExtensionControls from "./AgentExtensionControls.svelte";
   import PluginCard from "./PluginCard.svelte";
+  import { groupByCategory } from "./categories";
   import TrustDialog from "./TrustDialog.svelte";
   import type { AgentsState } from "./requirementsModel";
   import {
@@ -61,6 +62,8 @@
   /** Chimaera's own plugins first (the curated list), then the rest, each
    *  in the daemon's order. */
   const plugins = $derived([...(loaded ?? [])].sort((a, b) => Number(ours(b)) - Number(ours(a))));
+  /** The list under its categories (Writing, Presentations, …). */
+  const groups = $derived(groupByCategory(plugins));
 
   const k = $derived($knowledge);
   const counts = $derived(k !== null && k.provider !== null ? k.counts : null);
@@ -259,24 +262,29 @@
     <p class="empty">No plugins on this host yet — install one from a repository below.</p>
   {/if}
 
-  {#each plugins as p (p.id)}
-    <PluginCard
-      plugin={p}
-      {agentPlugins}
-      {agentState}
-      {agentError}
-      {counts}
-      {wsId}
-      {now}
-      {onAttach}
-      {onOpenSession}
-      {onRefresh}
-      removing={removing?.id === p.id && removeBusy}
-      onRemove={(x) => {
-        removeError = null;
-        removing = x;
-      }}
-    />
+  {#each groups as g (g.id)}
+    <div class="group" role="group" aria-label={g.label === "" ? undefined : g.label}>
+      {#if g.label !== ""}<h3 class="cat">{g.label}</h3>{/if}
+      {#each g.plugins as p (p.id)}
+        <PluginCard
+          plugin={p}
+          {agentPlugins}
+          {agentState}
+          {agentError}
+          {counts}
+          {wsId}
+          {now}
+          {onAttach}
+          {onOpenSession}
+          {onRefresh}
+          removing={removing?.id === p.id && removeBusy}
+          onRemove={(x) => {
+            removeError = null;
+            removing = x;
+          }}
+        />
+      {/each}
+    </div>
   {/each}
 
   {#if plugins.length > 0 && !anyInstalled}
@@ -466,6 +474,20 @@
     display: flex;
     flex-direction: column;
     gap: 12px;
+  }
+  .group {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .group + .group {
+    margin-top: 6px;
+  }
+  .cat {
+    margin: 0;
+    font-size: var(--text-sm);
+    font-weight: 600;
+    color: var(--fg);
   }
   .lbl {
     margin: 0;

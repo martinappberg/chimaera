@@ -263,6 +263,7 @@ version = "0.1.1"               # the plugin's own, MAJOR.MINOR.PATCH; must equa
 summary = "Project memory your agents record as they work — findings, decisions, learnings."
 description = "Mycelium is the Arjun Raj lab's living-repository framework: …"   # optional: a few plain sentences
 homepage = "https://github.com/arjunrajlaboratory/mycelium"   # optional; the card's name links here
+category = "knowledge"          # optional; the Extensions page's group: writing | presentations | data | knowledge | agents
 api = "0.1"                     # the chimaera:plugin WIT version it targets (MAJOR.MINOR): "0.1" or "0.2"
 
 [detect]                        # workspace-relative; ANY present ⇒ detected
@@ -311,6 +312,7 @@ What each part does, and what exists today:
 
 | Part | What it does | Where the host reads it |
 |---|---|---|
+| `category` | the group the Extensions page lists the plugin under: `writing`, `presentations`, `data`, `knowledge` or `agents`; without one, or with a name the daemon doesn't know, it is listed under Other. A first-party plugin's group is the lock's, whatever its manifest says. A daemon older than this key refuses a manifest that has it, so a plugin that sets it also sets `[requires] chimaera` | `plugins::category`, `manifest_fields` |
 | `id`, `name`, `summary`, `homepage` | the card; `id` names a directory and a URL segment, so it is charset-gated (and `install` / `preview`, routes' own segments, are taken); the name links to `homepage` (an http(s) URL; opened in the system browser) | `plugins::validate`, `manifest_json` |
 | `description` | optional: a few plain sentences from the author — what the plugin is and why a person would switch it on — shown under the summary, clamped to two lines with "more"; blank is omitted (`description: null` on the wire) | `manifest_json` |
 | `version`, `api` | which build runs, and the WIT it needs; `api` is a gate | `plugins::gate`, `resolve` |

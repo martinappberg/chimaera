@@ -133,6 +133,9 @@ export interface WorkspacePlugin {
   /** The plugin's own page (the card's name links to it); an http(s) URL
    *  or null. */
   homepage: string | null;
+  /** The Extensions page's group for it (`categories.ts`): an id, or null
+   *  for none. Absent from a daemon that predates categories. */
+  category?: string | null;
   adds: { ui: string[]; agents: string[] };
   provides: { knowledge?: string | null; mcp_tools: string[]; views: string[] };
   setup: { prompt: string } | null;
