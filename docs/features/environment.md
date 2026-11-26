@@ -33,8 +33,10 @@ route + per-session materialization) and `crates/chimaera-core/src/shellint.rs`
   /environment` re-reads the file, PUT/PATCH install at once, and a spawn composes its prelude
   from the cache without touching the disk. Injection: `environment::materialize_prelude`
   writes the effective text to `runtime_dir()/preludes/<session-id>.sh` and the spawn env
-  carries `CHIMAERA_PRELUDE`; the shell-integration rc (bash `--init-file`, zsh ZDOTDIR
-  shim) sources it after the user's rc, and the agent login-wrapper
+  carries `CHIMAERA_PRELUDE`; the shell-integration startup (bash `--init-file`, zsh ZDOTDIR
+  shim) sources it after the user's startup files — the login profile, the rc and, for zsh,
+  `.zlogin` ([what a terminal's shell reads](terminals.md#what-a-terminals-shell-reads)) — and
+  after the shim dir is back in front of `PATH`, and the agent login-wrapper
   (`launcher::wrap_login_shell`) sources it before `exec`ing the agent — after the login
   profile has run and the interactive shell's PATH has been restored
   ([what an agent starts with](agents.md#the-environment-an-agent-starts-with)), so a prelude's

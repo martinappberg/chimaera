@@ -432,7 +432,9 @@
       "page": "docs/features/drag-drop-and-uploads.md",
       "paths": [
         "crates/chimaera-server/src/upload.rs",
+        "crates/chimaera-server/src/upload/chunked.rs",
         "web-ui/src/lib/net/uploads.ts",
+        "web-ui/src/lib/net/chunkedUpload.ts",
         "web-ui/src/lib/net/localDrop.ts",
         "web-ui/src/lib/chat/images.ts",
         "web-ui/src/lib/shared/reference.ts",
@@ -785,6 +787,8 @@
       "page": "docs/features/terminals.md",
       "paths": [
         "crates/chimaera-pty/src/**",
+        "crates/chimaera-core/src/shellint.rs",
+        "crates/chimaera-core/src/shellint/**",
         "web-ui/src/lib/terminal/**",
         "crates/chimaera-server/src/exec.rs",
         "crates/chimaera-server/src/api/exec.rs",
@@ -793,6 +797,7 @@
       "maps": [
         "crates/chimaera-server/AGENTS.md",
         "crates/chimaera-pty/AGENTS.md",
+        "crates/chimaera-core/AGENTS.md",
         "web-ui/src/lib/net/AGENTS.md",
         "web-ui/src/lib/terminal/AGENTS.md"
       ],
@@ -804,6 +809,7 @@
       "checks": [
         "cargo test -p chimaera-server",
         "cargo test -p chimaera-pty",
+        "cargo test -p chimaera-core",
         "npm --prefix web-ui run check",
         "npm --prefix web-ui run test"
       ]

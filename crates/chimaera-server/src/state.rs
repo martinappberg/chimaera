@@ -210,6 +210,9 @@ pub(crate) struct AppState {
     /// night-scrubbed on HPC. Size-capped per file and per session (`upload`),
     /// pruned when the session ends and at boot.
     pub(crate) uploads_root: PathBuf,
+    /// Uploads the web UI has open piece by piece (`upload::chunked`): each
+    /// one's temp file, committed offset and writer seat. Per process.
+    pub(crate) chunked_uploads: crate::upload::chunked::Uploads,
     /// Draft mirror (`~/.chimaera/drafts/`): unsaved editor text mirrored by
     /// the client so a window on another origin can recover it. Capped and
     /// evicted in `drafts`.
@@ -381,6 +384,7 @@ impl AppState {
             worktrees_root_real: real_path(&data_dir.join("worktrees")),
             shims_dir: data_dir.join("shims"),
             uploads_root: data_dir.join("uploads"),
+            chunked_uploads: Default::default(),
             drafts_root: data_dir.join("drafts"),
             fs_touched: tokio::sync::broadcast::channel(crate::fs_watch::TOUCHED_CAPACITY).0,
             installs: Mutex::new(HashMap::new()),
