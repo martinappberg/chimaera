@@ -1,6 +1,7 @@
 <script lang="ts">
   import { approvalSubject, orderedOptions, type ApprovalTool } from "./approval";
   import DiffView from "./DiffView.svelte";
+  import { mayTakeFocus } from "./promptFocus";
   import { readableToolTitle } from "./toolLabels";
   import type { PendingPermission } from "./store.svelte";
 
@@ -119,8 +120,9 @@
   // Mirror the TUI: the permission prompt captures input on arrival.
   // preventScroll keeps ChatView's stick-to-bottom-unless-reading contract —
   // its own effect (keyed on pending.length) scrolls when the user is at bottom.
+  // Only on arrival, and never out from under typing (`mayTakeFocus`).
   $effect(() => {
-    if (visible) cardEl?.focus({ preventScroll: true });
+    if (visible && cardEl !== null && mayTakeFocus(cardEl)) cardEl.focus({ preventScroll: true });
   });
 
   const preview = $derived(JSON.stringify(request.inputPreview, null, 2));

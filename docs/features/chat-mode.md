@@ -764,7 +764,9 @@ unused week reads 0%); an
   `details` shows the raw arguments for every request. Options come in one order on every card —
   allow once, allow and remember, deny (`orderedOptions`; labels stay the agent's own) — with a
   destination cycler for Claude's "always" rules (this project just-you / all projects / this
-  project shared / this session, persisted in localStorage). The card captures focus on arrival;
+  project shared / this session, persisted in localStorage). The card captures focus on arrival —
+  unless you are typing (a draft in the composer, a terminal or editor in another pane), so a
+  keystroke meant for those never answers a prompt (`promptFocus.ts`; question cards too);
   Enter = allow once, Esc = deny (or closes the feedback row first when it's open), and the two
   buttons say so. The decision is recorded on the call's own row — "allowed", "always allowed",
   "denied", "not answered" — never as a line of its own, so a run of approved calls folds as one

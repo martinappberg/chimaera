@@ -10,6 +10,7 @@
    * chosen labels highlighted, no controls), so an answered question stays
    * visible instead of vanishing.
    */
+  import { mayTakeFocus } from "./promptFocus";
   import type { PendingQuestion } from "./store.svelte";
 
   interface Props {
@@ -112,7 +113,7 @@
   // Like the permission prompt: the ask takes the keyboard on arrival.
   // preventScroll keeps ChatView's own stick-to-bottom contract.
   $effect(() => {
-    if (visible && !readOnly) cardEl?.focus({ preventScroll: true });
+    if (visible && !readOnly && cardEl !== null && mayTakeFocus(cardEl)) cardEl.focus({ preventScroll: true });
   });
   /** 1–9 pick an option of the first question still open (the only one, for
    *  an instant card); Enter sends a complete answer. Typing in "other…"
