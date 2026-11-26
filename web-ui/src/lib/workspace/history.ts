@@ -442,6 +442,17 @@ export function sameFileCurrent(w: Pick<SameFileWrite, "at" | "active">, now: nu
   return w.active || now - w.at < SAME_FILE_FRESH_MS;
 }
 
+/** How long a write keeps the notice's warn tone. After that the note is
+ *  still shown (until {@link SAME_FILE_FRESH_MS}) but in the quiet tone: it
+ *  was worth a glance when it happened, not a standing alarm above the input. */
+export const SAME_FILE_LOUD_MS = 3 * 60_000;
+
+/** Whether a shown write still carries the warn tone at `now`: made in the
+ *  writer's running turn, or younger than {@link SAME_FILE_LOUD_MS}. */
+export function sameFileLoud(w: Pick<SameFileWrite, "at" | "active">, now: number): boolean {
+  return w.active || now - w.at < SAME_FILE_LOUD_MS;
+}
+
 /** A session's notes from its writes: the current ones only, the newest per
  *  other session, newest first, at most `cap`. */
 export function currentSameFileNotes(
