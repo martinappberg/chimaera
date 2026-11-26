@@ -16,14 +16,17 @@ edges share one destination — the live session's input (a chat composer or a P
   is referenced **where it is** instead: no copy is made.
 
 **Where it lives (shared):** UI `web-ui/src/App.svelte` (window drop handlers, `referenceFileDrop`,
-`insertUploadedPath`, `dropFilesOnSession`), `web-ui/src/lib/net/uploads.ts` (upload client +
-job chrome), `web-ui/src/lib/chat/images.ts` (downscale/encode), `web-ui/src/lib/layout/dnd.ts`
+`insertUploadedPath`, `dropFilesOnSession`), `web-ui/src/lib/net/uploads.ts` (job chrome + the
+callers' entry points), `web-ui/src/lib/net/chunkedUpload.ts` (the transport),
+`web-ui/src/lib/chat/images.ts` (downscale/encode), `web-ui/src/lib/layout/dnd.ts`
 (`refPath` gate, `paneIdAt`), `web-ui/src/lib/workspace/FileTree.svelte`, `Pane.svelte` (the
 overlays), `Terminal.svelte` (paste-capture), `web-ui/src/lib/chat/composerBus.ts`. Daemon:
-`crates/chimaera-server/src/upload.rs`. Native shell: `crates/chimaera-app/src/shell/restore.rs`,
-`shell/commands.rs::dropped_paths`. Files shown on a surface: `web-ui/src/lib/shared/fileHandle.ts`;
-local drops: `web-ui/src/lib/net/localDrop.ts`.
-Wire: `POST /api/v1/sessions/{id}/upload?name=`. Reuses `web-ui/src/lib/shared/reference.ts`
+`crates/chimaera-server/src/upload.rs` + `upload/chunked.rs`. Native shell:
+`crates/chimaera-app/src/shell/restore.rs`, `shell/commands.rs::dropped_paths`. Files shown on a
+surface: `web-ui/src/lib/shared/fileHandle.ts`; local drops: `web-ui/src/lib/net/localDrop.ts`.
+Wire: `/api/v1/uploads` (begin, `PUT` a piece, `GET`
+the offset, `finish`, `DELETE`); the one-request `POST /api/v1/sessions/{id}/upload?name=` and
+`POST /api/v1/fs/upload` stay for scripts. Reuses `web-ui/src/lib/shared/reference.ts`
 (`composeAgentPathReference`/`composeShellPathReference`) — the same path-composition as terminal
 selection references (see [terminals.md](terminals.md)).
 
@@ -131,9 +134,9 @@ selection references (see [terminals.md](terminals.md)).
   column or a FILES-tree directory — which uploads the file **into that folder** on the daemon.
   The folder target wins over the session pane it may sit inside. The daemon that owns the
   session/window receives the bytes, so an agent (or a shell) on a remote host can read a file
-  you dragged from your laptop. Folder uploads go through `POST /api/v1/fs/upload?dir=&name=`
-  (`upload::upload_to_dir`), stream the same way, cap one user-chosen file at 2 GB, then bump the fs epoch
-  so the tree/Finder re-list. In-app moves use dragging or copy/cut/paste (above).
+  you dragged from your laptop. Folder uploads use the same transport with the folder as the
+  destination, take a file of up to 64 GB, then bump the fs epoch so the tree/Finder re-list.
+  In-app moves use dragging or copy/cut/paste (above).
   Dragging files **out to the desktop** is punted —
   the pointer-drag stack plus remote-over-tunnel bytes make it not worth it in two of three
   runtimes; the per-row Download menu covers remote→local retrieval.
@@ -151,9 +154,12 @@ selection references (see [terminals.md](terminals.md)).
   `upload into ⟨dir⟩/` chip at its foot — the chip lives on the pane, never inside a column, so
   hovering can't grow a column's content mid-drag — while the column/row is what says *where*.
   Release to upload each file and type its returned path. An
-  in-flight upload shows byte progress plus a cancel action in a quiet chip bottom-center; failures
-  briefly explain what happened. A two-minute no-progress watchdog turns a dead SSH tunnel or stuck
-  destination filesystem into an actionable error instead of an endless spinner. Dropping an **image**
+  in-flight upload shows progress plus a cancel action in a quiet chip bottom-center; the
+  percentage counts bytes the host has confirmed. If the connection drops, the chip reads
+  "Waiting for the connection" and the upload goes on from where the host stands once it is back;
+  after two minutes without a byte getting through it fails and says how far it got. A file the
+  host cannot take (too big for the destination, no room on its disk) is refused before anything is
+  sent, with the reason. A failed or cancelled upload leaves nothing on the host. Dropping an **image**
   onto a *chat* pane that advertises image input additionally attaches its pixels to the composer; the
   uploaded path stays the durable, host-side artifact the agent can re-read later.
 - **On this computer, a dropped file is referenced where it is.** In the native app, on a window
@@ -195,14 +201,29 @@ selection references (see [terminals.md](terminals.md)).
   `uploadDir.row` (additive DropSpot field) so `FinderView` (`dropDir` + `dropOnRow` props, passed
   down by `Pane.svelte`) lights the row alone, never also a column showing the same dir. `dragover`
   only rewrites `dropSpot` on a logical change (`sameSpot`). `dropFilesOnSession` uploads via
-  `uploads.ts::uploadAndInsert` then inserts through `insertUploadedPath`. Daemon route
-  `upload::upload` (`router.rs`; a per-route `DefaultBodyLimit` override lifts axum's 2 MB buffered
-  default).
-- **Key behaviors.** The route **streams** the body chunk-by-chunk to a hidden tmp sibling then
-  renames (a partial upload is never visible under its final name) — the whole file **never sits in
-  RAM** (the daemon lives on shared login nodes). Hard caps: **64 MB per session file, 256 MB and 256 files
-  per session dir**; completion rechecks those aggregate quotas including in-flight temp files,
-  and overflow aborts, deletes the tmp, and answers `413`. Filenames sanitize to a strict
+  `uploads.ts::uploadAndInsert` then inserts through `insertUploadedPath`. The bytes go through
+  `chunkedUpload.ts::uploadChunked` to the daemon's `upload::chunked` routes (`router.rs`).
+- **How the bytes travel.** In pieces, one at a time: the next piece is sent only after the daemon
+  answered the last. A remote window's requests all ride one ssh connection, and a whole file
+  handed to it at once filled that connection's send queue for the entire transfer — the terminals,
+  the chat and the app's own connection check each waited seconds behind it (about 4 s at 1 MB/s,
+  16 s at 250 KB/s), long enough for the app to judge the connection dead and rebuild it under the
+  upload. With one piece in flight, sized from the link's measured speed to take about half a
+  second (16 KB to 8 MB), nothing waits longer than that. A piece that gets no answer is asked about
+  (`GET /uploads/{id}` gives the daemon's offset) and sent again from there, so a drop costs one
+  piece and no piece is applied twice (the daemon accepts a piece only at its own offset). Every
+  piece carries its SHA-256; `finish` carries a running digest of all of them, which the daemon
+  compares with its own, then it syncs the file and renames it into place — so a full disk or an
+  exceeded quota on a network filesystem is an error, never a short file. The daemon forgets its
+  uploads when it restarts: the file is then sent once more from the start, and a temp file an
+  interrupted upload left behind is removed by the next daemon from a record under its data
+  dir (`uploads-open/`). Open uploads are capped at 32 and expire after 30 idle minutes.
+- **Key behaviors.** Each piece **streams** to a hidden tmp sibling, renamed at the end (a partial
+  upload is never visible under its final name) — the whole file **never sits in RAM** on either
+  side (the daemon lives on shared login nodes; the page holds one piece). Hard caps: **64 MB per
+  session file, 256 MB and 256 files per session dir**, checked when the upload opens (`413` with
+  the sizes in words, before a byte is sent); completion rechecks the aggregate quotas including
+  in-flight temp files, and overflow aborts, deletes the tmp, and answers `413`. Filenames sanitize to a strict
   basename (no separators, no control bytes, no dot-dirs, ≤200 chars) before becoming a path on a
   shared host, then land under a **mention-safe** form (`upload::mention_safe_name`): whitespace
   and the punctuation that ends or splits an `@mention` (claude's `#` line anchor and `:` resource
@@ -222,10 +243,13 @@ selection references (see [terminals.md](terminals.md)).
   session id `404`s and never mints a directory. A drop caps at **8 files**; **folders** dropped
   from the OS are rejected with a toast (recursive upload is a follow-up). User-chosen Finder/tree
   uploads are distinct: they land outside daemon-owned state, keep the user's name **verbatim**,
-  stay constant-memory and atomic, and accept up to **2 GB per file**. The browser/webview Blob
-  stream is deliberately the common transport rather than `rsync`: it works without extra host
-  tools and is remote-correct in both the native app and an ordinary browser, where the source
-  file's local path is not available.
+  stay constant-memory and atomic, and accept up to **64 GB per file** (refused up front when the
+  destination filesystem reports less free space than the file needs). Reading the dropped `Blob`
+  piece by piece in the page is deliberately the common transport rather than `rsync`: it works
+  without extra host tools and is remote-correct in both the native app and an ordinary browser,
+  where the source file's local path is not available. The one-request routes
+  (`POST /sessions/{id}/upload`, `POST /fs/upload`, 2 GB) remain for scripts; they refuse an
+  over-cap `Content-Length` before reading the body and sync before the rename too.
 
 ## Screenshot / clipboard-image paste into a terminal
 

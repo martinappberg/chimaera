@@ -5,7 +5,7 @@
  * CLI's own status command is the only thing that ever says "signed in".
  */
 import { patchAgentSignedIn, type AgentInfo } from "./launcher";
-import { agentOperationPath, postJson, request, type OperationProgress } from "./operations";
+import { agentOperationPath, operationRunning, postJson, request, type OperationProgress } from "./operations";
 
 export interface SignInProgress extends OperationProgress {
   how: "browser";
@@ -34,6 +34,29 @@ export interface SignInStatus {
  *  surface answers with a Sign in. Unknown stays quiet. */
 export function needsSignIn(a: AgentInfo | null | undefined): boolean {
   return a !== null && a !== undefined && a.installed && a.signedIn === false;
+}
+
+/** What a card's first read of the agent's `operation` makes history: a
+ *  finished attempt. The daemon keeps an agent's last result until the next
+ *  attempt, so that one is another card's, an hour ago. A running one is
+ *  the card's to show (a repeated click, a second window), and so is every
+ *  attempt after it. */
+export function historyAttempt(first: OperationProgress | null | undefined): string | null {
+  return first && !operationRunning(first) ? first.id : null;
+}
+
+/** Whether a card shows `operation`: anything but its history. */
+export function attemptShown(history: string | null, operation: OperationProgress | null | undefined): boolean {
+  return operation !== null && operation !== undefined && operation.id !== history;
+}
+
+/** Whether `operation` is a sign-in that landed since the card opened: its
+ *  own, or one finished elsewhere meanwhile (Settings, another window).
+ *  Never the history: read as this card's success, that one closed a chat's
+ *  `/login` card before it could start a login, so nobody could sign in a
+ *  second time. */
+export function attemptLanded(history: string | null, operation: OperationProgress | null | undefined): boolean {
+  return attemptShown(history, operation) && operation?.phase === "succeeded";
 }
 
 const path = (agent: string) => agentOperationPath(agent, "sign-in");

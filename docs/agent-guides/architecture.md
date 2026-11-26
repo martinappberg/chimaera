@@ -1159,8 +1159,9 @@ per-session setup your dotfiles don't do* — the things nobody puts in an rc.
   profile is a host/workspace default) as settings keys; a settings **Environment** category
   edits them (bespoke panel, the `AgentsSettings` special-case pattern).
 - **One injection seam, two hooks that already exist.** Write the effective prelude to a
-  per-session file and export `CHIMAERA_PRELUDE`; the shell-integration rc sources it *after*
-  the user's rc (`shellint`), and the agent login-wrapper sources it before `exec`
+  per-session file and export `CHIMAERA_PRELUDE`; the shell-integration startup sources it
+  *after* the user's profile and rc (`shellint`; a terminal is a login shell), and the agent
+  login-wrapper sources it before `exec`
   (`wrap_login_shell`). Env vars ride the existing `SpawnOpts.env` overlay (`session_env`). Both
   terminal and agent spawns already funnel through these, so the prelude applies uniformly.
   Preludes run once per real spawn, **not on reconnect** (reconnect reuses the live PTY — no
