@@ -1164,6 +1164,7 @@
             {
               "created_at_ms": 1700000000000,
               "cron": "*/10 * * * *",
+              "expires_at_ms": 1702592000000,
               "id": "f2143f41",
               "next_at_ms": 1700000600000,
               "prompt": "post the graph",
