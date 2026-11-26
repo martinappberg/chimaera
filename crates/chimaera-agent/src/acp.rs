@@ -1242,6 +1242,11 @@ impl AcpMapper {
         }
     }
     /// The user's answer, mapped back onto the reply shape the agent asked in.
+    /// Typed text with no field to carry it (a single-choice permission
+    /// request, an `agy acp` question without `q<N>_other`) withdraws or
+    /// skips that question and reaches the agent as the next prompt, named
+    /// as the answer it is; text beside a pick there is dropped. The
+    /// resolution reports only what the agent was given.
     fn answer(
         &mut self,
         request_id: String,
@@ -1271,31 +1276,45 @@ impl AcpMapper {
             }
             (chosen, (!typed.is_empty()).then(|| typed.join("\n")))
         };
+        let label = |question: &Question, at: usize| question.options[at].label.clone();
+        // What the agent is given, per question id, as the card will show it.
+        let mut delivered: HashMap<String, Vec<String>> = HashMap::new();
+        // Typed answers with no field of their own: the next prompt.
+        let mut follow: Vec<(String, String)> = Vec::new();
         match &asked.reply {
             QuestionReply::Form(form) => {
                 let mut content = serde_json::Map::new();
                 for (question, field) in asked.questions.iter().zip(form) {
                     let (chosen, typed) = picked(question);
                     let consts: Vec<&String> = chosen.iter().map(|&i| &field.consts[i]).collect();
+                    let mut shown: Vec<String> = Vec::new();
                     if field.multi && !consts.is_empty() {
                         content.insert(question.id.clone(), json!(consts));
+                        shown.extend(chosen.iter().map(|&i| label(question, i)));
                     } else if let Some(first) = consts.first() {
                         content.insert(question.id.clone(), json!(first));
+                        shown.push(label(question, chosen[0]));
                     }
-                    if let (Some(text), true) = (typed, field.other) {
-                        content.insert(format!("{}_other", question.id), json!(text));
+                    match typed {
+                        Some(text) if field.other => {
+                            content.insert(format!("{}_other", question.id), json!(text));
+                            shown.push(text);
+                        }
+                        Some(text) if chosen.is_empty() => {
+                            follow.push((question.id.clone(), text));
+                        }
+                        _ => {}
+                    }
+                    if !shown.is_empty() {
+                        delivered.insert(question.id.clone(), shown);
                     }
                 }
                 if content.is_empty() {
                     step.outbound
                         .push(Self::question_cancel(&asked.wire_id, &asked.reply));
-                    step.events.push(AgentEvent::QuestionResolved {
-                        request_id,
-                        answers: Default::default(),
-                    });
-                    return;
+                } else {
+                    step.outbound.push(json!({"jsonrpc":"2.0","id":asked.wire_id,"result":{"action":"accept","content":content}}));
                 }
-                step.outbound.push(json!({"jsonrpc":"2.0","id":asked.wire_id,"result":{"action":"accept","content":content}}));
             }
             QuestionReply::Choice(option_ids) => {
                 let Some(question) = asked.questions.first() else {
@@ -1304,39 +1323,48 @@ impl AcpMapper {
                 let (chosen, typed) = picked(question);
                 if let Some(&at) = chosen.first() {
                     step.outbound.push(json!({"jsonrpc":"2.0","id":asked.wire_id,"result":{"outcome":{"outcome":"selected","optionId":option_ids[at]}}}));
+                    delivered.insert(question.id.clone(), vec![label(question, at)]);
                 } else {
-                    // The request offers only its options. Free text cancels it
-                    // and reaches the agent as the next prompt, named as the
-                    // answer it is; the card already shows it as the reply.
+                    // The request offers only its options: free text cancels it.
                     step.outbound
                         .push(Self::question_cancel(&asked.wire_id, &asked.reply));
-                    let Some(text) = typed else {
-                        step.events.push(AgentEvent::QuestionResolved {
-                            request_id,
-                            answers: Default::default(),
-                        });
-                        return;
-                    };
-                    if self.queue.len() >= 64 {
-                        step.events.push(AgentEvent::Notice {
-                            text: "Your typed answer could not be sent: too many messages are waiting. Send it again once the turn ends.".into(),
-                        });
-                    } else {
-                        let text = format!(
-                            "My answer to your question \"{}\": {text}",
-                            question.question
-                        );
-                        let mut item = Queued::new(fresh_uuid(), vec![ContentBlock::Text { text }]);
-                        item.silent = true;
-                        self.queue.push_front(item);
-                        self.resume(step);
+                    if let Some(text) = typed {
+                        follow.push((question.id.clone(), text));
                     }
+                }
+            }
+        }
+        if !follow.is_empty() {
+            if self.queue.len() >= MAX_PENDING {
+                step.events.push(AgentEvent::Notice {
+                    text: "Your typed answer could not be sent: too many messages are waiting. Send it again once the turn ends.".into(),
+                });
+            } else {
+                let text = follow
+                    .iter()
+                    .map(|(id, text)| {
+                        let asked_as = asked
+                            .questions
+                            .iter()
+                            .find(|q| &q.id == id)
+                            .map_or("", |q| q.question.as_str());
+                        format!("My answer to your question \"{asked_as}\": {text}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                // No bubble of its own: the card shows it as the reply.
+                let mut item = Queued::new(fresh_uuid(), vec![ContentBlock::Text { text }]);
+                item.silent = true;
+                self.queue.push_front(item);
+                self.resume(step);
+                for (id, text) in follow {
+                    delivered.entry(id).or_default().push(text);
                 }
             }
         }
         step.events.push(AgentEvent::QuestionResolved {
             request_id,
-            answers,
+            answers: delivered,
         });
     }
     /// agy-acp 1.4.5 asks a question as a permission request (Pass 62): its
@@ -4120,6 +4148,123 @@ mod tests {
             &grok.on_frame(&interaction(6)).events[..],
             [AgentEvent::PermissionRequest { .. }]
         ));
+    }
+    /// An `agy acp` question whose schema has no `q1_other`: nothing carries
+    /// typed text in the form.
+    fn closed_question(id: &str) -> Value {
+        json!({"jsonrpc":"2.0","id":id,"method":"elicitation/create","params":{"sessionId":"session","toolCallId":"call_1","mode":"form","message":"The agent has 1 question.","requestedSchema":{"type":"object","properties":{
+            "q1":{"type":"string","title":"Which language should the service use?","oneOf":[{"const":"1","title":"Rust"},{"const":"2","title":"Go"}]}}}}})
+    }
+    fn resolved(step: &DriverStep) -> HashMap<String, Vec<String>> {
+        step.events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::QuestionResolved { answers, .. } => Some(answers.clone()),
+                _ => None,
+            })
+            .expect("the question resolves")
+    }
+    fn fill_queue(m: &mut AcpMapper) {
+        while m.queue.len() < MAX_PENDING {
+            m.queue.push_back(Queued::new(
+                fresh_uuid(),
+                vec![ContentBlock::Text {
+                    text: "waiting".into(),
+                }],
+            ));
+        }
+    }
+    #[test]
+    fn agy_form_typed_text_without_a_field_follows_as_a_prompt() {
+        let mut m = agy_cli();
+        let turn = send(&mut m, "ask me");
+        // Typed text alone withdraws the question and goes as the next
+        // prompt, which the card shows as the reply.
+        let (id, _) = question_request(&m.on_frame(&closed_question("1")));
+        let step = m.on_command(answer(&id, &[("q1", &["Zig"])]));
+        assert_eq!(step.outbound[0]["result"], json!({"action":"cancel"}));
+        assert_eq!(resolved(&step)["q1"], ["Zig"]);
+        let ended =
+            m.on_frame(&json!({"id":turn.outbound[0]["id"],"result":{"stopReason":"end_turn"}}));
+        let prompt = ended.outbound[0]["params"]["prompt"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(
+            prompt.contains("Which language should the service use?") && prompt.contains("Zig"),
+            "{prompt}"
+        );
+        assert!(!ended.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::UserMessage { .. } | AgentEvent::UserMessageUpdate { .. }
+        )));
+
+        // Beside a pick the text has no way in: the pick alone goes, and the
+        // card shows only the pick.
+        let (id, _) = question_request(&m.on_frame(&closed_question("2")));
+        let step = m.on_command(answer(&id, &[("q1", &["Go", "Zig"])]));
+        assert_eq!(
+            step.outbound,
+            [json!({"jsonrpc":"2.0","id":"2","result":{"action":"accept","content":{"q1":"2"}}})]
+        );
+        assert_eq!(resolved(&step)["q1"], ["Go"]);
+        assert!(m.queue.is_empty());
+
+        // A full queue cannot take the text: the question is withdrawn and
+        // resolves unanswered, with a notice.
+        let (id, _) = question_request(&m.on_frame(&closed_question("3")));
+        fill_queue(&mut m);
+        let step = m.on_command(answer(&id, &[("q1", &["Zig"])]));
+        assert_eq!(step.outbound[0]["result"], json!({"action":"cancel"}));
+        assert!(resolved(&step).is_empty());
+        assert!(step
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Notice { .. })));
+    }
+    #[test]
+    fn agy_form_reports_only_what_it_sent() {
+        let mut m = agy_cli();
+        send(&mut m, "ask me");
+        // A single-choice field takes one pick; a label repeated counts once.
+        let (id, _) = question_request(&m.on_frame(&two_questions("1")));
+        let step = m.on_command(answer(
+            &id,
+            &[("q1", &["Go", "Rust"]), ("q2", &["Auth", "Auth"])],
+        ));
+        assert_eq!(
+            step.outbound[0]["result"],
+            json!({"action":"accept","content":{"q1":"2","q2":["1"]}})
+        );
+        let answers = resolved(&step);
+        assert_eq!(answers["q1"], ["Go"]);
+        assert_eq!(answers["q2"], ["Auth"]);
+    }
+    #[test]
+    fn standalone_interaction_reports_only_what_it_sent() {
+        let mut m = agy_standalone();
+        send(&mut m, "ask me");
+        // A pick beside typed text: the pick is the reply, the text is not.
+        let (id, _) = question_request(&m.on_frame(&interaction(2)));
+        let step = m.on_command(answer(&id, &[("q1", &["Green", "Purple"])]));
+        assert_eq!(
+            step.outbound[0]["result"],
+            json!({"outcome":{"outcome":"selected","optionId":"2"}})
+        );
+        assert_eq!(resolved(&step)["q1"], ["Green"]);
+        assert!(m.queue.is_empty());
+        // Typed text a full queue cannot take resolves unanswered.
+        let (id, _) = question_request(&m.on_frame(&interaction(3)));
+        fill_queue(&mut m);
+        let step = m.on_command(answer(&id, &[("q1", &["Purple"])]));
+        assert_eq!(
+            step.outbound[0]["result"],
+            json!({"outcome":{"outcome":"cancelled"}})
+        );
+        assert!(resolved(&step).is_empty());
+        assert!(step
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Notice { .. })));
     }
     fn tool_row(step: &DriverStep) -> (String, ToolKind, Option<String>) {
         step.events

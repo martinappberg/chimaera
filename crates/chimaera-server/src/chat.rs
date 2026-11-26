@@ -3819,6 +3819,18 @@ pub(crate) async fn spawn_chat_session(
         spec.env
             .push(("NO_OPEN_BROWSER".to_string(), "1".to_string()));
     }
+    // `agy acp` is the terminal agy, started from its canonicalized path,
+    // which skips the activation shim that would switch its updater off; a
+    // managed agy's updater would then overwrite Chimaera's install
+    // (`runtimes::AGY_NO_SELF_UPDATE`). `recipe.bin` is the detected
+    // activation path, so ownership reads the same as detection's verdict.
+    // Before the overlay, so the user's rc cannot turn the updater back on.
+    if agy_cli {
+        spec.env.extend(crate::runtimes::managed_agent_env(
+            recipe.kind,
+            crate::runtimes::owns_binary(state, &recipe.bin),
+        ));
+    }
     // The codex MCP key rides the env, never argv (see mcp_url_bare): the
     // record is re-read here rather than threaded — the spawn paths insert
     // it before this runs, matching the mcp_url lookup above.
