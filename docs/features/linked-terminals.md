@@ -24,8 +24,13 @@ leash-drawing in `web-ui/src/App.svelte`; the drag band that arms a link is in
   share the branch/worktree context row with open and unlink controls. A drag onto an agent pane also reveals
   the terminal beside it; mentioning alone does not rearrange the layout.
 - **Precise references.** Picker and drag references carry `@term:SESSION_ID`, so duplicate shell
-  names and later renames cannot change the selected target. Drafts show readable, atomic chips;
-  send, copy, and saved drafts retain the ID. Sent messages show terminal-icon chips that open
+  names and later renames cannot change the selected target. Drafts show readable, atomic chips
+  (`@term:<label>`, the label bare: a quoted one was rewritten by macOS smart quotes as soon as
+  text was typed beside it, and the chip collapsed to the substituted quote; a system
+  substitution inside any chip is now undone, `uploadTokens.ts::settleEdit`);
+  send, copy, and saved drafts retain the ID. A drop that links also re-tiles the window (the
+  terminal is revealed beside the chat), which remounts the composer: the reference is saved at
+  the insert so the new composer has it, and the keys go back to the agent. Sent messages show terminal-icon chips that open
   the live terminal. A manually typed name remains supported and must be unique; an unavailable
   or ambiguous reference stays inert rather than opening a guessed terminal.
 - **Where it lives.** `agentLinks.ts` (`listLinks`/`putLink`/`deleteLink`, `termReference`,

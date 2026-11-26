@@ -27,11 +27,11 @@ daemon  ──WS /ws/chat/{id}──▶  chatWs.ts (ChatSocket)
 | `transcriptWindow.ts`, `readingAnchor.ts`, `heightModel.ts` | Window math, reading anchor, row heights. |
 | `Markdown`, `streamSegments.ts`, `revealLedger.ts`, `tables.ts`, `markedExtensions.ts`, `MathText`, `math.ts` | Sanitized prose and math, streamed. A file link opens here or beside (⌘/Ctrl-click, a middle click, its right-click menu); the layout decides where ([open beside](../../../../docs/features/workbench.md#splitting-tabs--drag-and-drop)). |
 | `ChatHeader`, `ModelPicker`, `EffortPopover`, `capabilities.ts` | Header controls from capabilities. |
-| `Composer`, `composer.ts`, `composerHeight.ts`, `composerBus.ts`, `drafts.ts` | Input, slash completion, inserts, drafts; one context row for branch/worktree, linked terminals and notices, only when populated; terminal completion opens through `@term`, with no permanent launcher. |
+| `Composer`, `composer.ts`, `composerHeight.ts`, `composerBus.ts`, `drafts.ts` | Input, slash completion, inserts (saved at the insert: a gesture that also re-tiles the window remounts the composer before its effects run), drafts; its root names the chat (`data-chat-session`) and the pane's reference band (`data-drop-band`); one context row for branch/worktree, linked terminals and notices, only when populated; terminal completion opens through `@term`, with no permanent launcher. |
 | `stopConfirm.ts` + `StopNote.svelte` | Esc / Stop / Clear goal ask once ("Also stops 2 subagents · Esc again to stop") when that action also ends background subagents or workflows, the line above the control pressed and worded by the real gesture; otherwise they act at once. |
-| `uploadTokens.ts`, `uploadChips.ts`, `ComposerMentions`, `terminalMentions.ts` | Atomic mention tokens in the draft. |
+| `uploadTokens.ts`, `uploadChips.ts`, `ComposerMentions`, `terminalMentions.ts` | Atomic mention tokens in the draft. A terminal's is `@term:<label>`, never quoted, and a system substitution inside any token is undone (macOS smart quotes broke the chip). |
 | `voice*.ts`, `VoiceMeter` | Voice dictation. |
-| `images.ts`, `AttachmentStrip`, `ImagePreview` | Image attachments and tiles. |
+| `images.ts`, `AttachmentStrip`, `ImagePreview` | Image attachments and tiles. A sent tile, like a file chip, a mention chip and an embed card, is a `../shared/fileHandle.ts` handle: drag onto the composer, or right-click → Reference in chat ([drops](../../../../docs/features/drag-drop-and-uploads.md#a-file-a-chat-already-shows)). |
 | `ToolCallCard`, `ToolGroup`, `toolLabels.ts` | Tool calls and their one-line labels. |
 | `Activity*`, `activityFold.ts`, `FinishedFold`, `FinishedRow` | Folds of settled activity. |
 | `ThoughtRow`, `thoughtText.ts`, `HookRow`, `hookNotice.ts`, `statusWord.ts` | Thought and hook lines; status word. |

@@ -118,7 +118,8 @@ export function fileHandle(get: () => HandledFile | null): Attachment<HTMLElemen
   return (el) => {
     const onPointerDown = (e: PointerEvent) => {
       const file = get();
-      if (file === null || host === null || e.button !== 0) return;
+      // A mouse only: a finger on a figure is scrolling the transcript.
+      if (file === null || host === null || e.button !== 0 || e.pointerType !== "mouse") return;
       host.drag(e, file.path, file.kind ?? "file");
     };
     const onContextMenu = (e: MouseEvent) => {

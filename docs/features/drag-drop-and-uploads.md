@@ -1,22 +1,28 @@
 # File dragging, references & desktop uploads
 
-Getting a **path** or a **file** into the session you're talking to, by dragging. Two intake
+Getting a **path** or a **file** into the session you're talking to, by dragging. Three intake
 edges share one destination — the live session's input (a chat composer or a PTY):
 
 - **Left-tree drag-to-reference** — drag a file *or folder* from the file tree onto a live-session
   pane's **"@ reference"** band; the path types into that session (agents get an `@mention`, shells
   a shell-quoted path). No bytes move — the file is already on the session's host.
+- **A file a chat already shows** — drag an attachment tile, an embedded figure, a written-file
+  chip or a mention chip from the transcript onto the composer, or right-click it and choose
+  **Reference in chat**. Nothing is opened and nothing is copied: the file is on the session's host.
 - **OS-desktop drop / screenshot paste** — drop a file from the desktop (or paste a clipboard
   screenshot) onto a session; the bytes **stream to the daemon that owns the session** (so a
   remote window lands the file on the remote host, over the ssh tunnel), then the returned path
-  is referenced exactly like a tree drag.
+  is referenced exactly like a tree drag. In the native app on the daemon's own computer the file
+  is referenced **where it is** instead: no copy is made.
 
 **Where it lives (shared):** UI `web-ui/src/App.svelte` (window drop handlers, `referenceFileDrop`,
 `insertUploadedPath`, `dropFilesOnSession`), `web-ui/src/lib/net/uploads.ts` (upload client +
 job chrome), `web-ui/src/lib/chat/images.ts` (downscale/encode), `web-ui/src/lib/layout/dnd.ts`
 (`refPath` gate, `paneIdAt`), `web-ui/src/lib/workspace/FileTree.svelte`, `Pane.svelte` (the
 overlays), `Terminal.svelte` (paste-capture), `web-ui/src/lib/chat/composerBus.ts`. Daemon:
-`crates/chimaera-server/src/upload.rs`. Native shell: `crates/chimaera-app/src/shell/restore.rs`.
+`crates/chimaera-server/src/upload.rs`. Native shell: `crates/chimaera-app/src/shell/restore.rs`,
+`shell/commands.rs::dropped_paths`. Files shown on a surface: `web-ui/src/lib/shared/fileHandle.ts`;
+local drops: `web-ui/src/lib/net/localDrop.ts`.
 Wire: `POST /api/v1/sessions/{id}/upload?name=`. Reuses `web-ui/src/lib/shared/reference.ts`
 (`composeAgentPathReference`/`composeShellPathReference`) — the same path-composition as terminal
 selection references (see [terminals.md](terminals.md)).
@@ -74,6 +80,45 @@ selection references (see [terminals.md](terminals.md)).
   dropping the same folder onto a zone twice opens two Finder tabs (files dedupe by path); a
   reference drop opens nothing. Pure client — no wire change.
 
+## A file a chat already shows
+
+- **What & when.** A picture you sent, a figure the agent embedded, a file on the "Written this
+  turn" line or a file mention in a message can be referenced again in the reply you are writing,
+  without opening it first.
+- **How it's used.** Drag it onto the composer: the pane's **"@ reference in ⟨session⟩"** band
+  lights, and releasing types the file's mention (an upload reads as its short name, a workspace
+  file as its workspace-relative path). Or right-click it: **Open**, **Open Beside**, **Reference
+  in chat**, and **Reveal in Finder** where the files are this computer's. Dropped on another
+  pane it opens there, like a FILES-tree row; it is never moved or copied by a drag. A plain
+  click keeps its action (open).
+- **Where it lives.** `shared/fileHandle.ts`: the `fileHandle` attachment (a pointer drag and a
+  context menu on one element), `fileMenuEntries` (the rows, pure), `chatSessionOf` (which chat a
+  surface belongs to, read from the composer's `data-chat-session`), and the host App registers
+  (`setFileHandleHost`: `beginDrag` with a file tab and no file-transfer source, and
+  `referencePathIn`). Attached by `AttachmentStrip` (sent tiles), `FileChip` (the turn-end line and
+  prose document chips), `UserText` (resolved mention chips), and `EmbedCard` (its name, and an
+  image or PDF body; text bodies stay selectable). A prose file link gets the menu row from
+  `Markdown.svelte`'s own link menu.
+- **Key behaviors.** The handle is on the element that takes the click: a drag captures the pointer
+  on its source, and Chromium sends a captured press's click to that element. Mouse only, so a
+  finger on a figure still scrolls. A gone file is not a handle. Outside a chat (an embed card in a
+  document) the menu references into the window's reference target, and has no row when there is
+  none. Pure client: no wire change.
+
+## Dropping onto the composer
+
+- **The band is the input area.** The "@ reference" and "link to agent" bands take the pane's
+  lower ~22%, and grow to hold the whole composer when it is taller (a long draft, attachments, a
+  short pane), up to half the pane (`dnd.ts::bandFraction`, measured from the composer's
+  `data-drop-band`; `Pane.svelte` draws the wash with the same share). A release anywhere on the
+  composer therefore references; with a fixed share the top of a tall composer was the "add to
+  this pane" zone.
+- **A drop is not a click.** The browser makes a click of the release that ends a drag, on the
+  element that captured the pointer. A tab dropped on the band was referenced and then activated by
+  its own click handler, and a linked terminal's rail row took the focus the link had handed the
+  agent. `dnd.ts` swallows that one click for every drag source (`swallowDragClick`); a release
+  before the drag threshold is still a click.
+
 ## OS-desktop file drops
 
 - **What & when.** Drop a file from the desktop/Finder onto a live-session pane (uploads into
@@ -106,6 +151,18 @@ selection references (see [terminals.md](terminals.md)).
   destination filesystem into an actionable error instead of an endless spinner. Dropping an **image**
   onto a *chat* pane that advertises image input additionally attaches its pixels to the composer; the
   uploaded path stays the durable, host-side artifact the agent can re-read later.
+- **On this computer, a dropped file is referenced where it is.** In the native app, on a window
+  whose daemon runs on the same computer (`native.ts::hasLocalFiles`: the connection the shell
+  opened the window on, never a host-name guess), a file or folder dropped on a session pane is
+  not uploaded: its own path is typed (workspace-relative inside the workspace, absolute outside
+  it), and a folder is referenced with a trailing slash instead of being refused. The wash reads
+  **"@ reference in ⟨session⟩"**. A picture dropped on a chat still attaches its pixels. A remote
+  window, a browser, a paste of image bytes, and a drop whose path the shell cannot name (a file
+  promised by another app) upload as before. A web view never tells the page where a dropped file
+  lives, so the page asks the shell (`dropped_paths`: the system drag pasteboard, macOS only) and
+  pairs each answer with its dropped `File` by name, kind and size (`net/localDrop.ts`
+  `pairDroppedPaths`, `routeDrop`); an entry it cannot pair is ignored. A drop on a
+  file-manager folder is still a copy into that folder.
 - **In a chat, a dropped file reads as its name, where you referenced it.** The composer shows the
   mention as `@Screenshot-….png` in place of the ~100-character landing-pad path, as a quiet pill
   (every `@` mention in the draft gets one); resting the pointer on an upload's pill shows the path it
@@ -186,7 +243,10 @@ selection references (see [terminals.md](terminals.md)).
   one code path runs everywhere.
 - **Key behaviors.** Remote-correct **by construction**: the native path a Tauri drag-drop event
   would carry is meaningless on a *remote* host, whereas the upload path streams the bytes to the
-  owning daemon regardless. One line, no new IPC command, no capability change.
+  owning daemon regardless. One addition for local windows: `shell/commands.rs::dropped_paths`
+  (local-only, `require_local`) reads the file URLs of AppKit's drag pasteboard, which keeps the
+  last drag's contents after the drop, so the page can reference a dropped file in place. It
+  reports each entry's path, name, size and kind, at most 32, and nothing off macOS.
 
 ---
 

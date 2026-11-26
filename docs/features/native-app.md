@@ -118,6 +118,9 @@ app-build` (never the root `cargo`).
   cross-window drags between same-scope windows (`drag_track`/`drag_drop` + `xdrag` events,
   coordinate math in `shell/drag.rs` — logical space on macOS, physical elsewhere).
   Quit cancels in-flight connects and closes every tunnel at once within 5 s.
+  An OS file drop is the page's to handle (`disable_drag_drop_handler`); on a local window the
+  page asks `dropped_paths` where the dropped files live and references them in place
+  ([drag-drop-and-uploads.md](drag-drop-and-uploads.md#native-app-tauri)).
   Closing a window removes its record (macOS convention) **except during quit** (guarded by an
   `AtomicBool quitting` so teardown doesn't forget every window). Geometry is stored in logical pixels
   (correct across scale factors) on a slow 2s tick. A `windows.json` that repeats an id loads the
