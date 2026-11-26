@@ -99,8 +99,9 @@ function collapse(rows: DiffRow[], context: number): DiffRow[] {
       skipped += 1;
     }
   });
-  // Nothing changed (identical texts): say so with the gap alone.
-  if (skipped > 0 && out.length > 0) out.push({ kind: "gap", text: String(skipped) });
+  // A trailing unchanged run — or, for identical texts, the whole of it
+  // (a change of only the final newline): the gap alone says nothing moved.
+  if (skipped > 0) out.push({ kind: "gap", text: String(skipped) });
   return out;
 }
 

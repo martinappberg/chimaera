@@ -628,7 +628,26 @@ describe("ChatStore pending-send ordering", () => {
     expect(store.blocks.some((b) => b.kind === "notice")).toBe(false);
     const [first, second] = store.blocks.filter((b) => b.kind === "tool");
     expect(first).toMatchObject({ allowed: true, decision: "always", decisionLabel: "Allow Always (risky)" });
-    expect(second).toMatchObject({ denied: true, decision: "lapsed" });
+    // Unanswered is not refused: no denial, so no failed badge on the run.
+    expect(second).toMatchObject({ denied: false, decision: "lapsed" });
+  });
+
+  it("keeps a plan approval's own line even when its call drew a row", () => {
+    const store = fold([
+      { type: "tool_call", id: "plan", kind: "other", title: "ExitPlanMode", status: "pending" },
+      {
+        type: "permission_request",
+        request_id: "r1",
+        tool_call_id: "plan",
+        title: "ExitPlanMode",
+        plan: "## Plan",
+        options: [{ id: "keep", label: "No, keep planning", kind: "reject_once" }],
+      },
+      { type: "permission_resolved", request_id: "r1", option_id: "keep" },
+    ]);
+    expect(store.blocks.find((b) => b.kind === "notice")).toMatchObject({
+      text: "ExitPlanMode — No, keep planning",
+    });
   });
 
   it("records a decision with no row as one line, however long the agent's title", () => {

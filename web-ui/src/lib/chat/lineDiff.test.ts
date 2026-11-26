@@ -34,6 +34,11 @@ describe("diffLines", () => {
     ]);
   });
 
+  it("says nothing moved when only the final newline differs", () => {
+    expect(shape(diffLines("a\nb", "a\nb\n"))).toEqual(["~2"]);
+    expect(diffLines("", "")).toEqual([]);
+  });
+
   it("reads a new file as additions only", () => {
     expect(shape(diffLines("", "one\ntwo\n"))).toEqual(["+one", "+two"]);
   });

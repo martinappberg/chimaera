@@ -112,7 +112,8 @@
   const refusal = $derived(
     block.decision === "denied" ? "denied" : block.decision === "lapsed" ? "not answered" : null,
   );
-  /** A prompt that lapsed was never refused: its row stays quiet, not red. */
+  /** A prompt that lapsed was never refused (the reducer leaves `denied`
+   *  off); rows journaled before that distinction stay quiet too. */
   const denied = $derived(block.denied && block.decision !== "lapsed");
   const statusTitle = $derived(
     refusal ?? (block.denied ? "denied" : allowed ? "allowed" : block.status.replace("_", " ")),

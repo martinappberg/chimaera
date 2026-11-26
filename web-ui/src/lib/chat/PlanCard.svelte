@@ -344,7 +344,9 @@
     stroke: var(--accent);
     animation: plan-turn 0.9s linear infinite;
   }
-  :global(html.app-hidden) .plan-card .mark.current .arc {
+  /* Same selector weight as the rule above plus the root class: the
+     `animation` shorthand there would otherwise reset the play state. */
+  :global(html.app-hidden) .plan-card.visible:not(.inactive) .mark.current .arc {
     animation-play-state: paused;
   }
   @media (prefers-reduced-motion: reduce) {

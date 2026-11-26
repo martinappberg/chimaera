@@ -15,7 +15,9 @@
 
   interface Props {
     request: PendingQuestion;
-    onAnswer?: (answers: Record<string, string[]>) => void;
+    /** False when the answer could not be sent (not connected): the card
+     *  stays answerable. */
+    onAnswer?: (answers: Record<string, string[]>) => boolean | void;
     /** Chosen labels per question id; non-null renders the read-only
      *  answered card. Empty object = resolved without an answer. */
     answered?: Record<string, string[]> | null;
@@ -100,9 +102,19 @@
   /** One question, one choice: picking it IS the answer — no second press.
    *  Anything richer (several questions, a multi-select) collects first. */
   const instant = $derived(request.questions.length === 1 && !request.questions[0].multiSelect);
+  /** The question the number keys act on; its options alone show their
+   *  digit. A single choice moves on to the next question, a multi-select
+   *  keeps the keys until Enter. */
+  let cursor = $state(0);
   function choose(qi: number, oi: number, multi: boolean) {
     toggle(qi, oi, multi);
-    if (instant) submit();
+    if (instant) {
+      // The pick is the whole answer: text left in "other…" does not ride.
+      other = {};
+      submit();
+      return;
+    }
+    cursor = multi ? qi : Math.min(qi + 1, request.questions.length - 1);
   }
 
   /** Options with something to say about themselves read as a list, one per
@@ -115,22 +127,24 @@
   $effect(() => {
     if (visible && !readOnly && cardEl !== null && mayTakeFocus(cardEl)) cardEl.focus({ preventScroll: true });
   });
-  /** 1–9 pick an option of the first question still open (the only one, for
-   *  an instant card); Enter sends a complete answer. Typing in "other…"
-   *  is never read as a shortcut. */
+  /** 1–9 pick an option of the question the keys are on; Enter moves past a
+   *  multi-select, and sends the answer once it is complete and the keys are
+   *  on the last question. Typing in "other…" is never read as a shortcut. */
   function onKeydown(e: KeyboardEvent) {
     if (readOnly || e.metaKey || e.ctrlKey || e.altKey) return;
     if (e.target instanceof HTMLInputElement) return;
-    if (e.key === "Enter" && e.target === e.currentTarget && complete) {
-      e.preventDefault();
-      submit();
+    const qi = Math.min(cursor, request.questions.length - 1);
+    if (e.key === "Enter" && e.target === e.currentTarget) {
+      if (qi < request.questions.length - 1) {
+        e.preventDefault();
+        cursor = qi + 1;
+      } else if (complete) {
+        e.preventDefault();
+        submit();
+      }
       return;
     }
     if (!/^[1-9]$/.test(e.key)) return;
-    const qi = Math.max(
-      0,
-      request.questions.findIndex((q, i) => q.multiSelect || (picked[i] ?? []).length === 0),
-    );
     const q = request.questions[qi];
     const oi = Number(e.key) - 1;
     if (q === undefined || oi >= q.options.length) return;
@@ -138,14 +152,20 @@
     choose(qi, oi, q.multiSelect);
   }
 
+  /** One answer per card: a second key or click before the daemon's
+   *  `question_resolved` lands must not send another. */
+  let sent = false;
   function submit() {
+    if (sent) return;
+    sent = true;
     const answers: Record<string, string[]> = {};
     request.questions.forEach((q, qi) => {
       const own = (picked[qi] ?? []).map((oi) => q.options[oi]?.label).filter((l) => l != null);
       const free = (other[qi] ?? "").trim();
       answers[q.id] = free.length > 0 ? [...own, free] : own;
     });
-    onAnswer?.(answers);
+    // Never lose the answer to a closed socket: an unsent one unlatches.
+    if (onAnswer?.(answers) === false) sent = false;
   }
 </script>
 
@@ -235,7 +255,7 @@
               aria-pressed={(picked[qi] ?? []).includes(oi)}
               onclick={() => choose(qi, oi, q.multiSelect)}
             >
-              {#if oi < 9}<kbd>{oi + 1}</kbd>{/if}
+              {#if oi < 9}<kbd class:off={qi !== Math.min(cursor, request.questions.length - 1)}>{oi + 1}</kbd>{/if}
               <span class="q-label">{opt.label}</span>
               {#if opt.description !== ""}<span class="q-desc">{opt.description}</span>{/if}
             </button>
@@ -325,6 +345,11 @@
   }
   .opt kbd {
     margin-left: 7px;
+  }
+  /* The digits belong to one question at a time; the others keep the
+     column (no shift as the keys move on) but not the hint. */
+  kbd.off {
+    visibility: hidden;
   }
   /* Options that describe themselves: one per line, the label leading. */
   .q-options.list {

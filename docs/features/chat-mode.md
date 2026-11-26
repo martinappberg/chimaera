@@ -796,9 +796,10 @@ unused week reads 0%); an
   `AskUserQuestion` / codex `requestUserInput` / Antigravity's `ask_question`) render as one card
   for every agent. Options that describe themselves list one per line, label then description;
   bare labels stay chips; a multi-select says "choose any"; every question takes a typed answer
-  ("other…"). The card takes the keyboard on arrival: 1–9 pick an option of the first question
-  still open, Enter sends a complete answer, and a lone single-choice question is answered by
-  the pick itself. Once answered it stays in the transcript as a quiet row per question — what
+  ("other…"). The card takes the keyboard on arrival: 1–9 pick an option of the question the keys
+  are on (its options show their digits; a single choice moves the keys to the next question,
+  Enter moves them past a multi-select), Enter on the last question sends a complete answer, and
+  a lone single-choice question is answered by the pick itself. One answer is sent per card. Once answered it stays in the transcript as a quiet row per question — what
   was asked, what was chosen — that expands to the options not taken. Selections are keyed by
   question/option **index**, not by model-authored id/label (those are untrusted and can collide).
   A codex question carrying `autoResolutionMs` shows a live "skips in Ns" countdown, then auto-skips

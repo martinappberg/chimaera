@@ -1793,14 +1793,18 @@ export class ChatStore {
         if (row !== null) {
           // The call's own row is the record of the decision — "what did I
           // allow?" survives a reload there, and a run of approved calls
-          // stays one run instead of a line per answer.
+          // stays one run instead of a line per answer. A prompt that went
+          // away unanswered was never refused: its row is not a denial (and
+          // not a failure in the run's badge).
           if (allowed) row.allowed = true;
-          else row.denied = true;
+          else if (!lapsed) row.denied = true;
           row.decision = lapsed ? "lapsed" : !allowed ? "denied" : kind === "allow_always" ? "always" : "allowed";
           row.decisionLabel = label;
-          this.touchTranscript();
-        } else if (req !== undefined) {
-          // No row to carry it (a plan approval, a hidden call): a quiet line.
+        }
+        // A plan approval answers the plan, not a command: it keeps its own
+        // line whether or not ExitPlanMode drew a row. So does a request
+        // with no row to carry the decision (a hidden call).
+        if (req !== undefined && (row === null || req.plan !== null)) {
           this.notice(decisionLine(req.title, label), "info");
         }
         break;
@@ -2367,8 +2371,7 @@ export class ChatStore {
     this.elicitations = [];
     for (const p of this.pending) {
       const row = p.toolCallId != null ? this.toolBlock(p.toolCallId) : null;
-      if (row !== null) {
-        row.denied = true;
+      if (row !== null && p.plan === null) {
         row.decision = "lapsed";
         row.decisionLabel = "no longer active";
       } else {

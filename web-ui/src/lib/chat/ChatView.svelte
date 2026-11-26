@@ -1614,6 +1614,13 @@
     return false;
   }
 
+  /** The row an approval is about. Reads the transcript's version so a row
+   *  that lands after its request (the id index is a plain Map) is picked up. */
+  function approvalTool(toolCallId: string | null) {
+    void store.transcriptVersion;
+    return toolCallId !== null ? store.toolBlock(toolCallId) : null;
+  }
+
   function decide(requestId: string, optionId: string, destination?: string, feedback?: string) {
     // Never lose a decision to a closed socket: the card stays answerable
     // (no resolved event will arrive), so say why nothing happened.
@@ -1629,8 +1636,8 @@
     );
   }
 
-  function answer(requestId: string, answers: Record<string, string[]>) {
-    sendCommand({ type: "answer", request_id: requestId, answers }, "answer not sent");
+  function answer(requestId: string, answers: Record<string, string[]>): boolean {
+    return sendCommand({ type: "answer", request_id: requestId, answers }, "answer not sent");
   }
 
   /** Every action that interrupts the turn asks once when it would also end
@@ -3606,7 +3613,7 @@
       {:else}
         <PermissionCard
           {request}
-          tool={request.toolCallId !== null ? store.toolBlock(request.toolCallId) : null}
+          tool={approvalTool(request.toolCallId)}
           pathLabel={(path) => prosePaths?.label(path) ?? path}
           onOpenPath={(path, e) => openProsePath(path, "file", { split: e.metaKey || e.ctrlKey })}
           canFeedback={supports("permission_feedback")}

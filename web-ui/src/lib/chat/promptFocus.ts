@@ -23,6 +23,9 @@ export function yieldsFocus(field: FocusedField | null): boolean {
 
 export function mayTakeFocus(card: Element, active: Element | null = document.activeElement): boolean {
   if (!(active instanceof HTMLElement)) return true;
+  // A frame (an HTML preview, a plugin screen) or a shadow tree owns its own
+  // focus: whatever has it inside is unreadable from here, so it is typing.
+  if (active instanceof HTMLIFrameElement || active.shadowRoot !== null) return false;
   const text =
     active instanceof HTMLTextAreaElement || active instanceof HTMLInputElement
       ? active.value

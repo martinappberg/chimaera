@@ -120,7 +120,8 @@
   // Mirror the TUI: the permission prompt captures input on arrival.
   // preventScroll keeps ChatView's stick-to-bottom-unless-reading contract —
   // its own effect (keyed on pending.length) scrolls when the user is at bottom.
-  // Only on arrival, and never out from under typing (`mayTakeFocus`).
+  // On arrival and whenever the tab is shown again; never out from under
+  // typing (`mayTakeFocus`).
   $effect(() => {
     if (visible && cardEl !== null && mayTakeFocus(cardEl)) cardEl.focus({ preventScroll: true });
   });
