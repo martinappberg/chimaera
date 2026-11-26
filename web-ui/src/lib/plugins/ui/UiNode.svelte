@@ -296,7 +296,7 @@
     aria-label={typeof label === "string" ? label : undefined}
     aria-hidden={typeof label === "string" ? undefined : "true"}
   >
-    {#each iconOf(name) as d (d)}<path {d} />{/each}
+    {#each iconOf(name) as d, n (n)}<path {d} />{/each}
   </svg>
 {/snippet}
 

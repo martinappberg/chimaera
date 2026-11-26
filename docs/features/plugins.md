@@ -681,7 +681,8 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   - A deck a plugin rendered (the `slides` node: pictures, one or more builds a slide) draws in
     the slide viewers' chrome (`ui/DeckNode.svelte`): the picture in the image viewer with its
     area tool, a thumbnail strip, keys that walk a slide's builds and then the slides, **@** for
-    the slide's code, **present** (full screen, a click a build, hidden slides skipped, as in the
+    the slide's code, **present** (full screen, opening the slide at its first build, a click a
+    build, hidden slides skipped, as in the
     PowerPoint viewer: `previews/slideShow.ts`) and **presenter** (this slide, the next click,
     the notes, a timer). Open the deck in two windows and they keep step while either is in the
     show: the show on the projector, the presenter's view on the laptop. Paging never calls the
@@ -976,3 +977,21 @@ _Captured 2026-11-04 from the maintainer's decisions on the
   change); `[[programs]] also` finds macOS's LibreOffice without PATH setup; no one-click
   LibreOffice yet (host unpackers for app images next); the plugin is named "PowerPoint".
 - **Do not change (or: open to change):** _pending capture._
+
+### Decks a plugin renders, a show's rules, and categories — why they exist
+_Captured 2026-11-26 from the maintainer's words in the chat that built them; the questionnaire's
+questions on promises and what must not change were not asked._
+
+- **Problem it solves (decks from plugins):** "one can open and reference Manimble slides
+  directly in chimaera (and draw etc.). Don't need to build out their full functionality I
+  guess, just similar to how the pptx is".
+- **Hidden slides and the presenter view:** "More nice thing in both pptx and fo manimble if we
+  can do is hidden slides, like if you are presenting, hidden slides should not be shown. Maybe
+  we can actually also do a presenter view here somehow (in the plugins) if not too difficult ?"
+- **General, not one plugin's:** "The chimaera specific things we changed are general right and
+  not focused on Manimble ? since this is an extension". The deck viewer, a tab's icon and the
+  categories are the platform's; what is Manimble's lives in its plugin.
+- **Categories:** "the extensions on the extension page should have some sort of category I
+  think ? so we can sort them and show them where they should be, and we should fix all
+  extensions to adhere to this category. Just some nice UI / UX and simple grouping".
+- **How settled it is / do not change:** _pending capture._

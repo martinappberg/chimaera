@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { clampPlace, clockText, isForward, notesAt, parseDeck, placeOf, readSync, syncName } from "./deck";
+import { clampPlace, clockText, notesAt, parseDeck, placeOf, readSync, syncName } from "./deck";
 
 const RAW = [
   { title: "Title", file: "deck/slides.py", line: 6, builds: [{ src: "output:d/a.png" }], notes: "Welcome." },
@@ -46,11 +46,14 @@ describe("parseDeck", () => {
       null,
     ]);
   });
-  it("knows a move on from a move back", () => {
-    expect(isForward({ slide: 1, build: 0 }, { slide: 1, build: 1 })).toBe(true);
-    expect(isForward({ slide: 1, build: 2 }, { slide: 2, build: 0 })).toBe(true);
-    expect(isForward({ slide: 1, build: 1 }, { slide: 1, build: 1 })).toBe(false);
-    expect(isForward({ slide: 2, build: 0 }, { slide: 1, build: 3 })).toBe(false);
+  it("tells slides of one title apart by where they stand", () => {
+    const twice = parseDeck(["Intro", "Results", "Method", "Results", "End"].map((title) => ({ title, builds: ["p.png"] })));
+    expect(placeOf(twice, "Results", 0)?.slide).toBe(1);
+    expect(placeOf(twice, "Results", 0, 3)?.slide).toBe(3);
+    // A slide put in before it moved it one on: the nearest is still it.
+    expect(placeOf(twice, "Results", 0, 4)?.slide).toBe(3);
+    expect(placeOf(twice, "Results", 0, 2)?.slide).toBe(1);
+    expect(placeOf(twice, "Method", 0, 4)?.slide).toBe(2);
   });
   it("caps a runaway deck", () => {
     const many = Array.from({ length: 2000 }, (_, i) => ({ title: `S${i}`, builds: Array.from({ length: 100 }, () => "p.png") }));
@@ -87,7 +90,10 @@ describe("sync", () => {
     expect(syncName("w-1", "decks", "deck-a")).toBe("chimaera-deck:w-1:decks:deck-a");
   });
   it("reads only well-formed messages", () => {
-    expect(readSync({ kind: "at", from: "a", title: "Plan", build: 1 })).toEqual({ kind: "at", from: "a", title: "Plan", build: 1 });
+    expect(readSync({ kind: "at", from: "a", title: "Plan", slide: 3, build: 1 })).toEqual({ kind: "at", from: "a", title: "Plan", slide: 3, build: 1 });
+    // A window that says no index (or a bad one) means the first such slide.
+    expect(readSync({ kind: "at", from: "a", title: "Plan", build: 1 })).toEqual({ kind: "at", from: "a", title: "Plan", slide: 0, build: 1 });
+    expect(readSync({ kind: "at", from: "a", title: "Plan", slide: -2, build: 1 })).toMatchObject({ slide: 0 });
     expect(readSync({ kind: "where", from: "b" })).toEqual({ kind: "where", from: "b" });
     for (const bad of [null, "at", {}, { kind: "at", from: "a" }, { kind: "at", from: "", title: "x", build: 0 }, { kind: "at", from: "a", title: "x", build: -1 }, { kind: "at", from: "a", title: "x", build: 1.5 }, { kind: "go", from: "a" }]) {
       expect(readSync(bad)).toBeNull();

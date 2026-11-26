@@ -930,7 +930,7 @@
               stroke-linejoin="round"
               aria-hidden="true"
             >
-              {#each pluginViewIcon($workspacePlugins?.plugins, tab.plugin, tab.view) ?? [] as d (d)}<path {d} />{/each}
+              {#each pluginViewIcon($workspacePlugins?.plugins, tab.plugin, tab.view) ?? [] as d, n (n)}<path {d} />{/each}
             </svg>
           {:else if tab.surface === "plugins" || tab.surface === "plugin"}
             <!-- Extensions: three cells and a plus (plugins/glyph.ts), at its

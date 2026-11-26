@@ -98,17 +98,17 @@ export function clampPlace(slides: readonly DeckSlide[], at: Place): Place {
 }
 
 /** The slide called `title`, at `build` (clamped; "last" for its whole
- *  picture): null when the deck has no such slide. */
-export function placeOf(slides: readonly DeckSlide[], title: string, build: number | "last"): Place | null {
-  const slide = slides.findIndex((s) => s.title === title);
+ *  picture): null when the deck has no such slide. Titles can repeat, so of
+ *  several the one at `near`, else the nearest to it, is meant. */
+export function placeOf(slides: readonly DeckSlide[], title: string, build: number | "last", near = 0): Place | null {
+  let slide = -1;
+  for (let i = 0; i < slides.length; i++) {
+    if (slides[i]?.title !== title) continue;
+    if (slide === -1 || Math.abs(i - near) < Math.abs(slide - near)) slide = i;
+  }
   if (slide === -1) return null;
   const last = Math.max(0, (slides[slide]?.builds.length ?? 1) - 1);
   return { slide, build: build === "last" ? last : Math.min(Math.max(0, build), last) };
-}
-
-/** Whether `to` is later in the deck than `from`: a move the show animates. */
-export function isForward(from: Place, to: Place): boolean {
-  return to.slide > from.slide || (to.slide === from.slide && to.build > from.build);
 }
 
 /** What the presenter reads at a place: the slide's notes, then the build's. */
@@ -125,7 +125,7 @@ export function syncName(ws: string, plugin: string, id: string): string {
 
 /** Where a window stands (`at`), or a window asking where the others are. */
 export type DeckSync =
-  | { kind: "at"; from: string; title: string; build: number }
+  | { kind: "at"; from: string; title: string; slide: number; build: number }
   | { kind: "where"; from: string };
 
 /** Another window's message, checked: anything else is ignored. */
@@ -134,8 +134,10 @@ export function readSync(data: unknown): DeckSync | null {
   const d = data as Record<string, unknown>;
   if (typeof d.from !== "string" || d.from === "") return null;
   if (d.kind === "where") return { kind: "where", from: d.from };
-  if (d.kind === "at" && typeof d.title === "string" && typeof d.build === "number" && Number.isInteger(d.build) && d.build >= 0) {
-    return { kind: "at", from: d.from, title: d.title, build: d.build };
+  const index = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0;
+  if (d.kind === "at" && typeof d.title === "string" && index(d.build)) {
+    // The index only tells same-titled slides apart: without one, the first.
+    return { kind: "at", from: d.from, title: d.title, slide: index(d.slide) ? d.slide : 0, build: d.build };
   }
   return null;
 }

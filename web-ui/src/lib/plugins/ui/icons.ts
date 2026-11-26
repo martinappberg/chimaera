@@ -32,5 +32,6 @@ export const UNKNOWN_ICON = ["M12 12m-2 0a2 2 0 1 0 4 0a2 2 0 1 0 -4 0"];
 
 /** The paths of a named icon, or null when the set has no such name. */
 export function pluginIcon(name: unknown): string[] | null {
-  return typeof name === "string" && Object.hasOwn(PLUGIN_ICONS, name) ? PLUGIN_ICONS[name] : null;
+  // Not `Object.hasOwn`: the app's web view may predate it.
+  return typeof name === "string" && Object.prototype.hasOwnProperty.call(PLUGIN_ICONS, name) ? PLUGIN_ICONS[name] : null;
 }

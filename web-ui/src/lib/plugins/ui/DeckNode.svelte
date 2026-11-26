@@ -28,11 +28,17 @@
   import { deckStep, showEdge, showPosition, type Place } from "../../previews/slideShow";
   import { pageVisible } from "../../shared/visibility";
   import type { UiNodeData } from "../platform";
-  import { clampPlace, clockText, isForward, notesAt, parseDeck, placeOf, readSync, syncName, type DeckSync } from "./deck";
+  import { clampPlace, clockText, notesAt, parseDeck, placeOf, readSync, syncName, type DeckSync } from "./deck";
   import { str, useScreen } from "./screen";
 
   let { node }: { node: UiNodeData } = $props();
   const screen = useScreen();
+
+  /** The view went: a ticket or a play() answered after that changes nothing. */
+  let disposed = false;
+  $effect(() => () => {
+    disposed = true;
+  });
 
   const slides = $derived(parseDeck(node.slides));
   const hidden = $derived(slides.map((s) => s.hidden));
@@ -64,7 +70,7 @@
         startSeen = asked;
         if (start !== null) next = placeOf(all, start, "last");
       }
-      next ??= placeOf(all, standing, at.build) ?? clampPlace(all, at);
+      next ??= placeOf(all, standing, at.build, at.slide) ?? clampPlace(all, at);
       at = next;
       standing = all[next.slide]?.title ?? "";
     });
@@ -105,10 +111,10 @@
     const moved = next.slide !== at.slide || next.build !== at.build;
     at = next;
     standing = slides[next.slide]?.title ?? "";
-    if (moved || !animate) {
-      playing = animate && slides[next.slide]?.builds[next.build]?.clip != null ? { ...next, under, ended: false } : null;
-    }
-    if (tell && mode !== "browse") say({ kind: "at", from: me, title: standing, build: next.build });
+    // Only a move ends or starts a clip: another window naming the place we
+    // already stand on must not cut ours off.
+    if (moved) playing = animate && slides[next.slide]?.builds[next.build]?.clip != null ? { ...next, under, ended: false } : null;
+    if (tell && mode !== "browse") say({ kind: "at", from: me, title: standing, slide: next.slide, build: next.build });
   }
 
   /** One click on or back: a show skips hidden slides, browsing doesn't.
@@ -137,12 +143,21 @@
     if (clip.auto) step(1);
   }
 
+  /** The clip's video could not load (its file went, its ticket lapsed):
+   *  the build's picture shows, and the clip is asked for again. */
+  function clipFailed(src: string): void {
+    if (clip?.src === src) playing = null;
+    broken(src);
+  }
+
   function clipReady(e: Event): void {
     const v = e.currentTarget as HTMLVideoElement;
+    const mine = clip?.src;
     if (clip !== null) v.playbackRate = clip.rate;
     void v.play().catch(() => {
-      // Refused (a web view that will not autoplay): the picture stays.
-      playing = null;
+      // Refused (a web view that will not autoplay): the picture stays. A
+      // video the next click replaced rejects too, and is not ours to end.
+      if (!disposed && clip?.src === mine) playing = null;
     });
   }
 
@@ -159,12 +174,15 @@
       const msg = readSync(e.data);
       if (msg === null || msg.from === me) return;
       if (msg.kind === "where") {
-        ch.postMessage({ kind: "at", from: me, title: standing, build: at.build } satisfies DeckSync);
+        ch.postMessage({ kind: "at", from: me, title: standing, slide: at.slide, build: at.build } satisfies DeckSync);
         return;
       }
-      const place = placeOf(slides, msg.title, msg.build);
-      // The show follows the presenter's clicker with the same animation.
-      if (place !== null) go(place, false, mode === "present" && isForward(at, place));
+      const place = placeOf(slides, msg.title, msg.build, msg.slide);
+      if (place === null) return;
+      // The show follows the presenter's clicker with the same animation:
+      // one click on plays, a jump shows the picture.
+      const click = nextPlace !== null && nextPlace.slide === place.slide && nextPlace.build === place.build;
+      go(place, false, mode === "present" && click);
     };
     channel = ch;
     // Joining late: line up with whoever is already in the show.
@@ -182,15 +200,22 @@
    *  build has a new `src`, so an entry never goes stale. */
   let urls = $state<Record<string, string>>({});
   let paths = $state<Record<string, string>>({});
-  const asked = new Set<string>();
+  /** When each `src` was last asked for. The daemon's ticket lives about
+   *  ten minutes from the last ask and answers with the same URL while the
+   *  file is unchanged, so asking again only keeps it alive. */
+  const asked = new Map<string, number>();
+  const TICKET_KEEP_MS = 4 * 60 * 1000;
   let pictureError = $state<string | null>(null);
 
-  function want(src: string | undefined): void {
-    if (src === undefined || src === "" || asked.has(src)) return;
-    asked.add(src);
+  function want(src: string | undefined, again = false): void {
+    if (src === undefined || src === "") return;
+    const last = asked.get(src);
+    if (!again && last !== undefined && Date.now() - last < TICKET_KEEP_MS) return;
+    asked.set(src, Date.now());
     screen
       .resolve(src)
       .then((abs) => {
+        if (disposed) return "";
         paths[src] = abs;
         const hit = lastRawTicketUrl(abs);
         if (hit !== null) urls[src] = hit;
@@ -198,24 +223,40 @@
       })
       .then(
         (url) => {
-          urls[src] = url;
+          if (!disposed && url !== "") urls[src] = url;
         },
         (e) => {
+          if (disposed) return;
           asked.delete(src);
           if (src === build?.src) pictureError = e instanceof Error ? e.message : String(e);
+          // A clip that can't be had: its build's picture, not a show left
+          // waiting on the picture before it.
+          if (src === clip?.src) playing = null;
         },
       );
   }
 
-  /** A ticket that expired under a long-open deck: mint it again, once. */
-  const retried = new Set<string>();
+  /** A ticket that lapsed under a long-open deck: mint it again, though
+   *  not in a loop for a file that is really gone. */
+  const retried = new Map<string, number>();
   function broken(src: string): void {
-    if (retried.has(src)) return;
-    retried.add(src);
-    asked.delete(src);
+    if (Date.now() - (retried.get(src) ?? 0) < 30_000) return;
+    retried.set(src, Date.now());
     delete urls[src];
-    want(src);
+    want(src, true);
   }
+
+  // A talk can stand on one build for longer than a ticket lives: while in
+  // the show, keep alive what is on screen and what the next click needs.
+  $effect(() => {
+    if (mode === "browse" || !$pageVisible) return;
+    const keep = () => {
+      for (const src of [build?.src, build?.clip?.src, nextBuild?.src, nextBuild?.clip?.src]) want(src, true);
+    };
+    untrack(keep);
+    const id = setInterval(keep, TICKET_KEEP_MS);
+    return () => clearInterval(id);
+  });
 
   const nextBuild = $derived(nextPlace === null ? undefined : slides[nextPlace.slide]?.builds[nextPlace.build]);
   $effect(() => {
@@ -236,6 +277,7 @@
           delete urls[src];
           delete paths[src];
           asked.delete(src);
+          retried.delete(src);
         }
       }
     });
@@ -252,22 +294,30 @@
 
   let strip = $state<HTMLDivElement | null>(null);
   /** Thumbnails load as they come near the strip's window. */
-  function nearby(el: HTMLElement, src: string | undefined): { destroy(): void } {
-    if (src === undefined || typeof IntersectionObserver === "undefined") {
-      want(src);
-      return { destroy() {} };
-    }
-    const io = new IntersectionObserver(
-      (entries) => {
-        if (entries.some((e) => e.isIntersecting)) {
-          want(src);
-          io.disconnect();
-        }
-      },
-      { root: strip, rootMargin: "0px 240px" },
-    );
-    io.observe(el);
-    return { destroy: () => io.disconnect() };
+  function nearby(el: HTMLElement, src: string | undefined): { update(src: string | undefined): void; destroy(): void } {
+    let io: IntersectionObserver | null = null;
+    // A re-render gives an edited slide a new picture: watch again for it.
+    const watch = (s: string | undefined): void => {
+      io?.disconnect();
+      io = null;
+      if (s === undefined) return;
+      if (typeof IntersectionObserver === "undefined") {
+        want(s);
+        return;
+      }
+      io = new IntersectionObserver(
+        (entries) => {
+          if (!entries.some((e) => e.isIntersecting)) return;
+          want(s);
+          io?.disconnect();
+          io = null;
+        },
+        { root: strip, rootMargin: "0px 240px" },
+      );
+      io.observe(el);
+    };
+    watch(src);
+    return { update: watch, destroy: () => io?.disconnect() };
   }
 
   // Keep the current thumbnail in the strip's window, moving only the strip
@@ -289,8 +339,14 @@
   let root = $state<HTMLDivElement | null>(null);
   let showEl = $state<HTMLDivElement | null>(null);
 
+  /** The show took the screen (as opposed to covering the window). */
+  let wentFull = false;
+
   async function present(): Promise<void> {
     mode = "present";
+    // A show opens a slide as a click would have: at its first build
+    // (browsing stands on a slide's last, its whole picture).
+    go({ slide: at.slide, build: 0 }, false);
     play();
     await tick();
     const el = showEl;
@@ -299,6 +355,7 @@
       // Without full screen (a web view that refuses it) the show still
       // covers the window: `.show:not(:fullscreen)`.
       await el.requestFullscreen?.();
+      wentFull = document.fullscreenElement === el;
     } catch {
       // Refused: the fixed overlay is the show.
     }
@@ -306,6 +363,7 @@
   }
 
   async function leave(): Promise<void> {
+    wentFull = false;
     if (document.fullscreenElement !== null) await document.exitFullscreen().catch(() => {});
     playing = null;
     mode = "browse";
@@ -316,7 +374,10 @@
   // Leaving full screen by the browser's own key ends the show.
   $effect(() => {
     const onChange = () => {
-      if (document.fullscreenElement === null && mode === "present") {
+      // Only a show that had the screen ends with it: one covering the
+      // window is not ended by something else leaving full screen.
+      if (document.fullscreenElement === null && mode === "present" && wentFull) {
+        wentFull = false;
         playing = null;
         mode = "browse";
       }
@@ -498,7 +559,7 @@
         {:else if clip !== null && urls[clip.src] !== undefined}
           {#key clip.src}
             <!-- svelte-ignore a11y_media_has_caption — a slide's animation: silent, and its picture carries the alt text -->
-            <video class="clip" src={urls[clip.src]} muted playsinline aria-label={pictureAlt} onloadeddata={clipReady} onended={clipEnded} onerror={() => (playing = null)}></video>
+            <video class="clip" src={urls[clip.src]} muted playsinline aria-label={pictureAlt} onloadeddata={clipReady} onended={clipEnded} onerror={() => clipFailed(clip.src)}></video>
           {/key}
         {:else if ImageView !== null && paths[build.src] !== undefined}
           <ImageView path={paths[build.src] ?? ""} />
@@ -530,7 +591,7 @@
     {/if}
 
     {#if mode === "present"}
-      <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions, a11y_click_events_have_key_events — the show: a click is the presenter's clicker, the keys are handled beside it -->
+      <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions — the show: a click is the presenter's clicker, the keys are handled beside it -->
       <div class="show" role="document" aria-label="{label}: the show" tabindex="0" bind:this={showEl} onclick={() => step(1)} onkeydown={onKey}>
         {#if build !== undefined}
           {@const still = clip !== null && playing !== null && !playing.ended ? playing.under : build.src}
@@ -540,7 +601,7 @@
           {#if clip !== null && urls[clip.src] !== undefined}
             {#key clip.src}
               <!-- svelte-ignore a11y_media_has_caption — a slide's animation: silent, and its picture carries the alt text -->
-              <video src={urls[clip.src]} muted playsinline loop={clip.loop} onloadeddata={clipReady} onended={clipEnded} onerror={() => (playing = null)}></video>
+              <video src={urls[clip.src]} muted playsinline loop={clip.loop} onloadeddata={clipReady} onended={clipEnded} onerror={() => clipFailed(clip.src)}></video>
             {/key}
           {/if}
         {/if}

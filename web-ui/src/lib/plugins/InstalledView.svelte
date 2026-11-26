@@ -263,8 +263,8 @@
   {/if}
 
   {#each groups as g (g.id)}
-    <div class="group" role="group" aria-label={g.label === "" ? undefined : g.label}>
-      {#if g.label !== ""}<h3 class="cat">{g.label}</h3>{/if}
+    <div class="group" role={g.label === "" ? undefined : "group"} aria-labelledby={g.label === "" ? undefined : `wb-cat-${g.id}`}>
+      {#if g.label !== ""}<h3 class="cat" id="wb-cat-{g.id}">{g.label}</h3>{/if}
       {#each g.plugins as p (p.id)}
         <PluginCard
           plugin={p}
