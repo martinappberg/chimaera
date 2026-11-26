@@ -4,6 +4,13 @@
 //! per file and per session, into `uploads_root/<session-id>/`. The route is
 //! session-scoped so the daemon derives the destination itself and can prune
 //! everything a session left behind when it ends.
+//!
+//! Two transports land files through the same caps, names and publication:
+//! the one-request routes here (`upload`, `upload_to_dir`), and the chunked,
+//! resumable one the web UI uses ([`chunked`]), which keeps a long transfer
+//! from monopolising a remote window's tunnel and survives a dropped link.
+
+pub(crate) mod chunked;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,7 +18,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{Path as UrlPath, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures::StreamExt;
@@ -46,7 +53,7 @@ pub(crate) struct UploadQuery {
 /// A safe basename for the uploaded file: no separators (path traversal on a
 /// shared login node), no control bytes (it gets typed into shells/prompts),
 /// no dot-dirs, bounded length. `None` rejects the name outright.
-fn sanitize_name(raw: &str) -> Option<String> {
+pub(super) fn sanitize_name(raw: &str) -> Option<String> {
     let name = raw.trim();
     if name.is_empty() || name.len() > 200 || name == "." || name == ".." {
         return None;
@@ -114,7 +121,7 @@ pub(crate) fn mention_safe_name(name: &str) -> String {
 /// Current (bytes, file-count) in a session's uploads dir (flat — uploads are
 /// never nested). Missing dir reads as (0, 0). One scan feeds both caps; one
 /// blocking-pool hop for the whole scan.
-async fn dir_usage(dir: &Path) -> (u64, usize) {
+pub(super) async fn dir_usage(dir: &Path) -> (u64, usize) {
     let dir = dir.to_path_buf();
     tokio::task::spawn_blocking(move || dir_usage_blocking(&dir))
         .await
@@ -133,14 +140,10 @@ pub(crate) async fn upload(
     State(state): State<Arc<AppState>>,
     UrlPath(id): UrlPath<String>,
     Query(query): Query<UploadQuery>,
+    headers: HeaderMap,
     body: Body,
 ) -> Response {
-    // Existence check doubles as path-safety: only a registered session id
-    // (a generated token, never attacker-shaped) becomes a directory name.
-    let known = state.sessions.get(&id).is_some()
-        || state.chat.get(&id).is_some()
-        || crate::lock(&state.agents).contains_key(&id);
-    if !known {
+    if !session_known(&state, &id) {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({"error": format!("unknown session {id}")})),
@@ -162,16 +165,10 @@ pub(crate) async fn upload(
         return internal(&dir, "failed to create uploads dir", &err.into());
     }
     let (existing, existing_count) = dir_usage(&dir).await;
-    if existing_count >= MAX_SESSION_UPLOAD_FILES {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Json(json!({
-                "error": format!(
-                    "session upload file limit ({MAX_SESSION_UPLOAD_FILES} files) reached"
-                )
-            })),
-        )
-            .into_response();
+    if let Some(refusal) =
+        session_refusal(&name, declared_length(&headers), existing, existing_count)
+    {
+        return refusal;
     }
 
     // Stream to a hidden tmp sibling, then rename — a partial upload is never
@@ -221,13 +218,13 @@ pub(crate) async fn upload(
         if let Err(err) = file.write_all(&chunk).await {
             drop(file);
             let _ = tokio::fs::remove_file(&tmp).await;
-            return internal(&tmp, "failed to write upload", &err.into());
+            return write_refusal(&tmp, &err);
         }
     }
-    if let Err(err) = file.flush().await {
+    if let Err(err) = settle(&mut file).await {
         drop(file);
         let _ = tokio::fs::remove_file(&tmp).await;
-        return internal(&tmp, "failed to flush upload", &err.into());
+        return write_refusal(&tmp, &err);
     }
     drop(file);
 
@@ -244,12 +241,40 @@ pub(crate) async fn upload(
             .into_response();
     }
 
-    // Keep the (mention-safe) dropped name when free; a taken name gets a short
-    // random prefix instead of clobbering. The exists→rename window is racy
-    // only against the same user re-dropping the same name in the same
-    // instant — an accepted, self-inflicted overwrite.
-    let mut target = dir.join(&name);
-    let mut final_name = name.clone();
+    let (target, final_name) = match publish_in_session(&dir, &tmp, &name).await {
+        Ok(published) => published,
+        Err(refusal) => return refusal,
+    };
+
+    Json(json!({
+        "path": target.to_string_lossy(),
+        "name": final_name,
+        "size": written,
+    }))
+    .into_response()
+}
+
+/// Whether `id` names a session an upload may land for. Doubles as
+/// path-safety: only a registered id (a generated token, never
+/// attacker-shaped) becomes a directory name.
+pub(super) fn session_known(state: &AppState, id: &str) -> bool {
+    state.sessions.get(id).is_some()
+        || state.chat.get(id).is_some()
+        || crate::lock(&state.agents).contains_key(id)
+}
+
+/// Give a finished session upload its final name: the (mention-safe) dropped
+/// name when free, else that name behind a short random prefix, never a
+/// clobber. The exists→rename window is racy only against the same user
+/// re-dropping the same name in the same instant — an accepted,
+/// self-inflicted overwrite. A refusal has already removed `tmp`.
+pub(super) async fn publish_in_session(
+    dir: &Path,
+    tmp: &Path,
+    name: &str,
+) -> Result<(PathBuf, String), Response> {
+    let mut target = dir.join(name);
+    let mut final_name = name.to_string();
     if tokio::fs::try_exists(&target).await.unwrap_or(false) {
         let mut available = None;
         for _ in 0..16 {
@@ -264,27 +289,134 @@ pub(crate) async fn upload(
             }
         }
         let Some(candidate) = available else {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return (
+            let _ = tokio::fs::remove_file(tmp).await;
+            return Err((
                 StatusCode::CONFLICT,
                 Json(json!({"error": "could not choose a free upload name"})),
             )
-                .into_response();
+                .into_response());
         };
         final_name = candidate;
         target = dir.join(&final_name);
     }
-    if let Err(err) = tokio::fs::rename(&tmp, &target).await {
-        let _ = tokio::fs::remove_file(&tmp).await;
-        return internal(&target, "failed to finalize upload", &err.into());
+    if let Err(err) = tokio::fs::rename(tmp, &target).await {
+        let _ = tokio::fs::remove_file(tmp).await;
+        return Err(internal(&target, "failed to finalize upload", &err.into()));
     }
+    Ok((target, final_name))
+}
 
-    Json(json!({
-        "path": target.to_string_lossy(),
-        "name": final_name,
-        "size": written,
-    }))
-    .into_response()
+/// Give a finished folder upload its final name: the user's own name, or a
+/// " copy" sibling when that is taken — never a clobber. A refusal has
+/// already removed `tmp`.
+pub(super) async fn publish_in_dir(
+    dir: &Path,
+    tmp: &Path,
+    name: &str,
+) -> Result<(PathBuf, String), Response> {
+    let mut target = dir.join(name);
+    let mut final_name = name.to_string();
+    if tokio::fs::try_exists(&target).await.unwrap_or(false) {
+        let (stem, ext) = match name.split_once('.') {
+            Some((s, e)) => (s.to_string(), format!(".{e}")),
+            None => (name.to_string(), String::new()),
+        };
+        let mut available = None;
+        for n in 1..10_000 {
+            let candidate = if n == 1 {
+                format!("{stem} copy{ext}")
+            } else {
+                format!("{stem} copy {n}{ext}")
+            };
+            if !tokio::fs::try_exists(dir.join(&candidate))
+                .await
+                .unwrap_or(true)
+            {
+                available = Some(candidate);
+                break;
+            }
+        }
+        let Some(candidate) = available else {
+            let _ = tokio::fs::remove_file(tmp).await;
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({"error": "no free copy name available"})),
+            )
+                .into_response());
+        };
+        final_name = candidate;
+        target = dir.join(&final_name);
+    }
+    if let Err(err) = tokio::fs::rename(tmp, &target).await {
+        let _ = tokio::fs::remove_file(tmp).await;
+        return Err(internal(&target, "failed to finalize upload", &err.into()));
+    }
+    Ok((target, final_name))
+}
+
+/// The directory a folder upload names, canonical, or the 400 that says why
+/// it cannot take a file.
+pub(super) async fn resolve_upload_dir(raw: &str) -> Result<PathBuf, Response> {
+    let refuse = |message: String| {
+        (StatusCode::BAD_REQUEST, Json(json!({"error": message}))).into_response()
+    };
+    let dir = tokio::fs::canonicalize(raw)
+        .await
+        .map_err(|err| refuse(format!("{raw}: {err}")))?;
+    match tokio::fs::metadata(&dir).await {
+        Ok(meta) if meta.is_dir() => Ok(dir),
+        Ok(_) => Err(refuse(format!("{raw} is not a directory"))),
+        Err(err) => Err(refuse(format!("{raw}: {err}"))),
+    }
+}
+
+/// The request's declared body length, when it sent one.
+fn declared_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(axum::http::header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
+}
+
+/// A byte count the way the UI and the docs write one (`64 MB`, `3.2 GB`;
+/// binary multiples).
+pub(super) fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if bytes < 1024 {
+        return format!("{bytes} bytes");
+    }
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if value >= 100.0 || (value - value.round()).abs() < 0.05 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// Flush `file` to the filesystem and report what that surfaces. A network
+/// filesystem accepts writes into its cache and reports a full disk or an
+/// exceeded quota only here; without it the rename would publish a file
+/// that is shorter than what was sent.
+pub(super) async fn settle(file: &mut tokio::fs::File) -> std::io::Result<()> {
+    file.flush().await?;
+    file.sync_all().await
+}
+
+/// Why writing an upload failed, in words: the two causes a user can act on
+/// are named, anything else keeps the system's own message.
+pub(super) fn write_failure(err: &std::io::Error) -> String {
+    match err.kind() {
+        std::io::ErrorKind::StorageFull => "the destination is out of space".to_string(),
+        std::io::ErrorKind::QuotaExceeded => "the destination is over its disk quota".to_string(),
+        _ => format!("failed to write upload: {err}"),
+    }
 }
 
 #[derive(Deserialize)]
@@ -307,6 +439,7 @@ pub(crate) struct DirUploadQuery {
 pub(crate) async fn upload_to_dir(
     State(state): State<Arc<AppState>>,
     Query(query): Query<DirUploadQuery>,
+    headers: HeaderMap,
     body: Body,
 ) -> Response {
     let Some(name) = sanitize_name(query.name.as_deref().unwrap_or("upload.bin")) else {
@@ -316,22 +449,17 @@ pub(crate) async fn upload_to_dir(
         )
             .into_response();
     };
-    let dir = match tokio::fs::canonicalize(&query.dir).await {
-        Ok(dir) if dir.is_dir() => dir,
-        Ok(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("{} is not a directory", query.dir)})),
-            )
-                .into_response();
-        }
-        Err(err) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("{}: {err}", query.dir)})),
-            )
-                .into_response();
-        }
+    // Refused before a byte is read: a file past the cap otherwise crosses the
+    // whole link first, and the answer can be lost to the reset that follows.
+    if declared_length(&headers).is_some_and(|len| len > MAX_DIR_UPLOAD_BYTES) {
+        return too_large(format!(
+            "{name} is larger than {}, the most one request can carry",
+            human_bytes(MAX_DIR_UPLOAD_BYTES)
+        ));
+    }
+    let dir = match resolve_upload_dir(&query.dir).await {
+        Ok(dir) => dir,
+        Err(refusal) => return refusal,
     };
 
     // Hidden tmp sibling then rename — a partial upload never appears under its
@@ -377,54 +505,20 @@ pub(crate) async fn upload_to_dir(
         if let Err(err) = file.write_all(&chunk).await {
             drop(file);
             let _ = tokio::fs::remove_file(&tmp).await;
-            return internal(&tmp, "failed to write upload", &err.into());
+            return write_refusal(&tmp, &err);
         }
     }
-    if let Err(err) = file.flush().await {
+    if let Err(err) = settle(&mut file).await {
         drop(file);
         let _ = tokio::fs::remove_file(&tmp).await;
-        return internal(&tmp, "failed to flush upload", &err.into());
+        return write_refusal(&tmp, &err);
     }
     drop(file);
 
-    // Never clobber an existing file: a taken name gets a " copy" sibling.
-    let mut target = dir.join(&name);
-    let mut final_name = name.clone();
-    if tokio::fs::try_exists(&target).await.unwrap_or(false) {
-        let (stem, ext) = match name.split_once('.') {
-            Some((s, e)) => (s.to_string(), format!(".{e}")),
-            None => (name.clone(), String::new()),
-        };
-        let mut available = None;
-        for n in 1..10_000 {
-            let candidate = if n == 1 {
-                format!("{stem} copy{ext}")
-            } else {
-                format!("{stem} copy {n}{ext}")
-            };
-            if !tokio::fs::try_exists(dir.join(&candidate))
-                .await
-                .unwrap_or(true)
-            {
-                available = Some(candidate);
-                break;
-            }
-        }
-        let Some(candidate) = available else {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({"error": "no free copy name available"})),
-            )
-                .into_response();
-        };
-        final_name = candidate;
-        target = dir.join(&final_name);
-    }
-    if let Err(err) = tokio::fs::rename(&tmp, &target).await {
-        let _ = tokio::fs::remove_file(&tmp).await;
-        return internal(&target, "failed to finalize upload", &err.into());
-    }
+    let (target, final_name) = match publish_in_dir(&dir, &tmp, &name).await {
+        Ok(published) => published,
+        Err(refusal) => return refusal,
+    };
     // Nudge the git watcher so the tree/panel refetch without polling (same
     // reason the fs mutations do).
     crate::git::mark_path_dirty(&state, &query.dir).await;
@@ -437,7 +531,61 @@ pub(crate) async fn upload_to_dir(
     .into_response()
 }
 
-fn internal(path: &Path, what: &str, err: &anyhow::Error) -> Response {
+/// What a session upload of `size` bytes (when the request declared one) is
+/// refused for before any of it is read: the file-count cap, the per-file
+/// cap, or the room the session has left.
+pub(super) fn session_refusal(
+    name: &str,
+    size: Option<u64>,
+    existing: u64,
+    existing_count: usize,
+) -> Option<Response> {
+    if existing_count >= MAX_SESSION_UPLOAD_FILES {
+        return Some(too_large(format!(
+            "session upload file limit ({MAX_SESSION_UPLOAD_FILES} files) reached"
+        )));
+    }
+    let size = size?;
+    if size > MAX_SESSION_UPLOAD_FILE_BYTES {
+        return Some(too_large(format!(
+            "{name} is {}; a file dropped on a session can be at most {}",
+            human_bytes(size),
+            human_bytes(MAX_SESSION_UPLOAD_FILE_BYTES)
+        )));
+    }
+    if existing.saturating_add(size) > MAX_SESSION_UPLOAD_BYTES {
+        return Some(too_large(format!(
+            "{name} is {} and this session has {} of its {} left for dropped files",
+            human_bytes(size),
+            human_bytes(MAX_SESSION_UPLOAD_BYTES.saturating_sub(existing)),
+            human_bytes(MAX_SESSION_UPLOAD_BYTES)
+        )));
+    }
+    None
+}
+
+pub(super) fn too_large(message: String) -> Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(json!({"error": message})),
+    )
+        .into_response()
+}
+
+/// The answer for a write, flush or sync that failed: 507 with the cause in
+/// words when the filesystem is full or over quota, else a 500.
+pub(super) fn write_refusal(path: &Path, err: &std::io::Error) -> Response {
+    tracing::warn!(path = %path.display(), %err, "failed to write upload");
+    let status = match err.kind() {
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded => {
+            StatusCode::INSUFFICIENT_STORAGE
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, Json(json!({"error": write_failure(err)}))).into_response()
+}
+
+pub(super) fn internal(path: &Path, what: &str, err: &anyhow::Error) -> Response {
     tracing::warn!(path = %path.display(), %err, "{what}");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -620,6 +768,7 @@ fn dir_usage_blocking(dir: &Path) -> (u64, usize) {
 /// a big dir on NFS can stall, and no caller (DELETE, retire, close-all)
 /// should block on it.
 pub(crate) fn prune_session_uploads(state: &Arc<AppState>, session_id: &str) {
+    state.chunked_uploads.forget_session(session_id);
     prune_dir(state.uploads_root.join(session_id));
 }
 
@@ -627,6 +776,7 @@ pub(crate) fn prune_session_uploads(state: &Arc<AppState>, session_id: &str) {
 /// `prune_session_uploads` (kill_all never touches `recents::retire`, so
 /// per-session hooks would miss plain shells).
 pub(crate) fn prune_all_uploads(state: &Arc<AppState>) {
+    state.chunked_uploads.forget_sessions();
     prune_dir(state.uploads_root.clone());
 }
 

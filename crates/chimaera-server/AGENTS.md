@@ -22,7 +22,7 @@ Orientation for coding agents. This crate is the daemon: every HTTP route, every
 | `fs_watch.rs`, `doc_check.rs`, `drafts.rs`, `agent_docs.rs` | Disk monitor; dialect checker; draft mirror; "teach agents" docs. |
 | `proxy.rs`, `browser_open.rs` | Browser-pane reverse proxy; the agent `open_browser` tool. |
 | `agent_browser/` | The agent browser's `browser_*` MCP tools (`tools.rs`) over two engines: the app engine drives a pane view in a connected app window through the `/ws/events` request channel (`app_engine.rs`, `channel.rs`), the Chromium engine a headless browser over `--remote-debugging-pipe` (`chromium.rs`, `cdp.rs`); a file on the host opens as a ticketed `/raw/` page (`file_page.rs`); pages, shared panes, take-over and the reaper in `mod.rs` ([reference](REFERENCE.md#agent_browser), [feature](../../docs/features/agent-browser.md)). |
-| `download.rs`, `upload.rs`, `voice/` | Ticketed downloads; streamed uploads; dictation relay. |
+| `download.rs`, `upload.rs` + `upload/chunked.rs`, `voice/` | Ticketed downloads; streamed uploads (the one-request routes, and the chunked, resumable transport the UI uses: [reference](REFERENCE.md#uploadrs)); dictation relay. |
 | `notices.rs`, `update.rs` | The notice feed; the self-update reporter. |
 | `runtimes.rs`, `runtime_retention.rs`, `agent_updates.rs` | Managed agent runtimes, their cleanup, release awareness. |
 | `environment.rs`, `compute.rs` | Environment preludes; Slurm awareness and `/compute`. |
