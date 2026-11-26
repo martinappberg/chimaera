@@ -799,6 +799,7 @@ events = ["file-saved", "file-changed", "settings-changed", "switched-on", "swit
 id = "document"
 title = "Document"         # required: every view has a name
 slot = "file"
+icon = "book"              # optional: a tab view's glyph, a name from the `icon` node's set
 
 [[files]]                  # files matching `match` open in `view` (Text one click away)
 match = ["*.tex", "*.ltx"] # a pattern without `/` matches the name anywhere; `**` spans folders
@@ -867,16 +868,16 @@ daemon log).
 | `keyvalue` | **`items`**: `[{key, value, tone?}]` |
 | `badge` | **`text`**, `tone` |
 | `status` | **`text`**, `state` (`idle busy ok warn bad`: a spinner for busy, a check for ok), `detail` (muted, beside it) — one pill for a process's state, a build's |
-| `icon` | **`name`** (`check x alert info clock file folder play stop refresh download external grid list book bolt settings search`), `label`, `tone` |
+| `icon` | **`name`** (`check x alert info clock file folder play stop refresh download external grid list book bolt settings search slides`), `label`, `tone` |
 | `progress` | `value` (0–1; absent: indeterminate), `label` |
 | `empty` | **`title`**, `text`, `action` `{label, action, payload}` |
 | `callout` | **`text`**, `title`, `tone`, `actions` (buttons beside it: a notice with its fix) |
-| `list` | **`items`**: `[{title, subtitle?, badges?, actions?: [nodes], action?, payload?, file?, line?}]`; `more` `{query, args}` pages through `query` (it answers `{items, more?}`) |
+| `list` | **`items`**: `[{title, subtitle?, badges?, actions?: [nodes], action?, payload?, file?, line?}]`; `more` `{query, args}` pages through `query` (it answers `{items, more?}`). A row's title runs its `action`, or without one opens its `file`; with both, the title runs the action and the subtitle opens the file |
 | `table` | **`columns`** `[{key, title, align?}]`, **`rows`** `[{<key>: text}]`; `more` as for a list (`{rows, more?}`) |
 | `file` | **`path`** (a workspace path or `output:<path>`), `label`, `line` — a card that opens it |
 | `link` | **`text`**; `href` (http/https, opens outside) or `file` + `line` |
 | `image` | **`src`**, **`alt`** |
-| `slides` | **`slides`**: `[{title, builds: [{src, notes?}], hidden?, notes?, file?, line?, tag?}]` (a build is a picture: a workspace path or `output:<path>`; ≤ 600 slides, 40 builds each); `id` (names the deck: two windows on it keep step in a show), `start` (the title of the slide to open on), `width` + `height` (the slides' shape, 16:9 without), `label` — a deck of pictures you rendered, in the app's slide viewer: the picture in the image viewer (zoom, the area tool that points an agent at part of a slide), a thumbnail strip, keys that walk a slide's builds and then the slides, **@** (the slide's `file` and `line` to an agent), **present** (full screen, a click a build, `hidden` slides skipped) and **presenter** (this slide, the next click, the notes, a timer). Paging is the viewer's own: no action comes back to you. It keeps its place by `title` when you draw again |
+| `slides` | **`slides`**: `[{title, builds: [{src, notes?}], hidden?, notes?, file?, line?, tag?}]` (a build is a picture: a workspace path or `output:<path>`; ≤ 600 slides, 40 builds each); `id` (names the deck: two windows on it keep step in a show), `start` (the title of the slide to open on; a new `startKey` opens on it again, for a "show this slide" action), `width` + `height` (the slides' shape, 16:9 without), `label` — a deck of pictures you rendered, in the app's slide viewer: the picture in the image viewer (zoom, the area tool that points an agent at part of a slide), a thumbnail strip, keys that walk a slide's builds and then the slides, **@** (the slide's `file` and `line` to an agent), **present** (full screen, a click a build, `hidden` slides skipped) and **presenter** (this slide, the next click, the notes, a timer). Paging is the viewer's own: no action comes back to you. It keeps its place by `title` when you draw again |
 | `button` | **`label`**, **`action`**, `payload`, `tone`, `icon`, `disabled`, `title` (its tooltip) |
 | `toggle` | **`label`**, **`name`**, `value`, `action` (sends `{value}` beside the payload) |
 | `select` | **`label`**, **`name`**, **`options`** (`[{value, label}]` or strings), `value`, `action` |

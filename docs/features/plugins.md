@@ -684,6 +684,8 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     the notes, a timer). Open the deck in two windows and they keep step while either is in the
     show: the show on the projector, the presenter's view on the laptop. Paging never calls the
     plugin; the place survives a re-render by the slide's title.
+  - A plugin's tab wears its own glyph when its view names one (`[[views]] icon`, from the same
+    set screens draw icons from, `ui/icons.ts`); without one it wears the Extensions glyph.
   - Code excerpts share the bounded, syntax-highlighted `ExtensionCode` renderer with
     Claude Mods. The existing `ui/1` format, named actions and WASM capabilities stay
     unchanged; [portable Mod authoring](../design/mods-extension-compatibility.md) is a

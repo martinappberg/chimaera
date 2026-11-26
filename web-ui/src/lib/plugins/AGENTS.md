@@ -13,6 +13,9 @@ with four equal segments: **Plugins** · **Connections** · **Skills** · **Brow
 "plugins". Its glyph (2×2 cells, the top-right a plus) is `glyph.ts`, drawn
 only through `ExtensionsGlyph.svelte` by PaneTabs, App's rail row and
 QuickOpen — not in `shared/icons.ts`, which `prebuild` regenerates from Tabler.
+A plugin's own tab wears the icon its view names (`[[views]] icon`, a name
+from `ui/icons.ts`, the set `ui/1` screens draw from) and falls back to that
+glyph.
 
 Agent plugin/skill/connection reports accept namespaced identities and explicit supported
 actions. Never default unknown agents to Codex, synthesize `$skill` syntax for them, or show

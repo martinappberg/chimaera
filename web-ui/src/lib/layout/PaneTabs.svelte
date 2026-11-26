@@ -46,7 +46,7 @@
   import { paneViewsPossible } from "../shared/paneViewRoute";
   import ExtensionsGlyph from "../plugins/ExtensionsGlyph.svelte";
   import { workspacePlugins } from "../plugins/store";
-  import { pluginViewTitle } from "../plugins/platform";
+  import { pluginViewIcon, pluginViewTitle } from "../plugins/platform";
 
   interface Props {
     node: PaneNode;
@@ -913,6 +913,24 @@
             <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
               <title>all sessions</title>
               <path d="M3 4h10M3 8h10M3 12h6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+            </svg>
+          {:else if tab.surface === "plugin" && pluginViewIcon($workspacePlugins?.plugins, tab.plugin, tab.view) !== null}
+            <!-- A plugin tab whose view names an icon wears it (24-unit
+                 Tabler strokes, so 12px keeps the line near the 1.3px of
+                 the glyphs beside it). -->
+            <svg
+              class="glyph plugin-glyph"
+              viewBox="0 0 24 24"
+              width="12"
+              height="12"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2.2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              {#each pluginViewIcon($workspacePlugins?.plugins, tab.plugin, tab.view) ?? [] as d (d)}<path {d} />{/each}
             </svg>
           {:else if tab.surface === "plugins" || tab.surface === "plugin"}
             <!-- Extensions: three cells and a plus (plugins/glyph.ts), at its

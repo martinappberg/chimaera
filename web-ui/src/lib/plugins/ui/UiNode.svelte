@@ -22,6 +22,7 @@
   import DeckNode from "./DeckNode.svelte";
   import Switch from "../../shared/Switch.svelte";
   import FileIcon from "../../shared/FileIcon.svelte";
+  import { pluginIcon, UNKNOWN_ICON } from "./icons";
   import Markdown from "../../chat/Markdown.svelte";
   import ExtensionCode from "../../shared/ExtensionCode.svelte";
   import { openInSystemBrowser } from "../../shared/urlOpen";
@@ -55,28 +56,7 @@
   const t = $derived(tone(node.tone));
   const known = $derived(KNOWN_NODES.has(kind));
 
-  // --- small icon set (semantic names; Tabler-style strokes) ----------------
-  const ICONS: Record<string, string[]> = {
-    check: ["M5 12l5 5l10 -10"],
-    x: ["M18 6l-12 12", "M6 6l12 12"],
-    alert: ["M12 9v4", "M12 16v.01", "M10.363 3.591l-8.106 13.534a1.914 1.914 0 0 0 1.636 2.871h16.214a1.914 1.914 0 0 0 1.636 -2.87l-8.106 -13.536a1.914 1.914 0 0 0 -3.274 0"],
-    info: ["M12 9h.01", "M11 12h1v4h1", "M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0"],
-    clock: ["M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0", "M12 7v5l3 3"],
-    file: ["M14 3v4a1 1 0 0 0 1 1h4", "M17 21h-10a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2h7l5 5v11a2 2 0 0 1 -2 2"],
-    folder: ["M5 4h4l3 3h7a2 2 0 0 1 2 2v8a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2v-11a2 2 0 0 1 2 -2"],
-    play: ["M7 4v16l13 -8z"],
-    stop: ["M5 5h14v14h-14z"],
-    refresh: ["M20 11a8.1 8.1 0 0 0 -15.5 -2m-.5 -4v4h4", "M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4"],
-    download: ["M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2 -2v-2", "M7 11l5 5l5 -5", "M12 4l0 12"],
-    external: ["M12 6h-6a2 2 0 0 0 -2 2v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-6", "M11 13l9 -9", "M15 4h5v5"],
-    grid: ["M4 4h6v6h-6z", "M14 4h6v6h-6z", "M4 14h6v6h-6z", "M14 14h6v6h-6z"],
-    list: ["M9 6l11 0", "M9 12l11 0", "M9 18l11 0", "M5 6l0 .01", "M5 12l0 .01", "M5 18l0 .01"],
-    book: ["M3 19a9 9 0 0 1 9 0a9 9 0 0 1 9 0", "M3 6a9 9 0 0 1 9 0a9 9 0 0 1 9 0", "M3 6l0 13", "M12 6l0 13", "M21 6l0 13"],
-    bolt: ["M13 3l0 7l6 0l-8 11l0 -7l-6 0l8 -11"],
-    settings: ["M10.325 4.317c.426 -1.756 2.924 -1.756 3.35 0a1.724 1.724 0 0 0 2.573 1.066c1.543 -.94 3.31 .826 2.37 2.37a1.724 1.724 0 0 0 1.065 2.572c1.756 .426 1.756 2.924 0 3.35a1.724 1.724 0 0 0 -1.066 2.573c.94 1.543 -.826 3.31 -2.37 2.37a1.724 1.724 0 0 0 -2.572 1.065c-.426 1.756 -2.924 1.756 -3.35 0a1.724 1.724 0 0 0 -2.573 -1.066c-1.543 .94 -3.31 -.826 -2.37 -2.37a1.724 1.724 0 0 0 -1.065 -2.572c-1.756 -.426 -1.756 -2.924 0 -3.35a1.724 1.724 0 0 0 1.066 -2.573c-.94 -1.543 .826 -3.31 2.37 -2.37c1 .608 2.296 .07 2.572 -1.065", "M9 12a3 3 0 1 0 6 0a3 3 0 0 0 -6 0"],
-    search: ["M10 10m-7 0a7 7 0 1 0 14 0a7 7 0 1 0 -14 0", "M21 21l-6 -6"],
-  };
-  const iconOf = (name: unknown): string[] => ICONS[str(name)] ?? ["M12 12m-2 0a2 2 0 1 0 4 0a2 2 0 1 0 -4 0"];
+  const iconOf = (name: unknown): string[] => pluginIcon(name) ?? UNKNOWN_ICON;
 
   // --- actions ---------------------------------------------------------------
   function run(action: unknown, payload: unknown, extra?: { form?: Record<string, unknown>; value?: unknown }): void {
@@ -501,7 +481,17 @@
             {:else}
               <span class="item-title">{str(item?.title)}</span>
             {/if}
-            {#if typeof item?.subtitle === "string"}<span class="item-sub">{item.subtitle}</span>{/if}
+            {#if typeof item?.subtitle === "string"}
+              {#if typeof item.action === "string" && typeof item.file === "string"}
+                <!-- A row with both: its title runs the action, so its
+                     subtitle is the way to the file. -->
+                <button class="item-sub link" onclick={() => run("open-file", { file: item.file, line: item.line })}
+                  >{item.subtitle}</button
+                >
+              {:else}
+                <span class="item-sub">{item.subtitle}</span>
+              {/if}
+            {/if}
           </div>
           {#each Array.isArray(item?.badges) ? (item.badges as Record<string, unknown>[]) : [] as b, j (j)}
             <span class="badge tone-{tone(b?.tone)}">{str(b?.text)}</span>
@@ -1189,6 +1179,10 @@
   }
   .link:hover {
     text-decoration: underline;
+  }
+  .item-sub.link {
+    font-size: var(--text-xs);
+    color: var(--muted);
   }
   .rich {
     /* The app's viewers fill their box absolutely: this is their box. */

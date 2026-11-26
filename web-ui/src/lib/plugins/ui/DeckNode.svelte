@@ -43,17 +43,20 @@
   let at = $state<Place>({ slide: 0, build: 0 });
   /** The slide we stand on, by name: what a re-render is matched against. */
   let standing = "";
-  let startSeen: string | null | undefined;
+  /** The last `start` honoured, with its `startKey`. */
+  let startSeen: string | undefined;
 
-  // The deck changed under us (a re-render), or the plugin names another
-  // slide to open on (`start`): find our place again.
+  // The deck changed under us (a re-render), or the plugin names a slide to
+  // open on (`start`; the same slide again when `startKey` changes): find
+  // our place again.
   $effect(() => {
     const all = slides;
     const start = typeof node.start === "string" ? node.start : null;
+    const asked = JSON.stringify([start, node.startKey ?? null]);
     untrack(() => {
       let next: Place | null = null;
-      if (start !== startSeen) {
-        startSeen = start;
+      if (asked !== startSeen) {
+        startSeen = asked;
         if (start !== null) next = placeOf(all, start, "last");
       }
       next ??= placeOf(all, standing, at.build) ?? clampPlace(all, at);
