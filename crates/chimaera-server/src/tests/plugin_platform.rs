@@ -187,6 +187,7 @@ async fn a_0_2_plugin_draws_every_node_and_acts() {
         "file",
         "link",
         "image",
+        "slides",
         "button",
         "toggle",
         "select",

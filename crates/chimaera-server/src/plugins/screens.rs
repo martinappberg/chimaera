@@ -80,6 +80,7 @@ fn required(node: &str) -> Option<&'static [(&'static str, Kind)]> {
         "file" => &[("path", Str)],
         "link" => &[("text", Str)],
         "image" => &[("src", Str), ("alt", Str)],
+        "slides" => &[("slides", Array)],
         "button" => &[("label", Str), ("action", Str)],
         "toggle" => &[("label", Str), ("name", Str)],
         "select" => &[("label", Str), ("name", Str), ("options", Array)],
@@ -703,6 +704,17 @@ mod tests {
             problems
                 .iter()
                 .any(|p| p.starts_with("root.actions[0].action")),
+            "{problems:?}"
+        );
+
+        // A deck of pictures names its slides.
+        let deck = json!({"ui": "1", "root": {"type": "slides", "slides": [
+            {"title": "One", "builds": [{"src": "output:a.png"}]}]}});
+        assert!(check_tree(&deck.to_string()).is_ok());
+        let no_slides = json!({"ui": "1", "root": {"type": "slides"}});
+        let problems = check_tree(&no_slides.to_string()).unwrap_err();
+        assert!(
+            problems.iter().any(|p| p.starts_with("root.slides")),
             "{problems:?}"
         );
 
