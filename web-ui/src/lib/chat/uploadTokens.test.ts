@@ -147,6 +147,43 @@ describe("a short form is one unit", () => {
     expect(settleEdit("@plot.png", "@plxot.png", 4, tokens)).toEqual({ text: "x", caret: 1 });
   });
 
+  it("puts it back when the system rewrites part of it", () => {
+    const chips: UploadTokens = new Map([
+      ['@term:"zsh"', "@term:s-1234abcd"],
+      ["@plot.png", `@${PAD}/plot.png`],
+    ]);
+    // Smart quotes: the opening quote of a quoted short form turned curly
+    // when the first letter was typed after it. The chip used to vanish,
+    // leaving the curly quote.
+    expect(settleEdit('@term:"zsh" h', '@term:\u201czsh" h', 13, chips)).toEqual({
+      text: '@term:"zsh" h',
+      caret: 13,
+      restored: true,
+    });
+    // Both quotes in one edit.
+    expect(settleEdit('@term:"zsh" ', '@term:\u201czsh\u201d ', 12, chips)).toEqual({
+      text: '@term:"zsh" ',
+      caret: 12,
+      restored: true,
+    });
+    // A spelling correction of a word in the name; the caret was left in it.
+    expect(settleEdit("see @plot.png now", "see @plod.png now", 9, chips)).toEqual({
+      text: "see @plot.png now",
+      caret: 13,
+      restored: true,
+    });
+    // A correction that only adds a letter is one when the browser says so.
+    expect(settleEdit("see @plot.png", "see @ploot.png", 14, chips, true)).toEqual({
+      text: "see @plot.png",
+      caret: 13,
+      restored: true,
+    });
+  });
+
+  it("still takes a whole one that was selected and replaced", () => {
+    expect(settleEdit("see @plot.png now", "see X now", 5, tokens)).toBeNull();
+  });
+
   it("leaves every other edit alone", () => {
     expect(settleEdit("hi @plot.png", "hi@plot.png", 2, tokens)).toBeNull();
     expect(settleEdit("see ", "see @plot.png", 13, tokens)).toBeNull();

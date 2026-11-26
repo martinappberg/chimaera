@@ -6,6 +6,7 @@
    * clipped frame, a click opens the full viewer. The `src` is set only once
    * the card is near the viewport.
    */
+  import type { Attachment } from "svelte/attachments";
   import { cropLayout, frameWidth } from "./embed";
   import type { Region } from "./fragment";
 
@@ -19,9 +20,11 @@
     compact: boolean;
     active: boolean;
     onOpen: () => void;
+    /** Makes the frame a handle on the file (drag, right-click). */
+    grip?: Attachment<HTMLElement>;
   }
 
-  let { url, natural, region, alt, hint, compact, active, onOpen }: Props = $props();
+  let { url, natural, region, alt, hint, compact, active, onOpen, grip }: Props = $props();
 
   /** Tallest a picture is drawn inline / in a compact glance. */
   const MAX_H = 420;
@@ -63,6 +66,7 @@
     style:width={boxWidth !== null ? `${boxWidth}px` : compact ? "100%" : `${Math.round((maxH * 4) / 3)}px`}
     style:aspect-ratio={aspect}
     onclick={onOpen}
+    {@attach grip}
   >
     {#if failed}
       <span class="note">couldn't load this image</span>

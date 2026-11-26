@@ -70,6 +70,7 @@
   path={hit?.path ?? shown}
   {label}
   state={chipState}
+  file={hit?.path ?? null}
   onOpen={onOpen !== undefined ? open : undefined}
   hover={hit !== null && hoverTargets !== undefined ? { targets: hoverTargets, target: { path: hit.path, fragment } } : null}
   name={alt !== "" ? `open ${alt} (${label})` : undefined}

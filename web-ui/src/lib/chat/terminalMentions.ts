@@ -59,7 +59,13 @@ export function terminalDescription(t: TerminalOption, agentId: string | null): 
 }
 
 /** Only explicit IDs are shortened. Typed names retain the daemon's ambiguity checks.
- * Short forms are never reassigned: undo must still refer to the originally picked shell. */
+ * Short forms are never reassigned: undo must still refer to the originally picked shell.
+ *
+ * A short form is `@term:<label>`, the label bare. It is recognized by its
+ * whole text (`tokenSpans`), so a spaced label needs no quotes, and it must
+ * not carry any: macOS turns a straight quote next to typed text into a
+ * curly one (smart quotes are on by default, in the app's web view too),
+ * which rewrote the chip under the user and broke it. */
 export function collapseTerminalMentions(
   text: string,
   terminals: TerminalOption[],
@@ -75,15 +81,14 @@ export function collapseTerminalMentions(
     const old = [...tokens].find(([short, full]) => full === whole && short.startsWith("@term:"));
     let short = old?.[0];
     if (!short) {
-      const name = terminalLabel(terminal, terminals).replace(/["'\r\n]/g, " ").trim() || terminal.id;
-      // Always quote labels: punctuation is part of a name, never a token terminator.
-      short = `@term:"${name}"`;
+      const name = terminalLabel(terminal, terminals).replace(/["'\s]+/g, " ").trim() || terminal.id;
+      short = `@term:${name}`;
       let suffix = 0;
       while (
         (tokens.has(short) && tokens.get(short) !== whole) ||
         tokenSpans(`${context}\n${text}`, new Map([[short, whole]])).length > 0
       ) {
-        short = `@term:"${name} · ${terminal.id}${suffix++ ? ` ${suffix}` : ""}"`;
+        short = `@term:${name} · ${terminal.id}${suffix++ ? ` ${suffix}` : ""}`;
       }
       tokens.set(short, whole);
     }

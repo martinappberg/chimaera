@@ -185,12 +185,13 @@
   // snapshot, not the proxy: it tracks in-place pushes (onPaste mutates) and
   // stores plain data. Reads $state, writes the module map — no read+write
   // loop, no timer.
-  $effect(() => {
+  $effect(() => persistDraft());
+  function persistDraft(): void {
     const text = expandUploadMentions(draft, uploadTokens);
     const imgs = $state.snapshot(images);
     if (sessionId === null) return;
     saveDraft(sessionId, text, imgs);
-  });
+  }
   let el = $state<HTMLTextAreaElement | null>(null);
   let nativeSuggestion = $state("");
   let nativeDecorations = $state<unknown>([]);
@@ -460,6 +461,12 @@
         } else {
           el?.focus();
         }
+        // Saved now, not at the next effect run: the gesture that inserts
+        // often re-tiles the window in the same task (linking a terminal
+        // reveals it beside this chat), which remounts this composer before
+        // its effects run. The next composer reads the saved draft, and the
+        // reference just delivered was missing from it.
+        persistDraft();
       },
       view,
     );
@@ -1006,7 +1013,11 @@
   }
 </script>
 
-<div class="composer" class:visible>
+<!-- `data-drop-band`: the pane's "@ reference" / "link to agent" band grows
+     to hold all of this (layout/dnd.ts `paneBandFraction`).
+     `data-chat-session`: which chat a file shown above belongs to, for its
+     "Reference in chat" (shared/fileHandle.ts `chatSessionOf`). -->
+<div class="composer" class:visible data-drop-band data-chat-session={disabled ? undefined : (sessionId ?? undefined)}>
   <!-- A Stop that would also end subagents or workflows asks once, here by
        the stop control: a press outside, any other key, or the timeout lets
        it go (ChatView owns the state and the polite announcement). -->

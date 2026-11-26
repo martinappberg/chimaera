@@ -10,6 +10,7 @@
 
 import { writable } from "svelte/store";
 import { getHostLabel, getJobContext, getToken } from "./api";
+import type { DroppedPath } from "./localDrop";
 import type { Workspace } from "../workspace/sessions";
 
 interface TauriGlobal {
@@ -325,6 +326,30 @@ export async function copyFileToClipboard(path: string): Promise<boolean> {
     return true;
   } catch {
     return false;
+  }
+}
+
+/**
+ * Where the files of the OS drag that just ended on this window live (see
+ * `localDrop.ts`): the shell's reading of the system drag pasteboard. Empty
+ * in a browser, on a remote window, off macOS, and on any shell error or
+ * malformed answer, so a caller that gets nothing uploads as before.
+ */
+export async function droppedPaths(): Promise<DroppedPath[]> {
+  const t = tauri();
+  if (t === null || !hasLocalFiles()) return [];
+  try {
+    const raw = await t.core.invoke<unknown>("dropped_paths");
+    if (!Array.isArray(raw)) return [];
+    return raw.flatMap((r: unknown): DroppedPath[] => {
+      if (typeof r !== "object" || r === null) return [];
+      const { path, name, size, dir } = r as Record<string, unknown>;
+      return typeof path === "string" && typeof name === "string" && typeof size === "number" && typeof dir === "boolean"
+        ? [{ path, name, size, dir }]
+        : [];
+    });
+  } catch {
+    return [];
   }
 }
 

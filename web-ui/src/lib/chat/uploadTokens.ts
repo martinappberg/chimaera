@@ -174,13 +174,24 @@ function lostTokens(
  * the text it should have become, or null when it is fine as it is. A short
  * form the edit cut into is removed whole (what it had left of it goes too);
  * one the edit glued text onto gets a space after it.
+ *
+ * One edit is not the user's at all: the system replacing text INSIDE a
+ * short form (smart quotes, a spelling correction, a text replacement). The
+ * caret never rests inside one and a selection takes it whole, so nobody
+ * can replace a part of one by hand. Such an edit is undone (`restored`):
+ * the short form goes back as it was, instead of being deleted with the
+ * substituted character left behind in its place. `replacement`: the
+ * browser said so itself (`insertReplacementText`), whatever shape the
+ * change has; otherwise it is recognized by its shape, some of the short
+ * form's own characters swapped for others.
  */
 export function settleEdit(
   before: string,
   after: string,
   caret: number,
   tokens: UploadTokens,
-): { text: string; caret: number } | null {
+  replacement = false,
+): { text: string; caret: number; restored?: true } | null {
   const old = tokenSpans(before, tokens);
   if (old.length === 0) return null;
   // The changed stretch: `before[from, oldEnd)` became `after[from, newEnd)`,
@@ -193,6 +204,27 @@ export function settleEdit(
   while (from < headMax && before[from] === after[from]) from++;
   const oldEnd = before.length - tail;
   const inserted = after.slice(from, after.length - tail);
+
+  // The system rewrote part of a short form: put it back. Read off the
+  // smallest change, wherever the caret is: a substitution happens beside
+  // what was typed, not at it, so the caret-bounded stretch above would
+  // run from the rewritten character to the caret.
+  let end = 0;
+  const endMax = Math.min(before.length, after.length) - from;
+  while (end < endMax && before[before.length - 1 - end] === after[after.length - 1 - end]) end++;
+  const wasEnd = before.length - end;
+  const nowEnd = after.length - end;
+  const inside = old.find((s) =>
+    wasEnd > from
+      ? s.start <= from && wasEnd <= s.end && wasEnd - from < s.end - s.start
+      : replacement && s.start < from && from < s.end,
+  );
+  if (inside !== undefined && nowEnd > from) {
+    // The caret keeps its place in the text; one the rewrite left inside
+    // the short form goes to its end.
+    const at = caret >= nowEnd ? caret - nowEnd + wasEnd : caret;
+    return { text: before, caret: inside.start < at && at < inside.end ? inside.end : at, restored: true };
+  }
 
   // A short form the change reached into without taking whole goes whole.
   let cutFrom = from;
