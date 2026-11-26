@@ -1016,7 +1016,7 @@
 <!-- `data-drop-band`: the pane's "@ reference" / "link to agent" band grows
      to hold all of this (layout/dnd.ts `paneBandFraction`).
      `data-chat-session`: which chat a file shown above belongs to, for its
-     "Reference in chat" (shared/fileHandle.ts `chatSessionOf`). -->
+     "Reference in chat" (shared/fileHandle.ts `referenceScope`). -->
 <div class="composer" class:visible data-drop-band data-chat-session={disabled ? undefined : (sessionId ?? undefined)}>
   <!-- A Stop that would also end subagents or workflows asks once, here by
        the stop control: a press outside, any other key, or the timeout lets

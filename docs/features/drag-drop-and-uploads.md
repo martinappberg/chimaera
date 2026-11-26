@@ -92,7 +92,7 @@ selection references (see [terminals.md](terminals.md)).
   pane it opens there, like a FILES-tree row; it is never moved or copied by a drag. A plain
   click keeps its action (open).
 - **Where it lives.** `shared/fileHandle.ts`: the `fileHandle` attachment (a pointer drag and a
-  context menu on one element), `fileMenuEntries` (the rows, pure), `chatSessionOf` (which chat a
+  context menu on one element), `fileMenuEntries` (the rows, pure), `referenceScope` (which chat a
   surface belongs to, read from the composer's `data-chat-session`), and the host App registers
   (`setFileHandleHost`: `beginDrag` with a file tab and no file-transfer source, and
   `referencePathIn`). Attached by `AttachmentStrip` (sent tiles), `FileChip` (the turn-end line and

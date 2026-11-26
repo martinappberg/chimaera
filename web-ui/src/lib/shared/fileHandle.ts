@@ -46,10 +46,18 @@ export interface HandledFile {
   kind?: PathKind;
 }
 
-/** The chat a surface is shown in, read off the DOM so no component has to
- *  thread a session id down to its tiles: the chat's composer names it. */
-export function chatSessionOf(el: Element | null): string | null {
-  return el?.closest(".chat")?.querySelector<HTMLElement>("[data-chat-session]")?.dataset.chatSession ?? null;
+/**
+ * Where a file shown at `el` is referenced, read off the DOM so no component
+ * has to thread a session id down to its tiles: the chat it is shown in
+ * (its composer names it, `data-chat-session`), `null` for the window's
+ * reference target (a surface outside any chat), or `undefined` when it is
+ * in a chat that takes no input (ended, read-only): a reference made there
+ * must not land in some other agent's draft.
+ */
+export function referenceScope(el: Element | null): string | null | undefined {
+  const chat = el?.closest(".chat") ?? null;
+  if (chat === null) return null;
+  return chat.querySelector<HTMLElement>("[data-chat-session]")?.dataset.chatSession;
 }
 
 /** Label of the menu row that references a file in a chat's input. */
@@ -78,28 +86,28 @@ export function fileMenuEntries(
 /** Whether a file shown at `el` can be referenced: its chat is live, or
  *  (outside a chat) the window has a reference target. */
 export function canReferenceFile(el: Element | null): boolean {
-  return host?.canReference(chatSessionOf(el)) === true;
+  const scope = referenceScope(el);
+  return scope !== undefined && host?.canReference(scope) === true;
 }
 
 /** Type `file`'s mention into the chat `el` is shown in (or the window's
  *  reference target). False when nothing can take it. */
 export function referenceHandledFile(file: HandledFile, el: Element | null): boolean {
-  const sessionId = chatSessionOf(el);
-  if (host === null || !host.canReference(sessionId)) return false;
-  host.reference(file.path, file.kind ?? "file", sessionId);
+  const scope = referenceScope(el);
+  if (host === null || scope === undefined || !host.canReference(scope)) return false;
+  host.reference(file.path, file.kind ?? "file", scope);
   return true;
 }
 
 /** The right-click menu for `file`, opened at `e` (see `fileMenuEntries`). */
 export function openFileMenu(e: MouseEvent, file: HandledFile, el: Element | null): void {
   const kind = file.kind ?? "file";
-  const sessionId = chatSessionOf(el);
   const fromPane = pathPaneFrom(el);
   contextMenu.openAt(
     e,
     fileMenuEntries(
       file,
-      { canReference: host?.canReference(sessionId) === true, reveal: revealEntries(file.path) },
+      { canReference: canReferenceFile(el), reveal: revealEntries(file.path) },
       {
         open: (split) => void openPath(file.path, kind, { split, fromPane }),
         reference: () => void referenceHandledFile(file, el),

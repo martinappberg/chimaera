@@ -1790,7 +1790,13 @@
     let accepted = 0;
     for (const [i, { file, dir }] of picked.entries()) {
       const route = routeDrop(items[i], paths[i], local);
+      // One cap for the gesture, whichever way each file goes.
+      if (route.how !== "refuse" && accepted >= OS_DROP_MAX_FILES) {
+        reportUploadError(`${items[i].name}: skipped (max ${OS_DROP_MAX_FILES} files per drop)`);
+        continue;
+      }
       if (route.how === "reference") {
+        accepted += 1;
         // Already on this computer: nothing is copied. A picture still
         // rides along as pixels in a chat, as an uploaded one does.
         const s = sessionsById.get(sessionId);
@@ -1807,10 +1813,6 @@
         continue;
       }
       if (file === null) continue;
-      if (accepted >= OS_DROP_MAX_FILES) {
-        reportUploadError(`${file.name}: skipped (max ${OS_DROP_MAX_FILES} files per drop)`);
-        continue;
-      }
       accepted += 1;
       // An image dropped on a CHAT pane also attaches its pixels, so the
       // model sees it immediately; the uploaded path stays the durable,
