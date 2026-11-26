@@ -7,6 +7,11 @@
   skipped. **presenter** is the speaker's side of it: this slide, the next
   click, the notes, a timer.
 
+  A build may carry a `clip`, the animation that ends on its picture. The
+  show plays it when a click moves forward onto that build and then holds
+  its last frame; a move back, or a jump, shows the picture. Browsing plays
+  it only from the bar's play button.
+
   Two windows on the same deck keep step while either is presenting or in
   the presenter's view (a BroadcastChannel named for the workspace, plugin
   and the node's `id`): the show on the projector, the presenter's view on
@@ -23,7 +28,7 @@
   import { deckStep, showEdge, showPosition, type Place } from "../../previews/slideShow";
   import { pageVisible } from "../../shared/visibility";
   import type { UiNodeData } from "../platform";
-  import { clampPlace, clockText, notesAt, parseDeck, placeOf, readSync, syncName, type DeckSync } from "./deck";
+  import { clampPlace, clockText, isForward, notesAt, parseDeck, placeOf, readSync, syncName, type DeckSync } from "./deck";
   import { str, useScreen } from "./screen";
 
   let { node }: { node: UiNodeData } = $props();
@@ -89,16 +94,56 @@
     }
   }
 
-  function go(place: Place, tell = true): void {
+  /** The build whose clip is on screen (playing, or held on its last
+   *  frame), and the picture that was there before it, kept under the video
+   *  until its first frame is drawn. */
+  let playing = $state<{ slide: number; build: number; under: string | null; ended: boolean } | null>(null);
+
+  function go(place: Place, tell = true, animate = false): void {
     const next = clampPlace(slides, place);
+    const under = build?.src ?? null;
+    const moved = next.slide !== at.slide || next.build !== at.build;
     at = next;
     standing = slides[next.slide]?.title ?? "";
+    if (moved || !animate) {
+      playing = animate && slides[next.slide]?.builds[next.build]?.clip != null ? { ...next, under, ended: false } : null;
+    }
     if (tell && mode !== "browse") say({ kind: "at", from: me, title: standing, build: next.build });
   }
 
-  /** One click on or back: a show skips hidden slides, browsing doesn't. */
+  /** One click on or back: a show skips hidden slides, browsing doesn't.
+   *  A click on, in the show, plays the build it lands on. */
   function step(delta: 1 | -1): void {
-    go(deckStep(buildCounts, hidden, at, delta, inShow));
+    go(deckStep(buildCounts, hidden, at, delta, inShow), true, delta === 1 && mode === "present");
+  }
+
+  /** Play the clip of the build we stand on (browsing's play button, and
+   *  the show's first build). */
+  function play(): void {
+    if (build?.clip == null) return;
+    playing = { ...at, under: null, ended: false };
+  }
+
+  const clip = $derived(playing !== null && playing.slide === at.slide && playing.build === at.build ? (build?.clip ?? null) : null);
+
+  function clipEnded(): void {
+    if (playing === null || clip === null) return;
+    if (mode !== "present") {
+      // Browsing goes back to the picture, with its zoom and area tool.
+      playing = null;
+      return;
+    }
+    playing.ended = true;
+    if (clip.auto) step(1);
+  }
+
+  function clipReady(e: Event): void {
+    const v = e.currentTarget as HTMLVideoElement;
+    if (clip !== null) v.playbackRate = clip.rate;
+    void v.play().catch(() => {
+      // Refused (a web view that will not autoplay): the picture stays.
+      playing = null;
+    });
   }
 
   function edge(end: "first" | "last"): void {
@@ -118,7 +163,8 @@
         return;
       }
       const place = placeOf(slides, msg.title, msg.build);
-      if (place !== null) go(place, false);
+      // The show follows the presenter's clicker with the same animation.
+      if (place !== null) go(place, false, mode === "present" && isForward(at, place));
     };
     channel = ch;
     // Joining late: line up with whoever is already in the show.
@@ -175,13 +221,15 @@
   $effect(() => {
     pictureError = null;
     want(build?.src);
+    want(build?.clip?.src);
     // The next click's picture is in the cache before it is asked for.
     want(nextBuild?.src);
+    want(nextBuild?.clip?.src);
   });
 
   // Entries for builds the deck no longer has go with them.
   $effect(() => {
-    const live = new Set(slides.flatMap((s) => s.builds.map((b) => b.src)));
+    const live = new Set(slides.flatMap((s) => s.builds.flatMap((b) => (b.clip === null ? [b.src] : [b.src, b.clip.src]))));
     untrack(() => {
       for (const src of Object.keys(urls)) {
         if (!live.has(src)) {
@@ -243,6 +291,7 @@
 
   async function present(): Promise<void> {
     mode = "present";
+    play();
     await tick();
     const el = showEl;
     if (el === null) return;
@@ -258,6 +307,7 @@
 
   async function leave(): Promise<void> {
     if (document.fullscreenElement !== null) await document.exitFullscreen().catch(() => {});
+    playing = null;
     mode = "browse";
     await tick();
     root?.focus();
@@ -266,7 +316,10 @@
   // Leaving full screen by the browser's own key ends the show.
   $effect(() => {
     const onChange = () => {
-      if (document.fullscreenElement === null && mode === "present") mode = "browse";
+      if (document.fullscreenElement === null && mode === "present") {
+        playing = null;
+        mode = "browse";
+      }
     };
     document.addEventListener("fullscreenchange", onChange);
     return () => document.removeEventListener("fullscreenchange", onChange);
@@ -275,6 +328,7 @@
   let started = $state(Date.now());
   let now = $state(Date.now());
   function presenter(): void {
+    playing = null;
     if (mode === "presenter") {
       mode = "browse";
       return;
@@ -392,6 +446,11 @@
       {#if slide?.hidden}<span class="tag" title="a show skips this slide">hidden</span>{/if}
       {#if slide?.tag != null}<span class="tag">{slide.tag}</span>{/if}
       <span class="grow"></span>
+      {#if build?.clip != null && mode === "browse"}
+        <button class="bbtn icon" onclick={play} title="play this build's animation" aria-label="play this build's animation">
+          <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M5 3.2v9.6L12.5 8z" fill="currentColor" /></svg>
+        </button>
+      {/if}
       {#if slide?.file != null}
         <button class="bbtn" onclick={askAgent} disabled={screen.busy} title="point an agent at this slide's code">@</button>
       {/if}
@@ -436,6 +495,11 @@
           <p class="none bad">{pictureError}</p>
         {:else if build === undefined}
           <p class="none">{slide?.title} has no picture.</p>
+        {:else if clip !== null && urls[clip.src] !== undefined}
+          {#key clip.src}
+            <!-- svelte-ignore a11y_media_has_caption — a slide's animation: silent, and its picture carries the alt text -->
+            <video class="clip" src={urls[clip.src]} muted playsinline aria-label={pictureAlt} onloadeddata={clipReady} onended={clipEnded} onerror={() => (playing = null)}></video>
+          {/key}
         {:else if ImageView !== null && paths[build.src] !== undefined}
           <ImageView path={paths[build.src] ?? ""} />
         {/if}
@@ -468,8 +532,21 @@
     {#if mode === "present"}
       <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions, a11y_click_events_have_key_events — the show: a click is the presenter's clicker, the keys are handled beside it -->
       <div class="show" role="document" aria-label="{label}: the show" tabindex="0" bind:this={showEl} onclick={() => step(1)} onkeydown={onKey}>
-        {#if build !== undefined && urls[build.src] !== undefined}
-          <img src={urls[build.src]} alt={pictureAlt} draggable="false" onerror={() => broken(build.src)} />
+        {#if build !== undefined}
+          {@const still = clip !== null && playing !== null && !playing.ended ? playing.under : build.src}
+          {#if still !== null && urls[still] !== undefined}
+            <img src={urls[still]} alt={pictureAlt} draggable="false" onerror={() => broken(still)} />
+          {/if}
+          {#if clip !== null && urls[clip.src] !== undefined}
+            {#key clip.src}
+              <!-- svelte-ignore a11y_media_has_caption — a slide's animation: silent, and its picture carries the alt text -->
+              <video src={urls[clip.src]} muted playsinline loop={clip.loop} onloadeddata={clipReady} onended={clipEnded} onerror={() => (playing = null)}></video>
+            {/key}
+          {/if}
+        {/if}
+        {#if nextBuild?.clip != null && urls[nextBuild.clip.src] !== undefined}
+          <!-- The next click's animation is fetched before it is asked for. -->
+          <video class="warm" src={urls[nextBuild.clip.src]} muted preload="auto" aria-hidden="true" tabindex="-1"></video>
         {/if}
         <span class="show-count">{position.n} / {position.of}</span>
       </div>
@@ -701,12 +778,28 @@
     inset: 0;
     z-index: 1000;
   }
-  .show img {
+  .show img,
+  .show video {
     display: block;
     width: 100%;
     height: 100%;
     object-fit: contain;
     user-select: none;
+  }
+  .show video {
+    position: absolute;
+    inset: 0;
+  }
+  .show video.warm {
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    pointer-events: none;
+  }
+  .stage .clip {
+    width: 100%;
+    object-fit: contain;
+    background: #000;
   }
   .show-count {
     position: absolute;

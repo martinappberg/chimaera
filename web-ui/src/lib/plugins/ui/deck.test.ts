@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { clampPlace, clockText, notesAt, parseDeck, placeOf, readSync, syncName } from "./deck";
+import { clampPlace, clockText, isForward, notesAt, parseDeck, placeOf, readSync, syncName } from "./deck";
 
 const RAW = [
   { title: "Title", file: "deck/slides.py", line: 6, builds: [{ src: "output:d/a.png" }], notes: "Welcome." },
@@ -14,8 +14,8 @@ describe("parseDeck", () => {
     expect(d[0]).toMatchObject({ file: "deck/slides.py", line: 6, hidden: false, tag: null });
     expect(d[1]?.hidden).toBe(true);
     expect(d[1]?.builds).toEqual([
-      { src: "output:d/b0.png", notes: "" },
-      { src: "output:d/b1.png", notes: "Second point." },
+      { src: "output:d/b0.png", notes: "", clip: null },
+      { src: "output:d/b1.png", notes: "Second point.", clip: null },
     ]);
     expect(d[2]).toMatchObject({ tag: "stale", builds: [] });
   });
@@ -23,9 +23,34 @@ describe("parseDeck", () => {
     const d = parseDeck([null, 3, "x", { builds: [{ src: "" }, {}, 7, { src: "p.png" }], line: -2, file: 9 }]);
     expect(d).toHaveLength(1);
     expect(d[0]).toMatchObject({ title: "Slide 1", file: null, line: null });
-    expect(d[0]?.builds).toEqual([{ src: "p.png", notes: "" }]);
+    expect(d[0]?.builds).toEqual([{ src: "p.png", notes: "", clip: null }]);
     expect(parseDeck("nope")).toEqual([]);
     expect(parseDeck(undefined)).toEqual([]);
+  });
+  it("reads a build's animation, and plays a bad one at its own speed", () => {
+    const d = parseDeck([
+      {
+        title: "A",
+        builds: [
+          { src: "a.png", clip: { src: "deck/slides/files/A/1.mp4", loop: true, rate: 2 } },
+          { src: "b.png", clip: { src: "b.mp4", auto: true, rate: 900 } },
+          { src: "c.png", clip: { loop: true } },
+          { src: "d.png", clip: "d.mp4" },
+        ],
+      },
+    ]);
+    expect(d[0]?.builds.map((b) => b.clip)).toEqual([
+      { src: "deck/slides/files/A/1.mp4", loop: true, auto: false, rate: 2 },
+      { src: "b.mp4", loop: false, auto: true, rate: 1 },
+      null,
+      null,
+    ]);
+  });
+  it("knows a move on from a move back", () => {
+    expect(isForward({ slide: 1, build: 0 }, { slide: 1, build: 1 })).toBe(true);
+    expect(isForward({ slide: 1, build: 2 }, { slide: 2, build: 0 })).toBe(true);
+    expect(isForward({ slide: 1, build: 1 }, { slide: 1, build: 1 })).toBe(false);
+    expect(isForward({ slide: 2, build: 0 }, { slide: 1, build: 3 })).toBe(false);
   });
   it("caps a runaway deck", () => {
     const many = Array.from({ length: 2000 }, (_, i) => ({ title: `S${i}`, builds: Array.from({ length: 100 }, () => "p.png") }));

@@ -7,10 +7,23 @@
  */
 import type { Place } from "../../previews/slideShow";
 
+/** A build's animation: a video that ends on the build's picture. */
+export interface DeckClip {
+  /** The video: a workspace path or `output:<path>`. */
+  src: string;
+  /** Plays round until the next click. */
+  loop: boolean;
+  /** The show moves on by itself when it ends. */
+  auto: boolean;
+  /** Playback speed (1 is the clip's own). */
+  rate: number;
+}
+
 export interface DeckBuild {
   /** The picture: a workspace path or `output:<path>`. */
   src: string;
   notes: string;
+  clip: DeckClip | null;
 }
 
 export interface DeckSlide {
@@ -34,6 +47,15 @@ function text(v: unknown, max: number): string {
   return typeof v === "string" ? v.slice(0, max) : "";
 }
 
+function clipOf(raw: unknown): DeckClip | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const c = raw as Record<string, unknown>;
+  const src = text(c.src, 2048);
+  if (src === "") return null;
+  const rate = typeof c.rate === "number" && c.rate >= 0.1 && c.rate <= 8 ? c.rate : 1;
+  return { src, loop: c.loop === true, auto: c.auto === true, rate };
+}
+
 /** The node's `slides`: malformed rows dropped, sizes capped. A slide with
  *  no picture stays (its place in the show is real), with no builds. */
 export function parseDeck(raw: unknown): DeckSlide[] {
@@ -44,10 +66,11 @@ export function parseDeck(raw: unknown): DeckSlide[] {
     const r = row as Record<string, unknown>;
     const builds: DeckBuild[] = [];
     for (const b of Array.isArray(r.builds) ? r.builds.slice(0, DECK_BUILDS_MAX) : []) {
-      if (typeof b === "string" && b !== "") builds.push({ src: b, notes: "" });
+      if (typeof b === "string" && b !== "") builds.push({ src: b, notes: "", clip: null });
       else if (typeof b === "object" && b !== null) {
-        const src = text((b as Record<string, unknown>).src, 2048);
-        if (src !== "") builds.push({ src, notes: text((b as Record<string, unknown>).notes, NOTES_MAX) });
+        const o = b as Record<string, unknown>;
+        const src = text(o.src, 2048);
+        if (src !== "") builds.push({ src, notes: text(o.notes, NOTES_MAX), clip: clipOf(o.clip) });
       }
     }
     const line = typeof r.line === "number" && Number.isInteger(r.line) && r.line > 0 ? r.line : null;
@@ -81,6 +104,11 @@ export function placeOf(slides: readonly DeckSlide[], title: string, build: numb
   if (slide === -1) return null;
   const last = Math.max(0, (slides[slide]?.builds.length ?? 1) - 1);
   return { slide, build: build === "last" ? last : Math.min(Math.max(0, build), last) };
+}
+
+/** Whether `to` is later in the deck than `from`: a move the show animates. */
+export function isForward(from: Place, to: Place): boolean {
+  return to.slide > from.slide || (to.slide === from.slide && to.build > from.build);
 }
 
 /** What the presenter reads at a place: the slide's notes, then the build's. */

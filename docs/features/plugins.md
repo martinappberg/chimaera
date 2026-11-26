@@ -683,7 +683,10 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     PowerPoint viewer: `previews/slideShow.ts`) and **presenter** (this slide, the next click,
     the notes, a timer). Open the deck in two windows and they keep step while either is in the
     show: the show on the projector, the presenter's view on the laptop. Paging never calls the
-    plugin; the place survives a re-render by the slide's title.
+    plugin; the place survives a re-render by the slide's title. A build may carry a `clip`
+    (its animation, a video ending on its picture): the show plays it when a click moves on to
+    that build and holds the last frame, with the next click's clip fetched ahead; a step back
+    shows the picture; browsing plays it from the bar's play button.
   - A plugin's tab wears its own glyph when its view names one (`[[views]] icon`, from the same
     set screens draw icons from, `ui/icons.ts`); without one it wears the Extensions glyph.
   - Code excerpts share the bounded, syntax-highlighted `ExtensionCode` renderer with
