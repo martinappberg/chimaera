@@ -11,6 +11,7 @@
    * visible instead of vanishing.
    */
   import { mayTakeFocus } from "./promptFocus";
+  import { askedText } from "./questionText";
   import type { PendingQuestion } from "./store.svelte";
 
   interface Props {
@@ -205,7 +206,7 @@
       <span class="q-pairs">
         {#each request.questions as q, qi (qi)}
           <span class="q-pair">
-            <span class="q-asked">{q.question}</span>
+            <span class="q-asked">{askedText(q.question)}</span>
             <span class="q-collapse-answer" class:none={chosen(q.id).length === 0}
               >{chosen(q.id).length === 0 ? "not answered" : chosen(q.id).join(", ")}</span
             >
@@ -217,7 +218,7 @@
       {#each request.questions as q, qi (qi)}
         <div class="q">
           {#if request.questions.length > 1}
-            <div class="q-text">{q.question}</div>
+            <div class="q-text">{askedText(q.question)}</div>
           {/if}
           <div class="q-options">
             {#each q.options as opt, oi (oi)}
@@ -246,7 +247,7 @@
             <span class="q-hint">choose any</span>
           {/if}
         </div>
-        <div class="q-text">{q.question}</div>
+        <div class="q-text">{askedText(q.question)}</div>
         <div class="q-options" class:list={described(q)}>
           {#each q.options as opt, oi (oi)}
             <button
