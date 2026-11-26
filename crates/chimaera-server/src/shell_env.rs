@@ -334,9 +334,15 @@ async fn capture(source: &Source, budget: Duration) -> Result<Vec<(String, Strin
         }
         parse_capture(&bytes, &start, &end)
     };
-    tokio::time::timeout(budget, work)
+    let result = tokio::time::timeout(budget, work)
         .await
-        .unwrap_or(Err(CaptureError::Timeout))
+        .unwrap_or(Err(CaptureError::Timeout));
+    if group.0.is_some() {
+        // Not reaped (out of time, or an rc job outlived the answer): end it
+        // the way a probe's shell ends, so no rc tool's lock is left behind.
+        crate::launcher::end_shell_group(group, child);
+    }
+    result
 }
 
 /// The startup files a shell reads, with each one's mtime and size (`None` =

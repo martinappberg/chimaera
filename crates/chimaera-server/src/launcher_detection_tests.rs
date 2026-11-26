@@ -326,6 +326,43 @@ async fn shell_probe_timeout_kills_startup_children_and_does_not_become_a_miss()
     );
 }
 
+/// The pyenv case: an rc tool holds a lock file and removes it in an exit
+/// trap. A shell that ran out of time must be ended so that trap still runs;
+/// an outright SIGKILL left the lock behind and stalled every later shell
+/// start for the tool's own lock timeout.
+#[tokio::test]
+async fn shell_probe_timeout_lets_an_rc_tool_release_its_lock() {
+    let f = Fixture::new();
+    let lock = f.0.join("tool.lock");
+    let tool = f.executable(
+        "rehash",
+        &format!(
+            // HUP named beside EXIT: dash (Linux's /bin/sh) runs an EXIT trap
+            // only on a normal exit, bash (pyenv's shell) also when hung up on.
+            "trap 'rm -f \"{lock}\"; exit 0' HUP EXIT\n: > \"{lock}\"\nwhile :; do /bin/sleep 0.05; done",
+            lock = lock.display()
+        ),
+    );
+    let shell = f.executable("slow-shell", &format!("'{}'", tool.display()));
+    let error = probe_login_shell(shell.to_str().unwrap(), "codex", Duration::from_millis(300))
+        .await
+        .unwrap_err();
+    assert!(error.reason.contains("timed out"));
+    // Held when the probe gave up, released within the grace.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        !lock.exists(),
+        "the rc tool's lock outlived the timed-out shell"
+    );
+    // And nothing of the shell is left once the grace has passed.
+    tokio::time::sleep(SHELL_END_GRACE + Duration::from_millis(400)).await;
+    let alive = std::process::Command::new("/usr/bin/pgrep")
+        .args(["-f", tool.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(alive.stdout.is_empty(), "the rc tool survived the grace");
+}
+
 #[tokio::test]
 async fn shell_probe_caps_noisy_startup_output() {
     let f = Fixture::new();

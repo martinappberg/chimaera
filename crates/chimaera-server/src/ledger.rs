@@ -778,6 +778,22 @@ pub(crate) async fn restore(state: &Arc<AppState>, boot: BootLedger) {
     let restore = crate::lock(&state.settings).restore_sessions();
     let mut respawned = 0usize;
     let mut retired = 0usize;
+    // One patient look for the agents about to come back, started now and
+    // awaited at the first agent: a login shell that is slow right after a
+    // restart (everything starts at once, or an rc tool is waiting on its own
+    // lock) must not retire every chat through a 6 s check each.
+    let mut warm = {
+        let mut kinds = Vec::new();
+        for agent in boot.sessions.iter().filter_map(|e| e.agent.as_ref()) {
+            if restore && !kinds.contains(&agent.kind) {
+                kinds.push(agent.kind);
+            }
+        }
+        (!kinds.is_empty()).then(|| {
+            let state = state.clone();
+            tokio::spawn(async move { crate::launcher::warm_for_restore(&state, kinds).await })
+        })
+    };
     for (done, entry) in boot.sessions.iter().enumerate() {
         // The rest stay pending: the stop's write carries them to the next
         // boot verbatim, and nothing spawns after the stop ends the chats.
@@ -793,6 +809,11 @@ pub(crate) async fn restore(state: &Arc<AppState>, boot: BootLedger) {
         let settled = match plan {
             RestorePlan::Respawn => {
                 let workspace = workspace.expect("plan requires a workspace");
+                if entry.agent.is_some() {
+                    if let Some(warm) = warm.take() {
+                        let _ = warm.await;
+                    }
+                }
                 match respawn(state, entry, workspace).await {
                     // Landed as the stop began: kept pending as well, so the
                     // stop's write keeps what its process owes (`merge_pending`).
