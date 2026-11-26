@@ -253,7 +253,7 @@ which the free plans still have. Once available, the host's account-specific cat
   terminal executable. Which server a chat uses is decided at launch (`launcher.rs`
   `chat_executable`): an explicit `agents.agy.chatPath` wins (the standalone `agy_acp_server.par`
   or an `agy` CLI — told apart by file name, so a wrapper must keep the name); otherwise the
-  CLI's own `agy acp` once the installed agy reports 1.5.15 or newer (it brings plan, auto and
+  CLI's own `agy acp` once the installed agy reports 1.5.15 or newer (verified on 1.5.18; it brings plan, auto and
   accept-edits modes, native question forms and mid-turn messages); otherwise the standalone
   server. Grok uses xAI’s standalone release. Cursor CLI installs the package the
   official installer names (see [Cursor CLI](#cursor-cli)). These two chat/runtime artifacts are

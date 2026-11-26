@@ -2104,3 +2104,25 @@ Entries that matter to a host driving the CLI structurally. Rows without "live" 
 - `just check`: one full run green on the tree before the review fixes (fmt, clippy and every test in both workspaces; its last step, which refuses an uncommitted wire fixture, flagged `chat-events.json` for the new `expires_at_ms` until the fixture was committed with the client change). On the final tree fmt, clippy, the agent crate's tests, the plugins workspace's tests and the fixture guard are green, but three further runs of `cargo test --workspace` each failed one different `chimaera-server` test on a wait (`tests::plugins::agent_plugin_install_ignores_forged_completion_title`, `tests::comms::a_working_chat_hears_it_at_its_next_step_and_its_transcript_shows_it`, `tests::plugin_jobs::a_tool_downloads_checks_unpacks_sets_up_and_runs`) while other sessions' builds held the load average at 14–19; the three passed together alone, five times. None reaches the changed code. `npm --prefix web-ui run check` (0 errors) and `run test` (3212 passed).
 - Live UI (isolated daemon on this branch, the real claude 2.1.332, no turn sent): a fresh Claude chat's composer offered `/goal` and `/xlsx` (the 86th and last catalog entry), and `/claude` listed the account's MCP prompt (`claude.ai <Connector>:<prompt> (MCP)`), which only the `commands_changed` push carries.
 - Pins moved: `TESTED_CLAUDE_VERSION` 2.1.332, `TESTED_CODEX_VERSION` 0.172.0.
+
+## Pass 64 — 2026-11-26: `agy acp` on agy 1.5.18, the automatic switch end to end
+
+The newest agy the managed installer offered was 1.5.18. It was installed through the daemon's own route (`POST /api/v1/agents/agy/install`) into an isolated daemon's managed root (fresh `CHIMAERA_HOME`, no `agents.agy.path` or `chatPath`), sha512-checked by the curated script, and detected as a managed install. It picked up the existing Antigravity sign-in (free tier). Turns ran on Gemini 3.8 Flash, thinking low. Facts are in [acp.md](acp.md).
+
+### Findings
+
+- **Raw protocol unchanged.** `initialize` and `session/new` are identical to 1.5.12 apart from the version string. A raw turn (shell, edit, a two-question `ask_question`) produced the same frames as 1.5.12: `name` + `rawInput` (+ `args`), the "Created At / Completed At / Command exited with code N / Command output:" preamble with `\r\n`, options `allow` / `deny`, the snippet diff only on the permission request's `toolCall.content` (the completed update carries the whole-file diff), and the `q<N>` / `q<N>_other` form with a multi-select array (answers read back). `thought_level` lists only the current model's levels (Flash: no xhigh).
+- **The subagent defect is gone.** Asked to delegate `sleep 10; echo sub-done` and wait, 1.5.18 answered `end_turn` 7 s after the child's command finished, with the child's result; 1.5.12 had answered `end_turn` right after `invoke_subagent` completed. The child's tool calls stream on the parent session as `<child conversation uuid>:call_<n>`, and their permission requests come there too. `invoke_subagent` still completes at dispatch, and its `rawInput` adds `Model` (and `Workspace`) `"inherit"`.
+- **Product path.** With no chatPath, a new Antigravity chat ran `<managed>/agy/1.5.18/bin/agy acp` (child of the daemon) with `AGY_CLI_DISABLE_AUTO_UPDATE=true` in its environment; the daemon logged the expected drift line (detected 1.5.18, tested 1.5.12); the version directory and the binary's sha256 were unchanged after every chat. Over `/ws/chat`: chimaera's `update_plan` → `Plan` events advanced step by step with no row and no approval; `Read: notes.txt`; `ls -la` behind an approval, output without the preamble; `Edit: notes.txt` with its diff on the row before the `PermissionRequest`, then the whole-file diff; a question card answered with typed text ("Chartreuse green" → `q1_other`, restated by the agent); a mid-turn Send during a running command went into the running turn (bubble `sent` at once, one `turn_completed`, the reply followed the steer); a Send while the child's approval was open waited and went after the turn; `SendAfterTurn` ran as the next turn; Send now stopped a running command (`turn_aborted`, row `failed`) and sent the waiting message as a new turn. All 15 agy commands reached the composer catalog after main's Pass 63 change.
+
+### Adopted
+
+- `TESTED_AGY_CLI_VERSION` = 1.5.18. `AGY_CLI_CHAT_MIN` stays 1.5.15: the subagent fix the gate relies on is now verified on 1.5.18 (1.5.15–1.5.17 were not run). No adapter change.
+
+### Not adopted (recorded for later)
+
+- Nesting a subagent's rows under its `Agent:` row and keeping that row running until the child reports: the frames give only the child conversation id prefix, no link to the parent call.
+
+### Gate (Pass 64)
+
+- Live: `CHIMAERA_TEST_AGY_ACP=<managed>/agy/1.5.18/bin/agy cargo test -p chimaera-agent --test acp_live antigravity -- --ignored` passed on this branch before and after merging main (Pass 63).

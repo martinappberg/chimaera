@@ -18,14 +18,14 @@ pub const TESTED_GROK_VERSION: &str = "1.0.70";
 /// agy CLI (`runtimes.rs`), verified by chat-smoke-acp (Pass 59). Not the
 /// CLI's built-in `agy acp`, a different server.
 pub const TESTED_AGY_VERSION: &str = "1.4.5";
-/// The agy CLI whose own `agy acp` server was probed (PROTOCOL.md Pass 62).
-/// Chat prefers it from [`AGY_CLI_CHAT_MIN`] (the daemon's launcher).
-pub const TESTED_AGY_CLI_VERSION: &str = "1.5.12";
+/// The agy CLI whose own `agy acp` server was probed (PROTOCOL.md Pass 62
+/// on 1.5.12, Pass 64 on 1.5.18). Chat prefers it from [`AGY_CLI_CHAT_MIN`]
+/// (the daemon's launcher).
+pub const TESTED_AGY_CLI_VERSION: &str = "1.5.18";
 /// The first agy CLI whose `agy acp` keeps a turn open while a subagent it
 /// started still runs: 1.5.12 ended the turn first, and 1.5.15 fixed it per
-/// agy's changelog — not verified here (1.5.12 was, through an explicit
-/// `agents.agy.chatPath`). Until the pin moves, a 1.5.15+ agy logs the
-/// expected drift line against `TESTED_AGY_CLI_VERSION`.
+/// agy's changelog. Verified live on 1.5.18 (Pass 64: `end_turn` came after
+/// the child reported); 1.5.15–1.5.17 were not run.
 pub const AGY_CLI_CHAT_MIN: (u64, u64, u64) = (1, 5, 15);
 /// `cursor-agent --version` of the build whose `acp` server was probed
 /// (PROTOCOL.md, ACP › Cursor; Pass 59).

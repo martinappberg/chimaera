@@ -89,8 +89,8 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   placeholder names the chord ("add to this turn… · ⌥↩ after it ends"; Esc to stop lives on the
   visible stop button's tooltip). ACP providers queue both send forms for the next turn, with one
   exception: an Antigravity chat served by the CLI's own server (`agy acp`) reads a message sent
-  mid-turn inside the running turn (a second prompt steers it; one sent while an approval is open
-  is refused by agy and waits for the turn to end). Grok, Cursor and Antigravity's standalone
+  mid-turn inside the running turn (a second prompt steers it; one sent while an approval or
+  question is open waits for the turn to end, since agy refuses a prompt then). Grok, Cursor and Antigravity's standalone
   server have no mid-turn input. `socket.send` returns `false` when the socket isn't OPEN, so the
   draft is only cleared on an accepted send — a message during a reconnect window is preserved, not
   lost; reconnect replays the daemon-owned state.
