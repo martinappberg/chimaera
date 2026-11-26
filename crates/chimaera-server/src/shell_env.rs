@@ -284,7 +284,8 @@ async fn capture(source: &Source, budget: Duration) -> Result<Vec<(String, Strin
     let nonce = chimaera_core::generate_token();
     let start = format!("chimaera-env-{nonce}-start");
     let end = format!("chimaera-env-{nonce}-end");
-    let mut child = tokio::process::Command::new(&source.shell)
+    let mut command = tokio::process::Command::new(&source.shell);
+    command
         .arg("-ilc")
         .arg(capture_script(&source.shell, &start, &end))
         .env_clear()
@@ -293,11 +294,11 @@ async fn capture(source: &Source, budget: Duration) -> Result<Vec<(String, Strin
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .process_group(0)
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| CaptureError::Start(e.kind()))?;
-    // Dropped unless the shell is reaped first: an rc's children die with a
-    // capture that timed out or was abandoned.
+        .kill_on_drop(true);
+    crate::launcher::default_signals(&mut command);
+    let mut child = command.spawn().map_err(|e| CaptureError::Start(e.kind()))?;
+    // Dropped unless the shell is reaped first: an rc's children are hung up
+    // on with a capture that was abandoned.
     let mut group = crate::launcher::ShellProbeGroup(
         child.id().map(|pid| nix::unistd::Pid::from_raw(pid as i32)),
     );

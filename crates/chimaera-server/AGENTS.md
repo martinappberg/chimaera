@@ -56,7 +56,7 @@ A chat session's truth spans several `AppState` locks; keep them coherent ([→]
 - **An agent-plugin change clears the probe cache and advances the `agent_plugins` epoch; an explicit refresh never broadcasts** ([→](REFERENCE.md#agent-plugin-change-pushes)).
 - **Auth every new route** ([→](REFERENCE.md#auth-every-new-route)).
 - **Kill-then-respawn is not atomic** ([→](REFERENCE.md#kill-then-respawn)).
-- **A login shell that ran out of time is hung up on, never killed first** (`launcher::end_shell_group`: SIGHUP, a grace, then SIGKILL): an rc tool killed mid-work leaves its lock behind (`pyenv rehash`), and every later shell start waits out the tool's own timeout. A restart's restore asks for its agents once, patiently (`warm_for_restore`) ([→](REFERENCE.md#launcherrs)).
+- **A login shell that ran out of time is hung up on, never killed first** (`launcher::end_shell_group`: SIGHUP, a grace, then SIGKILL; spawned through `default_signals`, since a detached daemon's ignored SIGHUP is inherited): an rc tool killed mid-work leaves its lock behind (`pyenv rehash`), and every later shell start waits out the tool's own timeout. A restart's restore asks for its agents once, patiently (`warm_for_restore`) ([→](REFERENCE.md#launcherrs)).
 - **Chat sessions survive disconnect AND a daemon restart** ([→](REFERENCE.md#chat-sessions-survive-disconnect-and-restart)).
 - **`close-all` / `shutdown` must stop chat drivers too** ([→](REFERENCE.md#close-all-and-shutdown)).
 - **~150 MB RSS, no unbounded buffers, no blocking fs on the reactor (`spawn_blocking`)** ([→](REFERENCE.md#resource-discipline)).

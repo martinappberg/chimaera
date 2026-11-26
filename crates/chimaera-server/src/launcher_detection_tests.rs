@@ -329,38 +329,98 @@ async fn shell_probe_timeout_kills_startup_children_and_does_not_become_a_miss()
 /// The pyenv case: an rc tool holds a lock file and removes it in an exit
 /// trap. A shell that ran out of time must be ended so that trap still runs;
 /// an outright SIGKILL left the lock behind and stalled every later shell
-/// start for the tool's own lock timeout.
+/// start for the tool's own lock timeout. What ignores the hang-up is killed
+/// once the grace is over.
 #[tokio::test]
 async fn shell_probe_timeout_lets_an_rc_tool_release_its_lock() {
     let f = Fixture::new();
     let lock = f.0.join("tool.lock");
+    let took = f.0.join("tool.took-the-lock");
     let tool = f.executable(
         "rehash",
         &format!(
             // HUP named beside EXIT: dash (Linux's /bin/sh) runs an EXIT trap
             // only on a normal exit, bash (pyenv's shell) also when hung up on.
-            "trap 'rm -f \"{lock}\"; exit 0' HUP EXIT\n: > \"{lock}\"\nwhile :; do /bin/sleep 0.05; done",
-            lock = lock.display()
+            "trap 'rm -f \"{lock}\"; exit 0' HUP EXIT\n: > \"{lock}\"\n: > \"{took}\"\nwhile :; do /bin/sleep 0.05; done",
+            lock = lock.display(),
+            took = took.display(),
         ),
     );
-    let shell = f.executable("slow-shell", &format!("'{}'", tool.display()));
-    let error = probe_login_shell(shell.to_str().unwrap(), "codex", Duration::from_millis(300))
-        .await
-        .unwrap_err();
+    let deaf = f.executable(
+        "deaf-daemon",
+        "trap '' HUP\nwhile :; do /bin/sleep 0.05; done",
+    );
+    let shell = f.executable(
+        "slow-shell",
+        &format!("'{}' &\n'{}'", deaf.display(), tool.display()),
+    );
+    let error = probe_login_shell(
+        shell.to_str().unwrap(),
+        "codex",
+        Duration::from_millis(1500),
+    )
+    .await
+    .unwrap_err();
     assert!(error.reason.contains("timed out"));
-    // Held when the probe gave up, released within the grace.
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        took.exists(),
+        "the tool never took its lock: nothing was tested"
+    );
+    let running = |script: &Path| {
+        !std::process::Command::new("/usr/bin/pgrep")
+            .args(["-f", script.to_str().unwrap()])
+            .output()
+            .unwrap()
+            .stdout
+            .is_empty()
+    };
+    // Released within the grace, while what ignores the hang-up still runs.
+    tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(
         !lock.exists(),
         "the rc tool's lock outlived the timed-out shell"
     );
+    assert!(running(&deaf), "the grace was cut short");
     // And nothing of the shell is left once the grace has passed.
     tokio::time::sleep(SHELL_END_GRACE + Duration::from_millis(400)).await;
-    let alive = std::process::Command::new("/usr/bin/pgrep")
-        .args(["-f", tool.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(alive.stdout.is_empty(), "the rc tool survived the grace");
+    assert!(!running(&tool), "the rc tool survived the grace");
+    assert!(
+        !running(&deaf),
+        "a child that ignores the hang-up was never killed"
+    );
+}
+
+/// A daemon started detached ignores SIGHUP, and its children inherit that:
+/// a login shell must start with the default again, or the hang-up that ends
+/// a timed-out one does nothing (a script cannot even trap an inherited
+/// ignore).
+#[tokio::test]
+async fn login_shells_start_with_default_signals_under_a_detached_daemon() {
+    let run = |reset: bool| async move {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("trap 'echo hung-up' HUP; kill -HUP $$; echo done")
+            .stdin(std::process::Stdio::null());
+        // What `serve --daemonize` and `nohup` leave every child with.
+        unsafe {
+            command.pre_exec(|| {
+                use nix::sys::signal::{signal, SigHandler, Signal};
+                let _ = signal(Signal::SIGHUP, SigHandler::SigIgn);
+                Ok(())
+            });
+        }
+        if reset {
+            default_signals(&mut command);
+        }
+        String::from_utf8(command.output().await.unwrap().stdout).unwrap()
+    };
+    assert_eq!(
+        run(false).await.trim(),
+        "done",
+        "the fixture inherits the ignore"
+    );
+    assert_eq!(run(true).await.trim(), "hung-up\ndone");
 }
 
 #[tokio::test]
