@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { compactCount, cronWords, goalLive, jobPeriodMs, scheduleWords, parseGoal, parseSchedule, ringFraction, untilLabel } from "./ahead";
+import { compactCount, cronWords, goalLive, jobEndsAtMs, jobPeriodMs, scheduleWords, parseGoal, parseSchedule, ringFraction, untilLabel } from "./ahead";
 
 describe("ahead", () => {
   it("says when, calmly: minutes, seconds only at the end, a clock time past the hour", () => {
@@ -49,6 +49,19 @@ describe("ahead", () => {
     const done = parseGoal({ objective: "x", status: "complete" });
     expect(goalLive(done)).toBe(false);
     expect(goalLive(parseGoal({ objective: "x" }))).toBe(true);
+  });
+
+  it("ends a recurring job when the agent says, else a week after it was made", () => {
+    const day = 86_400_000;
+    const jobs = parseSchedule({
+      jobs: [
+        { id: "new", cron: "*/5 * * * *", recurring: true, created_at_ms: 1000, expires_at_ms: 1000 + 30 * day },
+        { id: "old", cron: "*/5 * * * *", recurring: true, created_at_ms: 1000 },
+        { id: "once", cron: "30 14 * * *", recurring: false, created_at_ms: 1000, expires_at_ms: 9 },
+        { id: "unknown", cron: "*/5 * * * *", recurring: true },
+      ],
+    }).jobs;
+    expect(jobs.map(jobEndsAtMs)).toEqual([1000 + 30 * day, 1000 + 7 * day, null, null]);
   });
 
   it("counts tokens at a glance", () => {

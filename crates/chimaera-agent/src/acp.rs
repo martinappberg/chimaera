@@ -1656,14 +1656,31 @@ impl Mapper for AcpMapper {
                 });
             }
             "available_commands_update" => {
-                self.commands = unique_rows(&update["availableCommands"], "name")
-                    .take(SLASH_COMMANDS_CAP)
-                    .map(|c| SlashCommand {
-                        name: small(&c["name"]),
-                        description: small(&c["description"]),
-                        skill_path: None,
-                    })
-                    .collect();
+                // Not `unique_rows`: that reads `MAX_CHOICES` (64) rows, the
+                // bound for a picker's choices, and a command list is longer
+                // (Cursor sends about 78). The shared catalog bound applies
+                // instead; the scan itself stops after a few times that.
+                let mut seen = HashSet::new();
+                self.commands = crate::model::cap_slash_catalog(
+                    update["availableCommands"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .take(4 * SLASH_COMMANDS_CAP)
+                        .filter(|c| {
+                            c["name"].as_str().is_some_and(|name| {
+                                !name.is_empty()
+                                    && name.len() <= 128
+                                    && !name.chars().any(char::is_control)
+                                    && seen.insert(name.to_owned())
+                            })
+                        })
+                        .map(|c| SlashCommand {
+                            name: small(&c["name"]),
+                            description: small(&c["description"]),
+                            skill_path: None,
+                        }),
+                );
                 if self.grok_modes {
                     self.list_grok_modes(&mut step);
                     self.resume(&mut step);
@@ -2076,6 +2093,22 @@ mod tests {
         let step = m.on_frame(&json!({"method":"session/update","params":{"sessionId":"session","update":{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"help"},{"name":"help"},{"name":""}]}}}));
         assert_eq!(m.commands.len(), 1);
         assert!(serde_json::to_vec(&step.events[0]).unwrap().len() < 256 * 1024);
+        // A command list is not a 64-row picker: Cursor's ~78 commands all
+        // arrive, and a longer list stops at the shared catalog bound.
+        let listed = |n: usize| -> Vec<Value> {
+            (0..n)
+                .map(|i| json!({"name": format!("command-{i}"), "description": "does a thing"}))
+                .collect()
+        };
+        let update = |list: Vec<Value>| json!({"method":"session/update","params":{"sessionId":"session","update":{"sessionUpdate":"available_commands_update","availableCommands":list}}});
+        m.on_frame(&update(listed(78)));
+        assert_eq!(m.commands.len(), 78);
+        assert_eq!(m.commands[77].name, "command-77");
+        let step = m.on_frame(&update(listed(5000)));
+        assert_eq!(m.commands.len(), crate::model::SLASH_COMMANDS_CAP);
+        for event in &step.events {
+            assert!(serde_json::to_vec(event).unwrap().len() < 256 * 1024);
+        }
         let hostile = "\0".repeat(64 * 1024);
         let content =
             vec![json!({"type":"diff","path":"file","oldText":hostile,"newText":hostile}); 64];

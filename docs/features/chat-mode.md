@@ -168,7 +168,9 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
 - **Autocomplete.** The selected suggestion row leads with a `❯` pointer as well as the highlight,
   so the choice reads without colour (the pointer's slot is always reserved; rows never shift).
   `/` → slash-command popover (native chimaera pickers first, then the CLI's
-  own commands and Codex's enabled skills); `@name` → fuzzy file/dir quick-open; `@term:` → workspace-terminal grants (see
+  own commands and Codex's enabled skills; Claude's list is replaced whenever the CLI pushes a
+  new one, so prompts and skills from MCP servers that connect after start appear, and up to 256
+  commands are kept, where 64 used to cut `/goal` and `/recap` off a long list); `@name` → fuzzy file/dir quick-open; `@term:` → workspace-terminal grants (see
   [linked-terminals.md](linked-terminals.md)). `/rename <name>` pins a session name. `/compact`
   is native for codex (`thread/compact/start`; the compaction runs as its own turn) — claude's
   `/compact` rides its own CLI catalog as prompt text. Manual and automatic compaction on either
@@ -289,7 +291,7 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   focus to the trigger. The agent's *live* catalog (claude `initialize.models` / codex
   `model/list`) beats the daemon's curated list — and once any chat of that agent has handshaked,
   `GET /api/v1/agents` serves that live catalog for launch-time choices too (fallback: `fable`,
-  `opus`, `sonnet`, `haiku`; `gpt-6-astra`, `gpt-5.6-sol`). Claude's bracketed ids (`opus[1m]`,
+  `opus`, `sonnet`, `haiku`; `gpt-6.2-sol`, `gpt-6.1-sol`, `gpt-5.6-sol`). Claude's bracketed ids (`opus[1m]`,
   `claude-fable-5-1[1m]`) are accepted everywhere a model id is. The permission-mode chip is
   seeded at the handshake from `initialize.current_permission_mode` (2.1.259). Effort is per-model (codex falls back to the
   `minimal…xhigh` ladder; **`xhigh` is never relabeled** — canonical vocabulary is sacred).

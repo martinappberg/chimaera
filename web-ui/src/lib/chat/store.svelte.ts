@@ -619,12 +619,17 @@ export interface SlashCommand {
   skill_path?: string;
 }
 
+/** The daemon's bound on a slash catalog (`SLASH_COMMANDS_CAP`): Claude lists
+ * 86 commands on an ordinary account, so the 64 that fits models and modes
+ * cut the end of the list. */
+const SLASH_COMMANDS_CAP = 256;
+
 /** Provider/plugin catalogs can repeat ids. Bound and deduplicate before
  * they reach keyed menus; Init and later catalog updates use the same parser. */
-function catalogRows(value: unknown, key: string): Record<string, unknown>[] {
+function catalogRows(value: unknown, key: string, cap = 64): Record<string, unknown>[] {
   if (!Array.isArray(value)) return [];
   const seen = new Set<string>();
-  return value.slice(0, 64).filter((row): row is Record<string, unknown> => {
+  return value.slice(0, cap).filter((row): row is Record<string, unknown> => {
     if (row === null || typeof row !== "object") return false;
     const id = row[key];
     if (typeof id !== "string" || id.length === 0 || id.length > 512 || seen.has(id)) return false;
@@ -1078,7 +1083,7 @@ export class ChatStore {
     this.modelCatalogReceived = true;
     const label = (value: unknown, fallback = "") => typeof value === "string" ? value.slice(0, 512) : fallback;
     this.modes = catalogRows(ev.modes, "id").map((m) => ({ id: m.id as string, label: label(m.label, m.id as string) }));
-    this.slashCommands = catalogRows(ev.slash_commands, "name").map((c) => ({
+    this.slashCommands = catalogRows(ev.slash_commands, "name", SLASH_COMMANDS_CAP).map((c) => ({
       name: c.name as string, description: label(c.description),
       skill_path: typeof c.skill_path === "string" ? c.skill_path : undefined,
     }));
