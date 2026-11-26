@@ -1370,3 +1370,12 @@ _Captured 2026-11-04 (the maintainer, in the session that built it)._
 - **How settled it is:** the why is settled; which fences qualify, which terminal it picks and how
   the text is typed are additions, free to change if improved.
 - **Do not change (or: open to change):** open to change; nothing about the Run behavior is frozen.
+
+### Approvals, questions, tool rows and the task card that read at a glance — why it exists
+_Captured 2026-11-26 from the maintainer's own words in the session that built it; settled vs. free-to-change is still pending._
+
+- **Why (maintainer, verbatim):** "Agy is becoming MUCH more relvevant … especially AGY, such as when it asks questions or call tools etc. should be updated ? in general the whole chat UI can get a little polish there with tool calls, when checking commands etc. Think of a nice smooth UI for this that makes sense, and that it is easy to follow what is going on (but not crowded when just chatting) similar to how we have it today but polish it and make it nice."
+- **Tool rows (verbatim):** "the commands in the normal chat, like when you are inspecting what it is doing, these are sometimes not clickable, or you cant really see what is going on, in a nice way (for when you're interested)."
+- **Task list (verbatim):** "the TOOLing like the progress task list, is SO bad, like the agents really do not adhere to that for some reason ? it is kinda annoying. Especially on long running tasks. You want to see what is in progress and what it is working on." He showed Claude desktop's pinned task list (filled check, spinner, dashed ring) and said: "I also really like these cards".
+- **Antigravity sends (verbatim):** "Also AGY send now send later etc. is that working as expected ?"
+- _Settled vs. free-to-change, and what must not be "fixed": pending — not yet asked. Choices made without asking, open to change: a permission decision is recorded on its tool row instead of a transcript line; a lone single-choice question is answered by the pick itself; an arriving prompt does not take the keyboard from typing; Antigravity chat moves to `agy acp` only from agy 1.5.15._
