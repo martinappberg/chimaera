@@ -3,11 +3,14 @@
    * "qc.py also edited by 'fix normalization' · 3 min ago" — this live
    * session and another live one in the workspace wrote the same file, the
    * other one recently or in its running turn (`sameFile.svelte.ts`; the
-   * note ages out on its own). Small and warn-toned, the only color it carries;
-   * a click opens the other session. Renders nothing without an overlap, so
-   * a host can mount it unconditionally. Nothing locks.
+   * note ages out on its own). Small, and warn-toned only while it is news
+   * (the writer's running turn, or the first minutes after the write): then
+   * it fades to the quiet tone until it ages out. A click opens the other
+   * session. Renders nothing without an overlap, so a host can mount it
+   * unconditionally. Nothing locks.
    */
   import { pageVisible } from "../shared/visibility";
+  import { sameFileLoud } from "./history";
   import { sameFile } from "./sameFile.svelte";
 
   interface Props {
@@ -30,6 +33,8 @@
     return () => clearInterval(t);
   });
 
+  const loud = $derived(first !== null && sameFileLoud(first, now));
+
   function base(path: string): string {
     return path.split("/").pop() || path;
   }
@@ -50,7 +55,7 @@
 </script>
 
 {#if first !== null}
-  <button class="same-file" {title} onclick={() => sameFile.open(first.other)}>
+  <button class="same-file" class:aged={!loud} {title} onclick={() => sameFile.open(first.other)}>
     {base(first.path)} also edited by ‘{sameFile.nameOf(first.other)}’{ago(first.at)}{#if notes.length > 1}<span
         class="more">+{notes.length - 1}</span
       >{/if}
@@ -73,6 +78,16 @@
     color: var(--warn);
     text-align: left;
     cursor: pointer;
+    transition: color 1.2s ease;
+  }
+  /* No longer news: still there to open, no longer asking to be read. */
+  .same-file.aged {
+    color: var(--muted);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .same-file {
+      transition: none;
+    }
   }
   .same-file:hover {
     text-decoration: underline;

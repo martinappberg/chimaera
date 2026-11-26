@@ -118,9 +118,11 @@ reads an ended session's record; the same-file line rides the claude hook answer
 - Only for two LIVE agent sessions in one workspace, and only while the other session's write is
   news: it wrote the file in the last 15 minutes, or in the turn it is running now. Both sessions
   merely staying open is not news, so the notice ages out on its own (no reload, no poll) and
-  returns when the other session writes the file again. A small warn-toned notice on the dashboard
+  returns when the other session writes the file again. A small notice on the dashboard
   card and on the chat's line just above the input (right side) — "qc.py also edited by 'fix
-  normalization' · 3 min ago". Clicking it opens that session. Never on the rail. The
+  normalization' · 3 min ago" — warn-toned while the write is fresh (the writer's running turn,
+  or the first 3 minutes, `SAME_FILE_LOUD_MS`), then fading to the quiet tone until it ages out.
+  Clicking it opens that session. Never on the rail. The
   `files_touched` lists already on the wire say which sessions overlap (`sameFile.svelte.ts`);
   `GET /workspaces/{id}/same-file` lists the current writes (`at`, and `active` for one made in
   the writer's running turn), fetched only when the overlapping pairs or those sessions' turn
