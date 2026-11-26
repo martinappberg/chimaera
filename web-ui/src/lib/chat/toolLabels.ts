@@ -224,6 +224,44 @@ export function browserTitle(call: BrowserCall, live: boolean): string {
   return call.opened ? `Showed ${what} in a browser pane` : `Didn't open ${what} in a browser pane`;
 }
 
+/** A row's title as its head draws it: the kind of call in the prose face
+ *  (`name`), what it acted on after it (`detail`, in mono when it is a
+ *  path, a pattern, a URL or a command). */
+export interface ToolTitleParts {
+  name: string | null;
+  detail: string;
+  mono: boolean;
+}
+
+/** Kinds whose detail is literal text rather than a sentence. */
+const LITERAL_KINDS = new Set(["execute", "read", "edit", "search", "fetch", "delete", "move"]);
+
+/**
+ * Drivers title a call "Tool: detail" ("Read: calc.py", "Bash: git status").
+ * The head draws the two halves apart, and a command without its tool's
+ * name: the row's mark already says it ran in a shell, and the driver's
+ * whole title stays on hover. Only a title that leads with the call's own
+ * name, or with one capitalised word, splits: a command that merely
+ * contains ": " ("echo a: b") is left whole.
+ */
+export function toolTitleParts(t: { tool: string; title: string; nativeName?: string }, shown: string): ToolTitleParts {
+  // Reworded for reading (agent communication, the browser): one sentence.
+  if (shown !== t.title) return { name: null, detail: shown, mono: false };
+  const mono = LITERAL_KINDS.has(t.tool);
+  const native = t.nativeName ?? "";
+  let name: string | null = null;
+  let detail = shown;
+  if (native !== "" && shown.startsWith(`${native}: `) && shown.length > native.length + 2) {
+    name = native;
+    detail = shown.slice(native.length + 2);
+  } else {
+    const m = /^([A-Z][A-Za-z]{1,19}): (\S[\s\S]*)$/.exec(shown);
+    if (m !== null) [, name, detail] = m;
+  }
+  if (name === null) return { name: null, detail: shown, mono: t.tool === "execute" };
+  return { name: t.tool === "execute" ? null : name, detail, mono };
+}
+
 /** A tool row's title as the card shows it: agent-communication and browser
  *  calls in words, every other tool as the driver titled it. */
 export function readableToolTitle(t: {

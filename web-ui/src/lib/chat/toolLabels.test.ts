@@ -3,6 +3,7 @@ import {
   commsCall,
   commsTitle,
   readableToolTitle,
+  toolTitleParts,
   setAgentNames,
   spanLabel,
   toolDescription,
@@ -348,5 +349,40 @@ describe("a run's elapsed", () => {
     expect(toolSpanMs([{ status: "completed", startedAtMs: 1 }], 5_000)).toBeNull(); // reconciled
     expect(spanLabel(400)).toBeNull();
     expect(spanLabel(null)).toBeNull();
+  });
+});
+
+describe("toolTitleParts", () => {
+  const parts = (tool: string, title: string, nativeName?: string) => toolTitleParts({ tool, title, nativeName }, title);
+
+  it("draws a named call as its name and what it acted on", () => {
+    expect(parts("read", "Read: calc.py", "Read")).toEqual({ name: "Read", detail: "calc.py", mono: true });
+    expect(parts("search", "Grep: def test_", "Grep")).toEqual({ name: "Grep", detail: "def test_", mono: true });
+    // Antigravity's rows are titled by the daemon, not by the call's own name.
+    expect(parts("edit", "Edit: calc.py", "replace_file_content")).toEqual({ name: "Edit", detail: "calc.py", mono: true });
+    expect(parts("agent", "Agent: Reviewer", "Task")).toEqual({ name: "Agent", detail: "Reviewer", mono: false });
+  });
+
+  it("shows a command without its tool's name", () => {
+    expect(parts("execute", "Bash: git status --short", "Bash")).toEqual({
+      name: null,
+      detail: "git status --short",
+      mono: true,
+    });
+    expect(parts("execute", "cargo test -p core")).toEqual({ name: null, detail: "cargo test -p core", mono: true });
+  });
+
+  it("leaves a command that only contains a colon whole", () => {
+    expect(parts("execute", "echo a: b")).toEqual({ name: null, detail: "echo a: b", mono: true });
+    expect(parts("execute", "git commit -m 'fix: x'")).toEqual({ name: null, detail: "git commit -m 'fix: x'", mono: true });
+  });
+
+  it("keeps an unnamed title as one line, in prose unless it is a command", () => {
+    expect(parts("other", "list_issues (github)")).toEqual({ name: null, detail: "list_issues (github)", mono: false });
+    expect(toolTitleParts({ tool: "other", title: "chimaera.workspace_agents" }, "Listed agents")).toEqual({
+      name: null,
+      detail: "Listed agents",
+      mono: false,
+    });
   });
 });

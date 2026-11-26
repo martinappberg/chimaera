@@ -6,7 +6,8 @@
   import DiffView from "./DiffView.svelte";
   import ModelChip from "./ModelChip.svelte";
   import { argRows } from "./toolArgs";
-  import { readableToolTitle, toolDescription } from "./toolLabels";
+  import ToolGlyph from "./ToolGlyph.svelte";
+  import { readableToolTitle, toolDescription, toolTitleParts } from "./toolLabels";
 
   interface Props {
     block: Extract<ChatBlock, { kind: "tool" }>;
@@ -54,22 +55,11 @@
     if (block.status === "failed" && !userToggled) open = true;
   });
 
-  const GLYPHS: Record<string, string> = {
-    execute: "❯",
-    read: "≡",
-    edit: "±",
-    search: "⌕",
-    fetch: "↓",
-    delete: "✕",
-    move: "→",
-    think: "…",
-    agent: "✳",
-    other: "·",
-  };
-  const glyph = $derived(GLYPHS[block.tool] ?? "·");
   /** Agent-communication calls read as what they did ("Message to …");
    *  the driver's own title stays on hover. */
   const shownTitle = $derived(readableToolTitle(block));
+  /** The title's two halves: the call's name in prose, its subject in mono. */
+  const parts = $derived(toolTitleParts(block, shownTitle));
   /** The call's own plain-language description (claude Bash), when the
    *  wire gave one: it leads, the command follows in mono. */
   const described = $derived.by(() => {
@@ -206,15 +196,18 @@
       aria-expanded={hasBody ? open : undefined}
       title={statusTitle}
     >
-      <span class="glyph">{glyph}</span>
+      <span class="glyph"><ToolGlyph kind={block.tool} /></span>
       {#if described !== null && liveLine === null}
         <span class="title described">{described}</span>
-        <span class="cmd" title={block.title}>{shownTitle}</span>
+        <span class="cmd" title={block.title}>{parts.detail}</span>
       {:else}
         <span
           class="title"
           class:with-live={liveLine !== null}
-          title={shownTitle !== block.title ? block.title : undefined}>{shownTitle}</span
+          title={parts.detail !== block.title ? block.title : undefined}
+          >{#if parts.name !== null}<span class="name">{parts.name}</span>{/if}<span class:mono={parts.mono}
+            >{parts.detail}</span
+          ></span
         >
       {/if}
       {#if liveLine !== null}
@@ -310,12 +303,21 @@
     {:else if refusal !== null}
       <span class="refused" class:lapsed={block.decision === "lapsed"} title={block.decisionLabel}>{refusal}</span>
     {/if}
-    <span
-      class="dot"
-      class:run={block.status === "in_progress" || block.status === "pending"}
-      class:ok={block.status === "completed" && !denied}
-      class:bad={block.status === "failed" || denied}
-    ></span>
+    <!-- One slot, one width: a call that ran and was fine says nothing here
+         (it is the expected outcome, and a column of identical marks is
+         noise); a live or failed one shows its dot; the rest show, under
+         the pointer, that the row opens. -->
+    <span class="state">
+      {#if running}
+        <span class="dot run"></span>
+      {:else if block.status === "failed" || denied}
+        <span class="dot bad"></span>
+      {:else if hasBody}
+        <svg class="chev" class:open viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
+          <path d="M5 3l6 5-6 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+      {/if}
+    </span>
   </div>
   {#if open && hasBody}
     <!-- .body scrolls; the wrapper is the non-scrolling anchor the copy
@@ -406,6 +408,8 @@
      error stands out in a long list. */
   .tool {
     overflow: hidden;
+    /* The opened body answers to the row's own width. */
+    container-type: inline-size;
   }
   .tool + :global(.tool) {
     border-top: 1px solid color-mix(in srgb, var(--edge) 40%, transparent);
@@ -486,9 +490,13 @@
     line-height: 1;
   }
   .glyph {
-    color: var(--muted);
-    font-family: var(--mono, monospace);
     flex: none;
+    display: inline-flex;
+    color: var(--muted);
+  }
+  .failed .glyph,
+  .denied .glyph {
+    color: color-mix(in srgb, var(--err) 75%, var(--muted));
   }
   .title {
     flex: 1;
@@ -496,6 +504,13 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  /* "Read  calc.py": the kind of call steps back, its subject carries. */
+  .name {
+    margin-right: 7px;
+    color: var(--muted);
+  }
+  .mono {
     font-family: var(--mono, monospace);
   }
   /* A described call: the agent's words lead in the prose face, the
@@ -503,7 +518,6 @@
   .title.described {
     flex: 0 1 auto;
     max-width: 65%;
-    font-family: inherit;
   }
   .cmd {
     flex: 1;
@@ -549,6 +563,34 @@
   .refused.lapsed {
     color: var(--muted);
   }
+  .state {
+    flex: none;
+    display: inline-grid;
+    place-items: center;
+    width: 12px;
+    height: 12px;
+  }
+  .chev {
+    color: var(--muted);
+    opacity: 0;
+    transition:
+      opacity 0.12s ease,
+      transform 0.12s ease;
+  }
+  .chev.open {
+    opacity: 1;
+    transform: rotate(90deg);
+  }
+  .head:hover .chev,
+  .expand:focus-visible ~ .state .chev {
+    opacity: 1;
+  }
+  /* No pointer to hover with: the row always shows that it opens. */
+  @media (hover: none) {
+    .chev {
+      opacity: 1;
+    }
+  }
   .dot {
     flex: none;
     width: 7px;
@@ -559,13 +601,6 @@
   .dot.run {
     background: var(--accent);
     animation: pulse 1.4s ease-in-out infinite;
-  }
-  /* Settled and fine is the expected outcome: a quiet ring in the finished
-     rows' check colour — a different shape from the solid live dot, so the
-     two read apart even with the pulse off (reduced motion). */
-  .dot.ok {
-    background: none;
-    box-shadow: inset 0 0 0 1.5px var(--done-quiet);
   }
   .dot.bad {
     background: var(--err);
@@ -578,18 +613,31 @@
       animation: none;
       opacity: 0.55;
     }
+    .chev {
+      transition: none;
+    }
   }
   .failed,
   .denied {
     box-shadow: inset 2px 0 0 color-mix(in srgb, var(--err) 60%, transparent);
   }
+  /* The opened row: one framed panel under the row's words (past its
+     mark), holding what was asked and what came back. */
   .body-wrap {
     position: relative;
+    margin: 1px 10px 8px 32px;
+  }
+  @container (max-width: 420px) {
+    .body-wrap {
+      margin-left: 10px;
+    }
   }
   .body {
-    border-top: 1px solid var(--edge);
-    padding: 6px 10px;
-    max-height: 260px;
+    border: 1px solid color-mix(in srgb, var(--edge) 80%, transparent);
+    border-radius: 7px;
+    background: color-mix(in srgb, var(--fg) 2.5%, transparent);
+    padding: 8px 10px;
+    max-height: 280px;
     overflow: auto;
     scrollbar-width: thin;
     scrollbar-color: color-mix(in srgb, var(--fg) 22%, transparent) transparent;
@@ -628,9 +676,9 @@
      arguments — then the result, set apart by a hairline. */
   .command,
   .args {
-    margin: 0 0 6px;
-    padding-bottom: 6px;
-    border-bottom: 1px solid color-mix(in srgb, var(--edge) 50%, transparent);
+    margin: 0 0 8px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid color-mix(in srgb, var(--edge) 60%, transparent);
   }
   .command:last-child,
   .args:last-child {
@@ -639,7 +687,7 @@
     border-bottom: none;
   }
   .prompt {
-    color: var(--muted);
+    color: var(--accent-text, var(--accent));
     user-select: none;
   }
   .args {
@@ -664,6 +712,7 @@
   pre {
     margin: 0;
     font-size: var(--text-sm);
+    line-height: 1.5;
     font-family: var(--mono, monospace);
     white-space: pre-wrap;
     word-break: break-word;
