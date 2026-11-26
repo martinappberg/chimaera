@@ -68,6 +68,9 @@
   import { chipLabels, embedsAsChip } from "./artifacts";
   import { refFragment, type HoverTargets } from "./hoverTargets";
   import { linkReferences, referenceMatcher, referenceSources } from "../shared/references";
+  // Registers the agents' reference source (an `@agent:` id in prose reads
+  // as that agent's tag) before any prose here is linked.
+  import "./agentMentions";
   import ProseChip from "./ProseChip.svelte";
   import type { Reveal } from "../shared/reveal";
   import { openPath } from "../shared/openPath";

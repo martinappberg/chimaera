@@ -195,7 +195,10 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   band holds all of it): an **"@ reference in ⟨session⟩"** band (a file
   *or folder* drag types its path into a live session — see
   [drag-drop-and-uploads.md](drag-drop-and-uploads.md), which also covers OS-desktop file drops
-  and screenshot paste) and a **"link to ⟨agent⟩"** band (a terminal drag leashes it — see
+  and screenshot paste; an agent's tab or rail row dragged over another live agent's pane arms
+  the same band there and types its `@agent:` reference, see
+  [agent-communication.md](agent-communication.md#referencing-an-agent-in-a-message)) and a
+  **"link to ⟨agent⟩"** band (a terminal drag leashes it — see
   [linked-terminals.md](linked-terminals.md)). **Every preview says what it does**: zone previews
   carry a centred label (`split left/right/up/down`, `add to this pane`), the window-edge preview
   says `split window ⟨side⟩`, and the drag ghost's hint names the hovered spot in the same words

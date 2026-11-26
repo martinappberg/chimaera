@@ -117,6 +117,10 @@ selection references (see [terminals.md](terminals.md)).
   `data-drop-band`; `Pane.svelte` draws the wash with the same share). A release anywhere on the
   composer therefore references; with a fixed share the top of a tall composer was the "add to
   this pane" zone.
+- **An agent is a reference too.** An agent's tab or rail row dragged over another agent's pane
+  arms the same band there (never on its own pane, never on a shell); the drop types
+  `@agent:<session id>` and rearranges nothing
+  ([agent-communication.md](agent-communication.md#referencing-an-agent-in-a-message)).
 - **A drop is not a click.** The browser makes a click of the release that ends a drag, on the
   element that captured the pointer (Chromium and the native app's WebKit alike). A tab dropped on the band was referenced and then activated by
   its own click handler, and a linked terminal's rail row took the focus the link had handed the

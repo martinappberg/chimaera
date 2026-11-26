@@ -98,9 +98,11 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   `knowledge_search` · `knowledge_get` for every agent here), **LaTeX** and **Typst**
   ([below](#programs-and-tools-the-privileged-tier)), and **PowerPoint** (`render_slides` shows
   agents their slides, `check_deck` finds layout problems, and plain themes or the user's own),
-  and **Chromium** (a headless `chrome-headless-shell` for the
+  **Chromium** (a headless `chrome-headless-shell` for the
   [agent browser](agent-browser.md#engines-and-how-one-is-chosen) on a host with none, downloaded
-  only from its Tools' Install). The daemon carries none of them: each is
+  only from its Tools' Install), and **Manimble** (a Manimble deck's slides beside its code in the
+  [slide viewer for plugin decks](#plugin-screens-files-and-settings-the-02-platform), and `manimble_slides`
+  shows agents the slides they write). The daemon carries none of them: each is
   listed as *available* until the user installs it on this host
   ([below](#versions-installs--updates)).
 - **How it's used.** Open Extensions from the rail's **Extensions** row or quick-open
@@ -248,7 +250,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     in separate repositories and install from locked releases; the daemon carries no plugin
     bytes. Capability trust, both WIT worlds, plugin screens and file views, query routes,
     switch events, program jobs and tool downloads are implemented (sections below).
-    LaTeX, Typst and PowerPoint use the 0.2 platform. **Browse** remains disabled, "later".
+    LaTeX, Typst, PowerPoint, Chromium and Manimble use the 0.2 platform. **Browse** remains disabled, "later".
 
 ## The plugin host
 
@@ -716,7 +718,8 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   can run. The host runs them as **jobs** under fixed limits, and downloads a **tool** only
   when you click Install. The locked first-party LaTeX and Typst plugins use this tier
   for document compilation, diagnostics, and agent compilation tools; PowerPoint uses it to
-  render slides with LibreOffice.
+  render slides with LibreOffice, and Manimble to render a deck with the Manimble engine on
+  the host.
 - **How to use.** Such a plugin's card says **runs programs** and lists every program under
   **Can** ("Runs latexmk"; a shell gets "Runs sh: this plugin can run any command on this
   host"; a program that reaches the network says so: "tlmgr uses the network: CTAN mirrors"). Before install, **Downloads** says what its tools would fetch and from where ("TeX

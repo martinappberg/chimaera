@@ -48,6 +48,16 @@
 
   import { collapseTerminalMentions, terminalDescription, terminalLabel, type TerminalOption } from "./terminalMentions";
   import TerminalIcon from "../shared/TerminalIcon.svelte";
+  import SessionGlyph from "../shared/SessionGlyph.svelte";
+  import {
+    agentLabel,
+    agentMatches,
+    agentReference,
+    collapseAgentMentions,
+    mentionableAgents,
+    mentionChoices,
+    type AgentOption,
+  } from "./agentMentions";
   import { termReference } from "../workspace/agentLinks";
 
   interface Props {
@@ -146,8 +156,12 @@
    *  the send, a copy, and the saved draft. */
   const uploadTokens: UploadTokens = new Map();
   function collapseMentions(text: string, context = ""): string {
-    return collapseTerminalMentions(collapseUploadMentions(text, uploadTokens, context), terminals, uploadTokens, context);
+    const files = collapseUploadMentions(text, uploadTokens, context);
+    const shells = collapseTerminalMentions(files, terminals, uploadTokens, context);
+    return collapseAgentMentions(shells, $mentionableAgents, uploadTokens, context);
   }
+  /** The other live agents of this workspace: who `@agent:` can name. */
+  const agentChoices = $derived(mentionChoices($mentionableAgents, sessionId, workspaceId));
   let draft = $state(collapseMentions(savedDraft.text));
   let images = $state<ImageAttachment[]>(savedDraft.images.slice(0, IMAGE_MAX_ATTACHMENTS));
   let attachmentError = $state<string | null>(null);
@@ -723,8 +737,9 @@
       return;
     }
     fileToken = token;
-    // @term: tokens complete against workspace terminals, not files.
-    if (token.text === "@term" || token.text.startsWith("@term:")) {
+    // @term: and @agent: tokens complete against the workspace's sessions,
+    // not files.
+    if (isSessionToken(token.text, "term") || isSessionToken(token.text, "agent")) {
       fileMatches = [];
       return;
     }
@@ -748,10 +763,22 @@
     };
   });
 
+  /** `@term` / `@term:…`, `@agent` / `@agent:…`: a session picker's token. */
+  function isSessionToken(text: string, kind: "term" | "agent"): boolean {
+    return text === `@${kind}` || text.startsWith(`@${kind}:`);
+  }
+
+  /** @agent: mentions — another agent of this workspace, by id. */
+  const agentRows = $derived.by(() => {
+    const token = fileToken;
+    if (token === null || !isSessionToken(token.text, "agent")) return [];
+    return agentMatches(agentChoices, token.text.slice("@agent:".length));
+  });
+
   /** @term: mentions — Chimaera's linked-terminal grants. */
   const termMatches = $derived.by(() => {
     const token = fileToken;
-    if (token === null || !(token.text === "@term" || token.text.startsWith("@term:"))) return [];
+    if (token === null || !isSessionToken(token.text, "term")) return [];
     const q = token.text.slice(6).toLowerCase();
     return terminals.filter((t) => `${t.name} ${t.id} ${t.cwd ?? ""}`.toLowerCase().includes(q))
       .toSorted((a, b) => Number(b.linkedAgentId === sessionId) - Number(a.linkedAgentId === sessionId)).slice(0, 8);
@@ -760,9 +787,11 @@
   const popover = $derived(
     slashMatches.length > 0
       ? "slash"
-      : fileToken !== null && (fileToken.text === "@term" || fileToken.text.startsWith("@term:"))
+      : fileToken !== null && isSessionToken(fileToken.text, "term")
         ? "term"
-        : fileMatches.length > 0
+        : fileToken !== null && isSessionToken(fileToken.text, "agent")
+          ? "agent"
+          : fileMatches.length > 0
           ? "file"
           : null,
   );
@@ -773,6 +802,7 @@
     void popover;
     void slashMatches.length;
     void termMatches.length;
+    void agentRows.length;
     void fileMatches.length;
     selected = 0;
   });
@@ -780,7 +810,7 @@
   let terminalPopover = $state<HTMLDivElement | null>(null);
   $effect(() => {
     const menu = terminalPopover;
-    if (!menu || popover !== "term" || !visible) return;
+    if (!menu || (popover !== "term" && popover !== "agent") || !visible) return;
     const row = menu.querySelector<HTMLElement>(`[id="${uid}-opt-${selected}"]`);
     if (!row) return;
     if (row.offsetTop < menu.scrollTop) menu.scrollTop = row.offsetTop;
@@ -842,6 +872,12 @@
     const token = fileToken;
     const rest = token === null ? draft : draft.slice(0, token.start) + draft.slice(token.start + token.text.length);
     replaceToken(`${collapseMentions(termReference(t.id), rest)} `);
+  }
+
+  function pickAgent(a: AgentOption) {
+    const token = fileToken;
+    const rest = token === null ? draft : draft.slice(0, token.start) + draft.slice(token.start + token.text.length);
+    replaceToken(`${collapseMentions(agentReference(a.id), rest)} `);
   }
 
   function replaceToken(replacement: string) {
@@ -930,17 +966,24 @@
           ? slashMatches.length
           : popover === "term"
             ? termMatches.length
+            : popover === "agent"
+              ? agentRows.length
             : fileMatches.length;
       if (e.key === "ArrowDown" || e.key === "ArrowUp") {
         e.preventDefault();
         if (items > 0) selected = (selected + (e.key === "ArrowDown" ? 1 : items - 1)) % items;
         return;
       }
-      if (e.key === "Tab" || e.key === "Enter") {
+      // Nothing to pick from an agent picker (no other agent here, or none
+      // matching): the key is the composer's, so `@agent` typed as a word
+      // still sends.
+      const pickable = !(popover === "agent" && items === 0);
+      if (pickable && (e.key === "Tab" || e.key === "Enter")) {
         e.preventDefault();
         if (items === 0) return;
         if (popover === "slash") pickSlash(slashMatches[selected]);
         else if (popover === "term") pickTerm(termMatches[selected]);
+        else if (popover === "agent") pickAgent(agentRows[selected]);
         else pickFile(fileMatches[selected]);
         return;
       }
@@ -1076,6 +1119,29 @@
         </button>
       {/each}
     </div>
+  {:else if popover === "agent"}
+    <!-- Another agent of this workspace, named by id in what is sent (the
+         agents' own tools address each other by it). -->
+    <div class="overlay-surface pop terminal-pop quiet-scrollbar" bind:this={terminalPopover} id="{uid}-pop" role="listbox" aria-label="agents">
+      <div class="terminal-picker-heading">Reference an agent</div>
+      {#if agentRows.length === 0}<div class="terminal-empty">{agentChoices.length === 0 ? "No other agents in this workspace." : "No matching agents."}</div>{/if}
+      {#each agentRows as a, i (a.id)}
+        <button
+          class="overlay-row pop-row"
+          class:sel={i === selected}
+          id={`${uid}-opt-${i}`}
+          role="option"
+          aria-selected={i === selected}
+          onclick={() => pickAgent(a)}
+        >
+          <span class="pop-ptr" aria-hidden="true">❯</span>
+          <SessionGlyph kind="agent" agentKind={a.agentKind} size={16} />
+          <span class="terminal-choice">
+            <span class="terminal-choice-top"><span>{agentLabel(a, $mentionableAgents)}</span>{#if a.status}<span class="terminal-state">{a.status}</span>{/if}</span>
+          </span>
+        </button>
+      {/each}
+    </div>
   {:else if popover === "file"}
     <div class="overlay-surface pop" id="{uid}-pop" role="listbox" aria-label="files and folders">
       {#each fileMatches as entry, i (entry.path)}
@@ -1193,7 +1259,7 @@
       aria-expanded={popover !== null}
       aria-controls="{uid}-pop"
       aria-autocomplete="list"
-      aria-activedescendant={popover !== null && (popover !== "term" || termMatches.length > 0) ? `${uid}-opt-${selected}` : undefined}
+      aria-activedescendant={popover !== null && (popover !== "term" || termMatches.length > 0) && (popover !== "agent" || agentRows.length > 0) ? `${uid}-opt-${selected}` : undefined}
       class:voice={voiceOn}
       class:dictating={spoken !== null}
       class:mod-decorated={hasNativeDecorations && spoken === null}

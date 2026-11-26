@@ -43,6 +43,12 @@ export interface RefTarget {
   base?: string | null;
   /** One line above the preview ("F-228 · finding · 2026-09-28"). */
   note?: string;
+  /** What the chip reads in place of the id as written: a name the id
+   *  stands for (an agent's, for its session id). The id stays in the
+   *  chip's tooltip. Absent, the chip reads the id. */
+  label?: string;
+  /** A 16×16 stroked mark drawn before the label (a session's glyph). */
+  icon?: { d: string; stroke: number };
   open: (from: OpenFrom) => void;
 }
 
@@ -60,7 +66,16 @@ export interface RefSource {
   /** The targets `id` names. `kind` is the shape it matched; `near` is the
    *  source's own context (Knowledge: the citing entry), for narrowing a
    *  reused id. */
-  lookup: (id: string, kind: string, near?: unknown) => RefTarget[];
+  lookup: (id: string, kind: string, near?: unknown, at?: RefSite) => RefTarget[];
+}
+
+/** Where in a run of text an id was found, for a source whose ids also
+ *  occur inside other things (a session id as a folder name in a path):
+ *  `text.slice(index, index + id.length)` is the id. Absent when the id is
+ *  all there is (`resolveReference`). */
+export interface RefSite {
+  text: string;
+  index: number;
 }
 
 const sources = writable<Map<string, RefSource>>(new Map());
@@ -196,6 +211,25 @@ export function referenceHoverTarget(targets: readonly RefTarget[]): HostTarget 
 
 const SKIP = new Set(["A", "PRE", "SCRIPT", "STYLE", "TEXTAREA", "BUTTON", "INPUT", "SVG"]);
 
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+/** A tag chip's mark, built by hand like the chip itself (this module makes
+ *  DOM for hosts that render HTML strings). Drawn in the chip's own color. */
+function tagIcon(icon: { d: string; stroke: number }): SVGSVGElement {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("viewBox", "0 0 16 16");
+  svg.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS(SVG_NS, "path");
+  path.setAttribute("d", icon.d);
+  path.setAttribute("fill", "none");
+  path.setAttribute("stroke", "currentColor");
+  path.setAttribute("stroke-width", String(icon.stroke));
+  path.setAttribute("stroke-linecap", "round");
+  path.setAttribute("stroke-linejoin", "round");
+  svg.append(path);
+  return svg;
+}
+
 /**
  * Turn resolvable ids in `root`'s text into chips (`span.kchip`, focusable,
  * role link), registered in `chips`. Text inside links, code blocks,
@@ -225,6 +259,10 @@ export function linkReferences(
     let m: RegExpExecArray | null;
     let last = 0;
     const frag = document.createDocumentFragment();
+    // Inline code this text sits in, if any: a tag replaces what was written
+    // with a name, and code is read as written.
+    const code = node.parentElement?.closest("code") ?? null;
+    let quoted: HTMLElement | null = null;
     while ((m = matcher.re.exec(text)) !== null) {
       const id = m[0];
       if (id === "") {
@@ -234,20 +272,41 @@ export function linkReferences(
       const g = m.slice(1).findIndex((x) => x !== undefined);
       const group = matcher.groups[g];
       if (group === undefined) continue;
-      const found = group.source.lookup(id, group.kind, near);
+      const found = group.source.lookup(id, group.kind, near, { text, index: m.index });
       if (found.length === 0) continue;
+      if (code !== null && found[0].label !== undefined) {
+        // Left alone inside code (`message_agent to=s-…` stays a command),
+        // unless the id is all the code there is: an id put in backticks
+        // names the thing, and reads as its tag in place of the code span.
+        if (code.textContent?.trim() !== id || !root.contains(code) || code === root) continue;
+        quoted = code;
+      }
       if (m.index > last) frag.append(text.slice(last, m.index));
       const chip = document.createElement("span");
       chip.className = "kchip";
       chip.setAttribute("role", "link");
       chip.tabIndex = 0;
-      chip.textContent = id;
+      const named = found[0];
+      if (named.label === undefined) {
+        chip.textContent = id;
+      } else {
+        // A tag: the name the id stands for, the id itself on hover.
+        chip.classList.add("ktag");
+        chip.title = id;
+        if (named.icon !== undefined) chip.append(tagIcon(named.icon));
+        chip.append(named.label);
+      }
       chips.set(chip, found);
       frag.append(chip);
       last = m.index + id.length;
       made++;
     }
     if (last === 0) continue;
+    if (quoted !== null) {
+      const chip = frag.querySelector(".kchip");
+      if (chip !== null) quoted.replaceWith(chip);
+      continue;
+    }
     if (last < text.length) frag.append(text.slice(last));
     node.replaceWith(frag);
   }

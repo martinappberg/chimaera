@@ -289,6 +289,11 @@ async fn workspace_agents_and_addressing() {
             serde_json::json!({"to": a, "text": "hi"}),
             "that session is you",
         ),
+        // The user's `@agent:` mention, passed as it was written.
+        (
+            serde_json::json!({"to": format!("@agent:{a}"), "text": "hi"}),
+            "that session is you",
+        ),
         (
             serde_json::json!({"to": b, "text": "  "}),
             "missing required argument: text",
@@ -313,6 +318,26 @@ async fn workspace_agents_and_addressing() {
         let (is_err, text) = send(&state, &a, "ka", args).await;
         assert!(is_err && text.contains(needle), "{needle}: {text}");
     }
+
+    // read_agent and message_agent take the mention form of a real target.
+    let mention = format!("@agent:{b}");
+    let (is_err, text) = mcp_tool_call(
+        &state,
+        &a,
+        "ka",
+        "read_agent",
+        serde_json::json!({"agent": mention}),
+    )
+    .await;
+    assert!(!is_err, "{text}");
+    let (is_err, text) = send(
+        &state,
+        &a,
+        "ka",
+        serde_json::json!({"to": mention, "text": "the loader API changed"}),
+    )
+    .await;
+    assert!(!is_err, "{text}");
 
     for sid in [a, b, outsider] {
         state.sessions.kill(&sid).ok();

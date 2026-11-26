@@ -1116,9 +1116,28 @@ enum Addressee {
     Everyone,
 }
 
+/// The id (or name) inside an `@agent:` mention, or `raw` when it is not
+/// one. The user references another agent in a message as `@agent:<id>`
+/// (the chat composer writes it from a pick or a drop), and a model handed
+/// that text passes it to a tool as it stands, so `to` and `agent` take the
+/// mention form too: the prefix, and quotes around a name, come off here.
+pub(crate) fn mention_target(raw: &str) -> &str {
+    let raw = raw.trim();
+    let Some(rest) = raw.strip_prefix("@agent:") else {
+        return raw;
+    };
+    let rest = rest.trim();
+    for (open, close) in [('"', '"'), ('\u{201c}', '\u{201d}'), ('\'', '\'')] {
+        if let Some(inner) = rest.strip_prefix(open).and_then(|r| r.strip_suffix(close)) {
+            return inner.trim();
+        }
+    }
+    rest
+}
+
 /// `to` → who, within the sender's workspace. Model-facing errors.
 fn resolve(state: &AppState, from: &Reader, to: &str) -> Result<Addressee, String> {
-    let to = to.trim();
+    let to = mention_target(to);
     if to.eq_ignore_ascii_case("everyone") || to == "*" {
         return Ok(Addressee::Everyone);
     }
@@ -2261,7 +2280,7 @@ pub(crate) fn tool_defs() -> Vec<Value> {
                 "properties": {
                     "agent": {
                         "type": "string",
-                        "description": "The agent's id (from workspace_agents)",
+                        "description": "The agent's id (from workspace_agents, or the ID of an @agent:ID the user wrote)",
                     },
                     "lines": {
                         "type": "integer",
@@ -2285,7 +2304,7 @@ pub(crate) fn tool_defs() -> Vec<Value> {
                 "properties": {
                     "to": {
                         "type": "string",
-                        "description": "An agent's id (from workspace_agents), \"mastermind\", or \"everyone\"",
+                        "description": "An agent's id (from workspace_agents, or the ID of an @agent:ID the user wrote), \"mastermind\", or \"everyone\"",
                     },
                     "text": {
                         "type": "string",
@@ -2327,7 +2346,9 @@ pub(crate) fn instructions(sid: &str, mastermind_here: bool, is_mastermind: bool
     let mut out = format!(
         "\n\nAgent communication: other agents may be working in this workspace — the agent \
          sessions the user started (Claude, Codex, Antigravity, Grok, Cursor; chat or \
-         terminal){}. You are session {sid}. workspace_agents shows who is \
+         terminal){}. You are session {sid}. @agent:ID names an agent by its id: the \
+         user may write it, and you may when you name one to the user (it shows as that \
+         agent). workspace_agents shows who is \
          here and what each is doing; read_agent reads one's recent work (it costs them \
          nothing, so try it before asking). message_agent sends one of them (by id, \
          \"mastermind\", or \"everyone\") a short message: a finding it needs, a blocker, a \
@@ -3009,6 +3030,22 @@ pub(crate) async fn append_plugin_note(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tool takes the user's `@agent:` mention as it was written.
+    #[test]
+    fn a_mention_names_its_target() {
+        assert_eq!(mention_target("s-1234abcd"), "s-1234abcd");
+        assert_eq!(mention_target(" @agent:s-1234abcd "), "s-1234abcd");
+        assert_eq!(mention_target("@agent:\"data loader\""), "data loader");
+        assert_eq!(
+            mention_target("@agent:\u{201c}data loader\u{201d}"),
+            "data loader"
+        );
+        assert_eq!(mention_target("@agent:'analyst'"), "analyst");
+        // Not a mention: the other addressees and names are left alone.
+        assert_eq!(mention_target("mastermind"), "mastermind");
+        assert_eq!(mention_target("@term:zsh"), "@term:zsh");
+    }
 
     fn reader(sid: &str) -> Reader {
         Reader {

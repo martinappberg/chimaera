@@ -148,6 +148,11 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   does. So reloads, other windows and replay show the pictures too. The journal still never holds
   the bytes. Old journals, Remote Control messages and seeded history carry only a count and keep
   the "N images" line; a copy gone with its session's uploads shows a dashed empty tile.
+- **Referencing another agent.** `@agent` in the composer picks one of the workspace's other
+  agents, and an agent dragged onto the chat is referenced the same way. The draft shows a chip
+  (`@agent:“analyst”`), the agent receives `@agent:<session id>`, and the sent message and any
+  agent's reply show the agent's tag, which opens it
+  ([agent-communication.md](agent-communication.md#referencing-an-agent-in-a-message)).
 - **Referencing what the chat shows.** A sent picture's tile, an embedded figure, a file on the
   "Written this turn" line and a file mention chip drag onto the composer, or offer **Reference
   in chat** on right-click, and become a mention of that same file in the draft: nothing is

@@ -1286,6 +1286,7 @@ fn resolve_workspace_session(
         .get("agent")
         .or_else(|| args.get("session"))
         .and_then(|s| s.as_str())
+        .map(crate::comms::mention_target)
     else {
         return Err("missing required argument: agent".to_string());
     };
