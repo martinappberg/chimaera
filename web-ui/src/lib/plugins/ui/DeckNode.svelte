@@ -27,7 +27,7 @@
   import { lastRawTicketUrl, rawTicketUrl } from "../../previews/files";
   import { deckStep, showEdge, showPosition, type Place } from "../../previews/slideShow";
   import { pageVisible } from "../../shared/visibility";
-  import type { UiNodeData } from "../platform";
+  import { copyTabToWindow, type UiNodeData } from "../platform";
   import { clampPlace, clockText, notesAt, parseDeck, placeOf, readSync, syncName, type DeckSync } from "./deck";
   import { str, useScreen } from "./screen";
 
@@ -166,10 +166,12 @@
     go({ slide: i, build: end === "first" ? 0 : Math.max(0, (slides[i]?.builds.length ?? 1) - 1) });
   }
 
+  const syncKey = $derived(syncName(screen.ws, screen.plugin, str(node.id, screen.view)));
+
   // Two windows on one deck keep step while this one is in the show.
   $effect(() => {
     if (mode === "browse" || typeof BroadcastChannel === "undefined") return;
-    const ch = new BroadcastChannel(syncName(screen.ws, screen.plugin, str(node.id, screen.view)));
+    const ch = new BroadcastChannel(syncKey);
     ch.onmessage = (e: MessageEvent) => {
       const msg = readSync(e.data);
       if (msg === null || msg.from === me) return;
@@ -283,7 +285,73 @@
     });
   });
 
-  let ImageView = $state<Component<{ path: string }> | null>(null);
+  /** Pictures decoded ahead of their click. A show that swapped an `<img>`
+   *  to a picture not yet decoded painted a blank frame between slides:
+   *  every swap waits for its decode, and the next click's is done before
+   *  it is asked for. A few are kept (each 1280×720 is ~3.7 MB decoded). */
+  const decoded = new Map<string, { img: HTMLImageElement; ready: Promise<void> }>();
+  const DECODED_KEEP = 8;
+  function decode(url: string): Promise<void> {
+    let hit = decoded.get(url);
+    if (hit === undefined) {
+      const img = new Image();
+      img.src = url;
+      hit = { img, ready: img.decode().catch(() => {}) };
+      decoded.set(url, hit);
+      while (decoded.size > DECODED_KEEP) decoded.delete(decoded.keys().next().value as string);
+    } else {
+      // Most recently wanted last: what is evicted is what was shown longest ago.
+      decoded.delete(url);
+      decoded.set(url, hit);
+    }
+    return hit.ready;
+  }
+
+  /** `want()`'s URL for a picture, swapped in only once it is decoded: until
+   *  then the picture before it stays on screen. */
+  function steady(get: () => string | null): { readonly url: string | null } {
+    let shown = $state<string | null>(null);
+    $effect(() => {
+      const url = get();
+      if (url === null) {
+        // Out of the show (or a clip with nothing under it): a later show
+        // must not open on the picture this one ended on.
+        shown = null;
+        return;
+      }
+      let live = true;
+      void decode(url).then(() => {
+        if (live && !disposed) shown = url;
+      });
+      return () => {
+        live = false;
+      };
+    });
+    return {
+      get url() {
+        return shown;
+      },
+    };
+  }
+
+  /** The show's picture: under a clip that is still playing, the picture
+   *  that was there before it. */
+  const still = $derived(build === undefined ? null : clip !== null && playing !== null && !playing.ended ? playing.under : build.src);
+  const showPicture = steady(() => (mode === "present" && still !== null ? (urls[still] ?? null) : null));
+  const nowPicture = steady(() => (mode === "presenter" && build !== undefined ? (urls[build.src] ?? null) : null));
+  const nextPicture = steady(() => (mode === "presenter" && nextBuild !== undefined ? (urls[nextBuild.src] ?? null) : null));
+  // The next click's picture is decoded before the click.
+  $effect(() => {
+    if (mode === "browse" || nextBuild === undefined) return;
+    const url = urls[nextBuild.src];
+    if (url !== undefined) void decode(url);
+  });
+
+  /** The clip whose first frame has played: before it, the video is not
+   *  drawn (a video element paints black until it has a frame). */
+  let clipDrawn = $state<string | null>(null);
+
+  let ImageView = $state<Component<{ path: string; pixels?: boolean }> | null>(null);
   $effect(() => {
     if (ImageView === null && mode === "browse") {
       void import("../../previews/ImageView.svelte").then((m) => (ImageView = m.default));
@@ -325,7 +393,7 @@
   $effect(() => {
     const i = at.slide;
     const el = strip;
-    if (el === null || mode !== "browse") return;
+    if (el === null || mode === "present") return;
     const thumb = el.children[i] as HTMLElement | undefined;
     if (thumb === undefined) return;
     const left = thumb.offsetLeft - 10;
@@ -399,6 +467,58 @@
     mode = "presenter";
     void tick().then(() => root?.focus());
   }
+  // --- the show in its own window ---------------------------------------------
+
+  /** The presenter's view here, the show in a new window (the projector's):
+   *  the window opens this tab again and finds an invite (localStorage, read
+   *  once, only while fresh) that starts its show; the channel lines it up. */
+  const INVITE = "chimaera.deck.show-window";
+  const INVITE_MS = 15_000;
+  let windowError = $state<string | null>(null);
+
+  function showInWindow(): void {
+    windowError = null;
+    if (root === null) return;
+    try {
+      localStorage.setItem(INVITE, JSON.stringify({ sync: syncKey, at: Date.now() }));
+    } catch {
+      // No storage: the window opens on the deck, and F starts its show.
+    }
+    if (!copyTabToWindow(root)) {
+      windowError = "This view can't open a window here.";
+      try {
+        localStorage.removeItem(INVITE);
+      } catch {
+        // Nothing was stored.
+      }
+      return;
+    }
+    if (mode !== "presenter") presenter();
+  }
+
+  function invited(): boolean {
+    try {
+      const raw = localStorage.getItem(INVITE);
+      if (raw === null) return false;
+      const v = JSON.parse(raw) as { sync?: unknown; at?: unknown };
+      if (v.sync !== syncKey || typeof v.at !== "number" || Date.now() - v.at > INVITE_MS) return false;
+      localStorage.removeItem(INVITE);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // The window a presenter opened takes the show as soon as it has slides.
+  let inviteChecked = false;
+  $effect(() => {
+    if (slides.length === 0 || inviteChecked) return;
+    inviteChecked = true;
+    untrack(() => {
+      if (invited()) void present();
+    });
+  });
+
   // The timer ticks only while someone can see it.
   $effect(() => {
     if (mode !== "presenter" || !$pageVisible) return;
@@ -465,6 +585,32 @@
   const pictureAlt = $derived([slide?.title ?? "", buildLabel].filter((p) => p !== "").join(", "));
 </script>
 
+<!-- Every slide, hidden ones dimmed. Browsing opens a slide whole (its last
+     build); the presenter jumps the show to its first, hidden or not, and a
+     show window follows. -->
+{#snippet slideStrip()}
+  <div class="strip" bind:this={strip}>
+    {#each slides as s, i (i)}
+      {@const last = s.builds[s.builds.length - 1]}
+      <button
+        class="thumb"
+        class:on={i === at.slide}
+        class:dim={s.hidden}
+        onclick={() => go({ slide: i, build: mode === "presenter" ? 0 : Math.max(0, s.builds.length - 1) })}
+        title={s.hidden ? `${s.title} (hidden)` : s.title}
+        aria-label="slide {i + 1}: {s.title}{s.hidden ? ' (hidden)' : ''}"
+        aria-current={i === at.slide ? "true" : undefined}
+        use:nearby={last?.src}
+      >
+        {#if last !== undefined && urls[last.src] !== undefined}
+          <img src={urls[last.src]} alt="" draggable="false" onerror={() => broken(last.src)} />
+        {/if}
+        <span class="num">{i + 1}</span>
+      </button>
+    {/each}
+  </div>
+{/snippet}
+
 <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions — the deck pages by key from its own focus, as the slide viewers' stages do -->
 <div
   class="deck"
@@ -515,6 +661,8 @@
       {#if slide?.file != null}
         <button class="bbtn" onclick={askAgent} disabled={screen.busy} title="point an agent at this slide's code">@</button>
       {/if}
+      {#if windowError !== null}<span class="tag" role="status">{windowError}</span>{/if}
+      <button class="bbtn" onclick={showInWindow} title="the show in a new window (drag it to the projector); this one shows your notes, the next click and every slide">show in window</button>
       <button class="bbtn" class:on={mode === "presenter"} onclick={presenter} aria-pressed={mode === "presenter"} title="presenter view: this slide, the next, your notes, a timer (P)">presenter</button>
       <button class="bbtn" onclick={() => void present()} title="present full screen; hidden slides are skipped (F)">present</button>
     </div>
@@ -522,8 +670,8 @@
     {#if mode === "presenter"}
       <div class="console">
         <div class="now">
-          {#if build !== undefined && urls[build.src] !== undefined}
-            <img src={urls[build.src]} alt={pictureAlt} onerror={() => broken(build.src)} />
+          {#if build !== undefined && nowPicture.url !== null}
+            <img src={nowPicture.url} alt={pictureAlt} onerror={() => broken(build.src)} />
           {:else}
             <p class="none">{slide?.title} has no picture.</p>
           {/if}
@@ -533,8 +681,8 @@
             <span class="cap">Next</span>
             {#if nextPlace === null}
               <p class="end">End of the show</p>
-            {:else if nextBuild !== undefined && urls[nextBuild.src] !== undefined}
-              <img src={urls[nextBuild.src]} alt="next: {slides[nextPlace.slide]?.title ?? ''}" onerror={() => broken(nextBuild.src)} />
+            {:else if nextBuild !== undefined && nextPicture.url !== null}
+              <img src={nextPicture.url} alt="next: {slides[nextPlace.slide]?.title ?? ''}" onerror={() => broken(nextBuild.src)} />
             {:else}
               <p class="end">{slides[nextPlace.slide]?.title}</p>
             {/if}
@@ -550,6 +698,7 @@
           <span class="meta">{wallClock}</span>
         </div>
       </div>
+      {@render slideStrip()}
     {:else}
       <div class="stage">
         {#if pictureError !== null}
@@ -562,46 +711,36 @@
             <video class="clip" src={urls[clip.src]} muted playsinline aria-label={pictureAlt} onloadeddata={clipReady} onended={clipEnded} onerror={() => clipFailed(clip.src)}></video>
           {/key}
         {:else if ImageView !== null && paths[build.src] !== undefined}
-          <ImageView path={paths[build.src] ?? ""} />
+          <ImageView path={paths[build.src] ?? ""} pixels={false} />
         {/if}
       </div>
       {#if notes !== ""}
         <div class="notes" aria-label="speaker notes">{notes}</div>
       {/if}
-      <div class="strip" bind:this={strip}>
-        {#each slides as s, i (i)}
-          {@const last = s.builds[s.builds.length - 1]}
-          <button
-            class="thumb"
-            class:on={i === at.slide}
-            class:dim={s.hidden}
-            onclick={() => go({ slide: i, build: Math.max(0, s.builds.length - 1) })}
-            title={s.hidden ? `${s.title} (hidden)` : s.title}
-            aria-label="slide {i + 1}: {s.title}{s.hidden ? ' (hidden)' : ''}"
-            aria-current={i === at.slide ? "true" : undefined}
-            use:nearby={last?.src}
-          >
-            {#if last !== undefined && urls[last.src] !== undefined}
-              <img src={urls[last.src]} alt="" draggable="false" onerror={() => broken(last.src)} />
-            {/if}
-            <span class="num">{i + 1}</span>
-          </button>
-        {/each}
-      </div>
+      {@render slideStrip()}
     {/if}
 
     {#if mode === "present"}
       <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions — the show: a click is the presenter's clicker, the keys are handled beside it -->
       <div class="show" role="document" aria-label="{label}: the show" tabindex="0" bind:this={showEl} onclick={() => step(1)} onkeydown={onKey}>
         {#if build !== undefined}
-          {@const still = clip !== null && playing !== null && !playing.ended ? playing.under : build.src}
-          {#if still !== null && urls[still] !== undefined}
-            <img src={urls[still]} alt={pictureAlt} draggable="false" onerror={() => broken(still)} />
+          {#if showPicture.url !== null}
+            <img src={showPicture.url} alt={pictureAlt} draggable="false" onerror={() => still !== null && broken(still)} />
           {/if}
           {#if clip !== null && urls[clip.src] !== undefined}
             {#key clip.src}
               <!-- svelte-ignore a11y_media_has_caption — a slide's animation: silent, and its picture carries the alt text -->
-              <video src={urls[clip.src]} muted playsinline loop={clip.loop} onloadeddata={clipReady} onended={clipEnded} onerror={() => clipFailed(clip.src)}></video>
+              <video
+                class:drawn={clipDrawn === clip.src}
+                src={urls[clip.src]}
+                muted
+                playsinline
+                loop={clip.loop}
+                onloadeddata={clipReady}
+                onplaying={() => (clipDrawn = clip?.src ?? null)}
+                onended={clipEnded}
+                onerror={() => clipFailed(clip.src)}
+              ></video>
             {/key}
           {/if}
         {/if}
@@ -850,6 +989,10 @@
   .show video {
     position: absolute;
     inset: 0;
+    opacity: 0;
+  }
+  .show video.drawn {
+    opacity: 1;
   }
   .show video.warm {
     width: 1px;

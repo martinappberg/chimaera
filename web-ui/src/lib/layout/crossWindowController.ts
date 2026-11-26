@@ -185,6 +185,9 @@ export interface CrossWindow {
   reattachToOrigin(): Promise<void>;
   /** The pane menu's "Open in new window". */
   detachTabToWindow(paneId: string, index: number): void;
+  /** The same tab opened again in a new window, this one keeping it (a deck
+   *  shown on a second screen while its presenter's view stays here). */
+  copyTabToWindow(paneId: string, index: number): void;
   moveTargets(): XwinWindowInfo[];
   refreshMoveTargets(): void;
   moveTabToWindow(paneId: string, index: number, winId: string): void;
@@ -308,9 +311,10 @@ export function createCrossWindow(host: CrossWindowHost): CrossWindow {
    * are views onto daemon-owned state, so the new window reattaches its own
    * sockets; nothing is ever moved but layout.
    */
-  async function detachOut(tabs: Tab[], at: OutPoint, active = 0, fontSize?: number): Promise<void> {
+  async function detachOut(tabs: Tab[], at: OutPoint, active = 0, fontSize?: number, keep = false): Promise<void> {
     const wsId = host.getWs();
-    if (wsId === null || tabs.length === 0 || guardDirtyMove(tabs)) return;
+    // A copy leaves its tab (and any unsaved edit) here: nothing to guard.
+    if (wsId === null || tabs.length === 0 || (!keep && guardDirtyMove(tabs))) return;
     const solo = soloLayout(tabs, active, fontSize);
     const winId = `w-${crypto.randomUUID()}`;
     const blob = buildViewBlob({
@@ -342,7 +346,36 @@ export function createCrossWindow(host: CrossWindowHost): CrossWindow {
       host.flash("the browser blocked the popup — allow popups to detach tabs");
       return;
     }
-    host.setLayout(removeSent(host.getLayout(), tabs));
+    if (!keep) host.setLayout(removeSent(host.getLayout(), tabs));
+  }
+
+  function toWindow(paneId: string, index: number, keep: boolean): void {
+    const p = findPane(host.getLayout().root, paneId);
+    const tab = p?.tabs[index];
+    if (p === null || tab === undefined) return;
+    // No drop point on the menu path: open near the pane, offset a touch
+    // so the new window reads as "came out of here". Client coords sit in
+    // the VIEWPORT while window.screenX/Y is the OUTER frame — the browser
+    // chrome (tab strip + toolbar) between them must be added, or the
+    // popup opens a chrome-height too high. (Native ignores screen coords;
+    // the shell lifts client coords itself.)
+    const rect = paneRootEl(paneId)?.getBoundingClientRect();
+    const cx = (rect?.left ?? 80) + 48;
+    const cy = (rect?.top ?? 80) + 48;
+    const chromeX = Math.max((window.outerWidth - window.innerWidth) / 2, 0);
+    const chromeY = Math.max(window.outerHeight - window.innerHeight, 0);
+    void detachOut(
+      [tab],
+      {
+        clientX: cx,
+        clientY: cy,
+        screenX: window.screenX + chromeX + cx,
+        screenY: window.screenY + chromeY + cy,
+      },
+      0,
+      p.fontSize,
+      keep,
+    );
   }
 
   return {
@@ -443,31 +476,11 @@ export function createCrossWindow(host: CrossWindowHost): CrossWindow {
     },
 
     detachTabToWindow(paneId, index) {
-      const p = findPane(host.getLayout().root, paneId);
-      const tab = p?.tabs[index];
-      if (p === null || tab === undefined) return;
-      // No drop point on the menu path: open near the pane, offset a touch
-      // so the new window reads as "came out of here". Client coords sit in
-      // the VIEWPORT while window.screenX/Y is the OUTER frame — the browser
-      // chrome (tab strip + toolbar) between them must be added, or the
-      // popup opens a chrome-height too high. (Native ignores screen coords;
-      // the shell lifts client coords itself.)
-      const rect = paneRootEl(paneId)?.getBoundingClientRect();
-      const cx = (rect?.left ?? 80) + 48;
-      const cy = (rect?.top ?? 80) + 48;
-      const chromeX = Math.max((window.outerWidth - window.innerWidth) / 2, 0);
-      const chromeY = Math.max(window.outerHeight - window.innerHeight, 0);
-      void detachOut(
-        [tab],
-        {
-          clientX: cx,
-          clientY: cy,
-          screenX: window.screenX + chromeX + cx,
-          screenY: window.screenY + chromeY + cy,
-        },
-        0,
-        p.fontSize,
-      );
+      toWindow(paneId, index, false);
+    },
+
+    copyTabToWindow(paneId, index) {
+      toWindow(paneId, index, true);
     },
 
     moveTargets: () => roster,

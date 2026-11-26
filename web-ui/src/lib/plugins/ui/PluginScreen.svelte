@@ -393,8 +393,13 @@
       animation: none;
     }
   }
+  /* Exactly the pane's height: a body that only had a minimum grew to its
+     tallest side (a 44-slide list), and a viewer beside it centred its
+     picture in a box taller than the window. A pane too short for the body's
+     floor still scrolls (the tab's overflow). */
   .screen.fill {
     box-sizing: border-box;
+    height: 100%;
     min-height: 100%;
   }
   .screen.fill > :global(.stack) {
@@ -406,6 +411,18 @@
   .screen.fill > :global(.stack > :last-child) {
     flex: 1;
     min-height: 0;
+  }
+  /* A body split side by side is one row the body's height, and each side
+     scrolls on its own: the long side (a list) never sets the row. */
+  @container plugin-screen (min-width: 561px) {
+    .screen.fill > :global(.stack > .split:last-child) {
+      grid-template-rows: minmax(0, 1fr);
+      min-height: 320px;
+    }
+    .screen.fill > :global(.stack > .split:last-child > .pane) {
+      overflow: auto;
+      scrollbar-width: thin;
+    }
   }
   .screen.fill > :global(.stack > .rich.tall:last-child) {
     height: auto;

@@ -686,8 +686,15 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     the slide's code, **present** (full screen, opening the slide at its first build, a click a
     build, hidden slides skipped, as in the
     PowerPoint viewer: `previews/slideShow.ts`) and **presenter** (this slide, the next click,
-    the notes, a timer). Open the deck in two windows and they keep step while either is in the
-    show: the show on the projector, the presenter's view on the laptop. Paging never calls the
+    the notes, a timer, and a strip of every slide, hidden ones dimmed, whose click jumps the
+    show to that slide's first build). **show in window** opens the same tab again in a new
+    window that starts the show by itself (`platform.ts::copyTabToWindow`, the layout's
+    `copyTabToWindow`; a short-lived localStorage invite names the deck) while this one becomes
+    the presenter's view; two windows on a deck keep step while either is in the show: the
+    show on the projector, the presenter's view on the laptop. A show swaps a picture in only
+    once it is decoded (the next click's is decoded ahead) and draws a clip from its first
+    frame, so a click never flashes black. Browsing's image viewer draws a slide smoothly at
+    any zoom (no pixel grid). Paging never calls the
     plugin; the place survives a re-render by the slide's title. A build may carry a `clip`
     (its animation, a video ending on its picture): the show plays it when a click moves on to
     that build and holds the last frame, with the next click's clip fetched ahead; a step back
