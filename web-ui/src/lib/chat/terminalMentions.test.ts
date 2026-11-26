@@ -37,8 +37,7 @@ describe("terminal mentions", () => {
     const tokens = new Map<string, string>();
     const text = "use @term:s-1234abcd and @term:s-5678abcd then @term:s-aabbccdd.";
     const shown = collapseTerminalMentions(text, shells, tokens);
-    expect(shown).toContain('@term:"bash · a"');
-    expect(shown).toContain('@term:"gpu shell"');
+    expect(shown).toBe("use @term:\u201cbash · a\u201d and @term:\u201cbash · b\u201d then @term:\u201cgpu shell\u201d.");
     expect(expandUploadMentions(shown, tokens)).toBe(text);
     expect(tokenSpans(shown, tokens)).toHaveLength(3);
     const chip = tokenSpans(shown, tokens)[0];
@@ -62,9 +61,28 @@ describe("terminal mentions", () => {
   });
   it("does not capture a typed name elsewhere in the draft", () => {
     const tokens = new Map<string, string>();
-    const shown = collapseTerminalMentions("@term:s-aabbccdd", shells, tokens, '@term:"gpu shell"');
-    expect(shown).not.toBe('@term:"gpu shell"');
-    expect(expandUploadMentions(`@term:"gpu shell" ${shown}`, tokens)).toBe('@term:"gpu shell" @term:s-aabbccdd');
+    const typed = "@term:\u201cgpu shell\u201d";
+    const shown = collapseTerminalMentions("@term:s-aabbccdd", shells, tokens, typed);
+    expect(shown).not.toBe(typed);
+    expect(expandUploadMentions(`${typed} ${shown}`, tokens)).toBe(`${typed} @term:s-aabbccdd`);
+  });
+  it("writes no straight quote into a chip: the OS rewrites one beside typed text", () => {
+    const quoted = [{ id: "s-0badcafe", name: `it's "the" shell` }];
+    const tokens = new Map<string, string>();
+    const shown = collapseTerminalMentions("@term:s-0badcafe ", quoted, tokens);
+    expect(shown).toBe("@term:\u201cit s the shell\u201d ");
+    expect(shown).not.toMatch(/["']/);
+    expect(expandUploadMentions(shown, tokens)).toBe("@term:s-0badcafe ");
+  });
+  it("never takes a name typed by hand for an earlier pick", () => {
+    // The chip grants the terminal it was picked for; a typed name is the
+    // daemon's to resolve, and may by now mean another shell.
+    const tokens = new Map<string, string>();
+    const shown = collapseTerminalMentions("@term:s-aabbccdd", shells, tokens);
+    const draft = `${shown} and @term:gpu`;
+    expect(tokenSpans(draft, tokens)).toHaveLength(1);
+    expect(tokenSpans("@term:gpu shell", tokens)).toHaveLength(0);
+    expect(expandUploadMentions("see @term:gpu shell", tokens)).toBe("see @term:gpu shell");
   });
   it("never reassigns an old chip after a terminal rename or replacement (undo)", () => {
     const tokens = new Map<string, string>();

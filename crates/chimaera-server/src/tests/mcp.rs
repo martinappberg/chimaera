@@ -322,7 +322,7 @@ async fn update_plan_journals_a_plan_level_set_for_chats_only() {
     )
     .await;
     assert!(!is_error, "{text}");
-    assert_eq!(text, "Plan shown (1/3 done).");
+    assert_eq!(text, "Now: Run the tests · 2 left");
     let journal = state.chat.journal_dir().join(format!("{sid}.jsonl"));
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     let plan = loop {
@@ -344,9 +344,43 @@ async fn update_plan_journals_a_plan_level_set_for_chats_only() {
     assert_eq!(entries[2]["status"], "todo");
     assert_eq!(entries[2]["id"], "3");
 
+    // `advance` steps that plan on and journals the new level-set.
+    let (is_error, text) = mcp_tool_call(
+        &state,
+        &sid,
+        &key,
+        "update_plan",
+        serde_json::json!({"advance": true}),
+    )
+    .await;
+    assert!(!is_error, "{text}");
+    assert_eq!(text, "Now: Write the report · 1 left");
+    let (is_error, text) = mcp_tool_call(
+        &state,
+        &sid,
+        &key,
+        "update_plan",
+        serde_json::json!({"advance": true}),
+    )
+    .await;
+    assert_eq!((is_error, text.as_str()), (false, "All 3 steps done."));
+    let (is_error, text) = mcp_tool_call(
+        &state,
+        &sid,
+        &key,
+        "update_plan",
+        serde_json::json!({"advance": true}),
+    )
+    .await;
+    assert!(is_error && text.contains("nothing to advance"), "{text}");
+
     // Malformed: refused with the reason, nothing journaled.
     for (args, hint) in [
         (serde_json::json!({}), "needs `items`"),
+        (
+            serde_json::json!({"advance": true, "items": [{"content": "x", "status": "pending"}]}),
+            "not both",
+        ),
         (serde_json::json!({"items": []}), "1 to 32 steps"),
         (
             serde_json::json!({"items": [{"content": "x", "status": "soon"}]}),

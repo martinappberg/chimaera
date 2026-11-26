@@ -216,9 +216,11 @@ workspace-relative as `path:line`, `path#L10-L20` or a relative markdown link.";
 /// through its built-in TodoWrite (`cursor/update_todos` to the client),
 /// Grok through its `todo_write` (the ACP `plan` update) — and the desktop
 /// apps get that card on every multi-step request only because they ask
-/// for it. Antigravity has no plan tool at all (asked, 2026-10-15: "I do not
-/// have a built-in plan, task, or todo tool"), so it is told there is no
-/// card and asked to keep the plan in its reply; a runtime this daemon has
+/// for it. Antigravity has no plan tool of its own (asked, 2026-10-15: "I do
+/// not have a built-in plan, task, or todo tool"), so it gets chimaera's, in
+/// Claude's words (its calls are pre-approved and draw no row, PROTOCOL.md
+/// Pass 62). Each paragraph names the cadence agents skip: the update rides
+/// the message that starts the next step (`advance`). A runtime this daemon has
 /// not probed (no record for the session, a legacy kind) gets the neutral
 /// words, since nothing is known about its tools. A plan written as prose
 /// draws nothing, so each runtime is asked in its own tool's words. A
@@ -234,48 +236,38 @@ fn task_list_instructions(
         return "".into();
     }
     let instructions = match kind {
-        Some(AgentKind::Claude) => {
+        Some(AgentKind::Claude) | Some(AgentKind::Antigravity) => {
             "\n\n\
 Plan card: for any request that edits files or runs more than one command, \
-track your steps with the update_plan TOOL from the chimaera MCP server \
-(never a file, a markdown checklist, or prose: only that tool call draws the \
-card): the whole plan up front, exactly one step in_progress, each marked \
-completed as it finishes, the list resent whenever it changes. The user \
-follows that card beside the chat while you work."
+keep the update_plan TOOL from the chimaera MCP server current (only it \
+draws the card): the whole plan with your first tool call, exactly one step \
+in_progress; at each step boundary, the message that starts the next step \
+also sends {\"advance\": true}. A list left unchanged while work moves on is \
+wrong."
         }
         Some(AgentKind::Codex) => {
             "\n\n\
 Plan card: for any request that edits files or runs more than one command, \
-track your steps with your built-in update_plan TOOL (never a file, a \
-markdown checklist, or prose: only that tool call draws the card): the whole \
-plan up front, exactly one step in_progress, each marked completed as it \
-finishes, the list updated when the plan changes. The user follows that card \
-beside the chat while you work."
+keep your built-in update_plan TOOL current (only it draws the card): the \
+whole list with your first tool call, exactly one step in_progress; at each \
+step boundary, the message that starts the next step also updates the list. \
+A list left unchanged while work moves on is wrong."
         }
         Some(AgentKind::Cursor) => {
             "\n\n\
 Plan card: for any request that edits files or runs more than one command, \
-track your steps with your built-in TodoWrite TOOL (never a file, a markdown \
-checklist, or prose: only that tool draws the card): the whole list up \
-front, exactly one item in_progress, each marked completed as it finishes, \
-the list updated when the plan changes. The user follows that card beside \
-the chat while you work."
+keep your built-in TodoWrite TOOL current (only it draws the card): the \
+whole list with your first tool call, exactly one item in_progress; at each \
+item boundary, the message that starts the next item also updates the list. \
+A list left unchanged while work moves on is wrong."
         }
         Some(AgentKind::Grok) => {
             "\n\n\
 Plan card: for any request that edits files or runs more than one command, \
-track your steps with your built-in todo_write TOOL (never a file, a \
-markdown checklist, or prose: only that tool draws the card): the whole list \
-up front, exactly one item in_progress, each marked completed as it \
-finishes, the list updated when the plan changes. The user follows that card \
-beside the chat while you work."
-        }
-        Some(AgentKind::Antigravity) => {
-            "\n\n\
-Plan: this runtime has no plan or to-do tool that reaches the chat's plan \
-card, so for any request that edits files or runs more than one command, \
-open your reply with the steps as a short numbered list and say when each \
-is done."
+keep your built-in todo_write TOOL current (only it draws the card): the \
+whole list with your first tool call, exactly one item in_progress; at each \
+item boundary, the message that starts the next item also updates the list. \
+A list left unchanged while work moves on is wrong."
         }
         _ => {
             "\n\n\
@@ -286,9 +278,6 @@ finishes. The user follows it as a card beside the chat while you work; a \
 plan written as a file or prose draws nothing there."
         }
     };
-    if kind == Some(AgentKind::Antigravity) {
-        return instructions.into();
-    }
     format!("{instructions}\n\n{TASK_LIST_FINISH_INSTRUCTIONS}").into()
 }
 
@@ -482,22 +471,33 @@ fn initialize_result(
     // own text fills, so a paragraph appended after it never reached Claude.
     // Only up to `PLUGIN_LEAD_MAX` of them lead, so plugins together can't
     // push chimaera's own opening (~2 KB) out of that window; the rest
-    // follow it. None when no plugin is on: a plugin-free workspace hands
-    // agents byte-identical instructions.
+    // follow it.
+    //
+    // A chat's plan paragraph (every runtime's, in its own words) sits right
+    // after that lead and counts against its budget: appended after
+    // chimaera's text, a full lead pushed it past the window and the plan
+    // card went unkept. So a chat's instructions now open with it; only a
+    // terminal session with no plugin on starts with chimaera's own text.
+    let plan = task_list_instructions(kind, chat);
+    let plan = plan.trim_start();
+    let lead_max = PLUGIN_LEAD_MAX.saturating_sub(if plan.is_empty() { 0 } else { plan.len() + 2 });
     let mut instructions = String::new();
     let mut trailing = Vec::new();
     for paragraph in plugin_paragraphs {
         let paragraph = paragraph.trim();
-        if instructions.len() + paragraph.len() + 2 <= PLUGIN_LEAD_MAX {
+        if instructions.len() + paragraph.len() + 2 <= lead_max {
             instructions.push_str(paragraph);
             instructions.push_str("\n\n");
         } else {
             trailing.push(paragraph);
         }
     }
+    if !plan.is_empty() {
+        instructions.push_str(plan);
+        instructions.push_str("\n\n");
+    }
     instructions.push_str(INSTRUCTIONS);
     instructions.push_str(DOCUMENTS_INSTRUCTIONS);
-    instructions.push_str(&task_list_instructions(kind, chat));
     if comms_on {
         instructions.push_str(&crate::comms::instructions(
             agent_id,
@@ -647,11 +647,13 @@ fn mastermind_tool_defs() -> Vec<Value> {
 }
 
 /// Whether this session is offered chimaera's `update_plan`: a Claude chat
-/// (no task tool under `-p`). Codex has its built-in `update_plan` — a second
-/// tool of the same name would compete with it — an ACP agent reports its
-/// plan over its own protocol, and a terminal has no card to draw.
+/// (no task tool under `-p`) or an Antigravity chat (no plan tool at all).
+/// Codex has its built-in `update_plan` — a second tool of the same name
+/// would compete with it — Cursor and Grok report their plans over ACP, and
+/// a terminal has no card to draw.
 fn plan_tool_for(kind: Option<crate::agents::AgentKind>, chat: bool) -> bool {
-    chat && kind == Some(crate::agents::AgentKind::Claude)
+    use crate::agents::AgentKind;
+    chat && matches!(kind, Some(AgentKind::Claude | AgentKind::Antigravity))
 }
 
 fn tool_defs(plan_tool: bool, comms_on: bool, mastermind: bool, plugin_tools: Vec<Value>) -> Value {
@@ -713,10 +715,12 @@ fn tool_annotations(name: &str) -> Option<Value> {
     match name {
         // A level-set of the chat's plan card: a repeat with the same steps
         // draws the same card, so a retry after a dropped connection is safe.
+        // `items` is a level-set, but `advance` steps the plan on: a retry
+        // of an advance whose answer was lost would skip a step.
         "update_plan" => Some(json!({
             "readOnlyHint": false,
             "destructiveHint": false,
-            "idempotentHint": true,
+            "idempotentHint": false,
         })),
         // It settles every message it shows. A retry of a call whose answer
         // was lost would read "No messages waiting" while the batch the
@@ -911,33 +915,33 @@ fn notify(state: &AppState, agent_id: &str, args: &Value) -> Value {
     }
 }
 
-/// The `update_plan` tool def (Claude chats — `plan_tool_for`): the plan
-/// card beside the chat. Claude Code offers no task-list tool under `-p`
-/// (TaskCreate/TaskUpdate are interactive-only; probed on 2.1.300), so this
-/// is the one way a Claude chat draws the card; Codex has its own
-/// `update_plan`, which the driver already maps, and an ACP agent its plan.
+/// The `update_plan` tool def (Claude and Antigravity chats — `plan_tool_for`):
+/// the plan card beside the chat. Claude Code offers no task-list tool under
+/// `-p` (TaskCreate/TaskUpdate are interactive-only; probed on 2.1.300) and
+/// Antigravity none at all, so this is how those chats draw the card; Codex
+/// has its own `update_plan`, which the driver already maps, and Grok and
+/// Cursor report theirs over ACP.
 fn update_plan_tool_def() -> Value {
     json!({
         "name": "update_plan",
         "description": "Show the user your plan as a card beside the chat and keep it \
-                        current. Send the WHOLE list every time (it replaces the last \
-                        one): the steps in order, exactly one in_progress while you work, \
-                        each completed as it finishes, pending for the rest. Call it with \
-                        the first tool call of any request that edits files or runs more \
-                        than one command, and again as each step finishes or the plan \
-                        changes. Before your final reply, call it again to reflect what \
-                        actually finished; leave unfinished work pending, and use \
-                        in_progress only for work still running. Do not ask the user to \
-                        refresh the list. It draws the card and nothing else; a plan written as a \
-                        file, a checklist or prose shows nothing there.",
+                        current. With the first tool call of any request that edits files \
+                        or runs more than one command, send `items`: the WHOLE list in \
+                        order (it replaces the last one), exactly one in_progress, pending \
+                        for the rest. At every step boundary, in the same message that \
+                        starts the next step, send {\"advance\": true}: it completes the \
+                        step in progress and starts the next pending one. Send `items` \
+                        again only when the plan itself changes. A list left unchanged while \
+                        work moves on is wrong. Before your final reply, make it show what \
+                        actually finished; leave unfinished work pending. Only this tool \
+                        draws the card; a file, a checklist or prose shows nothing there.",
         "inputSchema": {
             "type": "object",
-            "required": ["items"],
             "properties": {
                 "items": {
                     "type": "array",
                     "maxItems": UPDATE_PLAN_ITEMS_MAX,
-                    "description": "The plan, in order (1–32 steps).",
+                    "description": "The whole plan, in order (1–32 steps). Omit with `advance`.",
                     "items": {
                         "type": "object",
                         "required": ["content", "status"],
@@ -954,6 +958,11 @@ fn update_plan_tool_def() -> Value {
                         "additionalProperties": false,
                     },
                 },
+                "advance": {
+                    "type": "boolean",
+                    "description": "true: complete the step in progress and start the next \
+                                    pending one. Send it without `items`.",
+                },
             },
             "additionalProperties": false,
         },
@@ -964,59 +973,157 @@ fn update_plan_tool_def() -> Value {
 const UPDATE_PLAN_ITEMS_MAX: usize = 32;
 const UPDATE_PLAN_STEP_MAX: usize = 200;
 
+/// The last plan `update_plan` drew for each live chat, which `advance`
+/// steps from: the journal folds no plan, and the agent's own plan events
+/// never reach this tool. An entry goes when its chat's driver exits
+/// (`forget_plan`, from the chat exit path) and is bounded besides: when
+/// full, sessions no longer alive go first. After a restart or a respawn an
+/// `advance` asks for `items`. Every call holds the lock from reading the
+/// plan to journaling the next one, so concurrent calls journal in order.
+static PLANS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, Vec<chimaera_agent::model::PlanEntry>>>,
+> = std::sync::LazyLock::new(Default::default);
+const PLANS_MAX: usize = 256;
+
+/// Drop a chat's stored plan: its driver exited.
+pub(crate) fn forget_plan(agent_id: &str) {
+    crate::lock(&PLANS).remove(agent_id);
+}
+
+/// `advance`: the step in progress completes and the next pending one (after
+/// it, else the first) starts. `None` when there is nothing left to start.
+fn advance_plan(entries: &mut [chimaera_agent::model::PlanEntry]) -> Option<()> {
+    use chimaera_agent::model::PlanStatus;
+    let current = entries
+        .iter()
+        .position(|e| e.status == PlanStatus::InProgress);
+    let from = current.map_or(0, |i| i + 1);
+    let next = entries[from..]
+        .iter()
+        .position(|e| e.status == PlanStatus::Todo)
+        .map(|i| i + from)
+        .or_else(|| entries.iter().position(|e| e.status == PlanStatus::Todo));
+    if current.is_none() && next.is_none() {
+        return None;
+    }
+    if let Some(i) = current {
+        entries[i].status = PlanStatus::Done;
+    }
+    if let Some(i) = next {
+        entries[i].status = PlanStatus::InProgress;
+    }
+    Some(())
+}
+
+/// One line that reminds the agent where it is: the step now in progress
+/// and how many steps are not yet done.
+fn plan_position(entries: &[chimaera_agent::model::PlanEntry]) -> String {
+    use chimaera_agent::model::PlanStatus;
+    let left = entries
+        .iter()
+        .filter(|e| e.status != PlanStatus::Done)
+        .count();
+    match entries.iter().find(|e| e.status == PlanStatus::InProgress) {
+        Some(now) => format!("Now: {} · {left} left", now.content),
+        None if left == 0 => format!("All {} steps done.", entries.len()),
+        None => format!("No step in progress · {left} left"),
+    }
+}
+
 /// `update_plan`: the level-set becomes the session's `Plan` event through
 /// the pump's own queue (journaled, replayed, drawn by every surface the
 /// driver's native plans reach). A terminal session has no transcript to
 /// draw it in, so it says so instead of pretending.
 fn update_plan(state: &AppState, agent_id: &str, args: &Value) -> Value {
     use chimaera_agent::model::{AgentEvent, PlanEntry, PlanStatus};
-    let Some(items) = args.get("items").and_then(Value::as_array) else {
-        return tool_error("update_plan needs `items`: the whole plan, in order".to_string());
-    };
-    if items.is_empty() || items.len() > UPDATE_PLAN_ITEMS_MAX {
-        return tool_error(format!(
-            "update_plan takes 1 to {UPDATE_PLAN_ITEMS_MAX} steps (got {})",
-            items.len()
-        ));
-    }
-    let mut entries = Vec::with_capacity(items.len());
-    for (i, item) in items.iter().enumerate() {
-        let content = item
-            .get("content")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .unwrap_or_default();
-        if content.is_empty() {
-            return tool_error(format!("step {} has no content", i + 1));
+    let advance = args.get("advance").and_then(Value::as_bool) == Some(true);
+    let mut plans = crate::lock(&PLANS);
+    let entries = match (args.get("items").and_then(Value::as_array), advance) {
+        (Some(_), true) => {
+            return tool_error(
+                "update_plan takes `items` (the whole plan) or `advance`, not both".to_string(),
+            )
         }
-        let status = match item.get("status").and_then(Value::as_str) {
-            Some("pending") | Some("todo") => PlanStatus::Todo,
-            Some("in_progress") => PlanStatus::InProgress,
-            Some("completed") | Some("done") => PlanStatus::Done,
-            other => {
-                return tool_error(format!(
-                    "step {} has status {other:?}; use pending, in_progress or completed",
-                    i + 1
-                ))
+        (None, true) => {
+            let Some(mut entries) = plans.get(agent_id).cloned() else {
+                return tool_error(
+                    "no plan to advance in this chat yet: send `items`, the whole plan, first"
+                        .to_string(),
+                );
+            };
+            if advance_plan(&mut entries).is_none() {
+                return tool_error(
+                    "nothing to advance: no step is in progress or pending. Send `items` with \
+                     the plan as it now stands"
+                        .to_string(),
+                );
             }
-        };
-        entries.push(PlanEntry {
-            content: content.chars().take(UPDATE_PLAN_STEP_MAX).collect(),
-            status,
-            id: Some((i + 1).to_string()),
-            active_form: None,
-            description: None,
-            owner: None,
-            blocked_by: Vec::new(),
-        });
-    }
-    let done = entries
-        .iter()
-        .filter(|e| e.status == PlanStatus::Done)
-        .count();
-    let total = entries.len();
-    match state.chat.annotate(agent_id, AgentEvent::Plan { entries }) {
-        Ok(()) => tool_text(format!("Plan shown ({done}/{total} done).")),
+            entries
+        }
+        (None, false) => {
+            return tool_error(
+                "update_plan needs `items` (the whole plan, in order) or {\"advance\": true}"
+                    .to_string(),
+            )
+        }
+        (Some(items), false) => {
+            if items.is_empty() || items.len() > UPDATE_PLAN_ITEMS_MAX {
+                return tool_error(format!(
+                    "update_plan takes 1 to {UPDATE_PLAN_ITEMS_MAX} steps (got {})",
+                    items.len()
+                ));
+            }
+            let mut entries = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                let content = item
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .unwrap_or_default();
+                if content.is_empty() {
+                    return tool_error(format!("step {} has no content", i + 1));
+                }
+                let status = match item.get("status").and_then(Value::as_str) {
+                    Some("pending") | Some("todo") => PlanStatus::Todo,
+                    Some("in_progress") => PlanStatus::InProgress,
+                    Some("completed") | Some("done") => PlanStatus::Done,
+                    other => {
+                        return tool_error(format!(
+                            "step {} has status {other:?}; use pending, in_progress or completed",
+                            i + 1
+                        ))
+                    }
+                };
+                entries.push(PlanEntry {
+                    content: content.chars().take(UPDATE_PLAN_STEP_MAX).collect(),
+                    status,
+                    id: Some((i + 1).to_string()),
+                    active_form: None,
+                    description: None,
+                    owner: None,
+                    blocked_by: Vec::new(),
+                });
+            }
+            entries
+        }
+    };
+    let reply = plan_position(&entries);
+    match state.chat.annotate(
+        agent_id,
+        AgentEvent::Plan {
+            entries: entries.clone(),
+        },
+    ) {
+        Ok(()) => {
+            if !plans.contains_key(agent_id) && plans.len() >= PLANS_MAX {
+                plans.retain(|id, _| state.chat.get(id).is_some_and(|info| info.alive));
+                if plans.len() >= PLANS_MAX {
+                    plans.clear();
+                }
+            }
+            plans.insert(agent_id.to_string(), entries);
+            tool_text(reply)
+        }
         Err(_) => tool_error(
             "this session has no chat transcript to show a plan in (a terminal session): \
              keep your plan in your reply instead"
@@ -2540,7 +2647,7 @@ mod tests {
                 assert_eq!(instructions.contains(TASK_LIST_FINISH_INSTRUCTIONS), chat);
             }
         }
-        // Antigravity has no task tool: do not tell it to call one.
+        // Antigravity now keeps chimaera's plan tool, so it is told to finish it too.
         let result = initialize_result(
             &json!({}),
             "test-agent",
@@ -2551,7 +2658,7 @@ mod tests {
             false,
             &[],
         );
-        assert!(!result["instructions"]
+        assert!(result["instructions"]
             .as_str()
             .unwrap()
             .contains(TASK_LIST_FINISH_INSTRUCTIONS));
@@ -2589,6 +2696,82 @@ mod tests {
             .starts_with(INSTRUCTIONS));
     }
 
+    /// A Claude (or Antigravity) chat always gets its plan paragraph inside
+    /// the ~4 KB Claude Code keeps, however much plugin text leads: the
+    /// paragraph counts against the lead budget and follows it directly.
+    #[test]
+    fn the_plan_paragraph_fits_claude_codes_window_with_a_full_plugin_lead() {
+        use crate::agents::AgentKind;
+        let lead: Vec<String> = (0..8).map(|i| format!("{i}{}", "p".repeat(500))).collect();
+        for kind in [AgentKind::Claude, AgentKind::Antigravity] {
+            let result = initialize_result(
+                &json!({}),
+                "a",
+                Some(kind),
+                true,
+                false,
+                false,
+                false,
+                &lead,
+            );
+            let text = result["instructions"].as_str().unwrap();
+            let plan = task_list_instructions(Some(kind), true);
+            let plan = plan.trim_start();
+            let at = text.find(plan).expect("the plan paragraph");
+            assert!(at + plan.len() < 4096, "{}", at + plan.len());
+            assert!(text.find(INSTRUCTIONS).unwrap() < PLUGIN_LEAD_MAX);
+            // Plugins still lead, and the ones that no longer fit follow.
+            assert!(text.starts_with("0ppp"));
+            assert!(text.ends_with(&lead[7]));
+        }
+        // With no plugin on, every chat opens with its own runtime's paragraph.
+        for kind in [
+            AgentKind::Claude,
+            AgentKind::Codex,
+            AgentKind::Cursor,
+            AgentKind::Grok,
+            AgentKind::Antigravity,
+        ] {
+            let result =
+                initialize_result(&json!({}), "a", Some(kind), true, false, false, false, &[]);
+            let text = result["instructions"].as_str().unwrap();
+            let plan = task_list_instructions(Some(kind), true);
+            assert!(text.starts_with(plan.trim_start()), "{kind:?}: {text}");
+        }
+    }
+
+    /// `advance` steps the stored plan; the reply names where the agent is.
+    #[test]
+    fn update_plan_advance_steps_the_plan_and_says_where_it_is() {
+        use chimaera_agent::model::{PlanEntry, PlanStatus};
+        let step = |content: &str, status| PlanEntry {
+            content: content.into(),
+            status,
+            id: None,
+            active_form: None,
+            description: None,
+            owner: None,
+            blocked_by: Vec::new(),
+        };
+        let mut plan = vec![
+            step("read", PlanStatus::Done),
+            step("edit", PlanStatus::InProgress),
+            step("test", PlanStatus::Todo),
+        ];
+        assert_eq!(plan_position(&plan), "Now: edit · 2 left");
+        advance_plan(&mut plan).unwrap();
+        assert_eq!(plan[1].status, PlanStatus::Done);
+        assert_eq!(plan_position(&plan), "Now: test · 1 left");
+        advance_plan(&mut plan).unwrap();
+        assert_eq!(plan_position(&plan), "All 3 steps done.");
+        assert!(advance_plan(&mut plan).is_none());
+        // Nothing in progress: the first pending step starts.
+        let mut fresh = vec![step("a", PlanStatus::Todo), step("b", PlanStatus::Todo)];
+        assert_eq!(plan_position(&fresh), "No step in progress · 2 left");
+        advance_plan(&mut fresh).unwrap();
+        assert_eq!(plan_position(&fresh), "Now: a · 2 left");
+    }
+
     /// The plan paragraph and tool follow the runtime and the surface: a
     /// Claude chat gets chimaera's `update_plan`, a Codex chat is pointed at
     /// its built-in one (no second tool of that name), an ACP chat is asked
@@ -2608,15 +2791,19 @@ mod tests {
         assert!(cursor.contains("your built-in TodoWrite TOOL"), "{cursor}");
         let grok = task_list_instructions(Some(AgentKind::Grok), true);
         assert!(grok.contains("your built-in todo_write TOOL"), "{grok}");
+        // Antigravity has no plan tool, so it gets chimaera's, in Claude's words.
         let agy = task_list_instructions(Some(AgentKind::Antigravity), true);
-        assert!(agy.contains("no plan or to-do tool"), "{agy}");
-        for acp in [cursor, grok, agy] {
+        assert_eq!(agy, claude);
+        assert!(agy.contains("{\"advance\": true}"), "{agy}");
+        for acp in [cursor, grok] {
             assert!(!acp.contains("update_plan"), "{acp}");
             assert!(!acp.contains("chimaera"), "{acp}");
         }
-        for kind in [AgentKind::Antigravity, AgentKind::Grok, AgentKind::Cursor] {
+        for kind in [AgentKind::Grok, AgentKind::Cursor] {
             assert!(!plan_tool_for(Some(kind), true));
         }
+        assert!(plan_tool_for(Some(AgentKind::Antigravity), true));
+        assert!(ALWAYS_ALLOWED_TOOLS.contains(&"update_plan"));
         for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::Grok] {
             assert_eq!(task_list_instructions(Some(kind), false), "");
             assert!(!plan_tool_for(Some(kind), false));

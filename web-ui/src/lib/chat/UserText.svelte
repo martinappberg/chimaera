@@ -5,6 +5,7 @@
   import FolderIcon from "../shared/FolderIcon.svelte";
   import { extractFileRefs, revealOf, type FileRef } from "../shared/fileRef";
   import { quoteRuns } from "../shared/reference";
+  import { fileHandle } from "../shared/fileHandle";
   import { chipLabels } from "./artifacts";
   import MathText from "./MathText.svelte";
   import { splitUserMath } from "./math";
@@ -205,7 +206,8 @@
         class:ambiguous={res.state === "ambiguous"}
         title={titleFor(t, res)}
         data-full={t.text}
-        onclick={(e) => activate(e, t, res)}>{@render chip(t, label, res)}</button>{:else if label !== null}<span
+        onclick={(e) => activate(e, t, res)}
+        {@attach fileHandle(() => (res.state === "hit" ? res.hit : null))}>{@render chip(t, label, res)}</button>{:else if label !== null}<span
         class="chip inert"
         class:quote={t.quote}
         class:missing={missing(t)}

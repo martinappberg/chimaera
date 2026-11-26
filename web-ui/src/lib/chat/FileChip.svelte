@@ -6,13 +6,16 @@
   /**
    * A file named on a chip: every file on the "written this turn" line (a
    * figure as much as a note) and a document the prose embeds
-   * (`![plan](analysis/PLAN.md)`). Click opens it;
+   * (`![plan](analysis/PLAN.md)`). Click opens it; dragged onto the
+   * composer, or from its right-click menu, it is referenced there
+   * (`fileHandle`, once `file` says where it is);
    * resting the pointer on it previews it — the chat's hover controller
    * finds the chip through the registry (`hoverTargets.ts`), so only a chip
    * whose file is known registers. A gone or not-found file keeps its name,
    * plainly not there.
    */
   import FileIcon from "../shared/FileIcon.svelte";
+  import { fileHandle } from "../shared/fileHandle";
   import type { ChatHoverTarget, HoverTargets } from "./hoverTargets";
 
   interface Props {
@@ -29,9 +32,12 @@
     /** A tooltip, for what no preview shows (gone, not found). */
     title?: string;
     onEnter?: () => void;
+    /** The file's absolute path once it is known to be there: the chip can
+     *  then be dragged and referenced. */
+    file?: string | null;
   }
 
-  let { path, label, state = "present", onOpen, hover = null, name, title, onEnter }: Props = $props();
+  let { path, label, state = "present", onOpen, hover = null, name, title, onEnter, file = null }: Props = $props();
 
   const absent = $derived(state === "gone" || state === "missing");
 
@@ -53,6 +59,7 @@
   onclick={(e) => onOpen?.(e)}
   onpointerenter={onEnter}
   {@attach register}
+  {@attach fileHandle(() => (file !== null ? { path: file } : null))}
 >
   <FileIcon {path} size={13} broken={absent} />
   <span class="name">{label}</span>

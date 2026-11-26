@@ -27,23 +27,25 @@ daemon  ──WS /ws/chat/{id}──▶  chatWs.ts (ChatSocket)
 | `transcriptWindow.ts`, `readingAnchor.ts`, `heightModel.ts` | Window math, reading anchor, row heights. |
 | `Markdown`, `streamSegments.ts`, `revealLedger.ts`, `tables.ts`, `markedExtensions.ts`, `MathText`, `math.ts` | Sanitized prose and math, streamed. A file link opens here or beside (⌘/Ctrl-click, a middle click, its right-click menu); the layout decides where ([open beside](../../../../docs/features/workbench.md#splitting-tabs--drag-and-drop)). |
 | `ChatHeader`, `ModelPicker`, `EffortPopover`, `capabilities.ts` | Header controls from capabilities. |
-| `Composer`, `composer.ts`, `composerHeight.ts`, `composerBus.ts`, `drafts.ts` | Input, slash completion, inserts, drafts; one context row for branch/worktree, linked terminals and notices, only when populated; terminal completion opens through `@term`, with no permanent launcher. The agent's slash catalog is kept to 256 rows (`store.svelte.ts`, the daemon's `SLASH_COMMANDS_CAP`); models and modes stay at 64. |
+| `Composer`, `composer.ts`, `composerHeight.ts`, `composerBus.ts`, `drafts.ts` | Input, slash completion, inserts (saved at the insert: a gesture that also re-tiles the window remounts the composer before its effects run), drafts; its root names the chat (`data-chat-session`) and the pane's reference band (`data-drop-band`); one context row for branch/worktree, linked terminals and notices, only when populated; terminal completion opens through `@term`, with no permanent launcher. The agent's slash catalog is kept to 256 rows (`store.svelte.ts`, the daemon's `SLASH_COMMANDS_CAP`); models and modes stay at 64. |
 | `stopConfirm.ts` + `StopNote.svelte` | Esc / Stop / Clear goal ask once ("Also stops 2 subagents · Esc again to stop") when that action also ends background subagents or workflows, the line above the control pressed and worded by the real gesture; otherwise they act at once. |
-| `uploadTokens.ts`, `uploadChips.ts`, `ComposerMentions`, `terminalMentions.ts` | Atomic mention tokens in the draft. |
+| `uploadTokens.ts`, `uploadChips.ts`, `ComposerMentions`, `terminalMentions.ts` | Atomic mention tokens in the draft. A terminal's is `@term:“<label>”` (curly quotes: macOS smart quotes rewrote the straight ones and broke the chip), and a system substitution inside any token is undone. |
 | `voice*.ts`, `VoiceMeter` | Voice dictation. |
-| `images.ts`, `AttachmentStrip`, `ImagePreview` | Image attachments and tiles. |
-| `ToolCallCard`, `ToolGroup`, `toolLabels.ts`, `agentNames.ts` | Tool calls and their one-line labels; `agentNames.ts` holds the id → name lookup App sets, apart so the always-loaded entry doesn't carry the labels. |
+| `images.ts`, `AttachmentStrip`, `ImagePreview` | Image attachments and tiles. A sent tile, like a file chip, a mention chip and an embed card, is a `../shared/fileHandle.ts` handle: drag onto the composer, or right-click → Reference in chat ([drops](../../../../docs/features/drag-drop-and-uploads.md#a-file-a-chat-already-shows)). |
+| `ToolCallCard`, `ToolGlyph`, `ToolGroup`, `ChangeSize`, `toolLabels.ts`, `toolArgs.ts` | Tool calls, their icons and one-line labels, a run's and an edit's change size, and what an opened row lists. |
+| `FailureRow`, `failureText.ts` | A failed turn or error line: mark, short headline, the raw text one click away. |
+| `DiffView`, `lineDiff.ts` | One file's change as changed lines; shared by edit rows and the approval card. |
 | `Activity*`, `activityFold.ts`, `FinishedFold`, `FinishedRow` | Folds of settled activity. |
 | `ThoughtRow`, `thoughtText.ts`, `HookRow`, `hookNotice.ts`, `statusWord.ts` | Thought and hook lines; status word. |
 | `AgentsTray`, `BackgroundTray`, `PlanCard`, `AheadCard`, `WorkStrip`, `workStrip.ts` | Pinned work cards; one shared inventory folds three kinds (including tasks) into a labelled strip; Running groups background agents and commands behind an activity icon. Idle tasks fold without adding a status label or refresh action; task tools own completion. A recurring job's "ends" date is the agent's own (`ahead.ts` `jobEndsAtMs`: `expires_at_ms`, else 7 days from creation). |
 | `subagent*.ts`, `SubagentBanner`, `SubagentChip`, `ModelChip` | A subagent as a read-only chat. |
 | `AgentMessageCards`, `agentMessages.ts`, `WakeRequestBar` | Other agents' messages and wake requests. |
-| `PermissionCard`, `QuestionCard`, `PlanApprovalCard`, `Elicitation*` | Answers to the agent. |
+| `PermissionCard`, `approval.ts`, `QuestionCard`, `PlanApprovalCard`, `Elicitation*` | Answers to the agent; an approval shows its command or diff, read from the tool row it points at. |
 | `RewindDialog`, `ForkDialog`, `AgentMessageMeta` | Rewind, fork, message actions. |
 | `McpPanel`, `UsagePanel`, `UsageMeter` | `/mcp`, `/usage` and the usage meter (its popover also holds a Claude chat's Auto-compact switch: `store.autoCompact` from the `auto_compact` read-back, `set_auto_compact` capability; `store.autoCompactDisabledBy` disables it, reading Off, "set off by <var>"; `store.contextCompactAt`, the `context_usage` event's `auto_compact_at`, draws a notch on the Context bar and "Auto-compact at N%", hidden while it is off; a Codex chat shows the line without a switch). |
 | `LimitCard`, `limitCard.ts` | The transcript-tail line while the agent reports the account's limit as reached (`store.rateLimit.limitReached`): what was hit and when it resets, as a quiet notice with a muted link to the sign-in for another account (never a call to action); only where `canSwitchAccount` (the catalog row's `sign_in` descriptor) holds. A `mode_switch` with `sign_in` drops the old account's limit state. |
 | `ArtifactGallery`, `artifacts.ts`, `embeds.ts`, `FileChip`, `ProseChip`, `hoverTargets.ts` | Embeds, written files, hover previews. |
-| `paths.ts`, `UserText` | Path links; the user-message bubble. |
+| `paths.ts`, `linkContext.ts`, `UserText` | Path links (App registers their context through the `linkContext.ts` leaf); the user-message bubble. |
 | `runCommand.ts` | Run buttons on settled shell fences: which fences, the typed text; App picks the terminal. |
 | `ChatFind`, `chatFind.ts`, `quoteSelection.ts` | Find in chat; quote a selection. |
 | `nativeUi.ts`, `mods.svelte.ts`, `Mod*.svelte`, `modClient.ts`, `nativeComposer.ts` | [Claude Mods](REFERENCE.md#claude-mods): never journaled or replayed. |
@@ -63,6 +65,7 @@ daemon  ──WS /ws/chat/{id}──▶  chatWs.ts (ChatSocket)
 - **Render agent output only through `Markdown.svelte`'s sanitizer** ([render](REFERENCE.md#render-and-sanitizer-invariants)).
 - **Streaming is never more permissive than settle** ([pipeline](REFERENCE.md#the-streaming-render-pipeline)).
 - **Trust the daemon's seq: a gap heals by replay, and fork points are event-backed** ([reducer](REFERENCE.md#reducer-invariants)).
+- **A permission decision is recorded on its tool row, not as a transcript line** (`decision` on the block; a line only when no row exists), so approved calls fold as one run.
 - **A queued send becomes a block only once read, and agents' messages are cards** ([reducer](REFERENCE.md#reducer-invariants)).
 - **The reducer's vocabulary is pinned by daemon-written fixtures.** `net/fixtures/wire/chat-events.json` (every `AgentEvent` variant, written by chimaera-agent's wire test) goes through `ChatStore.apply` in `net/wireFixtures.test.ts`, which expects `store.unhandledEventTypes` to stay empty — a type the reducer ignores on purpose is an explicit `case`, never the `default:`.
 - **Never lose a user action to a closed socket; hiding a chat never stops its agent** ([transport](REFERENCE.md#transport-invariants)).
@@ -71,6 +74,7 @@ daemon  ──WS /ws/chat/{id}──▶  chatWs.ts (ChatSocket)
 - **Keep floating chrome off `.column`** ([quote](REFERENCE.md#copy-and-quote-selection)).
 - **`ForkDialog` is pane-local, not a window modal:** no focus trap, so App's chords stay live; Escape anywhere in its pane or a press outside it in its pane cancels, and that Escape never reaches the composer's interrupt ([ui-contracts §3](../../../../docs/agent-guides/ui-contracts.md#3-focus-escape-and-keyboard-navigation)).
 - **Never infer controls from the agent's brand** ([capabilities](REFERENCE.md#session-capabilities)).
+- **App imports only leaves from here.** App sits in the always-loaded entry, which the build caps at 500 kB (`vite.config.ts`). A registry App fills (`linkContext.ts`, `composerBus.ts`) must not live in a module that carries the chat's logic: importing `paths.ts` for one setter cost 8 kB.
 - **Mutate `$state` only in store methods, tear down every `$effect` timer, use theme tokens, share chrome instead of re-pasting it per card** ([conventions](REFERENCE.md#runes-and-ui-conventions)).
 
 ## Adding to the chat UI

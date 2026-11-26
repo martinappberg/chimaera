@@ -70,6 +70,14 @@ describe("block height model", () => {
     expect(tailWeights(run.slice(0, 5), 1, 100).total).toBe(4);
   });
 
+  it("weighs a JSON failure by the one line it draws, not its body", () => {
+    const reason = `API Error: 401 {"type":"error","error":{"message":"invalid x-api-key"},"request_id":"req_${"x".repeat(600)}"}`;
+    const failure = { uid: 7, kind: "notice", text: `turn failed: ${reason}`, tone: "error", reason } as ChatBlock;
+    expect(blockWeight(failure, null, 100)).toBe(1.5);
+    const raw = { uid: 8, kind: "notice", text: `turn failed: ${reason}`, tone: "info" } as ChatBlock;
+    expect(blockWeight(raw, null, 100)).toBeGreaterThan(6);
+  });
+
   it("adds a picture row to a user message with saved images", () => {
     const user = (attachmentPaths: string[]): ChatBlock =>
       ({ uid: 5, kind: "user", text: "look", attachments: attachmentPaths.length, attachmentPaths, checkpoint: null, id: null, origin: null, forkSeq: 0 }) as ChatBlock;

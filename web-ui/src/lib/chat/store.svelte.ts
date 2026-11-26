@@ -177,6 +177,9 @@ export interface PermissionOption {
   kind: "allow_once" | "allow_always" | "reject_once" | "reject_always";
 }
 
+/** How a tool's permission prompt ended (`ChatBlock` tool rows). */
+export type ToolDecision = "allowed" | "always" | "denied" | "lapsed";
+
 export interface PendingPermission {
   requestId: string;
   toolCallId: string | null;
@@ -379,6 +382,13 @@ export type ChatBlock = BlockIdentity &
        *  (claude `allow_*`, codex `accept*`) — distinct from a plain completion
        *  so the card can read "allowed" rather than dumping the command. */
       allowed: boolean;
+      /** How this call's permission prompt ended, in the user's terms: the
+       *  row's own mark is the transcript's record of it (no separate line).
+       *  `always` = an allow that also saved a rule; `lapsed` = the prompt
+       *  went away unanswered (cancelled, expired). Absent: never asked. */
+      decision?: ToolDecision;
+      /** The option's label as the agent worded it ("Allow Always (risky)"). */
+      decisionLabel?: string;
       /** Live output streamed ahead of the authoritative result. */
       streaming: boolean;
       /** Process-owned work that may outlive its parent turn (Codex collab
@@ -400,7 +410,18 @@ export type ChatBlock = BlockIdentity &
        *  turn-end gallery scans for the files a script wrote. */
       command: string | null;
     }
-  | { kind: "notice"; text: string; tone: "info" | "error"; signIn?: boolean }
+  | {
+      kind: "notice";
+      text: string;
+      tone: "info" | "error";
+      signIn?: boolean;
+      /** The user stopped the turn here; drawn as a stop mark. */
+      stop?: boolean;
+      /** The turn failed here: the agent's reason as it gave it ("" when it
+       *  gave none). Drawn as a failure row (`FailureRow`); `text` keeps the
+       *  "turn failed: …" line for find and copy. */
+      reason?: string;
+    }
   | {
       /** A turn nobody typed: the agent woke on its own — a monitor event, a
        *  scheduled wake-up, work it left running. The wire never carries the
@@ -909,6 +930,13 @@ export class ChatStore {
    *  the oldest message down or eagerly load every historical artifact. */
   hydrating = $state(true);
   private replayHead = 0;
+  /** Counts the connections that have caught up: each `ready` whose replay
+   *  has reached the advertised head. A question card latches its answer
+   *  to the epoch it was sent in; one still pending after a later catch-up
+   *  never reached the daemon (its socket dropped), so it may be sent again. */
+  liveEpoch = $state(0);
+  /** A `ready` whose replay has not yet reached {@link replayHead}. */
+  private catchingUp = false;
   /** Local clock minus the daemon's journal clock, sampled only from frames
    *  the socket delivered live past the replay head (a replayed frame's `ts`
    *  is its original time, so sampling one would read its age as skew): a
@@ -963,11 +991,14 @@ export class ChatStore {
       const initial = this.hydrating || this.lastSeq === 0;
       this.replayHead = head;
       this.hydrating = initial && this.lastSeq < head;
+      this.catchingUp = this.lastSeq < head;
     } else {
       // Compatibility with a server that predates the additive head field:
       // it cannot give us a hydration boundary, so preserve the old live fold.
       this.hydrating = false;
+      this.catchingUp = false;
     }
+    if (!this.catchingUp) this.liveEpoch += 1;
     if (isRealModel(session.model)) this.model = session.model;
     if (session.current_mode !== null) this.currentMode = session.current_mode;
     if (!session.alive && this.exited === null) {
@@ -1100,6 +1131,10 @@ export class ChatStore {
     if (entry.seq <= this.lastSeq) return;
     this.lastSeq = entry.seq;
     if (this.hydrating && this.lastSeq >= this.replayHead) this.hydrating = false;
+    if (this.catchingUp && this.lastSeq >= this.replayHead) {
+      this.catchingUp = false;
+      this.liveEpoch += 1;
+    }
     if (live && entry.ts > 0 && entry.seq > this.replayHead) this.clockSkewMs = Date.now() - entry.ts;
     const ev = entry.ev;
     switch (ev.type) {
@@ -1781,21 +1816,26 @@ export class ChatStore {
         // keeps their prior "not allowed" (denied) treatment unchanged.
         const kind = req?.options.find((o) => o.id === option)?.kind ?? null;
         const allowed = kind !== null ? kind.startsWith("allow") : option.startsWith("allow");
-        if (req !== undefined) {
-          // Fold the decision into history as a quiet row — the card itself
-          // is overlay-only, and "what did I allow?" must survive a reload.
-          const label =
-            req.options.find((o) => o.id === option)?.label ??
-            (option === "cancelled" || option === "expired" ? "no longer active" : option);
-          this.notice(decisionLine(req.title, label), "info");
+        const lapsed = kind === null && (option === "cancelled" || option === "expired");
+        const label =
+          req?.options.find((o) => o.id === option)?.label ?? (lapsed ? "no longer active" : option);
+        const row = req?.toolCallId != null ? this.toolBlock(req.toolCallId) : null;
+        if (row !== null) {
+          // The call's own row is the record of the decision — "what did I
+          // allow?" survives a reload there, and a run of approved calls
+          // stays one run instead of a line per answer. A prompt that went
+          // away unanswered was never refused: its row is not a denial (and
+          // not a failure in the run's badge).
+          if (allowed) row.allowed = true;
+          else if (!lapsed) row.denied = true;
+          row.decision = lapsed ? "lapsed" : !allowed ? "denied" : kind === "allow_always" ? "always" : "allowed";
+          row.decisionLabel = label;
         }
-        if (req?.toolCallId != null) {
-          const idx = this.toolIndex.get(req.toolCallId);
-          const block = idx !== undefined ? this.blocks[idx] : undefined;
-          if (block !== undefined && block.kind === "tool") {
-            if (allowed) block.allowed = true;
-            else block.denied = true;
-          }
+        // A plan approval answers the plan, not a command: it keeps its own
+        // line whether or not ExitPlanMode drew a row. So does a request
+        // with no row to carry the decision (a hidden call).
+        if (req !== undefined && (row === null || req.plan !== null)) {
+          this.notice(decisionLine(req.title, label), "info");
         }
         break;
       }
@@ -1965,14 +2005,17 @@ export class ChatStore {
         // wire's `interrupted` flag is the drivers' structural signal
         // (claude's free-text result string never reliably said so); the
         // reason regex survives only for pre-flag journal replays. Render a
-        // calm muted "stopped", keep --err for real failures. Both drivers'
+        // calm stop mark, keep --err for real failures. Both drivers'
         // fallback reason is literally "turn failed", so don't prefix it
         // into "turn failed: turn failed".
         const reason = ev.reason as string;
         if (ev.interrupted === true || /interrupt/i.test(reason)) {
-          this.notice("stopped", "info");
+          this.blocks.push(this.stamp({ kind: "notice", text: "Stopped", tone: "info", stop: true }));
         } else {
-          this.notice(reason === "turn failed" ? "turn failed" : `turn failed: ${reason}`, "error");
+          const said = typeof reason !== "string" || reason === "turn failed" ? "" : reason;
+          this.blocks.push(
+            this.stamp({ kind: "notice", text: said === "" ? "turn failed" : `turn failed: ${said}`, tone: "error", reason: said }),
+          );
         }
         break;
       }
@@ -2331,6 +2374,13 @@ export class ChatStore {
     else if (!live && i !== -1) this.activeAgents.splice(i, 1);
   }
 
+  /** The transcript row of a tool call, or null (never drawn, or trimmed). */
+  toolBlock(id: string): Extract<ChatBlock, { kind: "tool" }> | null {
+    const idx = this.toolIndex.get(id);
+    const block = idx !== undefined ? this.blocks[idx] : undefined;
+    return block !== undefined && block.kind === "tool" ? block : null;
+  }
+
   /** Also the client's own channel for local notices (usage summaries,
    *  intercepted commands) — they are NOT journaled, deliberately. */
   notice(text: string, tone: "info" | "error", signIn = false): void {
@@ -2361,7 +2411,13 @@ export class ChatStore {
     this.questions = [];
     this.elicitations = [];
     for (const p of this.pending) {
-      this.notice(decisionLine(p.title, "no longer active"), "info");
+      const row = p.toolCallId != null ? this.toolBlock(p.toolCallId) : null;
+      if (row !== null && p.plan === null) {
+        row.decision = "lapsed";
+        row.decisionLabel = "no longer active";
+      } else {
+        this.notice(decisionLine(p.title, "no longer active"), "info");
+      }
     }
     this.pending = [];
   }

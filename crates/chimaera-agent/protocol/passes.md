@@ -1944,6 +1944,40 @@ The same day's drift pass probed the newest Grok Build, Antigravity and Cursor r
 
 - Hermetic, new: `acp.rs` `grok_billing_without_a_percent_reads_an_unused_period`, `a_combined_model_id_restores_as_model_and_thinking_level`, `shell_output_comes_from_raw_output_when_content_is_absent` (all from the logged frames); `runtimes.rs` `shim_turns_off_self_update_for_the_managed_agy_only`, `only_a_managed_agy_spawn_turns_off_self_update`; `agent_probe.rs` `probes_never_start_an_agent_self_update`; `runtime_retention.rs` `a_self_updated_activation_keeps_every_package`.
 
+## Pass 62 — 2026-11-26: Antigravity chats first-class (agy 1.5.12 `agy acp`, agy-acp 1.4.5)
+
+Raw ACP probes logged every frame from `agy acp` (CLI 1.5.12) and the standalone agy-acp-server 1.4.5 on one free-tier account: tools, questions, plan mode, a subagent, an MCP stand-in, and two mid-turn prompts. Facts are in [acp.md](acp.md).
+
+### Findings
+
+- **Questions.** `agy acp` asks with `elicitation/create` (a `q<N>` / `q<N>_other` form) only when the client advertises `clientCapabilities.elicitation.form`; otherwise the question is printed as chat text and the turn ends. The standalone 1.4.5 asks with a permission request (`toolCallId: "interaction_<hex>"`, no `kind`, the answers as `allow_once` options), which chat drew as an approval card.
+- **Approvals without context.** `agy acp`'s edit diff rides only the permission request's `toolCall.content`; its row had none.
+- **Rows.** Both servers title rows in their own words ("File notes.txt" for a read and an edit, "File ../../../…" outside the workspace, "Run invoke_subagent", "Running view_file", "Run edit_file?"); `agy acp` adds a non-spec `name` and `rawInput.toolSummary`. Its shell output opens with a "Created At / Completed At / Command exited with code N / Command output:" preamble and keeps `\r\n`; `rawOutput.exit_code` holds the code.
+- **Mid-turn prompts.** A second `session/prompt` during a running shell command made the first answer `end_turn` at once and the turn continued under the second, which answered last with the new text. During an open permission it was refused at once (`-32603 … waiting for a permission or question answer`).
+- **MCP.** The stdin `mcpServers` http entry works without `--process-per-session`, despite the help text. Calls are `name: "mcp_<server>_<tool>"`, title `Run <name>`, no `_meta` (unlike agy-acp's `_meta.mcp`), with an injected `toolSummary` argument.
+- **1.5.12 ends a turn under a running subagent** (`invoke_subagent` completes, `end_turn`); upstream fixed it in 1.5.15.
+- `session/resume` (advertised), allow/deny, Stop during an approval, queue cancel and `set_config_option` read-back (model, and `thought_level` through a combined model id) held in the live run.
+
+### Adopted
+
+- `acp::ANTIGRAVITY_CLI` (`TESTED_AGY_CLI_VERSION` = 1.5.12; `elicitation` and `steers` on). The launcher runs `<agy> acp` when `agents.agy.chatPath` names an agy binary or, with none, when the terminal agy's cached version is ≥ 1.5.15 (`AGY_CLI_CHAT_MIN`: the subagent turn-end fix per agy's changelog, not verified here; 1.5.12 was verified through an explicit chatPath, and a pre-release version counts as too old); the standalone server otherwise, as before. `is_agy_standalone_server` tells them apart by file name, so a wrapper around the `.par` must keep its name; the journaled version is the terminal agy's under `agy acp`, which logs the expected drift line against 1.5.12 until the pin moves.
+- Questions → `QuestionRequest` / `Answer` / `QuestionResolved` for both servers (`form_questions`, `choice_question`); free text rides `q<N>_other`, or, on 1.4.5, cancels and follows as the next prompt with no bubble. Other forms → `ElicitationRequest` via the shared normalizer, else `decline`. Open questions are cancelled on interrupt and at turn end, resolved at exit. Antigravity chats list `answer`.
+- Hidden rows: `ask_question`, 1.4.5's `interaction_*` call, and chimaera's `update_plan` in both servers' MCP shapes (the daemon now offers that tool to Antigravity chats).
+- A permission request's content the row lacks goes to the row first (`ToolCallUpdate` at the row's own status), for Antigravity only (both servers).
+- Antigravity rows: `Read:` / `Edit:` / `Write: <file>`, `Agent: <Role>` (kind `agent`), execute rows' `ToolCall.command`, `ToolRenderData {name, input}` on every row; the shell preamble cut, `\r\n` → `\n`; a non-zero `exit_code` is `failed`, matching codex's rows.
+- `agy acp` pre-approval reads `mcp_<consented server>_<tool>` with the exact title.
+- Steering on `agy acp` (`can_steer`, `Pending::Steer`): a Send mid-turn goes at once when nothing is open; a refusal or cancel waits for the turn's end, joined with what queued behind it (`SendIfRunning`: `dropped`). A typed 1.4.5 answer goes with a Stopped turn.
+
+### Not adopted (recorded for later)
+
+- Advertising `elicitation.form` to the standalone server, Grok or Cursor: their reaction is unprobed.
+- Send now through a steer instead of cancel-and-join on `agy acp`.
+
+### Gate (Pass 62)
+
+- Hermetic, new in `acp.rs`: `agy_form_questions_become_a_question_card_and_answer_by_const`, `open_agy_questions_are_cancelled_by_interrupt_turn_end_and_exit`, `other_agy_forms_use_the_form_card_or_are_declined`, `standalone_interaction_is_a_question_and_free_text_follows_as_a_prompt`, `antigravity_rows_name_their_file_role_or_tool`, `agy_question_and_plan_calls_draw_no_row`, `agy_acp_mcp_calls_are_pre_approved_in_their_own_shape`, `agy_shell_output_loses_its_preamble_and_a_nonzero_exit_fails`, `a_permission_carrying_the_change_puts_it_on_the_row_first`, `agy_acp_steers_a_running_turn_and_falls_back_to_the_queue`, `antigravity_servers_are_told_apart_by_name_and_version`; server: the `build_acp_chat_command` argv cases.
+- Live: `CHIMAERA_TEST_AGY_ACP=~/.chimaera/agents/bin/agy cargo test -p chimaera-agent --test acp_live antigravity -- --ignored` passed on agy 1.5.12 (`agy acp`), with the new question and steer turns. The standalone 1.4.5 paths are covered from its captured frames only.
+
 ## Pass 63 (2026-11-26 — live probes claude 2.1.332, codex 0.172.0): drift pass for the two native drivers. Both pins moved; four Claude mappings ADOPTED, one Codex list updated.
 
 Claude Code 2.1.318 → 2.1.332 (npm `latest`; `stable` is 2.1.326; 2.1.320 and 2.1.324 have no changelog section and 2.1.322 is one line) and Codex 0.166.0 → 0.172.0 (npm and GitHub latest). The maintainer also asked that anything new in either range be supported, so the changelogs were read whole for features a host should handle, not only for breakage.
@@ -2070,3 +2104,25 @@ Entries that matter to a host driving the CLI structurally. Rows without "live" 
 - `just check`: one full run green on the tree before the review fixes (fmt, clippy and every test in both workspaces; its last step, which refuses an uncommitted wire fixture, flagged `chat-events.json` for the new `expires_at_ms` until the fixture was committed with the client change). On the final tree fmt, clippy, the agent crate's tests, the plugins workspace's tests and the fixture guard are green, but three further runs of `cargo test --workspace` each failed one different `chimaera-server` test on a wait (`tests::plugins::agent_plugin_install_ignores_forged_completion_title`, `tests::comms::a_working_chat_hears_it_at_its_next_step_and_its_transcript_shows_it`, `tests::plugin_jobs::a_tool_downloads_checks_unpacks_sets_up_and_runs`) while other sessions' builds held the load average at 14–19; the three passed together alone, five times. None reaches the changed code. `npm --prefix web-ui run check` (0 errors) and `run test` (3212 passed).
 - Live UI (isolated daemon on this branch, the real claude 2.1.332, no turn sent): a fresh Claude chat's composer offered `/goal` and `/xlsx` (the 86th and last catalog entry), and `/claude` listed the account's MCP prompt (`claude.ai <Connector>:<prompt> (MCP)`), which only the `commands_changed` push carries.
 - Pins moved: `TESTED_CLAUDE_VERSION` 2.1.332, `TESTED_CODEX_VERSION` 0.172.0.
+
+## Pass 64 — 2026-11-26: `agy acp` on agy 1.5.18, the automatic switch end to end
+
+The newest agy the managed installer offered was 1.5.18. It was installed through the daemon's own route (`POST /api/v1/agents/agy/install`) into an isolated daemon's managed root (fresh `CHIMAERA_HOME`, no `agents.agy.path` or `chatPath`), sha512-checked by the curated script, and detected as a managed install. It picked up the existing Antigravity sign-in (free tier). Turns ran on Gemini 3.8 Flash, thinking low. Facts are in [acp.md](acp.md).
+
+### Findings
+
+- **Raw protocol unchanged.** `initialize` and `session/new` are identical to 1.5.12 apart from the version string. A raw turn (shell, edit, a two-question `ask_question`) produced the same frames as 1.5.12: `name` + `rawInput` (+ `args`), the "Created At / Completed At / Command exited with code N / Command output:" preamble with `\r\n`, options `allow` / `deny`, the snippet diff only on the permission request's `toolCall.content` (the completed update carries the whole-file diff), and the `q<N>` / `q<N>_other` form with a multi-select array (answers read back). `thought_level` lists only the current model's levels (Flash: no xhigh).
+- **The subagent defect is gone.** Asked to delegate `sleep 10; echo sub-done` and wait, 1.5.18 answered `end_turn` 7 s after the child's command finished, with the child's result; 1.5.12 had answered `end_turn` right after `invoke_subagent` completed. The child's tool calls stream on the parent session as `<child conversation uuid>:call_<n>`, and their permission requests come there too. `invoke_subagent` still completes at dispatch, and its `rawInput` adds `Model` (and `Workspace`) `"inherit"`.
+- **Product path.** With no chatPath, a new Antigravity chat ran `<managed>/agy/1.5.18/bin/agy acp` (child of the daemon) with `AGY_CLI_DISABLE_AUTO_UPDATE=true` in its environment; the daemon logged the expected drift line (detected 1.5.18, tested 1.5.12); the version directory and the binary's sha256 were unchanged after every chat. Over `/ws/chat`: chimaera's `update_plan` → `Plan` events advanced step by step with no row and no approval; `Read: notes.txt`; `ls -la` behind an approval, output without the preamble; `Edit: notes.txt` with its diff on the row before the `PermissionRequest`, then the whole-file diff; a question card answered with typed text ("Chartreuse green" → `q1_other`, restated by the agent); a mid-turn Send during a running command went into the running turn (bubble `sent` at once, one `turn_completed`, the reply followed the steer); a Send while the child's approval was open waited and went after the turn; `SendAfterTurn` ran as the next turn; Send now stopped a running command (`turn_aborted`, row `failed`) and sent the waiting message as a new turn. All 15 agy commands reached the composer catalog after main's Pass 63 change.
+
+### Adopted
+
+- `TESTED_AGY_CLI_VERSION` = 1.5.18. `AGY_CLI_CHAT_MIN` stays 1.5.15: the subagent fix the gate relies on is now verified on 1.5.18 (1.5.15–1.5.17 were not run). No adapter change.
+
+### Not adopted (recorded for later)
+
+- Nesting a subagent's rows under its `Agent:` row and keeping that row running until the child reports: the frames give only the child conversation id prefix, no link to the parent call.
+
+### Gate (Pass 64)
+
+- Live: `CHIMAERA_TEST_AGY_ACP=<managed>/agy/1.5.18/bin/agy cargo test -p chimaera-agent --test acp_live antigravity -- --ignored` passed on this branch before and after merging main (Pass 63).

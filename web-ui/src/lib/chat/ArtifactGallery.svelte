@@ -252,6 +252,7 @@
           {state}
           name={chipName(f.path, state)}
           title={state === "gone" ? chipName(f.path, state) : undefined}
+          file={state === "gone" ? null : f.path}
           onOpen={onOpenPath !== undefined ? (e) => onOpenPath(f.path, "file", { split: e.metaKey || e.ctrlKey }) : undefined}
           hover={hoverTargets !== undefined && state !== "gone"
             ? {

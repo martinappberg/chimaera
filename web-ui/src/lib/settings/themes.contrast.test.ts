@@ -24,6 +24,23 @@ const mix = (a: string, b: string, p: number) => {
   return "#" + A.map((v, i) => Math.round((v * p + B[i] * (1 - p)) * 255).toString(16).padStart(2, "0")).join("");
 };
 
+// The git status tints live in app.css by MODE, not per theme; read them
+// from there so the floor below follows the real values. Vitest drops CSS
+// imports (even `?raw`), and the UI's tsconfig carries no node types, so
+// node's fs comes in through a narrow cast.
+type NodeFs = { readFileSync(path: URL, encoding: "utf8"): string };
+const nodeFs = (
+  globalThis as unknown as { process: { getBuiltinModule(id: "node:fs"): NodeFs } }
+).process.getBuiltinModule("node:fs");
+const APP_CSS = nodeFs.readFileSync(new URL("../../app.css", import.meta.url), "utf8");
+function modeToken(mode: "light" | "dark", token: string): string {
+  const start = mode === "light" ? APP_CSS.indexOf(":root {") : APP_CSS.indexOf(':root[data-theme="dark"] {');
+  const block = APP_CSS.slice(start, APP_CSS.indexOf("\n}", start));
+  const hit = new RegExp(`${token}:\\s*(#[0-9a-fA-F]{6})`).exec(block);
+  if (hit === null) throw new Error(`${token} not found in the ${mode} block of app.css`);
+  return hit[1];
+}
+
 const TEXT_TOKENS = [
   "--fg",
   "--muted",
@@ -56,6 +73,15 @@ describe("theme text contrast", () => {
       it("--accent as text (app.css --accent-text: 75% toward --fg) holds 4.5:1", () => {
         expect(ratio(mix(theme.tokens["--accent"], theme.tokens["--fg"], 0.75), sheet)).toBeGreaterThanOrEqual(4.5);
       });
+      // "+54 −3" on activity lines and diff headers is text: the added and
+      // removed tints hold the text floor on the page and the code sheet.
+      for (const token of ["--git-added", "--git-deleted"]) {
+        it(`${token} holds 4.5:1 as change-size text`, () => {
+          const tint = modeToken(theme.kind, token);
+          expect(ratio(tint, theme.tokens["--bg"])).toBeGreaterThanOrEqual(4.5);
+          expect(ratio(tint, sheet)).toBeGreaterThanOrEqual(4.5);
+        });
+      }
       it("--rate (a glyph tone, never prose) holds 3:1", () => {
         expect(ratio(theme.tokens["--rate"], sheet)).toBeGreaterThanOrEqual(3.0);
       });

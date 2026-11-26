@@ -515,6 +515,38 @@ function windowEdgeAt(x: number, y: number): DropSpot | null {
 /** The "@ reference" / "link to agent" bands cover the bottom ~22% of a
  *  pane (one geometry, two payloads: files reference, terminals link). */
 export const REF_BAND_FRAC = 0.22;
+/** The most of a pane a band may take: the tile zones keep the rest. */
+export const BAND_MAX_FRAC = 0.5;
+
+/**
+ * The band's share of a pane: the bottom ~22%, grown to hold the whole input
+ * area when that is taller (a long draft, attachments, a short pane). The
+ * band means "into this input", so a release anywhere on the input has to
+ * land in it: with a fixed share, the top of a tall composer fell in the
+ * center zone, and a tab dropped there moved into the pane instead.
+ * `inputTop` is the input area's top edge in the pane's own coordinates, or
+ * null where the pane shows none (a terminal's agent).
+ */
+export function bandFraction(paneHeight: number, inputTop: number | null): number {
+  if (inputTop === null || !(paneHeight > 0)) return REF_BAND_FRAC;
+  const share = (paneHeight - inputTop) / paneHeight;
+  return Math.min(BAND_MAX_FRAC, Math.max(REF_BAND_FRAC, share));
+}
+
+/** The band's share of `paneId` right now (`bandFraction` over the shown
+ *  view's `data-drop-band` element; a kept-alive view behind it is inert). */
+export function paneBandFraction(paneId: string): number {
+  const reg = paneRegs.get(paneId);
+  if (reg === undefined) return REF_BAND_FRAC;
+  const r = reg.root.getBoundingClientRect();
+  let top: number | null = null;
+  for (const el of reg.content.querySelectorAll<HTMLElement>("[data-drop-band]")) {
+    if (el.closest("[inert]") !== null) continue;
+    const b = el.getBoundingClientRect();
+    if (b.height > 0) top = Math.min(top ?? Infinity, b.top - r.top);
+  }
+  return bandFraction(r.height, top);
+}
 
 /**
  * Link-intent hit-test (a drag from a pane's link icon): the WHOLE agent view
@@ -613,7 +645,7 @@ function spotAt(
   const linkActive = paneHit !== null && linkTargets?.has(paneHit.paneId) === true;
   if (paneHit !== null && (refActive || linkActive)) {
     const ny = (y - paneHit.r.top) / paneHit.r.height;
-    if (ny >= 1 - REF_BAND_FRAC) {
+    if (ny >= 1 - paneBandFraction(paneHit.paneId)) {
       // Mutually exclusive by payload: ref only arms for file drags, link
       // only for shell-terminal drags (see startDrag / DragOptions).
       return refActive
@@ -703,8 +735,8 @@ function leashAnchor(spot: DropSpot | null): { x: number; y: number } | null {
     const reg = paneRegs.get(spot.paneId);
     if (reg !== undefined) {
       const r = reg.content.getBoundingClientRect();
-      // The band lives on the pane's lower ~22%; aim the leash into it.
-      return { x: r.left + r.width / 2, y: r.bottom - r.height * 0.11 };
+      // The band lives on the pane's lower part; aim the leash into it.
+      return { x: r.left + r.width / 2, y: r.bottom - (r.height * paneBandFraction(spot.paneId)) / 2 };
     }
   }
   if (spot.kind === "linkpane") {
@@ -796,6 +828,42 @@ export interface DragOptions {
    * frame.
    */
   describe?: (spot: DropSpot) => string | null;
+}
+
+/**
+ * An active drag's release is not a click, but the browser still makes one of
+ * it, on the source that captured the pointer (Chromium and WebKit both, the
+ * native app's web view included: observed live). A source with a click
+ * handler of its own (a tab activates, a rail row opens its session) would
+ * then act a second time on a gesture the drop already consumed: a tab
+ * dropped on the reference band was referenced AND activated, and a linked
+ * terminal took the focus the link had just handed the agent. Swallow that
+ * one click, for every source at once.
+ *
+ * The click is dispatched in the release's own task, so the guard leaves on
+ * the next one. A drag cancelled while the button is still down (Escape, a
+ * window blur) keeps it until that press ends; the next press always ends it,
+ * and a click the keyboard makes (Enter or Space on a focused control:
+ * `detail` 0) passes, so a release the window never saw cannot cost a later,
+ * real click.
+ */
+function swallowDragClick(released: boolean): void {
+  function swallow(e: Event): void {
+    off();
+    if ((e as MouseEvent).detail === 0) return;
+    e.stopPropagation();
+    e.preventDefault();
+  }
+  function off(): void {
+    window.removeEventListener("click", swallow, true);
+    window.removeEventListener("pointerup", soon, true);
+    window.removeEventListener("pointerdown", off, true);
+  }
+  const soon = () => setTimeout(off, 0);
+  window.addEventListener("click", swallow, true);
+  window.addEventListener("pointerdown", off, true);
+  if (released) soon();
+  else window.addEventListener("pointerup", soon, true);
 }
 
 /**
@@ -940,9 +1008,10 @@ export function startDrag(
     if (raf === 0) raf = requestAnimationFrame(update);
   };
 
-  const finish = (commit: boolean) => {
+  const finish = (commit: boolean, released = commit) => {
     if (done) return;
     done = true;
+    if (active) swallowDragClick(released);
     window.removeEventListener("pointermove", onMove);
     window.removeEventListener("pointerup", onUp);
     window.removeEventListener("pointercancel", onCancel);
@@ -983,7 +1052,8 @@ export function startDrag(
     finish(true);
   };
   const onCancel = (ev: PointerEvent) => {
-    if (ev.pointerId === pointerId) finish(false);
+    // The pointer is gone: no click follows, and none is owed a guard.
+    if (ev.pointerId === pointerId) finish(false, true);
   };
   const onKey = (ev: KeyboardEvent) => {
     if (ev.key === "Escape") {
