@@ -676,6 +676,14 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   - A screen is data: semantic props only (tone, size, icon names), so light, dark and the
     brand hold; markdown goes through chat's sanitizer; links open outside; images and files
     come from the workspace or the plugin's output folder only.
+  - A deck a plugin rendered (the `slides` node: pictures, one or more builds a slide) draws in
+    the slide viewers' chrome (`ui/DeckNode.svelte`): the picture in the image viewer with its
+    area tool, a thumbnail strip, keys that walk a slide's builds and then the slides, **@** for
+    the slide's code, **present** (full screen, a click a build, hidden slides skipped, as in the
+    PowerPoint viewer: `previews/slideShow.ts`) and **presenter** (this slide, the next click,
+    the notes, a timer). Open the deck in two windows and they keep step while either is in the
+    show: the show on the projector, the presenter's view on the laptop. Paging never calls the
+    plugin; the place survives a re-render by the slide's title.
   - Code excerpts share the bounded, syntax-highlighted `ExtensionCode` renderer with
     Claude Mods. The existing `ui/1` format, named actions and WASM capabilities stay
     unchanged; [portable Mod authoring](../design/mods-extension-compatibility.md) is a

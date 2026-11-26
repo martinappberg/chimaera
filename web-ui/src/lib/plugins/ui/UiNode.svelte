@@ -19,6 +19,7 @@
    */
   import { onDestroy, onMount, untrack, type Component } from "svelte";
   import UiNode from "./UiNode.svelte";
+  import DeckNode from "./DeckNode.svelte";
   import Switch from "../../shared/Switch.svelte";
   import FileIcon from "../../shared/FileIcon.svelte";
   import Markdown from "../../chat/Markdown.svelte";
@@ -559,6 +560,8 @@
       <ImageView path={resolved} />
     {/if}
   </div>
+{:else if kind === "slides"}
+  <div class="rich tall"><DeckNode {node} /></div>
 {:else if kind === "button"}
   {@render actionButton(node)}
 {:else if kind === "toggle"}

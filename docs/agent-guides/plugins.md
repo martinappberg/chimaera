@@ -876,6 +876,7 @@ daemon log).
 | `file` | **`path`** (a workspace path or `output:<path>`), `label`, `line` — a card that opens it |
 | `link` | **`text`**; `href` (http/https, opens outside) or `file` + `line` |
 | `image` | **`src`**, **`alt`** |
+| `slides` | **`slides`**: `[{title, builds: [{src, notes?}], hidden?, notes?, file?, line?, tag?}]` (a build is a picture: a workspace path or `output:<path>`; ≤ 600 slides, 40 builds each); `id` (names the deck: two windows on it keep step in a show), `start` (the title of the slide to open on), `width` + `height` (the slides' shape, 16:9 without), `label` — a deck of pictures you rendered, in the app's slide viewer: the picture in the image viewer (zoom, the area tool that points an agent at part of a slide), a thumbnail strip, keys that walk a slide's builds and then the slides, **@** (the slide's `file` and `line` to an agent), **present** (full screen, a click a build, `hidden` slides skipped) and **presenter** (this slide, the next click, the notes, a timer). Paging is the viewer's own: no action comes back to you. It keeps its place by `title` when you draw again |
 | `button` | **`label`**, **`action`**, `payload`, `tone`, `icon`, `disabled`, `title` (its tooltip) |
 | `toggle` | **`label`**, **`name`**, `value`, `action` (sends `{value}` beside the payload) |
 | `select` | **`label`**, **`name`**, **`options`** (`[{value, label}]` or strings), `value`, `action` |
@@ -905,7 +906,7 @@ claimed file; the view owns the pane: the root stack's last child grows to its
 height, and an `editor` or `pdf` first in a split pane, a stack or a tab fills
 it — an embedded viewer shows no path bar), `status` (a chip in a claimed file's bar), `card` (inside its
 Extensions card). Any other view takes the same layout when its tree says
-`"fill": true` beside `ui` and `root` (a tab whose split puts an `image` or `pdf`
+`"fill": true` beside `ui` and `root` (a tab whose split puts an `image`, `slides` or `pdf`
 first in a pane: the PowerPoint plugin's Slides and Themes); otherwise a viewer
 keeps its fixed box. The UI renders only on open, on an action, and on
 `invalidate`; nothing polls.

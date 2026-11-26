@@ -115,6 +115,10 @@ fn board(cx: &Context) -> Value {
             {"type": "pdf", "src": "output:out.pdf"},
         ]},
         {"type": "image", "src": "output:pic.png", "alt": "A picture the fixture wrote"},
+        {"type": "slides", "id": "fixture", "slides": [
+            {"title": "One", "notes": "Say hello.", "builds": [{"src": "output:pic.png"}]},
+            {"title": "Two", "hidden": true, "builds": [{"src": "output:pic.png"}]},
+        ]},
         {"type": "diagnostics", "file": "notes.fixture"},
         {"type": "diff", "before": "the quick brown fox\n", "after": "the quick red fox\n", "mode": "prose"},
         {"type": "log", "src": "output:hello.txt"},
