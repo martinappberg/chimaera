@@ -11,7 +11,7 @@
   import { resolvedTheme } from "../settings/store.svelte";
   import { ApiError } from "../net/api";
   import type { AgentInfo } from "./launcher";
-  import { cancelSignIn, getSignIn, sendSignInCode, startSignIn, type SignInProgress, type SignInStatus } from "./agentSignIn";
+  import { attemptLanded, cancelSignIn, getSignIn, sendSignInCode, shownAttempt, startSignIn, type SignInProgress, type SignInStatus } from "./agentSignIn";
   import { operationRunning } from "./operations";
 
   interface Props {
@@ -43,8 +43,9 @@
   let checking = $state(false);
   let disposed = false;
   let announced: string | null = null;
-  /** The attempt this card started: a finished attempt from elsewhere (an
-   *  earlier card, another window) is history, not this card's state. */
+  /** The attempt this card started, or found running and shows: a finished
+   *  attempt from elsewhere (an earlier card, another window) is history,
+   *  not this card's state, and never this card's success. */
   let ownAttempt = $state<string | null>(null);
 
   const operation = $derived<SignInProgress | null>(
@@ -66,7 +67,8 @@
       if (disposed) return;
       status = next;
       if (next.operation?.id === requestId) { ownAttempt = requestId; requestId = null; }
-      if (next.operation?.phase === "succeeded" && announced !== next.operation.id) {
+      ownAttempt = shownAttempt(ownAttempt, next.operation);
+      if (next.operation && attemptLanded(ownAttempt, next.operation) && announced !== next.operation.id) {
         announced = next.operation.id;
         onSignedIn?.();
       }
@@ -87,7 +89,7 @@
   });
 
   async function start(): Promise<void> {
-    if (busy || running || workspaceId === null) return;
+    if (disposed || busy || running || workspaceId === null) return;
     busy = true; error = null; code = "";
     requestId ??= crypto.randomUUID();
     try {

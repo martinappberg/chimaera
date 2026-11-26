@@ -240,6 +240,14 @@ pub(crate) struct AgentRecord {
     /// holds the old login, and restarting it then would kill the turn. It
     /// relaunches in place once that turn ends (`chat::relaunch_after_turn`).
     pub(crate) relaunch_after_turn: bool,
+    /// The agent's own telemetry says its account's limit is reached
+    /// (`RateLimit {limit_reached}`, latest wins). That process keeps the
+    /// login it started with, so a sign-in landing later relaunches it in
+    /// place too (`chat::relaunch_after_sign_in`).
+    pub(crate) limit_reached: bool,
+    /// One-shot: the relaunch under way is for a new sign-in, so its journal
+    /// marker says so (`ModeSwitch.sign_in`). Taken by that relaunch.
+    pub(crate) relaunch_for_sign_in: bool,
     /// Live subagents (SubagentStart/Stop hooks), capped at
     /// [`SUBAGENTS_CAP`]; cleared when the turn ends (Stop) or the session
     /// exits (the record dies with it).
@@ -339,6 +347,8 @@ impl AgentRecord {
             compute_ctx_delivered: false,
             signed_out_at_start: false,
             relaunch_after_turn: false,
+            limit_reached: false,
+            relaunch_for_sign_in: false,
             subagents: Vec::new(),
             now_line: None,
             usage: None,

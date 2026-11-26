@@ -5,7 +5,7 @@
  * CLI's own status command is the only thing that ever says "signed in".
  */
 import { patchAgentSignedIn, type AgentInfo } from "./launcher";
-import { agentOperationPath, postJson, request, type OperationProgress } from "./operations";
+import { agentOperationPath, operationRunning, postJson, request, type OperationProgress } from "./operations";
 
 export interface SignInProgress extends OperationProgress {
   how: "browser";
@@ -34,6 +34,23 @@ export interface SignInStatus {
  *  surface answers with a Sign in. Unknown stays quiet. */
 export function needsSignIn(a: AgentInfo | null | undefined): boolean {
   return a !== null && a !== undefined && a.installed && a.signedIn === false;
+}
+
+/** The attempt a card reports on, after reading the agent's `operation`: the
+ *  one it started, or a running one it found and now shows (a repeated click,
+ *  a second window). The daemon keeps an agent's last result until the next
+ *  attempt, so a finished one a card never showed is history: another card's,
+ *  an hour ago. */
+export function shownAttempt(own: string | null, operation: OperationProgress | null | undefined): string | null {
+  return operation && operationRunning(operation) ? operation.id : own;
+}
+
+/** Whether `operation` is this card's attempt, landed. Never the daemon's
+ *  kept result of an earlier sign-in: read as this card's success, that one
+ *  closed a chat's `/login` card before it could start a login, so nobody
+ *  could sign in a second time. */
+export function attemptLanded(own: string | null, operation: OperationProgress | null | undefined): boolean {
+  return operation?.phase === "succeeded" && operation.id === own;
 }
 
 const path = (agent: string) => agentOperationPath(agent, "sign-in");
