@@ -6,6 +6,7 @@
  * plain counts: "Ran 2 commands, read a file". Still-running calls are said in
  * the present tense, so a live group never claims work it has not finished.
  */
+import { agentName } from "./agentNameLookup";
 import { formatElapsedSeconds } from "../shared/time";
 import { diffLines, diffStat } from "./lineDiff";
 
@@ -124,13 +125,10 @@ export function commsCall(title: string, input?: Record<string, unknown> | null)
   return null;
 }
 
-/** Names the app knows for session ids (set once from the live roster):
- *  an agent passes an id to message or read another, and the card should say
- *  the name the user sees. Ids it doesn't know stay ids. */
-let agentName: (id: string) => string | null = () => null;
-export function setAgentNames(resolve: (id: string) => string | null): void {
-  agentName = resolve;
-}
+// Session names come from `agentNameLookup.ts`: the app shell sets them, and
+// importing that one small module keeps this file out of the always-loaded
+// entry bundle (vite.config.ts holds it to a budget).
+export { setAgentNames } from "./agentNameLookup";
 
 /** A recipient as a sentence says it: the two reserved addresses in words,
  *  a session id by its name. */
