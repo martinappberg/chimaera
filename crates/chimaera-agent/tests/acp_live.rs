@@ -1,7 +1,7 @@
 //! Explicitly opt-in ACP verification. The binaries come from official releases;
 //! each test uses a throwaway workspace and the user's existing agent login.
 use chimaera_agent::{
-    acp::{AcpAdapter, ANTIGRAVITY, CURSOR, GROK},
+    acp::{is_agy_standalone_server, AcpAdapter, ANTIGRAVITY, ANTIGRAVITY_CLI, CURSOR, GROK},
     driver::SpawnSpec,
     journal::SeqEvent,
     model::{
@@ -159,6 +159,12 @@ async fn exercise(adapter: AcpAdapter, env: &str, args: &[&str]) {
     if adapter.kind == ANTIGRAVITY.kind {
         exercise_combined_model_id(&manager, &mut rx).await;
     }
+    if adapter.elicitation {
+        exercise_question(&manager, &mut rx).await;
+    }
+    if adapter.steers {
+        exercise_steer(&manager, &mut rx).await;
+    }
     manager.kill("acp");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while manager.get("acp").unwrap().alive {
@@ -235,6 +241,157 @@ async fn exercise_shell_output(
         )
     })
     .await;
+}
+
+/// `agy acp` asks with `elicitation/create`: a question card, its tool row
+/// hidden, the answer mapped back to the option's const (Pass 62).
+async fn exercise_question(
+    manager: &ChatManager,
+    rx: &mut tokio::sync::broadcast::Receiver<Arc<SeqEvent>>,
+) {
+    send(
+        manager,
+        "Use your ask_question tool exactly once to ask \"Pick a codename\" with the options Alpha and Beta. After my answer, reply with only the option I chose.",
+    )
+    .await;
+    let asked = until(rx, |e| {
+        matches!(
+            e,
+            AgentEvent::QuestionRequest { .. }
+                | AgentEvent::ToolCall { .. }
+                | AgentEvent::TurnCompleted { .. }
+                | AgentEvent::TurnAborted { .. }
+        ) && !matches!(e, AgentEvent::ToolCall { title, .. } if !title.contains("ask_question"))
+    })
+    .await;
+    let AgentEvent::QuestionRequest {
+        request_id,
+        questions,
+        ..
+    } = asked
+    else {
+        panic!("expected a question card, got {asked:?}");
+    };
+    let question = &questions[0];
+    assert!(
+        question.options.iter().any(|o| o.label == "Beta"),
+        "{question:?}"
+    );
+    manager
+        .command(
+            "acp",
+            AgentCommand::Answer {
+                request_id,
+                answers: [(question.id.clone(), vec!["Beta".to_string()])].into(),
+            },
+        )
+        .await
+        .unwrap();
+    let mut reply = String::new();
+    loop {
+        match until(rx, |e| {
+            matches!(
+                e,
+                AgentEvent::MessageChunk { .. }
+                    | AgentEvent::TurnCompleted { .. }
+                    | AgentEvent::TurnAborted { .. }
+            )
+        })
+        .await
+        {
+            AgentEvent::MessageChunk { text, .. } => reply.push_str(&text),
+            AgentEvent::TurnCompleted { .. } => break,
+            other => panic!("question turn: {other:?}"),
+        }
+    }
+    assert!(reply.to_lowercase().contains("beta"), "{reply}");
+}
+
+/// `agy acp` takes a prompt sent mid-turn into the running turn: the message
+/// settles `sent` before that turn ends, which answers it (Pass 62).
+async fn exercise_steer(
+    manager: &ChatManager,
+    rx: &mut tokio::sync::broadcast::Receiver<Arc<SeqEvent>>,
+) {
+    send(
+        manager,
+        "Use your shell tool to run exactly: sleep 8 && echo steer-marker . Wait for it to finish, then reply with one short sentence.",
+    )
+    .await;
+    // The command asks first; the message goes once it runs.
+    let ask = until(rx, |e| {
+        matches!(
+            e,
+            AgentEvent::PermissionRequest { .. } | AgentEvent::TurnCompleted { .. }
+        )
+    })
+    .await;
+    if let AgentEvent::PermissionRequest {
+        request_id,
+        options,
+        ..
+    } = ask
+    {
+        let option_id = options
+            .iter()
+            .find(|o| o.kind == PermissionOptionKind::AllowOnce)
+            .unwrap()
+            .id
+            .clone();
+        manager
+            .command(
+                "acp",
+                AgentCommand::Permission {
+                    request_id,
+                    option_id,
+                    feedback: None,
+                    destination: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    send(manager, "Also include the word banana in your reply.").await;
+    let queued = until(rx, |e| {
+        matches!(e, AgentEvent::UserMessage { queued: true, .. })
+    })
+    .await;
+    let AgentEvent::UserMessage {
+        id: Some(id),
+        after_turn,
+        ..
+    } = queued
+    else {
+        panic!();
+    };
+    assert!(!after_turn, "a mid-turn message joins the turn");
+    let mut sent = false;
+    let mut reply = String::new();
+    loop {
+        match until(rx, |e| {
+            matches!(
+                e,
+                AgentEvent::UserMessageUpdate { .. }
+                    | AgentEvent::MessageChunk { .. }
+                    | AgentEvent::TurnCompleted { .. }
+                    | AgentEvent::TurnAborted { .. }
+            )
+        })
+        .await
+        {
+            AgentEvent::UserMessageUpdate {
+                id: key,
+                state: UserMessageState::Sent,
+            } if key == id => sent = true,
+            AgentEvent::MessageChunk { text, .. } => reply.push_str(&text),
+            AgentEvent::TurnCompleted { .. } => break,
+            AgentEvent::UserMessageUpdate { .. } => {}
+            other => panic!("steered turn: {other:?}"),
+        }
+    }
+    assert!(sent, "the steer never settled sent");
+    assert!(reply.to_lowercase().contains("banana"), "{reply}");
 }
 
 /// agy-acp 1.2.1 offered effort-suffixed model ids; 1.4.5 offers the model
@@ -475,6 +632,13 @@ async fn exercise_controls(
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live: needs Antigravity login and bills short chat and approval turns"]
 async fn antigravity_stream_replay_and_resume() {
+    // CHIMAERA_TEST_AGY_ACP names the standalone `.par` or the agy CLI,
+    // whose own server is `agy acp` (the launcher's rule).
+    let bin = std::env::var("CHIMAERA_TEST_AGY_ACP").expect("set CHIMAERA_TEST_AGY_ACP");
+    if !is_agy_standalone_server(std::path::Path::new(&bin)) {
+        std::env::set_var("AGY_CLI_DISABLE_AUTO_UPDATE", "true");
+        return exercise(ANTIGRAVITY_CLI, "CHIMAERA_TEST_AGY_ACP", &["acp"]).await;
+    }
     let args: &[&str] = if cfg!(target_os = "linux") {
         &["--uid="]
     } else {

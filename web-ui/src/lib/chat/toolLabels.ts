@@ -6,7 +6,9 @@
  * plain counts: "Ran 2 commands, read a file". Still-running calls are said in
  * the present tense, so a live group never claims work it has not finished.
  */
+import { agentName } from "./agentNameLookup";
 import { formatElapsedSeconds } from "../shared/time";
+import { diffLines, diffStat } from "./lineDiff";
 
 /** The fields of a tool row the title reads. */
 export interface LabelledTool {
@@ -123,13 +125,10 @@ export function commsCall(title: string, input?: Record<string, unknown> | null)
   return null;
 }
 
-/** Names the app knows for session ids (set once from the live roster):
- *  an agent passes an id to message or read another, and the card should say
- *  the name the user sees. Ids it doesn't know stay ids. */
-let agentName: (id: string) => string | null = () => null;
-export function setAgentNames(resolve: (id: string) => string | null): void {
-  agentName = resolve;
-}
+// Session names come from `agentNameLookup.ts`: the app shell sets them, and
+// importing that one small module keeps this file out of the always-loaded
+// entry bundle (vite.config.ts holds it to a budget).
+export { setAgentNames } from "./agentNameLookup";
 
 /** A recipient as a sentence says it: the two reserved addresses in words,
  *  a session id by its name. */
@@ -222,6 +221,51 @@ export function browserTitle(call: BrowserCall, live: boolean): string {
   const what = call.address ?? "a page";
   if (live) return `Showing ${what} in a browser pane`;
   return call.opened ? `Showed ${what} in a browser pane` : `Didn't open ${what} in a browser pane`;
+}
+
+/** A row's title as its head draws it: the kind of call in the prose face
+ *  (`name`), what it acted on after it (`detail`, in mono when it is a
+ *  path, a pattern, a URL or a command). */
+export interface ToolTitleParts {
+  name: string | null;
+  detail: string;
+  mono: boolean;
+}
+
+/** Kinds whose detail is literal text rather than a sentence. */
+const LITERAL_KINDS = new Set(["execute", "read", "edit", "search", "fetch", "delete", "move"]);
+
+/** The shell tools a driver names in a command's title: Claude titles
+ *  `Bash` / `PowerShell` calls "Bash: <command>". Codex and the ACP agents
+ *  title a command with the command itself. */
+const SHELL_TITLE_NAMES = new Set(["Bash", "PowerShell"]);
+
+/**
+ * Drivers title a call "Tool: detail" ("Read: calc.py", "Bash: git status").
+ * The head draws the two halves apart, and a command without its tool's
+ * name: the row's mark already says it ran in a shell, and the driver's
+ * whole title stays on hover. Only a title that leads with the call's own
+ * name, or with one capitalised word, splits: a command that merely
+ * contains ": " ("echo a: b") is left whole. A command row splits only on
+ * its own tool's name (or a known shell tool's), since a raw command may
+ * itself start "Note: …".
+ */
+export function toolTitleParts(t: { tool: string; title: string; nativeName?: string }, shown: string): ToolTitleParts {
+  // Reworded for reading (agent communication, the browser): one sentence.
+  if (shown !== t.title) return { name: null, detail: shown, mono: false };
+  const mono = LITERAL_KINDS.has(t.tool);
+  const native = t.nativeName ?? "";
+  let name: string | null = null;
+  let detail = shown;
+  if (native !== "" && shown.startsWith(`${native}: `) && shown.length > native.length + 2) {
+    name = native;
+    detail = shown.slice(native.length + 2);
+  } else {
+    const m = /^([A-Z][A-Za-z]{1,19}): (\S[\s\S]*)$/.exec(shown);
+    if (m !== null && (t.tool !== "execute" || (native === "" && SHELL_TITLE_NAMES.has(m[1])))) [, name, detail] = m;
+  }
+  if (name === null) return { name: null, detail: shown, mono: t.tool === "execute" };
+  return { name: t.tool === "execute" ? null : name, detail, mono };
 }
 
 /** A tool row's title as the card shows it: agent-communication and browser
@@ -433,7 +477,9 @@ export function toolDescription(t: { tool: string; nativeInput?: unknown }): str
   if (t.tool !== "execute") return null;
   const input = t.nativeInput;
   if (typeof input !== "object" || input === null) return null;
-  const raw = (input as { description?: unknown }).description;
+  // claude Bash says `description`; Antigravity's run_command, `toolSummary`.
+  const said = input as { description?: unknown; toolSummary?: unknown };
+  const raw = typeof said.description === "string" ? said.description : said.toolSummary;
   if (typeof raw !== "string") return null;
   const line = raw.replace(/\s+/g, " ").trim();
   if (line === "") return null;
@@ -496,4 +542,61 @@ export function toolGroupTitle(tools: LabelledTool[]): string {
   const rest = countPhrase(tools.slice(lastLabelled + 1));
   if (labels.length === 0) return capitalize(rest);
   return rest === "" ? labels.join(" · ") : `${labels.join(" · ")} · ${rest}`;
+}
+
+/** The content fields a change size reads (`ToolContent`'s diff shape). */
+export interface DiffContent {
+  kind: string;
+  old_text?: string | null;
+  new_text?: string;
+  truncated?: boolean;
+  diffs?: DiffContent[];
+}
+
+/** The fields of a tool row its change size reads. */
+export interface ChangedTool {
+  status: string;
+  /** The user rejected it: an ACP agent may still report it `completed`. */
+  denied?: boolean;
+  content?: DiffContent | null;
+}
+
+/** One diff's size, cached on the content object: the reducer replaces a
+ *  row's content whole (only streamed `output` text mutates in place), so a
+ *  diff is computed once however often its group's line re-derives. */
+const statCache = new WeakMap<object, { added: number; removed: number } | null>();
+
+/** Null when the diff cannot say exactly what changed: its text was cut to
+ *  fit (`truncated`), or it has no old text. A missing old text is not proof
+ *  of a new file: Claude's `Write` replaces a file whole and sends only the
+ *  new text, and Codex's update carries hunks in `new_text` alone. */
+function diffSize(d: DiffContent): { added: number; removed: number } | null {
+  let stat = statCache.get(d);
+  if (stat === undefined) {
+    stat = d.truncated === true || d.old_text == null ? null : diffStat(diffLines(d.old_text, d.new_text ?? "", 0));
+    statCache.set(d, stat);
+  }
+  return stat;
+}
+
+/** "+54 −3": how much a run of calls changed, summed over its finished
+ *  edits (a diff, or a batch of them). A call still waiting or running, one
+ *  that failed or that the user denied, changed nothing; a diff whose size
+ *  is not exact ({@link diffSize}) is left out rather than guessed. Null
+ *  when nothing countable changed. */
+export function toolChangeSize(tools: readonly ChangedTool[]): { added: number; removed: number } | null {
+  let added = 0;
+  let removed = 0;
+  for (const t of tools) {
+    if (t.status !== "completed" || t.denied === true || t.content == null) continue;
+    const parts = t.content.kind === "diff" ? [t.content] : t.content.kind === "batch" ? (t.content.diffs ?? []) : [];
+    for (const d of parts) {
+      if (d.kind !== "diff") continue;
+      const size = diffSize(d);
+      if (size === null) continue;
+      added += size.added;
+      removed += size.removed;
+    }
+  }
+  return added + removed > 0 ? { added, removed } : null;
 }

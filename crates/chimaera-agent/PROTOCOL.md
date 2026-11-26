@@ -11,7 +11,7 @@ Sources: **live** = probed against the real CLI at the version named; **official
 | Claude Code stream-json | `src/claude.rs` | `TESTED_CLAUDE_VERSION` = 2.1.332 | `just chat-smoke` | [claude-code.md](protocol/claude-code.md) | Pass 63 |
 | Codex app-server | `src/codex.rs` | `TESTED_CODEX_VERSION` = 0.172.0 | `just chat-smoke` | [codex.md](protocol/codex.md) | Pass 63 |
 | ACP: Grok Build | `src/acp.rs` | `TESTED_GROK_VERSION` = 1.0.70 | `just chat-smoke-acp` | [acp.md](protocol/acp.md) | Pass 60 |
-| ACP: Google Antigravity | `src/acp.rs` | `TESTED_AGY_VERSION` = 1.4.5 | `just chat-smoke-acp` | [acp.md](protocol/acp.md) | Pass 60 |
+| ACP: Google Antigravity | `src/acp.rs` | `TESTED_AGY_VERSION` = 1.4.5 (standalone server); `TESTED_AGY_CLI_VERSION` = 1.5.18 (`agy acp`) | `just chat-smoke-acp` | [acp.md](protocol/acp.md) | Pass 64 |
 | ACP: Cursor CLI | `src/acp.rs` | `TESTED_CURSOR_VERSION` = 2026.10.22-27dcf5f | `just chat-smoke-acp` | [acp.md](protocol/acp.md) | Pass 60 |
 | Claude Mods native UI | `src/native_ui.rs` | `TESTED_CLAUDE_VERSION` | `just chat-mods-smoke` | [mods.md](protocol/mods.md) | Pass 63 |
 

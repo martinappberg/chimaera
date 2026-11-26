@@ -2,9 +2,13 @@
   import { copyText } from "../shared/clipboard";
   import { contextMenu } from "../shared/contextMenu.svelte";
   import { menuPoint, resolveAndOpen, type OpenPathFn, type PathResolver } from "./paths";
-  import type { ChatBlock, SubagentInfo, ToolContent } from "./store.svelte";
+  import type { ChatBlock, SubagentInfo } from "./store.svelte";
+  import DiffView from "./DiffView.svelte";
   import ModelChip from "./ModelChip.svelte";
-  import { readableToolTitle, toolDescription } from "./toolLabels";
+  import { argRows } from "./toolArgs";
+  import ToolGlyph from "./ToolGlyph.svelte";
+  import ChangeSize from "./ChangeSize.svelte";
+  import { readableToolTitle, toolChangeSize, toolDescription, toolTitleParts } from "./toolLabels";
 
   interface Props {
     block: Extract<ChatBlock, { kind: "tool" }>;
@@ -52,32 +56,39 @@
     if (block.status === "failed" && !userToggled) open = true;
   });
 
-  const GLYPHS: Record<string, string> = {
-    execute: "❯",
-    read: "≡",
-    edit: "±",
-    search: "⌕",
-    fetch: "↓",
-    delete: "✕",
-    move: "→",
-    think: "…",
-    agent: "✳",
-    other: "·",
-  };
-  const glyph = $derived(GLYPHS[block.tool] ?? "·");
   /** Agent-communication calls read as what they did ("Message to …");
    *  the driver's own title stays on hover. */
   const shownTitle = $derived(readableToolTitle(block));
+  /** The title's two halves: the call's name in prose, its subject in mono. */
+  const parts = $derived(toolTitleParts(block, shownTitle));
   /** The call's own plain-language description (claude Bash), when the
    *  wire gave one: it leads, the command follows in mono. */
   const described = $derived.by(() => {
     const d = toolDescription(block);
     return d !== null && d !== shownTitle ? d : null;
   });
-  const hasBody = $derived(
+  const hasContent = $derived(
     block.content !== null &&
       !(block.content.kind === "output" && (block.content.text ?? "").trim() === ""),
   );
+  /** The whole command, for the opened row: the head keeps one clipped line. */
+  const command = $derived(
+    block.tool === "execute" ? (block.command ?? (block.title.trim() !== "" ? block.title : null)) : null,
+  );
+  /** The head already shows a short command whole; the opened row repeats
+   *  it only when the head clipped it or led with the description. */
+  const commandDetail = $derived(
+    command !== null && (described !== null || command !== shownTitle || command.length > 72 || command.includes("\n")),
+  );
+  /** "+4 −1": what this call's finished edit changed (the group line's
+   *  helper and cache, so the rows add up to the line's total). */
+  const change = $derived(toolChangeSize([block]));
+  /** What the agent passed, for calls whose title is only a name. */
+  const args = $derived(argRows(block.nativeInput, block.locations));
+  /** Every call that has anything to say opens: its command, its arguments,
+   *  its result. A line with none of those opens what it touched instead. */
+  const hasBody = $derived(hasContent || command !== null || args.length > 0);
+  const opensPath = $derived(!hasBody && block.locations.length > 0 && onOpenPath !== undefined);
   /** A permission the user ALLOWED — a quiet inline "allowed" mark beside the
    *  command, never the denied/failed red. A genuinely failed or denied command
    *  wins (an allowed exec can still exit non-zero), so those stay distinct. */
@@ -90,8 +101,16 @@
       ? (block.content.text ?? "").trim() || null
       : null,
   );
+  /** The prompt's outcome when it was not a plain allow: the row is the
+   *  transcript's only record of the decision, so it says which. */
+  const refusal = $derived(
+    block.decision === "denied" ? "denied" : block.decision === "lapsed" ? "not answered" : null,
+  );
+  /** A prompt that lapsed was never refused (the reducer leaves `denied`
+   *  off); rows journaled before that distinction stay quiet too. */
+  const denied = $derived(block.denied && block.decision !== "lapsed");
   const statusTitle = $derived(
-    block.denied ? "denied" : allowed ? "allowed" : block.status.replace("_", " "),
+    refusal ?? (block.denied ? "denied" : allowed ? "allowed" : block.status.replace("_", " ")),
   );
 
   // Live output follows its own tail (terminal-style) while streaming.
@@ -160,57 +179,48 @@
   );
 </script>
 
-{#snippet diff(d: ToolContent, showPath = true)}
-  <div class="diff">
-    {#if d.path && showPath}
-      <button class="diff-path" onclick={(e) => openLoc(d.path ?? "", e, e.currentTarget)}
-        >{d.path}</button
-      >
-    {/if}
-    {#if d.old_text}
-      <pre class="old">{d.old_text}</pre>
-    {/if}
-    <pre class="new">{d.new_text}</pre>
-    {#if d.truncated}
-      <span class="trunc">truncated — open the file for the full change</span>
-    {/if}
-  </div>
-{/snippet}
-
 <div
   class="tool"
   class:visible
   class:failed={block.status === "failed"}
-  class:denied={block.denied}
+  class:denied={denied}
 >
   <div class="head">
     <button
       class="expand"
-      class:inert={!hasBody}
-      onclick={() => {
+      class:inert={!hasBody && !opensPath}
+      onclick={(e) => {
         if (hasBody) {
           userToggled = true;
           open = !open;
+        } else if (opensPath) {
+          openLoc(block.locations[0], e, e.currentTarget);
         }
       }}
       aria-expanded={hasBody ? open : undefined}
       title={statusTitle}
     >
-      <span class="glyph">{glyph}</span>
+      <span class="glyph"><ToolGlyph kind={block.tool} /></span>
       {#if described !== null && liveLine === null}
         <span class="title described">{described}</span>
-        <span class="cmd" title={block.title}>{shownTitle}</span>
+        <span class="cmd" title={block.title}>{parts.detail}</span>
       {:else}
         <span
           class="title"
           class:with-live={liveLine !== null}
-          title={shownTitle !== block.title ? block.title : undefined}>{shownTitle}</span
+          title={parts.detail !== block.title ? block.title : undefined}
+          >{#if parts.name !== null}<span class="name">{parts.name}</span>{/if}<span class:mono={parts.mono}
+            >{parts.detail}</span
+          ></span
         >
       {/if}
       {#if liveLine !== null}
         <span class="live">{liveLine}</span>
       {/if}
     </button>
+    {#if change !== null}
+      <ChangeSize added={change.added} removed={change.removed} />
+    {/if}
     {#if running && block.tool !== "agent" && onBackground !== undefined}
       <!-- Ctrl-B parity: the tool keeps running while the agent moves on;
            an honest "could not be backgrounded" notice covers refusals. -->
@@ -284,7 +294,7 @@
     {#if allowed}
       <!-- Compact "allowed" mark: the command stays on its one collapsed line
            (the title), an explicit allowed state instead of dumping it below. -->
-      <span class="allowed" title="you allowed this command">
+      <span class="allowed" title={block.decisionLabel ?? "you allowed this"}>
         <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
           <path
             d="M3.5 8.5l3 3 6-6.5"
@@ -295,22 +305,48 @@
             stroke-linejoin="round"
           />
         </svg>
-        allowed
+        {block.decision === "always" ? "always allowed" : "allowed"}
       </span>
+    {:else if refusal !== null}
+      <span class="refused" class:lapsed={block.decision === "lapsed"} title={block.decisionLabel}>{refusal}</span>
     {/if}
-    <span
-      class="dot"
-      class:run={block.status === "in_progress" || block.status === "pending"}
-      class:ok={block.status === "completed" && !block.denied}
-      class:bad={block.status === "failed" || block.denied}
-    ></span>
+    <!-- One slot, one width: a call that ran and was fine says nothing here
+         (it is the expected outcome, and a column of identical marks is
+         noise); a live or failed one shows its dot; the rest show, under
+         the pointer, that the row opens. -->
+    <span class="state">
+      {#if running}
+        <span class="dot run"></span>
+      {:else if block.status === "failed" || denied}
+        <span class="dot bad"></span>
+      {:else if hasBody}
+        <svg class="chev" class:open viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
+          <path d="M5 3l6 5-6 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+      {/if}
+    </span>
   </div>
-  {#if open && hasBody && block.content !== null}
+  {#if open && hasBody}
     <!-- .body scrolls; the wrapper is the non-scrolling anchor the copy
          button pins to, so it never rides away with the content. -->
     <div class="body-wrap">
       <div class="body quiet-scrollbar" bind:this={bodyEl}>
-        {#if block.content.kind === "output"}
+        {#if commandDetail}
+          <pre class="command"><span class="prompt" aria-hidden="true">❯ </span>{command}</pre>
+        {/if}
+        {#if args.length > 0}
+          <dl class="args">
+            {#each args as arg (arg.key)}
+              <dt>{arg.key}</dt>
+              <dd>{arg.value}</dd>
+            {/each}
+          </dl>
+        {/if}
+        {#if block.content === null || !hasContent}
+          {#if command !== null && !running}
+            <span class="none">no output</span>
+          {/if}
+        {:else if block.content.kind === "output"}
           <pre>{block.content.text}</pre>
           {#if block.streaming}
             <span class="cursor" aria-hidden="true"></span>
@@ -319,15 +355,15 @@
             <span class="trunc">output truncated</span>
           {/if}
         {:else if block.content.kind === "diff"}
-          {@render diff(block.content)}
+          <DiffView diff={block.content} label={locLabel} onOpen={openLoc} />
         {:else if block.content.kind === "batch"}
           {@const diffs = block.content.diffs ?? []}
           {#each diffs as d, i (i)}
-            {@render diff(d, i === 0 || diffs[i - 1].path !== d.path)}
+            <DiffView diff={d} showPath={i === 0 || diffs[i - 1].path !== d.path} label={locLabel} onOpen={openLoc} />
           {/each}
         {/if}
       </div>
-      {#if block.content.kind === "output"}
+      {#if hasContent && block.content?.kind === "output"}
         <button
           class="copy"
           class:copied
@@ -375,10 +411,12 @@
 
 <style>
   /* A row inside a ToolGroup — the group draws the container, so the row is
-     borderless and quiet. A failed/denied row gets a soft left rail so the
-     error stands out in a long list. */
+     borderless and quiet. A failed/denied row says so with its red dot and
+     tinted icon, nothing louder. */
   .tool {
     overflow: hidden;
+    /* The opened body answers to the row's own width. */
+    container-type: inline-size;
   }
   .tool + :global(.tool) {
     border-top: 1px solid color-mix(in srgb, var(--edge) 40%, transparent);
@@ -410,6 +448,7 @@
     padding: 0 10px 0 0;
     color: var(--fg);
     font-size: var(--text-sm);
+    transition: background-color 0.12s ease;
   }
   .expand {
     flex: 1;
@@ -424,11 +463,11 @@
     font: inherit;
     text-align: left;
     cursor: pointer;
-    transition: background-color 0.12s ease;
   }
   /* fg color-mix, not --row-hover: the card sits on --term-bg, where the
-     solid row tokens tuned for --bg surfaces can clash. */
-  .expand:not(.inert):hover {
+     solid row tokens tuned for --bg surfaces can clash. The whole head
+     tints, so the row's trailing marks sit inside its hover, not past it. */
+  .head:has(> .expand:not(.inert)):hover {
     background: var(--hover-tint);
   }
   .expand.inert {
@@ -459,9 +498,13 @@
     line-height: 1;
   }
   .glyph {
-    color: var(--muted);
-    font-family: var(--mono, monospace);
     flex: none;
+    display: inline-flex;
+    color: var(--muted);
+  }
+  .failed .glyph,
+  .denied .glyph {
+    color: color-mix(in srgb, var(--err) 75%, var(--muted));
   }
   .title {
     flex: 1;
@@ -469,6 +512,13 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  /* "Read  calc.py": the kind of call steps back, its subject carries. */
+  .name {
+    margin-right: 7px;
+    color: var(--muted);
+  }
+  .mono {
     font-family: var(--mono, monospace);
   }
   /* A described call: the agent's words lead in the prose face, the
@@ -476,7 +526,6 @@
   .title.described {
     flex: 0 1 auto;
     max-width: 65%;
-    font-family: inherit;
   }
   .cmd {
     flex: 1;
@@ -513,6 +562,43 @@
     font-family: var(--mono, monospace);
     font-size: var(--text-xs);
   }
+  .refused {
+    flex: none;
+    color: var(--err);
+    font-family: var(--mono, monospace);
+    font-size: var(--text-xs);
+  }
+  .refused.lapsed {
+    color: var(--muted);
+  }
+  .state {
+    flex: none;
+    display: inline-grid;
+    place-items: center;
+    width: 12px;
+    height: 12px;
+  }
+  .chev {
+    color: var(--muted);
+    opacity: 0;
+    transition:
+      opacity 0.12s ease,
+      transform 0.12s ease;
+  }
+  .chev.open {
+    opacity: 1;
+    transform: rotate(90deg);
+  }
+  .head:hover .chev,
+  .expand:focus-visible ~ .state .chev {
+    opacity: 1;
+  }
+  /* No pointer to hover with: the row always shows that it opens. */
+  @media (hover: none) {
+    .chev {
+      opacity: 1;
+    }
+  }
   .dot {
     flex: none;
     width: 7px;
@@ -523,13 +609,6 @@
   .dot.run {
     background: var(--accent);
     animation: pulse 1.4s ease-in-out infinite;
-  }
-  /* Settled and fine is the expected outcome: a quiet ring in the finished
-     rows' check colour — a different shape from the solid live dot, so the
-     two read apart even with the pulse off (reduced motion). */
-  .dot.ok {
-    background: none;
-    box-shadow: inset 0 0 0 1.5px var(--done-quiet);
   }
   .dot.bad {
     background: var(--err);
@@ -542,18 +621,27 @@
       animation: none;
       opacity: 0.55;
     }
+    .chev {
+      transition: none;
+    }
   }
-  .failed,
-  .denied {
-    box-shadow: inset 2px 0 0 color-mix(in srgb, var(--err) 60%, transparent);
-  }
+  /* The opened row: one framed panel under the row's words (past its
+     mark), holding what was asked and what came back. */
   .body-wrap {
     position: relative;
+    margin: 1px 10px 8px 32px;
+  }
+  @container (max-width: 420px) {
+    .body-wrap {
+      margin-left: 10px;
+    }
   }
   .body {
-    border-top: 1px solid var(--edge);
-    padding: 6px 10px;
-    max-height: 260px;
+    border: 1px solid color-mix(in srgb, var(--edge) 80%, transparent);
+    border-radius: 7px;
+    background: color-mix(in srgb, var(--fg) 2.5%, transparent);
+    padding: 8px 10px;
+    max-height: 280px;
     overflow: auto;
     scrollbar-width: thin;
     scrollbar-color: color-mix(in srgb, var(--fg) 22%, transparent) transparent;
@@ -588,40 +676,50 @@
   .copy.copied {
     color: var(--accent);
   }
-  pre {
-    margin: 0;
+  /* The opened row leads with what was asked — the command as it ran, the
+     arguments — then the result, set apart by a hairline. */
+  .command,
+  .args {
+    margin: 0 0 8px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid color-mix(in srgb, var(--edge) 60%, transparent);
+  }
+  .command:last-child,
+  .args:last-child {
+    margin-bottom: 0;
+    padding-bottom: 0;
+    border-bottom: none;
+  }
+  .prompt {
+    color: var(--accent-text, var(--accent));
+    user-select: none;
+  }
+  .args {
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    gap: 2px 12px;
     font-size: var(--text-sm);
     font-family: var(--mono, monospace);
+  }
+  .args dt {
+    color: var(--muted);
+  }
+  .args dd {
+    margin: 0;
     white-space: pre-wrap;
     word-break: break-word;
   }
-  .diff + .diff {
-    margin-top: 8px;
-  }
-  .diff-path {
-    display: block;
-    background: none;
-    border: none;
-    padding: 0 0 4px;
-    color: var(--accent-text);
+  .none {
+    color: var(--muted);
     font-size: var(--text-sm);
+  }
+  pre {
+    margin: 0;
+    font-size: var(--text-sm);
+    line-height: 1.5;
     font-family: var(--mono, monospace);
-    cursor: pointer;
-    text-align: left;
-  }
-  .diff-path:hover {
-    text-decoration: underline;
-  }
-  .old {
-    background: color-mix(in srgb, var(--err) 12%, transparent);
-    padding: 3px 6px;
-    border-radius: 4px;
-  }
-  .new {
-    background: color-mix(in srgb, var(--accent) 12%, transparent);
-    padding: 3px 6px;
-    border-radius: 4px;
-    margin-top: 2px;
+    white-space: pre-wrap;
+    word-break: break-word;
   }
   .trunc {
     display: block;
