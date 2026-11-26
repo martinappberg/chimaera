@@ -435,8 +435,10 @@
         "crates/chimaera-server/src/upload/chunked.rs",
         "web-ui/src/lib/net/uploads.ts",
         "web-ui/src/lib/net/chunkedUpload.ts",
+        "web-ui/src/lib/net/localDrop.ts",
         "web-ui/src/lib/chat/images.ts",
-        "web-ui/src/lib/shared/reference.ts"
+        "web-ui/src/lib/shared/reference.ts",
+        "web-ui/src/lib/shared/fileHandle.ts"
       ],
       "maps": [
         "crates/chimaera-server/AGENTS.md",

@@ -1208,6 +1208,7 @@ pub fn run() {
             commands::shell_build,
             commands::write_clipboard,
             commands::copy_file_to_clipboard,
+            commands::dropped_paths,
             commands::reveal_in_file_manager,
             commands::open_external,
             office::office_open,

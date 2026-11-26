@@ -7,6 +7,7 @@
    * the page's own size is known, then settles once; wider panes redraw
    * sharper only when the card has grown by a third.
    */
+  import type { Attachment } from "svelte/attachments";
   import { cropLayout } from "./embed";
   import type { Region } from "./fragment";
   import type { OpenedPdf } from "./pdfEmbed";
@@ -19,9 +20,11 @@
     compact: boolean;
     active: boolean;
     onOpen: () => void;
+    /** Makes the frame a handle on the file (drag, right-click). */
+    grip?: Attachment<HTMLElement>;
   }
 
-  let { url, page, region, compact, active, onOpen }: Props = $props();
+  let { url, page, region, compact, active, onOpen, grip }: Props = $props();
 
   const MAX_H = 560;
   const TILE_H = 200;
@@ -151,6 +154,7 @@
     style:max-width="{frameMax}px"
     style:aspect-ratio="{frame.w} / {frame.h}"
     onclick={onOpen}
+    {@attach grip}
   >
     <canvas
       bind:this={canvas}

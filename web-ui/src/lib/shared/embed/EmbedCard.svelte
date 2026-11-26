@@ -20,6 +20,7 @@
   import FolderIcon from "../FolderIcon.svelte";
   import { basename, formatMtime, fsDownload, humanSize, tableHeaderRow } from "../../previews/files";
   import { isRemoteHost } from "../../net/api";
+  import { fileHandle } from "../fileHandle";
   import { openPath } from "../openPath";
   import { isAbsolute } from "../paths";
   import type { Reveal } from "../reveal";
@@ -242,6 +243,11 @@
     else openPath(p, hit.kind, reveal !== undefined ? { reveal } : {});
   }
 
+  /** The card's name and a picture or page body are handles on the file:
+   *  dragged onto an agent's input (or from the right-click menu) it is
+   *  referenced there. Text bodies stay selectable, so they are not. */
+  const grip = fileHandle(() => (hit !== null ? { path: hit.path, kind: hit.kind } : null));
+
   function download(): void {
     if (hit !== null) void fsDownload(hit.path);
   }
@@ -267,7 +273,7 @@
 >
   {#if chrome}
   <div class="head">
-    <button class="name" title={hit !== null ? `open ${hit.path} in a pane` : path} disabled={hit === null} onclick={open}>
+    <button class="name" title={hit !== null ? `open ${hit.path} in a pane` : path} disabled={hit === null} onclick={open} {@attach grip}>
       {#if kind === "dir"}
         <FolderIcon size={13} />
       {:else}
@@ -321,9 +327,10 @@
       {compact}
       active={near}
       onOpen={open}
+      {grip}
     />
   {:else if kind === "pdf"}
-    <PdfBody {url} page={frag.at?.page ?? 1} region={frag.at?.region} {compact} active={near} onOpen={open} />
+    <PdfBody {url} page={frag.at?.page ?? 1} region={frag.at?.region} {compact} active={near} onOpen={open} {grip} />
   {:else if kind === "code"}
     <CodeBody path={hit.path} version={hit.version} lines={frag.lines} {compact} active={near} />
   {:else if kind === "table" || kind === "xlsx"}

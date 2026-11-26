@@ -62,7 +62,15 @@ export function terminalDescription(t: TerminalOption, agentId: string | null): 
 }
 
 /** Only explicit IDs are shortened. Typed names retain the daemon's ambiguity checks.
- * Short forms are never reassigned: undo must still refer to the originally picked shell. */
+ * Short forms are never reassigned: undo must still refer to the originally picked shell.
+ *
+ * A short form is `@term:“<label>”`, in curly quotes. Quoted, so that a
+ * name typed by hand (`@term:zsh`, the daemon's by-name grammar) is never
+ * taken for an earlier pick: a mention grants its terminal on send, and a
+ * typed name must reach the daemon's own lookup, not an id this composer
+ * remembered. Curly, because macOS turns a straight quote beside typed text
+ * into a curly one (smart quotes are on by default, in the app's web view
+ * too): a straight-quoted chip was rewritten under the user and broke. */
 export function collapseTerminalMentions(
   text: string,
   terminals: TerminalOption[],
@@ -78,15 +86,14 @@ export function collapseTerminalMentions(
     const old = [...tokens].find(([short, full]) => full === whole && short.startsWith("@term:"));
     let short = old?.[0];
     if (!short) {
-      const name = terminalLabel(terminal, terminals).replace(/["'\r\n]/g, " ").trim() || terminal.id;
-      // Always quote labels: punctuation is part of a name, never a token terminator.
-      short = `@term:"${name}"`;
+      const name = terminalLabel(terminal, terminals).replace(/["'\u2018\u2019\u201c\u201d\s]+/g, " ").trim() || terminal.id;
+      short = `@term:\u201c${name}\u201d`;
       let suffix = 0;
       while (
         (tokens.has(short) && tokens.get(short) !== whole) ||
         tokenSpans(`${context}\n${text}`, new Map([[short, whole]])).length > 0
       ) {
-        short = `@term:"${name} · ${terminal.id}${suffix++ ? ` ${suffix}` : ""}"`;
+        short = `@term:\u201c${name} · ${terminal.id}${suffix++ ? ` ${suffix}` : ""}\u201d`;
       }
       tokens.set(short, whole);
     }

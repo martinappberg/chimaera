@@ -58,6 +58,7 @@
   } from "./paths";
   import { extractFileRefs, parseFileRef, revealOf, type FileRef, type FoundRef } from "../shared/fileRef";
   import { activateUrl, isWebUrl, OPEN_BESIDE, urlMenuEntries } from "../shared/urlOpen";
+  import { canReferenceFile, REFERENCE_IN_CHAT, referenceHandledFile } from "../shared/fileHandle";
   import { contextMenu } from "../shared/contextMenu.svelte";
   import { safeDecodeUri } from "../previews/files";
   import { getContext, mount, unmount, untrack } from "svelte";
@@ -520,9 +521,16 @@
     const target = e.target as Element | null;
     const link = fileLinkAt(target);
     if (link !== null) {
+      // A link with one standing answer names a file: it can be referenced
+      // in this chat's input as well as opened.
+      const res = stamps.get(link.node)?.res;
+      const file = res?.state === "hit" ? res.hit : null;
       contextMenu.openAt(e, [
         { label: "Open", onSelect: () => openFileLink(link, e, false) },
         { label: OPEN_BESIDE, onSelect: () => openFileLink(link, e, true) },
+        ...(file !== null && canReferenceFile(link.node)
+          ? ["separator" as const, { label: REFERENCE_IN_CHAT, onSelect: () => void referenceHandledFile(file, link.node) }]
+          : []),
       ]);
       return;
     }

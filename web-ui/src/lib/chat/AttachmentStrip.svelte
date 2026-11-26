@@ -23,8 +23,10 @@
    *   remove button; a click previews the picture large.
    * - `paths` (a sent or queued message): the daemon's saved copies,
    *   resolved when the strip nears the viewport; a click opens the picture
-   *   in a pane, as an agent's figure does. A copy that is gone says so in
-   *   place (uploads end with their session).
+   *   in a pane, as an agent's figure does, and it drags onto the composer
+   *   (or right-clicks) to be referenced again without opening it
+   *   (`fileHandle`). A copy that is gone says so in place (uploads end
+   *   with their session).
    *
    * Tiles share one row height and take their width from the picture, so
    * nothing below moves when bytes arrive. No hover effects (the figure
@@ -33,6 +35,7 @@
   import FileIcon from "../shared/FileIcon.svelte";
   import { isMissing, rawUrl, resolveFile, type TargetResult } from "../shared/embed/embed";
   import { basename } from "../previews/files";
+  import { fileHandle } from "../shared/fileHandle";
   import { attachmentSrc, tileBox, type ImageAttachment } from "./images";
 
   interface Props {
@@ -173,6 +176,7 @@
         aria-label={savedTitle(path, answer, failed)}
         disabled={hit === null || onOpen === undefined}
         onclick={(e) => onOpen?.(path, e)}
+        {@attach fileHandle(() => (hit !== null && !failed ? { path: hit.path } : null))}
       >
         {#if url !== null}
           <img
