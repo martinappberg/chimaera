@@ -1120,16 +1120,27 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
     themes and the accent come through): add, never rename. The page's URL carries the theme
     (`chimaera-theme`, base64url JSON) so it applies at once; a framed page hears later themes as
     messages and never reloads, while an app view loads again for a new theme.
-  - **`chimaera.send(text)` / `chimaera.draft(text)`.** Taken only right after the person pressed
-    or typed in the page — the app's bridge checks in its own world; for a frame the parent
-    checks that the frame holds focus and, where the browser says, that the window has transient
-    activation — at most one a second, 4,000 characters, prefixed "From the page “title”:". Only a
-    card in a chat's own answer sends, to that chat (`shared/pageMessage.ts`, App's handler, the
-    chat's live socket; a closed one drafts instead with a notice). Anywhere else — a preview
-    pane, a card in a document, a hover — both draft into the agent the person works with, who
-    sends it or not: a page that isn't the agent's own must not message an agent as the person.
-    Agents learn the variables and the two calls from the chat host frame
-    (`launcher::CHAT_HOST_PROMPT`).
+  - **`chimaera.send(text)` / `chimaera.draft(text)`.** 4,000 characters at most, at most one a
+    second, prefixed "From the page “title”:". A send needs the person's fresh press, one message
+    per press: the app's bridge, in its own world, takes a pointer press or Enter/Space in the page
+    and consumes it (`pane_bridge.js`; nothing while an agent drives the view); for a frame, which
+    the window can't look inside, the parent takes the person at the frame (focus in it, or the
+    pointer over it: a canvas such as GenomeSpy's keeps focus out), the window's transient
+    activation with no press or key of the window's own for an activation's life (5 s), and one
+    send per activation — and with no `navigator.userActivation` a frame never sends
+    (`shared/paneFrame.ts`). Short of that evidence a send is a draft. Even then only a card in a
+    chat's own answer whose file was written while that chat ran (its mtime against the session's
+    start, `writtenDuringChat`) sends, to that chat (`shared/pageMessage.ts`, App's handler, the
+    chat's live socket; a closed one drafts instead with a notice). Anywhere else — an older file
+    the agent only embedded, a preview pane, a card in a document, a hover — both draft into the
+    agent the person works with, who sends it or not: a page that isn't the agent's own must not
+    message an agent as the person. Agents learn the variables and the two calls from the chat
+    host frame (`launcher::CHAT_HOST_PROMPT`).
+  - **Limits.** A sandboxed page can't load the app's own fonts: `--ch-mono` and `--ch-font` name
+    them with their fallbacks, so a page shows the first one the system has. `--ch-text-*` are the
+    window's root sizes; chat prose sets its own, so a page in an answer may read a step larger.
+    An app view's URL carries the theme, so it reloads once a theme change settles (400 ms);
+    a framed page takes it live.
 - **PDF rendering.** Cards, panes and region snapshots share nonzero raster dimensions capped at
   12 million pixels and 8192 pixels per edge (`shared/pdfCanvas.ts`). Each draw owns a fresh canvas,
   and failed draws are cancelled before their handles are discarded: a graphics-initialization

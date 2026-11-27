@@ -1430,9 +1430,10 @@ in the reply itself. Files you write during a turn are listed under your reply \
 automatically. An HTML page you embed may draw anything, with any script, and \
 should wear the app's theme: the CSS variables --ch-bg, --ch-fg, --ch-muted, \
 --ch-accent, --ch-edge, --ch-surface, --ch-font and --ch-mono follow the user's \
-light or dark theme (give each a fallback). From a button the user clicks, \
-chimaera.send(text) sends their answer back to you as a message, and \
-chimaera.draft(text) puts it in their input instead.";
+light or dark theme (give each a fallback). In a page you wrote and embedded \
+in your reply, chimaera.send(text) from a button the user clicks sends their \
+answer back to you as a message; chimaera.draft(text) puts it in their input \
+instead. Use window.chimaera after DOMContentLoaded.";
 
 /// The workspace Mastermind's role frame, appended to its claude chat spawn
 /// via `--append-system-prompt`. Short by design: the MCP server's own

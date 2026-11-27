@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { encodePageTheme, PAGE_THEME_TOKENS } from "./pageTheme";
-import { pageMessageText } from "./pageMessage";
+import { pageMessageText, writtenDuringChat, WRITTEN_SLACK_MS } from "./pageMessage";
 
 /** What the page API does with the URL value (`chimaera-core` `page_api.js`). */
 function decodeLikeThePage(raw: string): unknown {
@@ -29,5 +29,17 @@ describe("pageMessageText", () => {
   it("says where the message came from", () => {
     expect(pageMessageText({ text: "a = FORMAT", title: "VCF quiz" })).toBe("From the page “VCF quiz”:\n\na = FORMAT");
     expect(pageMessageText({ text: "hi", title: "  " })).toBe("From a page:\n\nhi");
+  });
+});
+
+describe("writtenDuringChat", () => {
+  const started = 1_800_000_000_000;
+  it("counts a file written while the chat ran, within the clocks' slack", () => {
+    expect(writtenDuringChat(started + 60_000, started)).toBe(true);
+    expect(writtenDuringChat(started - WRITTEN_SLACK_MS + 1, started)).toBe(true);
+  });
+  it("refuses an older file, and an unknown time", () => {
+    expect(writtenDuringChat(started - 86_400_000, started)).toBe(false);
+    expect(writtenDuringChat(null, started)).toBe(false);
   });
 });

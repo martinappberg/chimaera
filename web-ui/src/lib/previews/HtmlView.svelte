@@ -140,7 +140,7 @@
   /** A page here is not in a chat's answer: what it asks to send is only
    *  drafted for the agent the person works with (`shared/pageMessage.ts`). */
   const onPageMessage = (m: { send: boolean; text: string; title: string }): void => {
-    pageMessage({ chat: null, ...m });
+    pageMessage({ chat: null, writtenAtMs: null, ...m });
   };
 
   // Reset per path.

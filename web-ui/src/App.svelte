@@ -258,7 +258,7 @@
   import "./lib/knowledge/references";
   import "./lib/plugins/references";
   import { registerAskAgent } from "./lib/shared/askAgent";
-  import { registerPageMessages, pageMessageText, type PageMessage } from "./lib/shared/pageMessage";
+  import { registerPageMessages, pageMessageText, writtenDuringChat, type PageMessage } from "./lib/shared/pageMessage";
   import { flash, showFlash } from "./lib/shared/flash.svelte";
   import {
     activatePluginsWorkspace,
@@ -2190,17 +2190,20 @@
    *  user works with, surfaced beside Knowledge when it isn't open. Never
    *  sends — the user reads the draft first. */
   /**
-   * A page's message for an agent (`shared/pageMessage.ts`), already known
-   * to follow the person's own press or key in it. A page in a chat's own
-   * answer sends to that chat over its live socket (the composer's path;
-   * a closed socket turns it into a draft there, never a lost click). Any
-   * other page drafts into the agent the person works with.
+   * A page's message for an agent (`shared/pageMessage.ts`); `send` only
+   * when its host saw the person's fresh press in it. A page in a chat's own
+   * answer, written while that chat ran, sends to that chat over its live
+   * socket (the composer's path; a closed socket turns it into a draft
+   * there, never a lost click); an older file there only drafts. Any other
+   * page drafts into the agent the person works with.
    */
   function onPageMessage(m: PageMessage): "sent" | "drafted" | "none" {
     const text = pageMessageText(m);
     if (m.chat !== null) {
       const entry = chatPool.pool.get(m.chat);
-      if (m.send && entry !== undefined) {
+      const started = sessionsById.get(m.chat)?.created_at;
+      const own = started !== undefined && writtenDuringChat(m.writtenAtMs, started * 1000);
+      if (m.send && own && entry !== undefined) {
         if (entry.socket.send({ type: "send", blocks: [{ type: "text", text }] })) {
           followToBottom(m.chat);
           return "sent";

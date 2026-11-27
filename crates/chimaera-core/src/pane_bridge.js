@@ -223,17 +223,25 @@
 
   // The page API's messages (`page_api.js`, in the page's world) reach a
   // native view's shell only through here, and only right after the person
-  // pressed or typed in the page: a page can ask on a timer, never be
-  // believed on one. At most one a second. A framed page posts to its
-  // parent itself, which checks the same (`shared/paneFrame.ts`).
+  // pressed in the page — a pointer press, or Enter or Space (what activates
+  // a control) — one message per press: a page can ask on a timer or on
+  // every keystroke typed into its field, never be believed on one. A
+  // framed page posts to its parent itself, which checks what it can
+  // (`shared/paneFrame.ts`).
   if (native !== null) {
     const PAGE_TEXT_MAX = 4000;
-    let lastPageMessage = 0;
+    let lastPress = 0;
+    const notePress = (e) => {
+      if (!e.isTrusted) return;
+      if (e.type === "keydown" && e.key !== "Enter" && e.key !== " ") return;
+      lastPress = Date.now();
+    };
+    addEventListener("pointerdown", notePress, true);
+    addEventListener("keydown", notePress, true);
     document.addEventListener("chimaera:page", (e) => {
       const detail = e.detail;
       if (typeof detail !== "string" || detail.length > 16384) return;
-      const now = Date.now();
-      if (now - lastInput > INPUT_FRESH_MS || now - lastPageMessage < 1000) return;
+      if (Date.now() - lastPress > INPUT_FRESH_MS) return;
       let m;
       try {
         m = JSON.parse(detail);
@@ -243,7 +251,7 @@
       if (m === null || typeof m !== "object") return;
       if (m.kind !== "page_send" && m.kind !== "page_draft") return;
       if (typeof m.text !== "string" || m.text.trim() === "") return;
-      lastPageMessage = now;
+      lastPress = 0;
       post({ kind: m.kind, text: m.text.slice(0, PAGE_TEXT_MAX), title: clip(document.title) ?? "" });
     });
   }

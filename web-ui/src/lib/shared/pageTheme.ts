@@ -34,6 +34,9 @@ export const PAGE_THEME_TOKENS: ReadonlyArray<readonly [name: string, token: str
   ["radius", "--radius-card"],
 ];
 
+/** How long the window's theme must hold still before pages get it. */
+const SETTLE_MS = 400;
+
 export interface PageTheme {
   m: "light" | "dark";
   v: Record<string, string>;
@@ -60,24 +63,28 @@ export function encodePageTheme(theme: PageTheme): string {
 
 /**
  * The encoded theme, renewed when the window's root changes theme (the
- * appearance settings write its `data-theme` and inline tokens). Equal
- * encodings don't notify, so a root style change that leaves these tokens
- * alone reloads nothing.
+ * appearance settings write its `data-theme` and inline tokens) and has
+ * held still for `SETTLE_MS`: an app view's URL carries the theme, so a
+ * dragged accent picker would otherwise reload its page at every step.
+ * Equal encodings don't notify, so a root style change that leaves these
+ * tokens alone reloads nothing.
  */
 export const pageTheme: Readable<string> = readable("", (set) => {
   if (typeof document === "undefined") return;
   const root = document.documentElement;
-  let queued = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
   const read = (): void => {
-    queued = false;
+    timer = null;
     set(encodePageTheme(readPageTheme(root)));
   };
   read();
   const observer = new MutationObserver(() => {
-    if (queued) return;
-    queued = true;
-    queueMicrotask(read);
+    if (timer !== null) clearTimeout(timer);
+    timer = setTimeout(read, SETTLE_MS);
   });
   observer.observe(root, { attributes: true, attributeFilter: ["style", "data-theme", "class"] });
-  return () => observer.disconnect();
+  return () => {
+    observer.disconnect();
+    if (timer !== null) clearTimeout(timer);
+  };
 });

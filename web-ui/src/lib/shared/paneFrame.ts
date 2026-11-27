@@ -35,8 +35,8 @@ export interface PaneFrameParams {
   onReference?: () => void;
   /** The page loaded, or its title or same-document URL changed. */
   onPage?: (page: { url: string; title: string }) => void;
-  /** The page API's `send` / `draft`, taken only right after the person
-   *  acted in the frame (see `pageMessageBelieved`). */
+  /** The page API's `send` / `draft`: a send only on fresh evidence of the
+   *  person's press, else a draft (see `pageMessageTrust`). */
   onPageMessage?: (m: { send: boolean; text: string; title: string }) => void;
   /** The app's theme, encoded (`pageTheme.ts`): posted to the page API
    *  whenever it changes and to each new document, so a framed page
@@ -51,27 +51,31 @@ const REFERENCE_GAP_MS = 1000;
 const PAGE_MESSAGE_GAP_MS = 1000;
 
 /**
- * Whether a framed page's `send` / `draft` follows the person's own input.
- * The page shares the bridge's world and can post this on a timer, so the
- * check is this window's:
- * - the person is in the frame: it holds this document's focus, or the
- *   pointer is over it (a canvas page often keeps focus from moving into
- *   its frame — GenomeSpy's does — and a page can't move the pointer);
- * - where the browser says, this window has transient activation, which a
- *   press or a key in the frame gives its ancestors too;
- * - and this window saw no press or key of its own just now, so the
- *   activation is the frame's, not a click elsewhere in the app.
+ * What a framed page's `send` / `draft` may become. The page shares the
+ * bridge's world and can post on a timer, and this window can't see into a
+ * frame of another origin — not its input, not even the pointer over it (a
+ * site-isolated frame runs in a process of its own) — and a canvas page
+ * often keeps focus out of its frame (GenomeSpy's does). What this window
+ * can see is its own transient activation, which a press or key in a frame
+ * gives its ancestors too:
+ * - a send needs that activation, with no press or key of this window's
+ *   own for an activation's whole life (so it is a frame's, not a click
+ *   elsewhere in the app), and at most one send per activation. Where the
+ *   browser can't say (no `navigator.userActivation`), a page never sends;
+ * - a draft needs the activation, or focus in the frame;
+ * - else nothing. The host then lets only a page in a chat's own answer,
+ *   written while that chat ran, send (`shared/pageMessage.ts`).
  */
-function pageMessageBelieved(inFrame: boolean, ownInputAgoMs: number): boolean {
-  if (!inFrame) return false;
+function pageMessageTrust(inFrame: boolean, ownInputAgoMs: number, lastSendAgoMs: number): "send" | "draft" | null {
   const activation = (navigator as Navigator & { userActivation?: { isActive: boolean } }).userActivation;
-  if (activation === undefined) return true;
-  return activation.isActive && ownInputAgoMs > OWN_INPUT_QUIET_MS;
+  const active = activation !== undefined && activation.isActive;
+  if (active && ownInputAgoMs > ACTIVATION_LIFE_MS && lastSendAgoMs > ACTIVATION_LIFE_MS) return "send";
+  return active || inFrame ? "draft" : null;
 }
 
-/** How long after this window's own press or key a frame's activation is
- *  not believed to be the frame's. */
-const OWN_INPUT_QUIET_MS = 1000;
+/** The longest a browser keeps transient activation (Chrome and Firefox:
+ *  about 5 s; WebKit: shorter). */
+const ACTIVATION_LIFE_MS = 5000;
 
 /** `use:paneFrame={{ … }}` on the `<iframe>`. */
 export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
@@ -79,6 +83,7 @@ export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
   let control = initial.control ?? null;
   let lastReference = Number.NEGATIVE_INFINITY;
   let lastPageMessage = Number.NEGATIVE_INFINITY;
+  let lastPageSend = Number.NEGATIVE_INFINITY;
   let theme = initial.theme ?? "";
 
   const post = (cmd: Record<string, unknown>): void => {
@@ -91,8 +96,6 @@ export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
 
   /** The user is in the frame: it holds this document's focus. */
   const userInFrame = (): boolean => document.activeElement === node;
-  /** The person is at the frame: focus in it, or the pointer over it. */
-  const userAtFrame = (): boolean => userInFrame() || node.matches(":hover");
   // This window's own presses and keys (a frame's never reach it): a page
   // message right after one rides the app's activation, not the frame's.
   let lastOwnInput = Number.NEGATIVE_INFINITY;
@@ -140,10 +143,13 @@ export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
       case "page_send":
       case "page_draft": {
         const now = performance.now();
-        if (!pageMessageBelieved(userAtFrame(), now - lastOwnInput)) break;
         if (now - lastPageMessage < PAGE_MESSAGE_GAP_MS) break;
+        const trust = pageMessageTrust(userInFrame(), now - lastOwnInput, now - lastPageSend);
+        if (trust === null) break;
         lastPageMessage = now;
-        params.onPageMessage?.({ send: ev.kind === "page_send", text: ev.text, title: ev.title });
+        const send = ev.kind === "page_send" && trust === "send";
+        if (send) lastPageSend = now;
+        params.onPageMessage?.({ send, text: ev.text, title: ev.title });
         break;
       }
       case "page":

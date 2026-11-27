@@ -44,9 +44,12 @@
     /** The chat whose answer shows this card: a page may send to it
      *  (`shared/pageMessage.ts`); null anywhere else. */
     chat?: string | null;
+    /** When the page's file was last written (epoch ms): only a page written
+     *  during its chat may send. */
+    writtenAtMs?: number | null;
   }
 
-  let { url: pageUrl, title, compact, active, visible = true, chat = null }: Props = $props();
+  let { url: pageUrl, title, compact, active, visible = true, chat = null, writtenAtMs = null }: Props = $props();
 
   // The page as Chimaera shows it (`withPageApi`): in the app, its URL
   // carries the theme (a new theme loads it again); framed, the theme it
@@ -56,7 +59,7 @@
     pageUrl === null ? null : withPageApi(pageUrl, { framed: true, theme: untrack(() => $pageTheme) }),
   );
   const onPageMessage = (m: { send: boolean; text: string; title: string }): void => {
-    pageMessage({ chat, ...m });
+    pageMessage({ chat, writtenAtMs, ...m });
   };
 
   let expanded = $state(false);
