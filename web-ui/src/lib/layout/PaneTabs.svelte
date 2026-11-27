@@ -1453,8 +1453,8 @@
     /* Never wider than the strip: a lone long name ellipsizes instead of
        overflowing under the bar's controls. */
     max-width: min(180px, 100%);
-    font-family: var(--mono);
-    font-size: var(--text-xs);
+    font-family: var(--name-font);
+    font-size: var(--text-sm);
     color: var(--muted);
     cursor: default;
     user-select: none;

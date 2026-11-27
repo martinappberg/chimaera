@@ -399,9 +399,10 @@
     align-items: center;
     gap: 5px;
     color: var(--fg);
-    font-family: var(--mono);
+    font-family: var(--name-font);
+    font-weight: 500;
     flex: none;
-    padding-right: 4px;
+    padding-right: 6px;
     border-right: 1px solid var(--edge);
     margin-right: 2px;
   }

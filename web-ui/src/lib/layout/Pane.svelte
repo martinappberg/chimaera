@@ -923,8 +923,11 @@
     outline: none;
   }
 
-  /* The focused pane is unmistakable: hairline accent instead of the edge. */
-  .pane.focused {
+  /* The focused pane is unmistakable: hairline accent instead of the edge.
+     Only among panes (a split's cell): a window's one pane is always the
+     focused one, and a permanent accent frame around the whole page says
+     nothing and tints everything inside it. */
+  :global(.split > .cell) .pane.focused {
     border-color: color-mix(in srgb, var(--accent) 62%, var(--edge));
   }
 

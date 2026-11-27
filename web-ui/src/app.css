@@ -15,6 +15,11 @@
     system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --ui-font: var(--ui-font-custom, var(--ui-font-default));
   --editor-font: var(--editor-font-custom, var(--mono));
+  /* What things are called in chrome: session titles, tab titles, file names
+     in the tree, the agent's name. These are names people read, so they are
+     set in the interface face; --mono is for what is literally code or
+     terminal text (commands, paths in prose, hashes, counts that must align). */
+  --name-font: var(--ui-font);
   /* The whole interface scale — four sizes, set live from
      appearance.interfaceFontSize. Content surfaces may override the scale
      locally (chat) or use their own pixel settings (terminal/editor).
