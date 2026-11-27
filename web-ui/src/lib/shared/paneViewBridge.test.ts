@@ -213,8 +213,8 @@ describe("page size", () => {
   });
 
   it("marks an inline page in its URL", () => {
-    expect(withPageApi("/raw/t/a.html", { framed: true, theme: null, inline: true })).toBe(
-      "/raw/t/a.html?bridge=1&chimaera-inline=1",
+    expect(withPageApi("/raw/t/a.html", { framed: true, theme: null, inline: 720 })).toBe(
+      "/raw/t/a.html?bridge=1&chimaera-inline=720",
     );
   });
 });

@@ -87,7 +87,9 @@
   // background, so the browser's own defaults — text, form controls,
   // scrollbars — follow the theme's light or dark there; any other page
   // keeps its browser defaults.
-  const inline = query.get("chimaera-inline") === "1";
+  // `chimaera-inline=<max px>`: the most height the card gives the page.
+  const inlineMax = Number(query.get("chimaera-inline"));
+  const inline = Number.isFinite(inlineMax) && inlineMax > 0;
   const baseApply = applyTheme;
   applyTheme = (t) => {
     baseApply(t);
@@ -96,23 +98,37 @@
   applyTheme(decodeTheme(query.get("chimaera-theme")));
 
   // The page's own height, for an inline card that takes it: reported when
-  // it changes, at most once a frame. The body's box with its margins, not
-  // the root's scroll height, which never drops below the frame's own (so a
-  // page could grow and never shrink). A page laid out at `height: 100%`
-  // has no height of its own: it gives its plot an explicit one.
+  // it changes, at most once a frame. The body's box with its margins (the
+  // root's scroll height alone never drops below the frame's own, so a page
+  // could grow and never shrink), or the root's scroll height when content
+  // overflows the frame. A page laid out at `height: 100%` has no height of
+  // its own: it gives its plot an explicit one.
+  //
+  // While the page fits the card's most (`inlineMax`), the root scrolls
+  // never: no scrollbar to flash while the card catches up, and none to
+  // narrow the page, rewrap its text and change its height — with an
+  // always-shown scrollbar that loop resized the card without end.
   if (inline) {
     let sent = -1;
     let queued = false;
+    const root = document.documentElement;
     const measure = () => {
       const body = document.body;
-      if (body === null) return document.documentElement.scrollHeight;
-      const cs = getComputedStyle(body);
-      return body.getBoundingClientRect().height + parseFloat(cs.marginTop) + parseFloat(cs.marginBottom);
+      let h = 0;
+      if (body !== null) {
+        const cs = getComputedStyle(body);
+        h = body.getBoundingClientRect().height + parseFloat(cs.marginTop) + parseFloat(cs.marginBottom);
+      }
+      if (root.scrollHeight > root.clientHeight + 1) h = Math.max(h, root.scrollHeight);
+      return h;
     };
     const report = () => {
       queued = false;
       const h = Math.ceil(measure());
-      if (h === sent) return;
+      root.style.overflowY = h <= inlineMax ? "hidden" : "";
+      // Grow at once; shrink only past a couple of pixels (sub-pixel
+      // rounding must not set the card bobbing).
+      if (h === sent || (h < sent && sent - h <= 2)) return;
       sent = h;
       post({ kind: "page_size", height: h });
     };

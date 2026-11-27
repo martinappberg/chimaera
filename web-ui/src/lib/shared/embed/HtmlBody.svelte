@@ -82,9 +82,9 @@
   // The page as Chimaera shows it (`withPageApi`): in the app, its URL
   // carries the theme (a new theme loads it again); framed, the theme it
   // loaded with, and later ones as messages, so the frame never reloads.
-  const url = $derived(pageUrl === null ? null : withPageApi(pageUrl, { framed: false, theme: $pageTheme, inline }));
+  const url = $derived(pageUrl === null ? null : withPageApi(pageUrl, { framed: false, theme: $pageTheme, inline: inline ? INLINE_MAX : undefined }));
   const frameUrl = $derived(
-    pageUrl === null ? null : withPageApi(pageUrl, { framed: true, theme: untrack(() => $pageTheme), inline }),
+    pageUrl === null ? null : withPageApi(pageUrl, { framed: true, theme: untrack(() => $pageTheme), inline: inline ? INLINE_MAX : undefined }),
   );
   const onPageMessage = (m: { send: boolean; text: string; title: string }): void => {
     pageMessage({ chat, writtenAtMs, ...m });

@@ -232,12 +232,13 @@ export function withBridge(url: string): string {
  */
 export function withPageApi(
   url: string,
-  opts: { framed: boolean; theme: string | null; inline?: boolean },
+  opts: { framed: boolean; theme: string | null; inline?: number },
 ): string {
   let asked = opts.framed ? withBridge(url) : withPair(url, "api=1");
   // An inline page (`#inline` on its embed) follows the theme's light/dark
   // for the browser's own defaults too (its text, its controls): it sits on
-  // the app's background, not a white card.
-  if (opts.inline === true) asked = withPair(asked, "chimaera-inline=1");
+  // the app's background, not a white card. The value is the most height
+  // the card gives it: up to that, the page never shows a scrollbar.
+  if (opts.inline !== undefined && opts.inline > 0) asked = withPair(asked, `chimaera-inline=${Math.round(opts.inline)}`);
   return opts.theme === null || opts.theme === "" ? asked : withPair(asked, `chimaera-theme=${opts.theme}`);
 }

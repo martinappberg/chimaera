@@ -1142,7 +1142,10 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
     file header, box, caption or expand; it sits on the app's background at its own height — the
     page API reports its body's height (`page_size`, clamped 48–720 px; past that it scrolls
     inside), and its browser defaults (text, controls) follow the theme's light or dark
-    (`chimaera-inline=1` in its URL, `color-scheme` on its root) — with an **open ↗** on hover (in
+    (`chimaera-inline=<max px>` in its URL, `color-scheme` on its root); up to that most it never
+    shows a scrollbar (its root's `overflow-y` is hidden, so a scrollbar can't narrow the page,
+    rewrap it and resize the card in a loop), the app's bridge always delivers the latest size
+    (held to ten a second, never dropped), and a shrink under 3 px is ignored — with an **open ↗** on hover (in
     the app, a quiet row under it, since nothing draws over a view). A page laid out at
     `height: 100%` has no height of its own and stays at the 160 px start: give a plot an explicit
     height. Without `#inline` an HTML page is a file card, right for a report. The agent decides,

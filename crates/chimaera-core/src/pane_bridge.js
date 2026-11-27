@@ -239,6 +239,8 @@
     addEventListener("pointerdown", notePress, true);
     addEventListener("keydown", notePress, true);
     let lastSize = 0;
+    let sizeTimer = 0;
+    let pendingSize = 0;
     document.addEventListener("chimaera:page", (e) => {
       const detail = e.detail;
       if (typeof detail !== "string" || detail.length > 16384) return;
@@ -250,12 +252,21 @@
       }
       if (m === null || typeof m !== "object") return;
       // The page's height, for an inline card: no input needed (the host
-      // clamps it), ten a second at most.
+      // clamps it), ten a second at most — and always the latest: a report
+      // that comes too soon is held and sent at the end of the tenth, never
+      // dropped (a dropped last size left the card short, scrolling).
       if (m.kind === "page_size") {
-        const now = Date.now();
-        if (now - lastSize < 100 || typeof m.height !== "number" || !Number.isFinite(m.height)) return;
-        lastSize = now;
-        post({ kind: "page_size", height: Math.max(0, Math.min(100000, m.height)) });
+        if (typeof m.height !== "number" || !Number.isFinite(m.height)) return;
+        pendingSize = Math.max(0, Math.min(100000, m.height));
+        if (sizeTimer !== 0) return;
+        const flush = () => {
+          sizeTimer = 0;
+          lastSize = Date.now();
+          post({ kind: "page_size", height: pendingSize });
+        };
+        const wait = 100 - (Date.now() - lastSize);
+        if (wait <= 0) flush();
+        else sizeTimer = setTimeout(flush, wait);
         return;
       }
       if (Date.now() - lastPress > INPUT_FRESH_MS) return;
