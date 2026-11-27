@@ -45,7 +45,10 @@ export type NativeViewEvent =
   /** The page API's report of the page's content height (CSS px), for an
    *  inline card that takes the page's own height. The page's word: a host
    *  clamps it. */
-  | { id: string; kind: "page_size"; height: number };
+  | { id: string; kind: "page_size"; height: number }
+  /** The pointer came over the page or left it (trusted pointer events,
+   *  for a control that shows on hover). */
+  | { id: string; kind: "hover"; inside: boolean };
 
 /** The most of a page's message, and of its title, that is kept. */
 export const PAGE_TEXT_MAX = 4000;
@@ -95,6 +98,9 @@ export function decodeNativeViewEvent(raw: unknown): NativeViewEvent | null {
     case "page":
       if (!str(raw.url) || !str(raw.title)) return null;
       return { id, kind: "page", url: raw.url, title: raw.title };
+    case "hover":
+      if (!bool(raw.inside)) return null;
+      return { id, kind: "hover", inside: raw.inside };
     case "page_size":
       if (!num(raw.height) || raw.height < 0) return null;
       return { id, kind: "page_size", height: Math.min(raw.height, 100_000) };

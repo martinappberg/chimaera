@@ -311,6 +311,27 @@
     true,
   );
 
+  // --- the pointer over the page -----------------------------------------------
+  // For a host control that shows while the pointer is over the page (an
+  // inline card's open button): a host can't see hover over a page in a
+  // view or a site-isolated frame. Only trusted pointer events; nothing acts
+  // on it but a control's visibility.
+  let pointerInside = false;
+  addEventListener(
+    "pointerover",
+    (e) => {
+      if (!e.isTrusted || pointerInside) return;
+      pointerInside = true;
+      post({ kind: "hover", inside: true });
+    },
+    true,
+  );
+  addEventListener("mouseout", (e) => {
+    if (!e.isTrusted || e.relatedTarget !== null || !pointerInside) return;
+    pointerInside = false;
+    post({ kind: "hover", inside: false });
+  });
+
   // --- the page, as the workbench names it ----------------------------------------
   let lastHref = "";
   let lastTitle = "";

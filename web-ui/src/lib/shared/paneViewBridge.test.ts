@@ -218,3 +218,11 @@ describe("page size", () => {
     );
   });
 });
+
+describe("hover", () => {
+  it("reads the pointer coming over the page and leaving it", () => {
+    expect(decodeNativeViewEvent({ id: "v1", kind: "hover", inside: true })).toEqual({ id: "v1", kind: "hover", inside: true });
+    expect(decodeFrameMessage({ chimaeraPaneView: { kind: "hover", inside: false } })).toEqual({ kind: "hover", inside: false });
+    expect(decodeNativeViewEvent({ id: "v1", kind: "hover", inside: "yes" })).toBeNull();
+  });
+});

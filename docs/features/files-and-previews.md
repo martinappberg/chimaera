@@ -1145,8 +1145,12 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
     (`chimaera-inline=<max px>` in its URL, `color-scheme` on its root); up to that most it never
     shows a scrollbar (its root's `overflow-y` is hidden, so a scrollbar can't narrow the page,
     rewrap it and resize the card in a loop), the app's bridge always delivers the latest size
-    (held to ten a second, never dropped), and a shrink under 3 px is ignored — with an **open ↗** on hover (in
-    the app, a quiet row under it, since nothing draws over a view). A page laid out at
+    (held to ten a second, never dropped), and a shrink under 3 px is ignored. With no background
+    of its own the page is painted the colour behind its card (`backgroundBehind`: a chat paints
+    its own, not the window's `--bg`), so a web view's default canvas never shows as a box. A small
+    **open ↗** shows under its corner, in space the card keeps, while the pointer is over the page
+    — the pane bridge reports `hover` from trusted pointer events, since the window sees no hover
+    over a view or a site-isolated frame — and nothing moves when it does. A page laid out at
     `height: 100%` has no height of its own and stays at the 160 px start: give a plot an explicit
     height. Without `#inline` an HTML page is a file card, right for a report. The agent decides,
     per embed; Chimaera never guesses from size.

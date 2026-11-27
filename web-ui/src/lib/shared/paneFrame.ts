@@ -41,6 +41,8 @@ export interface PaneFrameParams {
   onPageMessage?: (m: { send: boolean; text: string; title: string }) => void;
   /** The page API's content height (CSS px; the page's word). */
   onPageSize?: (height: number) => void;
+  /** The pointer came over the page, or left it. */
+  onHover?: (inside: boolean) => void;
   /** The app's theme, encoded (`pageTheme.ts`): posted to the page API
    *  whenever it changes and to each new document, so a framed page
    *  follows the theme without a reload. */
@@ -162,6 +164,9 @@ export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
         break;
       case "page_size":
         params.onPageSize?.(ev.height);
+        break;
+      case "hover":
+        params.onHover?.(ev.inside);
         break;
       case "page_send":
       case "page_draft": {

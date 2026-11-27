@@ -391,8 +391,12 @@
      the prose on the app's background, at its own height. */
   .embed-card.inline {
     border-color: transparent;
+    border-radius: 0;
     background: transparent;
     box-shadow: none;
+    /* The open button sits under the page, in this kept space. */
+    overflow: visible;
+    margin-bottom: 1.7em;
   }
   .embed-card {
     display: flex;

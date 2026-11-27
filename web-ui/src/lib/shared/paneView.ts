@@ -109,6 +109,8 @@ export interface PaneViewParams {
   onPageMessage?: (m: { send: boolean; text: string; title: string }) => void;
   /** The page API's content height (CSS px; the page's word). */
   onPageSize?: (height: number) => void;
+  /** The pointer came over the page, or left it. */
+  onHover?: (inside: boolean) => void;
   /** The page loaded, or its title or same-document URL changed. */
   onPage?: (page: { url: string; title: string }) => void;
   /** The view's own web process died twice within a minute and the shell
@@ -667,6 +669,9 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
         break;
       case "page_size":
         params.onPageSize?.(ev.height);
+        break;
+      case "hover":
+        params.onHover?.(ev.inside);
         break;
       case "crashed":
         crashed = true;

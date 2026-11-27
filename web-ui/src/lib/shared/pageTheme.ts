@@ -53,6 +53,24 @@ export function readPageTheme(root: HTMLElement = document.documentElement): Pag
   return { m: root.dataset.theme === "dark" ? "dark" : "light", v };
 }
 
+/** The colour actually painted behind `el`: its nearest ancestor's opaque
+ *  background (a chat paints its own, not the window's `--bg`), or null. */
+export function backgroundBehind(el: Element): string | null {
+  for (let at: Element | null = el; at !== null; at = at.parentElement) {
+    const bg = getComputedStyle(at).backgroundColor;
+    if (bg !== "" && bg !== "transparent" && !/^rgba\(.*,\s*0\)$/.test(bg)) return bg;
+  }
+  return null;
+}
+
+/** The theme as drawn now, for a page that sits on `behind` (an inline
+ *  page, on its card's background): `bg` is that colour. */
+export function pageThemeOn(behind: string | null): string {
+  const t = readPageTheme();
+  if (behind !== null) t.v.bg = behind;
+  return encodePageTheme(t);
+}
+
 /** base64url (no padding) of the theme's JSON, as the page API decodes it. */
 export function encodePageTheme(theme: PageTheme): string {
   const bytes = new TextEncoder().encode(JSON.stringify(theme));

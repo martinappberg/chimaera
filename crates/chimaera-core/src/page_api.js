@@ -91,9 +91,24 @@
   const inlineMax = Number(query.get("chimaera-inline"));
   const inline = Number.isFinite(inlineMax) && inlineMax > 0;
   const baseApply = applyTheme;
+  // Whether the page paints a background of its own (its root's or its
+  // body's, which the canvas takes); read once, before we set one.
+  let ownBackground = null;
+  const clear = (c) => c === "" || c === "transparent" || /^rgba\(.*,\s*0\)$/.test(c);
   applyTheme = (t) => {
     baseApply(t);
-    if (inline && t !== null) document.documentElement.style.colorScheme = t.m;
+    if (!inline || t === null) return;
+    const root = document.documentElement;
+    root.style.colorScheme = t.m;
+    // Without its own, a web view paints its default canvas (a grey that
+    // isn't the chat's): the app's background instead.
+    if (ownBackground === null) {
+      const body = document.body;
+      ownBackground =
+        !clear(getComputedStyle(root).backgroundColor) ||
+        (body !== null && !clear(getComputedStyle(body).backgroundColor));
+    }
+    if (!ownBackground && typeof t.v.bg === "string") root.style.backgroundColor = t.v.bg;
   };
   applyTheme(decodeTheme(query.get("chimaera-theme")));
 
