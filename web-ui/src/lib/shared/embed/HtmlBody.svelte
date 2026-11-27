@@ -27,8 +27,13 @@
   import SlowLoad from "../SlowLoad.svelte";
   import { PaneViewControl, paneView, paneViewsPossible } from "../paneView";
   import { liveViews, type Still } from "./liveViews.svelte";
+  import { paneFrame } from "../paneFrame";
+  import { withPageApi } from "../paneViewBridge";
+  import { pageTheme } from "../pageTheme";
+  import { pageMessage } from "../pageMessage";
 
   interface Props {
+    /** The page's own `/raw` URL, as the card resolved it. */
     url: string | null;
     title: string;
     compact: boolean;
@@ -36,9 +41,23 @@
     active: boolean;
     /** On screen now (the app's view shows only while it is). */
     visible?: boolean;
+    /** The chat whose answer shows this card: a page may send to it
+     *  (`shared/pageMessage.ts`); null anywhere else. */
+    chat?: string | null;
   }
 
-  let { url, title, compact, active, visible = true }: Props = $props();
+  let { url: pageUrl, title, compact, active, visible = true, chat = null }: Props = $props();
+
+  // The page as Chimaera shows it (`withPageApi`): in the app, its URL
+  // carries the theme (a new theme loads it again); framed, the theme it
+  // loaded with, and later ones as messages, so the frame never reloads.
+  const url = $derived(pageUrl === null ? null : withPageApi(pageUrl, { framed: false, theme: $pageTheme }));
+  const frameUrl = $derived(
+    pageUrl === null ? null : withPageApi(pageUrl, { framed: true, theme: untrack(() => $pageTheme) }),
+  );
+  const onPageMessage = (m: { send: boolean; text: string; title: string }): void => {
+    pageMessage({ chat, ...m });
+  };
 
   let expanded = $state(false);
   const height = $derived(compact ? 200 : expanded ? 720 : 360);
@@ -174,6 +193,7 @@
             onPage: () => (crashed = false),
             onFocus: () => liveViews.activate(id),
             onShown: (on) => (shownNow = on),
+            onPageMessage,
             control,
           }}
         >
@@ -204,8 +224,14 @@
   </div>
 {:else}
   <div class="html-body" class:tile={compact} style:height="{height}px">
-    {#if active && url !== null}
-      <iframe src={url} {title} sandbox="allow-scripts" referrerpolicy="no-referrer"></iframe>
+    {#if active && frameUrl !== null}
+      <iframe
+        src={frameUrl}
+        {title}
+        sandbox="allow-scripts"
+        referrerpolicy="no-referrer"
+        use:paneFrame={{ onPageMessage, theme: $pageTheme }}
+      ></iframe>
     {/if}
     {#if !compact}
       <button class="expand" onclick={() => (expanded = !expanded)} title={expanded ? "collapse" : "show more of the page"}>

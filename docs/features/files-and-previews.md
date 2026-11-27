@@ -1105,6 +1105,31 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   since nothing draws over a view. A browser tab, the Linux and Windows apps, and an app build
   without pane views — or with pane views but older than this (`native_view_show` answers
   `fit`; an older shell drops the crop silently) — keep the sandboxed frame.
+- **Pages that wear the theme and answer back.** An HTML page a preview or a card shows gets
+  `window.chimaera`, the page API (`chimaera-core` `page_api.js`), which the daemon appends to the
+  ticket's own page: with the pane bridge for a framed page (`?bridge=1`), alone for an app view
+  (`?api=1`, whose bridge the app injects). Pages still draw whatever they like, with any script.
+  Appended after the document, it runs after the page's own inline scripts and before
+  `DOMContentLoaded`: a page reads `window.chimaera` from that event or a click handler.
+  - **Theme.** The app's tokens arrive as CSS variables on the page's root — `--ch-bg`, `--ch-fg`,
+    `--ch-muted`, `--ch-accent`, `--ch-accent-text`, `--ch-edge`, `--ch-surface`, `--ch-hover`,
+    `--ch-focus`, `--ch-err`, `--ch-warn`, `--ch-font`, `--ch-mono`, `--ch-text-sm/md/lg`,
+    `--ch-radius` — with the mode as `data-chimaera-theme`, `chimaera.theme` and `onTheme(fn)`.
+    Only variables, never an element style, so an old report renders exactly as before. The
+    names are a contract (`shared/pageTheme.ts`, read off the window's computed style, so custom
+    themes and the accent come through): add, never rename. The page's URL carries the theme
+    (`chimaera-theme`, base64url JSON) so it applies at once; a framed page hears later themes as
+    messages and never reloads, while an app view loads again for a new theme.
+  - **`chimaera.send(text)` / `chimaera.draft(text)`.** Taken only right after the person pressed
+    or typed in the page — the app's bridge checks in its own world; for a frame the parent
+    checks that the frame holds focus and, where the browser says, that the window has transient
+    activation — at most one a second, 4,000 characters, prefixed "From the page “title”:". Only a
+    card in a chat's own answer sends, to that chat (`shared/pageMessage.ts`, App's handler, the
+    chat's live socket; a closed one drafts instead with a notice). Anywhere else — a preview
+    pane, a card in a document, a hover — both draft into the agent the person works with, who
+    sends it or not: a page that isn't the agent's own must not message an agent as the person.
+    Agents learn the variables and the two calls from the chat host frame
+    (`launcher::CHAT_HOST_PROMPT`).
 - **PDF rendering.** Cards, panes and region snapshots share nonzero raster dimensions capped at
   12 million pixels and 8192 pixels per edge (`shared/pdfCanvas.ts`). Each draw owns a fresh canvas,
   and failed draws are cancelled before their handles are discarded: a graphics-initialization

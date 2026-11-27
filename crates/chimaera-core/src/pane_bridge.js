@@ -220,6 +220,33 @@
   addEventListener("pointerdown", (e) => e.isTrusted && post({ kind: "focus" }), true);
   addEventListener("focus", (e) => e.isTrusted && post({ kind: "focus" }));
   for (const type of ["pointerdown", "pointerup", "keydown", "keyup"]) addEventListener(type, noteInput, true);
+
+  // The page API's messages (`page_api.js`, in the page's world) reach a
+  // native view's shell only through here, and only right after the person
+  // pressed or typed in the page: a page can ask on a timer, never be
+  // believed on one. At most one a second. A framed page posts to its
+  // parent itself, which checks the same (`shared/paneFrame.ts`).
+  if (native !== null) {
+    const PAGE_TEXT_MAX = 4000;
+    let lastPageMessage = 0;
+    document.addEventListener("chimaera:page", (e) => {
+      const detail = e.detail;
+      if (typeof detail !== "string" || detail.length > 16384) return;
+      const now = Date.now();
+      if (now - lastInput > INPUT_FRESH_MS || now - lastPageMessage < 1000) return;
+      let m;
+      try {
+        m = JSON.parse(detail);
+      } catch {
+        return;
+      }
+      if (m === null || typeof m !== "object") return;
+      if (m.kind !== "page_send" && m.kind !== "page_draft") return;
+      if (typeof m.text !== "string" || m.text.trim() === "") return;
+      lastPageMessage = now;
+      post({ kind: m.kind, text: m.text.slice(0, PAGE_TEXT_MAX), title: clip(document.title) ?? "" });
+    });
+  }
   // A trusted click on a link: the shell lets that exact URL out to the
   // user's browser, and nothing else (a script's `a.click()` is untrusted).
   const noteLink = (e) => {

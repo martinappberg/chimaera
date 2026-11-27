@@ -88,7 +88,7 @@
   import { typeIntoDetachedSession } from "./lib/terminal/ws";
   import { terminalInput } from "./lib/chat/runCommand";
   import { reconnectingSockets } from "./lib/net/reconnect";
-  import { insertIntoComposer } from "./lib/chat/composerBus";
+  import { followToBottom, insertIntoComposer } from "./lib/chat/composerBus";
   import { volatileChatDrafts } from "./lib/chat/drafts";
   import { imageToAttachment, type ImageAttachment } from "./lib/chat/images";
   import {
@@ -258,6 +258,7 @@
   import "./lib/knowledge/references";
   import "./lib/plugins/references";
   import { registerAskAgent } from "./lib/shared/askAgent";
+  import { registerPageMessages, pageMessageText, type PageMessage } from "./lib/shared/pageMessage";
   import { flash, showFlash } from "./lib/shared/flash.svelte";
   import {
     activatePluginsWorkspace,
@@ -799,9 +800,11 @@
       openKnowledgeFromPane(from.paneId ?? layout.focusedPaneId, ekey, from.newSplit),
     );
     const offAsk = registerAskAgent((text) => askAgentFrom(layout.focusedPaneId, text));
+    const offPage = registerPageMessages(onPageMessage);
     return () => {
       offOpen();
       offAsk();
+      offPage();
     };
   });
 
@@ -2186,6 +2189,30 @@
   /** Knowledge's "Ask an agent": the drafted request lands in the agent the
    *  user works with, surfaced beside Knowledge when it isn't open. Never
    *  sends — the user reads the draft first. */
+  /**
+   * A page's message for an agent (`shared/pageMessage.ts`), already known
+   * to follow the person's own press or key in it. A page in a chat's own
+   * answer sends to that chat over its live socket (the composer's path;
+   * a closed socket turns it into a draft there, never a lost click). Any
+   * other page drafts into the agent the person works with.
+   */
+  function onPageMessage(m: PageMessage): "sent" | "drafted" | "none" {
+    const text = pageMessageText(m);
+    if (m.chat !== null) {
+      const entry = chatPool.pool.get(m.chat);
+      if (m.send && entry !== undefined) {
+        if (entry.socket.send({ type: "send", blocks: [{ type: "text", text }] })) {
+          followToBottom(m.chat);
+          return "sent";
+        }
+        entry.store.notice("not connected — the page's message is in the input instead", "error");
+      }
+      insertIntoComposer(m.chat, text, "block");
+      return "drafted";
+    }
+    return askAgentFrom(layout.focusedPaneId, text) !== null ? "drafted" : "none";
+  }
+
   function askAgentFrom(paneId: string, text: string): string | null {
     const target = refTargetSession;
     if (target === null) return null;

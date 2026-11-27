@@ -29,13 +29,21 @@ interface Pending {
 
 export class EmbedResolver {
   readonly #context: () => LinkContext;
+  readonly #chat: () => string | null;
   readonly #cache = new Map<string, { r: TargetResult; at: number }>();
   #queue = new Map<string, Pending>();
   #timer: ReturnType<typeof setTimeout> | null = null;
   #disposed = false;
 
-  constructor(context: () => LinkContext) {
+  constructor(context: () => LinkContext, chat: () => string | null = () => null) {
     this.#context = context;
+    this.#chat = chat;
+  }
+
+  /** The chat whose transcript these embeds are in, if any: an HTML page
+   *  among them may send to it (`shared/pageMessage.ts`). */
+  get chat(): string | null {
+    return this.#chat();
   }
 
   #key(ctx: LinkContext, target: string, bases: string[]): string {

@@ -65,6 +65,9 @@
     resolve?: () => Promise<TargetResult | null>;
     /** Open in a pane. Default: the workbench opener (`openPath`). */
     onOpen?: (path: string, kind: "file" | "dir", reveal?: Reveal) => void;
+    /** The chat whose answer shows the card: an HTML page in it may send
+     *  to that chat (`shared/pageMessage.ts`). */
+    chat?: string | null;
   }
 
   let {
@@ -77,6 +80,7 @@
     chrome = true,
     resolve,
     onOpen,
+    chat = null,
   }: Props = $props();
 
   /** A fresher answer than `info` (a self-resolve, or a refresh after the
@@ -335,7 +339,7 @@
   {:else if kind === "table" || kind === "xlsx"}
     <TableBody path={hit.path} version={hit.version} {kind} {frag} {compact} active={near} />
   {:else if kind === "html"}
-    <HtmlBody {url} title={name} {compact} active={near} visible={onScreen} />
+    <HtmlBody {url} title={name} {compact} active={near} visible={onScreen} {chat} />
   {:else if kind === "video" || kind === "audio"}
     <MediaBody {url} {kind} time={frag.at?.time} {compact} active={near} onDownload={remote ? download : undefined} />
   {:else if kind === "notebook"}

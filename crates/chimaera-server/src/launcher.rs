@@ -1410,7 +1410,10 @@ pub(crate) fn build_agent_resume_command(
 /// `--append-system-prompt`, codex through `developer_instructions`; a
 /// forked branch carries it at the head of its portable context instead
 /// (`chat::portable_context_prompt`), since that context rides the same
-/// channel. Short and cached with the system prompt: under 200 tokens.
+/// channel. Short and cached with the system prompt: under 300 tokens. Its
+/// last sentences are the page API (`chimaera_core::PAGE_API_JS`): the
+/// `--ch-*` names are the web UI's `shared/pageTheme.ts` contract, and an
+/// HTML card in this chat's answer is the one place `send` sends.
 pub(crate) const CHAT_HOST_PROMPT: &str = "\
 You are running in chimaera's chat, which renders your replies as markdown in a \
 workbench beside the user's files. A markdown image link to a local file renders \
@@ -1424,7 +1427,12 @@ to read, such as a markdown note, plan or report, with an ordinary link like \
 [the plan](analysis/PLAN.md), not an image link: the user can preview it on \
 hover or open it. When a few numbers carry the point, put a small markdown table \
 in the reply itself. Files you write during a turn are listed under your reply \
-automatically.";
+automatically. An HTML page you embed may draw anything, with any script, and \
+should wear the app's theme: the CSS variables --ch-bg, --ch-fg, --ch-muted, \
+--ch-accent, --ch-edge, --ch-surface, --ch-font and --ch-mono follow the user's \
+light or dark theme (give each a fallback). From a button the user clicks, \
+chimaera.send(text) sends their answer back to you as a message, and \
+chimaera.draft(text) puts it in their input instead.";
 
 /// The workspace Mastermind's role frame, appended to its claude chat spawn
 /// via `--append-system-prompt`. Short by design: the MCP server's own

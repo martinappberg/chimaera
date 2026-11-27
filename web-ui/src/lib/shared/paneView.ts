@@ -104,6 +104,9 @@ export interface PaneViewParams {
   onSelection?: (sel: { text: string; context: string | null; rect: ViewRect | null }) => void;
   /** The in-page reference pill was clicked. */
   onReference?: () => void;
+  /** The page API's `send` / `draft`, right after the person's own input
+   *  in the page (the bridge checked, in its own world). */
+  onPageMessage?: (m: { send: boolean; text: string; title: string }) => void;
   /** The page loaded, or its title or same-document URL changed. */
   onPage?: (page: { url: string; title: string }) => void;
   /** The view's own web process died twice within a minute and the shell
@@ -655,6 +658,10 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
         break;
       case "user_input":
         params.onUserInput?.();
+        break;
+      case "page_send":
+      case "page_draft":
+        params.onPageMessage?.({ send: ev.kind === "page_send", text: ev.text, title: ev.title });
         break;
       case "crashed":
         crashed = true;

@@ -36,7 +36,16 @@ export type NativeViewEvent =
   | { id: string; kind: "crashed" }
   /** Trusted input in the view that matches no input an agent injected:
    *  the person at the window acted (agent browser take-over). */
-  | { id: string; kind: "user_input" };
+  | { id: string; kind: "user_input" }
+  /** The page API's `send` / `draft` (`chimaera-core` `page_api.js`): a
+   *  page asking to message the agent, believed only right after the
+   *  person's own input (the native bridge checks; a framed page's host
+   *  checks itself). `title` is the page's own and only words. */
+  | { id: string; kind: "page_send" | "page_draft"; text: string; title: string };
+
+/** The most of a page's message, and of its title, that is kept. */
+export const PAGE_TEXT_MAX = 4000;
+const PAGE_TITLE_MAX = 120;
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null;
 const str = (v: unknown): v is string => typeof v === "string";
@@ -82,6 +91,12 @@ export function decodeNativeViewEvent(raw: unknown): NativeViewEvent | null {
     case "page":
       if (!str(raw.url) || !str(raw.title)) return null;
       return { id, kind: "page", url: raw.url, title: raw.title };
+    case "page_send":
+    case "page_draft": {
+      if (!str(raw.text) || raw.text.trim() === "") return null;
+      const title = str(raw.title) ? raw.title.replace(/\s+/g, " ").trim().slice(0, PAGE_TITLE_MAX) : "";
+      return { id, kind: raw.kind, text: raw.text.slice(0, PAGE_TEXT_MAX), title };
+    }
     default:
       return null;
   }
@@ -182,13 +197,33 @@ export function isChord(k: NativeViewKey, chord: ChordLike): boolean {
   );
 }
 
-/** `url` asking the daemon for its pane bridge (`?bridge=1`), any query
- *  and fragment it already carries kept. */
-export function withBridge(url: string): string {
+/** `url` with `pair` added to its query (unless it is already there), any
+ *  query and fragment it carries kept. */
+function withPair(url: string, pair: string): string {
   const hash = url.indexOf("#");
   const base = hash === -1 ? url : url.slice(0, hash);
   const frag = hash === -1 ? "" : url.slice(hash);
-  if (/[?&]bridge=1(&|$)/.test(base)) return url;
+  const [key] = pair.split("=");
+  if (new RegExp(`[?&]${key}=`).test(base)) return url;
   const sep = !base.includes("?") ? "?" : base.endsWith("?") || base.endsWith("&") ? "" : "&";
-  return `${base}${sep}bridge=1${frag}`;
+  return `${base}${sep}${pair}${frag}`;
+}
+
+/** `url` asking the daemon for its pane bridge (`?bridge=1`), any query
+ *  and fragment it already carries kept. A framed page gets the page API
+ *  with it. */
+export function withBridge(url: string): string {
+  return withPair(url, "bridge=1");
+}
+
+/**
+ * A preview's own page as Chimaera shows it: with the page API
+ * (`window.chimaera`) — and, framed, the pane bridge — appended by the
+ * daemon, and the app's theme (`pageTheme.ts`, encoded) for the page to
+ * read at once. A framed page hears later themes as messages; a native
+ * view's URL carries the current one, so a new theme loads it again.
+ */
+export function withPageApi(url: string, opts: { framed: boolean; theme: string | null }): string {
+  const asked = opts.framed ? withBridge(url) : withPair(url, "api=1");
+  return opts.theme === null || opts.theme === "" ? asked : withPair(asked, `chimaera-theme=${opts.theme}`);
 }

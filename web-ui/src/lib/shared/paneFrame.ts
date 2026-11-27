@@ -35,17 +35,42 @@ export interface PaneFrameParams {
   onReference?: () => void;
   /** The page loaded, or its title or same-document URL changed. */
   onPage?: (page: { url: string; title: string }) => void;
+  /** The page API's `send` / `draft`, taken only right after the person
+   *  acted in the frame (see `pageMessageBelieved`). */
+  onPageMessage?: (m: { send: boolean; text: string; title: string }) => void;
+  /** The app's theme, encoded (`pageTheme.ts`): posted to the page API
+   *  whenever it changes and to each new document, so a framed page
+   *  follows the theme without a reload. */
+  theme?: string;
   control?: PaneViewControl;
 }
 
 /** The least time between two references a framed page may ask for. */
 const REFERENCE_GAP_MS = 1000;
+/** The least time between two messages a framed page may ask to send. */
+const PAGE_MESSAGE_GAP_MS = 1000;
+
+/**
+ * Whether a framed page's `send` / `draft` follows the person's own input.
+ * The page shares the bridge's world and can post this on a timer, so the
+ * check is this window's: the person is in the frame (it holds this
+ * document's focus), and — where the browser says — this window has
+ * transient activation, which a press or a key in the frame gives its
+ * ancestors too.
+ */
+function pageMessageBelieved(inFrame: boolean): boolean {
+  if (!inFrame) return false;
+  const activation = (navigator as Navigator & { userActivation?: { isActive: boolean } }).userActivation;
+  return activation === undefined || activation.isActive;
+}
 
 /** `use:paneFrame={{ … }}` on the `<iframe>`. */
 export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
   let params = initial;
   let control = initial.control ?? null;
   let lastReference = Number.NEGATIVE_INFINITY;
+  let lastPageMessage = Number.NEGATIVE_INFINITY;
+  let theme = initial.theme ?? "";
 
   const post = (cmd: Record<string, unknown>): void => {
     try {
@@ -57,6 +82,10 @@ export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
 
   /** The user is in the frame: it holds this document's focus. */
   const userInFrame = (): boolean => document.activeElement === node;
+
+  const sendTheme = (): void => {
+    if (theme !== "") post({ op: "theme", theme });
+  };
 
   const reference = (): void => {
     if (!userInFrame()) return;
@@ -89,10 +118,21 @@ export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
       case "reference":
         reference();
         break;
+      case "page_send":
+      case "page_draft": {
+        if (!pageMessageBelieved(userInFrame())) break;
+        const now = performance.now();
+        if (now - lastPageMessage < PAGE_MESSAGE_GAP_MS) break;
+        lastPageMessage = now;
+        params.onPageMessage?.({ send: ev.kind === "page_send", text: ev.text, title: ev.title });
+        break;
+      }
       case "page":
         if (ev.url === "about:blank") break;
-        // A new document starts without the pill: give it back.
+        // A new document starts without the pill or the newest theme
+        // (its URL holds the one it was first loaded with): give both back.
         control?.applyChip();
+        sendTheme();
         params.onPage?.({ url: ev.url, title: ev.title });
         break;
     }
@@ -112,6 +152,10 @@ export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
   return {
     update(next: PaneFrameParams): void {
       params = next;
+      if ((next.theme ?? "") !== theme) {
+        theme = next.theme ?? "";
+        sendTheme();
+      }
       const nextControl = next.control ?? null;
       if (nextControl !== control) {
         control?.unbind(transport);

@@ -2121,7 +2121,10 @@
   /** Files the chat shows as embed cards (prose `![](…)`, the turn
    *  gallery's shell-written files) resolve against the same directories,
    *  strictly: an embed names one file. */
-  const proseEmbeds = new EmbedResolver(() => untrack(() => linkContext()));
+  const proseEmbeds = new EmbedResolver(
+    () => untrack(() => linkContext()),
+    () => untrack(() => session.id),
+  );
   /** What the transcript's path links and document chips preview on a
    *  rest (the document view's hover preview, over the transcript). */
   const hoverTargets = new HoverTargets();

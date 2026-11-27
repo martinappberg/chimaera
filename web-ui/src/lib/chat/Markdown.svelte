@@ -205,7 +205,7 @@
         alt,
         width,
         ...(resolver !== undefined
-          ? { info: resolver.peek(target), resolve: () => resolver.resolve(target) }
+          ? { info: resolver.peek(target), resolve: () => resolver.resolve(target), chat: resolver.chat }
           : {}),
         ...(onOpenPath !== undefined
           ? { onOpen: (p, kind, reveal) => onOpenPath(p, kind, reveal !== undefined ? { reveal } : {}) }

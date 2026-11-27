@@ -1,0 +1,118 @@
+// The page API: `window.chimaera` for an HTML page Chimaera shows (a preview
+// pane, an embed card in an agent's answer), so a page an agent writes can
+// wear the app's theme and answer back.
+//
+// It runs in the PAGE's own world and is the page's convenience, never a
+// boundary: a page can ignore it, replace it or post the same messages
+// itself. Every check lives on the trusted side — the parent window for a
+// framed page (`web-ui` `shared/paneFrame.ts`), the pane bridge's isolated
+// world for a native view (`pane_bridge.js`) — and a page's word is only a
+// request there.
+//
+// The daemon appends it after `</html>` to the ticket's own page when asked
+// (`?bridge=1` for a framed page, with the bridge; `?api=1` for a native
+// view, whose bridge the app injects itself), the way it appends the bridge.
+// So it runs after the page's own inline scripts and before
+// `DOMContentLoaded`: a page reads `window.chimaera` from that event or a
+// click, never at the top of an inline script (the theme variables apply
+// either way, being CSS).
+//
+// - Theme: the host puts the app's current theme in the page's URL
+//   (`chimaera-theme`: base64url JSON `{m: "light"|"dark", v: {name: css}}`)
+//   and, for a framed page, posts a new one when it changes. Each value
+//   becomes a CSS variable `--ch-<name>` on the root element, and the mode
+//   `data-chimaera-theme` there. Variables only — no element style — so a
+//   page that doesn't use them renders exactly as it did.
+// - `send(text)` / `draft(text)`: a message for the agent. The host honours
+//   either only right after the person pressed or typed in the page; it
+//   adds where the text came from, and only a page embedded in a chat's own
+//   answer may send to that chat — anywhere else both become a draft in the
+//   agent's input, which the person sends or not.
+(() => {
+  "use strict";
+  if (globalThis.chimaera !== undefined) return;
+  const framed = window.parent !== window;
+  const TEXT_MAX = 4000;
+
+  const post = (msg) => {
+    try {
+      if (framed) window.parent.postMessage({ chimaeraPaneView: msg }, "*");
+      // A native view's bridge lives in a world of its own: a DOM event,
+      // with a string detail (an object would not cross worlds).
+      else document.dispatchEvent(new CustomEvent("chimaera:page", { detail: JSON.stringify(msg) }));
+    } catch {
+      /* the host went away */
+    }
+  };
+
+  const decodeTheme = (raw) => {
+    if (typeof raw !== "string" || raw === "" || raw.length > 8192) return null;
+    try {
+      const b64 = raw.replace(/-/g, "+").replace(/_/g, "/");
+      const json = new TextDecoder().decode(Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)));
+      const t = JSON.parse(json);
+      if (t === null || typeof t !== "object" || (t.m !== "light" && t.m !== "dark")) return null;
+      if (t.v === null || typeof t.v !== "object") return null;
+      return t;
+    } catch {
+      return null;
+    }
+  };
+
+  let theme = { mode: "light", vars: {} };
+  const listeners = new Set();
+  const NAME = /^[a-z][a-z0-9-]{0,40}$/;
+  const applyTheme = (t) => {
+    if (t === null) return;
+    const root = document.documentElement;
+    const vars = {};
+    for (const [name, value] of Object.entries(t.v)) {
+      if (!NAME.test(name) || typeof value !== "string" || value.length > 200) continue;
+      vars[name] = value;
+    }
+    for (const name of Object.keys(theme.vars)) if (!(name in vars)) root.style.removeProperty(`--ch-${name}`);
+    for (const [name, value] of Object.entries(vars)) root.style.setProperty(`--ch-${name}`, value);
+    root.dataset.chimaeraTheme = t.m;
+    theme = Object.freeze({ mode: t.m, vars: Object.freeze(vars) });
+    for (const fn of listeners) {
+      try {
+        fn(theme);
+      } catch (err) {
+        console.error(err);
+      }
+    }
+  };
+  applyTheme(decodeTheme(new URLSearchParams(location.search).get("chimaera-theme")));
+  if (framed) {
+    addEventListener("message", (e) => {
+      const cmd = e.source === window.parent ? e.data?.chimaeraPaneViewCommand : undefined;
+      if (cmd?.op === "theme") applyTheme(decodeTheme(cmd.theme));
+    });
+  }
+
+  const message = (kind) => (text) => {
+    if (typeof text !== "string" || text.trim() === "") return false;
+    post({ kind, text: text.length > TEXT_MAX ? text.slice(0, TEXT_MAX) : text, title: document.title });
+    return true;
+  };
+
+  Object.defineProperty(globalThis, "chimaera", {
+    value: Object.freeze({
+      version: 1,
+      /** `{mode, vars}`: the app's theme now ("light" | "dark"; vars by name, without `--ch-`). */
+      get theme() {
+        return theme;
+      },
+      /** Call `fn(theme)` when the theme changes; returns a function that stops it. */
+      onTheme(fn) {
+        if (typeof fn !== "function") return () => {};
+        listeners.add(fn);
+        return () => listeners.delete(fn);
+      },
+      /** Ask to send `text` to the agent: from a click or a key press only. */
+      send: message("page_send"),
+      /** Ask to put `text` in the agent's input for the person to send. */
+      draft: message("page_draft"),
+    }),
+  });
+})();
