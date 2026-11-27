@@ -258,6 +258,9 @@
   import "./lib/knowledge/references";
   import "./lib/plugins/references";
   import { registerAskAgent } from "./lib/shared/askAgent";
+  // From the start: a page's activation is told from the app's own input
+  // (`shared/paneFrame.ts`), including input before the page mounted.
+  import "./lib/shared/ownInput";
   import { registerPageMessages, pageMessageText, writtenDuringChat, type PageMessage } from "./lib/shared/pageMessage";
   import { flash, showFlash } from "./lib/shared/flash.svelte";
   import {

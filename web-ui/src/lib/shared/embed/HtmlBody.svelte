@@ -47,23 +47,51 @@
     /** When the page's file was last written (epoch ms): only a page written
      *  during its chat may send. */
     writtenAtMs?: number | null;
+    /** Part of the answer (`#inline`): the page's own height, the app's
+     *  background, no expand; an open button on hover. */
+    inline?: boolean;
+    /** Open the page in a pane (inline mode's only control). */
+    onOpen?: () => void;
   }
 
-  let { url: pageUrl, title, compact, active, visible = true, chat = null, writtenAtMs = null }: Props = $props();
+  let {
+    url: pageUrl,
+    title,
+    compact,
+    active,
+    visible = true,
+    chat = null,
+    writtenAtMs = null,
+    inline = false,
+    onOpen,
+  }: Props = $props();
+
+  /** An inline page's height as it reports it (the page API's `page_size`),
+   *  kept between these bounds: past the top it scrolls inside itself. */
+  const INLINE_MIN = 48;
+  const INLINE_MAX = 720;
+  const INLINE_START = 160;
+  /** The app view's quiet open row under an inline page (nothing draws over
+   *  a view, so its control can't sit on the page). */
+  const INLINE_FOOT = 22;
+  let reported = $state<number | null>(null);
+  const onPageSize = (h: number): void => {
+    reported = Math.min(INLINE_MAX, Math.max(INLINE_MIN, Math.ceil(h)));
+  };
 
   // The page as Chimaera shows it (`withPageApi`): in the app, its URL
   // carries the theme (a new theme loads it again); framed, the theme it
   // loaded with, and later ones as messages, so the frame never reloads.
-  const url = $derived(pageUrl === null ? null : withPageApi(pageUrl, { framed: false, theme: $pageTheme }));
+  const url = $derived(pageUrl === null ? null : withPageApi(pageUrl, { framed: false, theme: $pageTheme, inline }));
   const frameUrl = $derived(
-    pageUrl === null ? null : withPageApi(pageUrl, { framed: true, theme: untrack(() => $pageTheme) }),
+    pageUrl === null ? null : withPageApi(pageUrl, { framed: true, theme: untrack(() => $pageTheme), inline }),
   );
   const onPageMessage = (m: { send: boolean; text: string; title: string }): void => {
     pageMessage({ chat, writtenAtMs, ...m });
   };
 
   let expanded = $state(false);
-  const height = $derived(compact ? 200 : expanded ? 720 : 360);
+  const height = $derived(compact ? 200 : inline ? (reported ?? INLINE_START) : expanded ? 720 : 360);
 
   /** A still is taken this long after the page shows (its first paint
    *  settles: fonts, a chart drawing in). */
@@ -164,7 +192,7 @@
 </script>
 
 {#if native}
-  <div class="html-body native" class:tile={compact} style:height="{height}px">
+  <div class="html-body native" class:tile={compact} class:inline style:height="{height + (inline ? INLINE_FOOT : 0)}px">
     <div class="stage" bind:this={host} bind:clientWidth={stageWidth}>
       {#if still !== null}
         <img
@@ -197,6 +225,7 @@
             onFocus: () => liveViews.activate(id),
             onShown: (on) => (shownNow = on),
             onPageMessage,
+            onPageSize,
             control,
           }}
         >
@@ -216,7 +245,12 @@
         </div>
       {/if}
     </div>
-    {#if !compact}
+    {#if inline}
+      <!-- Outside the stage: the view draws above anything over it. -->
+      <div class="foot inline-foot">
+        <button class="pill" onclick={() => onOpen?.()} title="open in a pane">open ↗</button>
+      </div>
+    {:else if !compact}
       <!-- Outside the stage: the view draws above anything over it. -->
       <div class="foot">
         <button class="pill" onclick={() => (expanded = !expanded)} title={expanded ? "collapse" : "show more of the page"}>
@@ -226,17 +260,19 @@
     {/if}
   </div>
 {:else}
-  <div class="html-body" class:tile={compact} style:height="{height}px">
+  <div class="html-body" class:tile={compact} class:inline style:height="{height}px">
     {#if active && frameUrl !== null}
       <iframe
         src={frameUrl}
         {title}
         sandbox="allow-scripts"
         referrerpolicy="no-referrer"
-        use:paneFrame={{ onPageMessage, theme: $pageTheme }}
+        use:paneFrame={{ onPageMessage, onPageSize, theme: $pageTheme }}
       ></iframe>
     {/if}
-    {#if !compact}
+    {#if inline}
+      <button class="expand open" onclick={() => onOpen?.()} title="open in a pane">open ↗</button>
+    {:else if !compact}
       <button class="expand" onclick={() => (expanded = !expanded)} title={expanded ? "collapse" : "show more of the page"}>
         {expanded ? "collapse" : "expand"}
       </button>
@@ -250,6 +286,25 @@
     /* Pages assume a white canvas regardless of theme. */
     background: #ffffff;
     transition: height 0.18s ease;
+  }
+  /* Part of the answer: the page wears the app's theme (`--ch-*`), so it
+     sits on the app's own background; its open button shows on hover. */
+  .html-body.inline {
+    background: transparent;
+  }
+  .html-body.inline .open {
+    opacity: 0;
+    transition: opacity 0.12s ease;
+  }
+  .html-body.inline:hover .open,
+  .html-body.inline .open:focus-visible {
+    opacity: 1;
+  }
+  .inline-foot {
+    border-top: none;
+    background: transparent;
+    padding: 2px 0 0;
+    opacity: 0.7;
   }
   .html-body.tile {
     flex: 1;

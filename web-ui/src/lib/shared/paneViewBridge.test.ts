@@ -203,3 +203,18 @@ describe("withPageApi", () => {
     expect(withPageApi("/raw/t/a.html", { framed: true, theme: "" })).toBe("/raw/t/a.html?bridge=1");
   });
 });
+
+describe("page size", () => {
+  it("reads a page's height and refuses a bad one", () => {
+    expect(decodeNativeViewEvent({ id: "v1", kind: "page_size", height: 412.5 })).toEqual({ id: "v1", kind: "page_size", height: 412.5 });
+    expect(decodeFrameMessage({ chimaeraPaneView: { kind: "page_size", height: 9e9 } })).toEqual({ kind: "page_size", height: 100_000 });
+    expect(decodeNativeViewEvent({ id: "v1", kind: "page_size", height: -1 })).toBeNull();
+    expect(decodeNativeViewEvent({ id: "v1", kind: "page_size", height: "400" })).toBeNull();
+  });
+
+  it("marks an inline page in its URL", () => {
+    expect(withPageApi("/raw/t/a.html", { framed: true, theme: null, inline: true })).toBe(
+      "/raw/t/a.html?bridge=1&chimaera-inline=1",
+    );
+  });
+});

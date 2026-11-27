@@ -62,7 +62,7 @@
   let theme = { mode: "light", vars: {} };
   const listeners = new Set();
   const NAME = /^[a-z][a-z0-9-]{0,40}$/;
-  const applyTheme = (t) => {
+  let applyTheme = (t) => {
     if (t === null) return;
     const root = document.documentElement;
     const vars = {};
@@ -82,7 +82,53 @@
       }
     }
   };
-  applyTheme(decodeTheme(new URLSearchParams(location.search).get("chimaera-theme")));
+  const query = new URLSearchParams(location.search);
+  // An inline page (its embed says `#inline`) sits on the app's own
+  // background, so the browser's own defaults — text, form controls,
+  // scrollbars — follow the theme's light or dark there; any other page
+  // keeps its browser defaults.
+  const inline = query.get("chimaera-inline") === "1";
+  const baseApply = applyTheme;
+  applyTheme = (t) => {
+    baseApply(t);
+    if (inline && t !== null) document.documentElement.style.colorScheme = t.m;
+  };
+  applyTheme(decodeTheme(query.get("chimaera-theme")));
+
+  // The page's own height, for an inline card that takes it: reported when
+  // it changes, at most once a frame. The body's box with its margins, not
+  // the root's scroll height, which never drops below the frame's own (so a
+  // page could grow and never shrink). A page laid out at `height: 100%`
+  // has no height of its own: it gives its plot an explicit one.
+  if (inline) {
+    let sent = -1;
+    let queued = false;
+    const measure = () => {
+      const body = document.body;
+      if (body === null) return document.documentElement.scrollHeight;
+      const cs = getComputedStyle(body);
+      return body.getBoundingClientRect().height + parseFloat(cs.marginTop) + parseFloat(cs.marginBottom);
+    };
+    const report = () => {
+      queued = false;
+      const h = Math.ceil(measure());
+      if (h === sent) return;
+      sent = h;
+      post({ kind: "page_size", height: h });
+    };
+    const schedule = () => {
+      if (queued) return;
+      queued = true;
+      requestAnimationFrame(report);
+    };
+    const observer = new ResizeObserver(schedule);
+    observer.observe(document.documentElement);
+    const watchBody = () => document.body !== null && observer.observe(document.body);
+    if (document.body !== null) watchBody();
+    else addEventListener("DOMContentLoaded", watchBody, { once: true });
+    addEventListener("load", schedule);
+    schedule();
+  }
   if (framed) {
     addEventListener("message", (e) => {
       const cmd = e.source === window.parent ? e.data?.chimaeraPaneViewCommand : undefined;

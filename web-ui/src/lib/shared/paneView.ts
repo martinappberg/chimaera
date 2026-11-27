@@ -107,6 +107,8 @@ export interface PaneViewParams {
   /** The page API's `send` / `draft`, right after the person's own input
    *  in the page (the bridge checked, in its own world). */
   onPageMessage?: (m: { send: boolean; text: string; title: string }) => void;
+  /** The page API's content height (CSS px; the page's word). */
+  onPageSize?: (height: number) => void;
   /** The page loaded, or its title or same-document URL changed. */
   onPage?: (page: { url: string; title: string }) => void;
   /** The view's own web process died twice within a minute and the shell
@@ -662,6 +664,9 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
       case "page_send":
       case "page_draft":
         params.onPageMessage?.({ send: ev.kind === "page_send", text: ev.text, title: ev.title });
+        break;
+      case "page_size":
+        params.onPageSize?.(ev.height);
         break;
       case "crashed":
         crashed = true;

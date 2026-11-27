@@ -238,10 +238,10 @@
     };
     addEventListener("pointerdown", notePress, true);
     addEventListener("keydown", notePress, true);
+    let lastSize = 0;
     document.addEventListener("chimaera:page", (e) => {
       const detail = e.detail;
       if (typeof detail !== "string" || detail.length > 16384) return;
-      if (Date.now() - lastPress > INPUT_FRESH_MS) return;
       let m;
       try {
         m = JSON.parse(detail);
@@ -249,6 +249,16 @@
         return;
       }
       if (m === null || typeof m !== "object") return;
+      // The page's height, for an inline card: no input needed (the host
+      // clamps it), ten a second at most.
+      if (m.kind === "page_size") {
+        const now = Date.now();
+        if (now - lastSize < 100 || typeof m.height !== "number" || !Number.isFinite(m.height)) return;
+        lastSize = now;
+        post({ kind: "page_size", height: Math.max(0, Math.min(100000, m.height)) });
+        return;
+      }
+      if (Date.now() - lastPress > INPUT_FRESH_MS) return;
       if (m.kind !== "page_send" && m.kind !== "page_draft") return;
       if (typeof m.text !== "string" || m.text.trim() === "") return;
       lastPress = 0;

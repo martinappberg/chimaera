@@ -1136,6 +1136,15 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
     agent the person works with, who sends it or not: a page that isn't the agent's own must not
     message an agent as the person. Agents learn the variables and the two calls from the chat
     host frame (`launcher::CHAT_HOST_PROMPT`).
+  - **Inline or a file.** `![quiz](learn/quiz.html#inline)` makes a page part of the answer: no
+    file header, box, caption or expand; it sits on the app's background at its own height — the
+    page API reports its body's height (`page_size`, clamped 48–720 px; past that it scrolls
+    inside), and its browser defaults (text, controls) follow the theme's light or dark
+    (`chimaera-inline=1` in its URL, `color-scheme` on its root) — with an **open ↗** on hover (in
+    the app, a quiet row under it, since nothing draws over a view). A page laid out at
+    `height: 100%` has no height of its own and stays at the 160 px start: give a plot an explicit
+    height. Without `#inline` an HTML page is a file card, right for a report. The agent decides,
+    per embed; Chimaera never guesses from size.
   - **Limits.** A sandboxed page can't load the app's own fonts: `--ch-mono` and `--ch-font` name
     them with their fallbacks, so a page shows the first one the system has. `--ch-text-*` are the
     window's root sizes; chat prose sets its own, so a page in an answer may read a step larger.

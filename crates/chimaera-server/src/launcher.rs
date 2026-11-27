@@ -1427,7 +1427,11 @@ to read, such as a markdown note, plan or report, with an ordinary link like \
 [the plan](analysis/PLAN.md), not an image link: the user can preview it on \
 hover or open it. When a few numbers carry the point, put a small markdown table \
 in the reply itself. Files you write during a turn are listed under your reply \
-automatically. An HTML page you embed may draw anything, with any script, and \
+automatically. An HTML page you embed may draw anything, with any script. One \
+that is part of your answer, such as a quiz, a widget or an interactive plot, \
+gets #inline after its path, as in ![quiz](learn/quiz.html#inline): it draws in \
+the reply at its own height, so give a plot an explicit height; without \
+#inline the page is a file card the user opens, right for a report. Pages \
 should wear the app's theme: the CSS variables --ch-bg, --ch-fg, --ch-muted, \
 --ch-accent, --ch-edge, --ch-surface, --ch-font and --ch-mono follow the user's \
 light or dark theme (give each a fallback). In a page you wrote and embedded \

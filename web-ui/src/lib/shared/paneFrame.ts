@@ -24,6 +24,7 @@
 import { REFERENCE_CHORD } from "./keys";
 import type { PaneTransport, PaneViewControl } from "./paneView";
 import { decodeFrameMessage, isChord } from "./paneViewBridge";
+import { ownInputAgoMs } from "./ownInput";
 import type { ViewRect } from "../net/native";
 
 export interface PaneFrameParams {
@@ -38,6 +39,8 @@ export interface PaneFrameParams {
   /** The page API's `send` / `draft`: a send only on fresh evidence of the
    *  person's press, else a draft (see `pageMessageTrust`). */
   onPageMessage?: (m: { send: boolean; text: string; title: string }) => void;
+  /** The page API's content height (CSS px; the page's word). */
+  onPageSize?: (height: number) => void;
   /** The app's theme, encoded (`pageTheme.ts`): posted to the page API
    *  whenever it changes and to each new document, so a framed page
    *  follows the theme without a reload. */
@@ -58,19 +61,21 @@ const PAGE_MESSAGE_GAP_MS = 1000;
  * often keeps focus out of its frame (GenomeSpy's does). What this window
  * can see is its own transient activation, which a press or key in a frame
  * gives its ancestors too:
- * - a send needs that activation, with no press or key of this window's
- *   own for an activation's whole life (so it is a frame's, not a click
- *   elsewhere in the app), and at most one send per activation. Where the
- *   browser can't say (no `navigator.userActivation`), a page never sends;
- * - a draft needs the activation, or focus in the frame;
+ * - a frame's activation is that activation with no press or key of this
+ *   window's own for an activation's whole life (else it may be the app's:
+ *   a click or an Enter in the composer);
+ * - a send needs a frame's activation, at most one send per activation.
+ *   Where the browser can't say (no `navigator.userActivation`), a page
+ *   never sends;
+ * - a draft needs a frame's activation, or focus in the frame;
  * - else nothing. The host then lets only a page in a chat's own answer,
  *   written while that chat ran, send (`shared/pageMessage.ts`).
  */
 function pageMessageTrust(inFrame: boolean, ownInputAgoMs: number, lastSendAgoMs: number): "send" | "draft" | null {
   const activation = (navigator as Navigator & { userActivation?: { isActive: boolean } }).userActivation;
-  const active = activation !== undefined && activation.isActive;
-  if (active && ownInputAgoMs > ACTIVATION_LIFE_MS && lastSendAgoMs > ACTIVATION_LIFE_MS) return "send";
-  return active || inFrame ? "draft" : null;
+  const frames = activation !== undefined && activation.isActive && ownInputAgoMs > ACTIVATION_LIFE_MS;
+  if (frames && lastSendAgoMs > ACTIVATION_LIFE_MS) return "send";
+  return frames || inFrame ? "draft" : null;
 }
 
 /** The longest a browser keeps transient activation (Chrome and Firefox:
@@ -96,14 +101,7 @@ export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
 
   /** The user is in the frame: it holds this document's focus. */
   const userInFrame = (): boolean => document.activeElement === node;
-  // This window's own presses and keys (a frame's never reach it): a page
-  // message right after one rides the app's activation, not the frame's.
-  let lastOwnInput = Number.NEGATIVE_INFINITY;
-  const noteOwnInput = (e: Event): void => {
-    if (e.isTrusted) lastOwnInput = performance.now();
-  };
-  window.addEventListener("pointerdown", noteOwnInput, true);
-  window.addEventListener("keydown", noteOwnInput, true);
+
 
   const sendTheme = (): void => {
     if (theme !== "") post({ op: "theme", theme });
@@ -140,11 +138,14 @@ export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
       case "reference":
         reference();
         break;
+      case "page_size":
+        params.onPageSize?.(ev.height);
+        break;
       case "page_send":
       case "page_draft": {
         const now = performance.now();
         if (now - lastPageMessage < PAGE_MESSAGE_GAP_MS) break;
-        const trust = pageMessageTrust(userInFrame(), now - lastOwnInput, now - lastPageSend);
+        const trust = pageMessageTrust(userInFrame(), ownInputAgoMs(), now - lastPageSend);
         if (trust === null) break;
         lastPageMessage = now;
         const send = ev.kind === "page_send" && trust === "send";
@@ -190,8 +191,6 @@ export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
     },
     destroy(): void {
       window.removeEventListener("message", onMessage);
-      window.removeEventListener("pointerdown", noteOwnInput, true);
-      window.removeEventListener("keydown", noteOwnInput, true);
       control?.unbind(transport);
     },
   };

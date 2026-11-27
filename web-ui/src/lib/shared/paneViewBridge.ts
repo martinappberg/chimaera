@@ -41,7 +41,11 @@ export type NativeViewEvent =
    *  page asking to message the agent, believed only right after the
    *  person's own input (the native bridge checks; a framed page's host
    *  checks itself). `title` is the page's own and only words. */
-  | { id: string; kind: "page_send" | "page_draft"; text: string; title: string };
+  | { id: string; kind: "page_send" | "page_draft"; text: string; title: string }
+  /** The page API's report of the page's content height (CSS px), for an
+   *  inline card that takes the page's own height. The page's word: a host
+   *  clamps it. */
+  | { id: string; kind: "page_size"; height: number };
 
 /** The most of a page's message, and of its title, that is kept. */
 export const PAGE_TEXT_MAX = 4000;
@@ -91,6 +95,9 @@ export function decodeNativeViewEvent(raw: unknown): NativeViewEvent | null {
     case "page":
       if (!str(raw.url) || !str(raw.title)) return null;
       return { id, kind: "page", url: raw.url, title: raw.title };
+    case "page_size":
+      if (!num(raw.height) || raw.height < 0) return null;
+      return { id, kind: "page_size", height: Math.min(raw.height, 100_000) };
     case "page_send":
     case "page_draft": {
       if (!str(raw.text) || raw.text.trim() === "") return null;
@@ -223,7 +230,14 @@ export function withBridge(url: string): string {
  * read at once. A framed page hears later themes as messages; a native
  * view's URL carries the current one, so a new theme loads it again.
  */
-export function withPageApi(url: string, opts: { framed: boolean; theme: string | null }): string {
-  const asked = opts.framed ? withBridge(url) : withPair(url, "api=1");
+export function withPageApi(
+  url: string,
+  opts: { framed: boolean; theme: string | null; inline?: boolean },
+): string {
+  let asked = opts.framed ? withBridge(url) : withPair(url, "api=1");
+  // An inline page (`#inline` on its embed) follows the theme's light/dark
+  // for the browser's own defaults too (its text, its controls): it sits on
+  // the app's background, not a white card.
+  if (opts.inline === true) asked = withPair(asked, "chimaera-inline=1");
   return opts.theme === null || opts.theme === "" ? asked : withPair(asked, `chimaera-theme=${opts.theme}`);
 }

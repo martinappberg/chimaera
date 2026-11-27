@@ -106,6 +106,11 @@
    *  depends on the file's extension). */
   const frag = $derived(parseEmbedFragment(fragment, hit?.path ?? path));
   const label = $derived(fragmentLabel(frag, tableHeaderRow(hit?.path ?? path)));
+  /** `![…](page.html#inline)`: a page that is part of the answer (a quiz, an
+   *  interactive plot), not a file to open — drawn in the prose at its own
+   *  height, without the file's header, box or caption; an open button on
+   *  hover. Without `#inline` an HTML page is a file card (a report). */
+  const inline = $derived(kind === "html" && frag.anchor === "inline" && !compact && chrome);
 
   let card = $state<HTMLElement | null>(null);
   /** Near the scroller's viewport: load (one-way — a loaded body stays). */
@@ -271,10 +276,11 @@
   class:bare={!chrome}
   class:fit={kind === "image" && !compact}
   class:missing={current !== null && isMissing(current)}
+  class:inline
   bind:this={card}
   data-embed-kind={kind ?? "pending"}
 >
-  {#if chrome}
+  {#if chrome && !inline}
   <div class="head">
     <button class="name" title={hit !== null ? `open ${hit.path} in a pane` : path} disabled={hit === null} onclick={open} {@attach grip}>
       {#if kind === "dir"}
@@ -339,7 +345,17 @@
   {:else if kind === "table" || kind === "xlsx"}
     <TableBody path={hit.path} version={hit.version} {kind} {frag} {compact} active={near} />
   {:else if kind === "html"}
-    <HtmlBody {url} title={name} {compact} active={near} visible={onScreen} {chat} writtenAtMs={hit?.mtime_ms ?? null} />
+    <HtmlBody
+      {url}
+      title={alt !== "" ? alt : name}
+      {compact}
+      {inline}
+      active={near}
+      visible={onScreen}
+      {chat}
+      writtenAtMs={hit?.mtime_ms ?? null}
+      onOpen={open}
+    />
   {:else if kind === "video" || kind === "audio"}
     <MediaBody {url} {kind} time={frag.at?.time} {compact} active={near} onDownload={remote ? download : undefined} />
   {:else if kind === "notebook"}
@@ -365,12 +381,19 @@
       {#if !chrome && kind === "file"}<span class="quiet">No inline preview for this file type.</span>{/if}
     </div>
   {/if}
-  {#if alt !== "" && kind !== null && kind !== "image" && !compact}
+  {#if alt !== "" && kind !== null && kind !== "image" && !compact && !inline}
     <div class="caption">{alt}</div>
   {/if}
 </div>
 
 <style>
+  /* Part of the answer: no box, no header, no caption — the page draws in
+     the prose on the app's background, at its own height. */
+  .embed-card.inline {
+    border-color: transparent;
+    background: transparent;
+    box-shadow: none;
+  }
   .embed-card {
     display: flex;
     flex-direction: column;

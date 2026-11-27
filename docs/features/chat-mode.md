@@ -903,7 +903,9 @@ unused week reads 0%); an
   a figure, a PDF page, a table slice, a sandboxed HTML report with its assets, a notebook cell, a
   slide, a player, a document excerpt, a file card. Click a card's name (or ↗) to open the full
   viewer in a pane at the same spot.
-- **Pages that answer back.** An HTML page in an answer may draw anything, with any script; it
+- **Pages that answer back.** An HTML page embedded with `#inline` (`![quiz](learn/quiz.html#inline)`)
+  is part of the answer — no file header or box, at its own height — while one without it stays
+  a file card for a report the user opens. An HTML page in an answer may draw anything, with any script; it
   wears the app's theme through `--ch-*` CSS variables, and a click in it can send the user's
   answer back to the chat that showed it (`chimaera.send`) or draft it in the input
   (`chimaera.draft`), the message labelled "From the page “title”:" — a quiz, a picker, a
