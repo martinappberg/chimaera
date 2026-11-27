@@ -75,9 +75,9 @@ it.**
 | **What it is** | Any `.html` file an agent writes, as today, with whatever JavaScript and libraries it wants | A page from an active plugin's bundle, shown by a `web` node on the plugin's screens |
 | **Looks like Chimaera through** | Theme tokens injected into every page, plus the optional `chimaera.css` | The same |
 | **Talks back through** | `send` and `reference` (to the chat that made it) | The same, plus `act` (to its plugin) and calls from its plugin |
-| **Files it can read** | Its own folder and below, in **data mode** ([below](#data-or-network-never-both)) | Whatever its plugin's `[access]` allows |
-| **Network** | Open in network mode, none in data mode | Only its declared hosts |
-| **Libraries** | A CDN in network mode. In either mode, libraries from active plugins (`chimaera:lib/…`) | Its own bundle |
+| **Files it can read** | Its own folder and below ([one fixed rule](#what-a-page-can-reach-one-fixed-rule-nothing-for-the-user-to-choose)) | Whatever its plugin's `[access]` allows |
+| **Network** | None beyond the daemon (plus the hosts of a plugin library it imports) | Only its declared hosts |
+| **Libraries** | Active plugins' libraries (`chimaera:lib/…`) and the well-known library CDNs | Its own bundle |
 
 So GenomeSpy can appear in an agent's teaching page **only where the GenomeSpy
 plugin is active**. The page imports the plugin's library. That is the "if they
@@ -151,34 +151,51 @@ With `<script src="chimaera:web.js">`, a page gets the agents' part of
 - **`theme`, `onTheme` and `visibility`**, as on plugin pages. A page should stop
   animating while it is hidden.
 
-### Data or network, never both
+### What a page can reach: one fixed rule, nothing for the user to choose
 
-A page that can read workspace files and also reach the internet can leak
-those files. A page might come from a repository you cloned rather than from
-your agent. So a page runs in one of two modes, and the daemon serves each one
-with its own CSP:
+There are no modes, no settings and no prompts. Every agent page gets the same
+rule:
 
-- **Network mode** is the default and is what every page gets today. The page
-  can load scripts from CDNs and reach any host. It cannot read workspace files
-  beyond loading its own folder's assets through tags.
-- **Data mode.** A page asks for it with
-  `<meta name="chimaera" content="data">`.
-  - **Reading.** `chimaera.url(path)` gives it URLs for files **under its own
-    folder**. These are streamed with Range support, so even a large BAM or a
-    50 MB CSV loads without being inlined.
-  - **No network at all.** In exchange, `connect-src`, `script-src` and
-    `style-src` allow only the daemon: the page's folder, its data URLs and
-    libraries from active plugins.
-  - **Who may use it.** Pages your agents wrote in this workspace get data mode
-    without a prompt. The daemon already knows which files a turn wrote, for
-    the "Written this turn" list. Any other page asks once ("This page wants to
-    read files in `analysis/`"), and the answer is remembered for that file's
-    contents.
-  - *Spike:* a sandboxed iframe can still navigate itself to an outside URL,
-    which would carry data out. In the app, the native pane view can refuse
-    that navigation. In the browser, the iframe needs a guard that blocks or
-    detects the navigation and closes the frame. If no guard holds, data mode
-    is offered in the app only.
+- **It reads the files beside it.** `chimaera.url(path)` gives it URLs for files
+  in its own folder and below. They are streamed with Range support, so a 50 MB
+  CSV or a BAM loads without being inlined.
+- **It loads libraries.** These come from active plugins (`chimaera:lib/…`) and
+  from the well-known library CDNs (`cdnjs.cloudflare.com`, `cdn.jsdelivr.net`,
+  `unpkg.com`), so the Plotly or D3 `<script>` tag an agent already writes keeps
+  working.
+- **It sends nothing anywhere else.** Requests (`connect-src`) and images go only
+  to the daemon. There is no fetch to arbitrary sites, no tracking pixel and no
+  form post.
+
+The reason for the rule: a page that could read your files *and* reach any site
+could leak them, and an HTML file might come from a cloned repository rather
+than from your agent. A page that can only show your data to you is harmless,
+so nobody needs to approve anything.
+
+Nothing in the use cases needs more:
+
+- **Plots and teaching widgets** draw from the files beside them, using a library.
+- **GenomeSpy** runs from the plugin's local bundle and reads local files. It
+  is not a web service. Its only network use is optional public reference
+  tracks (cytobands, gene annotations). Those hosts are declared in the
+  verified plugin's manifest, so a page that imports its library may read from
+  them.
+- **Rarer pages** (one that calls a live API, or a map that needs a tile server)
+  open in the browser pane through the agent browser, where pages are ordinary
+  web pages.
+
+What the rule costs:
+
+- **Old reports that call outside APIs.** An agent's existing report that
+  fetches an outside API would stop doing so inside an embed. That is rare for
+  generated reports, and they still open fully in the browser pane.
+- **A trickle through library CDNs.** In theory a page could encode a few bytes
+  into script URLs it requests from a library CDN. That is low-bandwidth, and
+  the requests are seen only by the CDN operator. This is accepted.
+- *Spike:* a sandboxed iframe can still navigate itself to an outside URL. The
+  app's native pane view refuses that navigation. In the browser the frame needs
+  a guard that catches the navigation and closes the frame. The spike tests
+  this first. If no guard holds, reading files is app-only.
 
 ### Libraries from plugins: the "if they have access" rule
 
@@ -197,8 +214,8 @@ with its own CSP:
 - **Offline clusters.** Libraries served this way also work there, where a CDN
   does not.
 - **Charts.** A first-party **Plotting** plugin could provide Plotly, Vega-Lite,
-  Observable Plot and D3 the same way, pinned and verified, for data-mode pages
-  and offline hosts ([open question 2](#open-questions)).
+  Observable Plot and D3 the same way, pinned and verified, for hosts with no
+  internet ([open question 1](#open-questions)).
 
 ### How the agent sees its page
 
@@ -293,7 +310,6 @@ The manifest declares the pages and the hosts:
 [web]
 pages = ["genome.html"]
 network = ["data.genomespy.app", "hgdownload.soe.ucsc.edu"]   # https only; each one on the card
-network_user = true      # the user may add hosts in the plugin's settings
 ```
 
 ### Data URLs
@@ -394,8 +410,7 @@ without `/` is matched against the whole file name (`matchesPattern`,
 ### Trust
 
 - **The card's Can list** shows "Draws its own views (web pages in a sandbox)",
-  then one line per declared host ("Reaches data.genomespy.app"), then "You can
-  let it reach other sites" when `network_user` is set.
+  then one line per declared host ("Reaches data.genomespy.app").
 - **Tier.** Web views alone keep a plugin **sandboxed**: the browser enforces the
   isolation, and the page's file access is the plugin's own.
 - **Verified plugins.** A verified (first-party) plugin's declared hosts are
@@ -493,7 +508,7 @@ preview, and a click opens the view at that region.
 
 **On an agent's page**, `chimaera:lib/genome-spy` draws a genome view inside the
 answer, for a lesson, a results summary or a variant report. The page reads the
-files beside it in data mode, and it works only where the plugin is active.
+files beside it, and it works only where the plugin is active.
 
 ### What agents get
 
@@ -537,7 +552,6 @@ api = "0.3"
 [web] pages = ["genome.html"]
       libraries = ["genome-spy"]       # for agents' pages where GenomeSpy is on
       network = ["data.genomespy.app", "hgdownload.soe.ucsc.edu", "ftp.ensembl.org"]
-      network_user = true
 [[views]] id = "spec"    slot = "file"  title = "Genome view"
 [[views]] id = "data"    slot = "file"  title = "Genome view"
 [[views]] id = "browser" slot = "tab"   title = "GenomeSpy"   # every genome view here + recent regions
@@ -611,14 +625,14 @@ in total.
    - `web/1`: data, theme, visibility, act, reference, save and status.
    - CSP built from `[web]`, the Can list and the capability atoms, and the
      resource limits.
-   - Data mode for agents' pages, with its navigation guard, and plugin
-     libraries (`chimaera:lib/…`).
+   - File reading for agents' pages under the fixed rule, with its navigation
+     guard, and plugin libraries (`chimaera:lib/…`).
    - `plugins/test-web` and `tests/plugin_web.rs`, plus the guide's section and
      the feature page.
    - Acceptance:
      - the fixture's page draws in both hosts;
-     - an agent's data-mode page imports the fixture's library and reads a CSV
-       beside it, and it is refused any network;
+     - an agent's page imports the fixture's library and reads a CSV beside it,
+       and a request to any other site is refused;
      - it reads a workspace file by range;
      - it is refused outside its access, at an undeclared host, and where its
        plugin is off;
@@ -644,8 +658,8 @@ in total.
 6. **Later, if wanted.**
    - GenomeSpy's sample-collection App (cohorts, provenance) as a second page.
    - A privileged opt-in plugin for indexing and bgzipping.
-   - Other visualization plugins on the same platform: Vega-Lite (charts in
-     agents' views, [open question 2](#open-questions)), Mol\*, maps.
+   - Other visualization plugins on the same platform: the Plotting libraries
+     ([open question 1](#open-questions)), Mol\*, maps.
 
 **Shipping.** Phases 1 and 2 are `feat:` PRs to Chimaera. Each needs the ship-pr
 gates, the feature pages, the guide, and wire fixtures for any new frames.
@@ -663,8 +677,8 @@ with `tier = "sandboxed"`.
 - **Agents' pages are untrusted code, and so is any HTML file in a cloned
   repository.** The defences:
   - a page has no origin and never reaches the app;
-  - data mode and network mode never combine;
-  - data mode is automatic only for pages this workspace's agents wrote;
+  - a page that can read files can send nothing out, beyond requesting
+    libraries;
   - `send` needs a real user action.
 
   The navigation guard in the browser host is the weakest point and is the
@@ -683,9 +697,9 @@ with `tier = "sandboxed"`.
 2. **The bundle ships inside the plugin**, embedded in its `plugin.wasm`, and
    never in Chimaera. Only people who install the plugin download it.
 3. **Network hosts.** A verified plugin's declared hosts are trusted by default
-   (the lock review covers them). Hosts a user adds in the plugin's settings are
-   trusted because the user added them. An unverified plugin's hosts appear in
-   its trust prompt.
+   (the lock review covers them). An unverified plugin's hosts appear in its
+   trust prompt. There is no user-added host list; it can come later if
+   someone needs it.
 4. **Reveal reuses `browser_show`'s hand-over**: the agent opens the view beside
    its own session, without taking focus.
 5. **Spec files are named `*.genomespy.json`.**
@@ -693,19 +707,17 @@ with `tier = "sandboxed"`.
    Chimaera's part is the theme (tokens, an optional stylesheet, chart
    palettes), the way to talk back, and safe data access. A plugin's library,
    such as GenomeSpy, works on a page only where that plugin is active.
+7. **Nothing for users to configure.** Every agent page follows one fixed rule:
+   it reads the files beside it, loads libraries from plugins and the
+   well-known library CDNs, and sends nothing anywhere else. There are no
+   modes, settings or prompts.
 
 ## Open questions
 
-1. **Data mode for pages the agents did not write.** Two options:
-   - ask once for each file's contents (recommended);
-   - refuse outright, and require the user to copy the page into the workspace
-     with an agent.
-2. **A first-party Plotting plugin.** It would provide pinned Plotly, Vega-Lite,
-   Observable Plot and D3 as `chimaera:lib/…`. Data-mode pages need it, because
-   they can't use a CDN, and so do offline clusters. *Recommended: yes*, right
-   after phase 2, since data mode is where plots of real result files need
-   these libraries.
-3. **The injected token names.** They could be `--ch-*`, or the app's own names
+1. **A first-party Plotting plugin.** It would provide pinned Plotly, Vega-Lite,
+   Observable Plot and D3 as `chimaera:lib/…`, for clusters without internet,
+   where the CDNs don't load. *Recommended: yes*, after phase 2.
+2. **The injected token names.** They could be `--ch-*`, or the app's own names
    (`--fg`, `--accent`). *Recommended: `--ch-*`*, so they never collide with a
    page's own variables.
 
