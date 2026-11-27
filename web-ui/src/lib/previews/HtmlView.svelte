@@ -779,11 +779,14 @@
     background: #ffffff; /* pages assume a white canvas regardless of theme */
   }
 
-  /* Where the native pane view sits: the page's own white until it paints. */
+  /* Where the native pane view sits: the workbench's own surface while the
+     page loads (a white one flashed the whole pane in dark mode); a page
+     that wears the theme paints the same colour, and a white report shows
+     its white once it is there. */
   .native-slot {
     position: absolute;
     inset: 0;
-    background: #ffffff;
+    background: var(--bg);
   }
 
   .cover-still {

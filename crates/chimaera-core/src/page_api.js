@@ -95,13 +95,29 @@
   // body's, which the canvas takes); read once, before we set one.
   let ownBackground = null;
   const clear = (c) => c === "" || c === "transparent" || /^rgba\(.*,\s*0\)$/.test(c);
+  // A page that wears the theme — inline, or any `--ch-` variable in its
+  // own styles — gets the theme's canvas too, wherever it is shown (a pane,
+  // a card): its background and the browser's light or dark defaults. A
+  // page that never mentions the theme (an old report) keeps the browser's
+  // white exactly as it was made for.
+  let follows = null;
+  const wearsTheme = () => {
+    if (inline) return true;
+    for (const s of document.querySelectorAll("style")) if ((s.textContent ?? "").includes("--ch-")) return true;
+    for (const el of document.querySelectorAll("[style]")) {
+      if (el !== document.documentElement && (el.getAttribute("style") ?? "").includes("--ch-")) return true;
+    }
+    return false;
+  };
   applyTheme = (t) => {
     baseApply(t);
-    if (!inline || t === null) return;
+    if (t === null) return;
+    if (follows === null) follows = wearsTheme();
+    if (!follows) return;
     const root = document.documentElement;
     root.style.colorScheme = t.m;
-    // Without its own, a web view paints its default canvas (a grey that
-    // isn't the chat's): the app's background instead.
+    // Without its own, a web view paints its default canvas (white, or a
+    // grey that isn't the chat's): the app's background instead.
     if (ownBackground === null) {
       const body = document.body;
       ownBackground =

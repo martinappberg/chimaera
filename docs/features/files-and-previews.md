@@ -1115,7 +1115,12 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
     `--ch-muted`, `--ch-accent`, `--ch-accent-text`, `--ch-edge`, `--ch-surface`, `--ch-hover`,
     `--ch-focus`, `--ch-err`, `--ch-warn`, `--ch-font`, `--ch-mono`, `--ch-text-sm/md/lg`,
     `--ch-radius` — with the mode as `data-chimaera-theme`, `chimaera.theme` and `onTheme(fn)`.
-    Only variables, never an element style, so an old report renders exactly as before. The
+    Only variables, never an element style, so an old report renders exactly as before. A page
+    that wears the theme — inline, or any `--ch-` variable in its own `<style>` or `style`
+    attributes — also gets the theme's canvas wherever it is shown, a preview pane included: its
+    root's background when it sets none of its own, and `color-scheme` for the browser's own
+    light or dark defaults. A page that never mentions the theme keeps the browser's white. An
+    app pane's placeholder is the workbench's surface while a page loads, not white. The
     names are a contract (`shared/pageTheme.ts`, read off the window's computed style, so custom
     themes and the accent come through): add, never rename. CSS that uses them follows a switch
     live; a chart library that bakes its colours in when it draws (GenomeSpy, Plotly) reads them
