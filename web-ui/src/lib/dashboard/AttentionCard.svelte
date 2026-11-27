@@ -123,7 +123,8 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-family: var(--mono);
+    font-family: var(--name-font);
+    font-weight: 500;
     font-size: var(--text-md);
   }
 

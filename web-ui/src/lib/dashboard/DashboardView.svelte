@@ -836,7 +836,7 @@
     margin-top: auto;
   }
 
-  /* Small-caps section labels — the one label voice for every section
+  /* Section labels — the one label voice for every section
      (the blank state's quieter lowercase title stays .sec-title). */
   .lbl {
     /* A section's heading in the page's own voice: sentence case, a size

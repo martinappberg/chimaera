@@ -1683,7 +1683,7 @@
     border-radius: 9px;
     background: hsl(var(--hue) 50% 55% / 0.08);
     color: var(--fg);
-    font-family: var(--mono);
+    font-family: var(--name-font);
     font-size: var(--text-xs);
     max-width: 150px;
     min-width: 0;
@@ -1824,9 +1824,8 @@
   .link-menu-title {
     padding: 3px 8px 5px;
     font-size: var(--text-xs);
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--muted);
+    font-weight: 600;
+    color: color-mix(in srgb, var(--fg) 72%, var(--muted));
   }
 
   .link-menu-item {

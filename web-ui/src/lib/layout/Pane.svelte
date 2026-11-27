@@ -854,7 +854,7 @@
   }
   .pane-guide.shown { opacity: 1; }
   .pane-guide-center { display: flex; flex-direction: column; align-items: center; gap: 18px; text-align: center; }
-  .pane-guide-label { font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: color-mix(in srgb, var(--muted) 75%, transparent); }
+  .pane-guide-label { font-size: var(--text-sm); font-weight: 600; color: color-mix(in srgb, var(--fg) 72%, var(--muted)); }
   .pane-guide-number { font-size: clamp(80px, 12vw, 160px); font-weight: 200; line-height: 1; letter-spacing: -0.06em; color: color-mix(in srgb, var(--fg) 12%, transparent); }
   .pane-guide-move { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; justify-content: center; }
   .pane-guide kbd { font: 11px var(--mono); color: var(--text); border: 1px solid var(--edge); border-radius: 5px; padding: 3px 6px; white-space: nowrap; }

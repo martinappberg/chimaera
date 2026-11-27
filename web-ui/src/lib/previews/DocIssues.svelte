@@ -308,9 +308,8 @@
   .divider {
     padding: 8px 8px 3px;
     font-size: var(--text-xs);
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--muted);
+    font-weight: 600;
+    color: color-mix(in srgb, var(--fg) 72%, var(--muted));
   }
 
   .row {

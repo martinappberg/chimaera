@@ -406,8 +406,12 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-family: var(--mono);
+    font-family: var(--name-font);
     font-size: var(--text-sm);
+  }
+
+  .name:has(+ .meta.path) {
+    font-family: var(--file-font);
   }
 
   .meta {

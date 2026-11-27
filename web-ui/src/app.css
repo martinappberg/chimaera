@@ -194,7 +194,7 @@
    comrak's bare <table>, so there the table itself scrolls as a display:block
    box, which keeps its table semantics (verified on WebKit 26.6 and Chromium
    151: table / row / columnheader / cell all survive). Either scroller
-   chains like the surface's own bar (thin) and contains horizontal
+   draws a slim bar ("Scrollers inside prose", below) and contains horizontal
    overscroll so a trackpad swipe at a table edge never becomes WebKit's back
    gesture; its 1px padding keeps the outer half of the collapsed border
    (which lies outside the table box) inside the clip. An agent's unhosted
@@ -222,8 +222,13 @@
   display: block;
   overflow-x: auto;
   overscroll-behavior-x: contain;
-  scrollbar-width: thin;
   padding: 1px;
+}
+@supports not selector(::-webkit-scrollbar) {
+  :is(.md, .cm-md-live) .md-table,
+  :is(.md-body, .md-doc) table:not(:where(.embed-card *)) {
+    scrollbar-width: thin;
+  }
 }
 :is(.md, .cm-md-live) .md-table,
 .md table:not(.md-table > table):not(:where(.embed-card *)),
@@ -732,6 +737,52 @@ body.dragging {
   .sidebar-scrollbar::-webkit-scrollbar-thumb:hover,
   .quiet-scrollbar::-webkit-scrollbar-thumb:hover {
     background-color: color-mix(in srgb, var(--fg) 38%, transparent);
+  }
+}
+
+/* Scrollers inside prose (a fenced block's code, a wide table, display
+   math, on every markdown surface): a slim thumb that shows only while the
+   pointer or the keyboard is on the block. A full-size bar under three
+   lines of code is the heaviest thing in the block; the engine's own
+   overlay bar still appears while scrolling where the platform has one.
+   The component rules must not set scrollbar-width / scrollbar-color on
+   these: a non-auto standard value switches the WebKit pseudos off — and
+   scrollbar-color inherits (the transcript sets one), so it is reset here. */
+@supports selector(::-webkit-scrollbar) {
+  :is(.md, .md-doc, .md-body, .nb-md) pre > code,
+  :is(.md, .cm-md-live) .md-table,
+  :is(.md-body, .md-doc) table,
+  :is(.md, .md-doc) .md-math-display {
+    scrollbar-width: auto;
+    scrollbar-color: auto;
+  }
+  :is(.md, .md-doc, .md-body, .nb-md) pre > code::-webkit-scrollbar,
+  :is(.md, .cm-md-live) .md-table::-webkit-scrollbar,
+  :is(.md-body, .md-doc) table::-webkit-scrollbar,
+  :is(.md, .md-doc) .md-math-display::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  :is(.md, .md-doc, .md-body, .nb-md) pre > code::-webkit-scrollbar-track,
+  :is(.md, .cm-md-live) .md-table::-webkit-scrollbar-track,
+  :is(.md-body, .md-doc) table::-webkit-scrollbar-track,
+  :is(.md, .md-doc) .md-math-display::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  :is(.md, .md-doc, .md-body, .nb-md) pre > code::-webkit-scrollbar-thumb,
+  :is(.md, .cm-md-live) .md-table::-webkit-scrollbar-thumb,
+  :is(.md-body, .md-doc) table::-webkit-scrollbar-thumb,
+  :is(.md, .md-doc) .md-math-display::-webkit-scrollbar-thumb {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 3px;
+    background-clip: padding-box;
+  }
+  :is(.md, .md-doc, .md-body, .nb-md) pre:is(:hover, :focus-within) > code::-webkit-scrollbar-thumb,
+  :is(.md, .cm-md-live) .md-table:is(:hover, :focus-within)::-webkit-scrollbar-thumb,
+  :is(.md-body, .md-doc) table:is(:hover, :focus-within)::-webkit-scrollbar-thumb,
+  :is(.md, .md-doc) .md-math-display:is(:hover, :focus-within)::-webkit-scrollbar-thumb {
+    background-color: color-mix(in srgb, var(--fg) 24%, transparent);
   }
 }
 

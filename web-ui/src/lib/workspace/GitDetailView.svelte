@@ -433,7 +433,7 @@
   }
   .fname {
     min-width: 0;
-    font-family: var(--mono);
+    font-family: var(--file-font);
     font-size: var(--text-sm);
     overflow: hidden;
     text-overflow: ellipsis;

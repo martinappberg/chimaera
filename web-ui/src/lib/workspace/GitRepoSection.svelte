@@ -598,9 +598,8 @@
     gap: 0.4rem;
     padding: 0.3rem 0.7rem 0.2rem;
     font-size: var(--text-xs);
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: var(--muted);
+    font-weight: 600;
+    color: color-mix(in srgb, var(--fg) 72%, var(--muted));
   }
 
   .gcount {
@@ -643,7 +642,7 @@
   }
 
   .gname {
-    font-family: var(--mono);
+    font-family: var(--file-font);
     font-size: var(--text-sm);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -693,17 +692,16 @@
     border-radius: 4px;
     font: inherit;
     font-size: var(--text-xs);
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: var(--muted);
+    font-weight: 600;
+    color: color-mix(in srgb, var(--fg) 72%, var(--muted));
     cursor: pointer;
   }
   .sec-toggle:hover {
     color: var(--fg);
   }
   .sec-toggle.sub {
-    text-transform: none;
-    letter-spacing: 0;
+    font-weight: 400;
+    color: var(--muted);
     padding-left: 0.45rem;
   }
 
@@ -875,8 +873,6 @@
     cursor: pointer;
     padding: 0.05rem 0.35rem;
     border-radius: 4px;
-    text-transform: none;
-    letter-spacing: 0;
   }
   .gt-action:hover {
     background: var(--row-hover);

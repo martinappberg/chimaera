@@ -689,10 +689,9 @@
     color: var(--muted);
   }
   .legend .lh {
-    font-size: 10.5px;
+    font-size: var(--text-xs);
     font-weight: 600;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
+    color: color-mix(in srgb, var(--fg) 72%, var(--muted));
     margin-bottom: 4px;
   }
   .legend p {

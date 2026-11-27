@@ -632,7 +632,6 @@
   }
 
   .now {
-    font-family: var(--mono);
     font-size: var(--text-sm);
     color: var(--muted);
     overflow: hidden;
@@ -640,13 +639,15 @@
     white-space: nowrap;
   }
   /* Inline markdown in the now-line (inlineMarkdown): emphasis reads as a
-     firmer ink on the muted line; the line is already mono, so code needs no
-     pill — just a hair more presence. */
+     firmer ink on the muted line; code takes the mono face without a pill —
+     just a hair more presence. */
   .now :global(strong) {
     font-weight: 600;
     color: color-mix(in srgb, var(--fg) 80%, var(--muted));
   }
   .now :global(code) {
+    font-family: var(--mono);
+    font-size: 0.92em;
     color: color-mix(in srgb, var(--fg) 80%, var(--muted));
   }
   .now :global(del) {

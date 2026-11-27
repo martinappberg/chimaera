@@ -1301,7 +1301,6 @@
   .md :global(pre code) {
     display: block;
     overflow-x: auto;
-    scrollbar-width: thin;
     background: none;
     padding: 0;
     font-size: var(--text-sm);

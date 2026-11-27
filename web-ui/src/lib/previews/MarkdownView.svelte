@@ -2329,7 +2329,6 @@
   .md-view :global(.md-doc pre code) {
     display: block;
     overflow-x: auto;
-    scrollbar-width: thin;
     background: none;
     padding: 0;
     font-size: 0.848em;
@@ -2407,7 +2406,6 @@
     max-width: 100%;
     overflow-x: auto;
     overflow-y: hidden;
-    scrollbar-width: thin;
     margin: 0.55em 0;
     padding: 0.1em 0;
   }

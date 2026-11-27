@@ -1,7 +1,7 @@
 <script lang="ts">
   /**
    * "Now" — who is running, as ONE line (decision 1: the rail has the
-   * detail, the dashboard stops competing). Each agent is its name in mono
+   * detail, the dashboard stops competing). Each agent is its name
    * plus a short honest phrase from the same state vocabulary as the rail;
    * terminals fold into a count. "show cards" flips the roster setting.
    */

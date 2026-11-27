@@ -887,7 +887,7 @@
 
   .open-name {
     flex: none;
-    font-family: var(--mono);
+    font-family: var(--name-font);
     font-size: var(--text-sm);
     color: var(--fg);
   }

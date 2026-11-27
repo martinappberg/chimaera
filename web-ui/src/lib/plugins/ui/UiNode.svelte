@@ -1281,9 +1281,7 @@
   }
   .problems-title {
     font-weight: 600;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--muted);
+    color: color-mix(in srgb, var(--fg) 72%, var(--muted));
   }
   .problems-head .count {
     font-weight: 500;

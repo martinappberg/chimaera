@@ -946,7 +946,7 @@
     border-color: color-mix(in srgb, var(--accent) 45%, var(--edge));
   }
   .choice:has(input:checked) {
-    border-color: color-mix(in srgb, var(--accent) 60%, var(--edge));
+    border-color: var(--focus-edge);
   }
   .choice input {
     flex: none;
@@ -960,7 +960,8 @@
     min-width: 0;
   }
   .cname {
-    font-family: var(--mono);
+    font-family: var(--name-font);
+    font-weight: 500;
     font-size: var(--text-sm);
     color: var(--fg);
   }

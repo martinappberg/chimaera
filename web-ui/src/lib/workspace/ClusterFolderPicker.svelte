@@ -592,7 +592,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-family: var(--mono);
+    font-family: var(--file-font);
     font-size: var(--text-sm);
   }
 

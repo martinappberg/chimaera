@@ -1113,10 +1113,9 @@
     min-height: 0;
   }
   .cap {
-    font-size: 10px;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--muted);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    color: color-mix(in srgb, var(--fg) 72%, var(--muted));
   }
   .end {
     margin: 0;
