@@ -135,21 +135,53 @@ Three things are missing:
 
 ### Talking back
 
-With `<script src="chimaera:web.js">`, a page gets the agents' part of
-`web/1`:
+*As built (phase 1, 2026-11-27):* the daemon appends `window.chimaera` to every
+page Chimaera shows; nothing to include. A page reads it from
+`DOMContentLoaded` or a click handler, because it runs after the page's own
+inline scripts.
 
-- **`send(text, data?)`** posts a **user message** to the chat whose answer
-  embeds the page, shown as coming from it ("From *VCF explained*: …").
-  - It runs only from a click or a key press the person made, and the bridge
-    checks that the event was a real user action. A page can never send on a
-    timer or on load.
-  - This makes the learning loop work: the agent asks a question in the page,
-    the user answers there, and the agent replies.
-- **`reference({text, crop?})`** puts the user's selection, such as a point on a
-  plot or a brushed range, into the composer as a draft. It is never sent on
-  its own.
-- **`theme`, `onTheme` and `visibility`**, as on plugin pages. A page should stop
-  animating while it is hidden.
+- **`send(text)`** posts a **user message** to the chat whose answer embeds the
+  page, shown as coming from it ("From the page “VCF quiz”: …").
+  - **Only the agent's own page sends.** The page must be a card in that chat's
+    answer, and its file must have been written while the chat ran (its mtime
+    against the session's start). A cloned repository's page that the agent
+    merely embeds only drafts.
+  - **One fresh press, one message.**
+    - In the app, the bridge (in its own world) counts a pointer press, or
+      Enter or Space, and consumes it.
+    - In a frame, the window can't see the page's input or even the pointer
+      over it, so it relies on its own transient activation. That activation
+      must come from the frame: the window itself saw no press or key for
+      5 s. One send per activation is allowed. Without
+      `navigator.userActivation`, a frame never sends.
+  - **Anything else drafts, or is dropped.** A message that doesn't meet these
+    rules becomes a draft, and a timer gets nothing at all.
+  - **The learning loop.** The agent asks in the page, the user answers there,
+    and the agent replies.
+- **`draft(text)`** puts the text in the agent's input, where the person sends
+  it or not.
+- **`theme` and `onTheme`**, as on plugin pages. *Not built yet:* `reference`
+  with a crop, and `visibility`.
+
+### Inline, or a file to open
+
+Two kinds of HTML embed answer two needs, and the agent says which, per embed.
+Chimaera never guesses from size.
+
+- **Inline: `![quiz](learn/quiz.html#inline)`.** The page is part of the answer,
+  such as a quiz, a widget or an interactive plot.
+  - It has no file header, box, caption or expand control.
+  - It sits on the app's background at its own height. The page API reports
+    its body's height, clamped to 48–720 px; past that, the page scrolls
+    inside.
+  - The browser's defaults (text, form controls) follow the theme's light or
+    dark.
+  - **open ↗** appears on hover.
+  - A page laid out at `height: 100%` has no height of its own, so a plot
+    needs an explicit height.
+- **A file card: `![report](out/report.html)`.** A report the user opens. This
+  is today's card, unchanged: a header with the file's name, a fixed box and
+  **expand**.
 
 ### What a page can reach: one fixed rule, nothing for the user to choose
 
@@ -618,7 +650,51 @@ in total.
      `description`).
 
    It ends with a go/no-go note in this record.
-1. **Agents' pages in the theme, talking back.** This can ship before phase 2.
+
+   **Spike results (2026-11-27): go.** GenomeSpy 1.3.0 ran as an agent's
+   inline page in a chat answer, in Chrome:
+   - **It works in the sandbox.** WebGL ran in a frame with no origin, it
+     embedded in about 40 ms, and it wore the app's theme.
+   - **A click reaches the agent.** Clicking a variant sent "Tell me about the
+     missense variant at chr17:7672396" to the agent, who answered it.
+
+   What it taught:
+   - **ES modules can't load from a page's own folder.** A frame with no
+     origin fetches modules with CORS, and the folder route deliberately sends
+     no CORS header. GenomeSpy's classic single-file build (`index.js`, 1.5 MB)
+     loads with a plain `<script>` tag and works. Phase 2's bundle route should
+     send `Access-Control-Allow-Origin: *` for scripts only. Those are the
+     plugin's own code, and a CSV beside a page stays unreadable.
+   - **The CSP it needs.** GenomeSpy compiles expressions and parsers with
+     `Function(...)`, which needs `'unsafe-eval'`. It has a WebAssembly
+     inflate, which needs `'wasm-unsafe-eval'`. A non-default font loads from
+     `raw.githubusercontent.com`, so a page for an offline cluster keeps the
+     default font.
+   - **Clicks.** `api.addEventListener("click")` carries `event.datum`, while
+     `api.events.subscribe("click")` reports only the pointer.
+   - **Theme.** GenomeSpy takes its colours at embed, so in dark mode its axis
+     labels stayed dark. The spike page now maps `--ch-*` into GenomeSpy's
+     `theme` (`axis` / `legend` / `title` colours) and re-embeds on `onTheme`,
+     keeping the region (`getComplexDomain`, then `zoomTo`). It must embed a
+     **fresh copy** of the spec each time: GenomeSpy writes into the spec it
+     is given, and a second embed of the same object fails with
+     `Invalid field "_linearized_chrom_start"`.
+   - **Trust.** A site-isolated frame shows the window neither its input nor
+     the pointer over it, and GenomeSpy's canvas keeps focus out. That ruled
+     out focus and hover as evidence; transient activation is what works (see
+     [Talking back](#talking-back)).
+
+   Not yet tested:
+   - WKWebView (the app is built for that check);
+   - WebKitGTK;
+   - headless Chromium;
+   - workspace data by Range (phase 2's data URLs);
+   - idle CPU.
+
+   The package is 3.2 MB unpacked (`dist/bundle`).
+1. **Agents' pages in the theme, talking back.** *Built 2026-11-27, with the
+   inline mode: theme, `send`/`draft` and `#inline`; the bundled libraries
+   are #396.* This can ship before phase 2.
    - The injected token variables, with live theme updates.
    - `chimaera:theme.css`, `chimaera:web.js` with `send`, `reference`, `theme` and
      `visibility`, the chart palettes, and the bundled D3, Observable Plot and Vega-Lite.

@@ -61,9 +61,12 @@ const PAGE_MESSAGE_GAP_MS = 1000;
  * often keeps focus out of its frame (GenomeSpy's does). What this window
  * can see is its own transient activation, which a press or key in a frame
  * gives its ancestors too:
- * - a frame's activation is that activation with no press or key of this
- *   window's own for an activation's whole life (else it may be the app's:
- *   a click or an Enter in the composer);
+ * - a frame's activation is that activation when this window's last own
+ *   press or key came before focus moved into this frame (the person's
+ *   last press was in the frame: a page's button takes focus), or, for a
+ *   page that keeps focus out (a canvas), when this window saw no press or
+ *   key of its own for an activation's whole life (else it may be the
+ *   app's: a click or an Enter in the composer);
  * - a send needs a frame's activation, at most one send per activation.
  *   Where the browser can't say (no `navigator.userActivation`), a page
  *   never sends;
@@ -71,9 +74,17 @@ const PAGE_MESSAGE_GAP_MS = 1000;
  * - else nothing. The host then lets only a page in a chat's own answer,
  *   written while that chat ran, send (`shared/pageMessage.ts`).
  */
-function pageMessageTrust(inFrame: boolean, ownInputAgoMs: number, lastSendAgoMs: number): "send" | "draft" | null {
+function pageMessageTrust(
+  inFrame: boolean,
+  focusedAfterOwnInput: boolean,
+  ownInputAgoMs: number,
+  lastSendAgoMs: number,
+): "send" | "draft" | null {
   const activation = (navigator as Navigator & { userActivation?: { isActive: boolean } }).userActivation;
-  const frames = activation !== undefined && activation.isActive && ownInputAgoMs > ACTIVATION_LIFE_MS;
+  const frames =
+    activation !== undefined &&
+    activation.isActive &&
+    ((inFrame && focusedAfterOwnInput) || ownInputAgoMs > ACTIVATION_LIFE_MS);
   if (frames && lastSendAgoMs > ACTIVATION_LIFE_MS) return "send";
   return frames || inFrame ? "draft" : null;
 }
@@ -101,6 +112,17 @@ export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
 
   /** The user is in the frame: it holds this document's focus. */
   const userInFrame = (): boolean => document.activeElement === node;
+  // When focus last moved into this frame (this window loses it to the
+  // frame: `blur`): later than this window's own last press, it was the
+  // person pressing in the frame.
+  let focusedAt = Number.NEGATIVE_INFINITY;
+  const onWindowBlur = (): void => {
+    // The frame takes focus a tick after the window lets it go.
+    setTimeout(() => {
+      if (document.activeElement === node) focusedAt = performance.now();
+    }, 0);
+  };
+  window.addEventListener("blur", onWindowBlur);
 
 
   const sendTheme = (): void => {
@@ -145,7 +167,8 @@ export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
       case "page_draft": {
         const now = performance.now();
         if (now - lastPageMessage < PAGE_MESSAGE_GAP_MS) break;
-        const trust = pageMessageTrust(userInFrame(), ownInputAgoMs(), now - lastPageSend);
+        const ownAgo = ownInputAgoMs();
+        const trust = pageMessageTrust(userInFrame(), now - focusedAt < ownAgo, ownAgo, now - lastPageSend);
         if (trust === null) break;
         lastPageMessage = now;
         const send = ev.kind === "page_send" && trust === "send";
@@ -191,6 +214,7 @@ export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
     },
     destroy(): void {
       window.removeEventListener("message", onMessage);
+      window.removeEventListener("blur", onWindowBlur);
       control?.unbind(transport);
     },
   };

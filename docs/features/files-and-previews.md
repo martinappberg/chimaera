@@ -1117,7 +1117,9 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
     `--ch-radius` — with the mode as `data-chimaera-theme`, `chimaera.theme` and `onTheme(fn)`.
     Only variables, never an element style, so an old report renders exactly as before. The
     names are a contract (`shared/pageTheme.ts`, read off the window's computed style, so custom
-    themes and the accent come through): add, never rename. The page's URL carries the theme
+    themes and the accent come through): add, never rename. CSS that uses them follows a switch
+    live; a chart library that bakes its colours in when it draws (GenomeSpy, Plotly) reads them
+    then and draws again in `chimaera.onTheme` — the chat host frame tells agents so. The page's URL carries the theme
     (`chimaera-theme`, base64url JSON) so it applies at once; a framed page hears later themes as
     messages and never reloads, while an app view loads again for a new theme.
   - **`chimaera.send(text)` / `chimaera.draft(text)`.** 4,000 characters at most, at most one a

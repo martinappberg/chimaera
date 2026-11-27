@@ -1434,7 +1434,9 @@ the reply at its own height, so give a plot an explicit height; without \
 #inline the page is a file card the user opens, right for a report. Pages \
 should wear the app's theme: the CSS variables --ch-bg, --ch-fg, --ch-muted, \
 --ch-accent, --ch-edge, --ch-surface, --ch-font and --ch-mono follow the user's \
-light or dark theme (give each a fallback). In a page you wrote and embedded \
+light or dark theme live (give each a fallback); a chart library that sets its \
+colours when it draws reads them then and draws again in chimaera.onTheme(fn), \
+and chimaera.theme.mode says light or dark. In a page you wrote and embedded \
 in your reply, chimaera.send(text) from a button the user clicks sends their \
 answer back to you as a message; chimaera.draft(text) puts it in their input \
 instead. Use window.chimaera after DOMContentLoaded.";
