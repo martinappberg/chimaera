@@ -53,16 +53,25 @@ const PAGE_MESSAGE_GAP_MS = 1000;
 /**
  * Whether a framed page's `send` / `draft` follows the person's own input.
  * The page shares the bridge's world and can post this on a timer, so the
- * check is this window's: the person is in the frame (it holds this
- * document's focus), and — where the browser says — this window has
- * transient activation, which a press or a key in the frame gives its
- * ancestors too.
+ * check is this window's:
+ * - the person is in the frame: it holds this document's focus, or the
+ *   pointer is over it (a canvas page often keeps focus from moving into
+ *   its frame — GenomeSpy's does — and a page can't move the pointer);
+ * - where the browser says, this window has transient activation, which a
+ *   press or a key in the frame gives its ancestors too;
+ * - and this window saw no press or key of its own just now, so the
+ *   activation is the frame's, not a click elsewhere in the app.
  */
-function pageMessageBelieved(inFrame: boolean): boolean {
+function pageMessageBelieved(inFrame: boolean, ownInputAgoMs: number): boolean {
   if (!inFrame) return false;
   const activation = (navigator as Navigator & { userActivation?: { isActive: boolean } }).userActivation;
-  return activation === undefined || activation.isActive;
+  if (activation === undefined) return true;
+  return activation.isActive && ownInputAgoMs > OWN_INPUT_QUIET_MS;
 }
+
+/** How long after this window's own press or key a frame's activation is
+ *  not believed to be the frame's. */
+const OWN_INPUT_QUIET_MS = 1000;
 
 /** `use:paneFrame={{ … }}` on the `<iframe>`. */
 export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
@@ -82,6 +91,16 @@ export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
 
   /** The user is in the frame: it holds this document's focus. */
   const userInFrame = (): boolean => document.activeElement === node;
+  /** The person is at the frame: focus in it, or the pointer over it. */
+  const userAtFrame = (): boolean => userInFrame() || node.matches(":hover");
+  // This window's own presses and keys (a frame's never reach it): a page
+  // message right after one rides the app's activation, not the frame's.
+  let lastOwnInput = Number.NEGATIVE_INFINITY;
+  const noteOwnInput = (e: Event): void => {
+    if (e.isTrusted) lastOwnInput = performance.now();
+  };
+  window.addEventListener("pointerdown", noteOwnInput, true);
+  window.addEventListener("keydown", noteOwnInput, true);
 
   const sendTheme = (): void => {
     if (theme !== "") post({ op: "theme", theme });
@@ -120,8 +139,8 @@ export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
         break;
       case "page_send":
       case "page_draft": {
-        if (!pageMessageBelieved(userInFrame())) break;
         const now = performance.now();
+        if (!pageMessageBelieved(userAtFrame(), now - lastOwnInput)) break;
         if (now - lastPageMessage < PAGE_MESSAGE_GAP_MS) break;
         lastPageMessage = now;
         params.onPageMessage?.({ send: ev.kind === "page_send", text: ev.text, title: ev.title });
@@ -165,6 +184,8 @@ export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
     },
     destroy(): void {
       window.removeEventListener("message", onMessage);
+      window.removeEventListener("pointerdown", noteOwnInput, true);
+      window.removeEventListener("keydown", noteOwnInput, true);
       control?.unbind(transport);
     },
   };
