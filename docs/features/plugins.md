@@ -695,7 +695,10 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     once it is decoded (the next click's is decoded ahead) and draws a clip from its first
     frame, so a click never flashes black. Clicks closer together than 0.4 s flick through: each
     lands on its build's finished picture, the pictures a few clicks on are requested ahead, and a
-    click after a pause plays its animation again (as in Keynote). Browsing's image viewer draws a slide smoothly at
+    click after a pause plays its animation again (as in Keynote). An animation fades in over
+    the picture under it and out once its build's own picture is drawn, so a video frame's softer
+    look never pops at a click. The strip's thumbnails load from their own URL, so a picture first
+    drawn at thumbnail size never comes back that small in the slide viewer. Browsing's image viewer draws a slide smoothly at
     any zoom (no pixel grid). Paging never calls the
     plugin; the place survives a re-render by the slide's title. A build may carry a `clip`
     (its animation, a video ending on its picture): the show plays it when a click moves on to

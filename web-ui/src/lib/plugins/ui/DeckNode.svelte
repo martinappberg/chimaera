@@ -252,6 +252,14 @@
       );
   }
 
+  /** A thumbnail's own URL for a picture (the daemon reads only the path).
+   *  WebKit keeps one decoded copy per URL, and a picture drawn first at a
+   *  thumbnail's size came back at that size in the slide viewer (192×108
+   *  for a 1280×720 slide: the last build, the one the strip shows). */
+  function thumbUrl(url: string): string {
+    return `${url}${url.includes("?") ? "&" : "?"}thumb`;
+  }
+
   /** A ticket that lapsed under a long-open deck: mint it again, though
    *  not in a loop for a file that is really gone. */
   const retried = new Map<string, number>();
@@ -651,7 +659,7 @@
         use:nearby={last?.src}
       >
         {#if last !== undefined && urls[last.src] !== undefined}
-          <img src={urls[last.src]} alt="" draggable="false" onerror={() => broken(last.src)} />
+          <img src={thumbUrl(urls[last.src] ?? "")} alt="" draggable="false" onerror={() => broken(last.src)} />
         {/if}
         <span class="num">{i + 1}</span>
       </button>
@@ -780,6 +788,7 @@
             {#key clip.src}
               <!-- svelte-ignore a11y_media_has_caption — a slide's animation: silent, and its picture carries the alt text -->
               <video
+                class:done={playing?.ended === true && showPicture.src === build.src}
                 src={urls[clip.src]}
                 muted
                 playsinline
@@ -1034,15 +1043,28 @@
     object-fit: contain;
     user-select: none;
   }
+  /* A video frame is a touch softer and its colours a touch off the
+     picture's (compressed, another colour pipeline): it fades in over the
+     picture under it and out once its build's own picture is drawn, so
+     neither the start nor the end of an animation nor the next click pops. */
   .show video {
     position: absolute;
     inset: 0;
     opacity: 0;
+    transition: opacity 0.12s ease;
   }
   /* Set on the element by its own first `playing`: a replayed clip is a new
      element that has no frame yet, and a video with none paints black. */
   .show video:global(.drawn) {
     opacity: 1;
+  }
+  .show video.done:global(.drawn) {
+    opacity: 0;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .show video {
+      transition: none;
+    }
   }
   .show video.warm {
     width: 1px;
