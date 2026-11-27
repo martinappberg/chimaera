@@ -3796,7 +3796,7 @@
               {:else}
                 <div class="bubble">
                   <UserText {terminals} {onOpenTerminal}
-                    text={send.text}
+                    text={send.origin === "page" ? (splitPageMessage(send.text)?.body ?? send.text) : send.text}
                     onOpenPath={openProsePath}
                     resolvePaths={prosePaths}
                   />

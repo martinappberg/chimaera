@@ -95,14 +95,18 @@
   // body's, which the canvas takes); read once, before we set one.
   let ownBackground = null;
   const clear = (c) => c === "" || c === "transparent" || /^rgba\(.*,\s*0\)$/.test(c);
-  // A page that wears the theme — inline, or any `--ch-` variable in its
-  // own styles — gets the theme's canvas too, wherever it is shown (a pane,
-  // a card): its background and the browser's light or dark defaults. A
-  // page that never mentions the theme (an old report) keeps the browser's
-  // white exactly as it was made for.
+  // A page that wears the theme — inline, any `--ch-` variable in its own
+  // `<style>` or `style` attributes, or `<meta name="chimaera"
+  // content="theme">` (a linked stylesheet can't be read from the page's
+  // sandbox) — gets the theme's canvas too, wherever it is shown (a pane, a
+  // card): its background and the browser's light or dark defaults; and its
+  // host is told, so an app view reloads for a new theme only for such a
+  // page. A page that never mentions the theme (an old report) keeps the
+  // browser's white exactly as it was made for, and is never reloaded.
   let follows = null;
   const wearsTheme = () => {
     if (inline) return true;
+    if (document.querySelector('meta[name="chimaera"][content~="theme"]') !== null) return true;
     for (const s of document.querySelectorAll("style")) if ((s.textContent ?? "").includes("--ch-")) return true;
     for (const el of document.querySelectorAll("[style]")) {
       if (el !== document.documentElement && (el.getAttribute("style") ?? "").includes("--ch-")) return true;
@@ -112,7 +116,10 @@
   applyTheme = (t) => {
     baseApply(t);
     if (t === null) return;
-    if (follows === null) follows = wearsTheme();
+    if (follows === null) {
+      follows = wearsTheme();
+      if (follows) post({ kind: "page_themed" });
+    }
     if (!follows) return;
     const root = document.documentElement;
     root.style.colorScheme = t.m;

@@ -43,6 +43,8 @@ export interface PaneFrameParams {
   onPageSize?: (height: number) => void;
   /** The pointer came over the page, or left it. */
   onHover?: (inside: boolean) => void;
+  /** The page wears the app's theme (see `page_themed`). */
+  onPageThemed?: () => void;
   /** The app's theme, encoded (`pageTheme.ts`): posted to the page API
    *  whenever it changes and to each new document, so a framed page
    *  follows the theme without a reload. */
@@ -73,7 +75,11 @@ const PAGE_MESSAGE_GAP_MS = 1000;
  *   Where the browser can't say (no `navigator.userActivation`), a page
  *   never sends;
  * - a draft needs a frame's activation, or focus in the frame;
- * - else nothing. The host then lets only a page in a chat's own answer,
+ * - else nothing.
+ * The window's activation doesn't say WHICH frame was pressed: a press in
+ * another frame lets this page send once too. Bounded — one send per
+ * activation and frame, and only a page the agent wrote in that chat sends
+ * at all (`shared/pageMessage.ts`) — and accepted. The host then lets only a page in a chat's own answer,
  *   written while that chat ran, send (`shared/pageMessage.ts`).
  */
 function pageMessageTrust(
@@ -167,6 +173,9 @@ export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
         break;
       case "hover":
         params.onHover?.(ev.inside);
+        break;
+      case "page_themed":
+        params.onPageThemed?.();
         break;
       case "page_send":
       case "page_draft": {

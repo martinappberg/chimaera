@@ -1116,8 +1116,9 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
     `--ch-focus`, `--ch-err`, `--ch-warn`, `--ch-font`, `--ch-mono`, `--ch-text-sm/md/lg`,
     `--ch-radius` — with the mode as `data-chimaera-theme`, `chimaera.theme` and `onTheme(fn)`.
     Only variables, never an element style, so an old report renders exactly as before. A page
-    that wears the theme — inline, or any `--ch-` variable in its own `<style>` or `style`
-    attributes — also gets the theme's canvas wherever it is shown, a preview pane included: its
+    that wears the theme — inline, any `--ch-` variable in its own `<style>` or `style`
+    attributes, or `<meta name="chimaera" content="theme">` (a linked stylesheet can't be read
+    from the page's sandbox) — also gets the theme's canvas wherever it is shown, a preview pane included: its
     root's background when it sets none of its own, and `color-scheme` for the browser's own
     light or dark defaults. A page that never mentions the theme keeps the browser's white. An
     app pane's placeholder is the workbench's surface while a page loads, not white. The
@@ -1170,8 +1171,10 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   - **Limits.** A sandboxed page can't load the app's own fonts: `--ch-mono` and `--ch-font` name
     them with their fallbacks, so a page shows the first one the system has. `--ch-text-*` are the
     window's root sizes; chat prose sets its own, so a page in an answer may read a step larger.
-    An app view's URL carries the theme, so it reloads once a theme change settles (400 ms);
-    a framed page takes it live.
+    An app view's URL carries the theme, so a page that wears the theme reloads once a theme
+    change settles (400 ms) — it says so with `page_themed` — while a page that doesn't (an old
+    report) is never reloaded for one and keeps its scroll and state; a framed page takes a new
+    theme live either way.
 - **PDF rendering.** Cards, panes and region snapshots share nonzero raster dimensions capped at
   12 million pixels and 8192 pixels per edge (`shared/pdfCanvas.ts`). Each draw owns a fresh canvas,
   and failed draws are cancelled before their handles are discarded: a graphics-initialization
@@ -1598,3 +1601,24 @@ _Captured 2026-11-04 (the maintainer, in the session that built it)._
 - **Deliberately left out:** "we skip all real Linters" — "If something is out of scope it should
   be an extension". Core reads and highlights; checking code is not core.
 - **Do not change (or: open to change):** nothing is frozen; the area is open to improvement.
+
+### Pages in an answer (theme, inline, answering back) — why it exists
+_Captured 2026-11-27 (the maintainer, in the session that built it; their words quoted)._
+
+- **Problem it solves:** agents write HTML artifacts all the time, "something that lives within
+  the answer, such as when you try to learn things". They "should be allowed to do that however
+  they want … like when they do interactive plots with like things to teach you", and "own
+  elements" meant the *theme*, not a fixed set of components. An HTML file that is part of the
+  answer should show inline, while "sometimes … there are files we definitely should open! So
+  needs to be a good distinction between those two". A click in such a page is an answer: "should
+  this not be an automatic answer? since it is a click." The page-to-agent message is meant to be
+  general, not only for quizzes.
+- **How settled it is (intended vs provisional):** **provisional**, in the maintainer's word: an
+  experiment, and most of it — the aim included — may change once it is used.
+- **Deliberately open / where it may go:** users configure nothing ("we dont want it complicated
+  for the users") — no modes, settings or prompts for pages. Chart libraries are themed through
+  their own light/dark themes, never colour by colour ("if something has not a default theme, we
+  cant go through all of these acrobatics"); the bundled plotting toolkit is a separate task
+  (issue 396). The open button shows on hover rather than as a permanent row.
+- **Do not change (or: open to change):** **open to change** — the maintainer named nothing as
+  off limits; everything here may change if improved.

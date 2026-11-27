@@ -255,6 +255,11 @@
       // clamps it), ten a second at most — and always the latest: a report
       // that comes too soon is held and sent at the end of the tenth, never
       // dropped (a dropped last size left the card short, scrolling).
+      // The page wears the theme: its host may reload it for a new one.
+      if (m.kind === "page_themed") {
+        post({ kind: "page_themed" });
+        return;
+      }
       if (m.kind === "page_size") {
         if (typeof m.height !== "number" || !Number.isFinite(m.height)) return;
         pendingSize = Math.max(0, Math.min(100000, m.height));

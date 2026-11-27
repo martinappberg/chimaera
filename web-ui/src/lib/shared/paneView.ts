@@ -111,6 +111,8 @@ export interface PaneViewParams {
   onPageSize?: (height: number) => void;
   /** The pointer came over the page, or left it. */
   onHover?: (inside: boolean) => void;
+  /** The page wears the app's theme (see `page_themed`). */
+  onPageThemed?: () => void;
   /** The page loaded, or its title or same-document URL changed. */
   onPage?: (page: { url: string; title: string }) => void;
   /** The view's own web process died twice within a minute and the shell
@@ -672,6 +674,9 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
         break;
       case "hover":
         params.onHover?.(ev.inside);
+        break;
+      case "page_themed":
+        params.onPageThemed?.();
         break;
       case "crashed":
         crashed = true;

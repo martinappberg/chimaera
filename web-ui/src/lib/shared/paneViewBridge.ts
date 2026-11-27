@@ -48,7 +48,11 @@ export type NativeViewEvent =
   | { id: string; kind: "page_size"; height: number }
   /** The pointer came over the page or left it (trusted pointer events,
    *  for a control that shows on hover). */
-  | { id: string; kind: "hover"; inside: boolean };
+  | { id: string; kind: "hover"; inside: boolean }
+  /** The page wears the app's theme (the page API: `--ch-*` in its own
+   *  styles, `#inline`, or its meta tag): its host may load it again for a
+   *  new theme. A page that doesn't is never reloaded for one. */
+  | { id: string; kind: "page_themed" };
 
 /** The most of a page's message, and of its title, that is kept. */
 export const PAGE_TEXT_MAX = 4000;
@@ -98,6 +102,8 @@ export function decodeNativeViewEvent(raw: unknown): NativeViewEvent | null {
     case "page":
       if (!str(raw.url) || !str(raw.title)) return null;
       return { id, kind: "page", url: raw.url, title: raw.title };
+    case "page_themed":
+      return { id, kind: "page_themed" };
     case "hover":
       if (!bool(raw.inside)) return null;
       return { id, kind: "hover", inside: raw.inside };

@@ -32,6 +32,11 @@
 //! and the `to` / `agent` argument descriptions say the id of one is taken.
 //! `worker_tools.json` and both instruction files change; the `_off` view
 //! and the settings do not.
+//! Re-blessed 2026-11-27: the chat host frame (`launcher::CHAT_HOST_PROMPT`,
+//! which a codex chat gets as `developer_instructions`) tells agents about
+//! pages in an answer: `#inline`, the `--ch-*` theme variables, a chart
+//! library's own light or dark theme, and `chimaera.send` / `draft`. Only
+//! `codex_argv.json` changes.
 
 use super::support::*;
 use crate::{lock, AppState};

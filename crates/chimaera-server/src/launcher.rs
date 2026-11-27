@@ -1410,10 +1410,11 @@ pub(crate) fn build_agent_resume_command(
 /// `--append-system-prompt`, codex through `developer_instructions`; a
 /// forked branch carries it at the head of its portable context instead
 /// (`chat::portable_context_prompt`), since that context rides the same
-/// channel. Short and cached with the system prompt: under 300 tokens. Its
-/// last sentences are the page API (`chimaera_core::PAGE_API_JS`): the
-/// `--ch-*` names are the web UI's `shared/pageTheme.ts` contract, and an
-/// HTML card in this chat's answer is the one place `send` sends.
+/// channel. Short and cached with the system prompt: about 400 tokens, held
+/// under 1,900 characters by `chat_host_prompt_stays_short`. Its last
+/// sentences are the page API (`chimaera_core::PAGE_API_JS`): the `--ch-*`
+/// names are the web UI's `shared/pageTheme.ts` contract, and an HTML card
+/// in this chat's answer is the one place `send` sends.
 pub(crate) const CHAT_HOST_PROMPT: &str = "\
 You are running in chimaera's chat, which renders your replies as markdown in a \
 workbench beside the user's files. A markdown image link to a local file renders \
@@ -1427,20 +1428,16 @@ to read, such as a markdown note, plan or report, with an ordinary link like \
 [the plan](analysis/PLAN.md), not an image link: the user can preview it on \
 hover or open it. When a few numbers carry the point, put a small markdown table \
 in the reply itself. Files you write during a turn are listed under your reply \
-automatically. An HTML page you embed may draw anything, with any script. One \
-that is part of your answer, such as a quiz, a widget or an interactive plot, \
-gets #inline after its path, as in ![quiz](learn/quiz.html#inline): it draws in \
-the reply at its own height, so give a plot an explicit height; without \
-#inline the page is a file card the user opens, right for a report. Pages \
-should wear the app's theme: the CSS variables --ch-bg, --ch-fg, --ch-muted, \
---ch-accent, --ch-edge, --ch-surface, --ch-font and --ch-mono follow the user's \
-light or dark theme live (give each a fallback). For a chart library, pick its \
-own light or dark theme from chimaera.theme.mode and draw again in \
-chimaera.onTheme(fn); one without a theme keeps its own light background. In a \
-page you wrote and embedded \
-in your reply, chimaera.send(text) from a button the user clicks sends their \
-answer back to you as a message; chimaera.draft(text) puts it in their input \
-instead. Use window.chimaera after DOMContentLoaded.";
+automatically. An HTML page you embed may use any script. Add #inline for one \
+that is part of the answer (a quiz, an interactive plot), as in \
+![quiz](learn/quiz.html#inline), and give its plot a height; without it a page \
+is a file card, right for a report. Style pages with --ch-bg, --ch-fg, \
+--ch-muted, --ch-accent, --ch-edge, --ch-font and --ch-mono (with fallbacks): \
+they follow the user's light or dark theme. Give a chart library its own light \
+or dark theme from chimaera.theme.mode and redraw in chimaera.onTheme(fn). In a \
+page you wrote, chimaera.send(text) on the user's click sends it to you as \
+their message; chimaera.draft(text) fills their input. Use window.chimaera \
+after DOMContentLoaded.";
 
 /// The workspace Mastermind's role frame, appended to its claude chat spawn
 /// via `--append-system-prompt`. Short by design: the MCP server's own
@@ -2025,6 +2022,17 @@ mod detection_tests;
 
 #[cfg(test)]
 mod tests {
+    /// The chat host frame rides every chat spawn's system prompt (and a
+    /// fork's portable context): it must stay short.
+    #[test]
+    fn chat_host_prompt_stays_short() {
+        assert!(
+            CHAT_HOST_PROMPT.len() < 1_900,
+            "CHAT_HOST_PROMPT grew to {} characters",
+            CHAT_HOST_PROMPT.len()
+        );
+    }
+
     use super::*;
 
     /// A Codex TUI gets the threshold as a launch-scoped `-c`, and nothing

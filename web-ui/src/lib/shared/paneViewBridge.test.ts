@@ -226,3 +226,10 @@ describe("hover", () => {
     expect(decodeNativeViewEvent({ id: "v1", kind: "hover", inside: "yes" })).toBeNull();
   });
 });
+
+describe("page themed", () => {
+  it("reads a page saying it wears the theme", () => {
+    expect(decodeNativeViewEvent({ id: "v1", kind: "page_themed" })).toEqual({ id: "v1", kind: "page_themed" });
+    expect(decodeFrameMessage({ chimaeraPaneView: { kind: "page_themed" } })).toEqual({ kind: "page_themed" });
+  });
+});

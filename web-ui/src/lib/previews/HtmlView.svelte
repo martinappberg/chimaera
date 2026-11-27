@@ -131,9 +131,20 @@
   const error = $derived(entry?.rawError ?? null);
   // The page as Chimaera shows it: the page API appended, the app's theme
   // in its URL. A native view loads again for a new theme (its URL holds
-  // it); a framed page keeps the one it loaded with and hears later ones
-  // as messages (`paneFrame`'s `theme`), so a theme switch never reloads it.
-  const nativeUrl = $derived(url === null ? null : withPageApi(url, { framed: false, theme: $pageTheme }));
+  // it) only once the page said it wears the theme (`page_themed`): an old
+  // report keeps its scroll and state across a theme switch. A framed page
+  // keeps the theme it loaded with and hears later ones as messages
+  // (`paneFrame`'s `theme`), so a theme switch never reloads it.
+  let pageThemed = $state(false);
+  $effect(() => {
+    void url;
+    pageThemed = false;
+  });
+  const nativeUrl = $derived(
+    url === null
+      ? null
+      : withPageApi(url, { framed: false, theme: pageThemed ? $pageTheme : untrack(() => $pageTheme) }),
+  );
   const frameUrl = $derived(
     url === null ? null : withPageApi(url, { framed: true, theme: untrack(() => $pageTheme) }),
   );
@@ -577,6 +588,7 @@
             onSelection: onPageSelection,
             onReference: onPageReference,
             onPageMessage,
+            onPageThemed: () => (pageThemed = true),
             onCoverStill: (shot) =>
               (coverStill =
                 shot === null ? null : { src: `data:image/png;base64,${shot.png}`, width: shot.width, height: shot.height }),

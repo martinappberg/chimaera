@@ -111,9 +111,29 @@
     if (!inline || box === null) return base;
     return pageThemeOn(backgroundBehind(box.parentElement ?? box));
   });
-  const url = $derived(pageUrl === null ? null : withPageApi(pageUrl, { framed: false, theme, inline: inline ? INLINE_MAX : undefined }));
+  // An app view carries a new theme in its URL (a reload) only once the
+  // page said it wears it (`page_themed`): an old report keeps its state
+  // across a theme switch. An inline card waits for its box, so its page's
+  // first theme already has the colour behind it.
+  let pageThemed = $state(false);
+  $effect(() => {
+    void pageUrl;
+    pageThemed = false;
+  });
+  const waiting = $derived(pageUrl === null || (inline && box === null));
+  const url = $derived(
+    waiting || pageUrl === null
+      ? null
+      : withPageApi(pageUrl, {
+          framed: false,
+          theme: pageThemed ? theme : untrack(() => theme),
+          inline: inline ? INLINE_MAX : undefined,
+        }),
+  );
   const frameUrl = $derived(
-    pageUrl === null ? null : withPageApi(pageUrl, { framed: true, theme: untrack(() => theme), inline: inline ? INLINE_MAX : undefined }),
+    waiting || pageUrl === null
+      ? null
+      : withPageApi(pageUrl, { framed: true, theme: untrack(() => theme), inline: inline ? INLINE_MAX : undefined }),
   );
   const onPageMessage = (m: { send: boolean; text: string; title: string }): void => {
     pageMessage({ chat, writtenAtMs, ...m });
@@ -256,6 +276,7 @@
             onPageMessage,
             onPageSize,
             onHover,
+            onPageThemed: () => (pageThemed = true),
             control,
           }}
         >
