@@ -905,11 +905,12 @@ done).
 
 Where a view draws: `tab` (its own tab: the card's **Open**, `open-view`, a file
 action's `open`), `panel` (the dashboard, after core's sections), `file` (a
-claimed file; the view owns the pane: the screen is exactly the pane's height,
+claimed file; the view owns the pane: the screen is at least the pane's height,
 the root stack's last child takes what is left, and an `editor` or `pdf` first
-in a split pane, a stack or a tab fills it; a split side by side is one row of
-that height whose sides scroll on their own, so a long list beside a viewer
-never stretches it — an embedded viewer shows no path bar), `status` (a chip in a claimed file's bar), `card` (inside its
+in a split pane, a stack or a tab fills it; a root whose last child is a split
+is exactly the pane's height, the split side by side one row whose sides
+scroll on their own (stacked, the split scrolls), so a long list beside a
+viewer never stretches it — an embedded viewer shows no path bar), `status` (a chip in a claimed file's bar), `card` (inside its
 Extensions card). Any other view takes the same layout when its tree says
 `"fill": true` beside `ui` and `root` (a tab whose split puts an `image`, `slides` or `pdf`
 first in a pane: the PowerPoint plugin's Slides and Themes); otherwise a viewer
