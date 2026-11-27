@@ -1489,8 +1489,9 @@
     bottom: 100%;
     left: 10px;
     right: 10px;
-    margin-bottom: 4px;
+    margin-bottom: 6px;
     z-index: 10;
+    border-radius: 12px;
   }
   .pop-row {
     display: flex;
@@ -1740,10 +1741,11 @@
     cursor: default;
     opacity: 0.6;
   }
+  /* Stop is send's other face: the same ink disc, a square for the arrow.
+     The breathing halo around it is what says the agent is working. */
   .stop {
-    background: color-mix(in srgb, var(--accent) 12%, transparent);
-    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
-    color: var(--accent);
+    background: var(--fg);
+    color: var(--overlay-bg);
   }
   /* Faint breathing ring while the agent works — presence, not alarm. A
      STATIC halo on a pseudo-element breathed via opacity: animating
@@ -1754,7 +1756,7 @@
     inset: -1px;
     border-radius: 999px; /* .action's disc, outside its 1px border */
     pointer-events: none;
-    box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 8%, transparent);
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 22%, transparent);
     opacity: 0;
     animation: stop-breathe 1.8s ease-in-out infinite;
   }
@@ -1767,8 +1769,7 @@
     animation-play-state: paused;
   }
   .stop:hover {
-    background: color-mix(in srgb, var(--accent) 22%, transparent);
-    border-color: var(--accent);
+    background: color-mix(in srgb, var(--fg) 84%, var(--overlay-bg));
   }
   @keyframes stop-breathe {
     50% {
@@ -1778,16 +1779,14 @@
   /* Waiting for the second press: the stop takes the warning tone, so the
      button the note points at is the one that confirms. */
   .stop.armed {
-    color: var(--warn);
-    background: color-mix(in srgb, var(--warn) 14%, transparent);
-    border-color: color-mix(in srgb, var(--warn) 60%, var(--edge));
+    color: var(--overlay-bg);
+    background: var(--warn);
   }
   .stop.armed:hover {
-    background: color-mix(in srgb, var(--warn) 22%, transparent);
-    border-color: var(--warn);
+    background: color-mix(in srgb, var(--warn) 86%, var(--fg));
   }
   .stop.armed::after {
-    box-shadow: 0 0 0 4px color-mix(in srgb, var(--warn) 14%, transparent);
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--warn) 26%, transparent);
   }
   @media (prefers-reduced-motion: reduce) {
     .stop::after {
