@@ -14,7 +14,7 @@
 >   only where that plugin is active.
 > - The answers to the four earlier questions are in [decided](#decided).
 >
-> **Still open:** the items in [open questions](#open-questions).
+> **Still open:** nothing yet; the spike may raise questions.
 >
 > **Sources:**
 >
@@ -213,9 +213,17 @@ What the rule costs:
   bridge turns into an offer: "This page uses GenomeSpy. Turn it on here".
 - **Offline clusters.** Libraries served this way also work there, where a CDN
   does not.
-- **Charts.** A first-party **Plotting** plugin could provide Plotly, Vega-Lite,
-  Observable Plot and D3 the same way, pinned and verified, for hosts with no
-  internet ([open question 1](#open-questions)).
+- **Charts come with the app.** Plotting is something nearly every agent does
+  for nearly every user, unlike genome browsing. So Chimaera itself bundles a
+  small pinned set at the same addresses: D3, Observable Plot and Vega-Lite
+  (`chimaera:lib/d3/…`, `chimaera:lib/plot/…`, `chimaera:lib/vega-lite/…`).
+  - **Cost.** They load only when a page imports them, and they add about 1.5 MB
+    to the binary.
+  - **Offline.** They work on clusters with no internet.
+  - **Plotly** is about 3.5 MB, so pages keep loading it from its CDN unless the
+    spike shows it is worth bundling.
+  - **Same addresses either way.** A page imports the same paths whether the app
+    or a plugin provides them.
 
 ### How the agent sees its page
 
@@ -613,7 +621,7 @@ in total.
 1. **Agents' pages in the theme, talking back.** This can ship before phase 2.
    - The injected token variables, with live theme updates.
    - `chimaera:theme.css`, `chimaera:web.js` with `send`, `reference`, `theme` and
-     `visibility`, and the chart palettes.
+     `visibility`, the chart palettes, and the bundled D3, Observable Plot and Vega-Lite.
    - The host frame's paragraph and the guide.
    - Acceptance: an agent asked to teach a concept answers with an interactive
      Plotly or D3 page. The page wears the app's theme and follows a theme
@@ -658,8 +666,7 @@ in total.
 6. **Later, if wanted.**
    - GenomeSpy's sample-collection App (cohorts, provenance) as a second page.
    - A privileged opt-in plugin for indexing and bgzipping.
-   - Other visualization plugins on the same platform: the Plotting libraries
-     ([open question 1](#open-questions)), Mol\*, maps.
+   - Other visualization plugins on the same platform: Mol\* and maps.
 
 **Shipping.** Phases 1 and 2 are `feat:` PRs to Chimaera. Each needs the ship-pr
 gates, the feature pages, the guide, and wire fixtures for any new frames.
@@ -712,14 +719,15 @@ with `tier = "sandboxed"`.
    well-known library CDNs, and sends nothing anywhere else. There are no
    modes, settings or prompts.
 
+8. **Plotting libraries are bundled with the app** (D3, Observable Plot,
+   Vega-Lite), served at `chimaera:lib/…` and loaded only when a page imports
+   them. Domain libraries such as GenomeSpy come from plugins.
+9. **The injected theme variables are named `--ch-*`**, so they never collide
+   with a page's own.
+
 ## Open questions
 
-1. **A first-party Plotting plugin.** It would provide pinned Plotly, Vega-Lite,
-   Observable Plot and D3 as `chimaera:lib/…`, for clusters without internet,
-   where the CDNs don't load. *Recommended: yes*, after phase 2.
-2. **The injected token names.** They could be `--ch-*`, or the app's own names
-   (`--fg`, `--accent`). *Recommended: `--ch-*`*, so they never collide with a
-   page's own variables.
+None at the moment. The spike's go/no-go note may raise some.
 
 ## Sources
 
