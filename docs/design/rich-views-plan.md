@@ -213,7 +213,7 @@ What the rule costs:
   bridge turns into an offer: "This page uses GenomeSpy. Turn it on here".
 - **Offline clusters.** Libraries served this way also work there, where a CDN
   does not.
-- **Charts come with the app.** Plotting is something nearly every agent does
+- **Charts come with the app** (its own task: [the visualization toolkit, issue 396](https://github.com/martinappberg/chimaera/issues/396)). Plotting is something nearly every agent does
   for nearly every user, unlike genome browsing. So Chimaera itself bundles a
   small pinned set at the same addresses: D3, Observable Plot and Vega-Lite
   (`chimaera:lib/d3/…`, `chimaera:lib/plot/…`, `chimaera:lib/vega-lite/…`).
