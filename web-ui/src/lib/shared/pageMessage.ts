@@ -50,10 +50,21 @@ export function registerPageMessages(h: Handler): () => void {
   };
 }
 
-/** The message as the agent reads it: where it came from, then the text. */
+/** The message as the agent reads it: the page it came from, in one short
+ *  lead, then the text. The transcript shows a page's send (origin `page`)
+ *  without the lead, as a tag (`splitPageMessage`). */
 export function pageMessageText(m: Pick<PageMessage, "text" | "title">): string {
-  const title = m.title.trim();
-  return `${title !== "" ? `From the page “${title}”:` : "From a page:"}\n\n${m.text}`;
+  const title = m.title.replace(/[\]”]/g, "").trim();
+  return `${title !== "" ? `[from the page “${title}”]` : "[from a page]"} ${m.text}`;
+}
+
+const LEAD = /^\[from (?:the page “([^”\]]*)”|a page)\] ?/;
+
+/** A page's message as the transcript shows it: the page's name, and the
+ *  user's words without the lead. Null when the text has no lead. */
+export function splitPageMessage(text: string): { title: string; body: string } | null {
+  const m = LEAD.exec(text);
+  return m === null ? null : { title: m[1] ?? "", body: text.slice(m[0].length) };
 }
 
 export function pageMessage(m: PageMessage): PageMessageOutcome {

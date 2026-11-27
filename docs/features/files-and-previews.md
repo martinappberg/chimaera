@@ -1132,7 +1132,11 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
     (`chimaera-theme`, base64url JSON) so it applies at once; a framed page hears later themes as
     messages and never reloads, while an app view loads again for a new theme.
   - **`chimaera.send(text)` / `chimaera.draft(text)`.** 4,000 characters at most, at most one a
-    second, prefixed "From the page “title”:". A send needs the person's fresh press, one message
+    second, led by `[from the page “title”]` so the agent knows its source. A send goes over the
+    chat socket with `origin: "page"` — the one origin a window may ask for (`ws.rs`
+    `asked_origin`) — and journals as `UserMessage.origin = "page"`
+    (`chimaera_agent::model::ORIGIN_PAGE`); the transcript shows the words without the lead and the
+    page as a quiet "from <title>" tag under the bubble (`splitPageMessage`). A send needs the person's fresh press, one message
     per press: the app's bridge, in its own world, takes a pointer press or Enter/Space in the page
     and consumes it (`pane_bridge.js`; nothing while an agent drives the view); for a frame, which
     the window can't look inside, the parent takes the person at the frame (focus in it, or the

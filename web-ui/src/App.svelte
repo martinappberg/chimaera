@@ -2207,7 +2207,9 @@
       const started = sessionsById.get(m.chat)?.created_at;
       const own = started !== undefined && writtenDuringChat(m.writtenAtMs, started * 1000);
       if (m.send && own && entry !== undefined) {
-        if (entry.socket.send({ type: "send", blocks: [{ type: "text", text }] })) {
+        // `origin: "page"`: the daemon journals it as a page's send, which
+        // the transcript shows as the user's words with the page as a tag.
+        if (entry.socket.send({ type: "send", blocks: [{ type: "text", text }], origin: "page" })) {
           followToBottom(m.chat);
           return "sent";
         }

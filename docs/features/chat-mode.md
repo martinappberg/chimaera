@@ -908,7 +908,8 @@ unused week reads 0%); an
   a file card for a report the user opens. An HTML page in an answer may draw anything, with any script; it
   wears the app's theme through `--ch-*` CSS variables, and a click in it can send the user's
   answer back to the chat that showed it (`chimaera.send`) or draft it in the input
-  (`chimaera.draft`), the message labelled "From the page “title”:" — a quiz, a picker, a
+  (`chimaera.draft`) — your bubble shows your words with a quiet "from <page>" tag, the agent
+  reads them led by the page's name — a quiz, a picker, a
   "which run did you mean?". Only a card in that chat's own answer sends; elsewhere a page only
   drafts. The page API and its checks: [files & previews](files-and-previews.md#embed-cards)
   ("Pages that wear the theme and answer back"); `EmbedResolver.chat` carries the chat's id to

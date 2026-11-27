@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { encodePageTheme, PAGE_THEME_TOKENS } from "./pageTheme";
-import { pageMessageText, writtenDuringChat, WRITTEN_SLACK_MS } from "./pageMessage";
+import { pageMessageText, splitPageMessage, writtenDuringChat, WRITTEN_SLACK_MS } from "./pageMessage";
 
 /** What the page API does with the URL value (`chimaera-core` `page_api.js`). */
 function decodeLikeThePage(raw: string): unknown {
@@ -26,9 +26,22 @@ describe("PAGE_THEME_TOKENS", () => {
 });
 
 describe("pageMessageText", () => {
-  it("says where the message came from", () => {
-    expect(pageMessageText({ text: "a = FORMAT", title: "VCF quiz" })).toBe("From the page “VCF quiz”:\n\na = FORMAT");
-    expect(pageMessageText({ text: "hi", title: "  " })).toBe("From a page:\n\nhi");
+  it("leads with the page the message came from, on one line", () => {
+    expect(pageMessageText({ text: "a = FORMAT", title: "VCF quiz" })).toBe("[from the page “VCF quiz”] a = FORMAT");
+    expect(pageMessageText({ text: "hi", title: "  " })).toBe("[from a page] hi");
+  });
+
+  it("splits back into the page and the words, whatever the page called itself", () => {
+    for (const [title, text] of [
+      ["TP53 variants", "Tell me about chr17:7671909."],
+      ["Quiz ] “tricky”", "line one\nline two"],
+      ["", "untitled"],
+    ]) {
+      const split = splitPageMessage(pageMessageText({ title, text }));
+      expect(split?.body).toBe(text);
+      expect(split?.title).toBe(title.replace(/[\]”]/g, "").trim());
+    }
+    expect(splitPageMessage("an ordinary message")).toBeNull();
   });
 });
 

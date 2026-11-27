@@ -79,6 +79,7 @@
   import { subagentChatId, subagentModel, subagentRunning } from "./subagentView";
   import ArtifactGallery from "./ArtifactGallery.svelte";
   import { EmbedResolver } from "./embeds";
+  import { splitPageMessage } from "../shared/pageMessage";
   import { HoverTargets } from "./hoverTargets";
   import { isMissing, rawUrl, resolveFile, resolveTargets } from "../shared/embed/embed";
   import { HoverPreviews } from "../previews/doc/hoverController.svelte";
@@ -3373,6 +3374,9 @@
         <!-- Only delivered (sent) user messages render inline; queued/dropped
              ones live in the pending tail below. -->
         {@const pictureOnly = block.text.length === 0 && block.attachmentPaths.length > 0}
+        <!-- A click in a page the agent embedded sent this (origin `page`):
+             the user's words, the page as a tag under the bubble. -->
+        {@const pageSent = block.origin === "page" ? splitPageMessage(block.text) : null}
         <div class="msg user" data-block-index={item.index} data-block-uid={block.uid}>
           {#if block.attachmentPaths.length > 0 && !pictureOnly}
             {@render sentImages(block.attachmentPaths)}
@@ -3405,16 +3409,18 @@
             {:else}
               <div class="bubble">
                 {#if agentKind === "claude" && block.checkpoint?.id}
-                  <ModSite {mods} component="UserMessage" instanceId={block.checkpoint.id} active={visible && $pageVisible} props={{ text: block.text, origin: { kind: block.origin ? "unclassified" : "composer" }, isExpanded: true }}>
-                    {#snippet children(draw)}<UserText {terminals} {onOpenTerminal} text={typeof draw.text === "string" ? draw.text : block.text} onOpenPath={openProsePath} resolvePaths={prosePaths} />{/snippet}
+                  <ModSite {mods} component="UserMessage" instanceId={block.checkpoint.id} active={visible && $pageVisible} props={{ text: pageSent?.body ?? block.text, origin: { kind: block.origin ? "unclassified" : "composer" }, isExpanded: true }}>
+                    {#snippet children(draw)}<UserText {terminals} {onOpenTerminal} text={typeof draw.text === "string" ? draw.text : (pageSent?.body ?? block.text)} onOpenPath={openProsePath} resolvePaths={prosePaths} />{/snippet}
                   </ModSite>
-                {:else}<UserText {terminals} {onOpenTerminal} text={block.text} onOpenPath={openProsePath} resolvePaths={prosePaths} />{/if}
+                {:else}<UserText {terminals} {onOpenTerminal} text={pageSent?.body ?? block.text} onOpenPath={openProsePath} resolvePaths={prosePaths} />{/if}
               </div>
             {/if}
           </div>
-          {#if unsavedImages(block) !== "" || block.origin === "remote" || block.origin === "restart" || block.origin === "worker"}
+          {#if unsavedImages(block) !== "" || block.origin === "remote" || block.origin === "restart" || block.origin === "worker" || pageSent !== null}
             <span class="bubble-meta">
-              {#if block.origin === "remote"}
+              {#if pageSent !== null}
+                <span class="origin auto" title={pageSent.title !== "" ? `sent with your click in the page “${pageSent.title}”` : "sent with your click in a page"}>{pageSent.title !== "" ? `from ${pageSent.title}` : "from a page"}</span>
+              {:else if block.origin === "remote"}
                 <span class="origin" title="sent from a Remote Control client (the Claude app or claude.ai/code)">via Remote Control</span>
               {:else if block.origin === "restart"}
                 <span class="origin auto" title="chimaera sent this itself: the daemon restarted while this chat had work running, so it asked the resumed agent to pick that work back up (setting: Pick Up Interrupted Work After a Restart)">sent by chimaera after a restart</span>

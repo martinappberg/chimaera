@@ -141,7 +141,9 @@ page Chimaera shows; nothing to include. A page reads it from
 inline scripts.
 
 - **`send(text)`** posts a **user message** to the chat whose answer embeds the
-  page, shown as coming from it ("From the page “VCF quiz”: …").
+  page: in your bubble as your own words, with a quiet "from VCF quiz" tag
+  under it (`origin: "page"`, journaled by the daemon); the agent reads a
+  one-line lead, `[from the page “VCF quiz”] …`, so it knows the source.
   - **Only the agent's own page sends.** The page must be a card in that chat's
     answer, and its file must have been written while the chat ran (its mtime
     against the session's start). A cloned repository's page that the agent
