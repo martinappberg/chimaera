@@ -1579,13 +1579,13 @@
     font-weight: 600;
   }
 
-  /* A VS Code preview tab: italic until it is pinned (dbl-click / edit). */
   /* A file's tab is its file name (app.css --file-font); a session's or a
      view's is a title. */
   .tab-name.file {
     font-family: var(--file-font);
     font-size: var(--text-xs);
   }
+  /* A VS Code preview tab: italic until it is pinned (dbl-click / edit). */
   .tab-name.preview {
     font-style: italic;
   }
@@ -1824,8 +1824,8 @@
   .link-menu-title {
     padding: 3px 8px 5px;
     font-size: var(--text-xs);
-    font-weight: 600;
-    color: color-mix(in srgb, var(--fg) 72%, var(--muted));
+    font-weight: 500;
+    color: var(--muted);
   }
 
   .link-menu-item {

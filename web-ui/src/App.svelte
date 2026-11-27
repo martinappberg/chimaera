@@ -6495,7 +6495,7 @@
     font-size: var(--text-xs);
     font-weight: 500;
     letter-spacing: 0.01em;
-    color: color-mix(in srgb, var(--muted) 88%, transparent);
+    color: var(--muted);
     user-select: none;
   }
 
@@ -6535,7 +6535,7 @@
     font-size: var(--text-xs);
     font-weight: 500;
     letter-spacing: 0.01em;
-    color: color-mix(in srgb, var(--muted) 88%, transparent);
+    color: var(--muted);
     user-select: none;
   }
 
@@ -6755,7 +6755,7 @@
     font-size: var(--text-xs);
     font-weight: 500;
     letter-spacing: 0.01em;
-    color: color-mix(in srgb, var(--muted) 88%, transparent);
+    color: var(--muted);
     cursor: pointer;
     user-select: none;
   }

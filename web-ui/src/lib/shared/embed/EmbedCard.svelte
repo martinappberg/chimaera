@@ -411,7 +411,7 @@
     padding: 0;
     background: none;
   }
-  .embed-card.fit > :global(.image-body .frame) {
+  .embed-card.fit:not(.bare) > :global(.image-body .frame) {
     border-radius: 10px;
     box-shadow: 0 0 0 1px color-mix(in srgb, var(--edge) 80%, transparent);
   }
@@ -455,9 +455,10 @@
     border: none;
     border-radius: 4px;
     background: none;
-    /* The name is there when you look for it: faint at rest, in ink once
-       the pointer or the keyboard is on the card. */
-    color: color-mix(in srgb, var(--muted) 88%, transparent);
+    /* The name is there when you look for it: the muted voice at rest (no
+       fainter: it must hold the theme's contrast floor), in ink once the
+       pointer or the keyboard is on the card. */
+    color: var(--muted);
     font: inherit;
     font-family: var(--file-font, var(--mono, monospace));
     font-size: var(--text-xs);
@@ -479,7 +480,9 @@
   .embed-card:focus-within .name > :global(svg) {
     opacity: 1;
   }
-  .name:hover:not(:disabled) {
+  /* Out-specifies the card-hover ink above: on the name itself, the link
+     colour. */
+  .embed-card .name:hover:not(:disabled) {
     color: var(--accent);
     background: color-mix(in srgb, var(--fg) 5%, transparent);
   }

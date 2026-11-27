@@ -254,7 +254,6 @@
   .standalone .hp-content :global(.md-doc pre code) {
     display: block;
     overflow-x: auto;
-    scrollbar-width: thin;
     background: none;
     padding: 0;
     font-size: 0.848em;
@@ -290,6 +289,7 @@
   .standalone .hp-content :global(.md-doc ol > li::marker) {
     color: var(--accent-text);
     font-variant-numeric: tabular-nums;
+    font-weight: 500;
   }
 
   /* Task boxes, as the reading view draws them. */

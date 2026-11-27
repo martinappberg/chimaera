@@ -1068,10 +1068,12 @@
     padding: 0 8px 4px;
   }
 
+  /* Lowercase in the markup ("jobs", "workspaces"): the rail's quiet label
+     voice, not a sentence-case page head. */
   .sec-title {
-    font-size: var(--text-sm);
-    font-weight: 600;
-    color: color-mix(in srgb, var(--fg) 72%, var(--muted));
+    font-size: var(--text-xs);
+    font-weight: 500;
+    color: var(--muted);
   }
 
   .sec-acts {

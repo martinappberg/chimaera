@@ -2479,6 +2479,13 @@
     background: none;
   }
 
+  /* A document's own picture stays bare: the transcript's figure frame
+     (shared/embed/EmbedCard .fit) is not this view's. */
+  .md-view :global(.md-doc .md-embed-image > .embed-card[data-embed-kind="image"] .image-body .frame) {
+    border-radius: 4px;
+    box-shadow: none;
+  }
+
   .md-view :global(.md-doc .md-embed-image > .embed-card[data-embed-kind="pending"]:not(.missing)) {
     display: none;
   }

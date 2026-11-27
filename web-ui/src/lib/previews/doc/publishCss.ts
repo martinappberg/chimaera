@@ -61,7 +61,7 @@ body{margin:0;color:var(--fg);font-family:var(--ui-font);font-size:16px;line-hei
 .md-doc ul,.md-doc ol{padding-left:1.6em;margin:.6em 0}
 .md-doc li{margin:.2em 0}
 .md-doc ul>li::marker{color:color-mix(in srgb,var(--accent) 70%,var(--muted))}
-.md-doc ol>li::marker{color:color-mix(in srgb,var(--accent) 75%,var(--fg));font-variant-numeric:tabular-nums}
+.md-doc ol>li::marker{color:color-mix(in srgb,var(--accent) 75%,var(--fg));font-variant-numeric:tabular-nums;font-weight:500}
 .md-doc :is(strong,b){font-weight:600}
 .md-doc hr{border:none;border-top:1px solid var(--edge);margin:1.8em 0}
 .md-doc img{max-width:100%;height:auto}

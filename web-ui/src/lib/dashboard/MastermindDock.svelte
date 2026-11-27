@@ -946,7 +946,7 @@
     border-color: color-mix(in srgb, var(--accent) 45%, var(--edge));
   }
   .choice:has(input:checked) {
-    border-color: var(--focus-edge);
+    border-color: color-mix(in srgb, var(--accent) 60%, var(--edge));
   }
   .choice input {
     flex: none;

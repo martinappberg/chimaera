@@ -308,8 +308,8 @@
   .divider {
     padding: 8px 8px 3px;
     font-size: var(--text-xs);
-    font-weight: 600;
-    color: color-mix(in srgb, var(--fg) 72%, var(--muted));
+    font-weight: 500;
+    color: var(--muted);
   }
 
   .row {

@@ -1024,7 +1024,6 @@
     border-radius: 6px;
     padding: 0.7em 0.9em;
     overflow-x: auto;
-    scrollbar-width: thin;
     line-height: 1.5;
   }
 
@@ -1052,6 +1051,7 @@
   .nb-md :global(ol > li)::marker {
     color: var(--accent-text);
     font-variant-numeric: tabular-nums;
+    font-weight: 500;
   }
 
   .nb-md :global(hr) {
@@ -1066,7 +1066,6 @@
 
   .nb-md :global(.nb-math-block) {
     overflow-x: auto;
-    scrollbar-width: thin;
     text-align: center;
   }
 

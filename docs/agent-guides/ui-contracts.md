@@ -20,8 +20,8 @@ color values are only the no-JS fallback.
   `--accent`, `--err`, `--warn`, `--edge`, `--row-hover`, …). Add a new
   themable color to `TOKEN_NAMES` and to every theme, not to `app.css`.
 - Use `--accent-text` for accent-colored text. It keeps 75% `--accent` and
-  mixes in 25% `--fg`, so that text holds 4.5:1 (`app.css:35-39`).
-- Use `--focus-ring` for every keyboard focus outline (`app.css:33-34`).
+  mixes in 25% `--fg`, so that text holds 4.5:1 (`app.css`, `--accent-text`).
+- Use `--focus-ring` for every keyboard focus outline (`app.css`).
 - Use `--focus-edge` for the border of the surface that has focus (the
   active pane among several, the composer's field): a tint, not a frame.
 - Use the four type roles: `--text-xs` (section labels, badges), `--text-sm`
@@ -46,7 +46,7 @@ color values are only the no-JS fallback.
   tables"). Change one, change them all.
 - Use `--radius-card`, `--composer-radius`, `--overlay-radius`,
   `--overlay-shadow` and `--hover-tint` for surfaces; `--pane-tab-height`, `--pane-toolbar-height` and
-  `--pane-control-size` for pane chrome (`app.css:757-764`).
+  `--pane-control-size` for pane chrome (`app.css`, "pane chrome" tokens).
 
 **Contrast.** `lib/settings/themes.contrast.test.ts` holds every theme to
 4.5:1 against `--term-bg` for `--fg`, `--muted`, `--err`, `--warn`, the

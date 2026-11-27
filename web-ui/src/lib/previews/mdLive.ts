@@ -1382,16 +1382,16 @@ const liveTheme: Extension = EditorView.theme({
     padding: "0 1em",
   },
   "&.cm-md-live .lp-codeblock-first": {
-    borderTop: "1px solid var(--edge)",
-    borderRadius: "8px 8px 0 0",
+    borderTop: "1px solid color-mix(in srgb, var(--edge) 75%, transparent)",
+    borderRadius: "10px 10px 0 0",
     paddingTop: "0.5em",
   },
   "&.cm-md-live .lp-codeblock-last": {
-    borderBottom: "1px solid var(--edge)",
-    borderRadius: "0 0 8px 8px",
+    borderBottom: "1px solid color-mix(in srgb, var(--edge) 75%, transparent)",
+    borderRadius: "0 0 10px 10px",
     paddingBottom: "0.5em",
   },
-  "&.cm-md-live .lp-codeblock-first.lp-codeblock-last": { borderRadius: "8px" },
+  "&.cm-md-live .lp-codeblock-first.lp-codeblock-last": { borderRadius: "10px" },
   "&.cm-md-live .lp-fence-chrome": { color: "var(--muted)", opacity: "0.75" },
 
   "&.cm-md-live .lp-inline-code": {
