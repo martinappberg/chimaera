@@ -1559,8 +1559,8 @@
     border: none;
     outline: none;
     background: none;
-    font-family: var(--name-font);
-    font-size: var(--text-md);
+    font-family: var(--file-font);
+    font-size: var(--text-sm);
     color: var(--fg);
     padding: 1px 0;
   }
@@ -1752,8 +1752,8 @@
   }
 
   .node-name {
-    font-family: var(--name-font);
-    font-size: var(--text-md);
+    font-family: var(--file-font);
+    font-size: var(--text-sm);
     color: var(--fg);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1766,8 +1766,8 @@
   .edit-input {
     flex: 1;
     min-width: 0;
-    font-family: var(--name-font);
-    font-size: var(--text-md);
+    font-family: var(--file-font);
+    font-size: var(--text-sm);
     color: var(--fg);
     background: var(--bg);
     border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--edge));

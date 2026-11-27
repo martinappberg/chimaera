@@ -27,19 +27,20 @@ color values are only the no-JS fallback.
   (body text). `lib/settings/store.svelte.ts:351-355` derives them from
   `appearance.interfaceFontSize` (11–18 px, default 13.5). Do not hard-code a
   chrome font size. Chat, terminal and editor have their own size settings.
-- Use `--ui-font`, `--name-font`, `--mono` and `--editor-font` for type
-  faces. A name a person reads (a session or tab title, a file name in the
-  tree, an agent's name) is `--name-font`; `--mono` is for what is literally
-  code or terminal text (commands, paths in prose, hashes, counts that must
-  align).
+- Use `--ui-font`, `--name-font`, `--file-font`, `--mono` and
+  `--editor-font` for type faces. A title a person reads (a session, a view's
+  tab, an agent's name) is `--name-font`; a file's name, in the tree and on
+  its tab, is `--file-font` (the terminal's face); `--mono` is for what is
+  literally code or terminal text (commands, paths in prose, hashes, counts
+  that must align).
 - Label a section in its own case: the rail's lowercase labels, a page's
   sentence-case heads (the dashboard's `.lbl`). No tracked capitals.
 - Markdown reads the same on every surface: the chat transcript
   (`chat/Markdown.svelte`), the reading and live document views
   (`previews/MarkdownView.svelte`, `previews/mdLive.ts`), notebooks, hover
   previews and published pages (`previews/doc/publishCss.ts`) share one
-  recipe for quotes (a margin rule, no fill), markers (bullets in ink,
-  numbers in `--accent-text`) and tables (ruled rows, `app.css` "Markdown
+  recipe for quotes (a margin rule, no fill), markers (bullets in a quiet
+  accent, numbers in `--accent-text`) and tables (ruled rows, `app.css` "Markdown
   tables"). Change one, change them all.
 - Use `--radius-card`, `--composer-radius`, `--overlay-radius`,
   `--overlay-shadow` and `--hover-tint` for surfaces; `--pane-tab-height`, `--pane-toolbar-height` and

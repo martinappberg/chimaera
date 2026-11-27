@@ -2422,10 +2422,10 @@
     margin: 0.2em 0;
   }
 
-  /* A bullet is punctuation and stays in the text's ink; a numbered step
-     keeps the accent (chat/Markdown.svelte). */
+  /* Markers carry the accent, quiet for a bullet and at text strength for a
+     numbered step (chat/Markdown.svelte). */
   .md-view :global(.md-doc ul > li)::marker {
-    color: color-mix(in srgb, var(--fg) 42%, transparent);
+    color: color-mix(in srgb, var(--accent) 70%, var(--muted));
   }
   .md-view :global(.md-doc ol > li)::marker {
     color: var(--accent-text);

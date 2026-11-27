@@ -1047,7 +1047,7 @@
   }
 
   .nb-md :global(ul > li)::marker {
-    color: color-mix(in srgb, var(--fg) 42%, transparent);
+    color: color-mix(in srgb, var(--accent) 70%, var(--muted));
   }
   .nb-md :global(ol > li)::marker {
     color: var(--accent-text);

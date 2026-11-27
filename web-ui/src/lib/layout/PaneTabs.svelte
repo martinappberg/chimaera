@@ -971,6 +971,7 @@
             <span
               class="tab-name"
               class:preview={isPreviewTab(tab)}
+              class:file={tab.surface === "file"}
               class:unread
               data-label={label(tab)}
               style:color={fDeco ? fDeco.color : undefined}>{label(tab)}</span
@@ -1579,6 +1580,12 @@
   }
 
   /* A VS Code preview tab: italic until it is pinned (dbl-click / edit). */
+  /* A file's tab is its file name (app.css --file-font); a session's or a
+     view's is a title. */
+  .tab-name.file {
+    font-family: var(--file-font);
+    font-size: var(--text-xs);
+  }
   .tab-name.preview {
     font-style: italic;
   }

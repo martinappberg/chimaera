@@ -1246,10 +1246,11 @@
   .md :global(li > :is(ul, ol)) {
     margin: 0.3em 0;
   }
-  /* Markers stay in the text's ink: a bullet is punctuation. Only a
-     numbered step keeps the accent, where the number is the content. */
+  /* Markers carry the accent, quietened for a bullet and at text strength
+     for a numbered step, where the number is content: the one place the
+     house colour runs through an agent's prose. */
   .md :global(ul > li)::marker {
-    color: color-mix(in srgb, var(--fg) 42%, transparent);
+    color: color-mix(in srgb, var(--accent) 70%, var(--muted));
   }
   .md :global(ol > li)::marker {
     color: var(--accent-text);

@@ -285,7 +285,7 @@
   }
 
   .standalone .hp-content :global(.md-doc ul > li::marker) {
-    color: color-mix(in srgb, var(--fg) 42%, transparent);
+    color: color-mix(in srgb, var(--accent) 70%, var(--muted));
   }
   .standalone .hp-content :global(.md-doc ol > li::marker) {
     color: var(--accent-text);

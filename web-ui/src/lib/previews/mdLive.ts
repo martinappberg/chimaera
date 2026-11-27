@@ -1450,7 +1450,7 @@ const liveTheme: Extension = EditorView.theme({
   "&.cm-md-live .lp-table": { whiteSpace: "pre" },
 
   "&.cm-md-live .lp-bullet": {
-    color: "color-mix(in srgb, var(--fg) 42%, transparent)",
+    color: "color-mix(in srgb, var(--accent) 70%, var(--muted))",
   },
   "&.cm-md-live .lp-hr": {
     display: "inline-block",

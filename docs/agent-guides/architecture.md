@@ -389,8 +389,8 @@ focus-mode exactly.
 CDN, embedded in the binary like everything else) instead of the system ui-monospace default,
 and the same face is used for the UI's monospace accents (commands, paths in prose, hashes,
 counts that must align), so terminal content and chrome share typographic DNA instead of
-feeling like two applications. Names people read (session and tab titles, file names in the
-tree, the agent's name) are set in the interface face through `--name-font` (`app.css`).
+feeling like two applications. Titles people read (sessions, view tabs, the agent's name) are set in the interface face
+through `--name-font`; file names keep the mono through `--file-font` (`app.css`).
 
 ### Interaction model: naming, orientation, navigation
 

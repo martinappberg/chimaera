@@ -144,7 +144,7 @@
   const linkedTerminals = $derived(terminals.filter((t) => t.linkedAgentId === sessionId));
   /** One line of the default text inside the card's padding (the CSS
    *  `min-height` of the textarea). */
-  const COMPOSER_MIN_HEIGHT = 50;
+  const COMPOSER_MIN_HEIGHT = 44;
   const COMPOSER_MAX_HEIGHT = 352;
 
   // The parent keys ChatView (and so this composer) per session — one
@@ -512,7 +512,7 @@
       : dictationParts(dictating.before, dictating.after, dictation.finals, dictation.interim),
   );
   /** Right padding for the stop button, send button and waveform. */
-  const DICTATING_PAD = 122;
+  const DICTATING_PAD = 100;
 
   // The draft follows the words. Reads the transcript, writes only `draft`.
   $effect(() => {
@@ -1603,18 +1603,18 @@
     font: inherit;
     font-size: var(--text-md);
     line-height: var(--chat-line-height, 1.45);
-    padding: 12px 50px 12px 16px; /* right clears the 30px action button */
-    min-height: 50px;
+    padding: 9px 42px 9px 14px; /* right clears the 26px action button */
+    min-height: 44px;
     max-height: min(42vh, 22rem);
     overflow-y: auto;
     outline: none;
     box-sizing: border-box;
     transition: border-color 0.12s ease;
   }
-  /* The field is focused most of the time it is on screen, so focus deepens
-     its edge in the text's own ink instead of lighting it in the accent. */
+  /* Focus warms the edge toward the accent, a step below the action
+     button's: the field is focused most of the time it is on screen. */
   textarea:focus {
-    border-color: color-mix(in srgb, var(--fg) 26%, var(--edge));
+    border-color: color-mix(in srgb, var(--accent) 42%, var(--edge));
   }
   /* The hint in the empty box: the theme's muted ink, not the browser's
      default grey, so both curated themes hold. */
@@ -1624,19 +1624,19 @@
   }
   /* Room for the mic beside the action button. */
   textarea.voice {
-    padding-right: 86px;
+    padding-right: 70px;
   }
   /* Dictating: the textarea keeps the text (so its size, wrapping and scroll
      are the real ones) but draws none of it; .ghost draws it instead, with
      the spoken words dimmed. Every box and font property must match. */
   textarea.dictating {
-    padding-right: 122px; /* DICTATING_PAD: stop + send + waveform */
+    padding-right: 100px; /* DICTATING_PAD: stop + send + waveform */
     color: transparent;
     caret-color: transparent;
   }
   textarea.mod-decorated { color: transparent; caret-color: var(--fg); }
-  .ghost.mod-decoration { padding-right: 50px; }
-  textarea.voice ~ .ghost.mod-decoration { padding-right: 86px; }
+  .ghost.mod-decoration { padding-right: 42px; }
+  textarea.voice ~ .ghost.mod-decoration { padding-right: 70px; }
   .ghost {
     position: absolute;
     inset: 0;
@@ -1644,7 +1644,7 @@
     pointer-events: none;
     box-sizing: border-box;
     border: 1px solid transparent;
-    padding: 12px 122px 12px 16px;
+    padding: 9px 100px 9px 14px;
     font: inherit;
     font-size: var(--text-md);
     line-height: var(--chat-line-height, 1.45);
@@ -1661,8 +1661,8 @@
   }
   .meter-slot {
     position: absolute;
-    right: 86px;
-    bottom: 16px;
+    right: 71px;
+    bottom: 13px;
     z-index: 2;
     display: inline-flex;
     pointer-events: auto;
@@ -1673,53 +1673,56 @@
   /* Bottom-anchored so it stays put while the textarea autosizes upward. */
   .action {
     position: absolute;
-    right: 10px;
-    bottom: 10px;
-    width: 30px;
-    height: 30px;
+    right: 8px;
+    bottom: 8px;
+    width: 28px;
+    height: 28px;
     box-sizing: border-box;
     display: inline-flex;
     align-items: center;
     justify-content: center;
     padding: 0;
     border: 1px solid transparent;
-    border-radius: 999px;
+    border-radius: 8px;
     cursor: pointer;
     transition:
       color 0.12s ease,
       background-color 0.12s ease,
       border-color 0.12s ease;
   }
-  /* Send is the one solid control in the pane: the text's ink as a disc, the
-     sheet's colour as the arrow. Ink and sheet contrast on every theme by
-     construction, which no accent does (there is no on-accent token). With
-     nothing to send it is a quiet disc that reads as not-yet. */
+  /* The workbench's active-accent treatment (.chip.on / UpdateToast .primary):
+     tinted, not solid — there is no on-accent token, and the composer is quiet
+     chrome. The accent here is the house mark on the card. */
   .send {
-    background: var(--fg);
-    color: var(--overlay-bg);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
+    color: var(--accent);
   }
   .send:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--fg) 84%, var(--overlay-bg));
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+    border-color: var(--accent);
   }
   .send:disabled {
-    background: color-mix(in srgb, var(--fg) 9%, transparent);
-    color: color-mix(in srgb, var(--fg) 38%, transparent);
+    background: none;
+    border-color: color-mix(in srgb, var(--edge) 70%, transparent);
+    color: var(--muted);
+    opacity: 0.55;
     cursor: default;
   }
   /* Quiet until recording: then it takes the recording red. */
   .mic {
     position: absolute;
-    right: 46px;
-    bottom: 10px;
-    width: 30px;
-    height: 30px;
+    right: 40px;
+    bottom: 8px;
+    width: 28px;
+    height: 28px;
     box-sizing: border-box;
     display: inline-flex;
     align-items: center;
     justify-content: center;
     padding: 0;
     border: 1px solid transparent;
-    border-radius: 999px;
+    border-radius: 8px;
     background: none;
     color: var(--muted);
     cursor: pointer;
@@ -1741,11 +1744,10 @@
     cursor: default;
     opacity: 0.6;
   }
-  /* Stop is send's other face: the same ink disc, a square for the arrow.
-     The breathing halo around it is what says the agent is working. */
   .stop {
-    background: var(--fg);
-    color: var(--overlay-bg);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
+    color: var(--accent);
   }
   /* Faint breathing ring while the agent works — presence, not alarm. A
      STATIC halo on a pseudo-element breathed via opacity: animating
@@ -1754,9 +1756,9 @@
     content: "";
     position: absolute;
     inset: -1px;
-    border-radius: 999px; /* .action's disc, outside its 1px border */
+    border-radius: 9px; /* .action's 8px, outside its 1px border */
     pointer-events: none;
-    box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 22%, transparent);
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 8%, transparent);
     opacity: 0;
     animation: stop-breathe 1.8s ease-in-out infinite;
   }
@@ -1769,7 +1771,8 @@
     animation-play-state: paused;
   }
   .stop:hover {
-    background: color-mix(in srgb, var(--fg) 84%, var(--overlay-bg));
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+    border-color: var(--accent);
   }
   @keyframes stop-breathe {
     50% {
@@ -1779,14 +1782,16 @@
   /* Waiting for the second press: the stop takes the warning tone, so the
      button the note points at is the one that confirms. */
   .stop.armed {
-    color: var(--overlay-bg);
-    background: var(--warn);
+    color: var(--warn);
+    background: color-mix(in srgb, var(--warn) 14%, transparent);
+    border-color: color-mix(in srgb, var(--warn) 60%, var(--edge));
   }
   .stop.armed:hover {
-    background: color-mix(in srgb, var(--warn) 86%, var(--fg));
+    background: color-mix(in srgb, var(--warn) 22%, transparent);
+    border-color: var(--warn);
   }
   .stop.armed::after {
-    box-shadow: 0 0 0 4px color-mix(in srgb, var(--warn) 26%, transparent);
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--warn) 14%, transparent);
   }
   @media (prefers-reduced-motion: reduce) {
     .stop::after {
