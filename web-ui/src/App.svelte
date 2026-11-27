@@ -267,7 +267,7 @@
     onAgentPluginsChanged,
     workspacePlugins,
   } from "./lib/plugins/store";
-  import { platformFrame, pluginViewTitle, setViewOpener } from "./lib/plugins/platform";
+  import { platformFrame, pluginViewTitle, setViewOpener, setWindowCopier } from "./lib/plugins/platform";
   import ExtensionsGlyph from "./lib/plugins/ExtensionsGlyph.svelte";
   import ComputeStrip from "./lib/workspace/ComputeStrip.svelte";
   import type JobWindowNotices from "./lib/workspace/JobWindowNotices.svelte";
@@ -1338,6 +1338,11 @@
       },
     });
     setViewOpener(openPluginViewSurface);
+    setWindowCopier((paneId) => {
+      const p = findPane(layout.root, paneId);
+      if (p === null || p.tabs[p.active] === undefined) return Promise.resolve(false);
+      return xw.copyTabToWindow(paneId, p.active);
+    });
     setSameFileOpener(openSess);
     setChatLinkContext(linkContext);
     // An agent named in a message: shown where it is already open, else
@@ -1508,6 +1513,7 @@
       setPathOpener(null);
       setFileHandleHost(null);
       setViewOpener(null);
+      setWindowCopier(null);
       setSameFileOpener(null);
       recentsRail.dispose();
       setChatLinkContext(null);

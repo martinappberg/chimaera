@@ -692,6 +692,25 @@ export function sizeWords(bytes: number): string {
   return `${n < 10 ? n.toFixed(1) : Math.round(n)} ${units[u]}`;
 }
 
+// --- a view's tab again in a new window ---------------------------------------
+
+type WindowCopier = (paneId: string) => Promise<boolean>;
+let windowCopier: WindowCopier | null = null;
+
+/** App-level wiring (the layout owns windows); null unregisters. */
+export function setWindowCopier(fn: WindowCopier | null): void {
+  windowCopier = fn;
+}
+
+/** Open the tab that holds `el` again in a new window, keeping it here (a
+ *  deck's show on the projector while the presenter's view stays). False
+ *  when nothing can, or the window did not open (the layer says why). */
+export function copyTabToWindow(el: Element): Promise<boolean> {
+  const paneId = el.closest("[data-pane-id]")?.getAttribute("data-pane-id");
+  if (paneId == null || windowCopier === null) return Promise.resolve(false);
+  return windowCopier(paneId);
+}
+
 // --- opening a plugin's tab view --------------------------------------------
 
 type ViewOpener = (plugin: string, view: string) => void;

@@ -879,7 +879,7 @@ daemon log).
 | `file` | **`path`** (a workspace path or `output:<path>`), `label`, `line` — a card that opens it |
 | `link` | **`text`**; `href` (http/https, opens outside) or `file` + `line` |
 | `image` | **`src`**, **`alt`** |
-| `slides` | **`slides`**: `[{title, builds: [{src, notes?, clip?}], hidden?, notes?, file?, line?, tag?}]` (a build is a picture: a workspace path or `output:<path>`; ≤ 600 slides, 40 builds each; a build's `clip` `{src, loop?, auto?, rate?}` is the video that ends on that picture: the show plays it when a click moves on to the build and holds its last frame, `loop` plays it round until the next click, `auto` moves on when it ends); `id` (names the deck: two windows on it keep step in a show), `start` (the title of the slide to open on, the first of that title when titles repeat; a new `startKey` opens on it again, for a "show this slide" action), `width` + `height` (the slides' shape, 16:9 without), `label` — a deck of pictures you rendered, in the app's slide viewer: the picture in the image viewer (zoom, the area tool that points an agent at part of a slide), a thumbnail strip, keys that walk a slide's builds and then the slides, **@** (the slide's `file` and `line` to an agent), **present** (full screen, a click a build, `hidden` slides skipped) and **presenter** (this slide, the next click, the notes, a timer). Paging is the viewer's own: no action comes back to you. It keeps its place by `title` when you draw again |
+| `slides` | **`slides`**: `[{title, builds: [{src, notes?, clip?}], hidden?, notes?, file?, line?, tag?}]` (a build is a picture: a workspace path or `output:<path>`; ≤ 600 slides, 40 builds each; a build's `clip` `{src, loop?, auto?, rate?}` is the video that ends on that picture: the show plays it when a click moves on to the build and holds its last frame, `loop` plays it round until the next click, `auto` moves on when it ends); `id` (names the deck: two windows on it keep step in a show), `start` (the title of the slide to open on, the first of that title when titles repeat; a new `startKey` opens on it again, for a "show this slide" action), `width` + `height` (the slides' shape, 16:9 without), `label` — a deck of pictures you rendered, in the app's slide viewer: the picture in the image viewer (zoom, the area tool that points an agent at part of a slide), a thumbnail strip, keys that walk a slide's builds and then the slides, **@** (the slide's `file` and `line` to an agent), **present** (full screen, a click a build, `hidden` slides skipped; each picture swaps in once decoded and a clip shows from its first frame, so a click never flashes) and **presenter** (this slide, the next click, the notes, a timer, a strip of every slide, hidden ones too, that jumps the show; **show in window** opens the show in a new window that follows it, for the projector). Paging is the viewer's own: no action comes back to you. It keeps its place by `title` when you draw again |
 | `button` | **`label`**, **`action`**, `payload`, `tone`, `icon`, `disabled`, `title` (its tooltip) |
 | `toggle` | **`label`**, **`name`**, `value`, `action` (sends `{value}` beside the payload) |
 | `select` | **`label`**, **`name`**, **`options`** (`[{value, label}]` or strings), `value`, `action` |
@@ -905,9 +905,12 @@ done).
 
 Where a view draws: `tab` (its own tab: the card's **Open**, `open-view`, a file
 action's `open`), `panel` (the dashboard, after core's sections), `file` (a
-claimed file; the view owns the pane: the root stack's last child grows to its
-height, and an `editor` or `pdf` first in a split pane, a stack or a tab fills
-it — an embedded viewer shows no path bar), `status` (a chip in a claimed file's bar), `card` (inside its
+claimed file; the view owns the pane: the screen is at least the pane's height,
+the root stack's last child takes what is left, and an `editor` or `pdf` first
+in a split pane, a stack or a tab fills it; a root whose last child is a split
+is exactly the pane's height, the split side by side one row whose sides
+scroll on their own (stacked, the split scrolls), so a long list beside a
+viewer never stretches it — an embedded viewer shows no path bar), `status` (a chip in a claimed file's bar), `card` (inside its
 Extensions card). Any other view takes the same layout when its tree says
 `"fill": true` beside `ui` and `root` (a tab whose split puts an `image`, `slides` or `pdf`
 first in a pane: the PowerPoint plugin's Slides and Themes); otherwise a viewer

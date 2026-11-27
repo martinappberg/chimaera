@@ -34,9 +34,13 @@
 
   interface Props {
     path: string;
+    /** Pixel inspection: blocky scaling past 1:1 and a grid past 8×. Off for
+     *  a picture that stands for something drawn (a rendered slide), which
+     *  stays smooth however far it is zoomed. */
+    pixels?: boolean;
   }
 
-  let { path }: Props = $props();
+  let { path, pixels = true }: Props = $props();
 
   const MIN_SCALE = 0.05;
   const MAX_SCALE = 64;
@@ -61,7 +65,7 @@
   const isSvg = $derived(innerExtension(path) === "svg");
   const pct = $derived(Math.round(scale * 100));
   /** Pixel grid only helps for raster pixels; SVG stays vector-crisp. */
-  const showGrid = $derived(!isSvg && scale >= GRID_SCALE && natural !== null);
+  const showGrid = $derived(pixels && !isSvg && scale >= GRID_SCALE && natural !== null);
 
   // The ticketed /raw/ URL comes from the shared store: cached across a tab
   // switch (no re-mint), and re-minted in place when the file changes on disk.
@@ -531,7 +535,7 @@
         bind:this={imgEl}
         src={url}
         alt={path}
-        class:pixelated={!isSvg && scale > 1}
+        class:pixelated={pixels && !isSvg && scale > 1}
         class:measuring={natural === null}
         style:width={natural !== null ? `${natural.w * scale}px` : undefined}
         style:height={natural !== null ? `${natural.h * scale}px` : undefined}
