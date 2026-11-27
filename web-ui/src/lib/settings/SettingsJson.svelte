@@ -29,6 +29,7 @@
   import { expectedType, sanitize, settingDef, SETTINGS } from "./schema";
   import { getSetting, rawUserSettings, replaceSettings } from "./store.svelte";
   import { isMac } from "../shared/keys";
+  import { codeWrap } from "../previews/wrap";
 
   const SAVE_HINT = isMac ? "⌘S to save" : "Ctrl+S to save";
 
@@ -166,7 +167,7 @@
     return [
       makeTheme(),
       getSetting("editor.lineNumbers") ? lineNumbers() : [],
-      getSetting("editor.wordWrap") ? EditorView.lineWrapping : [],
+      codeWrap(getSetting("editor.wordWrap")),
       EditorState.tabSize.of(tabSize),
       indentUnit.of(" ".repeat(tabSize)),
     ];

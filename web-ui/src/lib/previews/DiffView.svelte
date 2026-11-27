@@ -19,6 +19,7 @@
   import { syntaxHighlighting } from "@codemirror/language";
   import { languageFor } from "./languages";
   import { codeHighlight, makeCodeTheme } from "./cm";
+  import { codeWrap } from "./wrap";
   import { fetchGitDiff, gitRepoStatuses, gitStatus, type DiffMode, type GitDiff } from "../workspace/git";
   import { basename } from "./files";
   import { getSetting } from "../settings/store.svelte";
@@ -97,7 +98,7 @@
     return [
       makeCodeTheme(getSetting("editor.fontSize"), getSetting("editor.lineHeight")),
       getSetting("editor.lineNumbers") ? lineNumbers() : [],
-      getSetting("editor.wordWrap") ? EditorView.lineWrapping : [],
+      codeWrap(getSetting("editor.wordWrap")),
       EditorState.tabSize.of(tabSize),
     ];
   }

@@ -53,6 +53,7 @@ import {
 } from "@codemirror/state";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { languageNamed } from "./languages";
+import { ownLineLayout } from "./wrap";
 import type { SyntaxNode, SyntaxNodeRef, Tree } from "@lezer/common";
 import { lastRawTicketUrl, rawTicketUrl, resolveDocPath, safeDecodeUri } from "./files";
 import { placeOffset } from "./mdDoc";
@@ -1641,6 +1642,7 @@ export function markdownLive(
 ): Extension {
   return [
     EditorView.lineWrapping,
+    ownLineLayout.of(true),
     EditorView.editorAttributes.of({ class: "cm-md-live" }),
     docPath.of(path),
     linkContext.of(links),

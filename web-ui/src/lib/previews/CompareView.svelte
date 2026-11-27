@@ -16,6 +16,7 @@
   import { syntaxHighlighting } from "@codemirror/language";
   import { languageFor } from "./languages";
   import { codeHighlight, makeCodeTheme } from "./cm";
+  import { codeWrap } from "./wrap";
   import { getSetting } from "../settings/store.svelte";
 
   interface Props {
@@ -40,7 +41,7 @@
       syntaxHighlighting(codeHighlight, { fallback: true }),
       makeCodeTheme(getSetting("editor.fontSize"), getSetting("editor.lineHeight")),
       getSetting("editor.lineNumbers") ? lineNumbers() : [],
-      getSetting("editor.wordWrap") ? EditorView.lineWrapping : [],
+      codeWrap(getSetting("editor.wordWrap")),
       EditorState.tabSize.of(getSetting("editor.tabSize")),
       EditorState.readOnly.of(true),
       EditorView.editable.of(false),

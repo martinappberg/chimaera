@@ -33,6 +33,7 @@
     REVEAL_FLASH_MS,
   } from "./cm";
   import { humanSize, type FileChunk } from "./files";
+  import { codeWrap } from "./wrap";
   import { openBuffer, releaseBuffer, presence } from "./buffers.svelte";
   import { getSetting } from "../settings/store.svelte";
   import { isMac } from "../shared/keys";
@@ -172,7 +173,7 @@
     return [
       makeTheme(getSetting("editor.fontSize"), getSetting("editor.lineHeight")),
       getSetting("editor.lineNumbers") ? lineNumbers() : [],
-      getSetting("editor.wordWrap") ? EditorView.lineWrapping : [],
+      codeWrap(getSetting("editor.wordWrap")),
       EditorState.tabSize.of(tabSize),
       indentUnit.of(" ".repeat(tabSize)),
     ];

@@ -213,7 +213,10 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   decompressed bytes). `PUT /api/v1/fs/file?path=&expect_hash=` (or `expect_mtime=` against a
   daemon that never sent a hash) writes atomically. Cmd/Ctrl+S saves; Mod-f searches (every
   editor, read-only ones too); the **Autosave** setting (`editor.autosave` off | after a delay,
-  `editor.autosaveDelay`) saves after idle typing and on blur / tab switch.
+  `editor.autosaveDelay`) saves after idle typing and on blur / tab switch. **Word Wrap**
+  (`editor.wordWrap`, on by default) wraps long lines to the pane in every CodeMirror surface (the
+  editor, diffs, comparisons, the settings JSON); a wrapped line's continuation rows hang under its
+  own indentation, up to half the pane width (`previews/wrap.ts`). Markdown live always wraps.
 - **Where it lives.** `fs.rs` (`file`/`read_file_response`/`read_gz_slice`, `put_file`/
   `write_file_atomic`); UI `previews/buffers.svelte.ts` (the buffer store), `CodeView.svelte` (a
   view onto a buffer) + `cm.ts`, `textCodec.ts` (byte fidelity), `merge.ts` (three-way merge over
