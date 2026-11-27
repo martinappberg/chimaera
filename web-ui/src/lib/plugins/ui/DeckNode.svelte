@@ -100,10 +100,9 @@
     }
   }
 
-  /** The build whose clip is on screen (playing, or held on its last
-   *  frame), and the picture that was there before it, kept under the video
-   *  until its first frame is drawn. */
-  /** A clip being played; `n` tells one play from the next of the same build. */
+  /** The clip being played where the show stands (or ended there, its last
+   *  frame held), and the picture that was there before it; `n` tells one
+   *  play from the next of the same build. */
   let playing = $state<{ n: number; slide: number; build: number; under: string | null; ended: boolean } | null>(null);
   let plays = 0;
 
@@ -428,8 +427,11 @@
     }
     const ls = layers;
     if (ls.length === 0) return;
+    // A play is current only while it is where the show stands and its clip
+    // is still the deck's (a re-render can move the place or the file).
     const n = playing?.n;
-    const cur = n === undefined ? -1 : ls.findIndex((l) => l.n === n);
+    const src = clip?.src;
+    const cur = n === undefined || src === undefined ? -1 : ls.findIndex((l) => l.n === n && l.src === src);
     let keep: Layer[];
     if (cur >= 0) {
       const top = ls[cur] as Layer;
@@ -442,7 +444,7 @@
     if (keep.length !== ls.length || keep.some((l, i) => l !== ls[i])) layers = keep;
   });
 
-  const isCurrent = (l: Layer): boolean => playing !== null && playing.n === l.n;
+  const isCurrent = (l: Layer): boolean => playing !== null && playing.n === l.n && clip?.src === l.src;
 
   function layerReady(e: Event, l: Layer): void {
     const v = e.currentTarget as HTMLVideoElement;
@@ -465,6 +467,7 @@
 
   function layerFailed(l: Layer): void {
     if (isCurrent(l)) playing = null;
+    else layers = layers.filter((x) => x.id !== l.id);
     broken(l.src);
   }
   // The presenter's panels draw pictures smaller than the show and the
@@ -847,7 +850,7 @@
           <p class="none bad">{pictureError}</p>
         {:else if build === undefined}
           <p class="none">{slide?.title} has no picture.</p>
-        {:else if clip !== null && urls[clip.src] !== undefined}
+        {:else if mode === "browse" && clip !== null && urls[clip.src] !== undefined}
           {#key clip.src}
             <!-- svelte-ignore a11y_media_has_caption — a slide's animation: silent, and its picture carries the alt text -->
             <video class="clip" src={urls[clip.src]} muted playsinline aria-label={pictureAlt} onloadeddata={clipReady} onended={clipEnded} onerror={() => clipFailed(clip.src)}></video>
