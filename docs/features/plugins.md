@@ -693,7 +693,9 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     opened after it takes it) while this one becomes the presenter's view once the window is open; two windows on a deck keep step while either is in the show: the
     show on the projector, the presenter's view on the laptop. A show swaps a picture in only
     once it is decoded (the next click's is decoded ahead) and draws a clip from its first
-    frame, so a click never flashes black. Browsing's image viewer draws a slide smoothly at
+    frame, so a click never flashes black. Clicks closer together than 0.4 s flick through: each
+    lands on its build's finished picture, the pictures a few clicks on are fetched ahead, and a
+    click after a pause plays its animation again (as in Keynote). Browsing's image viewer draws a slide smoothly at
     any zoom (no pixel grid). Paging never calls the
     plugin; the place survives a re-render by the slide's title. A build may carry a `clip`
     (its animation, a video ending on its picture): the show plays it when a click moves on to

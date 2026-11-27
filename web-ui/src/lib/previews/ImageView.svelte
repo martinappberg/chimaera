@@ -38,9 +38,15 @@
      *  a picture that stands for something drawn (a rendered slide), which
      *  stays smooth however far it is zoomed. */
     pixels?: boolean;
+    /** The picture's URL, minted and decoded by the host (a deck paging
+     *  through its slides): swapped in place, with no ticket or disk watch of
+     *  its own. `onbroken` asks the host for a fresh one. */
+    src?: string;
+    onbroken?: () => void;
   }
 
-  let { path, pixels = true }: Props = $props();
+  let { path, pixels = true, src, onbroken }: Props = $props();
+  const hosted = $derived(src !== undefined);
 
   const MIN_SCALE = 0.05;
   const MAX_SCALE = 64;
@@ -73,12 +79,18 @@
   // ticket; the store sync below feeds them and clears a stale error on re-mint.
   let entry = $state<FileEntry | null>(null);
   $effect(() => {
+    if (hosted) return;
     const e = retain(path);
     entry = e;
     void e.ensureRawUrl();
     return () => release(path);
   });
   $effect(() => {
+    if (src !== undefined) {
+      url = src;
+      error = null;
+      return;
+    }
     const e = entry;
     if (e === null) return;
     if (e.rawUrl !== null) {
@@ -541,7 +553,10 @@
         style:height={natural !== null ? `${natural.h * scale}px` : undefined}
         style:transform={natural !== null ? `translate(${tx}px, ${ty}px)` : undefined}
         onload={onLoad}
-        onerror={() => (error = "image failed to load (ticket may have expired — reopen the tab)")}
+        onerror={() => {
+          if (onbroken !== undefined) onbroken();
+          else error = "image failed to load (ticket may have expired — reopen the tab)";
+        }}
         draggable="false"
       />
       {#if showGrid && natural !== null}

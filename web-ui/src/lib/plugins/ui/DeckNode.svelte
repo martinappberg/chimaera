@@ -105,7 +105,19 @@
    *  until its first frame is drawn. */
   let playing = $state<{ slide: number; build: number; under: string | null; ended: boolean } | null>(null);
 
+  /** Clicks closer together than this flick through the show: each lands on
+   *  its build's finished picture, as in Keynote and PowerPoint, instead of
+   *  starting an animation the next click cuts off. A click after a pause
+   *  plays its animation again. */
+  const FLICK_MS = 400;
+  let lastClick = 0;
+
   function go(place: Place, tell = true, animate = false): void {
+    if (animate) {
+      const t = performance.now();
+      if (t - lastClick < FLICK_MS) animate = false;
+      lastClick = t;
+    }
     const next = clampPlace(slides, place);
     const under = build?.src ?? null;
     const moved = next.slide !== at.slide || next.build !== at.build;
@@ -261,6 +273,19 @@
   });
 
   const nextBuild = $derived(nextPlace === null ? undefined : slides[nextPlace.slide]?.builds[nextPlace.build]);
+  const AHEAD = 6;
+  const ahead = $derived.by(() => {
+    const out: string[] = [];
+    let p: Place = at;
+    for (let i = 0; i < AHEAD; i++) {
+      const n = deckStep(buildCounts, hidden, p, 1, inShow);
+      if (n.slide === p.slide && n.build === p.build) break;
+      const src = slides[n.slide]?.builds[n.build]?.src;
+      if (src !== undefined) out.push(src);
+      p = n;
+    }
+    return out;
+  });
   $effect(() => {
     pictureError = null;
     want(build?.src);
@@ -268,6 +293,9 @@
     // The next click's picture is in the cache before it is asked for.
     want(nextBuild?.src);
     want(nextBuild?.clip?.src);
+    // A run of clicks outruns one: the pictures a few clicks on are minted
+    // too (a flick lands on pictures, not clips).
+    for (const src of ahead) want(src);
   });
 
   // Entries for builds the deck no longer has go with them.
@@ -308,21 +336,24 @@
     return hit.ready;
   }
 
-  /** `want()`'s URL for a picture, swapped in only once it is decoded: until
-   *  then the picture before it stays on screen. */
-  function steady(get: () => string | null): { readonly url: string | null } {
-    let shown = $state<string | null>(null);
+  /** A build's picture, swapped in only once its URL is minted and the
+   *  picture decoded: until then the picture before it stays on screen, so
+   *  a fast run of clicks never shows a blank frame or a half-drawn one. */
+  function steady(get: () => string | null): { readonly url: string | null; readonly src: string | null } {
+    let shown = $state<{ src: string; url: string } | null>(null);
     $effect(() => {
-      const url = get();
-      if (url === null) {
+      const src = get();
+      if (src === null) {
         // Out of the show (or a clip with nothing under it): a later show
         // must not open on the picture this one ended on.
         shown = null;
         return;
       }
+      const url = urls[src];
+      if (url === undefined || untrack(() => shown?.url) === url) return;
       let live = true;
       void decode(url).then(() => {
-        if (live && !disposed) shown = url;
+        if (live && !disposed) shown = { src, url };
       });
       return () => {
         live = false;
@@ -330,7 +361,10 @@
     });
     return {
       get url() {
-        return shown;
+        return shown?.url ?? null;
+      },
+      get src() {
+        return shown?.src ?? null;
       },
     };
   }
@@ -338,17 +372,20 @@
   /** The show's picture: under a clip that is still playing, the picture
    *  that was there before it. */
   const still = $derived(build === undefined ? null : clip !== null && playing !== null && !playing.ended ? playing.under : build.src);
-  const showPicture = steady(() => (mode === "present" && still !== null ? (urls[still] ?? null) : null));
-  const nowPicture = steady(() => (mode === "presenter" && build !== undefined ? (urls[build.src] ?? null) : null));
-  const nextPicture = steady(() => (mode === "presenter" && nextBuild !== undefined ? (urls[nextBuild.src] ?? null) : null));
+  const showPicture = steady(() => (mode === "present" ? still : null));
+  const nowPicture = steady(() => (mode === "presenter" && build !== undefined ? build.src : null));
+  const nextPicture = steady(() => (mode === "presenter" && nextBuild !== undefined ? nextBuild.src : null));
+  // Browsing's viewer is handed the deck's own decoded picture: a run of
+  // arrow keys swaps it in place, never a fresh ticket and load per slide.
+  const browsePicture = steady(() => (mode === "browse" && build !== undefined ? build.src : null));
   // The next click's picture is decoded before the click.
   $effect(() => {
-    if (mode === "browse" || nextBuild === undefined) return;
+    if (nextBuild === undefined) return;
     const url = urls[nextBuild.src];
     if (url !== undefined) void decode(url);
   });
 
-  let ImageView = $state<Component<{ path: string; pixels?: boolean }> | null>(null);
+  let ImageView = $state<Component<{ path: string; src?: string; pixels?: boolean; onbroken?: () => void }> | null>(null);
   $effect(() => {
     if (ImageView === null && mode === "browse") {
       void import("../../previews/ImageView.svelte").then((m) => (ImageView = m.default));
@@ -719,8 +756,9 @@
             <!-- svelte-ignore a11y_media_has_caption — a slide's animation: silent, and its picture carries the alt text -->
             <video class="clip" src={urls[clip.src]} muted playsinline aria-label={pictureAlt} onloadeddata={clipReady} onended={clipEnded} onerror={() => clipFailed(clip.src)}></video>
           {/key}
-        {:else if ImageView !== null && paths[build.src] !== undefined}
-          <ImageView path={paths[build.src] ?? ""} pixels={false} />
+        {:else if ImageView !== null && browsePicture.src !== null && paths[browsePicture.src] !== undefined}
+          {@const src = browsePicture.src}
+          <ImageView path={paths[src] ?? ""} src={browsePicture.url ?? undefined} pixels={false} onbroken={() => broken(src)} />
         {/if}
       </div>
       {#if notes !== ""}
