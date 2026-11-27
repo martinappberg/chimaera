@@ -23,7 +23,7 @@
   /* The whole interface scale — four sizes, set live from
      appearance.interfaceFontSize. Content surfaces may override the scale
      locally (chat) or use their own pixel settings (terminal/editor).
-     xs: tabs/titles/strip/crumbs/badges · sm: mono names/hints ·
+     xs: titles/strip/crumbs/badges · sm: tabs/hints ·
      md: rows/buttons/inputs · lg: body/terminal. */
   --text-xs: 11.5px;
   --text-sm: 12.5px;
