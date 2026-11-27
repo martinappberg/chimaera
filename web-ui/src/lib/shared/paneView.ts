@@ -459,6 +459,39 @@ function drawn(el: Element): boolean {
 }
 
 /**
+ * Whether an overlay candidate floats over the workbench, from the CSS
+ * `position` of it and its two nearest ancestors (it first): out of flow
+ * itself, or inside a backdrop that is. Only that near — pane layers are
+ * absolutely positioned too, and an element in a pane's own flow is not
+ * an overlay. A modal's dialog box usually sits
+ * in normal flow inside its fixed backdrop (the SSH prompt's does), and was
+ * missed when only the dialog's own position counted, leaving the page's
+ * native view drawn over the prompt.
+ */
+export function floatsOver(positions: readonly string[]): boolean {
+  return positions.some((p) => p === "fixed" || p === "absolute");
+}
+
+/**
+ * Whether an overlay hides a view: a window modal (`aria-modal="true"`,
+ * which dims the whole window) hides every view — the page must not show
+ * through its backdrop — any other overlay only the views it meets.
+ */
+export function overlayHides(modal: boolean, meets: boolean): boolean {
+  return modal || meets;
+}
+
+/** The `position` of `el` and its two nearest ancestors (a modal's box,
+ *  its backdrop, at most a wrapper), never past `<body>`. */
+function positionsUp(el: Element): string[] {
+  const out: string[] = [];
+  for (let at: Element | null = el; at !== null && at !== document.body && out.length < 3; at = at.parentElement) {
+    out.push(getComputedStyle(at).position);
+  }
+  return out;
+}
+
+/**
  * Out-of-flow overlay elements outside `host`. The candidate list is
  * re-collected lazily after a DOM change that could add or drop one;
  * whether each is painted is read at check time (a layer parks by flipping
@@ -519,11 +552,15 @@ class OverlayWatch {
       this.dirty = false;
       this.found = [...document.querySelectorAll(OVERLAY_SELECTOR)].filter((el) => {
         if (this.host.contains(el) || el.contains(this.host)) return false;
-        const position = getComputedStyle(el).position;
-        return position === "fixed" || position === "absolute";
+        return floatsOver(positionsUp(el));
       });
     }
-    return this.found.some((el) => el.isConnected && intersects(el.getBoundingClientRect(), rect) && painted(el));
+    return this.found.some(
+      (el) =>
+        el.isConnected &&
+        overlayHides(el.getAttribute("aria-modal") === "true", intersects(el.getBoundingClientRect(), rect)) &&
+        painted(el),
+    );
   }
 
   stop(): void {
