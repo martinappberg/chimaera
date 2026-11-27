@@ -4180,6 +4180,8 @@
      is the boundary (the Claude Desktop treatment). */
   .chat > :global(.composer) {
     border-top: none;
+    /* Room for the card's shadow to fall before the pane's edge. */
+    padding-bottom: 14px;
   }
   /* The pinned cards (subagents, background, plan) keep their borders on
      the column's text edges and stack 6px apart. */
@@ -4258,13 +4260,15 @@
     flex-direction: column;
     align-items: flex-end;
     max-width: min(85%, 40rem);
-    margin-top: 14px;
-    margin-bottom: 6px;
+    /* A new turn starts here: the gap above a question is the widest in the
+       transcript, so turns separate at a glance while scrolling. */
+    margin-top: 22px;
+    margin-bottom: 8px;
   }
   .msg.user .bubble {
     background: color-mix(in srgb, var(--fg) 6%, transparent);
-    border-radius: 14px;
-    padding: 8px 14px;
+    border-radius: 18px;
+    padding: 9px 16px;
     max-width: 100%;
   }
   .attach {

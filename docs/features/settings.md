@@ -62,11 +62,11 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
   file tree, pane tabs, dashboard, settings, dialogs, Git, and preview chrome move together.
   `appearance.interfaceFontFamily` supplies the shared UI font stack. Small chrome uses those
   tokens rather than fixed rem/px sizes.
-- **Content surfaces stay independently legible.** Chat defaults to a 14 px base at line height
-  1.57 and overrides the shared scale within each `ChatView` (panes, the subagent read-only view,
+- **Content surfaces stay independently legible.** Chat defaults to a 15 px base at line height
+  1.6 and overrides the shared scale within each `ChatView` (panes, the subagent read-only view,
   and the dashboard's embedded Mastermind) and exposes font size/family and line height. Terminal
   keeps its xterm-specific font controls. Editor typography
-  covers code, diffs, and the JSON editor; rendered Markdown defaults to the same 14 px as Chat, so
+  covers code, diffs, and the JSON editor; rendered Markdown defaults to the same 15 px as Chat, so
   an agent's reply and the document it wrote read alike,
   but has its own font-size and line-height settings rather than borrowing `terminal.fontSize`.
   CodeMirror views reconfigure while mounted. Word Wrap (`editor.wordWrap`, on by default) applies

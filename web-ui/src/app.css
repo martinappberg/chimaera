@@ -41,6 +41,9 @@
      composer (plan, plan approval, agent messages, the pinned trays) —
      the composer's box too, so the stack reads as one family. */
   --radius-card: 8px;
+  /* The composer's card: softer than a transcript card, because it is the
+     one surface the user writes on rather than reads. */
+  --composer-radius: 16px;
   /* A floating surface's corners and shadow (menus, popovers, tooltips). */
   --overlay-radius: 8px;
   --overlay-shadow: 0 6px 24px rgba(0, 0, 0, 0.22);
@@ -218,10 +221,22 @@
   border-collapse: collapse;
   font-size: var(--md-table-font-size, 0.924em);
 }
+/* Ruled, not boxed: one hairline under each row and a firmer one under the
+   header, no verticals and no header fill — the numbers carry the table and
+   the page stays one surface. The first column starts on the prose's left
+   edge so a table reads as part of the text it sits in. */
 :is(.md, .md-body, .md-doc, .cm-md-live) table:not(:where(.embed-card *)) :is(th, td) {
-  border: 1px solid var(--edge);
-  padding: var(--md-table-cell-padding, 0.35em 0.7em);
+  border: none;
+  border-bottom: 1px solid color-mix(in srgb, var(--edge) 85%, transparent);
+  padding: var(--md-table-cell-padding, 0.5em 0.85em);
   text-align: left;
+  vertical-align: top;
+}
+:is(.md, .md-body, .md-doc, .cm-md-live) table:not(:where(.embed-card *)) :is(th, td):first-child {
+  padding-left: 0.15em;
+}
+:is(.md, .md-body, .md-doc, .cm-md-live) table:not(:where(.embed-card *)) tbody tr:last-child > td {
+  border-bottom-color: transparent;
 }
 :is(.md, .md-body, .md-doc, .cm-md-live) table:not(:where(.embed-card *)) :is(th, td)[align="center" i] {
   text-align: center;
@@ -231,7 +246,8 @@
 }
 :is(.md, .md-body, .md-doc, .cm-md-live) table:not(:where(.embed-card *)) th {
   font-weight: 600;
-  background: color-mix(in srgb, var(--fg) 4%, transparent);
+  vertical-align: bottom;
+  border-bottom-color: color-mix(in srgb, var(--fg) 22%, transparent);
 }
 :is(.md, .cm-md-live) .md-table table :is(th, td),
 :is(.md-body, .md-doc) table:not(:where(.embed-card *)) :is(th, td) {

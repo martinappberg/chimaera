@@ -440,7 +440,7 @@ const DEFS = {
     description:
       "The whole chat surface: transcript, composer, tool cards, trays and the dashboard's Mastermind.",
     type: "number",
-    default: 14,
+    default: 15,
     min: 11,
     max: 24,
     step: 0.5,
@@ -462,7 +462,7 @@ const DEFS = {
     category: "Chat",
     description: "Line height multiplier for messages and the composer.",
     type: "number",
-    default: 1.57,
+    default: 1.6,
     min: 1.2,
     max: 2.2,
     step: 0.01,
@@ -477,7 +477,8 @@ const DEFS = {
     description:
       "Width of the reading column in chat transcripts (composer included) and rendered Markdown. Narrower panes fit their space.",
     type: "integer",
-    // The Claude desktop app's reading column; ~97 characters of 14px text.
+    // About 85 characters of the default 15px text: the upper end of a
+    // comfortable measure, so long replies do not read as a wide slab.
     default: 680,
     min: 480,
     max: 1400,
@@ -626,7 +627,7 @@ const DEFS = {
     description:
       "Body size for rendered Markdown. Defaults to the Chat size; Pane actions → Smaller / Larger text overrides it per pane.",
     type: "number",
-    default: 14,
+    default: 15,
     min: 10,
     max: 32,
     step: 0.5,

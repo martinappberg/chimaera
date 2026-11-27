@@ -142,7 +142,9 @@
 
   const uid = $props.id();
   const linkedTerminals = $derived(terminals.filter((t) => t.linkedAgentId === sessionId));
-  const COMPOSER_MIN_HEIGHT = 38;
+  /** One line of the default text inside the card's padding (the CSS
+   *  `min-height` of the textarea). */
+  const COMPOSER_MIN_HEIGHT = 50;
   const COMPOSER_MAX_HEIGHT = 352;
 
   // The parent keys ChatView (and so this composer) per session — one
@@ -510,7 +512,7 @@
       : dictationParts(dictating.before, dictating.after, dictation.finals, dictation.interim),
   );
   /** Right padding for the stop button, send button and waveform. */
-  const DICTATING_PAD = 96;
+  const DICTATING_PAD = 122;
 
   // The draft follows the words. Reads the transcript, writes only `draft`.
   $effect(() => {
@@ -1274,7 +1276,7 @@
             ? afterTurnHint !== ""
               ? `add to this turn… · ${afterTurnHint} after it ends`
               : "add to this turn…"
-            : nativeSuggestion ? `${nativeSuggestion} (Tab to accept)` : "message the agent… · / commands · @ files"}
+            : nativeSuggestion ? `${nativeSuggestion} (Tab to accept)` : "Message the agent… · / commands · @ files"}
       rows={1}
       {disabled}
     ></textarea>
@@ -1541,9 +1543,18 @@
   .input-row {
     position: relative;
     display: flex;
-    /* The mention highlights sit under the textarea's (translucent) fill:
-       their layer goes negative inside this row, not under the page. */
+    /* The mention highlights sit under the textarea (which paints no fill
+       of its own): their layer goes negative inside this row, above the
+       row's card fill and not under the page. */
     isolation: isolate;
+    /* The card: a raised sheet with soft corners, the one surface in the
+       pane that is the user's. The fill and shadow live here, the border on
+       the textarea, so the field's box (and every mirror of it) is unchanged. */
+    border-radius: var(--composer-radius);
+    background: var(--overlay-bg);
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.04),
+      0 4px 18px rgba(0, 0, 0, 0.06);
   }
   /* A top-edge grip is the natural geometry for a bottom-anchored composer:
      dragging up makes room, while click toggles expanded/content-fit.
@@ -1552,8 +1563,8 @@
     position: absolute;
     z-index: 2;
     top: -5px;
-    left: 18px;
-    right: 18px;
+    left: 24px;
+    right: 24px;
     height: 10px;
     display: flex;
     align-items: center;
@@ -1584,22 +1595,25 @@
   textarea {
     width: 100%;
     resize: none;
-    background: color-mix(in srgb, var(--fg) 3%, transparent);
+    background: none;
     border: 1px solid var(--edge);
-    border-radius: var(--radius-card);
+    border-radius: var(--composer-radius);
     color: var(--fg);
     font: inherit;
     font-size: var(--text-md);
     line-height: var(--chat-line-height, 1.45);
-    padding: 7px 38px 7px 10px; /* right clears the 26px action button */
-    min-height: 38px;
+    padding: 12px 50px 12px 16px; /* right clears the 30px action button */
+    min-height: 50px;
     max-height: min(42vh, 22rem);
     overflow-y: auto;
     outline: none;
     box-sizing: border-box;
+    transition: border-color 0.12s ease;
   }
+  /* The field is focused most of the time it is on screen, so focus deepens
+     its edge in the text's own ink instead of lighting it in the accent. */
   textarea:focus {
-    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
+    border-color: color-mix(in srgb, var(--fg) 26%, var(--edge));
   }
   /* The hint in the empty box: the theme's muted ink, not the browser's
      default grey, so both curated themes hold. */
@@ -1609,19 +1623,19 @@
   }
   /* Room for the mic beside the action button. */
   textarea.voice {
-    padding-right: 66px;
+    padding-right: 86px;
   }
   /* Dictating: the textarea keeps the text (so its size, wrapping and scroll
      are the real ones) but draws none of it; .ghost draws it instead, with
      the spoken words dimmed. Every box and font property must match. */
   textarea.dictating {
-    padding-right: 96px; /* DICTATING_PAD: stop + send + waveform */
+    padding-right: 122px; /* DICTATING_PAD: stop + send + waveform */
     color: transparent;
     caret-color: transparent;
   }
   textarea.mod-decorated { color: transparent; caret-color: var(--fg); }
-  .ghost.mod-decoration { padding-right: 38px; }
-  textarea.voice ~ .ghost.mod-decoration { padding-right: 66px; }
+  .ghost.mod-decoration { padding-right: 50px; }
+  textarea.voice ~ .ghost.mod-decoration { padding-right: 86px; }
   .ghost {
     position: absolute;
     inset: 0;
@@ -1629,7 +1643,7 @@
     pointer-events: none;
     box-sizing: border-box;
     border: 1px solid transparent;
-    padding: 7px 96px 7px 10px;
+    padding: 12px 122px 12px 16px;
     font: inherit;
     font-size: var(--text-md);
     line-height: var(--chat-line-height, 1.45);
@@ -1646,8 +1660,8 @@
   }
   .meter-slot {
     position: absolute;
-    right: 67px;
-    bottom: 10px;
+    right: 86px;
+    bottom: 16px;
     z-index: 2;
     display: inline-flex;
     pointer-events: auto;
@@ -1658,56 +1672,53 @@
   /* Bottom-anchored so it stays put while the textarea autosizes upward. */
   .action {
     position: absolute;
-    right: 5px;
-    bottom: 5px;
-    width: 26px;
-    height: 26px;
+    right: 10px;
+    bottom: 10px;
+    width: 30px;
+    height: 30px;
     box-sizing: border-box;
     display: inline-flex;
     align-items: center;
     justify-content: center;
     padding: 0;
     border: 1px solid transparent;
-    border-radius: 6px;
+    border-radius: 999px;
     cursor: pointer;
     transition:
       color 0.12s ease,
       background-color 0.12s ease,
       border-color 0.12s ease;
   }
-  /* The workbench's active-accent treatment (.chip.on / UpdateToast .primary):
-     tinted, not solid — there is no on-accent token, and the composer is quiet
-     chrome. */
+  /* Send is the one solid control in the pane: the text's ink as a disc, the
+     sheet's colour as the arrow. Ink and sheet contrast on every theme by
+     construction, which no accent does (there is no on-accent token). With
+     nothing to send it is a quiet disc that reads as not-yet. */
   .send {
-    background: color-mix(in srgb, var(--accent) 12%, transparent);
-    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
-    color: var(--accent);
+    background: var(--fg);
+    color: var(--overlay-bg);
   }
   .send:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--accent) 22%, transparent);
-    border-color: var(--accent);
+    background: color-mix(in srgb, var(--fg) 84%, var(--overlay-bg));
   }
   .send:disabled {
-    background: none;
-    border-color: color-mix(in srgb, var(--edge) 70%, transparent);
-    color: var(--muted);
-    opacity: 0.55;
+    background: color-mix(in srgb, var(--fg) 9%, transparent);
+    color: color-mix(in srgb, var(--fg) 38%, transparent);
     cursor: default;
   }
   /* Quiet until recording: then it takes the recording red. */
   .mic {
     position: absolute;
-    right: 35px;
-    bottom: 5px;
-    width: 26px;
-    height: 26px;
+    right: 46px;
+    bottom: 10px;
+    width: 30px;
+    height: 30px;
     box-sizing: border-box;
     display: inline-flex;
     align-items: center;
     justify-content: center;
     padding: 0;
     border: 1px solid transparent;
-    border-radius: 6px;
+    border-radius: 999px;
     background: none;
     color: var(--muted);
     cursor: pointer;
@@ -1741,7 +1752,7 @@
     content: "";
     position: absolute;
     inset: -1px;
-    border-radius: 7px; /* .action's 6px, outside its 1px border */
+    border-radius: 999px; /* .action's disc, outside its 1px border */
     pointer-events: none;
     box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 8%, transparent);
     opacity: 0;

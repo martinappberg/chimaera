@@ -261,16 +261,10 @@
   }
 
   .standalone .hp-content :global(.md-doc blockquote) {
-    margin: 0.8em 0;
-    padding: 0.55em 1em;
-    border-left: 3px solid color-mix(in srgb, var(--accent) 60%, transparent);
-    border-radius: 0 8px 8px 0;
-    background: linear-gradient(
-      to right,
-      color-mix(in srgb, var(--accent) 5%, transparent),
-      color-mix(in srgb, var(--fg) 3%, transparent) 55%
-    );
-    color: color-mix(in srgb, var(--fg) 45%, var(--muted));
+    margin: 0.9em 0;
+    padding: 0.1em 1em;
+    border-left: 3px solid color-mix(in srgb, var(--fg) 16%, transparent);
+    color: color-mix(in srgb, var(--fg) 55%, var(--muted));
   }
 
   .standalone .hp-content :global(.md-doc blockquote > :first-child) {
@@ -290,8 +284,12 @@
     margin: 0.2em 0;
   }
 
-  .standalone .hp-content :global(.md-doc li::marker) {
-    color: color-mix(in srgb, var(--accent) 70%, var(--muted));
+  .standalone .hp-content :global(.md-doc ul > li::marker) {
+    color: color-mix(in srgb, var(--fg) 42%, transparent);
+  }
+  .standalone .hp-content :global(.md-doc ol > li::marker) {
+    color: var(--accent-text);
+    font-variant-numeric: tabular-nums;
   }
 
   /* Task boxes, as the reading view draws them. */

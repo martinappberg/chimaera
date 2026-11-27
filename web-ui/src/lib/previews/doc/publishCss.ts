@@ -53,21 +53,25 @@ body{margin:0;color:var(--fg);font-family:var(--ui-font);font-size:16px;line-hei
 .md-doc a:hover{text-decoration:underline}
 .md-doc a.wikilink{text-decoration:underline dotted color-mix(in srgb,var(--accent) 55%,transparent);text-underline-offset:.18em}
 .md-doc code{font-family:var(--mono);font-size:.84em;background:color-mix(in srgb,var(--fg) 6%,transparent);border-radius:4px;padding:.12em .34em}
-.md-doc pre{background:color-mix(in srgb,var(--fg) 4.5%,transparent);border:1px solid var(--edge);border-radius:8px;padding:.8em 1em;overflow:hidden;line-height:1.5}
+.md-doc pre{background:color-mix(in srgb,var(--fg) 4%,transparent);border:1px solid color-mix(in srgb,var(--edge) 75%,transparent);border-radius:10px;padding:.8em 1em;overflow:hidden;line-height:1.5}
 .md-doc pre code{display:block;overflow-x:auto;background:none;padding:0;font-size:.848em;white-space:pre}
-.md-doc blockquote{margin:.8em 0;padding:.55em 1em;border-left:3px solid color-mix(in srgb,var(--accent) 60%,transparent);border-radius:0 8px 8px 0;background:linear-gradient(to right,color-mix(in srgb,var(--accent) 5%,transparent),color-mix(in srgb,var(--fg) 3%,transparent) 55%);color:color-mix(in srgb,var(--fg) 45%,var(--muted))}
+.md-doc blockquote{margin:.9em 0;padding:.1em 1em;border-left:3px solid color-mix(in srgb,var(--fg) 16%,transparent);color:color-mix(in srgb,var(--fg) 55%,var(--muted))}
 .md-doc blockquote>:first-child{margin-top:0}
 .md-doc blockquote>:last-child{margin-bottom:0}
 .md-doc ul,.md-doc ol{padding-left:1.6em;margin:.6em 0}
 .md-doc li{margin:.2em 0}
-.md-doc li::marker{color:color-mix(in srgb,var(--accent) 70%,var(--muted))}
+.md-doc ul>li::marker{color:color-mix(in srgb,var(--fg) 42%,transparent)}
+.md-doc ol>li::marker{color:color-mix(in srgb,var(--accent) 75%,var(--fg));font-variant-numeric:tabular-nums}
+.md-doc :is(strong,b){font-weight:600}
 .md-doc hr{border:none;border-top:1px solid var(--edge);margin:1.8em 0}
 .md-doc img{max-width:100%;height:auto}
 .md-doc table{display:block;overflow-x:auto;padding:1px;margin:1em 0;border-collapse:collapse;font-size:.924em}
-.md-doc table :is(th,td){border:1px solid var(--edge);padding:.35em .7em;text-align:left;font-variant-numeric:tabular-nums}
+.md-doc table :is(th,td){border:none;border-bottom:1px solid color-mix(in srgb,var(--edge) 85%,transparent);padding:.5em .85em;text-align:left;vertical-align:top;font-variant-numeric:tabular-nums}
+.md-doc table :is(th,td):first-child{padding-left:.15em}
+.md-doc table tbody tr:last-child>td{border-bottom-color:transparent}
 .md-doc table :is(th,td)[align="center" i]{text-align:center}
 .md-doc table :is(th,td)[align="right" i]{text-align:right}
-.md-doc table th{font-weight:600;background:color-mix(in srgb,var(--fg) 4%,transparent)}
+.md-doc table th{font-weight:600;vertical-align:bottom;border-bottom-color:color-mix(in srgb,var(--fg) 22%,transparent)}
 .md-doc .md-math{color:inherit}
 .md-doc math{font-family:"Latin Modern Math","STIX Two Math","Cambria Math",math;font-size:1.02em}
 .md-doc .md-math-display{display:block;max-width:100%;overflow-x:auto;overflow-y:hidden;margin:.55em 0;padding:.1em 0}
