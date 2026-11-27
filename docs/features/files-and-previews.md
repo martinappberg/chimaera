@@ -1123,8 +1123,12 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
     app pane's placeholder is the workbench's surface while a page loads, not white. The
     names are a contract (`shared/pageTheme.ts`, read off the window's computed style, so custom
     themes and the accent come through): add, never rename. CSS that uses them follows a switch
-    live; a chart library that bakes its colours in when it draws (GenomeSpy, Plotly) reads them
-    then and draws again in `chimaera.onTheme` — the chat host frame tells agents so. The page's URL carries the theme
+    live. A chart library is never re-coloured token by token: a page picks the library's own
+    light or dark theme from `chimaera.theme.mode` (Plotly's `plotly_dark`, Vega-Lite's dark config,
+    GenomeSpy's `defaultThemeColors` parameter) and draws again in `chimaera.onTheme`; a library
+    without a theme keeps its own light background, so nothing ends up dark on dark — the chat host
+    frame tells agents so. A fuller mapping for a library, where it is worth it, is written once by
+    its owner: the library's plugin, or the bundled plotting toolkit (issue 396). The page's URL carries the theme
     (`chimaera-theme`, base64url JSON) so it applies at once; a framed page hears later themes as
     messages and never reloads, while an app view loads again for a new theme.
   - **`chimaera.send(text)` / `chimaera.draft(text)`.** 4,000 characters at most, at most one a

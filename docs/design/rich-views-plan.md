@@ -673,9 +673,14 @@ in total.
    - **Clicks.** `api.addEventListener("click")` carries `event.datum`, while
      `api.events.subscribe("click")` reports only the pointer.
    - **Theme.** GenomeSpy takes its colours at embed, so in dark mode its axis
-     labels stayed dark. The spike page now maps `--ch-*` into GenomeSpy's
-     `theme` (`axis` / `legend` / `title` colours) and re-embeds on `onTheme`,
-     keeping the region (`getComplexDomain`, then `zoomTo`). It must embed a
+     labels stayed dark. Overriding its config piece by piece missed places
+     where it inks black (`axisLocus` chromosome labels, legend titles). The
+     right hook is GenomeSpy's own theme: one spec parameter,
+     `defaultThemeColors` (`foreground`, `stroke`, `grid`, `chromosomeTick`,
+     `symbolStroke`, `background`), which every default reads. The page fills
+     it from `--ch-*` and re-embeds on `onTheme`, keeping the region
+     (`getComplexDomain`, then `zoomTo`). The general rule: feed the
+     library's own theme, never re-colour it token by token. It must embed a
      **fresh copy** of the spec each time: GenomeSpy writes into the spec it
      is given, and a second embed of the same object fails with
      `Invalid field "_linearized_chrom_start"`.
