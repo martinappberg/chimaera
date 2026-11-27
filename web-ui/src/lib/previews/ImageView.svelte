@@ -554,8 +554,10 @@
         style:transform={natural !== null ? `translate(${tx}px, ${ty}px)` : undefined}
         onload={onLoad}
         onerror={() => {
-          if (onbroken !== undefined) onbroken();
-          else error = "image failed to load (ticket may have expired — reopen the tab)";
+          // The host's fresh URL replaces this message; one it answers with
+          // the same URL (a picture that really won't load) leaves it shown.
+          error = "image failed to load (ticket may have expired — reopen the tab)";
+          onbroken?.();
         }}
         draggable="false"
       />

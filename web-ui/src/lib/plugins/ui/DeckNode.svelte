@@ -112,8 +112,10 @@
   const FLICK_MS = 400;
   let lastClick = 0;
 
-  function go(place: Place, tell = true, animate = false): void {
-    if (animate) {
+  function go(place: Place, tell = true, animate = false, auto = false): void {
+    // An auto-advance (a clip that moves on when it ends) is not a click:
+    // it neither flicks nor makes the click after it one.
+    if (animate && !auto) {
       const t = performance.now();
       if (t - lastClick < FLICK_MS) animate = false;
       lastClick = t;
@@ -131,8 +133,8 @@
 
   /** One click on or back: a show skips hidden slides, browsing doesn't.
    *  A click on, in the show, plays the build it lands on. */
-  function step(delta: 1 | -1): void {
-    go(deckStep(buildCounts, hidden, at, delta, inShow), true, delta === 1 && mode === "present");
+  function step(delta: 1 | -1, auto = false): void {
+    go(deckStep(buildCounts, hidden, at, delta, inShow), true, delta === 1 && mode === "present", auto);
   }
 
   /** Play the clip of the build we stand on (browsing's play button, and
@@ -152,7 +154,7 @@
       return;
     }
     playing.ended = true;
-    if (clip.auto) step(1);
+    if (clip.auto) step(1, true);
   }
 
   /** The clip's video could not load (its file went, its ticket lapsed):
