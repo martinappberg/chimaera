@@ -40,6 +40,11 @@
   --notice-stack-offset: 140px;
   /* Single focus treatment for every keyboard-focusable control. */
   --focus-ring: color-mix(in srgb, var(--accent) 70%, transparent);
+  /* The edge of the surface that has focus (the active pane among several,
+     the Mastermind card, the composer's field): a tint of the accent on the
+     ordinary edge, enough to find at a glance and never a coloured frame.
+     Keyboard focus on a control keeps the full --focus-ring. */
+  --focus-edge: color-mix(in srgb, var(--accent) 32%, var(--edge));
   /* The accent as TEXT (links, paths, allowed-labels): an accent chosen for
      dots and buttons can sit under 4.5:1 on the sheet (chimaera-light's green
      is 3.4:1), so prose-sized accent text takes it a quarter toward --fg —
@@ -822,6 +827,11 @@ body.dragging {
   --pane-tab-height: 28px;
   --pane-toolbar-height: 30px;
   --pane-control-size: 24px;
+  /* A pane's toolbar (the chat's agent strip, a document's mode strip) sits
+     on the page's own sheet under a faint rule: one surface with what it
+     controls, not a second bar stacked under the tabs. */
+  --pane-toolbar-bg: var(--term-bg);
+  --pane-toolbar-edge: color-mix(in srgb, var(--edge) 60%, transparent);
   --pane-control-hover: color-mix(in srgb, var(--fg) 5%, transparent);
   --pane-control-selected: color-mix(in srgb, var(--fg) 8%, transparent);
 }

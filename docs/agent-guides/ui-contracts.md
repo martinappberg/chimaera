@@ -22,6 +22,8 @@ color values are only the no-JS fallback.
 - Use `--accent-text` for accent-colored text. It keeps 75% `--accent` and
   mixes in 25% `--fg`, so that text holds 4.5:1 (`app.css:35-39`).
 - Use `--focus-ring` for every keyboard focus outline (`app.css:33-34`).
+- Use `--focus-edge` for the border of the surface that has focus (the
+  active pane among several, the composer's field): a tint, not a frame.
 - Use the four type roles: `--text-xs` (section labels, badges), `--text-sm`
   (tabs, hints), `--text-md` (rows, names, buttons, inputs) and `--text-lg`
   (body text). `lib/settings/store.svelte.ts:351-355` derives them from

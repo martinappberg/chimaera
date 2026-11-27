@@ -1660,8 +1660,8 @@
   }
 
   .node.active {
-    background-color: color-mix(in srgb, var(--accent) 15%, var(--rail-bg));
-    box-shadow: inset 3px 0 0 var(--accent);
+    background-color: color-mix(in srgb, var(--accent) 9%, var(--row-active));
+    box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent) 75%, transparent);
   }
 
   /* Reveal flash (terminal dir links): a brief accent wash that fades. */

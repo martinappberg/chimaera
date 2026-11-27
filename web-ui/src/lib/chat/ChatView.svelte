@@ -4733,27 +4733,28 @@
   }
   .jump {
     position: sticky;
-    bottom: 4px;
+    bottom: 8px;
     align-self: center;
     display: grid;
     place-items: center;
-    width: 24px;
-    height: 24px;
+    width: 28px;
+    height: 28px;
     /* No net height in the column (its own plus the column's gap): it
        appears and goes as the reader leaves and reaches the bottom, and a
        row coming and going there clamped scrollTop — a snap on every
        arrival at the live edge. */
-    margin-top: calc(-24px - var(--row-gap));
+    margin-top: calc(-28px - var(--row-gap));
     padding: 0;
     font: inherit;
-    font-size: var(--text-lg);
+    font-size: var(--text-md);
     line-height: 1;
-    color: color-mix(in srgb, var(--fg) 40%, transparent);
-    background: none;
-    border: none;
-    text-shadow:
-      0 1px 2px var(--term-bg),
-      0 0 6px var(--term-bg);
+    /* A real control over the text it floats on: a small raised disc, not a
+       bare glyph the words show through. */
+    color: var(--muted);
+    background: var(--overlay-bg);
+    border: 1px solid var(--edge);
+    border-radius: 999px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
     cursor: pointer;
     transition:
       color 0.12s ease,
@@ -4761,7 +4762,7 @@
   }
   .jump:hover,
   .jump:focus-visible {
-    color: color-mix(in srgb, var(--fg) 72%, transparent);
+    color: var(--fg);
   }
   .jump:hover {
     transform: translateY(1px);

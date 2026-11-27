@@ -144,7 +144,7 @@
   const linkedTerminals = $derived(terminals.filter((t) => t.linkedAgentId === sessionId));
   /** One line of the default text inside the card's padding (the CSS
    *  `min-height` of the textarea). */
-  const COMPOSER_MIN_HEIGHT = 44;
+  const COMPOSER_MIN_HEIGHT = 42;
   const COMPOSER_MAX_HEIGHT = 352;
 
   // The parent keys ChatView (and so this composer) per session — one
@@ -1603,18 +1603,18 @@
     font: inherit;
     font-size: var(--text-md);
     line-height: var(--chat-line-height, 1.45);
-    padding: 9px 42px 9px 14px; /* right clears the 26px action button */
-    min-height: 44px;
+    padding: 9px 42px 9px 14px; /* right clears the 28px action button */
+    min-height: 42px;
     max-height: min(42vh, 22rem);
     overflow-y: auto;
     outline: none;
     box-sizing: border-box;
     transition: border-color 0.12s ease;
   }
-  /* Focus warms the edge toward the accent, a step below the action
-     button's: the field is focused most of the time it is on screen. */
+  /* Focus warms the edge toward the accent (app.css --focus-edge): the
+     field is focused most of the time it is on screen. */
   textarea:focus {
-    border-color: color-mix(in srgb, var(--accent) 42%, var(--edge));
+    border-color: var(--focus-edge);
   }
   /* The hint in the empty box: the theme's muted ink, not the browser's
      default grey, so both curated themes hold. */
@@ -1662,7 +1662,7 @@
   .meter-slot {
     position: absolute;
     right: 71px;
-    bottom: 13px;
+    bottom: 12px;
     z-index: 2;
     display: inline-flex;
     pointer-events: auto;
@@ -1673,8 +1673,8 @@
   /* Bottom-anchored so it stays put while the textarea autosizes upward. */
   .action {
     position: absolute;
-    right: 8px;
-    bottom: 8px;
+    right: 7px;
+    bottom: 7px;
     width: 28px;
     height: 28px;
     box-sizing: border-box;
@@ -1712,8 +1712,8 @@
   /* Quiet until recording: then it takes the recording red. */
   .mic {
     position: absolute;
-    right: 40px;
-    bottom: 8px;
+    right: 39px;
+    bottom: 7px;
     width: 28px;
     height: 28px;
     box-sizing: border-box;

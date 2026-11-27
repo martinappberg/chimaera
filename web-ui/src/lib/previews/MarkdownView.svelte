@@ -1753,8 +1753,8 @@
     height: var(--pane-toolbar-height);
     padding: 0 8px;
     white-space: nowrap;
-    border-bottom: 1px solid var(--edge);
-    background: color-mix(in srgb, var(--bg) 65%, var(--term-bg));
+    border-bottom: 1px solid var(--pane-toolbar-edge);
+    background: var(--pane-toolbar-bg);
   }
 
   .toggle {

@@ -71,11 +71,11 @@
     align-items: center;
     gap: 5px;
     max-width: 100%;
-    padding: 1px 7px 1px 5px;
-    border: 1px solid var(--edge);
+    padding: 2px 9px 2px 7px;
+    border: 1px solid color-mix(in srgb, var(--edge) 70%, transparent);
     border-radius: 999px;
     background: color-mix(in srgb, var(--fg) 3%, transparent);
-    color: var(--fg);
+    color: color-mix(in srgb, var(--fg) 82%, var(--muted));
     font: inherit;
     font-size: var(--text-xs);
     line-height: 1.5;
@@ -89,6 +89,7 @@
   .chip:focus-visible {
     border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
     background: color-mix(in srgb, var(--accent) 9%, transparent);
+    color: var(--fg);
   }
   .chip:disabled {
     cursor: default;
@@ -98,7 +99,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-family: var(--mono, monospace);
+    font-family: var(--file-font, var(--mono, monospace));
   }
   /* Gone or not found: still named, plainly not there. */
   .chip.absent {

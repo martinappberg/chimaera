@@ -1479,7 +1479,7 @@
     background: color-mix(in srgb, var(--fg) 4%, transparent);
     border-radius: 6px 6px 0 0;
     color: var(--fg);
-    box-shadow: inset 0 -2px 0 color-mix(in srgb, var(--accent) 70%, transparent);
+    box-shadow: inset 0 -2px 0 color-mix(in srgb, var(--accent) 55%, transparent);
   }
 
   /* Hairline between neighbours: absolute, so it costs no width. Vertically

@@ -928,7 +928,7 @@
      focused one, and a permanent accent frame around the whole page says
      nothing and tints everything inside it. */
   :global(.split > .cell) .pane.focused {
-    border-color: color-mix(in srgb, var(--accent) 62%, var(--edge));
+    border-color: var(--focus-edge);
   }
 
   /* A linked terminal carries its agent's hue as a quiet border tint
