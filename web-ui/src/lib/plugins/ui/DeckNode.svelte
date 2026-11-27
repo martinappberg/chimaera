@@ -100,10 +100,11 @@
     }
   }
 
-  /** The build whose clip is on screen (playing, or held on its last
-   *  frame), and the picture that was there before it, kept under the video
-   *  until its first frame is drawn. */
-  let playing = $state<{ slide: number; build: number; under: string | null; ended: boolean } | null>(null);
+  /** The clip being played where the show stands (or ended there, its last
+   *  frame held), and the picture that was there before it; `n` tells one
+   *  play from the next of the same build. */
+  let playing = $state<{ n: number; slide: number; build: number; under: string | null; ended: boolean } | null>(null);
+  let plays = 0;
 
   /** Clicks closer together than this flick through the show: each lands on
    *  its build's finished picture, as in Keynote and PowerPoint, instead of
@@ -127,7 +128,7 @@
     standing = slides[next.slide]?.title ?? "";
     // Only a move ends or starts a clip: another window naming the place we
     // already stand on must not cut ours off.
-    if (moved) playing = animate && slides[next.slide]?.builds[next.build]?.clip != null ? { ...next, under, ended: false } : null;
+    if (moved) playing = animate && slides[next.slide]?.builds[next.build]?.clip != null ? { n: ++plays, ...next, under, ended: false } : null;
     if (tell && mode !== "browse") say({ kind: "at", from: me, title: standing, slide: next.slide, build: next.build });
   }
 
@@ -141,7 +142,7 @@
    *  the show's first build). */
   function play(): void {
     if (build?.clip == null) return;
-    playing = { ...at, under: null, ended: false };
+    playing = { n: ++plays, ...at, under: null, ended: false };
   }
 
   const clip = $derived(playing !== null && playing.slide === at.slide && playing.build === at.build ? (build?.clip ?? null) : null);
@@ -387,6 +388,88 @@
    *  that was there before it. */
   const still = $derived(build === undefined ? null : clip !== null && playing !== null && !playing.ended ? playing.under : build.src);
   const showPicture = steady(() => (mode === "present" ? still : null));
+
+  // --- the show's videos ---------------------------------------------------------
+
+  /** A video frame and a picture of the same slide never look quite the same
+   *  (the frame is compressed and goes through the video colour pipeline), so
+   *  the show never swaps one for the other on unchanged content: once a clip
+   *  has played, its last frame stays up (as in Manimble's own player), and
+   *  the next clip replaces it frame for frame once its own first frame is
+   *  drawn. A picture takes over only when the build moves without a clip to
+   *  play (a flick, a jump, a build with none), once that picture is drawn. */
+  type Layer = { id: number; n: number; slide: number; build: number; src: string; url: string; loop: boolean; rate: number; drawn: boolean };
+  let layers = $state<Layer[]>([]);
+  let layerIds = 0;
+
+  // A new play is a new layer, over whatever is on screen.
+  $effect(() => {
+    const p = playing;
+    const c = clip;
+    if (mode !== "present" || p === null || c === null) return;
+    const url = urls[c.src];
+    if (url === undefined) return;
+    const n = p.n;
+    const at0 = { slide: p.slide, build: p.build };
+    untrack(() => {
+      if (layers.some((l) => l.n === n)) return;
+      layers = [...layers, { id: ++layerIds, n, ...at0, src: c.src, url, loop: c.loop, rate: c.rate, drawn: false }];
+    });
+  });
+
+  // What stays: the current play's layer, and under it the last drawn one
+  // until the current is drawn; with no current play, the last drawn layer
+  // until the build's picture is drawn.
+  $effect(() => {
+    if (mode !== "present") {
+      if (untrack(() => layers.length) > 0) layers = [];
+      return;
+    }
+    const ls = layers;
+    if (ls.length === 0) return;
+    // A play is current only while it is where the show stands and its clip
+    // is still the deck's (a re-render can move the place or the file).
+    const n = playing?.n;
+    const src = clip?.src;
+    const cur = n === undefined || src === undefined ? -1 : ls.findIndex((l) => l.n === n && l.src === src);
+    let keep: Layer[];
+    if (cur >= 0) {
+      const top = ls[cur] as Layer;
+      const held = ls.slice(0, cur).findLast((l) => l.drawn);
+      keep = top.drawn || held === undefined ? [top] : [held, top];
+    } else {
+      const held = ls.findLast((l) => l.drawn);
+      keep = held === undefined || (build !== undefined && showPicture.src === build.src) ? [] : [held];
+    }
+    if (keep.length !== ls.length || keep.some((l, i) => l !== ls[i])) layers = keep;
+  });
+
+  const isCurrent = (l: Layer): boolean => playing !== null && playing.n === l.n && clip?.src === l.src;
+
+  function layerReady(e: Event, l: Layer): void {
+    const v = e.currentTarget as HTMLVideoElement;
+    v.playbackRate = l.rate;
+    void v.play().catch(() => {
+      // Refused (a web view that will not autoplay), or replaced: the
+      // picture stays.
+      if (!disposed && isCurrent(l)) playing = null;
+    });
+  }
+
+  function layerDrawn(id: number): void {
+    const l = layers.find((x) => x.id === id);
+    if (l !== undefined) l.drawn = true;
+  }
+
+  function layerEnded(l: Layer): void {
+    if (isCurrent(l)) clipEnded();
+  }
+
+  function layerFailed(l: Layer): void {
+    if (isCurrent(l)) playing = null;
+    else layers = layers.filter((x) => x.id !== l.id);
+    broken(l.src);
+  }
   // The presenter's panels draw pictures smaller than the show and the
   // viewer: their own URLs, for the same reason as the strip's thumbUrl.
   const nowPicture = steady(() => (mode === "presenter" && build !== undefined ? build.src : null), "now");
@@ -767,7 +850,7 @@
           <p class="none bad">{pictureError}</p>
         {:else if build === undefined}
           <p class="none">{slide?.title} has no picture.</p>
-        {:else if clip !== null && urls[clip.src] !== undefined}
+        {:else if mode === "browse" && clip !== null && urls[clip.src] !== undefined}
           {#key clip.src}
             <!-- svelte-ignore a11y_media_has_caption — a slide's animation: silent, and its picture carries the alt text -->
             <video class="clip" src={urls[clip.src]} muted playsinline aria-label={pictureAlt} onloadeddata={clipReady} onended={clipEnded} onerror={() => clipFailed(clip.src)}></video>
@@ -790,22 +873,20 @@
           {#if showPicture.url !== null}
             <img src={showPicture.url} alt={pictureAlt} draggable="false" onerror={() => still !== null && broken(still)} />
           {/if}
-          {#if clip !== null && urls[clip.src] !== undefined}
-            {#key clip.src}
-              <!-- svelte-ignore a11y_media_has_caption — a slide's animation: silent, and its picture carries the alt text -->
-              <video
-                class:done={playing?.ended === true && showPicture.src === build.src}
-                src={urls[clip.src]}
-                muted
-                playsinline
-                loop={clip.loop}
-                onloadeddata={clipReady}
-                onplaying={(e) => e.currentTarget.classList.add("drawn")}
-                onended={clipEnded}
-                onerror={() => clipFailed(clip.src)}
-              ></video>
-            {/key}
-          {/if}
+          {#each layers as l (l.id)}
+            <!-- svelte-ignore a11y_media_has_caption — a slide's animation: silent, and its picture carries the alt text -->
+            <video
+              class:drawn={l.drawn}
+              src={l.url}
+              muted
+              playsinline
+              loop={l.loop}
+              onloadeddata={(e) => layerReady(e, l)}
+              onplaying={() => layerDrawn(l.id)}
+              onended={() => layerEnded(l)}
+              onerror={() => layerFailed(l)}
+            ></video>
+          {/each}
         {/if}
         {#if nextBuild?.clip != null && urls[nextBuild.clip.src] !== undefined}
           <!-- The next click's animation is fetched before it is asked for. -->
@@ -1049,28 +1130,16 @@
     object-fit: contain;
     user-select: none;
   }
-  /* A video frame is a touch softer and its colours a touch off the
-     picture's (compressed, another colour pipeline): it fades in over the
-     picture under it and out once its build's own picture is drawn, so
-     neither the start nor the end of an animation nor the next click pops. */
+  /* A layer is drawn only from its own first frame: a video with none
+     paints black. No fades: a blend of a frame and a picture is the shift
+     the layers exist to avoid. */
   .show video {
     position: absolute;
     inset: 0;
     opacity: 0;
-    transition: opacity 0.12s ease;
   }
-  /* Set on the element by its own first `playing`: a replayed clip is a new
-     element that has no frame yet, and a video with none paints black. */
-  .show video:global(.drawn) {
+  .show video.drawn {
     opacity: 1;
-  }
-  .show video.done:global(.drawn) {
-    opacity: 0;
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .show video {
-      transition: none;
-    }
   }
   .show video.warm {
     width: 1px;
