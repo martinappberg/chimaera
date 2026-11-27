@@ -1,4 +1,4 @@
-# Rich views: agents' answer views, plugin web views, and GenomeSpy
+# Rich views: agents' pages, plugin web views, and GenomeSpy
 
 > **Dated design record (2026-11-26).** No code has shipped.
 >
@@ -8,9 +8,10 @@
 >   screens. This amends
 >   [platform decision 2](plugin-platform-plan.md#decisions-maintainer-2026-09-29);
 >   see [the amendment](#the-amendment-to-platform-decision-2).
-> - Agents' views in an answer use Chimaera's own elements first. They embed a
->   plugin's web view only where that plugin is active, and an HTML report only
->   as a last resort.
+> - Agents write pages (HTML and JavaScript) as freely as they like, for
+>   interactive plots and teaching widgets. The pages wear Chimaera's theme and
+>   can talk back to the agent. They use a plugin's library, such as GenomeSpy,
+>   only where that plugin is active.
 > - The answers to the four earlier questions are in [decided](#decided).
 >
 > **Still open:** the items in [open questions](#open-questions).
@@ -61,94 +62,154 @@ for:
   - `dataLoading` reports which sources loaded or failed.
   - `imageExport` returns PNG or SVG.
 
-## The layering
+## One sandbox, two authors
 
-Anything an agent or a plugin shows is built from three layers. Each one is
-used only when the one before it cannot express the result:
+Agents and plugins both put pages in front of the user. Both run in **the same
+sandbox**: an iframe with no origin in the browser, or a native pane view in its
+own process in the app. Both use the same theme and the same bridge, `web/1`.
+They differ in one thing: **what a page may reach, which follows from who made
+it.**
 
-| Layer | What it is | Who makes it | Safety |
-|---|---|---|---|
-| 1. **Chimaera's own elements** | A `ui/1` tree: text, markdown with math, headings, cards, tabs, sections, key–value lists, tables, lists, callouts, badges, code, diffs, images and SVG, PDF pages, slides, buttons and forms. These are the same nodes plugins already return, drawn by core. | Agents, as view files. Plugins, as screens. | Data only. It is checked by the host and drawn by core's own components. |
-| 2. **A plugin's web view** | A `web` node: a page from an **active** plugin's bundle, such as GenomeSpy's genome view, with the data it needs. | Plugins on their screens. Agents inside their view files, but only where that plugin is on. | It runs in a sandbox with no origin and only the plugin's own file access and declared hosts ([below](#part-2-plugin-web-views)). |
-| 3. **An HTML report** | An agent's own HTML file, embedded as today. | Agents. | Sandboxed. It cannot read workspace data or reply to the agent. This layer is unchanged and is the last resort. |
+| | An agent's page | A plugin's page |
+|---|---|---|
+| **What it is** | Any `.html` file an agent writes, as today, with whatever JavaScript and libraries it wants | A page from an active plugin's bundle, shown by a `web` node on the plugin's screens |
+| **Looks like Chimaera through** | Theme tokens injected into every page, plus the optional `chimaera.css` | The same |
+| **Talks back through** | `send` and `reference` (to the chat that made it) | The same, plus `act` (to its plugin) and calls from its plugin |
+| **Files it can read** | Its own folder and below, in **data mode** ([below](#data-or-network-never-both)) | Whatever its plugin's `[access]` allows |
+| **Network** | Open in network mode, none in data mode | Only its declared hosts |
+| **Libraries** | A CDN in network mode. In either mode, libraries from active plugins (`chimaera:lib/…`) | Its own bundle |
 
-All three use **one renderer** (`plugins/ui/UiNode.svelte`), **one validator**
-(`plugins/screens.rs` `check_tree`) and **one sandbox for web code**. A new node
-added for plugins is available to agents at once, and a new viewer plugin's page
-can be used in agents' answers. Claude Mods stay as they are. They are Claude's
-own unversioned protocol (`docs/features/claude-mods.md`). `ui/1` is Chimaera's
-format and works the same for every agent Chimaera runs.
+So GenomeSpy can appear in an agent's teaching page **only where the GenomeSpy
+plugin is active**. The page imports the plugin's library. That is the "if they
+have access" rule.
 
-## Part 1: views in an answer, in Chimaera's own elements
+Claude Mods stay as they are. They are Claude's own unversioned protocol
+([Claude Mods](../features/claude-mods.md)). Pages work the same for every
+agent Chimaera runs.
 
-### What the agent writes
+## Part 1: agents' pages, in Chimaera's theme
 
-An agent's view is a **view file**: `*.view.json`, containing a `ui/1` tree,
-the same shape a plugin's screen has:
+### What already works
 
-```json
-{"ui": "1", "title": "How a VCF is read",
- "root": {"type": "stack", "children": [
-   {"type": "markdown", "text": "A **VCF** row is one site. Columns 1–8 describe it; from 9 on, one column per sample…"},
-   {"type": "tabs", "tabs": [
-     {"title": "Example row", "children": [{"type": "code", "language": "text", "text": "chr17\t7674220\t.\tC\tT\t…"}]},
-     {"title": "Fields", "children": [{"type": "table", "columns": [{"key": "f", "title": "Field"}, {"key": "m", "title": "Means"}],
-                                       "rows": [{"f": "POS", "m": "1-based position"}, {"f": "GT", "m": "genotype, 0/1 = het"}]}]}]},
-   {"type": "form", "action": "send", "submit": "Check my answer",
-    "children": [{"type": "select", "name": "a", "label": "Which column holds the genotype?", "options": ["INFO", "FORMAT + sample", "QUAL"]}]},
-   {"type": "web", "plugin": "genomespy", "entry": "genome.html", "label": "The site on hg38",
-    "data": {"spec": "learn/vcf-site.genomespy.json"},
-    "fallback": {"type": "image", "src": "learn/vcf-site.png", "alt": "The site on hg38"}}]}}
-```
+An agent writes `figs/explainer.html` and embeds it in its answer with
+`![VCF explained](figs/explainer.html)`. The page appears as an embed card with
+a fixed height and an expand control, and it opens in a pane. Its scripts run
+and its own folder's assets load (`/raw/{ticket}/{*rest}`, `fs.rs:5072`). The
+agent can check it with `browser_navigate {path}` and `browser_screenshot`
+([files as pages](../features/agent-browser.md#files-as-pages)).
 
-- **Why a file and not text inside the message.** A file lasts. It can be
-  edited and opened in a pane, and it is kept in git. The agent writes it with
-  its own Write tool, and the user can edit it as JSON. Embed cards already
-  work this way, and an embed names one file.
-- **Where it shows.** It appears in the answer with
-  `![How a VCF is read](learn/vcf.view.json)`. This is the existing embed card,
-  given a new body kind for this file type. It also opens in its own pane, in
-  markdown documents, and in hover previews.
-- **What is allowed in it.**
-  - **Paths:** workspace paths only. `output:` paths are refused, because a view
-    file has no plugin.
-  - **Actions:** only built-in actions, plus `send` (below).
-  - **Web views:** a `web` node only when its `plugin` is active here. Anywhere
-    else it draws its `fallback`, or "Turn on GenomeSpy to see this view" with
-    the existing **Turn on** offer (`plugins/platform.ts` `offersFor`).
-- **Errors.** The tree is checked by the same validator as plugin screens. A bad
-  one shows "could not draw" with a list of what to fix, giving each problem's
-  JSON path. The new `view_check {path}` tool gives the agent the same list
-  ([open question 1](#open-questions)).
+Three things are missing:
 
-### Interactions with no plugin behind the view
+- **The page doesn't look like Chimaera.** It doesn't follow light and dark.
+- **It can't read data.** It cannot read the CSV or BAM next to it, which is
+  deliberate (`fs.rs:5068`). So agents inline the data, which stops working past
+  a few megabytes.
+- **It can't answer back.** A quiz or a "which run do you mean?" widget has no
+  way to reach the agent.
 
-A plugin screen sends its actions to the plugin. An agent's view has no code
-behind it, so its interactions are of three kinds:
+### The theme: free to draw, dressed like the app
 
-- **Kept in the window.** Tabs, collapsible sections, and reveal-on-click (a
-  `section` that starts collapsed hides a quiz answer). These need no round trip.
-- **Back to the agent.**
-  - `ask-agent` (it exists already) puts a reference in the composer as a draft.
-  - The new built-in `send` posts the form's values as a **user message** to the
-    chat whose answer holds the view. It is shown in the transcript as coming
-    from the view ("From *How a VCF is read*: a = FORMAT + sample"), and it runs
-    only on the user's click.
-  - Together these make a learning loop: the agent asks, the user answers in the
-    view, and the agent replies.
-- **In the workbench.** `open-file`, `open-url` (the system browser) and `copy`.
+- **Tokens on every page.** Every HTML page Chimaera serves in the sandbox gets
+  a small injected `<style>` of **CSS variables only**:
+  - `--ch-bg`, `--ch-fg`, `--ch-muted`, `--ch-accent` and the rest of the app's
+    tokens;
+  - the fonts;
+  - a categorical chart palette and a sequential one, checked for contrast in
+    both themes.
 
-A view sends nothing on its own. Every `send` is one click by the user, so an
-agent's view can never act as the user.
+  It contains no element styles, so a page that ignores the variables renders
+  exactly as before. The daemon already injects the pane bridge in the same
+  place (`PANE_BRIDGE_TAIL`, `fs.rs:5129`). A theme change updates the variables
+  live, without a reload.
+- **An optional stylesheet.** `<link rel="stylesheet" href="chimaera:theme.css">`
+  gives a page the app's typography, buttons, inputs, tables, cards and spacing
+  for in-page controls.
+- **Help for chart libraries.** `chimaera.palette()` and
+  `chimaera.theme.plot` hand Plotly, Vega-Lite, Observable Plot and D3 their
+  colours, fonts and axis and grid styles.
+- **Freedom stays.** The agent writes any HTML, SVG, canvas or WebGL it likes.
+  The theme is a set of materials it is asked to use, not a cage. The host frame
+  (`launcher::CHAT_HOST_PROMPT`, `launcher.rs:1414`) gets one paragraph saying
+  so, and a short guide the agent reads on demand lists the variables, the
+  stylesheet and the bridge.
 
-### What agents are told
+### Talking back
 
-The chat host frame (`launcher::CHAT_HOST_PROMPT`, `launcher.rs:1414`) gets one
-more short paragraph. When a result is something to look at or use, write a
-`*.view.json` from Chimaera's elements and embed it. Use a plugin's web view
-inside it only when that plugin is active here. Write HTML only when neither
-can express the result. The full list of nodes lives in a guide the agent reads
-on demand, so the always-on text stays short.
+With `<script src="chimaera:web.js">`, a page gets the agents' part of
+`web/1`:
+
+- **`send(text, data?)`** posts a **user message** to the chat whose answer
+  embeds the page, shown as coming from it ("From *VCF explained*: …").
+  - It runs only from a click or a key press the person made, and the bridge
+    checks that the event was a real user action. A page can never send on a
+    timer or on load.
+  - This makes the learning loop work: the agent asks a question in the page,
+    the user answers there, and the agent replies.
+- **`reference({text, crop?})`** puts the user's selection, such as a point on a
+  plot or a brushed range, into the composer as a draft. It is never sent on
+  its own.
+- **`theme`, `onTheme` and `visibility`**, as on plugin pages. A page should stop
+  animating while it is hidden.
+
+### Data or network, never both
+
+A page that can read workspace files and also reach the internet can leak
+those files. A page might come from a repository you cloned rather than from
+your agent. So a page runs in one of two modes, and the daemon serves each one
+with its own CSP:
+
+- **Network mode** is the default and is what every page gets today. The page
+  can load scripts from CDNs and reach any host. It cannot read workspace files
+  beyond loading its own folder's assets through tags.
+- **Data mode.** A page asks for it with
+  `<meta name="chimaera" content="data">`.
+  - **Reading.** `chimaera.url(path)` gives it URLs for files **under its own
+    folder**. These are streamed with Range support, so even a large BAM or a
+    50 MB CSV loads without being inlined.
+  - **No network at all.** In exchange, `connect-src`, `script-src` and
+    `style-src` allow only the daemon: the page's folder, its data URLs and
+    libraries from active plugins.
+  - **Who may use it.** Pages your agents wrote in this workspace get data mode
+    without a prompt. The daemon already knows which files a turn wrote, for
+    the "Written this turn" list. Any other page asks once ("This page wants to
+    read files in `analysis/`"), and the answer is remembered for that file's
+    contents.
+  - *Spike:* a sandboxed iframe can still navigate itself to an outside URL,
+    which would carry data out. In the app, the native pane view can refuse
+    that navigation. In the browser, the iframe needs a guard that blocks or
+    detects the navigation and closes the frame. If no guard holds, data mode
+    is offered in the app only.
+
+### Libraries from plugins: the "if they have access" rule
+
+- **Declaring them.** A plugin can declare libraries for any page in a
+  workspace where it is active:
+
+  ```toml
+  [web] libraries = ["genome-spy"]   # served at chimaera:lib/genome-spy/<its files>
+  ```
+
+  This is how an agent's teaching page about variant calling shows the real BAM
+  in a genome view: it imports `chimaera:lib/genome-spy/index.es.js` and reads
+  the file through `chimaera.url`.
+- **Where the plugin is off,** the import fails with a plain error that the
+  bridge turns into an offer: "This page uses GenomeSpy. Turn it on here".
+- **Offline clusters.** Libraries served this way also work there, where a CDN
+  does not.
+- **Charts.** A first-party **Plotting** plugin could provide Plotly, Vega-Lite,
+  Observable Plot and D3 the same way, pinned and verified, for data-mode pages
+  and offline hosts ([open question 2](#open-questions)).
+
+### How the agent sees its page
+
+Two ways:
+
+- **The browser tools.** The agent opens its page with `browser_navigate` and
+  `browser_screenshot`, as it does today, and the theme and bridge are present
+  there too.
+- **What the user did.** `send` brings back what the user did in the page.
+
+Neither needs a new tool.
 
 ## Part 2: plugin web views
 
@@ -175,9 +236,6 @@ into core.
  "data": {"spec": "results/tp53.genomespy.json", "locus": "chr17:7668402-7687550"}, "key": 3,
  "fallback": {"type": "callout", "text": "This chimaera cannot draw this view."}}
 ```
-
-`plugin` is implied on a plugin's own screen and is required in an agent's view
-file.
 
 - **Props.**
   - `entry` is a page in that plugin's bundle.
@@ -274,7 +332,8 @@ The page includes the host's `chimaera-web.js`. In the browser it talks over
 | `chimaera.theme`, `onTheme(fn)` | `{mode, tokens, fonts}`. `chimaera-web.css` exposes the tokens as CSS variables and styles in-page buttons, inputs and toolbars like core's. |
 | `chimaera.visibility`, `onVisibility(fn)` | Whether the page is visible. The page stops drawing while hidden. |
 | `url(path)` | A data URL ([above](#data-urls)). |
-| `act(action, payload)` | The plugin's `on_action`, or a built-in action. In an agent's view file, only the built-ins and `send`. |
+| `act(action, payload)` | The plugin's `on_action`, or a built-in action (plugin pages only). |
+| `send(text, data?)` | A user message to the chat, from a real click or key press only, as on agents' pages. |
 | `reference({text, file?, line?, crop?})` | Points an agent at the user's selection. It becomes a draft in the composer with the crop attached, as with the image area tool (`ImageView.svelte:272`). It is never sent on its own. |
 | `save(name, blob)` | Writes into the plugin's output folder, for exports and pictures. |
 | `handle(method, fn)` | Answers calls from the page's plugin ([next](#calls-from-a-plugin-or-an-agent-to-its-page)). |
@@ -432,9 +491,9 @@ waits on the daemon. They are styled with `chimaera-web.css`.
 **Loci in chat become chips** through pattern references. Hovering one shows a
 preview, and a click opens the view at that region.
 
-**In an agent's view file**, a `web` node with `"plugin": "genomespy"` draws a
-genome view inside the answer: for a lesson, a results summary or a variant
-report.
+**On an agent's page**, `chimaera:lib/genome-spy` draws a genome view inside the
+answer, for a lesson, a results summary or a variant report. The page reads the
+files beside it in data mode, and it works only where the plugin is active.
 
 ### What agents get
 
@@ -446,7 +505,7 @@ raw data up front.
 
 | Tool | Needs | Does |
 |---|---|---|
-| `genomespy_guide {topic?}` | nothing new | The grammar for the GenomeSpy version the plugin bundles. It covers tracks per data type, multiscale, assemblies, loci and the coordinate rules, and how to put a genome view in a `*.view.json`. |
+| `genomespy_guide {topic?}` | nothing new | The grammar for the GenomeSpy version the plugin bundles. It covers tracks per data type, multiscale, assemblies, loci and the coordinate rules, and how to draw a genome view from an agent's own page (`chimaera:lib/genome-spy`). |
 | `genomespy_inspect {path}` | nothing new | What is in a data file, read from its header: the format, the contigs with lengths and `chr` naming, the reference build it matches and how sure that match is, samples and read groups, INFO and FORMAT keys, zoom levels, indexes present or missing, and a ready-made track snippet. The headers are parsed in pure Rust over `host::read`. |
 | `genomespy_check {path}` | nothing new, then calls | It checks the spec's shape, the paths, the indexes, chromosome naming against the build, and field names against TSV and VCF headers. With calls, it also runs GenomeSpy's own validation in a real embed. The answer lists problems with their lines, and the same problems appear as editor marks. |
 | `genomespy_look {path, locus?, width?, height?}` | calls | A picture of the view in its answer, plus the visible region, the rows loaded per track, and any sources that failed. When the user has the view open, it renders from their window, so the agent sees what they see. Otherwise it renders headless. |
@@ -461,7 +520,7 @@ A typical loop:
 3. `check` it.
 4. `look` at it.
 5. Fix any problems.
-6. `show` it, or embed it in a `*.view.json` in the answer.
+6. `show` it, or draw it inside a teaching page in the answer.
 7. Later, `where` and `query` answer questions about the user's selection.
 
 ### The manifest
@@ -476,6 +535,7 @@ api = "0.3"
 [provides] mcp_tools = ["genomespy_guide", "genomespy_inspect", "genomespy_check", …]
            events = ["file-saved", "file-changed", "settings-changed"]
 [web] pages = ["genome.html"]
+      libraries = ["genome-spy"]       # for agents' pages where GenomeSpy is on
       network = ["data.genomespy.app", "hgdownload.soe.ucsc.edu", "ftp.ensembl.org"]
       network_user = true
 [[views]] id = "spec"    slot = "file"  title = "Genome view"
@@ -536,25 +596,29 @@ in total.
      `description`).
 
    It ends with a go/no-go note in this record.
-1. **Answer views in Chimaera's elements.** This needs no web code and can ship
-   before phase 2.
-   - `*.view.json` as an embed body and as a pane view, with the same renderer
-     and validator.
-   - Window-only interactions, plus `send` with its transcript attribution.
-   - The paragraph in the host frame, and `view_check`.
-   - Acceptance: an agent asked to explain a file format answers with a view
-     that has tabs, a table and a quiz. The user's answer comes back as an
-     attributed message, and the agent replies. The view is correct in light,
-     dark, narrow and wide.
+1. **Agents' pages in the theme, talking back.** This can ship before phase 2.
+   - The injected token variables, with live theme updates.
+   - `chimaera:theme.css`, `chimaera:web.js` with `send`, `reference`, `theme` and
+     `visibility`, and the chart palettes.
+   - The host frame's paragraph and the guide.
+   - Acceptance: an agent asked to teach a concept answers with an interactive
+     Plotly or D3 page. The page wears the app's theme and follows a theme
+     switch live. Its quiz answer comes back as an attributed message, and the
+     agent replies. It works in the browser and in the app, and an unchanged old
+     report renders as before.
 2. **The web views platform.**
    - The `web` node, API 0.3 `web-bundle()`, `/webdata` and `url()`.
    - `web/1`: data, theme, visibility, act, reference, save and status.
    - CSP built from `[web]`, the Can list and the capability atoms, and the
      resource limits.
+   - Data mode for agents' pages, with its navigation guard, and plugin
+     libraries (`chimaera:lib/…`).
    - `plugins/test-web` and `tests/plugin_web.rs`, plus the guide's section and
      the feature page.
    - Acceptance:
-     - the fixture's page draws in both hosts and in an agent's view file;
+     - the fixture's page draws in both hosts;
+     - an agent's data-mode page imports the fixture's library and reads a CSV
+       beside it, and it is refused any network;
      - it reads a workspace file by range;
      - it is refused outside its access, at an undeclared host, and where its
        plugin is off;
@@ -596,10 +660,15 @@ with `tier = "sandboxed"`.
   - it reaches only the hosts it declares;
   - the lock reviews each first-party bundle;
   - the spike reviews every path where spec text could turn into HTML.
-- **Agents' views are untrusted output.** A view is data checked by the host and
-  drawn by core. Markdown in it is sanitized as in chat. A web node inside it
-  runs only an active plugin's page, with that plugin's limits. A view never
-  sends anything without the user's click.
+- **Agents' pages are untrusted code, and so is any HTML file in a cloned
+  repository.** The defences:
+  - a page has no origin and never reaches the app;
+  - data mode and network mode never combine;
+  - data mode is automatic only for pages this workspace's agents wrote;
+  - `send` needs a real user action.
+
+  The navigation guard in the browser host is the weakest point and is the
+  spike's first test.
 - **A page that ignores visibility** can keep a browser CPU busy. The native view
   can be suspended. For first-party plugins, the fixture test checks CPU and
   the lock review checks the page.
@@ -620,25 +689,25 @@ with `tier = "sandboxed"`.
 4. **Reveal reuses `browser_show`'s hand-over**: the agent opens the view beside
    its own session, without taking focus.
 5. **Spec files are named `*.genomespy.json`.**
-6. **Answer views use Chimaera's elements first** (a `*.view.json` `ui/1` tree),
-   a plugin's web view only where that plugin is active, and HTML only as a last
-   resort.
+6. **Agents draw however they like.** Their pages are free HTML and JavaScript.
+   Chimaera's part is the theme (tokens, an optional stylesheet, chart
+   palettes), the way to talk back, and safe data access. A plugin's library,
+   such as GenomeSpy, works on a page only where that plugin is active.
 
 ## Open questions
 
-1. **A `view_check` tool for every agent.** It would be a built-in MCP tool
-   beside the browser tools, answering a view file's problems with their JSON
-   paths. Without it, an agent sees a broken view only if the user says so.
-   *Recommended: yes*, as one tool with a short description.
-2. **Charts in agents' views.** `ui/1` has tables but no charts, and "a chart of
-   the result" is the most common thing a view would want. There are two routes:
-   - a first-party Vega-Lite plugin on web views, which needs the plugin to be on;
-   - a small `chart` node in core, which every view could use.
-
-   *Recommended: the Vega-Lite plugin*, which keeps to the layering. Revisit if
-   charts turn out to be needed in most answers.
-3. **The view file's name.** `*.view.json` is short and says what it is. The
-   alternative is `*.ui.json`. *Recommended: `*.view.json`.*
+1. **Data mode for pages the agents did not write.** Two options:
+   - ask once for each file's contents (recommended);
+   - refuse outright, and require the user to copy the page into the workspace
+     with an agent.
+2. **A first-party Plotting plugin.** It would provide pinned Plotly, Vega-Lite,
+   Observable Plot and D3 as `chimaera:lib/…`. Data-mode pages need it, because
+   they can't use a CDN, and so do offline clusters. *Recommended: yes*, right
+   after phase 2, since data mode is where plots of real result files need
+   these libraries.
+3. **The injected token names.** They could be `--ch-*`, or the app's own names
+   (`--fg`, `--accent`). *Recommended: `--ch-*`*, so they never collide with a
+   page's own variables.
 
 ## Sources
 
