@@ -255,9 +255,11 @@
   /** A thumbnail's own URL for a picture (the daemon reads only the path).
    *  WebKit keeps one decoded copy per URL, and a picture drawn first at a
    *  thumbnail's size came back at that size in the slide viewer (192×108
-   *  for a 1280×720 slide: the last build, the one the strip shows). */
-  function thumbUrl(url: string): string {
-    return `${url}${url.includes("?") ? "&" : "?"}thumb`;
+   *  for a 1280×720 slide: the last build, the one the strip shows). Each
+   *  size a picture is drawn at gets its own URL (`tag`); the price is one
+   *  more fetch and decoded copy of a picture per size, all local. */
+  function thumbUrl(url: string, tag = "thumb"): string {
+    return `${url}${url.includes("?") ? "&" : "?"}${tag}`;
   }
 
   /** A ticket that lapsed under a long-open deck: mint it again, though
@@ -349,7 +351,7 @@
   /** A build's picture, swapped in only once its URL is minted and the
    *  picture decoded: until then the picture before it stays on screen, so
    *  a fast run of clicks never shows a blank frame or a half-drawn one. */
-  function steady(get: () => string | null): { readonly url: string | null; readonly src: string | null } {
+  function steady(get: () => string | null, tag?: string): { readonly url: string | null; readonly src: string | null } {
     let shown = $state<{ src: string; url: string } | null>(null);
     $effect(() => {
       const src = get();
@@ -359,8 +361,10 @@
         shown = null;
         return;
       }
-      const url = urls[src];
-      if (url === undefined || untrack(() => shown?.url) === url) return;
+      const minted = urls[src];
+      if (minted === undefined) return;
+      const url = tag === undefined ? minted : thumbUrl(minted, tag);
+      if (untrack(() => shown?.url) === url) return;
       let live = true;
       void decode(url).then(() => {
         if (live && !disposed) shown = { src, url };
@@ -383,8 +387,10 @@
    *  that was there before it. */
   const still = $derived(build === undefined ? null : clip !== null && playing !== null && !playing.ended ? playing.under : build.src);
   const showPicture = steady(() => (mode === "present" ? still : null));
-  const nowPicture = steady(() => (mode === "presenter" && build !== undefined ? build.src : null));
-  const nextPicture = steady(() => (mode === "presenter" && nextBuild !== undefined ? nextBuild.src : null));
+  // The presenter's panels draw pictures smaller than the show and the
+  // viewer: their own URLs, for the same reason as the strip's thumbUrl.
+  const nowPicture = steady(() => (mode === "presenter" && build !== undefined ? build.src : null), "now");
+  const nextPicture = steady(() => (mode === "presenter" && nextBuild !== undefined ? nextBuild.src : null), "next");
   // Browsing's viewer is handed the deck's own decoded picture: a run of
   // arrow keys swaps it in place, never a fresh ticket and load per slide.
   const browsePicture = steady(() => (mode === "browse" && build !== undefined ? build.src : null));
