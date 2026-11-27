@@ -393,14 +393,24 @@
       animation: none;
     }
   }
-  /* Exactly the pane's height: a body that only had a minimum grew to its
-     tallest side (a 44-slide list), and a viewer beside it centred its
-     picture in a box taller than the window. A pane too short for the body's
-     floor still scrolls (the tab's overflow). */
   .screen.fill {
     box-sizing: border-box;
-    height: 100%;
     min-height: 100%;
+  }
+  /* A split body pins the screen to the pane's height: with only a minimum
+     it grew to its tallest side (a 44-slide list), and a viewer beside it
+     centred its picture in a box taller than the window. Any other body
+     keeps growing with its content (the tab scrolls), so a long list never
+     overflows a pinned box. A pane too short for the split's floor still
+     scrolls (the tab's overflow). */
+  .screen.fill:has(> :global(.stack > .split:last-child)) {
+    height: 100%;
+  }
+  /* Stacked (a narrow pane), the split scrolls inside the pinned screen,
+     so nothing after it (the Replace note) is painted over. */
+  .screen.fill > :global(.stack > .split:last-child) {
+    overflow: auto;
+    scrollbar-width: thin;
   }
   .screen.fill > :global(.stack) {
     flex: 1;

@@ -1340,9 +1340,8 @@
     setViewOpener(openPluginViewSurface);
     setWindowCopier((paneId) => {
       const p = findPane(layout.root, paneId);
-      if (p === null || p.tabs[p.active] === undefined) return false;
-      xw.copyTabToWindow(paneId, p.active);
-      return true;
+      if (p === null || p.tabs[p.active] === undefined) return Promise.resolve(false);
+      return xw.copyTabToWindow(paneId, p.active);
     });
     setSameFileOpener(openSess);
     setChatLinkContext(linkContext);

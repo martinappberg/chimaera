@@ -288,9 +288,10 @@
   /** Pictures decoded ahead of their click. A show that swapped an `<img>`
    *  to a picture not yet decoded painted a blank frame between slides:
    *  every swap waits for its decode, and the next click's is done before
-   *  it is asked for. A few are kept (each 1280×720 is ~3.7 MB decoded). */
+   *  it is asked for. The show needs three at once (shown, now, next): a 4K
+   *  picture is ~33 MB decoded, so only a few are kept. */
   const decoded = new Map<string, { img: HTMLImageElement; ready: Promise<void> }>();
-  const DECODED_KEEP = 8;
+  const DECODED_KEEP = 4;
   function decode(url: string): Promise<void> {
     let hit = decoded.get(url);
     if (hit === undefined) {
@@ -346,10 +347,6 @@
     const url = urls[nextBuild.src];
     if (url !== undefined) void decode(url);
   });
-
-  /** The clip whose first frame has played: before it, the video is not
-   *  drawn (a video element paints black until it has a frame). */
-  let clipDrawn = $state<string | null>(null);
 
   let ImageView = $state<Component<{ path: string; pixels?: boolean }> | null>(null);
   $effect(() => {
@@ -471,21 +468,30 @@
 
   /** The presenter's view here, the show in a new window (the projector's):
    *  the window opens this tab again and finds an invite (localStorage, read
-   *  once, only while fresh) that starts its show; the channel lines it up. */
+   *  once, only while fresh) that starts its show; the channel lines it up.
+   *  Only a document created after the invite takes it: the same deck open
+   *  in another pane of an existing window never starts a show by itself. */
   const INVITE = "chimaera.deck.show-window";
-  const INVITE_MS = 15_000;
+  const INVITE_MS = 60_000;
   let windowError = $state<string | null>(null);
 
-  function showInWindow(): void {
+  let opening = $state(false);
+
+  async function showInWindow(): Promise<void> {
     windowError = null;
-    if (root === null) return;
+    if (root === null || opening) return;
     try {
       localStorage.setItem(INVITE, JSON.stringify({ sync: syncKey, at: Date.now() }));
     } catch {
       // No storage: the window opens on the deck, and F starts its show.
     }
-    if (!copyTabToWindow(root)) {
-      windowError = "This view can't open a window here.";
+    opening = true;
+    const opened = await copyTabToWindow(root).catch(() => false);
+    opening = false;
+    if (!opened) {
+      // The layer flashed why (popup blocked, daemon unreachable); a view
+      // with no layer to ask says so here.
+      windowError = "The show's window didn't open.";
       try {
         localStorage.removeItem(INVITE);
       } catch {
@@ -493,7 +499,7 @@
       }
       return;
     }
-    if (mode !== "presenter") presenter();
+    if (!disposed && mode !== "presenter") presenter();
   }
 
   function invited(): boolean {
@@ -502,6 +508,9 @@
       if (raw === null) return false;
       const v = JSON.parse(raw) as { sync?: unknown; at?: unknown };
       if (v.sync !== syncKey || typeof v.at !== "number" || Date.now() - v.at > INVITE_MS) return false;
+      // A window that was already open (another pane on this deck) is not
+      // the one the presenter opened.
+      if (performance.timeOrigin < v.at) return false;
       localStorage.removeItem(INVITE);
       return true;
     } catch {
@@ -662,7 +671,7 @@
         <button class="bbtn" onclick={askAgent} disabled={screen.busy} title="point an agent at this slide's code">@</button>
       {/if}
       {#if windowError !== null}<span class="tag" role="status">{windowError}</span>{/if}
-      <button class="bbtn" onclick={showInWindow} title="the show in a new window (drag it to the projector); this one shows your notes, the next click and every slide">show in window</button>
+      <button class="bbtn" disabled={opening} onclick={() => void showInWindow()} title="the show in a new window (drag it to the projector); this one shows your notes, the next click and every slide">show in window</button>
       <button class="bbtn" class:on={mode === "presenter"} onclick={presenter} aria-pressed={mode === "presenter"} title="presenter view: this slide, the next, your notes, a timer (P)">presenter</button>
       <button class="bbtn" onclick={() => void present()} title="present full screen; hidden slides are skipped (F)">present</button>
     </div>
@@ -731,13 +740,12 @@
             {#key clip.src}
               <!-- svelte-ignore a11y_media_has_caption — a slide's animation: silent, and its picture carries the alt text -->
               <video
-                class:drawn={clipDrawn === clip.src}
                 src={urls[clip.src]}
                 muted
                 playsinline
                 loop={clip.loop}
                 onloadeddata={clipReady}
-                onplaying={() => (clipDrawn = clip?.src ?? null)}
+                onplaying={(e) => e.currentTarget.classList.add("drawn")}
                 onended={clipEnded}
                 onerror={() => clipFailed(clip.src)}
               ></video>
@@ -991,7 +999,9 @@
     inset: 0;
     opacity: 0;
   }
-  .show video.drawn {
+  /* Set on the element by its own first `playing`: a replayed clip is a new
+     element that has no frame yet, and a video with none paints black. */
+  .show video:global(.drawn) {
     opacity: 1;
   }
   .show video.warm {

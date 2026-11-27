@@ -694,7 +694,7 @@ export function sizeWords(bytes: number): string {
 
 // --- a view's tab again in a new window ---------------------------------------
 
-type WindowCopier = (paneId: string) => boolean;
+type WindowCopier = (paneId: string) => Promise<boolean>;
 let windowCopier: WindowCopier | null = null;
 
 /** App-level wiring (the layout owns windows); null unregisters. */
@@ -704,10 +704,10 @@ export function setWindowCopier(fn: WindowCopier | null): void {
 
 /** Open the tab that holds `el` again in a new window, keeping it here (a
  *  deck's show on the projector while the presenter's view stays). False
- *  when nothing can. */
-export function copyTabToWindow(el: Element): boolean {
+ *  when nothing can, or the window did not open (the layer says why). */
+export function copyTabToWindow(el: Element): Promise<boolean> {
   const paneId = el.closest("[data-pane-id]")?.getAttribute("data-pane-id");
-  if (paneId == null || windowCopier === null) return false;
+  if (paneId == null || windowCopier === null) return Promise.resolve(false);
   return windowCopier(paneId);
 }
 
