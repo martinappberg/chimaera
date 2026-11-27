@@ -36,7 +36,7 @@ It covers feature boundaries, architecture, tests, agent guidance, and worktree 
 | Agent coordination | [Communication](agent-communication-plan.md), [dashboard](agent-dashboard-plan.md) | [Agent communication](../features/agent-communication.md), [dashboard](../features/dashboard.md) |
 | Project context | [Timeline and Knowledge](timeline-knowledge-plugins-plan.md), [Knowledge redesign](knowledge-redesign-plan.md) | [Timeline and Knowledge](../features/timeline-and-knowledge.md) |
 | Git and history | [Git and session history](git-and-session-history-plan.md) | [Git](../features/git.md), [session history](../features/session-history.md) |
-| Extensions | [Plugin system](plugin-system-plan.md), [extension platform](plugin-platform-plan.md), [Mod compatibility](mods-extension-compatibility.md), [LaTeX workflows](latex-reports-plan.md), [plugin web views and GenomeSpy (planned)](genomespy-plugin-plan.md) | [Plugins](../features/plugins.md), [extension authoring](../agent-guides/plugins.md) |
+| Extensions | [Plugin system](plugin-system-plan.md), [extension platform](plugin-platform-plan.md), [Mod compatibility](mods-extension-compatibility.md), [LaTeX workflows](latex-reports-plan.md), [rich views: answer views, plugin web views, GenomeSpy (planned)](rich-views-plan.md) | [Plugins](../features/plugins.md), [extension authoring](../agent-guides/plugins.md) |
 | Remote and compute | [Remote performance](perf-remote-plan.md), [cluster workspaces](hpc-portal-plan.md) | [Remote connections](../features/remote-connect.md), [compute](../features/compute.md) |
 | Windows | [Windows and WSL](windows-wsl-plan.md) | [Native app](../features/native-app.md) |
 
