@@ -251,7 +251,7 @@
   .prose :global(blockquote) {
     margin: 0.4em 0;
     padding: 2px 10px;
-    border-left: 2px solid color-mix(in srgb, var(--accent) 60%, transparent);
+    border-left: 2px solid color-mix(in srgb, var(--fg) 16%, transparent);
     color: var(--muted);
   }
   .more {

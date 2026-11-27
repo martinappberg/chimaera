@@ -854,7 +854,7 @@
   }
   .pane-guide.shown { opacity: 1; }
   .pane-guide-center { display: flex; flex-direction: column; align-items: center; gap: 18px; text-align: center; }
-  .pane-guide-label { font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: color-mix(in srgb, var(--muted) 75%, transparent); }
+  .pane-guide-label { font-size: var(--text-sm); font-weight: 600; color: color-mix(in srgb, var(--fg) 72%, var(--muted)); }
   .pane-guide-number { font-size: clamp(80px, 12vw, 160px); font-weight: 200; line-height: 1; letter-spacing: -0.06em; color: color-mix(in srgb, var(--fg) 12%, transparent); }
   .pane-guide-move { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; justify-content: center; }
   .pane-guide kbd { font: 11px var(--mono); color: var(--text); border: 1px solid var(--edge); border-radius: 5px; padding: 3px 6px; white-space: nowrap; }
@@ -923,9 +923,12 @@
     outline: none;
   }
 
-  /* The focused pane is unmistakable: hairline accent instead of the edge. */
-  .pane.focused {
-    border-color: color-mix(in srgb, var(--accent) 62%, var(--edge));
+  /* The focused pane is unmistakable: hairline accent instead of the edge.
+     Only among panes (a split's cell): a window's one pane is always the
+     focused one, and a permanent accent frame around the whole page says
+     nothing and tints everything inside it. */
+  :global(.split > .cell) .pane.focused {
+    border-color: var(--focus-edge);
   }
 
   /* A linked terminal carries its agent's hue as a quiet border tint

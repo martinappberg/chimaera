@@ -308,8 +308,7 @@
   .divider {
     padding: 8px 8px 3px;
     font-size: var(--text-xs);
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
+    font-weight: 500;
     color: var(--muted);
   }
 

@@ -156,7 +156,7 @@
     transition: border-color 0.12s ease;
   }
   .card.focused {
-    border-color: color-mix(in srgb, var(--accent) 62%, var(--edge));
+    border-color: var(--focus-edge);
   }
   .overlay .card {
     box-shadow: -14px 0 36px rgba(0, 0, 0, 0.22);

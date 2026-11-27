@@ -462,7 +462,7 @@ const DEFS = {
     category: "Chat",
     description: "Line height multiplier for messages and the composer.",
     type: "number",
-    default: 1.57,
+    default: 1.6,
     min: 1.2,
     max: 2.2,
     step: 0.01,

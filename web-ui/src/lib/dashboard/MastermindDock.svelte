@@ -960,7 +960,8 @@
     min-width: 0;
   }
   .cname {
-    font-family: var(--mono);
+    font-family: var(--name-font);
+    font-weight: 500;
     font-size: var(--text-sm);
     color: var(--fg);
   }

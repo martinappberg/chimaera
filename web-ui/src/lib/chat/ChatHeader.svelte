@@ -382,11 +382,11 @@
     align-items: center;
     min-width: 0;
     height: var(--pane-toolbar-height);
-    gap: 5px;
-    padding: 0 8px;
+    gap: 4px;
+    padding: 0 10px;
     white-space: nowrap;
-    border-bottom: 1px solid var(--edge);
-    background: color-mix(in srgb, var(--bg) 65%, var(--term-bg));
+    border-bottom: 1px solid var(--pane-toolbar-edge);
+    background: var(--pane-toolbar-bg);
     font-size: var(--text-xs);
     color: var(--muted);
     flex: none;
@@ -399,11 +399,12 @@
     align-items: center;
     gap: 5px;
     color: var(--fg);
-    font-family: var(--mono);
+    font-family: var(--name-font);
+    font-weight: 600;
     flex: none;
-    padding-right: 4px;
-    border-right: 1px solid var(--edge);
-    margin-right: 2px;
+    /* The agent is who you are talking to; what follows are its settings.
+       Space separates them, not a rule. */
+    margin-right: 6px;
   }
   .agent-name {
     white-space: nowrap;
@@ -435,6 +436,18 @@
     background: var(--pane-control-hover);
   }
   .chip.pick:disabled { cursor: default; color: var(--muted); }
+  /* The model is the setting people reach for: a soft pill marks it as the
+     control. Mode and effort stay plain words beside it. */
+  .model-picker .chip.pick {
+    padding: 0 8px;
+    border-color: color-mix(in srgb, var(--edge) 85%, transparent);
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--fg) 2.5%, transparent);
+  }
+  .model-picker .chip.pick:disabled {
+    border-color: transparent;
+    background: none;
+  }
   .mode-picker .chip, .effort-picker .chip { color: var(--muted); }
   .caret {
     flex: none;

@@ -1358,42 +1358,40 @@ const liveTheme: Extension = EditorView.theme({
     opacity: "0.6",
   },
 
+  // The reading view's quote (MarkdownView .md-doc blockquote): a rule in
+  // the margin and a quieter ink, no fill.
   "&.cm-md-live .lp-quote": {
-    borderLeft: "3px solid color-mix(in srgb, var(--accent) 60%, transparent)",
-    background:
-      "linear-gradient(to right, color-mix(in srgb, var(--accent) 5%, transparent), color-mix(in srgb, var(--fg) 3%, transparent) 55%)",
+    borderLeft: "3px solid color-mix(in srgb, var(--fg) 16%, transparent)",
     padding: "0 1em",
-    color: "color-mix(in srgb, var(--fg) 45%, var(--muted))",
+    color: "color-mix(in srgb, var(--fg) 55%, var(--muted))",
   },
   "&.cm-md-live .lp-quote-first": {
-    borderTopRightRadius: "8px",
-    paddingTop: "0.45em",
+    paddingTop: "0.1em",
   },
   "&.cm-md-live .lp-quote-last": {
-    borderBottomRightRadius: "8px",
-    paddingBottom: "0.45em",
+    paddingBottom: "0.1em",
   },
 
   "&.cm-md-live .lp-codeblock": {
-    background: "color-mix(in srgb, var(--fg) 4.5%, transparent)",
-    borderLeft: "1px solid var(--edge)",
-    borderRight: "1px solid var(--edge)",
+    background: "color-mix(in srgb, var(--fg) 4%, transparent)",
+    borderLeft: "1px solid color-mix(in srgb, var(--edge) 75%, transparent)",
+    borderRight: "1px solid color-mix(in srgb, var(--edge) 75%, transparent)",
     fontFamily: "var(--mono)",
     fontSize: "0.848em",
     lineHeight: "1.5",
     padding: "0 1em",
   },
   "&.cm-md-live .lp-codeblock-first": {
-    borderTop: "1px solid var(--edge)",
-    borderRadius: "8px 8px 0 0",
+    borderTop: "1px solid color-mix(in srgb, var(--edge) 75%, transparent)",
+    borderRadius: "10px 10px 0 0",
     paddingTop: "0.5em",
   },
   "&.cm-md-live .lp-codeblock-last": {
-    borderBottom: "1px solid var(--edge)",
-    borderRadius: "0 0 8px 8px",
+    borderBottom: "1px solid color-mix(in srgb, var(--edge) 75%, transparent)",
+    borderRadius: "0 0 10px 10px",
     paddingBottom: "0.5em",
   },
-  "&.cm-md-live .lp-codeblock-first.lp-codeblock-last": { borderRadius: "8px" },
+  "&.cm-md-live .lp-codeblock-first.lp-codeblock-last": { borderRadius: "10px" },
   "&.cm-md-live .lp-fence-chrome": { color: "var(--muted)", opacity: "0.75" },
 
   "&.cm-md-live .lp-inline-code": {

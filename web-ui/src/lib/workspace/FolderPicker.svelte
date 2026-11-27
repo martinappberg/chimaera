@@ -835,12 +835,13 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-family: var(--mono);
+    font-family: var(--file-font);
     font-size: var(--text-sm);
   }
 
   .name.here-label {
     flex: none;
+    font-family: var(--name-font);
   }
 
   /* "new folder…" — accent-coloured so the make-a-directory row reads apart
@@ -910,7 +911,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-family: var(--mono);
+    font-family: var(--file-font);
     font-weight: 600;
   }
 

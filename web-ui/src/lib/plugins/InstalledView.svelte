@@ -491,11 +491,9 @@
   }
   .lbl {
     margin: 0;
-    font-size: 11px;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--muted);
+    font-size: var(--text-sm);
     font-weight: 600;
+    color: color-mix(in srgb, var(--fg) 72%, var(--muted));
   }
   .empty {
     margin: 0;
@@ -615,7 +613,7 @@
     border-bottom: 1px solid var(--edge);
   }
   .gname {
-    font-family: var(--mono);
+    font-family: var(--name-font);
     font-size: var(--text-md);
     font-weight: 600;
   }
@@ -665,7 +663,7 @@
     min-width: 0;
   }
   .pname {
-    font-family: var(--mono);
+    font-family: var(--name-font);
     font-weight: 600;
     min-width: 0;
     overflow: hidden;

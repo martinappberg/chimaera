@@ -283,22 +283,19 @@
     display: flex;
     align-items: center;
     gap: 7px;
-    font-size: var(--text-xs);
+    font-size: var(--text-sm);
     font-weight: 600;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--accent);
+    color: color-mix(in srgb, var(--fg) 72%, var(--muted));
   }
 
   .label svg {
     flex: none;
+    color: var(--accent);
   }
 
   /* A non-RUNNING allocation state (COMPLETING, …) is worth caution. */
   .label .state {
     font-family: var(--mono);
-    letter-spacing: normal;
-    text-transform: none;
     color: var(--warn);
   }
 

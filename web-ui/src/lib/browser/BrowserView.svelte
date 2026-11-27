@@ -1013,7 +1013,7 @@
     container: browser-chrome / inline-size;
   }
 
-  /* The opening agent: the linked-terminal chip's shape (mono pill) with
+  /* The opening agent: the linked-terminal chip's shape (a pill) with
      only its mark in the agent's link hue — quieter than the address it
      sits beside; the page title stays the tab's label. */
   .opener {
@@ -1030,7 +1030,7 @@
     border-radius: 9px;
     background: none;
     color: var(--fg);
-    font-family: var(--mono);
+    font-family: var(--name-font);
     font-size: var(--text-xs);
     line-height: 1;
     cursor: pointer;
@@ -1099,7 +1099,7 @@
     border-radius: 9px;
     background: hsl(var(--hue) 50% 55% / 0.08);
     color: var(--fg);
-    font-family: var(--mono);
+    font-family: var(--name-font);
     font-size: var(--text-xs);
     line-height: 1;
     user-select: none;
@@ -1302,7 +1302,7 @@
 
   .degraded {
     flex: none;
-    font-family: var(--mono);
+    font-family: var(--name-font);
     font-size: var(--text-xs);
     color: var(--err, #c66);
     padding: 0 6px;

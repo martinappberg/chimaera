@@ -525,11 +525,9 @@
   }
   h3 {
     margin: 0 0 8px;
-    font-size: 10.5px;
+    font-size: var(--text-sm);
     font-weight: 600;
-    letter-spacing: 0.09em;
-    text-transform: uppercase;
-    color: var(--muted);
+    color: color-mix(in srgb, var(--fg) 72%, var(--muted));
   }
   .status {
     display: flex;

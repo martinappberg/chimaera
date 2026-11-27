@@ -1113,19 +1113,15 @@
   }
   .card-tools > h4 {
     margin: 0;
-    font-size: 11px;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--muted);
+    font-size: var(--text-sm);
     font-weight: 600;
+    color: color-mix(in srgb, var(--fg) 72%, var(--muted));
   }
   .card-settings > summary {
     cursor: pointer;
-    font-size: 11px;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--muted);
+    font-size: var(--text-sm);
     font-weight: 600;
+    color: color-mix(in srgb, var(--fg) 72%, var(--muted));
     padding-top: 12px;
     border-top: 1px solid var(--edge);
   }
@@ -1139,11 +1135,9 @@
     border-top: 1px solid var(--edge);
   }
   .facts dt {
-    font-size: 11px;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--muted);
+    font-size: var(--text-sm);
     font-weight: 600;
+    color: color-mix(in srgb, var(--fg) 72%, var(--muted));
     white-space: nowrap;
   }
   .facts dd {
@@ -1177,11 +1171,9 @@
     gap: 12px;
   }
   .side-title {
-    font-size: 11px;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--muted);
+    font-size: var(--text-sm);
     font-weight: 600;
+    color: color-mix(in srgb, var(--fg) 72%, var(--muted));
   }
   .side-link {
     margin-left: auto;
@@ -1220,8 +1212,8 @@
     font-size: var(--text-sm);
   }
   .aname {
-    font-family: var(--mono);
-    font-size: 12.5px;
+    font-family: var(--name-font);
+    font-size: var(--text-sm);
     color: var(--fg);
   }
   .astate {

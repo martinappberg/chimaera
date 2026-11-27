@@ -912,7 +912,7 @@
     background: none;
     color: var(--muted);
     font: inherit;
-    font-family: var(--mono);
+    font-family: var(--name-font);
     font-size: var(--text-sm);
     display: inline-flex;
     align-items: center;
@@ -968,10 +968,9 @@
 
   h1 {
     margin: 0;
-    font-family: var(--mono);
+    font-family: var(--name-font);
     font-size: calc(var(--text-lg) + 4px);
     font-weight: 600;
-    letter-spacing: 0.01em;
     overflow-wrap: anywhere;
   }
 
@@ -1069,11 +1068,12 @@
     padding: 0 8px 4px;
   }
 
+  /* Lowercase in the markup ("jobs", "workspaces"): the rail's quiet label
+     voice, not a sentence-case page head. */
   .sec-title {
     font-size: var(--text-xs);
+    font-weight: 500;
     color: var(--muted);
-    text-transform: lowercase;
-    letter-spacing: 0.04em;
   }
 
   .sec-acts {
@@ -1259,7 +1259,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-family: var(--mono);
+    font-family: var(--name-font);
     font-size: var(--text-md);
   }
 

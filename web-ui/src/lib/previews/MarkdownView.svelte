@@ -1753,8 +1753,8 @@
     height: var(--pane-toolbar-height);
     padding: 0 8px;
     white-space: nowrap;
-    border-bottom: 1px solid var(--edge);
-    background: color-mix(in srgb, var(--bg) 65%, var(--term-bg));
+    border-bottom: 1px solid var(--pane-toolbar-edge);
+    background: var(--pane-toolbar-bg);
   }
 
   .toggle {
@@ -2318,9 +2318,9 @@
      copy button never rides away with scrolled content. */
   .md-view :global(.md-doc pre) {
     position: relative; /* the copy button's anchor */
-    background: color-mix(in srgb, var(--fg) 4.5%, transparent);
-    border: 1px solid var(--edge);
-    border-radius: 8px;
+    background: color-mix(in srgb, var(--fg) 4%, transparent);
+    border: 1px solid color-mix(in srgb, var(--edge) 75%, transparent);
+    border-radius: 10px;
     padding: 0.8em 1em;
     overflow: hidden;
     line-height: 1.5;
@@ -2329,26 +2329,19 @@
   .md-view :global(.md-doc pre code) {
     display: block;
     overflow-x: auto;
-    scrollbar-width: thin;
     background: none;
     padding: 0;
     font-size: 0.848em;
   }
 
-  /* Quoted material as a quiet card — the same treatment as the chat
-     transcript: an accent→neutral wash a half-step off the page. */
+  /* Quoted material: a rule in the margin and a quieter ink, no fill — the
+     chat transcript's treatment (chat/Markdown.svelte). */
   .md-view :global(.md-doc blockquote) {
     position: relative; /* the copy button's anchor */
-    margin: 0.8em 0;
-    padding: 0.55em 1em;
-    border-left: 3px solid color-mix(in srgb, var(--accent) 60%, transparent);
-    border-radius: 0 8px 8px 0;
-    background: linear-gradient(
-      to right,
-      color-mix(in srgb, var(--accent) 5%, transparent),
-      color-mix(in srgb, var(--fg) 3%, transparent) 55%
-    );
-    color: color-mix(in srgb, var(--fg) 45%, var(--muted));
+    margin: 0.9em 0;
+    padding: 0.1em 2em 0.1em 1em;
+    border-left: 3px solid color-mix(in srgb, var(--fg) 16%, transparent);
+    color: color-mix(in srgb, var(--fg) 55%, var(--muted));
   }
 
   .md-view :global(.md-doc blockquote > :first-child) {
@@ -2413,7 +2406,6 @@
     max-width: 100%;
     overflow-x: auto;
     overflow-y: hidden;
-    scrollbar-width: thin;
     margin: 0.55em 0;
     padding: 0.1em 0;
   }
@@ -2428,8 +2420,18 @@
     margin: 0.2em 0;
   }
 
-  .md-view :global(.md-doc li)::marker {
+  /* Markers carry the accent, quiet for a bullet and at text strength for a
+     numbered step (chat/Markdown.svelte). */
+  .md-view :global(.md-doc ul > li)::marker {
     color: color-mix(in srgb, var(--accent) 70%, var(--muted));
+  }
+  .md-view :global(.md-doc ol > li)::marker {
+    color: var(--accent-text);
+    font-variant-numeric: tabular-nums;
+    font-weight: 500;
+  }
+  .md-view :global(.md-doc :is(strong, b)) {
+    font-weight: 600;
   }
 
   .md-view :global(.md-doc hr) {
@@ -2475,6 +2477,13 @@
   .md-view :global(.md-doc .md-embed-image > .embed-card[data-embed-kind="image"] .image-body) {
     padding: 0;
     background: none;
+  }
+
+  /* A document's own picture stays bare: the transcript's figure frame
+     (shared/embed/EmbedCard .fit) is not this view's. */
+  .md-view :global(.md-doc .md-embed-image > .embed-card[data-embed-kind="image"] .image-body .frame) {
+    border-radius: 4px;
+    box-shadow: none;
   }
 
   .md-view :global(.md-doc .md-embed-image > .embed-card[data-embed-kind="pending"]:not(.missing)) {

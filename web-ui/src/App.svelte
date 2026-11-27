@@ -6027,7 +6027,7 @@
   .row.agent-row {
     box-sizing: border-box;
     flex-shrink: 0;
-    height: calc(var(--text-sm) * 1.3 + 12px);
+    height: calc(var(--text-md) * 1.3 + 13px);
   }
 
   /* The dashboard home row: fixed above the session sections, quiet until
@@ -6054,11 +6054,10 @@
     display: block;
   }
   .dash-label {
-    /* Match the session rows' name type (mono, text-sm) — the dashboard row
-       sits in the same list and must read as one of them, not a stray
-       proportional label. */
-    font-family: var(--mono);
-    font-size: var(--text-sm);
+    /* Match the session rows' name type — the dashboard row sits in the
+       same list and must read as one of them. */
+    font-family: var(--name-font);
+    font-size: var(--text-md);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -6140,8 +6139,8 @@
     border: 1px solid color-mix(in srgb, var(--accent) 55%, transparent);
     border-radius: 4px;
     background: var(--overlay-bg);
-    font-family: var(--mono);
-    font-size: var(--text-sm);
+    font-family: var(--name-font);
+    font-size: var(--text-md);
     color: var(--fg);
     outline: none;
   }
@@ -6152,8 +6151,8 @@
     white-space: nowrap;
     flex: 1;
     min-width: 0;
-    font-family: var(--mono);
-    font-size: var(--text-sm);
+    font-family: var(--name-font);
+    font-size: var(--text-md);
   }
   /* A branch shares the name's line without taking its full width. */
   .wt-mark {
@@ -6355,7 +6354,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-family: var(--mono);
+    font-family: var(--name-font);
     font-size: var(--text-xs);
     color: var(--muted);
   }
@@ -6487,14 +6486,15 @@
     color: var(--err);
   }
 
-  /* Rail section headers: terminals above, agents below. */
+  /* Rail section headers: terminals above, agents below. Quiet lowercase
+     labels in the rail's own voice (dashboard, + terminal, local) — a
+     tracked capital would be the loudest type in the column. */
   .rail-sec {
     flex: none;
-    padding: 4px 8px 3px;
+    padding: 4px 8px 4px;
     font-size: var(--text-xs);
-    font-weight: 600;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
+    font-weight: 500;
+    letter-spacing: 0.01em;
     color: var(--muted);
     user-select: none;
   }
@@ -6533,9 +6533,8 @@
     justify-content: space-between;
     padding: 4px 8px;
     font-size: var(--text-xs);
-    font-weight: 600;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
+    font-weight: 500;
+    letter-spacing: 0.01em;
     color: var(--muted);
     user-select: none;
   }
@@ -6591,8 +6590,8 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-family: var(--mono);
-    font-size: var(--text-sm);
+    font-family: var(--name-font);
+    font-size: var(--text-md);
     color: var(--muted);
     transition: color 0.12s ease;
   }
@@ -6754,9 +6753,8 @@
     padding: 4px 16px;
     font: inherit;
     font-size: var(--text-xs);
-    font-weight: 600;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
+    font-weight: 500;
+    letter-spacing: 0.01em;
     color: var(--muted);
     cursor: pointer;
     user-select: none;

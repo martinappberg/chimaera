@@ -1142,15 +1142,15 @@
 
 <style>
   .md {
-    line-height: var(--chat-line-height, 1.57);
+    line-height: var(--chat-line-height, 1.6);
     font-size: var(--text-md);
     word-break: break-word;
     /* Table spacing over the shared recipe (app.css "Markdown tables"): the
        transcript's tighter rhythm, and an absolute cell size — --text-sm
        keeps a legibility floor at the smallest pane font. */
-    --md-table-margin: 0.4em;
+    --md-table-margin: 0.9em;
     --md-table-font-size: var(--text-sm);
-    --md-table-cell-padding: 3px 8px;
+    --md-table-cell-padding: 0.42em 0.85em;
   }
   /* Streaming containers are layout-neutral: display:contents removes the
      live shell and each segment wrapper from the box tree, so block margins,
@@ -1179,55 +1179,90 @@
       animation: none;
     }
   }
+  /* Paragraphs breathe: three quarters of a line between them, so a reply
+     reads as paragraphs rather than one block. Inside a list item the
+     paragraph is the item's own text and keeps the list's tighter step. */
   .md :global(p) {
-    margin: 0.35em 0;
+    margin: 0.75em 0;
+  }
+  .md :global(li > p) {
+    margin: 0.3em 0;
+  }
+  /* 700 on the system face is poster weight at reading size; a lead-in label
+     ("Why it fails:") should sit in the line, not on top of it. */
+  .md :global(strong),
+  .md :global(b) {
+    font-weight: 600;
   }
   /* Equation typography (.katex) is global — app.css; MathML output has no
      .katex-display wrapper, display math is `<math display="block">`. */
-  /* Heading ladder: real hierarchy (agents lean on markdown constantly), with
-     a hairline under the top two ranks — quiet document structure, not chrome. */
+  /* Heading ladder: the document view's (previews/MarkdownView), a step
+     tighter for a transcript. A heading belongs to what follows it, so the
+     space above is three times the space below; the hairline under the top
+     two ranks is quiet document structure, not chrome. */
   .md :global(h1),
   .md :global(h2),
   .md :global(h3),
-  .md :global(h4) {
-    margin: 0.85em 0 0.35em;
+  .md :global(h4),
+  .md :global(h5),
+  .md :global(h6) {
+    margin: 1.5em 0 0.5em;
     font-weight: 600;
     line-height: 1.3;
+    letter-spacing: -0.011em;
   }
   .md :global(h1) {
-    font-size: 1.3em;
+    font-size: 1.45em;
   }
   .md :global(h2) {
-    font-size: 1.18em;
+    font-size: 1.25em;
   }
   .md :global(h3) {
-    font-size: 1.08em;
+    font-size: 1.1em;
   }
-  .md :global(h4) {
+  .md :global(h4),
+  .md :global(h5),
+  .md :global(h6) {
     font-size: 1em;
   }
   .md :global(h1),
   .md :global(h2) {
-    padding-bottom: 0.15em;
-    border-bottom: 1px solid color-mix(in srgb, var(--edge) 70%, transparent);
+    padding-bottom: 0.3em;
+    border-bottom: 1px solid color-mix(in srgb, var(--edge) 80%, transparent);
+  }
+  /* A heading that follows a heading is its subtitle: no second gap. */
+  .md :global(:is(h1, h2, h3, h4) + :is(h2, h3, h4, h5)) {
+    margin-top: 0.7em;
   }
   .md :global(ul),
   .md :global(ol) {
-    margin: 0.3em 0;
-    padding-left: 1.4em;
+    margin: 0.65em 0;
+    padding-left: 1.5em;
   }
   .md :global(li) {
-    margin: 0.15em 0;
+    margin: 0.3em 0;
+    padding-left: 0.15em;
   }
-  .md :global(li)::marker {
+  .md :global(li > :is(ul, ol)) {
+    margin: 0.3em 0;
+  }
+  /* Markers carry the accent, quietened for a bullet and at text strength
+     for a numbered step, where the number is content: the one place the
+     house colour runs through an agent's prose. */
+  .md :global(ul > li)::marker {
     color: color-mix(in srgb, var(--accent) 70%, var(--muted));
+  }
+  .md :global(ol > li)::marker {
+    color: var(--accent-text);
+    font-variant-numeric: tabular-nums;
+    font-weight: 500;
   }
   .md :global(code) {
     font-family: var(--mono, monospace);
-    font-size: 0.92em;
-    background: color-mix(in srgb, var(--fg) 7%, transparent);
-    border-radius: 3px;
-    padding: 0.05em 0.3em;
+    font-size: 0.88em;
+    background: color-mix(in srgb, var(--fg) 6.5%, transparent);
+    border-radius: 5px;
+    padding: 0.14em 0.38em;
   }
   .md :global(.md-path) {
     cursor: pointer;
@@ -1252,12 +1287,13 @@
   }
   .md :global(pre) {
     position: relative; /* the copy button's anchor */
-    background: color-mix(in srgb, var(--fg) 5%, transparent);
-    border: 1px solid var(--edge);
-    border-radius: 6px;
-    padding: 8px 10px;
+    background: color-mix(in srgb, var(--fg) 4%, transparent);
+    border: 1px solid color-mix(in srgb, var(--edge) 75%, transparent);
+    border-radius: 10px;
+    padding: 12px 14px;
     overflow-x: auto;
-    margin: 0.4em 0;
+    margin: 0.9em 0;
+    line-height: 1.55;
   }
   /* The CODE child is the horizontal scroller (not the pre), so the pinned
      copy button never rides away with scrolled content; a bare raw-HTML pre
@@ -1265,7 +1301,6 @@
   .md :global(pre code) {
     display: block;
     overflow-x: auto;
-    scrollbar-width: thin;
     background: none;
     padding: 0;
     font-size: var(--text-sm);
@@ -1275,8 +1310,8 @@
      themes hold. */
   .md :global(.md-copy) {
     position: absolute;
-    top: 5px;
-    right: 5px;
+    top: 7px;
+    right: 7px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -1333,22 +1368,16 @@
   .md :global(.md-copy.copied .ic-check) {
     display: block;
   }
-  /* Quoted material (agents echo source prose back for review) reads as a
-     quiet card — prose-set and wrapped, deliberately unlike code chrome, but
-     carrying the same pinned copy affordance. The wash fades accent→neutral so
-     the quote sits a half-step off the page in both themes without shouting. */
+  /* Quoted material (agents echo source prose back for review): a rule in
+     the margin and a quieter ink — prose-set and wrapped, deliberately
+     unlike code chrome, with the same pinned copy affordance. No fill: the
+     rule alone says "quoted", and the page stays one surface. */
   .md :global(blockquote) {
     position: relative; /* the copy button's anchor */
-    margin: 0.5em 0;
-    padding: 8px 14px;
-    border-left: 2.5px solid color-mix(in srgb, var(--accent) 60%, transparent);
-    border-radius: 0 7px 7px 0;
-    background: linear-gradient(
-      to right,
-      color-mix(in srgb, var(--accent) 5%, transparent),
-      color-mix(in srgb, var(--fg) 3%, transparent) 55%
-    );
-    color: color-mix(in srgb, var(--fg) 45%, var(--muted));
+    margin: 0.9em 0;
+    padding: 0.1em 2em 0.1em 1em;
+    border-left: 3px solid color-mix(in srgb, var(--fg) 16%, transparent);
+    color: color-mix(in srgb, var(--fg) 55%, var(--muted));
   }
   /* Trim the card's inner rhythm: first/last CONTENT blocks sit flush (the
      appended copy button is the structural last child, hence the `of` form). */
@@ -1360,6 +1389,14 @@
   }
   .md :global(a) {
     color: var(--accent-text);
+    text-decoration-line: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 3px;
+    text-decoration-color: color-mix(in srgb, var(--accent-text) 38%, transparent);
+    transition: text-decoration-color 0.12s ease;
+  }
+  .md :global(a:hover) {
+    text-decoration-color: var(--accent-text);
   }
   /* Chat's one table delta over the shared recipe (app.css "Markdown
      tables"), which styles the .md-table host tables.ts emits and every
@@ -1374,7 +1411,7 @@
   .md :global(hr) {
     border: none;
     border-top: 1px solid var(--edge);
-    margin: 0.6em 0;
+    margin: 1.4em 0;
   }
   /* Local images are embed cards (upgradeEmbeds). Until a streaming
      segment closes, its placeholder holds a quiet box of about a card's

@@ -335,7 +335,7 @@
   }
 
   .dpath {
-    font-family: var(--mono);
+    font-family: var(--file-font);
     color: var(--fg);
     overflow: hidden;
     text-overflow: ellipsis;
