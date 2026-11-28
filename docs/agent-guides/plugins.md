@@ -362,6 +362,7 @@ a user's trust answer covers. Print both for your manifest, no daemon needed:
 ```sh
 chimaera plugin caps plugin.toml          # tier, digest, the Can list
 chimaera plugin caps plugin.toml --json   # the atoms too
+chimaera plugin caps new.toml --against old.toml   # what a release adds and drops, and whether only its words changed (JSON)
 ```
 
 A release whose digest isn't covered asks the user before it installs or

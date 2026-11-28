@@ -635,9 +635,18 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     that newly blocks a loaded build drops its instances and cancels its jobs at once and logs
     a `blocked` entry; a soft block the user allowed (by the build's sha256) runs.
   - **Lock bumps.** The lock records each first-party plugin's `tier` and `caps`; the
-    `plugin-lock` workflow auto-merges a bump only when the plugin is sandboxed and its release's
-    capability lines match the pinned release's — otherwise the PR waits for a maintainer, and
-    CI (which checks both against the release) stays red until they are set.
+    `plugin-lock` workflow writes each bump with the release's own `tier` and `caps`
+    (read by the daemon's own code: the `chimaera` CLI built from the checkout, `chimaera plugin caps
+    --against`) and auto-merges it only when the pinned release reads as the lock records, the two
+    `plugin.toml`s are identical except for words (`plugins::same_behaviour`), and, for a privileged plugin, its
+    `plugin.wasm` and `plugin.toml` are in one attestation from the plugin repository's release workflow,
+    at the release's tag or on main, from the commit the tag points to, which is on main
+    (`gh attestation verify`), so a release run by hand on main counts too. That proves where the files
+    were built, not that anyone reviewed the commit: whoever can merge to a privileged plugin's main and
+    release it ships without a second look at the lock PR, by the maintainer's choice. Otherwise the PR waits
+    for a maintainer, and its body says which condition failed, whether provenance verified, and which
+    Can lines the release adds and drops. CI checks only that the lock matches
+    the release, which is not an approval: a green bump that waits still needs a person to read the code.
 
 ## Plugin screens, files and settings (the 0.2 platform)
 

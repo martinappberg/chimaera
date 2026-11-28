@@ -144,6 +144,16 @@ jobs:
       - run: cargo test --workspace
         env:
           CHIMAERA_WIRE_FIXTURES: check
+      # The plugin-lock decision end to end: the chimaera CLI this commit
+      # builds reads the manifests, plugin-lock.mjs decides on its answer
+      # (the node job runs the rest of that suite without a binary).
+      - run: cargo build --locked -p chimaera
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+      - run: node --test --test-name-pattern "real CLI" .github/scripts/plugin-lock.test.mjs
+        env:
+          CHIMAERA_BIN: ${{ github.workspace }}/target/debug/chimaera
       - run: cargo test --manifest-path plugins/Cargo.toml
 
   musl:

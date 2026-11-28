@@ -222,14 +222,43 @@ The platform's rule:
   reach users through the lock: the plugin's release, then a lock bump, then a
   chimaera release. A user can still install a newer release early, through the trust
   prompt, as an unverified version.
-- **Lock bumps** (the `plugin-lock` workflow): auto-merge only when the tier is
-  sandboxed and the digest is unchanged. Any privileged bump, and any digest change,
-  opens the pull request without auto-merge and with a label asking for review.
-- **Provenance** for privileged plugins: the plugin repository's release workflow
-  attests that `plugin.wasm` was built from the tagged source (`actions/attest`, which
-  takes the release's existing `SHA256SUMS` as its subjects), and the lock check runs
-  `gh attestation verify` pinned to that repository and its release workflow before it
-  proposes the bump. Review then covers the code that actually ships. The daemon does
+- **Lock bumps** (the `plugin-lock` workflow): the bump writes the release's own tier
+  and digest, read by the daemon's own code (the `chimaera` CLI built from the checkout,
+  `chimaera plugin caps --against`; no second reader), and auto-merges only when the
+  pinned release reads as the lock records, the two `plugin.toml`s are identical except
+  for words (`plugins::same_behaviour`: version, name, summary, description, category,
+  `[adds]` and the two summaries are words; every other field is behaviour, `homepage`
+  included (a link on a verified card) — `Manifest`, `Requires` and `Recommends` by an
+  exhaustive destructure, the nested declarations compared whole through their derived
+  `Debug`, so a field added to one is compared automatically; unknown keys are refused), and, for a
+  privileged plugin, provenance verifies (below). Anything else opens the pull request without auto-merge, saying which
+  condition failed; CI checking the lock against the release is not an approval, so
+  such a PR still needs a person to read the code. A sandboxed plugin needs no
+  provenance: the sandbox bounds what its new code can do.
+- **Provenance** for privileged plugins (built): the plugin repository's release
+  workflow (`.github/workflows/release.yml`, a convention fixed in the chimaera
+  repository, never read from the release) signs one attestation whose subjects are
+  `plugin.wasm` and `plugin.toml`, the exact files it uploads and lists in `SHA256SUMS`
+  (`actions/attest`, in a publish job that checks them against the read-only build
+  job's hashes), and the lock bump requires both files in one attestation by the plugin
+  repository's release workflow, at the release's tag or on main, from the commit the
+  tag points to, which is on main: it resolves the tag to its commit through the GitHub
+  API, checks the commit is on main (the compare API), runs `gh attestation verify` on
+  the release's wasm pinned to that repository, that workflow at exactly one of the two
+  refs (`--cert-identity`, `--source-ref`) and that commit (`--source-digest`), then
+  checks gh's result again, the toml's digest included. Binding to the commit, not a
+  ref name, is what lets a release run by hand on main (how these plugins are released)
+  count. Its manifest must also be the pinned release's but for its words (every field,
+  not only the digest's atoms). A privileged release that meets
+  all this merges by itself. What the attestation proves is that the files were built by
+  the repository's release workflow from a commit on main; it does not prove anyone
+  reviewed that commit. With this rule, whoever can merge to a privileged plugin's main
+  and release it ships to users without a second look at the lock PR: the maintainer's
+  chosen trade. The repositories' rulesets keep a `v*` tag from being moved or deleted
+  and `main` from being force-pushed or deleted; creating a tag is not restricted, so the
+  script's checks are what stop a tag on a side commit. One that doesn't verify (no
+  attestation, the toml not in it, another workflow, ref or commit, a commit off main,
+  an unresolvable tag, a network error, gh missing) waits for a person. The daemon does
   not verify attestations itself: it trusts the lock, which pins the hashes, so the
   check runs once, in CI, where people can see it.
 - **Rebuildable.** A plugin repository's CI builds its component twice, in different
@@ -950,7 +979,8 @@ the redesign should build so that the two fit, decided here for both:
    snapshot out, 30 s, 4 MiB). A provider may stay on `api = "0.1"`. One that
    moves to `api = "0.2"` must declare `[access] files = "read"` (0.2 grants
    nothing unsaid), which changes its capability digest: its lock bump then
-   waits for a maintainer, who sets `caps` from `chimaera plugin caps`.
+   waits for a maintainer, who reviews the `tier` and `caps` the bump wrote (what
+   `chimaera plugin caps` prints) and the Can lines it adds.
 3. **Spans are one shape everywhere:** `{path, line, end_line}`,
    workspace-relative, 1-based, inclusive (as `diagnostics/1`). Core reads the
    slice through the ordinary file routes; bodies never ride a surface.

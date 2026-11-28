@@ -397,10 +397,17 @@ pub async fn untrust(id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `chimaera plugin caps <plugin.toml>`: no daemon, the host's own reading.
-pub fn caps(manifest: &Path, as_json: bool) -> anyhow::Result<()> {
-    let text =
-        std::fs::read_to_string(manifest).with_context(|| format!("{}", manifest.display()))?;
+/// `chimaera plugin caps <plugin.toml> [--against <pinned.toml>]`: no
+/// daemon, the host's own reading. With `--against`, the comparison the
+/// plugin-lock workflow decides a bump with (always JSON).
+pub fn caps(manifest: &Path, as_json: bool, against: Option<&Path>) -> anyhow::Result<()> {
+    let read = |p: &Path| std::fs::read_to_string(p).with_context(|| format!("{}", p.display()));
+    let text = read(manifest)?;
+    if let Some(pinned) = against {
+        let v = chimaera_server::plugin_bump(&text, &read(pinned)?).map_err(anyhow::Error::msg)?;
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
     let v = chimaera_server::plugin_capabilities(&text).map_err(anyhow::Error::msg)?;
     if as_json {
         println!("{}", serde_json::to_string_pretty(&v)?);
