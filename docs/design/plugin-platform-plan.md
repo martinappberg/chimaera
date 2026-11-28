@@ -226,9 +226,11 @@ The platform's rule:
   and digest, read by the daemon's own code (the `chimaera` CLI built from the checkout,
   `chimaera plugin caps --against`; no second reader), and auto-merges only when the
   pinned release reads as the lock records, the two `plugin.toml`s are identical except
-  for words (`plugins::same_behaviour`: version, name, summary, description, homepage,
-  category, `[adds]` and the two summaries are words; every other field of the manifest
-  type is behaviour, by an exhaustive destructure; unknown keys are refused), and, for a
+  for words (`plugins::same_behaviour`: version, name, summary, description, category,
+  `[adds]` and the two summaries are words; every other field is behaviour, `homepage`
+  included (a link on a verified card) — `Manifest`, `Requires` and `Recommends` by an
+  exhaustive destructure, the nested declarations compared whole through their derived
+  `Debug`, so a field added to one is compared automatically; unknown keys are refused), and, for a
   privileged plugin, provenance verifies (below). Anything else opens the pull request without auto-merge, saying which
   condition failed; CI checking the lock against the release is not an approval, so
   such a PR still needs a person to read the code. A sandboxed plugin needs no

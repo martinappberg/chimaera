@@ -202,6 +202,19 @@ export function bumpFacts(json) {
  * daemon reads) on the two manifests, from a private temp dir, without a
  * shell. Throws when it fails or its answer isn't what `bumpFacts` accepts.
  */
+/** What a failed `chimaera plugin caps --against` means, in one line: the
+ *  CLI didn't run, a file it was given couldn't be read (the CLI names the
+ *  path), or the daemon refused the release's manifest. */
+export function capsFailure(error, releasePath, pinnedPath) {
+  if (error?.code === "ENOENT" || error?.code === "EACCES") return `the chimaera CLI can't run (${error.code})`;
+  if (error?.killed || error?.signal) return "the chimaera CLI timed out";
+  const stderr = String(error?.stderr ?? "");
+  const last = oneLine(stderr.trim().split("\n").at(-1)?.trim() || String(error?.message ?? "failed"), 200);
+  if (stderr.includes(pinnedPath)) return `the pinned plugin.toml couldn't be read: ${last}`;
+  if (stderr.includes(releasePath)) return `the release's plugin.toml couldn't be read: ${last}`;
+  return `the release's plugin.toml doesn't read as a manifest: ${last}`;
+}
+
 export async function caps(bin, releaseToml, pinnedToml, run = execFileAsync) {
   if (typeof bin !== "string" || bin === "") throw new Error("no chimaera CLI to read the manifests with (--chimaera)");
   const dir = await mkdtemp(join(tmpdir(), "plugin-lock-caps-"));
@@ -218,8 +231,7 @@ export async function caps(bin, releaseToml, pinnedToml, run = execFileAsync) {
         maxBuffer: 4 * 1024 * 1024,
       }));
     } catch (error) {
-      const first = oneLine(String(error?.stderr ?? "").trim().split("\n").at(-1) || String(error?.message ?? "failed"), 200);
-      throw new Error(`the release's plugin.toml doesn't read as a manifest: ${first}`);
+      throw new Error(capsFailure(error, release, pinned));
     }
     return bumpFacts(stdout);
   } finally {

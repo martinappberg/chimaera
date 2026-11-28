@@ -423,6 +423,10 @@ impl Manifest {
 /// was already refused (`deny_unknown_fields` at every level), never
 /// ignored; and the comparison is of the parsed values, so TOML's spellings
 /// of one value (inline tables, dotted keys, comments, quoting) are one value.
+/// The exhaustive destructure covers `Manifest`, `Requires` and
+/// `Recommends`; the nested declarations (programs, tools, views, settings…)
+/// are compared whole through their derived `Debug`, so a field added to one
+/// of them is compared automatically.
 pub(crate) fn same_behaviour(a: &Manifest, b: &Manifest) -> bool {
     behaviour(a) == behaviour(b)
 }
@@ -436,16 +440,17 @@ fn behaviour(m: &Manifest) -> String {
     let Manifest {
         // Words. `version` is checked against the tag and the lock and
         // selects nothing; `name` and `summary` are the card's and the lock's
-        // text; `description`, `homepage`, `category` and `adds` are only
-        // shown on the card (`manifest_fields`, `category()`).
+        // text; `description`, `category` and `adds` are only shown on the
+        // card (`manifest_fields`, `category()`).
         name: _,
         version: _,
         summary: _,
         description: _,
-        homepage: _,
         category: _,
         adds: _,
-        // Behaviour.
+        // Behaviour. `homepage` too: it is shown as a link on a card the
+        // maintainers verify, so a release that repoints it waits.
+        homepage,
         id,
         api,
         detect,
@@ -481,7 +486,7 @@ fn behaviour(m: &Manifest) -> String {
     format!(
         "{:?}",
         (
-            id,
+            (id, homepage),
             api,
             detect,
             access,
@@ -696,9 +701,12 @@ mod behaviour_tests {
             .replace("summary = \"Notes.\"", "summary = \"Other words.\"")
             .replace(
                 "api = \"0.2\"\n",
-                "api = \"0.2\"\ndescription = \"Longer.\"\nhomepage = \"https://example.org\"\ncategory = \"writing\"\n",
+                "api = \"0.2\"\ndescription = \"Longer.\"\ncategory = \"writing\"\n",
             )
-            .replace("agents = [\"notes_read\"]", "agents = [\"notes_read, said better\"]");
+            .replace(
+                "agents = [\"notes_read\"]",
+                "agents = [\"notes_read, said better\"]",
+            );
         assert!(same(&pinned, &words));
         assert!(same(
             &pinned,
@@ -722,6 +730,17 @@ mod behaviour_tests {
         ));
     }
 
+    /// Refused, and for that reason: an unknown key, not some other fault.
+    fn refuses_unknown(text: &str, what: &str) {
+        match parse_manifest(text) {
+            Ok(_) => panic!("{what}: an unknown key was accepted"),
+            Err(e) => assert!(
+                e.contains("unknown field"),
+                "{what}: refused for another reason: {e}"
+            ),
+        }
+    }
+
     #[test]
     fn a_key_the_manifest_type_does_not_carry_is_refused_at_every_level() {
         for (table, at) in [
@@ -737,10 +756,7 @@ mod behaviour_tests {
         ] {
             let text = base().replacen(at, &format!("{at}zz_unknown = 1\n"), 1);
             assert_ne!(text, base(), "{table}");
-            assert!(
-                parse_manifest(&text).is_err(),
-                "{table}: an unknown key is refused"
-            );
+            refuses_unknown(&text, table);
         }
         for extra in [
             "[detect]\nany = []\nzz = 1\n",
@@ -749,22 +765,157 @@ mod behaviour_tests {
             "[recommends.agent_plugins.claude]\nid = \"x\"\nzz = 1\n",
             "[setup]\nprompt = \"x\"\nzz = 1\n",
             "[[views]]\nid = \"v\"\ntitle = \"V\"\nslot = \"tab\"\nzz = 1\n",
+            "[[views]]\nid = \"v\"\ntitle = \"V\"\nslot = \"file\"\n\
+             [[files]]\nmatch = [\"*.x\"]\nview = \"v\"\nlabel = \"X\"\nzz = 1\n",
             "[[actions]]\nmatch = [\"*.x\"]\nlabel = \"X\"\naction = \"x\"\nzz = 1\n",
             "[[settings]]\nkey = \"k\"\ntype = \"bool\"\ndefault = true\nlabel = \"K\"\nzz = 1\n",
         ] {
-            assert!(
-                parse_manifest(&format!("{}{extra}", base())).is_err(),
-                "{extra}"
-            );
+            refuses_unknown(&format!("{}{extra}", base()), extra);
         }
-        assert!(
-            parse_manifest(
-                &format!("{HEAD}api = \"0.3\"\n[web]\nnetwork = [\"a.example.org\"]\nzz = 1\n")
-                    .replacen("api = \"0.2\"\n", "", 1)
-            )
-            .is_err(),
-            "[web]"
+        refuses_unknown(
+            &format!("{HEAD}[web]\nnetwork = [\"a.example.org\"]\nzz = 1\n").replacen(
+                "api = \"0.2\"",
+                "api = \"0.3\"",
+                1,
+            ),
+            "[web]",
         );
+    }
+
+    /// Fields a release could change without touching the capability digest,
+    /// or that sit near the words, each pinned as behaviour: moving one into
+    /// the ignored words fails here.
+    #[test]
+    fn each_of_these_is_behaviour() {
+        let platform = format!(
+            "{HEAD}[[views]]\nid = \"doc\"\ntitle = \"Doc\"\nslot = \"file\"\n\
+             [[views]]\nid = \"panel\"\ntitle = \"Panel\"\nslot = \"tab\"\n\
+             [[files]]\nmatch = [\"*.tex\"]\nview = \"doc\"\nlabel = \"LaTeX\"\n\
+             [[actions]]\nmatch = [\"*.tex\"]\nlabel = \"Build\"\naction = \"build\"\n\
+             [[settings]]\nkey = \"n\"\ntype = \"number\"\ndefault = 1\nmin = 0.0\nmax = 10\nlabel = \"N\"\n\
+             [requires.agent_plugins.claude]\nid = \"x@y\"\nmarketplace = \"o/x\"\n"
+        );
+        let web = format!("{HEAD}[web]\nnetwork = [\"a.example.org\"]\n").replacen(
+            "api = \"0.2\"",
+            "api = \"0.3\"",
+            1,
+        );
+        for (what, pinned, next) in [
+            (
+                "a view's slot",
+                platform.clone(),
+                platform.replace("slot = \"tab\"", "slot = \"panel\""),
+            ),
+            (
+                "a file kind",
+                platform.clone(),
+                platform.replace("label = \"LaTeX\"", "label = \"TeX\""),
+            ),
+            (
+                "a file action",
+                platform.clone(),
+                platform.replace("action = \"build\"", "action = \"clean\""),
+            ),
+            (
+                "a setting's default, 1 vs 1.0",
+                platform.clone(),
+                platform.replace("default = 1\n", "default = 1.0\n"),
+            ),
+            (
+                "a setting's bounds, 0.0 vs -0.0",
+                platform.clone(),
+                platform.replace("min = 0.0", "min = -0.0"),
+            ),
+            (
+                "web.network",
+                web.clone(),
+                web.replace("a.example.org", "b.example.org"),
+            ),
+            (
+                "requires.agent_plugins marketplace",
+                platform.clone(),
+                platform.replace("marketplace = \"o/x\"", "marketplace = \"o/y\""),
+            ),
+            (
+                "a tool's display name",
+                base(),
+                base().replace("name = \"TinyTeX\"", "name = \"TinyTeX 2\""),
+            ),
+            (
+                "the homepage (a link on a verified card)",
+                base(),
+                base().replace(
+                    "api = \"0.2\"\n",
+                    "api = \"0.2\"\nhomepage = \"https://example.org\"\n",
+                ),
+            ),
+            (
+                "a changed homepage",
+                base().replace(
+                    "api = \"0.2\"\n",
+                    "api = \"0.2\"\nhomepage = \"https://a.example\"\n",
+                ),
+                base().replace(
+                    "api = \"0.2\"\n",
+                    "api = \"0.2\"\nhomepage = \"https://b.example\"\n",
+                ),
+            ),
+        ] {
+            assert_ne!(pinned, next, "{what}: the case changes something");
+            assert!(!same(&pinned, &next), "{what} is behaviour");
+        }
+    }
+
+    /// The answer the plugin-lock workflow validates key by key
+    /// (`bumpFacts` in .github/scripts/plugin-lock.mjs): a change to its
+    /// shape fails here, in the PR that makes it.
+    #[test]
+    fn describe_bump_has_exactly_the_keys_the_workflow_reads() {
+        use serde_json::Value;
+        let keys = |v: &Value| {
+            let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        let v = capabilities::describe_bump(&base(), &base()).unwrap();
+        assert_eq!(
+            keys(&v),
+            [
+                "added",
+                "dropped",
+                "pinned",
+                "pinned_error",
+                "release",
+                "same_behaviour"
+            ]
+        );
+        let side = [
+            "can",
+            "caps",
+            "downloads",
+            "github",
+            "id",
+            "name",
+            "summary",
+            "tier",
+            "version",
+        ];
+        assert_eq!(keys(&v["release"]), side);
+        assert_eq!(keys(&v["pinned"]), side);
+        assert_eq!(
+            keys(&v["release"]["downloads"][0]),
+            ["platform", "sha256", "size", "tool", "url"]
+        );
+        assert_eq!(keys(&v["release"]["can"][0]), ["privileged", "text"]);
+        assert_eq!(v["same_behaviour"], Value::Bool(true));
+        assert!(v["pinned_error"].is_null());
+        // A pinned manifest this daemon can't read: null, with why.
+        let unreadable = capabilities::describe_bump(&base(), "zz = 1\n").unwrap();
+        assert!(unreadable["pinned"].is_null() && unreadable["added"].is_null());
+        assert!(unreadable["pinned_error"].is_string());
+        assert_eq!(unreadable["same_behaviour"], Value::Bool(false));
+        // A release it can't read is an error, not an answer.
+        assert!(capabilities::describe_bump("zz = 1\n", &base()).is_err());
     }
 }
 

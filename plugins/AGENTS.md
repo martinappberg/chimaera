@@ -118,11 +118,14 @@ does not activate it. Rebuild, copy and reinstall the same version to iterate.
    manifests with the daemon's own code and answers each one's tier, digest,
    Can lines and tool downloads, the Can lines added and dropped, and whether
    the two are the same but for their words (`plugins::same_behaviour`: an
-   exhaustive destructure of `Manifest`, so a new field fails to compile
-   until it is named words or behaviour; the words are `name`, `version`,
-   `summary`, `description`, `homepage`, `category`, `[adds]` and the two
-   agent-plugin summaries; unknown keys are refused by the manifest type at
-   every level). The script validates that answer strictly (`bumpFacts`); a
+   exhaustive destructure of `Manifest`, `Requires` and `Recommends`, so a
+   new field there fails to compile until it is named words or behaviour;
+   the nested declarations (programs, tools, views, settings…) are compared
+   whole through their derived `Debug`, so a field added to one is compared
+   automatically; the words are `name`, `version`, `summary`,
+   `description`, `category`, `[adds]` and the two agent-plugin summaries —
+   `homepage` is behaviour, a link on a verified card; unknown keys are
+   refused by the manifest type at every level). The script validates that answer strictly (`bumpFacts`); a
    manifest the daemon refuses is refused like any failed check. It is
    never a downloaded release binary: an older one could ignore a key the
    current daemon reads. The lock is written with the release's own `tier`

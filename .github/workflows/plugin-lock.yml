@@ -35,6 +35,11 @@ name: plugin-lock
 # cla status would never report and auto-merge would never fire, and a merge
 # it made would not start ci.yml's main run, which a release waits on.
 # Without the secret a bump is only reported (a warning), never opened.
+# Three jobs: `gate` (is a bump PR open; is anything newer), `build` (only
+# when something is: the chimaera CLI from this checkout, with no secret and
+# read-only contents, no cache) and `decide`. The secret is in the
+# environment of exactly two steps, the ones that close or update an open
+# bump and that push and open a new one; no build step ever sees it.
 # Setup: plugins/AGENTS.md.
 on:
   schedule:
@@ -43,9 +48,9 @@ on:
   repository_dispatch:
     types: [plugin-released]
 
+# The least by default; each job names what it needs.
 permissions:
   contents: read
-  pull-requests: read
 
 # One bump at a time; a queued run sees the PR the running one opened.
 concurrency:
@@ -53,11 +58,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  bump:
+  # Whether there is anything to do. Most hourly runs stop here.
+  gate:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     env:
-      LOCK_TOKEN: ${{ secrets.PLUGIN_LOCK_TOKEN }}
       REPO: ${{ github.repository }}
+    outputs:
+      open: ${{ steps.open.outputs.open }}
+      newer: ${{ steps.newer.outputs.newer }}
+      newer_failed: ${{ steps.newer.outcome == 'failure' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -77,6 +89,8 @@ jobs:
         id: open
         env:
           GH_TOKEN: ${{ github.token }}
+          # Only this step (gh) sees it in this job.
+          LOCK_TOKEN: ${{ secrets.PLUGIN_LOCK_TOKEN }}
         run: |
           set -euo pipefail
           pr="$(gh pr list --repo "$REPO" --state open --limit 100 --json number,headRefName \
@@ -99,60 +113,121 @@ jobs:
           fi
           echo "open=$pr" >> "$GITHUB_OUTPUT"
 
-      # Cheap first: only whether any plugin has a newer release. Most hourly
-      # runs stop here, without building anything.
+      # Cheap: only whether any plugin has a newer release (API calls).
       - name: anything newer?
         id: newer
         if: steps.open.outputs.open == ''
         # A repository whose latest release can't be read must not hold back
-        # the others; the last step fails the run.
+        # the others; the deciding job fails the run.
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: node .github/scripts/plugin-lock.mjs --newer
 
-      # The manifests are read by the daemon's own code: the chimaera CLI
-      # built from this checkout (never a downloaded release binary — an
-      # older one could ignore a key the current daemon reads, which would
-      # fail open). The daemon embeds web-ui/dist (rust-embed needs it at
-      # compile time), so the UI is built first, as ci.yml does. A debug
-      # build: `chimaera plugin caps` runs in well under a second either way.
+  # The manifests are read by the daemon's own code: the chimaera CLI built
+  # from this checkout (never a downloaded release binary — an older one
+  # could ignore a key the current daemon reads, which would fail open).
+  # This job runs the build (npm, Vite, build.rs, proc-macros) with no
+  # secret and read-only contents, and hands the binary over as an artifact
+  # whose sha256 the deciding job checks. No cache: a restored target/ could
+  # carry a prebuilt binary with forged fingerprints that cargo would reuse,
+  # so every build is cold (a few times a month). The npm cache setup-node
+  # keeps is only downloaded tarballs, which `npm ci` checks against the
+  # sha512 integrity in package-lock.json, so it can't change what is built;
+  # crates are fetched fresh and checked against Cargo.lock's checksums.
+  build:
+    needs: gate
+    if: needs.gate.outputs.newer == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      sha256: ${{ steps.binary.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        if: steps.newer.outputs.newer == 'true'
         with:
           node-version-file: .nvmrc
           cache: npm
           cache-dependency-path: web-ui/package-lock.json
+      # The daemon embeds web-ui/dist (rust-embed needs it at compile time).
+      # No dependency's install scripts run (--ignore-scripts); the UI builds
+      # without them.
       - name: build the web UI the daemon embeds
-        if: steps.newer.outputs.newer == 'true'
         working-directory: web-ui
-        run: npm ci && npm run build
+        run: npm ci --ignore-scripts && npm run build
       - name: toolchain (rust-toolchain.toml)
-        if: steps.newer.outputs.newer == 'true'
         run: rustup show
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        if: steps.newer.outputs.newer == 'true'
+      - name: build the chimaera CLI from this checkout (cold, its own target dir)
+        id: binary
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/target
+        run: |
+          set -euo pipefail
+          cargo build --locked -p chimaera
+          mkdir -p "$RUNNER_TEMP/cli"
+          cp "$CARGO_TARGET_DIR/debug/chimaera" "$RUNNER_TEMP/cli/chimaera"
+          echo "sha256=$(sha256sum "$RUNNER_TEMP/cli/chimaera" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          key: plugin-lock
-      - name: build the chimaera CLI from this checkout
-        if: steps.newer.outputs.newer == 'true'
-        run: cargo build --locked -p chimaera
+          name: chimaera-cli
+          path: ${{ runner.temp }}/cli/chimaera
+          if-no-files-found: error
+          retention-days: 1
+
+  # Decides and, with the token on the one step that writes, opens the PR.
+  decide:
+    needs: [gate, build]
+    if: ${{ always() && needs.gate.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.gate.outputs.newer == 'true' && needs.build.result == 'success'
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: needs.gate.outputs.newer == 'true' && needs.build.result == 'success'
+        with:
+          node-version-file: .nvmrc
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.gate.outputs.newer == 'true' && needs.build.result == 'success'
+        with:
+          name: chimaera-cli
+          path: ${{ runner.temp }}/cli
+      - name: the binary is the one the build job made
+        if: needs.gate.outputs.newer == 'true' && needs.build.result == 'success'
+        env:
+          WANT: ${{ needs.build.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          printf '%s  %s\n' "$WANT" "$RUNNER_TEMP/cli/chimaera" | sha256sum --strict -c
+          chmod +x "$RUNNER_TEMP/cli/chimaera"
 
       - name: check the latest releases
         id: bump
-        if: steps.newer.outputs.newer == 'true'
+        if: needs.gate.outputs.newer == 'true' && needs.build.result == 'success'
         # A release that fails a check must not hold back the others: the
         # PR still opens for those, and the last step fails the run.
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: node .github/scripts/plugin-lock.mjs --chimaera target/debug/chimaera --write --out "$RUNNER_TEMP/plugin-lock"
+        run: node .github/scripts/plugin-lock.mjs --chimaera "$RUNNER_TEMP/cli/chimaera" --write --out "$RUNNER_TEMP/plugin-lock"
 
       - name: open the pull request
         if: steps.bump.outputs.bumped == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           AUTOMERGE: ${{ steps.bump.outputs.automerge }}
+          # The only step in this job that sees it: it pushes the branch and
+          # opens the PR, after the decision is made.
+          LOCK_TOKEN: ${{ secrets.PLUGIN_LOCK_TOKEN }}
         run: |
           set -euo pipefail
           dir="$RUNNER_TEMP/plugin-lock"
@@ -186,11 +261,13 @@ jobs:
           if [ "$AUTOMERGE" = true ]; then
             gh pr merge "$branch" --repo "$REPO" --auto --squash
           else
-            echo "::notice title=plugin-lock::'$title' needs a maintainer's review (a tier or capability change, or a privileged release without a verified attestation; the PR body says which): no auto-merge"
+            echo "::notice title=plugin-lock::'$title' needs a maintainer's review (a capability or manifest change, or a privileged release without a verified attestation; the PR body says which): no auto-merge"
           fi
 
       - name: a release failed its checks
-        if: steps.newer.outcome == 'failure' || steps.bump.outcome == 'failure'
+        if: needs.gate.outputs.newer_failed == 'true' || steps.bump.outcome == 'failure' || (needs.gate.outputs.newer == 'true' && needs.build.result != 'success')
+        env:
+          BUILD: ${{ needs.build.result }}
         run: |
-          echo "::error title=plugin-lock::a plugin release failed its checks (see 'check the latest releases'); the lock keeps the version it had"
+          echo "::error title=plugin-lock::a plugin release failed its checks, or the chimaera CLI didn't build (build: $BUILD); the lock keeps the version it had"
           exit 1

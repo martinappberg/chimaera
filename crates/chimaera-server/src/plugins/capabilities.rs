@@ -546,8 +546,10 @@ pub fn describe_manifest(text: &str) -> Result<Value, String> {
 /// fields, tier, digest, Can lines and tool downloads; the Can lines the
 /// release adds and drops; and whether the two are the same but for their
 /// words (`same_behaviour`). The release must parse (an `Err` refuses the
-/// bump); a pinned manifest this daemon can't read is `null` with
-/// `pinned_error`, and then nothing is the same.
+/// bump). A pinned manifest this daemon refuses (a parse or validation
+/// error) is `null` with `pinned_error`, and then nothing is the same; a
+/// pinned file the CLI can't read at all (missing, not UTF-8) makes it exit 1
+/// before this runs. Both fail closed.
 pub fn describe_bump(release: &str, pinned: &str) -> Result<Value, String> {
     let next = super::parse_manifest(release)?;
     let (prev, pinned_error) = match super::parse_manifest(pinned) {

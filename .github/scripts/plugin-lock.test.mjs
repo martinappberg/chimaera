@@ -1,8 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -12,6 +10,7 @@ import {
   bumpFacts,
   capabilityChange,
   caps,
+  capsFailure,
   code,
   commandMessage,
   ghEnv,
@@ -244,6 +243,21 @@ test("caps runs the CLI without a shell on two private files, and refuses what i
     /doesn't read as a manifest: Error: plugin\.toml: unknown field `zz`/,
   );
   await assert.rejects(caps("/x/chimaera", Buffer.from("r"), Buffer.from("p"), async () => ({ stdout: "{}" })), /has keys/);
+  // Each way the CLI can fail says which.
+  assert.equal(capsFailure({ code: "ENOENT" }, "/t/release.toml", "/t/pinned.toml"), "the chimaera CLI can't run (ENOENT)");
+  assert.equal(capsFailure({ killed: true, signal: "SIGTERM" }, "/t/release.toml", "/t/pinned.toml"), "the chimaera CLI timed out");
+  assert.equal(
+    capsFailure({ stderr: "Error: /t/pinned.toml\n\nCaused by:\n    stream did not contain valid UTF-8\n" }, "/t/release.toml", "/t/pinned.toml"),
+    "the pinned plugin.toml couldn't be read: stream did not contain valid UTF-8",
+  );
+  assert.equal(
+    capsFailure({ stderr: "Error: /t/release.toml\n\nCaused by:\n    No such file or directory (os error 2)\n" }, "/t/release.toml", "/t/pinned.toml"),
+    "the release's plugin.toml couldn't be read: No such file or directory (os error 2)",
+  );
+  assert.equal(
+    capsFailure({ stderr: "Error: plugin.toml: unknown field `zz`\n" }, "/t/release.toml", "/t/pinned.toml"),
+    "the release's plugin.toml doesn't read as a manifest: Error: plugin.toml: unknown field `zz`",
+  );
 });
 
 test("auto-merge: the pinned release reads as the lock, the manifests are the same but for words, provenance when privileged (the safeguard)", () => {
@@ -771,7 +785,6 @@ test("with the real CLI: the reproductions wait, words-only merges", { skip: CHI
     ["the latex setup-step attack", pinnedTool, `${pinnedTool}[[tools.setup]] # appended\nprogram = "tlmgr"\n${evil}\n`],
     ["a changed setup step", pinnedTool, tool(evil)],
   ];
-  const dir = mkdtempSync(join(tmpdir(), "plugin-lock-e2e-"));
   for (const [what, pinned, next] of cases) {
     const facts = await caps(CHIMAERA_BIN, Buffer.from(next), Buffer.from(pinned));
     assert.equal(facts.same_behaviour, false, what);
@@ -792,7 +805,11 @@ test("with the real CLI: the reproductions wait, words-only merges", { skip: CHI
   assert.equal(review(entryOf(ok), ok, unverified("no attestation")).automerge, false);
   // A key the manifest type doesn't carry: the daemon refuses the release.
   await assert.rejects(caps(CHIMAERA_BIN, Buffer.from(`${words}zz = 1\n`), Buffer.from(pinnedTool)), /doesn't read as a manifest/);
-  writeFileSync(join(dir, "done"), "");
+  // A pinned file the CLI can't read at all fails closed, and says so.
+  await assert.rejects(caps(CHIMAERA_BIN, Buffer.from(words), Buffer.from([0xff, 0xfe, 0x00])), /the pinned plugin\.toml couldn't be read/);
+  // A homepage change waits: it is a link on a verified card.
+  const relinked = await caps(CHIMAERA_BIN, Buffer.from(words.replace('api = "0.2"\n', 'api = "0.2"\nhomepage = "https://b.example"\n')), Buffer.from(pinnedTool));
+  assert.equal(relinked.same_behaviour, false);
 });
 
 test("md and code: release text as plain markdown and as a literal span", () => {
