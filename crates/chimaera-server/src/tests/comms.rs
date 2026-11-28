@@ -48,6 +48,16 @@ async fn chat(state: &Arc<AppState>, ws: &str, label: &str) -> (String, String) 
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let sid = body["id"].as_str().unwrap().to_string();
+    // Comms counts a chat as working only once its driver is alive: a test
+    // that marks it Running before then reads as idle under a loaded CI.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !state.chat.get(&sid).is_some_and(|info| info.alive) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the fake chat never came up"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     // Past the handshake's `Init`: it settles a record that says Running
     // with no turn in flight, so a state a test sets before it lands is
     // overwritten (`chat::apply_chat_event`).
@@ -628,6 +638,15 @@ async fn a_wake_inside_the_gap_comes_when_it_passes() {
     .await;
     assert!(text.contains("started a turn"), "{text}");
     journal_has(&state, &c, "first-task").await;
+    // The wake's turn reports itself started after its message is
+    // journaled; ending it before that lands would leave it Running.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while lock(&state.agents).get(&c).unwrap().state != agent_state::AgentState::Running {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the wake's turn starts");
     idle(&state);
 
     let (_, text) = send(

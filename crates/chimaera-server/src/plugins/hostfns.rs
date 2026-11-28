@@ -35,8 +35,8 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use super::capabilities::{FilesAccess, SessionsAccess, TimelineAccess};
-use super::runtime::v3::chimaera::plugin::{host, platform};
-use super::runtime::{v1, v2, wit, CallScope, HostState, EVENT_MAX};
+use super::runtime::v4::chimaera::plugin::{host, platform};
+use super::runtime::{v1, v2, v3, wit, CallKind, CallScope, HostState, EVENT_MAX};
 use crate::timeline;
 
 /// A read's ceiling, whatever `cap` the plugin asks for.
@@ -811,9 +811,8 @@ mod v1_host {
     }
 }
 
-/// 0.2's `host` and `platform`: the same functions as 0.3's (the `cx` a
-/// guest passes is ignored either way), under 0.2's package version and
-/// types.
+/// 0.2's `host` and `platform`: 0.3's but `read-at` (the `cx` a guest
+/// passes is ignored either way), under 0.2's package version and types.
 mod v2_host {
     use super::*;
     use v2::chimaera::plugin::{host as old_host, platform as old_platform, types as old};
@@ -836,6 +835,230 @@ mod v2_host {
             cap: u32,
         ) -> Result<Vec<u8>, String> {
             host::Host::read(self, cx(c), path, cap).await
+        }
+
+        async fn stat(&mut self, c: old::Context, path: String) -> Result<old::Stat, String> {
+            host::Host::stat(self, cx(c), path)
+                .await
+                .map(|s| old::Stat {
+                    size: s.size,
+                    mtime_ms: s.mtime_ms,
+                    is_dir: s.is_dir,
+                })
+        }
+
+        async fn list(
+            &mut self,
+            c: old::Context,
+            path: String,
+            cap: u32,
+        ) -> Result<Vec<old::Entry>, String> {
+            host::Host::list(self, cx(c), path, cap)
+                .await
+                .map(|entries| {
+                    entries
+                        .into_iter()
+                        .map(|e| old::Entry {
+                            name: e.name,
+                            is_dir: e.is_dir,
+                            is_symlink: e.is_symlink,
+                        })
+                        .collect()
+                })
+        }
+
+        async fn state_get(&mut self, c: old::Context, key: String) -> Option<String> {
+            host::Host::state_get(self, cx(c), key).await
+        }
+
+        async fn state_put(
+            &mut self,
+            c: old::Context,
+            key: String,
+            value: String,
+        ) -> Result<(), String> {
+            host::Host::state_put(self, cx(c), key, value).await
+        }
+
+        async fn sessions(&mut self, c: old::Context) -> Vec<old::Session> {
+            host::Host::sessions(self, cx(c))
+                .await
+                .into_iter()
+                .map(|s| old::Session {
+                    id: s.id,
+                    kind: s.kind,
+                    name: s.name,
+                    chat: s.chat,
+                    alive: s.alive,
+                    mastermind: s.mastermind,
+                })
+                .collect()
+        }
+
+        async fn timeline_append(&mut self, c: old::Context, entry: String) -> Result<u64, String> {
+            host::Host::timeline_append(self, cx(c), entry).await
+        }
+
+        async fn timeline_recent(
+            &mut self,
+            c: old::Context,
+            kinds: Vec<String>,
+            limit: u32,
+        ) -> Vec<String> {
+            host::Host::timeline_recent(self, cx(c), kinds, limit).await
+        }
+
+        async fn emit(&mut self, c: old::Context, event: String) {
+            host::Host::emit(self, cx(c), event).await
+        }
+
+        async fn now_ms(&mut self) -> u64 {
+            host::Host::now_ms(self).await
+        }
+
+        async fn log(&mut self, level: old::Level, message: String) {
+            let level = match level {
+                old::Level::Debug => wit::Level::Debug,
+                old::Level::Info => wit::Level::Info,
+                old::Level::Warn => wit::Level::Warn,
+                old::Level::Error => wit::Level::Error,
+            };
+            host::Host::log(self, level, message).await
+        }
+    }
+
+    impl old_platform::Host for HostState {
+        async fn output_read(
+            &mut self,
+            c: old::Context,
+            path: String,
+            offset: u64,
+            cap: u32,
+        ) -> Result<Vec<u8>, String> {
+            platform::Host::output_read(self, cx(c), path, offset, cap).await
+        }
+
+        async fn output_list(
+            &mut self,
+            c: old::Context,
+            path: String,
+            cap: u32,
+        ) -> Result<Vec<old::Entry>, String> {
+            platform::Host::output_list(self, cx(c), path, cap)
+                .await
+                .map(|entries| {
+                    entries
+                        .into_iter()
+                        .map(|e| old::Entry {
+                            name: e.name,
+                            is_dir: e.is_dir,
+                            is_symlink: e.is_symlink,
+                        })
+                        .collect()
+                })
+        }
+
+        async fn output_write(
+            &mut self,
+            c: old::Context,
+            path: String,
+            bytes: Vec<u8>,
+        ) -> Result<(), String> {
+            platform::Host::output_write(self, cx(c), path, bytes).await
+        }
+
+        async fn output_remove(&mut self, c: old::Context, path: String) -> Result<(), String> {
+            platform::Host::output_remove(self, cx(c), path).await
+        }
+
+        async fn publish(
+            &mut self,
+            c: old::Context,
+            surface: String,
+            key: String,
+            data: String,
+        ) -> Result<(), String> {
+            platform::Host::publish(self, cx(c), surface, key, data).await
+        }
+
+        async fn invalidate(&mut self, c: old::Context, view: String) {
+            platform::Host::invalidate(self, cx(c), view).await
+        }
+
+        async fn watch(&mut self, c: old::Context, paths: Vec<String>) -> Result<(), String> {
+            platform::Host::watch(self, cx(c), paths).await
+        }
+
+        async fn setting_get(&mut self, c: old::Context, key: String) -> Option<String> {
+            platform::Host::setting_get(self, cx(c), key).await
+        }
+
+        async fn state_keep(
+            &mut self,
+            c: old::Context,
+            key: String,
+            value: String,
+        ) -> Result<(), String> {
+            platform::Host::state_keep(self, cx(c), key, value).await
+        }
+
+        async fn roots(&mut self, c: old::Context) -> String {
+            platform::Host::roots(self, cx(c)).await
+        }
+
+        async fn job_start(&mut self, c: old::Context, spec: String) -> Result<String, String> {
+            platform::Host::job_start(self, cx(c), spec).await
+        }
+
+        async fn job_status(&mut self, c: old::Context, id: String) -> String {
+            platform::Host::job_status(self, cx(c), id).await
+        }
+
+        async fn job_cancel(&mut self, c: old::Context, id: String) {
+            platform::Host::job_cancel(self, cx(c), id).await
+        }
+
+        async fn tool_state(&mut self, c: old::Context, tool: String) -> String {
+            platform::Host::tool_state(self, cx(c), tool).await
+        }
+    }
+}
+
+/// 0.3's `host` and `platform`: 0.4's but `web-call`, `web-call-result`
+/// and `reveal` (the `cx` a guest passes is ignored either way), under
+/// 0.3's package version and types.
+mod v3_host {
+    use super::*;
+    use v3::chimaera::plugin::{host as old_host, platform as old_platform, types as old};
+
+    fn cx(c: old::Context) -> wit::Context {
+        wit::Context {
+            workspace: c.workspace,
+            session: c.session,
+            mastermind: c.mastermind,
+        }
+    }
+
+    impl old::Host for HostState {}
+
+    impl old_host::Host for HostState {
+        async fn read(
+            &mut self,
+            c: old::Context,
+            path: String,
+            cap: u32,
+        ) -> Result<Vec<u8>, String> {
+            host::Host::read(self, cx(c), path, cap).await
+        }
+
+        async fn read_at(
+            &mut self,
+            c: old::Context,
+            path: String,
+            offset: u64,
+            cap: u32,
+        ) -> Result<Vec<u8>, String> {
+            host::Host::read_at(self, cx(c), path, offset, cap).await
         }
 
         async fn stat(&mut self, c: old::Context, path: String) -> Result<old::Stat, String> {
@@ -1203,6 +1426,52 @@ impl platform::Host for HostState {
                 .to_string(),
             None => json!({"tool": tool, "declared": false, "installed": null}).to_string(),
         }
+    }
+
+    async fn web_call(&mut self, _cx: wit::Context, spec: String) -> Result<String, String> {
+        let scope = self.scope()?;
+        // The headless host renders the view to find its node: a render
+        // that asked a page would ask a render again.
+        if scope.kind == CallKind::Render {
+            return Err(
+                "a view's render can't call a page; call it from a tool or an action".into(),
+            );
+        }
+        let app = scope.app.clone();
+        let m = self
+            .manifest
+            .clone()
+            .ok_or_else(|| "no manifest is loaded for this instance".to_string())?;
+        self.current(&app, true)?;
+        super::web_calls::start(&app, &m, &self.workspace, &spec)
+    }
+
+    async fn web_call_result(
+        &mut self,
+        _cx: wit::Context,
+        call: String,
+    ) -> Result<Option<String>, String> {
+        let app = self.scope()?.app.clone();
+        app.plugin_platform
+            .web_calls
+            .result(&self.plugin, &self.workspace, &call)
+    }
+
+    async fn reveal(&mut self, _cx: wit::Context, spec: String) -> Result<String, String> {
+        let scope = self.scope()?;
+        // Only an agent's own call (its tool, or that tool's resume) opens
+        // a view beside it: never a hook, an event or a render.
+        let session = match scope.kind {
+            CallKind::Tool => scope.cx.session.clone(),
+            _ => None,
+        };
+        let app = scope.app.clone();
+        let m = self
+            .manifest
+            .clone()
+            .ok_or_else(|| "no manifest is loaded for this instance".to_string())?;
+        self.current(&app, true)?;
+        super::reveal::reveal(&app, &m, &self.workspace, session.as_deref(), &spec).await
     }
 }
 

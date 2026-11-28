@@ -83,6 +83,31 @@
         api.onData((data) => {
           $("data").textContent = JSON.stringify(data, null, 2);
         });
+        // 0.4: the plugin's calls (`web_ask`), answered here.
+        const answered = (method, value) => {
+          log(`call ${method}`);
+          return value;
+        };
+        api.handle("ping", () =>
+          answered("ping", {
+            pong: true,
+            pings: api.data?.pings ?? null,
+            item: api.data?.item ?? null,
+            file: api.data?.file ?? null,
+            visible: api.visibility,
+            theme: api.theme.mode,
+          }),
+        );
+        api.handle("slow", (args) => {
+          const ms = Math.min(Number(args?.ms) || 0, 60000);
+          return new Promise((done) => setTimeout(() => done(answered("slow", { waited: ms })), ms));
+        });
+        api.handle("big", () => answered("big", { text: "x".repeat(70 * 1024) }));
+        api.handle("fail", () => {
+          log("call fail");
+          throw new Error("the fixture failed on purpose");
+        });
+        setTimeout(() => api.handle("late", () => answered("late", { late: true })), 2000);
         api.onVisibility((visible) => {
           $("shown").textContent = visible ? "shown" : "hidden";
           log(`visibility: ${visible}`);

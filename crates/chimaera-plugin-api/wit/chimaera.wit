@@ -1,4 +1,4 @@
-package chimaera:plugin@0.3.0;
+package chimaera:plugin@0.4.0;
 
 // The platform world (docs/design/plugin-platform-plan.md). Everything 0.1 had keeps
 // its meaning; 0.2 adds the `platform` imports (output folders, data surfaces,
@@ -6,7 +6,10 @@ package chimaera:plugin@0.3.0;
 // roots, and programs run as jobs), the `screens` exports (render, on-action,
 // tool-resume), new events, and `wait` on a tool result. 0.3 adds the `web`
 // export: the plugin's own web pages (docs/design/rich-views-plan.md, Part
-// 2), and `host.read-at`. The host serves 0.1 and 0.2 beside it (`wit-0.1/`, `wit-0.2/`).
+// 2), and `host.read-at`. 0.4 adds three `platform` imports: `web-call` and
+// `web-call-result` (a plugin asks its own page), and `reveal` (a view opened
+// beside the calling session). The host serves 0.1, 0.2 and 0.3 beside it
+// (`wit-0.1/`, `wit-0.2/`, `wit-0.3/`).
 
 interface types {
     /// A JSON document as text (serde on both sides).
@@ -24,9 +27,9 @@ interface types {
     }
 
     record tool-def { name: string, description: string, input-schema: json }
-    /// A tool's answer. `wait`: a job this answer waits for — the host holds
-    /// the agent's call until the job ends (at most about 45 s), then asks
-    /// `tool-resume` for the final answer.
+    /// A tool's answer. `wait`: a job, or (0.4) a page call, this answer
+    /// waits for — the host holds the agent's call until it ends (at most
+    /// about 45 s), then asks `tool-resume` for the final answer.
     record tool-result { text: string, is-error: bool, wait: option<string> }
 
     record stat { size: u64, mtime-ms: u64, is-dir: bool }
@@ -143,6 +146,24 @@ interface platform {
     /// A declared side program (`[[tools]]`): installed? which version? a
     /// copy found on the PATH?
     tool-state: func(cx: context, tool: string) -> json;
+
+    /// 0.4: ask one of this plugin's own pages: the `web` node `id` in
+    /// view `view`. The spec: {view, id, method, args?, file?, fresh?}.
+    /// The window showing that node answers; when none does (or `fresh`), a
+    /// headless browser on this host loads the view and answers. Returns a
+    /// call id at once: answer `wait` with it, then read the answer with
+    /// `web-call-result` in `tool-resume`.
+    web-call: func(cx: context, spec: json) -> result<string, string>;
+    /// A call's answer: the page's value, none while it still waits, or why
+    /// it failed (no page could answer, the page threw, no handler, over
+    /// 64 KiB, 45 s passed).
+    web-call-result: func(cx: context, call: string) -> result<option<json>, string>;
+
+    /// 0.4: open one of this plugin's views beside the calling session,
+    /// without taking focus. The spec: {view, args?} (a tab view) or
+    /// {file, args?} (a file it claims). Only from a session's own call, at
+    /// most 4 a minute per session. What happened, in words.
+    reveal: func(cx: context, spec: json) -> result<string, string>;
 }
 
 /// What a plugin provides (as in 0.1).
@@ -171,7 +192,8 @@ interface screens {
     /// tree, or `null` to keep it.
     on-action: func(cx: context, view: string, action: string, payload: json) -> result<json, string>;
 
-    /// The final answer of a tool that answered `wait`, once its job ended.
+    /// The final answer of a tool that answered `wait`, once its job (or
+    /// page call) ended.
     tool-resume: func(cx: context, name: string, job: string) -> tool-result;
 }
 

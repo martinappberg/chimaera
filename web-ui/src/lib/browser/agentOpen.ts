@@ -21,6 +21,7 @@ import {
   focusPane,
   freshBrowserTab,
   openTab,
+  paneForTab,
   panes,
   sessionPaneId,
   setBrowserOpener,
@@ -109,7 +110,10 @@ export interface WindowView {
  * workspace and someone can see it. Several such windows may all act —
  * acceptable, since none of them holds the session.
  */
-export function shouldActOnAgentBrowserOpen(open: AgentBrowserOpen, view: WindowView): boolean {
+export function shouldActOnAgentBrowserOpen(
+  open: Pick<AgentBrowserOpen, "sessionId" | "workspaceId">,
+  view: WindowView,
+): boolean {
   if (sessionPaneId(view.layout, open.sessionId) !== null) return true;
   return view.visible && open.workspaceId !== null && open.workspaceId === view.workspaceId;
 }
@@ -200,15 +204,44 @@ export function placeHandover(
   return { layout: placeBeside(l, tab, anchor, covers, l), tabId: tab.id };
 }
 
-/** Steps 2–4 of `placeAgentBrowser`: put `tab` in a browser pane that
- *  covers nothing, an empty pane, a split beside `anchor`, or a neighbour;
- *  focus goes back to where it was in `before`. */
+/**
+ * A plugin's reveal (`plugin_reveal`): its view (`tab`, a `plugin` tab or a
+ * claimed file's `file` tab) opens beside the calling session as an
+ * agent-opened browser pane does, focus untouched. One already open is
+ * shown where it is, unless showing it would cover the session's or the
+ * focused pane's view: then it moves beside them. A new one joins a pane
+ * already showing that plugin's view, else steps 2–4 above.
+ */
+export function placeReveal(l: Layout, sessionId: string, tab: Tab): Layout {
+  const focused = l.focusedPaneId;
+  const anchor = sessionPaneId(l, sessionId) ?? focused;
+  const covers = (paneId: string) => paneId === anchor || paneId === focused;
+  const plugin = tab.surface === "plugin" ? tab.plugin : null;
+  const joins = (t: Tab) => plugin !== null && t.surface === "plugin" && t.plugin === plugin;
+  const loc = paneForTab(l.root, tab);
+  if (loc !== null) {
+    const pane = findPane(l.root, loc.paneId);
+    const existing = pane?.tabs[loc.index];
+    if (pane === null || existing === undefined) return l;
+    if (pane.active === loc.index || !covers(loc.paneId)) {
+      return restoreFocus(activateTab(l, loc.paneId, loc.index), l);
+    }
+    return placeBeside(detachTab(l, loc.paneId, loc.index), existing, anchor, covers, l, joins);
+  }
+  return placeBeside(l, tab, anchor, covers, l, joins);
+}
+
+/** Steps 2–4 of `placeAgentBrowser`: put `tab` in a pane that covers
+ *  nothing and already shows its kind (`joins`: a browser, by default), an
+ *  empty pane, a split beside `anchor`, or a neighbour; focus goes back to
+ *  where it was in `before`. */
 function placeBeside(
   l: Layout,
   tab: Tab,
   anchor: string,
   covers: (paneId: string) => boolean,
   before: Layout,
+  joins: (t: Tab) => boolean = (t) => t.surface === "browser",
 ): Layout {
   let next = l;
   const all = panes(next.root);
@@ -217,7 +250,7 @@ function placeBeside(
   const home =
     all.find((p) => {
       const active = p.tabs[p.active];
-      return !covers(p.id) && active !== undefined && active.surface === "browser";
+      return !covers(p.id) && active !== undefined && joins(active);
     }) ?? all.find((p) => p.tabs.length === 0);
   if (home !== undefined) {
     next = openTab(focusPane(next, home.id), tab);

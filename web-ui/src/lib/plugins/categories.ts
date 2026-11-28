@@ -10,6 +10,7 @@ export const CATEGORIES: readonly { id: string; label: string }[] = [
   { id: "writing", label: "Writing" },
   { id: "presentations", label: "Presentations" },
   { id: "data", label: "Data" },
+  { id: "biology", label: "Biology" },
   { id: "knowledge", label: "Knowledge" },
   { id: "agents", label: "Agent tools" },
 ];

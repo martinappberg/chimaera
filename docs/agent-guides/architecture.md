@@ -960,7 +960,7 @@ hook's `additionalContext`, a chat send or steer, a billed wake. One switch
 Opt-in capabilities beyond the core (Mycelium's Knowledge reader, LaTeX, Typst, PowerPoint, Chromium, Manimble, GenomeSpy) are **workbench
 plugins**, with their feature logic in separate repositories. API 0.2 implements
 semantic screens, declared native programs, downloaded tools, output folders,
-settings and durable plugin state. LaTeX, Typst, PowerPoint, Chromium, Manimble and GenomeSpy use that platform:
+settings and durable plugin state; API 0.3 adds a plugin's own web views. LaTeX, Typst, PowerPoint, Chromium and Manimble use 0.2, GenomeSpy 0.3:
 [plugin-platform-plan.md](../design/plugin-platform-plan.md),
 [latex-reports-plan.md](../design/latex-reports-plan.md). A plugin is a
 Rust crate compiled to one portable WebAssembly component (`plugin.wasm`, `wasm32-wasip2`)

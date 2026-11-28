@@ -274,7 +274,8 @@
     workspacePlugins,
   } from "./lib/plugins/store";
   import { registerPluginOffers } from "./lib/shared/pageNeeds";
-  import { platformFrame, pluginViewTitle, railViews, setViewOpener, setWindowCopier } from "./lib/plugins/platform";
+  import { platformFrame, pluginViewTitle, railViews, setViewArgs, setViewOpener, setWindowCopier } from "./lib/plugins/platform";
+  import type { PluginReveal } from "./lib/net/browserWire";
   import ExtensionsGlyph from "./lib/plugins/ExtensionsGlyph.svelte";
   import ComputeStrip from "./lib/workspace/ComputeStrip.svelte";
   import type JobWindowNotices from "./lib/workspace/JobWindowNotices.svelte";
@@ -332,6 +333,7 @@
     agentOpenShare,
     placeAgentBrowserTab,
     placeHandover,
+    placeReveal,
     shouldActOnAgentBrowserOpen,
     type AgentBrowserOpen,
   } from "./lib/browser/agentOpen";
@@ -1427,6 +1429,7 @@
         });
       },
       onBrowserOpen: onAgentBrowserOpen,
+      onPluginReveal,
       onBrowserRequest: (req) => void agentBrowser.handle(req),
       // RTT reset + comms refetch on recovery, then eventsUp, then the
       // dead-link save retry (net/connection.svelte.ts). A drop also ends
@@ -2008,6 +2011,26 @@
     if (share !== null && get(browserLinks).get(share.tab) !== share.agent) {
       linkBrowserTo(share.tab, share.agent);
     }
+  }
+
+  /**
+   * A plugin opens one of its views (or a file it claims) beside an agent
+   * session (`reveal`): placed like an agent-opened browser pane, focus —
+   * layout and DOM — untouched, and only by a window on the plugin's
+   * workspace. Its args reach the view's `render` (a locus to show).
+   */
+  function onPluginReveal(r: PluginReveal): void {
+    if (!layoutReady || activeWsId !== r.workspaceId) return;
+    const view = { layout, workspaceId: activeWsId, visible: document.visibilityState === "visible" };
+    if (!shouldActOnAgentBrowserOpen(r, view)) return;
+    const root = workspace?.root ?? null;
+    if (r.file !== null && root === null) return;
+    setViewArgs(r.workspaceId, r.plugin, r.view, r.file, r.args);
+    const tab: Tab =
+      r.file !== null
+        ? { surface: "file", path: `${root!.replace(/\/+$/, "")}/${r.file}` }
+        : { surface: "plugin", plugin: r.plugin, view: r.view };
+    layout = placeReveal(layout, r.sessionId, tab);
   }
 
   /**

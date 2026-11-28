@@ -29,6 +29,15 @@
    * edit touched is redrawn from its patched XML, so the stage and strip
    * always show the renderer's real output. "PowerPoint" opens the deck in
    * the real app through the native shell (a round trip for a remote host).
+   *
+   * The show, the presenter's view and paging run on the show controller
+   * (`show/showController.svelte.ts`): **presenter** puts the stage (this slide at its build) beside the
+   * next click, drawn live by a second render of that slide with its state
+   * on it, over the speaker notes, a timer and the strip of every slide;
+   * **show in window** opens this tab again in a new window that starts its
+   * own show and follows this one (and this one it) by slide part and build.
+   * A click in the show advances, except on a link the slide made
+   * navigable or while text is being selected.
    */
   import { tick, untrack } from "svelte";
   import type { SlideData, SlideHandle } from "@aiden0z/pptx-renderer";
@@ -37,14 +46,19 @@
   import { onDiskVersion, ownedObjectUrls, paneVisibility, useFileEntry } from "./viewLifecycle.svelte";
   import { fetchRawBytes, TooLargeError } from "./rawBytes";
   import { loadDeck, loadNotes, type Deck } from "./pptxDeck";
-  import { deckStep, showEdge, showPosition, showReach, type Place } from "./slideShow";
+  import { showPosition, showReach } from "./slideShow";
+  import { SlideShow } from "./show/showController.svelte";
+  import { syncName } from "./show/showSync";
+  import PresenterView from "./show/PresenterView.svelte";
+  import ClickDots from "./show/ClickDots.svelte";
+  import { copyTabToWindow } from "../plugins/platform";
   import { buildStates, extractTiming, parseTimeline, type BuildState, type SlideTimeline, type TimingExtract } from "./pptxTiming";
   import { pruneTagged, tagSlide, type TaggedSlide } from "./pptxTag";
   import { applyState, clearState } from "./pptxPlay";
   import { sanitizeRendered } from "./officeSafety";
   import { revealRequest, takeReveal } from "../shared/reveal";
   import { activateUrl } from "../shared/urlOpen";
-  import { isRemoteHost } from "../net/api";
+  import { getActiveWorkspaceId, isRemoteHost } from "../net/api";
   import Spinner from "./Spinner.svelte";
   import ReferenceButton from "../shared/ReferenceButton.svelte";
   import ReferenceChip from "../shared/ReferenceChip.svelte";
@@ -88,15 +102,71 @@
   let deck = $state.raw<Deck | null>(null);
   let error = $state<string | null>(null);
   let tooLarge = $state(false);
-  let current = $state(0);
   let showThumbs = $state(true);
   let showNotes = $state(true);
   let hasNotes = $state(false);
-  let presenting = $state(false);
   let nodeErrors = $state(0);
   let pendingSlide: number | null = null;
   /** Bumped when a new deck lands, so the mount effects start over. */
   let deckGen = $state(0);
+  /** The view's root: what a show window copies (its pane's tab). */
+  let viewEl = $state<HTMLDivElement | null>(null);
+
+  /** Two windows on this file keep step on this channel. */
+  const wsId = getActiveWorkspaceId() ?? "";
+  const syncKey = $derived(syncName(wsId, "file", path));
+
+  const show = new SlideShow({
+    deck: {
+      count: () => deck?.presentation.slides.length ?? 0,
+      hidden: () => hiddenFlags,
+      builds: (need) => {
+        for (const j of need) timelineOf(j);
+        return buildCounts();
+      },
+      // The slide part: a reorder or an edit elsewhere doesn't change it.
+      key: (i) => deck?.presentation.slides[i]?.slidePath ?? String(i),
+      find: (key) => {
+        const slides = deck?.presentation.slides ?? [];
+        const i = slides.findIndex((sl) => sl.slidePath === key);
+        if (i >= 0) return i;
+        const n = /^[0-9]{1,6}$/.test(key) ? Number(key) : -1;
+        // A slide with no part path is named by its position.
+        return n >= 0 && n < slides.length ? n : null;
+      },
+    },
+    sync: () => syncKey,
+    visible: () => onScreen.shown,
+    showEl: () => stageEl,
+    openWindow: () => (viewEl === null ? Promise.resolve(false) : copyTabToWindow(viewEl)),
+    browseBySlide: true,
+    endOnLastBuild: false,
+    // The show opens a slide before its first click, as PowerPoint's does;
+    // the presenter's view keeps a build a click dot chose.
+    opening: (mode, at) => ({ slide: at.slide, build: mode === "presenter" && !asDrawn ? at.build : 0 }),
+    arrive: (from, to) => {
+      if (to.slide === from.slide) return;
+      clearPick();
+      if (show.mode === "browse") asDrawn = true;
+    },
+    left: () => {
+      asDrawn = true;
+      // The stage was re-created out of the presenter's cell (or the show
+      // ended): the keys go back to it unless focus went elsewhere.
+      void tick().then(() => {
+        if (disposed || !onScreen.pane) return;
+        const a = document.activeElement;
+        if (a === null || a === document.body || (viewEl?.contains(a) === true && !stageEl?.contains(a))) {
+          stageEl?.focus({ preventScroll: true });
+        }
+      });
+    },
+  });
+  const current = $derived(show.at.slide);
+  /** The show has the screen (or covers the window). */
+  const presenting = $derived(show.mode === "present");
+  /** The show or the presenter's view: builds step, hidden slides skip. */
+  const inShow = $derived(show.mode !== "browse");
 
   /** Blob URLs for the deck's media, shared by every slide render; revoked
    *  when the next deck lands and when the view goes. */
@@ -180,9 +250,12 @@
       tooLarge = false;
       nodeErrors = 0;
       hasNotes = false;
-      const want = pendingSlide ?? current;
+      // A re-read mid-show stays on the same slide part (both windows do),
+      // the build held to the slide's clicks.
+      const want = pendingSlide;
       pendingSlide = null;
-      current = Math.min(Math.max(0, want), d.presentation.slides.length - 1);
+      if (want !== null) go(want);
+      else show.relocate();
       void loadNotes(bytes, d).then(
         (any) => {
           if (still()) hasNotes = any;
@@ -222,6 +295,7 @@
         pdfjs: false,
         onNodeError: () => (nodeErrors += 1),
         onNavigate: (t) => {
+          navigatedAt = performance.now();
           if (t.slideIndex !== undefined) go(t.slideIndex);
           else if (t.url !== undefined) activateUrl(t.url);
         },
@@ -258,12 +332,13 @@
   const stageTags = new WeakMap<HTMLElement, TaggedSlide>();
 
   function disposeAll(): void {
-    for (const h of [...stageHandles.values(), ...thumbHandles.values()]) {
+    for (const h of [...stageHandles.values(), ...thumbHandles.values(), ...nextHandles.values()]) {
       h.dispose();
       h.element.remove();
     }
     stageHandles.clear();
     thumbHandles.clear();
+    nextHandles.clear();
   }
 
   /** A slide for the stage, rendered into the slot (hidden) if it isn't
@@ -301,6 +376,9 @@
     const i = current;
     void deckGen;
     if (el === null || untrack(() => deck) === null) return;
+    // The stage moves between the browsing layout and the presenter's: the
+    // kept slides follow it into the new slot, laid out as they were.
+    for (const h of stageHandles.values()) if (h.element.parentElement !== el) el.appendChild(h.element);
     const handle = untrack(() => stageHandle(i, el));
     for (const [j, h] of stageHandles) h.element.style.visibility = j === i ? "visible" : "hidden";
     if (handle === null) return;
@@ -331,10 +409,8 @@
    *  PowerPoint's), browsing as drawn. */
   function go(i: number): void {
     if (deck === null) return;
-    const next = Math.min(Math.max(0, i), count - 1);
-    if (next !== current) clearPick();
-    current = next;
-    build = presenting ? 0 : null;
+    asDrawn = true;
+    show.go({ slide: Math.min(Math.max(0, i), count - 1), build: 0 });
   }
 
   /** Which slides the deck marks hidden (`show="0"`): read with each slide's
@@ -349,19 +425,15 @@
    *  next slide from its first state (back: the previous one at its last),
    *  skipping hidden slides as PowerPoint's does; browsing the deck walks
    *  every slide, each as drawn. */
-  function page(delta: 1 | -1): void {
-    if (!presenting) {
+  function page(delta: 1 | -1, auto = false): void {
+    if (deck === null) return;
+    if (!inShow) {
       go(current + delta);
       return;
     }
-    // A slide not parsed yet counts as one build: the slides this click can
-    // land on (hidden ones skipped) are parsed first.
-    for (const j of [current, ...showReach(hiddenFlags, current, true)]) timelineOf(j);
-    const at: Place = { slide: current, build: buildAt ?? 0 };
-    const to = deckStep(buildCounts(), hiddenFlags, at, delta, true);
-    if (to.slide !== current) clearPick();
-    current = to.slide;
-    build = to.build;
+    // The controller parses the slides this click can land on first (a
+    // slide not parsed yet counts as one build).
+    show.step(delta, auto);
   }
 
   // --- builds ------------------------------------------------------------------------
@@ -380,9 +452,21 @@
   let extracts = new Map<string, TimingExtract>();
   /** Bumped when a timeline is parsed, so what counts builds re-reads. */
   let timelineGen = $state(0);
+  /** Browsing shows the slide as drawn until a click dot is used. */
+  let asDrawn = $state(true);
   /** The stage's build: the state after that many clicks; null is the slide
-   *  as drawn (browsing, until a click dot is used). */
-  let build = $state<number | null>(null);
+   *  as drawn. In the show and the presenter's view, the controller's. */
+  const build = $derived(show.mode === "browse" && asDrawn ? null : show.at.build);
+
+  /** Show build `k` of the current slide; null: the slide as drawn. */
+  function setBuild(k: number | null): void {
+    if (k === null) {
+      asDrawn = true;
+      return;
+    }
+    asDrawn = false;
+    show.go({ slide: current, build: k });
+  }
   /** Something on the current slide's builds could only be approximated. */
   let playApprox = $state(false);
 
@@ -426,13 +510,13 @@
   // slides a click can land on too, so a step back lands on the last build.
   $effect(() => {
     const i = current;
-    const show = presenting;
+    const showing = inShow;
     const flags = hiddenFlags;
     void deckGen;
     void slideGen;
     untrack(() => {
       let fresh = false;
-      for (const j of show ? [i, ...showReach(flags, i, true)] : [i]) {
+      for (const j of showing ? [i, ...showReach(flags, i, true)] : [i]) {
         const sl = deck?.presentation.slides[j];
         if (sl === undefined || timelines.has(sl.slidePath)) continue;
         if (timelineOf(j) !== null) fresh = true;
@@ -441,13 +525,14 @@
     });
   });
 
-  /** The current slide's timing. */
+  /** The current slide's timing (parsed on first read: the controller may
+   *  count a slide's builds before the parse effect gets to it). */
   const timed = $derived.by(() => {
     void timelineGen;
     void deckGen;
     void slideGen;
-    const sl = deck?.presentation.slides[current];
-    return sl === undefined ? null : (timelines.get(sl.slidePath) ?? null);
+    void deck;
+    return timelineOf(current);
   });
   /** The build on screen, held to the timeline (a re-read deck may have fewer). */
   const buildAt = $derived(build === null ? null : Math.min(build, Math.max(0, (timed?.states.length ?? 1) - 1)));
@@ -489,47 +574,19 @@
    *  slide as drawn. */
   function showBuild(k: number): void {
     if (editMode) return;
-    build = !presenting && buildAt === k ? null : k;
-  }
-
-  /** The click dots: the slide's start, then one per click, at most DOTS
-   *  of them in a window that follows the build (a deck of 300 clicks
-   *  keeps a short row). */
-  const DOTS = 8;
-  const dotWindow = $derived.by(() => {
-    if (clicks <= DOTS) return { first: 1, last: clicks };
-    const first = Math.min(Math.max(1, (buildAt ?? 0) - Math.floor(DOTS / 2) + 1), clicks - DOTS + 1);
-    return { first, last: first + DOTS - 1 };
-  });
-
-  let dotsEl = $state<HTMLSpanElement | null>(null);
-  /** Arrows move along the dots (and the build with them); Escape is the
-   *  slide as drawn again. */
-  function onDotsKey(e: KeyboardEvent): void {
-    if (e.metaKey || e.ctrlKey || e.altKey) return;
-    let to: number | null;
-    if (e.key === "ArrowRight") to = Math.min(clicks, (buildAt ?? -1) + 1);
-    else if (e.key === "ArrowLeft") to = Math.max(0, (buildAt ?? 1) - 1);
-    else if (e.key === "Home") to = 0;
-    else if (e.key === "End") to = clicks;
-    else if (e.key === "Escape" && !presenting && build !== null) to = null;
-    else return;
-    e.preventDefault();
-    e.stopPropagation();
-    build = to;
-    void tick().then(() => dotsEl?.querySelector<HTMLElement>('[tabindex="0"]')?.focus());
+    setBuild(!inShow && buildAt === k ? null : k);
   }
 
   // The show moves on by itself where the slide says (`advTm`), once its
   // last build is up; only while someone can see it, and any move restarts it.
   $effect(() => {
-    if (!presenting || editMode || !onScreen.shown) return;
+    if (!inShow || editMode || !onScreen.shown) return;
     const b = buildAt;
     const t = timed;
     const after = t?.timeline.transition?.advanceAfter ?? null;
     if (t === null || after === null || b === null || b < t.states.length - 1) return;
     const timer = setTimeout(() => {
-      if (!disposed) page(1);
+      if (!disposed) page(1, true);
     }, after);
     return () => clearTimeout(timer);
   });
@@ -646,7 +703,6 @@
     const now = d.presentation.slides.map((sl) => sl.slidePath);
     if (order.length !== now.length || order.every((p, k) => p === now[k])) return;
     if (new Set(order).size !== order.length || order.some((p) => !now.includes(p))) return;
-    const keep = now[current];
     const perm = order.map((p) => now.indexOf(p));
     const slides = perm.map((k) => d.presentation.slides[k]!);
     slides.forEach((sl, k) => (sl.index = k));
@@ -657,7 +713,8 @@
     itemsMemo = null;
     deck = { ...d, notes: perm.map((k) => d.notes[k] ?? ""), notesSkipped };
     deckGen += 1;
-    current = Math.max(0, keep === undefined ? current : order.indexOf(keep));
+    // The controller stands on the slide by its part: it follows the move.
+    show.relocate();
   }
 
   /** Draw slide `i` from `xml`: a fresh lazy slide in the presentation, its
@@ -686,6 +743,13 @@
       nodeErrors += 1;
     }
     itemsMemo = null;
+    // The next click's picture of this slide is drawn again from the edit.
+    const nx = nextHandles.get(i);
+    if (nx !== undefined) {
+      nx.dispose();
+      nx.element.remove();
+      nextHandles.delete(i);
+    }
     const th = thumbHandles.get(i);
     if (th !== undefined) {
       // The old picture stays until the new one replaces it (syncThumbs'
@@ -742,10 +806,14 @@
       stageEl?.focus({ preventScroll: true });
       return;
     }
+    // The show window never edits; the presenter's view ends first, as the
+    // show does (the slide as drawn is what an edit acts on).
+    if (show.isShowWindow) return;
+    if (show.mode === "presenter") show.presenter();
     if (areaMode) toggleArea();
     clearPick();
     revealed = null;
-    build = null;
+    asDrawn = true;
     editMode = true;
     stageEl?.focus({ preventScroll: true });
     void checkLock();
@@ -985,7 +1053,7 @@
 
   let stageW = $state(0);
   let stageH = $state(0);
-  const pad = $derived(presenting ? 0 : 20);
+  const pad = $derived(inShow ? 0 : 20);
   const scale = $derived(
     stageW > 0 && stageH > 0 ? Math.max(0.05, Math.min((stageW - pad * 2) / w, (stageH - pad * 2) / h)) : 0,
   );
@@ -1036,7 +1104,7 @@
   }
 
   function onBoxPointerDown(e: PointerEvent): void {
-    if (e.button !== 0 || deck === null || presenting || editMode || !(areaMode || e.shiftKey)) return;
+    if (e.button !== 0 || deck === null || inShow || editMode || !(areaMode || e.shiftKey)) return;
     const at = slidePoint(e);
     if (at === null) return;
     e.preventDefault();
@@ -1094,7 +1162,7 @@
    *  shape's jump or web link (the renderer's listeners, on the target)
    *  must not run. The slide's @ is a button of its own. */
   function onBoxClickCapture(e: MouseEvent): void {
-    if (!(areaMode || e.shiftKey || editMode)) return;
+    if (inShow || !(areaMode || e.shiftKey || editMode)) return;
     if ((e.target as Element | null)?.closest?.(".slide-ref") != null) return;
     e.preventDefault();
     e.stopPropagation();
@@ -1147,7 +1215,7 @@
   /** The chip sits under the box's bottom-right corner, inside the stage. */
   const chipPos = $derived.by(() => {
     const p = pick;
-    if (p === null || !pickReady || presenting) return null;
+    if (p === null || !pickReady || inShow) return null;
     const left0 = (stageW - w * scale) / 2;
     const top0 = (stageH - h * scale) / 2;
     const clamp = (n: number, lo: number, hi: number) => Math.min(Math.max(n, lo), Math.max(lo, hi));
@@ -1203,12 +1271,32 @@
     void thumbRange;
     void deckGen;
     void slideGen;
-    if (!showThumbs || stripEl === null) return;
+    if (stripEl === null) return;
     // After the stage: thumbnails never hold up the slide being read.
     let t = setTimeout(function pump() {
       if (untrack(syncThumbs)) t = setTimeout(pump, 16);
     }, 60);
     return () => clearTimeout(t);
+  });
+
+  // The strip moves between the browsing layout and the presenter's: the
+  // thumbnails already drawn go into the new strip's boxes.
+  $effect(() => {
+    const strip = stripEl;
+    if (strip === null) return;
+    untrack(() => {
+      stripLeft = strip.scrollLeft;
+      for (const [i, handle] of thumbHandles) {
+        if (strip.contains(handle.element)) continue;
+        const box = strip.querySelector<HTMLElement>(`[data-thumb="${i}"] .thumb-slide`);
+        if (box !== null) box.replaceChildren(handle.element);
+        else {
+          handle.dispose();
+          handle.element.remove();
+          thumbHandles.delete(i);
+        }
+      }
+    });
   });
 
   $effect(() => {
@@ -1221,7 +1309,7 @@
   });
 
   $effect(() => {
-    if (!showThumbs) {
+    if (!showThumbs && show.mode !== "presenter") {
       for (const handle of thumbHandles.values()) handle.dispose();
       thumbHandles.clear();
     }
@@ -1231,13 +1319,92 @@
   $effect(() => {
     const strip = stripEl;
     const i = current;
-    if (strip === null || !showThumbs) return;
+    if (strip === null) return;
     const left = i * (thumbW + THUMB_GAP);
     const right = left + thumbW;
     if (left < strip.scrollLeft + 8) strip.scrollTo({ left: Math.max(0, left - 24), behavior: "smooth" });
     else if (right > strip.scrollLeft + strip.clientWidth - 8) {
       strip.scrollTo({ left: right - strip.clientWidth + 24, behavior: "smooth" });
     }
+  });
+
+  // --- the presenter's next click ------------------------------------------------
+
+  /** What the next click shows: the same slide one build on, or the next
+   *  shown slide before its first click; null at the end of the show. */
+  const nextPlace = $derived.by(() => {
+    void timelineGen;
+    void deckGen;
+    void slideGen;
+    if (show.mode !== "presenter" || deck === null) return null;
+    return show.next();
+  });
+
+  /** The next click drawn live: a second render of that slide, tagged and
+   *  at that build. Two at most (this slide's next build and the next
+   *  slide's start are often both wanted, back and forth). */
+  const nextHandles = new Map<number, SlideHandle>();
+  const NEXT_KEEP = 2;
+  let nextSlot = $state<HTMLDivElement | null>(null);
+  let nextW = $state(0);
+  const nextScale = $derived(nextW > 0 ? nextW / w : 0);
+
+  function disposeNext(): void {
+    for (const h of nextHandles.values()) {
+      h.dispose();
+      h.element.remove();
+    }
+    nextHandles.clear();
+  }
+
+  $effect(() => {
+    const el = nextSlot;
+    const p = nextPlace;
+    void deckGen;
+    void slideGen;
+    if (el === null || p === null) return;
+    untrack(() => {
+      let hd = nextHandles.get(p.slide);
+      if (hd !== undefined && hd.element.parentElement !== el) {
+        // Drawn into a slot that went (the view left and came back).
+        hd.dispose();
+        hd.element.remove();
+        nextHandles.delete(p.slide);
+        hd = undefined;
+      }
+      if (hd === undefined) {
+        const made = render(p.slide, true);
+        if (made === null) return;
+        made.element.classList.add("stage-slide");
+        // Never a link or a jump: the next click is only a picture.
+        made.element.setAttribute("inert", "");
+        el.appendChild(made.element);
+        nextHandles.set(p.slide, made);
+        hd = made;
+        while (nextHandles.size > NEXT_KEEP) {
+          const [old, h] = nextHandles.entries().next().value as [number, SlideHandle];
+          h.dispose();
+          h.element.remove();
+          nextHandles.delete(old);
+        }
+      } else {
+        nextHandles.delete(p.slide);
+        nextHandles.set(p.slide, hd);
+      }
+      for (const [j, h] of nextHandles) h.element.style.visibility = j === p.slide ? "visible" : "hidden";
+      const tagged = stageTags.get(hd.element);
+      const state = timelineOf(p.slide)?.states[p.build];
+      if (tagged !== undefined) {
+        if (state === undefined) clearState(tagged);
+        else applyState(tagged, state, w, h);
+      }
+    });
+  });
+
+  // Out of the presenter's view (or at the end of the show) the next
+  // click's renders go, charts and listeners with them.
+  $effect(() => {
+    if (nextSlot === null) untrack(disposeNext);
   });
 
   // --- keys, present -------------------------------------------------------------
@@ -1285,21 +1452,25 @@
         page(-1);
         break;
       case "Home":
-        go(presenting ? showEdge(hiddenFlags, "first") : 0);
-        break;
       case "End":
-        go(presenting ? showEdge(hiddenFlags, "last") : count - 1);
+        // In the show, its first or last shown slide at its first state.
+        if (inShow) show.edge(e.key === "Home" ? "first" : "last");
+        else go(e.key === "Home" ? 0 : count - 1);
         break;
       case "f":
       case "F5":
         void togglePresent();
         break;
+      case "p":
+        if (presenting || editMode) return;
+        void togglePresenter();
+        break;
       case "Escape":
-        if (presenting) void togglePresent();
+        if (inShow) void show.leave();
         else if (pick !== null) clearPick();
         else if (revealBox !== null) revealed = null;
         else if (areaMode) areaMode = false;
-        else if (build !== null) build = null;
+        else if (build !== null) setBuild(null);
         else return;
         break;
       default:
@@ -1312,6 +1483,13 @@
    *  a drag, the bar's buttons), not only on the stage. A text field keeps
    *  its own undo. */
   function onViewKey(e: KeyboardEvent): void {
+    // The presenter's view pages from anywhere in it (the strip, the timer),
+    // not only from the stage, which handles its own keys first.
+    // Modified keys go on to save and undo, as the bar's controls do.
+    if (show.mode === "presenter" && !e.defaultPrevented && !(e.metaKey || e.ctrlKey || e.altKey)) {
+      onKey(e);
+      return;
+    }
     if (!(e.metaKey || e.ctrlKey) || e.altKey || deck === null || presenting || texting) return;
     if (!(editMode || edits.dirty)) return;
     const t = e.target as HTMLElement | null;
@@ -1328,47 +1506,60 @@
   }
 
   async function togglePresent(): Promise<void> {
-    const el = stageEl;
-    if (el === null) return;
     if (presenting) {
-      if (document.fullscreenElement !== null) await document.exitFullscreen().catch(() => {});
-      presenting = false;
-      build = null;
+      await show.leave();
       return;
     }
     // The show is never an editor: edit mode ends first, as its own button
     // or Esc would end it (unsaved edits stay where they are).
     if (editMode) await toggleEdit();
-    // The show opens the slide as PowerPoint's does: before its first click.
-    presenting = true;
-    build = 0;
-    el.focus();
-    try {
-      await el.requestFullscreen?.();
-    } catch {
-      // Not allowed here (some webviews): the window-covering stage stands in.
-    }
+    await show.present();
   }
 
-  $effect(() => {
-    const onChange = () => {
-      if (document.fullscreenElement === null && presenting && stageEl !== null) {
-        presenting = false;
-        build = null;
-      }
-    };
-    document.addEventListener("fullscreenchange", onChange);
-    return () => document.removeEventListener("fullscreenchange", onChange);
-  });
+  async function togglePresenter(): Promise<void> {
+    if (editMode) await toggleEdit();
+    show.presenter();
+    await tick();
+    if (!disposed) stageEl?.focus({ preventScroll: true });
+  }
+
+  /** The show in a new window; this view, now the presenter's, keeps the
+   *  keys (the controller ignores a second press while the window opens). */
+  async function openShowWindow(): Promise<void> {
+    await show.showInWindow();
+    await tick();
+    if (!disposed && show.mode === "presenter") stageEl?.focus({ preventScroll: true });
+  }
+
+  /** When a slide's own link last ran (the renderer's `onNavigate`): that
+   *  click is the link's, never the show's. */
+  let navigatedAt = -Infinity;
+  /** Where a press on the show started: a drag is not a click. */
+  let pressAt: { x: number; y: number } | null = null;
+
+  /** A click in the show is the presenter's clicker: one build on. Not on
+   *  a link, not when the press dragged or selected text. */
+  function showClick(e: MouseEvent): void {
+    const from = pressAt;
+    pressAt = null;
+    if (e.button !== 0 || performance.now() - navigatedAt < 400) return;
+    if (from !== null && Math.hypot(e.clientX - from.x, e.clientY - from.y) > 4) return;
+    const sel = window.getSelection();
+    if (sel !== null && !sel.isCollapsed && stageEl?.contains(sel.anchorNode) === true) return;
+    page(1);
+  }
 
   /** Web links inside a slide open through the app, never in this page. */
   function onStageClick(e: MouseEvent): void {
-    if (areaMode || e.shiftKey || editMode) {
+    if (!inShow && (areaMode || e.shiftKey || editMode)) {
       e.preventDefault();
       return;
     }
     const a = (e.target as Element | null)?.closest?.("a[href]");
-    if (a === null || a === undefined) return;
+    if (a === null || a === undefined) {
+      if (presenting) showClick(e);
+      return;
+    }
     e.preventDefault();
     const href = a.getAttribute("href") ?? "";
     if (/^https?:/i.test(href)) activateUrl(href, e.metaKey || e.ctrlKey);
@@ -1392,7 +1583,7 @@
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="pptx-view" onkeydown={onViewKey}>
+<div class="pptx-view" bind:this={viewEl} onkeydown={onViewKey}>
   <div class="slides-bar">
     {#if deck !== null}
       <button class="bbtn icon" onclick={() => go(current - 1)} disabled={current === 0} title="previous slide (←)" aria-label="previous slide">
@@ -1416,52 +1607,19 @@
         {#if nodeErrors > 0 || deck.blocked > 0}<span>approximate</span>{/if}
       </span>
       <!-- One dot a click, last in the bar's left cluster so a row that
-           grows or goes shifts nothing. The start mark is the slide before
-           its first click; the dot of the build on screen, clicked again (or
-           Escape), is the slide as drawn. -->
-      {#if !editMode && clicks > 0}
-        {@const tip = (label: string) => (approxNote === "" ? label : `${label} · ${approxNote}`)}
-        <span
-          class="builds"
-          bind:this={dotsEl}
-          role="group"
-          aria-label="builds"
-          title={approxNote || undefined}
-        >
-          <button
-            class="pip start"
-            class:on={buildAt !== null}
-            class:at={buildAt === 0}
-            tabindex={buildAt === null || buildAt === 0 ? 0 : -1}
-            onclick={() => showBuild(0)}
-            onkeydown={onDotsKey}
-            title={tip(buildAt === 0 && !presenting ? "before the first click (click again: as drawn)" : "before the first click")}
-            aria-label="before click 1 of {clicks}"
-            aria-current={buildAt === 0 ? "step" : undefined}
-          ><span aria-hidden="true"></span></button>
-          {#each { length: dotWindow.last - dotWindow.first + 1 } as _, n (n)}
-            {@const k = dotWindow.first + n}
-            <button
-              class="pip"
-              class:on={buildAt !== null && k <= buildAt}
-              class:at={buildAt === k}
-              class:more={(n === 0 && k > 1) || (k === dotWindow.last && k < clicks)}
-              tabindex={buildAt === k ? 0 : -1}
-              onclick={() => showBuild(k)}
-              onkeydown={onDotsKey}
-              title={tip(buildAt === k && !presenting ? `click ${k} of ${clicks} (click again: as drawn)` : `click ${k} of ${clicks}`)}
-              aria-label="click {k} of {clicks}"
-              aria-current={buildAt === k ? "step" : undefined}
-            ><span aria-hidden="true"></span></button>
-          {/each}
-        </span>
+           grows or goes shifts nothing; the dot of the build on screen,
+           clicked again (or Escape), is the slide as drawn. The presenter's
+           view has them in its footer. -->
+      {#if !editMode && clicks > 0 && show.mode !== "presenter"}
+        <span class="bar-dots">{@render clickDots()}</span>
       {/if}
     {/if}
     {#if downloadError !== null}<span class="bar-err">{downloadError}</span>{/if}
     {#if officeError !== null}<span class="bar-err">{officeError}</span>{/if}
     {#if officeNote !== null}<span class="status" role="status">{officeNote}</span>{/if}
+    {#if show.windowError !== null}<span class="bar-err" role="status">{show.windowError}</span>{/if}
     <span class="spacer"></span>
-    {#if deck !== null && (editMode || edits.dirty || edits.saving)}
+    {#if deck !== null && !show.isShowWindow && (editMode || edits.dirty || edits.saving)}
       <span class="edit-tools" role="group" aria-label="editing">
         {#if edits.blocked !== null}
           <span class="bar-err" title={edits.blocked}>can't edit: {edits.blocked}</span>
@@ -1494,38 +1652,62 @@
       </span>
     {/if}
     {#if deck !== null}
-      {#if hasNotes}
-        <button class="bbtn" class:on={showNotes} onclick={() => (showNotes = !showNotes)} title="show or hide the speaker notes">notes</button>
-      {/if}
-      <button class="bbtn" class:on={showThumbs} onclick={() => (showThumbs = !showThumbs)} title="show or hide the thumbnail strip">thumbnails</button>
-      <button
-        class="bbtn icon area-btn"
-        class:on={areaMode}
-        onclick={toggleArea}
-        aria-label="select an area"
-        aria-pressed={areaMode}
-        title={areaMode
-          ? "drag a box on the slide, or click a shape, to reference it in an agent — click to stop (Esc)"
-          : "select an area or a shape to reference in an agent (or Shift-drag)"}
-      >
-        <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"
-          ><path
-            d="M2.5 5V3.5a1 1 0 0 1 1-1H5M11 2.5h1.5a1 1 0 0 1 1 1V5M13.5 11v1.5a1 1 0 0 1-1 1H11M5 13.5H3.5a1 1 0 0 1-1-1V11M7.2 2.5h1.6M7.2 13.5h1.6M2.5 7.2v1.6M13.5 7.2v1.6"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.3"
-            stroke-linecap="round"
-          /></svg
+      <!-- The presenter's view has its own notes and strip: their switches
+           belong to browsing. -->
+      {#if show.mode !== "presenter"}
+        {#if hasNotes}
+          <button class="bbtn" class:on={showNotes} onclick={() => (showNotes = !showNotes)} title="show or hide the speaker notes">notes</button>
+        {/if}
+        <button class="bbtn" class:on={showThumbs} onclick={() => (showThumbs = !showThumbs)} title="show or hide the thumbnail strip">thumbnails</button>
+        <button
+          class="bbtn icon area-btn"
+          class:on={areaMode}
+          onclick={toggleArea}
+          aria-label="select an area"
+          aria-pressed={areaMode}
+          title={areaMode
+            ? "drag a box on the slide, or click a shape, to reference it in an agent — click to stop (Esc)"
+            : "select an area or a shape to reference in an agent (or Shift-drag)"}
         >
-      </button>
-      <button class="bbtn" onclick={() => void togglePresent()} title="present full screen (F)">present</button>
+          <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"
+            ><path
+              d="M2.5 5V3.5a1 1 0 0 1 1-1H5M11 2.5h1.5a1 1 0 0 1 1 1V5M13.5 11v1.5a1 1 0 0 1-1 1H11M5 13.5H3.5a1 1 0 0 1-1-1V11M7.2 2.5h1.6M7.2 13.5h1.6M2.5 7.2v1.6M13.5 7.2v1.6"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.3"
+              stroke-linecap="round"
+            /></svg
+          >
+        </button>
+      {/if}
+      {#if !show.isShowWindow}
+        <!-- On while a show window answers: it is there and following. -->
+        <button
+          class="bbtn"
+          class:mode-on={show.followed}
+          aria-busy={show.opening}
+          onclick={() => void openShowWindow()}
+          title="the show in a new window (drag it to the projector); this one shows your notes, the next click and every slide"
+          >show in window</button
+        >
+      {/if}
       <button
         class="bbtn"
-        class:on={editMode}
-        onclick={() => void toggleEdit()}
-        aria-pressed={editMode}
-        title={editMode ? "stop editing (Esc)" : "edit: move, resize and retype shapes, drag thumbnails to reorder"}>edit</button
+        class:mode-on={show.mode === "presenter"}
+        onclick={() => void togglePresenter()}
+        aria-pressed={show.mode === "presenter"}
+        title="presenter view: this slide, the next click, your notes, a timer (P)">presenter</button
       >
+      <button class="bbtn" onclick={() => void togglePresent()} title="present full screen (F)">present</button>
+      {#if !show.isShowWindow}
+        <button
+          class="bbtn"
+          class:on={editMode}
+          onclick={() => void toggleEdit()}
+          aria-pressed={editMode}
+          title={editMode ? "stop editing (Esc)" : "edit: move, resize and retype shapes, drag thumbnails to reorder"}>edit</button
+        >
+      {/if}
     {/if}
     {#if officeOk}
       {#if tripLabel !== null}<span class="status" title="saves in PowerPoint are uploaded to {basename(path)} on this host">{tripLabel}</span>{/if}
@@ -1578,11 +1760,13 @@
     <div class="banner" role="alert"><span>{trip.message}</span></div>
   {/if}
 
+{#snippet stageView()}
   <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div
     class="stage"
     class:presenting
+    class:in-presenter={show.mode === "presenter"}
     bind:this={stageEl}
     bind:clientWidth={stageW}
     bind:clientHeight={stageH}
@@ -1592,6 +1776,7 @@
     onkeydown={onKey}
     onclick={onStageClick}
     onpointerdown={(e) => {
+      if (presenting) pressAt = { x: e.clientX, y: e.clientY };
       // The grey around the slide is "nothing": a press there deselects.
       if (editMode && e.target === e.currentTarget && !texting) selectedShape = null;
     }}
@@ -1616,7 +1801,7 @@
         onclickcapture={onBoxClickCapture}
       >
         <div class="slide-scale" style:width="{w}px" style:height="{h}px" style:transform="scale({scale})" bind:this={slot}></div>
-        {#if !presenting}
+        {#if show.mode === "browse"}
           {#if editMode && edits.ready && edits.blocked === null && editSlide !== undefined}
             <PptxEditLayer
               bind:this={editLayer}
@@ -1680,52 +1865,98 @@
       <div class="stale-note" role="status">{error} — showing the last good render</div>
     {/if}
   </div>
+{/snippet}
 
-  {#if deck !== null && showNotes && (note !== "" || noteSkipped) && !presenting}
-    {#if noteSkipped}
-      <div class="notes skipped" role="note" aria-label="speaker notes">this slide's notes are too large to show here</div>
-    {:else}
-      <div class="notes" role="note" aria-label="speaker notes">{note}</div>
-    {/if}
-  {/if}
-
-  {#if deck !== null && showThumbs && count > 1}
-    <div class="strip" bind:this={stripEl} onscroll={() => stripEl !== null && (stripLeft = stripEl.scrollLeft)}>
-      <div class="strip-inner" style:width="{count * (thumbW + THUMB_GAP) - THUMB_GAP}px" style:height="{THUMB_H}px">
-        {#each { length: count } as _, i (i)}
-          <button
-            class="thumb"
-            class:on={i === current}
-            class:dim={deck.presentation.slides[i]?.hidden === true}
-            class:dragging={thumbDrag?.moved === true && thumbDrag.from === i}
-            class:reorder={editMode}
-            data-thumb={i}
-            style:left="{i * (thumbW + THUMB_GAP)}px"
-            style:width="{thumbW}px"
-            style:transform={thumbDrag?.moved === true && thumbDrag.from === i ? `translateX(${thumbDrag.dx}px)` : undefined}
-            onpointerdown={(e) => onThumbDown(e, i)}
-            onpointermove={onThumbMove}
-            onpointerup={onThumbUp}
-            onpointercancel={onThumbCancel}
-            ondragstart={(e) => e.preventDefault()}
-            onclick={() => {
-              if (swallowClick) {
-                swallowClick = false;
-                return;
-              }
-              go(i);
-              stageEl?.focus();
-            }}
-            aria-label="slide {i + 1}"
-            aria-current={i === current ? "true" : undefined}
-          >
-            <span class="thumb-slide" style:width="{w}px" style:height="{h}px" style:transform="scale({thumbScale})"></span>
-            <span class="num">{i + 1}</span>
-          </button>
-        {/each}
-        {#if dropMarkX !== null}<span class="drop-mark" aria-hidden="true" style:left="{dropMarkX}px"></span>{/if}
-      </div>
+<!-- Every slide, hidden ones dimmed: browsing opens one as drawn; the
+     presenter's view jumps the show to its first state, and a show window
+     follows. -->
+{#snippet stripView()}
+  <div class="strip" class:flush={show.mode === "presenter"} bind:this={stripEl} onscroll={() => stripEl !== null && (stripLeft = stripEl.scrollLeft)}>
+    <div class="strip-inner" style:width="{count * (thumbW + THUMB_GAP) - THUMB_GAP}px" style:height="{THUMB_H}px">
+      {#each { length: count } as _, i (i)}
+        <button
+          class="thumb"
+          class:on={i === current}
+          class:dim={deck?.presentation.slides[i]?.hidden === true}
+          class:dragging={thumbDrag?.moved === true && thumbDrag.from === i}
+          class:reorder={editMode}
+          data-thumb={i}
+          style:left="{i * (thumbW + THUMB_GAP)}px"
+          style:width="{thumbW}px"
+          style:transform={thumbDrag?.moved === true && thumbDrag.from === i ? `translateX(${thumbDrag.dx}px)` : undefined}
+          onpointerdown={(e) => onThumbDown(e, i)}
+          onpointermove={onThumbMove}
+          onpointerup={onThumbUp}
+          onpointercancel={onThumbCancel}
+          ondragstart={(e) => e.preventDefault()}
+          onclick={() => {
+            if (swallowClick) {
+              swallowClick = false;
+              return;
+            }
+            go(i);
+            stageEl?.focus();
+          }}
+          aria-label="slide {i + 1}"
+          aria-current={i === current ? "true" : undefined}
+        >
+          <span class="thumb-slide" style:width="{w}px" style:height="{h}px" style:transform="scale({thumbScale})"></span>
+          <span class="num">{i + 1}</span>
+        </button>
+      {/each}
+      {#if dropMarkX !== null}<span class="drop-mark" aria-hidden="true" style:left="{dropMarkX}px"></span>{/if}
     </div>
+  </div>
+{/snippet}
+
+<!-- The next click, drawn live at its build (`nextPlace`). -->
+{#snippet clickDots()}
+  <ClickDots
+    {clicks}
+    at={buildAt}
+    canClear={!inShow}
+    note={approxNote}
+    onpick={showBuild}
+    onset={setBuild}
+  />
+{/snippet}
+
+{#snippet nextView()}
+  <div class="next-frame" bind:clientWidth={nextW}>
+    {#if nextScale > 0}
+      <div class="slide-scale" style:width="{w}px" style:height="{h}px" style:transform="scale({nextScale})" bind:this={nextSlot}></div>
+    {/if}
+  </div>
+{/snippet}
+
+  {#if show.mode === "presenter" && deck !== null}
+    <PresenterView
+      now={stageView}
+      next={nextPlace === null ? null : nextView}
+      strip={count > 1 ? stripView : undefined}
+      ratio={w / h}
+      notes={noteSkipped ? "" : note}
+      noNotes={noteSkipped ? "This slide's notes are too large to show here." : undefined}
+      dots={clicks > 0 ? clickDots : undefined}
+      elapsed={show.elapsed}
+      onResetTimer={() => show.resetTimer()}
+      place="{showAt.n} / {showAt.of}"
+      wallClock={show.wallClock}
+    />
+  {:else}
+    {@render stageView()}
+
+    {#if deck !== null && showNotes && (note !== "" || noteSkipped) && !presenting}
+      {#if noteSkipped}
+        <div class="notes skipped" role="note" aria-label="speaker notes">this slide's notes are too large to show here</div>
+      {:else}
+        <div class="notes" role="note" aria-label="speaker notes">{note}</div>
+      {/if}
+    {/if}
+
+    {#if deck !== null && showThumbs && count > 1}
+      {@render stripView()}
+    {/if}
   {/if}
 </div>
 
@@ -1737,12 +1968,18 @@
     flex-direction: column;
   }
 
+  /* A pane too narrow for one row takes a second: nothing is squeezed (a
+     counter that wrapped mid-number, a button that broke its words) and
+     nothing is cut off. The spacer fills the first row, so what wraps lines
+     up on the right like the row above it. */
   .slides-bar {
     flex: none;
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
-    gap: 0.35rem;
-    height: 26px;
+    justify-content: flex-end;
+    gap: 0 0.35rem;
+    min-height: 26px;
     padding: 0 0.5rem 0 0.4rem;
     border-bottom: 1px solid var(--edge);
     font-size: var(--text-xs);
@@ -1751,75 +1988,19 @@
   }
 
   .count {
+    flex: none;
     min-width: 4.5ch;
+    white-space: nowrap;
     text-align: center;
     font-family: var(--mono);
     font-variant-numeric: tabular-nums;
     color: var(--fg);
   }
 
-  /* The click dots: as wide as their dots (at most the start mark and DOTS). */
-  .builds {
+  .bar-dots {
     flex: none;
     display: inline-flex;
-    align-items: center;
-    height: 18px;
     margin-left: 0.25rem;
-  }
-
-  .pip {
-    appearance: none;
-    flex: none;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 10px;
-    height: 18px;
-    padding: 0;
-    border: none;
-    border-radius: 3px;
-    background: none;
-    cursor: pointer;
-  }
-
-  .pip > span {
-    width: 5px;
-    height: 5px;
-    border-radius: 50%;
-    background: color-mix(in srgb, var(--fg) 22%, transparent);
-    transition:
-      background-color 0.12s ease,
-      box-shadow 0.12s ease;
-  }
-
-  /* The start mark: a short bar, the slide before its first click. */
-  .pip.start > span {
-    width: 2px;
-    height: 9px;
-    border-radius: 1px;
-  }
-
-  /* More clicks beyond the window's edge. */
-  .pip.more > span {
-    width: 3px;
-    height: 3px;
-  }
-
-  .pip:hover > span {
-    background: color-mix(in srgb, var(--fg) 50%, transparent);
-  }
-
-  .pip.on > span {
-    background: var(--accent);
-  }
-
-  .pip.at:not(.start) > span {
-    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 28%, transparent);
-  }
-
-  .pip:focus-visible {
-    outline: 2px solid var(--focus-ring);
-    outline-offset: -1px;
   }
 
   .tag {
@@ -1831,6 +2012,7 @@
   }
 
   .limits {
+    flex: none;
     display: inline-flex;
     align-items: center;
     gap: 0.3rem;
@@ -1926,6 +2108,7 @@
     padding: 0.1rem 0.45rem;
     border-radius: 4px;
     white-space: nowrap;
+    flex: none;
     transition:
       background-color 0.12s ease,
       color 0.12s ease;
@@ -1952,6 +2135,14 @@
     color: var(--fg);
   }
 
+  /* A mode that is on (the presenter's view, a connected show window):
+     a fill that stays under hover, so on never reads as hovered. */
+  .bbtn.mode-on,
+  .bbtn.mode-on:hover:not(:disabled) {
+    color: var(--fg);
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+  }
+
   .bbtn:disabled {
     opacity: 0.4;
     cursor: default;
@@ -1975,6 +2166,33 @@
 
   .stage.presenting {
     background: #000;
+  }
+
+  /* In the presenter's view the stage is the "now" picture: it fills its
+     cell, on the view's own background. */
+  .stage.in-presenter {
+    align-self: stretch;
+    align-items: flex-start;
+    background: none;
+  }
+
+  /* The stage holds the keys for the whole view: it is focused all the
+     time, so it wears no ring there (the controls around it do). */
+  .stage.in-presenter:focus-visible {
+    box-shadow: none;
+  }
+
+  /* The next click: the slide scaled to its frame, white like the stage's. */
+  .next-frame {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+    background: #fff;
+  }
+
+  /* The show is the slide and nothing else: no focus frame on the projector. */
+  .stage.presenting:focus-visible {
+    box-shadow: none;
   }
 
   .stage.presenting:not(:fullscreen) {
@@ -2158,6 +2376,17 @@
     margin: 0 auto;
   }
 
+  /* In the presenter's view the strip starts at the console's edge, on its
+     surface. */
+  .strip.flush {
+    padding: 8px 12px 10px;
+    background: none;
+  }
+
+  .strip.flush .strip-inner {
+    margin: 0;
+  }
+
   .thumb {
     position: absolute;
     top: 0;
@@ -2231,8 +2460,9 @@
     bottom: 2px;
     padding: 0 3px;
     border-radius: 3px;
-    background: color-mix(in srgb, var(--term-bg) 80%, transparent);
-    color: var(--muted);
+    /* On the slide's own white in every theme, so one style for both. */
+    background: color-mix(in srgb, #000 8%, transparent);
+    color: color-mix(in srgb, #000 60%, transparent);
     font-family: var(--mono);
     font-size: 9px;
     line-height: 1.4;
@@ -2240,15 +2470,15 @@
   }
 
   .thumb.on .num {
-    color: var(--accent);
+    background: var(--accent);
+    color: #fff;
   }
 
   @media (prefers-reduced-motion: reduce) {
     .bbtn,
     .opt,
     .thumb,
-    .slide-ref,
-    .pip > span {
+    .slide-ref {
       transition: none;
     }
   }

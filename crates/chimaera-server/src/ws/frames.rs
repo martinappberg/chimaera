@@ -209,8 +209,34 @@ pub(crate) fn browser_open(
     })
 }
 
+/// A plugin opens one of its views (or a file it claims, in its view)
+/// beside an agent session, without taking focus (`plugins::reveal`): every
+/// window gets it, and the one holding the session's pane, else a visible
+/// window on the workspace, places the tab (as for `browser_open`). `file`
+/// is workspace-relative; `args` reach the view's `render`.
+pub(crate) fn plugin_reveal(
+    session_id: &str,
+    workspace_id: &str,
+    plugin: &str,
+    view: &str,
+    file: Option<&str>,
+    args: &serde_json::Map<String, Value>,
+) -> Value {
+    json!({
+        "type": "plugin_reveal",
+        "session_id": session_id,
+        "workspace_id": workspace_id,
+        "plugin": plugin,
+        "view": view,
+        "file": file,
+        "args": args,
+    })
+}
+
 /// The agent browser asks ONE window to act on a pane view (CONTRACTS §2):
-/// `op` is `open|drive|nav|close|handover|state`, `view` an agent's own view
+/// `op` is `open|drive|nav|close|handover|state`, or `web_call` (a plugin's
+/// call to the page of a web node the window shows, `plugins::web_calls`:
+/// `{plugin, node_view, node, file, call, method, args}`), `view` an agent's own view
 /// id (`null` for a shared pane), `tab` the shared pane's browser tab (`null`
 /// for an own view); `fields` are the op's own keys. The window answers with
 /// a `browser_reply` carrying the same `rid`. The host's keys land last, so

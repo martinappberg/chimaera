@@ -208,6 +208,11 @@ enum ClientMessage {
         /// URL in app terms). Agents see these read-only.
         #[serde(default)]
         pages: Vec<crate::agent_browser::channel::HelloPage>,
+        /// Additive: the plugins' web nodes this window shows on screen
+        /// (`{plugin, view, id, file?}`), which answer their plugin's calls
+        /// (`plugins::web_calls`).
+        #[serde(default)]
+        web_views: Vec<crate::agent_browser::channel::HelloWebView>,
     },
     /// `/ws/events` only: the answer to a `browser_request` with this `rid`.
     BrowserReply {
@@ -1518,6 +1523,7 @@ async fn events_client_text(
             height,
             tabs,
             pages,
+            web_views,
         }) => state.browsers.channel.hello(
             socket_id,
             Hello {
@@ -1528,6 +1534,7 @@ async fn events_client_text(
                 height,
                 tabs,
                 pages,
+                web_views,
             },
         ),
         Ok(ClientMessage::BrowserReply {
@@ -1953,8 +1960,10 @@ mod tests {
                 height,
                 tabs,
                 pages,
+                web_views,
             } => {
                 assert!(app_engine && visible && !focused);
+                assert!(web_views.is_empty(), "older windows send no web views");
                 assert_eq!((width, height), (1440, 900));
                 assert_eq!(tabs, vec!["a".to_string(), "b".to_string()]);
                 assert!(pages.is_empty(), "older windows send no pages");
@@ -2225,7 +2234,7 @@ mod tests {
         pin(
             "events-bus",
             "crates/chimaera-server/src/ws.rs",
-            "/ws/events frames (ws::frames): the sessions roster + links + browser links, settings, the invalidation frames, fs changes, update status, notices, browser_open, the agent browser's browser_request ops, the plugin platform frames, and the error.",
+            "/ws/events frames (ws::frames): the sessions roster + links + browser links, settings, the invalidation frames, fs changes, update status, notices, browser_open, the agent browser's browser_request ops (and a plugin's web_call), plugin_reveal, the plugin platform frames, and the error.",
             vec![
                 case("sessions", "the full roster (a shell row, a chat row; session-rows.json has every row shape), one terminal link and one shared browser tab (page = the id the agent uses)", frames::sessions(rows, links, browser_links)),
                 case("sessions_empty", "no sessions, no links", frames::sessions(vec![], vec![], vec![])),
@@ -2306,6 +2315,25 @@ mod tests {
                     "agent browser: the driving/paused marker for a shared pane (no native call; reply {})",
                     frames::browser_request(24, "state", None, Some("k3x9a2b"),
                         fields(serde_json::json!({"driving": true, "paused": false}))),
+                ),
+                case(
+                    "browser_request_web_call",
+                    "a plugin's call to the page of a web node this window shows (reply {value} or the page's {error}; a refusal means not here; plugins::web_calls)",
+                    frames::browser_request(25, "web_call", None, None,
+                        fields(serde_json::json!({"workspace": "w1", "plugin": "genomespy", "node_view": "data", "node": "genome",
+                            "file": "reads/tp53.bam", "call": "wc-0123456789abcdef", "method": "look",
+                            "args": {"width": 1200}}))),
+                ),
+                case(
+                    "plugin_reveal",
+                    "a plugin opens its view (or a file it claims) beside an agent session, without focus",
+                    frames::plugin_reveal("s-chat1", "w1", "genomespy", "genome", None,
+                        &fields(serde_json::json!({"locus": "chr17:7,668,402-7,687,550"}))),
+                ),
+                case(
+                    "plugin_reveal_file",
+                    "a reveal of a file the plugin claims (workspace-relative), in its view",
+                    frames::plugin_reveal("s-chat1", "w1", "genomespy", "data", Some("reads/tp53.bam"), &serde_json::Map::new()),
                 ),
                 case("plugin_view", "a plugin screen should re-render", frames::plugin_view("latex", "w1", "preview")),
                 case("plugin_surface", "a plugin published a data surface key", frames::plugin_surface(&"latex", &"w1", &"figures", &"fig-1")),

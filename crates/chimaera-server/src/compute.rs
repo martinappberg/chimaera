@@ -539,6 +539,13 @@ impl ComputeService {
         self.detected.store(DET_NONE, Ordering::Release);
     }
 
+    /// Tests: this daemon is on a cluster login node (Slurm detected, no
+    /// job), without probing.
+    #[cfg(test)]
+    pub(crate) fn assume_login_node(&self) {
+        self.detected.store(DET_SLURM, Ordering::Release);
+    }
+
     /// Detect, mirroring the verdict into [`Self::detected`].
     async fn detect(&self) -> Option<Detection> {
         let found = detect_tools(self.bindir.as_deref()).await;

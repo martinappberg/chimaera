@@ -24,11 +24,38 @@ export interface PluginRef {
   view?: string;
 }
 
+/** A shape whose every match opens a view (`references/1` 0.4): its args,
+ *  with `"<match>"` standing for the matched text. */
+export interface ShapeView {
+  view: string;
+  args: Record<string, string>;
+}
+
 /** Everything one plugin published here, merged across its keys. */
 export interface PluginRefs {
   plugin: string;
   shapes: RefShape[];
   byId: Map<string, PluginRef[]>;
+  /** By shape kind: the view its matches open (the first shape's). */
+  viewShapes: Map<string, ShapeView>;
+}
+
+function shapeViewOf(v: unknown): ShapeView | undefined {
+  const o = v as { view?: unknown; args_from_match?: unknown } | null | undefined;
+  if (o === null || typeof o !== "object" || !text(o.view)) return undefined;
+  const raw = o.args_from_match;
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const args: Record<string, string> = {};
+  for (const [k, val] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof val !== "string") return undefined;
+    args[k] = val;
+  }
+  return { view: o.view, args };
+}
+
+/** A shape view's args for one match: every `"<match>"` is the text. */
+export function argsForMatch(sv: ShapeView, match: string): Record<string, string> {
+  return Object.fromEntries(Object.entries(sv.args).map(([k, v]) => [k, v.split("<match>").join(match)]));
 }
 
 const text = (v: unknown): v is string => typeof v === "string" && v !== "";
@@ -49,15 +76,17 @@ export function collectReferences(items: readonly SurfaceItem[]): Map<string, Pl
     if (data === null || typeof data !== "object") continue;
     let refs = out.get(it.plugin);
     if (refs === undefined) {
-      refs = { plugin: it.plugin, shapes: [], byId: new Map() };
+      refs = { plugin: it.plugin, shapes: [], byId: new Map(), viewShapes: new Map() };
       out.set(it.plugin, refs);
     }
     for (const s of Array.isArray(data.shapes) ? data.shapes : []) {
-      const shape = s as Partial<RefShape>;
+      const shape = s as Partial<RefShape> & { view?: unknown };
       if (!text(shape.kind) || !text(shape.pattern)) continue;
       if (!refs.shapes.some((x) => x.kind === shape.kind && x.pattern === shape.pattern)) {
         refs.shapes.push({ kind: shape.kind, pattern: shape.pattern });
       }
+      const sv = shapeViewOf(shape.view);
+      if (sv !== undefined && !refs.viewShapes.has(shape.kind)) refs.viewShapes.set(shape.kind, sv);
     }
     for (const r of Array.isArray(data.ids) ? data.ids : []) {
       const o = r as Partial<PluginRef> & { span?: unknown };
@@ -71,7 +100,9 @@ export function collectReferences(items: readonly SurfaceItem[]): Map<string, Pl
       else if (!list.some((x) => x.key === ref.key)) list.push(ref);
     }
   }
-  for (const [pid, refs] of out) if (refs.shapes.length === 0 || refs.byId.size === 0) out.delete(pid);
+  for (const [pid, refs] of out) {
+    if (refs.shapes.length === 0 || (refs.byId.size === 0 && refs.viewShapes.size === 0)) out.delete(pid);
+  }
   return out;
 }
 
@@ -107,7 +138,22 @@ export function pluginSource(refs: PluginRefs, name: string, root: string | null
       const all = refs.byId.get(id) ?? [];
       // The id's own kind when it has that one; any of its kinds otherwise.
       const same = all.filter((r) => r.kind === kind);
-      return (same.length > 0 ? same : all).map(target);
+      if (all.length > 0) return (same.length > 0 ? same : all).map(target);
+      // A shape whose matches open a view: any match is one (a locus).
+      const sv = refs.viewShapes.get(kind);
+      if (sv === undefined) return [];
+      const args = argsForMatch(sv, id);
+      return [
+        {
+          key: `${refs.plugin}:${kind}:${id}`,
+          kind,
+          title: id,
+          note: [id, kind, name].filter((x, i, every) => every.indexOf(x) === i).join(" · "),
+          open: () => {
+            if (ws !== null) openPluginView(refs.plugin, sv.view, { ws, args });
+          },
+        },
+      ];
     },
   };
 }

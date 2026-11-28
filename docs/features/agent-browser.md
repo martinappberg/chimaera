@@ -172,6 +172,10 @@ marker), `layout/PaneTabs.svelte` (the chain link and chips). Wire: `browser_req
 - Chromium: `Fetch` pauses every main-frame document request (redirects and page-initiated
   navigations included) and `check_target` decides; a refused one fails with `BlockedByClient`
   and the tool says why. Subframes and subresources pass, the same as pane views.
+- The Chromium engine also hosts plugins' headless web pages (`plugins::web_headless`, [web
+  views](web-views.md#a-plugins-tools-and-its-page-api-04)): the daemon's own `/web/w-…` grant
+  path passes the gate like a `/raw/` ticket, and such a page is pinned (`Chromium::pin`) so its
+  main frame never leaves its own `/web/{grant}/`.
 
 ## Sharing a pane (the chain link)
 
@@ -229,7 +233,9 @@ marker), `layout/PaneTabs.svelte` (the chain link and chips). Wire: `browser_req
 ## Limits and resources
 
 - One own page per agent; one browser call at a time per agent.
-- At most 6 app-engine agent views per daemon (`APP_VIEWS_MAX`); at most 4 Chromium pages.
+- At most 6 app-engine agent views per daemon (`APP_VIEWS_MAX`); at most 4 Chromium pages, which
+  plugins' headless web pages share (at most 2 of them, closed after 2 idle minutes by the same
+  reaper).
 - Own pages close after 10 idle minutes, when their agent ends, or when their window goes away
   (the reaper, every minute). The Chromium browser closes when it has no pages left and is
   killed by process group at daemon shutdown.
@@ -240,7 +246,8 @@ marker), `layout/PaneTabs.svelte` (the chain link and chips). Wire: `browser_req
   node-local directory.
 - The window channel: per-socket queue of 64 frames, 256 requests in flight daemon-wide, a 15 s
   default deadline per request, replies capped at 8 MB. A closed socket fails its requests at
-  once (`Gone`).
+  once (`Gone`). It also carries plugins' calls to the web views a window shows (op `web_call`,
+  45 s; the hello's `web_views` say which), [web views](web-views.md#a-plugins-tools-and-its-page-api-04).
 
 ## Known gaps
 

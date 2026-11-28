@@ -10,6 +10,7 @@
  * `/ws/events` reach listeners through `onPlatformFrame`, so a screen
  * re-renders when its plugin says it changed.
  */
+import { writable, type Readable } from "svelte/store";
 import { api, ApiError } from "../net/api";
 import { isAbsolute, joinPath, relativeTo } from "../shared/paths";
 import type { WorkspacePlugin } from "./store";
@@ -377,11 +378,12 @@ export async function fetchView(
   ws: string,
   pid: string,
   view: string,
-  opts: { file?: string; width?: "narrow" | "wide" } = {},
+  opts: { file?: string; width?: "narrow" | "wide"; args?: Record<string, unknown> } = {},
 ): Promise<RenderResult> {
   const q = new URLSearchParams();
   if (opts.file !== undefined) q.set("file", opts.file);
   if (opts.width !== undefined) q.set("width", opts.width);
+  if (opts.args !== undefined && Object.keys(opts.args).length > 0) q.set("args", JSON.stringify(opts.args));
   const qs = q.toString();
   const b = await body<RenderWire>(
     await api(`${base(ws, pid)}/views/${encodeURIComponent(view)}${qs ? `?${qs}` : ""}`),
@@ -394,12 +396,14 @@ export async function fetchView(
 /** A page of the plugin's own bundle for a `web` node: its URL under a
  *  grant ticket (`/web/{grant}/{entry}`, `plugins::web`). Asked again while
  *  the node is shown, it answers the same URL and keeps it alive. */
-export async function mintWebPage(ws: string, pid: string, entry: string): Promise<string> {
+export async function mintWebPage(ws: string, pid: string, entry: string, theme = ""): Promise<string> {
+  // The window's theme rides along: a headless page the daemon opens for
+  // a plugin's call (no window showing it) wears the same one.
   const b = await body<{ url?: unknown; error?: unknown }>(
     await api(`${base(ws, pid)}/web`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ entry }),
+      body: JSON.stringify(theme !== "" ? { entry, theme } : { entry }),
     }),
   );
   if (typeof b.url !== "string") throw new Error(typeof b.error === "string" ? b.error : "no page");
@@ -427,18 +431,23 @@ export async function postViewAction(
 
 export interface FileActionAnswer {
   message: string | null;
-  open: { view: string; file?: string } | null;
+  /** A view to open: a tab view, or a file view on `file` (workspace-relative;
+   *  null: the file the action ran on). */
+  open: { view: string; file: string | null } | null;
 }
 
 export async function postFileAction(ws: string, pid: string, action: string, file: string): Promise<FileActionAnswer> {
-  const b = await body<{ message?: string | null; open?: { view: string; file?: string } | null }>(
+  const b = await body<{ message?: string | null; open?: { view: string; file?: string | null } | null }>(
     await api(`${base(ws, pid)}/file-actions/${encodeURIComponent(action)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ file }),
     }),
   );
-  return { message: b.message ?? null, open: b.open ?? null };
+  return {
+    message: b.message ?? null,
+    open: b.open ? { view: b.open.view, file: typeof b.open.file === "string" ? b.open.file : null } : null,
+  };
 }
 
 export async function fetchQuery(ws: string, pid: string, name: string, args: unknown): Promise<unknown> {
@@ -738,6 +747,55 @@ export function copyTabToWindow(el: Element): Promise<boolean> {
   return windowCopier(paneId);
 }
 
+// --- a file view asked for on one file --------------------------------------
+
+/** A plugin's file view, on a file it may not claim by pattern. */
+export function viewClaim(plugins: readonly WorkspacePlugin[], plugin: string, view: string): FileClaim | null {
+  const p = plugins.find((x) => x.id === plugin && x.active);
+  const v = p?.platform.views.find((x) => x.id === view && x.slot === "file");
+  return p !== undefined && v !== undefined ? { plugin: p, view: v, kind: { match: [], view: v.id, label: v.title } } : null;
+}
+
+/** A plain workspace-relative path: no empty, `.` or `..` segment, no
+ *  backslash; the daemon's `workspace_file`, checked again here because an
+ *  older daemon passed a plugin's answer through unchecked. */
+export function plainWorkspaceFile(f: string): boolean {
+  return f.length > 0 && f.length <= 1024 && !/[\\\0]/.test(f) && f.split("/").every((s) => s !== "" && s !== "." && s !== "..");
+}
+
+/** Where a file action's `open` goes: a plugin's tab, or one of its file
+ *  views on a file of the workspace (`null`: the file the action ran on).
+ *  A file that isn't a plain workspace path opens nothing. */
+export function fileActionTarget(
+  plugins: readonly WorkspacePlugin[],
+  plugin: string,
+  open: { view: string; file: string | null },
+  from: string,
+): { kind: "tab"; view: string } | { kind: "file"; view: string; file: string } | null {
+  const v = plugins.find((x) => x.id === plugin)?.platform.views.find((x) => x.id === open.view);
+  if (v === undefined) return null;
+  if (v.slot === "file") {
+    if (open.file !== null && !plainWorkspaceFile(open.file)) return null;
+    return { kind: "file", view: v.id, file: open.file ?? from };
+  }
+  return v.slot === "tab" ? { kind: "tab", view: v.id } : null;
+}
+
+/** A file view asked for on the file at `path` (absolute), for the one
+ *  file gate that shows it, already open or about to open: the first gate
+ *  on that path takes it and clears it. `at` is when. */
+export interface FileViewRequest {
+  path: string;
+  plugin: string;
+  view: string;
+  at: number;
+}
+
+/** A request older than this is a stale one a later open must not take. */
+export const FILE_VIEW_REQUEST_MS = 10_000;
+
+export const fileViewRequest = writable<FileViewRequest | null>(null);
+
 // --- opening a plugin's tab view --------------------------------------------
 
 type ViewOpener = (plugin: string, view: string) => void;
@@ -748,11 +806,40 @@ export function setViewOpener(fn: ViewOpener | null): void {
   viewOpener = fn;
 }
 
-/** Open (or focus) a plugin's tab view. False when nothing can open it. */
-export function openPluginView(plugin: string, view: string): boolean {
+/** Open (or focus) a plugin's tab view, with `args` for its `render` in
+ *  workspace `ws` when given (a reveal, a reference chip). False when
+ *  nothing can open it. */
+export function openPluginView(plugin: string, view: string, args?: { ws: string; args: Record<string, unknown> }): boolean {
   if (viewOpener === null) return false;
+  if (args !== undefined) setViewArgs(args.ws, plugin, view, null, args.args);
   viewOpener(plugin, view);
   return true;
+}
+
+/**
+ * The args a view was last opened with (`render`'s `args`): a reveal or a
+ * reference chip says what to show ({"locus": …}); the open screen draws
+ * again with them. Kept for this page's life only, per workspace, plugin,
+ * view and file: a gesture, not layout state.
+ */
+const viewArgsStore = writable<ReadonlyMap<string, Record<string, unknown>>>(new Map());
+export const viewArgs: Readable<ReadonlyMap<string, Record<string, unknown>>> = { subscribe: viewArgsStore.subscribe };
+/** How many views' args are kept (the oldest goes first). */
+const VIEW_ARGS_MAX = 64;
+
+export function viewArgsKey(ws: string, plugin: string, view: string, file: string | null): string {
+  return `${ws}\n${plugin}\n${view}\n${file ?? ""}`;
+}
+
+export function setViewArgs(ws: string, plugin: string, view: string, file: string | null, args: Record<string, unknown>): void {
+  viewArgsStore.update((m) => {
+    const next = new Map(m);
+    const key = viewArgsKey(ws, plugin, view, file);
+    next.delete(key);
+    next.set(key, args);
+    while (next.size > VIEW_ARGS_MAX) next.delete(next.keys().next().value as string);
+    return next;
+  });
 }
 
 /** The sidebar rows active plugins ask for (`[[views]] rail`): each a tab
