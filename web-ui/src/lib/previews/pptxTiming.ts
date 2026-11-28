@@ -1034,20 +1034,124 @@ export function progress(
 }
 
 
+
+// --- time and path math shared with playback (`pptxMotion.ts`) --------------------
+// One copy of each: the state a click lands on and the frames that play it
+// must agree, or the landing jumps.
+
+/** A behaviour's dur, a set of dur 1 counting 0 (PowerPoint's instant, R10);
+ *  null when it never ends. */
+export function instantDur(b: Behaviour): number | null {
+  if (b.dur === null) return null;
+  return b.kind === "set" && b.dur === 1 ? 0 : b.dur;
+}
+
+/** The effect's span before its own repeat: its latest finite behaviour
+ *  end (R11, in ms as doubles: R25's `S`). */
+export function effectSpan(e: Effect): number {
+  let span = 0;
+  for (const b of e.behaviours) {
+    const d = instantDur(b);
+    if (d === null || b.repeatCount === null) continue;
+    span = Math.max(span, b.delay + (d * b.repeatCount * (b.autoRev ? 2 : 1)) / 1000);
+  }
+  return span;
+}
+
+/** The effect's own clock `tau` ms after it starts (its accel, decel,
+ *  repeat and autoRev; R25): null before it starts. */
+export function effectTime(e: Effect, tau: number): number | null {
+  if (tau < 0) return null;
+  const span = effectSpan(e);
+  if (span <= 0) return 0;
+  if (e.accel === 0 && e.decel === 0 && !e.autoRev && e.repeatCount === 1000) return Math.min(tau, span);
+  const q = progress(tau, span, e.repeatCount, e.autoRev, e.accel, e.decel);
+  return q === null ? null : q * span;
+}
+
+/** A behaviour's own progress (0–1) at its effect's clock `c`: null before
+ *  it begins or when it never ends. */
+export function behaviourProgress(b: Behaviour, c: number): number | null {
+  const d = instantDur(b);
+  if (d === null || b.repeatCount === null) return null;
+  return progress(c - b.delay, d, b.repeatCount, b.autoRev, b.accel, b.decel);
+}
+
+/** Keyframes: progress (0–1) → value, in document order. */
+export type Keys = { at: number; v: number }[];
+
+/**
+ * `p:anim`'s values as keyframes (R28), or null when it contributes
+ * nothing: a `valueType` other than `num`, `calcmode` `fmla`, a `tav`
+ * with a formula, a value `read` refuses, a time outside 0–1 or before
+ * the one before it. Without `tav`s: `from` (else `cur`, the value now)
+ * to `to`, or to `from + by`, or staying at `cur`.
+ */
+export function animKeys(b: Behaviour & { kind: "anim" }, read: (v: TimeValue | null) => number | null, cur: number): Keys | null {
+  if (b.valueType !== null && b.valueType !== "num") return null;
+  if (b.calcmode === "fmla") return null;
+  if (b.tav.length > 0) {
+    const n = b.tav.length;
+    const keys: Keys = [];
+    for (const [i, tav] of b.tav.entries()) {
+      if (tav.fmla !== null && tav.fmla !== "") return null;
+      const v = read(tav.val);
+      if (v === null) return null;
+      const at = tav.tm === null ? (n === 1 ? 0 : i / (n - 1)) : tav.tm / 100000;
+      if (!(at >= 0 && at <= 1)) return null;
+      if (keys.length > 0 && at < keys[keys.length - 1]!.at) return null;
+      keys.push({ at, v });
+    }
+    return keys;
+  }
+  const from = b.from === null ? cur : read(b.from);
+  if (from === null) return null;
+  let to: number | null = cur;
+  if (b.to !== null) to = read(b.to);
+  else if (b.by !== null) {
+    const by = read(b.by);
+    to = by === null ? null : from + by;
+  }
+  return to === null ? null : [
+    { at: 0, v: from },
+    { at: 1, v: to },
+  ];
+}
+
+/** The keyframes' value at progress `q` (R28): the first before the
+ *  first, the last after the last; between two times, linear (`discrete`:
+ *  the earlier); at a time several keys share, the last of them. */
+export function keyValue(keys: Keys, q: number, discrete: boolean): number {
+  if (q < keys[0]!.at) return keys[0]!.v;
+  let i = 0;
+  while (i + 1 < keys.length && keys[i + 1]!.at <= q) i++;
+  const a = keys[i]!;
+  const z = keys[i + 1];
+  if (z === undefined || q === a.at || discrete) return a.v;
+  return a.v + ((z.v - a.v) * (q - a.at)) / (z.at - a.at);
+}
+
 const PATH_ARITY = new Map<string, number>([
   ["M", 2],
   ["L", 2],
   ["C", 6],
 ]);
 
+/** One piece of a motion path, in absolute coordinates: a move or line to
+ *  `to`, a cubic through `c1`, `c2` to `to`, or a close back to `to`. */
+export type PathPiece =
+  | { kind: "move" | "line" | "close"; from: [number, number]; to: [number, number] }
+  | { kind: "curve"; from: [number, number]; c1: [number, number]; c2: [number, number]; to: [number, number] };
+
 /**
- * Where a PowerPoint motion path ends, relative to where it starts. Pairs
- * after an `M` beyond the first are line-tos (they don't move the subpath
- * start); `Z` returns to the subpath start; `E` or the end of the string ends
- * the path; lowercase `m`/`l`/`c` are relative; any other command, or a
- * number where none fits, stops the walk at the point reached so far.
+ * Walks a PowerPoint motion path from (0, 0) by R19, handing each piece to
+ * `visit` (return `false` to stop). Pairs after an `M` beyond the first are
+ * line-tos (they don't move the subpath start); `Z` returns to the subpath
+ * start; `E` or the end of the string ends the path; lowercase `m`/`l`/`c`
+ * are relative; any other command, or a number where none fits, stops the
+ * walk. Returns the point reached.
  */
-export function pathEnd(path: string): [number, number] {
+export function walkPath(path: string, visit?: (p: PathPiece) => boolean | void): [number, number] {
   const tokens = path.match(/[A-Za-z]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?/g) ?? [];
   let x = 0;
   let y = 0;
@@ -1061,9 +1165,11 @@ export function pathEnd(path: string): [number, number] {
       i++;
       if (tok === "E" || tok === "e") break;
       if (tok === "Z" || tok === "z") {
+        const from: [number, number] = [x, y];
         x = sx;
         y = sy;
         cmd = "";
+        if (visit?.({ kind: "close", from, to: [x, y] }) === false) break;
         continue;
       }
       if (!PATH_ARITY.has(tok.toUpperCase())) break;
@@ -1076,15 +1182,27 @@ export function pathEnd(path: string): [number, number] {
     if (v.some((n) => !Number.isFinite(n))) break;
     i += arity;
     const rel = cmd === cmd.toLowerCase();
-    x = v[arity - 2]! + (rel ? x : 0);
-    y = v[arity - 1]! + (rel ? y : 0);
-    if (cmd === "M" || cmd === "m") {
+    const ox = rel ? x : 0;
+    const oy = rel ? y : 0;
+    const from: [number, number] = [x, y];
+    x = v[arity - 2]! + ox;
+    y = v[arity - 1]! + oy;
+    let piece: PathPiece;
+    if (cmd === "C" || cmd === "c") piece = { kind: "curve", from, c1: [v[0]! + ox, v[1]! + oy], c2: [v[2]! + ox, v[3]! + oy], to: [x, y] };
+    else if (cmd === "M" || cmd === "m") {
+      piece = { kind: "move", from, to: [x, y] };
       sx = x;
       sy = y;
       cmd = cmd === "M" ? "L" : "l";
-    }
+    } else piece = { kind: "line", from, to: [x, y] };
+    if (visit?.(piece) === false) break;
   }
   return [x, y];
+}
+
+/** Where a PowerPoint motion path ends, relative to where it starts (R19). */
+export function pathEnd(path: string): [number, number] {
+  return walkPath(path);
 }
 
 /** To 4 decimals, half away from zero, never −0. */
@@ -1121,17 +1239,8 @@ function visibilityEvents(effects: readonly Effect[]): VisEvent[] {
  *  acceleration first, then the behaviour's own. */
 function endProgress(e: Effect, b: Behaviour): number | null {
   if (b.dur === null || b.repeatCount === null || e.repeatCount === null) return null;
-  const dur = b.kind === "set" && b.dur === 1 ? 0 : b.dur;
-  let span = 0;
-  for (const o of e.behaviours) {
-    if (o.dur === null || o.repeatCount === null) continue;
-    const d = o.kind === "set" && o.dur === 1 ? 0 : o.dur;
-    span = Math.max(span, o.delay + (d * o.repeatCount * (o.autoRev ? 2 : 1)) / 1000);
-  }
-  const total = (span * e.repeatCount * (e.autoRev ? 2 : 1)) / 1000;
-  const q = span > 0 ? progress(total, span, e.repeatCount, e.autoRev, e.accel, e.decel) : 1;
-  const local = q === null ? 0 : q * span;
-  return progress(local - b.delay, dur, b.repeatCount, b.autoRev, b.accel, b.decel);
+  const c = effectTime(e, (effectSpan(e) * e.repeatCount * (e.autoRev ? 2 : 1)) / 1000);
+  return behaviourProgress(b, c ?? 0);
 }
 
 /** Whether a behaviour's value stays once its effect is over (R24). */
@@ -1141,28 +1250,12 @@ function holds(e: Effect, b: Behaviour): boolean {
   return b.fill === "hold" || b.fill === "freeze";
 }
 
-/** `p:anim`'s value at progress `q` when every value is a plain number
- *  (R28): null otherwise. */
-function animNumber(b: Behaviour & { kind: "anim" }, q: number): number | null {
-  const n = b.tav.length;
-  if (n === 0) return null;
-  const keys: { at: number; v: number }[] = [];
-  for (const [i, tav] of b.tav.entries()) {
-    const v = decimalOf(tav.val);
-    if (v === null || (tav.fmla !== null && tav.fmla !== "")) return null;
-    const at = tav.tm === null ? (n === 1 ? 0 : i / (n - 1)) : tav.tm / 100000;
-    // In document order; a time outside 0–1 or before the one before makes
-    // the anim contribute nothing (R28).
-    if (!(at >= 0 && at <= 1) || (keys.length > 0 && at < keys[keys.length - 1]!.at)) return null;
-    keys.push({ at, v });
-  }
-  if (q <= keys[0]!.at) return keys[0]!.v;
-  for (let i = 1; i < keys.length; i++) {
-    const a = keys[i - 1]!;
-    const z = keys[i]!;
-    if (q <= z.at) return z.at === a.at ? z.v : a.v + ((z.v - a.v) * (q - a.at)) / (z.at - a.at);
-  }
-  return keys[n - 1]!.v;
+/** A held `p:anim`'s value at progress `q`, from `cur` the value held so
+ *  far: the same keyframes and interpolation playback uses (R28), values
+ *  read as R2a decimals; null when it contributes nothing. */
+function animHeld(b: Behaviour & { kind: "anim" }, q: number, cur: number): number | null {
+  const keys = animKeys(b, decimalOf, cur);
+  return keys === null ? null : keyValue(keys, q, b.calcmode === "discrete");
 }
 
 const ROTATION_ATTRS = new Set(["r", "ppt_r", "style.rotation"]);
@@ -1222,11 +1315,15 @@ function applyHeld(step: readonly Effect[], held: Held): void {
           } else if (b.by !== null) setFinite(held.turn, key, (b.from === null ? cur : b.from / 60000) + (b.by / 60000) * q);
         };
       } else if (b.kind === "anim" && b.attrs.some((a) => ROTATION_ATTRS.has(a))) {
-        const v = animNumber(b, q);
-        if (v !== null) run = () => setFinite(held.turn, key, v);
+        run = () => {
+          const v = animHeld(b, q, held.turn.get(key) ?? 0);
+          if (v !== null) setFinite(held.turn, key, v);
+        };
       } else if (b.kind === "anim" && b.attrs.includes("style.opacity")) {
-        const v = animNumber(b, q);
-        if (v !== null) run = () => setFinite(held.opacity, key, v);
+        run = () => {
+          const v = animHeld(b, q, held.opacity.get(key) ?? 1);
+          if (v !== null) setFinite(held.opacity, key, v);
+        };
       } else if (b.kind === "set" && b.attrs.includes("style.opacity")) {
         const v = decimalOf(b.to);
         if (v !== null) run = () => setFinite(held.opacity, key, v);

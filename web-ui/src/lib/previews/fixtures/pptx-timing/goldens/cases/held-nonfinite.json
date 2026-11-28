@@ -8,7 +8,7 @@
       {
         "trigger": "click",
         "start": 0,
-        "dur": 500,
+        "dur": 250,
         "class": "entr",
         "preset": 25,
         "subtype": 0,

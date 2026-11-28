@@ -209,3 +209,31 @@ main = [
 write('hostile-strings.xml', slide([shape(2, 'A', 0), shape(3, 'B', 1)],
       after_clr='<p:transition spd="__proto__"><p:fade/></p:transition>',
       timing=timing(ids, main, bld='<p:bldP spid="__proto__" grpId="0" animBg="1"/>' + bldp(2, 3))))
+
+# --- p:anim keyframes, held and played by the same rules (R28): a time
+# several tavs share takes the last of them, discrete keeps the earlier,
+# from/to without tavs, and what contributes nothing. Each effect repeats
+# half a time, so its behaviours end at progress 0.5.
+ids = new_ids()
+def anim(t, attr, tavs=None, dur=1000, **kw):
+    a = ctn_attrs(**{k: v for k, v in kw.items() if k in ('calcmode', 'valueType', 'from_', 'to', 'by')})
+    a = a.replace(' from=', ' from=')
+    lst = ''
+    if tavs is not None:
+        lst = '<p:tavLst>' + ''.join(
+            (f'<p:tav tm="{tm}">' if tm is not None else '<p:tav>') + f'<p:val><p:fltVal val="{v}"/></p:val></p:tav>'
+            for tm, v in tavs) + '</p:tavLst>'
+    return (f'<p:anim{a}><p:cBhvr><p:cTn id="{ids()}" dur="{dur}" fill="hold"/>{t}'
+            f'<p:attrNameLst><p:attrName>{attr}</p:attrName></p:attrNameLst></p:cBhvr>{lst}</p:anim>')
+def half(behaviours):
+    return group(ids, [sub(ids, 0, [effect(ids, 'emph', 9, 'clickEffect', behaviours, repeatCount='500')])])
+main = [
+    half([anim(tgt(2), 'style.rotation', [(0, 0), (50000, 90), (50000, 180), (100000, 180)], calcmode='lin', valueType='num')]),  # 180
+    half([anim(tgt(3), 'style.opacity', from_='1', to='0.5', calcmode='lin', valueType='num')]),                                 # 0.75
+    half([anim(tgt(4), 'style.opacity', [(0, 1), (60000, 0.5), (100000, 0.2)], calcmode='discrete', valueType='num')]),         # 1: held, nothing written
+    half([anim(tgt(4), 'style.opacity', [(0, 0.4), (60000, 0.6), (100000, 0.6)], calcmode='discrete', valueType='num')]),       # 0.4
+    half([anim(tgt(5), 'style.opacity', [(0, 1), (80000, 0.5), (40000, 0.2)], calcmode='lin', valueType='num')]),               # nothing: out of order
+    half([anim(tgt(6), 'style.opacity', [(0, 0.5), (100000, 0.5)], calcmode='lin', valueType='str')]),                          # nothing: not num
+    half([anim(tgt(6), 'style.rotation', [(None, 0), (None, 40), (None, 80)], calcmode='lin', valueType='num')]),                # 40: spread evenly
+]
+write('anim-keys.xml', slide([shape(i, f'S{i}', i - 2) for i in range(2, 7)], timing=timing(ids, main, bld=bldp(2, 3, 4, 5, 6))))

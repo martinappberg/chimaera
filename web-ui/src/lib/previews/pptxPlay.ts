@@ -590,7 +590,7 @@ function union(gs: Geom[]): Geom | null {
     y0 = Math.min(y0, g.ppt_y - g.ppt_h / 2);
     y1 = Math.max(y1, g.ppt_y + g.ppt_h / 2);
   }
-  return { ppt_x: (x0 + x1) / 2, ppt_y: (y0 + y1) / 2, ppt_w: x1 - x0, ppt_h: y1 - y0, sx: gs[0]!.sx, sy: gs[0]!.sy, turn: gs[0]!.turn };
+  return { ppt_x: (x0 + x1) / 2, ppt_y: (y0 + y1) / 2, ppt_w: x1 - x0, ppt_h: y1 - y0, sx: gs[0]!.sx, sy: gs[0]!.sy, turn: gs[0]!.turn, op: gs[0]!.op };
 }
 
 /** The last snapshot at or before `t` (strictly before with `pre`). */
@@ -653,7 +653,7 @@ export function planStep(
       elementsOf(key, shapes)
         .map(baseOf)
         .filter((b): b is ElementBase => b !== null)
-        .map((b) => ({ ...b.geom, sx: b.sx, sy: b.sy, turn: b.rot })),
+        .map((b) => ({ ...b.geom, sx: b.sx, sy: b.sy, turn: b.rot, op: b.held })),
     );
 
   const motions = effects.map((e) => effectMotion(e, geom));

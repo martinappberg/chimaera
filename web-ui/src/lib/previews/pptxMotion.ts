@@ -26,13 +26,25 @@
  */
 
 import { formulaValue, type FormulaVars } from "./pptxFormula";
-import { decimalOf, progress, targetKey, type Behaviour, type Effect } from "./pptxTiming";
+import {
+  animKeys,
+  behaviourProgress,
+  decimalOf,
+  effectTime,
+  instantDur,
+  keyValue,
+  targetKey,
+  walkPath,
+  type Effect,
+  type TimeValue,
+} from "./pptxTiming";
 
 export { progress, warp } from "./pptxTiming";
 
 /** A target's place (centre and size, in fractions of the slide) and what
- *  it holds before the step (R26–R27): a `to` scale or turn starts there. */
-export type Geom = FormulaVars & { sx?: number; sy?: number; turn?: number };
+ *  it holds before the step (R26–R28): a `to` scale, turn or opacity
+ *  without a `from` starts there. */
+export type Geom = FormulaVars & { sx?: number; sy?: number; turn?: number; op?: number };
 
 export type Channel = "x" | "y" | "w" | "h" | "mx" | "my" | "sx" | "sy" | "sxAbs" | "syAbs" | "rot" | "rotAbs" | "op" | "opAbs" | "clip";
 
@@ -62,96 +74,17 @@ export interface EffectMotion {
   note: string | null;
 }
 
-// --- time ---------------------------------------------------------------------------
-
-/** A set whose dur is 1 is PowerPoint's instant (README R10). */
-function bDur(b: Behaviour): number | null {
-  if (b.dur === null) return null;
-  return b.kind === "set" && b.dur === 1 ? 0 : b.dur;
-}
-
-/** The effect's own span before its repeat: its latest finite behaviour end. */
-function baseSpan(e: Effect): number {
-  let span = 0;
-  for (const b of e.behaviours) {
-    const d = bDur(b);
-    if (d === null || b.repeatCount === null) continue;
-    span = Math.max(span, b.delay + (d * b.repeatCount * (b.autoRev ? 2 : 1)) / 1000);
-  }
-  return span;
-}
-
-/** Step time → the effect's own time (its accel/decel/repeat/autoRev). */
-function effectClock(e: Effect): (t: number) => number | null {
-  const span = baseSpan(e);
-  const plain = e.accel === 0 && e.decel === 0 && !e.autoRev && e.repeatCount === 1000;
-  return (t) => {
-    const tau = t - e.start;
-    if (tau < 0) return null;
-    if (plain || span <= 0) return tau;
-    const q = progress(tau, span, e.repeatCount, e.autoRev, e.accel, e.decel);
-    return q === null ? null : q * span;
-  };
-}
-
 // --- values -----------------------------------------------------------------------
 
-/** Keyframes: progress (0–1) → value, sorted by progress. */
-type Keys = { at: number; v: number }[];
-
-function interpolate(keys: Keys, q: number, discrete: boolean): number {
-  if (q <= keys[0]!.at) return keys[0]!.v;
-  for (let i = 1; i < keys.length; i++) {
-    const k = keys[i]!;
-    if (q < k.at || (q === k.at && i === keys.length - 1)) {
-      const j = keys[i - 1]!;
-      if (q === k.at) return k.v;
-      if (discrete) return j.v;
-      const span = k.at - j.at;
-      return span <= 0 ? k.v : j.v + ((k.v - j.v) * (q - j.at)) / span;
-    }
-  }
-  return keys[keys.length - 1]!.v;
-}
-
-function valueOf(v: string | number | boolean | null, vars: Geom): number | null {
+function valueOf(v: TimeValue | null, vars: Geom): number | null {
   if (typeof v === "number") return Number.isFinite(v) ? v : null;
   if (typeof v === "string") return formulaValue(v, vars);
   return null;
 }
 
-/** `p:anim`'s values as keyframes, or null when they aren't plain numbers
- *  and the four shape variables. `cur` is the attribute's value now. */
-function animKeys(b: Behaviour & { kind: "anim" }, vars: Geom, cur: number): Keys | null {
-  if (b.valueType !== null && b.valueType !== "num") return null;
-  if (b.calcmode === "fmla") return null;
-  if (b.tav.length > 0) {
-    const n = b.tav.length;
-    const keys: Keys = [];
-    for (const [i, tav] of b.tav.entries()) {
-      if (tav.fmla !== null && tav.fmla.trim() !== "") return null;
-      const v = valueOf(tav.val, vars);
-      if (v === null) return null;
-      const at = tav.tm === null ? (n === 1 ? 0 : i / (n - 1)) : tav.tm / 100000;
-      if (!(at >= 0 && at <= 1)) return null;
-      if (keys.length > 0 && at < keys[keys.length - 1]!.at) return null;
-      keys.push({ at, v });
-    }
-    return keys;
-  }
-  const from = b.from === null ? cur : formulaValue(b.from, vars);
-  if (from === null) return null;
-  let to: number | null = cur;
-  if (b.to !== null) to = formulaValue(b.to, vars);
-  else if (b.by !== null) {
-    const by = formulaValue(b.by, vars);
-    to = by === null ? null : from + by;
-  }
-  return to === null ? null : [
-    { at: 0, v: from },
-    { at: 1, v: to },
-  ];
-}
+/** Channels the state holds (R27, R28) read their values as the held
+ *  state does, so the last frame is the landing. */
+const HELD_CHANNELS = new Set<Channel>(["opAbs", "rotAbs"]);
 
 const ANIM_CHANNEL = new Map<string, Channel>([
   ["ppt_x", "x"],
@@ -178,6 +111,9 @@ function curOf(ch: Channel, g: Geom): number {
     case "h":
       return g.ppt_h;
     case "opAbs":
+      return g.op ?? 1;
+    case "rotAbs":
+      return g.turn ?? 0;
     case "sx":
     case "sy":
     case "op":
@@ -380,84 +316,37 @@ function regionOf(filter: string, out: boolean): ((p: number, w: number, h: numb
 /** Most points a sampled motion path keeps. */
 export const PATH_MAX_POINTS = 4096;
 const CURVE_STEPS = 16;
-const PATH_ARITY = new Map<string, number>([
-  ["M", 2],
-  ["L", 2],
-  ["C", 6],
-]);
-
 /**
  * A motion path as a polyline from (0, 0), walked by the timing
- * contract's rules (R19, as `pathEnd`): its last point is `pathEnd(path)`.
+ * contract's own walker (`walkPath`, R19): its last point is `pathEnd(path)`.
  * Cubic curves are sampled; a move is a jump (`jump` marks the point it
  * jumps to). Null past `PATH_MAX_POINTS`.
  */
 export function pathPolyline(path: string): { pts: Pt[]; jump: boolean[] } | null {
-  const tokens = path.match(/[A-Za-z]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?/g) ?? [];
   const pts: Pt[] = [[0, 0]];
   const jump: boolean[] = [false];
-  let x = 0;
-  let y = 0;
-  let sx = 0;
-  let sy = 0;
-  let cmd = "";
-  let i = 0;
-  const add = (p: Pt, j: boolean) => {
-    pts.push(p);
-    jump.push(j);
-  };
-  while (i < tokens.length) {
-    if (pts.length > PATH_MAX_POINTS) return null;
-    const tok = tokens[i]!;
-    if (/^[A-Za-z]$/.test(tok)) {
-      i++;
-      if (tok === "E" || tok === "e") break;
-      if (tok === "Z" || tok === "z") {
-        x = sx;
-        y = sy;
-        add([x, y], false);
-        cmd = "";
-        continue;
-      }
-      if (!PATH_ARITY.has(tok.toUpperCase())) break;
-      cmd = tok;
-      continue;
+  let over = false;
+  walkPath(path, (p) => {
+    if (pts.length > PATH_MAX_POINTS) {
+      over = true;
+      return false;
     }
-    const arity = PATH_ARITY.get(cmd.toUpperCase());
-    if (arity === undefined || i + arity > tokens.length) break;
-    const v = tokens.slice(i, i + arity).map(Number);
-    if (v.some((n) => !Number.isFinite(n))) break;
-    i += arity;
-    const rel = cmd === cmd.toLowerCase();
-    const ox = rel ? x : 0;
-    const oy = rel ? y : 0;
-    const nx = v[arity - 2]! + ox;
-    const ny = v[arity - 1]! + oy;
-    if (cmd === "C" || cmd === "c") {
-      const [c1x, c1y, c2x, c2y] = [v[0]! + ox, v[1]! + oy, v[2]! + ox, v[3]! + oy];
+    if (p.kind === "curve") {
+      const [x, y] = p.from;
       for (let s = 1; s < CURVE_STEPS; s++) {
         const t = s / CURVE_STEPS;
         const u = 1 - t;
-        add(
-          [
-            u * u * u * x + 3 * u * u * t * c1x + 3 * u * t * t * c2x + t * t * t * nx,
-            u * u * u * y + 3 * u * u * t * c1y + 3 * u * t * t * c2y + t * t * t * ny,
-          ],
-          false,
-        );
+        pts.push([
+          u * u * u * x + 3 * u * u * t * p.c1[0] + 3 * u * t * t * p.c2[0] + t * t * t * p.to[0],
+          u * u * u * y + 3 * u * u * t * p.c1[1] + 3 * u * t * t * p.c2[1] + t * t * t * p.to[1],
+        ]);
+        jump.push(false);
       }
     }
-    const move = cmd === "M" || cmd === "m";
-    x = nx;
-    y = ny;
-    add([x, y], move);
-    if (move) {
-      sx = x;
-      sy = y;
-      cmd = cmd === "M" ? "L" : "l";
-    }
-  }
-  return { pts, jump };
+    pts.push(p.to);
+    jump.push(p.kind === "move");
+  });
+  return over ? null : { pts, jump };
 }
 
 /** The point at fraction `u` of the path's length (paced: constant speed;
@@ -525,7 +414,7 @@ export function effectMotion(e: Effect, geom: (key: string) => Geom | null): Eff
     return { segments: [{ key, ch: "op", value }], from: e.start, to: end, note: `${e.name}: plays as a fade (${why})` };
   };
 
-  const clock = effectClock(e);
+  const clock = (t: number) => effectTime(e, t - e.start);
   const segments: Segment[] = [];
   let note: string | null = null;
   let colour = false;
@@ -547,12 +436,11 @@ export function effectMotion(e: Effect, geom: (key: string) => Geom | null): Eff
       }
       continue;
     }
-    const d = bDur(b);
-    if (d === null || b.repeatCount === null) return fade("a part that never ends");
+    if (instantDur(b) === null || b.repeatCount === null) return fade("a part that never ends");
     if (g === null) continue;
     const local = (s: number): number | null => {
       const c = clock(s);
-      return c === null ? null : progress(c - b.delay, d, b.repeatCount, b.autoRev, b.accel, b.decel);
+      return c === null ? null : behaviourProgress(b, c);
     };
     switch (b.kind) {
       case "effect": {
@@ -583,10 +471,11 @@ export function effectMotion(e: Effect, geom: (key: string) => Geom | null): Eff
           }
           return fade(`${attr || "an attribute"} isn't animated here`);
         }
-        const keys = animKeys(b, g, curOf(ch, g));
+        const read = HELD_CHANNELS.has(ch) ? decimalOf : (v: TimeValue | null) => valueOf(v, g);
+        const keys = animKeys(b, read, curOf(ch, g));
         if (keys === null) return fade(`a value it can't read on ${attr}`);
         const discrete = b.calcmode === "discrete";
-        segments.push({ key, ch, value: (s) => { const q = local(s); return q === null ? null : interpolate(keys, q, discrete); } });
+        segments.push({ key, ch, value: (s) => { const q = local(s); return q === null ? null : keyValue(keys, q, discrete); } });
         break;
       }
       case "scale": {

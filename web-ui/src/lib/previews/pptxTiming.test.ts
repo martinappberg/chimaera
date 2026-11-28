@@ -6,6 +6,7 @@ import {
   effectName,
   extractTiming,
   goldenSlide,
+  keyValue,
   parseTimeline,
   pathEnd,
   targetKey,
@@ -511,6 +512,22 @@ describe("the hand-written cases", () => {
       "7": [0, 0],
     });
     expect(Object.is(states.at(-1)!.moved["5"]![0], 0)).toBe(true);
+  });
+
+  it("holds a p:anim's keyframes as playback reads them: shared times take the last, discrete the earlier (R28)", () => {
+    const states = buildStates(parseTimeline(caseXml("anim-keys")));
+    expect(states.at(-1)!.turn).toEqual({ "2": 180, "6": 40 });
+    // 4's discrete anim holds 1 (left out), then 0.4; 5 is out of order and 6's opacity isn't `num`.
+    expect(states.at(-1)!.opacity).toEqual({ "3": 0.75, "4": 0.4 });
+    const keys = [
+      { at: 0, v: 0 },
+      { at: 0.5, v: 90 },
+      { at: 0.5, v: 180 },
+      { at: 1, v: 200 },
+    ];
+    expect([0, 0.25, 0.5, 0.75, 1, 2].map((q) => keyValue(keys, q, false))).toEqual([0, 45, 180, 190, 200, 200]);
+    expect([0, 0.25, 0.5, 0.75, 1].map((q) => keyValue(keys, q, true))).toEqual([0, 0, 180, 180, 200]);
+    expect(keyValue([{ at: 0.2, v: 5 }], -1, false)).toBe(5);
   });
 
   it("hostile strings reach no lookup", () => {
