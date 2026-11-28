@@ -186,10 +186,12 @@ const GROW = new Map<string, Grow>([
   [
     "plus",
     (q, w, h) => {
-      const [cx, cy, L, H, t, u] = [w / 2, h / 2, q * w, q * h, (q * w) / 2, (q * h) / 2];
+      // PowerPoint's film: the cross's arms span the whole box from the
+      // start and thicken with the box's own aspect.
+      const [cx, cy, t, u] = [w / 2, h / 2, (q * w) / 2, (q * h) / 2];
       return [
-        [cx - L, cy], [cx - L, cy - u], [cx - t, cy - u], [cx - t, cy - H], [cx + t, cy - H], [cx + t, cy - u],
-        [cx + L, cy - u], [cx + L, cy + u], [cx + t, cy + u], [cx + t, cy + H], [cx - t, cy + H], [cx - t, cy + u], [cx - L, cy + u],
+        [0, cy], [0, cy - u], [cx - t, cy - u], [cx - t, 0], [cx + t, 0], [cx + t, cy - u],
+        [w, cy - u], [w, cy + u], [cx + t, cy + u], [cx + t, h], [cx - t, h], [cx - t, cy + u], [0, cy + u],
       ];
     },
   ],

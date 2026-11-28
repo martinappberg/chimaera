@@ -184,6 +184,19 @@ describe("pattern filters, laid out as PowerPoint's film of the filters deck sho
     expect(Math.max(...wedge.map(([, y]) => y))).toBeCloseTo(50, 0);
   });
 
+  it("plus: arms span the whole box from the start and thicken with its aspect; circle and diamond keep its aspect", () => {
+    const e = clipMargin(400, 200);
+    const plus = pts(clipRegion("plus(out)", false)!(0.25, 400, 200));
+    // Arms reach the box's edges (pushed out by the margin) at a quarter.
+    expect(Math.min(...plus.map(([x]) => x))).toBe(-e);
+    expect(Math.max(...plus.map(([x]) => x))).toBe(400 + e);
+    expect(plus).toEqual(expect.arrayContaining([[150, -e], [250, -e], [-e, 75], [-e, 125]]));
+    const diamond = pts(clipRegion("diamond(out)", false)!(0.25, 400, 200));
+    const xs = diamond.map(([x]) => x);
+    const ys = diamond.map(([, y]) => y);
+    expect((Math.max(...xs) - Math.min(...xs)) / (Math.max(...ys) - Math.min(...ys))).toBeCloseTo(2, 6);
+  });
+
   it("dissolve and random bars are patterns, in and out; slide still fades", () => {
     expect(patternOf("dissolve", true)).toEqual({ kind: "dissolve", horizontal: false, out: true });
     expect(patternOf("randombar(vertical)", false)).toEqual({ kind: "bars", horizontal: false, out: false });
