@@ -619,19 +619,29 @@
   });
   $effect(() => () => stopPlaying());
 
-  /** Effects on this slide that play other than PowerPoint would. */
-  const motionNote = $derived(timed === null ? "" : motionNotes(timed.timeline.steps).join("; "));
+  /** Effects on a slide that play other than PowerPoint would, by its
+   *  parsed timeline: worked out the first time the dots' tooltip asks
+   *  (walking every effect and each path's points), not on every slide
+   *  browsed. */
+  const motionNoteOf = new WeakMap<object, string>();
+  function motionNote(t: NonNullable<typeof timed>): string {
+    let n = motionNoteOf.get(t.timeline);
+    if (n === undefined) motionNoteOf.set(t.timeline, (n = motionNotes(t.timeline.steps).join("; ")));
+    return n;
+  }
 
-  /** Why the current slide's builds are approximate, for the dots' tooltip. */
-  const approxNote = $derived.by(() => {
-    const code = timed?.timeline.approximate ?? null;
+  /** Why the current slide's builds are approximate, for the dots' tooltip
+   *  (asked when it is about to show). */
+  function approxNote(): string {
+    const t = timed;
+    const code = t?.timeline.approximate ?? null;
     if (code !== null) return `this slide's animation couldn't be read (${code}): it shows as a plain slide`;
     const parts = [
       playApprox ? "some builds on this slide are approximate: a shape or paragraph couldn't be matched to what was drawn" : "",
-      motionNote,
+      t === null ? "" : motionNote(t),
     ];
     return parts.filter((p) => p !== "").join(" · ");
-  });
+  }
 
   /** Show build `k` (a click dot); the build already shown goes back to the
    *  slide as drawn. */
