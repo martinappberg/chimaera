@@ -3036,6 +3036,11 @@ async fn allow_document(state: &Weak<AppState>, url: &str) -> Result<(), String>
         )),
         // A ticketed file (`file_page`): the one daemon path a page may load.
         Ok(Err(proxy::Refusal::Daemon)) if super::file_page::is_raw_path(url_path(url)) => Ok(()),
+        // A plugin's page under its grant (the headless host,
+        // `plugins::web_headless`): the grant is the capability.
+        Ok(Err(proxy::Refusal::Daemon)) if crate::plugins::web::is_page_path(url_path(url)) => {
+            Ok(())
+        }
         Ok(Err(proxy::Refusal::Daemon)) => Err(format!(
             "{host}:{port} is the Chimaera daemon itself, which the agent browser never opens."
         )),

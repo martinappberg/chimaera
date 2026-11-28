@@ -1,16 +1,23 @@
 # Test-only: built into plugins/dist-test, embedded only by the daemon's
-# test builds. A plugin page, a library for agents' pages, a declared host.
+# test builds. A plugin page, a library for agents' pages, a declared host;
+# 0.4: tools that call the page (`web_ask`) and open its views beside the
+# agent (`web_show`), and loci-like ids (`TW-<n>`) whose chips open the board.
 id = "test-web"
 name = "Web fixture"
 version = "0.1.0"
 summary = "Draws its own web view and lends a library to agents' pages, for chimaera's tests."
-api = "0.3"
+api = "0.4"
 
 [access]
 files = "read"
 
+[provides]
+mcp_tools = ["web_ask", "web_show"]
+events = ["switched-on"]
+
 [adds]
-ui = ["A Web board tab with a page of its own"]
+ui = ["A Web board tab with a page of its own", "Opens .webfix files in its page"]
+agents = ["2 tools: web_ask, web_show"]
 
 [web]
 pages = ["view.html"]
@@ -23,3 +30,13 @@ title = "Web board"
 slot = "tab"
 icon = "grid"
 rail = true            # a sidebar row while it is on
+
+[[views]]
+id = "doc"
+title = "Web fixture document"
+slot = "file"
+
+[[files]]
+match = ["*.webfix"]
+view = "doc"
+label = "Web fixture document"

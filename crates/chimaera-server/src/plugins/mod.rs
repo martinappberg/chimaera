@@ -65,6 +65,7 @@ pub(crate) mod platform;
 pub(crate) mod preview;
 pub(crate) mod releases;
 pub(crate) mod retired;
+pub(crate) mod reveal;
 pub(crate) mod revoke;
 pub(crate) mod runtime;
 pub(crate) mod screens;
@@ -73,16 +74,18 @@ pub(crate) mod toolchain;
 pub(crate) mod tools;
 pub(crate) mod trust;
 pub(crate) mod web;
+pub(crate) mod web_calls;
+pub(crate) mod web_headless;
 
 /// How long a workspace's detect result is trusted before a re-stat.
 const DETECT_TTL: Duration = Duration::from_secs(30);
 
-/// The newest WIT version (`chimaera:plugin@0.3.x`): what a new plugin targets.
-pub(crate) const API: &str = "0.3";
+/// The newest WIT version (`chimaera:plugin@0.4.x`): what a new plugin targets.
+pub(crate) const API: &str = "0.4";
 /// Every WIT version this host serves. A manifest's `api` must be one of
 /// them; a WIT bump adds a version here and keeps the old ones (each through
-/// its own bindings, `runtime::v1`, `v2`).
-pub(crate) const SERVED_APIS: &[&str] = &["0.1", "0.2", API];
+/// its own bindings, `runtime::v1`, `v2`, `v3`).
+pub(crate) const SERVED_APIS: &[&str] = &["0.1", "0.2", "0.3", API];
 /// MCP tools one plugin may name (`provides.mcp_tools`): each is offered,
 /// with its schema, in every session's `tools/list` where it is on.
 pub(crate) const MCP_TOOLS_MAX: usize = 64;

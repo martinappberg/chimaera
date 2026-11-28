@@ -55,7 +55,26 @@ pub(crate) struct Hello {
     pub(crate) tabs: Vec<String>,
     /// What those tabs show (additive; older windows send none).
     pub(crate) pages: Vec<HelloPage>,
+    /// Plugins' web nodes shown on screen here (additive): they answer
+    /// their plugin's calls (`plugins::web_calls`).
+    pub(crate) web_views: Vec<HelloWebView>,
 }
+
+/// One plugin web node a window shows: its plugin, view and node id, and a
+/// file view's file (workspace-relative).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub(crate) struct HelloWebView {
+    pub(crate) plugin: String,
+    pub(crate) view: String,
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) file: Option<String>,
+}
+
+/// Web views a hello may list, and the longest name or file kept.
+pub(crate) const HELLO_WEB_VIEWS_MAX: usize = 32;
+const WEB_VIEW_NAME_MAX: usize = 128;
+const WEB_VIEW_FILE_MAX: usize = 1024;
 
 /// One tab's title and app-terms URL, as the window reports it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
@@ -79,6 +98,13 @@ impl Hello {
         self.pages
             .retain(|p| !p.tab.is_empty() && p.tab.len() <= TAB_ID_MAX);
         self.pages.truncate(HELLO_TABS_MAX);
+        self.web_views.retain(|w| {
+            [&w.plugin, &w.view, &w.id]
+                .iter()
+                .all(|s| !s.is_empty() && s.len() <= WEB_VIEW_NAME_MAX)
+                && w.file.as_ref().is_none_or(|f| f.len() <= WEB_VIEW_FILE_MAX)
+        });
+        self.web_views.truncate(HELLO_WEB_VIEWS_MAX);
         for page in &mut self.pages {
             if page.title.chars().count() > PAGE_TITLE_MAX {
                 page.title = page.title.chars().take(PAGE_TITLE_MAX).collect();
@@ -289,6 +315,38 @@ impl Channel {
             .map(|(_, id)| id)
     }
 
+    /// The window on `workspace` that shows plugin web node `node` on screen
+    /// (visible windows only; focused first, the newest on a tie): the one
+    /// that answers its plugin's call.
+    pub(crate) fn socket_with_web_view(
+        &self,
+        workspace: &str,
+        node: &crate::plugins::web_calls::WebViewRef<'_>,
+    ) -> Option<SocketId> {
+        let inner = crate::lock(&self.inner);
+        inner
+            .sockets
+            .iter()
+            .filter_map(|(id, s)| {
+                let hello = s.hello.as_ref().filter(|h| h.visible)?;
+                if s.workspace.as_deref() != Some(workspace) {
+                    return None;
+                }
+                hello
+                    .web_views
+                    .iter()
+                    .any(|w| {
+                        w.plugin == node.plugin
+                            && w.view == node.view
+                            && w.id == node.id
+                            && node.file.is_none_or(|f| w.file.as_deref() == Some(f))
+                    })
+                    .then(|| (hello.rank(), *id))
+            })
+            .max()
+            .map(|(_, id)| id)
+    }
+
     /// Connected app-engine windows, and how many of them are on `workspace`
     /// (for the refusal that names the fix).
     pub(crate) fn app_windows(&self, workspace: Option<&str>) -> (usize, usize) {
@@ -400,6 +458,7 @@ mod tests {
             height: 900,
             tabs: tabs.iter().map(|t| t.to_string()).collect(),
             pages: Vec::new(),
+            web_views: Vec::new(),
         }
     }
 
@@ -596,6 +655,65 @@ mod tests {
             "an over-long URL is dropped, not cut"
         );
         assert_eq!(long_url.pages[0].title, "T");
+    }
+
+    #[test]
+    fn a_web_node_is_answered_by_a_visible_window_on_its_workspace_showing_it() {
+        use crate::plugins::web_calls::WebViewRef;
+        let channel = Channel::default();
+        let shows = |file: Option<&str>| HelloWebView {
+            plugin: "gs".into(),
+            view: "data".into(),
+            id: "genome".into(),
+            file: file.map(String::from),
+        };
+        let (a, _ra) = channel.register();
+        let (b, _rb) = channel.register();
+        let (c, _rc) = channel.register();
+        for (s, ws) in [(&a, "w1"), (&b, "w1"), (&c, "w2")] {
+            channel.set_workspace(s.id, Some(ws.into()));
+        }
+        // a: visible, unfocused; b: hidden; c: another workspace.
+        let mut h = hello(false, true, false, &[]);
+        h.web_views = vec![shows(Some("x.bam"))];
+        channel.hello(a.id, h.clone());
+        let mut hidden = hello(false, false, true, &[]);
+        hidden.web_views = vec![shows(Some("x.bam"))];
+        channel.hello(b.id, hidden);
+        channel.hello(c.id, h);
+        let node = |file| WebViewRef {
+            plugin: "gs",
+            view: "data",
+            id: "genome",
+            file,
+        };
+        assert_eq!(channel.socket_with_web_view("w1", &node(None)), Some(a.id));
+        assert_eq!(
+            channel.socket_with_web_view("w1", &node(Some("x.bam"))),
+            Some(a.id)
+        );
+        assert_eq!(
+            channel.socket_with_web_view("w1", &node(Some("y.bam"))),
+            None
+        );
+        assert_eq!(channel.socket_with_web_view("w3", &node(None)), None);
+        let other = WebViewRef {
+            plugin: "gs",
+            view: "data",
+            id: "other",
+            file: None,
+        };
+        assert_eq!(channel.socket_with_web_view("w1", &other), None);
+        // Bounded like the tabs.
+        let bounded = Hello {
+            web_views: (0..HELLO_WEB_VIEWS_MAX + 4)
+                .map(|_| shows(None))
+                .chain([HelloWebView::default()])
+                .collect(),
+            ..Hello::default()
+        }
+        .bounded();
+        assert_eq!(bounded.web_views.len(), HELLO_WEB_VIEWS_MAX);
     }
 
     #[tokio::test]

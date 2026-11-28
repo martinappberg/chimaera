@@ -818,6 +818,12 @@ pub(crate) struct Platform {
     pub(crate) installs: super::toolchain::Installs,
     /// Web views: grants, data tickets, unpacked bundles (`web`).
     pub(crate) web: super::web::Web,
+    /// Calls from plugins to their pages (`web_calls`), and the headless
+    /// pages that answer when no window shows one (`web_headless`).
+    pub(crate) web_calls: super::web_calls::WebCalls,
+    pub(crate) web_headless: super::web_headless::Headless,
+    /// Views opened beside a session, per session (`reveal`).
+    pub(crate) reveals: super::reveal::Reveals,
 }
 
 impl Platform {
@@ -834,6 +840,9 @@ impl Platform {
             jobs: Default::default(),
             installs: Default::default(),
             web: Default::default(),
+            web_calls: Default::default(),
+            web_headless: Default::default(),
+            reveals: Default::default(),
         }
     }
 }

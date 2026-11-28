@@ -369,6 +369,7 @@ describe("events-bus: /ws/events frames through EventsSocket", () => {
       onNotices: (notices) => seen.push({ kind: "notices", detail: notices.length }),
       onBrowserOpen: (open) => seen.push({ kind: "browser_open", detail: open }),
       onBrowserRequest: (req) => seen.push({ kind: "browser_request", detail: req }),
+      onPluginReveal: (reveal) => seen.push({ kind: "plugin_reveal", detail: reveal }),
       onStatus: () => {},
       onFatal: (message) => seen.push({ kind: "fatal", detail: message }),
     };
@@ -403,6 +404,27 @@ describe("events-bus: /ws/events frames through EventsSocket", () => {
     browser_open: (seen) =>
       expect(seen).toEqual([
         { kind: "browser_open", detail: expect.objectContaining({ sessionId: "s-chat1", workspaceId: "w1", host: "127.0.0.1", port: 5173, path: "/docs" }) },
+      ]),
+    plugin_reveal: (seen) =>
+      expect(seen).toEqual([
+        {
+          kind: "plugin_reveal",
+          detail: {
+            sessionId: "s-chat1",
+            workspaceId: "w1",
+            plugin: "genomespy",
+            view: "genome",
+            file: null,
+            args: { locus: "chr17:7,668,402-7,687,550" },
+          },
+        },
+      ]),
+    plugin_reveal_file: (seen) =>
+      expect(seen).toEqual([
+        {
+          kind: "plugin_reveal",
+          detail: expect.objectContaining({ plugin: "genomespy", view: "data", file: "reads/tp53.bam", args: {} }),
+        },
       ]),
     plugin_view: (seen) => expect(seen).toEqual([{ kind: "platform", detail: "view" }]),
     plugin_surface: (seen) => expect(seen).toEqual([{ kind: "platform", detail: "surface" }]),
@@ -449,7 +471,7 @@ describe("events-bus: /ws/events frames through EventsSocket", () => {
     for (const c of eventsBus.cases.filter((c) => c.frame.type === "browser_request")) {
       const req = decodeBrowserRequest(c.frame);
       expect(req, c.name).not.toBeNull();
-      expect(["open", "drive", "nav", "close", "handover", "state"], c.name).toContain(req!.op);
+      expect(["open", "drive", "nav", "close", "handover", "state", "web_call"], c.name).toContain(req!.op);
     }
   });
   it("a browser_request reaches the handler, and a sessions frame's browser_links decode", () => {

@@ -462,9 +462,13 @@ pub(crate) struct RenderQuery {
     file: Option<String>,
     #[serde(default)]
     width: Option<String>,
+    /// 0.4: the view's args (a JSON object, ≤ 4 KiB): what a reveal or a
+    /// reference chip opened it with.
+    #[serde(default)]
+    args: Option<String>,
 }
 
-/// `GET /workspaces/{id}/plugins/{pid}/views/{view}?file=&width=`: the
+/// `GET /workspaces/{id}/plugins/{pid}/views/{view}?file=&width=&args=`: the
 /// view's tree, checked — `{"view", "title", "slot", "tree"}`, or
 /// `{"error", "problems"}` when the plugin failed or sent a bad tree.
 pub(crate) async fn render_route(
@@ -498,7 +502,21 @@ pub(crate) async fn render_route(
         Some("narrow") => "narrow",
         _ => "wide",
     };
-    let args = json!({"file": q.file, "width": width, "slot": decl.slot.as_str()});
+    let view_args = match q.args.as_deref() {
+        None | Some("") => Value::Object(Map::new()),
+        Some(text) if text.len() > super::reveal::ARGS_MAX => {
+            return super::bad_request(format!(
+                "a view's args are at most {} KiB",
+                super::reveal::ARGS_MAX >> 10
+            ))
+        }
+        Some(text) => match serde_json::from_str::<Value>(text) {
+            Ok(v @ Value::Object(_)) => v,
+            _ => return super::bad_request("a view's args are a JSON object"),
+        },
+    };
+    let args =
+        json!({"file": q.file, "width": width, "slot": decl.slot.as_str(), "args": view_args});
     crate::lock(&state.plugin_platform.screens).mark_open(&m.id, &ws, q.file.as_deref());
     // The watch sweep runs while a view is open: start it if it sleeps.
     state.plugin_platform.files_wake.notify_one();

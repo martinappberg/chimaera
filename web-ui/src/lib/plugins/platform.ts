@@ -10,7 +10,7 @@
  * `/ws/events` reach listeners through `onPlatformFrame`, so a screen
  * re-renders when its plugin says it changed.
  */
-import { writable } from "svelte/store";
+import { writable, type Readable } from "svelte/store";
 import { api, ApiError } from "../net/api";
 import type { WorkspacePlugin } from "./store";
 import { pluginIcon } from "./ui/icons";
@@ -377,11 +377,12 @@ export async function fetchView(
   ws: string,
   pid: string,
   view: string,
-  opts: { file?: string; width?: "narrow" | "wide" } = {},
+  opts: { file?: string; width?: "narrow" | "wide"; args?: Record<string, unknown> } = {},
 ): Promise<RenderResult> {
   const q = new URLSearchParams();
   if (opts.file !== undefined) q.set("file", opts.file);
   if (opts.width !== undefined) q.set("width", opts.width);
+  if (opts.args !== undefined && Object.keys(opts.args).length > 0) q.set("args", JSON.stringify(opts.args));
   const qs = q.toString();
   const b = await body<RenderWire>(
     await api(`${base(ws, pid)}/views/${encodeURIComponent(view)}${qs ? `?${qs}` : ""}`),
@@ -394,12 +395,14 @@ export async function fetchView(
 /** A page of the plugin's own bundle for a `web` node: its URL under a
  *  grant ticket (`/web/{grant}/{entry}`, `plugins::web`). Asked again while
  *  the node is shown, it answers the same URL and keeps it alive. */
-export async function mintWebPage(ws: string, pid: string, entry: string): Promise<string> {
+export async function mintWebPage(ws: string, pid: string, entry: string, theme = ""): Promise<string> {
+  // The window's theme rides along: a headless page the daemon opens for
+  // a plugin's call (no window showing it) wears the same one.
   const b = await body<{ url?: unknown; error?: unknown }>(
     await api(`${base(ws, pid)}/web`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ entry }),
+      body: JSON.stringify(theme !== "" ? { entry, theme } : { entry }),
     }),
   );
   if (typeof b.url !== "string") throw new Error(typeof b.error === "string" ? b.error : "no page");
@@ -795,11 +798,39 @@ export function setViewOpener(fn: ViewOpener | null): void {
   viewOpener = fn;
 }
 
-/** Open (or focus) a plugin's tab view. False when nothing can open it. */
-export function openPluginView(plugin: string, view: string): boolean {
+/** Open (or focus) a plugin's tab view, with `args` for its `render` when
+ *  given (a reveal, a reference chip). False when nothing can open it. */
+export function openPluginView(plugin: string, view: string, args?: Record<string, unknown>): boolean {
   if (viewOpener === null) return false;
+  if (args !== undefined) setViewArgs(plugin, view, null, args);
   viewOpener(plugin, view);
   return true;
+}
+
+/**
+ * The args a view was last opened with (`render`'s `args`): a reveal or a
+ * reference chip says what to show ({"locus": …}); the open screen draws
+ * again with them. Kept for this page's life only, per plugin, view and
+ * file: a gesture, not layout state.
+ */
+const viewArgsStore = writable<ReadonlyMap<string, Record<string, unknown>>>(new Map());
+export const viewArgs: Readable<ReadonlyMap<string, Record<string, unknown>>> = { subscribe: viewArgsStore.subscribe };
+/** How many views' args are kept (the oldest goes first). */
+const VIEW_ARGS_MAX = 64;
+
+export function viewArgsKey(plugin: string, view: string, file: string | null): string {
+  return `${plugin}\n${view}\n${file ?? ""}`;
+}
+
+export function setViewArgs(plugin: string, view: string, file: string | null, args: Record<string, unknown>): void {
+  viewArgsStore.update((m) => {
+    const next = new Map(m);
+    const key = viewArgsKey(plugin, view, file);
+    next.delete(key);
+    next.set(key, args);
+    while (next.size > VIEW_ARGS_MAX) next.delete(next.keys().next().value as string);
+    return next;
+  });
 }
 
 /** The sidebar rows active plugins ask for (`[[views]] rail`): each a tab

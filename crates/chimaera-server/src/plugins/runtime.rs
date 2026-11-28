@@ -54,11 +54,24 @@ use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use super::Manifest;
 use crate::AppState;
 
-/// The 0.3 world (`wit/`): what the host implements and speaks inside.
-pub(crate) mod v3 {
+/// The 0.4 world (`wit/`): what the host implements and speaks inside.
+pub(crate) mod v4 {
     wasmtime::component::bindgen!({
         world: "chimaera-plugin",
         path: "../chimaera-plugin-api/wit",
+        imports: { default: async },
+        exports: { default: async },
+    });
+}
+
+/// The 0.3 world (`wit-0.3/`), served unchanged beside 0.4: the same
+/// exports, and the imports without 0.4's `web-call`, `web-call-result`
+/// and `reveal`, under its own package version; the host translates its
+/// types at the edge (`hostfns::v3_host`, `invoke_v3`).
+pub(crate) mod v3 {
+    wasmtime::component::bindgen!({
+        world: "chimaera-plugin",
+        path: "../chimaera-plugin-api/wit-0.3",
         imports: { default: async },
         exports: { default: async },
     });
@@ -88,7 +101,7 @@ pub(crate) mod v1 {
     });
 }
 
-pub(crate) use v3::chimaera::plugin::types as wit;
+pub(crate) use v4::chimaera::plugin::types as wit;
 
 /// Wall-clock budget for `tools`, `instructions`, `call-tool`, `query` and
 /// `on-event`; `knowledge` (a whole reader pass) gets `KNOWLEDGE_BUDGET`.
@@ -144,6 +157,7 @@ enum Pre {
     V1(v1::ChimaeraPluginPre<HostState>),
     V2(v2::ChimaeraPluginPre<HostState>),
     V3(v3::ChimaeraPluginPre<HostState>),
+    V4(v4::ChimaeraPluginPre<HostState>),
 }
 
 /// A live instance's bindings, of the world it was built against.
@@ -151,6 +165,7 @@ enum Bindings {
     V1(v1::ChimaeraPlugin),
     V2(v2::ChimaeraPlugin),
     V3(v3::ChimaeraPlugin),
+    V4(v4::ChimaeraPlugin),
 }
 
 /// One plugin's compiled builds by SHA-256, most recently used first. Only
@@ -236,11 +251,11 @@ fn build_shared() -> wasmtime::Result<Shared> {
     let mut linker: Linker<HostState> = Linker::new(&engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
     // Every world in one linker: their imports are versioned
-    // (`chimaera:plugin/host@0.1.0`, `…@0.2.0`, `…@0.3.0`), so they never
-    // collide.
+    // (`chimaera:plugin/host@0.1.0`, … `…@0.4.0`), so they never collide.
     v1::ChimaeraPlugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s)?;
     v2::ChimaeraPlugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s)?;
     v3::ChimaeraPlugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s)?;
+    v4::ChimaeraPlugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s)?;
     // The daemon's one ticker: it only bumps an atomic, 10 times a second,
     // and only once a plugin has been used.
     let ticking = engine.clone();
@@ -320,7 +335,8 @@ async fn compile(shared: &Shared, m: &Manifest) -> Result<Pre, String> {
         Ok::<_, wasmtime::Error>(match api.as_str() {
             "0.1" => Pre::V1(v1::ChimaeraPluginPre::new(pre)?),
             "0.2" => Pre::V2(v2::ChimaeraPluginPre::new(pre)?),
-            _ => Pre::V3(v3::ChimaeraPluginPre::new(pre)?),
+            "0.3" => Pre::V3(v3::ChimaeraPluginPre::new(pre)?),
+            _ => Pre::V4(v4::ChimaeraPluginPre::new(pre)?),
         })
     })
     .await
@@ -812,7 +828,8 @@ enum Reply {
 async fn invoke(live: &mut Live, cx: &wit::Context, call: Call) -> wasmtime::Result<Reply> {
     let store = &mut live.store;
     let plugin = match &live.plugin {
-        Bindings::V3(plugin) => plugin,
+        Bindings::V4(plugin) => plugin,
+        Bindings::V3(old) => return invoke_v3(old, store, cx, call).await,
         Bindings::V2(old) => return invoke_v2(old, store, cx, call).await,
         Bindings::V1(old) => return invoke_v1(old, store, cx, call).await,
     };
@@ -840,6 +857,91 @@ async fn invoke(live: &mut Live, cx: &wit::Context, call: Call) -> wasmtime::Res
         Call::ToolResume(name, job) => {
             Reply::ToolResult(screens.call_tool_resume(store, cx, &name, &job).await?)
         }
+        Call::WebBundle => Reply::Bytes(plugin.chimaera_plugin_web().call_web_bundle(store).await?),
+    })
+}
+
+/// A call into a 0.3 build: the same exports as 0.4, its own types.
+async fn invoke_v3(
+    plugin: &v3::ChimaeraPlugin,
+    store: &mut Store<HostState>,
+    cx: &wit::Context,
+    call: Call,
+) -> wasmtime::Result<Reply> {
+    use v3::chimaera::plugin::types as old;
+    let exports = plugin.chimaera_plugin_plugin();
+    let screens = plugin.chimaera_plugin_screens();
+    let cx = old::Context {
+        workspace: cx.workspace.clone(),
+        session: cx.session.clone(),
+        mastermind: cx.mastermind,
+    };
+    let result = |r: old::ToolResult| wit::ToolResult {
+        text: r.text,
+        is_error: r.is_error,
+        wait: r.wait,
+    };
+    Ok(match call {
+        Call::Tools => Reply::Tools(
+            exports
+                .call_tools(store)
+                .await?
+                .into_iter()
+                .map(|d| wit::ToolDef {
+                    name: d.name,
+                    description: d.description,
+                    input_schema: d.input_schema,
+                })
+                .collect(),
+        ),
+        Call::Instructions => Reply::Instructions(exports.call_instructions(store).await?),
+        Call::Tool(name, args) => Reply::ToolResult(result(
+            exports.call_call_tool(store, &cx, &name, &args).await?,
+        )),
+        Call::Knowledge(known) => Reply::Knowledge(
+            exports
+                .call_knowledge(store, &cx, known.as_ref())
+                .await?
+                .map(|s| {
+                    s.map(|s| wit::Snapshot {
+                        stamp: s.stamp,
+                        data: s.data,
+                    })
+                }),
+        ),
+        Call::Query(name, args) => Reply::Json(exports.call_query(store, &cx, &name, &args).await?),
+        Call::OnEvent(event) => {
+            let event = match event {
+                wit::Event::Hook(h) => old::Event::Hook(old::Hook {
+                    session: h.session,
+                    name: h.name,
+                }),
+                wit::Event::SessionEnded(s) => old::Event::SessionEnded(s),
+                wit::Event::SwitchedOn => old::Event::SwitchedOn,
+                wit::Event::SwitchedOff => old::Event::SwitchedOff,
+                wit::Event::FileSaved(p) => old::Event::FileSaved(p),
+                wit::Event::FileChanged(p) => old::Event::FileChanged(p),
+                wit::Event::JobFinished(j) => old::Event::JobFinished(old::JobEnd {
+                    id: j.id,
+                    exit: j.exit,
+                    timed_out: j.timed_out,
+                    duration_ms: j.duration_ms,
+                }),
+                wit::Event::SettingsChanged(k) => old::Event::SettingsChanged(k),
+            };
+            Reply::Event(exports.call_on_event(store, &cx, &event).await?)
+        }
+        Call::Render(view, args) => {
+            Reply::Json(screens.call_render(store, &cx, &view, &args).await?)
+        }
+        Call::Action(view, action, payload) => Reply::Json(
+            screens
+                .call_on_action(store, &cx, &view, &action, &payload)
+                .await?,
+        ),
+        Call::ToolResume(name, job) => Reply::ToolResult(result(
+            screens.call_tool_resume(store, &cx, &name, &job).await?,
+        )),
         Call::WebBundle => Reply::Bytes(plugin.chimaera_plugin_web().call_web_bundle(store).await?),
     })
 }
@@ -1241,6 +1343,7 @@ impl PluginRuntime {
                     Pre::V1(pre) => pre.instantiate_async(&mut store).await.map(Bindings::V1),
                     Pre::V2(pre) => pre.instantiate_async(&mut store).await.map(Bindings::V2),
                     Pre::V3(pre) => pre.instantiate_async(&mut store).await.map(Bindings::V3),
+                    Pre::V4(pre) => pre.instantiate_async(&mut store).await.map(Bindings::V4),
                 }
             })
             .await;
@@ -1357,12 +1460,18 @@ impl PluginRuntime {
         }
         let call = Call::Tool(name.to_string(), args.to_string());
         let mut answer = self.run(state, m, ws, Some(session), call).await;
-        // A long tool: the call waits (the instance doesn't) for its job,
-        // then the plugin gives the final answer; past the hold, its own
-        // "still running" text stands.
+        // A long tool: the call waits (the instance doesn't) for its job or
+        // page call, then the plugin gives the final answer; past the hold,
+        // its own "still running" text stands.
         if let Ok(Reply::ToolResult(result)) = &answer {
             if let Some(job) = result.wait.clone() {
-                if super::jobs::tool_wait(state, &m.id, &job).await {
+                // A page call (`web-call`) or a job.
+                let ended = if super::web_calls::is_call(&job) {
+                    super::web_calls::tool_wait(state, &m.id, &job).await
+                } else {
+                    super::jobs::tool_wait(state, &m.id, &job).await
+                };
+                if ended {
                     let resume = Call::ToolResume(name.to_string(), job);
                     answer = self.run(state, m, ws, Some(session), resume).await;
                 }

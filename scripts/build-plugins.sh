@@ -20,7 +20,7 @@
 #   plugins/dist-test/test-platform/{plugin.wasm,plugin.toml}
 #       plugins/test-platform, the platform fixture (screens, surfaces, …).
 #   plugins/dist-test/test-web/{plugin.wasm,plugin.toml}
-#       plugins/test-web, the web views fixture (API 0.3: its own page, a
+#       plugins/test-web, the web views fixture (API 0.4: its own page, a
 #       library for agents' pages, a declared host).
 #   plugins/dist-test/test-privileged/{plugin.wasm,plugin.toml}
 #       plugins/test-privileged, the programs-and-tools fixture (its tool's

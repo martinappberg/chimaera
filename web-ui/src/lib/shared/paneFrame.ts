@@ -210,6 +210,11 @@ export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
       case "web_status":
         if (webAllowed()) params.onWeb?.(ev);
         break;
+      // An answer to its plugin's call: the host takes it only for an id
+      // it sent (`plugins/ui/webCalls.ts`), so no gate of its own here.
+      case "web_answer":
+        params.onWeb?.(ev);
+        break;
       case "web_reference": {
         const now = performance.now();
         if (now - lastPageMessage < PAGE_MESSAGE_GAP_MS) break;

@@ -55,6 +55,10 @@ const PAGES_MAX: usize = 2000;
 /// references/1: id shapes per key, ids per key, and a shape's regex
 /// source (the client's registry refuses longer ones, and any group).
 const SHAPES_MAX: usize = 16;
+/// references/1: a shape's view args made from its match, and each one's
+/// length.
+const MATCH_ARGS_MAX: usize = 8;
+const MATCH_ARG_MAX: usize = 200;
 const REF_IDS_MAX: usize = 5000;
 const PATTERN_MAX: usize = 80;
 /// Unbounded repeats one alternative of a shape may have: each more one
@@ -326,6 +330,28 @@ pub(crate) fn check(surface: &str, data: &Value) -> Result<(), String> {
                         "{at}.pattern has more than {UNBOUNDED_MAX} unbounded repeats \
                          (`*`, `+`, `{{n,}}`) in one alternative"
                     ));
+                }
+                // 0.4: every match opens this view, its args made from the
+                // matched text (`"<match>"`), with no id listed for it.
+                if let Some(view) = shape.get("view").filter(|v| !v.is_null()) {
+                    let at = format!("{at}.view");
+                    short_text(view, "view", &at, 64)?;
+                    let args = view
+                        .get("args_from_match")
+                        .and_then(Value::as_object)
+                        .ok_or_else(|| format!("{at}.args_from_match must be an object"))?;
+                    if args.len() > MATCH_ARGS_MAX
+                        || args.iter().any(|(k, v)| {
+                            k.is_empty()
+                                || k.len() > 64
+                                || v.as_str().is_none_or(|v| v.len() > MATCH_ARG_MAX)
+                        })
+                    {
+                        return Err(format!(
+                            "{at}.args_from_match is at most {MATCH_ARGS_MAX} strings of at \
+                             most {MATCH_ARG_MAX} bytes (\"<match>\" is the matched text)"
+                        ));
+                    }
                 }
             }
             let ids = data
@@ -671,6 +697,15 @@ mod tests {
             ],
         });
         check("references/1", &good).unwrap();
+        // A shape whose every match opens a view: no ids needed. A locus
+        // keeps its repeats bounded (at most two unbounded ones).
+        check(
+            "references/1",
+            &json!({"shapes": [{"kind": "locus", "pattern": "chr[0-9XYM]{1,2}:[0-9,]{1,13}-[0-9,]{1,13}",
+                "view": {"view": "genome", "args_from_match": {"locus": "<match>"}}}],
+                "ids": []}),
+        )
+        .unwrap();
         // Two repeats in one alternative (Mycelium's topic ids) are fine;
         // a class keeps its brackets' `*` and `+` to itself.
         assert_eq!(unbounded_per_alternative("T-\\d*[A-Za-z][A-Za-z0-9]*"), 2);
@@ -682,6 +717,16 @@ mod tests {
         assert_eq!(unbounded_per_alternative("a{2,}b\\+c+"), 2);
         for (bad, why) in [
             (json!({"shapes": [], "ids": []}), "shapes per key"),
+            (
+                json!({"shapes": [{"kind": "locus", "pattern": "chr[0-9]+",
+                    "view": {"view": "genome"}}], "ids": []}),
+                "args_from_match must be an object",
+            ),
+            (
+                json!({"shapes": [{"kind": "locus", "pattern": "chr[0-9]+",
+                    "view": {"view": "genome", "args_from_match": {"locus": 7}}}], "ids": []}),
+                "at most 8 strings",
+            ),
             (
                 json!({"shapes": [{"kind": "x", "pattern": "(a+)+"}], "ids": []}),
                 "groups",

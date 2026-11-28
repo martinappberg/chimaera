@@ -100,7 +100,7 @@ fn the_manifest_declares_pages_libraries_and_hosts_and_the_card_says_so() {
 
     // `[web]` needs a 0.3 component; a bad host is refused by name.
     let text = crate::plugins::test_catalog::dist_test_text("test-web/plugin.toml");
-    let old = text.replace("api = \"0.3\"", "api = \"0.2\"");
+    let old = text.replace("api = \"0.4\"", "api = \"0.2\"");
     let err = crate::plugins::parse_manifest(&old).unwrap_err();
     assert!(err.contains("[web] needs api = \"0.3\""), "{err}");
     let bad = text.replace("\"data.example.org\"", "\"https://data.example.org\"");
@@ -116,7 +116,8 @@ fn the_manifest_declares_pages_libraries_and_hosts_and_the_card_says_so() {
     let err = crate::plugins::parse_manifest(&panel).unwrap_err();
     assert!(err.contains("only a tab view"), "{err}");
     let old = text
-        .replace("api = \"0.3\"", "api = \"0.2\"")
+        .replace("api = \"0.4\"", "api = \"0.2\"")
+        .replace("[provides]\nmcp_tools = [\"web_ask\", \"web_show\"]\nevents = [\"switched-on\"]\n", "")
         .replace("[web]\npages = [\"view.html\"]\nlibraries = [\"testlib\"]\nnetwork = [\"data.example.org\"]\n", "");
     let err = crate::plugins::parse_manifest(&old).unwrap_err();
     assert!(err.contains("rail needs api = \"0.3\""), "{err}");
@@ -506,4 +507,296 @@ fn urlencoding_lite(s: &str) -> String {
             _ => format!("%{b:02X}"),
         })
         .collect()
+}
+
+// ---- 0.4: calls to a plugin's page, the headless host, reveal, shapes ----
+
+/// A window on `ws` that shows the fixture's web node (or not), and the
+/// receiving end of its request queue.
+fn fake_window(
+    state: &Arc<AppState>,
+    ws: &str,
+    shows: bool,
+) -> (
+    crate::agent_browser::channel::SocketId,
+    tokio::sync::mpsc::Receiver<Arc<str>>,
+) {
+    use crate::agent_browser::channel::{Hello, HelloWebView};
+    // The registration lives as long as the test's state: leak its guard.
+    let (reg, rx) = state.browsers.channel.register();
+    let id = reg.id;
+    std::mem::forget(reg);
+    state
+        .browsers
+        .channel
+        .set_workspace(id, Some(ws.to_string()));
+    let web_views = if shows {
+        vec![HelloWebView {
+            plugin: PID.into(),
+            view: "board".into(),
+            id: "fixture".into(),
+            file: None,
+        }]
+    } else {
+        Vec::new()
+    };
+    state.browsers.channel.hello(
+        id,
+        Hello {
+            visible: true,
+            focused: true,
+            web_views,
+            ..Hello::default()
+        },
+    );
+    (id, rx)
+}
+
+async fn ask(state: &Arc<AppState>, ws: &str, args: Value) -> Value {
+    let m = crate::plugins::test_catalog::web();
+    state
+        .plugin_runtime
+        .call_tool(state, &m, ws, "s-web-agent", "web_ask", &args)
+        .await
+}
+
+fn text_of(answer: &Value) -> String {
+    answer["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// `web_ask`: the plugin's `web-call` reaches the window showing its node
+/// as a `web_call` request; the page's answer comes back through
+/// `wait_call` → `tool-resume` → `web-call-result`. A page's error is the
+/// tool's error, in its words.
+#[tokio::test]
+async fn a_call_is_answered_by_the_window_that_shows_its_node() {
+    let (state, ws, _) = web_workspace("web-call").await;
+    let (socket, mut rx) = fake_window(&state, &ws, true);
+    let window = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut seen = Vec::new();
+            while let Some(frame) = rx.recv().await {
+                let f: Value = serde_json::from_str(&frame).unwrap();
+                if f["type"] != "browser_request" {
+                    continue;
+                }
+                let rid = f["rid"].as_u64().unwrap();
+                seen.push(f.clone());
+                let outcome = match f["method"].as_str() {
+                    Some("ping") => Ok(json!({"value": {"pong": true, "item": null}})),
+                    _ => Err("the fixture failed on purpose".to_string()),
+                };
+                state.browsers.channel.reply(socket, rid, outcome);
+                if seen.len() == 2 {
+                    return seen;
+                }
+            }
+            seen
+        })
+    };
+    let answer = ask(&state, &ws, json!({"method": "ping"})).await;
+    assert!(answer["isError"].is_null(), "{answer}");
+    assert_eq!(
+        text_of(&answer),
+        r#"the page answered: {"item":null,"pong":true}"#
+    );
+    let failed = ask(&state, &ws, json!({"method": "fail"})).await;
+    assert_eq!(failed["isError"], true, "{failed}");
+    assert!(
+        text_of(&failed).contains("the fixture failed on purpose"),
+        "{failed}"
+    );
+    let seen = window.await.unwrap();
+    assert_eq!(seen[0]["op"], "web_call");
+    assert_eq!(seen[0]["plugin"], PID);
+    assert_eq!(seen[0]["node_view"], "board");
+    assert_eq!(seen[0]["node"], "fixture");
+    assert!(seen[0]["call"].as_str().unwrap().starts_with("wc-"));
+    assert_eq!(state.plugin_platform.web_calls.waiting(), 0);
+}
+
+/// No window shows the node, and the daemon sits on a cluster login node:
+/// the headless host refuses plainly (no browser is started), and the
+/// agent reads why and what to do.
+#[tokio::test]
+async fn with_no_window_showing_it_a_login_node_refuses_plainly() {
+    let (state, ws, _) = web_workspace("web-login").await;
+    state.compute.assume_login_node();
+    // A window on the workspace that doesn't show the node answers nothing.
+    let (_socket, _rx) = fake_window(&state, &ws, false);
+    let answer = ask(&state, &ws, json!({"method": "ping"})).await;
+    assert_eq!(answer["isError"], true, "{answer}");
+    let text = text_of(&answer);
+    assert!(
+        text.contains("No Chimaera window shows Web board"),
+        "{text}"
+    );
+    assert!(text.contains("cluster login node"), "{text}");
+    // `fresh` skips any window and gets the same refusal.
+    let fresh = ask(&state, &ws, json!({"method": "ping", "fresh": true})).await;
+    assert!(text_of(&fresh).contains("cluster login node"), "{fresh}");
+}
+
+/// What a plugin may ask is checked before anything is sent.
+#[test]
+fn a_call_names_a_declared_view_and_a_short_method() {
+    let m = crate::plugins::test_catalog::web();
+    let parse = |spec: Value| crate::plugins::web_calls::parse(&m, &spec.to_string());
+    assert!(parse(json!({"view": "board", "id": "fixture", "method": "ping"})).is_ok());
+    for (spec, why) in [
+        (
+            json!({"view": "nope", "id": "fixture", "method": "ping"}),
+            "declares no view",
+        ),
+        (
+            json!({"view": "board", "id": "", "method": "ping"}),
+            "web node's id",
+        ),
+        (
+            json!({"view": "board", "id": "fixture", "method": "a b"}),
+            "a method is",
+        ),
+        (
+            json!({"view": "board", "id": "fixture", "method": "ping",
+                   "args": {"x": "y".repeat(70 * 1024)}}),
+            "64 KiB",
+        ),
+        (
+            json!({"view": "doc", "id": "fixture", "method": "ping", "fresh": true}),
+            "a fresh call names its file",
+        ),
+        (
+            json!({"view": "doc", "id": "fixture", "method": "ping", "file": "a.csv"}),
+            "does not open a.csv",
+        ),
+        (
+            json!({"view": "board", "id": "fixture", "method": "ping", "extra": 1}),
+            "not a web call spec",
+        ),
+    ] {
+        let err = parse(spec.clone()).unwrap_err();
+        assert!(err.contains(why), "{spec}: {err}");
+    }
+}
+
+async fn show(state: &Arc<AppState>, ws: &str, session: Option<&str>, args: Value) -> Value {
+    let m = crate::plugins::test_catalog::web();
+    match session {
+        Some(sid) => {
+            state
+                .plugin_runtime
+                .call_tool(state, &m, ws, sid, "web_show", &args)
+                .await
+        }
+        None => {
+            let spec = match args.get("file") {
+                Some(file) => json!({"file": file}),
+                None => json!({"view": "board"}),
+            };
+            let out = crate::plugins::reveal::reveal(state, &m, ws, None, &spec.to_string()).await;
+            json!({"isError": out.is_err(), "content": [{"text": out.unwrap_or_else(|e| e)}]})
+        }
+    }
+}
+
+/// `web_show`: a reveal goes to every window as a `plugin_reveal` frame,
+/// with the view's args; only from a session's call, four a minute, and a
+/// file only one the plugin claims.
+#[tokio::test]
+async fn a_reveal_opens_a_view_beside_the_session_four_a_minute() {
+    let (state, ws, root) = web_workspace("web-reveal").await;
+    std::fs::write(root.join("one.webfix"), "x").unwrap();
+    // No window: nothing to open, said so, and no budget spent.
+    let none = show(&state, &ws, Some("s-reveal"), json!({"item": "TW-1"})).await;
+    assert_eq!(none["isError"], true, "{none}");
+    assert!(text_of(&none).contains("no Chimaera window"), "{none}");
+
+    let (_socket, mut rx) = fake_window(&state, &ws, false);
+    let no_session = show(&state, &ws, None, json!({})).await;
+    assert!(
+        text_of(&no_session).contains("came from no session"),
+        "{no_session}"
+    );
+
+    let ok = show(&state, &ws, Some("s-reveal"), json!({"item": "TW-7"})).await;
+    assert!(ok["isError"].is_null(), "{ok}");
+    assert!(
+        text_of(&ok).contains("Web board beside the session"),
+        "{ok}"
+    );
+    let frame: Value = loop {
+        let f: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        if f["type"] == "plugin_reveal" {
+            break f;
+        }
+    };
+    assert_eq!(
+        frame,
+        json!({"type": "plugin_reveal", "session_id": "s-reveal", "workspace_id": ws,
+               "plugin": PID, "view": "board", "file": null, "args": {"item": "TW-7"}})
+    );
+    let file = show(&state, &ws, Some("s-reveal"), json!({"file": "one.webfix"})).await;
+    assert!(
+        text_of(&file).contains("one.webfix in Web fixture document"),
+        "{file}"
+    );
+    let unclaimed = show(&state, &ws, Some("s-reveal"), json!({"file": "sample.csv"})).await;
+    assert!(
+        text_of(&unclaimed).contains("doesn't open sample.csv"),
+        "{unclaimed}"
+    );
+    for _ in 0..2 {
+        show(&state, &ws, Some("s-reveal"), json!({})).await;
+    }
+    let fifth = show(&state, &ws, Some("s-reveal"), json!({})).await;
+    assert_eq!(fifth["isError"], true, "{fifth}");
+    assert!(
+        text_of(&fifth).contains("4 views in the last minute"),
+        "{fifth}"
+    );
+}
+
+/// A view opened with args (a reveal, a chip) renders with them; and the
+/// fixture's `TW-<n>` shape opens its board at the match.
+#[tokio::test]
+async fn a_view_renders_with_its_args_and_a_shape_opens_it() {
+    let (state, ws, _) = web_workspace("web-args").await;
+    let args = urlencoding_lite(r#"{"item":"TW-7"}"#);
+    let (status, body) = request(
+        &state,
+        Method::GET,
+        &format!("/api/v1/workspaces/{ws}/plugins/{PID}/views/board?args={args}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let web = &body["tree"]["root"]["children"][0];
+    assert_eq!(web["data"]["item"], "TW-7", "{body}");
+    let (status, _) = request(
+        &state,
+        Method::GET,
+        &format!("/api/v1/workspaces/{ws}/plugins/{PID}/views/board?args=%5B1%5D"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, body) = request(
+        &state,
+        Method::GET,
+        &format!("/api/v1/workspaces/{ws}/surfaces/references/1"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let text = body.to_string();
+    assert!(text.contains("TW-[0-9]+"), "{text}");
+    assert!(
+        text.contains(r#""args_from_match":{"item":"<match>"}"#),
+        "{text}"
+    );
 }

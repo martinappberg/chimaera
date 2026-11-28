@@ -11,7 +11,7 @@
    * draw, says so in one line (its problems are in the daemon's log and a
    * disclosure), never a blank box.
    */
-  import { onDestroy, onMount } from "svelte";
+  import { onDestroy, onMount, untrack } from "svelte";
   import UiNode from "./UiNode.svelte";
   import Spinner from "../../previews/Spinner.svelte";
   import { copyText } from "../../shared/clipboard";
@@ -30,6 +30,8 @@
     postViewAction,
     resolvePlace,
     saveOutput,
+    viewArgs,
+    viewArgsKey,
     type RenderResult,
   } from "../platform";
   import { BUILTIN_ACTIONS, provideScreen, str, type ScreenCtx } from "./screen";
@@ -50,6 +52,8 @@
 
   let { ws, wsRoot, plugin, view, file = undefined, compact = false, fill = false }: Props = $props();
 
+  /** What a reveal or a reference chip last opened this view with. */
+  const args = $derived($viewArgs.get(viewArgsKey(plugin, view, file ?? null)));
   let result = $state<RenderResult | null>(null);
   /** A file view always fills; any other view when its tree asks (`fill`). */
   const fills = $derived(fill || (result?.ok === true && result.tree.fill === true && !compact));
@@ -75,7 +79,7 @@
     loading = true;
     const mine = ++seq;
     try {
-      const r = await fetchView(ws, plugin, view, { file, width });
+      const r = await fetchView(ws, plugin, view, { file, width, args: untrack(() => args) });
       if (mine === seq) {
         result = r;
         loadError = null;
@@ -222,6 +226,9 @@
     get view() {
       return view;
     },
+    get file() {
+      return file ?? null;
+    },
     get busy() {
       return busy;
     },
@@ -231,13 +238,14 @@
   };
   provideScreen(ctx);
 
-  // Render again when the view, file or width class changes.
+  // Render again when the view, file, width class or args change.
   $effect(() => {
     void ws;
     void plugin;
     void view;
     void file;
     void width;
+    void args;
     void load();
   });
 

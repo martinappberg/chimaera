@@ -5,7 +5,7 @@ name = "Platform fixture"
 version = "0.1.0"
 summary = "Draws every screen node and uses every platform call, for chimaera's tests."
 description = "A plugin that exists only for chimaera's own tests of the 0.2 plugin platform: screens, surfaces, file kinds and actions, file events, the watch set, output folders, settings and durable state."
-api = "0.3"
+api = "0.4"
 
 [access]
 files = "read"

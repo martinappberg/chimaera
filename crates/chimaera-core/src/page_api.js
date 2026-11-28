@@ -38,8 +38,14 @@
 //   text})` (its pill) and `save(name, blob)` (into its output folder).
 //   `url` and `save` go straight to the daemon under the page's own ticket;
 //   the rest through the host, which checks them. A host's word arrives as
-//   a `theme`/`data`/`visibility` command: posted by the parent window to a
-//   framed page, a `chimaera:host` event from the bridge in a native view.
+//   a `theme`/`data`/`visibility`/`call` command: posted by the parent window
+//   to a framed page, a `chimaera:host` event from the bridge in a native
+//   view (or from the daemon itself, in the headless host).
+// - Calls (web/1, API 0.4): `handle(method, fn)` answers its plugin's
+//   `web-call`. A `call` command `{id, method, args}` runs `fn(args)` (a
+//   value or a Promise) and posts `web_answer {id, ok, value | error}`; a
+//   call that comes before its handler waits for one up to `CALL_WAIT_MS`.
+//   The host accepts an answer only for an id it sent.
 (() => {
   "use strict";
   if (globalThis.chimaera !== undefined) return;
@@ -214,8 +220,56 @@
       }
     }
   };
+  // Calls from the page's plugin (`handle`).
+  const ANSWER_MAX = 64 * 1024;
+  const CALL_WAIT_MS = 15000;
+  const CALLS_QUEUED_MAX = 16;
+  const handlers = new Map();
+  const queued = [];
+  const answer = (id, outcome) => {
+    let msg;
+    if (outcome.ok) {
+      let text;
+      try {
+        text = JSON.stringify(outcome.value === undefined ? null : outcome.value);
+      } catch (err) {
+        text = undefined;
+        outcome = { ok: false, error: `the answer is not JSON: ${err instanceof Error ? err.message : err}` };
+      }
+      if (outcome.ok && text !== undefined && text.length > ANSWER_MAX) {
+        outcome = { ok: false, error: `the answer is ${Math.round(text.length / 1024)} KiB, over 64 KiB: save a picture or a table with chimaera.save and answer its path` };
+      }
+      if (outcome.ok) msg = { kind: "web_answer", id, ok: true, value: JSON.parse(text ?? "null") };
+    }
+    msg ??= { kind: "web_answer", id, ok: false, error: String(outcome.error).slice(0, 2000) };
+    post(msg);
+  };
+  const run = (id, fn, args) => {
+    Promise.resolve()
+      .then(() => fn(args))
+      .then(
+        (value) => answer(id, { ok: true, value }),
+        (err) => answer(id, { ok: false, error: err instanceof Error ? err.message : String(err) }),
+      );
+  };
+  const call = (cmd) => {
+    if (!plugin || typeof cmd.id !== "string" || cmd.id === "" || typeof cmd.method !== "string") return;
+    const fn = handlers.get(cmd.method);
+    if (fn !== undefined) return run(cmd.id, fn, cmd.args ?? null);
+    if (queued.length >= CALLS_QUEUED_MAX) {
+      return answer(cmd.id, { ok: false, error: "too many calls are waiting for this page's handlers" });
+    }
+    const entry = { id: cmd.id, method: cmd.method, args: cmd.args ?? null, timer: 0 };
+    entry.timer = setTimeout(() => {
+      const at = queued.indexOf(entry);
+      if (at >= 0) queued.splice(at, 1);
+      answer(entry.id, { ok: false, error: `this page has no handler for ${entry.method}` });
+    }, CALL_WAIT_MS);
+    queued.push(entry);
+  };
   const command = (cmd) => {
     if (cmd === null || typeof cmd !== "object") return;
+    if (cmd.op === "call") return call(cmd);
     if (cmd.op === "theme") applyTheme(decodeTheme(cmd.theme));
     else if (cmd.op === "data") {
       data = cmd.data ?? null;
@@ -407,6 +461,23 @@
       },
       /** A plugin's page: write `blob` to its output folder: a Promise of `output:<name>`. */
       save,
+      /**
+       * A plugin's page: answer its plugin's calls to `method` with
+       * `fn(args)` (a JSON value, or a Promise of one, at most 64 KiB; a
+       * throw is the call's error). Returns a function that stops it.
+       */
+      handle(method, fn) {
+        if (!plugin || typeof method !== "string" || method === "" || typeof fn !== "function") return () => {};
+        handlers.set(method, fn);
+        for (const entry of queued.filter((q) => q.method === method)) {
+          queued.splice(queued.indexOf(entry), 1);
+          clearTimeout(entry.timer);
+          run(entry.id, fn, entry.args);
+        }
+        return () => {
+          if (handlers.get(method) === fn) handlers.delete(method);
+        };
+      },
     }),
   });
 })();
