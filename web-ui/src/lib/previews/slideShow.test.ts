@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { deckStep, showEdge, showPosition, showStep } from "./slideShow";
+import { deckStep, showEdge, showPosition, showReach, showStep } from "./slideShow";
 
 const H = [false, true, true, false, false, true];
 
@@ -67,5 +67,25 @@ describe("deckStep", () => {
     expect(deckStep(builds, hidden, { slide: 0, build: 0 }, -1, true)).toEqual({ slide: 0, build: 0 });
     expect(deckStep(builds, hidden, { slide: 1, build: 9 }, 1, true)).toEqual({ slide: 3, build: 0 });
     expect(deckStep(builds, hidden, { slide: 9, build: 0 }, 1, true)).toEqual({ slide: 9, build: 0 });
+  });
+});
+
+describe("showReach", () => {
+  const hidden = [false, true, false];
+  it("names the slides a click lands on, hidden ones skipped in a show", () => {
+    expect(showReach(hidden, 2, true)).toEqual([0]);
+    expect(showReach(hidden, 0, true)).toEqual([2]);
+    expect(showReach(hidden, 2, false)).toEqual([1]);
+    expect(showReach([false, false, false], 1, true)).toEqual([0, 2]);
+    expect(showReach([false], 0, true)).toEqual([]);
+  });
+  it("is what a step back over a hidden slide needs: the build count of the slide it lands on", () => {
+    // Slide 0 has three builds, slide 1 is hidden: parsing by index (slide 1)
+    // would leave slide 0 counted as one build, and back would land on 0.
+    const unparsed = [1, 1, 2];
+    const parsed = [3, 1, 2];
+    expect(deckStep(unparsed, hidden, { slide: 2, build: 0 }, -1, true)).toEqual({ slide: 0, build: 0 });
+    for (const j of showReach(hidden, 2, true)) unparsed[j] = parsed[j]!;
+    expect(deckStep(unparsed, hidden, { slide: 2, build: 0 }, -1, true)).toEqual({ slide: 0, build: 2 });
   });
 });

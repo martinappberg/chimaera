@@ -829,6 +829,52 @@ function readSlide(xml: string, root: XmlEl): SlideTimeline {
   return { steps, transition, interactive, builds: readBuilds(xml, childP(timing, "bldLst")), approximate: null };
 }
 
+/** What a viewer keeps of a slide part for its timeline (see `extractTiming`). */
+export interface TimingExtract {
+  /** A slide part that parses to the same timeline as the whole part; null
+   *  when `timeline` was read at once instead. */
+  source: string | null;
+  /** The timeline, when keeping a source would cost more than reading it
+   *  now (past a cap, or XML the scanner refuses). */
+  timeline: SlideTimeline | null;
+  /** The slide is hidden in the show (`show="0"` on the root). */
+  hidden: boolean;
+}
+
+/** Most UTF-16 units of source kept per slide before it is read at once
+ *  instead (the `p:timing` cap, with room for the transition). */
+const EXTRACT_MAX = TIMING_CAPS.timingBytes + 64 * 1024;
+
+/**
+ * The part of a slide `parseTimeline` reads, cut from the whole part with
+ * the scanner's offsets: the root's start tag (its namespace declarations),
+ * the root's `p:transition`, `p:timing` and `mc:AlternateContent` children
+ * as written, and the root's end tag. `parseTimeline` gives the same result
+ * for it as for the whole part, so a viewer can let the shapes' XML go and
+ * parse later. A part past the caps is read at once (its timeline is small).
+ */
+export function extractTiming(slideXml: string): TimingExtract {
+  if (utf8Over(slideXml, 0, slideXml.length, TIMING_CAPS.partBytes)) {
+    return { source: null, timeline: parseTimeline(slideXml), hidden: false };
+  }
+  let root: XmlEl;
+  try {
+    root = scan(slideXml);
+  } catch {
+    return { source: null, timeline: plain(null, "unreadable"), hidden: false };
+  }
+  const show = attr(slideXml, root, "show");
+  const hidden = show === "0" || show === "false";
+  const kept = root.children.filter((c) => isP(c, "transition") || isP(c, "timing") || (c.local === "AlternateContent" && c.ns === NS_MC));
+  const size = kept.reduce((n, c) => n + (c.end - c.start), 0);
+  if (size > EXTRACT_MAX || root.selfClosing) return { source: null, timeline: parseTimeline(slideXml), hidden };
+  const source =
+    slideXml.slice(root.start, root.openEnd) +
+    kept.map((c) => slideXml.slice(c.start, c.end)).join("") +
+    slideXml.slice(root.closeStart, root.end);
+  return { source, timeline: null, hidden };
+}
+
 // --- build states -------------------------------------------------------------------
 
 const PATH_ARITY = new Map<string, number>([

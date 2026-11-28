@@ -20,6 +20,7 @@ Decks whose animations and transitions were written by PowerPoint itself, and th
 | `interactive` | (PowerPoint's scripting cannot set a trigger shape, so the deck holds only a plain click; the on-shape-click case is the hand-written `cases/interactive-trigger.xml`) |
 | `transitions` | none (slide 1 has no `p:transition` at all), fade, fade through black, push, wipe, cut, one outside the vocabulary (checker), auto-advance |
 | `morph` | Morph by object (moved, resized, rotated, `!!` names across shape types, arriving and leaving shapes), by word, by character |
+| `autofit` | text boxes that grow to fit their text (`spAutoFit`) in a font no machine has: six long bullets built by paragraph, and a wrapping heading animated as a whole; a renderer draws these boxes at its own measured size, not the file's |
 | `agent-written` | no animation; `-raw` is the file as python-pptx wrote it with a duplicated shape id, the other is that file after PowerPoint saved it |
 
 ## What PowerPoint does (observed, PowerPoint for Mac 16.115)

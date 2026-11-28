@@ -925,8 +925,35 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   renderer finishes text layout asynchronously and a detached slide measures as empty and loses
   its text — and the strip mounts only the thumbnails near its visible span, two per tick. Charts
   draw with ECharts (most of the viewer's ~1.1 MB / 345 KB-gzip chunk, loaded only by a deck).
-  Animations and transitions aren't played and missing fonts fall back to the system's; the ⓘ in
-  the bar says so, and counts shapes that couldn't be drawn. Refused past 100 MB. A reveal's
+  **Builds step click by click, with no motion yet.** The show opens each slide as PowerPoint's
+  does, before its first click; each click (→, Space, Enter, PageDown) lands on the state
+  PowerPoint's show reaches after it (shapes and paragraphs appear and disappear, motion paths
+  land at their ends), and at the last build the next click is the next slide's first state. Back
+  lands on the previous build, or on the previous slide's last; Home, End and a jump land on a
+  slide's first state; a slide with an advance time (`advTm`) moves on by itself that long after
+  its last build, only while the show is on screen. **present** from edit mode leaves edit mode
+  first. At load each slide keeps only its timing and transition XML (`extractTiming`, capped);
+  the timing is parsed on demand by `pptxTiming.ts` (the contract and its PowerPoint-written
+  corpus: `fixtures/pptx-timing/`): browsing, the current slide's only; in the show, also the
+  slides a click can land on, hidden ones skipped, so a step back over a hidden slide lands on
+  the last build before it.
+  `pptxTag.ts` finds each top-level shape and paragraph in the drawn slide and `pptxPlay.ts`
+  hides it (`opacity: 0` + `inert`) or offsets it (`translate`; a paragraph's offset is divided
+  by the scale of a text body the renderer shrank to fit). A text box that grows to fit its text
+  is drawn at the size its text measures here, so a shape is matched by its origin and a size no
+  smaller than the file's. The bar shows a row of click dots for the slide, last in its left
+  cluster so it shifts nothing as it grows or goes (a start mark, then one dot a click; past
+  eight clicks the dots window around the build; none on a slide without clicks or in edit
+  mode). Browsing shows every slide as drawn,
+  as PowerPoint's normal view does, until a dot is used; the dot of the build on screen, clicked
+  again, or Esc, goes back to as drawn. Thumbnails and edit mode always show the slide as drawn.
+  Approximate, and said in the dots' tooltip: a slide whose timing is past the parser's caps (it
+  plays as a plain slide); a slide whose drawn shapes didn't line up with the file's (found by
+  their boxes instead); a text box whose background builds apart from its text (the renderer
+  draws one box, so it shows with its text); paragraphs the renderer didn't draw one to one (the
+  whole shape then comes with its first paragraph). Group members animate with their group.
+  Transitions and effect motion aren't played yet, and missing fonts fall back to the system's;
+  the ⓘ in the bar says so, and counts shapes that couldn't be drawn. Refused past 100 MB. A reveal's
   plain line (`deck.pptx:3`, a deck check's problem on slide 3) lands on that slide.
 - **Editing a deck.** The bar's **edit** turns the stage into an editor (`PptxEditLayer.svelte`):
   click a shape to select it (the grey around the slide deselects), drag it (snapping to the
