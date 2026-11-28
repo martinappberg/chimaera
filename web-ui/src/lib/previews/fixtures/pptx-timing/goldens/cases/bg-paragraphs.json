@@ -1,0 +1,89 @@
+{
+  "part": "bg-paragraphs.xml",
+  "id": 0,
+  "transition": null,
+  "steps": [
+    [],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 500,
+        "class": "entr",
+        "preset": 10,
+        "subtype": 0,
+        "effect": "fade-in",
+        "dir": null,
+        "target": "2:bg",
+        "sets": "visible"
+      },
+      {
+        "trigger": "with",
+        "start": 0,
+        "dur": 500,
+        "class": "entr",
+        "preset": 10,
+        "subtype": 0,
+        "effect": "fade-in",
+        "dir": null,
+        "target": "2:p0-0",
+        "sets": "visible"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 500,
+        "class": "entr",
+        "preset": 10,
+        "subtype": 0,
+        "effect": "fade-in",
+        "dir": null,
+        "target": "2:p1-1",
+        "sets": "visible"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 500,
+        "class": "exit",
+        "preset": 10,
+        "subtype": 0,
+        "effect": "fade-out",
+        "dir": null,
+        "target": "2",
+        "sets": "hidden"
+      }
+    ]
+  ],
+  "states": [
+    {
+      "hidden": [
+        "2:bg",
+        "2:p0-0",
+        "2:p1-1"
+      ],
+      "moved": {}
+    },
+    {
+      "hidden": [
+        "2:p1-1"
+      ],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [
+        "2"
+      ],
+      "moved": {}
+    }
+  ],
+  "interactive": 0
+}

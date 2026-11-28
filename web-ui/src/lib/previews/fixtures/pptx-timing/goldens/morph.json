@@ -1,0 +1,86 @@
+{
+  "deck": "morph.pptx",
+  "slides": [
+    {
+      "part": "ppt/slides/slide1.xml",
+      "id": 256,
+      "transition": null,
+      "steps": [
+        []
+      ],
+      "states": [
+        {
+          "hidden": [],
+          "moved": {}
+        }
+      ],
+      "interactive": 0
+    },
+    {
+      "part": "ppt/slides/slide2.xml",
+      "id": 257,
+      "transition": {
+        "kind": "morph",
+        "dir": null,
+        "dur": 1500,
+        "advanceAfter": null,
+        "advanceOnClick": true,
+        "morph": "byObject"
+      },
+      "steps": [
+        []
+      ],
+      "states": [
+        {
+          "hidden": [],
+          "moved": {}
+        }
+      ],
+      "interactive": 0
+    },
+    {
+      "part": "ppt/slides/slide3.xml",
+      "id": 258,
+      "transition": {
+        "kind": "morph",
+        "dir": null,
+        "dur": 2000,
+        "advanceAfter": null,
+        "advanceOnClick": true,
+        "morph": "byWord"
+      },
+      "steps": [
+        []
+      ],
+      "states": [
+        {
+          "hidden": [],
+          "moved": {}
+        }
+      ],
+      "interactive": 0
+    },
+    {
+      "part": "ppt/slides/slide4.xml",
+      "id": 259,
+      "transition": {
+        "kind": "morph",
+        "dir": null,
+        "dur": 2000,
+        "advanceAfter": null,
+        "advanceOnClick": true,
+        "morph": "byChar"
+      },
+      "steps": [
+        []
+      ],
+      "states": [
+        {
+          "hidden": [],
+          "moved": {}
+        }
+      ],
+      "interactive": 0
+    }
+  ]
+}

@@ -1,0 +1,232 @@
+{
+  "part": "path-edges.xml",
+  "id": 0,
+  "transition": null,
+  "steps": [
+    [],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 2000,
+        "class": "path",
+        "preset": 0,
+        "subtype": 0,
+        "effect": "path",
+        "dir": null,
+        "target": "2",
+        "sets": null,
+        "path": "M 0 0 0.1 0.1 Z"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 2000,
+        "class": "path",
+        "preset": 0,
+        "subtype": 0,
+        "effect": "path",
+        "dir": null,
+        "target": "3",
+        "sets": null,
+        "path": "M 0 0 L 0.1 0.2 X 5 5 L 1 1 E"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 2000,
+        "class": "path",
+        "preset": 0,
+        "subtype": 0,
+        "effect": "path",
+        "dir": null,
+        "target": "4",
+        "sets": null,
+        "path": "M 0 0 L 0.00025 -0.00025"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 2000,
+        "class": "path",
+        "preset": 0,
+        "subtype": 0,
+        "effect": "path",
+        "dir": null,
+        "target": "5",
+        "sets": null,
+        "path": "M 0 0 L -0.00001 0 E"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 2000,
+        "class": "path",
+        "preset": 0,
+        "subtype": 0,
+        "effect": "path",
+        "dir": null,
+        "target": "6",
+        "sets": null,
+        "path": "m 0 0 l 0.1 0 l 0 0.1 e"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 2000,
+        "class": "path",
+        "preset": 0,
+        "subtype": 0,
+        "effect": "path",
+        "dir": null,
+        "target": "7",
+        "sets": null,
+        "path": "M 0 0 L 0.00004 0 E"
+      },
+      {
+        "trigger": "with",
+        "start": 0,
+        "dur": 2000,
+        "class": "path",
+        "preset": 0,
+        "subtype": 0,
+        "effect": "path",
+        "dir": null,
+        "target": "7",
+        "sets": null,
+        "path": "M 0 0 L 0.00004 0 E"
+      }
+    ]
+  ],
+  "states": [
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {
+        "2": [
+          0,
+          0
+        ]
+      }
+    },
+    {
+      "hidden": [],
+      "moved": {
+        "2": [
+          0,
+          0
+        ],
+        "3": [
+          0.1,
+          0.2
+        ]
+      }
+    },
+    {
+      "hidden": [],
+      "moved": {
+        "2": [
+          0,
+          0
+        ],
+        "3": [
+          0.1,
+          0.2
+        ],
+        "4": [
+          0.0003,
+          -0.0003
+        ]
+      }
+    },
+    {
+      "hidden": [],
+      "moved": {
+        "2": [
+          0,
+          0
+        ],
+        "3": [
+          0.1,
+          0.2
+        ],
+        "4": [
+          0.0003,
+          -0.0003
+        ],
+        "5": [
+          0,
+          0
+        ]
+      }
+    },
+    {
+      "hidden": [],
+      "moved": {
+        "2": [
+          0,
+          0
+        ],
+        "3": [
+          0.1,
+          0.2
+        ],
+        "4": [
+          0.0003,
+          -0.0003
+        ],
+        "5": [
+          0,
+          0
+        ],
+        "6": [
+          0.1,
+          0.1
+        ]
+      }
+    },
+    {
+      "hidden": [],
+      "moved": {
+        "2": [
+          0,
+          0
+        ],
+        "3": [
+          0.1,
+          0.2
+        ],
+        "4": [
+          0.0003,
+          -0.0003
+        ],
+        "5": [
+          0,
+          0
+        ],
+        "6": [
+          0.1,
+          0.1
+        ],
+        "7": [
+          0.0001,
+          0
+        ]
+      }
+    }
+  ],
+  "interactive": 0
+}
