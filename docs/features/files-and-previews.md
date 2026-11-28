@@ -1650,3 +1650,27 @@ _Captured 2026-11-27 (the maintainer, in the session that built it; their words 
   (issue 396). The open button shows on hover rather than as a permanent row.
 - **Do not change (or: open to change):** **open to change** — the maintainer named nothing as
   off limits; everything here may change if improved.
+
+### A PowerPoint deck steps through its builds — why it exists
+_Captured 2026-11-27 (the maintainer, in the session that planned and shipped it; PR #406)._
+
+- **Problem it solves:** the maintainer's decks had been Manimble decks, whose animations are
+  videos; presenting them from the app stayed rough ("the presenting view is still terrible") and
+  "when I export Manimble to powerpoint it doesn't work at all". The ask was the same fluency for
+  real PowerPoint files: "the agents REALLY understand, can inspect and see and use animations
+  etc. and the layout. Would be so awesome to have something similar in powerpoint", with the
+  deck staying a file a person opens and edits in PowerPoint ("easily edit in powerpoint
+  ourselves and for this to then be picked up (so the builder doesn't just rebuild and overwrite
+  things)"), and, for the show itself, "I just want to be able to go through the slides in a
+  nice way". Stepping builds click by click in the viewer is the first visible part of that.
+- **How settled it is (intended vs provisional):** **provisional.** Asked what here is a promise
+  and what is just how it works for now, the maintainer answered: "All can change".
+- **Decisions the maintainer made while planning** (choices, not frozen contracts): timelines
+  are edited by hand in PowerPoint, and the viewer shows them read-only; the viewer is to play
+  the common effects and Morph as motion with rare effects falling back to a fade, and every
+  click ends on what PowerPoint would show (this page's first version only shows and hides,
+  with no motion); agents write decks through the PowerPoint extension, never by regenerating
+  the file; an agent's change waits while PowerPoint has the deck open.
+- **Do not change (or: open to change):** **open to change.** The maintainer named nothing as
+  off limits: "All can change".
+
