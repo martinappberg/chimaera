@@ -30,7 +30,20 @@
  * shape id is accepted only as 1–10 ASCII digits.
  */
 
-import { attr, decodeEntities, scan, type XmlEl } from "./pptxXml";
+import { decodeEntities, scan, type XmlEl } from "./pptxXml";
+
+/** An attribute's value as XML gives it (README R23a): each literal tab,
+ *  newline or carriage return in the source becomes a space (a CRLF pair
+ *  one space) before references are decoded, so `&#10;` stays a newline. */
+function attr(xml: string, el: XmlEl, name: string): string | null {
+  const a = el.attrs.find((x) => x.qname === name);
+  if (a === undefined) return null;
+  return decodeEntities(xml.slice(a.valueStart, a.valueEnd).replace(/\r\n|[\t\n\r]/g, " "));
+}
+
+/** Most child transforms or attributes a colour may carry, and most `by`
+ *  changes one target's part may hold (R21): a real colour has a handful. */
+export const COLOR_CAPS = { parts: 8, chain: 16 } as const;
 
 const NS_P = new Set([
   "http://schemas.openxmlformats.org/presentationml/2006/main",
@@ -87,7 +100,8 @@ export type Approximate =
   | "timing-too-large"
   | "too-many-effects"
   | "too-many-clicks"
-  | "too-deep";
+  | "too-deep"
+  | "colour-too-large";
 
 export interface Target {
   /** Shape id (`cNvPr@id`): 1–10 ASCII digits. */
@@ -327,8 +341,19 @@ function childP(el: XmlEl | undefined, local: string): XmlEl | undefined {
 function childrenP(el: XmlEl | undefined, local: string): XmlEl[] {
   return el === undefined ? [] : el.children.filter((c) => isP(c, local));
 }
+/** An element's text as XML gives it (R23a): comments and processing
+ *  instructions dropped, CDATA sections taken as written (not decoded),
+ *  the rest's references decoded. */
 function text(xml: string, el: XmlEl): string {
-  return decodeEntities(xml.slice(el.openEnd, el.closeStart)).trim();
+  const raw = xml.slice(el.openEnd, el.closeStart);
+  let out = "";
+  const re = /<!--[\s\S]*?-->|<\?[\s\S]*?\?>|<!\[CDATA\[([\s\S]*?)\]\]>/g;
+  let last = 0;
+  for (let m = re.exec(raw); m !== null; m = re.exec(raw)) {
+    out += decodeEntities(raw.slice(last, m.index)) + (m[1] ?? "");
+    last = m.index + m[0].length;
+  }
+  return (out + decodeEntities(raw.slice(last))).trim();
 }
 /** An attribute by namespace + local name, whatever prefix the part binds. */
 function attrNs(xml: string, el: XmlEl, ns: string, local: string): string | null {
@@ -503,13 +528,18 @@ function point(xml: string, el: XmlEl | undefined): Point | null {
   return x === null || y === null ? null : { x, y };
 }
 
+/** A colour past `COLOR_CAPS`: the slide plays as a plain slide (R21). */
+class ColourTooLarge extends Error {}
+
 function color(xml: string, el: XmlEl | undefined): Color | null {
   const c = el?.children[0];
   if (c === undefined) return null;
   const attrs = Object.create(null) as Record<string, string>;
-  for (const a of [...c.attrs].sort((x, y) => (x.qname < y.qname ? -1 : x.qname > y.qname ? 1 : 0))) {
-    attrs[a.qname] = decodeEntities(xml.slice(a.valueStart, a.valueEnd));
-  }
+  // A prefixed attribute is never part of a colour (PowerPoint writes
+  // none; R29): dropped, so no unbound prefix reaches anything.
+  const own = c.attrs.filter((a) => !a.qname.includes(":"));
+  if (own.length > COLOR_CAPS.parts || c.children.length > COLOR_CAPS.parts) throw new ColourTooLarge();
+  for (const a of [...own].sort((x, y) => (x.qname < y.qname ? -1 : x.qname > y.qname ? 1 : 0))) attrs[a.qname] = attr(xml, c, a.qname)!;
   return { type: c.local, attrs, mods: c.children.map((m) => ({ name: m.local, val: attr(xml, m, "val") })) };
 }
 
@@ -856,11 +886,18 @@ function readSlide(xml: string, root: XmlEl): SlideTimeline {
 
   const groups = main === undefined ? [] : groupsOf(main);
   if (groups.length > TIMING_CAPS.clicks) return plain(transition, "too-many-clicks");
-  const steps = readSteps(xml, groups);
+  let steps: Effect[][];
+  try {
+    steps = readSteps(xml, groups);
+  } catch (e) {
+    if (e instanceof ColourTooLarge) return plain(transition, "colour-too-large");
+    throw e;
+  }
   // A first group whose first effect isn't a click runs on entry: it is step 0.
   // Otherwise nothing runs on entry and every group is a click.
   if (steps[0]?.[0]?.trigger !== "with" && steps[0]?.[0]?.trigger !== "after") steps.unshift([]);
 
+  let tooLarge = false;
   const interactive: InteractiveSequence[] = seqs
     .filter((c) => attr(xml, c, "nodeType") === "interactiveSeq")
     .map((c) => {
@@ -870,8 +907,30 @@ function readSlide(xml: string, root: XmlEl): SlideTimeline {
         trigger = readTarget(xml, childP(cond, "tgtEl"))?.spid ?? null;
         if (trigger !== null) break;
       }
-      return { trigger, steps: readSteps(xml, groupsOf(c)) };
+      let isteps: Effect[][] = [];
+      try {
+        isteps = readSteps(xml, groupsOf(c));
+      } catch (e) {
+        if (!(e instanceof ColourTooLarge)) throw e;
+        tooLarge = true;
+      }
+      return { trigger, steps: isteps };
     });
+  if (tooLarge) return plain(transition, "colour-too-large");
+  // A held `by` chain is bounded too (R21): count the colour changes by
+  // target and attribute over the main sequence.
+  const chains = new Map<string, number>();
+  for (const step of steps) {
+    for (const e of step) {
+      for (const b of e.behaviours) {
+        if (b.kind !== "color" || b.by === null || b.target === null) continue;
+        const k = `${targetKey(b.target)} ${(b.attrs[0] ?? "").toLowerCase()}`;
+        const n = (chains.get(k) ?? 0) + 1;
+        if (n > COLOR_CAPS.chain) return plain(transition, "colour-too-large");
+        chains.set(k, n);
+      }
+    }
+  }
 
   return { steps, transition, interactive, builds: readBuilds(xml, childP(timing, "bldLst")), approximate: null };
 }
@@ -1114,6 +1173,11 @@ const COLOR_PART = new Map<string, keyof HeldColors>([
   ["style.color", "text"],
 ]);
 
+/** A change whose result isn't finite is dropped: the value stays (R31). */
+function setFinite(m: Map<string, number>, key: string, v: number): void {
+  if (Number.isFinite(v)) m.set(key, v);
+}
+
 interface Held {
   scale: Map<string, [number, number]>;
   turn: Map<string, number>;
@@ -1147,25 +1211,25 @@ function applyHeld(step: readonly Effect[], held: Held): void {
             const by = f(b.by, axis);
             return by === null ? from : from * (1 + (by - 1) * q);
           }) as [number, number];
-          held.scale.set(key, next);
+          if (next.every(Number.isFinite)) held.scale.set(key, next);
         };
       } else if (b.kind === "rot") {
         run = () => {
           const cur = held.turn.get(key) ?? 0;
           if (b.to !== null) {
             const from = b.from === null ? cur : b.from / 60000;
-            held.turn.set(key, from + (b.to / 60000 - from) * q);
-          } else if (b.by !== null) held.turn.set(key, (b.from === null ? cur : b.from / 60000) + (b.by / 60000) * q);
+            setFinite(held.turn, key, from + (b.to / 60000 - from) * q);
+          } else if (b.by !== null) setFinite(held.turn, key, (b.from === null ? cur : b.from / 60000) + (b.by / 60000) * q);
         };
       } else if (b.kind === "anim" && b.attrs.some((a) => ROTATION_ATTRS.has(a))) {
         const v = animNumber(b, q);
-        if (v !== null) run = () => held.turn.set(key, v);
+        if (v !== null) run = () => setFinite(held.turn, key, v);
       } else if (b.kind === "anim" && b.attrs.includes("style.opacity")) {
         const v = animNumber(b, q);
-        if (v !== null) run = () => held.opacity.set(key, v);
+        if (v !== null) run = () => setFinite(held.opacity, key, v);
       } else if (b.kind === "set" && b.attrs.includes("style.opacity")) {
         const v = decimalOf(b.to);
-        if (v !== null) run = () => held.opacity.set(key, v);
+        if (v !== null) run = () => setFinite(held.opacity, key, v);
       } else if (b.kind === "color" && q === 1) {
         const part = b.attrs.map((a) => COLOR_PART.get(a.toLowerCase())).find((x) => x !== undefined);
         if (part !== undefined && (b.to !== null || b.by !== null)) {
@@ -1222,18 +1286,22 @@ function heldColorOut(c: HeldColor): HeldColor {
 /** The held values as a state carries them: rounded, identities left out. */
 function heldOut(held: Held, state: BuildState): void {
   const sorted = <V>(m: Map<string, V>) => [...m.keys()].sort().map((k) => [k, m.get(k)!] as const);
+  // A held value that isn't finite is not held (R31).
   const scale = Object.create(null) as Record<string, [number, number]>;
   for (const [k, [x, y]] of sorted(held.scale)) {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
     const v: [number, number] = [round4(x), round4(y)];
     if (v[0] !== 1 || v[1] !== 1) scale[k] = v;
   }
   const turn = Object.create(null) as Record<string, number>;
   for (const [k, d] of sorted(held.turn)) {
+    if (!Number.isFinite(d)) continue;
     const v = round4(((d % 360) + 360) % 360);
     if (v !== 0 && v !== 360) turn[k] = v;
   }
   const opacity = Object.create(null) as Record<string, number>;
   for (const [k, o] of sorted(held.opacity)) {
+    if (!Number.isFinite(o)) continue;
     const v = round4(Math.min(1, Math.max(0, o)));
     if (v !== 1) opacity[k] = v;
   }
