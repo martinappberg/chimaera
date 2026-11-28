@@ -1,0 +1,59 @@
+{
+  "part": "split-any-behaviour.xml",
+  "id": 0,
+  "transition": null,
+  "steps": [
+    [],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 0,
+        "class": "entr",
+        "preset": 1,
+        "subtype": 0,
+        "effect": "appear",
+        "dir": null,
+        "target": "2:p0-0",
+        "sets": "visible"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 500,
+        "class": "emph",
+        "preset": 6,
+        "subtype": 0,
+        "effect": "grow-shrink",
+        "dir": null,
+        "target": "2",
+        "sets": null
+      }
+    ]
+  ],
+  "states": [
+    {
+      "hidden": [
+        "2:p0-0"
+      ],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {},
+      "scale": {
+        "2:bg": [
+          1.5,
+          1.5
+        ]
+      }
+    }
+  ],
+  "interactive": 0
+}

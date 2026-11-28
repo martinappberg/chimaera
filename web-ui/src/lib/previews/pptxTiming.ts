@@ -66,6 +66,10 @@ export const TIMING_CAPS = {
   clicks: 300,
   /** `p:par`/`p:seq`/`p:excl` nesting, the root `p:par` being 1. */
   depth: 32,
+  /** What the states may hold in all: each main-sequence behaviour's
+   *  target keys (a paragraph range one per paragraph, up to
+   *  `HELD_PARAGRAPHS`) times the states from its step on (R21). */
+  values: 250_000,
 } as const;
 
 // --- types -------------------------------------------------------------------------
@@ -101,7 +105,8 @@ export type Approximate =
   | "too-many-effects"
   | "too-many-clicks"
   | "too-deep"
-  | "colour-too-large";
+  | "colour-too-large"
+  | "too-many-values";
 
 export interface Target {
   /** Shape id (`cNvPr@id`): 1–10 ASCII digits. */
@@ -353,7 +358,8 @@ function text(xml: string, el: XmlEl): string {
     out += decodeEntities(raw.slice(last, m.index)) + (m[1] ?? "");
     last = m.index + m[0].length;
   }
-  return (out + decodeEntities(raw.slice(last))).trim();
+  // XML's whitespace only (R23a): a no-break space or U+FEFF is text.
+  return (out + decodeEntities(raw.slice(last))).replace(/^[ \t\n\r]+|[ \t\n\r]+$/g, "");
 }
 /** An attribute by namespace + local name, whatever prefix the part binds. */
 function attrNs(xml: string, el: XmlEl, ns: string, local: string): string | null {
@@ -537,7 +543,8 @@ function color(xml: string, el: XmlEl | undefined): Color | null {
   const attrs = Object.create(null) as Record<string, string>;
   // A prefixed attribute is never part of a colour (PowerPoint writes
   // none; R29): dropped, so no unbound prefix reaches anything.
-  const own = c.attrs.filter((a) => !a.qname.includes(":"));
+  // Namespace declarations are not attributes (R21).
+  const own = c.attrs.filter((a) => !a.qname.includes(":") && a.qname !== "xmlns");
   if (own.length > COLOR_CAPS.parts || c.children.length > COLOR_CAPS.parts) throw new ColourTooLarge();
   for (const a of [...own].sort((x, y) => (x.qname < y.qname ? -1 : x.qname > y.qname ? 1 : 0))) attrs[a.qname] = attr(xml, c, a.qname)!;
   return { type: c.local, attrs, mods: c.children.map((m) => ({ name: m.local, val: attr(xml, m, "val") })) };
@@ -917,17 +924,31 @@ function readSlide(xml: string, root: XmlEl): SlideTimeline {
       return { trigger, steps: isteps };
     });
   if (tooLarge) return plain(transition, "colour-too-large");
-  // A held `by` chain is bounded too (R21): count the colour changes by
-  // target and attribute over the main sequence.
-  const chains = new Map<string, number>();
-  for (const step of steps) {
-    for (const e of step) {
+  // A held `by` chain is bounded too (R21), in every sequence alike: count
+  // the colour changes by target and attribute, each sequence on its own.
+  for (const seq of [steps, ...interactive.map((i) => i.steps)]) {
+    const chains = new Map<string, number>();
+    for (const step of seq) {
+      for (const e of step) {
+        for (const b of e.behaviours) {
+          if (b.kind !== "color" || b.by === null || b.target === null) continue;
+          const k = `${targetKey(b.target)} ${(b.attrs[0] ?? "").toLowerCase()}`;
+          const n = (chains.get(k) ?? 0) + 1;
+          if (n > COLOR_CAPS.chain) return plain(transition, "colour-too-large");
+          chains.set(k, n);
+        }
+      }
+    }
+  }
+  // What the states would hold (R21): bounded before any is built.
+  let values = 0;
+  for (let k = 0; k < steps.length; k++) {
+    for (const e of steps[k]!) {
       for (const b of e.behaviours) {
-        if (b.kind !== "color" || b.by === null || b.target === null) continue;
-        const k = `${targetKey(b.target)} ${(b.attrs[0] ?? "").toLowerCase()}`;
-        const n = (chains.get(k) ?? 0) + 1;
-        if (n > COLOR_CAPS.chain) return plain(transition, "colour-too-large");
-        chains.set(k, n);
+        const t = b.target ?? e.target;
+        if (t === null) continue;
+        values += (t.para === null ? 1 : Math.max(0, Math.min(t.para[1] - t.para[0] + 1, HELD_PARAGRAPHS))) * (steps.length - k);
+        if (values > TIMING_CAPS.values) return plain(transition, "too-many-values");
       }
     }
   }

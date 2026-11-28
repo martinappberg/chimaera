@@ -452,6 +452,19 @@ describe("parseTimeline on hand-written slides", () => {
 });
 
 describe("the hand-written cases", () => {
+  it("a hostile slide whose states would hold far past the values cap plays plain at once (R21)", () => {
+    // ~370 KB: 290 clicks, each holding a grow on paragraphs 0-255 of one box.
+    const grow = '<p:animScale><p:cBhvr><p:cTn id="9" dur="1" fill="hold"/><p:tgtEl><p:spTgt spid="2"><p:txEl><p:pRg st="0" end="255"/></p:txEl></p:spTgt></p:tgtEl></p:cBhvr><p:by x="150000" y="150000"/></p:animScale>';
+    const click = `<p:par><p:cTn id="7" fill="hold"><p:stCondLst><p:cond delay="indefinite"/></p:stCondLst><p:childTnLst><p:par><p:cTn id="8" presetID="6" presetClass="emph" fill="hold" nodeType="clickEffect"><p:childTnLst>${grow.repeat(5)}</p:childTnLst></p:cTn></p:par></p:childTnLst></p:cTn></p:par>`;
+    const xml = caseXml("values-cap").replace(/<p:childTnLst><p:par><p:cTn id="\d+" fill="hold"><p:stCondLst><p:cond delay="indefinite"\/>[\s\S]*<\/p:cTn><p:prevCondLst>/, `<p:childTnLst>${click.repeat(290)}</p:childTnLst></p:cTn><p:prevCondLst>`);
+    expect(xml.length).toBeGreaterThan(350_000);
+    const t0 = performance.now();
+    const t = parseTimeline(xml);
+    expect(t.approximate).toBe("too-many-values");
+    expect(performance.now() - t0).toBeLessThan(2000);
+    expect(buildStates(t)).toHaveLength(1);
+  });
+
   it("an on-shape-click sequence is counted, kept out of the steps, and only hides its target at first", () => {
     const t = parseTimeline(caseXml("interactive-trigger"));
     expect(t.approximate).toBeNull();

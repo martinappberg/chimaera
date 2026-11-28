@@ -1,0 +1,185 @@
+{
+  "part": "colour-chain-split.xml",
+  "id": 0,
+  "transition": null,
+  "steps": [
+    [],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 500,
+        "class": "emph",
+        "preset": 19,
+        "subtype": 0,
+        "effect": "other",
+        "dir": null,
+        "target": "4",
+        "sets": null
+      }
+    ]
+  ],
+  "states": [
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {},
+      "color": {
+        "4": {
+          "fill": {
+            "by": [
+              {
+                "type": "rgb",
+                "attrs": {
+                  "b": "0",
+                  "g": "0",
+                  "r": "1000"
+                },
+                "mods": []
+              },
+              {
+                "type": "rgb",
+                "attrs": {
+                  "b": "0",
+                  "g": "0",
+                  "r": "1000"
+                },
+                "mods": []
+              },
+              {
+                "type": "rgb",
+                "attrs": {
+                  "b": "0",
+                  "g": "0",
+                  "r": "1000"
+                },
+                "mods": []
+              },
+              {
+                "type": "rgb",
+                "attrs": {
+                  "b": "0",
+                  "g": "0",
+                  "r": "1000"
+                },
+                "mods": []
+              },
+              {
+                "type": "rgb",
+                "attrs": {
+                  "b": "0",
+                  "g": "0",
+                  "r": "1000"
+                },
+                "mods": []
+              },
+              {
+                "type": "rgb",
+                "attrs": {
+                  "b": "0",
+                  "g": "0",
+                  "r": "1000"
+                },
+                "mods": []
+              },
+              {
+                "type": "rgb",
+                "attrs": {
+                  "b": "0",
+                  "g": "0",
+                  "r": "1000"
+                },
+                "mods": []
+              },
+              {
+                "type": "rgb",
+                "attrs": {
+                  "b": "0",
+                  "g": "0",
+                  "r": "1000"
+                },
+                "mods": []
+              },
+              {
+                "type": "rgb",
+                "attrs": {
+                  "b": "0",
+                  "g": "0",
+                  "r": "1000"
+                },
+                "mods": []
+              },
+              {
+                "type": "rgb",
+                "attrs": {
+                  "b": "0",
+                  "g": "0",
+                  "r": "1000"
+                },
+                "mods": []
+              },
+              {
+                "type": "rgb",
+                "attrs": {
+                  "b": "0",
+                  "g": "0",
+                  "r": "1000"
+                },
+                "mods": []
+              },
+              {
+                "type": "rgb",
+                "attrs": {
+                  "b": "0",
+                  "g": "0",
+                  "r": "1000"
+                },
+                "mods": []
+              },
+              {
+                "type": "rgb",
+                "attrs": {
+                  "b": "0",
+                  "g": "0",
+                  "r": "1000"
+                },
+                "mods": []
+              },
+              {
+                "type": "rgb",
+                "attrs": {
+                  "b": "0",
+                  "g": "0",
+                  "r": "1000"
+                },
+                "mods": []
+              },
+              {
+                "type": "rgb",
+                "attrs": {
+                  "b": "0",
+                  "g": "0",
+                  "r": "1000"
+                },
+                "mods": []
+              },
+              {
+                "type": "rgb",
+                "attrs": {
+                  "b": "0",
+                  "g": "0",
+                  "r": "1000"
+                },
+                "mods": []
+              }
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "interactive": 1
+}
