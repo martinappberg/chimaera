@@ -1,27 +1,38 @@
-//! Replace a few entries of a zip package (an Office deck, workbook or
-//! document) while every other entry stays byte-identical: the backend of
-//! `POST /fs/package`.
+//! Edit a zip package (an Office deck, workbook or document) while every
+//! untouched entry stays byte-identical: the backend of `POST /fs/package`
+//! (which only replaces existing entries, [`splice`]) and of package edits
+//! that also add or remove parts ([`splice_edit`]; a new slide brings its
+//! XML, relationships and media).
 //!
 //! An edit to a 100 MB deck touches one or two small XML parts, and a deck
 //! on a remote host must not travel whole for that. So the archive is never
 //! re-encoded: untouched local records are copied verbatim in offset order,
-//! each replaced one becomes a fresh deflated record, and the central
-//! directory is rewritten with patched offsets. Memory stays bounded by the
-//! central directory ([`MAX_CENTRAL_DIR_BYTES`]) plus the replacements; the
-//! archive itself streams.
+//! a removed one is skipped, each replaced one becomes a fresh deflated
+//! record, added ones follow the last record, and the central directory is
+//! rewritten with patched offsets. Memory stays bounded by the central
+//! directory ([`MAX_CENTRAL_DIR_BYTES`]) plus the in-memory entry data; the
+//! archive itself and a streamed entry ([`EntryData::Stream`]) stream.
 //!
 //! Office files are untrusted input, and an archive this code cannot copy
 //! exactly is refused rather than guessed at ([`SpliceError::Refused`]):
 //! zip64, multi-disk, encrypted entries, duplicate names, local records that
 //! overlap or leave the file, and a central directory that does not end where
-//! the end record says. v1 only replaces existing entries.
+//! the end record says. So is an edit it cannot apply as asked: a replaced or
+//! removed name the archive lacks, an added one it already has, a name listed
+//! twice, or removing `[Content_Types].xml`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
 /// Most entries one request may replace.
 pub(crate) const MAX_REPLACED_ENTRIES: usize = 64;
+/// Most entries one [`Edit`] may name across replace, add and remove:
+/// adding or removing a slide names a handful of parts each.
+pub(crate) const MAX_EDITED_ENTRIES: usize = 256;
+/// Largest uncompressed entry a streamed source may hold: the package cap
+/// (`fs::MAX_PACKAGE_BYTES`), since a bigger entry could not fit anyway.
+pub(crate) const MAX_STREAMED_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
 /// Largest central directory read into memory. A real deck's is tens of KB;
 /// this only bounds a hostile one.
 const MAX_CENTRAL_DIR_BYTES: u64 = 16 * 1024 * 1024;
@@ -44,6 +55,17 @@ const FLAG_ENCRYPTED: u16 = 1 << 0;
 const FLAG_DESCRIPTOR: u16 = 1 << 3;
 const FLAG_STRONG: u16 = 1 << 6;
 const FLAG_CD_ENCRYPTED: u16 = 1 << 13;
+/// Language encoding: the name is UTF-8.
+const FLAG_UTF8: u16 = 1 << 11;
+/// Version 2.0: deflate. "Made by" for an added entry says MS-DOS (high
+/// byte 0), so its zero external attributes mean a plain file.
+const VERSION_DEFLATE: u16 = 20;
+const METHOD_DEFLATE: u16 = 8;
+/// 1980-01-01 00:00, the earliest DOS (date, time): an added entry's stamp
+/// in an archive with no entry to take one from.
+const DOS_EPOCH: (u16, u16) = (0x21, 0);
+/// The one part every Office package needs: removing it is refused.
+const CONTENT_TYPES: &str = "[Content_Types].xml";
 
 #[derive(Debug)]
 pub(crate) enum SpliceError {
@@ -78,6 +100,36 @@ fn refuse<T>(why: impl Into<String>) -> Result<T, SpliceError> {
 pub(crate) struct Replacement {
     pub(crate) name: String,
     pub(crate) data: Vec<u8>,
+}
+
+/// Anything an entry can be streamed from.
+pub(crate) trait ReadSeek: Read + Seek {}
+impl<T: Read + Seek + ?Sized> ReadSeek for T {}
+
+/// Where a replaced or added entry's contents come from.
+pub(crate) enum EntryData<'a> {
+    Bytes(&'a [u8]),
+    /// From the source's current position to its end, ≤
+    /// [`MAX_STREAMED_ENTRY_BYTES`]: a part too large to hold (a slide's
+    /// video). It is read twice, see [`measure`].
+    // Built by the plugin package host function; until then only by tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Stream(&'a mut dyn ReadSeek),
+}
+
+/// One entry an [`Edit`] writes.
+pub(crate) struct EntryEdit<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) data: EntryData<'a>,
+}
+
+/// What [`splice_edit`] changes: existing entries rewritten, new entries
+/// appended (in this order), existing entries dropped. A name appears once.
+#[derive(Default)]
+pub(crate) struct Edit<'a> {
+    pub(crate) replace: Vec<EntryEdit<'a>>,
+    pub(crate) add: Vec<EntryEdit<'a>>,
+    pub(crate) remove: Vec<&'a str>,
 }
 
 /// One entry as the central directory describes it.
@@ -168,6 +220,35 @@ pub(crate) fn check_request(replacements: &[Replacement]) -> Result<(), SpliceEr
         if !seen.insert(r.name.as_str()) {
             return refuse(format!("entry {:?} is listed twice", r.name));
         }
+    }
+    Ok(())
+}
+
+/// Edit-level checks that need no archive: count, names, a name used twice
+/// (within one list or across them), and the part a package cannot lose.
+fn check_edit(edit: &Edit<'_>) -> Result<(), SpliceError> {
+    let total = edit.replace.len() + edit.add.len() + edit.remove.len();
+    if total == 0 {
+        return refuse("no entries to edit");
+    }
+    if total > MAX_EDITED_ENTRIES {
+        return refuse(format!(
+            "too many entries in one edit ({total}, limit {MAX_EDITED_ENTRIES})"
+        ));
+    }
+    let names = edit.replace.iter().chain(&edit.add).map(|e| e.name);
+    let mut seen = HashSet::with_capacity(total);
+    for name in names.chain(edit.remove.iter().copied()) {
+        check_name(name)?;
+        if name.len() > usize::from(u16::MAX) {
+            return refuse(format!("entry name too long ({} bytes)", name.len()));
+        }
+        if !seen.insert(name) {
+            return refuse(format!("entry {name:?} is listed twice"));
+        }
+    }
+    if edit.remove.contains(&CONTENT_TYPES) {
+        return refuse(format!("{CONTENT_TYPES} cannot be removed"));
     }
     Ok(())
 }
@@ -355,40 +436,35 @@ fn record_end<R: Read + Seek>(
     Ok(data_end + len)
 }
 
-/// Pairs each replacement with the index of the entry it replaces.
-fn match_replacements<'a>(
-    archive: &Archive,
-    replacements: &'a [Replacement],
-) -> Result<HashMap<usize, &'a [u8]>, SpliceError> {
-    check_request(replacements)?;
-    let index: HashMap<&[u8], usize> = archive
-        .entries
-        .iter()
-        .enumerate()
-        .map(|(i, e)| (e.name(), i))
-        .collect();
-    let mut out = HashMap::with_capacity(replacements.len());
-    for r in replacements {
-        let Some(&i) = index.get(r.name.as_bytes()) else {
-            return refuse(format!("the archive has no entry {:?}", r.name));
-        };
-        out.insert(i, r.data.as_slice());
-    }
-    Ok(out)
-}
-
-/// A deflated replacement, ready to be written.
-struct Fresh {
+/// A replaced or added entry, deflated or measured, ready to be written.
+struct Fresh<'a> {
     crc: u32,
-    compressed: Vec<u8>,
+    /// Uncompressed size.
     size: u32,
+    csize: u32,
+    body: Body<'a>,
 }
 
-fn deflate(data: &[u8]) -> Result<Fresh, SpliceError> {
-    let size = u32::try_from(data.len())
+enum Body<'a> {
+    Deflated(Vec<u8>),
+    /// Deflated again as it is written; `start` is where [`measure`] began.
+    Stream {
+        src: &'a mut dyn ReadSeek,
+        start: u64,
+        cap: u64,
+    },
+}
+
+/// A 32-bit zip size field (zip64 is never written).
+fn size32(len: u64) -> Result<u32, SpliceError> {
+    u32::try_from(len)
         .ok()
         .filter(|&s| s != 0xFFFF_FFFF)
-        .ok_or_else(|| SpliceError::Refused("a replacement is too large".into()))?;
+        .ok_or_else(|| SpliceError::Refused("a replacement is too large".into()))
+}
+
+fn deflate<'a>(data: &[u8]) -> Result<Fresh<'a>, SpliceError> {
+    let size = size32(data.len() as u64)?;
     let mut crc = flate2::Crc::new();
     crc.update(data);
     let mut encoder = flate2::write::DeflateEncoder::new(
@@ -396,10 +472,115 @@ fn deflate(data: &[u8]) -> Result<Fresh, SpliceError> {
         flate2::Compression::default(),
     );
     encoder.write_all(data)?;
+    let compressed = encoder.finish()?;
     Ok(Fresh {
         crc: crc.sum(),
-        compressed: encoder.finish()?,
         size,
+        csize: size32(compressed.len() as u64)?,
+        body: Body::Deflated(compressed),
+    })
+}
+
+/// Deflate `src` (≤ `cap` bytes from its position) into `w`: its CRC, its
+/// size and the compressed size. Memory stays at `io::copy`'s buffer plus
+/// the encoder's window.
+fn deflate_stream<W: Write>(
+    src: &mut dyn ReadSeek,
+    cap: u64,
+    w: W,
+) -> Result<(u32, u64, u64), SpliceError> {
+    let mut reader = flate2::CrcReader::new(src.take(cap.saturating_add(1)));
+    let mut encoder = flate2::write::DeflateEncoder::new(
+        Tally { inner: w, at: 0 },
+        flate2::Compression::default(),
+    );
+    let size = io::copy(&mut reader, &mut encoder)?;
+    if size > cap {
+        return refuse(format!("a streamed entry is too large (limit {cap} bytes)"));
+    }
+    let crc = reader.crc().sum();
+    let written = encoder.finish()?;
+    Ok((crc, size, written.at))
+}
+
+/// First pass over a streamed entry. A local header carries the CRC and
+/// sizes before the data, and the output cannot be patched afterwards: it
+/// is a stream, hashed as it is written. A temp spool would put up to
+/// [`MAX_STREAMED_ENTRY_BYTES`] of compressed data on a disk the daemon
+/// does not own (a cluster's shared /tmp). So the source is deflated once
+/// into a counter, and again into the output ([`write_body`]): deflate is
+/// deterministic for one input and level, and the second pass checks that
+/// it saw the same bytes.
+fn measure(src: &mut dyn ReadSeek, cap: u64) -> Result<Fresh<'_>, SpliceError> {
+    let start = src.stream_position()?;
+    let (crc, size, csize) = deflate_stream(&mut *src, cap, io::sink())?;
+    Ok(Fresh {
+        crc,
+        size: size32(size)?,
+        csize: size32(csize)?,
+        body: Body::Stream { src, start, cap },
+    })
+}
+
+fn prepare(data: EntryData<'_>) -> Result<Fresh<'_>, SpliceError> {
+    match data {
+        EntryData::Bytes(bytes) => deflate(bytes),
+        EntryData::Stream(src) => measure(src, MAX_STREAMED_ENTRY_BYTES),
+    }
+}
+
+/// An edit matched against the archive, its entries ready to write.
+struct Plan<'a> {
+    /// By central-directory index.
+    replaced: HashMap<usize, Fresh<'a>>,
+    removed: HashSet<usize>,
+    added: Vec<(&'a str, Fresh<'a>)>,
+}
+
+/// Match `edit` to `archive`'s entries, then deflate or measure what it
+/// writes. Every name is matched first, so a refusal reads no data.
+fn plan<'a>(archive: &Archive, edit: Edit<'a>) -> Result<Plan<'a>, SpliceError> {
+    check_edit(&edit)?;
+    let index: HashMap<&[u8], usize> = archive
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.name(), i))
+        .collect();
+    let find = |name: &str| match index.get(name.as_bytes()) {
+        Some(&i) => Ok(i),
+        None => refuse(format!("the archive has no entry {name:?}")),
+    };
+    let mut replaced = Vec::with_capacity(edit.replace.len());
+    for entry in edit.replace {
+        replaced.push((find(entry.name)?, entry.data));
+    }
+    let mut removed = HashSet::with_capacity(edit.remove.len());
+    for name in &edit.remove {
+        removed.insert(find(name)?);
+    }
+    for entry in &edit.add {
+        if index.contains_key(entry.name.as_bytes()) {
+            return refuse(format!("the archive already has an entry {:?}", entry.name));
+        }
+    }
+    let count = archive.entries.len() - removed.len() + edit.add.len();
+    if count >= 0xFFFF {
+        return refuse("the edited archive would need zip64");
+    }
+
+    let mut fresh = HashMap::with_capacity(replaced.len());
+    for (i, data) in replaced {
+        fresh.insert(i, prepare(data)?);
+    }
+    let mut added = Vec::with_capacity(edit.add.len());
+    for entry in edit.add {
+        added.push((entry.name, prepare(entry.data)?));
+    }
+    Ok(Plan {
+        replaced: fresh,
+        removed,
+        added,
     })
 }
 
@@ -437,6 +618,88 @@ impl<W: Write> Tally<W> {
     }
 }
 
+impl<W: Write> Write for Tally<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.at += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Write a fresh entry's data: a streamed one is deflated a second time and
+/// must come out as [`measure`] counted it.
+fn write_body<W: Write>(out: &mut Tally<W>, fresh: &mut Fresh<'_>) -> Result<(), SpliceError> {
+    match &mut fresh.body {
+        Body::Deflated(bytes) => out.put(bytes)?,
+        Body::Stream { src, start, cap } => {
+            src.seek(SeekFrom::Start(*start))?;
+            let (crc, size, csize) = deflate_stream(&mut **src, *cap, &mut *out)?;
+            if crc != fresh.crc || size != u64::from(fresh.size) || csize != u64::from(fresh.csize)
+            {
+                return refuse("a streamed entry changed while it was written");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A fresh local record: deflate, no data descriptor, no extra field.
+fn put_local<W: Write>(
+    out: &mut Tally<W>,
+    flags: u16,
+    (date, time): (u16, u16),
+    name: &[u8],
+    fresh: &mut Fresh<'_>,
+) -> Result<(), SpliceError> {
+    let mut header = [0u8; LOCAL_LEN];
+    put_u32(&mut header, 0, LOCAL_SIG);
+    put_u16(&mut header, 4, VERSION_DEFLATE);
+    put_u16(&mut header, 6, flags);
+    put_u16(&mut header, 8, METHOD_DEFLATE);
+    put_u16(&mut header, 10, time);
+    put_u16(&mut header, 12, date);
+    put_u32(&mut header, 14, fresh.crc);
+    put_u32(&mut header, 18, fresh.csize);
+    put_u32(&mut header, 22, fresh.size);
+    // ≤ u16::MAX: an archive name came from a u16 field, an added one passed
+    // `check_edit`.
+    put_u16(&mut header, 26, name.len() as u16);
+    put_u16(&mut header, 28, 0);
+    out.put(&header)?;
+    out.put(name)?;
+    write_body(out, fresh)
+}
+
+/// An added entry's central record: made by MS-DOS 2.0, no extra, no
+/// comment, zero attributes.
+fn new_central(
+    name: &str,
+    flags: u16,
+    (date, time): (u16, u16),
+    fresh: &Fresh<'_>,
+    offset: u32,
+) -> Vec<u8> {
+    let mut record = vec![0u8; CENTRAL_LEN];
+    put_u32(&mut record, 0, CENTRAL_SIG);
+    put_u16(&mut record, 4, VERSION_DEFLATE);
+    put_u16(&mut record, 6, VERSION_DEFLATE);
+    put_u16(&mut record, 8, flags);
+    put_u16(&mut record, 10, METHOD_DEFLATE);
+    put_u16(&mut record, 12, time);
+    put_u16(&mut record, 14, date);
+    put_u32(&mut record, 16, fresh.crc);
+    put_u32(&mut record, 20, fresh.csize);
+    put_u32(&mut record, 24, fresh.size);
+    put_u16(&mut record, 28, name.len() as u16);
+    put_u32(&mut record, 42, offset);
+    record.extend_from_slice(name.as_bytes());
+    record
+}
+
 /// Drop zip64 extra blocks from a replaced entry's central extra field: no
 /// marker points at them, but a reader that honours them anyway would see
 /// the old sizes. A malformed extra is kept as it was.
@@ -460,27 +723,51 @@ fn without_zip64(extra: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Write `archive` (read from `r`) to `w` with `replacements` swapped in.
-///
-/// Before the central directory everything is copied byte for byte in
-/// offset order — a prefix before the first record, and each untouched
-/// record together with whatever follows it up to the next one — except a
-/// replaced record, which becomes a fresh local header (no data descriptor,
-/// deflate, the original flags without bit 3, time, date and name, no extra)
-/// plus its deflated data. Each central record is copied with its local
-/// offset patched (a replaced one also gets its version, flags, method, CRC
-/// and sizes), and the end record with the directory's new size and offset.
+/// Write `archive` (read from `r`) to `w` with `replacements` swapped in:
+/// the `POST /fs/package` edit, which only replaces existing entries (see
+/// [`splice_edit`]).
 pub(crate) fn splice<R: Read + Seek, W: Write>(
     r: &mut R,
     archive: &Archive,
     replacements: &[Replacement],
     w: W,
 ) -> Result<(), SpliceError> {
-    let replaced = match_replacements(archive, replacements)?;
-    let mut fresh: HashMap<usize, Fresh> = HashMap::with_capacity(replaced.len());
-    for (&i, data) in &replaced {
-        fresh.insert(i, deflate(data)?);
-    }
+    check_request(replacements)?;
+    let edit = Edit {
+        replace: replacements
+            .iter()
+            .map(|entry| EntryEdit {
+                name: &entry.name,
+                data: EntryData::Bytes(&entry.data),
+            })
+            .collect(),
+        ..Edit::default()
+    };
+    splice_edit(r, archive, edit, w)
+}
+
+/// Write `archive` (read from `r`) to `w` with `edit` applied.
+///
+/// Before the central directory everything is copied byte for byte in
+/// offset order — a prefix before the first record, and each untouched
+/// record together with whatever follows it up to the next one — except a
+/// removed record (and what follows it), which is skipped, and a replaced
+/// record, which becomes a fresh local header (no data descriptor, deflate,
+/// the original flags without bit 3, time, date and name, no extra) plus its
+/// deflated data. Added records follow the last one, in the edit's order,
+/// as fresh local headers too: UTF-8 flag when the name is not ASCII, and
+/// the archive's newest time and date, so the output stays a deterministic
+/// function of the input and the edit. Each kept central record is copied
+/// with its local offset patched (a replaced one also gets its version,
+/// flags, method, CRC and sizes), the added ones are appended, and the end
+/// record gets the new entry count and the directory's size and offset.
+pub(crate) fn splice_edit<R: Read + Seek, W: Write>(
+    r: &mut R,
+    archive: &Archive,
+    edit: Edit<'_>,
+    w: W,
+) -> Result<(), SpliceError> {
+    let mut plan = plan(archive, edit)?;
 
     let mut out = Tally { inner: w, at: 0 };
     let first = archive
@@ -491,26 +778,16 @@ pub(crate) fn splice<R: Read + Seek, W: Write>(
 
     let mut offsets = vec![0u32; archive.entries.len()];
     for (pos, &i) in archive.by_offset.iter().enumerate() {
+        if plan.removed.contains(&i) {
+            continue;
+        }
         let entry = &archive.entries[i];
         offsets[i] = out.offset32()?;
-        if let Some(new) = fresh.get(&i) {
+        if let Some(new) = plan.replaced.get_mut(&i) {
             let central = &entry.central;
-            let name = entry.name();
-            let mut header = [0u8; LOCAL_LEN];
-            put_u32(&mut header, 0, LOCAL_SIG);
-            put_u16(&mut header, 4, 20);
-            put_u16(&mut header, 6, u16_at(central, 8) & !FLAG_DESCRIPTOR);
-            put_u16(&mut header, 8, 8);
-            put_u16(&mut header, 10, u16_at(central, 12));
-            put_u16(&mut header, 12, u16_at(central, 14));
-            put_u32(&mut header, 14, new.crc);
-            put_u32(&mut header, 18, compressed_size(new)?);
-            put_u32(&mut header, 22, new.size);
-            put_u16(&mut header, 26, u16_at(central, 28));
-            put_u16(&mut header, 28, 0);
-            out.put(&header)?;
-            out.put(name)?;
-            out.put(&new.compressed)?;
+            let flags = u16_at(central, 8) & !FLAG_DESCRIPTOR;
+            let stamp = (u16_at(central, 14), u16_at(central, 12));
+            put_local(&mut out, flags, stamp, entry.name(), new)?;
         } else {
             let end = archive
                 .by_offset
@@ -521,18 +798,32 @@ pub(crate) fn splice<R: Read + Seek, W: Write>(
             out.copy(r, entry.local_offset, end - entry.local_offset)?;
         }
     }
+    let stamp = archive
+        .entries
+        .iter()
+        .map(|e| (u16_at(&e.central, 14), u16_at(&e.central, 12)))
+        .max()
+        .unwrap_or(DOS_EPOCH);
+    let mut added_offsets = Vec::with_capacity(plan.added.len());
+    for (name, new) in &mut plan.added {
+        added_offsets.push(out.offset32()?);
+        put_local(&mut out, added_flags(name), stamp, name.as_bytes(), new)?;
+    }
 
     let cd_start = out.offset32()?;
     for (i, entry) in archive.entries.iter().enumerate() {
+        if plan.removed.contains(&i) {
+            continue;
+        }
         let mut record = entry.central.clone();
         put_u32(&mut record, 42, offsets[i]);
-        if let Some(new) = fresh.get(&i) {
-            put_u16(&mut record, 6, 20);
+        if let Some(new) = plan.replaced.get(&i) {
+            put_u16(&mut record, 6, VERSION_DEFLATE);
             let flags = u16_at(&record, 8) & !FLAG_DESCRIPTOR;
             put_u16(&mut record, 8, flags);
-            put_u16(&mut record, 10, 8);
+            put_u16(&mut record, 10, METHOD_DEFLATE);
             put_u32(&mut record, 16, new.crc);
-            put_u32(&mut record, 20, compressed_size(new)?);
+            put_u32(&mut record, 20, new.csize);
             put_u32(&mut record, 24, new.size);
             let name_len = usize::from(u16_at(&record, 28));
             let extra_len = usize::from(u16_at(&record, 30));
@@ -548,9 +839,16 @@ pub(crate) fn splice<R: Read + Seek, W: Write>(
         }
         out.put(&record)?;
     }
+    for ((name, new), offset) in plan.added.iter().zip(added_offsets) {
+        out.put(&new_central(name, added_flags(name), stamp, new, offset))?;
+    }
     let cd_size = u32::try_from(out.at - u64::from(cd_start))
         .map_err(|_| SpliceError::Refused("the edited archive would need zip64".into()))?;
+    // < 0xFFFF, checked by `plan`.
+    let count = (archive.entries.len() - plan.removed.len() + plan.added.len()) as u16;
     let mut eocd = archive.eocd.clone();
+    put_u16(&mut eocd, 8, count);
+    put_u16(&mut eocd, 10, count);
     put_u32(&mut eocd, 12, cd_size);
     put_u32(&mut eocd, 16, cd_start);
     out.put(&eocd)?;
@@ -558,13 +856,13 @@ pub(crate) fn splice<R: Read + Seek, W: Write>(
     Ok(())
 }
 
-fn compressed_size(fresh: &Fresh) -> Result<u32, SpliceError> {
-    u32::try_from(fresh.compressed.len())
-        .ok()
-        .filter(|&s| s != 0xFFFF_FFFF)
-        .ok_or_else(|| SpliceError::Refused("a replacement is too large".into()))
+fn added_flags(name: &str) -> u16 {
+    if name.is_ascii() {
+        0
+    } else {
+        FLAG_UTF8
+    }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -986,5 +1284,358 @@ mod tests {
         assert_eq!(without_zip64(&extra), vec![0x55, 0x54, 0x01, 0x00, 7]);
         let malformed = [0x01, 0x00, 0x09, 0x00, 1];
         assert_eq!(without_zip64(&malformed), malformed.to_vec());
+    }
+
+    fn run_edit(input: &[u8], edit: Edit<'_>) -> Result<Vec<u8>, SpliceError> {
+        let mut r = Cursor::new(input);
+        let archive = read_archive(&mut r, input.len() as u64)?;
+        let mut out = Vec::new();
+        splice_edit(&mut r, &archive, edit, &mut out)?;
+        Ok(out)
+    }
+
+    fn bytes<'a>(name: &'a str, data: &'a [u8]) -> EntryEdit<'a> {
+        EntryEdit {
+            name,
+            data: EntryData::Bytes(data),
+        }
+    }
+
+    fn names(bytes: &[u8]) -> Vec<String> {
+        zip::ZipArchive::new(Cursor::new(bytes))
+            .unwrap()
+            .file_names()
+            .map(|n| n.unwrap().into_owned())
+            .collect()
+    }
+
+    /// Every entry of `input` not in `touched` reads back the same from
+    /// `output`, and its raw local record is byte-identical.
+    fn assert_untouched(input: &[u8], output: &[u8], touched: &[&str]) {
+        let before = contents(input);
+        let after = contents(output);
+        let raw_before = raw_records(input);
+        let raw_after = raw_records(output);
+        for (name, old) in &before {
+            if touched.contains(&name.as_str()) {
+                continue;
+            }
+            assert_eq!(&after[name], old, "{name}");
+            assert_eq!(raw_after[name], raw_before[name], "raw record of {name}");
+        }
+        let a = zip::ZipArchive::new(Cursor::new(input)).unwrap();
+        let b = zip::ZipArchive::new(Cursor::new(output)).unwrap();
+        assert_eq!(a.comment(), b.comment());
+    }
+
+    fn central_record_of<'a>(bytes: &'a [u8], name: &str) -> &'a [u8] {
+        let at = central_records(bytes)
+            .into_iter()
+            .find(|&at| {
+                let len = usize::from(u16_at(bytes, at + 28));
+                &bytes[at + CENTRAL_LEN..at + CENTRAL_LEN + len] == name.as_bytes()
+            })
+            .unwrap();
+        &bytes[at..at + CENTRAL_LEN]
+    }
+
+    #[test]
+    fn adds_an_entry_after_the_last_record() {
+        let input = deck(b"");
+        let new = SLIDE.repeat(2);
+        let edit = Edit {
+            add: vec![bytes("ppt/slides/slide3.xml", &new)],
+            ..Edit::default()
+        };
+        let output = run_edit(&input, edit).unwrap();
+        assert_untouched(&input, &output, &[]);
+        assert_eq!(contents(&output)["ppt/slides/slide3.xml"], new);
+        let mut expected = names(&input);
+        expected.push("ppt/slides/slide3.xml".into());
+        assert_eq!(names(&output), expected);
+
+        let mut zip = zip::ZipArchive::new(Cursor::new(&output[..])).unwrap();
+        let file = zip.by_name("ppt/slides/slide3.xml").unwrap();
+        assert_eq!(file.compression(), CompressionMethod::Deflated);
+        let start = file.header_start() as usize;
+        drop(file);
+        // After every original record, and with no data descriptor.
+        assert_eq!(
+            start,
+            zip::ZipArchive::new(Cursor::new(&input[..]))
+                .unwrap()
+                .central_directory_start() as usize
+        );
+        assert_eq!(u16_at(&output, start + 6), 0);
+        // Stamped like the archive's newest entry.
+        let newest = central_records(&input)
+            .into_iter()
+            .map(|at| (u16_at(&input, at + 14), u16_at(&input, at + 12)))
+            .max()
+            .unwrap();
+        let added = central_record_of(&output, "ppt/slides/slide3.xml");
+        assert_eq!((u16_at(added, 14), u16_at(added, 12)), newest);
+    }
+
+    #[test]
+    fn adds_a_non_ascii_name_as_utf8() {
+        let input = deck(b"");
+        let name = "ppt/media/bild-ä.png";
+        let edit = Edit {
+            add: vec![bytes(name, b"png bytes")],
+            ..Edit::default()
+        };
+        let output = run_edit(&input, edit).unwrap();
+        assert_eq!(contents(&output)[name], b"png bytes");
+        assert_eq!(u16_at(central_record_of(&output, name), 8), FLAG_UTF8);
+        assert_untouched(&input, &output, &[]);
+    }
+
+    #[test]
+    fn removes_an_entry_and_its_local_record() {
+        let input = deck(b"");
+        let gone = raw_records(&input)["ppt/slides/slide1.xml"].clone();
+        let edit = Edit {
+            remove: vec!["ppt/slides/slide1.xml"],
+            ..Edit::default()
+        };
+        let output = run_edit(&input, edit).unwrap();
+        assert_untouched(&input, &output, &["ppt/slides/slide1.xml"]);
+        let expected: Vec<String> = names(&input)
+            .into_iter()
+            .filter(|n| n != "ppt/slides/slide1.xml")
+            .collect();
+        assert_eq!(names(&output), expected);
+        assert!(!output.windows(gone.len()).any(|w| w == gone.as_slice()));
+        let kept = central_records(&output);
+        assert_eq!(kept.len(), central_records(&input).len() - 1);
+    }
+
+    #[test]
+    fn adds_removes_and_replaces_in_one_edit() {
+        let input = streamed_deck();
+        let new_a = b"<a>rewritten</a>".to_vec();
+        let new_d = b"<d>new part</d>".repeat(40);
+        let edit = Edit {
+            replace: vec![bytes("a.xml", &new_a)],
+            add: vec![bytes("d.xml", &new_d), bytes("media/e.bin", b"\x00\x01")],
+            remove: vec!["b.xml"],
+        };
+        let output = run_edit(&input, edit).unwrap();
+        assert_untouched(&input, &output, &["a.xml", "b.xml"]);
+        let after = contents(&output);
+        assert_eq!(after["a.xml"], new_a);
+        assert_eq!(after["d.xml"], new_d);
+        assert_eq!(after["media/e.bin"], b"\x00\x01");
+        assert!(!after.contains_key("b.xml"));
+        assert_eq!(names(&output), ["a.xml", "c.bin", "d.xml", "media/e.bin"]);
+        // The same edit again is the same bytes.
+        let again = Edit {
+            replace: vec![bytes("a.xml", &new_a)],
+            add: vec![bytes("d.xml", &new_d), bytes("media/e.bin", b"\x00\x01")],
+            remove: vec!["b.xml"],
+        };
+        assert_eq!(run_edit(&input, again).unwrap(), output);
+    }
+
+    #[test]
+    fn refuses_edits_it_cannot_apply() {
+        let input = deck(b"");
+        let slide1 = "ppt/slides/slide1.xml";
+        let cases: Vec<(Edit<'_>, &str)> = vec![
+            (Edit::default(), "no entries"),
+            (
+                Edit {
+                    add: vec![bytes(slide1, b"x")],
+                    ..Edit::default()
+                },
+                "already has",
+            ),
+            (
+                Edit {
+                    remove: vec!["ppt/slides/slide9.xml"],
+                    ..Edit::default()
+                },
+                "no entry",
+            ),
+            (
+                Edit {
+                    replace: vec![bytes("ppt/slides/slide9.xml", b"x")],
+                    ..Edit::default()
+                },
+                "no entry",
+            ),
+            (
+                Edit {
+                    remove: vec!["[Content_Types].xml"],
+                    ..Edit::default()
+                },
+                "cannot be removed",
+            ),
+            (
+                Edit {
+                    replace: vec![bytes(slide1, b"x")],
+                    remove: vec![slide1],
+                    ..Edit::default()
+                },
+                "twice",
+            ),
+            (
+                Edit {
+                    add: vec![bytes("new.xml", b"x"), bytes("new.xml", b"y")],
+                    ..Edit::default()
+                },
+                "twice",
+            ),
+            (
+                Edit {
+                    remove: vec![slide1, slide1],
+                    ..Edit::default()
+                },
+                "twice",
+            ),
+            (
+                Edit {
+                    add: vec![bytes("ppt/../evil.xml", b"x")],
+                    ..Edit::default()
+                },
+                "invalid entry name",
+            ),
+            (
+                Edit {
+                    remove: vec!["/abs.xml"],
+                    ..Edit::default()
+                },
+                "invalid entry name",
+            ),
+            (
+                Edit {
+                    remove: vec!["x"; MAX_EDITED_ENTRIES + 1],
+                    ..Edit::default()
+                },
+                "too many",
+            ),
+        ];
+        for (edit, expect) in cases {
+            let why = refusal(run_edit(&input, edit));
+            assert!(why.contains(expect), "{expect}: {why}");
+        }
+        let long = "x".repeat(usize::from(u16::MAX) + 1);
+        let edit = Edit {
+            add: vec![bytes(&long, b"x")],
+            ..Edit::default()
+        };
+        assert!(refusal(run_edit(&input, edit)).contains("too long"));
+    }
+
+    /// An edit to an archive this code cannot copy is refused the same way
+    /// a replacement is.
+    #[test]
+    fn refuses_adds_to_unsupported_archives() {
+        let input = deck(b"");
+        let mut bad = input.clone();
+        let eocd = bad.len() - EOCD_LEN - "deck comment".len();
+        put_u16(&mut bad, eocd + 4, 1);
+        let edit = Edit {
+            add: vec![bytes("new.xml", b"x")],
+            ..Edit::default()
+        };
+        assert!(refusal(run_edit(&bad, edit)).contains("multi-disk"));
+    }
+
+    fn noise(len: usize) -> Vec<u8> {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 32) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn streams_an_entry_from_a_reader() {
+        let input = deck(b"");
+        // A few MiB, half incompressible, read from past a prefix.
+        let mut data = noise(3 << 20);
+        data.extend(SLIDE.repeat(20_000));
+        let mut source = Cursor::new([b"skip me".as_slice(), &data].concat());
+        source.set_position(7);
+        let mut replacement = Cursor::new(SLIDE.repeat(3));
+        let edit = Edit {
+            replace: vec![EntryEdit {
+                name: "ppt/slides/slide2.xml",
+                data: EntryData::Stream(&mut replacement),
+            }],
+            add: vec![EntryEdit {
+                name: "ppt/media/media1.mp4",
+                data: EntryData::Stream(&mut source),
+            }],
+            ..Edit::default()
+        };
+        let output = run_edit(&input, edit).unwrap();
+        assert_untouched(&input, &output, &["ppt/slides/slide2.xml"]);
+        // The reader checks each entry's CRC as it reads to the end.
+        let after = contents(&output);
+        assert_eq!(after["ppt/slides/slide2.xml"], SLIDE.repeat(3));
+        assert!(after["ppt/media/media1.mp4"] == data);
+        let mut crc = flate2::Crc::new();
+        crc.update(&data);
+        let mut zip = zip::ZipArchive::new(Cursor::new(&output[..])).unwrap();
+        let file = zip.by_name("ppt/media/media1.mp4").unwrap();
+        assert_eq!(file.crc32(), crc.sum());
+        assert_eq!(file.size(), data.len() as u64);
+    }
+
+    #[test]
+    fn refuses_a_stream_over_its_cap() {
+        let mut source = Cursor::new(vec![0u8; 1025]);
+        match measure(&mut source, 1024) {
+            Err(SpliceError::Refused(why)) => assert!(why.contains("too large"), "{why}"),
+            _ => panic!("measured past the cap"),
+        }
+        let mut source = Cursor::new(vec![0u8; 1024]);
+        assert_eq!(measure(&mut source, 1024).ok().map(|f| f.size), Some(1024));
+    }
+
+    /// A source whose bytes change after the first pass.
+    struct Shifty {
+        inner: Cursor<Vec<u8>>,
+        seeks: u32,
+    }
+
+    impl Read for Shifty {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
+    impl Seek for Shifty {
+        fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+            self.seeks += 1;
+            if self.seeks == 2 {
+                self.inner.get_mut()[0] ^= 0xFF;
+            }
+            self.inner.seek(to)
+        }
+    }
+
+    #[test]
+    fn refuses_a_stream_that_changed_between_passes() {
+        let input = deck(b"");
+        let mut source = Shifty {
+            inner: Cursor::new(noise(4096)),
+            seeks: 0,
+        };
+        let edit = Edit {
+            add: vec![EntryEdit {
+                name: "ppt/media/image2.png",
+                data: EntryData::Stream(&mut source),
+            }],
+            ..Edit::default()
+        };
+        assert!(refusal(run_edit(&input, edit)).contains("changed"));
     }
 }
