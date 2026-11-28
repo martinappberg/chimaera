@@ -128,3 +128,10 @@ A plugin can ship its own HTML and JavaScript page for a drawing area that an ex
 ### Plugin web views and agents' pages that read files — why it exists
 
 *Pending:* to be captured with the maintainer through **capture-feature-intent**.
+
+### A plugin's tools and its page (API 0.4): why it exists
+_Captured 2026-11-27 from the maintainer: the wants relayed in this work's brief, and two answers asked directly._
+
+- **Problem it solves:** agents can look at, query and open a plugin's views (the genome view first) beside their chat, with nothing to configure and a seamless UI.
+- **How settled it is:** provisional. Only the why is settled; the mechanism (calls, the headless host, reveal, shapes with a view) may change as GenomeSpy and later plugins use it. Treat it as an addition, improvable.
+- **Do not change:** the platform stays general. It never grows GenomeSpy-specific code; GenomeSpy is only its first user.
