@@ -25,7 +25,7 @@ skills and connections. These are different authoring targets:
 | You want to add | Use | Start with |
 |---|---|---|
 | A workbench view, file preview/action, diagnostics, Knowledge provider, or workspace-scoped agent tool | A workbench plugin: `plugin.toml` + a WebAssembly component | The [starter below](#minimal-api-02-plugin), then the [platform reference](#the-platform-api-02) |
-| A drawing area an existing JavaScript library draws (a genome track, a molecule, a map), or a library agents' pages may import | A workbench plugin's own page: a `web` node and the `[web]` table (API 0.3) | [Web views](#web-views-api-03) |
+| A drawing area an existing JavaScript library draws (a genome track, a molecule, a map), or a library agents' pages may import | A workbench plugin's own page: a `web` node and the `[web]` table (API 0.3); tools that ask it and open it beside the agent (0.4) | [Web views](#web-views-api-03), [calls and reveal](#asking-your-page-and-opening-views-beside-the-agent-api-04) |
 | Instructions, skills, hooks or MCP connections inside an existing agent CLI | That agent's native extension package | Its own packaging/install contract; a workbench plugin may declare it in `requires.agent_plugins` or `recommends.agent_plugins` |
 | A new agent harness or structured chat driver | Chimaera's agent integration | [Agent engine map](../../crates/chimaera-agent/AGENTS.md) and [protocol](../../crates/chimaera-agent/PROTOCOL.md); a plugin manifest cannot register a harness |
 | A general workbench capability unavailable through host imports | A deliberate change to the host API | [API map](../../crates/chimaera-plugin-api/AGENTS.md), [server map](../../crates/chimaera-server/AGENTS.md), and [interface versioning](#versions-and-updates-from-the-authors-side) |
@@ -54,8 +54,9 @@ For an agent implementing a plugin, work in this order:
 5. Report commands, observed outcomes and any unverified platform or agent.
    Follow the [author checklist](#author-checklist) before releasing.
 
-The current SDK targets **API 0.3** (0.2 plus a plugin's own web pages); the
-host also serves the frozen 0.1 and 0.2 worlds.
+The current SDK targets **API 0.4** (0.2, plus a plugin's own web pages in
+0.3, plus calls to them and reveal in 0.4); the host also serves the frozen
+0.1, 0.2 and 0.3 worlds.
 For source questions, the authority is the
 [WIT](../../crates/chimaera-plugin-api/wit/chimaera.wit),
 [Rust SDK](../../crates/chimaera-plugin-api/src/lib.rs),
@@ -838,7 +839,8 @@ view"), so a release that claims a new kind asks its users again.
 ### The exports and imports
 
 `Plugin` gains `render(cx, view, args)` (the view's tree; `args` carries
-`file` for a file view, `width` `narrow`/`wide`, `slot`), `on_action(cx, view,
+`file` for a file view, `width` `narrow`/`wide`, `slot`, and from 0.4 `args`:
+what a reveal or a reference chip opened the view with), `on_action(cx, view,
 action, payload)` (the new tree, or `None` to keep it) and `tool_resume` (a
 long agent tool's final answer, [below](#programs-jobs-and-tools)). `platform::`
 has what 0.2 adds:
@@ -935,7 +937,7 @@ Data core draws with its own views; `publish` checks the shape:
 | `output/1` | `{source, output, state (building ok errors failed), label?, finished_ms?, changed_pages?, log?}` |
 | `sourcemap/1` | `{output, files: [path], records: [[file, line, page, x, y, width, height]]}`, ≤ 4 MiB, kept in the output folder |
 | `knowledge/1` | the Knowledge snapshot (see the [coordination section](../design/plugin-platform-plan.md#coordination-the-knowledge-redesign-2026-09-29)), ≤ 4 MiB |
-| `references/1` | ids it answers for: `{shapes: [{kind, pattern}], ids: [{id, key, kind, title, span?: {path, line, end_line}, view?}]}` — 1–16 shapes, each a regex source of ≤ 80 bytes with no groups or anchors; ≤ 5,000 ids a key; ≤ 4 MiB, kept in the output folder. Every id with a `span` or a `view` becomes a chip where its shape matches in chats and Knowledge: hover previews the span, a click opens it (or the plugin's view). `end_line` 0 means to the end of the file |
+| `references/1` | ids it answers for: `{shapes: [{kind, pattern, view?: {view, args_from_match}}], ids: [{id, key, kind, title, span?: {path, line, end_line}, view?}]}` — 1–16 shapes, each a regex source of ≤ 80 bytes with no groups or anchors and at most two unbounded repeats in an alternative (bound the rest: `chr[0-9XYM]{1,2}:[0-9,]{1,13}-[0-9,]{1,13}`); ≤ 5,000 ids a key; ≤ 4 MiB, kept in the output folder. Every id with a `span` or a `view` becomes a chip where its shape matches in chats and Knowledge: hover previews the span, a click opens it (or the plugin's view). `end_line` 0 means to the end of the file. A shape with a `view` (0.4) makes **every** match a chip, with no id listed: a click opens that tab view with `args_from_match` (≤ 8 strings of ≤ 200 bytes; `"<match>"` is the matched text), so a locus in chat opens the genome view there |
 
 Paths are workspace-relative or `output:<path>`. A window asks
 `GET /workspaces/{id}/surfaces/{kind}/{version}?file=` and hears a `surface`
@@ -1125,6 +1127,7 @@ your own buttons, inputs, toolbars (`.ch-toolbar`) and tables (`.ch-table`).
 | `chimaera.status({state, text})` | A small line under the page, only while it says something: `warn` and `bad` at once, `busy` once it lasts past 0.6 s; `ok` and `idle` show nothing. Report a state, never narrate what the page did. |
 | `chimaera.reference({text, file?, line?, crop?})` | A draft for the agent the person works with, with a picture: `crop` is a Blob, a canvas, or a rect of the page. Honoured only right after a press in the page; never sent on its own. |
 | `await chimaera.save(name, blob)` | Writes `output:<name>` (≤ 8 MiB, within the output quota). |
+| `chimaera.handle(method, fn)` | 0.4: answers your plugin's `web_call` to `method` with `fn(args)` (a value or a Promise, ≤ 64 KiB). Returns a function that stops it. [Below](#asking-your-page-and-opening-views-beside-the-agent-api-04). |
 
 **What the page may reach.** The page has no origin. Its CSP: scripts,
 styles and fonts from the daemon (its own bundle), `'unsafe-eval'` and
@@ -1145,6 +1148,85 @@ your plugin is on may import a declared library as
 `chimaera:lib/<name>/<file>` (a `<script src>` or an `import`). Where the
 plugin is off the import fails and the page's host offers to turn it on.
 A page that imports it may also reach your declared hosts.
+
+### Asking your page, and opening views beside the agent (API 0.4)
+
+0.4 adds three `platform` imports to 0.3's world (the host serves 0.3
+beside it, frozen in `wit-0.3/`). They let a tool look at, query and open
+the view the person sees — and look even when nobody has it open.
+`plugins/test-web` uses each one.
+
+**A call to your page.** The page answers a method with
+`chimaera.handle(method, fn)`: `fn(args)` returns a JSON value or a
+Promise of one (≤ 64 KiB; a throw is the call's error). Register handlers
+as soon as you can answer; a call that arrives first waits up to 15 s for
+its handler.
+
+```js
+chimaera.handle("look", async ({ width }) => {
+  const png = await api.exportPng(width);           // your library's own export
+  return { picture: await chimaera.save("look.png", png), region: api.region() };
+});
+```
+
+The tool names the `web` node by its view and `id` (and a file view's
+file), answers `wait_call`, and reads the answer in `tool_resume`:
+
+```rust
+fn call_tool(cx: Context, name: &str, args: Value) -> ToolResult {
+    match platform::web_call(&cx, "genome", "genome", "look", &json!({"width": 1200})) {
+        Ok(call) => ToolResult::wait_call(call, "the view is still drawing"),
+        Err(e) => ToolResult::error(e),
+    }
+}
+
+fn tool_resume(cx: Context, _name: &str, call: &str) -> ToolResult {
+    match platform::web_call_result(&cx, call) {
+        Ok(Some(v)) => ToolResult::text(format!("![the view]({})\n{}", v["picture"].as_str().unwrap_or(""), v["region"])),
+        Ok(None) => ToolResult::text("the view is still drawing"),
+        Err(why) => ToolResult::error(why),
+    }
+}
+```
+
+- **Who answers.** The window that shows that node on screen (focused
+  first). When none does, or the call says `fresh: true`
+  (`platform::web_call_with`), the daemon opens the same page in its own
+  headless Chromium — your view rendered as a window would render it, its
+  node's `data` and the window's last theme — and asks it there. Its
+  `act`, `status` and `reference` go nowhere: what the person's view
+  reports stays the person's, and it can't navigate away from its page. A
+  call to a file view names its `file`. A window that can't ask its page
+  (it stopped showing it) hands the call to the headless page; what your
+  page answered, a thrown error too, is the answer.
+- **Answer `wait_call`; never poll.** Your instance is busy while your
+  tool runs, and the headless host renders your view in it, so a tool
+  that loops on `web_call_result` blocks the very render it waits for.
+  A `render` can't call a page.
+- **Where no browser may start.** On a cluster login node (or where the
+  daemon can't tell) the headless host refuses, and the call's error says
+  so plainly: no window shows the view, open it, or open the workspace as a
+  cluster job. With no Chrome or Chromium on the host, the error names the
+  Chromium plugin and `browser.path`.
+- **Limits.** A call waits at most 45 s; an answer is at most 64 KiB (a
+  picture or a table goes through `chimaera.save` and comes back as an
+  `output:` path, which `![…](output:…)` in the answer shows the agent);
+  8 calls per plugin wait at once; at most 2 headless pages run, each
+  closed after 2 idle minutes. A finished call's answer is kept 2 minutes.
+
+**Reveal: a view beside the agent.** `platform::reveal(cx, &json!({"view":
+"genome", "args": {"locus": "chr17:7,668,402-7,687,550"}}))`, or
+`{"file": "reads/tp53.bam", "args": …}` for a file you claim, opens it
+beside the session whose tool call you are answering (never from a hook,
+an event or a render), as `browser_show`
+hands a page over: in a pane beside the session (one already showing
+your view, else an empty one, else a split), never taking the person's
+focus; a view already open shows where it is. `args` (a JSON object
+≤ 4 KiB) reach your `render` as `args.args`: put the locus in the node's
+`data`, and the running page gets it without a reload. Only from a
+session's own call, at most 4 a minute per session, each in your
+activity log; with no window connected it says so (tell the agent to
+give the person the view's name).
 
 ### Testing a 0.2 plugin
 

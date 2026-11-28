@@ -731,6 +731,7 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
       case "web_act":
       case "web_status":
       case "web_reference":
+      case "web_answer":
         params.onWeb?.(ev);
         break;
       case "crashed":

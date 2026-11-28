@@ -559,10 +559,54 @@ async fn on_in(state: &AppState, plugin: &str, ws: &str) -> bool {
 #[derive(Deserialize)]
 pub(crate) struct MintBody {
     entry: String,
+    /// The window's `chimaera-theme` (base64url JSON): kept per workspace
+    /// for the headless host's pages (`web_headless`).
+    #[serde(default)]
+    theme: Option<String>,
 }
 
-/// POST /api/v1/workspaces/{id}/plugins/{pid}/web {entry} — a page of the
-/// plugin's bundle for a `web` node: `{url}`, under a grant ticket.
+/// A page of `m`'s bundle in `ws`, under a grant: its path
+/// (`/web/{grant}/{entry}`). A grant for the same build here is renewed,
+/// not minted again, so the path stays the same.
+pub(crate) async fn mint(
+    state: &Arc<AppState>,
+    m: &Manifest,
+    ws: &str,
+    entry: &str,
+) -> Result<String, String> {
+    if !m
+        .web
+        .as_ref()
+        .is_some_and(|d| d.pages.iter().any(|p| p == entry))
+    {
+        return Err(format!("{} declares no page {entry}", m.name));
+    }
+    let dir = bundle(state, m, ws).await.inspect_err(|err| {
+        tracing::warn!(plugin = %m.id, %err, "plugin web bundle");
+    })?;
+    let grant = Grant {
+        plugin: m.id.clone(),
+        ws: ws.to_string(),
+        sha: m.wasm.sha256.clone(),
+        dir,
+    };
+    let key = format!("{}\n{}\n{}", m.id, ws, m.wasm.sha256);
+    let ticket = crate::lock(&state.plugin_platform.web.grants).mint("w", key, grant, TICKET_TTL);
+    // Still on: it was a moment ago, and a page's first loads follow.
+    crate::lock(&state.plugin_platform.web.active)
+        .insert((m.id.clone(), ws.to_string()), (true, Instant::now()));
+    Ok(format!("/web/{ticket}/{entry}"))
+}
+
+/// Whether `path` is a plugin page's (`/web/{grant}/…`): the one daemon
+/// path besides a file page's that the headless browser may load, its
+/// grant being the capability.
+pub(crate) fn is_page_path(path: &str) -> bool {
+    path.starts_with("/web/w-")
+}
+
+/// POST /api/v1/workspaces/{id}/plugins/{pid}/web {entry, theme?} — a page
+/// of the plugin's bundle for a `web` node: `{url}`, under a grant ticket.
 pub(crate) async fn mint_route(
     State(state): State<Arc<AppState>>,
     UrlPath((ws, pid)): UrlPath<(String, String)>,
@@ -572,29 +616,20 @@ pub(crate) async fn mint_route(
         Ok(m) => m,
         Err(response) => return response,
     };
-    let Some(decl) = m.web.as_ref().filter(|d| d.pages.contains(&body.entry)) else {
+    if !m
+        .web
+        .as_ref()
+        .is_some_and(|d| d.pages.contains(&body.entry))
+    {
         return super::not_found(&format!("{}'s page {}", m.name, body.entry));
-    };
-    let _ = decl;
-    let dir = match bundle(&state, &m, &ws).await {
-        Ok(dir) => dir,
-        Err(err) => {
-            tracing::warn!(plugin = %m.id, %err, "plugin web bundle");
-            return (StatusCode::BAD_GATEWAY, Json(json!({"error": err}))).into_response();
-        }
-    };
-    let grant = Grant {
-        plugin: m.id.clone(),
-        ws: ws.clone(),
-        sha: m.wasm.sha256.clone(),
-        dir,
-    };
-    let key = format!("{}\n{}\n{}", m.id, ws, m.wasm.sha256);
-    let ticket = crate::lock(&state.plugin_platform.web.grants).mint("w", key, grant, TICKET_TTL);
-    // Still on: it was a moment ago, and a page's first loads follow.
-    crate::lock(&state.plugin_platform.web.active)
-        .insert((m.id.clone(), ws.clone()), (true, Instant::now()));
-    Json(json!({"url": format!("/web/{ticket}/{}", body.entry)})).into_response()
+    }
+    if let Some(theme) = body.theme.as_deref() {
+        state.plugin_platform.web_headless.keep_theme(&ws, theme);
+    }
+    match mint(&state, &m, &ws, &body.entry).await {
+        Ok(url) => Json(json!({"url": url})).into_response(),
+        Err(err) => (StatusCode::BAD_GATEWAY, Json(json!({"error": err}))).into_response(),
+    }
 }
 
 /// A live grant whose plugin is still on in its workspace and still runs

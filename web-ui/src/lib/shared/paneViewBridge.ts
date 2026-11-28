@@ -69,13 +69,16 @@ export type NativeViewEvent =
       line: number | null;
       crop: WebCrop | null;
       title: string;
-    };
+    }
+  /** web/1, a plugin's page: its answer to its plugin's call (`handle`).
+   *  `call` is the call's id; a host takes it only for an id it sent. */
+  | { id: string; kind: "web_answer"; call: string; ok: boolean; value: unknown; error: string | null };
 
 export type WebState = "idle" | "busy" | "ok" | "warn" | "bad";
 export type WebCrop = { blob: Blob } | { dataUrl: string } | { rect: ViewRectLike };
 
 /** web/1's page events, as either transport delivers them. */
-export type WebEvent = WithoutId<Extract<NativeViewEvent, { kind: "web_act" | "web_status" | "web_reference" }>>;
+export type WebEvent = WithoutId<Extract<NativeViewEvent, { kind: "web_act" | "web_status" | "web_reference" | "web_answer" }>>;
 
 const WEB_STATES: readonly string[] = ["idle", "busy", "ok", "warn", "bad"];
 /** A `data:image/png` (or jpeg/webp) crop a native page may hand over. */
@@ -159,6 +162,17 @@ export function decodeNativeViewEvent(raw: unknown): NativeViewEvent | null {
     case "web_status":
       if (!str(raw.state) || !WEB_STATES.includes(raw.state)) return null;
       return { id, kind: "web_status", state: raw.state as WebState, text: str(raw.text) ? raw.text.slice(0, 200) : "" };
+    case "web_answer": {
+      if (!str(raw.call) || raw.call === "" || raw.call.length > 64 || !bool(raw.ok)) return null;
+      return {
+        id,
+        kind: "web_answer",
+        call: raw.call,
+        ok: raw.ok,
+        value: raw.ok ? (raw.value ?? null) : null,
+        error: raw.ok ? null : str(raw.error) ? raw.error.slice(0, 2000) : "the page failed",
+      };
+    }
     case "web_reference": {
       if (!str(raw.text)) return null;
       const title = str(raw.title) ? raw.title.replace(/\s+/g, " ").trim().slice(0, PAGE_TITLE_MAX) : "";

@@ -31,10 +31,11 @@ component; job resource limits do not isolate native filesystem/network access.
 
 | File | What |
 |---|---|
-| `wit/chimaera.wit` | The current world, package `chimaera:plugin@0.3.0`: the 0.2 world plus `host.read-at` (a workspace file from an offset) and the `web` export (`web-bundle() -> list<u8>`: a tar of the plugin's own pages and libraries, [web views](../../docs/agent-guides/plugins.md#web-views-api-03)). As in 0.2: `types`, `host` (imports as in 0.1: bounded fs, state, sessions, Timeline, emit, now, log), `platform` (imports: output folder, `publish`, `invalidate`, `watch`, `setting-get`, `state-keep`, `roots`, `job-*`, `tool-state`), `plugin` (exports as in 0.1) and `screens` (exports: `render`, `on-action`, `tool-resume`); new events and `tool-result.wait`. The daemon's `bindgen!` (`runtime::v3`) reads this file. |
+| `wit/chimaera.wit` | The current world, package `chimaera:plugin@0.4.0`: 0.3 plus three `platform` imports — `web-call` (a call id at once; the window showing the node answers, else the headless host), `web-call-result` (the answer, none while it waits, or why it failed) and `reveal` (a view or claimed file beside the calling session) — and `tool-result.wait` naming a page call too ([calls and reveal](../../docs/agent-guides/plugins.md#asking-your-page-and-opening-views-beside-the-agent-api-04)). 0.3 was the 0.2 world plus `host.read-at` (a workspace file from an offset) and the `web` export (`web-bundle() -> list<u8>`: a tar of the plugin's own pages and libraries, [web views](../../docs/agent-guides/plugins.md#web-views-api-03)). As in 0.2: `types`, `host` (imports as in 0.1: bounded fs, state, sessions, Timeline, emit, now, log), `platform` (imports: output folder, `publish`, `invalidate`, `watch`, `setting-get`, `state-keep`, `roots`, `job-*`, `tool-state`), `plugin` (exports as in 0.1) and `screens` (exports: `render`, `on-action`, `tool-resume`); new events and `tool-result.wait`. The daemon's `bindgen!` (`runtime::v4`) reads this file. |
+| `wit-0.3/chimaera.wit` | **Frozen**: `chimaera:plugin@0.3.0`, served beside 0.4 (`runtime::v3`, `invoke_v3`; its `host`/`platform` imports adapted in `hostfns.rs` `v3_host`) so a 0.3 component keeps loading. Never edit it; `plugins/api-0.3` builds the 0.3 fixture against it. |
 | `wit-0.2/chimaera.wit` | **Frozen**: `chimaera:plugin@0.2.0`, served beside 0.3 (`runtime::v2`, its `host`/`platform` imports adapted in `hostfns.rs` `v2_host`) so a 0.2 component — every first-party plugin built before 0.3 — keeps loading. Never edit it. |
 | `wit-0.1/chimaera.wit` | **Frozen**: `chimaera:plugin@0.1.0`, served beside 0.2 (`runtime::v1`) so a 0.1 component keeps loading. Never edit it; `plugins/api-0.1` builds the 0.1 fixture against it. |
-| `src/lib.rs` | `wit_bindgen::generate!` plus the ergonomic layer: the `Plugin` trait (every export has a default, 0.2's `render` / `on_action` / `tool_resume` and 0.3's `web_bundle` too, so an older plugin compiles unchanged), `export!`, `host::*` and `platform::*` wrappers (JSON parsed, fallible calls return `Result<_, String>`), `ui::*` helpers for `ui/1` trees, `ToolDef::new`, `ToolResult::text` / `error` / `wait`, `Snapshot::new`, and `serde_json` re-exported. |
+| `src/lib.rs` | `wit_bindgen::generate!` plus the ergonomic layer (0.4: `platform::web_call` / `web_call_with` (`WebCall`) / `web_call_result` / `reveal`, `ToolResult::wait_call`): the `Plugin` trait (every export has a default, 0.2's `render` / `on_action` / `tool_resume` and 0.3's `web_bundle` too, so an older plugin compiles unchanged), `export!`, `host::*` and `platform::*` wrappers (JSON parsed, fallible calls return `Result<_, String>`), `ui::*` helpers for `ui/1` trees, `ToolDef::new`, `ToolResult::text` / `error` / `wait`, `Snapshot::new`, and `serde_json` re-exported. |
 
 ## Rules
 
@@ -59,7 +60,7 @@ component; job resource limits do not isolate native filesystem/network access.
 - **WIT keywords need `%`.** `%list` is the function `list`; a type and a
   function may not share a name inside one interface (hence
   `stat as file-stat` in `host`).
-- The crate's version tracks the WIT package (0.3.0), not the daemon release.
+- The crate's version tracks the WIT package (0.4.0), not the daemon release.
 - **An old WIT is frozen, not deleted.** A bump copies the current `wit/` to
-  `wit-<old>/` first; the host binds each served version (`runtime::v1`,
-  `v2`, `v3`) and translates at the edge.
+  `wit-<old>/` first; the host binds each served version (`runtime::v1`
+  … `v4`) and translates at the edge.
