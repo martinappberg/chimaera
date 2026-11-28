@@ -11,9 +11,7 @@
 //! isolated preview. Never shipped.
 
 use chimaera_plugin_api::serde_json::{json, Value};
-use chimaera_plugin_api::{
-    host, platform, Context, Event, Plugin, ToolDef, ToolResult,
-};
+use chimaera_plugin_api::{host, platform, Context, Event, Plugin, ToolDef, ToolResult};
 
 struct Fixture;
 

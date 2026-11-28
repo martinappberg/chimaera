@@ -2318,9 +2318,9 @@ mod tests {
                 ),
                 case(
                     "browser_request_web_call",
-                    "a plugin's call to the page of a web node this window shows (reply {value}; plugins::web_calls)",
+                    "a plugin's call to the page of a web node this window shows (reply {value} or the page's {error}; a refusal means not here; plugins::web_calls)",
                     frames::browser_request(25, "web_call", None, None,
-                        fields(serde_json::json!({"plugin": "genomespy", "node_view": "data", "node": "genome",
+                        fields(serde_json::json!({"workspace": "w1", "plugin": "genomespy", "node_view": "data", "node": "genome",
                             "file": "reads/tp53.bam", "call": "wc-0123456789abcdef", "method": "look",
                             "args": {"width": 1200}}))),
                 ),

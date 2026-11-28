@@ -2024,7 +2024,7 @@
     if (!shouldActOnAgentBrowserOpen(r, view)) return;
     const root = workspace?.root ?? null;
     if (r.file !== null && root === null) return;
-    setViewArgs(r.plugin, r.view, r.file, r.args);
+    setViewArgs(r.workspaceId, r.plugin, r.view, r.file, r.args);
     const tab: Tab =
       r.file !== null
         ? { surface: "file", path: `${root!.replace(/\/+$/, "")}/${r.file}` }

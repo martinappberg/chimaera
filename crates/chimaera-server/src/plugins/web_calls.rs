@@ -134,11 +134,8 @@ pub(crate) fn parse(m: &Manifest, spec: &str) -> Result<Spec, String> {
                 return Err(format!("{} does not open {file} in {}", m.name, view.id));
             }
         }
-        (None, Slot::File) if spec.fresh => {
-            return Err(format!(
-                "{} is a file view: a fresh call names its file",
-                view.id
-            ))
+        (None, Slot::File) => {
+            return Err(format!("{} is a file view: a call names its file", view.id))
         }
         _ => {}
     }
@@ -325,7 +322,10 @@ fn bounded(v: Value) -> Result<Value, String> {
     Ok(v)
 }
 
-/// The window showing the node, else the headless host.
+/// The window showing the node, else the headless host. A window that
+/// can't ask its page (it no longer shows it, the page isn't running, the
+/// window went away) refuses, and the headless page answers instead; what
+/// the window's page answered, a failure too, is the answer.
 async fn dispatch(
     state: &Arc<AppState>,
     m: &Arc<Manifest>,
@@ -333,6 +333,7 @@ async fn dispatch(
     call: &str,
     spec: &Spec,
 ) -> Result<Value, String> {
+    use crate::agent_browser::BrowserError;
     if !spec.fresh {
         let node = WebViewRef {
             plugin: &m.id,
@@ -341,10 +342,9 @@ async fn dispatch(
             file: spec.file.as_deref(),
         };
         if let Some(socket) = state.browsers.channel.socket_with_web_view(ws, &node) {
-            match window_call(state, socket, &m.id, call, spec).await {
-                Ok(v) => return Ok(v),
-                // The window went away mid-call: a headless page answers.
-                Err(crate::agent_browser::BrowserError::Gone(_)) => {}
+            match window_call(state, socket, &m.id, ws, call, spec).await {
+                Ok(answer) => return answer,
+                Err(BrowserError::Gone(_) | BrowserError::Engine(_)) => {}
                 Err(e) => return Err(e.to_string()),
             }
         }
@@ -361,15 +361,18 @@ pub(crate) struct WebViewRef<'a> {
     pub(crate) file: Option<&'a str>,
 }
 
-/// Ask `socket`'s window: its node runs the page's handler.
+/// Ask `socket`'s window: its node runs the page's handler. The page's
+/// answer (`{value}`, or its failure `{error}`), or the window's refusal.
 async fn window_call(
     state: &AppState,
     socket: crate::agent_browser::channel::SocketId,
     plugin: &str,
+    ws: &str,
     call: &str,
     spec: &Spec,
-) -> Result<Value, crate::agent_browser::BrowserError> {
+) -> Result<Result<Value, String>, crate::agent_browser::BrowserError> {
     let fields = json!({
+        "workspace": ws,
         "plugin": plugin,
         "node_view": spec.view,
         "node": spec.id,
@@ -378,9 +381,8 @@ async fn window_call(
         "method": spec.method,
         "args": spec.args,
     });
-    let fields = match fields {
-        Value::Object(m) => m,
-        _ => unreachable!("an object"),
+    let Value::Object(fields) = fields else {
+        unreachable!("an object")
     };
     let out = state
         .browsers
@@ -391,7 +393,10 @@ async fn window_call(
             CALL_TIMEOUT,
         )
         .await?;
-    Ok(out.get("value").cloned().unwrap_or(Value::Null))
+    Ok(match out.get("error").and_then(Value::as_str) {
+        Some(error) => Err(error.chars().take(2048).collect()),
+        None => Ok(out.get("value").cloned().unwrap_or(Value::Null)),
+    })
 }
 
 /// `tool_wait` for a call: whether it finished within the hold.

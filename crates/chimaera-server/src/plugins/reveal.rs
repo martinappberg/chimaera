@@ -160,8 +160,8 @@ pub(crate) async fn reveal(
 ) -> Result<String, String> {
     let Some(session) = session.filter(|s| !s.is_empty()) else {
         return Err(
-            "reveal opens a view beside the agent session that called this plugin; this call \
-             came from no session"
+            "reveal opens a view beside the agent session whose tool call this is; this call \
+             came from no agent's tool call"
                 .into(),
         );
     };

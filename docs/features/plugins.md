@@ -661,8 +661,8 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   Chimaera's own. Settings → **Plugins** lists every installed plugin's settings (host-wide or
   per workspace), with what its output folder uses and **Clear**.
 - **Where it's wired.**
-  - **Daemon** (`crates/chimaera-server/src/plugins/`): `runtime.rs` binds both WIT worlds
-    (`v1`, `v2`) in one linker and picks by the manifest's `api`; `hostfns.rs` serves 0.1's
+  - **Daemon** (`crates/chimaera-server/src/plugins/`): `runtime.rs` binds every served WIT
+    world (`v1` … `v4`) in one linker and picks by the manifest's `api`; `hostfns.rs` serves 0.1's
     `host` through 0.2's and the new `platform` imports; `platform.rs` (the manifest tables,
     their checks, the file patterns, the per-daemon `Platform`), `screens.rs` (the `ui/1`
     check, render / action / file-action / query routes, invalidation at ≤ 4 a second),
@@ -738,7 +738,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
 
 ## Web views (API 0.3)
 
-A 0.3 plugin may ship its own HTML/JS page for a drawing area (a `web` node), and lend libraries to agents' pages; each page, library and host it declares is a line on its card's **Can** list, and web views alone keep it sandboxed. The whole feature: [web views](web-views.md); writing one: [the guide](../agent-guides/plugins.md#web-views-api-03).
+A 0.3 plugin may ship its own HTML/JS page for a drawing area (a `web` node), and lend libraries to agents' pages; each page, library and host it declares is a line on its card's **Can** list, and web views alone keep it sandboxed. From API 0.4 its tools can ask that page (`web-call`; a headless page answers when no window shows it), open its views beside the agent (`reveal`), and make every match of a `references/1` shape a chip that opens a view. The whole feature: [web views](web-views.md); writing one: [the guide](../agent-guides/plugins.md#web-views-api-03).
 
 ## Programs and tools (the privileged tier)
 

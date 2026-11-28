@@ -33,6 +33,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "chimaera-plugin-api-v0-3"
+version = "0.3.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wit-bindgen 0.63.0",
+]
+
+[[package]]
+name = "chimaera-plugin-test-api-03"
+version = "0.1.0"
+dependencies = [
+ "chimaera-plugin-api-v0-3",
+]
+
+[[package]]
 name = "chimaera-plugin-test-fixture"
 version = "0.1.0"
 dependencies = [

@@ -1050,6 +1050,15 @@ pub(crate) mod test_catalog {
         )
     }
 
+    /// A 0.3 component (`plugins/test-api-0.3`, on the frozen 0.3 SDK): the
+    /// host's 0.3 world, served beside 0.4.
+    pub(crate) fn api03() -> Arc<Manifest> {
+        add(
+            &dist_test_text("test-api-03/plugin.toml"),
+            dist_test_bytes("test-api-03/plugin.wasm"),
+        )
+    }
+
     /// The privileged fixture (`plugins/test-privileged`): programs, a
     /// tool download, a long agent tool.
     pub(crate) fn privileged() -> Arc<Manifest> {

@@ -22,6 +22,8 @@
 #   plugins/dist-test/test-web/{plugin.wasm,plugin.toml}
 #       plugins/test-web, the web views fixture (API 0.4: its own page, a
 #       library for agents' pages, a declared host).
+#   plugins/dist-test/test-api-03/{plugin.wasm,plugin.toml}
+#       plugins/test-api-0.3, a 0.3 component on the frozen plugins/api-0.3.
 #   plugins/dist-test/test-privileged/{plugin.wasm,plugin.toml}
 #       plugins/test-privileged, the programs-and-tools fixture (its tool's
 #       archive stays in its crate; the tests serve it from a fake host).
@@ -227,7 +229,8 @@ done 3<<<"$LOCKED"
 # injected: `version` equals the crate's (resolved) package version, and
 # `api` is the MAJOR.MINOR of a WIT package the host serves — the current
 # one (wit/, what chimaera-plugin-api publishes) or a frozen one it still
-# serves beside it (wit-0.1/, what plugins/api-0.1 publishes).
+# serves beside it (wit-0.1/ and wit-0.3/, what plugins/api-0.1 and
+# plugins/api-0.3 publish).
 APIS=" "
 for WIT in "$ROOT"/crates/chimaera-plugin-api/wit/chimaera.wit "$ROOT"/crates/chimaera-plugin-api/wit-*/chimaera.wit; do
   [ -f "$WIT" ] || continue

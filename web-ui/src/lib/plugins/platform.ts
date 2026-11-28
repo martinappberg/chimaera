@@ -798,11 +798,12 @@ export function setViewOpener(fn: ViewOpener | null): void {
   viewOpener = fn;
 }
 
-/** Open (or focus) a plugin's tab view, with `args` for its `render` when
- *  given (a reveal, a reference chip). False when nothing can open it. */
-export function openPluginView(plugin: string, view: string, args?: Record<string, unknown>): boolean {
+/** Open (or focus) a plugin's tab view, with `args` for its `render` in
+ *  workspace `ws` when given (a reveal, a reference chip). False when
+ *  nothing can open it. */
+export function openPluginView(plugin: string, view: string, args?: { ws: string; args: Record<string, unknown> }): boolean {
   if (viewOpener === null) return false;
-  if (args !== undefined) setViewArgs(plugin, view, null, args);
+  if (args !== undefined) setViewArgs(args.ws, plugin, view, null, args.args);
   viewOpener(plugin, view);
   return true;
 }
@@ -810,22 +811,22 @@ export function openPluginView(plugin: string, view: string, args?: Record<strin
 /**
  * The args a view was last opened with (`render`'s `args`): a reveal or a
  * reference chip says what to show ({"locus": …}); the open screen draws
- * again with them. Kept for this page's life only, per plugin, view and
- * file: a gesture, not layout state.
+ * again with them. Kept for this page's life only, per workspace, plugin,
+ * view and file: a gesture, not layout state.
  */
 const viewArgsStore = writable<ReadonlyMap<string, Record<string, unknown>>>(new Map());
 export const viewArgs: Readable<ReadonlyMap<string, Record<string, unknown>>> = { subscribe: viewArgsStore.subscribe };
 /** How many views' args are kept (the oldest goes first). */
 const VIEW_ARGS_MAX = 64;
 
-export function viewArgsKey(plugin: string, view: string, file: string | null): string {
-  return `${plugin}\n${view}\n${file ?? ""}`;
+export function viewArgsKey(ws: string, plugin: string, view: string, file: string | null): string {
+  return `${ws}\n${plugin}\n${view}\n${file ?? ""}`;
 }
 
-export function setViewArgs(plugin: string, view: string, file: string | null, args: Record<string, unknown>): void {
+export function setViewArgs(ws: string, plugin: string, view: string, file: string | null, args: Record<string, unknown>): void {
   viewArgsStore.update((m) => {
     const next = new Map(m);
-    const key = viewArgsKey(plugin, view, file);
+    const key = viewArgsKey(ws, plugin, view, file);
     next.delete(key);
     next.set(key, args);
     while (next.size > VIEW_ARGS_MAX) next.delete(next.keys().next().value as string);

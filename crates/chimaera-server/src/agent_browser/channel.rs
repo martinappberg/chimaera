@@ -64,6 +64,10 @@ pub(crate) struct Hello {
 /// file view's file (workspace-relative).
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
 pub(crate) struct HelloWebView {
+    /// The workspace whose screen shows it (a window can move between
+    /// workspaces while a node is still listed).
+    #[serde(default)]
+    pub(crate) workspace: Option<String>,
     pub(crate) plugin: String,
     pub(crate) view: String,
     pub(crate) id: String,
@@ -336,7 +340,8 @@ impl Channel {
                     .web_views
                     .iter()
                     .any(|w| {
-                        w.plugin == node.plugin
+                        w.workspace.as_deref().is_none_or(|ws| ws == workspace)
+                            && w.plugin == node.plugin
                             && w.view == node.view
                             && w.id == node.id
                             && node.file.is_none_or(|f| w.file.as_deref() == Some(f))
@@ -662,6 +667,7 @@ mod tests {
         use crate::plugins::web_calls::WebViewRef;
         let channel = Channel::default();
         let shows = |file: Option<&str>| HelloWebView {
+            workspace: Some("w1".into()),
             plugin: "gs".into(),
             view: "data".into(),
             id: "genome".into(),

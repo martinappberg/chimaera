@@ -53,7 +53,7 @@
   let { ws, wsRoot, plugin, view, file = undefined, compact = false, fill = false }: Props = $props();
 
   /** What a reveal or a reference chip last opened this view with. */
-  const args = $derived($viewArgs.get(viewArgsKey(plugin, view, file ?? null)));
+  const args = $derived($viewArgs.get(viewArgsKey(ws, plugin, view, file ?? null)));
   let result = $state<RenderResult | null>(null);
   /** A file view always fills; any other view when its tree asks (`fill`). */
   const fills = $derived(fill || (result?.ok === true && result.tree.fill === true && !compact));

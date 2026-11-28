@@ -1,0 +1,17 @@
+# FROZEN: the 0.3 guest API (chimaera:plugin@0.3.0), for the 0.3 test fixture
+# only (the host serves 0.3 beside 0.4; the daemon's tests prove it). A copy of
+# crates/chimaera-plugin-api as it was at 0.3.0, reading the host's frozen
+# 0.3 WIT. Plugins depend on it renamed as `chimaera-plugin-api`, so the
+# fixture's code is 0.3 code.
+[package]
+name = "chimaera-plugin-api-v0-3"
+version = "0.3.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wit-bindgen = "0.63"

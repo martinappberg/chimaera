@@ -116,6 +116,19 @@
     };
   });
 
+  // A new theme: the daemon keeps the window's latest for the headless
+  // pages that answer this plugin's calls when no window shows its view.
+  // (Not on mount: the grant's own first mint carries it.)
+  let mintedTheme: string | null = null;
+  $effect(() => {
+    const theme = $pageTheme;
+    const first = mintedTheme === null;
+    mintedTheme = theme;
+    const want = untrack(() => entry);
+    if (first || theme === "" || want === "" || !untrack(() => vis.shown)) return;
+    void mintWebPage(screen.ws, screen.plugin, want, theme).catch(() => {});
+  });
+
   // On screen: one of the window's most recent; hidden for long: closed.
   $effect(() => {
     if (vis.shown) {
@@ -145,6 +158,7 @@
     const key = nodeId;
     if (key === null || !live || !loaded || !vis.shown) return;
     const unregister = registerWebCallTarget({
+      workspace: screen.ws,
       plugin: screen.plugin,
       view: screen.view,
       id: key,

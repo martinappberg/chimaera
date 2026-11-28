@@ -43,7 +43,8 @@
 //   view (or from the daemon itself, in the headless host).
 // - Calls (web/1, API 0.4): `handle(method, fn)` answers its plugin's
 //   `web-call`. A `call` command `{id, method, args}` runs `fn(args)` (a
-//   value or a Promise) and posts `web_answer {id, ok, value | error}`; a
+//   value or a Promise) and posts `web_answer {call, ok, value | error}`
+//   (`call` is the command's id: a message's own `id` is its view's); a
 //   call that comes before its handler waits for one up to `CALL_WAIT_MS`.
 //   The host accepts an answer only for an id it sent.
 (() => {
@@ -239,9 +240,9 @@
       if (outcome.ok && text !== undefined && text.length > ANSWER_MAX) {
         outcome = { ok: false, error: `the answer is ${Math.round(text.length / 1024)} KiB, over 64 KiB: save a picture or a table with chimaera.save and answer its path` };
       }
-      if (outcome.ok) msg = { kind: "web_answer", id, ok: true, value: JSON.parse(text ?? "null") };
+      if (outcome.ok) msg = { kind: "web_answer", call: id, ok: true, value: JSON.parse(text ?? "null") };
     }
-    msg ??= { kind: "web_answer", id, ok: false, error: String(outcome.error).slice(0, 2000) };
+    msg ??= { kind: "web_answer", call: id, ok: false, error: String(outcome.error).slice(0, 2000) };
     post(msg);
   };
   const run = (id, fn, args) => {

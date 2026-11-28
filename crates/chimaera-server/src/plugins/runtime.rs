@@ -546,6 +546,19 @@ pub(super) struct CallScope {
     pub(super) cx: wit::Context,
     /// `log` lines this call wrote (capped per call).
     pub(super) logs: usize,
+    /// What the host is calling: some imports answer only some exports
+    /// (`reveal` only an agent's tool, `web-call` never a `render`).
+    pub(super) kind: CallKind,
+}
+
+/// The export a call is in, as the imports that care see it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CallKind {
+    /// `call-tool` or `tool-resume`: an agent's own call.
+    Tool,
+    /// `render`: drawing a view (which the headless host itself asks for).
+    Render,
+    Other,
 }
 
 impl WasiView for HostState {
@@ -581,13 +594,14 @@ impl HostState {
         }
     }
 
-    fn begin(&mut self, app: &Arc<AppState>, cx: &wit::Context, budget: Duration) {
+    fn begin(&mut self, app: &Arc<AppState>, cx: &wit::Context, budget: Duration, kind: CallKind) {
         self.deadline = Instant::now() + budget;
         self.stderr.clear();
         self.call = Some(CallScope {
             app: app.clone(),
             cx: cx.clone(),
             logs: 0,
+            kind,
         });
     }
 
@@ -1301,6 +1315,11 @@ impl PluginRuntime {
             }
         };
         let budget = self.budget(&call);
+        let kind = match &call {
+            Call::Tool(..) | Call::ToolResume(..) => CallKind::Tool,
+            Call::Render(..) => CallKind::Render,
+            _ => CallKind::Other,
+        };
         let cx = wit::Context {
             workspace: ws.to_string(),
             session: session.map(str::to_string),
@@ -1336,7 +1355,7 @@ impl PluginRuntime {
                     UpdateDeadline::Interrupt
                 })
             });
-            store.data_mut().begin(state, &cx, budget);
+            store.data_mut().begin(state, &cx, budget, kind);
             store.set_epoch_deadline(1);
             let made = tokio::time::timeout(budget + HOST_GRACE, async {
                 match &pre {
@@ -1375,7 +1394,7 @@ impl PluginRuntime {
         // closed window's request) drops the instance with it, instead of
         // leaving one wasmtime can't enter again to trap the next call.
         let mut live = guard.take().expect("instantiated above");
-        live.store.data_mut().begin(state, &cx, budget);
+        live.store.data_mut().begin(state, &cx, budget, kind);
         live.store.set_epoch_deadline(1);
         let outcome = tokio::time::timeout(budget + HOST_GRACE, invoke(&mut live, &cx, call)).await;
         live.store.data_mut().end();

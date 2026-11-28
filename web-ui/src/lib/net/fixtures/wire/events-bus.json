@@ -396,10 +396,11 @@
         "rid": 25,
         "tab": null,
         "type": "browser_request",
-        "view": null
+        "view": null,
+        "workspace": "w1"
       },
       "name": "browser_request_web_call",
-      "note": "a plugin's call to the page of a web node this window shows (reply {value}; plugins::web_calls)"
+      "note": "a plugin's call to the page of a web node this window shows (reply {value} or the page's {error}; a refusal means not here; plugins::web_calls)"
     },
     {
       "frame": {

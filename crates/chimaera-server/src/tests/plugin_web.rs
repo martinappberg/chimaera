@@ -532,6 +532,7 @@ fn fake_window(
         .set_workspace(id, Some(ws.to_string()));
     let web_views = if shows {
         vec![HelloWebView {
+            workspace: Some(ws.to_string()),
             plugin: PID.into(),
             view: "board".into(),
             id: "fixture".into(),
@@ -586,12 +587,15 @@ async fn a_call_is_answered_by_the_window_that_shows_its_node() {
                 }
                 let rid = f["rid"].as_u64().unwrap();
                 seen.push(f.clone());
+                // The page's own answers (a failure too) are results; a
+                // refusal means the window can't ask its page.
                 let outcome = match f["method"].as_str() {
                     Some("ping") => Ok(json!({"value": {"pong": true, "item": null}})),
-                    _ => Err("the fixture failed on purpose".to_string()),
+                    Some("fail") => Ok(json!({"error": "the fixture failed on purpose"})),
+                    _ => Err("this window no longer shows that view".to_string()),
                 };
                 state.browsers.channel.reply(socket, rid, outcome);
-                if seen.len() == 2 {
+                if seen.len() == 3 {
                     return seen;
                 }
             }
@@ -610,8 +614,17 @@ async fn a_call_is_answered_by_the_window_that_shows_its_node() {
         text_of(&failed).contains("the fixture failed on purpose"),
         "{failed}"
     );
+    // The window refuses (it stopped showing the node): the headless host
+    // answers instead — here a login node, which refuses plainly.
+    state.compute.assume_login_node();
+    let refused = ask(&state, &ws, json!({"method": "late"})).await;
+    assert!(
+        text_of(&refused).contains("cluster login node"),
+        "{refused}"
+    );
     let seen = window.await.unwrap();
     assert_eq!(seen[0]["op"], "web_call");
+    assert_eq!(seen[0]["workspace"], ws);
     assert_eq!(seen[0]["plugin"], PID);
     assert_eq!(seen[0]["node_view"], "board");
     assert_eq!(seen[0]["node"], "fixture");
@@ -666,8 +679,8 @@ fn a_call_names_a_declared_view_and_a_short_method() {
             "64 KiB",
         ),
         (
-            json!({"view": "doc", "id": "fixture", "method": "ping", "fresh": true}),
-            "a fresh call names its file",
+            json!({"view": "doc", "id": "fixture", "method": "ping"}),
+            "a call names its file",
         ),
         (
             json!({"view": "doc", "id": "fixture", "method": "ping", "file": "a.csv"}),
@@ -718,7 +731,7 @@ async fn a_reveal_opens_a_view_beside_the_session_four_a_minute() {
     let (_socket, mut rx) = fake_window(&state, &ws, false);
     let no_session = show(&state, &ws, None, json!({})).await;
     assert!(
-        text_of(&no_session).contains("came from no session"),
+        text_of(&no_session).contains("came from no agent's tool call"),
         "{no_session}"
     );
 
@@ -799,4 +812,42 @@ async fn a_view_renders_with_its_args_and_a_shape_opens_it() {
         text.contains(r#""args_from_match":{"item":"<match>"}"#),
         "{text}"
     );
+}
+
+/// A plugin built against API 0.3 keeps running beside 0.4, through the
+/// frozen world's own bindings: its tool (with 0.3's `host.read-at` and
+/// state), its `wait` answer, and its view.
+#[tokio::test]
+async fn a_0_3_component_runs_beside_0_4() {
+    let m = crate::plugins::test_catalog::api03();
+    assert_eq!(m.api, "0.3");
+    let state = test_state();
+    let ws = make_workspace(&state, "api-03").await;
+    switch(&state, &ws, "test-api-03", true).await;
+    let root = lock(&state.workspaces).get(&ws).unwrap().root;
+    std::fs::write(root.join("a.txt"), "0123456789abcdef").unwrap();
+    let call = |args: Value| {
+        let (state, m, ws) = (state.clone(), m.clone(), ws.clone());
+        async move {
+            state
+                .plugin_runtime
+                .call_tool(&state, &m, &ws, "s-api-03", "echo03", &args)
+                .await
+        }
+    };
+    let answer = call(json!({"text": "hi ", "path": "a.txt", "offset": 10})).await;
+    assert_eq!(text_of(&answer), "0.3 says hi abcdef", "{answer}");
+    // A `wait` on a job that never was: the hold ends at once and the
+    // plugin's own words stand.
+    let waited = call(json!({"wait": true})).await;
+    assert_eq!(text_of(&waited), "still waiting", "{waited}");
+    let (status, body) = request(
+        &state,
+        Method::GET,
+        &format!("/api/v1/workspaces/{ws}/plugins/test-api-03/views/board"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.to_string().contains("last: hi "), "{body}");
 }

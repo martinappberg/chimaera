@@ -95,6 +95,8 @@ export interface BrowserHello {
 /** One plugin web node a window shows (a file view's file is
  *  workspace-relative). */
 export interface HelloWebView {
+  /** The workspace whose screen shows it. */
+  workspace: string;
   plugin: string;
   view: string;
   id: string;
@@ -128,7 +130,10 @@ export function sameHello(a: BrowserHello | null, b: BrowserHello): boolean {
 function sameWebViews(a: HelloWebView[], b: HelloWebView[]): boolean {
   return (
     a.length === b.length &&
-    a.every((w, i) => w.plugin === b[i].plugin && w.view === b[i].view && w.id === b[i].id && w.file === b[i].file)
+    a.every(
+      (w, i) =>
+        w.workspace === b[i].workspace && w.plugin === b[i].plugin && w.view === b[i].view && w.id === b[i].id && w.file === b[i].file,
+    )
   );
 }
 

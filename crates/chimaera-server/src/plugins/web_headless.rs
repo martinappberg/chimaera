@@ -44,10 +44,15 @@ const THEMES_MAX: usize = 64;
 struct Page {
     /// The engine's page key.
     key: String,
-    /// What it shows: the entry, the build, and its data (as sent).
-    entry: String,
+    /// What it shows: the page's path (its grant and entry), the build,
+    /// and its data (as sent). An empty path: still opening.
+    path: String,
     sha: Arc<str>,
     data: String,
+    /// The theme it was last given (its URL's, then a `theme` command).
+    theme: String,
+    /// Calls it is answering now: a busy page is never closed for room.
+    busy: usize,
     used: Instant,
 }
 
@@ -94,6 +99,14 @@ pub(crate) fn login_node_text(view: &str) -> String {
     )
 }
 
+/// Why one try at a headless page didn't answer.
+enum Miss {
+    /// The page (or the browser) went away: open it again, once.
+    Gone,
+    /// Anything else, in words for the plugin.
+    Failed(String),
+}
+
 /// Answer `spec` from a headless page.
 pub(crate) async fn call(
     state: &Arc<AppState>,
@@ -116,23 +129,81 @@ pub(crate) async fn call(
     }
     let (entry, data) = render_node(state, m, ws, spec, decl.slot.as_str()).await?;
     let key = page_key(&m.id, ws, &spec.view, &spec.id, spec.file.as_deref());
+    for attempt in 0..2 {
+        match ask(state, m, ws, call, spec, &title, &entry, &data, &key).await {
+            Ok(v) => return Ok(v),
+            Err(Miss::Failed(why)) => return Err(why),
+            Err(Miss::Gone) => {
+                forget(state, &key);
+                if attempt == 1 {
+                    return Err(format!(
+                        "No Chimaera window shows {title}, and its headless page closed twice \
+                         while it answered."
+                    ));
+                }
+            }
+        }
+    }
+    unreachable!("the loop returns")
+}
+
+/// One try: the page open and current (opened, or told its new data and
+/// theme), then the call.
+#[allow(clippy::too_many_arguments)]
+async fn ask(
+    state: &Arc<AppState>,
+    m: &Arc<Manifest>,
+    ws: &str,
+    call: &str,
+    spec: &Spec,
+    title: &str,
+    entry: &str,
+    data: &Value,
+    key: &str,
+) -> Result<Value, Miss> {
+    use crate::agent_browser::BrowserError;
     let engine = &state.browsers.chromium;
-    let unable = |e: crate::agent_browser::BrowserError| {
-        format!("No Chimaera window shows {title}, and the headless browser couldn't answer: {e}")
+    let headless = &state.plugin_platform.web_headless;
+    let miss = |e: BrowserError| match e {
+        BrowserError::Gone(_) => Miss::Gone,
+        e => Miss::Failed(format!(
+            "No Chimaera window shows {title}, and the headless browser couldn't answer: {e}"
+        )),
     };
     {
-        let _one = state.plugin_platform.web_headless.opening.lock().await;
-        let path = super::web::mint(state, m, ws, &entry).await?;
-        let fresh = {
-            let pages = crate::lock(&state.plugin_platform.web_headless.pages);
-            pages
-                .get(&key)
-                .is_none_or(|p| p.entry != entry || p.sha != m.wasm.sha256)
-        };
+        let _one = headless.opening.lock().await;
+        let path = super::web::mint(state, m, ws, entry)
+            .await
+            .map_err(Miss::Failed)?;
+        let fresh = crate::lock(&headless.pages)
+            .get(key)
+            .is_none_or(|p| p.path != path || p.sha != m.wasm.sha256);
         if fresh {
-            close_over(state, PAGES_MAX - 1, &key).await;
+            make_room(state, key).map_err(Miss::Failed)?;
+            // Recorded before it opens, so a page whose open is cut short
+            // (the call's time ran out) is still closed by the reaper.
+            let theme = headless.theme(ws).unwrap_or_default();
+            crate::lock(&headless.pages).insert(
+                key.to_string(),
+                Page {
+                    key: key.to_string(),
+                    path: String::new(),
+                    sha: m.wasm.sha256.clone(),
+                    data: String::new(),
+                    theme: theme.clone(),
+                    busy: 0,
+                    used: Instant::now(),
+                },
+            );
+            // `/web/{grant}/`: what its main frame may load from now on (set
+            // first, so this navigation passes when the page already exists).
+            let prefix = path
+                .rsplit_once('/')
+                .map(|(dir, _)| format!("{dir}/"))
+                .unwrap_or_else(|| path.clone());
+            engine.pin(key, &prefix);
             let mut query = String::from("?api=1");
-            if let Some(theme) = state.plugin_platform.web_headless.theme(ws) {
+            if !theme.is_empty() {
                 query.push_str("&chimaera-theme=");
                 query.push_str(&theme);
             }
@@ -145,76 +216,78 @@ pub(crate) async fn call(
                 .act(
                     state,
                     Some(ws),
-                    &key,
+                    key,
                     Action::Open {
                         url,
                         width: WIDTH,
                         height: HEIGHT,
                     },
                 )
-                .await
-                .map_err(unable)?;
+                .await;
+            let opened = match opened {
+                Ok(out) => out,
+                Err(e) => {
+                    close_later(state, key);
+                    return Err(miss(e));
+                }
+            };
+            engine.pin(key, &prefix);
             if let ActionOut::Value(v) = &opened {
                 let status = v["status"].as_u64().unwrap_or(200);
                 if status >= 400 {
-                    return Err(format!(
+                    close_later(state, key);
+                    return Err(Miss::Failed(format!(
                         "No Chimaera window shows {title}, and the headless page didn't load \
                          (HTTP {status})."
-                    ));
+                    )));
                 }
             }
-            crate::lock(&state.plugin_platform.web_headless.pages).insert(
-                key.clone(),
-                Page {
-                    key: key.clone(),
-                    entry: entry.clone(),
-                    sha: m.wasm.sha256.clone(),
-                    data: String::new(),
-                    used: Instant::now(),
-                },
-            );
+            if let Some(p) = crate::lock(&headless.pages).get_mut(key) {
+                p.path = path;
+            }
         }
-        // The node's data, when it changed (a new page has none yet), and
-        // the page shown: the host's word, as a window gives it.
+        // The node's data, when it changed (a new page has none yet), the
+        // window's theme, when that changed, and the page shown: the
+        // host's word, as a window gives it.
         let sent = data.to_string();
-        let stale = {
-            let mut pages = crate::lock(&state.plugin_platform.web_headless.pages);
-            match pages.get_mut(&key) {
+        let theme = headless.theme(ws).unwrap_or_default();
+        let (stale, new_theme) = {
+            let mut pages = crate::lock(&headless.pages);
+            match pages.get_mut(key) {
                 Some(p) => {
                     p.used = Instant::now();
-                    let stale = p.data != sent;
+                    let changed = (p.data != sent, p.theme != theme);
                     p.data = sent.clone();
-                    stale
+                    p.theme = theme.clone();
+                    changed
                 }
-                None => true,
+                None => return Err(Miss::Gone),
             }
         };
-        if stale {
-            let host = engine
+        if stale || new_theme {
+            engine
                 .act(
                     state,
                     Some(ws),
-                    &key,
+                    key,
                     Action::Eval {
                         world: World::Page,
                         body: HOST_SCRIPT.to_string(),
-                        args: json!({"data": data}),
+                        args: json!({"data": data, "theme": if new_theme { Some(theme) } else { None }}),
                         timeout_ms: 5_000,
                     },
                 )
-                .await;
-            if let Err(e) = host {
-                forget(state, &key);
-                return Err(unable(e));
-            }
+                .await
+                .map_err(miss)?;
         }
     }
+    let _busy = Busy::start(state, key);
     let ms = super::web_calls::CALL_TIMEOUT.as_millis() as u64 - 2_000;
     let answer = engine
         .act(
             state,
             Some(ws),
-            &key,
+            key,
             Action::Eval {
                 world: World::Page,
                 body: CALL_SCRIPT.to_string(),
@@ -222,20 +295,87 @@ pub(crate) async fn call(
                 timeout_ms: ms + 1_000,
             },
         )
-        .await;
-    if let Some(p) = crate::lock(&state.plugin_platform.web_headless.pages).get_mut(&key) {
-        p.used = Instant::now();
-    }
+        .await
+        .map_err(miss)?;
     match answer {
-        Ok(ActionOut::Value(msg)) => answer_of(&msg),
-        Ok(_) => Err("the headless page gave no answer".into()),
-        Err(e) => {
-            if matches!(e, crate::agent_browser::BrowserError::Gone(_)) {
-                forget(state, &key);
-            }
-            Err(unable(e))
+        ActionOut::Value(msg) => answer_of(&msg).map_err(Miss::Failed),
+        _ => Err(Miss::Failed("the headless page gave no answer".into())),
+    }
+}
+
+/// A call in flight on a page: it is not closed for room meanwhile.
+struct Busy {
+    state: Arc<AppState>,
+    key: String,
+}
+
+impl Busy {
+    fn start(state: &Arc<AppState>, key: &str) -> Self {
+        if let Some(p) = crate::lock(&state.plugin_platform.web_headless.pages).get_mut(key) {
+            p.busy += 1;
+            p.used = Instant::now();
+        }
+        Busy {
+            state: state.clone(),
+            key: key.to_string(),
         }
     }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        if let Some(p) =
+            crate::lock(&self.state.plugin_platform.web_headless.pages).get_mut(&self.key)
+        {
+            p.busy = p.busy.saturating_sub(1);
+            p.used = Instant::now();
+        }
+    }
+}
+
+/// Room for one more page besides `key`: the least recently used idle
+/// pages are forgotten now and closed off this path; when every other page
+/// is answering, there is none.
+fn make_room(state: &Arc<AppState>, key: &str) -> Result<(), String> {
+    let victims: Vec<String> = {
+        let mut pages = crate::lock(&state.plugin_platform.web_headless.pages);
+        let others = pages.values().filter(|p| p.key != key).count();
+        let need = (others + 1).saturating_sub(PAGES_MAX);
+        let mut idle: Vec<(Instant, String)> = pages
+            .values()
+            .filter(|p| p.key != key && p.busy == 0)
+            .map(|p| (p.used, p.key.clone()))
+            .collect();
+        if idle.len() < need {
+            return Err(format!(
+                "the headless host is answering {PAGES_MAX} other views now; try again in a moment"
+            ));
+        }
+        idle.sort();
+        let victims: Vec<String> = idle.into_iter().take(need).map(|(_, k)| k).collect();
+        for v in &victims {
+            pages.remove(v);
+        }
+        victims
+    };
+    for key in victims {
+        close_later(state, &key);
+    }
+    Ok(())
+}
+
+/// Forget the page and close it in the background (its own lock may be
+/// held by a call that is ending).
+fn close_later(state: &Arc<AppState>, key: &str) {
+    forget(state, key);
+    let (state, key) = (state.clone(), key.to_string());
+    tokio::spawn(async move {
+        let _ = state
+            .browsers
+            .chromium
+            .act(&state, None, &key, Action::Close)
+            .await;
+    });
 }
 
 /// The page's `web_answer` as the call's outcome.
@@ -303,35 +443,7 @@ pub(crate) fn find_web_node<'a>(tree: &'a Value, id: &str) -> Option<&'a Value> 
 /// The engine's key for one node's page.
 fn page_key(plugin: &str, ws: &str, view: &str, id: &str, file: Option<&str>) -> String {
     let what = format!("{plugin}\n{ws}\n{view}\n{id}\n{}", file.unwrap_or(""));
-    format!("webview:{}", &super::web::fnv(what.as_bytes()))
-}
-
-/// Close the least recently used pages until at most `keep` are open
-/// besides `except`.
-async fn close_over(state: &Arc<AppState>, keep: usize, except: &str) {
-    let victims: Vec<String> = {
-        let pages = crate::lock(&state.plugin_platform.web_headless.pages);
-        let mut others: Vec<(&Instant, &String)> = pages
-            .values()
-            .filter(|p| p.key != except)
-            .map(|p| (&p.used, &p.key))
-            .collect();
-        others.sort();
-        let n = others.len().saturating_sub(keep);
-        others.into_iter().take(n).map(|(_, k)| k.clone()).collect()
-    };
-    for key in victims {
-        close(state, &key).await;
-    }
-}
-
-async fn close(state: &Arc<AppState>, key: &str) {
-    forget(state, key);
-    let _ = state
-        .browsers
-        .chromium
-        .act(state, None, key, Action::Close)
-        .await;
+    format!("webview:{}", super::web::fnv(what.as_bytes()))
 }
 
 fn forget(state: &AppState, key: &str) {
@@ -343,11 +455,11 @@ fn forget(state: &AppState, key: &str) {
 pub(crate) async fn reap(state: &Arc<AppState>) {
     let idle: Vec<String> = crate::lock(&state.plugin_platform.web_headless.pages)
         .values()
-        .filter(|p| p.used.elapsed() >= IDLE)
+        .filter(|p| p.busy == 0 && p.used.elapsed() >= IDLE)
         .map(|p| p.key.clone())
         .collect();
     for key in idle {
-        close(state, &key).await;
+        close_later(state, &key);
     }
 }
 
@@ -355,6 +467,7 @@ pub(crate) async fn reap(state: &Arc<AppState>) {
 /// that it is shown.
 const HOST_SCRIPT: &str = r#"
 const say = (cmd) => document.dispatchEvent(new CustomEvent("chimaera:host", { detail: JSON.stringify(cmd) }));
+if (typeof theme === "string" && theme !== "") say({ op: "theme", theme });
 say({ op: "data", data });
 say({ op: "visibility", visible: true });
 return true;
@@ -368,7 +481,7 @@ return await new Promise((resolve) => {
     if (typeof e.detail !== "string") return;
     let msg;
     try { msg = JSON.parse(e.detail); } catch { return; }
-    if (msg === null || msg.kind !== "web_answer" || msg.id !== id) return;
+    if (msg === null || msg.kind !== "web_answer" || msg.call !== id) return;
     done(msg);
   };
   const done = (msg) => {

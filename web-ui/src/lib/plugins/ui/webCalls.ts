@@ -8,6 +8,11 @@
  * sends its page a `call` command and resolves with the page's
  * `web_answer` — only an answer to an id it sent, at most once.
  *
+ * What the page answered, a failure included, is the reply's result
+ * (`{value}` or `{error}`). A refusal is only for "not here": no such node
+ * shown, its page not running or gone — and the daemon then asks a
+ * headless page instead.
+ *
  * Pure (no DOM, no Svelte), so it is unit-tested.
  */
 
@@ -15,13 +20,19 @@ import type { HelloWebView } from "../../net/browserWire";
 
 /** What a shown node offers: run `method` on its page. */
 export interface WebCallTarget {
+  /** The workspace the node's screen belongs to. */
+  workspace: string;
   plugin: string;
   view: string;
   id: string;
   file: string | null;
-  /** Send the page a call; resolves with its value, rejects with its error. */
-  call(callId: string, method: string, args: unknown): Promise<unknown>;
+  /** Send the page a call: what it answered (a failure too); rejects only
+   *  when the page can't be asked here. */
+  call(callId: string, method: string, args: unknown): Promise<PageAnswer>;
 }
+
+/** What a page answered a call. */
+export type PageAnswer = { ok: true; value: unknown } | { ok: false; error: string };
 
 /** How long a page may take before the window gives up (the daemon gives
  *  up at 45 s; this answers a little before it). */
@@ -55,7 +66,7 @@ export function onWebViewsChanged(fn: () => void): () => void {
 export function webViews(): HelloWebView[] {
   const seen = new Map<string, HelloWebView>();
   for (const t of targets) {
-    const w = { plugin: t.plugin, view: t.view, id: t.id, file: t.file };
+    const w = { workspace: t.workspace, plugin: t.plugin, view: t.view, id: t.id, file: t.file };
     seen.set(JSON.stringify(w), w);
   }
   return [...seen.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([, w]) => w);
@@ -63,18 +74,26 @@ export function webViews(): HelloWebView[] {
 
 const text = (v: unknown): v is string => typeof v === "string" && v !== "";
 
-/** A `web_call` request's fields: run it on the node it names. Rejects
- *  (the reply's error) when no node here shows it. */
-export async function dispatch(f: Record<string, unknown>): Promise<{ value: unknown }> {
+/** A `web_call` request's fields: run it on the node it names. The reply's
+ *  result is `{value}` or the page's `{error}`; it rejects (a refusal, which
+ *  the daemon answers headless) only when no node here can be asked. */
+export async function dispatch(f: Record<string, unknown>): Promise<{ value: unknown } | { error: string }> {
   if (!text(f.plugin) || !text(f.node_view) || !text(f.node) || !text(f.call) || !text(f.method)) {
     throw new Error("malformed web call");
   }
   const file = text(f.file) ? f.file : null;
+  const workspace = text(f.workspace) ? f.workspace : null;
   const target = [...targets].find(
-    (t) => t.plugin === f.plugin && t.view === f.node_view && t.id === f.node && (file === null || t.file === file),
+    (t) =>
+      t.plugin === f.plugin &&
+      t.view === f.node_view &&
+      t.id === f.node &&
+      (file === null || t.file === file) &&
+      (workspace === null || t.workspace === workspace),
   );
   if (target === undefined) throw new Error("this window no longer shows that view");
-  return { value: await target.call(f.call, f.method, f.args ?? null) };
+  const answer = await target.call(f.call, f.method, f.args ?? null);
+  return answer.ok ? { value: answer.value } : { error: answer.error };
 }
 
 /**
@@ -83,15 +102,18 @@ export async function dispatch(f: Record<string, unknown>): Promise<{ value: unk
  * never sent, or one already settled — is ignored).
  */
 export class PendingCalls {
-  private readonly pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+  private readonly pending = new Map<string, { resolve: (v: PageAnswer) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
 
-  start(callId: string, send: () => boolean, timeoutMs = CALL_TIMEOUT_MS): Promise<unknown> {
+  /** Send a call: what the page answers, a time-out as the page's failure
+   *  (there is no time left to ask elsewhere); rejects when the page can't
+   *  be asked (not running, too many waiting, gone). */
+  start(callId: string, send: () => boolean, timeoutMs = CALL_TIMEOUT_MS): Promise<PageAnswer> {
     if (this.pending.has(callId)) return Promise.reject(new Error("that call is already running"));
     if (this.pending.size >= PENDING_MAX) return Promise.reject(new Error("too many calls are waiting on this page"));
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(callId);
-        reject(new Error("the page didn't answer in time"));
+        resolve({ ok: false, error: "the page didn't answer in time" });
       }, timeoutMs);
       this.pending.set(callId, { resolve, reject, timer });
       if (!send()) {
@@ -107,8 +129,7 @@ export class PendingCalls {
     if (p === undefined) return false;
     this.pending.delete(callId);
     clearTimeout(p.timer);
-    if (ok) p.resolve(value);
-    else p.reject(new Error(error ?? "the page failed"));
+    p.resolve(ok ? { ok: true, value } : { ok: false, error: error ?? "the page failed" });
     return true;
   }
 

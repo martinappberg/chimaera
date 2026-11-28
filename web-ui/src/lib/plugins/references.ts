@@ -149,7 +149,7 @@ export function pluginSource(refs: PluginRefs, name: string, root: string | null
           title: id,
           note: [id, kind, name].filter((x, i, every) => every.indexOf(x) === i).join(" · "),
           open: () => {
-            openPluginView(refs.plugin, sv.view, args);
+            if (ws !== null) openPluginView(refs.plugin, sv.view, { ws, args });
           },
         },
       ];

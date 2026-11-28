@@ -163,11 +163,11 @@ export function decodeNativeViewEvent(raw: unknown): NativeViewEvent | null {
       if (!str(raw.state) || !WEB_STATES.includes(raw.state)) return null;
       return { id, kind: "web_status", state: raw.state as WebState, text: str(raw.text) ? raw.text.slice(0, 200) : "" };
     case "web_answer": {
-      if (!str(raw.id) || raw.id === "" || raw.id.length > 64 || !bool(raw.ok)) return null;
+      if (!str(raw.call) || raw.call === "" || raw.call.length > 64 || !bool(raw.ok)) return null;
       return {
         id,
         kind: "web_answer",
-        call: raw.id,
+        call: raw.call,
         ok: raw.ok,
         value: raw.ok ? (raw.value ?? null) : null,
         error: raw.ok ? null : str(raw.error) ? raw.error.slice(0, 2000) : "the page failed",

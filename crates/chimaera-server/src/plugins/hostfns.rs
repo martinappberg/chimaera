@@ -36,7 +36,7 @@ use serde_json::{json, Value};
 
 use super::capabilities::{FilesAccess, SessionsAccess, TimelineAccess};
 use super::runtime::v4::chimaera::plugin::{host, platform};
-use super::runtime::{v1, v2, v3, wit, CallScope, HostState, EVENT_MAX};
+use super::runtime::{v1, v2, v3, wit, CallKind, CallScope, HostState, EVENT_MAX};
 use crate::timeline;
 
 /// A read's ceiling, whatever `cap` the plugin asks for.
@@ -1400,7 +1400,15 @@ impl platform::Host for HostState {
     }
 
     async fn web_call(&mut self, _cx: wit::Context, spec: String) -> Result<String, String> {
-        let app = self.scope()?.app.clone();
+        let scope = self.scope()?;
+        // The headless host renders the view to find its node: a render
+        // that asked a page would ask a render again.
+        if scope.kind == CallKind::Render {
+            return Err(
+                "a view's render can't call a page; call it from a tool or an action".into(),
+            );
+        }
+        let app = scope.app.clone();
         let m = self
             .manifest
             .clone()
@@ -1422,7 +1430,13 @@ impl platform::Host for HostState {
 
     async fn reveal(&mut self, _cx: wit::Context, spec: String) -> Result<String, String> {
         let scope = self.scope()?;
-        let (app, session) = (scope.app.clone(), scope.cx.session.clone());
+        // Only an agent's own call (its tool, or that tool's resume) opens
+        // a view beside it: never a hook, an event or a render.
+        let session = match scope.kind {
+            CallKind::Tool => scope.cx.session.clone(),
+            _ => None,
+        };
+        let app = scope.app.clone();
         let m = self
             .manifest
             .clone()
