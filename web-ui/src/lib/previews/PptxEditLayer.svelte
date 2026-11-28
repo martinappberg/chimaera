@@ -72,6 +72,7 @@
   import { untrack } from "svelte";
   import type { DeckEdits } from "./pptxEditStore.svelte";
   import { LINE_BREAK, PptxXmlError, readText, readTexts, readXfrm, type Xfrm } from "./pptxXml";
+  import { drawnShapeEl, textBodyOf } from "./pptxTag";
 
   interface Props {
     edits: DeckEdits;
@@ -203,20 +204,12 @@
     }
   }
 
-  /** The renderer's element for shape `it`: the positioned div at its box.
-   *  The renderer tags no ids, so it's found by geometry; the later of two
-   *  shapes sharing a box wins (it is drawn on top). */
+  /** The renderer's element for shape `it`: the one the view tagged with its
+   *  id (`pptxTag.ts`), else the positioned div at its box (the later of two
+   *  shapes sharing a box wins: it is drawn on top). */
   function drawnShape(it: EditItem): HTMLElement | null {
     const root = slideEl();
-    if (root === null) return null;
-    const near = (a: string, b: number) => Math.abs(parseFloat(a) - b) < 0.75;
-    let found: HTMLElement | null = null;
-    for (const el of Array.from(root.querySelectorAll<HTMLElement>("div"))) {
-      const st = el.style;
-      if (st.position !== "absolute") continue;
-      if (near(st.left, it.x) && near(st.top, it.y) && near(st.width, it.w) && near(st.height, it.h)) found = el;
-    }
-    return found;
+    return root === null ? null : drawnShapeEl(root, it.id, it);
   }
 
   // --- gestures ------------------------------------------------------------------
@@ -666,13 +659,6 @@
       const t = p.replace(NBSP, " ");
       return t.endsWith(LINE_BREAK) ? t.slice(0, -1) : t;
     });
-  }
-
-  function textBodyOf(shape: HTMLElement): HTMLElement | null {
-    for (const el of Array.from(shape.querySelectorAll<HTMLElement>("div"))) {
-      if (el.style.display === "flex" && el.style.flexDirection === "column") return el;
-    }
-    return null;
   }
 
   /**
