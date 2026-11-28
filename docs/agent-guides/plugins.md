@@ -1104,9 +1104,9 @@ The bundle never ships in Chimaera.
 
 `entry` (one of `pages`) and `label` are required. `data` (≤ 64 KiB) reaches
 the page as `chimaera.data`. A new `key`, or new `data`, reaches the running
-page without a reload. The node fills its slot like `pdf`, under a slim head
-with its label and the page's status pill. A host that doesn't know `web`
-draws `fallback`.
+page without a reload. The page fills its slot with no chrome of the host's
+around it: no head, no frame (the tab or screen already names it; `label` is
+its accessible name). A host that doesn't know `web` draws `fallback`.
 
 **The page.** The host appends `window.chimaera` to the page; read it from
 `DOMContentLoaded` or later. Link `chimaera:web.css` for the app's look on
@@ -1119,7 +1119,7 @@ your own buttons, inputs, toolbars (`.ch-toolbar`) and tables (`.ch-table`).
 | `chimaera.visibility`, `onVisibility(fn)` | Whether the page is shown. **Stop drawing while hidden.** |
 | `await chimaera.url(path)` | A URL your page `fetch`es, by Range too: a workspace path (needs `[access] files = "read"`; never `..` or a link) or `output:<path>`. It stays valid while the page keeps using it. |
 | `chimaera.act(action, payload)` | Your plugin's `on_action` for the view, or a built-in action. At most ten a second. |
-| `chimaera.status({state, text})` | The pill in the node's head: `idle`, `busy`, `ok`, `warn`, `bad`. |
+| `chimaera.status({state, text})` | A small line under the page, only while it says something: `warn` and `bad` at once, `busy` once it lasts past 0.6 s; `ok` and `idle` show nothing. Report a state, never narrate what the page did. |
 | `chimaera.reference({text, file?, line?, crop?})` | A draft for the agent the person works with, with a picture: `crop` is a Blob, a canvas, or a rect of the page. Honoured only right after a press in the page; never sent on its own. |
 | `await chimaera.save(name, blob)` | Writes `output:<name>` (≤ 8 MiB, within the output quota). |
 

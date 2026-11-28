@@ -1199,6 +1199,11 @@
     flex-direction: column;
     min-width: 0;
   }
+  /* A plugin's own page fills its slot: no frame of the screen's around it. */
+  .rich.web {
+    border: none;
+    border-radius: 0;
+  }
   .rich.tall {
     height: 480px;
   }

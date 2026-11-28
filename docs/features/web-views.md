@@ -20,7 +20,7 @@ A plugin can ship its own HTML and JavaScript page for a drawing area that an ex
 
 ## A plugin's own page
 
-- **What & when.** A plugin draws a drawing area with a JavaScript library, inside its own `ui/1` screen. Everything around the page (its label, its status pill, the screen's other nodes) stays core's.
+- **What & when.** A plugin draws a drawing area with a JavaScript library, inside its own `ui/1` screen. The page fills its slot with no head or frame of the host's: its tab or screen names it, and its `label` is its accessible name. The screen's other nodes stay core's.
 - **How it's used.**
   1. A 0.3 plugin declares `[web] pages`, `libraries` and `network`, and returns its bundle from `web_bundle()`.
   2. One of its views returns a `web` node: `entry`, `label`, `data`, `key`, `id` and `fallback`.
@@ -45,6 +45,8 @@ A plugin can ship its own HTML and JavaScript page for a drawing area that an ex
     - `output:` paths are always the plugin's own.
   - **`save(name, blob)`.** It writes `output:<name>`: at most 8 MiB, charged to the output quota.
   - **Host commands.** `data`, `visibility` and `theme` reach the running page without a reload: a `postMessage` command into a frame, or `native_view_command` into the app's view (a `chimaera:host` event).
+  - **Status.** `chimaera.status` shows only while it says something: a small line under the page for `warn` and `bad`, and for `busy` once it lasts past 0.6 s. `ok` and `idle` show nothing.
+  - **The cursor (the app).** A pointer move over a page's native view goes to that view alone (`mac.rs` `move_monitor`). Otherwise the window's own web view, whose tracking area covers the view, also set the cursor at each move, and it flickered between the two.
   - **Limits.** At most 4 live web views run per window. The least recently shown view closes first and keeps a still. A view hidden for 2 minutes closes.
 - **How to extend it.** Add a `web/1` call in `page_api.js` and the host's handler (`WebNode.svelte` `onWeb`). Decode a new page event in `paneViewBridge.ts`, and gate it in `paneFrame.ts` and `pane_bridge.js`. Keep the [guide](../agent-guides/plugins.md#web-views-api-03) in step.
 - **Acceptance checks.**

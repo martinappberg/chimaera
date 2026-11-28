@@ -21,12 +21,11 @@ fn pings(cx: &Context) -> u64 {
         .unwrap_or(0)
 }
 
-/// The board: a heading and the web node, whose `data` carries the pings
+/// The board: the web node alone, whose `data` carries the pings
 /// so far (a new `key` delivers it to the running page without a reload).
 fn board(cx: &Context) -> Value {
     let n = pings(cx);
     json!({"ui": "1", "fill": true, "root": {"type": "stack", "children": [
-        {"type": "text", "text": format!("The page has pinged {n} times."), "tone": "neutral"},
         {"type": "web", "entry": "view.html", "id": "fixture", "label": "Web fixture page",
          "data": {"greeting": "hello from the plugin", "pings": n, "file": "sample.csv"},
          "key": n,

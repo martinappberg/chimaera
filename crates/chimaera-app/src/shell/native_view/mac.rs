@@ -171,6 +171,8 @@ thread_local! {
     static PANES: RefCell<HashMap<String, Pane>> = RefCell::new(HashMap::new());
     /// The wheel monitor is installed (once, for the app's life).
     static WHEEL_MONITOR: Cell<bool> = const { Cell::new(false) };
+    /// The pointer monitor is installed (once, for the app's life).
+    static MOVE_MONITOR: Cell<bool> = const { Cell::new(false) };
 }
 
 define_class!(
@@ -703,6 +705,90 @@ fn clip_view(mtm: MainThreadMarker) -> Retained<NSView> {
     view
 }
 
+/// A pointer move over a shown view goes to that view alone. AppKit hands a
+/// move to every tracking area under the pointer, and a view lies inside the
+/// owner's web view, whose own tracking area covers it: both web processes
+/// then set the cursor at each move (the page a hand over its button, the
+/// owner an arrow over the placeholder under it), and it flickers between
+/// the two. Over a view the move goes to its tracking-area owner (a
+/// `WKWebView` ignores `mouseMoved:` itself, `agent::hover`) and the owner
+/// never sees it; everywhere else it passes untouched.
+fn move_monitor() {
+    if MOVE_MONITOR.with(|on| on.replace(true)) {
+        return;
+    }
+    let block = RcBlock::new(|event: NonNull<NSEvent>| -> *mut NSEvent {
+        // SAFETY: AppKit hands a live event for the duration of the call.
+        let ev = unsafe { event.as_ref() };
+        let taken = catch_unwind(AssertUnwindSafe(|| {
+            view_under(ev).is_some_and(|wk| pointer_to(&wk, ev))
+        }))
+        .unwrap_or(false);
+        if taken {
+            std::ptr::null_mut()
+        } else {
+            event.as_ptr()
+        }
+    });
+    // SAFETY: the handler returns the event it was given or null. The
+    // monitor stays for the app's life (one per app, nothing to remove).
+    let monitor = unsafe {
+        NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::MouseMoved, &block)
+    };
+    std::mem::forget(monitor);
+}
+
+/// Deliver a pointer move to `wk`'s tracking-area owner; false when it has
+/// none that takes one (the move then goes its usual way).
+fn pointer_to(wk: &WKWebView, ev: &NSEvent) -> bool {
+    let me: *const AnyObject = (wk as *const WKWebView).cast();
+    for area in wk.trackingAreas().iter() {
+        let Some(owner) = area.owner() else { continue };
+        if std::ptr::eq(Retained::as_ptr(&owner), me) {
+            continue;
+        }
+        // SAFETY: `respondsToSelector:` on a live object; `mouseMoved:` is
+        // NSResponder's, taking an NSEvent, once it says it responds.
+        unsafe {
+            let responds: bool = msg_send![&*owner, respondsToSelector: objc2::sel!(mouseMoved:)];
+            if responds {
+                let _: () = msg_send![&*owner, mouseMoved: ev];
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The shown view (not an agent's own) whose visible box is under `ev`'s
+/// pointer, in `ev`'s window.
+fn view_under(ev: &NSEvent) -> Option<Retained<WKWebView>> {
+    let mtm = MainThreadMarker::new()?;
+    let window = ev.window(mtm)?;
+    let at = ev.locationInWindow();
+    PANES.with(|panes| {
+        panes.borrow().values().find_map(|pane| {
+            if pane.agent || pane.clip.isHidden() || pane.wk.isHidden() {
+                return None;
+            }
+            let same = pane
+                .clip
+                .window()
+                .is_some_and(|w| Retained::as_ptr(&w) == Retained::as_ptr(&window));
+            if !same {
+                return None;
+            }
+            let p = pane.clip.convertPoint_fromView(at, None);
+            let b = pane.clip.bounds();
+            let inside = p.x >= b.origin.x
+                && p.y >= b.origin.y
+                && p.x < b.origin.x + b.size.width
+                && p.y < b.origin.y + b.size.height;
+            inside.then(|| pane.wk.clone())
+        })
+    })
+}
+
 /// The owner page under a passive view takes its wheel: a scroll there goes
 /// to the owner's web view, which hit-tests the card's placeholder and
 /// scrolls the transcript around it. Hover and clicks still reach the view.
@@ -818,6 +904,7 @@ pub(super) fn show(
         agent,
     } = how;
     on_owner(owner, move |owner_wk, mtm| {
+        move_monitor();
         if passive {
             wheel_monitor();
         }

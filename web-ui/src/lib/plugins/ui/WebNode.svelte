@@ -6,8 +6,9 @@
   /**
    * The `web` node (docs/design/rich-views-plan.md, Part 2): a page of the
    * plugin's own bundle, for a drawing area a JavaScript library draws (a
-   * genome track, a molecule). Only the drawing area is web: the head (its
-   * label and the page's status pill) and everything around it stay core's.
+   * genome track, a molecule). Only the drawing area is web, and it fills
+   * its slot: no head of its own (its tab or screen already names it; the
+   * label is its accessible name). Everything around it stays core's.
    *
    * The page runs where agents' pages run: a native view of its own in the
    * macOS app (`shared/paneView.ts`), else a sandboxed frame inside the
@@ -16,7 +17,9 @@
    * page hears its node's `data` (on load, and again when it or `key`
    * changes), whether it is shown, and the theme — all without a reload
    * (`PaneViewControl.command`). What it asks back: `act` → the screen's
-   * action (the plugin's `on_action`, or a built-in), `status` → the pill,
+   * action (the plugin's `on_action`, or a built-in), `status` → a small
+   * line under the page only while it says something (`warn` or `bad`, or
+   * `busy` past `BUSY_AFTER_MS`; `ok` and `idle` show nothing),
    * `reference` → a draft with a picture for the agent the person works
    * with.
    *
@@ -66,6 +69,22 @@
   let crashed = $state(false);
   let loaded = $state(false);
   let status = $state<{ state: WebState; text: string } | null>(null);
+  /** A `busy` shows only once it has lasted this long: a quick load says
+   *  nothing. */
+  const BUSY_AFTER_MS = 600;
+  let busyShown = $state(false);
+  $effect(() => {
+    busyShown = false;
+    if (status?.state !== "busy") return;
+    const timer = setTimeout(() => (busyShown = true), BUSY_AFTER_MS);
+    return () => clearTimeout(timer);
+  });
+  /** What the line under the page says, when it says anything. */
+  const said = $derived(
+    status === null || status.state === "ok" || status.state === "idle" || (status.state === "busy" && !busyShown)
+      ? null
+      : status,
+  );
   let still = $state<{ src: string; width: number; height: number } | null>(null);
   /** Hidden longer than `PARKED_MS`: its page is closed. */
   let parked = $state(false);
@@ -192,15 +211,6 @@
 </script>
 
 <div class="web" bind:this={box} role="group" aria-label={label}>
-  <div class="head">
-    <span class="label">{label}</span>
-    {#if status !== null}
-      <span class="status s-{status.state}" title={status.text}>
-        {#if status.state === "busy"}<span class="spin" aria-hidden="true"></span>{/if}
-        {status.text !== "" ? status.text : status.state}
-      </span>
-    {/if}
-  </div>
   <div class="stage">
     {#if error !== null}
       <div class="note bad">{error}</div>
@@ -251,6 +261,14 @@
       <div class="note"><SlowLoad after={300}>loading…</SlowLoad></div>
     {/if}
   </div>
+  {#if said !== null}
+    <!-- Under the page, never over it (nothing draws over a native view),
+         and only while there is something to say. -->
+    <div class="said s-{said.state}" role="status">
+      {#if said.state === "busy"}<span class="spin" aria-hidden="true"></span>{/if}
+      <span class="said-text">{said.text !== "" ? said.text : said.state === "busy" ? "working…" : said.state}</span>
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -261,47 +279,26 @@
     height: 100%;
     min-height: 0;
   }
-  .head {
+  .said {
     display: flex;
     align-items: center;
-    gap: 8px;
-    height: 28px;
+    gap: 6px;
     flex: none;
-    padding: 0 10px;
-    border-bottom: 1px solid var(--edge);
+    min-width: 0;
+    padding: 3px 10px;
     font-size: var(--text-xs);
     color: var(--muted);
   }
-  .label {
-    flex: 1;
-    min-width: 0;
+  .said-text {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-  .status {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    max-width: 50%;
-    padding: 0 8px;
-    border: 1px solid var(--edge);
-    border-radius: 999px;
-    line-height: 18px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .s-ok {
-    color: var(--ok, var(--fg));
   }
   .s-warn {
     color: var(--warn);
-    border-color: color-mix(in srgb, var(--warn) 40%, var(--edge));
   }
   .s-bad {
     color: var(--err);
-    border-color: color-mix(in srgb, var(--err) 40%, var(--edge));
   }
   .spin {
     width: 8px;

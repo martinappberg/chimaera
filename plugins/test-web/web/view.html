@@ -87,7 +87,6 @@
           $("shown").textContent = visible ? "shown" : "hidden";
           log(`visibility: ${visible}`);
         });
-        api.status({ state: "ok", text: "ready" });
 
         $("read").onclick = async () => {
           try {
@@ -95,7 +94,6 @@
             const url = await api.url(file);
             const r = await fetch(url, { headers: { Range: "bytes=0-15" } });
             log(`read ${file}: ${r.status} ${JSON.stringify(await r.text())}`);
-            api.status({ state: "ok", text: `read ${file}` });
           } catch (err) {
             log(`read refused: ${err.message}`);
             api.status({ state: "warn", text: "read refused" });
