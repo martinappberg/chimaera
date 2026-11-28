@@ -982,7 +982,8 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   resolved against the slide's theme; line and font colour (by box or by paragraph) recolour the
   outline and the text (on all three, a theme colour the effect names lighter or darker plays as
   the plain theme colour, as PowerPoint's own show does, and an RGB colour keeps its shade); darken, lighten, desaturate and complementary colour shift a solid
-  fill, each stop of a gradient, the outline and the text (a picture fill gets a CSS filter
+  fill, a gradient (which goes solid in its first stop's colour, as PowerPoint's film shows: it
+  writes `fill.type solid` beside each), the outline and the text (a picture fill gets a CSS filter
   instead, named in the tooltip). Every click ends on exactly its build state, and its motion
   ends there too (each animation's last frame is the landed value). Nothing animates on back,
   Home, End, a dot or strip jump, a window joining, browsing, the presenter's own view (its now
