@@ -1968,12 +1968,18 @@
     flex-direction: column;
   }
 
+  /* A pane too narrow for one row takes a second: nothing is squeezed (a
+     counter that wrapped mid-number, a button that broke its words) and
+     nothing is cut off. The spacer fills the first row, so what wraps lines
+     up on the right like the row above it. */
   .slides-bar {
     flex: none;
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
-    gap: 0.35rem;
-    height: 26px;
+    justify-content: flex-end;
+    gap: 0 0.35rem;
+    min-height: 26px;
     padding: 0 0.5rem 0 0.4rem;
     border-bottom: 1px solid var(--edge);
     font-size: var(--text-xs);
@@ -1982,7 +1988,9 @@
   }
 
   .count {
+    flex: none;
     min-width: 4.5ch;
+    white-space: nowrap;
     text-align: center;
     font-family: var(--mono);
     font-variant-numeric: tabular-nums;
@@ -2004,6 +2012,7 @@
   }
 
   .limits {
+    flex: none;
     display: inline-flex;
     align-items: center;
     gap: 0.3rem;
@@ -2099,6 +2108,7 @@
     padding: 0.1rem 0.45rem;
     border-radius: 4px;
     white-space: nowrap;
+    flex: none;
     transition:
       background-color 0.12s ease,
       color 0.12s ease;
