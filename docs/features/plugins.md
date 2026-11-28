@@ -104,10 +104,12 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   [agent browser](agent-browser.md#engines-and-how-one-is-chosen) on a host with none, downloaded
   only from its Tools' Install), **Manimble** (a Manimble deck's slides beside its code in the
   [slide viewer for plugin decks](#plugin-screens-files-and-settings-the-02-platform), and `manimble_slides`
-  shows agents the slides they write), and **GenomeSpy** (`genomespy_inspect` reads a BAM, VCF,
-  BigWig, BigBed, GFF3 or FASTA header: its build, chromosome naming, samples and indexes;
-  `genomespy_check` finds what would break a `*.genomespy.json` view, by line; `genomespy_guide`
-  teaches the grammar). The daemon carries none of them: each is
+  shows agents the slides they write), and **GenomeSpy** (a `*.genomespy.json` opens as a live
+  genome view and BAM, BigWig, BigBed, VCF, GFF3 and FASTA files as generated ones, drawn by its
+  own [web view](web-views.md); `genomespy_inspect` reads a data file's header: its build,
+  chromosome naming, samples and indexes; `genomespy_check` finds what would break a view, by
+  line; `genomespy_where` says where the person is looking; `genomespy_guide` teaches the
+  grammar). The daemon carries none of them: each is
   listed as *available* until the user installs it on this host
   ([below](#versions-installs--updates)).
 - **How it's used.** Open Extensions from the rail's **Extensions** row or quick-open
@@ -255,7 +257,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     in separate repositories and install from locked releases; the daemon carries no plugin
     bytes. Capability trust, both WIT worlds, plugin screens and file views, query routes,
     switch events, program jobs and tool downloads are implemented (sections below).
-    LaTeX, Typst, PowerPoint, Chromium, Manimble and GenomeSpy use the 0.2 platform. **Browse** remains disabled, "later".
+    LaTeX, Typst, PowerPoint, Chromium and Manimble use the 0.2 platform, and GenomeSpy the 0.3 one (web views). **Browse** remains disabled, "later".
 
 ## The plugin host
 
