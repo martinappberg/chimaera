@@ -169,7 +169,7 @@
         </button>
       {/if}
       {#if operation.accepts_code}
-        <!-- The page shows a code to bring back (Claude). -->
+        <!-- The page shows a code to bring back (Claude, Antigravity). -->
         <form class="paste" onsubmit={(e) => { e.preventDefault(); void submitCode(); }}>
           <input bind:value={code} placeholder="Paste the code the page shows" spellcheck="false" autocomplete="off" disabled={busy} aria-label="Code from the sign-in page" />
           <button class="opt" type="submit" disabled={busy || code.trim() === ""}>Continue</button>
