@@ -4,6 +4,7 @@ import { attr, scan, type XmlEl } from "./pptxXml";
 import {
   buildStates,
   effectName,
+  extractTiming,
   goldenSlide,
   parseTimeline,
   pathEnd,
@@ -123,6 +124,30 @@ describe("the PowerPoint timing corpus", () => {
       golden(`cases/${name}.json`, caseGolden(name));
     });
   }
+
+  it("reads the same timeline from a slide's extract as from the whole part", async () => {
+    const same = (xml: string, label: string) => {
+      const ex = extractTiming(xml);
+      const tl = ex.source !== null ? parseTimeline(ex.source) : ex.timeline!;
+      expect(goldenSlide("p", 0, tl), label).toEqual(goldenSlide("p", 0, parseTimeline(xml)));
+      if (ex.source !== null) expect(ex.source.length, label).toBeLessThan(xml.length);
+    };
+    for (const name of DECKS) {
+      const zip = await JSZip.loadAsync(fs.readFileSync(new URL(`decks/${name}.pptx`, CORPUS)));
+      for (const s of await deckSlides(zip)) same(s.xml, `${name} ${s.part}`);
+    }
+    for (const name of CASES) same(caseXml(name), name);
+  });
+
+  it("reads a slide's show flag in its extract, and a part past the cap at once", () => {
+    const ns = 'xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"';
+    expect(extractTiming(`<p:sld ${ns} show="0"><p:cSld/></p:sld>`).hidden).toBe(true);
+    expect(extractTiming(`<p:sld ${ns}><p:cSld/></p:sld>`)).toEqual({ source: `<p:sld ${ns}></p:sld>`, timeline: null, hidden: false });
+    const big = extractTiming(`<p:sld ${ns}><p:cSld>${"x".repeat(TIMING_CAPS.partBytes + 1)}</p:cSld></p:sld>`);
+    expect(big.source).toBe(null);
+    expect(big.timeline?.approximate).toBe("part-too-large");
+    expect(extractTiming("<p:sld").timeline?.approximate).toBe("unreadable");
+  });
 
   it("starts an after effect when everything before it in its step has ended", async () => {
     for (const name of DECKS) {

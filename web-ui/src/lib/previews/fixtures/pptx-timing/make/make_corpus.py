@@ -27,6 +27,7 @@ from pptx import Presentation
 from pptx.chart.data import CategoryChartData
 from pptx.enum.chart import XL_CHART_TYPE
 from pptx.enum.shapes import MSO_CONNECTOR, MSO_SHAPE
+from pptx.enum.text import MSO_AUTO_SIZE
 from pptx.util import Inches, Pt
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -57,6 +58,17 @@ def row(names, kind="rect"):
 
 
 THREE = ["First point", "Second point", "Third point"]
+
+# A font no system ships: PowerPoint and browsers each substitute their own.
+MISSING_FONT = "Chimaera Corpus Missing Sans"
+LONG = [
+    "A first point that runs on long enough to wrap across the width of its box",
+    "A second point, with more words than the box was drawn to hold at first",
+    "Third: the box grows to fit, so its drawn height is not the file's height",
+    "Fourth, carrying on in the same way so the text keeps pushing downwards",
+    "Fifth, still more words, measured in whatever font stands in for the missing one",
+    "Sixth and last, which ends the list a good way below where the box began",
+]
 
 DECKS = {
     "entrances": [
@@ -267,6 +279,23 @@ DECKS = {
             "transition": {"effect": "morph by char"},
         },
     ],
+    # Text boxes that grow to fit their text (spAutoFit), set in a font no
+    # machine has, so every renderer measures them in its own fallback font
+    # and draws the box at its own size, not the file's.
+    "autofit": [
+        {
+            "shapes": [("Grows", "text", {"text": LONG, "box": (0.6, 0.8, 7.5, 1.0), "autofit": True,
+                                          "font": MISSING_FONT, "size": 24})],
+            "fx": [("Grows", "fade", "click", {"level": "first"})],
+        },
+        {
+            "shapes": [("Heading", "text", {"text": ["A heading long enough to wrap onto a second line in any font"],
+                                            "box": (0.6, 0.4, 6.0, 0.6), "autofit": True,
+                                            "font": MISSING_FONT, "size": 40}),
+                       ("Under", "rect", {"box": (0.6, 4.6, 3.0, 1.6)})],
+            "fx": [("Heading", "fade", "click", {}), ("Under", "fade", "click", {})],
+        },
+    ],
     # No animation, and saved by PowerPoint: what happens to the ids python-pptx
     # wrote (see agent-written-raw.pptx, the same deck before PowerPoint).
     "agent-written": [
@@ -300,12 +329,16 @@ def add_shape(slide, name, kind, opts, box):
         sh = shapes.add_textbox(x, y, w, h)
         tf = sh.text_frame
         tf.word_wrap = True
+        if opts.get("autofit"):
+            tf.auto_size = MSO_AUTO_SIZE.SHAPE_TO_FIT_TEXT
         for i, item in enumerate(opts.get("text", [name])):
             level, text = item if isinstance(item, tuple) else (0, item)
             p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
             p.text = text
             p.level = level
-            p.runs[0].font.size = Pt(28 - 4 * level)
+            p.runs[0].font.size = Pt(opts.get("size", 28) - 4 * level)
+            if "font" in opts:
+                p.runs[0].font.name = opts["font"]
     elif kind == "table":
         sh = shapes.add_table(2, 3, x, y, w, h)
         for r in range(2):
