@@ -7,6 +7,7 @@ Decks whose animations and transitions were written by PowerPoint itself, and th
 - `decks/*.pptx`: the corpus. Small, synthetic, no real content.
 - `goldens/<deck>.json`: what each deck parses to (format below); `goldens/cases/<case>.json`: what each case parses to (one slide, `part` the case's file name, `id` 0). Written by `npm --prefix web-ui run timing:golden` from the TypeScript parser, then checked by a person against PowerPoint's own slide show, once. A rule about what PowerPoint does must cite a file PowerPoint saved (a deck in `decks/`) or a frame of PowerPoint's own exported film; a rule without one is a guess, not a contract (R18's first wording, "paths add up", was such a guess and the film disproved it). After that it changes only through a reviewed diff.
 - `cases/*.xml`: hand-written slide parts for what the scripting model can't make and for the rules' edges, written by `make/make_cases.py` in the structure of the corpus decks' own slide XML (and ECMA-376 for the on-shape-click sequence). They are **not yet confirmed against a PowerPoint save**: `interactive-trigger` (an on-shape-click sequence whose shape the main sequence later shows too), `bg-paragraphs` (a filled box built by paragraph: `:bg`, paragraphs, then the whole shape leaves), `repeat-autorev`, `default-trigger`, `empty-group`, `over-nesting`, `transition-plain`, `transition-unknown-choice`, `path-edges`, `hostile-strings`, `xml-semantics` (R23a, R29's prefixed attributes), `colour-caps` (R21's colour caps), `held-nonfinite` (R31), `anim-keys` (R28's keyframes), `paragraph-order` (R31's paragraphs over overlapping ranges, R32's body).
+- `fallbacks.json`: what the viewer plays as a fade (below).
 - `make/make_corpus.py`: rebuilds the decks. python-pptx lays out named shapes; PowerPoint for Mac, driven in the background through its scripting model, adds the effects and transitions and saves. Needs a Mac with PowerPoint. Rerunning it changes ids inside the files, so regenerate the goldens with it.
 
 | Deck | Covers |
@@ -59,6 +60,10 @@ One name per effect, shared by both parsers, the plugin's timeline text and its 
 Fly and wipe carry `dir`, the side from the subtype (`top` `right` `bottom` `left`); every other effect has `dir: null`.
 
 Transitions: `none` (an empty `p:transition`), `fade`, `fade-black` (`p:fade thruBlk="1"`), `push`, `wipe`, `cut`, `morph` (`p159:morph`), `other`; `dir` is the transition element's `dir` as PowerPoint writes it (`l` `r` `u` `d`; absent means its default, `null`).
+
+## Played as a fade
+
+`fallbacks.json` lists the transition filters (`p:animEffect filter`, by the name before any parenthesis) that the viewer does not draw as PowerPoint does, each with the effect names that use it and why. An entrance or exit using one plays as a fade over its duration and lands on its state; every other filter in ECMA-376's grammar (`barn`, `blinds`, `box`, `circle`, `diamond`, `fade`, `plus`, `wheel`, `wipe`, with their subtypes) is drawn. The plugin reads this list to tell an agent what a deck will not look like in the viewer; `pptxMotion.test.ts` fails when the viewer falls back on a filter not listed or draws one that is. Beyond filters, a behaviour the viewer cannot read (an attribute it does not animate, a value that is not a number or a formula it knows, a part that never ends) makes its entrance or exit fade and its emphasis play nothing; the slide's tooltip names each.
 
 ## Golden format
 

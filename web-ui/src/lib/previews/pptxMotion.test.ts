@@ -458,3 +458,36 @@ describe("what a hostile deck can cost", () => {
     }
   });
 });
+
+describe("the contract's played-as-a-fade list (fixtures/pptx-timing/fallbacks.json)", () => {
+  // Every filter ECMA-376 names for p:animEffect, with each subtype.
+  const UNIVERSE = [
+    ...["inVertical", "inHorizontal", "outVertical", "outHorizontal"].map((s) => `barn(${s})`),
+    "blinds(horizontal)", "blinds(vertical)", "box(in)", "box(out)",
+    "checkerboard(across)", "checkerboard(down)", "circle(in)", "circle(out)",
+    "diamond(in)", "diamond(out)", "dissolve", "fade", "plus(in)", "plus(out)",
+    "randombar(horizontal)", "randombar(vertical)",
+    ...["fromTop", "fromBottom", "fromLeft", "fromRight"].map((s) => `slide(${s})`),
+    ...["downLeft", "upLeft", "downRight", "upRight"].map((s) => `strips(${s})`),
+    "wedge", ...[1, 2, 3, 4, 8].map((n) => `wheel(${n})`),
+    "wipe(up)", "wipe(down)", "wipe(left)", "wipe(right)",
+  ];
+  const listed = (JSON.parse(new TextDecoder().decode(fs.readFileSync(new URL("fallbacks.json", CORPUS)))) as { filters: { filter: string }[] }).filters.map((f) => f.filter);
+  const entrance = (filter: string): Effect => ({
+    trigger: "click", start: 0, dur: 500, presetClass: "entr", preset: 0, subtype: 0, name: "other", dir: null,
+    target: { spid: "2", bg: false, para: null }, sets: "visible", path: null, group: null, accel: 0, decel: 0, autoRev: false, repeatCount: 1000, fill: null,
+    behaviours: [{
+      kind: "effect", filter, transition: "in", prLst: null, target: { spid: "2", bg: false, para: null }, delay: 0, dur: 500,
+      repeatCount: 1000, autoRev: false, accel: 0, decel: 0, additive: null, fill: null, attrs: [],
+    }],
+  });
+
+  it("lists exactly the filters an entrance falls back to a fade on", () => {
+    const fallsBack = new Set<string>();
+    for (const f of UNIVERSE) {
+      const note = effectMotion(entrance(f), () => G).note;
+      if (note !== null && note.includes("plays as a fade")) fallsBack.add(/^[a-z]+/.exec(f)![0]);
+    }
+    expect([...fallsBack].sort()).toEqual([...new Set(listed)].sort());
+  });
+});
