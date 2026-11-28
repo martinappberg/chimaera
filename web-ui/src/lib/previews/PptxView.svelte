@@ -53,9 +53,9 @@
   import PresenterView from "./show/PresenterView.svelte";
   import ClickDots from "./show/ClickDots.svelte";
   import { copyTabToWindow } from "../plugins/platform";
-  import { buildStates, extractTiming, parseTimeline, type BuildState, type SlideTimeline, type TimingExtract } from "./pptxTiming";
   import { pruneTagged, tagSlide, type TaggedSlide } from "./pptxTag";
-  import { applyState, clearMasks, clearState, playStep, prepareStep, type Palette, type Playing, type PreparedStep } from "./pptxPlay";
+  import { applyState, clearMasks, clearState, playStep, type Palette } from "./pptxPlay";
+  import { slidePalette, SlideTimings, StageMotion, type Timed } from "./pptxStage.svelte";
   import { motionNotes } from "./pptxMotion";
   import { sanitizeRendered } from "./officeSafety";
   import { revealRequest, takeReveal } from "../shared/reveal";
@@ -124,72 +124,30 @@
   // a redraw, edit mode, leaving the show, hiding and unmounting all finish
   // a click that is playing (it lands on its state, never pauses).
 
-  /** Forward clicks closer together than this land without playing (the
-   *  plugin deck viewer's flick rule). */
-  const FLICK_MS = 400;
-  /** The click playing on the stage (plain, never `$state`). */
-  let playing: { p: Playing; slide: number; build: number; tagged: TaggedSlide; gen: string } | null = null;
-  /** The click the next state pass plays rather than lands on. */
-  let toPlay: { slide: number; build: number } | null = null;
-  /** The next forward click, planned while idle (`prepareStep`): a click
-   *  then only starts animations. Dropped on every pass. */
-  let warmed: { slide: number; build: number; gen: string; p: PreparedStep } | null = null;
-  let warmTimer: ReturnType<typeof setTimeout> | undefined;
+  /** The click's motion: what plays, what is playing, the next click
+   *  planned ahead (`pptxStage.svelte.ts`). */
+  const motion = new StageMotion();
+  const palettes = new Map<string, Palette>();
+  const paletteOf = (i: number): Palette | null => slidePalette(deck?.presentation, i, palettes);
+  const stopPlaying = (): void => motion.stop();
 
   function warmNext(gen: string): void {
-    clearTimeout(warmTimer);
-    warmed = null;
-    if (show.mode !== "present" || reducedMotion()) return;
-    warmTimer = setTimeout(() => {
-      if (disposed || playing !== null || show.mode !== "present") return;
-      const n = show.next();
-      if (n === null) return;
-      const handle = stageHandles.get(n.slide);
-      const tagged = handle === undefined ? undefined : stageTags.get(handle.element);
-      const t = timelineOf(n.slide);
-      if (tagged === undefined || t === null) return;
-      try {
-        const p = prepareStep(tagged, t.timeline, n.build, { w, h, states: t.states, palette: paletteOf(n.slide) });
-        if (p !== null) warmed = { slide: n.slide, build: n.build, gen, p };
-      } catch {
-        // Planned again at the click.
-      }
-    }, 200);
+    motion.warm(
+      gen,
+      {
+        live: () => !disposed && show.mode === "present",
+        next: () => show.next(),
+        tagged: (slide) => {
+          const handle = stageHandles.get(slide);
+          return handle === undefined ? undefined : stageTags.get(handle.element);
+        },
+        timeline: (slide) => timelineOf(slide),
+        options: (slide) => ({ w, h, palette: paletteOf(slide) }),
+      },
+      show.mode === "present" && !reducedMotion(),
+    );
   }
-  $effect(() => () => clearTimeout(warmTimer));
-
-  /** The place the build-state pass last stood on. */
-  let lastPass: { slide: number; build: number | null } | null = null;
-
-  /** Slide `i`'s theme colours and colour map: what a held colour that
-   *  names a scheme colour (`accent2`, `tx1`) resolves against. */
-  const palettes = new Map<string, Palette>();
-  function paletteOf(i: number): Palette | null {
-    const pres = deck?.presentation;
-    const sl = pres?.slides[i];
-    if (pres === undefined || sl === undefined) return null;
-    const hit = palettes.get(sl.slidePath);
-    if (hit !== undefined) return hit;
-    const masterKey = pres.layoutToMaster.get(sl.layoutIndex);
-    const master = masterKey === undefined ? undefined : pres.masters.get(masterKey);
-    const themeKey = masterKey === undefined ? undefined : pres.masterToTheme.get(masterKey);
-    const theme = themeKey === undefined ? undefined : pres.themes.get(themeKey);
-    const map = new Map(master?.colorMap ?? []);
-    if (sl.colorMapOverride !== undefined && sl.colorMapOverrideMode !== "master") for (const [k, v] of sl.colorMapOverride) map.set(k, v);
-    const palette: Palette = { scheme: theme?.colorScheme ?? new Map(), map };
-    palettes.set(sl.slidePath, palette);
-    return palette;
-  }
-  let lastClickAt = -Infinity;
-  /** A click is playing: the advance timer waits for it to land. */
-  let animating = $state(false);
-
-  function stopPlaying(): void {
-    const p = playing;
-    playing = null;
-    p?.p.finish();
-    if (animating) animating = false;
-  }
+  $effect(() => () => motion.dispose());
 
   function reducedMotion(): boolean {
     return typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -230,20 +188,7 @@
         if (!how.heard) stopPlaying();
         return;
       }
-      stopPlaying();
-      toPlay = null;
-      // Only a click on in the show plays (the presenter's own view and
-      // every jump land at once); an advance by itself neither flicks nor
-      // counts as the click before the next.
-      if (how.click && show.mode === "present") {
-        let animate = !reducedMotion();
-        if (!how.auto) {
-          const now = performance.now();
-          if (now - lastClickAt < FLICK_MS) animate = false;
-          lastClickAt = now;
-        }
-        if (animate) toPlay = { slide: to.slide, build: to.build };
-      }
+      motion.moved(to, how, show.mode === "present", reducedMotion(), performance.now());
       if (to.slide === from.slide) return;
       clearPick();
       if (show.mode === "browse") asDrawn = true;
@@ -517,7 +462,7 @@
   /** Which slides the deck marks hidden (`show="0"`): read with each slide's
    *  timing at load, since the renderer knows only once it lays one out. */
   const hiddenFlags = $derived(
-    deck?.presentation.slides.map((sl) => sl.hidden === true || extracts.get(sl.slidePath)?.hidden === true) ?? [],
+    deck?.presentation.slides.map((sl) => sl.hidden === true || timings.hidden(sl.slidePath)) ?? [],
   );
   /** Where the show stands among the slides it shows. */
   const showAt = $derived(showPosition(hiddenFlags, current));
@@ -539,18 +484,8 @@
 
   // --- builds ------------------------------------------------------------------------
 
-  interface Timed {
-    timeline: SlideTimeline;
-    states: BuildState[];
-  }
-
-  /** Parsed timing per slide part, for the deck version on screen. */
-  let timelines = new Map<string, Timed>();
-  /** What each slide part's timeline needs, cut from it at load
-   *  (`extractTiming`: its timing and transition, a few KB, capped), until
-   *  it is parsed. The whole part goes: the renderer drops its own copy once
-   *  it lays the slide out, and a deck's shapes can run to megabytes. */
-  let extracts = new Map<string, TimingExtract>();
+  /** Every slide's timing for the version on screen (`pptxStage.svelte.ts`). */
+  const timings = new SlideTimings();
   /** Bumped when a timeline is parsed, so what counts builds re-reads. */
   let timelineGen = $state(0);
   /** Browsing shows the slide as drawn until a click dot is used. */
@@ -571,40 +506,19 @@
   /** Something on the current slide's builds could only be approximated. */
   let playApprox = $state(false);
 
-  /** A new version: every slide's extract, before any is laid out (one scan
-   *  a slide; the parse waits until the slide is asked for). */
   function resetTimelines(d: Deck): void {
-    timelines = new Map();
-    extracts = new Map();
-    for (const sl of d.presentation.slides) {
-      if (sl.sourceXml !== undefined) extracts.set(sl.slidePath, extractTiming(sl.sourceXml));
-    }
+    timings.reset(d.presentation.slides);
   }
 
   /** Slide `i`'s timing, parsed on first ask. */
   function timelineOf(i: number): Timed | null {
     const sl = deck?.presentation.slides[i];
-    if (sl === undefined) return null;
-    const hit = timelines.get(sl.slidePath);
-    if (hit !== undefined) return hit;
-    const ex = extracts.get(sl.slidePath);
-    let timeline: SlideTimeline;
-    if (ex?.timeline != null) timeline = ex.timeline;
-    else {
-      const xml = ex?.source ?? untrack(() => edits.partText(sl.slidePath)) ?? sl.sourceXml ?? null;
-      if (xml === null) return null;
-      timeline = parseTimeline(xml);
-    }
-    const got = { timeline, states: buildStates(timeline) };
-    timelines.set(sl.slidePath, got);
-    // The hidden flag stays; the source is done with.
-    if (ex !== undefined) extracts.set(sl.slidePath, { source: null, timeline: null, hidden: ex.hidden });
-    return got;
+    return timings.of(sl, () => (sl === undefined ? null : untrack(() => edits.partText(sl.slidePath)) ?? null));
   }
 
   /** Build counts per slide for `deckStep` (one where not parsed yet). */
   function buildCounts(): number[] {
-    return deck?.presentation.slides.map((sl) => timelines.get(sl.slidePath)?.states.length ?? 1) ?? [];
+    return timings.counts(deck?.presentation.slides ?? []);
   }
 
   // The current slide is always parsed (its click dots); in the show, the
@@ -619,7 +533,7 @@
       let fresh = false;
       for (const j of showing ? [i, ...showReach(flags, i, true)] : [i]) {
         const sl = deck?.presentation.slides[j];
-        if (sl === undefined || timelines.has(sl.slidePath)) continue;
+        if (sl === undefined || timings.has(sl.slidePath)) continue;
         if (timelineOf(j) !== null) fresh = true;
       }
       if (fresh) timelineGen += 1;
@@ -660,21 +574,9 @@
     untrack(() => {
       // A click plays only on the pass that brought its place: a re-read
       // deck, a redraw or any later pass at the same place lands.
-      const arrived = lastPass === null || lastPass.slide !== i || lastPass.build !== b;
-      lastPass = { slide: i, build: b };
-      const want = arrived && showing ? toPlay : null;
-      toPlay = null;
+      const want = motion.pass(i, b, showing);
       const tagNow = stageHandles.get(i);
-      const ownPass =
-        showing &&
-        playing !== null &&
-        playing.slide === i &&
-        playing.build === b &&
-        !editing &&
-        playing.gen === gen &&
-        tagNow !== undefined &&
-        stageTags.get(tagNow.element) === playing.tagged;
-      if (!ownPass) stopPlaying();
+      if (!motion.owns(i, b, showing, editing, gen, tagNow === undefined ? undefined : stageTags.get(tagNow.element))) stopPlaying();
       let approx = false;
       for (const [j, handle] of stageHandles) {
         const tagged = stageTags.get(handle.element);
@@ -684,22 +586,17 @@
           clearState(tagged);
           continue;
         }
-        if (playing !== null && playing.tagged === tagged) {
-          approx = playing.p.approximate;
+        if (motion.playing !== null && motion.playing.tagged === tagged) {
+          approx = motion.playing.p.approximate;
           continue;
         }
         if (t !== null && b !== null && want?.slide === i && want.build === b && onScreen.shown) {
-          const ready = warmed !== null && warmed.slide === i && warmed.build === b && warmed.gen === gen ? warmed.p : null;
+          const ready = motion.prepared(i, b, gen);
           const p = playStep(tagged, t.timeline, b, { w, h, states: t.states, palette: paletteOf(i), reduced: reducedMotion(), prepared: ready });
           approx = p.approximate;
-          const mine = { p, slide: i, build: b, tagged, gen };
-          playing = mine;
-          animating = true;
-          void p.finished.then(() => {
-            if (playing !== mine) return;
-            playing = null;
+          motion.started({ p, slide: i, build: b, tagged, gen }, () => {
             if (!disposed) {
-              animating = false;
+              motion.animating = false;
               playApprox = p.approximate;
               warmNext(gen);
             }
@@ -711,8 +608,8 @@
       playApprox = approx;
       // Plan the next click once this pass stands still (a playing click
       // plans it when it lands).
-      if (playing === null) warmNext(gen);
-      else if (warmed !== null) warmed = null;
+      if (motion.playing === null) warmNext(gen);
+      else if (motion.warmed !== null) motion.warmed = null;
     });
   });
 
@@ -747,7 +644,7 @@
   // last build is up and has played; only while someone can see it, and
   // any move restarts it.
   $effect(() => {
-    if (!inShow || editMode || !onScreen.shown || animating) return;
+    if (!inShow || editMode || !onScreen.shown || motion.animating) return;
     const b = buildAt;
     const t = timed;
     const after = t?.timeline.transition?.advanceAfter ?? null;
@@ -910,8 +807,7 @@
       nodesMaterialized: false,
     };
     d.presentation.slides[i] = fresh;
-    timelines.delete(old.slidePath);
-    extracts.set(old.slidePath, extractTiming(xml));
+    timings.replace(old.slidePath, xml);
     try {
       materializeSlideNodes(d.presentation, fresh);
     } catch {
