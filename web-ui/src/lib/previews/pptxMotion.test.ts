@@ -224,6 +224,20 @@ describe("motion paths (paths slide 1)", async () => {
   });
 });
 
+describe("a chained path (order, slide 3: PowerPoint's film)", () => {
+  it("a second path written from where the first ended plays on from there, without a jump", async () => {
+    const t3 = await slide("order", 3);
+    const states = buildStates(t3);
+    const shapes = new Map<string, ShapeInfo>([["2", { paraCount: 0, paras: false }]]);
+    const b = { ...base(), tx: 0.25 * W, ty: 0 };
+    const kf = planStep(t3.steps[2]!, states[1]!, shapes, ["2"], () => b, noLanding, W, H).tracks[0]!.keyframes;
+    const xs = kf.map((k) => px(k.translate));
+    expect(xs[0]![0]).toBeCloseTo(0.25 * W, 3);
+    expect(xs.every(([x]) => Math.abs(x - 0.25 * W) < 1e-6)).toBe(true);
+    expect(xs.at(-1)![1]).toBeCloseTo(0.25 * H, 0);
+  });
+});
+
 describe("held emphasis plays from what the state before holds", () => {
   it("a second grow starts at 150% and ends at 225%; shrink to 50% is of the shape's own size", async () => {
     const t = await slide("emphasis", 1);

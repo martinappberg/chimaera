@@ -228,6 +228,12 @@ describe("parseTimeline on the corpus", () => {
     ]);
   });
 
+  it("a second path written from where the first ended ends at its own end (order, slide 3; PowerPoint's film)", async () => {
+    const t = await slideOf("order", 3);
+    expect(t.steps[2]![0]!.path).toBe("M 0.25 0 L 0.25 0.25 E");
+    expect(buildStates(t).at(-1)!.moved).toEqual({ "2": [0.25, 0.25], "3": [0, 0.25] });
+  });
+
   it("shows, keeps and hides one shape across three clicks (exits-emphasis, slide 3)", async () => {
     const t = await slideOf("exits-emphasis", 3);
     expect(buildStates(t).map((s) => s.hidden)).toEqual([["2"], [], [], ["2"]]);
