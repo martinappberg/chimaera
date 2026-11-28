@@ -1,6 +1,6 @@
 import JSZip from "jszip";
 import { describe, expect, it } from "vitest";
-import { boxGeom, clearState, paraOffset, planState, playStep, transformScale, type ShapeInfo } from "./pptxPlay";
+import { boxGeom, clearState, colorEasing, colorWindows, paraOffset, planState, playStep, transformScale, type ShapeInfo } from "./pptxPlay";
 import type { TaggedSlide } from "./pptxTag";
 import { buildStates, parseTimeline, type BuildState, type GoldenSlide } from "./pptxTiming";
 
@@ -354,4 +354,23 @@ describe("measured, never assumed: geometry under any fit", () => {
       expect(g.ppt_h).toBeCloseTo(60 / 720, 10);
     });
   }
+});
+
+describe("colour blends run on the effect's clock (B5)", () => {
+  const xml = (accel: number, decel: number) =>
+    `<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree/></p:cSld><p:timing><p:tnLst><p:par><p:cTn id="1" dur="indefinite" nodeType="tmRoot"><p:childTnLst><p:seq><p:cTn id="2" dur="indefinite" nodeType="mainSeq"><p:childTnLst>` +
+    `<p:par><p:cTn id="3" fill="hold"><p:stCondLst><p:cond delay="indefinite"/></p:stCondLst><p:childTnLst><p:par><p:cTn id="4" fill="hold"><p:stCondLst><p:cond delay="0"/></p:stCondLst><p:childTnLst>` +
+    `<p:par><p:cTn id="5" presetID="1" presetClass="emph" fill="hold" nodeType="clickEffect" accel="${accel}" decel="${decel}"><p:stCondLst><p:cond delay="0"/></p:stCondLst><p:childTnLst>` +
+    `<p:animClr clrSpc="rgb" dir="cw"><p:cBhvr><p:cTn id="6" dur="1000" fill="hold"/><p:tgtEl><p:spTgt spid="2"/></p:tgtEl><p:attrNameLst><p:attrName>fillcolor</p:attrName></p:attrNameLst></p:cBhvr><p:to><a:srgbClr val="FF0000"/></p:to></p:animClr>` +
+    `</p:childTnLst></p:cTn></p:par></p:childTnLst></p:cTn></p:par></p:childTnLst></p:cTn></p:par></p:childTnLst></p:cTn></p:seq></p:childTnLst></p:cTn></p:par></p:tnLst></p:timing></p:sld>`;
+
+  it("an even blend needs no easing; decel front-loads it as every other channel", () => {
+    const even = colorWindows(parseTimeline(xml(0, 0)).steps[1]!).get("2")!;
+    expect([even.from, even.to]).toEqual([0, 1000]);
+    expect(colorEasing(even)).toBeNull();
+    const eased = colorWindows(parseTimeline(xml(0, 100000)).steps[1]!).get("2")!;
+    expect(eased.progress(500)).toBeCloseTo(0.75, 6);
+    const ease = colorEasing(eased, 4)!;
+    expect(ease).toBe("linear(0, 0.4375, 0.75, 0.9375, 1)");
+  });
 });

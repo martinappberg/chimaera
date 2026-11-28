@@ -35,7 +35,7 @@
 
 import { heldColor, parseCss, pictureFilter, toCss, type Palette } from "./pptxColor";
 import { effectMotion, type Geom, type Segment } from "./pptxMotion";
-import { buildStates, splitShapes, targetKey, type BuildState, type Effect, type HeldColor, type HeldColors, type SlideTimeline } from "./pptxTiming";
+import { behaviourProgress, buildStates, effectTime, splitShapes, targetKey, type BuildState, type Effect, type HeldColor, type HeldColors, type SlideTimeline } from "./pptxTiming";
 import type { TaggedShape, TaggedSlide } from "./pptxTag";
 
 export type { Palette } from "./pptxColor";
@@ -992,19 +992,55 @@ function measure(tagged: TaggedSlide, id: ElementId, w: number, h: number): Elem
 const camel = (p: string) => p.replace(/-([a-z])/g, (_, c: string) => c.toUpperCase());
 const COLOR_PROPS = new Set(["fill", "stroke", "stroke-width", "stop-color", "color", "filter"]);
 
-/** When each shape's colour changes run in the step: [start, end] ms. */
-function colorWindows(effects: readonly Effect[]): Map<string, [number, number]> {
-  const out = new Map<string, [number, number]>();
+/** When a shape's colour changes run in the step (ms from its start) and
+ *  how far along they are at a time: the colour behaviour's own progress
+ *  on its effect's clock (accel, decel, repeat, autoRev), as every other
+ *  channel plays. */
+export interface ColorWindow {
+  from: number;
+  to: number;
+  progress(t: number): number;
+}
+
+export function colorWindows(effects: readonly Effect[]): Map<string, ColorWindow> {
+  const out = new Map<string, ColorWindow>();
   for (const e of effects) {
     for (const b of e.behaviours) {
       if (b.target === null || (b.kind !== "color" && !(b.kind === "set" && b.attrs.some((a) => /^(fill|stroke)\./.test(a))))) continue;
       const begin = e.start + b.delay;
-      const end = begin + (b.dur === null ? 0 : (b.dur * (b.repeatCount ?? 1000) * (b.autoRev ? 2 : 1)) / 1000);
+      const end = e.start + (e.dur ?? 0);
+      const progress = (t: number) => {
+        const c = effectTime(e, t - e.start);
+        const q = c === null ? null : behaviourProgress(b, c);
+        return q === null ? 0 : Math.min(1, Math.max(0, q));
+      };
       const was = out.get(b.target.spid);
-      out.set(b.target.spid, was === undefined ? [begin, end] : [Math.min(was[0], begin), Math.max(was[1], end)]);
+      // The colour behaviour (not a fill.type set) that ends last paces the blend.
+      const paces = b.kind === "color" && (was === undefined || end >= was.to);
+      out.set(b.target.spid, {
+        from: was === undefined ? begin : Math.min(was.from, begin),
+        to: was === undefined ? end : Math.max(was.to, end),
+        progress: paces || was === undefined ? progress : was.progress,
+      });
     }
   }
   return out;
+}
+
+/** Samples of a colour window's progress as a CSS `linear()` easing over
+ *  the window (null when it is linear already, or empty). */
+export function colorEasing(w: ColorWindow, samples = 32): string | null {
+  const span = w.to - w.from;
+  if (!(span > 0)) return null;
+  const pts: number[] = [];
+  for (let i = 0; i <= samples; i++) pts.push(Math.round(w.progress(w.from + (span * i) / samples) * 1e4) / 1e4);
+  if (pts.every((v, i) => Math.abs(v - i / samples) < 1e-4)) return null;
+  return `linear(${pts.join(", ")})`;
+}
+
+/** Whether this engine takes a `linear()` easing (Safari 17.2, Chrome 113). */
+function linearEasing(): boolean {
+  return typeof CSS !== "undefined" && typeof CSS.supports === "function" && CSS.supports("transition-timing-function", "linear(0, 0.5, 1)");
 }
 
 /** A click planned ahead: everything `playStep` needs but the animations. */
@@ -1015,7 +1051,7 @@ export interface PreparedStep {
   approximate: boolean;
   plan: StepPlan;
   duration: number;
-  windows: Map<string, [number, number]>;
+  windows: Map<string, ColorWindow>;
   blends: { el: Styled; prop: string; a: string; b: string; spid: string }[];
   landedBy: Map<Styled, Map<string, string>>;
 }
@@ -1093,7 +1129,7 @@ export function prepareStep(tagged: TaggedSlide, timeline: SlideTimeline, k: num
         else blends.push({ el, prop, a, b, spid });
       }
     }
-    for (const w of windows.values()) duration = Math.max(duration, Math.min(w[1], opts.maxMs ?? PLAY_MAX_MS));
+    for (const w of windows.values()) duration = Math.max(duration, Math.min(w.to, opts.maxMs ?? PLAY_MAX_MS));
     if (!(duration > 0)) return null;
     return { tagged, timeline, k, approximate: target.approximate, plan, duration, windows, blends, landedBy };
 }
@@ -1151,14 +1187,18 @@ export function playStep(tagged: TaggedSlide, timeline: SlideTimeline, k: number
     }
     for (const bl of blends) {
       if (typeof bl.el.animate !== "function") continue;
-      const [t0, t1] = windows.get(bl.spid) ?? [0, duration];
+      const win = windows.get(bl.spid);
+      const [t0, t1] = win === undefined ? [0, duration] : [win.from, win.to];
       const p = camel(bl.prop);
       const at = (t: number) => Math.min(1, Math.max(0, t / duration));
+      // The blend runs on the colour's own clock, eased like every other
+      // channel; an engine without `linear()` blends evenly.
+      const ease = win !== undefined && linearEasing() ? colorEasing(win) : null;
       anims.push(
         bl.el.animate(
           [
             { offset: 0, [p]: bl.a },
-            { offset: at(t0), [p]: bl.a },
+            { offset: at(t0), [p]: bl.a, ...(ease === null ? {} : { easing: ease }) },
             { offset: Math.max(at(t0), at(t1)), [p]: bl.b },
             { offset: 1, [p]: bl.b },
           ] as Keyframe[],
