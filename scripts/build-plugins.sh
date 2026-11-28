@@ -18,7 +18,10 @@
 #       plugins/test-fixture (a 0.1 plugin, on the frozen plugins/api-0.1)
 #       and its `v2` build (the "next release" the update tests serve).
 #   plugins/dist-test/test-platform/{plugin.wasm,plugin.toml}
-#       plugins/test-platform, the 0.2 platform fixture.
+#       plugins/test-platform, the platform fixture (screens, surfaces, …).
+#   plugins/dist-test/test-web/{plugin.wasm,plugin.toml}
+#       plugins/test-web, the web views fixture (API 0.3: its own page, a
+#       library for agents' pages, a declared host).
 #   plugins/dist-test/test-privileged/{plugin.wasm,plugin.toml}
 #       plugins/test-privileged, the programs-and-tools fixture (its tool's
 #       archive stays in its crate; the tests serve it from a fake host).

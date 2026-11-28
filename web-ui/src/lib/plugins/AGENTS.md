@@ -13,7 +13,7 @@ with four equal segments: **Plugins** · **Connections** · **Skills** · **Brow
 "plugins". Its glyph (2×2 cells, the top-right a plus) is `glyph.ts`, drawn
 only through `ExtensionsGlyph.svelte` by PaneTabs, App's rail row and
 QuickOpen — not in `shared/icons.ts`, which `prebuild` regenerates from Tabler.
-A plugin's own tab wears the icon its view names (`[[views]] icon`, a name
+A tab view that asks for it (`[[views]] rail`, 0.3) gets a sidebar row beside Knowledge while its plugin is on in the workspace (`platform.ts::railViews`, drawn in App.svelte's rail: its icon, its title, opening or focusing the tab). A plugin's own tab wears the icon its view names (`[[views]] icon`, a name
 from `ui/icons.ts`, the set `ui/1` screens draw from) and falls back to that
 glyph.
 
@@ -35,7 +35,8 @@ Use the [workbench-plugin guide](../../../../docs/agent-guides/plugins.md)
 and its [API 0.2 starter](../../../../docs/agent-guides/plugins.md#minimal-api-02-plugin)
 to add a plugin. A plugin declares views/file kinds/actions/settings in its
 manifest and returns semantic `ui/1` trees; its component does not ship a
-Svelte or JavaScript bundle. Keep the renderer and routing generic. Domain
+Svelte or JavaScript bundle — except a 0.3 plugin's own page for a drawing
+area, the `web` node ([web views](../../../../docs/features/web-views.md)). Keep the renderer and routing generic. Domain
 behavior belongs in the plugin repository, with the client reusing the core
 viewers and theme tokens.
 

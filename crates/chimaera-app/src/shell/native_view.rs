@@ -189,7 +189,8 @@ fn child_label(owner: &str, id: &str) -> String {
 /// The paths a view may show on its owner's daemon origin.
 fn view_path_allowed(url: &tauri::Url) -> bool {
     let path = url.path();
-    path.starts_with("/raw/") || path.starts_with("/proxy/")
+    // `/web/`: a plugin's own page under its grant (web views).
+    path.starts_with("/raw/") || path.starts_with("/proxy/") || path.starts_with("/web/")
 }
 
 /// `/proxy/{id}` of a proxied app's URL, or `None` for anything else.
@@ -475,6 +476,36 @@ pub(super) async fn native_view_chip(
         Err(UNSUPPORTED.into())
     }
 }
+
+/// A host's word for the page (web/1: its node's data, visibility, the
+/// theme): JSON text the bridge hands the page API as a `chimaera:host`
+/// event. The page's convenience, like everything it is told.
+#[tauri::command]
+pub(super) async fn native_view_command(
+    app: AppHandle,
+    webview: Webview,
+    id: String,
+    command: String,
+) -> Result<(), String> {
+    let label = own_label(&webview, &id)?;
+    if command.len() > COMMAND_MAX {
+        return Err("bad view request".into());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        mac::call(&app, label, "command", serde_json::Value::String(command))
+            .await
+            .map(|_| ())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (app, label, command);
+        Err(UNSUPPORTED.into())
+    }
+}
+
+/// A host command's JSON: a `web` node's data (64 KiB) with room to spare.
+const COMMAND_MAX: usize = 256 * 1024;
 
 /// The visible text inside `rect` (view CSS px), with the page's scroll
 /// offsets: the area tool's text and locator.

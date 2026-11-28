@@ -68,7 +68,7 @@ app-build` (never the root `cargo`).
   It is a plain subview, never a Tauri web view: it has no IPC, and Tauri's window lookups
   (`get_webview_window`, which `deliver_to` uses) keep finding the window — a Tauri child web
   view would make Tauri stop counting it as a webview window. It loads only its window's daemon
-  origin under `/raw/` or `/proxy/`; a clicked link elsewhere goes to the real browser
+  origin under `/raw/`, `/proxy/` or `/web/` (a plugin's own page, [web views](web-views.md)); `native_view_command` hands the page API the host's word (a web view's data, visibility, the theme) without a reload; a clicked link elsewhere goes to the real browser
   (`shell/native_view.rs`). Each sits in a clip box of its own, so an HTML embed card's view is
   cropped to its scroller ([embed cards](files-and-previews.md#embed-cards)); the wheel over a
   passive one (a card nobody clicked into) goes back to the window's page through an app-wide
