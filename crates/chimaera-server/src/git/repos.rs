@@ -608,15 +608,21 @@ mod tests {
         for dir in [&one, &two, &inner] {
             std::fs::create_dir_all(dir).unwrap();
         }
-        std::fs::write(one.join(".git"), "gitdir: /r/.git/worktrees/x\n").unwrap();
-        std::fs::write(two.join(".git"), "gitdir: /r/.git/worktrees/m\n").unwrap();
-        std::fs::write(inner.join(".git"), "gitdir: /r/.git/worktrees/n\n").unwrap();
+        // Git for Windows writes the gitdir with its drive.
+        let r = if cfg!(windows) { "C:/r" } else { "/r" };
+        std::fs::write(one.join(".git"), format!("gitdir: {r}/.git/worktrees/x\n")).unwrap();
+        std::fs::write(two.join(".git"), format!("gitdir: {r}/.git/worktrees/m\n")).unwrap();
+        std::fs::write(
+            inner.join(".git"),
+            format!("gitdir: {r}/.git/worktrees/n\n"),
+        )
+        .unwrap();
         let mut found = managed_worktrees_blocking(&base);
         found.sort();
         assert_eq!(found, vec![one.clone(), two.clone()]);
         assert_eq!(
             gitdir_of_blocking(&one),
-            Some(PathBuf::from("/r/.git/worktrees/x"))
+            Some(PathBuf::from(format!("{r}/.git/worktrees/x")))
         );
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -293,12 +293,17 @@ async fn capture(source: &Source, budget: Duration) -> Result<Vec<(String, Strin
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .process_group(0)
         .kill_on_drop(true);
-    crate::launcher::default_signals(&mut command);
+    // Never reached on Windows (`ready`).
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+        crate::launcher::default_signals(&mut command);
+    }
     let mut child = command.spawn().map_err(|e| CaptureError::Start(e.kind()))?;
     // Dropped unless the shell is reaped first: an rc's children are hung up
     // on with a capture that was abandoned.
+    #[cfg(unix)]
     let mut group = crate::launcher::ShellProbeGroup(
         child.id().map(|pid| nix::unistd::Pid::from_raw(pid as i32)),
     );
@@ -326,18 +331,22 @@ async fn capture(source: &Source, budget: Duration) -> Result<Vec<(String, Strin
                 break;
             }
         }
-        if tokio::time::timeout(Duration::from_secs(1), child.wait())
+        let reaped = tokio::time::timeout(Duration::from_secs(1), child.wait())
             .await
-            .is_ok()
-        {
-            // The leader has been reaped: never signal this group id again.
+            .is_ok();
+        // The leader has been reaped: never signal this group id again.
+        #[cfg(unix)]
+        if reaped {
             group.0 = None;
         }
+        #[cfg(not(unix))]
+        let _ = reaped;
         parse_capture(&bytes, &start, &end)
     };
     let result = tokio::time::timeout(budget, work)
         .await
         .unwrap_or(Err(CaptureError::Timeout));
+    #[cfg(unix)]
     if group.0.is_some() {
         // Not reaped (out of time, or an rc job outlived the answer): end it
         // the way a probe's shell ends, so no rc tool's lock is left behind.
@@ -549,7 +558,9 @@ static CACHE: LazyLock<Arc<ShellEnvCache>> = LazyLock::new(Default::default);
 pub(crate) async fn ready() {
     // Tests never read the developer's own rc files: it would make their
     // spawns depend on the machine, and cost a login shell per test binary.
-    if cfg!(test) {
+    // Windows has no rc files to read: a variable the user sets lives in the
+    // registry, which the daemon's own environment already carries.
+    if cfg!(test) || cfg!(windows) {
         return;
     }
     CACHE.ready(Source::daemon(), WAIT, BUDGET).await;
@@ -578,6 +589,7 @@ pub(crate) fn invalidate() {
     CACHE.invalidate();
 }
 
-#[cfg(test)]
+// The captures drive sh stand-ins; Windows never captures (`ready`).
+#[cfg(all(test, unix))]
 #[path = "shell_env_tests.rs"]
 mod tests;

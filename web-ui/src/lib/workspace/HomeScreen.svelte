@@ -620,9 +620,10 @@
     return node.split(".")[0] || node;
   }
 
-  /** Shorten an absolute path with ~ for scanability. */
+  /** Shorten an absolute path with ~ for scanability (a Windows daemon's
+   *  profile folder `C:/Users/<name>` too). */
   function tildify(path: string): string {
-    const m = path.match(/^\/(?:home|Users)\/[^/]+(\/.*)?$/);
+    const m = path.match(/^(?:\/(?:home|Users)|[A-Za-z]:\/Users)\/[^/]+(\/.*)?$/);
     return m ? `~${m[1] ?? ""}` : path;
   }
 

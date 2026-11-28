@@ -20,8 +20,8 @@ Views can disconnect without stopping daemon-owned work while the host and daemo
 remain alive. Restart restoration starts new processes and resumes supported
 conversations through their native handles and Chimaera journals; it does not
 preserve shell or agent process state. See [lifecycle and persistence](../features/lifecycle-and-persistence.md).
-The Tauri app is implemented for macOS, Linux and Windows (the Windows engine
-runs in WSL2); see [the native map](../../crates/chimaera-app/AGENTS.md).
+The Tauri app is implemented for macOS, Linux and Windows (Windows runs the
+daemon natively); see [the native map](../../crates/chimaera-app/AGENTS.md).
 
 Cluster connections use `chimaera-remote::cluster` to discover and submit Slurm
 jobs. A job runs `chimaera job-host` on its compute node and opens a separate
@@ -226,7 +226,7 @@ instinct was "Rust + GPU like Ghostty":
   for raw typing. You keep Ghostty for bare shells; Chimaera is the workbench.
 - The implemented **Tauri 2 native shell** wraps the same UI: real workspace
   windows, remote-host management, native notifications, SSH askpass and a signed
-  updater. Windows runs the daemon in WSL2. The one thing deliberately *not* on the roadmap is a bespoke GPU-native
+  updater. Windows runs the daemon natively. The one thing deliberately *not* on the roadmap is a bespoke GPU-native
   client (GPUI): adversarial review priced it at 18–24 solo-months on a pre-1.0
   Zed-source-as-docs framework, buying only raw-typing latency that WebGL xterm.js mostly
   matches — that's not the optimal build, it's a different and riskier project. The

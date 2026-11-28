@@ -332,20 +332,17 @@ async fn run(
             prelude.path(),
         );
         let terminal = if attempt.kind == AgentKind::Claude {
-            Some(
-                AuthPty::prepare(&mut command)
-                    .map_err(|_| "Couldn't prepare the agent's sign-in terminal.")?,
-            )
+            Some(AuthPty::prepare(&mut command).map_err(|_| AuthPty::UNAVAILABLE)?)
         } else {
             command.stdin(Stdio::piped());
             None
         };
-        command.process_group(0);
+        own_tree(&mut command);
         let mut child = command
             .spawn()
             .map_err(|_| "Couldn't start the agent's sign-in flow.")?;
         drop(command);
-        let group = GroupKill(child.id().map(|pid| nix::unistd::Pid::from_raw(pid as i32)));
+        let group = GroupKill::of(&child);
         let mut stdin = child.stdin.take();
         let mut stdout = child.stdout.take();
         let mut stderr = child.stderr.take();

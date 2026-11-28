@@ -1,6 +1,6 @@
 /** One transfer policy for clipboard paste and file-manager drops. The daemon
  * remains authoritative for symlinks, permissions, and destination collisions. */
-import { basename, dirname, joinPath } from "../previews/files";
+import { basename, dirname, isRoot, isUnder, joinPath, trimSlash } from "../shared/paths";
 import { reportUploadError, trackFileOp } from "../net/uploads";
 import { fsCopyOp, fsMoveOp } from "./fsEvents";
 
@@ -12,13 +12,13 @@ export interface FileSource {
 export type FileOperation = "copy" | "move";
 
 function withoutTrailingSlash(path: string): string {
-  return path.replace(/\/+$/, "") || "/";
+  return trimSlash(path) || "/";
 }
 
 export function transferBlock(source: FileSource, destDir: string, operation: FileOperation): string | null {
   const from = withoutTrailingSlash(source.path);
   const dir = withoutTrailingSlash(destDir);
-  if (source.kind === "dir" && (from === "/" || dir === from || dir.startsWith(`${from}/`))) {
+  if (source.kind === "dir" && (isRoot(from) || isUnder(dir, from))) {
     return "A folder can't go inside itself";
   }
   if (operation === "move" && dirname(from) === dir) return "Already in this folder";

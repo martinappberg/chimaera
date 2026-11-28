@@ -292,16 +292,17 @@ export async function writeClipboard(text: string): Promise<boolean> {
 /**
  * Whether this window can hand the daemon's files to the OS by path: the
  * native shell, on the machine the files live on. A remote window's paths
- * name another machine's files, and on Windows the local daemon runs inside
- * WSL2. The shell enforces the same rule; this only decides what to offer.
+ * name another machine's files. The shell enforces the same rule; this only
+ * decides what to offer.
  */
 export function hasLocalFiles(): boolean {
-  return tauri() !== null && getHostLabel() === "local" && !/\bWindows\b/.test(navigator.userAgent);
+  return tauri() !== null && getHostLabel() === "local";
 }
 
 /** What the platform calls showing a file in its file manager. */
-export function revealLabel(): string {
-  return /\bMac/.test(navigator.userAgent) ? "Reveal in Finder" : "Show in File Manager";
+export function revealLabel(ua: string = navigator.userAgent): string {
+  if (/\bMac/.test(ua)) return "Reveal in Finder";
+  return /\bWindows\b/.test(ua) ? "Show in Explorer" : "Show in File Manager";
 }
 
 /**

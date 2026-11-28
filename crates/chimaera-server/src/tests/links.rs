@@ -136,9 +136,11 @@ async fn user_prompt_mention_autolinks_terminal() {
         Some(serde_json::json!({"root": root.to_string_lossy()})),
     )
     .await;
-    let root = std::fs::canonicalize(&root).unwrap();
+    let root = canonical(&root);
     let shell = inject_shell(&state, &root, ws["id"].as_str().unwrap());
-    wait_display_name(&state, &shell, "bash").await;
+    shell_ready(&state, &shell).await;
+    let name = shell_name();
+    wait_display_name(&state, &shell, &name).await;
 
     // Mention by display name links it and reports back as context.
     let (status, out) = request(
@@ -147,7 +149,7 @@ async fn user_prompt_mention_autolinks_terminal() {
         &format!("/api/v1/agent-events/{agent}?key=mk"),
         Some(serde_json::json!({
             "hook_event_name": "UserPromptSubmit",
-            "prompt": "run squeue in @term:bash please",
+            "prompt": format!("run squeue in @term:{name} please"),
         })),
     )
     .await;
@@ -155,7 +157,10 @@ async fn user_prompt_mention_autolinks_terminal() {
     let context = out["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .unwrap_or("");
-    assert!(context.contains("Linked terminal 'bash'"), "{out}");
+    assert!(
+        context.contains(&format!("Linked terminal '{name}'")),
+        "{out}"
+    );
     let (_, list) = request(&state, Method::GET, "/api/v1/links", None).await;
     assert_eq!(
         list,
@@ -169,7 +174,7 @@ async fn user_prompt_mention_autolinks_terminal() {
         &format!("/api/v1/agent-events/{agent}?key=mk"),
         Some(serde_json::json!({
             "hook_event_name": "UserPromptSubmit",
-            "prompt": "again in @term:bash",
+            "prompt": format!("again in @term:{name}"),
         })),
     )
     .await;

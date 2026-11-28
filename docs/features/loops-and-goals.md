@@ -36,6 +36,7 @@ Work that resumes an agent on its own, shown in its chat: Claude Code's `/loop` 
 
 - Claude's `--resume` brings back its jobs and its goal but not a pending wakeup. The daemon carries all three (`Carryover`): the jobs and goal seed the new driver, and a lost wakeup makes the restart pick-up message name it ("Your pending loop wakeup was lost with the old process: "…", due in 6 minutes.") and ask Claude to schedule it again — subject to the usual pick-up rules (`chat.resumeAfterRestart`, never a Mastermind, the restart-loop guard).
 - Codex keeps its goal on the thread; the driver reads it again when the thread opens.
+- A job's next run is computed in the host's local time: `localtime_r` on Unix, the system time zone's own rules on Windows (`cron::local_tm`).
 
 ## Not shown (deliberately)
 

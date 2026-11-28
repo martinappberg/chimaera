@@ -52,7 +52,21 @@ const RECORDS_MAX: usize = 512;
 /// not one this daemon wrote, and it fails closed like a corrupt one.
 pub(crate) const TRUST_MAX: usize = 8 << 20;
 /// The machine-wide policy (an admin's; users can't loosen it).
-const POLICY_FILE: &str = "/etc/chimaera/policy.json";
+#[cfg(unix)]
+fn policy_file() -> PathBuf {
+    PathBuf::from("/etc/chimaera/policy.json")
+}
+
+/// Windows keeps machine-wide configuration under `%ProgramData%`, which
+/// only administrators can write by default.
+#[cfg(windows)]
+fn policy_file() -> PathBuf {
+    std::env::var_os("ProgramData")
+        .filter(|d| !d.is_empty())
+        .map_or_else(|| PathBuf::from(r"C:\ProgramData"), PathBuf::from)
+        .join("chimaera")
+        .join("policy.json")
+}
 const POLICY_MAX: usize = 64 << 10;
 /// How often the policy file is looked at (a stat; it is read again only
 /// when that changed). Not tied to `update.autoCheck`: that setting is the
@@ -155,6 +169,7 @@ struct PolicyStamp {
     ctime: (i64, i64),
 }
 
+#[cfg(unix)]
 fn policy_stamp(path: &Path) -> Option<PolicyStamp> {
     use std::os::unix::fs::MetadataExt;
     let md = std::fs::metadata(path).ok()?;
@@ -164,6 +179,37 @@ fn policy_stamp(path: &Path) -> Option<PolicyStamp> {
         len: md.len(),
         mtime: (md.mtime(), md.mtime_nsec()),
         ctime: (md.ctime(), md.ctime_nsec()),
+    })
+}
+
+/// Windows: the volume serial and file index stand in for dev and inode (a
+/// replace makes a new index), the last-write time (100 ns ticks) for
+/// mtime, and the creation time for ctime, which Windows doesn't keep.
+#[cfg(windows)]
+fn policy_stamp(path: &Path) -> Option<PolicyStamp> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let file = std::fs::File::open(path).ok()?;
+    // SAFETY: the handle is the open file's for the whole call, and `info`
+    // is a plain-data out parameter the call fills.
+    let info = unsafe {
+        let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+        if GetFileInformationByHandle(file.as_raw_handle(), &mut info) == 0 {
+            return None;
+        }
+        info
+    };
+    let ticks = |t: windows_sys::Win32::Foundation::FILETIME| {
+        ((u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime)) as i64
+    };
+    Some(PolicyStamp {
+        dev: u64::from(info.dwVolumeSerialNumber),
+        ino: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        len: (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow),
+        mtime: (ticks(info.ftLastWriteTime), 0),
+        ctime: (ticks(info.ftCreationTime), 0),
     })
 }
 
@@ -306,7 +352,7 @@ impl Guard {
         }
         let policy_path = std::env::var_os("CHIMAERA_POLICY_FILE")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(POLICY_FILE));
+            .unwrap_or_else(policy_file);
         Guard {
             path,
             store: Mutex::new(store),
@@ -437,7 +483,7 @@ fn insert(state: &AppState, record: Record) {
 /// Where an installed copy came from, as a trust record names it.
 pub(crate) fn source_of(m: &Manifest) -> String {
     if let Some(dir) = &m.origin.local_path {
-        return format!("path:{}", dir.display());
+        return format!("path:{}", chimaera_core::paths::wire_path(dir));
     }
     match m
         .origin

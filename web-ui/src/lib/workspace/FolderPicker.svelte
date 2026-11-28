@@ -5,6 +5,7 @@
   import { validateEntryName } from "../shared/fsNames";
   import { isMac } from "../shared/keys";
   import { modalFocus } from "../shared/modalFocus";
+  import { ancestors, basename, isAbsolute, isRoot, joinPath, rootOf } from "../shared/paths";
   import {
     createWorkspace,
     fsDirs,
@@ -52,12 +53,24 @@
   /** The Home row leads the list until the user starts filtering or browsing. */
   const showHome = $derived(onHome !== undefined && !navigated && input === "");
   const homeOffset = $derived(showHome ? 1 : 0);
+  /** The daemon's host names its roots by drive (`C:/`, a Windows host):
+   *  its top level `/` is the list of drives, not a folder. */
+  const driveHost = $derived(
+    listing !== null && (rootOf(listing.path) !== "/" || listing.dirs.some((d) => rootOf(d.path) !== "/")),
+  );
   /** An absolute (or ~) path typed into the filter: the footer's Open acts on
-   *  IT, not on the breadcrumb directory. */
+   *  IT, not on the breadcrumb directory. On a drive host a typed `C:\Users`
+   *  reads as `C:/Users`, and a bare `C:` as its root. */
   const typedPath = $derived.by((): string | null => {
     const t = input.trim();
-    return t.startsWith("/") || t.startsWith("~") ? t : null;
+    if (!driveHost) return t.startsWith("/") || t.startsWith("~") ? t : null;
+    const w = t.replaceAll("\\", "/");
+    if (/^[A-Za-z]:$/.test(w)) return `${w}/`;
+    return isAbsolute(w) || w.startsWith("~") ? w : null;
   });
+  /** The drive list is browsable but neither a workspace nor a place to
+   *  create a folder, so it has no "open this folder" or "new folder" rows. */
+  const driveList = $derived(driveHost && (typedPath ?? listing?.path) === "/");
   const filtered = $derived(
     listing === null || typedPath !== null
       ? []
@@ -140,19 +153,20 @@
       for (const dir of browseDirs) out.push({ kind: "dir", dir });
       // Browse mode only: create in the directory being browsed (the typed-
       // path mode has its own create — the footer's "Create & open").
-      if (typedPath === null) out.push({ kind: "newfolder" });
+      if (typedPath === null && !driveList) out.push({ kind: "newfolder" });
     }
     return out;
   });
   const browseOffset = $derived(homeOffset + (showRecents ? recents.length : 0));
-  const crumbs = $derived.by((): { name: string; path: string }[] => {
+  /** Breadcrumbs, each drawn after a `/` separator. A Unix root is that
+   *  leading separator alone; a drive host leads with its drive list. */
+  const crumbs = $derived.by((): { name: string; path: string; sep: boolean }[] => {
     if (listing === null) return [];
-    const out: { name: string; path: string }[] = [];
-    let acc = "";
-    for (const part of listing.path.split("/")) {
-      if (part === "") continue;
-      acc += `/${part}`;
-      out.push({ name: part, path: acc });
+    const out: { name: string; path: string; sep: boolean }[] = [];
+    if (driveHost) out.push({ name: "This PC", path: "/", sep: false });
+    for (const p of ancestors(listing.path)) {
+      if (p === "/") continue;
+      out.push({ name: isRoot(p) ? p.replace(/\/$/, "") : basename(p), path: p, sep: true });
     }
     return out;
   });
@@ -208,8 +222,9 @@
     }
   }
 
-  /** What the footer's Open acts on: the typed path, else the browsed folder. */
-  const target = $derived(typedPath ?? listing?.path ?? null);
+  /** What the footer's Open acts on: the typed path, else the browsed folder
+   *  (nothing on a drive host's drive list, which is not a folder). */
+  const target = $derived(driveList ? null : (typedPath ?? listing?.path ?? null));
 
   /** The footer's primary action (also Cmd/Ctrl+Enter, and Enter when no row
    *  is highlighted): open the target, creating it first when it doesn't exist. */
@@ -274,7 +289,7 @@
     }
     // Slashes allowed: fsMkdir creates parents, so a/b nests — consistent
     // with the inline creates in the tree and Finder.
-    const invalid = validateEntryName(name, { allowSlashes: true });
+    const invalid = validateEntryName(name, { allowSlashes: true, dir: listing?.path });
     if (invalid !== null) {
       if (viaBlur) cancelCreate();
       else error = invalid;
@@ -284,7 +299,7 @@
     if (base === undefined || busy) return;
     busy = true;
     try {
-      const created = await fsMkdir(`${base === "/" ? "" : base}/${name}`);
+      const created = await fsMkdir(joinPath(base, name));
       error = null;
       creating = false;
       createDraft = "";
@@ -484,7 +499,7 @@
           <span class="sep">/</span>
         {:else}
           {#each crumbs as c, ci (c.path)}
-            <span class="sep">/</span>
+            {#if c.sep}<span class="sep">/</span>{/if}
             <button class="crumb" class:current={typedPath === null && ci === crumbs.length - 1} tabindex="-1" onmousedown={keepFocus} onclick={() => void navigate(c.path)}
               >{c.name}</button
             >
@@ -580,7 +595,7 @@
             </button>
           </div>
         {/each}
-        {#if typedPath === null && listing !== null}
+        {#if typedPath === null && listing !== null && !driveList}
           {@const nfIdx = browseOffset + upOffset + browseDirs.length}
           <div
             class="rowwrap"

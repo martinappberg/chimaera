@@ -13,6 +13,7 @@
   import { linkReferences, type RefMatcher, type ReferenceChips } from "../shared/references";
   import type { Entry } from "./entries";
   import { drawMarkdown, entryMarkdown, entrySource } from "./render";
+  import { isAbsolute, joinPath } from "../shared/paths";
 
   interface Props {
     span: Span | null;
@@ -36,7 +37,7 @@
   let problem = $state<string | null>(null);
 
   function abs(p: string): string {
-    return p.startsWith("/") || wsRoot === null ? p : `${wsRoot}/${p}`;
+    return isAbsolute(p) || wsRoot === null ? p : joinPath(wsRoot, p);
   }
 
   /** A link in the body is routed, never a native navigation (that would

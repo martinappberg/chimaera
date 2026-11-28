@@ -17,35 +17,23 @@ mod shell;
 mod tray;
 mod update;
 mod windows;
-mod wsl;
 
 fn main() {
-    // Triple role. `--askpass <prompt>` is the tiny SSH_ASKPASS helper ssh
-    // runs to prompt for a password / 2FA: it relays to the running app over
+    // Triple role. `--askpass <prompt>` (on Windows: ssh running this exe with
+    // the prompt alone) is the tiny SSH_ASKPASS helper ssh runs to prompt for
+    // a password / 2FA: it relays to the running app over
     // a socket and prints the answer, no Tauri init. Checked first — it must
     // stay lightweight and never spawn a daemon or a window.
-    if std::env::args().any(|a| a == "--askpass") {
+    if askpass::is_helper_invocation() {
         askpass::run_helper();
         return;
     }
 
     // `chimaera-app --daemon` IS the local daemon (headless, no Tauri init),
-    // so the .app is self-contained — the shell spawns its own executable
-    // detached and the daemon outlives every window. On Windows the daemon
-    // is the Linux musl binary inside WSL2, never this exe — the flag must
-    // fail loudly, not silently fall through to a GUI launch.
+    // so the app is self-contained — the shell spawns its own executable
+    // detached and the daemon outlives every window.
     if std::env::args().any(|a| a == "--daemon") {
-        #[cfg(unix)]
         daemon::run_headless();
-        #[cfg(windows)]
-        {
-            eprintln!(
-                "chimaera --daemon does not exist on Windows: the daemon runs inside \
-                 WSL2 (wsl -d <distro> -- ~/.chimaera/bin/chimaera serve)"
-            );
-            std::process::exit(2);
-        }
-        #[cfg(unix)]
         return;
     }
 

@@ -14,6 +14,13 @@ with reconnect in `web-ui/src/lib/net/reconnect.ts`. Wire: `GET /ws/sessions/{id
 pipe), `POST /api/v1/sessions` (spawn), `POST /api/v1/sessions/{id}/exec`,
 `GET /api/v1/sessions/{id}/journal`. Rules: [rules/pty.md](../../.claude/rules/pty.md).
 
+**On Windows.** Terminals run on ConPTY (via portable-pty). The default shell is `pwsh.exe` if on
+PATH, else Windows PowerShell, else `%COMSPEC%`. PowerShell gets shell integration
+(`shellint/integration.ps1`: OSC 133, 633;E, OSC 7), so command marks and integrated exec work;
+`cmd.exe` has none and uses the sentinel exec mode. The daemon answers ConPTY's startup cursor query
+while no client is attached. A terminal is named after its program ("powershell"). Terminal process
+trees end with their session or the daemon (kill-on-close job), the analogue of the Unix PTY hangup.
+
 ## Persistent sessions & server-side state
 
 - **What & when.** Every terminal is a long-lived daemon child. Reopen a window/tab and the

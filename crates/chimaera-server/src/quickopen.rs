@@ -569,8 +569,8 @@ pub(crate) fn walk_bounded(
             let path = entry.path();
             let rel = path
                 .strip_prefix(root)
-                .map(|r| r.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+                .map(chimaera_core::paths::wire_path)
+                .unwrap_or_else(|_| chimaera_core::paths::wire_path(&path));
             let mtime = entry
                 .metadata()
                 .ok()
@@ -580,7 +580,7 @@ pub(crate) fn walk_bounded(
             files.push(IndexedFile {
                 rel_lower: rel.to_lowercase(),
                 name_lower: name.to_lowercase(),
-                path: path.to_string_lossy().into_owned(),
+                path: chimaera_core::paths::wire_path(&path),
                 rel,
                 name,
                 mtime,

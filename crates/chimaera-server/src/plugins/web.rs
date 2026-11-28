@@ -849,25 +849,10 @@ async fn data_url(state: &AppState, g: &Grant, m: &Manifest, path: &str) -> Resp
 /// Open `rel` beneath `root`, every component without following a link,
 /// as a regular file (blocking).
 fn open_data(root: &Path, rel: &Path) -> Result<(std::fs::File, std::fs::Metadata), String> {
-    let dir = std::fs::File::from(
-        rustix::fs::open(
-            root,
-            rustix::fs::OFlags::RDONLY
-                | rustix::fs::OFlags::DIRECTORY
-                | rustix::fs::OFlags::CLOEXEC,
-            rustix::fs::Mode::empty(),
-        )
-        .map_err(|e| e.to_string())?,
-    );
-    let file = crate::download::open_beneath(
-        &dir,
-        rel,
-        rustix::fs::OFlags::RDONLY
-            | rustix::fs::OFlags::NOFOLLOW
-            | rustix::fs::OFlags::CLOEXEC
-            | rustix::fs::OFlags::NONBLOCK,
-    )
-    .map_err(|e| super::hostfns::refused(root, rel, e))?;
+    use crate::download::Beneath;
+    let dir = crate::download::open_dir_path(root).map_err(|e| e.to_string())?;
+    let file = crate::download::open_beneath(&dir, rel, Beneath::Any)
+        .map_err(|e| super::hostfns::refused(root, rel, e))?;
     let meta = file.metadata().map_err(|e| e.to_string())?;
     if !meta.is_file() {
         return Err("not a file".into());
@@ -1076,7 +1061,8 @@ pub(crate) async fn save_route(
     .and_then(|r| r);
     match written {
         Ok(()) => with_cors(
-            Json(json!({"path": format!("output:{}", rel.to_string_lossy())})).into_response(),
+            Json(json!({"path": format!("output:{}", chimaera_core::paths::wire_path(&rel))}))
+                .into_response(),
         ),
         Err(err) => refused(StatusCode::INTERNAL_SERVER_ERROR, &err),
     }

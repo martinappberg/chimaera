@@ -1,12 +1,23 @@
 //! Claude's callback prompt requires terminal input AND output. This transport
 //! has no session, grid or log; nonblocking I/O makes cancellation drop it without
 //! leaving a blocking-pool read behind.
+//!
+//! Windows has no pty a `tokio::process::Command` can be given as stdio (a
+//! ConPTY owns the child's creation), so the Claude sign-in there is not
+//! offered from this flow: [`AuthPty::prepare`] fails with [`AuthPty::UNAVAILABLE`]
+//! as its user-facing reason.
+#[cfg(unix)]
 use std::{io, os::fd::OwnedFd, process::Stdio};
+#[cfg(unix)]
 use tokio::io::{unix::AsyncFd, Interest};
 
+#[cfg(unix)]
 pub(super) struct AuthPty(AsyncFd<OwnedFd>);
 
+#[cfg(unix)]
 impl AuthPty {
+    pub(super) const UNAVAILABLE: &'static str = "Couldn't prepare the agent's sign-in terminal.";
+
     pub(super) fn prepare(command: &mut tokio::process::Command) -> io::Result<Self> {
         use nix::{fcntl, sys::termios};
         let pty = nix::pty::openpty(None, None)?;
@@ -60,5 +71,26 @@ impl AuthPty {
             bytes = &bytes[n..];
         }
         Ok(())
+    }
+}
+
+/// Never constructed: [`AuthPty::prepare`] always fails on Windows.
+#[cfg(windows)]
+pub(super) enum AuthPty {}
+
+#[cfg(windows)]
+impl AuthPty {
+    pub(super) const UNAVAILABLE: &'static str = "Claude's connector sign-in isn't available here on Windows yet. Use /mcp in a Claude session to sign in.";
+
+    pub(super) fn prepare(_command: &mut tokio::process::Command) -> std::io::Result<Self> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+
+    pub(super) async fn read(&self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        match *self {}
+    }
+
+    pub(super) async fn write_all(&self, _bytes: &[u8]) -> std::io::Result<()> {
+        match *self {}
     }
 }

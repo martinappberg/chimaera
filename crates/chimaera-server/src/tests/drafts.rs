@@ -1,5 +1,6 @@
 //! The draft mirror (`/api/v1/fs/drafts`, `/api/v1/fs/draft`).
 
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 use super::support::*;
@@ -36,6 +37,7 @@ fn draft_uri(path: &str) -> String {
     format!("/api/v1/fs/draft?path={path}")
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn drafts_round_trip_list_newest_first_and_delete_idempotently() {
     let state = test_state();

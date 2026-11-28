@@ -245,6 +245,7 @@ impl LedgerStore {
     }
 
     /// Run `hook` after each boot entry's restore outcome.
+    #[cfg_attr(not(unix), allow(dead_code))]
     #[cfg(test)]
     pub(crate) fn set_restore_step_for_tests(&mut self, hook: crate::persist::Hook) {
         self.restore_step = Some(hook);

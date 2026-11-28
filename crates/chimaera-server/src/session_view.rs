@@ -55,7 +55,9 @@ pub(crate) fn session_json(
     };
     map.insert(
         "cwd_current".to_string(),
-        json!(polled_cwd.unwrap_or(&info.cwd)),
+        json!(chimaera_core::paths::wire_path(
+            polled_cwd.unwrap_or(&info.cwd)
+        )),
     );
     map.insert(
         "exec_stage".to_string(),
@@ -357,14 +359,22 @@ pub(crate) fn finish_row(
     if let serde_json::Value::Object(map) = &mut row {
         if let Some(cwd) = facts.and_then(|f| f.hook_cwd.as_ref()) {
             if map.get("kind").and_then(|k| k.as_str()) == Some("agent") {
-                map.insert("cwd_current".to_string(), json!(cwd));
+                map.insert(
+                    "cwd_current".to_string(),
+                    json!(chimaera_core::paths::wire_path(cwd)),
+                );
             }
         }
         map.insert(
             "git".to_string(),
             facts.map_or(serde_json::Value::Null, |f| f.git.clone()),
         );
-        map.insert("managed_worktree".to_string(), json!(managed_worktree));
+        map.insert(
+            "managed_worktree".to_string(),
+            json!(managed_worktree
+                .as_deref()
+                .map(chimaera_core::paths::wire_path)),
+        );
     }
     row
 }

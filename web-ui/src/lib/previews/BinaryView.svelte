@@ -8,6 +8,7 @@
    */
   import {
     basename,
+    dirname,
     formatMtime,
     fsDownload,
     fsList,
@@ -31,7 +32,7 @@
   $effect(() => {
     const p = path;
     entry = null;
-    const dir = p.slice(0, Math.max(p.lastIndexOf("/"), 1));
+    const dir = dirname(p);
     let stale = false;
     fsList(dir, true)
       .then((listing) => {

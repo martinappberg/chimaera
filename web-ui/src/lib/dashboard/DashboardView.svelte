@@ -50,6 +50,7 @@
   import { knowledge, knowledgeAvailable } from "../workspace/knowledge";
   import { knowledgePlugin, knowledgeProviderActive } from "../plugins/store";
   import { commsStore } from "../workspace/comms.svelte";
+  import { isAbsolute, joinPath } from "../shared/paths";
 
   interface Props {
     dash: DashCtx;
@@ -502,7 +503,7 @@
           <GuidanceRow
             guidance={$knowledge.guidance}
             onOpen={(p) =>
-              ctrl.openFileFrom(paneId, p.startsWith("/") || p.startsWith("~") || wsRoot === null ? p : `${wsRoot}/${p}`, false)}
+              ctrl.openFileFrom(paneId, isAbsolute(p) || p.startsWith("~") || wsRoot === null ? p : joinPath(wsRoot, p), false)}
           />
         {/if}
 

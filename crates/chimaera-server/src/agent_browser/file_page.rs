@@ -80,7 +80,7 @@ pub(crate) fn requested(path_arg: Option<&str>, url: &str) -> Option<String> {
 
 /// The local path a `file:` URL names on this host.
 fn from_file_url(url: &str) -> Option<String> {
-    let local = crate::embed::strip_file_scheme(url)?;
+    let local = crate::embed::file_url_local(url)?;
     // A file URL's query or fragment is not part of the file's name.
     let local = local.split(['?', '#']).next().unwrap_or(local);
     Some(crate::embed::percent_decode(local))
@@ -94,8 +94,8 @@ pub(crate) async fn target(state: &AppState, agent: &str, raw: &str) -> Result<T
     let raw = raw.to_string();
     let found = crate::doc_check::run_blocking(move || {
         let path = crate::doc_check::resolve_for_agent(&raw, cwd.as_deref(), root.as_deref())?;
-        let canonical =
-            std::fs::canonicalize(&path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        let canonical = chimaera_core::paths::canonicalize(&path)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
         let meta = std::fs::metadata(&canonical)
             .map_err(|e| anyhow::anyhow!("{}: {e}", canonical.display()))?;
         if !meta.is_file() {
@@ -181,8 +181,19 @@ pub(crate) fn file_url(state: &AppState, href: &str) -> Option<String> {
     };
     Some(format!(
         "file://{}{tail}",
-        encode_url_path(&local.to_string_lossy())
+        encode_url_path(&url_path(&local))
     ))
+}
+
+/// `local` as a `file:` URL's path: its wire form, so `/abs` stays as it is
+/// and a Windows drive path gets the URL's leading slash (`/C:/x`).
+fn url_path(local: &Path) -> String {
+    let wire = chimaera_core::paths::wire_path(local);
+    if wire.starts_with('/') {
+        wire
+    } else {
+        format!("/{wire}")
+    }
 }
 
 /// A path as a `file:` URL's path: only what would change what the URL

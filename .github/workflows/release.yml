@@ -312,8 +312,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
             libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      # chimaera-server embeds web-ui/dist on every platform, Windows included.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        if: runner.os == 'Linux'
         with:
           name: web-ui-dist
           path: web-ui/dist

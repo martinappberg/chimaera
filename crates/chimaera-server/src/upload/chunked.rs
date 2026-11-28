@@ -251,12 +251,6 @@ fn markers_dir(state: &AppState) -> PathBuf {
     state.uploads_root.with_file_name("uploads-open")
 }
 
-/// Bytes free to this user on the filesystem holding `dir` (blocking).
-fn free_bytes(dir: &Path) -> Option<u64> {
-    let st = rustix::fs::statvfs(dir).ok()?;
-    Some(st.f_bavail.saturating_mul(st.f_frsize))
-}
-
 #[derive(Deserialize)]
 pub(crate) struct Begin {
     /// The session whose landing pad takes the file …
@@ -343,7 +337,7 @@ async fn begin_upload(state: Arc<AppState>, req: Begin) -> Response {
     // A filesystem that cannot hold the file says so now. Best effort: a
     // quota is not visible here and surfaces at the next sync instead.
     let probe = dir.clone();
-    let free = tokio::task::spawn_blocking(move || free_bytes(&probe))
+    let free = tokio::task::spawn_blocking(move || crate::plugins::toolchain::free_bytes(&probe))
         .await
         .ok()
         .flatten();
@@ -840,7 +834,7 @@ async fn finish_upload(state: Arc<AppState>, id: String, chain: Option<String>) 
     // Recorded before anything else awaits: the file is published, and a
     // retried `finish` must get this answer rather than a failed rename.
     let outcome = json!({
-        "path": target.to_string_lossy(),
+        "path": chimaera_core::paths::wire_path(&target),
         "name": final_name,
         "size": upload.size,
     });

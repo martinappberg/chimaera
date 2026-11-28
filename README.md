@@ -48,7 +48,7 @@ project in view.
 |---|---|
 | macOS | Apple Silicon, `.dmg` |
 | Linux | x86_64, AppImage, `.deb`, or `.rpm` |
-| Windows | x64 installer, with the daemon and agents running in WSL2; beta |
+| Windows | x64 installer, with a native daemon; beta |
 
 [Installation and platform setup](https://chimaera.sh/docs.html#platforms) ·
 [All releases](https://github.com/martinappberg/chimaera/releases)
@@ -159,8 +159,8 @@ chimaera plugin list            # list available and installed workbench plugins
 
 You need **Node 26**, npm, Rust through **rustup**, and a C/C++ build toolchain.
 The repository pins Rust in [rust-toolchain.toml](rust-toolchain.toml); rustup
-selects it automatically. Run these commands on macOS, Linux, or inside WSL2 on
-Windows. Build the UI first because the daemon embeds it.
+selects it automatically. Run these commands on macOS or Linux (`just win-check` cross-checks the
+Windows build). Build the UI first because the daemon embeds it.
 
 ```sh
 git clone https://github.com/martinappberg/chimaera

@@ -11,10 +11,7 @@ async fn validate(state: &Arc<AppState>, body: serde_json::Value) -> serde_json:
 }
 
 fn canon(path: &std::path::Path) -> String {
-    std::fs::canonicalize(path)
-        .unwrap()
-        .to_string_lossy()
-        .into_owned()
+    wire(&canonical(path))
 }
 
 async fn workspace_at(state: &Arc<AppState>, root: &std::path::Path) -> String {

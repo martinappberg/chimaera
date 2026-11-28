@@ -32,6 +32,7 @@
   import { branchLabel, type Session } from "./sessions";
   import Chevron from "../shared/Chevron.svelte";
   import GitRepoSection from "./GitRepoSection.svelte";
+  import { basename, isUnder } from "../shared/paths";
 
   interface Props {
     wsId: string | null;
@@ -125,13 +126,13 @@
 
   function repoName(r: GitRepo): string {
     if (r.rel && r.rel !== ".") return r.rel;
-    return r.path.split("/").filter(Boolean).pop() ?? r.path;
+    return basename(r.path) || r.path;
   }
 
   /** The repositories directly inside `top` (their folders are links). */
   function nestedIn(top: string | null): string[] {
     if (top === null) return belowRoot;
-    return belowRoot.filter((p) => p !== top && p.startsWith(`${top}/`));
+    return belowRoot.filter((p) => p !== top && isUnder(p, top));
   }
 
   function openRepo(path: string): void {

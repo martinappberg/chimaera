@@ -216,6 +216,8 @@ async fn a_plugin_page_is_served_under_its_grant() {
 
 #[tokio::test]
 async fn a_plugin_page_reads_workspace_files_by_range_within_its_access() {
+    // `root` is for the Unix-only link check below.
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let (state, ws, root) = web_workspace("web-data").await;
     let (_, body) = mint(&state, &ws, PID, "view.html").await;
     let url = body["url"].as_str().unwrap();
@@ -247,15 +249,19 @@ async fn a_plugin_page_reads_workspace_files_by_range_within_its_access() {
     // Outside the workspace, or through a link: refused.
     let (status, _, _) = get(&state, &ask("../etc/passwd")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    let outside = test_dir("web-data-outside");
-    std::fs::write(outside.join("secret.txt"), "secret").unwrap();
-    std::os::unix::fs::symlink(&outside, root.join("away")).unwrap();
-    let (status, _, bytes) = get(&state, &ask("away/secret.txt")).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    assert!(
-        std::str::from_utf8(&bytes).unwrap().contains("link"),
-        "{bytes:?}"
-    );
+    // A symlink needs privileges on Windows.
+    #[cfg(unix)]
+    {
+        let outside = test_dir("web-data-outside");
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("away")).unwrap();
+        let (status, _, bytes) = get(&state, &ask("away/secret.txt")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            std::str::from_utf8(&bytes).unwrap().contains("link"),
+            "{bytes:?}"
+        );
+    }
 
     // `save` lands in its output folder, which `url` then reads.
     let png = b"\x89PNG\r\n\x1a\nfixture".to_vec();
@@ -464,6 +470,8 @@ async fn a_plain_report_keeps_its_bytes_under_the_fixed_rule() {
 
 #[tokio::test]
 async fn a_0_3_plugin_reads_a_workspace_file_from_an_offset() {
+    // `root` is for the Unix-only link check below.
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let (state, ws, root) = web_workspace("web-read-at").await;
     let read_at = |args: Value| {
         let state = state.clone();
@@ -488,9 +496,13 @@ async fn a_0_3_plugin_reads_a_workspace_file_from_an_offset() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["data"]["text"], json!(""));
     // The same confinement as `read`: no `..`, no link.
-    let outside = test_dir("web-read-at-outside");
-    std::fs::write(outside.join("secret.txt"), "secret").unwrap();
-    std::os::unix::fs::symlink(&outside, root.join("away")).unwrap();
+    // A symlink needs privileges on Windows; there `away` is simply missing.
+    #[cfg(unix)]
+    {
+        let outside = test_dir("web-read-at-outside");
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("away")).unwrap();
+    }
     for path in ["../x", "away/secret.txt"] {
         let (status, body) = read_at(json!({"path": path, "offset": 0, "cap": 5})).await;
         assert_ne!(status, StatusCode::OK, "{path}: {body}");

@@ -5,7 +5,14 @@
 //! prompt to the running app over a unix socket, the app shows a modal, and
 //! the typed answer flows back to ssh on stdout. Because every ssh call to a
 //! host multiplexes one ControlMaster, the user is asked once per host, not
-//! once per command.
+//! once per command. Windows' OpenSSH has no ControlMaster, so there a
+//! password or 2FA host asks once per ssh call.
+//!
+//! Transport: a unix socket in a private dir (unix); a token-gated loopback
+//! TCP listener (Windows), where ssh runs this executable itself as
+//! `SSH_ASKPASS` — no shell shim exists there to add `--askpass`, so the
+//! relay's env var plus a single argument marks the helper role
+//! ([`is_helper_invocation`]).
 //!
 //! Keyboard-interactive prompts (Duo's "Passcode or option (1-3):") reach
 //! askpass too, so the same modal — prompt text over a single input — covers
@@ -48,6 +55,12 @@ use tokio::sync::oneshot;
 #[cfg(unix)]
 const SOCK_ENV: &str = "CHIMAERA_ASKPASS_SOCK";
 
+/// Env var carrying the loopback relay's `"<port> <token>"` to the helper
+/// (Windows). It also marks a single-argument run of this executable as the
+/// helper, so only ssh — which inherits it from the app — ever sees it.
+#[cfg(windows)]
+const RELAY_ENV: &str = "CHIMAERA_ASKPASS_RELAY";
+
 /// Every variable `install` (or a connect, for the alias) puts in this
 /// process's environment for its OWN ssh children. The local daemon must not
 /// inherit them: its terminals and agents would then prompt through the app's
@@ -60,17 +73,25 @@ pub(crate) const APP_ASKPASS_ENV: &[&str] = &[
     "CHIMAERA_ASKPASS_SOCK",
     chimaera_remote::ASKPASS_ALIAS_ENV,
 ];
+#[cfg(windows)]
+pub(crate) const APP_ASKPASS_ENV: &[&str] = &[
+    "SSH_ASKPASS",
+    "SSH_ASKPASS_REQUIRE",
+    RELAY_ENV,
+    chimaera_remote::ASKPASS_ALIAS_ENV,
+];
 pub(crate) const SCOPE_FRAME: &str = "chimaera-askpass-scope-v1";
 
 /// Exit status of `--askpass` for a prompt that got no answer (cancelled,
 /// timed out, or its window gone). The shim ends the asking ssh on it.
 pub(crate) const CANCELLED_EXIT: i32 = 75;
 
-/// The tail of every askpass shim, unix and WSL: run right after the helper
-/// with its status in `$?`. A cancel ends the process that exec'd the shim —
-/// ssh, whose `$PPID` this is — because the only other thing a cancelled
-/// ssh does is ask again.
-pub(crate) fn cancel_epilogue() -> String {
+/// The tail of the unix askpass shim: run right after the helper with its
+/// status in `$?`. A cancel ends the process that exec'd the shim — ssh,
+/// whose `$PPID` this is — because the only other thing a cancelled ssh does
+/// is ask again. (Windows has no shim: the helper ends its ssh itself.)
+#[cfg(unix)]
+fn cancel_epilogue() -> String {
     format!(
         "rc=$?\n\
          [ \"$rc\" -eq {CANCELLED_EXIT} ] && kill -TERM \"$PPID\"\n\
@@ -116,10 +137,95 @@ fn decode_reply(reply: &str) -> Reply {
 }
 
 /// The helper's cancel: leave the note the connect flow reads on stderr
-/// (ssh's stderr is captured) and exit with the status the shim acts on.
+/// (ssh's stderr is captured) and exit with the status the shim acts on. On
+/// Windows there is no shim, so the helper ends the asking ssh itself.
 fn cancelled() -> ! {
     eprintln!("{}", chimaera_remote::ASKPASS_CANCELLED);
+    #[cfg(windows)]
+    end_asking_ssh();
     std::process::exit(CANCELLED_EXIT)
+}
+
+/// Whether this process is the askpass helper: `--askpass` (the unix shim's
+/// form), or on Windows the relay variable plus exactly one argument — how
+/// ssh runs `SSH_ASKPASS` (`<program> <prompt>`). A relaunch of the app
+/// (`restart` after an update) inherits the variable but never passes a lone
+/// argument.
+pub fn is_helper_invocation() -> bool {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if args.iter().any(|a| a == "--askpass") {
+        return true;
+    }
+    #[cfg(windows)]
+    if args.len() == 1 && std::env::var_os(RELAY_ENV).is_some() {
+        return true;
+    }
+    false
+}
+
+/// The prompt ssh handed the helper: the argument after `--askpass`, else
+/// the only argument (Windows, where ssh runs this executable directly).
+fn helper_prompt(args: &[String]) -> String {
+    match args.iter().position(|a| a == "--askpass") {
+        Some(i) => args.get(i + 1).cloned().unwrap_or_default(),
+        None => args.first().cloned().unwrap_or_default(),
+    }
+}
+
+/// End the ssh that ran this helper (its parent, checked by image name so a
+/// recycled pid is never hit). Best effort: if the parent is not ssh, the
+/// cancel degrades to ssh's own "no answer" — it asks again.
+#[cfg(windows)]
+fn end_asking_ssh() {
+    if let Some(pid) = parent_process()
+        .filter(|(_, image)| image.eq_ignore_ascii_case("ssh.exe"))
+        .map(|(pid, _)| pid)
+    {
+        chimaera_core::proc::kill_pid(pid);
+    }
+}
+
+/// This process's parent: its pid and image name, from one process snapshot.
+#[cfg(windows)]
+fn parent_process() -> Option<(u32, String)> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let me = std::process::id();
+    // SAFETY: a snapshot handle checked against INVALID_HANDLE_VALUE, walked
+    // with a correctly sized entry, and closed exactly once.
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut entries: Vec<(u32, u32, String)> = Vec::new();
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut more = Process32FirstW(snapshot, &mut entry) != 0;
+        while more {
+            let len = entry
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(entry.szExeFile.len());
+            entries.push((
+                entry.th32ProcessID,
+                entry.th32ParentProcessID,
+                String::from_utf16_lossy(&entry.szExeFile[..len]),
+            ));
+            more = Process32NextW(snapshot, &mut entry) != 0;
+        }
+        CloseHandle(snapshot);
+        let parent = entries.iter().find(|(pid, _, _)| *pid == me)?.1;
+        entries
+            .into_iter()
+            .find(|(pid, _, _)| *pid == parent)
+            .map(|(pid, _, image)| (pid, image))
+    }
 }
 
 /// Held by the tests that write a script and exec it. A fork in one test
@@ -331,11 +437,11 @@ fn ensure_private_fallback(dir: &Path) -> Result<()> {
 /// `SSH_ASKPASS` / `SSH_ASKPASS_REQUIRE` as they were before `install`, for
 /// the local daemon's environment. Never the app's own shim (an app started
 /// from a terminal whose daemon inherited it from an older app).
-#[cfg(unix)]
 static USER_ASKPASS: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
 
-#[cfg(unix)]
-fn remember_user_askpass(shim: &Path) {
+/// `shim` is what the app sets `SSH_ASKPASS` to: the unix shim script, or
+/// on Windows this executable itself.
+fn remember_user_askpass(shim: &std::path::Path) {
     let current: Vec<(String, String)> = ["SSH_ASKPASS", "SSH_ASKPASS_REQUIRE"]
         .iter()
         .filter_map(|key| Some((key.to_string(), std::env::var(key).ok()?)))
@@ -345,11 +451,10 @@ fn remember_user_askpass(shim: &Path) {
 
 /// The user's askpass settings among `current`: none at all when
 /// `SSH_ASKPASS` is unset or names the app's shim.
-#[cfg(unix)]
-fn user_askpass(current: Vec<(String, String)>, shim: &Path) -> Vec<(String, String)> {
+fn user_askpass(current: Vec<(String, String)>, shim: &std::path::Path) -> Vec<(String, String)> {
     let theirs = current
         .iter()
-        .any(|(k, v)| k == "SSH_ASKPASS" && !v.is_empty() && Path::new(v) != shim);
+        .any(|(k, v)| k == "SSH_ASKPASS" && !v.is_empty() && std::path::Path::new(v) != shim);
     if theirs {
         current
     } else {
@@ -358,7 +463,6 @@ fn user_askpass(current: Vec<(String, String)>, shim: &Path) -> Vec<(String, Str
 }
 
 /// What `remember_user_askpass` kept (empty before `install` or when none).
-#[cfg(unix)]
 pub(crate) fn user_askpass_env() -> &'static [(String, String)] {
     USER_ASKPASS.get().map_or(&[], Vec::as_slice)
 }
@@ -437,23 +541,6 @@ pub fn install(app: &AppHandle) -> Result<()> {
     Ok(())
 }
 
-/// Windows: a token-gated loopback TCP listener. ssh runs INSIDE WSL and
-/// execs a distro-side wrapper script (installed by `wsl::wire_connect`,
-/// which bakes this listener's port + token in); the wrapper pipes the
-/// prompt to `chimaera.exe --askpass` over interop, and that helper connects
-/// back here — Windows-side loopback, never WSL→Windows TCP (firewalled by
-/// default under NAT). The token exists because loopback TCP lacks the unix
-/// socket's 0700-dir confidentiality: without it any local process could
-/// present a fake prompt and be handed a typed password.
-#[cfg(windows)]
-static RELAY: std::sync::OnceLock<(u16, String)> = std::sync::OnceLock::new();
-
-/// The relay's `(port, token)` for the WSL wrapper script to embed.
-#[cfg(windows)]
-pub fn relay_endpoint() -> Option<(u16, String)> {
-    RELAY.get().cloned()
-}
-
 /// A version marker and per-child host context precede the arbitrary ssh
 /// prompt. The marker matters during rolling updates: an older helper can send
 /// a multi-line Duo prompt, and treating its first line as an alias would show
@@ -474,6 +561,12 @@ fn split_prompt_request(input: String) -> (Option<String>, String) {
     )
 }
 
+/// Windows: a token-gated loopback TCP listener, and this executable as
+/// `SSH_ASKPASS` (Win32-OpenSSH runs it with the prompt as its one argument).
+/// The token exists because loopback TCP lacks the unix socket's private-dir
+/// confidentiality: without it any local process could present a fake prompt
+/// and be handed a typed password. It reaches the helper through ssh's
+/// inherited environment, never argv.
 #[cfg(windows)]
 pub fn install(app: &AppHandle) -> Result<()> {
     let token = chimaera_core::generate_token();
@@ -481,7 +574,16 @@ pub fn install(app: &AppHandle) -> Result<()> {
         std::net::TcpListener::bind(("127.0.0.1", 0)).context("bind askpass relay")?;
     std_listener.set_nonblocking(true)?;
     let port = std_listener.local_addr()?.port();
-    let _ = RELAY.set((port, token.clone()));
+
+    let exe = std::env::current_exe().context("resolve current executable")?;
+    // The user's own askpass, if any, before ours replaces it: the daemon's
+    // sessions get it back (`daemon::spawn_detached`).
+    remember_user_askpass(&exe);
+    // REQUIRE=force: ssh would otherwise try the console first, and the app's
+    // ssh children have none.
+    std::env::set_var("SSH_ASKPASS", &exe);
+    std::env::set_var("SSH_ASKPASS_REQUIRE", "force");
+    std::env::set_var(RELAY_ENV, format!("{port} {token}"));
 
     let app = app.clone();
     // Same reactor rule as the unix listener: convert inside the runtime.
@@ -514,34 +616,15 @@ pub fn install(app: &AppHandle) -> Result<()> {
 }
 
 /// One relay request: first line is the auth token, the rest (to the
-/// client's half-close) is the prompt; reply secret + newline. The read is
-/// SIZE-CAPPED and TIMED: unlike the unix socket (gated by a 0700 dir), any
-/// local process can connect to this loopback port — without bounds one
-/// could stream gigabytes into this String or hold a task open forever.
-/// The token protects secrecy; these bounds protect availability.
+/// client's half-close) is the scoped prompt; reply as [`encode_reply`].
+/// Unlike the unix socket, any local process can connect to this port, so
+/// the token guards secrecy and the request bounds guard availability.
 #[cfg(windows)]
 async fn serve_one_tcp(app: AppHandle, mut stream: tokio::net::TcpStream, token: String) {
-    /// Token line + a generous ceiling for any real ssh prompt.
-    const MAX_REQUEST: u64 = 64 * 1024;
-    const READ_TIMEOUT: Duration = Duration::from_secs(10);
-
-    let mut input = String::new();
-    let read = tokio::time::timeout(
-        READ_TIMEOUT,
-        (&mut stream).take(MAX_REQUEST).read_to_string(&mut input),
-    )
-    .await;
-    match read {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => {
-            tracing::warn!("askpass: could not read relay request: {e}");
-            return;
-        }
-        Err(_) => {
-            tracing::warn!("askpass: relay request timed out");
-            return;
-        }
-    }
+    let Some(input) = read_request(&mut stream, MAX_PROMPT_REQUEST, PROMPT_READ_TIMEOUT).await
+    else {
+        return;
+    };
     let Some((client_token, request)) = input.split_once('\n') else {
         tracing::warn!("askpass: malformed relay request");
         return;
@@ -559,14 +642,12 @@ async fn serve_one_tcp(app: AppHandle, mut stream: tokio::net::TcpStream, token:
 /// A generous ceiling for any real ssh prompt request, and how long a client
 /// may take to send it. Any same-user process can connect to the socket;
 /// without bounds one could stream without end into a String or pin a task.
-#[cfg(unix)]
+/// (The Windows token line fits well inside the same ceiling.)
 const MAX_PROMPT_REQUEST: u64 = 64 * 1024;
-#[cfg(unix)]
 const PROMPT_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Read one whole request (to the client's half-close), or `None` when it is
 /// larger than `max` bytes, not UTF-8, or not finished within `timeout`.
-#[cfg(unix)]
 async fn read_request<R: tokio::io::AsyncRead + Unpin>(
     stream: &mut R,
     max: u64,
@@ -641,10 +722,7 @@ async fn resolve_prompt(app: &AppHandle, alias: Option<String>, prompt: String) 
 /// fails cleanly, never hangs).
 #[cfg(unix)]
 pub fn run_helper() {
-    let prompt = std::env::args()
-        .skip_while(|a| a != "--askpass")
-        .nth(1)
-        .unwrap_or_default();
+    let prompt = helper_prompt(&std::env::args().skip(1).collect::<Vec<_>>());
     let Some(sock) = std::env::var_os(SOCK_ENV) else {
         return;
     };
@@ -659,65 +737,136 @@ pub fn run_helper() {
     std::io::stdout().flush().ok();
 }
 
-/// Windows `--askpass`: invoked THROUGH WSL interop by the distro-side
-/// wrapper script. Everything arrives on stdin — line 1 `"<port> <token>"`,
-/// then the versioned scope frame, alias, and prompt to EOF — never argv,
-/// whose Linux→Windows marshaling for arbitrary prompt text is unverified.
+/// Windows: the same helper over the loopback relay named by [`RELAY_ENV`].
 /// Any failure prints nothing: ssh gets an empty answer and fails cleanly,
-/// never hangs. A prompt that got no answer exits [`CANCELLED_EXIT`], which
-/// the wrapper turns into ending ssh (see [`cancel_epilogue`]).
+/// never hangs. A prompt that got no answer ends the asking ssh
+/// ([`cancelled`]).
 #[cfg(windows)]
 pub fn run_helper() {
-    let mut input = String::new();
-    if std::io::stdin().read_to_string(&mut input).is_err() {
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let prompt = helper_prompt(&args);
+    let Some(relay) = std::env::var(RELAY_ENV).ok() else {
         return;
+    };
+    let Some((port, token)) = relay
+        .split_once(' ')
+        .and_then(|(port, token)| Some((port.parse::<u16>().ok()?, token)))
+    else {
+        return;
+    };
+    let alias = std::env::var(chimaera_remote::ASKPASS_ALIAS_ENV)
+        .ok()
+        .filter(|alias| !alias.is_empty());
+    match ask_tcp(port, token, alias.as_deref(), &prompt) {
+        Ok(Reply::Secret(secret)) => print!("{secret}"),
+        Ok(Reply::Cancelled) => cancelled(),
+        Ok(Reply::Unanswered) | Err(_) => {}
     }
-    let Some((head, prompt)) = input.split_once('\n') else {
-        return;
-    };
-    let mut parts = head.split_whitespace();
-    let (Some(port), Some(token)) = (
-        parts.next().and_then(|p| p.parse::<u16>().ok()),
-        parts.next(),
-    ) else {
-        return;
-    };
-    let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
-        return;
-    };
-    if stream.write_all(token.as_bytes()).is_err()
-        || stream.write_all(b"\n").is_err()
-        || stream.write_all(prompt.as_bytes()).is_err()
-        || stream.shutdown(Shutdown::Write).is_err()
-    {
-        return;
-    }
+    std::io::stdout().flush().ok();
+}
+
+/// One loopback relay round trip: the token line, then the same framing as
+/// the unix socket's.
+#[cfg(windows)]
+fn ask_tcp(port: u16, token: &str, alias: Option<&str>, prompt: &str) -> Result<Reply> {
+    let mut stream =
+        std::net::TcpStream::connect(("127.0.0.1", port)).context("connect askpass relay")?;
+    stream.write_all(token.as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.write_all(&scoped_request(alias, prompt))?;
+    stream.shutdown(Shutdown::Write)?;
     let mut reply = String::new();
-    if stream.read_to_string(&mut reply).is_err() {
-        return;
-    }
-    match decode_reply(&reply) {
-        Reply::Secret(secret) => print!("{secret}"),
-        Reply::Cancelled => cancelled(),
-        Reply::Unanswered => {}
-    }
-    let _ = std::io::stdout().flush();
+    stream.read_to_string(&mut reply)?;
+    Ok(decode_reply(&reply))
+}
+
+/// The scope frame, the alias and the prompt, one per line (the prompt may
+/// span several).
+fn scoped_request(alias: Option<&str>, prompt: &str) -> Vec<u8> {
+    format!("{SCOPE_FRAME}\n{}\n{prompt}", alias.unwrap_or_default()).into_bytes()
 }
 
 /// One relay round trip: the prompt out, the relay's reply back.
 #[cfg(unix)]
 fn ask(sock: &std::ffi::OsStr, alias: Option<&str>, prompt: &str) -> Result<Reply> {
     let mut stream = StdUnixStream::connect(sock).context("connect askpass socket")?;
-    stream.write_all(SCOPE_FRAME.as_bytes())?;
-    stream.write_all(b"\n")?;
-    stream.write_all(alias.unwrap_or_default().as_bytes())?;
-    stream.write_all(b"\n")?;
-    stream.write_all(prompt.as_bytes())?;
+    stream.write_all(&scoped_request(alias, prompt))?;
     // Half-close so the server's read-to-EOF returns the whole prompt.
     stream.shutdown(Shutdown::Write)?;
     let mut reply = String::new();
     stream.read_to_string(&mut reply)?;
     Ok(decode_reply(&reply))
+}
+
+#[cfg(test)]
+mod portable_tests {
+    use super::*;
+
+    #[test]
+    fn the_prompt_is_the_argument_after_the_flag_or_the_only_one() {
+        let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            helper_prompt(&args(&["--askpass", "Password:"])),
+            "Password:"
+        );
+        assert_eq!(helper_prompt(&args(&["Password: "])), "Password: ");
+        assert_eq!(helper_prompt(&args(&["--askpass"])), "");
+        assert_eq!(helper_prompt(&[]), "");
+    }
+
+    #[test]
+    fn a_scoped_request_round_trips_through_the_relays_parser() {
+        let request = String::from_utf8(scoped_request(Some("cluster"), "Passcode:\nDuo")).unwrap();
+        let (alias, prompt) = split_prompt_request(request);
+        assert_eq!(alias.as_deref(), Some("cluster"));
+        assert_eq!(prompt, "Passcode:\nDuo");
+        let (alias, _) =
+            split_prompt_request(String::from_utf8(scoped_request(None, "Password:")).unwrap());
+        assert_eq!(alias, None);
+    }
+
+    /// The Windows helper's framing against a stand-in relay: token line
+    /// first, then the scoped prompt; the reply decodes as on unix.
+    #[cfg(windows)]
+    #[test]
+    fn the_tcp_helper_sends_the_token_then_the_scoped_prompt() {
+        for (reply, want) in [
+            (
+                encode_reply(Some("hunter2")),
+                Reply::Secret("hunter2".into()),
+            ),
+            (encode_reply(None), Reply::Cancelled),
+            (Vec::new(), Reply::Unanswered),
+        ] {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let (mut s, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                s.read_to_string(&mut request).unwrap();
+                s.write_all(&reply).unwrap();
+                request
+            });
+            let got = ask_tcp(port, "tok", Some("cluster"), "Password:").unwrap();
+            assert_eq!(
+                server.join().unwrap(),
+                "tok\nchimaera-askpass-scope-v1\ncluster\nPassword:"
+            );
+            assert_eq!(got, want);
+        }
+    }
+
+    /// The cancel path's parent lookup finds a real, different process.
+    #[cfg(windows)]
+    #[test]
+    fn the_parent_process_is_found_by_snapshot() {
+        let (pid, image) = parent_process().expect("a parent");
+        assert_ne!(pid, std::process::id());
+        assert!(!image.is_empty());
+    }
 }
 
 #[cfg(all(test, unix))]

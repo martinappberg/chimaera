@@ -60,6 +60,7 @@ async fn fs_ticket_accepts_dirs_but_raw_stays_file_only() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn download_dir_zips_recursively_skipping_symlinks() {
     let state = test_state();

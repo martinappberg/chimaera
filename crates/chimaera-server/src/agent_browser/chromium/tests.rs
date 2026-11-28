@@ -451,6 +451,8 @@ fn startup_failures_are_explained() {
     assert!(!msg.contains("last output"));
 }
 
+// Unix executables: mode bits, not PATHEXT.
+#[cfg(unix)]
 #[test]
 fn discovery_prefers_the_setting_then_path() {
     use std::os::unix::fs::PermissionsExt;

@@ -13,6 +13,7 @@ import { writable, derived, get, type Readable } from "svelte/store";
 import type { DiffTab, GitDetailTab } from "../layout/layout";
 
 import { api, ApiError } from "../net/api";
+import { basename, dirname, isRoot, isUnder } from "../shared/paths";
 
 export interface GitEntry {
   /** Absolute path (matches FsEntry.path, so the tree can look it up directly). */
@@ -742,20 +743,21 @@ function addStatus(
     // Roll the category up to every ancestor directory so a collapsed folder
     // shows that something inside it changed — stopping at the repository's
     // own folder: a change inside a nested repository never colours the
-    // outer repository's folders. Absolute POSIX paths (the daemon is Unix).
+    // outer repository's folders. The filesystem root itself never carries a
+    // rollup.
     let p = bare;
     for (;;) {
-      const slash = p.lastIndexOf("/");
-      if (slash <= 0) break;
+      const parent = dirname(p);
+      if (parent === p || parent === "." || isRoot(parent)) break;
       if (top !== null && p === top) break;
-      p = p.slice(0, slash);
+      p = parent;
       if (top !== null && p.length < top.length) break;
       if (dirRank(cat) > dirRank(dirs.get(p))) dirs.set(p, cat);
     }
   }
 }
 
-function buildIndex(
+export function buildIndex(
   primary: GitStatus | null,
   others: Map<string, GitStatus>,
   repos: GitRepo[],
@@ -785,8 +787,7 @@ export function repoForPath(repos: GitRepo[], path: string | null | undefined): 
   if (!path) return null;
   let best: GitRepo | null = null;
   for (const r of repos) {
-    const root = r.path.endsWith("/") ? r.path : `${r.path}/`;
-    if (path === r.path || path.startsWith(root)) {
+    if (isUnder(path, r.path)) {
       if (best === null || r.path.length > best.path.length) best = r;
     }
   }
@@ -818,7 +819,7 @@ export function openFileHistory(path: string): void {
     view: "history",
     repo,
     path,
-    title: path.split("/").filter(Boolean).pop() ?? path,
+    title: basename(path) || path,
   });
 }
 
@@ -828,7 +829,7 @@ export function openBranchChanges(git: { worktree: string; branch: string | null
     surface: "gitx",
     view: "branch",
     repo: git.worktree,
-    title: git.branch ?? (git.worktree.split("/").filter(Boolean).pop() ?? git.worktree),
+    title: git.branch ?? (basename(git.worktree) || git.worktree),
   });
 }
 

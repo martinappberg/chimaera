@@ -13,6 +13,15 @@ async fn submitted_handshake_failure_keeps_chat_for_every_provider() {
     handshake_failure_for_every_provider(true).await;
 }
 
+/// A program that reads stdin to its end and never answers.
+fn swallow_stdin() -> Vec<String> {
+    #[cfg(unix)]
+    let argv = ["/bin/sh", "-c", "cat >/dev/null"];
+    #[cfg(windows)]
+    let argv = ["cmd.exe", "/d", "/c", "sort >nul"];
+    argv.iter().map(|a| a.to_string()).collect()
+}
+
 async fn handshake_failure_for_every_provider(submit: bool) {
     for kind in agents::AgentKind::ALL {
         let state = test_state();
@@ -47,11 +56,7 @@ async fn handshake_failure_for_every_provider(submit: bool) {
                 auto_compact: None,
             },
         );
-        let mut spec = chimaera_agent::driver::SpawnSpec::new(
-            id.clone(),
-            vec!["/bin/sh".into(), "-c".into(), "cat >/dev/null".into()],
-            dir,
-        );
+        let mut spec = chimaera_agent::driver::SpawnSpec::new(id.clone(), swallow_stdin(), dir);
         spec.handshake_timeout = std::time::Duration::from_millis(300);
         state
             .chat
@@ -107,6 +112,7 @@ async fn handshake_failure_for_every_provider(submit: bool) {
     }
 }
 
+#[cfg(unix)]
 /// A handshake failure with NO respawn recipe must not silently retire the
 /// session: it stays registered (dead) with the record Errored — the same
 /// keep-visible contract as ProtocolError — so the rail shows the failure
@@ -202,6 +208,7 @@ async fn only_cursor_chat_spawns_disable_the_browser_login() {
 /// agy's updater off (it would overwrite Chimaera's install), and must leave
 /// a user's own agy its updater. The real spawn path runs a fake that
 /// records its environment.
+#[cfg(unix)] // a sh stand-in for agy behind a symlink
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agy_cli_chat_switches_off_the_updater_only_for_a_managed_agy() {
     use std::os::unix::fs::PermissionsExt;
@@ -401,6 +408,7 @@ async fn resumed_handshake_failure_keeps_chat_for_every_provider() {
     }
 }
 
+#[cfg(unix)]
 /// An agent updated IN PLACE (same path, new binary) must be noticed by the
 /// next spawn-time detect: the cached version is re-probed from the new
 /// binary without a full re-resolution — the login shell is never consulted,
@@ -482,7 +490,7 @@ async fn create_agent_spawns_command_with_generated_settings() {
     preset_agent(
         &state,
         agents::AgentKind::Claude,
-        Ok(PathBuf::from("/bin/echo")),
+        Ok(quick_exit_bin()),
         None,
     );
     let root = test_dir("agent-spawn");
@@ -597,10 +605,13 @@ async fn agents_endpoint_lists_catalog_with_installed_and_missing() {
     assert_eq!(claude["latest_version"], "2.1.207");
     assert_eq!(claude["latest_checked_at"], 1_000);
     assert_eq!(claude["update_available"], true);
+    // Windows rows carry the vendor's PowerShell command; the managed
+    // installs are POSIX-only.
+    let posix = cfg!(unix);
     assert!(claude["install"]["command"]
         .as_str()
         .unwrap()
-        .starts_with("curl "));
+        .starts_with(if posix { "curl " } else { "irm " }));
     assert!(claude["install"]["url"]
         .as_str()
         .unwrap()
@@ -646,12 +657,16 @@ async fn agents_endpoint_lists_catalog_with_installed_and_missing() {
     assert_eq!(cursor["name"], "Cursor CLI");
     assert_eq!(cursor["version"], "2026.10.14-941492e");
     assert_eq!(cursor["update_available"], true);
-    assert_eq!(cursor["managed_install"], true);
+    assert_eq!(cursor["managed_install"], posix);
     assert_eq!(cursor["view_switchable"], false);
     assert_eq!(cursor["models"], serde_json::json!([]));
     assert_eq!(
         cursor["install"]["command"],
-        "curl https://cursor.com/install -fsS | bash"
+        if posix {
+            "curl https://cursor.com/install -fsS | bash"
+        } else {
+            "irm 'https://cursor.com/install?win32=true' | iex"
+        }
     );
 }
 
@@ -711,6 +726,8 @@ async fn agent_launcher_endpoints_without_token_are_401() {
 /// install), and the session mechanics (ordinary kind-"shell" session
 /// with streaming output, one install per agent = 409, watcher cleanup)
 /// driven with a stub script so the test never hits the network.
+// Managed installs run a bash script and are POSIX-only.
+#[cfg(unix)]
 #[tokio::test]
 async fn install_endpoint_contract_and_session_mechanics() {
     let state = test_state();
@@ -827,6 +844,8 @@ async fn install_endpoint_contract_and_session_mechanics() {
     state.sessions.kill(&other).ok();
 }
 
+// Managed installs run a bash script and are POSIX-only.
+#[cfg(unix)]
 #[tokio::test]
 async fn installer_result_survives_the_terminal_disappearing() {
     let state = test_state();
@@ -877,6 +896,8 @@ async fn installer_result_survives_the_terminal_disappearing() {
 /// own). Session mechanics ride the same `start_install` slot as installs —
 /// driven with a stub script so the test never hits the network; the pane
 /// name says "update", and a running update 409s BOTH endpoints.
+// Managed installs run a bash script and are POSIX-only.
+#[cfg(unix)]
 #[tokio::test]
 async fn update_endpoint_is_managed_only_and_shares_the_install_slot() {
     let state = test_state();
@@ -987,6 +1008,8 @@ async fn update_endpoint_is_managed_only_and_shares_the_install_slot() {
 /// the reservation is inserted before `SessionManager::spawn` registers
 /// the session, so a fresh reservation with no visible session is still
 /// busy; only one past the grace window is reclaimable.
+// Managed installs run a bash script and are POSIX-only.
+#[cfg(unix)]
 #[tokio::test]
 async fn install_reservation_blocks_the_spawn_registration_race() {
     let state = test_state();
@@ -1058,7 +1081,7 @@ async fn claude_theme_fills_gap_in_generated_settings() {
     preset_agent(
         &state,
         agents::AgentKind::Claude,
-        Ok(PathBuf::from("/bin/echo")),
+        Ok(quick_exit_bin()),
         None,
     );
     let ws_id = make_workspace(&state, "theme-root").await;
@@ -1165,21 +1188,23 @@ async fn agents_rows_flag_managed_installs() {
     };
 
     // The user's own claude: installed, not managed.
+    // Managed installs are POSIX-only: a Windows row never offers one.
+    let posix = cfg!(unix);
     let claude = row("claude");
     assert_eq!(claude["installed"], true);
     assert!(!claude.as_object().unwrap().contains_key("managed"));
-    assert_eq!(claude["managed_install"], true);
+    assert_eq!(claude["managed_install"], posix);
     // The managed codex: flagged per the pinned API contract.
     let codex = row("codex");
     assert_eq!(codex["installed"], true);
     assert_eq!(codex["managed"], true);
-    assert_eq!(codex["managed_install"], true);
+    assert_eq!(codex["managed_install"], posix);
     assert!(
         list.iter().all(|a| a["id"] != "gemini"),
         "legacy Gemini must not reappear in the new-agent picker"
     );
-    assert_eq!(row("grok")["managed_install"], true);
-    assert_eq!(row("agy")["managed_install"], true);
+    assert_eq!(row("grok")["managed_install"], posix);
+    assert_eq!(row("agy")["managed_install"], posix);
 
     // Sign-in (additive): the CLI's own verdict, unknown for a preset path
     // that runs no status command, null when not installed; every row says
@@ -1197,6 +1222,7 @@ async fn agents_rows_flag_managed_installs() {
     assert_eq!(row("cursor")["sign_in"]["command"], "cursor-agent login");
 }
 
+#[cfg(unix)]
 /// A chat that died at startup for want of a login is started again, in
 /// place, when that agent's sign-in lands — the same session id, a second
 /// life in the same journal — and a chat of another agent is left alone.
@@ -1271,6 +1297,7 @@ async fn a_landed_sign_in_relaunches_the_chats_that_waited_on_it() {
     );
 }
 
+#[cfg(unix)]
 /// A live chat that waited on a sign-in is started again in place when the
 /// login lands; one mid-turn is not interrupted but relaunches when that
 /// turn ends; a chat spawned while the cached verdict said signed out
@@ -1396,6 +1423,7 @@ async fn a_live_chat_that_waited_on_a_sign_in_is_relaunched_now_or_after_its_tur
     assert!(!lock(&state.agents).get(&id).unwrap().signed_out_at_start);
 }
 
+#[cfg(unix)] // write_fake_claude is a sh script
 /// A chat whose agent says its account's limit is reached is signed in the
 /// whole time, so nothing marked it as waiting on a login. A sign-in that
 /// lands (another account, from any card) starts it again in place all the
@@ -1541,6 +1569,7 @@ async fn a_landed_sign_in_relaunches_a_chat_stalled_at_its_limit() {
         .all(|e| !matches!(e.ev, AgentEvent::ModeSwitch { .. })));
 }
 
+#[cfg(unix)]
 /// The sign-in routes' happy path against a scripted CLI: start answers
 /// running, the page shows up, a repeated start joins, cancel ends it, and
 /// the catalog row names the operation throughout.
@@ -1734,6 +1763,7 @@ fn a_shim_rebuild_keeps_every_found_executable() {
     assert!(lock(&state.agent_bins).contains_key(&agents::AgentKind::Claude));
 }
 
+#[cfg(unix)]
 /// A detection miss is served for a short window, to the catalog read only:
 /// a spawn probes, a refresh probes, a hit is never shadowed, and a refresh
 /// whose probe misses keeps a hit that still validates.
@@ -1838,12 +1868,7 @@ async fn a_changed_agent_path_and_an_extensions_recheck_forget_cached_misses() {
 #[tokio::test]
 async fn create_codex_agent_is_plain_tui_with_agent_kind() {
     let state = test_state();
-    preset_agent(
-        &state,
-        agents::AgentKind::Codex,
-        Ok(PathBuf::from("/bin/echo")),
-        None,
-    );
+    preset_agent(&state, agents::AgentKind::Codex, Ok(quick_exit_bin()), None);
     let root = test_dir("codex-spawn");
     let (_, ws) = request(
         &state,
@@ -1883,15 +1908,10 @@ async fn create_agent_validates_agent_model_and_resume() {
     preset_agent(
         &state,
         agents::AgentKind::Claude,
-        Ok(PathBuf::from("/bin/echo")),
+        Ok(quick_exit_bin()),
         None,
     );
-    preset_agent(
-        &state,
-        agents::AgentKind::Codex,
-        Ok(PathBuf::from("/bin/echo")),
-        None,
-    );
+    preset_agent(&state, agents::AgentKind::Codex, Ok(quick_exit_bin()), None);
     let root = test_dir("agent-validate");
     let (_, ws) = request(
         &state,
@@ -2409,6 +2429,7 @@ async fn agent_first_prompt_is_provisional_display_name() {
     let state = test_state();
     // No shell underneath: a shell's title would outrank the prompt.
     let id = inject_silent_agent(&state, "k");
+    silent_agent_settled(&state, &id).await;
 
     // No hook data yet: the generic agent name.
     assert_eq!(session_entry(&state, &id).await["display_name"], "claude");

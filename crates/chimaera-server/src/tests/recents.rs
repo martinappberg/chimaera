@@ -625,6 +625,7 @@ async fn archiving_hides_recents_without_deleting_anything() {
     assert!(lock(&reloaded.recents_archive).hidden(&ws_id).is_empty());
 }
 
+#[cfg(unix)]
 /// Plant `body` at `path` and make it unreadable (mode 000). False when the
 /// process can read it anyway (root), so a test can skip rather than lie.
 pub(super) fn unreadable_file(path: &std::path::Path, body: &[u8]) -> bool {
@@ -634,6 +635,7 @@ pub(super) fn unreadable_file(path: &std::path::Path, body: &[u8]) -> bool {
     std::fs::read(path).is_err()
 }
 
+#[cfg(unix)]
 /// Give a test's unreadable file back its mode, so it can be read and removed.
 pub(super) fn readable_again(path: &std::path::Path) -> Vec<u8> {
     use std::os::unix::fs::PermissionsExt;
@@ -692,6 +694,7 @@ fn recents_store_oversized_file_loads_empty_and_is_replaced() {
     assert_eq!(reloaded.list("w")[0].title, "new");
 }
 
+#[cfg(unix)]
 /// Unreadable (a directory at the path, or a file without read
 /// permission): the daemon still serves recents from memory, but never
 /// writes over what it couldn't read — until it reads again: then the next
@@ -730,6 +733,7 @@ fn recents_store_unreadable_file_is_held_until_it_reads_then_merged() {
     assert_eq!(titles(&reloaded), ["latest", "newer", "new", "kept"]);
 }
 
+#[cfg(unix)]
 /// The archive: unreadable or oversized is held (replacing it would un-hide
 /// every conversation in it) and served from memory; once the file reads,
 /// the next change merges with it and lands — minus what was unarchived

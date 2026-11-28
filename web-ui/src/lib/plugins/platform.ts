@@ -12,6 +12,7 @@
  */
 import { writable, type Readable } from "svelte/store";
 import { api, ApiError } from "../net/api";
+import { isAbsolute, joinPath, relativeTo } from "../shared/paths";
 import type { WorkspacePlugin } from "./store";
 import { pluginIcon } from "./ui/icons";
 
@@ -218,8 +219,8 @@ export function matchesPattern(pattern: string, path: string): boolean {
 /** `path` relative to `root` (null when outside it). */
 export function workspaceRelative(root: string | null, path: string): string | null {
   if (root === null) return null;
-  const r = root.endsWith("/") ? root.slice(0, -1) : root;
-  return path.startsWith(`${r}/`) ? path.slice(r.length + 1) : null;
+  const rel = relativeTo(path, root);
+  return rel === "." ? null : rel;
 }
 
 /** An active plugin that opens `rel` in one of its views. */
@@ -518,9 +519,16 @@ export function outputRoot(ws: string, pid: string): Promise<string> {
   return p;
 }
 
-/** Whether `rel` is a plain relative path: no `..`, not absolute. */
+/** Whether `rel` is a plain relative path: no `..`, not absolute. A Windows
+ *  daemon also reads `\` as a separator and `C:x` as drive-relative, so
+ *  neither may smuggle a climb or a drive past this check. */
 export function plainRelative(rel: string): boolean {
-  return rel !== "" && !rel.startsWith("/") && !rel.split("/").some((c) => c === "..");
+  return (
+    rel !== "" &&
+    !isAbsolute(rel) &&
+    !/^[A-Za-z]:/.test(rel) &&
+    !rel.split(/[\\/]/).some((c) => c === "..")
+  );
 }
 
 /** `ref` (a workspace path, or `output:<path>`) as an absolute path. A
@@ -532,10 +540,10 @@ export async function resolvePlace(ws: string, wsRoot: string | null, pid: strin
     const rel = ref.slice("output:".length);
     if (!plainRelative(rel)) throw new Error(`${ref}: not a path in the plugin's output folder`);
     const root = await outputRoot(ws, pid);
-    return `${root}/${rel}`;
+    return joinPath(root, rel);
   }
   if (!plainRelative(ref) || wsRoot === null) throw new Error(`${ref}: not a path in this workspace`);
-  return `${wsRoot.endsWith("/") ? wsRoot.slice(0, -1) : wsRoot}/${ref}`;
+  return joinPath(wsRoot, ref);
 }
 
 export async function saveOutput(

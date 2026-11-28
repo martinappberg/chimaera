@@ -52,6 +52,11 @@ describe("open request", () => {
     expect(replaced).toHaveLength(1);
   });
 
+  it("accepts a Windows daemon's drive path", async () => {
+    const { api } = await boot("#token=t&open=C%3A%2FUsers%2Fu%2Fpeek%2Fplot.png");
+    expect(api.takeOpenRequest()).toBe("C:/Users/u/peek/plot.png");
+  });
+
   it("drops a relative path", async () => {
     const { api } = await boot("#token=t&open=notes.md");
     expect(api.takeOpenRequest()).toBeNull();

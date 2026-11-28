@@ -54,3 +54,19 @@ describe("surfacesOf (the view-state `surfaces` manifest)", () => {
     expect(focused).toEqual([{ surface: "file", path: `f${SURFACES_CAP + 4}.txt`, focused: true }]);
   });
 });
+
+describe("surfacesOf on a Windows host", () => {
+  it("makes paths under a drive-letter workspace relative and keeps others absolute", () => {
+    let l = openFile(defaultLayout(), "C:/Users/me/ws/src/main.rs");
+    l = openFile(l, "D:/data/x.csv");
+    expect(surfacesOf(l, "C:/Users/me/ws")).toEqual([
+      { surface: "file", path: "src/main.rs" },
+      { surface: "file", path: "D:/data/x.csv", focused: true },
+    ]);
+  });
+
+  it("a workspace at a drive root still yields relative paths", () => {
+    const l = openFile(defaultLayout(), "C:/notes.md");
+    expect(surfacesOf(l, "C:/")).toEqual([{ surface: "file", path: "notes.md", focused: true }]);
+  });
+});

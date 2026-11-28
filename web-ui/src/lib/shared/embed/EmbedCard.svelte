@@ -22,6 +22,7 @@
   import { isRemoteHost } from "../../net/api";
   import { fileHandle } from "../fileHandle";
   import { openPath } from "../openPath";
+  import { isAbsolute } from "../paths";
   import type { Reveal } from "../reveal";
   import { lastDiskChange, releaseDiskFile, retainDiskFile } from "../../workspace/diskWatch";
   import {
@@ -96,7 +97,7 @@
   /** A card that resolves its own absolute path takes a recent answer at
    *  mount, so a remount reserves its final box before the first paint. */
   const recentInfo = $derived(
-    info === null && resolve === undefined && path.startsWith("/") ? peekFile(path) : null,
+    info === null && resolve === undefined && isAbsolute(path) ? peekFile(path) : null,
   );
   const current = $derived<TargetResult | null>(fetched ?? info ?? recentInfo);
   const hit = $derived<TargetInfo | null>(current !== null && !isMissing(current) ? current : null);
@@ -159,7 +160,7 @@
   });
 
   function defaultResolve(): Promise<TargetResult | null> {
-    return path.startsWith("/") ? resolveFile(path) : Promise.resolve(null);
+    return isAbsolute(path) ? resolveFile(path) : Promise.resolve(null);
   }
 
   async function load(): Promise<void> {
@@ -198,7 +199,7 @@
   /** A missing file may be written after the prose that embeds it (an
    *  agent announces the plot, then saves it): look again whenever the card
    *  comes back on screen, at most every few seconds. */
-  const canRecheck = $derived(resolve !== undefined || path.startsWith("/"));
+  const canRecheck = $derived(resolve !== undefined || isAbsolute(path));
   let checkedAt = 0;
   $effect(() => {
     if (!onScreen || current === null || !isMissing(current) || !canRecheck) return;

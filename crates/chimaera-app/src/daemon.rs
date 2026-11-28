@@ -12,12 +12,12 @@
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::time::Duration;
 
-#[cfg(unix)]
 use anyhow::{bail, Context};
 use chimaera_core::Manifest;
-#[cfg(unix)]
 use chimaera_remote::Decision;
 
 /// A reachable local daemon.
@@ -34,9 +34,7 @@ pub struct LocalDaemon {
     pub live_sessions: Option<usize>,
 }
 
-/// Headless entry point for `chimaera-app --daemon`. Unix-only: on Windows
-/// the daemon is the Linux musl binary inside WSL2, never this executable.
-#[cfg(unix)]
+/// Headless entry point for `chimaera-app --daemon`.
 pub fn run_headless() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -70,7 +68,6 @@ pub fn run_headless() {
 /// A running daemon of a different build is replaced when idle (same
 /// decision policy as the remote connect flow) and attached as `outdated`
 /// when live sessions make replacing it unsafe.
-#[cfg(unix)]
 pub async fn ensure_local_daemon() -> anyhow::Result<LocalDaemon> {
     if let Some(m) = probe().await {
         let local_build = chimaera_core::BUILD_ID;
@@ -126,9 +123,7 @@ pub async fn ensure_local_daemon() -> anyhow::Result<LocalDaemon> {
 /// running: the old daemon (the stop failed), or nothing yet.
 #[derive(Debug)]
 pub enum UpdateFailure {
-    /// The old daemon refused to stop and is still serving. (The WSL engine
-    /// cannot tell a failed stop apart, so Windows never builds this one.)
-    #[cfg_attr(windows, allow(dead_code))]
+    /// The old daemon refused to stop and is still serving.
     StopFailed(anyhow::Error),
     /// The old daemon stopped (or was never found) and no new one came up.
     RespawnFailed(anyhow::Error),
@@ -181,7 +176,6 @@ where
     }
 }
 
-#[cfg(unix)]
 async fn update_once() -> Result<LocalDaemon, UpdateFailure> {
     if let Some(m) = probe().await {
         if chimaera_core::builds_match(chimaera_core::BUILD_ID, m.build.as_deref()) {
@@ -195,28 +189,8 @@ async fn update_once() -> Result<LocalDaemon, UpdateFailure> {
         .map_err(UpdateFailure::RespawnFailed)
 }
 
-// On Windows the local daemon is the Linux musl binary inside WSL2; the wsl
-// module owns detect/provision/spawn/adopt. Startup only ADOPTS here —
-// anything that would provision, replace, or install runs in the wizard
-// window instead, so minutes of download/setup are never invisible. Errors
-// carrying WslNotReady make startup open that wizard rather than fail.
-#[cfg(windows)]
-pub async fn ensure_local_daemon() -> anyhow::Result<LocalDaemon> {
-    crate::wsl::adopt_daemon().await
-}
-
-/// The WSL engine does not say whether the old daemon stopped; adopting is
-/// safe either way (it attaches whatever is running), so every failure is
-/// treated as a failed respawn and retried once.
-#[cfg(windows)]
-async fn update_once() -> Result<LocalDaemon, UpdateFailure> {
-    crate::wsl::update_daemon(&|_| {})
-        .await
-        .map_err(UpdateFailure::RespawnFailed)
-}
-
-/// Manifest → LocalDaemon, shared by the unix adopt path and the WSL engine.
-pub(crate) fn attached(m: Manifest, outdated: bool, live_sessions: Option<usize>) -> LocalDaemon {
+/// Manifest → LocalDaemon.
+fn attached(m: Manifest, outdated: bool, live_sessions: Option<usize>) -> LocalDaemon {
     LocalDaemon {
         port: m.port,
         token: m.token,
@@ -227,7 +201,6 @@ pub(crate) fn attached(m: Manifest, outdated: bool, live_sessions: Option<usize>
 }
 
 /// Manifest → live pid → authenticated health check, all three or nothing.
-#[cfg(unix)]
 async fn probe() -> Option<Manifest> {
     let m = Manifest::load().ok()??;
     if !m.is_alive() {
@@ -241,9 +214,8 @@ async fn probe() -> Option<Manifest> {
     ok.then_some(m)
 }
 
-/// GET /api/v1/health with the manifest token; any 200 counts. Shared with
-/// the WSL probe, where passing it also proves the NAT localhost forward.
-pub(crate) fn health_ok(port: u16, token: &str) -> bool {
+/// GET /api/v1/health with the manifest token; any 200 counts.
+fn health_ok(port: u16, token: &str) -> bool {
     crate::http::agent()
         .get(&format!("http://127.0.0.1:{port}/api/v1/health"))
         .header("Authorization", &format!("Bearer {token}"))
@@ -299,14 +271,81 @@ async fn stop_local(m: &Manifest) -> anyhow::Result<()> {
     )
 }
 
-#[cfg(unix)]
+/// Windows: no signal reaches a console-less daemon, so the stop is asked
+/// for in-band — `POST /api/v1/stop`, the same graceful path SIGTERM takes
+/// (sessions handed off for the next start) — then polled for exit like the
+/// unix one. A daemon still alive after that, or one that refused the
+/// request, is terminated: unlike a unix daemon it cannot be left running
+/// while its executable is replaced, and every caller has already decided
+/// that its sessions may end.
+#[cfg(windows)]
+async fn stop_local(m: &Manifest) -> anyhow::Result<()> {
+    tracing::info!("stopping local daemon (pid {})", m.pid);
+    let (port, token) = (m.port, m.token.clone());
+    let asked = tokio::task::spawn_blocking(move || request_stop(port, &token))
+        .await
+        .unwrap_or(false);
+    if asked && exited_within(m, Duration::from_secs(10)).await {
+        return Ok(());
+    }
+    tracing::warn!(
+        "local daemon (pid {}) did not stop {}; terminating it",
+        m.pid,
+        if asked { "within 10s" } else { "on request" }
+    );
+    chimaera_core::proc::kill_pid(m.pid);
+    if exited_within(m, Duration::from_secs(5)).await {
+        return Ok(());
+    }
+    bail!(
+        "local daemon (pid {}) is still running after it was terminated",
+        m.pid
+    )
+}
+
+/// `POST /api/v1/stop` with the manifest token; true when the daemon took it.
+#[cfg(windows)]
+fn request_stop(port: u16, token: &str) -> bool {
+    crate::http::agent()
+        .post(&format!("http://127.0.0.1:{port}/api/v1/stop"))
+        .header("Authorization", &format!("Bearer {token}"))
+        .config()
+        .timeout_global(Some(Duration::from_secs(5)))
+        .build()
+        .send_empty()
+        .is_ok()
+}
+
+#[cfg(windows)]
+async fn exited_within(m: &Manifest, limit: Duration) -> bool {
+    let step = Duration::from_millis(100);
+    for _ in 0..(limit.as_millis() / step.as_millis()) {
+        if !m.is_alive() {
+            return true;
+        }
+        tokio::time::sleep(step).await;
+    }
+    !m.is_alive()
+}
+
+/// Stop the running local daemon, if any, so its executable can be replaced
+/// (Windows locks a running image; the installer would fail or kill it
+/// without the handoff).
+#[cfg(windows)]
+pub async fn stop_for_install() -> anyhow::Result<()> {
+    match probe().await {
+        Some(m) => stop_local(&m).await,
+        None => Ok(()),
+    }
+}
+
 fn log_path() -> std::path::PathBuf {
     chimaera_core::data_dir().join("logs").join("serve.log")
 }
 
-/// Spawn our own executable as `--daemon`, in a new session with stdio on
-/// the serve log, so it survives the shell quitting.
-#[cfg(unix)]
+/// Spawn our own executable as `--daemon`, in a new session (Windows: a new
+/// process group with no console) with stdio on the serve log, so it
+/// survives the shell quitting.
 fn spawn_detached() -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("failed to resolve current executable")?;
     let log = log_path();
@@ -320,10 +359,12 @@ fn spawn_detached() -> anyhow::Result<()> {
         .with_context(|| format!("failed to open {}", log.display()))?;
     let err = out.try_clone()?;
     tracing::info!("starting local daemon: {} --daemon", exe.display());
-    daemon_command(&exe, crate::askpass::user_askpass_env())
-        .stdout(out)
-        .stderr(err)
-        .spawn()?;
+    let mut cmd = daemon_command(&exe, crate::askpass::user_askpass_env());
+    cmd.stdout(out).stderr(err);
+    #[cfg(unix)]
+    cmd.spawn()?;
+    #[cfg(windows)]
+    chimaera_core::proc::spawn_detached(&mut cmd)?;
     Ok(())
 }
 
@@ -332,12 +373,13 @@ fn spawn_detached() -> anyhow::Result<()> {
 /// it starts) must not inherit it, or their ssh would prompt through the
 /// app's modal and any agent could raise a native prompt for a real host.
 /// The user's own askpass settings from before the app's (`user`) go back.
-#[cfg(unix)]
 fn daemon_command(exe: &std::path::Path, user: &[(String, String)]) -> std::process::Command {
     let mut cmd = std::process::Command::new(exe);
-    cmd.arg("--daemon")
-        .stdin(std::process::Stdio::null())
-        .process_group(0);
+    cmd.arg("--daemon").stdin(std::process::Stdio::null());
+    #[cfg(unix)]
+    cmd.process_group(0);
+    #[cfg(windows)]
+    cmd.creation_flags(chimaera_core::proc::DETACHED_CREATION_FLAGS);
     for key in crate::askpass::APP_ASKPASS_ENV {
         cmd.env_remove(key);
     }
@@ -361,7 +403,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn the_daemon_never_inherits_the_apps_askpass_wiring() {
         let cmd = daemon_command(std::path::Path::new("/opt/chimaera"), &[]);
@@ -376,7 +417,6 @@ mod tests {
         assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["--daemon"]);
     }
 
-    #[cfg(unix)]
     #[test]
     fn the_users_own_askpass_reaches_the_daemon_instead_of_the_apps() {
         let user = [
@@ -397,7 +437,12 @@ mod tests {
             get("SSH_ASKPASS_REQUIRE"),
             Some(Some(std::ffi::OsStr::new("prefer")))
         );
-        assert_eq!(get("CHIMAERA_ASKPASS_SOCK"), Some(None));
+        for key in crate::askpass::APP_ASKPASS_ENV
+            .iter()
+            .filter(|k| !k.starts_with("SSH_ASKPASS"))
+        {
+            assert_eq!(get(key), Some(None), "{key} must be removed");
+        }
     }
 
     #[tokio::test]

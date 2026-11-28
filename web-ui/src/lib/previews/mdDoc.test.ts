@@ -192,6 +192,11 @@ describe("anchors and fragments", () => {
 });
 
 describe("classifyHref", () => {
+  it("reads a file URL with a drive as the drive path", () => {
+    expect(classifyHref("file:///C:/Users/me/a.md")).toEqual({ kind: "path", path: "C:/Users/me/a.md", fragment: null });
+    expect(classifyHref("file:///home/u/a.md#x")).toEqual({ kind: "path", path: "/home/u/a.md", fragment: "x" });
+  });
+
   it("sorts same-document targets", () => {
     expect(classifyHref("#fn-1")).toEqual({ kind: "anchor", anchor: "fn-1" });
     expect(classifyHref("#My%20Note")).toEqual({ kind: "anchor", anchor: "My Note" });

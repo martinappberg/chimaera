@@ -8,6 +8,7 @@
 use super::support::*;
 use crate::{lock, AppState};
 
+#[cfg(unix)]
 /// Exercise the route's exact shell program in a real PTY. A fast success
 /// or failure must still be readable by a client attaching after completion.
 #[tokio::test]
@@ -134,6 +135,8 @@ async fn agent_plugin_install_keeps_success_and_failure_until_acknowledged() {
     }
 }
 
+// The install script is bash; agent-plugin installs are not offered on Windows.
+#[cfg(unix)]
 #[test]
 fn agent_plugin_install_treats_names_as_data() {
     let root = test_dir("plugin-install-quoting");
@@ -167,6 +170,7 @@ fn agent_plugin_install_treats_names_as_data() {
     assert!(!root.join("injected-too").exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn agent_plugin_install_explains_claude_git_without_blocking_cached_installs() {
     use std::os::unix::fs::PermissionsExt;
@@ -226,6 +230,7 @@ fn agent_plugin_install_explains_claude_git_without_blocking_cached_installs() {
     }
 }
 
+#[cfg(unix)]
 /// The Git binary path setting's git reaches the agent's plugin manager
 /// ahead of an old system git — seen on a login node
 /// whose /usr/bin/git is 1.8.3 while the setting pointed at a module's 2.45.
@@ -284,6 +289,7 @@ fn agent_plugin_install_puts_the_resolved_git_first_on_path() {
     assert!(!screen.contains("--shallow-submodules."), "{screen}");
 }
 
+#[cfg(unix)]
 /// A CLI (or a manifest name echoed by the installer) can set any terminal
 /// title. It must not retire the completion watcher before the install ends.
 #[tokio::test]

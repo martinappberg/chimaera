@@ -425,6 +425,13 @@ impl Marks {
         }
     }
 
+    /// The shell's working directory from its last OSC 7 report, when it
+    /// sends them (shell integration). Windows naming uses it, having no
+    /// cheap way to read another process's cwd.
+    pub fn cwd(&self) -> Option<String> {
+        lock_unpoisoned(&self.inner).cwd.clone()
+    }
+
     pub fn phase(&self) -> ShellPhase {
         lock_unpoisoned(&self.inner).phase
     }
@@ -731,8 +738,39 @@ fn unescape_633(s: &str) -> String {
     out
 }
 
-/// Extract the percent-decoded path from a `file://host/path` URL.
+/// Extract the percent-decoded path from a `file://host/path` URL. On
+/// Windows a drive path (`file:///C:/x`, `file://host/c:/x`) comes back in
+/// the daemon's wire form (`C:/x`).
 fn parse_file_url(url: &str) -> Option<String> {
+    let path = decode_file_url(url)?;
+    if cfg!(windows) {
+        if let Some(drive) = drive_path(&path) {
+            return Some(drive);
+        }
+    }
+    Some(path)
+}
+
+/// `/C:/x`, `/c:` → `C:/x`, `C:/`: the path part of a Windows drive URL, its
+/// leading slash dropped, drive letter upper-cased, backslashes turned.
+fn drive_path(path: &str) -> Option<String> {
+    let rest = path.strip_prefix('/')?;
+    let bytes = rest.as_bytes();
+    if bytes.len() < 2 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' {
+        return None;
+    }
+    if bytes.len() > 2 && !matches!(bytes[2], b'/' | b'\\') {
+        return None;
+    }
+    let mut out = rest.replace('\\', "/");
+    out[..1].make_ascii_uppercase();
+    if out.len() == 2 {
+        out.push('/');
+    }
+    Some(out)
+}
+
+fn decode_file_url(url: &str) -> Option<String> {
     let rest = url.strip_prefix("file://")?;
     let path = &rest[rest.find('/')?..];
     let bytes = path.as_bytes();
@@ -791,6 +829,27 @@ mod tests {
         assert_eq!(entry.source, CommandSource::User);
         assert!(!entry.running);
         assert!(entry.ended_at_ms.is_some());
+    }
+
+    #[test]
+    fn drive_letter_file_urls() {
+        assert_eq!(drive_path("/C:/Users/me").as_deref(), Some("C:/Users/me"));
+        assert_eq!(drive_path("/c:").as_deref(), Some("C:/"));
+        assert_eq!(drive_path("/d:/").as_deref(), Some("D:/"));
+        assert_eq!(drive_path("/home/me"), None);
+        assert_eq!(drive_path("/C:x"), None);
+        assert_eq!(drive_path("//srv/share"), None);
+        let host = parse_file_url("file://box/C:/Users/me%20x");
+        let bare = parse_file_url("file:///c:/Users/me%20x");
+        let unix = parse_file_url("file://box/home/me");
+        assert_eq!(unix.as_deref(), Some("/home/me"));
+        if cfg!(windows) {
+            assert_eq!(host.as_deref(), Some("C:/Users/me x"));
+            assert_eq!(bare.as_deref(), Some("C:/Users/me x"));
+        } else {
+            assert_eq!(host.as_deref(), Some("/C:/Users/me x"));
+            assert_eq!(bare.as_deref(), Some("/c:/Users/me x"));
+        }
     }
 
     /// Claude Code 2.1.295+ speaks the Program Status Protocol (OSC 7501):

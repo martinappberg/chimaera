@@ -14,6 +14,9 @@ import {
   referenceNow,
   setReferenceHandler,
   type FileSelection,
+  composeShellPathReference,
+  powershellEscapePath,
+  workspaceRelative,
 } from "./reference";
 
 const crop = new Blob([new Uint8Array([137, 80, 78, 71])], { type: "image/png" });
@@ -217,5 +220,41 @@ describe("composeCommitReference", () => {
       `commit 3f2a1c9 ("fix: 'rounding'") in tools/cloned `,
     );
     expect(composeCommitReference({ ...sel, subject: "" }, "/w")).toBe("commit 3f2a1c9 ");
+  });
+});
+
+describe("workspaceRelative", () => {
+  it("relativizes under a Unix root", () => {
+    expect(workspaceRelative("/w/p/a.rs", "/w/p")).toBe("a.rs");
+    expect(workspaceRelative("/w/p", "/w/p/")).toBe(".");
+    expect(workspaceRelative("/w/pp/a.rs", "/w/p")).toBe("/w/pp/a.rs");
+    expect(workspaceRelative("/a.rs", "/")).toBe("a.rs");
+  });
+
+  it("relativizes under a Windows drive or share", () => {
+    expect(workspaceRelative("C:/w/p/a.rs", "C:/w/p")).toBe("a.rs");
+    expect(workspaceRelative("C:/w/p", "C:/w/p")).toBe(".");
+    expect(workspaceRelative("D:/w/p/a.rs", "C:/w/p")).toBe("D:/w/p/a.rs");
+    expect(workspaceRelative("C:/a.rs", "C:/")).toBe("a.rs");
+    expect(workspaceRelative("C:/", "C:/")).toBe(".");
+    expect(workspaceRelative("D:/a.rs", "C:/")).toBe("D:/a.rs");
+    expect(workspaceRelative("//srv/share/x/a.rs", "//srv/share")).toBe("x/a.rs");
+  });
+});
+
+describe("composeShellPathReference", () => {
+  it("quotes for a POSIX shell on a Unix host, unchanged", () => {
+    expect(composeShellPathReference("/w/data/x.tsv", "/w/data")).toBe("x.tsv ");
+    expect(composeShellPathReference("/w/a b/it's.txt", "/w")).toBe("'a b/it'\\''s.txt' ");
+    expect(composeShellPathReference("/o/x.tsv", "/w")).toBe("/o/x.tsv ");
+  });
+
+  it("quotes for PowerShell, in native form, on a Windows host", () => {
+    expect(composeShellPathReference("C:/w/data/x.tsv", "C:/w")).toBe("data\\x.tsv ");
+    expect(composeShellPathReference("C:/a b/x.txt", "D:/w")).toBe("'C:\\a b\\x.txt' ");
+    expect(composeShellPathReference("C:/w/it's.txt", "C:/w")).toBe("'it''s.txt' ");
+    expect(composeShellPathReference("//srv/share/x.txt", "//srv/share/w")).toBe("\\\\srv\\share\\x.txt ");
+    expect(powershellEscapePath("C:/x/$env.txt")).toBe("'C:\\x\\$env.txt'");
+    expect(powershellEscapePath("")).toBe("''");
   });
 });

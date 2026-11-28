@@ -997,8 +997,13 @@ mod tests {
 
     const SLIDE: &[u8] = b"<p:sld><p:cSld><p:spTree/></p:cSld></p:sld>";
 
+    // The zip crate writes the host it runs on into each header (DOS on
+    // Windows, with DOS attributes) unless told one, so a fixture built on
+    // Windows would hash differently.
     fn options(method: CompressionMethod) -> SimpleFileOptions {
-        SimpleFileOptions::default().compression_method(method)
+        SimpleFileOptions::default()
+            .compression_method(method)
+            .system(zip::System::Unix)
     }
 
     /// A deck-shaped archive: stored and deflated entries, an archive

@@ -77,6 +77,7 @@ npm --prefix web-ui run check      # svelte-check
 npm --prefix web-ui run test       # targeted Vitest suites (not browser/component tests)
 npm --prefix web-ui run build      # build before Rust checks: the daemon embeds web-ui/dist (rust-embed)
 just check                         # plugin test assets + fmt/clippy/test in daemon and plugin workspaces
+just win-check                     # cargo check for x86_64-pc-windows-gnu (the native Windows build); needs mingw-w64 + the rustup target
 bash scripts/build-plugins.sh      # tests only: the fixture + the locked releases → plugins/dist-test; not needed to build or run the daemon; `just plugins`
 node scripts/check-doc-links.mjs   # every relative markdown link + #anchor resolves
 node scripts/check-site.mjs        # public-site links, search/sharing metadata, and sitemap

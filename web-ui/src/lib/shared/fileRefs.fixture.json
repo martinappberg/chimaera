@@ -304,6 +304,40 @@
     { "style": "generic", "input": "src/**/*.ts", "expect": null },
     { "style": "generic", "input": "$HOME/x.txt", "expect": null },
     { "style": "generic", "input": "C:\\Users\\me\\x.txt", "expect": null },
+    {
+      "style": "generic",
+      "input": "C:/Users/me/proj/src/a.rs",
+      "expect": { "path": "C:/Users/me/proj/src/a.rs" }
+    },
+    {
+      "style": "generic",
+      "input": "C:/Users/me/proj/src/a.rs:12",
+      "expect": { "path": "C:/Users/me/proj/src/a.rs", "line": 12 }
+    },
+    {
+      "style": "generic",
+      "input": "`C:/x/y.rs:12:5`",
+      "expect": { "path": "C:/x/y.rs", "line": 12, "col": 5 }
+    },
+    {
+      "style": "generic",
+      "input": "c:/proj/notes.md#L3-L9",
+      "expect": { "path": "c:/proj/notes.md", "line": 3, "endLine": 9 }
+    },
+    {
+      "style": "generic",
+      "input": "file:///C:/proj/x.rs#L3",
+      "expect": { "path": "C:/proj/x.rs", "line": 3 }
+    },
+    {
+      "style": "generic",
+      "input": "C:/My Documents/plot 1.png",
+      "delimited": true,
+      "expect": { "path": "C:/My Documents/plot 1.png" }
+    },
+    { "style": "generic", "input": "C:", "expect": null },
+    { "style": "generic", "input": "C:/x/y.rs:abc", "expect": null },
+    { "style": "generic", "input": "src/C:/x.rs", "expect": null },
     { "style": "generic", "input": "2024/01/02", "expect": null },
     { "style": "generic", "input": "-la", "expect": null },
     { "style": "generic", "input": "--output=results/x.csv", "expect": null },
@@ -626,6 +660,18 @@
     }
   ],
   "text": [
+    {
+      "style": "generic",
+      "input": "error[E0308]: mismatched types --> C:/Users/me/proj/src/a.rs:12:3: here",
+      "expect": [
+        {
+          "text": "C:/Users/me/proj/src/a.rs:12:3",
+          "path": "C:/Users/me/proj/src/a.rs",
+          "line": 12,
+          "col": 3
+        }
+      ]
+    },
     {
       "style": "claude",
       "input": "I updated `web-ui/src/lib/chat/paths.ts:31` and web-ui/src/App.svelte:1924.",

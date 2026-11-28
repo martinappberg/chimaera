@@ -2517,7 +2517,7 @@ async fn show(state: &Arc<AppState>, ctx: &mut Ctx) -> ToolResult {
         .as_ref()
         .map(|f| f.url.clone())
         .unwrap_or_default();
-    if let Some(local) = crate::embed::strip_file_scheme(&url) {
+    if let Some(local) = crate::embed::file_url_local(&url) {
         let local = local.split(['?', '#']).next().unwrap_or(local);
         return Err(bad(format!(
             "Your page is a file, which opens for the user as a preview, not a browser pane: \

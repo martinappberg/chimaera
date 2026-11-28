@@ -20,10 +20,7 @@ fn check_dir_writable(label: &str, dir: &Path) {
 }
 
 fn check_in_path(bin: &str) {
-    let found = std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
-        .unwrap_or(false);
-    if found {
+    if chimaera_core::paths::find_on_path(bin, None).is_some() {
         println!("ok   {bin} found in PATH");
     } else {
         println!("warn {bin} not found in PATH");

@@ -1,5 +1,6 @@
 /** Terminal references keep session identity on the wire and readable names in the UI. */
 import { termReference } from "../workspace/agentLinks";
+import { basename, rootOf } from "../shared/paths";
 import { tokenSpans, type UploadTokens } from "./uploadTokens";
 
 export interface TerminalOption {
@@ -41,7 +42,9 @@ export function mentionedTerminal(target: string, terminals: TerminalOption[]): 
 export function terminalLabel(terminal: TerminalOption, terminals: TerminalOption[]): string {
   const peers = terminals.filter((t) => t.id !== terminal.id && t.name.toLowerCase() === terminal.name.toLowerCase());
   if (peers.length === 0) return terminal.name;
-  const folder = (t: TerminalOption) => t.cwd?.split("/").filter(Boolean).at(-1);
+  // A root names itself by its drive or share (`C:`); `/` names nothing.
+  const folder = (t: TerminalOption) =>
+    t.cwd ? basename(t.cwd) || rootOf(t.cwd).replace(/\/$/, "") || undefined : undefined;
   const directory = folder(terminal);
   const suffix = directory && peers.every((t) => folder(t) !== directory)
     ? directory

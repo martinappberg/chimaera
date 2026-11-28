@@ -1089,12 +1089,13 @@ async fn a_file_opens_as_a_ticketed_page_and_reloads_under_a_fresh_ticket() {
     )
     .await;
     assert!(!is_error(&r), "{r}");
-    let canonical = std::fs::canonicalize(root.join("out/my report.html")).unwrap();
-    let text = text_of(&r);
-    assert!(
-        text.contains(&format!("Loaded file://{}", canonical.display())),
-        "{text}"
+    let canonical = chimaera_core::paths::wire_path(
+        &chimaera_core::paths::canonicalize(&root.join("out/my report.html")).unwrap(),
     );
+    // `/abs` on Unix, `C:/x` on Windows: either way three slashes.
+    let file_url = format!("file:///{}", canonical.trim_start_matches('/'));
+    let text = text_of(&r);
+    assert!(text.contains(&format!("Loaded {file_url}")), "{text}");
     assert!(
         !text.contains("/raw/"),
         "the ticket stays out of the agent's terms: {text}"
@@ -1120,7 +1121,7 @@ async fn a_file_opens_as_a_ticketed_page_and_reloads_under_a_fresh_ticket() {
         &state,
         &agent,
         "browser_navigate",
-        json!({"url": format!("file://{}", canonical.display()).replace(' ', "%20")}),
+        json!({"url": file_url.replace(' ', "%20")}),
     )
     .await;
     assert!(!is_error(&r), "{r}");

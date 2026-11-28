@@ -19,6 +19,7 @@ import { inlineOf, destinationText, type DocText } from "../mdTable";
 import { isMath } from "../mdMath";
 import { classifyHref, parseFrontmatter } from "../mdDoc";
 import { basename, dirname, resolveDocPath } from "../files";
+import { isAbsolute, isUnder, rootOf } from "../../shared/paths";
 import { bodyText, docText } from "./model";
 import { docParser } from "./parser";
 import { escapeHref, escapeText, hrefFor, wikilinkHref } from "./render";
@@ -151,8 +152,7 @@ export function localTarget(href: string): { path: string; fragment: string | nu
 /** Whether absolute `path` is `dir` or inside it. */
 export function isInside(path: string, dir: string): boolean {
   if (dir === "/") return path.startsWith("/");
-  const d = dir.replace(/\/+$/, "");
-  return path === d || path.startsWith(`${d}/`);
+  return isUnder(path, dir);
 }
 
 function segments(path: string): string[] {
@@ -174,23 +174,35 @@ export function relPath(fromDir: string, to: string): string {
 /** The deepest directory holding every one of `dirs` (absolute). */
 export function commonDir(dirs: readonly string[]): string {
   if (dirs.length === 0) return "/";
-  let common = segments(dirs[0]);
+  // A drive or UNC root (Windows host) stays whole; `/` is just the leading
+  // empty segment. Directories on another root share nothing below it.
+  const root = rootOf(dirs[0]);
+  const drive = root !== "" && root !== "/";
+  const below = (d: string): string[] | null =>
+    !drive ? segments(d) : rootOf(d) === root ? segments(d.slice(root.length)) : null;
+  let common = below(dirs[0]) ?? [];
   for (const d of dirs.slice(1)) {
-    const s = segments(d);
+    const s = below(d) ?? [];
     let i = 0;
     while (i < common.length && i < s.length && common[i] === s[i]) i++;
     common = common.slice(0, i);
   }
-  return `/${common.join("/")}`;
+  return drive ? `${root}${common.join("/")}` : `/${common.join("/")}`;
 }
 
 /** A file name without its last extension, safe as a download or folder
- *  name. */
+ *  name on any OS the browser runs on: no Windows-reserved characters, no
+ *  trailing dot or space, and never a device name (`CON`, `nul`, `COM1` …),
+ *  which Windows refuses whatever extension follows. */
 export function stemOf(path: string): string {
   const name = basename(path);
   const dot = name.lastIndexOf(".");
-  const stem = (dot > 0 ? name.slice(0, dot) : name).replace(/[\\/:*?"<>|\u0000-\u001f]+/g, "-").trim();
-  return stem === "" ? "document" : stem;
+  const stem = (dot > 0 ? name.slice(0, dot) : name)
+    .replace(/[\\/:*?"<>|\u0000-\u001f]+/g, "-")
+    .trim()
+    .replace(/[. ]+$/, "");
+  if (stem === "") return "document";
+  return /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(stem) ? `${stem}-document` : stem;
 }
 
 // --- the bundle ---------------------------------------------------------------------
@@ -262,7 +274,7 @@ export function planBundle(
   const rewrites: Edit[] = [];
   let bytes = 0;
   for (const f of found) {
-    const absolute = f.written.startsWith("/");
+    const absolute = isAbsolute(f.written);
     const named = f.target.byName || absolute ? f.real : resolveDocPath(docPath, f.written);
     if (named === docPath || f.real === docPath) continue;
     if (!isInside(named, boundary)) {

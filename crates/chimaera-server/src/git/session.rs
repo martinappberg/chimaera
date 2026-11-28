@@ -106,8 +106,8 @@ impl Tracked {
             HeadRef::Unknown => (None, false, None),
         };
         json!({
-            "repo": repo.repo_path().to_string_lossy(),
-            "worktree": repo.toplevel.to_string_lossy(),
+            "repo": chimaera_core::paths::wire_path(&repo.repo_path()),
+            "worktree": chimaera_core::paths::wire_path(&repo.toplevel),
             "branch": branch,
             "detached": detached,
             "head": head,
@@ -532,7 +532,7 @@ pub(crate) fn session_turn_end(state: &Arc<AppState>, id: &str) {
 /// The managed root, resolved the way git prints worktree paths.
 async fn managed_root(state: &AppState) -> PathBuf {
     let root = state.worktrees_root.clone();
-    tokio::task::spawn_blocking(move || std::fs::canonicalize(&root).unwrap_or(root))
+    tokio::task::spawn_blocking(move || chimaera_core::paths::canonicalize(&root).unwrap_or(root))
         .await
         .unwrap_or_else(|_| state.worktrees_root.clone())
 }
@@ -801,18 +801,18 @@ mod tests {
     #[test]
     fn hook_cwds_take_only_absolute_bounded_paths() {
         let s = SessionGits::default();
+        // An absolute path needs a drive on Windows.
+        let root = if cfg!(windows) { "C:/" } else { "/" };
         assert!(!s.note_hook_cwd("a", "relative/dir"));
         assert!(!s.note_hook_cwd("a", ""));
-        assert!(!s.note_hook_cwd("a", &format!("/{}", "x".repeat(MAX_CWD_BYTES))));
-        assert!(s.note_hook_cwd("a", "/repo"));
+        assert!(!s.note_hook_cwd("a", &format!("{root}{}", "x".repeat(MAX_CWD_BYTES))));
+        assert!(s.note_hook_cwd("a", &format!("{root}repo")));
         // Unchanged is not a change.
-        assert!(!s.note_hook_cwd("a", "/repo"));
-        assert!(s.note_hook_cwd("a", "/repo/.claude/worktrees/x"));
+        assert!(!s.note_hook_cwd("a", &format!("{root}repo")));
+        let worktree = format!("{root}repo/.claude/worktrees/x");
+        assert!(s.note_hook_cwd("a", &worktree));
         let rows = s.rows();
-        assert_eq!(
-            rows["a"].hook_cwd.as_deref(),
-            Some(Path::new("/repo/.claude/worktrees/x"))
-        );
+        assert_eq!(rows["a"].hook_cwd.as_deref(), Some(Path::new(&worktree)));
         assert!(rows["a"].git.is_null());
     }
 

@@ -237,6 +237,7 @@ async fn a_graceful_stop_retires_every_open_record() {
     assert!(recs.iter().all(|r| r.outcome == Some(Outcome::Retired)));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_resurrected_chat_opens_a_restart_record() {
     let data = test_dir("history-resurrect");

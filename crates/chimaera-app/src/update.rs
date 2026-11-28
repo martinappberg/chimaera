@@ -57,6 +57,7 @@ pub fn write_intent() -> anyhow::Result<()> {
 }
 
 /// Discard a written intent (the install failed; the chain will not run).
+#[cfg(any(windows, test))]
 pub fn clear_intent() {
     std::fs::remove_file(intent_path()).ok();
 }
