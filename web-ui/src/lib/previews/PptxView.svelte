@@ -55,7 +55,7 @@
   import { copyTabToWindow } from "../plugins/platform";
   import { buildStates, extractTiming, parseTimeline, type BuildState, type SlideTimeline, type TimingExtract } from "./pptxTiming";
   import { pruneTagged, tagSlide, type TaggedSlide } from "./pptxTag";
-  import { applyState, clearState, playStep, prepareStep, type Palette, type Playing, type PreparedStep } from "./pptxPlay";
+  import { applyState, clearMasks, clearState, playStep, prepareStep, type Palette, type Playing, type PreparedStep } from "./pptxPlay";
   import { motionNotes } from "./pptxMotion";
   import { sanitizeRendered } from "./officeSafety";
   import { revealRequest, takeReveal } from "../shared/reveal";
@@ -338,6 +338,7 @@
   function applyVersion({ d, bytes }: { d: Deck; bytes: ArrayBuffer }, still: () => boolean): void {
       disposeAll();
       revokeMedia();
+      clearMasks();
       clearPick();
       lastBytes = bytes;
       drawn.clear();
@@ -795,7 +796,15 @@
   /** PowerPoint has this deck open here (its `~$` owner file sits beside it). */
   let lockedBy = $state(false);
   let disposed = false;
-  $effect(() => () => (disposed = true));
+  $effect(() => () => {
+    disposed = true;
+    // Pattern pictures no playing click holds (the cache is shared by views).
+    clearMasks();
+  });
+  // Leaving the show lets its pattern pictures go.
+  $effect(() => {
+    if (!inShow) untrack(clearMasks);
+  });
 
   async function attachEdits(bytes: ArrayBuffer, still: () => boolean): Promise<void> {
     const hash = await sha256Hex(bytes);

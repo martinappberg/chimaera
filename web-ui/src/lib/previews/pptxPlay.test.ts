@@ -1,6 +1,7 @@
 import JSZip from "jszip";
 import { describe, expect, it } from "vitest";
-import { boxGeom, clearState, colorEasing, colorWindows, paraOffset, planState, playStep, transformScale, type ShapeInfo } from "./pptxPlay";
+import { boxGeom, clearMasks, clearState, colorEasing, colorWindows, maskCacheStats, maskImages, paraOffset, planState, playStep, releaseMasks, retainMasks, transformScale, type ShapeInfo } from "./pptxPlay";
+import type { Pattern } from "./pptxMotion";
 import type { TaggedSlide } from "./pptxTag";
 import { buildStates, parseTimeline, type BuildState, type GoldenSlide } from "./pptxTiming";
 
@@ -363,6 +364,102 @@ describe("playStep lands every corpus click on its golden state", async () => {
     for (const el of all) expect(el.running).toBe(0);
     const info = new Map([...tagged.shapes].map(([id, x]) => [id, { paraCount: x.paraCount, paras: x.paras !== null }]));
     for (const [id, x] of tagged.shapes) expect(inline(x.el as unknown as FakeEl)).toEqual(expected(info, buildStates(s.t)[1]!, id));
+  });
+
+  it("a landing whose state throws still ends its animations and resolves", async () => {
+    const s = slides.find((x) => x.name === "entrances" && x.part.endsWith("slide2.xml"))!;
+    const { tagged, all } = fakeSlide(s.t);
+    const play = playStep(tagged, s.t, 1, { w: W, h: H });
+    expect(all.reduce((n, e) => n + e.running, 0)).toBe(1);
+    Object.defineProperty(tagged, "shapes", {
+      get() {
+        throw new Error("forced");
+      },
+    });
+    expect(() => play.finish()).toThrow("forced");
+    expect(all.reduce((n, e) => n + e.running, 0)).toBe(0);
+    await play.finished;
+  });
+});
+
+/** A canvas stand-in for `maskImages`: records each picture's size. */
+function withCanvas<T>(run: (sizes: [number, number][]) => T): T {
+  const g = globalThis as unknown as { document?: unknown };
+  const had = g.document;
+  const sizes: [number, number][] = [];
+  const urls = { create: URL.createObjectURL, revoke: URL.revokeObjectURL };
+  let n = 0;
+  const revoked: string[] = [];
+  g.document = {
+    createElement: () => {
+      const c = {
+        width: 0,
+        height: 0,
+        getContext: () => ({ createImageData: (w: number, h: number) => (sizes.push([w, h]), { data: new Uint8ClampedArray(w * h * 4) }), putImageData() {} }),
+        toDataURL: () => "data:image/png;base64,AAAA",
+      };
+      return c;
+    },
+  };
+  URL.createObjectURL = () => `blob:test/${n++}`;
+  URL.revokeObjectURL = (u: string) => void revoked.push(u);
+  try {
+    return run(Object.assign(sizes, { revoked }) as [number, number][]);
+  } finally {
+    g.document = had;
+    URL.createObjectURL = urls.create;
+    URL.revokeObjectURL = urls.revoke;
+    clearMasks();
+  }
+}
+
+describe("pattern pictures are bounded and outlive no click", () => {
+  const kinds: Pattern[] = [
+    { kind: "dissolve", horizontal: false, out: false },
+    { kind: "bars", horizontal: true, out: false },
+    { kind: "bars", horizontal: false, out: true },
+    { kind: "checker", horizontal: true, out: false },
+    { kind: "checker", horizontal: false, out: false },
+    { kind: "strips", horizontal: false, out: false, corner: [1, 1] },
+  ];
+  for (const pattern of kinds) {
+    it(`${pattern.kind}${pattern.horizontal ? " across" : ""} on a 1e8 px box draws a bounded picture, quickly`, () => {
+      withCanvas((sizes) => {
+        const t0 = performance.now();
+        const set = maskImages(pattern, 1e8, 1e8, 10, "4", 50);
+        expect(set).not.toBeNull();
+        expect(set!.urls.length).toBe(51);
+        for (const [w, h] of sizes) expect(w * h).toBeLessThanOrEqual(768 * 768);
+        expect(performance.now() - t0).toBeLessThan(3000);
+      });
+    });
+  }
+
+  it("refuses a box that is not finite, and caps the levels", () => {
+    withCanvas(() => {
+      expect(maskImages(kinds[0]!, Number.POSITIVE_INFINITY, 10, 0, "4", 12)).toBeNull();
+      expect(maskImages(kinds[0]!, 100, 100, 0, "4", 1e9)!.urls.length).toBe(51);
+    });
+  });
+
+  it("a click that dissolves 40 shapes draws a few sets, and keeps every set it holds", () => {
+    withCanvas((sizes) => {
+      const ids = Array.from({ length: 40 }, (_, i) => `${i + 2}`);
+      const sets = ids.map((id) => maskImages(kinds[0]!, 100, 100, 10, id, 12)!);
+      expect(new Set(sets).size).toBeLessThanOrEqual(8);
+      expect(sizes.length).toBeLessThanOrEqual(8 * 13);
+      // Held sets survive any number of later sets; released, they go.
+      retainMasks(sets);
+      const revoked = (sizes as unknown as { revoked: string[] }).revoked;
+      for (let i = 0; i < 60; i++) maskImages(kinds[3]!, 100 + i, 100, 10, "x", 12);
+      for (const s of sets) for (const u of s.urls) expect(revoked).not.toContain(/^url\("(.*)"\)$/.exec(u)![1]);
+      expect(maskCacheStats().size).toBeLessThanOrEqual(32 + 8);
+      releaseMasks(sets);
+      expect(maskCacheStats().held).toBe(0);
+      expect(maskCacheStats().size).toBeLessThanOrEqual(32);
+      clearMasks();
+      expect(maskCacheStats().size).toBe(0);
+    });
   });
 });
 

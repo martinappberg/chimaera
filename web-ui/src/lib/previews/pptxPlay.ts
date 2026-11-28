@@ -1161,7 +1161,69 @@ const DISSOLVE_TILE = 192;
  *  fewer, for bounded memory and a few ms a picture. */
 const MASK_SCALE = 1;
 const MASK_MAX = 768;
-const maskCache = new Map<string, MaskSet>();
+/** Most bars a random-bars picture draws, most strips squares a side, most
+ *  picture px a checkerboard cell is drawn with: past them bars, squares
+ *  and cells are drawn wider, so a picture's size is bounded whatever the
+ *  shape's (nothing bounds `a:ext`). */
+const MAX_BARS = 384;
+const MAX_SQUARES = 96;
+const CHECKER_PX = 64;
+/** Dissolve and random bars are seeded by one of this many variants of the
+ *  element: neighbours still differ, and a click that dissolves hundreds of
+ *  shapes draws a handful of picture sets, not hundreds. */
+const SEEDS = 8;
+/** Distinct picture sets one click may use; past it the click lands. */
+export const MASK_SETS_PER_CLICK = 24;
+/** Sets kept between clicks. A set a playing click holds is never evicted
+ *  (its `blob:` URLs are in its keyframes: a revoked one hides the shape). */
+const MASK_CACHE_MAX = 32;
+const maskCache = new Map<string, MaskSet & { holds: number }>();
+
+/** Hold a playing click's picture sets until `releaseMasks` (exported for tests). */
+export function retainMasks(sets: readonly MaskSet[]): void {
+  for (const s of sets) (s as MaskSet & { holds: number }).holds++;
+}
+export function releaseMasks(sets: readonly MaskSet[]): void {
+  for (const s of sets) (s as MaskSet & { holds: number }).holds--;
+  trimMasks(MASK_CACHE_MAX);
+}
+const revoke = (s: MaskSet) => {
+  for (const u of s.urls) {
+    const m = /^url\("(blob:.*)"\)$/.exec(u);
+    if (m !== null) URL.revokeObjectURL(m[1]!);
+  }
+};
+/** Evict the oldest sets no click holds until at most `max` remain. */
+function trimMasks(max: number): void {
+  for (const [key, s] of maskCache) {
+    if (maskCache.size <= max) return;
+    if (s.holds > 0) continue;
+    maskCache.delete(key);
+    revoke(s);
+  }
+}
+/** Revoke every picture set no click holds: leaving the show, a deck
+ *  re-read, the view's unmount. */
+export function clearMasks(): void {
+  trimMasks(0);
+}
+/** How many picture sets are cached and how many a click holds (tests). */
+export function maskCacheStats(): { size: number; held: number } {
+  let held = 0;
+  for (const s of maskCache.values()) if (s.holds > 0) held++;
+  return { size: maskCache.size, held };
+}
+
+/** The cache key of a pattern's pictures (`maskImages`). */
+function maskKey(pattern: Pattern, W: number, H: number, margin: number, seedKey: string, levels: number): string {
+  const { kind, out } = pattern;
+  return `${kind}|${pattern.horizontal}|${pattern.corner ?? ""}|${out}|${W}x${H}|${margin}|${levels}|${kind === "dissolve" || kind === "bars" ? seedOf(seedKey) % SEEDS : ""}`;
+}
+function seedOf(key: string): number {
+  let seed = 2166136261;
+  for (let i = 0; i < key.length; i++) seed = Math.imul(seed ^ key.charCodeAt(i), 16777619);
+  return seed >>> 0;
+}
 
 /** A seeded PRNG (mulberry32): the same element dissolves the same way. */
 function rng(seed: number): () => number {
@@ -1205,11 +1267,18 @@ export interface MaskSet {
  * each cell's soft edge (`revealAt`). Null where there is no canvas.
  */
 export function maskImages(pattern: Pattern, W: number, H: number, margin: number, seedKey: string, levels: number): MaskSet | null {
+  if (![W, H, margin].every(Number.isFinite) || W <= 0 || H <= 0 || margin < 0) return null;
+  levels = Math.min(50, Math.max(1, Math.round(levels) || 1));
   const [w, h] = [Math.max(1, W - 2 * margin), Math.max(1, H - 2 * margin)];
   const { kind, out } = pattern;
-  const cacheKey = `${kind}|${pattern.horizontal}|${pattern.corner ?? ""}|${out}|${W}x${H}|${margin}|${levels}|${kind === "dissolve" || kind === "bars" ? seedKey : ""}`;
+  const cacheKey = maskKey(pattern, W, H, margin, seedKey, levels);
   const hit = maskCache.get(cacheKey);
-  if (hit !== undefined) return hit;
+  if (hit !== undefined) {
+    // Most recently used last: eviction takes the oldest.
+    maskCache.delete(cacheKey);
+    maskCache.set(cacheKey, hit);
+    return hit;
+  }
   if (typeof document === "undefined") return null;
   let set: Omit<MaskSet, "urls">;
   let cw: number;
@@ -1217,8 +1286,7 @@ export function maskImages(pattern: Pattern, W: number, H: number, margin: numbe
   // Each picture px's cell, and each cell's alpha (0–255) at a progress.
   let cellOf: Uint32Array;
   let alphaOf: (cell: number, p: number) => number;
-  let seed = 2166136261;
-  for (let i = 0; i < seedKey.length; i++) seed = Math.imul(seed ^ seedKey.charCodeAt(i), 16777619);
+  const seed = (seedOf(seedKey) % SEEDS) + 1;
   const random = (n: number) => {
     const rand = rng(seed);
     return Float32Array.from({ length: n }, () => rand());
@@ -1231,7 +1299,7 @@ export function maskImages(pattern: Pattern, W: number, H: number, margin: numbe
     set = { size: [DISSOLVE_TILE * DISSOLVE_CELL, DISSOLVE_TILE * DISSOLVE_CELL], offset: [0, 0], repeat: true };
   } else if (kind === "bars") {
     // Two picture px per bar, one px across: drawn stretched over the box.
-    const n = Math.max(1, Math.ceil((pattern.horizontal ? H : W) / BAR));
+    const n = Math.max(1, Math.min(MAX_BARS, Math.ceil((pattern.horizontal ? H : W) / BAR)));
     [cw, ch] = pattern.horizontal ? [1, 2 * n] : [2 * n, 1];
     cellOf = Uint32Array.from({ length: cw * ch }, (_, i) => Math.floor(i / 2));
     const rank = random(n);
@@ -1244,8 +1312,7 @@ export function maskImages(pattern: Pattern, W: number, H: number, margin: numbe
     const across = pattern.horizontal;
     const c = (across ? h : w) / CHECKER_ROWS;
     const U = across ? w : h;
-    const k = Math.max(1, Math.min(2, 64 / c));
-    const n = Math.max(2, Math.round(c * k));
+    const n = Math.max(2, Math.round(Math.min(2 * c, CHECKER_PX)));
     [cw, ch] = across ? [n, 2 * n] : [2 * n, n];
     // A cell here is a column of the tile's px: its level is its place in the cell.
     cellOf = new Uint32Array(cw * ch);
@@ -1264,12 +1331,13 @@ export function maskImages(pattern: Pattern, W: number, H: number, margin: numbe
     // value of the square at the box's edge.
     const k = Math.min(MASK_SCALE, MASK_MAX / Math.max(W, H));
     [cw, ch] = [Math.max(1, Math.ceil(W * k)), Math.max(1, Math.ceil(H * k))];
-    const [nx, ny] = [Math.ceil(w / STRIP), Math.ceil(h / STRIP)];
+    const side = Math.max(STRIP, Math.max(w, h) / MAX_SQUARES);
+    const [nx, ny] = [Math.ceil(w / side), Math.ceil(h / side)];
     const [fx, fy] = pattern.corner ?? [0, 0];
     cellOf = new Uint32Array(cw * ch);
     const index = (v: number, len: number, n: number, from: number) => {
       const d = Math.min(len - 1e-6, Math.max(0, v / k - margin));
-      return Math.min(n - 1, Math.floor((from === 1 ? len - d : d) / STRIP));
+      return Math.min(n - 1, Math.floor((from === 1 ? len - d : d) / side));
     };
     for (let y = 0; y < ch; y++) {
       const j = index(y + 0.5, h, ny, fy);
@@ -1295,21 +1363,17 @@ export function maskImages(pattern: Pattern, W: number, H: number, margin: numbe
     ctx.putImageData(img, 0, 0);
     urls.push(`url("${blobUrl(canvas.toDataURL("image/png"))}")`);
   }
-  if (maskCache.size > 32) {
-    for (const s of maskCache.values()) for (const u of s.urls) URL.revokeObjectURL(/^url\("(.*)"\)$/.exec(u)?.[1] ?? "");
-    maskCache.clear();
-  }
-  const done = { ...set, urls };
+  const done = { ...set, urls, holds: 0 };
   maskCache.set(cacheKey, done);
+  trimMasks(MASK_CACHE_MAX);
   return done;
 }
 
 /** A track's keyframes with its pattern's progress as the pictures over
  *  the box (`x y W H` in the element's px, `margin` past the shape's box);
  *  the last frame (landed) has no mask. */
-function withMasks(kf: readonly PlayKeyframe[], tr: { id: ElementId; pattern: Pattern; box: [number, number, number, number]; margin: number; levels: number }): Keyframe[] {
-  const [x, y, W, H] = tr.box;
-  const set = maskImages(tr.pattern, W, H, tr.margin, tr.id, tr.levels);
+function withMasks(kf: readonly PlayKeyframe[], tr: { box: [number, number, number, number] }, set: MaskSet | null): Keyframe[] {
+  const [x, y] = tr.box;
   if (set === null) return kf.map(({ mask: _, ...f }) => f) as Keyframe[];
   const frame = {
     maskSize: `${r3(set.size[0])}px ${r3(set.size[1])}px`,
@@ -1318,7 +1382,7 @@ function withMasks(kf: readonly PlayKeyframe[], tr: { id: ElementId; pattern: Pa
   };
   return kf.map(({ mask, ...f }, i) => {
     if (mask === undefined || i === kf.length - 1) return { ...f, maskImage: "none" };
-    return { ...f, maskImage: set.urls[Math.min(tr.levels, Math.max(0, Math.round(mask * tr.levels)))]!, ...frame };
+    return { ...f, maskImage: set.urls[Math.min(set.urls.length - 1, Math.max(0, Math.round(mask * (set.urls.length - 1))))]!, ...frame };
   }) as Keyframe[];
 }
 
@@ -1422,8 +1486,12 @@ export function prepareStep(tagged: TaggedSlide, timeline: SlideTimeline, k: num
     };
     const plan = planStep(effects, before, info, elements, (id) => measure(tagged, id, opts.w, opts.h), landed, opts.w, opts.h, opts.maxMs);
     if (plan.overBudget) return null;
-    // A random pattern's mask images are drawn now, while the show is idle,
-    // not when the click starts them (they are cached by size and element).
+    // Past a bound on the pictures one click draws, it lands.
+    const keys = new Set<string>();
+    for (const tr of plan.tracks) if (tr.pattern !== undefined && tr.box !== undefined) keys.add(maskKey(tr.pattern, tr.box[2], tr.box[3], tr.margin ?? 0, tr.id, tr.levels ?? maskLevels(plan.duration)));
+    if (keys.size > MASK_SETS_PER_CLICK) return null;
+    // A pattern's mask images are drawn now, while the show is idle, not
+    // when the click starts them (they are cached by size and variant).
     for (const tr of plan.tracks) if (tr.pattern !== undefined && tr.box !== undefined) maskImages(tr.pattern, tr.box[2], tr.box[3], tr.margin ?? 0, tr.id, tr.levels ?? maskLevels(plan.duration));
     let duration = plan.duration;
     // Colours blend from the paint before to the paint after, over the
@@ -1475,6 +1543,7 @@ export function playStep(tagged: TaggedSlide, timeline: SlideTimeline, k: number
   const finished = new Promise<void>((r) => (resolve = r));
   const playing: Playing = { finished, finish: () => {}, approximate: false };
   const anims: Animation[] = [];
+  const held: MaskSet[] = [];
   let done = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const land = () => {
@@ -1482,9 +1551,14 @@ export function playStep(tagged: TaggedSlide, timeline: SlideTimeline, k: number
     done = true;
     if (timer !== undefined) clearTimeout(timer);
     // The state goes on first, in the same task: no frame shows neither.
-    if (after !== undefined) playing.approximate = applyState(tagged, after, opts.w, opts.h, palette);
-    for (const a of anims) a.cancel();
-    resolve();
+    // Whatever it throws, the animations end and `finished` resolves.
+    try {
+      if (after !== undefined) playing.approximate = applyState(tagged, after, opts.w, opts.h, palette);
+    } finally {
+      for (const a of anims) a.cancel();
+      releaseMasks(held.splice(0));
+      resolve();
+    }
   };
   playing.finish = land;
   if (after === undefined || before === undefined || opts.reduced === true || effects.length === 0) {
@@ -1507,7 +1581,16 @@ export function playStep(tagged: TaggedSlide, timeline: SlideTimeline, k: number
       // Tracks were planned for the step's motion; stretch to a longer colour window.
       const scale = plan.duration / duration;
       const planned = scale === 1 ? tr.keyframes : [...tr.keyframes.map((f) => ({ ...f, offset: f.offset * scale })), { ...tr.keyframes[tr.keyframes.length - 1]!, offset: 1 }];
-      const kf = tr.pattern === undefined || tr.box === undefined ? planned : withMasks(planned, { id: tr.id, pattern: tr.pattern, box: tr.box, margin: tr.margin ?? 0, levels: tr.levels ?? maskLevels(plan.duration) });
+      let kf: Keyframe[] | PlayKeyframe[] = planned;
+      if (tr.pattern !== undefined && tr.box !== undefined) {
+        const levels = tr.levels ?? maskLevels(plan.duration);
+        const set = maskImages(tr.pattern, tr.box[2], tr.box[3], tr.margin ?? 0, tr.id, levels);
+        if (set !== null) {
+          retainMasks([set]);
+          held.push(set);
+        }
+        kf = withMasks(planned, { box: tr.box }, set);
+      }
       anims.push(el.animate((masked(kf) ? kf.map((f) => ({ ...f, maskClip: "no-clip" })) : kf) as unknown as Keyframe[], { duration, fill: "both", easing: "linear" }));
     }
     for (const bl of blends) {
