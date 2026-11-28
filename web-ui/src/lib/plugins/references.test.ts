@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { collectReferences, pluginSource } from "./references";
+import { argsForMatch, collectReferences, pluginSource } from "./references";
 import type { SurfaceItem } from "./platform";
 
 const items: SurfaceItem[] = [
@@ -47,5 +47,48 @@ describe("plugins' published ids", () => {
     expect(first.note).toBe("sec:intro · label · LaTeX");
     expect(second.span).toBeUndefined();
     expect(src.lookup("sec:other", "label")).toEqual([]);
+  });
+});
+
+describe("a shape whose matches open a view", () => {
+  const locus: SurfaceItem[] = [
+    {
+      plugin: "gs",
+      key: "loci",
+      data: {
+        shapes: [
+          {
+            kind: "locus",
+            pattern: "chr[0-9XYM]{1,2}:[0-9,]{1,13}-[0-9,]{1,13}",
+            view: { view: "genome", args_from_match: { locus: "<match>", from: "chat" } },
+          },
+        ],
+        ids: [],
+      },
+    },
+  ];
+
+  it("keeps a plugin that lists no ids, and answers any match with the view", () => {
+    const refs = collectReferences(locus).get("gs");
+    expect(refs).toBeDefined();
+    expect(refs!.viewShapes.get("locus")).toEqual({ view: "genome", args: { locus: "<match>", from: "chat" } });
+    const targets = pluginSource(refs!, "GenomeSpy", "/ws").lookup("chr17:7,668,402-7,687,550", "locus");
+    expect(targets).toHaveLength(1);
+    expect(targets[0]).toMatchObject({ kind: "locus", title: "chr17:7,668,402-7,687,550" });
+    expect(pluginSource(refs!, "GenomeSpy", "/ws").lookup("x", "other")).toEqual([]);
+  });
+
+  it("puts the matched text in its args", () => {
+    expect(argsForMatch({ view: "genome", args: { locus: "<match>", q: "at <match>" } }, "chr1:1-2")).toEqual({
+      locus: "chr1:1-2",
+      q: "at chr1:1-2",
+    });
+  });
+
+  it("drops a malformed view", () => {
+    const bad = collectReferences([
+      { plugin: "gs", key: "k", data: { shapes: [{ kind: "locus", pattern: "chr1", view: { view: "genome", args_from_match: { n: 7 } } }], ids: [] } },
+    ]);
+    expect(bad.has("gs")).toBe(false);
   });
 });

@@ -7,6 +7,8 @@
  * hidden for `PARKED_MS` (its tab in the background) closes too.
  */
 
+import { untrack } from "svelte";
+
 /** Live web views per window. */
 export const WEB_LIVE_MAX = 4;
 /** A hidden web view keeps its page this long, then closes it. */
@@ -16,15 +18,20 @@ class WebViews {
   /** Views most recently shown or worked in, newest first. */
   private recent = $state<string[]>([]);
 
-  /** The view came on screen, or the person worked in it. */
+  /** The view came on screen, or the person worked in it. Called from a
+   *  node's effect, so it reads the list untracked: a tracked read made two
+   *  views on screen at once re-run each other's effect without end
+   *  (`effect_update_depth_exceeded`), each moving itself to the front. */
   seen(id: string): void {
-    if (this.recent[0] === id) return;
-    this.recent = [id, ...this.recent.filter((r) => r !== id)];
+    const recent = untrack(() => this.recent);
+    if (recent[0] === id) return;
+    this.recent = [id, ...recent.filter((r) => r !== id)];
   }
 
   /** The view went (unmounted, or closed while parked). */
   drop(id: string): void {
-    if (this.recent.includes(id)) this.recent = this.recent.filter((r) => r !== id);
+    const recent = untrack(() => this.recent);
+    if (recent.includes(id)) this.recent = recent.filter((r) => r !== id);
   }
 
   /** Whether the view may run its page. */

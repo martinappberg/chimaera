@@ -572,6 +572,7 @@ pub(crate) async fn reaper(state: Arc<crate::AppState>) {
         sweep_shared(&state);
         if n.is_multiple_of(REAP_EVERY) {
             reap_pages(&state).await;
+            crate::plugins::web_headless::reap(&state).await;
             state.browsers.chromium.reap_idle().await;
         }
     }

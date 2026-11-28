@@ -105,10 +105,12 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   [agent browser](agent-browser.md#engines-and-how-one-is-chosen) on a host with none, downloaded
   only from its Tools' Install), **Manimble** (a Manimble deck's slides beside its code in the
   [slide viewer for plugin decks](#plugin-screens-files-and-settings-the-02-platform), and `manimble_slides`
-  shows agents the slides they write), and **GenomeSpy** (`genomespy_inspect` reads a BAM, VCF,
-  BigWig, BigBed, GFF3 or FASTA header: its build, chromosome naming, samples and indexes;
-  `genomespy_check` finds what would break a `*.genomespy.json` view, by line; `genomespy_guide`
-  teaches the grammar). The daemon carries none of them: each is
+  shows agents the slides they write), and **GenomeSpy** (a `*.genomespy.json` opens as a live
+  genome view and BAM, BigWig, BigBed, VCF, GFF3 and FASTA files as generated ones, drawn by its
+  own [web view](web-views.md); `genomespy_inspect` reads a data file's header: its build,
+  chromosome naming, samples and indexes; `genomespy_check` finds what would break a view, by
+  line; `genomespy_where` says where the person is looking; `genomespy_guide` teaches the
+  grammar). The daemon carries none of them: each is
   listed as *available* until the user installs it on this host
   ([below](#versions-installs--updates)).
 - **How it's used.** Open Extensions from the rail's **Extensions** row or quick-open
@@ -118,7 +120,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   scrolls on its own below it, keeping its place when you switch away and back. The **Plugins**
   segment opens with "Plugins add tools for your agents and views for you. Install one, then
   switch it on per workspace." and shows, under **Chimaera plugins**, the plugins grouped by
-  category (**Writing**, **Presentations**, **Data**, **Knowledge**, **Agent tools**, then
+  category (**Writing**, **Presentations**, **Data**, **Biology**, **Knowledge**, **Agent tools**, then
   **Other**; empty groups are left out, Chimaera's own first within a group), a
   card per plugin with one primary control. Its head: a two-letter tile · the name (a link to
   the plugin's `homepage`, opened in the system browser) · the check badge · version
@@ -256,7 +258,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     in separate repositories and install from locked releases; the daemon carries no plugin
     bytes. Capability trust, both WIT worlds, plugin screens and file views, query routes,
     switch events, program jobs and tool downloads are implemented (sections below).
-    LaTeX, Typst, PowerPoint, Chromium, Manimble and GenomeSpy use the 0.2 platform. **Browse** remains disabled, "later".
+    LaTeX, Typst, PowerPoint, Chromium and Manimble use the 0.2 platform, and GenomeSpy the 0.3 one (web views). **Browse** remains disabled, "later".
 
 ## The plugin host
 
@@ -662,14 +664,16 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   its icon and title, while the plugin is on there: one click opens or focuses the tab
   (`platform.ts::railViews`, App.svelte's rail). A file it claims opens in its view; the
   bar above has **Text** (and, when two plugins claim it, each one — the choice is remembered
-  per workspace), its status chips and file actions. Opening such a file where the plugin is
+  per workspace), its status chips and file actions. A file action may open one of its plugin's
+  file views on a file, claimed or not ("View on genome" on a plain VCF): that view joins the
+  file's switch for that opening only. Opening such a file where the plugin is
   installed but off offers **Turn on** in that bar (**Not now** is remembered per workspace;
   one waiting for trust is left to its card). The dashboard shows its panels after
   Chimaera's own. Settings → **Plugins** lists every installed plugin's settings (host-wide or
   per workspace), with what its output folder uses and **Clear**.
 - **Where it's wired.**
-  - **Daemon** (`crates/chimaera-server/src/plugins/`): `runtime.rs` binds both WIT worlds
-    (`v1`, `v2`) in one linker and picks by the manifest's `api`; `hostfns.rs` serves 0.1's
+  - **Daemon** (`crates/chimaera-server/src/plugins/`): `runtime.rs` binds every served WIT
+    world (`v1` … `v4`) in one linker and picks by the manifest's `api`; `hostfns.rs` serves 0.1's
     `host` through 0.2's and the new `platform` imports; `platform.rs` (the manifest tables,
     their checks, the file patterns, the per-daemon `Platform`), `screens.rs` (the `ui/1`
     check, render / action / file-action / query routes, invalidation at ≤ 4 a second),
@@ -745,7 +749,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
 
 ## Web views (API 0.3)
 
-A 0.3 plugin may ship its own HTML/JS page for a drawing area (a `web` node), and lend libraries to agents' pages; each page, library and host it declares is a line on its card's **Can** list, and web views alone keep it sandboxed. The whole feature: [web views](web-views.md); writing one: [the guide](../agent-guides/plugins.md#web-views-api-03).
+A 0.3 plugin may ship its own HTML/JS page for a drawing area (a `web` node), and lend libraries to agents' pages; each page, library and host it declares is a line on its card's **Can** list, and web views alone keep it sandboxed. From API 0.4 its tools can ask that page (`web-call`; a headless page answers when no window shows it), open its views beside the agent (`reveal`), and make every match of a `references/1` shape a chip that opens a view. The whole feature: [web views](web-views.md); writing one: [the guide](../agent-guides/plugins.md#web-views-api-03).
 
 ## Programs and tools (the privileged tier)
 
