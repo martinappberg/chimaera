@@ -58,6 +58,19 @@ describe("colours", () => {
     expect(heldColor(null, { by: [DARKEN] }, palette)).toBe(null);
   });
 
+  it("a held scheme colour drops its transforms, an sRGB one keeps them (R33, PowerPoint's film)", () => {
+    const mods = (m: [string, string][]) => m.map(([name, val]) => ({ name, val }));
+    for (const m of [[["tint", "40000"]], [["shade", "50000"]], [["lumMod", "60000"], ["lumOff", "40000"]], [["lumMod", "75000"]]] as [string, string][][]) {
+      const to = { ...c("schemeClr", { val: "accent2" }), mods: mods(m) };
+      expect(toCss(heldColor(null, { to, solid: true }, palette)!), JSON.stringify(m)).toBe("rgb(192, 80, 77)");
+    }
+    const green = { ...c("srgbClr", { val: "00A000" }), mods: mods([["shade", "50000"]]) };
+    const g = heldColor(null, { to: green, solid: true }, palette)!;
+    // The film: 0,113,0 before its +3 correction.
+    expect(Math.abs(g.g - 116)).toBeLessThanOrEqual(4);
+    expect(g.r + g.b).toBe(0);
+  });
+
   it("a picture's darken stands in as a CSS filter; a `to` has none", () => {
     expect(pictureFilter({ by: [DARKEN] })).toMatch(/^brightness\(0\.49[0-9]*\) saturate/);
     expect(pictureFilter({ to: c("schemeClr", { val: "accent2" }) })).toBe(null);
