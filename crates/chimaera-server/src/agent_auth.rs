@@ -65,7 +65,8 @@ pub(crate) struct Recipe {
     pub(crate) how: How,
     /// What the login runs, in the user's words (shown in Settings).
     pub(crate) command: &'static str,
-    /// Claude's browser page shows a code the user pastes back.
+    /// The page shows a code the user pastes back (Claude; Antigravity when
+    /// its hosted callback doesn't reach the CLI).
     pub(crate) accepts_code: bool,
     /// The CLI prints a one-time code to enter on its page (device flows).
     /// Only these flows have one read out of their output.
@@ -108,13 +109,13 @@ pub(crate) fn recipe(kind: AgentKind) -> Option<Recipe> {
         },
         // No login command, but print mode signs in headlessly: a native
         // zero-turn command (`/skills`) triggers the OAuth URL and a 60 s wait
-        // for Google's hosted callback (probed 1.3.5). No pasted code: print
-        // mode reads a piped stdin as its prompt and abandons the login at
-        // once, so the login gets no stdin and only the callback completes it.
+        // for Google's hosted callback, or a pasted authorization code (probed
+        // 1.5.12). A piped stdin makes print mode abandon the login at once,
+        // so the code goes in through a terminal (`Headless::terminal`).
         AgentKind::Antigravity => Recipe {
             how: How::Browser,
             command: "agy -p /skills",
-            accepts_code: false,
+            accepts_code: true,
             device_code: false,
             relogin: false,
         },
@@ -133,6 +134,8 @@ struct Headless {
     /// ignores `BROWSER` and `NO_BROWSER`): a no-op `open` / `xdg-open` goes
     /// first on its PATH, so only the app opens the page.
     no_browser: bool,
+    /// A pasted code goes in through a pseudo-terminal, not a pipe.
+    terminal: bool,
 }
 
 fn login_launch(kind: AgentKind) -> Option<Headless> {
@@ -141,16 +144,19 @@ fn login_launch(kind: AgentKind) -> Option<Headless> {
             args: &["auth", "login"],
             env: &[("BROWSER", "true")],
             no_browser: false,
+            terminal: false,
         },
         AgentKind::Codex | AgentKind::Grok => Headless {
             args: &["login", "--device-auth"],
             env: &[],
             no_browser: false,
+            terminal: false,
         },
         AgentKind::Cursor => Headless {
             args: &["login"],
             env: &[("NO_OPEN_BROWSER", "1")],
             no_browser: false,
+            terminal: false,
         },
         AgentKind::Antigravity => Headless {
             args: &[
@@ -163,6 +169,7 @@ fn login_launch(kind: AgentKind) -> Option<Headless> {
             ],
             env: &[],
             no_browser: true,
+            terminal: true,
         },
         AgentKind::Gemini => return None,
     })
@@ -718,6 +725,7 @@ pub(crate) async fn start(
                 .chain(crate::runtimes::managed_agent_env(kind, detection.managed))
                 .collect(),
             stdin: recipe.accepts_code,
+            terminal: headless.terminal,
             cwd: workspace.root.clone(),
             no_browser: headless.no_browser,
         }
@@ -743,6 +751,8 @@ pub(crate) enum Launch {
         env: Vec<(String, String)>,
         /// Keep stdin open for a pasted code.
         stdin: bool,
+        /// ...as a pseudo-terminal rather than a pipe.
+        terminal: bool,
         cwd: PathBuf,
         /// Put a no-op `open` / `xdg-open` first on the login's PATH.
         no_browser: bool,
@@ -875,6 +885,7 @@ async fn run_login(
         argv,
         env: extra_env,
         stdin,
+        terminal,
         cwd,
         no_browser,
     } = launch;
@@ -904,7 +915,11 @@ async fn run_login(
     let exit = op
         .run(Run {
             command,
-            stdin: if stdin {
+            stdin: if stdin && terminal {
+                Stdin::Terminal {
+                    closed: "The sign-in stopped accepting input.",
+                }
+            } else if stdin {
                 // Claude's prompt reads a line.
                 Stdin::Lines {
                     closed: "The sign-in stopped accepting input.",
@@ -1444,7 +1459,7 @@ mod tests {
         }
         assert_eq!(recipe(AgentKind::Antigravity).unwrap().how, How::Browser);
         assert!(recipe(AgentKind::Claude).unwrap().accepts_code);
-        assert!(!recipe(AgentKind::Antigravity).unwrap().accepts_code);
+        assert!(recipe(AgentKind::Antigravity).unwrap().accepts_code);
         assert!(!recipe(AgentKind::Codex).unwrap().accepts_code);
         for (kind, device) in [
             (AgentKind::Claude, false),
@@ -1498,6 +1513,7 @@ mod tests {
             argv: vec!["/bin/bash".into(), "-c".into(), body.into()],
             env: vec![],
             stdin,
+            terminal: false,
             cwd: "/tmp".into(),
             no_browser: false,
         }
@@ -1618,6 +1634,66 @@ mod tests {
             "a finished page is stale"
         );
         assert!(String::from_utf8_lossy(&op.snapshot().cli).contains("got PASTED-1"));
+    }
+
+    #[tokio::test]
+    async fn antigravity_s_pasted_code_reaches_it_through_a_terminal() {
+        let state = state();
+        // The verdict's status command: a stand-in, never the host's agy.
+        let stand_in = std::env::temp_dir().join(format!(
+            "chimaera-auth-agy-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::write(&stand_in, "#!/bin/sh\nexit 0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        lock(&state.agent_bins).insert(
+            AgentKind::Antigravity,
+            crate::launcher::AgentDetection {
+                path: Ok(stand_in),
+                version: None,
+                managed: false,
+                explicit: false,
+                mtime: None,
+                unchecked: None,
+            },
+        );
+        // Like agy's print mode: a stdin that isn't a terminal ends the login.
+        let mut launch = script(
+            "[ -t 0 ] || { echo 'stdin is not a terminal'; exit 4; }; echo 'visit https://accounts.google.com/o/oauth2/auth?x=1'; read code; echo \"got $code\"; exit 0",
+            true,
+        );
+        let Launch::Browser { terminal, .. } = &mut launch;
+        *terminal = true;
+        start_operation(
+            state.clone(),
+            AgentKind::Antigravity,
+            request("one"),
+            launch,
+        )
+        .await;
+        let p = wait_for(&state, AgentKind::Antigravity, |p| p.url.is_some()).await;
+        assert!(p.accepts_code && p.running());
+        let fed = code(
+            State(state.clone()),
+            AxPath(("agy".into(), "one".into())),
+            Json(Code {
+                code: "4/0Abc_def".into(),
+            }),
+        )
+        .await;
+        assert_eq!(fed.status(), StatusCode::OK);
+        wait_for(&state, AgentKind::Antigravity, |p| !p.running()).await;
+        let op = state
+            .agent_auth
+            .operations
+            .get(AgentKind::Antigravity)
+            .unwrap();
+        let cli = String::from_utf8_lossy(&op.snapshot().cli).into_owned();
+        assert!(cli.contains("got 4/0Abc_def"), "{cli}");
+        assert!(!cli.contains("4/0Abc_def\ngot"), "echo is off: {cli}");
     }
 
     #[tokio::test]
