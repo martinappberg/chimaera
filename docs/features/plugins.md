@@ -634,9 +634,9 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     a `blocked` entry; a soft block the user allowed (by the build's sha256) runs.
   - **Lock bumps.** The lock records each first-party plugin's `tier` and `caps`; the
     `plugin-lock` workflow writes each bump with the release's own `tier` and `caps`
-    (`.github/scripts/plugin-caps.mjs`, held to the daemon's reading by fixtures) and auto-merges it only
-    when the plugin keeps its tier, its capability digest is exactly the approved one, its manifest changes
-    nothing but its words (the whole parsed `plugin.toml` compared), and, for a privileged plugin, its
+    (read by the daemon's own code: the `chimaera` CLI built from the checkout, `chimaera plugin caps
+    --against`) and auto-merges it only when the pinned release reads as the lock records, the two
+    `plugin.toml`s are identical except for words (`plugins::same_behaviour`), and, for a privileged plugin, its
     `plugin.wasm` and `plugin.toml` are in one attestation from the plugin repository's release workflow,
     at the release's tag or on main, from the commit the tag points to, which is on main
     (`gh attestation verify`), so a release run by hand on main counts too. That proves where the files

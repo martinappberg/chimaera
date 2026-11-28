@@ -74,6 +74,9 @@ pub struct ServerConfig {
 
 pub use job_host::run as run_job_host;
 pub use lifecycle::run;
+/// `chimaera plugin caps <release.toml> --against <pinned.toml>`: everything
+/// the plugin-lock workflow decides a bump with, by this daemon's own reading.
+pub use plugins::capabilities::describe_bump as plugin_bump;
 /// `chimaera plugin caps <plugin.toml>`: a manifest's tier, capability
 /// digest and Can list, as the lock and the card record them.
 pub use plugins::capabilities::describe_manifest as plugin_capabilities;

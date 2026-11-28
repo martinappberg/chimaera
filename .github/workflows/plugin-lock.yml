@@ -5,12 +5,12 @@ name: plugin-lock
 # checked release (.github/scripts/plugin-lock.mjs) becomes a `fix:` PR, CI
 # installs it against the new lock, and the merge requests a patch release
 # (the next daily batch ships it, docs/agent-guides/releases.md). The
-# lock is written with each release's own tier and caps (read from its
-# plugin.toml by .github/scripts/plugin-caps.mjs, held to the daemon's
-# reading by fixtures). The PR auto-merges (squash) only when every bumped
-# plugin keeps its tier, its capability digest is exactly the one the lock
-# approved, its plugin.toml is its pinned release's but for its words (the
-# whole parsed manifest compared), and a privileged one's plugin.wasm and
+# lock is written with each release's own tier and caps, read by the
+# daemon's own code: when a newer release exists, the chimaera CLI is built
+# from this checkout and `chimaera plugin caps --against` reads both
+# manifests. The PR auto-merges (squash) only when, for every bumped plugin,
+# the pinned release reads as the lock records, the two plugin.tomls are
+# identical except for words, and a privileged one's plugin.wasm and
 # plugin.toml are in one attestation from the plugin repository's release
 # workflow, at the release's tag or on main, from the commit the tag points
 # to, which is on main (the tag and main checked through the API, then
@@ -99,15 +99,54 @@ jobs:
           fi
           echo "open=$pr" >> "$GITHUB_OUTPUT"
 
+      # Cheap first: only whether any plugin has a newer release. Most hourly
+      # runs stop here, without building anything.
+      - name: anything newer?
+        id: newer
+        if: steps.open.outputs.open == ''
+        # A repository whose latest release can't be read must not hold back
+        # the others; the last step fails the run.
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node .github/scripts/plugin-lock.mjs --newer
+
+      # The manifests are read by the daemon's own code: the chimaera CLI
+      # built from this checkout (never a downloaded release binary — an
+      # older one could ignore a key the current daemon reads, which would
+      # fail open). The daemon embeds web-ui/dist (rust-embed needs it at
+      # compile time), so the UI is built first, as ci.yml does. A debug
+      # build: `chimaera plugin caps` runs in well under a second either way.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: steps.newer.outputs.newer == 'true'
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: web-ui/package-lock.json
+      - name: build the web UI the daemon embeds
+        if: steps.newer.outputs.newer == 'true'
+        working-directory: web-ui
+        run: npm ci && npm run build
+      - name: toolchain (rust-toolchain.toml)
+        if: steps.newer.outputs.newer == 'true'
+        run: rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.newer.outputs.newer == 'true'
+        with:
+          key: plugin-lock
+      - name: build the chimaera CLI from this checkout
+        if: steps.newer.outputs.newer == 'true'
+        run: cargo build --locked -p chimaera
+
       - name: check the latest releases
         id: bump
-        if: steps.open.outputs.open == ''
+        if: steps.newer.outputs.newer == 'true'
         # A release that fails a check must not hold back the others: the
         # PR still opens for those, and the last step fails the run.
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: node .github/scripts/plugin-lock.mjs --write --out "$RUNNER_TEMP/plugin-lock"
+        run: node .github/scripts/plugin-lock.mjs --chimaera target/debug/chimaera --write --out "$RUNNER_TEMP/plugin-lock"
 
       - name: open the pull request
         if: steps.bump.outputs.bumped == 'true'
@@ -151,7 +190,7 @@ jobs:
           fi
 
       - name: a release failed its checks
-        if: steps.bump.outcome == 'failure'
+        if: steps.newer.outcome == 'failure' || steps.bump.outcome == 'failure'
         run: |
           echo "::error title=plugin-lock::a plugin release failed its checks (see 'check the latest releases'); the lock keeps the version it had"
           exit 1

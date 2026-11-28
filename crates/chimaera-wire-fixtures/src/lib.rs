@@ -9,11 +9,6 @@
 //! the diff shows up in review, and the UI tests say whether the client
 //! still accepts it.
 //!
-//! One family is not a daemon↔UI shape: `plugin-caps` (manifests and what
-//! `chimaera plugin caps` prints for each) is read by
-//! `.github/scripts/plugin-caps.test.mjs`, which holds the plugin-lock
-//! workflow's JavaScript port of the capability digest to the daemon.
-//!
 //! Modes (`CHIMAERA_WIRE_FIXTURES`):
 //! - `write` (the default outside CI): a plain `cargo test` regenerates the
 //!   fixtures in place. Commit what changed; `just check` fails when the

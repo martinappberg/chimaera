@@ -223,10 +223,12 @@ The platform's rule:
   chimaera release. A user can still install a newer release early, through the trust
   prompt, as an unverified version.
 - **Lock bumps** (the `plugin-lock` workflow): the bump writes the release's own tier
-  and digest, and auto-merges only when the tier is unchanged (sandboxed stays
-  sandboxed, privileged stays privileged), the digest is exactly the approved one, the
-  whole parsed `plugin.toml` is the pinned release's but for its words (version, name,
-  summary, description, homepage, category, `[adds]` and the two summaries), and, for a
+  and digest, read by the daemon's own code (the `chimaera` CLI built from the checkout,
+  `chimaera plugin caps --against`; no second reader), and auto-merges only when the
+  pinned release reads as the lock records, the two `plugin.toml`s are identical except
+  for words (`plugins::same_behaviour`: version, name, summary, description, homepage,
+  category, `[adds]` and the two summaries are words; every other field of the manifest
+  type is behaviour, by an exhaustive destructure; unknown keys are refused), and, for a
   privileged plugin, provenance verifies (below). Anything else opens the pull request without auto-merge, saying which
   condition failed; CI checking the lock against the release is not an approval, so
   such a PR still needs a person to read the code. A sandboxed plugin needs no
@@ -244,8 +246,8 @@ The platform's rule:
   refs (`--cert-identity`, `--source-ref`) and that commit (`--source-digest`), then
   checks gh's result again, the toml's digest included. Binding to the commit, not a
   ref name, is what lets a release run by hand on main (how these plugins are released)
-  count. Its manifest must also be the pinned release's but for its words (the whole
-  parsed `plugin.toml`, not only the digest's atoms). A privileged release that meets
+  count. Its manifest must also be the pinned release's but for its words (every field,
+  not only the digest's atoms). A privileged release that meets
   all this merges by itself. What the attestation proves is that the files were built by
   the repository's release workflow from a commit on main; it does not prove anyone
   reviewed that commit. With this rule, whoever can merge to a privileged plugin's main

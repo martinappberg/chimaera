@@ -13,11 +13,18 @@
 // CI's plugin tests install the same release against the new lock,
 // so a bump this script writes still has to pass CI to merge.
 //
+// No TOML is read here: the chimaera CLI built from this checkout
+// (`chimaera plugin caps <release.toml> --against <pinned.toml> --json`,
+// `--chimaera <bin>`) reads both manifests with the daemon's own code and
+// answers each one's lock fields, tier, digest, Can lines and tool
+// downloads, what the release adds and drops, and whether the two are the
+// same but for their words (`bumpFacts` validates the answer strictly). A
+// release the daemon refuses is refused here too.
+//
 // What the plugin can do is the maintainers' to approve (`tier` and `caps`,
-// docs/design/plugin-platform-plan.md §2): a bump auto-merges only when
-// (`review`) the pinned release reads as the lock's tier and caps, the
-// release keeps that tier with exactly the lock's caps, its whole manifest is
-// the pinned release's but for its words (`sameBehaviour`), and, for a
+// docs/design/plugin-platform-plan.md §2). A bump auto-merges only when
+// (`review`): the pinned release reads as the lock records (its tier and
+// caps); the manifests are identical except for words; and, for a
 // privileged plugin, its plugin.wasm and plugin.toml are covered by one
 // attestation from the plugin repository's release workflow
 // (RELEASE_WORKFLOW), at the release's tag or on main (MAIN_REF), from the
@@ -28,23 +35,24 @@
 // ships to users without a second look at the lock PR, which is the
 // maintainer's chosen trade. A sandboxed plugin needs no attestation: the
 // sandbox bounds its code. Otherwise the PR opens without auto-merge and
-// says which condition failed. Either way the lock is written with the release's own
-// `tier` and `caps`, read from its plugin.toml by plugin-caps.mjs (the
-// daemon's reading, held to it by fixtures), and the PR body says, per
-// plugin, whether the tier changed and which of the card's Can lines the
-// release adds and drops against the pinned one. CI then checks only that
-// the lock matches the release: that is not an approval, so a green PR that
-// waits for review still needs a person to read the code. A plugin.toml that
-// can't be read for capabilities is refused like any other failed check.
+// says which condition failed. Either way the lock is written with the
+// release's own `tier` and `caps`, and the PR body says, per plugin,
+// whether the tier changed and which of the card's Can lines the release
+// adds and drops against the pinned one. CI then checks only that the lock
+// matches the release: that is not an approval, so a green PR that waits
+// for review still needs a person to read the code.
 //
-//   node .github/scripts/plugin-lock.mjs [--write] [--lock <file>] [--out <dir>]
+//   node .github/scripts/plugin-lock.mjs --newer [--lock <file>]
+//   node .github/scripts/plugin-lock.mjs --chimaera <bin> [--write] [--lock <file>] [--out <dir>]
 //
-// Without --write it only reports. --out receives `title`, `branch` and
-// `body.md` for the pull request when something was bumped. A release that
-// fails a check is skipped with an error (and a non-zero exit) while the
-// other plugins still bump. GITHUB_TOKEN, when set, is sent to the GitHub
-// API only (rate limits); release downloads are public. Text from a release
-// (names, capability strings) reaches the PR body escaped, and never
+// --newer only says (`newer=` in $GITHUB_OUTPUT) whether any plugin has a
+// newer release, so the workflow builds the CLI just then. Without --write
+// it only reports. --out receives `title`, `branch` and `body.md` for the
+// pull request when something was bumped. A release that fails a check is
+// skipped with an error (and a non-zero exit) while the other plugins still
+// bump. GITHUB_TOKEN, when set, is sent to the GitHub API only (rate
+// limits); release downloads are public. Text from a release (names,
+// capability strings) reaches the PR body escaped, and never
 // `$GITHUB_OUTPUT` or a workflow command unescaped.
 
 import { execFile } from "node:child_process";
@@ -55,8 +63,6 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
-import { beyond, describeManifest, linesOf, parseToml } from "./plugin-caps.mjs";
-
 const execFileAsync = promisify(execFile);
 const API = "https://api.github.com";
 /** The daemon's own caps (plugins::installed): a component, a manifest. */
@@ -64,8 +70,6 @@ const WASM_MAX = 16 * 1024 * 1024;
 const TOML_MAX = 64 * 1024;
 const SUMS_MAX = 4 * 1024;
 const LOCK_KEYS = ["id", "name", "summary", "category", "version", "repo", "sha256_wasm", "sha256_toml", "tier", "caps"];
-/** Tables of a plugin.toml that say nothing about what it can do. */
-const WORDS_ONLY = new Set(["adds", "release", "detect"]);
 const VERSION_RE = /^[0-9]+\.[0-9]+\.[0-9]+$/;
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 
@@ -123,161 +127,104 @@ export function setLockValues(text, entry, values) {
 }
 
 /**
- * What the lock takes from a release's plugin.toml: the top-level `id`,
- * `name`, `summary`, `version` (one-line basic strings, before the first
- * table) and `[release] github` — the fields scripts/build-plugins.sh and the
- * daemon compare with the lock. A value that isn't a plain one-line string
- * reads as absent, so the release is refused rather than misread.
+ * The `chimaera` CLI's answer about a bump, validated strictly:
+ * `chimaera plugin caps <release.toml> --against <pinned.toml> --json`
+ * (crates/chimaera-server/src/plugins/capabilities.rs `describe_bump`). The
+ * daemon's own code reads both manifests — no second TOML reader, no port of
+ * the capability rules — so the decision can't differ from what the daemon
+ * will do. Exact keys and types at every level; anything else throws (the
+ * bump is refused).
  */
-export function manifestFields(text) {
-  const top = {};
-  const release = {};
-  let table = null;
-  for (const line of text.split("\n")) {
-    const header = /^\s*\[([^\]]*)\]\s*(#.*)?$/.exec(line);
-    if (header !== null) {
-      table = header[1].trim();
-      continue;
-    }
-    const m = /^\s*([A-Za-z0-9_-]+)\s*=\s*"([^"\\]*)"\s*(#.*)?$/.exec(line);
-    if (m === null) continue;
-    const into = table === null ? top : table === "release" ? release : null;
-    if (into !== null && !(m[1] in into)) into[m[1]] = m[2];
-  }
-  return { id: top.id, name: top.name, summary: top.summary, version: top.version, github: release.github };
-}
-
-/**
- * The keys of a plugin.toml that carry no behaviour: the daemon only shows
- * them (or checks them against the tag and the lock). Everything else — every
- * `provides.*`, `[[programs]]` (`version` args included), `[[tools]]` (urls,
- * hashes, `bin`, `unpack`, `setup` steps), `[access]`, `[detect]`,
- * `[release]`, views, files, actions, settings, `requires.*` but its summary,
- * and any key this list doesn't name — must be identical for a bump to merge
- * by itself (`sameBehaviour`). Where the daemon reads each:
- *   version             mod.rs `Manifest::version` + `validate`: checked
- *                       against the tag here and the lock in CI; it selects
- *                       nothing.
- *   name, summary       mod.rs `manifest_fields` (the card) and the lock's
- *                       name/summary; `validate` keeps them one line.
- *   description,
- *   homepage            mod.rs `manifest_fields`: shown on the card only.
- *   category            mod.rs `category()`: the Extensions page's group.
- *   adds                mod.rs `Adds` ("the card's Adds lines, in words"),
- *                       shown by `manifest_fields`.
- *   requires.summary,
- *   recommends.summary  mod.rs `Requires`/`Recommends::summary`: one sentence
- *                       on the card (`manifest_fields`).
- */
-export const WORDS_ONLY_KEYS = [
-  ["version"],
-  ["name"],
-  ["summary"],
-  ["description"],
-  ["homepage"],
-  ["category"],
-  ["adds"],
-  ["requires", "summary"],
-  ["recommends", "summary"],
-];
-
-/** A parsed TOML value as canonical JSON: tables with sorted keys, arrays in
- *  order, numbers and strings as they are (NaN/Infinity spelled out). */
-function canonical(value) {
-  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
-  if (value !== null && typeof value === "object") {
-    const keys = Object.keys(value).sort();
-    return `{${keys.map((k) => `${JSON.stringify(k)}:${canonical(value[k])}`).join(",")}}`;
-  }
-  if (typeof value === "number" && !Number.isFinite(value)) return `"#${String(value)}"`;
-  return JSON.stringify(value);
-}
-
-/** What a plugin.toml makes the plugin do, canonical: the whole parsed
- *  manifest without `WORDS_ONLY_KEYS`. Throws when it isn't TOML this reads. */
-export function manifestBehaviour(text) {
-  const m = parseToml(text);
-  const copy = JSON.parse(JSON.stringify(m, (_k, v) => (typeof v === "number" && !Number.isFinite(v) ? `#${v}` : v)));
-  for (const path of WORDS_ONLY_KEYS) {
-    let t = copy;
-    for (const part of path.slice(0, -1)) t = t !== null && typeof t === "object" && !Array.isArray(t) ? t[part] : undefined;
-    if (t !== null && typeof t === "object" && !Array.isArray(t)) delete t[path.at(-1)];
-  }
-  // A table emptied of its words reads as absent, as an absent one does.
-  for (const table of ["requires", "recommends"]) {
-    const t = copy[table];
-    if (t !== null && typeof t === "object" && !Array.isArray(t) && Object.keys(t).length === 0) delete copy[table];
-  }
-  return canonical(copy);
-}
-
-/** Whether two plugin.tomls make the plugin do the same, key by key (only
- *  their words may differ). False when either can't be read. */
-export function sameBehaviour(a, b) {
+export function bumpFacts(json) {
+  const fail = (why) => {
+    throw new Error(`chimaera plugin caps --against: ${why}`);
+  };
+  const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+  const keys = (v, want, where) => {
+    if (!isObject(v)) fail(`${where} is not an object`);
+    const got = Object.keys(v).sort();
+    const expect = [...want].sort();
+    if (JSON.stringify(got) !== JSON.stringify(expect)) fail(`${where} has keys ${got.join(",")}, not ${expect.join(",")}`);
+  };
+  const str = (v, where) => {
+    if (typeof v !== "string") fail(`${where} is not a string`);
+    return v;
+  };
+  const lines = (v, where) => {
+    if (!Array.isArray(v)) fail(`${where} is not a list`);
+    v.forEach((l, n) => {
+      keys(l, ["text", "privileged"], `${where}[${n}]`);
+      str(l.text, `${where}[${n}].text`);
+      if (typeof l.privileged !== "boolean") fail(`${where}[${n}].privileged is not a boolean`);
+    });
+    return v;
+  };
+  const side = (v, where) => {
+    keys(v, ["id", "version", "name", "summary", "github", "tier", "caps", "can", "downloads"], where);
+    for (const k of ["id", "version", "name", "summary"]) str(v[k], `${where}.${k}`);
+    if (v.github !== null) str(v.github, `${where}.github`);
+    if (v.tier !== "sandboxed" && v.tier !== "privileged") fail(`${where}.tier is ${JSON.stringify(v.tier)}`);
+    if (!/^[0-9a-f]{64}$/.test(str(v.caps, `${where}.caps`))) fail(`${where}.caps is not a digest`);
+    lines(v.can, `${where}.can`);
+    if (!Array.isArray(v.downloads)) fail(`${where}.downloads is not a list`);
+    v.downloads.forEach((d, n) => {
+      const at = `${where}.downloads[${n}]`;
+      keys(d, ["tool", "platform", "url", "sha256", "size"], at);
+      for (const k of ["tool", "platform", "url", "sha256"]) str(d[k], `${at}.${k}`);
+      if (!Number.isSafeInteger(d.size) || d.size <= 0) fail(`${at}.size is not a positive integer`);
+    });
+    return v;
+  };
+  let v;
   try {
-    return manifestBehaviour(a) === manifestBehaviour(b);
+    v = JSON.parse(json);
   } catch {
-    return false;
+    fail("not JSON");
   }
+  keys(v, ["release", "pinned", "pinned_error", "added", "dropped", "same_behaviour"], "the answer");
+  side(v.release, "release");
+  if (typeof v.same_behaviour !== "boolean") fail("same_behaviour is not a boolean");
+  if (v.pinned === null) {
+    str(v.pinned_error, "pinned_error");
+    if (v.added !== null || v.dropped !== null || v.same_behaviour !== false) fail("a pinned manifest it couldn't read compares as nothing");
+  } else {
+    side(v.pinned, "pinned");
+    if (v.pinned_error !== null) fail("pinned_error with a pinned manifest");
+    lines(v.added, "added");
+    lines(v.dropped, "dropped");
+  }
+  return v;
 }
 
 /**
- * The lines of a plugin.toml that decide what the plugin can do, by a line
- * heuristic. It gates nothing any more (a commented header such as
- * `[[tools.setup]] # x` hides its lines from it); `sameBehaviour` decides.
- * Kept for the tests that show what it misses.
+ * Run `chimaera` (`bin`: the binary built from this checkout, never a
+ * downloaded release — an older binary could ignore a key the current
+ * daemon reads) on the two manifests, from a private temp dir, without a
+ * shell. Throws when it fails or its answer isn't what `bumpFacts` accepts.
  */
-export function capabilityLines(text) {
-  const out = [];
-  let table = null;
-  for (const raw of text.split("\n")) {
-    const line = raw.trim();
-    if (line === "" || line.startsWith("#")) continue;
-    const header = /^\[\[?\s*([^\]]*?)\s*\]\]?$/.exec(line);
-    if (header !== null) {
-      table = header[1];
-      if (!WORDS_ONLY.has(table.split(".")[0])) out.push(line);
-      continue;
+export async function caps(bin, releaseToml, pinnedToml, run = execFileAsync) {
+  if (typeof bin !== "string" || bin === "") throw new Error("no chimaera CLI to read the manifests with (--chimaera)");
+  const dir = await mkdtemp(join(tmpdir(), "plugin-lock-caps-"));
+  try {
+    const release = join(dir, "release.toml");
+    const pinned = join(dir, "pinned.toml");
+    await writeFile(release, releaseToml);
+    await writeFile(pinned, pinnedToml);
+    let stdout;
+    try {
+      ({ stdout } = await run(bin, ["plugin", "caps", release, "--against", pinned, "--json"], {
+        env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "" },
+        timeout: 60_000,
+        maxBuffer: 4 * 1024 * 1024,
+      }));
+    } catch (error) {
+      const first = oneLine(String(error?.stderr ?? "").trim().split("\n").at(-1) || String(error?.message ?? "failed"), 200);
+      throw new Error(`the release's plugin.toml doesn't read as a manifest: ${first}`);
     }
-    if (table === null) {
-      if (/^api\s*=/.test(line)) out.push(line);
-      continue;
-    }
-    if (!WORDS_ONLY.has(table.split(".")[0])) out.push(line);
+    return bumpFacts(stdout);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
-  return out;
-}
-
-/**
- * A plugin.toml's tool downloads (`[[tools.artifacts]]`,
- * docs/design/plugin-platform-plan.md §8): `{tool, platform, url, sha256, size}`
- * for each, from the same TOML parse that gives the capabilities
- * (plugin-caps.mjs), so an artifact written in any TOML form — a
- * `[[tools.artifacts]]` table or an inline `artifacts = [{ … }]` — is one the
- * bump fetches and compares. The lock pins the manifest, the manifest pins
- * every artifact: the chain holds only if these are read as the daemon reads
- * them. A value of the wrong type reads as missing (null), and a missing url
- * or sha256 is refused. Throws when the manifest is not TOML this reader
- * knows.
- */
-export function toolArtifacts(text) {
-  const m = parseToml(text);
-  const str = (v) => (typeof v === "string" ? v : null);
-  const out = [];
-  const tools = Array.isArray(m.tools) ? m.tools : [];
-  for (const tool of tools) {
-    if (tool === null || typeof tool !== "object" || Array.isArray(tool)) continue;
-    const artifacts = Array.isArray(tool.artifacts) ? tool.artifacts : [];
-    for (const a of artifacts) {
-      if (a === null || typeof a !== "object" || Array.isArray(a)) {
-        out.push({ tool: str(tool.id), platform: null, url: null, sha256: null, size: null });
-        continue;
-      }
-      const size = Number.isSafeInteger(a.size) && a.size > 0 ? a.size : null;
-      out.push({ tool: str(tool.id), platform: str(a.platform), url: str(a.url), sha256: str(a.sha256), size });
-    }
-  }
-  return out;
 }
 
 /** The daemon's cap on one tool download (plugins::platform::DOWNLOAD_MAX). */
@@ -373,7 +320,7 @@ function capabilitySection(b) {
       if (b.added.length === 0 && b.removed.length === 0) out.push("- The Can lines read the same; an atom's detail changed (a download's sha256, say).");
     }
   }
-  if (b.lock_drift) out.push(`- Note: the lock's tier and caps for v${b.from} aren't what this script reads from that release (${b.lock_drift}); check \`chimaera plugin caps\` on it.`);
+  if (b.lock_drift) out.push(`- Note: the lock's tier and caps for v${b.from} aren't what the daemon reads from that release (${b.lock_drift}); check \`chimaera plugin caps\` on it.`);
   if (b.provenance) {
     const p = b.provenance;
     const commit = p.commit ? `commit \`${p.commit}\`` : "the commit the tag points to (unresolved)";
@@ -422,12 +369,12 @@ export function pullRequest(bumps) {
     ...bumps.flatMap(capabilitySection),
     ...(review.length === 0
       ? [
-          "Each release keeps its tier, its capability digest is exactly the one the lock already approved, and its manifest is the pinned release's except for its words, so the `tier` and `caps` written are the approved ones. A privileged one's `plugin.wasm` and `plugin.toml` are also covered by one attestation from the plugin repository's release workflow, at the release's tag or on main, from the commit the tag points to, which is on main. That proves where and from what they were built, not that anyone reviewed that commit: merging a privileged plugin's main and releasing it ships it without a second look here, by the maintainer's choice.",
+          "Each pinned release reads as the lock records, and each release's `plugin.toml` is identical to it except for words (read by the daemon's own code), so the `tier` and `caps` written are the approved ones. A privileged one's `plugin.wasm` and `plugin.toml` are also covered by one attestation from the plugin repository's release workflow, at the release's tag or on main, from the commit the tag points to, which is on main. That proves where and from what they were built, not that anyone reviewed that commit: merging a privileged plugin's main and releasing it ships it without a second look here, by the maintainer's choice.",
           "",
           "CI installs these releases from GitHub against the new lock (`scripts/build-plugins.sh` and the server's plugin tests). Auto-merge (squash) is on: it lands when the required checks pass, and the `fix:` title requests a patch release, so the next daily release brings the app the new versions.",
         ]
       : [
-          "**Needs a maintainer's review — no auto-merge.** A bump merges by itself only when the plugin keeps its tier, its capability digest is exactly the approved one, its manifest changes nothing but its words, and — for a privileged plugin — its `plugin.wasm` and `plugin.toml` are covered by one attestation from the plugin repository's release workflow, at the release's tag or on main, from the commit the tag points to, which is on main. Here that doesn't hold:",
+          "**Needs a maintainer's review — no auto-merge.** A bump merges by itself only when the pinned release reads as the lock records, the two `plugin.toml`s are identical except for words, and — for a privileged plugin — its `plugin.wasm` and `plugin.toml` are covered by one attestation from the plugin repository's release workflow, at the release's tag or on main, from the commit the tag points to, which is on main. Here that doesn't hold:",
           "",
           ...review.map((b) => `- \`${b.id}\` ${b.to}: ${code(b.why)}`),
           "",
@@ -436,21 +383,18 @@ export function pullRequest(bumps) {
   ].join("\n");
   return { title, branch, body, automerge: review.length === 0 };
 }
-
 /**
- * Whether a bump may merge by itself, and if not why. Every condition must
- * hold:
- *   1. the lock's tier is exactly `sandboxed` or `privileged`, and the pinned
- *      release, read in full, is what the lock says it is (its tier and caps
- *      digest), so the approval the lock records is real;
- *   2. the release, read in full, has the lock's tier: sandboxed stays
- *      sandboxed, privileged stays privileged (any tier change waits);
- *   3. the release's caps digest is the lock's — exactly the approved one;
- *   4. its whole manifest, parsed, is the pinned release's except for the
- *      keys that carry no behaviour (`sameBehaviour`, `WORDS_ONLY_KEYS`):
- *      tool setup steps, program version args, downloads' `bin`/`unpack` and
- *      every other key the digest leaves out are compared too;
- *   5. for a privileged plugin only: provenance verified (`provenance`, the
+ * Whether a bump may merge by itself, and if not why. `facts` is what the
+ * daemon's own code says about the two manifests (`bumpFacts`). The rule:
+ *   1. the pinned release reads as the lock records: the lock's tier is
+ *      exactly `sandboxed` or `privileged`, and the pinned release's tier
+ *      and caps digest are the lock's, so the approval it records is real;
+ *   2. the manifests are identical except for words (`same_behaviour`,
+ *      `plugins::same_behaviour` in the daemon: every field of the manifest
+ *      type named as words or behaviour, unknown keys refused), so the
+ *      release's tier and digest are the pinned one's too — checked again
+ *      here because the values come from the same call;
+ *   3. for a privileged plugin only: provenance verified (`provenance`, the
  *      result of `verifyProvenance`): its plugin.wasm and plugin.toml are
  *      covered by one attestation from the plugin repository's release
  *      workflow, at the release's tag or on main, from the commit the tag
@@ -465,32 +409,47 @@ export function pullRequest(bumps) {
  * CI going green is no approval: this function is the only thing between a
  * release and an unreviewed merge. plugin-lock.test.mjs pins every case.
  */
-export function review(entry, pinnedToml, releaseToml, provenance = null) {
+export function review(entry, facts, provenance = null) {
   const failed = [];
   if (entry.tier !== "sandboxed" && entry.tier !== "privileged") failed.push("the lock's tier is neither sandboxed nor privileged");
-  let pinned = null;
-  try {
-    pinned = describeManifest(pinnedToml);
-  } catch {
-    // Unreadable: condition 2 fails below.
-  }
+  const pinned = facts?.pinned ?? null;
+  const next = facts?.release ?? null;
   if (pinned === null || pinned.tier !== entry.tier || pinned.caps !== entry.caps) {
     failed.push("the pinned release doesn't read as the tier and caps the lock records");
   }
-  let next = null;
-  try {
-    next = describeManifest(releaseToml);
-  } catch {
-    // Unreadable: conditions 3 and 4 fail below (check refuses it anyway).
-  }
+  if (facts?.same_behaviour !== true) failed.push("its manifest changes more than its words");
   if (next === null) failed.push("the release can't be read for capabilities");
   else if (next.tier !== entry.tier) failed.push(`its tier changes (${entry.tier} → ${next.tier})`);
   if (next === null || next.caps !== entry.caps) failed.push("its capability digest is not the approved one: it may ask for more");
-  if (!sameBehaviour(pinnedToml, releaseToml)) failed.push("its manifest changes more than its words");
   if (entry.tier !== "sandboxed" && provenance?.verified !== true) {
     failed.push(`it is privileged and its provenance did not verify: ${provenance?.why ?? "not checked"}`);
   }
   return failed.length === 0 ? { automerge: true, why: null } : { automerge: false, why: failed.join("; ") };
+}
+
+/**
+ * What the release can do against the pinned release, for the lock and the
+ * body, from the daemon's answer (`facts`): its own tier and caps (the lock
+ * takes them), the Can lines it adds and drops, and whether the lock's
+ * values for the pinned release are what the daemon reads from it.
+ */
+export function capabilityChange(entry, facts) {
+  const next = facts.release;
+  const prev = facts.pinned;
+  const drift = [];
+  if (prev !== null && prev.tier !== entry.tier) drift.push(`tier reads ${prev.tier}`);
+  if (prev !== null && prev.caps !== entry.caps) drift.push(`caps reads ${prev.caps.slice(0, 12)}`);
+  return {
+    tier: next.tier,
+    caps: next.caps,
+    from_tier: entry.tier,
+    from_caps: entry.caps,
+    can: next.can,
+    added: facts.added,
+    removed: facts.dropped,
+    unreadable: facts.pinned_error,
+    lock_drift: drift.length === 0 ? null : drift.join(", "),
+  };
 }
 
 /** The release workflow every first-party plugin repository publishes from:
@@ -723,39 +682,6 @@ export async function verifyProvenance(wasm, toml, repo, tag, { token = "", run 
   }
 }
 
-/**
- * What the release can do against the pinned release, for the lock and the
- * body: its own tier and caps (the lock takes them), the Can lines it adds
- * and drops, and whether the lock's values for the pinned release are what
- * this reads from it. Throws when the release's manifest can't be read for
- * capabilities (the bump is refused); a pinned manifest that can't be read
- * only costs the comparison.
- */
-export function capabilityChange(entry, pinnedToml, releaseToml) {
-  const next = describeManifest(releaseToml);
-  if (next.id !== entry.id) throw new Error(`its plugin.toml reads as id "${next.id}"`);
-  let prev = null;
-  let unreadable = null;
-  try {
-    prev = describeManifest(pinnedToml);
-  } catch (error) {
-    unreadable = error instanceof Error ? error.message : String(error);
-  }
-  const drift = [];
-  if (prev !== null && prev.tier !== entry.tier) drift.push(`tier reads ${prev.tier}`);
-  if (prev !== null && prev.caps !== entry.caps) drift.push(`caps reads ${prev.caps.slice(0, 12)}`);
-  return {
-    tier: next.tier,
-    caps: next.caps,
-    from_tier: entry.tier,
-    from_caps: entry.caps,
-    can: next.can,
-    added: prev === null ? null : linesOf(beyond(next.atoms, prev.atoms)),
-    removed: prev === null ? null : linesOf(beyond(prev.atoms, next.atoms)),
-    unreadable,
-    lock_drift: drift.length === 0 ? null : drift.join(", "),
-  };
-}
 
 /** A workflow command's message, escaped as the runner unescapes it, so a
  *  newline in it can never start a command of its own. */
@@ -788,10 +714,9 @@ async function get(url, { max, json = false, token = "" }) {
   return json ? JSON.parse(bytes.toString("utf8")) : bytes;
 }
 
-/** One lock entry against its repository's latest release: null when the
- *  lock is current, else the checked bump. Throws when the release fails a
- *  check. */
-async function check(entry, token) {
+/** The entry's repository's latest release when it is newer than the lock's
+ *  pin (`{tag, version}`), else null. Throws when its tag isn't vX.Y.Z. */
+async function newerRelease(entry, token) {
   const release = await get(`${API}/repos/${entry.repo}/releases/latest`, { json: true, max: 1 << 20, token });
   const tag = typeof release.tag_name === "string" ? release.tag_name : "";
   const version = tag.startsWith("v") ? tag.slice(1) : "";
@@ -800,6 +725,17 @@ async function check(entry, token) {
     console.log(`${entry.id}: ${entry.version} is current (latest release ${tag})`);
     return null;
   }
+  return { tag, version };
+}
+
+/** One lock entry against its repository's latest release: null when the
+ *  lock is current, else the checked bump. Throws when the release fails a
+ *  check. `bin` is the chimaera CLI built from this checkout, which reads
+ *  both manifests. */
+async function check(entry, token, bin) {
+  const latest = await newerRelease(entry, token);
+  if (latest === null) return null;
+  const { tag, version } = latest;
   const base = `https://github.com/${entry.repo}/releases/download/${tag}`;
   let sums, toml, wasm;
   try {
@@ -818,48 +754,43 @@ async function check(entry, token) {
   const refuse = (why) => new Error(`${entry.id} ${tag}: ${why}`);
   if (sums.get("plugin.wasm") !== shaWasm) throw refuse("SHA256SUMS does not list the downloaded plugin.wasm");
   if (sums.get("plugin.toml") !== shaToml) throw refuse("SHA256SUMS does not list the downloaded plugin.toml");
-  const m = manifestFields(toml.toString("utf8"));
-  if (m.id !== entry.id) throw refuse(`plugin.toml names id "${m.id}", the lock "${entry.id}"`);
-  if (m.version !== version) throw refuse(`plugin.toml says version "${m.version}", the tag ${version}`);
-  if ((m.github ?? "").toLowerCase() !== entry.repo.toLowerCase()) {
-    throw refuse(`plugin.toml names [release] github = "${m.github}", the lock ${entry.repo}`);
-  }
-  if (!m.name || !m.summary) throw refuse("plugin.toml has no one-line name or summary");
-  // The daemon's own rule (plugins::validate): words, never control characters.
-  for (const [what, text] of [["name", m.name], ["summary", m.summary]]) {
-    if (Buffer.byteLength(text) > 200 || /[\u0000-\u001f\u007f-\u009f]/u.test(text)) {
-      throw refuse(`plugin.toml's ${what} is not one line of at most 200 bytes without control characters`);
-    }
-  }
-  // What it can do, against the release the lock pins now (its plugin.toml
-  // checked against the lock's sha256 first). Read before any tool download:
-  // a manifest that can't be read for capabilities is refused cheaply.
+  // Both manifests read by the daemon's own code: the release's (refused if
+  // the daemon refuses it) against the one the lock pins now (its sha256
+  // checked against the lock's first).
   const pinned = await get(`https://github.com/${entry.repo}/releases/download/v${entry.version}/plugin.toml`, { max: TOML_MAX });
   if (sha256(pinned) !== entry.sha256_toml) throw refuse(`the pinned v${entry.version} plugin.toml isn't the one the lock names`);
-  let caps;
+  let facts;
   try {
-    caps = capabilityChange(entry, pinned.toString("utf8"), toml.toString("utf8"));
+    facts = await caps(bin, toml, pinned);
   } catch (error) {
-    throw refuse(`plugin.toml can't be read for capabilities: ${error instanceof Error ? error.message : String(error)}`);
+    throw refuse(error instanceof Error ? error.message : String(error));
   }
+  const m = facts.release;
+  if (m.id !== entry.id) throw refuse(`plugin.toml names id ${JSON.stringify(m.id)}, the lock "${entry.id}"`);
+  if (m.version !== version) throw refuse(`plugin.toml says version ${JSON.stringify(m.version)}, the tag ${version}`);
+  if ((m.github ?? "").toLowerCase() !== entry.repo.toLowerCase()) {
+    throw refuse(`plugin.toml names [release] github = ${JSON.stringify(m.github)}, the lock ${entry.repo}`);
+  }
+  // The daemon refuses a manifest whose name or summary is more than one
+  // line of 200 bytes; the lock stores them as plain one-line strings.
+  if (m.name === "" || m.summary === "") throw refuse("plugin.toml has no name or summary");
   // A privileged plugin's release merges by itself only if its plugin.wasm
-  // (these bytes, whose sha256 the lock takes) is attested by the plugin
-  // repository's release workflow, at this tag or on main, from the commit
-  // the tag points to.
+  // and plugin.toml (these bytes, whose sha256s the lock takes) are in one
+  // attestation from the plugin repository's release workflow, at this tag
+  // or on main, from the commit the tag points to, which is on main.
   const provenance =
-    entry.tier === "privileged" || caps.tier === "privileged" ? await verifyProvenance(wasm, toml, entry.repo, tag, { token }) : null;
+    entry.tier === "privileged" || m.tier === "privileged" ? await verifyProvenance(wasm, toml, entry.repo, tag, { token }) : null;
   if (provenance !== null) console.log(`${entry.id} ${tag}: provenance ${provenance.verified ? "verified" : `not verified (${provenance.why})`}`);
-  const { automerge, why } = review(entry, pinned.toString("utf8"), toml.toString("utf8"), provenance);
-  // Every tool download it names, fetched and compared: the lock pins this
-  // manifest, the manifest pins these, so a reviewer's approval of the one
-  // covers the others only if they are what it says.
-  const artifacts = toolArtifacts(toml.toString("utf8"));
-  for (const a of artifacts) {
-    const what = `tool ${a.tool ?? "?"} for ${a.platform ?? "?"}`;
-    if (a.url === null || !a.url.startsWith("https://")) throw refuse(`${what} has no https url`);
-    if (a.sha256 === null || !/^[0-9a-f]{64}$/.test(a.sha256)) throw refuse(`${what} has no sha256`);
-    const got = await sha256Of(a.url, Math.min(a.size ?? DOWNLOAD_MAX, DOWNLOAD_MAX));
-    if (got.sha256 !== a.sha256) throw refuse(`${what}: ${a.url} is not the file its sha256 names`);
+  const { automerge, why } = review(entry, facts, provenance);
+  // Every tool download it names (as the daemon reads them), fetched and
+  // compared: the lock pins this manifest, the manifest pins these, so an
+  // approval of the one covers the others only if they are what it says.
+  for (const a of m.downloads) {
+    const what = `tool ${a.tool} for ${a.platform}`;
+    if (!a.url.startsWith("https://")) throw refuse(`${what} has no https url`);
+    if (!/^[0-9a-fA-F]{64}$/.test(a.sha256)) throw refuse(`${what} has no sha256`);
+    const got = await sha256Of(a.url, Math.min(a.size, DOWNLOAD_MAX));
+    if (got.sha256 !== a.sha256.toLowerCase()) throw refuse(`${what}: ${a.url} is not the file its sha256 names`);
     console.log(`${entry.id} ${tag}: ${what} checked (${got.bytes} bytes)`);
   }
   return {
@@ -875,8 +806,8 @@ async function check(entry, token) {
     sha256_wasm: shaWasm,
     sha256_toml: shaToml,
     wasm_bytes: wasm.length,
-    tools_checked: artifacts.length,
-    ...caps,
+    tools_checked: m.downloads.length,
+    ...capabilityChange(entry, facts),
     provenance,
     automerge,
     why,
@@ -892,14 +823,33 @@ async function main() {
   const args = process.argv.slice(2);
   const lockPath = option(args, "--lock") ?? "plugins/plugins.lock";
   const out = option(args, "--out");
+  const bin = option(args, "--chimaera") ?? "";
   const token = process.env.GITHUB_TOKEN ?? "";
   const original = await readFile(lockPath, "utf8");
+  // --newer: only whether any plugin has a newer release, so the workflow
+  // builds the CLI just when there is something to read.
+  if (args.includes("--newer")) {
+    let any = false;
+    let failed = 0;
+    for (const entry of parseLock(original)) {
+      try {
+        if ((await newerRelease(entry, token)) !== null) any = true;
+      } catch (error) {
+        failed++;
+        console.log(`::error title=plugin-lock::${commandMessage(error instanceof Error ? error.message : String(error))}`);
+      }
+    }
+    console.log(any ? "a newer release exists" : "plugins.lock is current");
+    if (process.env.GITHUB_OUTPUT) await appendFile(process.env.GITHUB_OUTPUT, `newer=${any}\n`);
+    if (failed > 0) process.exitCode = 1;
+    return;
+  }
   let text = original;
   const bumps = [];
   const problems = [];
   for (const entry of parseLock(original)) {
     try {
-      const bump = await check(entry, token);
+      const bump = await check(entry, token, bin);
       if (bump === null) continue;
       text = setLockValues(text, entry, {
         version: bump.to,

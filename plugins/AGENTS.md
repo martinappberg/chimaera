@@ -110,23 +110,27 @@ does not activate it. Rebuild, copy and reinstall the same version to iterate.
    lock, fetches every tool download the manifest names (`[[tools.artifacts]]`)
    and compares it with its sha256, rewrites the entry (`version`, both sha256s,
    `name` / `summary`, and the release's own `tier` and `caps`) and
-   opens `fix: update <Name> to <version>`. `tier` and `caps` come from
-   `.github/scripts/plugin-caps.mjs`, a JavaScript port of
-   `plugins/capabilities.rs` (what `chimaera plugin caps` prints) held to it
-   by the `plugin-caps` fixture (written by the Rust test
-   `the_lock_scripts_port_is_pinned`, read by `plugin-caps.test.mjs`); a
-   manifest it can't read is refused like any failed check. The lock is
-   written with the release's own `tier` and `caps`. A bump auto-merges
-   (squash) only when (`review` in the script) the pinned release reads as
-   the lock's `tier` and `caps`, the release keeps that tier (sandboxed stays
-   sandboxed, privileged stays privileged) with exactly the lock's `caps`,
-   its whole manifest, parsed, is the pinned release's except for the keys
-   that carry no behaviour (`sameBehaviour`; `WORDS_ONLY_KEYS`: `version`,
-   `name`, `summary`, `description`, `homepage`, `category`, `[adds]`,
-   `requires.summary`, `recommends.summary`, each with the daemon file that
-   reads it; tool setup steps, program version args, downloads' `bin` and
-   `unpack` and every unknown key are compared), and, for a **privileged**
-   plugin only, its `plugin.wasm` and `plugin.toml` are covered by one
+   opens `fix: update <Name> to <version>`. No TOML is read in JavaScript:
+   when a newer release exists the workflow builds the `chimaera` CLI from
+   the checkout (after the web UI it embeds) and runs `chimaera plugin caps
+   <release.toml> --against <pinned.toml> --json` (`describe_bump` in
+   `crates/chimaera-server/src/plugins/capabilities.rs`), which reads both
+   manifests with the daemon's own code and answers each one's tier, digest,
+   Can lines and tool downloads, the Can lines added and dropped, and whether
+   the two are the same but for their words (`plugins::same_behaviour`: an
+   exhaustive destructure of `Manifest`, so a new field fails to compile
+   until it is named words or behaviour; the words are `name`, `version`,
+   `summary`, `description`, `homepage`, `category`, `[adds]` and the two
+   agent-plugin summaries; unknown keys are refused by the manifest type at
+   every level). The script validates that answer strictly (`bumpFacts`); a
+   manifest the daemon refuses is refused like any failed check. It is
+   never a downloaded release binary: an older one could ignore a key the
+   current daemon reads. The lock is written with the release's own `tier`
+   and `caps`. A bump auto-merges (squash) only when (`review` in the
+   script) the pinned release reads as the lock records (its `tier` and
+   `caps`); the manifests are identical except for words (so the tier and
+   digest are the pinned ones too, which the script also checks, for free);
+   and, for a **privileged** plugin only, its `plugin.wasm` and `plugin.toml` are covered by one
    attestation from the plugin repository's release workflow, at the
    release's tag or on main, from the commit the tag points to, which is on
    main. The script resolves the tag to its commit through the GitHub API
@@ -181,7 +185,10 @@ does not activate it. Rebuild, copy and reinstall the same version to iterate.
    release, and from that release (the next daily batch) **Install** fetches
    that version. Run it by hand with **Actions →
    plugin-lock → Run workflow**, or locally without writing:
-   `node .github/scripts/plugin-lock.mjs`. One bump PR at a time: a newer
+   `cargo build -p chimaera && node .github/scripts/plugin-lock.mjs --chimaera
+   target/debug/chimaera` (with `CHIMAERA_BIN=target/debug/chimaera`,
+   `node --test .github/scripts/` also runs its end-to-end test against
+   that binary). One bump PR at a time: a newer
    release waits for the open one to land, and one that can no longer land
    (it conflicts with a lock edited on `main`, or `main` already has its
    change) is closed as "Superseded:"
