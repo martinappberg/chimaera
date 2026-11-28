@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { boxMatches, matchByBox, planByOrder, type Box, type Candidate } from "./pptxTag";
+import { boxExact, boxMatches, matchByBox, planByOrder, type Box, type Candidate } from "./pptxTag";
 
 /**
  * The matching behind `tagSlide` (the DOM half is driven live: the UI's
@@ -19,6 +19,14 @@ describe("boxMatches", () => {
   it("takes a zero-height line drawn 1 px thick", () => {
     expect(boxMatches(box(0, 0, 100, 1), box(0, 0, 100, 0))).toBe(true);
     expect(boxMatches(box(0, 0, 100, 1), box(0, 0, 100, 2))).toBe(false);
+  });
+
+  it("takes a box grown to fit its text, never a shrunk or moved one", () => {
+    expect(boxMatches(box(10, 20, 100, 180), box(10, 20, 100, 50))).toBe(true);
+    expect(boxMatches(box(10, 20, 140, 50), box(10, 20, 100, 50))).toBe(true);
+    expect(boxMatches(box(10, 20, 100, 49), box(10, 20, 100, 50))).toBe(false);
+    expect(boxMatches(box(11, 20, 100, 180), box(10, 20, 100, 50))).toBe(false);
+    expect(boxExact(box(10, 20, 100, 180), box(10, 20, 100, 50))).toBe(false);
   });
 });
 
@@ -53,6 +61,17 @@ describe("matchByBox", () => {
     expect(matchByBox(cands, box(1, 1), new Set())).toBe(2);
     expect(matchByBox(cands, box(1, 1), new Set([2]))).toBe(0);
     expect(matchByBox(cands, box(7, 7), new Set())).toBe(null);
+  });
+
+  it("prefers an exact box to one grown from the same origin", () => {
+    const cands = [cand(box(1, 1, 100, 50)), cand(box(1, 1, 100, 300))];
+    expect(matchByBox(cands, box(1, 1, 100, 50), new Set())).toBe(0);
+    expect(matchByBox(cands, box(1, 1, 100, 50), new Set([0]))).toBe(1);
+  });
+
+  it("trusts the draw order for a text box grown to fit", () => {
+    const cands = [cand(box(1, 1)), cand(box(5, 5, 100, 400))];
+    expect(planByOrder(cands, [box(1, 1), box(5, 5, 100, 50)])).toEqual({ at: [0, 1], failed: false });
   });
 
   it("never picks a placeholder", () => {

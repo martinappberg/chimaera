@@ -126,6 +126,39 @@ export function planState(shapes: ReadonlyMap<string, ShapeInfo>, state: BuildSt
   return plan;
 }
 
+/**
+ * The uniform scale a chain of inline transforms applies (`scale(s)` or
+ * `scale(s, s)` only; none is 1), else null: a rotation, a flip or an
+ * uneven scale turns an offset, and only a scale can be undone by dividing.
+ */
+export function transformScale(transforms: readonly string[]): number | null {
+  let k = 1;
+  for (const t of transforms) {
+    const s = t.trim();
+    if (s === "" || s === "none") continue;
+    const rest = s.replace(/scale\(\s*([0-9.eE+-]+)\s*(?:,\s*([0-9.eE+-]+)\s*)?\)/g, (_, a: string, b: string | undefined) => {
+      const x = Number(a);
+      const y = b === undefined ? x : Number(b);
+      if (!Number.isFinite(x) || x <= 0 || x !== y) k = NaN;
+      else k *= x;
+      return "";
+    });
+    if (rest.trim() !== "" || Number.isNaN(k)) return null;
+  }
+  return k;
+}
+
+/**
+ * A paragraph's offset in its own px: the slide fractions in slide px,
+ * divided by the scale of the transforms between it and the slide (the
+ * renderer shrinks an overflowing text body with `scale()`). Null where
+ * those transforms do more than scale (the offset would turn).
+ */
+export function paraOffset(off: readonly [number, number], w: number, h: number, transforms: readonly string[]): [number, number] | null {
+  const k = transformScale(transforms);
+  return k === null ? null : [(off[0] * w) / k, (off[1] * h) / k];
+}
+
 // --- the DOM side ---------------------------------------------------------------------
 
 interface Original {
@@ -158,8 +191,9 @@ function restore(el: HTMLElement): void {
   if (!o.hadStyle && el.style.cssText === "") el.removeAttribute("style");
 }
 
-function put(el: HTMLElement, hidden: boolean, off: [number, number] | undefined, w: number, h: number): void {
-  const moved = off !== undefined && (off[0] !== 0 || off[1] !== 0);
+/** `px`: the offset in the element's own px. */
+function put(el: HTMLElement, hidden: boolean, px: [number, number] | undefined): void {
+  const moved = px !== undefined && (px[0] !== 0 || px[1] !== 0);
   if (!hidden && !moved) {
     restore(el);
     return;
@@ -169,7 +203,7 @@ function put(el: HTMLElement, hidden: boolean, off: [number, number] | undefined
   el.style.opacity = hidden ? "0" : o.opacity;
   if (hidden) el.setAttribute("inert", "");
   else if (!o.inert) el.removeAttribute("inert");
-  el.style.translate = moved ? `${off[0] * w}px ${off[1] * h}px` : o.translate;
+  el.style.translate = moved ? `${px[0]}px ${px[1]}px` : o.translate;
 }
 
 /**
@@ -181,14 +215,31 @@ export function applyState(tagged: TaggedSlide, state: BuildState, w: number, h:
   const info = new Map<string, ShapeInfo>();
   for (const [id, s] of tagged.shapes) info.set(id, { paraCount: s.paraCount, paras: s.paras !== null });
   const plan = planState(info, state);
+  let approximate = plan.approximate;
   for (const [id, s] of tagged.shapes) {
-    put(s.el, plan.hideShapes.has(id), plan.moveShapes.get(id), w, h);
+    const off = plan.moveShapes.get(id);
+    // The shape's own `translate` acts in the slide's px, before its transform.
+    put(s.el, plan.hideShapes.has(id), off === undefined ? undefined : [off[0] * w, off[1] * h]);
     if (s.paras === null) continue;
     const hide = plan.hideParas.get(id);
     const move = plan.moveParas.get(id);
-    s.paras.forEach((p, i) => put(p, hide?.has(i) === true, move?.get(i), w, h));
+    s.paras.forEach((p, i) => {
+      const m = move?.get(i);
+      let px: [number, number] | undefined;
+      if (m !== undefined) {
+        const chain: string[] = [];
+        for (let e = p.parentElement; e !== null; e = e.parentElement) {
+          chain.push(e.style.transform);
+          if (e === s.el) break;
+        }
+        const exact = paraOffset(m, w, h, chain);
+        if (exact === null) approximate = true;
+        px = exact ?? [m[0] * w, m[1] * h];
+      }
+      put(p, hide?.has(i) === true, px);
+    });
   }
-  return plan.approximate;
+  return approximate;
 }
 
 /** The slide as drawn: every shape and paragraph back as the renderer left it. */

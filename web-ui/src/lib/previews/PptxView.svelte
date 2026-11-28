@@ -37,8 +37,8 @@
   import { onDiskVersion, ownedObjectUrls, paneVisibility, useFileEntry } from "./viewLifecycle.svelte";
   import { fetchRawBytes, TooLargeError } from "./rawBytes";
   import { loadDeck, loadNotes, type Deck } from "./pptxDeck";
-  import { deckStep, showEdge, showPosition, type Place } from "./slideShow";
-  import { buildStates, parseTimeline, type BuildState, type SlideTimeline } from "./pptxTiming";
+  import { deckStep, showEdge, showPosition, showReach, type Place } from "./slideShow";
+  import { buildStates, extractTiming, parseTimeline, type BuildState, type SlideTimeline, type TimingExtract } from "./pptxTiming";
   import { pruneTagged, tagSlide, type TaggedSlide } from "./pptxTag";
   import { applyState, clearState } from "./pptxPlay";
   import { sanitizeRendered } from "./officeSafety";
@@ -215,8 +215,9 @@
     if (d === null) return null;
     const slide = d.presentation.slides[i];
     if (slide === undefined) return null;
+    let handle: SlideHandle;
     try {
-      const handle = renderSlide(d.presentation, slide, {
+      handle = renderSlide(d.presentation, slide, {
         mediaUrlCache: mediaUrls,
         pdfjs: false,
         onNodeError: () => (nodeErrors += 1),
@@ -225,6 +226,13 @@
           else if (t.url !== undefined) activateUrl(t.url);
         },
       });
+    } catch {
+      nodeErrors += 1;
+      return null;
+    }
+    // A slide that fails after it was drawn (tagging, sanitizing) is let go
+    // whole: an unsanitized slide must never reach the page.
+    try {
       // Tagged before sanitizing, which keeps `data-*` but may drop elements.
       const tagged = tag ? tagSlide(handle.element, slide.nodes) : null;
       // Defense in depth: the package was stripped of remote targets, and
@@ -236,6 +244,8 @@
       }
       return handle;
     } catch {
+      handle.dispose();
+      handle.element.remove();
       nodeErrors += 1;
       return null;
     }
@@ -327,8 +337,11 @@
     build = presenting ? 0 : null;
   }
 
-  /** Which slides the deck marks hidden (`show="0"`). */
-  const hiddenFlags = $derived(deck?.presentation.slides.map((sl) => sl.hidden === true) ?? []);
+  /** Which slides the deck marks hidden (`show="0"`): read with each slide's
+   *  timing at load, since the renderer knows only once it lays one out. */
+  const hiddenFlags = $derived(
+    deck?.presentation.slides.map((sl) => sl.hidden === true || extracts.get(sl.slidePath)?.hidden === true) ?? [],
+  );
   /** Where the show stands among the slides it shows. */
   const showAt = $derived(showPosition(hiddenFlags, current));
 
@@ -341,9 +354,9 @@
       go(current + delta);
       return;
     }
-    // A slide not parsed yet counts as one build; the ones a click can
-    // reach are parsed here first.
-    for (const j of [current - 1, current, current + 1]) timelineOf(j);
+    // A slide not parsed yet counts as one build: the slides this click can
+    // land on (hidden ones skipped) are parsed first.
+    for (const j of [current, ...showReach(hiddenFlags, current, true)]) timelineOf(j);
     const at: Place = { slide: current, build: buildAt ?? 0 };
     const to = deckStep(buildCounts(), hiddenFlags, at, delta, true);
     if (to.slide !== current) clearPick();
@@ -360,9 +373,11 @@
 
   /** Parsed timing per slide part, for the deck version on screen. */
   let timelines = new Map<string, Timed>();
-  /** Each slide part's XML as loaded, until it is parsed (the renderer drops
-   *  its copy once it lays the slide out). */
-  let sources = new Map<string, string>();
+  /** What each slide part's timeline needs, cut from it at load
+   *  (`extractTiming`: its timing and transition, a few KB, capped), until
+   *  it is parsed. The whole part goes: the renderer drops its own copy once
+   *  it lays the slide out, and a deck's shapes can run to megabytes. */
+  let extracts = new Map<string, TimingExtract>();
   /** Bumped when a timeline is parsed, so what counts builds re-reads. */
   let timelineGen = $state(0);
   /** The stage's build: the state after that many clicks; null is the slide
@@ -371,25 +386,34 @@
   /** Something on the current slide's builds could only be approximated. */
   let playApprox = $state(false);
 
+  /** A new version: every slide's extract, before any is laid out (one scan
+   *  a slide; the parse waits until the slide is asked for). */
   function resetTimelines(d: Deck): void {
     timelines = new Map();
-    sources = new Map();
-    for (const sl of d.presentation.slides) if (sl.sourceXml !== undefined) sources.set(sl.slidePath, sl.sourceXml);
+    extracts = new Map();
+    for (const sl of d.presentation.slides) {
+      if (sl.sourceXml !== undefined) extracts.set(sl.slidePath, extractTiming(sl.sourceXml));
+    }
   }
 
-  /** Slide `i`'s timing, parsed on first ask (the parser bounds the part's
-   *  size itself: past 4 MiB the slide plays plain). */
+  /** Slide `i`'s timing, parsed on first ask. */
   function timelineOf(i: number): Timed | null {
     const sl = deck?.presentation.slides[i];
     if (sl === undefined) return null;
     const hit = timelines.get(sl.slidePath);
     if (hit !== undefined) return hit;
-    const xml = untrack(() => edits.partText(sl.slidePath)) ?? sources.get(sl.slidePath) ?? sl.sourceXml ?? null;
-    if (xml === null) return null;
-    const timeline = parseTimeline(xml);
+    const ex = extracts.get(sl.slidePath);
+    let timeline: SlideTimeline;
+    if (ex?.timeline != null) timeline = ex.timeline;
+    else {
+      const xml = ex?.source ?? untrack(() => edits.partText(sl.slidePath)) ?? sl.sourceXml ?? null;
+      if (xml === null) return null;
+      timeline = parseTimeline(xml);
+    }
     const got = { timeline, states: buildStates(timeline) };
     timelines.set(sl.slidePath, got);
-    sources.delete(sl.slidePath);
+    // The hidden flag stays; the source is done with.
+    if (ex !== undefined) extracts.set(sl.slidePath, { source: null, timeline: null, hidden: ex.hidden });
     return got;
   }
 
@@ -398,14 +422,17 @@
     return deck?.presentation.slides.map((sl) => timelines.get(sl.slidePath)?.states.length ?? 1) ?? [];
   }
 
-  // The current slide and its neighbours are always parsed.
+  // The current slide is always parsed (its click dots); in the show, the
+  // slides a click can land on too, so a step back lands on the last build.
   $effect(() => {
     const i = current;
+    const show = presenting;
+    const flags = hiddenFlags;
     void deckGen;
     void slideGen;
     untrack(() => {
       let fresh = false;
-      for (const j of [i - 1, i, i + 1]) {
+      for (const j of show ? [i, ...showReach(flags, i, true)] : [i]) {
         const sl = deck?.presentation.slides[j];
         if (sl === undefined || timelines.has(sl.slidePath)) continue;
         if (timelineOf(j) !== null) fresh = true;
@@ -466,7 +493,8 @@
   }
 
   /** The click dots: the slide's start, then one per click, at most DOTS
-   *  of them in a window that follows the build (the row never grows). */
+   *  of them in a window that follows the build (a deck of 300 clicks
+   *  keeps a short row). */
   const DOTS = 8;
   const dotWindow = $derived.by(() => {
     if (clicks <= DOTS) return { first: 1, last: clicks };
@@ -651,7 +679,7 @@
     };
     d.presentation.slides[i] = fresh;
     timelines.delete(old.slidePath);
-    sources.set(old.slidePath, xml);
+    extracts.set(old.slidePath, extractTiming(xml));
     try {
       materializeSlideNodes(d.presentation, fresh);
     } catch {
@@ -1308,6 +1336,9 @@
       build = null;
       return;
     }
+    // The show is never an editor: edit mode ends first, as its own button
+    // or Esc would end it (unsaved edits stay where they are).
+    if (editMode) await toggleEdit();
     // The show opens the slide as PowerPoint's does: before its first click.
     presenting = true;
     build = 0;
@@ -1371,18 +1402,32 @@
       <button class="bbtn icon" onclick={() => go(current + 1)} disabled={current >= count - 1} title="next slide (→)" aria-label="next slide">
         <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" /></svg>
       </button>
-      <!-- One dot a click, at a fixed width so paging never shifts the bar. The
-           start mark is the slide before its first click; the dot of the build
-           on screen, clicked again (or Escape), is the slide as drawn. -->
+      {#if hiddenSlide}<span class="tag" title="this slide is hidden in the slide show">hidden</span>{/if}
       <span
-        class="builds"
-        bind:this={dotsEl}
-        role="group"
-        aria-label="builds"
-        title={approxNote || undefined}
+        class="limits"
+        title="drawn in the browser: builds appear and disappear click by click with no motion, no transitions, and fonts the deck doesn't embed fall back to this system's{deck.blocked > 0
+          ? `; ${deck.blocked} linked outside ${deck.blocked === 1 ? 'resource was' : 'resources were'} not loaded`
+          : ''}{nodeErrors > 0 ? `; ${nodeErrors} ${nodeErrors === 1 ? 'shape' : 'shapes'} couldn't be drawn` : ''}"
+        aria-label="rendering limits"
       >
-        {#if !editMode && clicks > 0}
-          {@const tip = (label: string) => (approxNote === "" ? label : `${label} · ${approxNote}`)}
+        <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"
+          ><circle cx="8" cy="8" r="6.2" fill="none" stroke="currentColor" stroke-width="1.3" /><path d="M8 7.2v4M8 4.9v.1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" /></svg
+        >
+        {#if nodeErrors > 0 || deck.blocked > 0}<span>approximate</span>{/if}
+      </span>
+      <!-- One dot a click, last in the bar's left cluster so a row that
+           grows or goes shifts nothing. The start mark is the slide before
+           its first click; the dot of the build on screen, clicked again (or
+           Escape), is the slide as drawn. -->
+      {#if !editMode && clicks > 0}
+        {@const tip = (label: string) => (approxNote === "" ? label : `${label} · ${approxNote}`)}
+        <span
+          class="builds"
+          bind:this={dotsEl}
+          role="group"
+          aria-label="builds"
+          title={approxNote || undefined}
+        >
           <button
             class="pip start"
             class:on={buildAt !== null}
@@ -1409,21 +1454,8 @@
               aria-current={buildAt === k ? "step" : undefined}
             ><span aria-hidden="true"></span></button>
           {/each}
-        {/if}
-      </span>
-      {#if hiddenSlide}<span class="tag" title="this slide is hidden in the slide show">hidden</span>{/if}
-      <span
-        class="limits"
-        title="drawn in the browser: builds appear and disappear click by click with no motion, no transitions, and fonts the deck doesn't embed fall back to this system's{deck.blocked > 0
-          ? `; ${deck.blocked} linked outside ${deck.blocked === 1 ? 'resource was' : 'resources were'} not loaded`
-          : ''}{nodeErrors > 0 ? `; ${nodeErrors} ${nodeErrors === 1 ? 'shape' : 'shapes'} couldn't be drawn` : ''}"
-        aria-label="rendering limits"
-      >
-        <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"
-          ><circle cx="8" cy="8" r="6.2" fill="none" stroke="currentColor" stroke-width="1.3" /><path d="M8 7.2v4M8 4.9v.1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" /></svg
-        >
-        {#if nodeErrors > 0 || deck.blocked > 0}<span>approximate</span>{/if}
-      </span>
+        </span>
+      {/if}
     {/if}
     {#if downloadError !== null}<span class="bar-err">{downloadError}</span>{/if}
     {#if officeError !== null}<span class="bar-err">{officeError}</span>{/if}
@@ -1726,13 +1758,13 @@
     color: var(--fg);
   }
 
-  /* The click dots: room for the start mark and DOTS dots, always. */
+  /* The click dots: as wide as their dots (at most the start mark and DOTS). */
   .builds {
     flex: none;
     display: inline-flex;
     align-items: center;
-    width: calc(9 * 10px);
     height: 18px;
+    margin-left: 0.25rem;
   }
 
   .pip {

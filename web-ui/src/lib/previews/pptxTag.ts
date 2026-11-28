@@ -36,12 +36,21 @@ export interface Candidate {
 const NEAR = 0.75;
 
 function near(actual: number, want: number): boolean {
-  if (Math.abs(actual - want) < NEAR) return true;
-  // Lines and connectors with no height (or width) are drawn 1px thick.
-  return want < 1 && Math.abs(actual - 1) < NEAR;
+  return Math.abs(actual - want) < NEAR;
 }
 
+/**
+ * The drawn box is the node's: the same origin, and a size no smaller. A
+ * drawn box may be larger: a text box that fits its shape to its text
+ * (`spAutoFit`) is drawn at the size its text measures in this browser's
+ * fonts, and a line with no height is drawn 1 px thick.
+ */
 export function boxMatches(actual: Box, want: Box): boolean {
+  return near(actual.x, want.x) && near(actual.y, want.y) && actual.w > want.w - NEAR && actual.h > want.h - NEAR;
+}
+
+/** The drawn box is the node's to the edit layer's tolerance on all four sides. */
+export function boxExact(actual: Box, want: Box): boolean {
   return near(actual.x, want.x) && near(actual.y, want.y) && near(actual.w, want.w) && near(actual.h, want.h);
 }
 
@@ -65,13 +74,16 @@ export function planByOrder(cands: readonly Candidate[], boxes: readonly Box[]):
   return { at, failed };
 }
 
-/** The last candidate at `want` not already `taken` (the later of two
- *  shapes sharing a box is drawn on top), else null. */
+/** The last candidate at exactly `want` not already `taken` (the later of
+ *  two shapes sharing a box is drawn on top), else the last one at its
+ *  origin drawn larger (a box grown to fit its text), else null. */
 export function matchByBox(cands: readonly Candidate[], want: Box, taken: ReadonlySet<number>): number | null {
-  for (let i = cands.length - 1; i >= 0; i--) {
-    const c = cands[i]!;
-    if (taken.has(i) || c.placeholder || c.box === null) continue;
-    if (boxMatches(c.box, want)) return i;
+  for (const fits of [boxExact, boxMatches]) {
+    for (let i = cands.length - 1; i >= 0; i--) {
+      const c = cands[i]!;
+      if (taken.has(i) || c.placeholder || c.box === null) continue;
+      if (fits(c.box, want)) return i;
+    }
   }
   return null;
 }
@@ -206,10 +218,13 @@ export function drawnShapeEl(root: HTMLElement, id: string, box: Box): HTMLEleme
   for (const el of Array.from(root.children)) {
     if (el instanceof HTMLElement && el.getAttribute("data-sid") === id) return el;
   }
-  let found: HTMLElement | null = null;
+  let exact: HTMLElement | null = null;
+  let grown: HTMLElement | null = null;
   for (const el of Array.from(root.querySelectorAll<HTMLElement>("div"))) {
     const b = boxOf(el);
-    if (b !== null && boxMatches(b, box)) found = el;
+    if (b === null) continue;
+    if (boxExact(b, box)) exact = el;
+    else if (boxMatches(b, box)) grown = el;
   }
-  return found;
+  return exact ?? grown;
 }

@@ -931,12 +931,20 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   land at their ends), and at the last build the next click is the next slide's first state. Back
   lands on the previous build, or on the previous slide's last; Home, End and a jump land on a
   slide's first state; a slide with an advance time (`advTm`) moves on by itself that long after
-  its last build, only while the show is on screen. The timing is parsed per slide, on demand,
-  by `pptxTiming.ts` (the contract and its PowerPoint-written corpus: `fixtures/pptx-timing/`);
+  its last build, only while the show is on screen. **present** from edit mode leaves edit mode
+  first. At load each slide keeps only its timing and transition XML (`extractTiming`, capped);
+  the timing is parsed on demand by `pptxTiming.ts` (the contract and its PowerPoint-written
+  corpus: `fixtures/pptx-timing/`): browsing, the current slide's only; in the show, also the
+  slides a click can land on, hidden ones skipped, so a step back over a hidden slide lands on
+  the last build before it.
   `pptxTag.ts` finds each top-level shape and paragraph in the drawn slide and `pptxPlay.ts`
-  hides it (`opacity: 0` + `inert`) or offsets it (`translate`). The bar shows a row of click dots
-  for the slide (a start mark, then one dot a click, at a fixed width so paging never shifts the
-  bar; past eight clicks the dots window around the build). Browsing shows every slide as drawn,
+  hides it (`opacity: 0` + `inert`) or offsets it (`translate`; a paragraph's offset is divided
+  by the scale of a text body the renderer shrank to fit). A text box that grows to fit its text
+  is drawn at the size its text measures here, so a shape is matched by its origin and a size no
+  smaller than the file's. The bar shows a row of click dots for the slide, last in its left
+  cluster so it shifts nothing as it grows or goes (a start mark, then one dot a click; past
+  eight clicks the dots window around the build; none on a slide without clicks or in edit
+  mode). Browsing shows every slide as drawn,
   as PowerPoint's normal view does, until a dot is used; the dot of the build on screen, clicked
   again, or Esc, goes back to as drawn. Thumbnails and edit mode always show the slide as drawn.
   Approximate, and said in the dots' tooltip: a slide whose timing is past the parser's caps (it

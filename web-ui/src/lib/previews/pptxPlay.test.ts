@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { planState, type ShapeInfo } from "./pptxPlay";
+import { paraOffset, planState, transformScale, type ShapeInfo } from "./pptxPlay";
 import type { BuildState } from "./pptxTiming";
 
 /**
@@ -77,5 +77,29 @@ describe("planState", () => {
     const p = planState(shapes([["2", { paraCount: 0, paras: false }]]), st(["__proto__", "2:x", "constructor"]));
     expect(p.hideShapes.size).toBe(0);
     expect(p.approximate).toBe(false);
+  });
+});
+
+describe("a paragraph's offset inside a scaled text body", () => {
+  it("multiplies the scales between the paragraph and the slide", () => {
+    expect(transformScale(["", "none"])).toBe(1);
+    expect(transformScale(["scale(0.5)"])).toBe(0.5);
+    expect(transformScale(["scale(0.5, 0.5)", "scale(0.8)"])).toBeCloseTo(0.4);
+  });
+
+  it("refuses what turns or flips an offset", () => {
+    expect(transformScale(["rotate(30deg)"])).toBe(null);
+    expect(transformScale(["scaleX(-1)"])).toBe(null);
+    expect(transformScale(["scale(0.5, 0.8)"])).toBe(null);
+    expect(transformScale(["rotate(180deg) scale(0.5)"])).toBe(null);
+    expect(transformScale(["scale(0)"])).toBe(null);
+  });
+
+  it("divides by the body's scale so the paragraph lands where PowerPoint puts it", () => {
+    // A quarter of a 1280 px slide is 320 px on the slide; inside a body
+    // drawn at 0.8, that is 400 of the body's own px.
+    expect(paraOffset([0.25, 0], 1280, 720, ["scale(0.8)", ""])).toEqual([400, 0]);
+    expect(paraOffset([0, 0.5], 1280, 720, [""])).toEqual([0, 360]);
+    expect(paraOffset([0.25, 0], 1280, 720, ["rotate(90deg)"])).toBe(null);
   });
 });
