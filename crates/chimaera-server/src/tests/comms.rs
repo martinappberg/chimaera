@@ -30,7 +30,7 @@ fn tui(state: &Arc<AppState>, ws: &str, key: &str) -> String {
 }
 
 /// A scripted claude chat session in `ws` (idle: the fake never starts a
-/// turn) and its MCP/hook key.
+/// turn) and its MCP/hook key, returned once its driver's `Init` has landed.
 async fn chat(state: &Arc<AppState>, ws: &str, label: &str) -> (String, String) {
     preset_agent(
         state,
@@ -47,13 +47,20 @@ async fn chat(state: &Arc<AppState>, ws: &str, label: &str) -> (String, String) 
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let sid = body["id"].as_str().unwrap().to_string();
-    // Comms counts a chat as working only once its driver is alive: a test
-    // that marks it Running before then reads as idle under a loaded CI.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !state.chat.get(&sid).is_some_and(|info| info.alive) {
+    // The session answers before its driver has started, and the driver's
+    // `Init` corrects a `Running` record with no turn in flight to
+    // `Finished` (chat.rs `apply_chat_event`). A test that marks the chat
+    // working before that lands reads it as idle at a later send, so wait
+    // until the `Init` has moved the record off its spawn-time `Unknown`.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let state_now = lock(&state.agents).get(&sid).map(|r| r.state);
+        if state_now != Some(agent_state::AgentState::Unknown) {
+            break;
+        }
         assert!(
             std::time::Instant::now() < deadline,
-            "the fake chat never came up"
+            "the fake chat's Init never landed"
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
@@ -892,10 +899,6 @@ async fn a_working_chat_hears_it_at_its_next_step_and_its_transcript_shows_it() 
     assert!(content.contains("heads-up: qc/ moved"), "{content}");
 
     // Still working, a second message; then the turn ends before any hook.
-    // Working again explicitly: the fake chat's own startup can land after
-    // the first line above and reset the record (a race the test must not
-    // depend on).
-    lock(&state.agents).get_mut(&c).unwrap().state = agent_state::AgentState::Running;
     let b = tui(&state, &ws, "kb");
     let (_, text) = send(
         &state,
