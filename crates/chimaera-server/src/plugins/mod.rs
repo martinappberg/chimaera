@@ -72,16 +72,17 @@ pub(crate) mod surfaces;
 pub(crate) mod toolchain;
 pub(crate) mod tools;
 pub(crate) mod trust;
+pub(crate) mod web;
 
 /// How long a workspace's detect result is trusted before a re-stat.
 const DETECT_TTL: Duration = Duration::from_secs(30);
 
-/// The newest WIT version (`chimaera:plugin@0.2.x`): what a new plugin targets.
-pub(crate) const API: &str = "0.2";
+/// The newest WIT version (`chimaera:plugin@0.3.x`): what a new plugin targets.
+pub(crate) const API: &str = "0.3";
 /// Every WIT version this host serves. A manifest's `api` must be one of
-/// them; a WIT bump adds a version here and keeps the old ones (0.1 through
-/// its own bindings, `runtime::v1`).
-pub(crate) const SERVED_APIS: &[&str] = &["0.1", API];
+/// them; a WIT bump adds a version here and keeps the old ones (each through
+/// its own bindings, `runtime::v1`, `v2`).
+pub(crate) const SERVED_APIS: &[&str] = &["0.1", "0.2", API];
 /// MCP tools one plugin may name (`provides.mcp_tools`): each is offered,
 /// with its schema, in every session's `tools/list` where it is on.
 pub(crate) const MCP_TOOLS_MAX: usize = 64;
@@ -272,6 +273,10 @@ pub(crate) struct Manifest {
     /// (privileged).
     #[serde(default)]
     pub(crate) tools: Vec<platform::ToolDecl>,
+    /// `[web]` (0.3): its own pages, the libraries it lends agents' pages,
+    /// and the hosts they may reach (`web`).
+    #[serde(default)]
+    pub(crate) web: Option<web::WebDecl>,
     /// The behaviour — set by the catalog, never by the TOML.
     #[serde(skip)]
     pub(crate) wasm: Wasm,
@@ -631,6 +636,12 @@ pub(crate) fn validate(m: &Manifest) -> Result<(), String> {
                     .into(),
             );
         }
+    }
+    if let Some(decl) = &m.web {
+        if m.api == "0.1" || m.api == "0.2" {
+            return Err("[web] needs api = \"0.3\"".into());
+        }
+        web::validate(decl)?;
     }
     platform::validate(m)?;
     // A 0.1 manifest can't declare [[tools]] (refused above), so this also
@@ -1017,6 +1028,15 @@ pub(crate) mod test_catalog {
         add(
             &dist_test_text("test-platform/plugin.toml"),
             dist_test_bytes("test-platform/plugin.wasm"),
+        )
+    }
+
+    /// The web views fixture (`plugins/test-web`): its own page, a library
+    /// for agents' pages, a declared host.
+    pub(crate) fn web() -> Arc<Manifest> {
+        add(
+            &dist_test_text("test-web/plugin.toml"),
+            dist_test_bytes("test-web/plugin.wasm"),
         )
     }
 
@@ -1544,6 +1564,7 @@ pub(crate) async fn put_workspace_plugin(
     // and a fault cleared (switching off and on is how the user retries a
     // faulted plugin).
     state.plugin_runtime.reset(&pid, &id);
+    web::forget(&state, &pid);
     crate::lock(&state.knowledge).forget_provider(&pid, Some(&id));
     // The switch is the moment agents' view changes: re-detect now so the
     // next connect answers from a fresh footprint.

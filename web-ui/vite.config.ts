@@ -181,6 +181,11 @@ export default defineConfig({
       },
       // Ticketed raw file bytes (iframes/images) live outside /api.
       "/raw": process.env.CHIMAERA_DEV_TARGET ?? "http://127.0.0.1:9700",
+      // Web views: a plugin's page under its grant, the data pages read,
+      // and the libraries plugins lend agents' pages (`plugins::web`).
+      "/web/": process.env.CHIMAERA_DEV_TARGET ?? "http://127.0.0.1:9700",
+      "/webdata": process.env.CHIMAERA_DEV_TARGET ?? "http://127.0.0.1:9700",
+      "/lib/": process.env.CHIMAERA_DEV_TARGET ?? "http://127.0.0.1:9700",
       // Ticketed downloads and the browser pane's reverse proxy (WS-capable).
       "/download": process.env.CHIMAERA_DEV_TARGET ?? "http://127.0.0.1:9700",
       "/proxy": {

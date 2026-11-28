@@ -37,6 +37,11 @@ pub const PANE_AGENT_JS: &str = include_str!("pane_agent.js");
 /// a framed page; `?api=1` alone for a native view).
 pub const PAGE_API_JS: &str = include_str!("page_api.js");
 
+/// `chimaera-web.css`: the app's look for a page's own controls (buttons,
+/// inputs, toolbars, tables, cards) in the `--ch-*` variables the page API
+/// sets. A page links it as `chimaera:web.css`, which the daemon serves.
+pub const WEB_CSS: &str = include_str!("chimaera_web.css");
+
 /// Version of the chimaera workspace.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

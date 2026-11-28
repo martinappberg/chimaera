@@ -2171,7 +2171,7 @@ async fn raw_html_is_sandboxed() {
     assert_eq!(header_str(&headers, "content-type"), "text/html");
     assert_eq!(
         header_str(&headers, "content-security-policy"),
-        "sandbox allow-scripts"
+        crate::plugins::web::agent_page_csp(&[])
     );
     assert_eq!(header_str(&headers, "referrer-policy"), "no-referrer");
     // Raw bytes pass through unmodified — the sandbox does the confining.

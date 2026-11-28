@@ -15,6 +15,8 @@ use serde_json::{json, Value};
 use super::Manifest;
 
 const VIEWS_MAX: usize = 32;
+/// Sidebar rows one plugin may add (`[[views]] rail`): the sidebar is shared.
+const RAIL_MAX: usize = 2;
 const FILE_KINDS_MAX: usize = 16;
 const ACTIONS_MAX: usize = 32;
 const SETTINGS_MAX: usize = 64;
@@ -67,6 +69,12 @@ pub(crate) struct ViewDecl {
     /// An icon from chimaera's set, by name.
     #[serde(default)]
     pub(crate) icon: Option<String>,
+    /// 0.3, a `tab` view: a row in the sidebar (with its icon, beside
+    /// Knowledge) that opens or focuses the tab, shown only while the plugin
+    /// is on in that workspace. For an app-like plugin people return to; a
+    /// view that opens from a file or an agent needs none.
+    #[serde(default)]
+    pub(crate) rail: bool,
 }
 
 /// `[[files]]`: files matching `match` open in `view` where the plugin is
@@ -617,6 +625,22 @@ pub(crate) fn validate(m: &Manifest) -> Result<(), String> {
             return Err(format!("view {:?} is declared twice", v.id));
         }
         short(&format!("view {}'s title", v.id), &v.title, TITLE_MAX)?;
+        if v.rail {
+            if v.slot != Slot::Tab {
+                return Err(format!(
+                    "view {:?}: only a tab view (slot = \"tab\") can have a sidebar row (rail)",
+                    v.id
+                ));
+            }
+            if m.api == "0.1" || m.api == "0.2" {
+                return Err(format!("view {:?}: rail needs api = \"0.3\"", v.id));
+            }
+        }
+    }
+    if m.views.iter().filter(|v| v.rail).count() > RAIL_MAX {
+        return Err(format!(
+            "at most {RAIL_MAX} views have a sidebar row (rail)"
+        ));
     }
     for f in &m.files {
         check_patterns(&format!("[[files]] {}", f.label), &f.patterns)?;
@@ -772,6 +796,7 @@ pub(crate) fn wire(m: &Manifest) -> Value {
     json!({
         "views": m.views.iter().map(|v| json!({
             "id": v.id, "title": v.title, "slot": v.slot.as_str(), "icon": v.icon,
+            "rail": v.rail,
         })).collect::<Vec<_>>(),
         "files": m.files.iter().map(|f| json!({
             "match": f.patterns, "view": f.view, "label": f.label,
@@ -818,6 +843,8 @@ pub(crate) struct Platform {
     pub(crate) jobs: super::jobs::Jobs,
     /// Tool installs in flight (`toolchain`).
     pub(crate) installs: super::toolchain::Installs,
+    /// Web views: grants, data tickets, unpacked bundles (`web`).
+    pub(crate) web: super::web::Web,
 }
 
 impl Platform {
@@ -833,6 +860,7 @@ impl Platform {
             worker: Default::default(),
             jobs: Default::default(),
             installs: Default::default(),
+            web: Default::default(),
         }
     }
 }

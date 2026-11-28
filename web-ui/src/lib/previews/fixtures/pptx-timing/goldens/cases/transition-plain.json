@@ -1,0 +1,22 @@
+{
+  "part": "transition-plain.xml",
+  "id": 0,
+  "transition": {
+    "kind": "wipe",
+    "dir": "d",
+    "dur": 750,
+    "advanceAfter": 4000,
+    "advanceOnClick": false,
+    "morph": null
+  },
+  "steps": [
+    []
+  ],
+  "states": [
+    {
+      "hidden": [],
+      "moved": {}
+    }
+  ],
+  "interactive": 0
+}

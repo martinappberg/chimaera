@@ -496,6 +496,18 @@ export interface NativeViewChip {
   enabled: boolean;
 }
 
+/** Tell a pane view's page API something (web/1: data, visibility,
+ *  theme): JSON text, handed to the page as a `chimaera:host` event. */
+export async function nativeViewCommand(id: string, command: string): Promise<void> {
+  const t = tauri();
+  if (t === null) return;
+  try {
+    await t.core.invoke<void>("native_view_command", { id, command });
+  } catch {
+    /* gone, or an app build without commands: the page keeps what it had */
+  }
+}
+
 /** Set (or with `null` remove) a pane view's in-page reference pill. */
 export async function nativeViewChip(id: string, chip: NativeViewChip | null): Promise<void> {
   const t = tauri();

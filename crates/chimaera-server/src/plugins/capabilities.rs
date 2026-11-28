@@ -210,6 +210,20 @@ impl Caps {
                 ]));
             }
         }
+        // Its own web pages (0.3): drawn in a sandbox, so not privileged;
+        // each host they may reach, and each library lent to agents' pages,
+        // is its own atom, so a release that adds one asks again.
+        if let Some(web) = &m.web {
+            if !web.pages.is_empty() || !web.libraries.is_empty() {
+                atoms.insert(atom(&["web"]));
+            }
+            for name in &web.libraries {
+                atoms.insert(atom(&["web-library", name]));
+            }
+            for host in &web.network {
+                atoms.insert(atom(&["web-host", host]));
+            }
+        }
         // Claiming a kind of file changes how the user's files open.
         for kind in &m.files {
             for pattern in &kind.patterns {
@@ -439,6 +453,21 @@ impl Caps {
                 kinds.join(", ")
             ));
         }
+        if has(&["web"]) {
+            plain("Draws its own views (web pages in a sandbox)".into());
+        }
+        for p in of_kind("web-library") {
+            if let [_, name] = p.as_slice() {
+                plain(format!(
+                    "Lends its {name} library to agents' pages where it is switched on"
+                ));
+            }
+        }
+        for p in of_kind("web-host") {
+            if let [_, host] = p.as_slice() {
+                plain(format!("Its pages reach {host}"));
+            }
+        }
         // Atoms this daemon has no words for (a newer kind): said plainly
         // rather than left off the list.
         let known = [
@@ -454,6 +483,9 @@ impl Caps {
             "program-also",
             "network",
             "download",
+            "web",
+            "web-library",
+            "web-host",
         ];
         for p in &parsed {
             let k = p.first().map(String::as_str).unwrap_or("");

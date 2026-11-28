@@ -68,7 +68,7 @@ app-build` (never the root `cargo`).
   It is a plain subview, never a Tauri web view: it has no IPC, and Tauri's window lookups
   (`get_webview_window`, which `deliver_to` uses) keep finding the window — a Tauri child web
   view would make Tauri stop counting it as a webview window. It loads only its window's daemon
-  origin under `/raw/` or `/proxy/`; a clicked link elsewhere goes to the real browser
+  origin under `/raw/`, `/proxy/` or `/web/` (a plugin's own page, [web views](web-views.md)); `native_view_command` hands the page API the host's word (a web view's data, visibility, the theme) without a reload; a clicked link elsewhere goes to the real browser
   (`shell/native_view.rs`). Each sits in a clip box of its own, so an HTML embed card's view is
   cropped to its scroller ([embed cards](files-and-previews.md#embed-cards)); the wheel over a
   passive one (a card nobody clicked into) goes back to the window's page through an app-wide
@@ -302,7 +302,8 @@ app-build` (never the root `cargo`).
   PowerShell command), agent-plugin installs from Extensions, environment preludes (POSIX
   snippets), the Claude MCP connector sign-in through a PTY (use `/mcp` in a Claude session), a
   per-file size limit for plugin jobs, the [agent browser](agent-browser.md) (its tools refuse and
-  say why), and code signing. `connect` has no long-lived ssh
+  say why), pasting Antigravity's sign-in code (it reads it from a terminal; sign in from one), and
+  code signing. `connect` has no long-lived ssh
   connection per host. The site's Windows download stays labeled beta until a real-hardware pass.
 - **Where it lives.** `daemon.rs` (spawn/adopt, shared with the other platforms), `update.rs`,
   `chimaera_core::proc` and `paths`, `chimaera_remote` (ssh options), CI `windows` job

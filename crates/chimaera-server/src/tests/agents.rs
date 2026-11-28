@@ -1217,7 +1217,7 @@ async fn agents_rows_flag_managed_installs() {
     assert_eq!(codex["sign_in"]["how"], "browser");
     assert_eq!(codex["sign_in"]["command"], "codex login --device-auth");
     assert_eq!(row("agy")["sign_in"]["how"], "browser");
-    assert_eq!(row("agy")["sign_in"]["accepts_code"], false);
+    assert_eq!(row("agy")["sign_in"]["accepts_code"], true);
     assert!(row("agy")["signed_in"].is_null());
     assert_eq!(row("cursor")["sign_in"]["command"], "cursor-agent login");
 }

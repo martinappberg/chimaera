@@ -100,9 +100,12 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   agents their slides, `check_deck` finds layout problems, and plain themes or the user's own),
   **Chromium** (a headless `chrome-headless-shell` for the
   [agent browser](agent-browser.md#engines-and-how-one-is-chosen) on a host with none, downloaded
-  only from its Tools' Install), and **Manimble** (a Manimble deck's slides beside its code in the
+  only from its Tools' Install), **Manimble** (a Manimble deck's slides beside its code in the
   [slide viewer for plugin decks](#plugin-screens-files-and-settings-the-02-platform), and `manimble_slides`
-  shows agents the slides they write). The daemon carries none of them: each is
+  shows agents the slides they write), and **GenomeSpy** (`genomespy_inspect` reads a BAM, VCF,
+  BigWig, BigBed, GFF3 or FASTA header: its build, chromosome naming, samples and indexes;
+  `genomespy_check` finds what would break a `*.genomespy.json` view, by line; `genomespy_guide`
+  teaches the grammar). The daemon carries none of them: each is
   listed as *available* until the user installs it on this host
   ([below](#versions-installs--updates)).
 - **How it's used.** Open Extensions from the rail's **Extensions** row or quick-open
@@ -250,7 +253,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     in separate repositories and install from locked releases; the daemon carries no plugin
     bytes. Capability trust, both WIT worlds, plugin screens and file views, query routes,
     switch events, program jobs and tool downloads are implemented (sections below).
-    LaTeX, Typst, PowerPoint, Chromium and Manimble use the 0.2 platform. **Browse** remains disabled, "later".
+    LaTeX, Typst, PowerPoint, Chromium, Manimble and GenomeSpy use the 0.2 platform. **Browse** remains disabled, "later".
 
 ## The plugin host
 
@@ -266,7 +269,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
 - **Where it lives.** `plugins/runtime.rs` (engine, instances, deadlines, faults; the entry
   points `offer` / `call_tool` / `knowledge` / `on_event`, `hook`, `session_ended`),
   `plugins/hostfns.rs` (the WIT `host` interface), `crates/chimaera-plugin-api/wit/chimaera.wit`
-  (the 0.2 world; `wit-0.1/chimaera.wit` retains 0.1; the daemon binds both). Tests:
+  (the 0.3 world; `wit-0.1/` and `wit-0.2/` retain 0.1 and 0.2; the daemon binds all three, `runtime::v1`/`v2`/`v3`). Tests:
   `crates/chimaera-server/src/tests/plugin_host.rs`, against `plugins/test-fixture` (embedded
   only by test builds, from `plugins/dist-test`, never shipped).
 - **Key behaviors** (every limit is the host's, so no plugin can forget one):
@@ -642,7 +645,10 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   restart. Shipped as the platform plan's phase P7; 0.1 plugins (Mycelium) run unchanged
   beside it.
 - **How to use.** Switch the plugin on in a workspace. Its card gains **Open <view>** for each
-  tab it offers, its card sections, and **Settings**. A file it claims opens in its view; the
+  tab it offers, its card sections, and **Settings**. A tab view that asks for it (`[[views]]
+  rail`, API 0.3; at most two per plugin) also gets a row in the sidebar beside Knowledge, in
+  its icon and title, while the plugin is on there: one click opens or focuses the tab
+  (`platform.ts::railViews`, App.svelte's rail). A file it claims opens in its view; the
   bar above has **Text** (and, when two plugins claim it, each one — the choice is remembered
   per workspace), its status chips and file actions. Opening such a file where the plugin is
   installed but off offers **Turn on** in that bar (**Not now** is remembered per workspace;
@@ -724,6 +730,10 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   - Claiming a file kind is on the **Can** list, so a release that claims a new one asks again.
   - The author's guide has every node, prop, surface and limit:
     [docs/agent-guides/plugins.md](../agent-guides/plugins.md#the-platform-api-02).
+
+## Web views (API 0.3)
+
+A 0.3 plugin may ship its own HTML/JS page for a drawing area (a `web` node), and lend libraries to agents' pages; each page, library and host it declares is a line on its card's **Can** list, and web views alone keep it sandboxed. The whole feature: [web views](web-views.md); writing one: [the guide](../agent-guides/plugins.md#web-views-api-03).
 
 ## Programs and tools (the privileged tier)
 

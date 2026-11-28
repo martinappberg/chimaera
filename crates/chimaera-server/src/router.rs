@@ -145,6 +145,13 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             get(plugins::screens::render_route),
         )
         .route(
+            "/workspaces/{id}/plugins/{pid}/web",
+            post(plugins::web::mint_route),
+        )
+        // An agent page's data key, for a host that shows it inside its
+        // navigation guard (`plugins::web::page_key_route`).
+        .route("/fs/page-key", post(plugins::web::page_key_route))
+        .route(
             "/workspaces/{id}/plugins/{pid}/views/{view}/actions",
             post(plugins::screens::action_route),
         )
@@ -465,6 +472,31 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/raw/{ticket}", get(fs::raw))
         // An HTML report's relative assets, confined to its folder.
         .route("/raw/{ticket}/{*rest}", get(fs::raw_asset))
+        // Web views (`plugins::web`): a plugin's page under its grant (the
+        // grant is the authority: its files, `~url`, `~save`), the data a
+        // page reads, and the libraries plugins lend agents' pages. A page
+        // has no origin, so each answers CORS preflights.
+        .route(
+            "/web/{ticket}/{*rest}",
+            get(plugins::web::serve_route)
+                .post(plugins::web::save_route)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    plugins::web::SAVE_MAX + 1,
+                ))
+                .options(plugins::web::preflight),
+        )
+        .route(
+            "/webdata/{ticket}",
+            get(plugins::web::data_route).options(plugins::web::preflight),
+        )
+        .route(
+            "/webdata/{ticket}/{*rest}",
+            get(plugins::web::page_data_route).options(plugins::web::preflight),
+        )
+        .route(
+            "/lib/{ticket}/{*rest}",
+            get(plugins::web::lib_route).options(plugins::web::preflight),
+        )
         .route("/download/{ticket}", get(download::download))
         // Three spellings because `{*path}` refuses an EMPTY tail: the bare
         // form redirects to the slashed form, the slashed form IS the app's

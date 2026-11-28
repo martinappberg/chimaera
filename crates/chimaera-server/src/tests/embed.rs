@@ -315,7 +315,7 @@ async fn raw_asset_serves_a_reports_folder_and_nothing_outside_it() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         header_str(&headers, "content-security-policy"),
-        "sandbox allow-scripts"
+        crate::plugins::web::agent_page_csp(&[])
     );
     let (status, headers, body) = get("app.js").await;
     assert_eq!(status, StatusCode::OK);
@@ -336,7 +336,7 @@ async fn raw_asset_serves_a_reports_folder_and_nothing_outside_it() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         header_str(&headers, "content-security-policy"),
-        "sandbox allow-scripts"
+        crate::plugins::web::agent_page_csp(&[])
     );
     // Ranges work (a video beside the report).
     let (status, _, body) = get_with(&state, &uri, &[("range", "bytes=0-3")]).await;
@@ -406,6 +406,10 @@ async fn raw_sandboxes_markup_and_every_report_asset() {
     std::fs::write(report.join("pages/other.html"), "<p>two</p>").unwrap();
 
     let ticket = ticket_for(&state, &report.join("index.html")).await;
+    // An agent's page: scripts in the sandbox's opaque origin, under the
+    // one fixed rule (`plugins::web`).
+    let agent_csp = crate::plugins::web::agent_page_csp(&[]);
+    let agent = agent_csp.as_str();
     // Under the report's folder: HTML keeps its scripts (in the sandbox's
     // opaque origin, like the report); everything else is script-less.
     for (rest, csp) in [
@@ -418,9 +422,9 @@ async fn raw_sandboxes_markup_and_every_report_asset() {
         ("style.css", "sandbox"),
         ("a.png", "sandbox"),
         ("blob.bin", "sandbox"),
-        ("evil.xhtml", "sandbox allow-scripts"),
-        ("pages/other.html", "sandbox allow-scripts"),
-        ("index.html", "sandbox allow-scripts"),
+        ("evil.xhtml", agent),
+        ("pages/other.html", agent),
+        ("index.html", agent),
     ] {
         let uri = format!("/raw/{ticket}/{rest}");
         let (status, headers, _) = get_with(&state, &uri, &[]).await;
@@ -455,8 +459,8 @@ async fn raw_sandboxes_markup_and_every_report_asset() {
         ("evil.svg", Some("sandbox")),
         ("evil.mml", Some("sandbox")),
         ("evil.rss", Some("sandbox")),
-        ("evil.xhtml", Some("sandbox allow-scripts")),
-        ("index.html", Some("sandbox allow-scripts")),
+        ("evil.xhtml", Some(agent)),
+        ("index.html", Some(agent)),
         ("a.png", None),
         ("app.js", None),
         ("blob.bin", None),
@@ -536,7 +540,7 @@ async fn raw_asset_serves_the_tickets_own_file_by_its_canonical_name() {
     assert_eq!(&body[..], b"<p>summary</p>");
     assert_eq!(
         header_str(&headers, "content-security-policy"),
-        "sandbox allow-scripts"
+        crate::plugins::web::agent_page_csp(&[])
     );
     let (status, _, _) = get_with(&state, &format!("/raw/{ticket}/figs/a.png"), &[]).await;
     assert_eq!(status, StatusCode::OK);
@@ -631,7 +635,7 @@ async fn a_preview_page_can_carry_the_pane_bridge() {
     assert_eq!(header_str(&headers, "accept-ranges"), "none");
     assert_eq!(
         header_str(&headers, "content-security-policy"),
-        "sandbox allow-scripts"
+        crate::plugins::web::agent_page_csp(&[])
     );
     // Its own validator: a cached plain page never answers a bridged ask.
     assert_ne!(

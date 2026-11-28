@@ -1,0 +1,134 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Web fixture page</title>
+    <link rel="stylesheet" href="chimaera:web.css" />
+    <script src="testlib/lib.js"></script>
+    <style>
+      body {
+        padding: 0 0 12px;
+      }
+      main {
+        display: grid;
+        grid-template-columns: minmax(180px, 280px) 1fr;
+        gap: 12px;
+        padding: 12px;
+      }
+      canvas {
+        width: 100%;
+        height: 160px;
+        border-radius: var(--ch-radius, 8px);
+      }
+      pre {
+        margin: 0;
+        white-space: pre-wrap;
+        font-size: var(--ch-text-sm, 12px);
+      }
+      #log {
+        min-height: 4em;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="ch-toolbar">
+      <strong>Web fixture</strong>
+      <button id="read" class="ch-primary">Read sample.csv</button>
+      <button id="outside">Fetch outside</button>
+      <button id="leave">Leave the page</button>
+      <button id="ping">Ping the plugin</button>
+      <button id="save">Save a picture</button>
+      <button id="at" title="Point the agent at this drawing">@</button>
+      <span class="ch-muted" id="shown">shown</span>
+    </div>
+    <main>
+      <canvas id="art" width="560" height="320" aria-label="A drawing in the theme's colours"></canvas>
+      <div>
+        <pre id="data" class="ch-card">no data yet</pre>
+        <pre id="log" class="ch-mono"></pre>
+      </div>
+    </main>
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const log = (line) => {
+        $("log").textContent = `${line}\n${$("log").textContent}`.slice(0, 2000);
+      };
+      const css = (name, fallback) =>
+        getComputedStyle(document.documentElement).getPropertyValue(`--ch-${name}`).trim() || fallback;
+
+      // Drawn in the theme's own colours, again on every theme change.
+      function draw() {
+        const c = $("art");
+        const g = c.getContext("2d");
+        g.fillStyle = css("surface", "#f4f4f4");
+        g.fillRect(0, 0, c.width, c.height);
+        g.fillStyle = css("accent", "#3b82f6");
+        g.beginPath();
+        g.arc(160, 160, 110, 0, Math.PI * 2);
+        g.fill();
+        g.fillStyle = css("fg", "#111");
+        g.font = `28px ${css("font", "sans-serif")}`;
+        g.fillText(document.documentElement.dataset.chimaeraTheme ?? "?", 300, 170);
+      }
+
+      addEventListener("DOMContentLoaded", () => {
+        const api = globalThis.chimaera;
+        log(`page api: ${api ? api.kind : "missing"}; testlib: ${globalThis.testlib?.hello()}`);
+        if (!api) return;
+        draw();
+        api.onTheme(() => {
+          draw();
+          log(`theme: ${api.theme.mode}`);
+        });
+        api.onData((data) => {
+          $("data").textContent = JSON.stringify(data, null, 2);
+        });
+        api.onVisibility((visible) => {
+          $("shown").textContent = visible ? "shown" : "hidden";
+          log(`visibility: ${visible}`);
+        });
+
+        $("read").onclick = async () => {
+          try {
+            const file = api.data?.file ?? "sample.csv";
+            const url = await api.url(file);
+            const r = await fetch(url, { headers: { Range: "bytes=0-15" } });
+            log(`read ${file}: ${r.status} ${JSON.stringify(await r.text())}`);
+          } catch (err) {
+            log(`read refused: ${err.message}`);
+            api.status({ state: "warn", text: "read refused" });
+          }
+        };
+        $("outside").onclick = async () => {
+          try {
+            await fetch("https://example.com/");
+            log("outside: reached (this should never happen)");
+          } catch (err) {
+            log(`outside: refused (${err.message})`);
+          }
+        };
+        $("leave").onclick = () => {
+          log("leaving for example.com…");
+          location.href = "https://example.com/?from=fixture";
+        };
+        $("ping").onclick = () => {
+          api.act("ping", {});
+          log("ping sent");
+        };
+        $("save").onclick = () => {
+          $("art").toBlob(async (blob) => {
+            try {
+              log(`saved ${await api.save("fixture.png", blob)}`);
+            } catch (err) {
+              log(`save refused: ${err.message}`);
+            }
+          }, "image/png");
+        };
+        $("at").onclick = () => {
+          api.reference({ text: "the fixture's drawing", crop: $("art") });
+          log("reference sent");
+        };
+      });
+    </script>
+  </body>
+</html>

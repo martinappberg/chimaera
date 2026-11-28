@@ -1,0 +1,196 @@
+{
+  "deck": "transitions.pptx",
+  "slides": [
+    {
+      "part": "ppt/slides/slide1.xml",
+      "id": 256,
+      "transition": null,
+      "steps": [
+        []
+      ],
+      "states": [
+        {
+          "hidden": [],
+          "moved": {}
+        }
+      ],
+      "interactive": 0
+    },
+    {
+      "part": "ppt/slides/slide2.xml",
+      "id": 257,
+      "transition": {
+        "kind": "fade",
+        "dir": null,
+        "dur": 2000,
+        "advanceAfter": null,
+        "advanceOnClick": true,
+        "morph": null
+      },
+      "steps": [
+        []
+      ],
+      "states": [
+        {
+          "hidden": [],
+          "moved": {}
+        }
+      ],
+      "interactive": 0
+    },
+    {
+      "part": "ppt/slides/slide3.xml",
+      "id": 258,
+      "transition": {
+        "kind": "fade-black",
+        "dir": null,
+        "dur": 1500,
+        "advanceAfter": null,
+        "advanceOnClick": true,
+        "morph": null
+      },
+      "steps": [
+        []
+      ],
+      "states": [
+        {
+          "hidden": [],
+          "moved": {}
+        }
+      ],
+      "interactive": 0
+    },
+    {
+      "part": "ppt/slides/slide4.xml",
+      "id": 259,
+      "transition": {
+        "kind": "push",
+        "dir": null,
+        "dur": 2000,
+        "advanceAfter": null,
+        "advanceOnClick": true,
+        "morph": null
+      },
+      "steps": [
+        []
+      ],
+      "states": [
+        {
+          "hidden": [],
+          "moved": {}
+        }
+      ],
+      "interactive": 0
+    },
+    {
+      "part": "ppt/slides/slide5.xml",
+      "id": 260,
+      "transition": {
+        "kind": "push",
+        "dir": "u",
+        "dur": 2000,
+        "advanceAfter": null,
+        "advanceOnClick": true,
+        "morph": null
+      },
+      "steps": [
+        []
+      ],
+      "states": [
+        {
+          "hidden": [],
+          "moved": {}
+        }
+      ],
+      "interactive": 0
+    },
+    {
+      "part": "ppt/slides/slide6.xml",
+      "id": 261,
+      "transition": {
+        "kind": "wipe",
+        "dir": "r",
+        "dur": 2000,
+        "advanceAfter": null,
+        "advanceOnClick": true,
+        "morph": null
+      },
+      "steps": [
+        []
+      ],
+      "states": [
+        {
+          "hidden": [],
+          "moved": {}
+        }
+      ],
+      "interactive": 0
+    },
+    {
+      "part": "ppt/slides/slide7.xml",
+      "id": 262,
+      "transition": {
+        "kind": "cut",
+        "dir": null,
+        "dur": 2000,
+        "advanceAfter": null,
+        "advanceOnClick": true,
+        "morph": null
+      },
+      "steps": [
+        []
+      ],
+      "states": [
+        {
+          "hidden": [],
+          "moved": {}
+        }
+      ],
+      "interactive": 0
+    },
+    {
+      "part": "ppt/slides/slide8.xml",
+      "id": 263,
+      "transition": {
+        "kind": "other",
+        "dir": null,
+        "dur": 2000,
+        "advanceAfter": null,
+        "advanceOnClick": true,
+        "morph": null
+      },
+      "steps": [
+        []
+      ],
+      "states": [
+        {
+          "hidden": [],
+          "moved": {}
+        }
+      ],
+      "interactive": 0
+    },
+    {
+      "part": "ppt/slides/slide9.xml",
+      "id": 264,
+      "transition": {
+        "kind": "fade",
+        "dir": null,
+        "dur": 2000,
+        "advanceAfter": 2000,
+        "advanceOnClick": true,
+        "morph": null
+      },
+      "steps": [
+        []
+      ],
+      "states": [
+        {
+          "hidden": [],
+          "moved": {}
+        }
+      ],
+      "interactive": 0
+    }
+  ]
+}

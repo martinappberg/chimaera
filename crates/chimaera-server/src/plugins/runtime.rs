@@ -54,11 +54,23 @@ use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use super::Manifest;
 use crate::AppState;
 
-/// The 0.2 world (`wit/`): what the host implements and speaks inside.
-pub(crate) mod v2 {
+/// The 0.3 world (`wit/`): what the host implements and speaks inside.
+pub(crate) mod v3 {
     wasmtime::component::bindgen!({
         world: "chimaera-plugin",
         path: "../chimaera-plugin-api/wit",
+        imports: { default: async },
+        exports: { default: async },
+    });
+}
+
+/// The 0.2 world (`wit-0.2/`), served unchanged beside 0.3: the same
+/// imports and exports without `web`, under its own package version; the
+/// host translates its types at the edge (`hostfns::v2_host`, `invoke_v2`).
+pub(crate) mod v2 {
+    wasmtime::component::bindgen!({
+        world: "chimaera-plugin",
+        path: "../chimaera-plugin-api/wit-0.2",
         imports: { default: async },
         exports: { default: async },
     });
@@ -76,7 +88,7 @@ pub(crate) mod v1 {
     });
 }
 
-pub(crate) use v2::chimaera::plugin::types as wit;
+pub(crate) use v3::chimaera::plugin::types as wit;
 
 /// Wall-clock budget for `tools`, `instructions`, `call-tool`, `query` and
 /// `on-event`; `knowledge` (a whole reader pass) gets `KNOWLEDGE_BUDGET`.
@@ -131,12 +143,14 @@ pub(crate) const EVENT_MAX: usize = 16 * 1024;
 enum Pre {
     V1(v1::ChimaeraPluginPre<HostState>),
     V2(v2::ChimaeraPluginPre<HostState>),
+    V3(v3::ChimaeraPluginPre<HostState>),
 }
 
 /// A live instance's bindings, of the world it was built against.
 enum Bindings {
     V1(v1::ChimaeraPlugin),
     V2(v2::ChimaeraPlugin),
+    V3(v3::ChimaeraPlugin),
 }
 
 /// One plugin's compiled builds by SHA-256, most recently used first. Only
@@ -221,10 +235,12 @@ fn build_shared() -> wasmtime::Result<Shared> {
     let engine = Engine::new(&config)?;
     let mut linker: Linker<HostState> = Linker::new(&engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
-    // Both worlds in one linker: their imports are versioned
-    // (`chimaera:plugin/host@0.1.0`, `…@0.2.0`), so they never collide.
+    // Every world in one linker: their imports are versioned
+    // (`chimaera:plugin/host@0.1.0`, `…@0.2.0`, `…@0.3.0`), so they never
+    // collide.
     v1::ChimaeraPlugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s)?;
     v2::ChimaeraPlugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s)?;
+    v3::ChimaeraPlugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s)?;
     // The daemon's one ticker: it only bumps an atomic, 10 times a second,
     // and only once a plugin has been used.
     let ticking = engine.clone();
@@ -301,10 +317,10 @@ async fn compile(shared: &Shared, m: &Manifest) -> Result<Pre, String> {
         let component = Component::new(&engine, &**bytes)?;
         let pre = linker.instantiate_pre(&component)?;
         // The gate already refused an `api` this host doesn't serve.
-        Ok::<_, wasmtime::Error>(if api == "0.1" {
-            Pre::V1(v1::ChimaeraPluginPre::new(pre)?)
-        } else {
-            Pre::V2(v2::ChimaeraPluginPre::new(pre)?)
+        Ok::<_, wasmtime::Error>(match api.as_str() {
+            "0.1" => Pre::V1(v1::ChimaeraPluginPre::new(pre)?),
+            "0.2" => Pre::V2(v2::ChimaeraPluginPre::new(pre)?),
+            _ => Pre::V3(v3::ChimaeraPluginPre::new(pre)?),
         })
     })
     .await
@@ -778,6 +794,7 @@ enum Call {
     Render(String, String),
     Action(String, String, String),
     ToolResume(String, String),
+    WebBundle,
 }
 
 enum Reply {
@@ -787,14 +804,16 @@ enum Reply {
     Knowledge(Result<Option<wit::Snapshot>, String>),
     Json(Result<String, String>),
     Event(Option<String>),
-    /// A 0.2 export asked of a 0.1 build (the routes check `api` first).
+    Bytes(Vec<u8>),
+    /// A newer export asked of an older build (the routes check `api` first).
     Unsupported,
 }
 
 async fn invoke(live: &mut Live, cx: &wit::Context, call: Call) -> wasmtime::Result<Reply> {
     let store = &mut live.store;
     let plugin = match &live.plugin {
-        Bindings::V2(plugin) => plugin,
+        Bindings::V3(plugin) => plugin,
+        Bindings::V2(old) => return invoke_v2(old, store, cx, call).await,
         Bindings::V1(old) => return invoke_v1(old, store, cx, call).await,
     };
     let exports = plugin.chimaera_plugin_plugin();
@@ -821,6 +840,92 @@ async fn invoke(live: &mut Live, cx: &wit::Context, call: Call) -> wasmtime::Res
         Call::ToolResume(name, job) => {
             Reply::ToolResult(screens.call_tool_resume(store, cx, &name, &job).await?)
         }
+        Call::WebBundle => Reply::Bytes(plugin.chimaera_plugin_web().call_web_bundle(store).await?),
+    })
+}
+
+/// A call into a 0.2 build: the 0.3 exports but `web`, its own types.
+async fn invoke_v2(
+    plugin: &v2::ChimaeraPlugin,
+    store: &mut Store<HostState>,
+    cx: &wit::Context,
+    call: Call,
+) -> wasmtime::Result<Reply> {
+    use v2::chimaera::plugin::types as old;
+    let exports = plugin.chimaera_plugin_plugin();
+    let screens = plugin.chimaera_plugin_screens();
+    let cx = old::Context {
+        workspace: cx.workspace.clone(),
+        session: cx.session.clone(),
+        mastermind: cx.mastermind,
+    };
+    let result = |r: old::ToolResult| wit::ToolResult {
+        text: r.text,
+        is_error: r.is_error,
+        wait: r.wait,
+    };
+    Ok(match call {
+        Call::Tools => Reply::Tools(
+            exports
+                .call_tools(store)
+                .await?
+                .into_iter()
+                .map(|d| wit::ToolDef {
+                    name: d.name,
+                    description: d.description,
+                    input_schema: d.input_schema,
+                })
+                .collect(),
+        ),
+        Call::Instructions => Reply::Instructions(exports.call_instructions(store).await?),
+        Call::Tool(name, args) => Reply::ToolResult(result(
+            exports.call_call_tool(store, &cx, &name, &args).await?,
+        )),
+        Call::Knowledge(known) => Reply::Knowledge(
+            exports
+                .call_knowledge(store, &cx, known.as_ref())
+                .await?
+                .map(|s| {
+                    s.map(|s| wit::Snapshot {
+                        stamp: s.stamp,
+                        data: s.data,
+                    })
+                }),
+        ),
+        Call::Query(name, args) => Reply::Json(exports.call_query(store, &cx, &name, &args).await?),
+        Call::OnEvent(event) => {
+            let event = match event {
+                wit::Event::Hook(h) => old::Event::Hook(old::Hook {
+                    session: h.session,
+                    name: h.name,
+                }),
+                wit::Event::SessionEnded(s) => old::Event::SessionEnded(s),
+                wit::Event::SwitchedOn => old::Event::SwitchedOn,
+                wit::Event::SwitchedOff => old::Event::SwitchedOff,
+                wit::Event::FileSaved(p) => old::Event::FileSaved(p),
+                wit::Event::FileChanged(p) => old::Event::FileChanged(p),
+                wit::Event::JobFinished(j) => old::Event::JobFinished(old::JobEnd {
+                    id: j.id,
+                    exit: j.exit,
+                    timed_out: j.timed_out,
+                    duration_ms: j.duration_ms,
+                }),
+                wit::Event::SettingsChanged(k) => old::Event::SettingsChanged(k),
+            };
+            Reply::Event(exports.call_on_event(store, &cx, &event).await?)
+        }
+        Call::Render(view, args) => {
+            Reply::Json(screens.call_render(store, &cx, &view, &args).await?)
+        }
+        Call::Action(view, action, payload) => Reply::Json(
+            screens
+                .call_on_action(store, &cx, &view, &action, &payload)
+                .await?,
+        ),
+        Call::ToolResume(name, job) => Reply::ToolResult(result(
+            screens.call_tool_resume(store, &cx, &name, &job).await?,
+        )),
+        Call::WebBundle => Reply::Unsupported,
     })
 }
 
@@ -887,7 +992,9 @@ async fn invoke_v1(
             };
             Reply::Event(exports.call_on_event(store, &cx, &event).await?)
         }
-        Call::Render(..) | Call::Action(..) | Call::ToolResume(..) => Reply::Unsupported,
+        Call::Render(..) | Call::Action(..) | Call::ToolResume(..) | Call::WebBundle => {
+            Reply::Unsupported
+        }
     })
 }
 
@@ -1133,6 +1240,7 @@ impl PluginRuntime {
                 match &pre {
                     Pre::V1(pre) => pre.instantiate_async(&mut store).await.map(Bindings::V1),
                     Pre::V2(pre) => pre.instantiate_async(&mut store).await.map(Bindings::V2),
+                    Pre::V3(pre) => pre.instantiate_async(&mut store).await.map(Bindings::V3),
                 }
             })
             .await;
@@ -1407,6 +1515,25 @@ impl PluginRuntime {
     ) -> Result<String, String> {
         let call = Call::Action(view.to_string(), action.to_string(), payload.to_string());
         self.json_call(state, m, ws, call).await
+    }
+
+    /// 0.3's web bundle: the tar of the plugin's pages, asked once per
+    /// build (`plugins::web` unpacks and keeps it). Empty when it has none;
+    /// an older build has none to give.
+    pub(crate) async fn web_bundle(
+        &self,
+        state: &Arc<AppState>,
+        m: &Manifest,
+        ws: &str,
+    ) -> Result<Vec<u8>, String> {
+        match self.run(state, m, ws, None, Call::WebBundle).await? {
+            Reply::Bytes(bytes) => Ok(bytes),
+            Reply::Unsupported => Err(format!(
+                "{} is built for plugin API {}, which has no web pages",
+                m.name, m.api
+            )),
+            _ => unreachable!("web-bundle answers Bytes"),
+        }
     }
 
     /// A read the UI makes (`query`, 0.1 and 0.2).

@@ -10,7 +10,8 @@
     "prebuild": "node scripts/gen-icons.mjs",
     "build": "vite build",
     "check": "svelte-check --tsconfig ./tsconfig.json",
-    "test": "vitest run"
+    "test": "vitest run",
+    "timing:golden": "TIMING_GOLDEN=write vitest run src/lib/previews/pptxTiming.test.ts"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^7.3.1",

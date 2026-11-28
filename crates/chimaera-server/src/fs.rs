@@ -1510,8 +1510,9 @@ fn write_in_place(
     })
 }
 
-/// Largest file `fs/package` splices and `fs/file/stream` accepts. Both
-/// stream, so this bounds disk and I/O per save, not memory.
+/// Largest file `fs/package` splices and `fs/file/stream` accepts, and the
+/// largest a package splice may write (`fs/zip_splice.rs`). Both stream,
+/// so this bounds disk and I/O per save, not memory.
 pub(crate) const MAX_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
 /// Cap on a `fs/package` body: the base64 JSON of the changed parts only.
 pub(crate) const MAX_PACKAGE_BODY_BYTES: usize = 8 * 1024 * 1024;
@@ -5297,6 +5298,13 @@ pub(crate) async fn raw(
             return raw_not_found();
         }
     };
+    if crate::plugins::web::is_html(&path) {
+        let caching = Caching::For(fresh_for);
+        return serve_page(
+            &state, &ticket, &path, file, &meta, &path, &headers, caching, None,
+        )
+        .await;
+    }
     serve_raw(
         file,
         &meta,
@@ -5306,6 +5314,37 @@ pub(crate) async fn raw(
         None,
     )
     .await
+}
+
+/// An agent's page (an HTML file `/raw` serves) under the one fixed rule
+/// (`plugins::web`): it reads the files beside it, loads libraries from
+/// active plugins and the library CDNs, and sends nothing anywhere else —
+/// its CSP — with its `chimaera:` addresses rewritten to this daemon.
+#[allow(clippy::too_many_arguments)]
+async fn serve_page(
+    state: &AppState,
+    ticket: &str,
+    page: &Path,
+    mut file: tokio::fs::File,
+    meta: &std::fs::Metadata,
+    name: &Path,
+    headers: &HeaderMap,
+    caching: Caching,
+    tail: Option<PageTail>,
+) -> Response {
+    use crate::plugins::web;
+    let _permit = web::PAGE_WORK.acquire().await;
+    let bytes = web::page_bytes(&mut file, meta).await;
+    let origin = web::request_origin(headers);
+    let served = web::agent_page(state, ticket, page, bytes, origin.as_deref()).await;
+    let serve = Serve {
+        caching,
+        security: web::page_security(&served.csp),
+        extra: Vec::new(),
+        tail,
+        body: served.body,
+    };
+    serve_file(file, meta, name, headers, serve).await
 }
 
 /// GET /raw/{ticket}/{*rest} — a file beside an HTML report, so the report's
@@ -5373,6 +5412,14 @@ pub(crate) async fn raw_asset(
         Ok(Ok(opened)) => opened,
         _ => return raw_not_found(),
     };
+    if crate::plugins::web::is_html(&relative) {
+        let file = tokio::fs::File::from_std(file);
+        let caching = Caching::Revalidate;
+        return serve_page(
+            &state, &ticket, &path, file, &meta, &relative, &headers, caching, tail,
+        )
+        .await;
+    }
     serve_raw(
         tokio::fs::File::from_std(file),
         &meta,
@@ -5388,7 +5435,7 @@ pub(crate) async fn raw_asset(
 /// the parser still runs it, and nothing before the page's own doctype
 /// changes (a leading script would drop the page into quirks mode).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum PageTail {
+pub(crate) enum PageTail {
     /// `?bridge=1`, a framed preview: the pane bridge (the same script the
     /// app injects into a native pane view, `chimaera_core::PANE_BRIDGE_JS`,
     /// here posting to the parent window), then the page API.
@@ -5400,7 +5447,7 @@ enum PageTail {
 
 impl PageTail {
     /// Which tail the query asks for, `bridge=1` winning.
-    fn asked(query: Option<&str>) -> Option<Self> {
+    pub(crate) fn asked(query: Option<&str>) -> Option<Self> {
         let has = |want: &str| query.is_some_and(|q| q.split('&').any(|pair| pair == want));
         if has("bridge=1") {
             Some(Self::Framed)
@@ -5447,7 +5494,7 @@ impl PageTail {
     }
 }
 
-fn raw_not_found() -> Response {
+pub(crate) fn raw_not_found() -> Response {
     let mut response = (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
     response.headers_mut().insert(
         header::X_CONTENT_TYPE_OPTIONS,
@@ -5511,9 +5558,25 @@ fn raw_security_headers(
     out
 }
 
+/// The security headers of a file under a page's folder, a plugin's
+/// bundle or a data ticket that is not served as a page: no scripts, ever.
+pub(crate) fn folder_security(name: &Path) -> Vec<(HeaderName, HeaderValue)> {
+    let mime = mime_guess::from_path(name).first_or_octet_stream();
+    let mut security = raw_security_headers(&mime, RawRoute::Folder);
+    // HTML here is data, not a page: the folder route's sandbox for it too.
+    if raw_sandbox(&mime, RawRoute::Folder) == Some("sandbox allow-scripts") {
+        security.retain(|(name, _)| name != header::CONTENT_SECURITY_POLICY);
+        security.push((
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("sandbox"),
+        ));
+    }
+    security
+}
+
 /// Whether a ticket's file opens its folder to [`raw_asset`]: HTML documents
 /// only (a report's page is what references neighbors by relative URL).
-fn opens_its_folder(path: &Path) -> bool {
+pub(crate) fn opens_its_folder(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| {
@@ -5525,7 +5588,7 @@ fn opens_its_folder(path: &Path) -> bool {
 
 /// `rest` as a relative path of plain, visible components, or `None`.
 /// Axum has already percent-decoded it, so `%2e%2e` arrives as `..` here.
-fn asset_relative(rest: &str) -> Option<PathBuf> {
+pub(crate) fn asset_relative(rest: &str) -> Option<PathBuf> {
     if rest.is_empty() || rest.starts_with('/') || rest.contains('\0') {
         return None;
     }
@@ -5543,7 +5606,10 @@ fn asset_relative(rest: &str) -> Option<PathBuf> {
 
 /// Open `relative` beneath `dir` without following any symlink, as a
 /// regular file (O_NONBLOCK: a planted FIFO must not park the worker).
-fn open_asset(dir: &Path, relative: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+pub(crate) fn open_asset(
+    dir: &Path,
+    relative: &Path,
+) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
     use crate::download::Beneath;
     let root = crate::download::open_nofollow(dir, Beneath::Dir)?;
     let file = crate::download::open_beneath(&root, relative, Beneath::Any)?;
@@ -5579,6 +5645,30 @@ fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {
         .any(|tag| tag.trim() == "*" || bare(tag) == want)
 }
 
+/// How a `/raw`-family response may be cached.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Caching {
+    /// The URL is stable per file version: fresh for this long.
+    For(Duration),
+    /// The URL outlives the file's version: revalidated on every load.
+    Revalidate,
+}
+
+/// What a `/raw`-family response carries besides the file: the headers it
+/// is confined with, the page tail, and — for a page whose `chimaera:`
+/// addresses were rewritten — the bytes to serve instead of the file.
+pub(crate) struct Serve {
+    pub(crate) caching: Caching,
+    /// On every status (304 and 416 too).
+    pub(crate) security: Vec<(HeaderName, HeaderValue)>,
+    /// CORS headers and the like: on every status too.
+    pub(crate) extra: Vec<(HeaderName, HeaderValue)>,
+    pub(crate) tail: Option<PageTail>,
+    /// The page as served instead of the file (never in ranges), and a mark
+    /// for its `ETag`: what it was made from besides the file.
+    pub(crate) body: Option<(Vec<u8>, String)>,
+}
+
 /// Stream an opened regular file as a `/raw` response. Caching: a strong
 /// `ETag` (version token + size) and `Last-Modified`, with, for the ticketed
 /// file itself, `Cache-Control: private, max-age=` the ticket's remaining
@@ -5591,24 +5681,64 @@ fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {
 /// for a framed page the pane bridge, on a preview's own page) is streamed
 /// after the file: it gets its own `ETag` and is never served in ranges.
 async fn serve_raw(
-    mut file: tokio::fs::File,
+    file: tokio::fs::File,
     meta: &std::fs::Metadata,
     name: &Path,
     headers: &HeaderMap,
     route: RawRoute,
     tail: Option<PageTail>,
 ) -> Response {
-    let total = meta.len();
-    let etag = match tail {
-        None => raw_etag(meta),
-        Some(tail) => format!("\"{}-{}-{}\"", mtime_token(meta), meta.len(), tail.tag()),
-    };
-    let append = tail.map(PageTail::text);
     let mime = mime_guess::from_path(name).first_or_octet_stream();
-    let security = raw_security_headers(&mime, route);
-    let cache_control = match route {
-        RawRoute::File { fresh_for } => format!("private, max-age={}", fresh_for.as_secs()),
-        RawRoute::Folder => "private, no-cache".to_string(),
+    let caching = match route {
+        RawRoute::File { fresh_for } => Caching::For(fresh_for),
+        RawRoute::Folder => Caching::Revalidate,
+    };
+    let serve = Serve {
+        caching,
+        security: raw_security_headers(&mime, route),
+        extra: Vec::new(),
+        tail,
+        body: None,
+    };
+    serve_file(file, meta, name, headers, serve).await
+}
+
+/// [`serve_raw`] with every choice the caller's: the `/raw` routes, the
+/// plugin web views' `/web`, `/webdata` and `/lib` (`plugins::web`).
+pub(crate) async fn serve_file(
+    mut file: tokio::fs::File,
+    meta: &std::fs::Metadata,
+    name: &Path,
+    headers: &HeaderMap,
+    serve: Serve,
+) -> Response {
+    let Serve {
+        caching,
+        mut security,
+        extra,
+        tail,
+        body,
+    } = serve;
+    security.extend(extra);
+    let total = body.as_ref().map_or(meta.len(), |(b, _)| b.len() as u64);
+    let etag = match (tail, &body) {
+        (None, None) => raw_etag(meta),
+        (tail, body) => format!(
+            "\"{}-{}{}{}\"",
+            mtime_token(meta),
+            meta.len(),
+            tail.map(|t| format!("-{}", t.tag())).unwrap_or_default(),
+            body.as_ref()
+                .map(|(_, mark)| format!("-{mark}"))
+                .unwrap_or_default()
+        ),
+    };
+    let appended: &'static str = tail.map(PageTail::text).unwrap_or("");
+    let whole = !appended.is_empty() || body.is_some();
+    let mime = mime_guess::from_path(name).first_or_octet_stream();
+    let cache_control = match caching {
+        Caching::For(fresh_for) => format!("private, max-age={}", fresh_for.as_secs()),
+        Caching::Revalidate => "private, no-cache".to_string(),
     };
     let mut validators: Vec<(HeaderName, HeaderValue)> = vec![
         (header::ETAG, ascii_header(&etag)),
@@ -5629,7 +5759,7 @@ async fn serve_raw(
 
     let range = headers
         .get(header::RANGE)
-        .filter(|_| append.is_none())
+        .filter(|_| !whole)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| parse_byte_range(v, total));
     let (status, span) = match range {
@@ -5651,25 +5781,33 @@ async fn serve_raw(
 
     let (start, end) = span;
     let len = if total == 0 { 0 } else { end - start + 1 };
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
-    if let Err(err) = file.seek(SeekFrom::Start(start)).await {
-        tracing::warn!(path = %name.display(), %err, "ticketed file read failed");
-        return raw_not_found();
-    }
-
-    // Stream the selected span. The previous `vec![0; len]` loaded an
-    // un-ranged file (or attacker-chosen large range) wholly into daemon RSS.
-    let appended = append.unwrap_or("");
-    let body = Body::from_stream(tokio_util::io::ReaderStream::new(
-        file.take(len).chain(appended.as_bytes()),
-    ));
+    let body = match body {
+        Some((bytes, _)) => {
+            let mut bytes = bytes;
+            bytes.extend_from_slice(appended.as_bytes());
+            Body::from(bytes)
+        }
+        None => {
+            use tokio::io::{AsyncReadExt, AsyncSeekExt};
+            if let Err(err) = file.seek(SeekFrom::Start(start)).await {
+                tracing::warn!(path = %name.display(), %err, "ticketed file read failed");
+                return raw_not_found();
+            }
+            // Stream the selected span. The previous `vec![0; len]` loaded an
+            // un-ranged file (or attacker-chosen large range) wholly into
+            // daemon RSS.
+            Body::from_stream(tokio_util::io::ReaderStream::new(
+                file.take(len).chain(appended.as_bytes()),
+            ))
+        }
+    };
     let mut response = (
         status,
         [
             (header::CONTENT_TYPE, mime.essence_str().to_string()),
             (
                 header::ACCEPT_RANGES,
-                if append.is_some() { "none" } else { "bytes" }.to_string(),
+                if whole { "none" } else { "bytes" }.to_string(),
             ),
             (
                 header::CONTENT_LENGTH,

@@ -1,0 +1,35 @@
+{
+  "deck": "agent-written.pptx",
+  "slides": [
+    {
+      "part": "ppt/slides/slide1.xml",
+      "id": 256,
+      "transition": null,
+      "steps": [
+        []
+      ],
+      "states": [
+        {
+          "hidden": [],
+          "moved": {}
+        }
+      ],
+      "interactive": 0
+    },
+    {
+      "part": "ppt/slides/slide2.xml",
+      "id": 257,
+      "transition": null,
+      "steps": [
+        []
+      ],
+      "states": [
+        {
+          "hidden": [],
+          "moved": {}
+        }
+      ],
+      "interactive": 0
+    }
+  ]
+}

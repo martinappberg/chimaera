@@ -34,6 +34,7 @@ mod plugin_platform;
 mod plugin_retired;
 mod plugin_trust;
 mod plugin_updates;
+mod plugin_web;
 mod plugins;
 mod proxy;
 mod recents;

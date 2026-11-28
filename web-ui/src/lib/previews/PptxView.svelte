@@ -10,7 +10,11 @@
    * span. The package is loaded with the renderer's zip limits for untrusted
    * input and every external load target stripped first (`pptxDeck.ts`), so
    * a deck never fetches anything; web links in it open through the app.
-   * Animations and transitions aren't played — the bar says so quietly.
+   * Builds play click by click in the show, with no motion yet: each click
+   * lands on the state PowerPoint's show reaches after it (`pptxTiming.ts`
+   * parses the slide's timing, `pptxTag.ts` finds its shapes in the drawn
+   * slide, `pptxPlay.ts` hides and offsets them). Browsing shows each slide
+   * as drawn until a click dot in the bar is used; thumbnails always do.
    *
    * Context bridge: the slide's @ sends the slide (its title and text); the
    * area tool (or Shift-drag) sends a box on it in points, a plain click in
@@ -26,14 +30,17 @@
    * always show the renderer's real output. "PowerPoint" opens the deck in
    * the real app through the native shell (a round trip for a remote host).
    */
-  import { untrack } from "svelte";
+  import { tick, untrack } from "svelte";
   import type { SlideData, SlideHandle } from "@aiden0z/pptx-renderer";
   import { materializeSlideNodes, renderSlide } from "@aiden0z/pptx-renderer";
   import { basename, dirname, fsDownload, fsList } from "./files";
   import { onDiskVersion, ownedObjectUrls, paneVisibility, useFileEntry } from "./viewLifecycle.svelte";
   import { fetchRawBytes, TooLargeError } from "./rawBytes";
   import { loadDeck, loadNotes, type Deck } from "./pptxDeck";
-  import { showEdge, showPosition, showStep } from "./slideShow";
+  import { deckStep, showEdge, showPosition, showReach, type Place } from "./slideShow";
+  import { buildStates, extractTiming, parseTimeline, type BuildState, type SlideTimeline, type TimingExtract } from "./pptxTiming";
+  import { pruneTagged, tagSlide, type TaggedSlide } from "./pptxTag";
+  import { applyState, clearState } from "./pptxPlay";
   import { sanitizeRendered } from "./officeSafety";
   import { revealRequest, takeReveal } from "../shared/reveal";
   import { activateUrl } from "../shared/urlOpen";
@@ -165,6 +172,7 @@
       clearPick();
       lastBytes = bytes;
       drawn.clear();
+      resetTimelines(d);
       relTargets = null;
       deck = d;
       deckGen += 1;
@@ -201,13 +209,15 @@
 
   // --- rendering ------------------------------------------------------------------
 
-  function render(i: number): SlideHandle | null {
+  /** Draw slide `i`. `tag`: a stage slide, whose shapes builds act on. */
+  function render(i: number, tag = false): SlideHandle | null {
     const d = deck;
     if (d === null) return null;
     const slide = d.presentation.slides[i];
     if (slide === undefined) return null;
+    let handle: SlideHandle;
     try {
-      const handle = renderSlide(d.presentation, slide, {
+      handle = renderSlide(d.presentation, slide, {
         mediaUrlCache: mediaUrls,
         pdfjs: false,
         onNodeError: () => (nodeErrors += 1),
@@ -216,11 +226,26 @@
           else if (t.url !== undefined) activateUrl(t.url);
         },
       });
+    } catch {
+      nodeErrors += 1;
+      return null;
+    }
+    // A slide that fails after it was drawn (tagging, sanitizing) is let go
+    // whole: an unsanitized slide must never reach the page.
+    try {
+      // Tagged before sanitizing, which keeps `data-*` but may drop elements.
+      const tagged = tag ? tagSlide(handle.element, slide.nodes) : null;
       // Defense in depth: the package was stripped of remote targets, and
       // this makes sure nothing in the laid-out slide still points out.
       sanitizeRendered([handle.element]);
+      if (tagged !== null) {
+        pruneTagged(handle.element, tagged);
+        stageTags.set(handle.element, tagged);
+      }
       return handle;
     } catch {
+      handle.dispose();
+      handle.element.remove();
       nodeErrors += 1;
       return null;
     }
@@ -229,6 +254,8 @@
   /** Stage handles by slide index, most recently used last. */
   const stageHandles = new Map<number, SlideHandle>();
   const thumbHandles = new Map<number, SlideHandle>();
+  /** Each stage slide's shapes by id, tagged as it was drawn. */
+  const stageTags = new WeakMap<HTMLElement, TaggedSlide>();
 
   function disposeAll(): void {
     for (const h of [...stageHandles.values(), ...thumbHandles.values()]) {
@@ -250,7 +277,7 @@
       stageHandles.set(i, hit);
       return hit;
     }
-    const made = render(i);
+    const made = render(i, true);
     if (made === null) return null;
     made.element.classList.add("stage-slide");
     made.element.style.visibility = "hidden";
@@ -300,23 +327,212 @@
     });
   });
 
+  /** Land on slide `i`: in the show at its first state (a jump, as
+   *  PowerPoint's), browsing as drawn. */
   function go(i: number): void {
     if (deck === null) return;
     const next = Math.min(Math.max(0, i), count - 1);
     if (next !== current) clearPick();
     current = next;
+    build = presenting ? 0 : null;
   }
 
-  /** Which slides the deck marks hidden (`show="0"`). */
-  const hiddenFlags = $derived(deck?.presentation.slides.map((sl) => sl.hidden === true) ?? []);
+  /** Which slides the deck marks hidden (`show="0"`): read with each slide's
+   *  timing at load, since the renderer knows only once it lays one out. */
+  const hiddenFlags = $derived(
+    deck?.presentation.slides.map((sl) => sl.hidden === true || extracts.get(sl.slidePath)?.hidden === true) ?? [],
+  );
   /** Where the show stands among the slides it shows. */
   const showAt = $derived(showPosition(hiddenFlags, current));
 
-  /** One slide on or back. A show skips hidden slides, as PowerPoint's
-   *  does; browsing the deck walks every slide. */
+  /** One click on or back. The show walks the slide's builds, then the
+   *  next slide from its first state (back: the previous one at its last),
+   *  skipping hidden slides as PowerPoint's does; browsing the deck walks
+   *  every slide, each as drawn. */
   function page(delta: 1 | -1): void {
-    go(presenting ? showStep(hiddenFlags, current, delta) : current + delta);
+    if (!presenting) {
+      go(current + delta);
+      return;
+    }
+    // A slide not parsed yet counts as one build: the slides this click can
+    // land on (hidden ones skipped) are parsed first.
+    for (const j of [current, ...showReach(hiddenFlags, current, true)]) timelineOf(j);
+    const at: Place = { slide: current, build: buildAt ?? 0 };
+    const to = deckStep(buildCounts(), hiddenFlags, at, delta, true);
+    if (to.slide !== current) clearPick();
+    current = to.slide;
+    build = to.build;
   }
+
+  // --- builds ------------------------------------------------------------------------
+
+  interface Timed {
+    timeline: SlideTimeline;
+    states: BuildState[];
+  }
+
+  /** Parsed timing per slide part, for the deck version on screen. */
+  let timelines = new Map<string, Timed>();
+  /** What each slide part's timeline needs, cut from it at load
+   *  (`extractTiming`: its timing and transition, a few KB, capped), until
+   *  it is parsed. The whole part goes: the renderer drops its own copy once
+   *  it lays the slide out, and a deck's shapes can run to megabytes. */
+  let extracts = new Map<string, TimingExtract>();
+  /** Bumped when a timeline is parsed, so what counts builds re-reads. */
+  let timelineGen = $state(0);
+  /** The stage's build: the state after that many clicks; null is the slide
+   *  as drawn (browsing, until a click dot is used). */
+  let build = $state<number | null>(null);
+  /** Something on the current slide's builds could only be approximated. */
+  let playApprox = $state(false);
+
+  /** A new version: every slide's extract, before any is laid out (one scan
+   *  a slide; the parse waits until the slide is asked for). */
+  function resetTimelines(d: Deck): void {
+    timelines = new Map();
+    extracts = new Map();
+    for (const sl of d.presentation.slides) {
+      if (sl.sourceXml !== undefined) extracts.set(sl.slidePath, extractTiming(sl.sourceXml));
+    }
+  }
+
+  /** Slide `i`'s timing, parsed on first ask. */
+  function timelineOf(i: number): Timed | null {
+    const sl = deck?.presentation.slides[i];
+    if (sl === undefined) return null;
+    const hit = timelines.get(sl.slidePath);
+    if (hit !== undefined) return hit;
+    const ex = extracts.get(sl.slidePath);
+    let timeline: SlideTimeline;
+    if (ex?.timeline != null) timeline = ex.timeline;
+    else {
+      const xml = ex?.source ?? untrack(() => edits.partText(sl.slidePath)) ?? sl.sourceXml ?? null;
+      if (xml === null) return null;
+      timeline = parseTimeline(xml);
+    }
+    const got = { timeline, states: buildStates(timeline) };
+    timelines.set(sl.slidePath, got);
+    // The hidden flag stays; the source is done with.
+    if (ex !== undefined) extracts.set(sl.slidePath, { source: null, timeline: null, hidden: ex.hidden });
+    return got;
+  }
+
+  /** Build counts per slide for `deckStep` (one where not parsed yet). */
+  function buildCounts(): number[] {
+    return deck?.presentation.slides.map((sl) => timelines.get(sl.slidePath)?.states.length ?? 1) ?? [];
+  }
+
+  // The current slide is always parsed (its click dots); in the show, the
+  // slides a click can land on too, so a step back lands on the last build.
+  $effect(() => {
+    const i = current;
+    const show = presenting;
+    const flags = hiddenFlags;
+    void deckGen;
+    void slideGen;
+    untrack(() => {
+      let fresh = false;
+      for (const j of show ? [i, ...showReach(flags, i, true)] : [i]) {
+        const sl = deck?.presentation.slides[j];
+        if (sl === undefined || timelines.has(sl.slidePath)) continue;
+        if (timelineOf(j) !== null) fresh = true;
+      }
+      if (fresh) timelineGen += 1;
+    });
+  });
+
+  /** The current slide's timing. */
+  const timed = $derived.by(() => {
+    void timelineGen;
+    void deckGen;
+    void slideGen;
+    const sl = deck?.presentation.slides[current];
+    return sl === undefined ? null : (timelines.get(sl.slidePath) ?? null);
+  });
+  /** The build on screen, held to the timeline (a re-read deck may have fewer). */
+  const buildAt = $derived(build === null ? null : Math.min(build, Math.max(0, (timed?.states.length ?? 1) - 1)));
+  /** Clicks on the current slide. */
+  const clicks = $derived(Math.max(0, (timed?.states.length ?? 1) - 1));
+
+  // Put the build on the stage slide: each redraw is re-tagged, and the
+  // state goes back on it at once (no motion), so a deck re-read mid-show
+  // keeps its place. Kept neighbours and edit mode show the slide as drawn.
+  $effect(() => {
+    const i = current;
+    const b = buildAt;
+    const t = timed;
+    const editing = editMode;
+    void deckGen;
+    void slideGen;
+    void slot;
+    untrack(() => {
+      let approx = false;
+      for (const [j, handle] of stageHandles) {
+        const tagged = stageTags.get(handle.element);
+        if (tagged === undefined) continue;
+        const state = j === i && b !== null && !editing ? t?.states[b] : undefined;
+        if (state === undefined) clearState(tagged);
+        else approx = applyState(tagged, state, w, h) || tagged.fellBack;
+      }
+      playApprox = approx;
+    });
+  });
+
+  /** Why the current slide's builds are approximate, for the dots' tooltip. */
+  const approxNote = $derived.by(() => {
+    const code = timed?.timeline.approximate ?? null;
+    if (code !== null) return `this slide's animation couldn't be read (${code}): it shows as a plain slide`;
+    return playApprox ? "some builds on this slide are approximate: a shape or paragraph couldn't be matched to what was drawn" : "";
+  });
+
+  /** Show build `k` (a click dot); the build already shown goes back to the
+   *  slide as drawn. */
+  function showBuild(k: number): void {
+    if (editMode) return;
+    build = !presenting && buildAt === k ? null : k;
+  }
+
+  /** The click dots: the slide's start, then one per click, at most DOTS
+   *  of them in a window that follows the build (a deck of 300 clicks
+   *  keeps a short row). */
+  const DOTS = 8;
+  const dotWindow = $derived.by(() => {
+    if (clicks <= DOTS) return { first: 1, last: clicks };
+    const first = Math.min(Math.max(1, (buildAt ?? 0) - Math.floor(DOTS / 2) + 1), clicks - DOTS + 1);
+    return { first, last: first + DOTS - 1 };
+  });
+
+  let dotsEl = $state<HTMLSpanElement | null>(null);
+  /** Arrows move along the dots (and the build with them); Escape is the
+   *  slide as drawn again. */
+  function onDotsKey(e: KeyboardEvent): void {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    let to: number | null;
+    if (e.key === "ArrowRight") to = Math.min(clicks, (buildAt ?? -1) + 1);
+    else if (e.key === "ArrowLeft") to = Math.max(0, (buildAt ?? 1) - 1);
+    else if (e.key === "Home") to = 0;
+    else if (e.key === "End") to = clicks;
+    else if (e.key === "Escape" && !presenting && build !== null) to = null;
+    else return;
+    e.preventDefault();
+    e.stopPropagation();
+    build = to;
+    void tick().then(() => dotsEl?.querySelector<HTMLElement>('[tabindex="0"]')?.focus());
+  }
+
+  // The show moves on by itself where the slide says (`advTm`), once its
+  // last build is up; only while someone can see it, and any move restarts it.
+  $effect(() => {
+    if (!presenting || editMode || !onScreen.shown) return;
+    const b = buildAt;
+    const t = timed;
+    const after = t?.timeline.transition?.advanceAfter ?? null;
+    if (t === null || after === null || b === null || b < t.states.length - 1) return;
+    const timer = setTimeout(() => {
+      if (!disposed) page(1);
+    }, after);
+    return () => clearTimeout(timer);
+  });
 
 
   // --- editing ---------------------------------------------------------------------
@@ -462,6 +678,8 @@
       nodesMaterialized: false,
     };
     d.presentation.slides[i] = fresh;
+    timelines.delete(old.slidePath);
+    extracts.set(old.slidePath, extractTiming(xml));
     try {
       materializeSlideNodes(d.presentation, fresh);
     } catch {
@@ -527,6 +745,7 @@
     if (areaMode) toggleArea();
     clearPick();
     revealed = null;
+    build = null;
     editMode = true;
     stageEl?.focus({ preventScroll: true });
     void checkLock();
@@ -1080,6 +1299,7 @@
         else if (pick !== null) clearPick();
         else if (revealBox !== null) revealed = null;
         else if (areaMode) areaMode = false;
+        else if (build !== null) build = null;
         else return;
         break;
       default:
@@ -1113,9 +1333,15 @@
     if (presenting) {
       if (document.fullscreenElement !== null) await document.exitFullscreen().catch(() => {});
       presenting = false;
+      build = null;
       return;
     }
+    // The show is never an editor: edit mode ends first, as its own button
+    // or Esc would end it (unsaved edits stay where they are).
+    if (editMode) await toggleEdit();
+    // The show opens the slide as PowerPoint's does: before its first click.
     presenting = true;
+    build = 0;
     el.focus();
     try {
       await el.requestFullscreen?.();
@@ -1126,7 +1352,10 @@
 
   $effect(() => {
     const onChange = () => {
-      if (document.fullscreenElement === null && presenting && stageEl !== null) presenting = false;
+      if (document.fullscreenElement === null && presenting && stageEl !== null) {
+        presenting = false;
+        build = null;
+      }
     };
     document.addEventListener("fullscreenchange", onChange);
     return () => document.removeEventListener("fullscreenchange", onChange);
@@ -1176,7 +1405,7 @@
       {#if hiddenSlide}<span class="tag" title="this slide is hidden in the slide show">hidden</span>{/if}
       <span
         class="limits"
-        title="drawn in the browser: no animations or transitions, and fonts the deck doesn't embed fall back to this system's{deck.blocked > 0
+        title="drawn in the browser: builds appear and disappear click by click with no motion, no transitions, and fonts the deck doesn't embed fall back to this system's{deck.blocked > 0
           ? `; ${deck.blocked} linked outside ${deck.blocked === 1 ? 'resource was' : 'resources were'} not loaded`
           : ''}{nodeErrors > 0 ? `; ${nodeErrors} ${nodeErrors === 1 ? 'shape' : 'shapes'} couldn't be drawn` : ''}"
         aria-label="rendering limits"
@@ -1186,6 +1415,47 @@
         >
         {#if nodeErrors > 0 || deck.blocked > 0}<span>approximate</span>{/if}
       </span>
+      <!-- One dot a click, last in the bar's left cluster so a row that
+           grows or goes shifts nothing. The start mark is the slide before
+           its first click; the dot of the build on screen, clicked again (or
+           Escape), is the slide as drawn. -->
+      {#if !editMode && clicks > 0}
+        {@const tip = (label: string) => (approxNote === "" ? label : `${label} · ${approxNote}`)}
+        <span
+          class="builds"
+          bind:this={dotsEl}
+          role="group"
+          aria-label="builds"
+          title={approxNote || undefined}
+        >
+          <button
+            class="pip start"
+            class:on={buildAt !== null}
+            class:at={buildAt === 0}
+            tabindex={buildAt === null || buildAt === 0 ? 0 : -1}
+            onclick={() => showBuild(0)}
+            onkeydown={onDotsKey}
+            title={tip(buildAt === 0 && !presenting ? "before the first click (click again: as drawn)" : "before the first click")}
+            aria-label="before click 1 of {clicks}"
+            aria-current={buildAt === 0 ? "step" : undefined}
+          ><span aria-hidden="true"></span></button>
+          {#each { length: dotWindow.last - dotWindow.first + 1 } as _, n (n)}
+            {@const k = dotWindow.first + n}
+            <button
+              class="pip"
+              class:on={buildAt !== null && k <= buildAt}
+              class:at={buildAt === k}
+              class:more={(n === 0 && k > 1) || (k === dotWindow.last && k < clicks)}
+              tabindex={buildAt === k ? 0 : -1}
+              onclick={() => showBuild(k)}
+              onkeydown={onDotsKey}
+              title={tip(buildAt === k && !presenting ? `click ${k} of ${clicks} (click again: as drawn)` : `click ${k} of ${clicks}`)}
+              aria-label="click {k} of {clicks}"
+              aria-current={buildAt === k ? "step" : undefined}
+            ><span aria-hidden="true"></span></button>
+          {/each}
+        </span>
+      {/if}
     {/if}
     {#if downloadError !== null}<span class="bar-err">{downloadError}</span>{/if}
     {#if officeError !== null}<span class="bar-err">{officeError}</span>{/if}
@@ -1486,6 +1756,70 @@
     font-family: var(--mono);
     font-variant-numeric: tabular-nums;
     color: var(--fg);
+  }
+
+  /* The click dots: as wide as their dots (at most the start mark and DOTS). */
+  .builds {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    height: 18px;
+    margin-left: 0.25rem;
+  }
+
+  .pip {
+    appearance: none;
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 10px;
+    height: 18px;
+    padding: 0;
+    border: none;
+    border-radius: 3px;
+    background: none;
+    cursor: pointer;
+  }
+
+  .pip > span {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: color-mix(in srgb, var(--fg) 22%, transparent);
+    transition:
+      background-color 0.12s ease,
+      box-shadow 0.12s ease;
+  }
+
+  /* The start mark: a short bar, the slide before its first click. */
+  .pip.start > span {
+    width: 2px;
+    height: 9px;
+    border-radius: 1px;
+  }
+
+  /* More clicks beyond the window's edge. */
+  .pip.more > span {
+    width: 3px;
+    height: 3px;
+  }
+
+  .pip:hover > span {
+    background: color-mix(in srgb, var(--fg) 50%, transparent);
+  }
+
+  .pip.on > span {
+    background: var(--accent);
+  }
+
+  .pip.at:not(.start) > span {
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 28%, transparent);
+  }
+
+  .pip:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: -1px;
   }
 
   .tag {
@@ -1913,7 +2247,8 @@
     .bbtn,
     .opt,
     .thumb,
-    .slide-ref {
+    .slide-ref,
+    .pip > span {
       transition: none;
     }
   }

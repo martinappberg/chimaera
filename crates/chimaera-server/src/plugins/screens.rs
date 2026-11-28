@@ -92,6 +92,7 @@ fn required(node: &str) -> Option<&'static [(&'static str, Kind)]> {
         "diagnostics" => &[],
         "diff" => &[],
         "log" => &[("src", Str)],
+        "web" => &[("entry", Str), ("label", Str)],
         _ => return None,
     })
 }
@@ -162,6 +163,19 @@ impl Walk {
             }
         }
         match kind {
+            "web" => {
+                let size = fields.get("data").map_or(0, |d| d.to_string().len());
+                if size > super::web::DATA_MAX {
+                    self.problem(
+                        &format!("{at}.data"),
+                        format!(
+                            "a web node's data is at most {} KiB (this is {} KiB)",
+                            super::web::DATA_MAX >> 10,
+                            size.div_ceil(1024)
+                        ),
+                    );
+                }
+            }
             "button" | "form" => self.action(&format!("{at}.action"), fields.get("action")),
             "toggle" | "select" | "segmented" => {
                 self.action(&format!("{at}.action"), fields.get("action"))
@@ -411,7 +425,11 @@ pub(crate) fn invalidate(state: &Arc<AppState>, m: &Manifest, ws: &str, view: &s
     clippy::result_large_err,
     reason = "Return the HTTP error directly without a second allocation"
 )]
-async fn active_plugin(state: &AppState, ws: &str, pid: &str) -> Result<Arc<Manifest>, Response> {
+pub(crate) async fn active_plugin(
+    state: &AppState,
+    ws: &str,
+    pid: &str,
+) -> Result<Arc<Manifest>, Response> {
     if crate::lock(&state.workspaces).get(ws).is_none() {
         return Err(super::not_found(&format!("workspace {ws}")));
     }

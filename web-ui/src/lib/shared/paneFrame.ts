@@ -23,7 +23,7 @@
 
 import { REFERENCE_CHORD } from "./keys";
 import type { PaneTransport, PaneViewControl } from "./paneView";
-import { decodeFrameMessage, isChord } from "./paneViewBridge";
+import { decodeFrameMessage, isChord, type WebEvent } from "./paneViewBridge";
 import { ownInputAgoMs } from "./ownInput";
 import type { ViewRect } from "../net/native";
 
@@ -45,6 +45,9 @@ export interface PaneFrameParams {
   onHover?: (inside: boolean) => void;
   /** The page wears the app's theme (see `page_themed`). */
   onPageThemed?: () => void;
+  /** web/1's page events: `act` and `status` at most ten a second, a
+   *  `reference` only on the evidence a draft needs (`pageMessageTrust`). */
+  onWeb?: (ev: WebEvent) => void;
   /** The app's theme, encoded (`pageTheme.ts`): posted to the page API
    *  whenever it changes and to each new document, so a framed page
    *  follows the theme without a reload. */
@@ -56,6 +59,8 @@ export interface PaneFrameParams {
 const REFERENCE_GAP_MS = 1000;
 /** The least time between two messages a framed page may ask to send. */
 const PAGE_MESSAGE_GAP_MS = 1000;
+/** `act` and `status` a framed page may post a second. */
+const WEB_RATE = 10;
 
 /**
  * What a framed page's `send` / `draft` may become. The page shares the
@@ -109,6 +114,17 @@ export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
   let lastPageMessage = Number.NEGATIVE_INFINITY;
   let lastPageSend = Number.NEGATIVE_INFINITY;
   let theme = initial.theme ?? "";
+  let webWindow = Number.NEGATIVE_INFINITY;
+  let webCount = 0;
+  const webAllowed = (): boolean => {
+    const now = performance.now();
+    if (now - webWindow > 1000) {
+      webWindow = now;
+      webCount = 0;
+    }
+    webCount += 1;
+    return webCount <= WEB_RATE;
+  };
 
   const post = (cmd: Record<string, unknown>): void => {
     try {
@@ -190,6 +206,20 @@ export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
         params.onPageMessage?.({ send, text: ev.text, title: ev.title });
         break;
       }
+      case "web_act":
+      case "web_status":
+        if (webAllowed()) params.onWeb?.(ev);
+        break;
+      case "web_reference": {
+        const now = performance.now();
+        if (now - lastPageMessage < PAGE_MESSAGE_GAP_MS) break;
+        const ownAgo = ownInputAgoMs();
+        const trust = pageMessageTrust(userInFrame(), now - focusedAt < ownAgo, ownAgo, now - lastPageSend);
+        if (trust === null) break;
+        lastPageMessage = now;
+        params.onWeb?.(ev);
+        break;
+      }
       case "page":
         if (ev.url === "about:blank") break;
         // A new document starts without the pill or the newest theme
@@ -209,6 +239,7 @@ export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
     region: () => Promise.resolve(null),
     nav: () => {},
     sync: () => {},
+    command: (cmd) => post(cmd),
   };
   control?.bind(transport);
 

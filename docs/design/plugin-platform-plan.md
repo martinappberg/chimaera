@@ -26,7 +26,7 @@ artifact attestations and Sigstore handle the same problems ([prior art](#prior-
    *Amended 2026-11-26 (maintainer):* screens stay data, but one node, `web`, may
    be a page from the plugin's own bundle, sandboxed and bridged, for drawing
    areas such as genome tracks, molecules and maps that existing JavaScript
-   libraries draw. Planned, not shipped; why and how:
+   libraries draw. Shipped 2026-11-27 (API 0.3, [web views](../features/web-views.md)); why and how:
    [plugin web views](rich-views-plan.md#the-amendment-to-platform-decision-2).
 3. **Plugins may run programs, and install the side programs they need**, through
    the host, declared in the manifest, bounded by the host.

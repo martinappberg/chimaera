@@ -25,6 +25,7 @@ skills and connections. These are different authoring targets:
 | You want to add | Use | Start with |
 |---|---|---|
 | A workbench view, file preview/action, diagnostics, Knowledge provider, or workspace-scoped agent tool | A workbench plugin: `plugin.toml` + a WebAssembly component | The [starter below](#minimal-api-02-plugin), then the [platform reference](#the-platform-api-02) |
+| A drawing area an existing JavaScript library draws (a genome track, a molecule, a map), or a library agents' pages may import | A workbench plugin's own page: a `web` node and the `[web]` table (API 0.3) | [Web views](#web-views-api-03) |
 | Instructions, skills, hooks or MCP connections inside an existing agent CLI | That agent's native extension package | Its own packaging/install contract; a workbench plugin may declare it in `requires.agent_plugins` or `recommends.agent_plugins` |
 | A new agent harness or structured chat driver | Chimaera's agent integration | [Agent engine map](../../crates/chimaera-agent/AGENTS.md) and [protocol](../../crates/chimaera-agent/PROTOCOL.md); a plugin manifest cannot register a harness |
 | A general workbench capability unavailable through host imports | A deliberate change to the host API | [API map](../../crates/chimaera-plugin-api/AGENTS.md), [server map](../../crates/chimaera-server/AGENTS.md), and [interface versioning](#versions-and-updates-from-the-authors-side) |
@@ -32,8 +33,10 @@ skills and connections. These are different authoring targets:
 Keep domain parsing, compilation orchestration and UI trees in the plugin's
 own repository. Extend the host only with a reusable capability and tests;
 the daemon and client must not branch on a new plugin's id or file format.
-Workbench plugins use the host's semantic `ui/1` trees and existing viewers,
-rather than shipping arbitrary JavaScript, HTML or a Svelte bundle.
+Workbench plugins use the host's semantic `ui/1` trees and existing viewers.
+The one exception is a drawing area that an existing JavaScript library draws:
+a 0.3 plugin may ship that page in its bundle ([web views](#web-views-api-03)).
+Everything around the drawing area stays `ui/1`.
 
 For an agent implementing a plugin, work in this order:
 
@@ -51,7 +54,8 @@ For an agent implementing a plugin, work in this order:
 5. Report commands, observed outcomes and any unverified platform or agent.
    Follow the [author checklist](#author-checklist) before releasing.
 
-The current SDK targets **API 0.2**; the host also serves the frozen 0.1 world.
+The current SDK targets **API 0.3** (0.2 plus a plugin's own web pages); the
+host also serves the frozen 0.1 and 0.2 worlds.
 For source questions, the authority is the
 [WIT](../../crates/chimaera-plugin-api/wit/chimaera.wit),
 [Rust SDK](../../crates/chimaera-plugin-api/src/lib.rs),
@@ -530,6 +534,7 @@ return the host's reason as a `String`). The limits are in
 | Call | What | Limit |
 |---|---|---|
 | `host::read(&cx, path, cap)` | a workspace file's bytes | workspace-relative only (`..` and absolute paths refused), `O_NOFOLLOW` on every component (no symlink anywhere in the path), at most `cap`, clamped to 8 MiB; off the reactor behind the filesystem semaphore |
+| `host::read_at(&cx, path, offset, cap)` (0.3) | the same, from `offset` | the same limits; empty at or past the end — a header past the first 8 MiB, the records an index points at |
 | `host::stat(&cx, path)` | size, `mtime_ms`, `is_dir` | the same path rules |
 | `host::list(&cx, path, cap)` | a directory's entries (`name`, `is_dir`, `is_symlink`) | the same path rules; at most `cap`, clamped to 4,096 |
 | `host::state_get` / `state_put(&cx, key, &value)` | small per-(plugin, workspace) state; `null` removes a key | 64 KiB per plugin per workspace, keys and values; in memory, so a daemon restart clears it; kept across a switch off and on and across versions |
@@ -802,6 +807,7 @@ id = "document"
 title = "Document"         # required: every view has a name
 slot = "file"
 icon = "book"              # optional: a tab view's glyph, a name from the `icon` node's set
+# rail = true              # 0.3, a tab view: a sidebar row (its icon and title) while the plugin is on here
 
 [[files]]                  # files matching `match` open in `view` (Text one click away)
 match = ["*.tex", "*.ltx"] # a pattern without `/` matches the name anywhere; `**` spans folders
@@ -903,8 +909,7 @@ bar with its stage and megabytes sits at the top of your screen meanwhile, the
 view draws again at once — `tool_state` then says `installing` — and when it is
 done).
 
-Where a view draws: `tab` (its own tab: the card's **Open**, `open-view`, a file
-action's `open`), `panel` (the dashboard, after core's sections), `file` (a
+Where a view draws: `tab` (its own tab: the card's **Open**, `open-view`, a file action's `open`, and with `rail = true` (0.3) a row in the sidebar beside Knowledge, in its icon and title, while the plugin is on in the workspace — for an app people come back to; at most two per plugin, and a view that opens from a file or an agent needs none), `panel` (the dashboard, after core's sections), `file` (a
 claimed file; the view owns the pane: the screen is at least the pane's height,
 the root stack's last child takes what is left, and an `editor` or `pdf` first
 in a split pane, a stack or a tab fills it; a root whose last child is a split
@@ -1055,11 +1060,96 @@ first-party [Chromium plugin](https://github.com/martinappberg/chimaera-plugin-c
 is the example: a manifest, an empty component and `scripts/pin.sh`, which
 pins a Chrome for Testing version's four downloads by sha256 and size.
 
+### Web views (API 0.3)
+
+A 0.3 plugin may ship its own HTML and JavaScript page for a **drawing area**:
+a genome track, a molecule, a map, drawn by an existing JavaScript library.
+Only the drawing area is web. Lists, forms, settings and every control around
+the page stay `ui/1`. Design and reasons: [rich views, Part 2](../design/rich-views-plan.md#part-2-plugin-web-views).
+
+**The manifest.**
+
+```toml
+api = "0.3"
+
+[access]
+files = "read"            # what `chimaera.url` may read; without it, only `output:`
+
+[web]
+pages = ["genome.html"]   # pages of the bundle a `web` node may show (≤ 16)
+libraries = ["genome-spy"] # top-level bundle folders lent to agents' pages (≤ 8)
+network = ["data.genomespy.app"] # bare https hosts its pages may reach (≤ 16)
+```
+
+Each declared page, library and host is on the card's **Can** list
+("Draws its own views (web pages in a sandbox)", "Lends its genome-spy
+library to agents' pages where it is switched on", "Its pages reach
+data.genomespy.app"), so a release that adds one asks its users again.
+Web views alone keep a plugin sandboxed.
+
+**The bundle.** `Plugin::web_bundle()` returns a plain tar of the pages,
+libraries and assets: files and folders only, no links, no `..`, at most
+64 MiB and 4,096 entries unpacked. Pack it in the plugin's build and
+`include_bytes!` it (`plugins/test-web/build.rs` packs `web/` with no
+dependency). The host asks once per build and unpacks it under its cache.
+The bundle never ships in Chimaera.
+
+**The node.**
+
+```json
+{"type": "web", "entry": "genome.html", "id": "tp53", "label": "Genome view of TP53",
+ "data": {"spec": "results/tp53.genomespy.json"}, "key": 3,
+ "fallback": {"type": "callout", "text": "This chimaera cannot draw this view."}}
+```
+
+`entry` (one of `pages`) and `label` are required. `data` (≤ 64 KiB) reaches
+the page as `chimaera.data`. A new `key`, or new `data`, reaches the running
+page without a reload. The page fills its slot with no chrome of the host's
+around it: no head, no frame (the tab or screen already names it; `label` is
+its accessible name). A host that doesn't know `web` draws `fallback`.
+
+**The page.** The host appends `window.chimaera` to the page; read it from
+`DOMContentLoaded` or later. Link `chimaera:web.css` for the app's look on
+your own buttons, inputs, toolbars (`.ch-toolbar`) and tables (`.ch-table`).
+
+| Call | Does |
+|---|---|
+| `chimaera.data`, `onData(fn)` | The node's `data`; `fn` runs now (if it came) and on each change. |
+| `chimaera.theme`, `onTheme(fn)` | `{mode, vars}`; the `--ch-*` variables are already on the root. Feed your library's own theme from them and re-draw on a change; never re-colour it token by token. |
+| `chimaera.visibility`, `onVisibility(fn)` | Whether the page is shown. **Stop drawing while hidden.** |
+| `await chimaera.url(path)` | A URL your page `fetch`es, by Range too: a workspace path (needs `[access] files = "read"`; never `..` or a link) or `output:<path>`. It stays valid while the page keeps using it. |
+| `chimaera.act(action, payload)` | Your plugin's `on_action` for the view, or a built-in action. At most ten a second. |
+| `chimaera.status({state, text})` | A small line under the page, only while it says something: `warn` and `bad` at once, `busy` once it lasts past 0.6 s; `ok` and `idle` show nothing. Report a state, never narrate what the page did. |
+| `chimaera.reference({text, file?, line?, crop?})` | A draft for the agent the person works with, with a picture: `crop` is a Blob, a canvas, or a rect of the page. Honoured only right after a press in the page; never sent on its own. |
+| `await chimaera.save(name, blob)` | Writes `output:<name>` (≤ 8 MiB, within the output quota). |
+
+**What the page may reach.** The page has no origin. Its CSP: scripts,
+styles and fonts from the daemon (its own bundle), `'unsafe-eval'` and
+`'wasm-unsafe-eval'`, images and media from the daemon, `data:` and
+`blob:`, and requests to the daemon and the hosts in `network` only.
+Workers only from `blob:` (fetch a worker script from the bundle and start it from a `blob:` URL, so it keeps the page's CSP). No forms, no popups, no navigating away: a framed
+page sits inside a guard that stops its navigation, and the app's own view
+refuses it. Every file of the bundle is served with
+`Access-Control-Allow-Origin: *`, so ES modules load from it.
+
+**Limits.** At most four web views run in a window; the least recently
+shown closes first and shows its last picture. A view hidden for two
+minutes closes. A page must stop drawing while hidden.
+
+**Libraries for agents' pages.** An agent's page in a workspace where
+your plugin is on may import a declared library as
+`chimaera:lib/<name>/<file>` (a `<script src>` or an `import`). Where the
+plugin is off the import fails and the page's host offers to turn it on.
+A page that imports it may also reach your declared hosts.
+
 ### Testing a 0.2 plugin
 
 `plugins/test-platform` uses every node, import and event once; the daemon's
 `tests/plugin_platform.rs` drives it through the routes (render, actions, file
 actions, query, settings, output, surfaces, file events, a restart).
+`plugins/test-web` covers web views (`tests/plugin_web.rs`: the manifest
+and Can list, the bundle, a page's grant and CSP, `url` by Range, `save`,
+the refusals, and an agent's page importing its library).
 `plugins/test-privileged` does the same for programs and tools
 (`tests/plugin_jobs.rs`: a job and its event, the limits, the queue, a tool
 served by a local fake host, a wrong checksum, a waiting agent tool). Copy

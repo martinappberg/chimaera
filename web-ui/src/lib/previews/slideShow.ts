@@ -73,3 +73,18 @@ export function deckStep(
   if (slide === at.slide) return { slide: at.slide, build };
   return { slide, build: delta === 1 ? 0 : count(slide) - 1 };
 }
+
+/**
+ * The slides one click from `at` can land on, back and forward (none at an
+ * end): with builds, the show needs these slides' build counts before the
+ * click, or a step back lands on a slide's first build instead of its last.
+ */
+export function showReach(hidden: readonly boolean[], at: number, skipHidden: boolean): number[] {
+  const flags = skipHidden ? hidden : hidden.map(() => false);
+  const out: number[] = [];
+  for (const delta of [-1, 1] as const) {
+    const to = showStep(flags, at, delta);
+    if (to !== at) out.push(to);
+  }
+  return out;
+}
