@@ -27,6 +27,11 @@ PTY snapshot-on-attach ([terminals.md](terminals.md)) and the chat seq-journal g
   alive (live pid **and** an HTTP answer on its port — a crash leftover or recycled pid doesn't
   block startup): a second daemon over the same ledger would respawn every session again as
   duplicate agent processes. Parallel daemons are sanctioned only via distinct `CHIMAERA_HOME`s.
+- **Hot state on Windows.** Per-session agent files (settings, MCP config, statusline) live in the
+  runtime dir, which the OS scrubs on Unix. Nothing scrubs `%LOCALAPPDATA%\chimaera\run`, so past
+  the one-daemon refusal and before resurrection, `serve` removes every session's set whose files
+  all sat untouched for 3 days (`agents::sweep_runtime_files_at_start`); a resurrected session
+  writes any file it lacks.
 
 ## Session ledger + restart handoff
 

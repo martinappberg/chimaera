@@ -130,7 +130,8 @@ on the alternate screen cannot restore the primary screen's scrollback
 - Hot state (socket, session index, replay rings) on node-local disk
   (`$XDG_RUNTIME_DIR`/`/tmp/chimaera-$UID`) — with the caveat that tmpfs is wiped on
   last-logout and cluster `/tmp` is night-scrubbed; the daemon must treat hot state as
-  reconstructible.
+  reconstructible. Windows has no such scrub (`%LOCALAPPDATA%\chimaera\run`), so the
+  daemon sweeps its stale per-session agent files there itself at start.
 - Durable state as append-only, size-capped JSONL under `~/.chimaera` (opencode's multi-GB
   unbounded-growth mistake is a named anti-goal; HPC home quotas are small).
 - Native conversation stores provide resume handles; Chimaera also persists its
