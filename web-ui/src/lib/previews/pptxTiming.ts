@@ -3,18 +3,34 @@
  * slide's state after each build. Pure: no DOM, no Svelte.
  *
  * The contract is `fixtures/pptx-timing/README.md`: what PowerPoint writes,
- * the effect vocabulary, and the golden JSON each corpus deck must parse to.
- * The PowerPoint plugin's Rust parser is held to the same goldens, so a
- * change in what this module returns for the corpus is a contract change.
+ * the effect vocabulary, the rules below, and the golden JSON each corpus
+ * deck and case must parse to. The PowerPoint plugin's Rust parser is held
+ * to the same goldens, so a change in what this module returns for the
+ * corpus is a contract change.
  *
  * Reads the timing tree as PowerPoint plays it: an effect starts at the sum
  * of the delays on its path below its click group (PowerPoint writes an
  * "after previous" effect's group delay as the end of what came before it).
- * Everything here degrades instead of throwing: XML that doesn't scan, or a
- * tree past the caps, yields a plain slide with an `approximate` reason.
+ *
+ * Caps (past any, the slide plays as a plain slide with an `approximate`
+ * code; the slide-part bound comes first because `scan` runs before the
+ * timing-level caps can be measured):
+ * - the slide part is at most 4 MiB of UTF-8;
+ * - the `p:timing` source is at most 512 KiB, measured in UTF-8 bytes;
+ * - at most 2,000 effects, counting every `p:cTn` in `p:timing` that has
+ *   `presetClass` or one of the three effect `nodeType`s, interactive
+ *   sequences included;
+ * - at most 300 click groups in the main sequence;
+ * - nesting counts `p:par`/`p:seq`/`p:excl` containers, starting at 1 for
+ *   the root `p:par` under `p:tnLst`; more than 32 is over.
+ * Nothing here throws: XML `scan` refuses is a plain slide too.
+ *
+ * Every string the file supplies is treated as hostile: vocabulary lookups
+ * go through `Map`s, objects keyed by file ids have no prototype, and a
+ * shape id is accepted only as 1–10 ASCII digits.
  */
 
-import { attr, decodeEntities, PptxXmlError, scan, type XmlEl } from "./pptxXml";
+import { attr, decodeEntities, scan, type XmlEl } from "./pptxXml";
 
 const NS_P = new Set([
   "http://schemas.openxmlformats.org/presentationml/2006/main",
@@ -26,14 +42,16 @@ const NS_P159 = "http://schemas.microsoft.com/office/powerpoint/2015/09/main";
 /** Namespaces whose `mc:Choice` we take: what PowerPoint wraps transitions in. */
 const UNDERSTOOD = new Set([NS_P14, NS_P159]);
 
-/** Past any of these the slide plays as a plain slide (`approximate` says why). */
+/** Past any of these the slide plays as a plain slide (`approximate` says which). */
 export const TIMING_CAPS = {
-  /** Characters of `p:timing` source. */
-  xmlChars: 512 * 1024,
+  /** UTF-8 bytes of the slide part. */
+  partBytes: 4 * 1024 * 1024,
+  /** UTF-8 bytes of the `p:timing` source. */
+  timingBytes: 512 * 1024,
   effects: 2000,
+  /** Click groups in the main sequence. */
   clicks: 300,
-  /** Time containers (`p:par`, `p:seq`, `p:excl`) nested in `p:timing`;
-   *  PowerPoint's own main sequence nests five. */
+  /** `p:par`/`p:seq`/`p:excl` nesting, the root `p:par` being 1. */
   depth: 32,
 } as const;
 
@@ -61,8 +79,18 @@ export type EffectName =
 
 export type Side = "top" | "right" | "bottom" | "left";
 
+/** Why a slide's timing was dropped; the codes are part of the contract. */
+export type Approximate =
+  | "unreadable"
+  | "unexpected"
+  | "part-too-large"
+  | "timing-too-large"
+  | "too-many-effects"
+  | "too-many-clicks"
+  | "too-deep";
+
 export interface Target {
-  /** Shape id (`cNvPr@id`) as written. */
+  /** Shape id (`cNvPr@id`): 1–10 ASCII digits. */
   spid: string;
   /** The text box's background (`p:bg`). */
   bg: boolean;
@@ -75,7 +103,7 @@ export type TimeValue = string | number | boolean;
 export interface Color {
   /** The colour element's local name (`srgbClr`, `schemeClr`, `hsl`, `rgb`, …). */
   type: string;
-  /** Its attributes, as written. */
+  /** Its attributes, as written (no prototype: keys are the file's). */
   attrs: Record<string, string>;
 }
 
@@ -83,10 +111,10 @@ interface BehaviourBase {
   target: Target | null;
   /** Offset from the effect's start, ms. */
   delay: number;
-  /** One iteration, ms; null for `indefinite`. */
+  /** One iteration, ms; null for `indefinite`, absent or malformed. */
   dur: number | null;
-  /** 1000ths of an iteration (1000 = once); Infinity for `indefinite`. */
-  repeatCount: number;
+  /** 1000ths of an iteration (1000 = once); null for `indefinite`. */
+  repeatCount: number | null;
   autoRev: boolean;
   /** 1000ths of the duration spent accelerating / decelerating. */
   accel: number;
@@ -125,7 +153,7 @@ export interface Effect {
   trigger: Trigger;
   /** From the start of the step, ms. */
   start: number;
-  /** ms; null when nothing in it ends (every behaviour `indefinite`). */
+  /** ms; null when nothing in it ends (see the README's duration rule). */
   dur: number | null;
   presetClass: string | null;
   preset: number;
@@ -134,7 +162,7 @@ export interface Effect {
   /** For fly and wipe: the side, from the subtype. */
   dir: Side | null;
   target: Target | null;
-  /** What it leaves the target's visibility at (its last `style.visibility` set). */
+  /** What it leaves the target's visibility at (its visibility set that ends last). */
   sets: Visibility | null;
   /** The motion path, on `path` effects. */
   path: string | null;
@@ -144,7 +172,7 @@ export interface Effect {
   accel: number;
   decel: number;
   autoRev: boolean;
-  repeatCount: number;
+  repeatCount: number | null;
   behaviours: Behaviour[];
 }
 
@@ -188,14 +216,61 @@ export interface SlideTimeline {
   interactive: InteractiveSequence[];
   builds: BuildLabel[];
   /** Why the timing was dropped (the slide then plays as a plain slide). */
-  approximate: string | null;
+  approximate: Approximate | null;
 }
 
 export interface BuildState {
   /** Target keys not on screen, sorted. */
   hidden: string[];
-  /** Target key → summed path offset [dx, dy] in slide fractions, keys sorted. */
+  /** Target key → summed path offset [dx, dy] in slide fractions, keys sorted.
+   *  No prototype: keys come from the file. */
   moved: Record<string, [number, number]>;
+}
+
+// --- numbers and strings -----------------------------------------------------------
+
+const INT = /^-?[0-9]{1,9}$/;
+const SPID = /^[0-9]{1,10}$/;
+
+/** An integer attribute: an optional `-` and 1–9 ASCII digits, else null. */
+function intOf(v: string | null): number | null {
+  return v !== null && INT.test(v) ? Number(v) : null;
+}
+/** An integer that counts as 0 below 0. */
+function natOf(v: string | null): number | null {
+  const n = intOf(v);
+  return n === null ? null : Math.max(0, n);
+}
+/** A real number (in-memory values only: scale, tav, colour; never contract fields). */
+function numOf(v: string | null): number | null {
+  if (v === null || v.trim() === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+function truthy(v: string | null): boolean {
+  return v === "1" || v === "true";
+}
+
+/** UTF-8 length of `s`, stopping once it passes `limit` (a lone surrogate
+ *  counts 3, as a UTF-8 encoder writes U+FFFD for it). */
+function utf8Over(s: string, start: number, end: number, limit: number): boolean {
+  if (end - start > limit) return true;
+  if ((end - start) * 3 <= limit) return false;
+  let n = 0;
+  for (let i = start; i < end; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) n += 1;
+    else if (c < 0x800) n += 2;
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < end) {
+      const d = s.charCodeAt(i + 1);
+      if (d >= 0xdc00 && d <= 0xdfff) {
+        n += 4;
+        i++;
+      } else n += 3;
+    } else n += 3;
+    if (n > limit) return true;
+  }
+  return false;
 }
 
 // --- tree helpers ----------------------------------------------------------------
@@ -211,18 +286,6 @@ function childrenP(el: XmlEl | undefined, local: string): XmlEl[] {
 }
 function text(xml: string, el: XmlEl): string {
   return decodeEntities(xml.slice(el.openEnd, el.closeStart)).trim();
-}
-function intOf(v: string | null): number | null {
-  if (v === null || !/^\s*-?\d+\s*$/.test(v)) return null;
-  return Number(v.trim());
-}
-function numOf(v: string | null): number | null {
-  if (v === null || v.trim() === "") return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-}
-function truthy(v: string | null): boolean {
-  return v === "1" || v === "true";
 }
 /** An attribute by namespace + local name, whatever prefix the part binds. */
 function attrNs(xml: string, el: XmlEl, ns: string, local: string): string | null {
@@ -259,36 +322,41 @@ function resolvedChildren(xml: string, el: XmlEl): XmlEl[] {
 
 // --- vocabulary ------------------------------------------------------------------
 
-const ENTR_EXIT: Record<number, string> = {
-  1: "appear",
-  2: "fly",
-  3: "blinds",
-  4: "box",
-  6: "circle",
-  9: "dissolve",
-  10: "fade",
-  16: "split",
-  21: "wheel",
-  22: "wipe",
-  23: "zoom",
-  42: "float",
-};
-const EMPH: Record<number, EffectName> = {
-  1: "fill-color",
-  6: "grow-shrink",
-  8: "spin",
-  9: "transparency",
-  24: "darken",
-  32: "teeter",
-};
-const SIDES: Record<number, Side> = { 1: "top", 2: "right", 4: "bottom", 8: "left" };
+const ENTR_EXIT = new Map<number, string>([
+  [1, "appear"],
+  [2, "fly"],
+  [3, "blinds"],
+  [4, "box"],
+  [6, "circle"],
+  [9, "dissolve"],
+  [10, "fade"],
+  [16, "split"],
+  [21, "wheel"],
+  [22, "wipe"],
+  [23, "zoom"],
+  [42, "float"],
+]);
+const EMPH = new Map<number, EffectName>([
+  [1, "fill-color"],
+  [6, "grow-shrink"],
+  [8, "spin"],
+  [9, "transparency"],
+  [24, "darken"],
+  [32, "teeter"],
+]);
+const SIDES = new Map<number, Side>([
+  [1, "top"],
+  [2, "right"],
+  [4, "bottom"],
+  [8, "left"],
+]);
 
 /** The vocabulary name for a preset (`other` outside it). */
 export function effectName(presetClass: string | null, preset: number): EffectName {
   if (presetClass === "path") return "path";
-  if (presetClass === "emph") return EMPH[preset] ?? "other";
+  if (presetClass === "emph") return EMPH.get(preset) ?? "other";
   if (presetClass !== "entr" && presetClass !== "exit") return "other";
-  const base = ENTR_EXIT[preset];
+  const base = ENTR_EXIT.get(preset);
   if (base === undefined) return "other";
   if (base === "appear") return presetClass === "entr" ? "appear" : "disappear";
   return `${base}-${presetClass === "entr" ? "in" : "out"}` as EffectName;
@@ -297,7 +365,7 @@ export function effectName(presetClass: string | null, preset: number): EffectNa
 function effectDir(presetClass: string | null, preset: number, subtype: number): Side | null {
   if (presetClass !== "entr" && presetClass !== "exit") return null;
   if (preset !== 2 && preset !== 22) return null;
-  return SIDES[subtype] ?? null;
+  return SIDES.get(subtype) ?? null;
 }
 
 // --- targets ---------------------------------------------------------------------
@@ -309,19 +377,24 @@ export function targetKey(t: Target): string {
   return t.spid;
 }
 
+/** A shape id as the contract accepts it, else null. */
+function spidOf(v: string | null): string | null {
+  return v !== null && SPID.test(v) ? v : null;
+}
+
 function readTarget(xml: string, tgtEl: XmlEl | undefined): Target | null {
   if (tgtEl === undefined) return null;
   const sp = childP(tgtEl, "spTgt") ?? childP(tgtEl, "inkTgt");
   if (sp === undefined) return null;
-  const spid = attr(xml, sp, "spid");
+  const spid = spidOf(attr(xml, sp, "spid"));
   if (spid === null) return null;
-  const tx = childP(sp, "txEl");
-  const pRg = childP(tx, "pRg");
+  const pRg = childP(childP(sp, "txEl"), "pRg");
   let para: [number, number] | null = null;
   if (pRg !== undefined) {
     const st = intOf(attr(xml, pRg, "st"));
     const end = intOf(attr(xml, pRg, "end"));
-    if (st !== null && end !== null) para = [st, end];
+    if (st === null || end === null || st < 0 || end < 0) return null;
+    para = [st, end];
   }
   // A character range (`charRg`), sub-shape and chart element animate within
   // the shape; until playback models them they target the whole shape.
@@ -330,12 +403,13 @@ function readTarget(xml: string, tgtEl: XmlEl | undefined): Target | null {
 
 // --- timing ----------------------------------------------------------------------
 
-/** A time node's start delay: its first plain `p:cond delay` (no event). */
+/** A time node's start delay: its first `p:cond` without `evt` whose
+ *  `delay` is an integer (negative counts as 0); 0 when none is. */
 function condDelay(xml: string, cTn: XmlEl): number {
   for (const c of childrenP(childP(cTn, "stCondLst"), "cond")) {
     if (attr(xml, c, "evt") !== null) continue;
-    const d = intOf(attr(xml, c, "delay"));
-    if (d !== null) return Math.max(0, d);
+    const d = natOf(attr(xml, c, "delay"));
+    if (d !== null) return d;
   }
   return 0;
 }
@@ -343,30 +417,23 @@ function condDelay(xml: string, cTn: XmlEl): number {
 interface NodeTiming {
   delay: number;
   dur: number | null;
-  repeatCount: number;
+  repeatCount: number | null;
   autoRev: boolean;
   accel: number;
   decel: number;
 }
 
 function nodeTiming(xml: string, cTn: XmlEl | undefined): NodeTiming {
-  if (cTn === undefined) return { delay: 0, dur: 0, repeatCount: 1000, autoRev: false, accel: 0, decel: 0 };
-  const durRaw = attr(xml, cTn, "dur");
-  const repRaw = attr(xml, cTn, "repeatCount");
+  if (cTn === undefined) return { delay: 0, dur: null, repeatCount: 1000, autoRev: false, accel: 0, decel: 0 };
+  const rep = attr(xml, cTn, "repeatCount");
   return {
     delay: condDelay(xml, cTn),
-    dur: durRaw === "indefinite" ? null : Math.max(0, intOf(durRaw) ?? 0),
-    repeatCount: repRaw === "indefinite" ? Number.POSITIVE_INFINITY : Math.max(0, intOf(repRaw) ?? 1000),
+    dur: natOf(attr(xml, cTn, "dur")),
+    repeatCount: rep === "indefinite" ? null : (natOf(rep) ?? 1000),
     autoRev: truthy(attr(xml, cTn, "autoRev")),
     accel: intOf(attr(xml, cTn, "accel")) ?? 0,
     decel: intOf(attr(xml, cTn, "decel")) ?? 0,
   };
-}
-
-/** How long a node runs once its delay has passed; null when it never ends. */
-function activeSpan(t: { dur: number | null; repeatCount: number; autoRev: boolean }): number | null {
-  if (t.dur === null || !Number.isFinite(t.repeatCount)) return null;
-  return Math.round(t.dur * (t.repeatCount / 1000) * (t.autoRev ? 2 : 1));
 }
 
 function timeValue(xml: string, holder: XmlEl | undefined): TimeValue | null {
@@ -396,7 +463,7 @@ function point(xml: string, el: XmlEl | undefined): Point | null {
 function color(xml: string, el: XmlEl | undefined): Color | null {
   const c = el?.children[0];
   if (c === undefined) return null;
-  const attrs: Record<string, string> = {};
+  const attrs = Object.create(null) as Record<string, string>;
   for (const a of c.attrs) attrs[a.qname] = decodeEntities(xml.slice(a.valueStart, a.valueEnd));
   return { type: c.local, attrs };
 }
@@ -506,24 +573,34 @@ function isVisibilitySet(b: Behaviour): b is Behaviour & { kind: "set" } {
   return b.kind === "set" && b.attrs.includes("style.visibility");
 }
 
-/** When a behaviour ends, relative to its effect. A `set`'s 1 ms is
- *  PowerPoint's "instant" (an appear lasts nothing, and the effect after it
- *  starts at 0), so it ends where it starts. */
-function behaviourEnd(b: Behaviour): number | null {
-  if (b.kind === "set" && b.dur === 1) return b.delay;
-  const span = activeSpan(b);
-  return span === null ? null : b.delay + span;
+/**
+ * When a behaviour ends, relative to its effect, in thousandths of a ms
+ * (exact integers): delay + dur × repeatCount/1000 × (2 with autoRev).
+ * `indefinite` (dur absent, malformed or `indefinite`, or repeatCount
+ * `indefinite`) is null. A `set` whose dur is exactly 1 is PowerPoint's
+ * "instant" and counts as dur 0: an appear lasts nothing, and PowerPoint
+ * starts the "after previous" effect that follows it at 0.
+ */
+function behaviourEnd(b: BehaviourBase & { kind: string }): bigint | null {
+  if (b.dur === null || b.repeatCount === null) return null;
+  const dur = b.kind === "set" && b.dur === 1 ? 0 : b.dur;
+  return BigInt(b.delay) * 1000n + BigInt(dur) * BigInt(b.repeatCount) * (b.autoRev ? 2n : 1n);
 }
 
-const NODE_TRIGGERS: Record<string, Trigger> = {
-  clickEffect: "click",
-  withEffect: "with",
-  afterEffect: "after",
-};
+/** `n / d` rounded half away from zero (n, d ≥ 0). */
+function roundDiv(n: bigint, d: bigint): number {
+  return Number((2n * n + d) / (2n * d));
+}
+
+const NODE_TRIGGERS = new Map<string, Trigger>([
+  ["clickEffect", "click"],
+  ["withEffect", "with"],
+  ["afterEffect", "after"],
+]);
 
 function isEffectNode(xml: string, cTn: XmlEl): boolean {
   const nodeType = attr(xml, cTn, "nodeType");
-  return (nodeType !== null && nodeType in NODE_TRIGGERS) || attr(xml, cTn, "presetClass") !== null;
+  return (nodeType !== null && NODE_TRIGGERS.has(nodeType)) || attr(xml, cTn, "presetClass") !== null;
 }
 
 function readEffect(xml: string, cTn: XmlEl, start: number, first: boolean): Effect {
@@ -533,32 +610,38 @@ function readEffect(xml: string, cTn: XmlEl, start: number, first: boolean): Eff
   const nodeType = attr(xml, cTn, "nodeType");
   const behaviours: Behaviour[] = [];
   readBehaviours(xml, childP(cTn, "childTnLst"), 0, behaviours);
-
-  let span: number | null = 0;
-  let finite = behaviours.length === 0;
-  for (const b of behaviours) {
-    const end = behaviourEnd(b);
-    if (end === null) continue;
-    finite = true;
-    span = Math.max(span ?? 0, end);
-  }
   const t = nodeTiming(xml, cTn);
-  const dur = finite ? activeSpan({ dur: span, repeatCount: t.repeatCount, autoRev: t.autoRev }) : null;
 
-  // The visibility the effect leaves: its last set in time (ties: document order).
-  let sets: Visibility | null = null;
-  let setAt = Number.NEGATIVE_INFINITY;
+  // Span: the latest finite end; null when none is finite or any repeats forever.
+  let span: bigint | null = null;
+  let forever = t.repeatCount === null;
   for (const b of behaviours) {
-    if (!isVisibilitySet(b) || b.delay < setAt) continue;
-    if (b.to === "visible" || b.to === "hidden") {
+    if (b.repeatCount === null) forever = true;
+    const end = behaviourEnd(b);
+    if (end !== null && (span === null || end > span)) span = end;
+  }
+  const dur =
+    forever || span === null
+      ? null
+      : roundDiv(span * BigInt(t.repeatCount ?? 1000) * (t.autoRev ? 2n : 1n), 1_000_000n);
+
+  // The visibility the effect leaves: its set that ends last (a set that never
+  // ends counts as last; ties: the later in document order).
+  let sets: Visibility | null = null;
+  let setEnd: bigint | null | undefined;
+  for (const b of behaviours) {
+    if (!isVisibilitySet(b) || (b.to !== "visible" && b.to !== "hidden")) continue;
+    const end = behaviourEnd(b);
+    const wins = setEnd === undefined || end === null || (setEnd !== null && end >= setEnd);
+    if (wins) {
       sets = b.to;
-      setAt = b.delay;
+      setEnd = end;
     }
   }
   const motion = behaviours.find((b) => b.kind === "motion");
   const name = effectName(presetClass, preset);
   return {
-    trigger: (nodeType === null ? undefined : NODE_TRIGGERS[nodeType]) ?? (first ? "click" : "with"),
+    trigger: (nodeType === null ? undefined : NODE_TRIGGERS.get(nodeType)) ?? (first ? "click" : "with"),
     start,
     dur,
     presetClass,
@@ -604,14 +687,23 @@ function groupsOf(seqCTn: XmlEl): XmlEl[] {
     .filter((c): c is XmlEl => c !== undefined);
 }
 
+/** A sequence's clicks: one effect list per group that yields any effect. */
+function readSteps(xml: string, groups: readonly XmlEl[]): Effect[][] {
+  return groups.map((g) => readGroup(xml, g)).filter((s) => s.length > 0);
+}
+
 // --- transition ------------------------------------------------------------------
 
-const SPEED: Record<string, number> = { fast: 500, med: 750, slow: 1000 };
+const SPEED = new Map<string, number>([
+  ["fast", 500],
+  ["med", 750],
+  ["slow", 1000],
+]);
 const IGNORED_TRANSITION_CHILDREN = new Set(["sndAc", "extLst"]);
 
 function readTransition(xml: string, el: XmlEl): Transition {
-  const p14dur = intOf(attrNs(xml, el, NS_P14, "dur"));
-  const spd = attr(xml, el, "spd") ?? "fast";
+  const p14dur = natOf(attrNs(xml, el, NS_P14, "dur"));
+  const spd = attr(xml, el, "spd");
   const effect = el.children.find((c) => !(NS_P.has(c.ns) && IGNORED_TRANSITION_CHILDREN.has(c.local)));
   let kind: Transition["kind"] = "other";
   let morph: string | null = null;
@@ -627,8 +719,8 @@ function readTransition(xml: string, el: XmlEl): Transition {
   return {
     kind,
     dir: effect === undefined ? null : attr(xml, effect, "dir"),
-    dur: p14dur !== null && p14dur >= 0 ? p14dur : (SPEED[spd] ?? 500),
-    advanceAfter: intOf(attr(xml, el, "advTm")),
+    dur: p14dur ?? (spd === null ? undefined : SPEED.get(spd)) ?? 500,
+    advanceAfter: natOf(attr(xml, el, "advTm")),
     advanceOnClick: !(advClick === "0" || advClick === "false"),
     morph,
     element: effect?.local ?? null,
@@ -637,12 +729,12 @@ function readTransition(xml: string, el: XmlEl): Transition {
 
 // --- the slide ----------------------------------------------------------------------
 
-function plain(transition: Transition | null, approximate: string | null): SlideTimeline {
+function plain(transition: Transition | null, approximate: Approximate | null): SlideTimeline {
   return { steps: [[]], transition, interactive: [], builds: [], approximate };
 }
 
-/** Time-node nesting (`p:par`/`p:seq`/`p:excl`) and effect count below
- *  `timing`, without recursion. */
+/** Container nesting (the root `p:par` is 1) and effect count in `timing`,
+ *  without recursion. */
 function measure(xml: string, timing: XmlEl): { depth: number; effects: number } {
   let depth = 0;
   let effects = 0;
@@ -660,7 +752,7 @@ function measure(xml: string, timing: XmlEl): { depth: number; effects: number }
 
 function readBuilds(xml: string, bldLst: XmlEl | undefined): BuildLabel[] {
   return (bldLst?.children ?? []).flatMap((b) => {
-    const spid = attr(xml, b, "spid");
+    const spid = spidOf(attr(xml, b, "spid"));
     if (spid === null) return [];
     return [
       {
@@ -677,17 +769,18 @@ function readBuilds(xml: string, bldLst: XmlEl | undefined): BuildLabel[] {
 
 /** Read a slide part's timing and transition. Never throws. */
 export function parseTimeline(slideXml: string): SlideTimeline {
+  if (utf8Over(slideXml, 0, slideXml.length, TIMING_CAPS.partBytes)) return plain(null, "part-too-large");
   let root: XmlEl;
   try {
     root = scan(slideXml);
-  } catch (e) {
-    return plain(null, `unreadable XML${e instanceof PptxXmlError ? ` (${e.message})` : ""}`);
+  } catch {
+    return plain(null, "unreadable");
   }
   try {
     return readSlide(slideXml, root);
-  } catch (e) {
+  } catch {
     // XML of a shape nothing here expected degrades; it never takes the slide down.
-    return plain(null, `unexpected XML (${e instanceof Error ? e.message : String(e)})`);
+    return plain(null, "unexpected");
   }
 }
 
@@ -701,10 +794,10 @@ function readSlide(xml: string, root: XmlEl): SlideTimeline {
   const transition = transitionEl === undefined ? null : readTransition(xml, transitionEl);
   if (timing === undefined) return plain(transition, null);
 
-  if (timing.end - timing.start > TIMING_CAPS.xmlChars) return plain(transition, "timing XML over 512 KB");
+  if (utf8Over(xml, timing.start, timing.end, TIMING_CAPS.timingBytes)) return plain(transition, "timing-too-large");
   const m = measure(xml, timing);
-  if (m.depth > TIMING_CAPS.depth) return plain(transition, `timing nested deeper than ${TIMING_CAPS.depth}`);
-  if (m.effects > TIMING_CAPS.effects) return plain(transition, `more than ${TIMING_CAPS.effects} effects`);
+  if (m.depth > TIMING_CAPS.depth) return plain(transition, "too-deep");
+  if (m.effects > TIMING_CAPS.effects) return plain(transition, "too-many-effects");
 
   const rootCTn = childrenP(childP(timing, "tnLst"), "par")
     .map((p) => childP(p, "cTn"))
@@ -714,12 +807,12 @@ function readSlide(xml: string, root: XmlEl): SlideTimeline {
     .filter((c): c is XmlEl => c !== undefined);
   const main = seqs.find((c) => attr(xml, c, "nodeType") === "mainSeq");
 
-  const steps: Effect[][] = (main === undefined ? [] : groupsOf(main)).map((g) => readGroup(xml, g));
-  // A first group that doesn't open with a click runs on entry: it is step 0.
+  const groups = main === undefined ? [] : groupsOf(main);
+  if (groups.length > TIMING_CAPS.clicks) return plain(transition, "too-many-clicks");
+  const steps = readSteps(xml, groups);
+  // A first group whose first effect isn't a click runs on entry: it is step 0.
   // Otherwise nothing runs on entry and every group is a click.
-  const first = steps[0]?.[0];
-  if (first === undefined || first.trigger === "click") steps.unshift([]);
-  if (steps.length - 1 > TIMING_CAPS.clicks) return plain(transition, `more than ${TIMING_CAPS.clicks} clicks`);
+  if (steps[0]?.[0]?.trigger !== "with" && steps[0]?.[0]?.trigger !== "after") steps.unshift([]);
 
   const interactive: InteractiveSequence[] = seqs
     .filter((c) => attr(xml, c, "nodeType") === "interactiveSeq")
@@ -730,7 +823,7 @@ function readSlide(xml: string, root: XmlEl): SlideTimeline {
         trigger = readTarget(xml, childP(cond, "tgtEl"))?.spid ?? null;
         if (trigger !== null) break;
       }
-      return { trigger, steps: groupsOf(c).map((g) => readGroup(xml, g)) };
+      return { trigger, steps: readSteps(xml, groupsOf(c)) };
     });
 
   return { steps, transition, interactive, builds: readBuilds(xml, childP(timing, "bldLst")), approximate: null };
@@ -738,87 +831,109 @@ function readSlide(xml: string, root: XmlEl): SlideTimeline {
 
 // --- build states -------------------------------------------------------------------
 
-/** Where a PowerPoint motion path ends, relative to where it starts. */
+const PATH_ARITY = new Map<string, number>([
+  ["M", 2],
+  ["L", 2],
+  ["C", 6],
+]);
+
+/**
+ * Where a PowerPoint motion path ends, relative to where it starts. Pairs
+ * after an `M` beyond the first are line-tos (they don't move the subpath
+ * start); `Z` returns to the subpath start; `E` or the end of the string ends
+ * the path; lowercase `m`/`l`/`c` are relative; any other command, or a
+ * number where none fits, stops the walk at the point reached so far.
+ */
 export function pathEnd(path: string): [number, number] {
-  const tokens = path.match(/[A-Za-z]|-?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?/g) ?? [];
+  const tokens = path.match(/[A-Za-z]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?/g) ?? [];
   let x = 0;
   let y = 0;
   let sx = 0;
   let sy = 0;
   let cmd = "";
   let i = 0;
-  const nums = (n: number): number[] | null => {
-    const out: number[] = [];
-    for (let k = 0; k < n; k++) {
-      const v = Number(tokens[i + k]);
-      if (tokens[i + k] === undefined || !Number.isFinite(v)) return null;
-      out.push(v);
-    }
-    i += n;
-    return out;
-  };
   while (i < tokens.length) {
     const tok = tokens[i]!;
-    if (/[A-Za-z]/.test(tok)) {
-      cmd = tok;
+    if (/^[A-Za-z]$/.test(tok)) {
       i++;
-      if (cmd === "Z" || cmd === "z") {
+      if (tok === "E" || tok === "e") break;
+      if (tok === "Z" || tok === "z") {
         x = sx;
         y = sy;
+        cmd = "";
+        continue;
       }
-      if (cmd === "E" || cmd === "e") break;
+      if (!PATH_ARITY.has(tok.toUpperCase())) break;
+      cmd = tok;
       continue;
     }
+    const arity = PATH_ARITY.get(cmd.toUpperCase());
+    if (arity === undefined || i + arity > tokens.length) break;
+    const v = tokens.slice(i, i + arity).map(Number);
+    if (v.some((n) => !Number.isFinite(n))) break;
+    i += arity;
     const rel = cmd === cmd.toLowerCase();
-    const arity = { M: 2, L: 2, C: 6 }[cmd.toUpperCase()];
-    const v = arity === undefined ? null : nums(arity);
-    if (v === null) break;
-    const nx = v[v.length - 2]! + (rel ? x : 0);
-    const ny = v[v.length - 1]! + (rel ? y : 0);
-    x = nx;
-    y = ny;
+    x = v[arity - 2]! + (rel ? x : 0);
+    y = v[arity - 1]! + (rel ? y : 0);
     if (cmd === "M" || cmd === "m") {
       sx = x;
       sy = y;
+      cmd = cmd === "M" ? "L" : "l";
     }
   }
   return [x, y];
 }
 
+/** To 4 decimals, half away from zero, never −0. */
 function round4(n: number): number {
-  return Math.round(n * 1e4) / 1e4 + 0;
+  const r = (Math.sign(n) * Math.round(Math.abs(n) * 1e4)) / 1e4;
+  return r === 0 ? 0 : r;
 }
 
-function visibilityEvents(effects: readonly Effect[]): { key: string; to: Visibility; at: number }[] {
-  const out: { key: string; to: Visibility; at: number }[] = [];
+interface VisEvent {
+  key: string;
+  to: Visibility;
+  /** Thousandths of a ms from the step's start; null when it never ends. */
+  at: bigint | null;
+}
+
+function visibilityEvents(effects: readonly Effect[]): VisEvent[] {
+  const out: VisEvent[] = [];
   for (const e of effects) {
     for (const b of e.behaviours) {
-      if (!isVisibilitySet(b) || (b.to !== "visible" && b.to !== "hidden")) continue;
-      const t = b.target ?? e.target;
-      if (t !== null) out.push({ key: targetKey(t), to: b.to, at: e.start + b.delay });
+      // A behaviour without a target of its own changes nothing (README R3).
+      const t = b.target;
+      if (!isVisibilitySet(b) || (b.to !== "visible" && b.to !== "hidden") || t === null) continue;
+      const end = behaviourEnd(b);
+      out.push({ key: targetKey(t), to: b.to, at: end === null ? null : BigInt(e.start) * 1000n + end });
     }
   }
   return out;
 }
 
-/** Targets whose first visibility set (document order) is `visible`. */
-function enteringTargets(steps: readonly Effect[][]): Set<string> {
-  const first = new Map<string, Visibility>();
-  for (const step of steps) for (const ev of visibilityEvents(step)) if (!first.has(ev.key)) first.set(ev.key, ev.to);
-  return new Set([...first].filter(([, v]) => v === "visible").map(([k]) => k));
-}
-
 /** The slide after each step: `states[k]` is after step k. */
 export function buildStates(timeline: SlideTimeline): BuildState[] {
-  const always = new Set<string>();
-  for (const seq of timeline.interactive) for (const k of enteringTargets(seq.steps)) always.add(k);
-  const hidden = enteringTargets(timeline.steps);
+  // Initially hidden: targets whose first visibility set, reading the main
+  // sequence and then the interactive sequences in document order, is `visible`.
+  const first = new Map<string, Visibility>();
+  const all = [...timeline.steps, ...timeline.interactive.flatMap((s) => s.steps)];
+  for (const step of all) for (const ev of visibilityEvents(step)) if (!first.has(ev.key)) first.set(ev.key, ev.to);
+  const hidden = new Set([...first].filter(([, v]) => v === "visible").map(([k]) => k));
+
   const moved = new Map<string, [number, number]>();
   const out: BuildState[] = [];
   for (const step of timeline.steps) {
+    // In the order the sets end; one that never ends goes last; ties keep document order.
     const events = visibilityEvents(step)
       .map((ev, i) => ({ ...ev, i }))
-      .sort((a, b) => a.at - b.at || a.i - b.i);
+      .sort((a, b) => {
+        if (a.at !== b.at) {
+          if (a.at === null) return 1;
+          if (b.at === null) return -1;
+          return a.at < b.at ? -1 : 1;
+        }
+        return a.i - b.i;
+      });
     for (const ev of events) {
       if (ev.to === "hidden") hidden.add(ev.key);
       else hidden.delete(ev.key);
@@ -826,21 +941,19 @@ export function buildStates(timeline: SlideTimeline): BuildState[] {
     for (const e of step) {
       if (e.name !== "path") continue;
       for (const b of e.behaviours) {
-        if (b.kind !== "motion" || b.path === null) continue;
-        const t = b.target ?? e.target;
-        if (t === null) continue;
-        const key = targetKey(t);
+        if (b.kind !== "motion" || b.path === null || b.target === null) continue;
+        const key = targetKey(b.target);
         const [dx, dy] = pathEnd(b.path);
         const was = moved.get(key) ?? [0, 0];
         moved.set(key, [was[0] + dx, was[1] + dy]);
       }
     }
-    const movedOut: Record<string, [number, number]> = {};
+    const movedOut = Object.create(null) as Record<string, [number, number]>;
     for (const key of [...moved.keys()].sort()) {
       const [dx, dy] = moved.get(key)!;
       movedOut[key] = [round4(dx), round4(dy)];
     }
-    out.push({ hidden: [...new Set([...hidden, ...always])].sort(), moved: movedOut });
+    out.push({ hidden: [...hidden].sort(), moved: movedOut });
   }
   return out;
 }
@@ -868,7 +981,7 @@ export interface GoldenSlide {
   steps: GoldenEffect[][];
   states: BuildState[];
   interactive: number;
-  approximate?: string;
+  approximate?: Approximate;
 }
 
 /** A parsed slide in exactly the golden-file shape (key order included). */
