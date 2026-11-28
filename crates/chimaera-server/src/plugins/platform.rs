@@ -778,6 +778,8 @@ pub(crate) struct Platform {
     pub(crate) jobs: super::jobs::Jobs,
     /// Tool installs in flight (`toolchain`).
     pub(crate) installs: super::toolchain::Installs,
+    /// Web views: grants, data tickets, unpacked bundles (`web`).
+    pub(crate) web: super::web::Web,
 }
 
 impl Platform {
@@ -793,6 +795,7 @@ impl Platform {
             worker: Default::default(),
             jobs: Default::default(),
             installs: Default::default(),
+            web: Default::default(),
         }
     }
 }

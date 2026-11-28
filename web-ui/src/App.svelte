@@ -269,8 +269,10 @@
     closeAttachSheet,
     knowledgeProviderActive,
     onAgentPluginsChanged,
+    setWorkspacePluginOn,
     workspacePlugins,
   } from "./lib/plugins/store";
+  import { registerPluginOffers } from "./lib/shared/pageNeeds";
   import { platformFrame, pluginViewTitle, setViewOpener, setWindowCopier } from "./lib/plugins/platform";
   import ExtensionsGlyph from "./lib/plugins/ExtensionsGlyph.svelte";
   import ComputeStrip from "./lib/workspace/ComputeStrip.svelte";
@@ -804,10 +806,18 @@
     );
     const offAsk = registerAskAgent((text) => askAgentFrom(layout.focusedPaneId, text));
     const offPage = registerPageMessages(onPageMessage);
+    // A page's "This page uses <plugin>. Turn it on here": only a plugin
+    // installed and off in this workspace, by its own name.
+    const offOffers = registerPluginOffers((pid) => {
+      const p = get(workspacePlugins)?.plugins.find((x) => x.id === pid && x.installed);
+      if (p === undefined || p.on) return null;
+      return { name: p.name, turnOn: () => setWorkspacePluginOn(pid, true) };
+    });
     return () => {
       offOpen();
       offAsk();
       offPage();
+      offOffers();
     };
   });
 
@@ -2202,6 +2212,17 @@
    */
   function onPageMessage(m: PageMessage): "sent" | "drafted" | "none" {
     const text = pageMessageText(m);
+    // A picture (a page's `reference`): always a draft, with the picture.
+    if (m.image !== undefined && m.image !== null) {
+      const target = m.chat ?? refTargetSession?.id ?? null;
+      if (target === null) return "none";
+      void imageToAttachment(m.image).then((image) => {
+        const attachment = image === null ? undefined : { ...image, label: m.title || "page" };
+        if (m.chat !== null) insertIntoComposer(m.chat, text, "block", undefined, attachment);
+        else askAgentFrom(layout.focusedPaneId, text, attachment);
+      });
+      return "drafted";
+    }
     if (m.chat !== null) {
       const entry = chatPool.pool.get(m.chat);
       const started = sessionsById.get(m.chat)?.created_at;
@@ -2221,7 +2242,7 @@
     return askAgentFrom(layout.focusedPaneId, text) !== null ? "drafted" : "none";
   }
 
-  function askAgentFrom(paneId: string, text: string): string | null {
+  function askAgentFrom(paneId: string, text: string, image?: ImageAttachment): string | null {
     const target = refTargetSession;
     if (target === null) return null;
     if (sessionPaneId(layout, target.id) === null) {
@@ -2231,7 +2252,7 @@
     if (target.ui === "chat") {
       const loc = paneForTab(layout.root, { surface: "terminal", sessionId: target.id });
       if (loc !== null) layout = activateTab(layout, loc.paneId, loc.index);
-      insertIntoComposer(target.id, text, "block");
+      insertIntoComposer(target.id, text, "block", undefined, image);
     } else {
       // A terminal input submits on a newline: the draft goes in as one line.
       typeIntoSession(target.id, text.replace(/\s*\n\s*/g, " "));

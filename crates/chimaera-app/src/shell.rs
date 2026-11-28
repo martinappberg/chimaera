@@ -1299,6 +1299,7 @@ pub fn run() {
             native_view::native_view_close,
             native_view::native_view_snapshot,
             native_view::native_view_chip,
+            native_view::native_view_command,
             native_view::native_view_region,
             native_view::native_view_nav,
             native_view::native_view_drive,

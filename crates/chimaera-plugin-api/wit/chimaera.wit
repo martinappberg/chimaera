@@ -1,11 +1,12 @@
-package chimaera:plugin@0.2.0;
+package chimaera:plugin@0.3.0;
 
 // The platform world (docs/design/plugin-platform-plan.md). Everything 0.1 had keeps
 // its meaning; 0.2 adds the `platform` imports (output folders, data surfaces,
 // screens' invalidation, the watch set, declared settings, durable state, the
 // roots, and programs run as jobs), the `screens` exports (render, on-action,
-// tool-resume), new events, and `wait` on a tool result. The host serves 0.1
-// beside it (`wit-0.1/`).
+// tool-resume), new events, and `wait` on a tool result. 0.3 adds the `web`
+// export: the plugin's own web pages (docs/design/rich-views-plan.md, Part
+// 2). The host serves 0.1 and 0.2 beside it (`wit-0.1/`, `wit-0.2/`).
 
 interface types {
     /// A JSON document as text (serde on both sides).
@@ -170,9 +171,19 @@ interface screens {
     tool-resume: func(cx: context, name: string, job: string) -> tool-result;
 }
 
+/// The plugin's own web pages (0.3): the drawing areas a `web` node shows.
+interface web {
+    /// A tar of the pages, libraries and assets its manifest's `[web]`
+    /// names: plain files and folders only (no links, no absolute paths,
+    /// no `..`). The host asks once per installed build and unpacks it;
+    /// empty when the plugin has no pages.
+    web-bundle: func() -> list<u8>;
+}
+
 world chimaera-plugin {
     import host;
     import platform;
     export plugin;
     export screens;
+    export web;
 }

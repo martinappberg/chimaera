@@ -28,11 +28,27 @@
 //   adds where the text came from, and only a page embedded in a chat's own
 //   answer may send to that chat — anywhere else both become a draft in the
 //   agent's input, which the person sends or not.
+// - web/1 (docs/design/rich-views-plan.md, Part 2): `url(path)` (a URL the
+//   page may `fetch`, by Range too: a file beside an agent's page — with
+//   the key the daemon puts before this script for a page a host shows
+//   inside its guard — or one within a plugin's access), `reference({text, file?, line?, crop?})` (a
+//   draft with a picture, after a press), `visibility`/`onVisibility`; and
+//   on a plugin's page (served under `/web/{grant}/`) `data`/`onData` (its
+//   node's data), `act(action, payload)` (to its plugin), `status({state,
+//   text})` (its pill) and `save(name, blob)` (into its output folder).
+//   `url` and `save` go straight to the daemon under the page's own ticket;
+//   the rest through the host, which checks them. A host's word arrives as
+//   a `theme`/`data`/`visibility` command: posted by the parent window to a
+//   framed page, a `chimaera:host` event from the bridge in a native view.
 (() => {
   "use strict";
   if (globalThis.chimaera !== undefined) return;
   const framed = window.parent !== window;
   const TEXT_MAX = 4000;
+  // `/web/{grant}/…`: a plugin's page; `/raw/{ticket}[/…]`: an agent's.
+  const where = /^\/(web|raw)\/([^/]+)(\/.*)?$/.exec(location.pathname);
+  const plugin = where !== null && where[1] === "web";
+  const ticket = where !== null ? where[2] : null;
 
   const post = (msg) => {
     try {
@@ -183,12 +199,143 @@
     addEventListener("load", schedule);
     schedule();
   }
+  // The node's data and the page's visibility, as the host says them.
+  let data = null;
+  let haveData = false;
+  const dataListeners = new Set();
+  let visible = true;
+  const visibilityListeners = new Set();
+  const tell = (set, value) => {
+    for (const fn of set) {
+      try {
+        fn(value);
+      } catch (err) {
+        console.error(err);
+      }
+    }
+  };
+  const command = (cmd) => {
+    if (cmd === null || typeof cmd !== "object") return;
+    if (cmd.op === "theme") applyTheme(decodeTheme(cmd.theme));
+    else if (cmd.op === "data") {
+      data = cmd.data ?? null;
+      haveData = true;
+      tell(dataListeners, data);
+    } else if (cmd.op === "visibility" && typeof cmd.visible === "boolean" && cmd.visible !== visible) {
+      visible = cmd.visible;
+      tell(visibilityListeners, visible);
+    }
+  };
   if (framed) {
     addEventListener("message", (e) => {
       const cmd = e.source === window.parent ? e.data?.chimaeraPaneViewCommand : undefined;
-      if (cmd?.op === "theme") applyTheme(decodeTheme(cmd.theme));
+      command(cmd);
+    });
+  } else {
+    document.addEventListener("chimaera:host", (e) => {
+      if (typeof e.detail !== "string") return;
+      try {
+        command(JSON.parse(e.detail));
+      } catch {
+        /* not ours */
+      }
     });
   }
+  const dataKey = typeof globalThis.__chimaeraDataKey === "string" ? globalThis.__chimaeraDataKey : null;
+  // A plugin library this page imports whose plugin is off here: the
+  // daemon names it, and the host offers to turn it on.
+  const needs = globalThis.__chimaeraNeeds;
+  if (Array.isArray(needs) && needs.length > 0) post({ kind: "page_needs", plugins: needs });
+
+  const fail = (why) => Promise.reject(new Error(why));
+  const absolute = (u) => new URL(u, location.href).href;
+  // A data URL. An agent's page: a file in its own folder or below, read
+  // through `/webdata/{ticket}/…` (the folder route itself stays unreadable).
+  // A plugin's page: the daemon checks the path against its `[access]`.
+  const url = (path) => {
+    if (typeof path !== "string" || path === "" || ticket === null) return fail("chimaera.url needs a path");
+    if (plugin) {
+      return fetch(`/web/${ticket}/~url?path=${encodeURIComponent(path)}`).then(async (r) => {
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok || typeof body.url !== "string") throw new Error(body.error ?? `chimaera.url: ${r.status}`);
+        return absolute(body.url);
+      });
+    }
+    const folder = `/raw/${ticket}/`;
+    const base = where[3] === undefined ? `${location.origin}${folder}page` : location.href;
+    let u;
+    try {
+      u = new URL(path, base);
+    } catch {
+      return fail(`chimaera.url: ${path} is not a path`);
+    }
+    if (u.origin !== location.origin || !u.pathname.startsWith(folder)) {
+      return fail(`chimaera.url: ${path} is outside this page's folder`);
+    }
+    // The key a host that shows this page inside its guard was given
+    // (the daemon's, before this script); a page loaded any other way
+    // reads nothing.
+    if (typeof dataKey !== "string") return fail("chimaera.url: this page can't read files where it is shown");
+    return Promise.resolve(absolute(`/webdata/${dataKey}/${u.pathname.slice(folder.length)}`));
+  };
+
+  // A picture for `reference`: a Blob, a canvas, or a rectangle of the page
+  // the host takes a picture of (a native view only).
+  const CROP_INLINE_MAX = 150000;
+  const asBlob = (crop) =>
+    crop instanceof HTMLCanvasElement
+      ? new Promise((resolve) => crop.toBlob((b) => resolve(b), "image/png"))
+      : Promise.resolve(crop instanceof Blob ? crop : null);
+  const rectOf = (crop) => {
+    if (crop instanceof Element) {
+      const r = crop.getBoundingClientRect();
+      return { x: r.x, y: r.y, width: r.width, height: r.height };
+    }
+    if (crop !== null && typeof crop === "object" && Number.isFinite(crop.width) && Number.isFinite(crop.height)) {
+      return { x: Number(crop.x) || 0, y: Number(crop.y) || 0, width: crop.width, height: crop.height };
+    }
+    return null;
+  };
+  const dataUrl = (blob) =>
+    new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(typeof reader.result === "string" ? reader.result : null);
+      reader.onerror = () => resolve(null);
+      reader.readAsDataURL(blob);
+    });
+  const reference = async (ref) => {
+    if (ref === null || typeof ref !== "object" || typeof ref.text !== "string") return false;
+    const msg = {
+      kind: "web_reference",
+      text: ref.text.slice(0, TEXT_MAX),
+      file: typeof ref.file === "string" ? ref.file : null,
+      line: Number.isInteger(ref.line) ? ref.line : null,
+      title: document.title,
+    };
+    const blob = ref.crop === undefined || ref.crop === null ? null : await asBlob(ref.crop);
+    if (blob !== null) {
+      // A frame carries the Blob itself; a native view's bridge only text.
+      if (framed) msg.crop = blob;
+      else if (blob.size <= CROP_INLINE_MAX) msg.crop = await dataUrl(blob);
+      else msg.crop = rectOf(ref.crop);
+    } else if (ref.crop !== undefined && ref.crop !== null) msg.crop = rectOf(ref.crop);
+    post(msg);
+    return true;
+  };
+
+  const save = (name, blob) => {
+    if (!plugin) return fail("chimaera.save is for a plugin's page");
+    if (typeof name !== "string" || name === "" || !(blob instanceof Blob)) {
+      return fail("chimaera.save needs a name and a Blob");
+    }
+    return fetch(`/web/${ticket}/~save?name=${encodeURIComponent(name)}`, { method: "POST", body: blob }).then(
+      async (r) => {
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok || typeof body.path !== "string") throw new Error(body.error ?? `chimaera.save: ${r.status}`);
+        return body.path;
+      },
+    );
+  };
 
   const message = (kind) => (text) => {
     if (typeof text !== "string" || text.trim() === "") return false;
@@ -213,6 +360,53 @@
       send: message("page_send"),
       /** Ask to put `text` in the agent's input for the person to send. */
       draft: message("page_draft"),
+      /** "plugin" (a plugin's own page) or "agent" (a page an agent wrote). */
+      kind: plugin ? "plugin" : "agent",
+      /** A URL for a data file the page may `fetch` (Range works): a Promise. */
+      url,
+      /** Point the agent at something here, with a picture: a draft, after a press. */
+      reference,
+      /** Whether the page is shown; a hidden page stops drawing. */
+      get visibility() {
+        return visible;
+      },
+      /** Call `fn(visible)` when that changes; returns a function that stops it. */
+      onVisibility(fn) {
+        if (typeof fn !== "function") return () => {};
+        visibilityListeners.add(fn);
+        return () => visibilityListeners.delete(fn);
+      },
+      /** A plugin's page: its node's `data` (null until the host sends it). */
+      get data() {
+        return data;
+      },
+      /** Call `fn(data)` with the node's data now (if it came) and on each change. */
+      onData(fn) {
+        if (typeof fn !== "function") return () => {};
+        dataListeners.add(fn);
+        if (haveData) {
+          try {
+            fn(data);
+          } catch (err) {
+            console.error(err);
+          }
+        }
+        return () => dataListeners.delete(fn);
+      },
+      /** A plugin's page: run `action` of its plugin (or a built-in one). */
+      act(action, payload) {
+        if (!plugin || typeof action !== "string" || action === "") return false;
+        post({ kind: "web_act", action, payload: payload ?? null });
+        return true;
+      },
+      /** A plugin's page: its pill — `{state: "busy"|"ok"|"warn"|"bad"|"idle", text}`. */
+      status(s) {
+        if (!plugin || s === null || typeof s !== "object") return false;
+        post({ kind: "web_status", state: String(s.state ?? "idle"), text: String(s.text ?? "") });
+        return true;
+      },
+      /** A plugin's page: write `blob` to its output folder: a Promise of `output:<name>`. */
+      save,
     }),
   });
 })();

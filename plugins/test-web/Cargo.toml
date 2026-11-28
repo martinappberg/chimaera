@@ -1,0 +1,18 @@
+# The web views fixture (API 0.3): a plugin page in its bundle, a library it
+# lends agents' pages, and a declared host, driven by the daemon's tests
+# (crates/chimaera-server/src/tests/plugin_web.rs) and by hand in the
+# isolated preview. Laid out under plugins/dist-test, which only test builds
+# embed: never in a real catalog.
+[package]
+name = "chimaera-plugin-test-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+chimaera-plugin-api.workspace = true

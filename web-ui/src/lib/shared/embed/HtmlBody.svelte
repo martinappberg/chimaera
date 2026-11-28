@@ -21,7 +21,14 @@
    * up to the `LIVE_MAX` budget. Elsewhere — a browser tab, Linux, Windows,
    * an app build without pane views — it is the sandboxed frame
    * (`allow-scripts`, never same-origin; the response carries the same
-   * CSP).
+   * CSP), inside the navigation guard (`shared/guardFrame.ts`): the page
+   * reads the files beside it, so it must not be able to leave for another
+   * site.
+   *
+   * web/1 on an agent's page: its `reference` drafts with a picture of the
+   * page (into this chat, else the agent the person works with), and a
+   * plugin library it imports whose plugin is off here is offered to turn
+   * on (`shared/pageNeeds.ts`) above the card.
    */
   import { untrack } from "svelte";
   import SlowLoad from "../SlowLoad.svelte";
@@ -31,6 +38,10 @@
   import { withPageApi } from "../paneViewBridge";
   import { backgroundBehind, pageTheme, pageThemeOn } from "../pageTheme";
   import { pageMessage } from "../pageMessage";
+  import { guardedPage } from "../guardFrame";
+  import { cropBlob, referenceText } from "../pageCrop";
+  import { pluginOffer, type PluginOffer } from "../pageNeeds";
+  import type { WebEvent } from "../paneViewBridge";
 
   interface Props {
     /** The page's own `/raw` URL, as the card resolved it. */
@@ -138,6 +149,42 @@
   const onPageMessage = (m: { send: boolean; text: string; title: string }): void => {
     pageMessage({ chat, writtenAtMs, ...m });
   };
+  /** Plugins this page's libraries need that are off here, by their own
+   *  names (`pluginOffer`): the strip above the card. */
+  let needs = $state<(PluginOffer & { id: string })[]>([]);
+  let turningOn = $state(false);
+  /** A framed page loads again under a new key (after a plugin went on). */
+  let reloadKey = $state(0);
+  $effect(() => {
+    void pageUrl;
+    needs = [];
+  });
+  const onWeb = (ev: WebEvent): void => {
+    if (ev.kind === "page_needs") {
+      const seen = new Set<string>();
+      needs = ev.plugins.flatMap((p) => {
+        const offer = seen.has(p.plugin) ? null : pluginOffer(p.plugin);
+        seen.add(p.plugin);
+        return offer === null ? [] : [{ id: p.plugin, ...offer }];
+      });
+    } else if (ev.kind === "web_reference") {
+      const text = referenceText(ev.text, ev.file, ev.line);
+      void cropBlob(ev.crop, native ? control : null).then((image) =>
+        pageMessage({ chat, writtenAtMs, send: false, text, title: ev.title, image }),
+      );
+    }
+  };
+  async function turnOn(offer: PluginOffer): Promise<void> {
+    turningOn = true;
+    try {
+      await offer.turnOn();
+      needs = [];
+      if (native) control.nav("reload");
+      else reloadKey += 1;
+    } finally {
+      turningOn = false;
+    }
+  }
 
   let expanded = $state(false);
   const height = $derived(compact ? 200 : inline ? (reported ?? INLINE_START) : expanded ? 720 : 360);
@@ -240,6 +287,14 @@
   });
 </script>
 
+{#if needs.length > 0}
+  <div class="needs" role="status">
+    {#each needs as offer (offer.id)}
+      <span>This page uses {offer.name}.</span>
+      <button class="pill" disabled={turningOn} onclick={() => void turnOn(offer)}>Turn it on here</button>
+    {/each}
+  </div>
+{/if}
 {#if native}
   <div class="html-body native" class:tile={compact} class:inline style:height="{height}px" bind:this={box}>
     <div class="stage" bind:this={host} bind:clientWidth={stageWidth}>
@@ -277,6 +332,7 @@
             onPageSize,
             onHover,
             onPageThemed: () => (pageThemed = true),
+            onWeb,
             control,
           }}
         >
@@ -319,13 +375,13 @@
 {:else}
   <div class="html-body" class:tile={compact} class:inline style:height="{height}px" bind:this={box}>
     {#if active && frameUrl !== null}
-      <iframe
-        src={frameUrl}
-        {title}
-        sandbox="allow-scripts"
-        referrerpolicy="no-referrer"
-        use:paneFrame={{ onPageMessage, onPageSize, onHover, theme }}
-      ></iframe>
+      {#key reloadKey}
+        <iframe
+          srcdoc={guardedPage(frameUrl, title)}
+          {title}
+          use:paneFrame={{ onPageMessage, onPageSize, onHover, onWeb, theme }}
+        ></iframe>
+      {/key}
     {/if}
     {#if inline}
       <button
@@ -442,6 +498,15 @@
     justify-content: center;
     padding: 8px;
     color: #6b6b6b;
+    font-size: var(--text-xs);
+  }
+  .needs {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 8px;
+    padding: 4px 0 6px;
+    color: var(--muted);
     font-size: var(--text-xs);
   }
   .foot {

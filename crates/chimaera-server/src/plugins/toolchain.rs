@@ -562,6 +562,39 @@ fn unpack_zip(file: File, root: &File, budget: &mut Budget) -> Result<(), String
     Ok(())
 }
 
+/// Unpack a plain tar held in memory into `dest`, which must not exist yet
+/// (blocking): a plugin's web bundle (`plugins::web`). Files and folders
+/// only — a link anywhere refuses the whole bundle. Its bytes unpacked.
+pub(crate) fn unpack_tar_bytes(
+    bytes: &[u8],
+    dest: &Path,
+    max_bytes: u64,
+    max_entries: usize,
+) -> Result<u64, String> {
+    std::fs::create_dir(dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+    let root = File::open(dest).map_err(|e| e.to_string())?;
+    let mut budget = Budget {
+        bytes: 0,
+        entries: 0,
+        max_bytes,
+        max_entries,
+        links: Vec::new(),
+    };
+    let unpacked = unpack_tar(std::io::Cursor::new(bytes), &root, &mut budget).and_then(|()| {
+        match budget.links.first() {
+            Some(link) => Err(format!(
+                "{}: a link (a web bundle holds files and folders only)",
+                link.display()
+            )),
+            None => Ok(budget.bytes),
+        }
+    });
+    if unpacked.is_err() {
+        let _ = std::fs::remove_dir_all(dest);
+    }
+    unpacked
+}
+
 /// Unpack `archive` (`kind`: tar, tar.gz, tar.xz, zip, none) into `dest`,
 /// which must not exist yet (blocking). Its bytes unpacked.
 pub(crate) fn unpack(

@@ -74,6 +74,7 @@ import {
   type ViewFit,
   nativeViewChip,
   nativeViewClose,
+  nativeViewCommand,
   nativeViewNav,
   nativeViewPlace,
   nativeViewRegion,
@@ -85,7 +86,7 @@ import {
   type NativeViewSnapshot,
   type ViewRect,
 } from "../net/native";
-import { chordInit, samePill, type NativeViewEvent } from "./paneViewBridge";
+import { chordInit, samePill, type NativeViewEvent, type WebEvent } from "./paneViewBridge";
 import { PANE_ZOOM_EVENT, routeNativeView, type PaneZoom } from "./paneViewRoute";
 
 export interface PaneViewParams {
@@ -113,6 +114,9 @@ export interface PaneViewParams {
   onHover?: (inside: boolean) => void;
   /** The page wears the app's theme (see `page_themed`). */
   onPageThemed?: () => void;
+  /** web/1's page events (`act`, `status`, `reference`, the plugins its
+   *  libraries need), the bridge having checked the press for `reference`. */
+  onWeb?: (ev: WebEvent) => void;
   /** The page loaded, or its title or same-document URL changed. */
   onPage?: (page: { url: string; title: string }) => void;
   /** The view's own web process died twice within a minute and the shell
@@ -218,6 +222,8 @@ export interface PaneTransport {
   nav(action: NativeViewNav): void;
   /** Re-evaluate placement now (a freeze flipped). */
   sync(): void;
+  /** A host's word for the page API (web/1: `data`, `visibility`, `theme`). */
+  command(cmd: Record<string, unknown>): void;
 }
 
 /**
@@ -270,6 +276,13 @@ export class PaneViewControl {
   /** The text under `rect` (viewport px) and the page's scroll then. */
   region(rect: ViewRect): Promise<NativeViewRegion | null> {
     return this.reach()?.region(rect) ?? Promise.resolve(null);
+  }
+
+  /** Tell the page API something (web/1: its node's `data`, whether it is
+   *  shown, the theme). Lost while the page is unreachable: a host says it
+   *  again when the page reports in (`onPage`). */
+  command(cmd: Record<string, unknown>): void {
+    this.reach()?.command(cmd);
   }
 
   /** The page's own history. */
@@ -715,6 +728,12 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
       case "page_themed":
         params.onPageThemed?.();
         break;
+      case "web_act":
+      case "web_status":
+      case "web_reference":
+      case "page_needs":
+        params.onWeb?.(ev);
+        break;
       case "crashed":
         crashed = true;
         awaiting = false;
@@ -742,6 +761,7 @@ export function paneView(node: HTMLElement, initial: PaneViewParams) {
       void nativeViewNav(id, action);
     },
     sync: () => burst(),
+    command: (cmd) => void nativeViewCommand(id, JSON.stringify(cmd)),
   };
   let control = initial.control ?? null;
   control?.bind(bound);

@@ -20,6 +20,7 @@
   import { onDestroy, onMount, untrack, type Component } from "svelte";
   import UiNode from "./UiNode.svelte";
   import DeckNode from "./DeckNode.svelte";
+  import WebNode from "./WebNode.svelte";
   import Switch from "../../shared/Switch.svelte";
   import FileIcon from "../../shared/FileIcon.svelte";
   import { pluginIcon, UNKNOWN_ICON } from "./icons";
@@ -552,6 +553,8 @@
   </div>
 {:else if kind === "slides"}
   <div class="rich tall"><DeckNode {node} /></div>
+{:else if kind === "web"}
+  <div class="rich tall web"><WebNode {node} /></div>
 {:else if kind === "button"}
   {@render actionButton(node)}
 {:else if kind === "toggle"}

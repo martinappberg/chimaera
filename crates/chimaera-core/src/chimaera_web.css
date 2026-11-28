@@ -1,0 +1,91 @@
+/* chimaera-web.css: the app's look for the controls inside a page Chimaera
+ * shows (`<link rel="stylesheet" href="chimaera:web.css">`). It styles
+ * buttons, inputs, selects, toolbars, tables and cards with the `--ch-*`
+ * variables the page API sets, so a page's own controls read like the
+ * workbench's in both themes. Opt-in classes only, apart from the page's
+ * text and form controls: nothing a page didn't ask for changes. */
+
+:root {
+  color-scheme: light dark;
+}
+
+body {
+  margin: 0;
+  background: var(--ch-bg, Canvas);
+  color: var(--ch-fg, CanvasText);
+  font-family: var(--ch-font, system-ui, sans-serif);
+  font-size: var(--ch-text-md, 13px);
+  line-height: 1.45;
+}
+
+code, pre, kbd, .ch-mono {
+  font-family: var(--ch-mono, ui-monospace, monospace);
+}
+
+button, .ch-button {
+  font: inherit;
+  color: var(--ch-fg, CanvasText);
+  background: var(--ch-surface, ButtonFace);
+  border: 1px solid var(--ch-edge, ButtonBorder);
+  border-radius: 6px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+button:hover, .ch-button:hover {
+  background: var(--ch-hover, ButtonFace);
+}
+button:disabled, .ch-button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+button.ch-primary, .ch-button.ch-primary {
+  background: var(--ch-accent, Highlight);
+  border-color: var(--ch-accent, Highlight);
+  color: var(--ch-accent-text, HighlightText);
+}
+
+input, select, textarea {
+  font: inherit;
+  color: var(--ch-fg, FieldText);
+  background: var(--ch-bg, Field);
+  border: 1px solid var(--ch-edge, ButtonBorder);
+  border-radius: 6px;
+  padding: 3px 8px;
+}
+
+:focus-visible {
+  outline: 2px solid var(--ch-focus, Highlight);
+  outline-offset: 1px;
+}
+
+.ch-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--ch-edge, GrayText);
+}
+
+.ch-muted {
+  color: var(--ch-muted, GrayText);
+}
+
+.ch-card {
+  border: 1px solid var(--ch-edge, GrayText);
+  border-radius: var(--ch-radius, 8px);
+  padding: 10px 12px;
+}
+
+table.ch-table {
+  border-collapse: collapse;
+  font-size: var(--ch-text-sm, 12px);
+}
+table.ch-table th, table.ch-table td {
+  border-bottom: 1px solid var(--ch-edge, GrayText);
+  padding: 4px 8px;
+  text-align: left;
+}
+table.ch-table th {
+  color: var(--ch-muted, GrayText);
+  font-weight: 600;
+}

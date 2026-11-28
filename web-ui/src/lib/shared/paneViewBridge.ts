@@ -52,7 +52,43 @@ export type NativeViewEvent =
   /** The page wears the app's theme (the page API: `--ch-*` in its own
    *  styles, `#inline`, or its meta tag): its host may load it again for a
    *  new theme. A page that doesn't is never reloaded for one. */
-  | { id: string; kind: "page_themed" };
+  | { id: string; kind: "page_themed" }
+  /** web/1, a plugin's page: run its plugin's `action` (`act`). The page's
+   *  word: its host checks the page is a plugin's and rate-limits it. */
+  | { id: string; kind: "web_act"; action: string; payload: unknown }
+  /** web/1, a plugin's page: its status pill. */
+  | { id: string; kind: "web_status"; state: WebState; text: string }
+  /** web/1: point the agent at something in the page, with a picture —
+   *  a draft, never sent (`reference`). `crop`: the picture (a Blob from a
+   *  frame, a data URL from a native view) or a rect for the host to take. */
+  | {
+      id: string;
+      kind: "web_reference";
+      text: string;
+      file: string | null;
+      line: number | null;
+      crop: WebCrop | null;
+      title: string;
+    }
+  /** Plugins whose library this agent page imports and that are off here
+   *  (the daemon names them; the page's word, checked against the catalog). */
+  | { id: string; kind: "page_needs"; plugins: PageNeed[] };
+
+export type WebState = "idle" | "busy" | "ok" | "warn" | "bad";
+export type WebCrop = { blob: Blob } | { dataUrl: string } | { rect: ViewRectLike };
+export interface PageNeed {
+  plugin: string;
+  name: string;
+  library: string;
+}
+
+/** web/1's page events, as either transport delivers them. */
+export type WebEvent = WithoutId<Extract<NativeViewEvent, { kind: "web_act" | "web_status" | "web_reference" | "page_needs" }>>;
+
+const WEB_STATES: readonly string[] = ["idle", "busy", "ok", "warn", "bad"];
+/** A `data:image/png` (or jpeg/webp) crop a native page may hand over. */
+const CROP_DATA_URL = /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/;
+const CROP_DATA_MAX = 200_000;
 
 /** The most of a page's message, and of its title, that is kept. */
 export const PAGE_TEXT_MAX = 4000;
@@ -66,6 +102,15 @@ const num = (v: unknown): v is number => typeof v === "number" && Number.isFinit
 function rectOf(v: unknown): ViewRectLike | null {
   if (!isObj(v) || !num(v.x) || !num(v.y) || !num(v.width) || !num(v.height)) return null;
   return { x: v.x, y: v.y, width: v.width, height: v.height };
+}
+
+function cropOf(v: unknown): WebCrop | null {
+  if (typeof Blob !== "undefined" && v instanceof Blob) {
+    return v.type.startsWith("image/") || v.type === "" ? { blob: v } : null;
+  }
+  if (str(v)) return v.length <= CROP_DATA_MAX && CROP_DATA_URL.test(v) ? { dataUrl: v } : null;
+  const rect = rectOf(v);
+  return rect !== null && rect.width > 0 && rect.height > 0 ? { rect } : null;
 }
 
 /** A `native-view` payload as a typed event, or null when it is not one. */
@@ -115,6 +160,34 @@ export function decodeNativeViewEvent(raw: unknown): NativeViewEvent | null {
       if (!str(raw.text) || raw.text.trim() === "") return null;
       const title = str(raw.title) ? raw.title.replace(/\s+/g, " ").trim().slice(0, PAGE_TITLE_MAX) : "";
       return { id, kind: raw.kind, text: raw.text.slice(0, PAGE_TEXT_MAX), title };
+    }
+    case "web_act":
+      if (!str(raw.action) || raw.action === "" || raw.action.length > 64) return null;
+      return { id, kind: "web_act", action: raw.action, payload: raw.payload ?? null };
+    case "web_status":
+      if (!str(raw.state) || !WEB_STATES.includes(raw.state)) return null;
+      return { id, kind: "web_status", state: raw.state as WebState, text: str(raw.text) ? raw.text.slice(0, 200) : "" };
+    case "web_reference": {
+      if (!str(raw.text)) return null;
+      const title = str(raw.title) ? raw.title.replace(/\s+/g, " ").trim().slice(0, PAGE_TITLE_MAX) : "";
+      return {
+        id,
+        kind: "web_reference",
+        text: raw.text.slice(0, PAGE_TEXT_MAX),
+        file: str(raw.file) && raw.file !== "" ? raw.file.slice(0, 1000) : null,
+        line: num(raw.line) && Number.isInteger(raw.line) && raw.line > 0 ? raw.line : null,
+        crop: cropOf(raw.crop),
+        title,
+      };
+    }
+    case "page_needs": {
+      if (!Array.isArray(raw.plugins)) return null;
+      const plugins = raw.plugins
+        .filter(isObj)
+        .filter((p) => str(p.plugin) && str(p.name) && str(p.library))
+        .slice(0, 8)
+        .map((p) => ({ plugin: p.plugin as string, name: (p.name as string).slice(0, 80), library: p.library as string }));
+      return plugins.length === 0 ? null : { id, kind: "page_needs", plugins };
     }
     default:
       return null;

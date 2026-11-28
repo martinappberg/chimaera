@@ -386,6 +386,21 @@ export async function fetchView(
 
 /** A node's action: the view's new tree, `null` (keep what it shows), or
  *  why it failed. */
+/** A page of the plugin's own bundle for a `web` node: its URL under a
+ *  grant ticket (`/web/{grant}/{entry}`, `plugins::web`). Asked again while
+ *  the node is shown, it answers the same URL and keeps it alive. */
+export async function mintWebPage(ws: string, pid: string, entry: string): Promise<string> {
+  const b = await body<{ url?: unknown; error?: unknown }>(
+    await api(`${base(ws, pid)}/web`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ entry }),
+    }),
+  );
+  if (typeof b.url !== "string") throw new Error(typeof b.error === "string" ? b.error : "no page");
+  return b.url;
+}
+
 export async function postViewAction(
   ws: string,
   pid: string,

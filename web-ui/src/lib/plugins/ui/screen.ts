@@ -20,7 +20,7 @@ export const KNOWN_NODES: ReadonlySet<string> = new Set([
   "text", "heading", "markdown", "code", "keyvalue", "badge", "status", "icon", "progress", "empty", "callout",
   "list", "table", "file", "link", "image", "slides",
   "button", "toggle", "select", "segmented", "textfield", "form",
-  "editor", "pdf", "diagnostics", "diff", "log",
+  "editor", "pdf", "diagnostics", "diff", "log", "web",
 ]);
 
 /** Actions the client carries out itself; a plugin names them on a button. */
