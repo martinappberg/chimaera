@@ -346,11 +346,28 @@ function childP(el: XmlEl | undefined, local: string): XmlEl | undefined {
 function childrenP(el: XmlEl | undefined, local: string): XmlEl[] {
   return el === undefined ? [] : el.children.filter((c) => isP(c, local));
 }
-/** An element's text as XML gives it (R23a): comments and processing
- *  instructions dropped, CDATA sections taken as written (not decoded),
- *  the rest's references decoded. */
+/** An element's text as XML gives it (R23a): a literal CR LF pair or lone
+ *  CR is a line feed (XML's end-of-line handling, before anything else),
+ *  comments and processing instructions dropped, CDATA sections taken as
+ *  written (not decoded), the rest's references decoded; a child element's
+ *  tags are dropped and its own text taken in place, as a DOM's
+ *  `textContent`. Trimmed of XML whitespace. */
 function text(xml: string, el: XmlEl): string {
-  const raw = xml.slice(el.openEnd, el.closeStart);
+  // XML's whitespace only (R23a): a no-break space or U+FEFF is text.
+  return innerText(xml, el).replace(/^[ \t\n\r]+|[ \t\n\r]+$/g, "");
+}
+function innerText(xml: string, el: XmlEl): string {
+  if (el.closeStart <= el.openEnd) return "";
+  let out = "";
+  let at = el.openEnd;
+  for (const c of el.children) {
+    out += charData(xml.slice(at, c.start)) + innerText(xml, c);
+    at = c.end;
+  }
+  return out + charData(xml.slice(at, el.closeStart));
+}
+function charData(source: string): string {
+  const raw = source.replace(/\r\n?/g, "\n");
   let out = "";
   const re = /<!--[\s\S]*?-->|<\?[\s\S]*?\?>|<!\[CDATA\[([\s\S]*?)\]\]>/g;
   let last = 0;
@@ -358,8 +375,7 @@ function text(xml: string, el: XmlEl): string {
     out += decodeEntities(raw.slice(last, m.index)) + (m[1] ?? "");
     last = m.index + m[0].length;
   }
-  // XML's whitespace only (R23a): a no-break space or U+FEFF is text.
-  return (out + decodeEntities(raw.slice(last))).replace(/^[ \t\n\r]+|[ \t\n\r]+$/g, "");
+  return out + decodeEntities(raw.slice(last));
 }
 /** An attribute by namespace + local name, whatever prefix the part binds. */
 function attrNs(xml: string, el: XmlEl, ns: string, local: string): string | null {
@@ -510,9 +526,11 @@ function nodeTiming(xml: string, cTn: XmlEl | undefined): NodeTiming {
   };
 }
 
+/** A time value (R28): the holder's first child, when it is a PresentationML
+ *  `strVal`, `fltVal`, `intVal` or `boolVal`; any other element is no value. */
 function timeValue(xml: string, holder: XmlEl | undefined): TimeValue | null {
   const v = holder?.children[0];
-  if (v === undefined) return null;
+  if (v === undefined || !NS_P.has(v.ns)) return null;
   const val = attr(xml, v, "val");
   switch (v.local) {
     case "strVal":
@@ -523,7 +541,7 @@ function timeValue(xml: string, holder: XmlEl | undefined): TimeValue | null {
     case "boolVal":
       return truthy(val);
     default:
-      return val;
+      return null;
   }
 }
 
@@ -945,7 +963,9 @@ function readSlide(xml: string, root: XmlEl): SlideTimeline {
   for (let k = 0; k < steps.length; k++) {
     for (const e of steps[k]!) {
       for (const b of e.behaviours) {
-        const t = b.target ?? e.target;
+        // A behaviour without its own target writes nothing (R3), so it
+        // counts nothing, as the colour-chain cap above.
+        const t = b.target;
         if (t === null) continue;
         values += (t.para === null ? 1 : Math.max(0, Math.min(t.para[1] - t.para[0] + 1, HELD_PARAGRAPHS))) * (steps.length - k);
         if (values > TIMING_CAPS.values) return plain(transition, "too-many-values");
@@ -1173,7 +1193,12 @@ export type PathPiece =
  * walk. Returns the point reached.
  */
 export function walkPath(path: string, visit?: (p: PathPiece) => boolean | void): [number, number] {
-  const tokens = path.match(/[A-Za-z]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?/g) ?? [];
+  // R19's grammar: words split at XML whitespace and commas; a word is one
+  // ASCII letter (a command) or an R2a decimal. Any other word, or a
+  // decimal too large to be finite, stops the walk where it stands.
+  const words = path.split(/[ \t\n\r,]+/).filter((w) => w !== "");
+  const bad = words.findIndex((w) => !/^[A-Za-z]$/.test(w) && numOf(w) === null);
+  const tokens = bad < 0 ? words : words.slice(0, bad);
   let x = 0;
   let y = 0;
   let sx = 0;

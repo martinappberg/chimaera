@@ -1,0 +1,47 @@
+{
+  "part": "text-markup.xml",
+  "id": 0,
+  "transition": null,
+  "steps": [
+    [],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 0,
+        "class": "entr",
+        "preset": 1,
+        "subtype": 0,
+        "effect": "appear",
+        "dir": null,
+        "target": "2",
+        "sets": "visible"
+      },
+      {
+        "trigger": "with",
+        "start": 0,
+        "dur": 0,
+        "class": "entr",
+        "preset": 1,
+        "subtype": 0,
+        "effect": "appear",
+        "dir": null,
+        "target": "3",
+        "sets": null
+      }
+    ]
+  ],
+  "states": [
+    {
+      "hidden": [
+        "2"
+      ],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {}
+    }
+  ],
+  "interactive": 0
+}

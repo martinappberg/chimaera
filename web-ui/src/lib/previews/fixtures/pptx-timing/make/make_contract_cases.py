@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""The contract-clarification cases (R18, R21, R22, R23a, R32): python make_contract_cases.py ../cases"""
-# Writes the contract-clarification cases (README R18, R21, R22, R23a, R32) into cases/.
+"""The contract-clarification cases (R18, R19, R21, R22, R23a, R28, R29, R32): python make_contract_cases.py ../cases"""
+# Writes the contract-clarification cases (README R18, R19, R21, R22, R23a, R28, R29, R32) into cases/.
 import sys, itertools
 OUT = sys.argv[1]
 ids = itertools.count(3)
@@ -74,3 +74,28 @@ def values_case(name, n, comment):
     write(name, slide(comment, [sp(2, 2), sp(3), sp(4)], groups))
 values_case("values-cap", 40, "R21/R22: 40 x 256 x 25 + 300 = 256,300 values, over 250,000: the slide plays plain (too-many-values).")
 values_case("values-under-cap", 39, "R21: 39 x 256 x 25 + 300 = 249,900 values, within 250,000: the slide is read.")
+# R21/R3: a behaviour without its own target writes nothing, so it counts nothing toward the values cap.
+def untargeted_scale():
+    return f'<p:animScale><p:cBhvr><p:cTn id="{next(ids)}" dur="500" fill="hold"/></p:cBhvr><p:by x="150000" y="150000"/></p:animScale>'
+groups = [group([effect("entr", 1, [vis(tgt(2, (0, 255))) for _ in range(39)] + [untargeted_scale() for _ in range(3)])])]
+groups += [group([effect("entr", 1, [vis(tgt(3))])]) for _ in range(24)]
+write("values-untargeted", slide("R21/R3: values-under-cap's 249,900 values, plus three p:animScale behaviours with no p:tgtEl in the paragraph effect: they write nothing and count 0, so the slide is read (counted with the effect's target they would add 3 x 256 x 25 and be over).", [sp(2, 2), sp(3), sp(4)], groups))
+# R28/R29: only PresentationML strVal, fltVal, intVal and boolVal are value elements.
+P_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
+def set_to(t, attr, value):
+    return f'<p:set>{cbhvr(t, attr)}<p:to>{value}</p:to></p:set>'
+write("value-elements", slide("R28/R29: S2's opacity is set to a p:clrVal and S3's to a fltVal in another namespace: neither is a value, nothing is held. S4's fill.on is set by a p:foo: nothing is recorded. S5's opacity is a fltVal under another prefix bound to PresentationML: it holds 0.5.", [sp(2), sp(3), sp(4), sp(5)],
+      [group([effect("emph", 9, [set_to(tgt(2), "style.opacity", '<p:clrVal val="0.5"/>')]),
+              effect("emph", 9, [set_to(tgt(3), "style.opacity", '<x:fltVal xmlns:x="urn:x" val="0.25"/>')], "withEffect"),
+              effect("emph", 1, [set_to(tgt(4), "fill.on", '<p:foo val="true"/>')], "withEffect"),
+              effect("emph", 9, [set_to(tgt(5), "style.opacity", f'<q:fltVal xmlns:q="{P_NS}" val="0.5"/>')], "withEffect")])]))
+# R19: the path grammar: words at XML whitespace and commas; a word that is neither a command nor a finite R2a number ends the string.
+write("path-grammar", slide("R19: S2 'M 0 0 L 0.5 ? 0.5' ends at [0, 0] (the L has one number before '?'); S3 'M0 0L.5.5' at [0, 0] ('M0' is no word); S4 'M 0 0 L 1e999 1 L 0.2 0.2' at [0, 0] (1e999 is not finite); S5 'M 0,0 L 0.25,0.1 E' at [0.25, 0.1] (commas separate).", [sp(2), sp(3), sp(4), sp(5)],
+      [group([effect("path", 0, [motion(tgt(2), "M 0 0 L 0.5 ? 0.5", "500")]),
+              effect("path", 0, [motion(tgt(3), "M0 0L.5.5", "500")], "withEffect"),
+              effect("path", 0, [motion(tgt(4), "M 0 0 L 1e999 1 L 0.2 0.2", "500")], "withEffect"),
+              effect("path", 0, [motion(tgt(5), "M 0,0 L 0.25,0.1 E", "500")], "withEffect")])]))
+# R23a: child markup inside an element's text, and an interior CR LF.
+write("text-markup", slide("R23a: S2's attrName is 'style.<x:b>visi</x:b>bility': the child's tags drop and its text stays, so it is a visibility set and S2 starts hidden. S3's is 'style.\\r\\nvisibility': the CR LF is one line feed inside the name, which is no attribute PowerPoint knows, so S3 is not hidden.", [sp(2), sp(3)],
+      [group([effect("entr", 1, [vis(tgt(2), attr='style.<x:b xmlns:x="urn:x">visi</x:b>bility')]),
+              effect("entr", 1, [vis(tgt(3), attr="style.\r\nvisibility")], "withEffect")])]))
