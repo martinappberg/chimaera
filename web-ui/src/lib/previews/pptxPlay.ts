@@ -1322,6 +1322,18 @@ function withMasks(kf: readonly PlayKeyframe[], tr: { id: ElementId; pattern: Pa
   }) as Keyframe[];
 }
 
+/** A mask is painted only inside the element's border box by default
+ *  (`mask-clip: border-box`), so a shape's shadow and the outer half of its
+ *  outline, drawn past the box, vanished for the length of a wipe, a
+ *  pattern or an iris and came back when it landed; the masks already
+ *  reach past the box by the shadow's margin (`clipMargin`). The outline
+ *  now stays; the shadow past the box is still clipped in Chrome and WebKit
+ *  (not `mask-clip`: removing the mask brings it back, a transparent
+ *  outline widening the ink does not). */
+function masked(kf: readonly object[]): boolean {
+  return kf.some((f) => "maskImage" in f && (f as { maskImage?: string }).maskImage !== "none");
+}
+
 /** A click planned ahead: everything `playStep` needs but the animations. */
 export interface PreparedStep {
   tagged: TaggedSlide;
@@ -1496,7 +1508,7 @@ export function playStep(tagged: TaggedSlide, timeline: SlideTimeline, k: number
       const scale = plan.duration / duration;
       const planned = scale === 1 ? tr.keyframes : [...tr.keyframes.map((f) => ({ ...f, offset: f.offset * scale })), { ...tr.keyframes[tr.keyframes.length - 1]!, offset: 1 }];
       const kf = tr.pattern === undefined || tr.box === undefined ? planned : withMasks(planned, { id: tr.id, pattern: tr.pattern, box: tr.box, margin: tr.margin ?? 0, levels: tr.levels ?? maskLevels(plan.duration) });
-      anims.push(el.animate(kf as unknown as Keyframe[], { duration, fill: "both", easing: "linear" }));
+      anims.push(el.animate((masked(kf) ? kf.map((f) => ({ ...f, maskClip: "no-clip" })) : kf) as unknown as Keyframe[], { duration, fill: "both", easing: "linear" }));
     }
     for (const bl of blends) {
       if (typeof bl.el.animate !== "function") continue;

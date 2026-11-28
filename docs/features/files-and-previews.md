@@ -1006,7 +1006,9 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   an SVG filter's picture from the scale it was first painted at, so a zoom from nothing drew a
   pale smear the size of the shadow until it landed. The last animated frame and the landed one
   are the same picture (0 px apart in window captures of fade, zoom, float, fly, wipe, spin, grow
-  and a path in WebKit). The next click
+  and a path in WebKit). A wipe, pattern or iris paints its mask past the shape's box
+  (`mask-clip: no-clip`), so the outline drawn outside the box stays while it plays (the shadow past the
+  box is still clipped while it plays, in Chrome and WebKit alike). The next click
   is planned while the show is idle, so a click only starts its animations.
   Slide transitions aren't played yet, and missing fonts fall back to the system's;
   the ⓘ in the bar says so, and counts shapes that couldn't be drawn. Refused past 100 MB. A reveal's
