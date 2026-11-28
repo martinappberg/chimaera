@@ -1,0 +1,16 @@
+{
+  "part": "colour-caps.xml",
+  "id": 0,
+  "transition": null,
+  "steps": [
+    []
+  ],
+  "states": [
+    {
+      "hidden": [],
+      "moved": {}
+    }
+  ],
+  "interactive": 0,
+  "approximate": "colour-too-large"
+}

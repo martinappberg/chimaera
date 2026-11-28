@@ -1,0 +1,39 @@
+{
+  "part": "path-behaviour-end.xml",
+  "id": 0,
+  "transition": null,
+  "steps": [
+    [],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 2000,
+        "class": "path",
+        "preset": 0,
+        "subtype": 0,
+        "effect": "path",
+        "dir": null,
+        "target": "2",
+        "sets": null,
+        "path": "M 0 0 L 0.1 0 E"
+      }
+    ]
+  ],
+  "states": [
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {
+        "2": [
+          0.1,
+          0
+        ]
+      }
+    }
+  ],
+  "interactive": 0
+}

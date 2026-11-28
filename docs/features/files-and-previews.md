@@ -925,7 +925,7 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   renderer finishes text layout asynchronously and a detached slide measures as empty and loses
   its text — and the strip mounts only the thumbnails near its visible span, two per tick. Charts
   draw with ECharts (most of the viewer's ~1.1 MB / 345 KB-gzip chunk, loaded only by a deck).
-  **Builds step click by click, with no motion yet.** The show opens each slide as PowerPoint's
+  **Builds step click by click.** The show opens each slide as PowerPoint's
   does, before its first click; each click (→, Space, Enter, PageDown) lands on the state
   PowerPoint's show reaches after it (shapes and paragraphs appear and disappear, motion paths
   land at their ends), and at the last build the next click is the next slide's first state. Back
@@ -952,7 +952,83 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   their boxes instead); a text box whose background builds apart from its text (the renderer
   draws one box, so it shows with its text); paragraphs the renderer didn't draw one to one (the
   whole shape then comes with its first paragraph). Group members animate with their group.
-  Transitions and effect motion aren't played yet, and missing fonts fall back to the system's;
+  **A click in the show plays its effects as motion**, read from the effect's own behaviours in
+  the file rather than a table of presets (`pptxMotion.ts`, the arithmetic of its time values in
+  `pptxFormula.ts`), so an effect outside the vocabulary, like boomerang, still plays: fades;
+  fly, float and rise (`ppt_x`/`ppt_y`, from off the slide on their side); zoom and grow
+  (`ppt_w`/`ppt_h`, `animScale`); spin, teeter and other turns; motion paths (followed at a steady
+  speed, curves sampled, ending where the build state puts the shape); wipe from the side it
+  names (`wipe(down)`, PowerPoint's "From Bottom", shows the bottom first), split, box, circle,
+  diamond, plus (`in` closes from the edges, `out` opens from the centre), blinds, wheel,
+  wedge, checkerboard and strips laid out as PowerPoint's own film shows them, each moving edge
+  a soft band 15% of its sweep as in that film (gradient masks; checkerboard's cells and strips'
+  squares as pictures); dissolve and random bars through a random pattern of fine cells or bars,
+  the same each time for a shape, filling at the film's pace; with the file's delays, durations, repeats, auto-reverse and ease in/out. An
+  arrival by a click plays the slide's on-entry step first, and "after previous" chains run on
+  their own times. A filter the viewer does not draw (the contract lists them in
+  `fixtures/pptx-timing/fallbacks.json`: only `slide`) fades; an entrance or exit
+  whose values can't be read fades over its duration; an emphasis that can't be read plays
+  nothing; the dots' tooltip names each such effect. **Emphasis holds** until the slide is left,
+  as in PowerPoint: a build state carries each target's size, turn, opacity and colours
+  (`fixtures/pptx-timing/README.md` R24–R32: what is held is read from the file's `fill`,
+  `autoRev`, `repeatCount` and never-ending sets, so a pulse or a full spin holds nothing; on a
+  text box animated by paragraph, a paragraph grows and turns about the centre of its own words
+  (as PowerPoint's film shows), an effect on the whole box acts on its body and never its
+  text, as PowerPoint's own film shows, and overlapping paragraph changes keep the later),
+  through later clicks, exits and re-entrances, on a jump, a step back and the presenter's
+  "next". Grow and shrink scale about the shape's centre (two grows multiply), turns add on top
+  of the shape's own rotation, transparency is instant, and colour changes blend during their
+  click and stay: fill colour replaces any fill (solid, gradient, picture) with one colour,
+  resolved against the slide's theme; line and font colour (by box or by paragraph) recolour the
+  outline and the text (on all three, a theme colour the effect names lighter or darker plays as
+  the plain theme colour, as PowerPoint's own show does, and an RGB colour keeps its shade); darken, lighten, desaturate and complementary colour shift a solid
+  fill, a gradient (which goes solid in its first stop's colour, as PowerPoint's film shows: it
+  writes `fill.type solid` beside each), the outline and the text (a picture fill gets a CSS filter
+  instead, named in the tooltip). Every click ends on exactly its build state, and its motion
+  ends there too (each animation's last frame is the landed value). Nothing animates on back,
+  Home, End, a dot or strip jump, a window joining, browsing, the presenter's own view (its now
+  and next show states at once), thumbnails or edit mode; forward clicks under 400 ms apart land
+  without playing (a click after a pause plays again); a click while one plays lands it first;
+  a slide's advance time starts once its last click has played; leaving the show, edit mode, a
+  re-read deck, hiding the pane or page and closing the view all land a playing click on its
+  state; `prefers-reduced-motion` plays nothing. A window resized while a click plays keeps it
+  playing at the new size, as PowerPoint does (the click is planned in slide px inside the `zoom`
+  fit, so nothing is re-planned; checked in Chrome and WKWebView: fitted and centred at each size,
+  landed on its state, nothing left inline). A show window following the presenter plays
+  the clicks the presenter makes and lands on the same state. Each moved element runs one Web
+  Animation over the click (`fill: both`, then cancelled), so nothing is left inline. The show (and the presenter's now and next) fits the slide with CSS
+  `zoom`, so it is laid out and painted at its real size: under a `transform: scale()` fit WebKit
+  composites the scaled stage whenever a shape animates and every label on the slide thins,
+  shifts and (above a fit of 1) blurs until the click lands. Browsing and edit mode keep the
+  transform fit; text lays out the same under both, and at every fit (WebKit sets optical sizing
+  off on every slide it draws, browse, edit, show, presenter and thumbnails alike, since it picks
+  the optical size and tracking from the used font size), which a wrap probe holds for every corpus
+  paragraph at fits 0.4–3 in Chrome and WebKit. In the native app this changed browsing from
+  earlier releases for text in the system font: no corpus paragraph changes its line count, line
+  widths move by up to 3.2% (largest at display sizes), so a line already at its box's edge can
+  wrap differently than before; browse and the show then agree. A shape that
+  grows or shrinks during a click repaints its shadow, glow or soft edge every frame: WebKit keeps
+  an SVG filter's picture from the scale it was first painted at, so a zoom from nothing drew a
+  pale smear the size of the shadow until it landed. A grow, shrink or turn is painted at the
+  size and angle it stands at in every frame (it plays through registered custom properties that
+  the shape's own `scale` and `rotate` read): played on `scale` itself WebKit stretched a picture
+  of the text drawn at the click's start, so a grown label was soft until it landed and then
+  sharpened (2,166 device px of a 1.5x grow's label changed at the landing; now 0, and a grown
+  paragraph's words at rest are as sharp as the same words laid out at that size). The last
+  animated frame and the landed one are the same picture (0 px apart in window captures of fade,
+  zoom, float, fly, wipe, grow by box and by paragraph and a path in WebKit; a shrink and a turn
+  differ 1 ms before their end only by the motion left). A paragraph's wipe, split or other filter sweeps its words padded by
+  0.7 em on the left and right and its lines by 0.55 em above and below, at PowerPoint's pace (its
+  film: 424 px/s for a 253 px line wiped from the side over 1 s, where the words alone gave 300; a
+  wipe from the top or bottom reveals a 40 pt line in 0.35 s of 1 s, and the viewer now in 0.32–0.36
+  against 0.60–0.64 unpadded; a split's edges move at 202 and 458 px/s on one and three lines,
+  the viewer's at 212 and 461; blinds, box, circle and the rest follow the same box, unfilmed). A wipe, pattern or iris is laid over the shape's whole drawing, its
+  outline and shadow included (a scaled shadow too), as PowerPoint's film lays it, and reveals the
+  shadow with the shape: while it plays the shape's box is grown to the mask's by a transparent border,
+  its content held in place to the device pixel, so nothing pops in when it lands; a shape wiped
+  while it moves, grows or turns in the same click lands where its state says. The next click
+  is planned while the show is idle, so a click only starts its animations.
+  Slide transitions aren't played yet, and missing fonts fall back to the system's;
   the ⓘ in the bar says so, and counts shapes that couldn't be drawn. Refused past 100 MB. A reveal's
   plain line (`deck.pptx:3`, a deck check's problem on slide 3) lands on that slide.
   A click in the show advances one build, as the clicker would, except on a link in the slide (a

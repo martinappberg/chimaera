@@ -16,15 +16,16 @@
     at: number | null;
     /** A click on the dot on screen goes back to as drawn (browsing). */
     canClear: boolean;
-    /** Why the builds are approximate, for the tooltips ("" when exact). */
-    note?: string;
+    /** Why the builds are approximate, for the tooltips ("" when exact):
+     *  asked when the pointer or focus comes to the dots, not on every render. */
+    note?: () => string;
     /** A dot was clicked. */
     onpick: (k: number) => void;
     /** The keys chose a build (null: as drawn). */
     onset: (k: number | null) => void;
   }
 
-  let { clicks, at, canClear, note = "", onpick, onset }: Props = $props();
+  let { clicks, at, canClear, note: noteOf, onpick, onset }: Props = $props();
 
   const DOTS = 8;
   const span = $derived.by(() => {
@@ -34,6 +35,11 @@
   });
 
   let el = $state<HTMLSpanElement | null>(null);
+  /** The note, worked out only while the pointer or focus is on the dots
+   *  (where a tooltip can show), and again if the slide changes under it. */
+  let pointer = $state(false);
+  let focused = $state(false);
+  const note = $derived(pointer || focused ? (noteOf?.() ?? "") : "");
   const tip = (label: string) => (note === "" ? label : `${label} · ${note}`);
 
   function onkey(e: KeyboardEvent): void {
@@ -52,7 +58,17 @@
   }
 </script>
 
-<span class="builds" bind:this={el} role="group" aria-label="builds" title={note || undefined}>
+<span
+  class="builds"
+  bind:this={el}
+  role="group"
+  aria-label="builds"
+  title={note || undefined}
+  onpointerenter={() => (pointer = true)}
+  onpointerleave={() => (pointer = false)}
+  onfocusin={() => (focused = true)}
+  onfocusout={(e) => (focused = e.relatedTarget instanceof Node && el?.contains(e.relatedTarget) === true)}
+>
   <button
     class="pip start"
     class:on={at !== null}

@@ -209,3 +209,53 @@ main = [
 write('hostile-strings.xml', slide([shape(2, 'A', 0), shape(3, 'B', 1)],
       after_clr='<p:transition spd="__proto__"><p:fade/></p:transition>',
       timing=timing(ids, main, bld='<p:bldP spid="__proto__" grpId="0" animBg="1"/>' + bldp(2, 3))))
+
+# --- p:anim keyframes, held and played by the same rules (R28): a time
+# several tavs share takes the last of them, discrete keeps the earlier,
+# from/to without tavs, and what contributes nothing. Each effect repeats
+# half a time, so its behaviours end at progress 0.5.
+ids = new_ids()
+def anim(t, attr, tavs=None, dur=1000, **kw):
+    a = ctn_attrs(**{k: v for k, v in kw.items() if k in ('calcmode', 'valueType', 'from_', 'to', 'by')})
+    a = a.replace(' from=', ' from=')
+    lst = ''
+    if tavs is not None:
+        lst = '<p:tavLst>' + ''.join(
+            (f'<p:tav tm="{tm}">' if tm is not None else '<p:tav>') + f'<p:val><p:fltVal val="{v}"/></p:val></p:tav>'
+            for tm, v in tavs) + '</p:tavLst>'
+    return (f'<p:anim{a}><p:cBhvr><p:cTn id="{ids()}" dur="{dur}" fill="hold"/>{t}'
+            f'<p:attrNameLst><p:attrName>{attr}</p:attrName></p:attrNameLst></p:cBhvr>{lst}</p:anim>')
+def half(behaviours):
+    return group(ids, [sub(ids, 0, [effect(ids, 'emph', 9, 'clickEffect', behaviours, repeatCount='500')])])
+main = [
+    half([anim(tgt(2), 'style.rotation', [(0, 0), (50000, 90), (50000, 180), (100000, 180)], calcmode='lin', valueType='num')]),  # 180
+    half([anim(tgt(3), 'style.opacity', from_='1', to='0.5', calcmode='lin', valueType='num')]),                                 # 0.75
+    half([anim(tgt(4), 'style.opacity', [(0, 1), (60000, 0.5), (100000, 0.2)], calcmode='discrete', valueType='num')]),         # 1: held, nothing written
+    half([anim(tgt(4), 'style.opacity', [(0, 0.4), (60000, 0.6), (100000, 0.6)], calcmode='discrete', valueType='num')]),       # 0.4
+    half([anim(tgt(5), 'style.opacity', [(0, 1), (80000, 0.5), (40000, 0.2)], calcmode='lin', valueType='num')]),               # nothing: out of order
+    half([anim(tgt(6), 'style.opacity', [(0, 0.5), (100000, 0.5)], calcmode='lin', valueType='str')]),                          # nothing: not num
+    half([anim(tgt(6), 'style.rotation', [(None, 0), (None, 40), (None, 80)], calcmode='lin', valueType='num')]),                # 40: spread evenly
+]
+write('anim-keys.xml', slide([shape(i, f'S{i}', i - 2) for i in range(2, 7)], timing=timing(ids, main, bld=bldp(2, 3, 4, 5, 6))))
+
+# --- held values on overlapping paragraph ranges (R31: kept per paragraph,
+# the change that ends later wins) and a whole-shape fill colour on a
+# shape whose text is animated by paragraph (R32: its body, never its text).
+ids = new_ids()
+def clr(t, attr, val, dur=500):
+    return (f'<p:animClr clrSpc="rgb" dir="cw"><p:cBhvr override="childStyle"><p:cTn id="{ids()}" dur="{dur}" fill="hold"/>{t}'
+            f'<p:attrNameLst><p:attrName>{attr}</p:attrName></p:attrNameLst></p:cBhvr><p:to><a:srgbClr val="{val}"/></p:to></p:animClr>')
+def rng(spid, st, end):
+    return f'<p:tgtEl><p:spTgt spid="{spid}"><p:txEl><p:pRg st="{st}" end="{end}"/></p:txEl></p:spTgt></p:tgtEl>'
+def emph_click(preset, behaviours):
+    return group(ids, [sub(ids, 0, [effect(ids, 'emph', preset, 'clickEffect', behaviours, subtype=2)])])
+main = [
+    emph_click(3, [clr(rng(2, 0, 1), 'style.color', 'FF0000')]),
+    emph_click(3, [clr(rng(2, 1, 2), 'style.color', '0000FF')]),
+    emph_click(3, [clr(tgt(2), 'style.color', '00FF00')]),
+    emph_click(1, [clr(tgt(2), 'fillcolor', 'FFC000')]),
+    emph_click(3, [clr(rng(3, 0, 2), 'style.color', '0000FF', dur=1000), clr(rng(3, 1, 1), 'style.color', 'FF0000')]),
+]
+write('paragraph-order.xml', slide([shape(2, 'Split', 0, paras=['One', 'Two', 'Three'], fill=True),
+                                    shape(3, 'Same click', 1, paras=['One', 'Two', 'Three'])],
+      timing=timing(ids, main, bld='<p:bldP spid="2" grpId="0" build="p" animBg="1"/><p:bldP spid="3" grpId="0" build="p"/>')))

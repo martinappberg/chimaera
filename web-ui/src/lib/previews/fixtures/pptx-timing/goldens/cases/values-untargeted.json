@@ -1,0 +1,470 @@
+{
+  "part": "values-untargeted.xml",
+  "id": 0,
+  "transition": null,
+  "steps": [
+    [],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 500,
+        "class": "entr",
+        "preset": 1,
+        "subtype": 0,
+        "effect": "appear",
+        "dir": null,
+        "target": "2:p0-255",
+        "sets": "visible"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 0,
+        "class": "entr",
+        "preset": 1,
+        "subtype": 0,
+        "effect": "appear",
+        "dir": null,
+        "target": "3",
+        "sets": "visible"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 0,
+        "class": "entr",
+        "preset": 1,
+        "subtype": 0,
+        "effect": "appear",
+        "dir": null,
+        "target": "3",
+        "sets": "visible"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 0,
+        "class": "entr",
+        "preset": 1,
+        "subtype": 0,
+        "effect": "appear",
+        "dir": null,
+        "target": "3",
+        "sets": "visible"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 0,
+        "class": "entr",
+        "preset": 1,
+        "subtype": 0,
+        "effect": "appear",
+        "dir": null,
+        "target": "3",
+        "sets": "visible"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 0,
+        "class": "entr",
+        "preset": 1,
+        "subtype": 0,
+        "effect": "appear",
+        "dir": null,
+        "target": "3",
+        "sets": "visible"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 0,
+        "class": "entr",
+        "preset": 1,
+        "subtype": 0,
+        "effect": "appear",
+        "dir": null,
+        "target": "3",
+        "sets": "visible"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 0,
+        "class": "entr",
+        "preset": 1,
+        "subtype": 0,
+        "effect": "appear",
+        "dir": null,
+        "target": "3",
+        "sets": "visible"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 0,
+        "class": "entr",
+        "preset": 1,
+        "subtype": 0,
+        "effect": "appear",
+        "dir": null,
+        "target": "3",
+        "sets": "visible"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 0,
+        "class": "entr",
+        "preset": 1,
+        "subtype": 0,
+        "effect": "appear",
+        "dir": null,
+        "target": "3",
+        "sets": "visible"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 0,
+        "class": "entr",
+        "preset": 1,
+        "subtype": 0,
+        "effect": "appear",
+        "dir": null,
+        "target": "3",
+        "sets": "visible"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 0,
+        "class": "entr",
+        "preset": 1,
+        "subtype": 0,
+        "effect": "appear",
+        "dir": null,
+        "target": "3",
+        "sets": "visible"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 0,
+        "class": "entr",
+        "preset": 1,
+        "subtype": 0,
+        "effect": "appear",
+        "dir": null,
+        "target": "3",
+        "sets": "visible"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 0,
+        "class": "entr",
+        "preset": 1,
+        "subtype": 0,
+        "effect": "appear",
+        "dir": null,
+        "target": "3",
+        "sets": "visible"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 0,
+        "class": "entr",
+        "preset": 1,
+        "subtype": 0,
+        "effect": "appear",
+        "dir": null,
+        "target": "3",
+        "sets": "visible"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 0,
+        "class": "entr",
+        "preset": 1,
+        "subtype": 0,
+        "effect": "appear",
+        "dir": null,
+        "target": "3",
+        "sets": "visible"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 0,
+        "class": "entr",
+        "preset": 1,
+        "subtype": 0,
+        "effect": "appear",
+        "dir": null,
+        "target": "3",
+        "sets": "visible"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 0,
+        "class": "entr",
+        "preset": 1,
+        "subtype": 0,
+        "effect": "appear",
+        "dir": null,
+        "target": "3",
+        "sets": "visible"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 0,
+        "class": "entr",
+        "preset": 1,
+        "subtype": 0,
+        "effect": "appear",
+        "dir": null,
+        "target": "3",
+        "sets": "visible"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 0,
+        "class": "entr",
+        "preset": 1,
+        "subtype": 0,
+        "effect": "appear",
+        "dir": null,
+        "target": "3",
+        "sets": "visible"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 0,
+        "class": "entr",
+        "preset": 1,
+        "subtype": 0,
+        "effect": "appear",
+        "dir": null,
+        "target": "3",
+        "sets": "visible"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 0,
+        "class": "entr",
+        "preset": 1,
+        "subtype": 0,
+        "effect": "appear",
+        "dir": null,
+        "target": "3",
+        "sets": "visible"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 0,
+        "class": "entr",
+        "preset": 1,
+        "subtype": 0,
+        "effect": "appear",
+        "dir": null,
+        "target": "3",
+        "sets": "visible"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 0,
+        "class": "entr",
+        "preset": 1,
+        "subtype": 0,
+        "effect": "appear",
+        "dir": null,
+        "target": "3",
+        "sets": "visible"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 0,
+        "class": "entr",
+        "preset": 1,
+        "subtype": 0,
+        "effect": "appear",
+        "dir": null,
+        "target": "3",
+        "sets": "visible"
+      }
+    ]
+  ],
+  "states": [
+    {
+      "hidden": [
+        "2:p0-255",
+        "3"
+      ],
+      "moved": {}
+    },
+    {
+      "hidden": [
+        "3"
+      ],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {}
+    }
+  ],
+  "interactive": 0
+}

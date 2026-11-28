@@ -1,0 +1,185 @@
+{
+  "part": "anim-keys.xml",
+  "id": 0,
+  "transition": null,
+  "steps": [
+    [],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 500,
+        "class": "emph",
+        "preset": 9,
+        "subtype": 0,
+        "effect": "transparency",
+        "dir": null,
+        "target": "2",
+        "sets": null
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 500,
+        "class": "emph",
+        "preset": 9,
+        "subtype": 0,
+        "effect": "transparency",
+        "dir": null,
+        "target": "3",
+        "sets": null
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 500,
+        "class": "emph",
+        "preset": 9,
+        "subtype": 0,
+        "effect": "transparency",
+        "dir": null,
+        "target": "4",
+        "sets": null
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 500,
+        "class": "emph",
+        "preset": 9,
+        "subtype": 0,
+        "effect": "transparency",
+        "dir": null,
+        "target": "4",
+        "sets": null
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 500,
+        "class": "emph",
+        "preset": 9,
+        "subtype": 0,
+        "effect": "transparency",
+        "dir": null,
+        "target": "5",
+        "sets": null
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 500,
+        "class": "emph",
+        "preset": 9,
+        "subtype": 0,
+        "effect": "transparency",
+        "dir": null,
+        "target": "6",
+        "sets": null
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 500,
+        "class": "emph",
+        "preset": 9,
+        "subtype": 0,
+        "effect": "transparency",
+        "dir": null,
+        "target": "6",
+        "sets": null
+      }
+    ]
+  ],
+  "states": [
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {},
+      "turn": {
+        "2": 180
+      }
+    },
+    {
+      "hidden": [],
+      "moved": {},
+      "turn": {
+        "2": 180
+      },
+      "opacity": {
+        "3": 0.75
+      }
+    },
+    {
+      "hidden": [],
+      "moved": {},
+      "turn": {
+        "2": 180
+      },
+      "opacity": {
+        "3": 0.75
+      }
+    },
+    {
+      "hidden": [],
+      "moved": {},
+      "turn": {
+        "2": 180
+      },
+      "opacity": {
+        "3": 0.75,
+        "4": 0.4
+      }
+    },
+    {
+      "hidden": [],
+      "moved": {},
+      "turn": {
+        "2": 180
+      },
+      "opacity": {
+        "3": 0.75,
+        "4": 0.4
+      }
+    },
+    {
+      "hidden": [],
+      "moved": {},
+      "turn": {
+        "2": 180
+      },
+      "opacity": {
+        "3": 0.75,
+        "4": 0.4
+      }
+    },
+    {
+      "hidden": [],
+      "moved": {},
+      "turn": {
+        "2": 180,
+        "6": 40
+      },
+      "opacity": {
+        "3": 0.75,
+        "4": 0.4
+      }
+    }
+  ],
+  "interactive": 0
+}

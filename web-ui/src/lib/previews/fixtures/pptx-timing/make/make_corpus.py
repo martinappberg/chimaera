@@ -36,9 +36,14 @@ OUT = os.path.normpath(os.path.join(HERE, "..", "decks"))
 # --- the corpus --------------------------------------------------------------
 #
 # A deck is a list of slides. A slide has:
-#   shapes: [(name, kind, {box?, text?, rot?})]   kind: rect oval text table chart
-#           picture group line
-#   fx:     [(shape, effect, trigger, {dir?, exit?, dur?, level?})]
+#   shapes: [(name, kind, {box?, text?, rot?, fill?, line?})]   kind: rect oval text
+#           table chart picture group line; fill: gradient | picture; line: width in pt
+#   fx:     [(shape, effect, trigger, {dir?, exit?, dur?, level?, amount?, size?, autorev?, color?, to?, path?})]
+#           amount: a spin's degrees; size: a grow's percent; autorev: plays back
+#           color: (r, g, b) a colour effect changes to; path: a motion path's string
+#           to: DrawingML a colour effect's p:to is rewritten to after PowerPoint's save
+#           (its scripting sets only RGB), then saved again by PowerPoint, which keeps it
+#           (dur and color apply to every effect one add makes: by paragraph, several)
 #           effect: PowerPoint's own name after "animation type"
 #           trigger: click | with | after
 #   transition: {effect, dur?, advance?}          effect: after "entry effect"
@@ -57,6 +62,7 @@ def row(names, kind="rect"):
     return [(n, kind, {}) for n in names]
 
 
+ACCENT2 = '<a:schemeClr val="accent2">%s</a:schemeClr>'
 THREE = ["First point", "Second point", "Third point"]
 
 # A font no system ships: PowerPoint and browsers each substitute their own.
@@ -296,6 +302,187 @@ DECKS = {
             "fx": [("Heading", "fade", "click", {}), ("Under", "fade", "click", {})],
         },
     ],
+    # Emphasis that holds after its click (README R24-R31): sizes and turns
+    # that compound, opacity, colour on solid, gradient and picture fills,
+    # lines and text, a group, an effect that plays back (and must not hold),
+    # and held values through an exit and a re-entrance.
+    "emphasis": [
+        {
+            "shapes": [("GrowTwice", "rect", {}), ("GrowShrink", "rect", {}), ("Spin90", "rect", {}),
+                       ("Tilted", "rect", {"rot": 30}), ("Pulse", "rect", {}), ("Group", "group", {})],
+            "fx": [
+                ("GrowTwice", "grow shrink", "click", {}),
+                ("GrowTwice", "grow shrink", "click", {}),
+                ("GrowShrink", "grow shrink", "click", {}),
+                ("GrowShrink", "grow shrink", "click", {"size": 50}),
+                ("Spin90", "spin", "click", {"amount": 90}),
+                ("Tilted", "spin", "click", {"amount": 90}),
+                ("Pulse", "grow shrink", "click", {"autorev": True}),
+                ("Group", "grow shrink", "click", {}),
+            ],
+        },
+        {
+            "shapes": [("FillSolid", "rect", {}), ("FillGradient", "rect", {"fill": "gradient"}),
+                       ("FillPicture", "rect", {"fill": "picture"}), ("LineColor", "rect", {"line": 6}),
+                       ("FontBox", "text", {"text": THREE}), ("FontParagraphs", "text", {"text": THREE})],
+            "fx": [
+                ("FillSolid", "change fill color", "click", {}),
+                ("FillGradient", "change fill color", "click", {}),
+                ("FillPicture", "change fill color", "click", {}),
+                ("LineColor", "change line color", "click", {}),
+                ("FontBox", "change font color", "click", {}),
+                ("FontParagraphs", "change font color", "click", {"level": "first"}),
+            ],
+        },
+        {
+            "shapes": [("Darken", "rect", {}), ("Lighten", "rect", {}), ("Desaturate", "rect", {}),
+                       ("Complementary", "rect", {}), ("DarkenGradient", "rect", {"fill": "gradient"}),
+                       ("Transparency", "rect", {})],
+            "fx": [
+                ("Darken", "darken", "click", {}),
+                ("Lighten", "lighten", "click", {}),
+                ("Desaturate", "desaturate", "click", {}),
+                ("Complementary", "complementary color", "click", {}),
+                ("DarkenGradient", "darken", "click", {}),
+                ("Transparency", "transparency", "click", {}),
+            ],
+        },
+        {
+            "shapes": [("Cycle", "rect", {}), ("Boomerang", "rect", {"rot": 30})],
+            "fx": [
+                ("Cycle", "grow shrink", "click", {}),
+                ("Cycle", "spin", "with", {"amount": 90}),
+                ("Cycle", "fade", "click", {"exit": True}),
+                ("Cycle", "fade", "click", {}),
+                ("Boomerang", "boomerang", "click", {}),
+            ],
+        },
+    ],
+    # Which change wins when two land on one text box, a paragraph and the
+    # whole box (font colour, transparency, size), in both orders; and a
+    # second path written to start where the first ended, as PowerPoint's
+    # own UI chains them (README R18, R30).
+    "order": [
+        {
+            "shapes": [("ParaThenBox", "text", {"text": ["First", "Second"]}),
+                       ("BoxThenPara", "text", {"text": ["First", "Second"]})],
+            "fx": [
+                ("ParaThenBox", "change font color", "click", {"level": "first", "color": (255, 0, 0), "dur": 0.5}),
+                ("ParaThenBox", "change font color", "click", {"color": (0, 0, 255), "dur": 0.5}),
+                ("BoxThenPara", "change font color", "click", {"color": (0, 0, 255), "dur": 0.5}),
+                ("BoxThenPara", "change font color", "click", {"level": "first", "color": (255, 0, 0), "dur": 0.5}),
+            ],
+        },
+        {
+            "shapes": [("FadeParaThenBox", "rect", {"text": ["First", "Second"]}),
+                       ("FadeBoxThenPara", "rect", {"text": ["First", "Second"]}),
+                       ("GrowParaThenBox", "rect", {"text": ["First", "Second"]})],
+            "fx": [
+                ("FadeParaThenBox", "transparency", "click", {"level": "first"}),
+                ("FadeParaThenBox", "transparency", "click", {}),
+                ("FadeBoxThenPara", "transparency", "click", {}),
+                ("FadeBoxThenPara", "transparency", "click", {"level": "first"}),
+                ("GrowParaThenBox", "grow shrink", "click", {"level": "first", "dur": 0.5}),
+                ("GrowParaThenBox", "grow shrink", "click", {"dur": 0.5}),
+            ],
+        },
+        {
+            "shapes": row(["Chained", "Restart"]),
+            "fx": [
+                ("Chained", "right path", "click", {"path": "M 0 0 L 0.25 0 E"}),
+                ("Chained", "down path", "click", {"path": "M 0.25 0 L 0.25 0.25 E"}),
+                ("Restart", "right path", "click", {"path": "M 0 0 L 0.25 0 E"}),
+                ("Restart", "down path", "click", {"path": "M 0 0 L 0 0.25 E"}),
+            ],
+        },
+    ],
+    # Every pattern filter PowerPoint's scripting offers, in and out, two
+    # seconds each so its film shows the pattern growing; and spins on
+    # shapes with and without shadow and outline, and on a picture, to find
+    # what PowerPoint turns them about.
+    "filters": [
+        {
+            "shapes": row(["Dissolve", "Checkerboard", "RandomBars", "Strips", "Wedge"]),
+            "fx": [
+                ("Dissolve", "dissolve", "click", {"dur": 2.0}),
+                ("Checkerboard", "checkerboard", "click", {"dur": 2.0}),
+                ("RandomBars", "random bars", "click", {"dur": 2.0}),
+                ("Strips", "strips", "click", {"dur": 2.0}),
+                ("Wedge", "wedge", "click", {"dur": 2.0}),
+            ],
+        },
+        {
+            "shapes": row(["CircleIn", "CircleOut", "DiamondIn", "DiamondOut", "PlusIn", "PlusOut"]),
+            "fx": [
+                ("CircleIn", "circle", "click", {"dur": 2.0, "dir": "inward"}),
+                ("CircleOut", "circle", "click", {"dur": 2.0, "dir": "out"}),
+                ("DiamondIn", "diamond", "click", {"dur": 2.0, "dir": "inward"}),
+                ("DiamondOut", "diamond", "click", {"dur": 2.0, "dir": "out"}),
+                ("PlusIn", "plus", "click", {"dur": 2.0, "dir": "inward"}),
+                ("PlusOut", "plus", "click", {"dur": 2.0, "dir": "out"}),
+            ],
+        },
+        {
+            "shapes": row(["DissolveOut", "CheckerboardOut", "RandomBarsOut", "StripsOut", "WedgeOut"]),
+            "fx": [
+                ("DissolveOut", "dissolve", "click", {"dur": 2.0, "exit": True}),
+                ("CheckerboardOut", "checkerboard", "click", {"dur": 2.0, "exit": True}),
+                ("RandomBarsOut", "random bars", "click", {"dur": 2.0, "exit": True}),
+                ("StripsOut", "strips", "click", {"dur": 2.0, "exit": True}),
+                ("WedgeOut", "wedge", "click", {"dur": 2.0, "exit": True}),
+            ],
+        },
+        {
+            "shapes": [("Plain", "rect", {"shadow": False, "noline": True}), ("Shadow", "rect", {"noline": True}),
+                       ("Outline", "rect", {"shadow": False, "line": 12}), ("Both", "rect", {"line": 12}),
+                       ("Picture", "picture", {})],
+            "fx": [
+                ("Plain", "spin", "click", {"amount": 90}),
+                ("Shadow", "spin", "click", {"amount": 90}),
+                ("Outline", "spin", "click", {"amount": 90}),
+                ("Both", "spin", "click", {"amount": 90}),
+                ("Picture", "spin", "click", {"amount": 90}),
+            ],
+        },
+    ],
+    # What a colour effect holds when its "to" is a theme colour with
+    # modifiers, on a fill, a line and text (README R33), beside an RGB
+    # colour with the same kind of modifier and a plain theme colour.
+    # PowerPoint's scripting sets only RGB, so each "to" is written into
+    # its save and saved again by PowerPoint (make's rewrite step).
+    "colours": [
+        {
+            "shapes": row(["FillTint", "FillShade", "FillLum", "FillLum75", "FillRgbShade", "FillPlain"]),
+            "fx": [
+                ("FillTint", "change fill color", "click", {"dur": 1.0, "to": ACCENT2 % '<a:tint val="40000"/>'}),
+                ("FillShade", "change fill color", "with", {"dur": 1.0, "to": ACCENT2 % '<a:shade val="50000"/>'}),
+                ("FillLum", "change fill color", "with",
+                 {"dur": 1.0, "to": ACCENT2 % '<a:lumMod val="60000"/><a:lumOff val="40000"/>'}),
+                ("FillLum75", "change fill color", "with", {"dur": 1.0, "to": ACCENT2 % '<a:lumMod val="75000"/>'}),
+                ("FillRgbShade", "change fill color", "with",
+                 {"dur": 1.0, "to": '<a:srgbClr val="00A000"><a:shade val="50000"/></a:srgbClr>'}),
+                ("FillPlain", "change fill color", "with", {"dur": 1.0, "to": '<a:schemeClr val="accent3"/>'}),
+            ],
+        },
+        {
+            "shapes": [(n, "rect", {"line": 24}) for n in ["LineTint", "LineShade", "LineLum", "LineRgbShade"]]
+            + [(n, "text", {"text": ["Colour"], "size": 72}) for n in ["FontTint", "FontShade", "FontLum", "FontRgbShade"]],
+            "fx": [
+                ("LineTint", "change line color", "click", {"dur": 1.0, "to": ACCENT2 % '<a:tint val="40000"/>'}),
+                ("LineShade", "change line color", "with", {"dur": 1.0, "to": ACCENT2 % '<a:shade val="50000"/>'}),
+                ("LineLum", "change line color", "with",
+                 {"dur": 1.0, "to": ACCENT2 % '<a:lumMod val="60000"/><a:lumOff val="40000"/>'}),
+                ("LineRgbShade", "change line color", "with",
+                 {"dur": 1.0, "to": '<a:srgbClr val="00A000"><a:shade val="50000"/></a:srgbClr>'}),
+                ("FontTint", "change font color", "with", {"dur": 1.0, "to": ACCENT2 % '<a:tint val="40000"/>'}),
+                ("FontShade", "change font color", "with", {"dur": 1.0, "to": ACCENT2 % '<a:shade val="50000"/>'}),
+                ("FontLum", "change font color", "with",
+                 {"dur": 1.0, "to": ACCENT2 % '<a:lumMod val="60000"/><a:lumOff val="40000"/>'}),
+                ("FontRgbShade", "change font color", "with",
+                 {"dur": 1.0, "to": '<a:srgbClr val="00A000"><a:shade val="50000"/></a:srgbClr>'}),
+            ],
+        },
+    ],
     # No animation, and saved by PowerPoint: what happens to the ids python-pptx
     # wrote (see agent-written-raw.pptx, the same deck before PowerPoint).
     "agent-written": [
@@ -319,12 +506,34 @@ def picture_file():
     return path
 
 
+def picture_fill(slide, sh):
+    """Fill an autoshape with a picture (python-pptx has no API for it)."""
+    from pptx.oxml.ns import qn
+    from lxml import etree
+
+    _, rid = slide.part.get_or_add_image_part(picture_file())
+    sp_pr = sh._element.spPr
+    for tag in ("a:solidFill", "a:gradFill", "a:noFill", "a:blipFill", "a:pattFill"):
+        for el in sp_pr.findall(qn(tag)):
+            sp_pr.remove(el)
+    blip = etree.SubElement(sp_pr, qn("a:blipFill"))
+    etree.SubElement(blip, qn("a:blip")).set(qn("r:embed"), rid)
+    etree.SubElement(etree.SubElement(blip, qn("a:stretch")), qn("a:fillRect"))
+    # A fill goes right after the geometry, before any line.
+    geom = sp_pr.find(qn("a:prstGeom"))
+    if geom is not None:
+        geom.addnext(blip)
+
+
 def add_shape(slide, name, kind, opts, box):
     x, y, w, h = (Inches(v) for v in opts.get("box", box))
     shapes = slide.shapes
     if kind in ("rect", "oval"):
         sh = shapes.add_shape(MSO_SHAPE.RECTANGLE if kind == "rect" else MSO_SHAPE.OVAL, x, y, w, h)
-        sh.text_frame.text = name
+        text = opts.get("text", [name])
+        sh.text_frame.text = text[0]
+        for t in text[1:]:
+            sh.text_frame.add_paragraph().text = t
     elif kind == "text":
         sh = shapes.add_textbox(x, y, w, h)
         tf = sh.text_frame
@@ -362,6 +571,17 @@ def add_shape(slide, name, kind, opts, box):
     else:
         raise ValueError(kind)
     sh.name = name
+    if opts.get("fill") == "gradient":
+        sh.fill.gradient()
+        sh.fill.gradient_angle = 90
+    elif opts.get("fill") == "picture":
+        picture_fill(slide, sh)
+    if "line" in opts:
+        sh.line.width = Pt(opts["line"])
+    if opts.get("noline"):
+        sh.line.fill.background()
+    if opts.get("shadow") is False:
+        sh.shadow.inherit = False
     if "rot" in opts:
         sh.rotation = opts["rot"]
     return sh
@@ -421,14 +641,32 @@ def script(name, slides):
             if "level" in o:
                 add += f" level {LEVEL[o['level']]}"
             add += f" trigger {TRIGGER[trigger]}"
-            body = [add]
+            body = ["set n0 to count of effects of seq", add]
             attempt(L, what, body)
             if o.get("exit"):
                 attempt(L, what + " exit", ["set exit animation of fx to true"])
             if "dir" in o:
                 attempt(L, what + " direction", [f"set direction of effect parameters of fx to {o['dir']}"])
             if "dur" in o:
-                attempt(L, what + " duration", [f"set duration of timing of fx to {o['dur']}"])
+                attempt(L, what + " duration", ["repeat with k from n0 + 1 to count of effects of seq",
+                                                 f"\tset duration of timing of effect k of seq to {o['dur']}", "end repeat"])
+            if "color" in o:
+                r, g, b = o["color"]
+                attempt(L, what + " color", ["repeat with k from n0 + 1 to count of effects of seq",
+                                             # By index: iterating the behaviours by reference crashes PowerPoint 16.115.
+                                             "\trepeat with m from 1 to count of animation behaviors of effect k of seq",
+                                             "\t\tset bh to animation behavior m of effect k of seq",
+                                             "\t\tif (animation behavior type of bh) is animation type color then",
+                                             f"\t\t\tset to_color of colors effect of bh to {{{r}, {g}, {b}}}",
+                                             "\t\tend if", "\tend repeat", "end repeat"])
+            if "path" in o:
+                attempt(L, what + " path", [f"set path of motion effect of animation behavior 1 of fx to {q(o['path'])}"])
+            if "amount" in o:
+                attempt(L, what + " amount", [f"set amount of effect parameters of fx to {o['amount']}"])
+            if "size" in o:
+                attempt(L, what + " size", [f"set size2 of effect parameters of fx to {o['size']}"])
+            if o.get("autorev"):
+                attempt(L, what + " autorev", ["set autoreverse of timing of fx to true"])
         for j, (button, shape, effect) in enumerate(spec.get("interactive", []), 1):
             attempt(L, f"slide {i} interactive {j}", [
                 "set iseq to add sequence (timeline of s)",
@@ -490,9 +728,65 @@ def make(name):
         osa(f'tell application "Microsoft PowerPoint" to close presentation {q(name + ".pptx")} saving no', 30)
         raise RuntimeError(f"{name}: {r.stderr.strip()}")
     problems = [p for p in r.stdout.strip().splitlines() if p]
+    if any("to" in o for spec in slides for *_, o in spec.get("fx", [])):
+        rewrite_to(path, slides)
+        open_in_powerpoint(path)
+        r = osa("\n".join([
+            'tell application "Microsoft PowerPoint"',
+            f"\tset pres to presentation {q(name + '.pptx')}",
+            "\tset n to name of shape 1 of slide 1 of pres",
+            "\tset name of shape 1 of slide 1 of pres to n",
+            "\tsave pres", "\tclose pres saving no", "end tell"]), 120)
+        if r.returncode != 0:
+            osa(f'tell application "Microsoft PowerPoint" to close presentation {q(name + ".pptx")} saving no', 30)
+            raise RuntimeError(f"{name} resave: {r.stderr.strip()}")
+        problems += kept_to(path, slides)
     print(f"{name}: {os.path.getsize(path)} bytes, {len(slides)} slides" + (f", {len(problems)} refused" if problems else ""))
     for p in problems:
         print("  refused:", p)
+
+
+def to_edits(slides):
+    """(slide number, shape name, p:to colour) for every effect with a "to"."""
+    return [(i, shape, o["to"]) for i, spec in enumerate(slides, 1)
+            for shape, _, _, o in spec.get("fx", []) if "to" in o]
+
+
+def rewrite_to(path, slides):
+    """Write each "to" into the p:to of the colour behaviours on its shape."""
+    import re
+    import shutil
+    import zipfile
+
+    edits = to_edits(slides)
+    tmp = path + ".tmp"
+    with zipfile.ZipFile(path) as zin, zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            m = re.fullmatch(r"ppt/slides/slide(\d+)\.xml", item.filename)
+            if m:
+                text = data.decode("utf-8")
+                for i, shape, colour in edits:
+                    if i != int(m.group(1)):
+                        continue
+                    spid = re.search(r'<p:cNvPr id="(\d+)" name="' + re.escape(shape) + '"', text).group(1)
+                    pat = re.compile(r'(<p:animClr\b(?:(?!</p:animClr>).)*?<p:spTgt spid="' + spid
+                                     + r'"(?:(?!</p:animClr>).)*?<p:to>).*?(</p:to>)', re.S)
+                    text, k = pat.subn(lambda mm: mm.group(1) + colour + mm.group(2), text)
+                    if k == 0:
+                        raise RuntimeError(f"{path}: no colour behaviour on {shape}")
+                data = text.encode("utf-8")
+            zout.writestr(item, data)
+    shutil.move(tmp, path)
+
+
+def kept_to(path, slides):
+    """Problems: a "to" PowerPoint's second save did not keep."""
+    import zipfile
+
+    with zipfile.ZipFile(path) as z:
+        return [f"slide {i} {shape}: PowerPoint did not keep {colour}" for i, shape, colour in to_edits(slides)
+                if f"<p:to>{colour}</p:to>" not in z.read(f"ppt/slides/slide{i}.xml").decode("utf-8")]
 
 
 def duplicate_an_id(src, dst):

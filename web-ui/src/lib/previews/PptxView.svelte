@@ -10,10 +10,11 @@
    * span. The package is loaded with the renderer's zip limits for untrusted
    * input and every external load target stripped first (`pptxDeck.ts`), so
    * a deck never fetches anything; web links in it open through the app.
-   * Builds play click by click in the show, with no motion yet: each click
-   * lands on the state PowerPoint's show reaches after it (`pptxTiming.ts`
-   * parses the slide's timing, `pptxTag.ts` finds its shapes in the drawn
-   * slide, `pptxPlay.ts` hides and offsets them). Browsing shows each slide
+   * Builds play click by click in the show: each click ends on the state
+   * PowerPoint's show reaches after it (`pptxTiming.ts` parses the slide's
+   * timing, `pptxTag.ts` finds its shapes in the drawn slide, `pptxPlay.ts`
+   * hides and offsets them), and a forward click plays its effects as
+   * motion on the way there (`pptxPlay.ts` `playStep`, from `pptxMotion.ts`). Browsing shows each slide
    * as drawn until a click dot in the bar is used; thumbnails always do.
    *
    * Context bridge: the slide's @ sends the slide (its title and text); the
@@ -52,9 +53,10 @@
   import PresenterView from "./show/PresenterView.svelte";
   import ClickDots from "./show/ClickDots.svelte";
   import { copyTabToWindow } from "../plugins/platform";
-  import { buildStates, extractTiming, parseTimeline, type BuildState, type SlideTimeline, type TimingExtract } from "./pptxTiming";
   import { pruneTagged, tagSlide, type TaggedSlide } from "./pptxTag";
-  import { applyState, clearState } from "./pptxPlay";
+  import { applyState, clearMasks, clearState, playStep, type Palette } from "./pptxPlay";
+  import { slidePalette, SlideTimings, StageMotion, type Timed } from "./pptxStage.svelte";
+  import { motionNotes } from "./pptxMotion";
   import { sanitizeRendered } from "./officeSafety";
   import { revealRequest, takeReveal } from "../shared/reveal";
   import { activateUrl } from "../shared/urlOpen";
@@ -116,6 +118,41 @@
   const wsId = getActiveWorkspaceId() ?? "";
   const syncKey = $derived(syncName(wsId, "file", path));
 
+  // --- a click's motion ------------------------------------------------------------
+  // A forward click in the show plays its effects (`playStep`) between two
+  // build states; everything else lands on its state at once. A new move,
+  // a redraw, edit mode, leaving the show, hiding and unmounting all finish
+  // a click that is playing (it lands on its state, never pauses).
+
+  /** The click's motion: what plays, what is playing, the next click
+   *  planned ahead (`pptxStage.svelte.ts`). */
+  const motion = new StageMotion();
+  const palettes = new Map<string, Palette>();
+  const paletteOf = (i: number): Palette | null => slidePalette(deck?.presentation, i, palettes);
+  const stopPlaying = (): void => motion.stop();
+
+  function warmNext(gen: string): void {
+    motion.warm(
+      gen,
+      {
+        live: () => !disposed && show.mode === "present",
+        next: () => show.next(),
+        tagged: (slide) => {
+          const handle = stageHandles.get(slide);
+          return handle === undefined ? undefined : stageTags.get(handle.element);
+        },
+        timeline: (slide) => timelineOf(slide),
+        options: (slide) => ({ w, h, palette: paletteOf(slide) }),
+      },
+      show.mode === "present" && !reducedMotion(),
+    );
+  }
+  $effect(() => () => motion.dispose());
+
+  function reducedMotion(): boolean {
+    return typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
+  }
+
   const show = new SlideShow({
     deck: {
       count: () => deck?.presentation.slides.length ?? 0,
@@ -144,7 +181,14 @@
     // The show opens a slide before its first click, as PowerPoint's does;
     // the presenter's view keeps a build a click dot chose.
     opening: (mode, at) => ({ slide: at.slide, build: mode === "presenter" && !asDrawn ? at.build : 0 }),
-    arrive: (from, to) => {
+    arrive: (from, to, how) => {
+      // Another window naming the place we stand on must not cut a click
+      // off; a click of our own there (the end of the show) lands it.
+      if (to.slide === from.slide && to.build === from.build) {
+        if (!how.heard) stopPlaying();
+        return;
+      }
+      motion.moved(to, how, show.mode === "present", reducedMotion(), performance.now());
       if (to.slide === from.slide) return;
       clearPick();
       if (show.mode === "browse") asDrawn = true;
@@ -239,10 +283,12 @@
   function applyVersion({ d, bytes }: { d: Deck; bytes: ArrayBuffer }, still: () => boolean): void {
       disposeAll();
       revokeMedia();
+      clearMasks();
       clearPick();
       lastBytes = bytes;
       drawn.clear();
       resetTimelines(d);
+      palettes.clear();
       relTargets = null;
       deck = d;
       deckGen += 1;
@@ -416,7 +462,7 @@
   /** Which slides the deck marks hidden (`show="0"`): read with each slide's
    *  timing at load, since the renderer knows only once it lays one out. */
   const hiddenFlags = $derived(
-    deck?.presentation.slides.map((sl) => sl.hidden === true || extracts.get(sl.slidePath)?.hidden === true) ?? [],
+    deck?.presentation.slides.map((sl) => sl.hidden === true || timings.hidden(sl.slidePath)) ?? [],
   );
   /** Where the show stands among the slides it shows. */
   const showAt = $derived(showPosition(hiddenFlags, current));
@@ -438,18 +484,8 @@
 
   // --- builds ------------------------------------------------------------------------
 
-  interface Timed {
-    timeline: SlideTimeline;
-    states: BuildState[];
-  }
-
-  /** Parsed timing per slide part, for the deck version on screen. */
-  let timelines = new Map<string, Timed>();
-  /** What each slide part's timeline needs, cut from it at load
-   *  (`extractTiming`: its timing and transition, a few KB, capped), until
-   *  it is parsed. The whole part goes: the renderer drops its own copy once
-   *  it lays the slide out, and a deck's shapes can run to megabytes. */
-  let extracts = new Map<string, TimingExtract>();
+  /** Every slide's timing for the version on screen (`pptxStage.svelte.ts`). */
+  const timings = new SlideTimings();
   /** Bumped when a timeline is parsed, so what counts builds re-reads. */
   let timelineGen = $state(0);
   /** Browsing shows the slide as drawn until a click dot is used. */
@@ -470,40 +506,19 @@
   /** Something on the current slide's builds could only be approximated. */
   let playApprox = $state(false);
 
-  /** A new version: every slide's extract, before any is laid out (one scan
-   *  a slide; the parse waits until the slide is asked for). */
   function resetTimelines(d: Deck): void {
-    timelines = new Map();
-    extracts = new Map();
-    for (const sl of d.presentation.slides) {
-      if (sl.sourceXml !== undefined) extracts.set(sl.slidePath, extractTiming(sl.sourceXml));
-    }
+    timings.reset(d.presentation.slides);
   }
 
   /** Slide `i`'s timing, parsed on first ask. */
   function timelineOf(i: number): Timed | null {
     const sl = deck?.presentation.slides[i];
-    if (sl === undefined) return null;
-    const hit = timelines.get(sl.slidePath);
-    if (hit !== undefined) return hit;
-    const ex = extracts.get(sl.slidePath);
-    let timeline: SlideTimeline;
-    if (ex?.timeline != null) timeline = ex.timeline;
-    else {
-      const xml = ex?.source ?? untrack(() => edits.partText(sl.slidePath)) ?? sl.sourceXml ?? null;
-      if (xml === null) return null;
-      timeline = parseTimeline(xml);
-    }
-    const got = { timeline, states: buildStates(timeline) };
-    timelines.set(sl.slidePath, got);
-    // The hidden flag stays; the source is done with.
-    if (ex !== undefined) extracts.set(sl.slidePath, { source: null, timeline: null, hidden: ex.hidden });
-    return got;
+    return timings.of(sl, () => (sl === undefined ? null : untrack(() => edits.partText(sl.slidePath)) ?? null));
   }
 
   /** Build counts per slide for `deckStep` (one where not parsed yet). */
   function buildCounts(): number[] {
-    return deck?.presentation.slides.map((sl) => timelines.get(sl.slidePath)?.states.length ?? 1) ?? [];
+    return timings.counts(deck?.presentation.slides ?? []);
   }
 
   // The current slide is always parsed (its click dots); in the show, the
@@ -518,7 +533,7 @@
       let fresh = false;
       for (const j of showing ? [i, ...showReach(flags, i, true)] : [i]) {
         const sl = deck?.presentation.slides[j];
-        if (sl === undefined || timelines.has(sl.slidePath)) continue;
+        if (sl === undefined || timings.has(sl.slidePath)) continue;
         if (timelineOf(j) !== null) fresh = true;
       }
       if (fresh) timelineGen += 1;
@@ -540,35 +555,93 @@
   const clicks = $derived(Math.max(0, (timed?.states.length ?? 1) - 1));
 
   // Put the build on the stage slide: each redraw is re-tagged, and the
-  // state goes back on it at once (no motion), so a deck re-read mid-show
-  // keeps its place. Kept neighbours and edit mode show the slide as drawn.
+  // state goes back on it at once, so a deck re-read mid-show keeps its
+  // place. A forward click in the show plays its way there instead
+  // (`toPlay`); any other pass finishes a click still playing. Kept
+  // neighbours and edit mode show the slide as drawn.
   $effect(() => {
     const i = current;
     const b = buildAt;
     const t = timed;
     const editing = editMode;
-    void deckGen;
-    void slideGen;
+    const gen = `${deckGen}:${slideGen}`;
+    // Only the show plays; the presenter's own view always lands.
+    const showing = show.mode === "present";
+    // Not `scale`: a click is planned in slide px inside the `zoom` fit, so
+    // a window resized while it plays keeps playing at the new size, as
+    // PowerPoint's does; re-reading the fit here would land it.
     void slot;
     untrack(() => {
+      // A click plays only on the pass that brought its place: a re-read
+      // deck, a redraw or any later pass at the same place lands.
+      const want = motion.pass(i, b, showing);
+      const tagNow = stageHandles.get(i);
+      if (!motion.owns(i, b, showing, editing, gen, tagNow === undefined ? undefined : stageTags.get(tagNow.element))) stopPlaying();
       let approx = false;
       for (const [j, handle] of stageHandles) {
         const tagged = stageTags.get(handle.element);
         if (tagged === undefined) continue;
         const state = j === i && b !== null && !editing ? t?.states[b] : undefined;
-        if (state === undefined) clearState(tagged);
-        else approx = applyState(tagged, state, w, h) || tagged.fellBack;
+        if (state === undefined) {
+          clearState(tagged);
+          continue;
+        }
+        if (motion.playing !== null && motion.playing.tagged === tagged) {
+          approx = motion.playing.p.approximate;
+          continue;
+        }
+        if (t !== null && b !== null && want?.slide === i && want.build === b && onScreen.shown) {
+          const ready = motion.prepared(i, b, gen);
+          const p = playStep(tagged, t.timeline, b, { w, h, states: t.states, palette: paletteOf(i), reduced: reducedMotion(), prepared: ready });
+          approx = p.approximate;
+          motion.started({ p, slide: i, build: b, tagged, gen }, () => {
+            if (!disposed) {
+              motion.animating = false;
+              playApprox = p.approximate;
+              warmNext(gen);
+            }
+          });
+          continue;
+        }
+        approx = applyState(tagged, state, w, h, paletteOf(j)) || tagged.fellBack;
       }
       playApprox = approx;
+      // Plan the next click once this pass stands still (a playing click
+      // plans it when it lands).
+      if (motion.playing === null) warmNext(gen);
+      else if (motion.warmed !== null) motion.warmed = null;
     });
   });
 
-  /** Why the current slide's builds are approximate, for the dots' tooltip. */
-  const approxNote = $derived.by(() => {
-    const code = timed?.timeline.approximate ?? null;
-    if (code !== null) return `this slide's animation couldn't be read (${code}): it shows as a plain slide`;
-    return playApprox ? "some builds on this slide are approximate: a shape or paragraph couldn't be matched to what was drawn" : "";
+  // A hidden pane or page lands the click that is playing; so does unmounting.
+  $effect(() => {
+    if (!onScreen.shown) untrack(stopPlaying);
   });
+  $effect(() => () => stopPlaying());
+
+  /** Effects on a slide that play other than PowerPoint would, by its
+   *  parsed timeline: worked out the first time the dots' tooltip asks
+   *  (walking every effect and each path's points), not on every slide
+   *  browsed. */
+  const motionNoteOf = new WeakMap<object, string>();
+  function motionNote(t: NonNullable<typeof timed>): string {
+    let n = motionNoteOf.get(t.timeline);
+    if (n === undefined) motionNoteOf.set(t.timeline, (n = motionNotes(t.timeline.steps).join("; ")));
+    return n;
+  }
+
+  /** Why the current slide's builds are approximate, for the dots' tooltip
+   *  (asked when it is about to show). */
+  function approxNote(): string {
+    const t = timed;
+    const code = t?.timeline.approximate ?? null;
+    if (code !== null) return `this slide's animation couldn't be read (${code}): it shows as a plain slide`;
+    const parts = [
+      playApprox ? "some builds on this slide are approximate: a shape or paragraph couldn't be matched to what was drawn" : "",
+      t === null ? "" : motionNote(t),
+    ];
+    return parts.filter((p) => p !== "").join(" · ");
+  }
 
   /** Show build `k` (a click dot); the build already shown goes back to the
    *  slide as drawn. */
@@ -578,9 +651,10 @@
   }
 
   // The show moves on by itself where the slide says (`advTm`), once its
-  // last build is up; only while someone can see it, and any move restarts it.
+  // last build is up and has played; only while someone can see it, and
+  // any move restarts it.
   $effect(() => {
-    if (!inShow || editMode || !onScreen.shown) return;
+    if (!inShow || editMode || !onScreen.shown || motion.animating) return;
     const b = buildAt;
     const t = timed;
     const after = t?.timeline.transition?.advanceAfter ?? null;
@@ -629,7 +703,15 @@
   /** PowerPoint has this deck open here (its `~$` owner file sits beside it). */
   let lockedBy = $state(false);
   let disposed = false;
-  $effect(() => () => (disposed = true));
+  $effect(() => () => {
+    disposed = true;
+    // Pattern pictures no playing click holds (the cache is shared by views).
+    clearMasks();
+  });
+  // Leaving the show lets its pattern pictures go.
+  $effect(() => {
+    if (!inShow) untrack(clearMasks);
+  });
 
   async function attachEdits(bytes: ArrayBuffer, still: () => boolean): Promise<void> {
     const hash = await sha256Hex(bytes);
@@ -735,8 +817,7 @@
       nodesMaterialized: false,
     };
     d.presentation.slides[i] = fresh;
-    timelines.delete(old.slidePath);
-    extracts.set(old.slidePath, extractTiming(xml));
+    timings.replace(old.slidePath, xml);
     try {
       materializeSlideNodes(d.presentation, fresh);
     } catch {
@@ -1396,7 +1477,7 @@
       const state = timelineOf(p.slide)?.states[p.build];
       if (tagged !== undefined) {
         if (state === undefined) clearState(tagged);
-        else applyState(tagged, state, w, h);
+        else applyState(tagged, state, w, h, paletteOf(p.slide));
       }
     });
   });
@@ -1596,7 +1677,7 @@
       {#if hiddenSlide}<span class="tag" title="this slide is hidden in the slide show">hidden</span>{/if}
       <span
         class="limits"
-        title="drawn in the browser: builds appear and disappear click by click with no motion, no transitions, and fonts the deck doesn't embed fall back to this system's{deck.blocked > 0
+        title="drawn in the browser: a click plays its effects (rare ones as a fade), slides change without their transitions, and fonts the deck doesn't embed fall back to this system's{deck.blocked > 0
           ? `; ${deck.blocked} linked outside ${deck.blocked === 1 ? 'resource was' : 'resources were'} not loaded`
           : ''}{nodeErrors > 0 ? `; ${nodeErrors} ${nodeErrors === 1 ? 'shape' : 'shapes'} couldn't be drawn` : ''}"
         aria-label="rendering limits"
@@ -1800,7 +1881,23 @@
         onpointercancel={onBoxPointerCancel}
         onclickcapture={onBoxClickCapture}
       >
-        <div class="slide-scale" style:width="{w}px" style:height="{h}px" style:transform="scale({scale})" bind:this={slot}></div>
+        <!-- The show fits the slide with `zoom`, so it is laid out and painted
+             at its real size. Under `transform: scale()` WebKit composites
+             the scaled ancestor whenever a shape animates (a bitmap of the
+             unscaled slide, stretched), so every label on the slide thins and
+             shifts for the length of each click and snaps back when it lands,
+             and above a fit of 1 it blurs. Keep it `zoom`: one rendering path.
+             Browsing and editing never animate and keep `transform`, which the
+             edit layer's pointer mapping is written for; text is laid out the
+             same under both (`fit-text` below, the wrap probe). -->
+        <div
+          class="slide-scale"
+          style:width="{w}px"
+          style:height="{h}px"
+          style:transform={inShow ? null : `scale(${scale})`}
+          style:zoom={inShow ? String(scale) : null}
+          bind:this={slot}
+        ></div>
         {#if show.mode === "browse"}
           {#if editMode && edits.ready && edits.blocked === null && editSlide !== undefined}
             <PptxEditLayer
@@ -1924,7 +2021,8 @@
 {#snippet nextView()}
   <div class="next-frame" bind:clientWidth={nextW}>
     {#if nextScale > 0}
-      <div class="slide-scale" style:width="{w}px" style:height="{h}px" style:transform="scale({nextScale})" bind:this={nextSlot}></div>
+      <!-- `zoom`, as the show's stage: see there. -->
+      <div class="slide-scale" style:width="{w}px" style:height="{h}px" style:zoom={String(nextScale)} bind:this={nextSlot}></div>
     {/if}
   </div>
 {/snippet}
@@ -2243,6 +2341,30 @@
   .slide-scale {
     position: relative;
     transform-origin: 0 0;
+  }
+
+  /* A slide's text must lay out the same at every fit (the show is fitted
+     with `zoom`, so its text is set at the real size; browsing is fitted
+     with a transform at the slide's own size). WebKit picks the optical
+     size and Apple's size-dependent tracking from the used font size, so
+     a line's width changed with the window (up to 1.9% of the slide at
+     a fit of 0.4): with optical sizing off, widths are exactly
+     proportional at every fit. Chrome already keeps them proportional and
+     gets wider at small sizes with it off, so this is WebKit's alone
+     (`-apple-system-body` is a font only WebKit knows). Measured by the
+     wrap probe across fits 0.4–3 in both engines. It reaches every slide
+     WebKit draws here: browse, edit, the show, the presenter's frames and
+     the thumbnails, on purpose, so browse and the show lay a paragraph out
+     alike. Against `origin/main` (optical sizing on in browse) the corpus's
+     181 paragraphs keep every line count at 960×600 and 1600×1000; line
+     widths change by up to 3.2% (72 pt text), the same at both sizes.
+     Browse against the show: 0 line counts, widths within 0.01% (WebKit)
+     and 2.2% at 960×600, 0.14% at 1600×1000 (Chrome, untouched by this). */
+  @supports (font: -apple-system-body) {
+    .slide-scale,
+    .thumb-slide {
+      font-optical-sizing: none;
+    }
   }
 
   /* Kept slides stack in the slot; only the current one is visible. */

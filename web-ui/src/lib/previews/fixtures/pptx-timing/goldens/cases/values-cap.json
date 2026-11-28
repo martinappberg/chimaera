@@ -1,0 +1,16 @@
+{
+  "part": "values-cap.xml",
+  "id": 0,
+  "transition": null,
+  "steps": [
+    []
+  ],
+  "states": [
+    {
+      "hidden": [],
+      "moved": {}
+    }
+  ],
+  "interactive": 0,
+  "approximate": "too-many-values"
+}

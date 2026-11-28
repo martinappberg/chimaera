@@ -6,8 +6,10 @@ import {
   effectName,
   extractTiming,
   goldenSlide,
+  keyValue,
   parseTimeline,
   pathEnd,
+  splitShapes,
   targetKey,
   TIMING_CAPS,
   type GoldenSlide,
@@ -216,14 +218,20 @@ describe("parseTimeline on the corpus", () => {
     expect(t.builds).toEqual([{ spid: "2", group: 0, kind: "bldP", build: "p", level: null, animBg: false }]);
   });
 
-  it("adds up paths on one shape (paths, slide 2)", async () => {
+  it("a second path on one shape replaces the first: offsets are from the layout place (paths, slide 2; PowerPoint's film)", async () => {
     const t = await slideOf("paths", 2);
     expect(buildStates(t).map((s) => s.moved)).toEqual([
       {},
       {},
       { "2": [0.25, 0] },
-      { "2": [0.25, 0.25] },
+      { "2": [0, 0.25] },
     ]);
+  });
+
+  it("a second path written from where the first ended ends at its own end (order, slide 3; PowerPoint's film)", async () => {
+    const t = await slideOf("order", 3);
+    expect(t.steps[2]![0]!.path).toBe("M 0.25 0 L 0.25 0.25 E");
+    expect(buildStates(t).at(-1)!.moved).toEqual({ "2": [0.25, 0.25], "3": [0, 0.25] });
   });
 
   it("shows, keeps and hides one shape across three clicks (exits-emphasis, slide 3)", async () => {
@@ -444,6 +452,19 @@ describe("parseTimeline on hand-written slides", () => {
 });
 
 describe("the hand-written cases", () => {
+  it("a hostile slide whose states would hold far past the values cap plays plain at once (R21)", () => {
+    // ~370 KB: 290 clicks, each holding a grow on paragraphs 0-255 of one box.
+    const grow = '<p:animScale><p:cBhvr><p:cTn id="9" dur="1" fill="hold"/><p:tgtEl><p:spTgt spid="2"><p:txEl><p:pRg st="0" end="255"/></p:txEl></p:spTgt></p:tgtEl></p:cBhvr><p:by x="150000" y="150000"/></p:animScale>';
+    const click = `<p:par><p:cTn id="7" fill="hold"><p:stCondLst><p:cond delay="indefinite"/></p:stCondLst><p:childTnLst><p:par><p:cTn id="8" presetID="6" presetClass="emph" fill="hold" nodeType="clickEffect"><p:childTnLst>${grow.repeat(5)}</p:childTnLst></p:cTn></p:par></p:childTnLst></p:cTn></p:par>`;
+    const xml = caseXml("values-cap").replace(/<p:childTnLst><p:par><p:cTn id="\d+" fill="hold"><p:stCondLst><p:cond delay="indefinite"\/>[\s\S]*<\/p:cTn><p:prevCondLst>/, `<p:childTnLst>${click.repeat(290)}</p:childTnLst></p:cTn><p:prevCondLst>`);
+    expect(xml.length).toBeGreaterThan(350_000);
+    const t0 = performance.now();
+    const t = parseTimeline(xml);
+    expect(t.approximate).toBe("too-many-values");
+    expect(performance.now() - t0).toBeLessThan(2000);
+    expect(buildStates(t)).toHaveLength(1);
+  });
+
   it("an on-shape-click sequence is counted, kept out of the steps, and only hides its target at first", () => {
     const t = parseTimeline(caseXml("interactive-trigger"));
     expect(t.approximate).toBeNull();
@@ -499,7 +520,7 @@ describe("the hand-written cases", () => {
     expect(parseTimeline(caseXml("transition-unknown-choice")).transition).toMatchObject({ kind: "fade", dur: 1000 });
   });
 
-  it("paths sum unrounded, then round half away from zero, never to -0", () => {
+  it("the path that ends last sets the offset, rounded half away from zero, never to -0", () => {
     const states = buildStates(parseTimeline(caseXml("path-edges")));
     expect(states.at(-1)!.moved).toEqual({
       "2": [0, 0],
@@ -507,9 +528,39 @@ describe("the hand-written cases", () => {
       "4": [0.0003, -0.0003],
       "5": [0, 0],
       "6": [0.1, 0.1],
-      "7": [0.0001, 0],
+      // Two paths of 0.00004 each: the later replaces (0.00004 rounds to 0).
+      "7": [0, 0],
     });
     expect(Object.is(states.at(-1)!.moved["5"]![0], 0)).toBe(true);
+  });
+
+  it("holds a p:anim's keyframes as playback reads them: shared times take the last, discrete the earlier (R28)", () => {
+    const states = buildStates(parseTimeline(caseXml("anim-keys")));
+    expect(states.at(-1)!.turn).toEqual({ "2": 180, "6": 40 });
+    // 4's discrete anim holds 1 (left out), then 0.4; 5 is out of order and 6's opacity isn't `num`.
+    expect(states.at(-1)!.opacity).toEqual({ "3": 0.75, "4": 0.4 });
+    const keys = [
+      { at: 0, v: 0 },
+      { at: 0.5, v: 90 },
+      { at: 0.5, v: 180 },
+      { at: 1, v: 200 },
+    ];
+    expect([0, 0.25, 0.5, 0.75, 1, 2].map((q) => keyValue(keys, q, false))).toEqual([0, 45, 180, 190, 200, 200]);
+    expect([0, 0.25, 0.5, 0.75, 1].map((q) => keyValue(keys, q, true))).toEqual([0, 0, 180, 180, 200]);
+    expect(keyValue([{ at: 0.2, v: 5 }], -1, false)).toBe(5);
+  });
+
+  it("keeps held values per paragraph, the later change winning where ranges overlap, and a split shape's whole on its body (R31, R32)", () => {
+    const t = parseTimeline(caseXml("paragraph-order"));
+    expect([...splitShapes(t)].sort()).toEqual(["2", "3"]);
+    const last = buildStates(t).at(-1)!;
+    const val = (k: string, part: "fill" | "text") => last.color?.[k]?.[part]?.to?.attrs.val;
+    expect(["2:p0-0", "2:p1-1", "2:p2-2"].map((k) => val(k, "text"))).toEqual(["FF0000", "0000FF", "0000FF"]);
+    // The whole box's green font colour holds nothing; its fill holds on the body.
+    expect(last.color?.["2"]).toBeUndefined();
+    expect(val("2:bg", "fill")).toBe("FFC000");
+    // One click: the range that ends later wins on the paragraph both reach.
+    expect(["3:p0-0", "3:p1-1", "3:p2-2"].map((k) => val(k, "text"))).toEqual(["0000FF", "0000FF", "0000FF"]);
   });
 
   it("hostile strings reach no lookup", () => {

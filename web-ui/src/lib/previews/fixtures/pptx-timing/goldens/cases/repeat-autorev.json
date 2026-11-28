@@ -114,27 +114,52 @@
     },
     {
       "hidden": [],
-      "moved": {}
+      "moved": {},
+      "turn": {
+        "3": 1
+      }
     },
     {
       "hidden": [],
-      "moved": {}
+      "moved": {},
+      "turn": {
+        "3": 1
+      }
     },
     {
       "hidden": [],
-      "moved": {}
+      "moved": {},
+      "turn": {
+        "3": 1,
+        "5": 180
+      }
     },
     {
       "hidden": [],
-      "moved": {}
+      "moved": {},
+      "turn": {
+        "3": 1,
+        "5": 180,
+        "6": 270
+      }
     },
     {
       "hidden": [],
-      "moved": {}
+      "moved": {},
+      "turn": {
+        "3": 1,
+        "5": 180,
+        "6": 270
+      }
     },
     {
       "hidden": [],
-      "moved": {}
+      "moved": {},
+      "turn": {
+        "3": 2,
+        "5": 180,
+        "6": 270
+      }
     }
   ],
   "interactive": 0

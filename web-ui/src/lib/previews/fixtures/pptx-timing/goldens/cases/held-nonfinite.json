@@ -1,0 +1,56 @@
+{
+  "part": "held-nonfinite.xml",
+  "id": 0,
+  "transition": null,
+  "steps": [
+    [],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 250,
+        "class": "entr",
+        "preset": 25,
+        "subtype": 0,
+        "effect": "other",
+        "dir": null,
+        "target": "2",
+        "sets": "visible"
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 2000,
+        "class": "emph",
+        "preset": 8,
+        "subtype": 0,
+        "effect": "spin",
+        "dir": null,
+        "target": "2",
+        "sets": null
+      }
+    ]
+  ],
+  "states": [
+    {
+      "hidden": [
+        "2"
+      ],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {},
+      "turn": {
+        "2": 90
+      }
+    }
+  ],
+  "interactive": 0
+}

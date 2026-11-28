@@ -1,0 +1,324 @@
+{
+  "part": "paragraph-order.xml",
+  "id": 0,
+  "transition": null,
+  "steps": [
+    [],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 500,
+        "class": "emph",
+        "preset": 3,
+        "subtype": 2,
+        "effect": "other",
+        "dir": null,
+        "target": "2:p0-1",
+        "sets": null
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 500,
+        "class": "emph",
+        "preset": 3,
+        "subtype": 2,
+        "effect": "other",
+        "dir": null,
+        "target": "2:p1-2",
+        "sets": null
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 500,
+        "class": "emph",
+        "preset": 3,
+        "subtype": 2,
+        "effect": "other",
+        "dir": null,
+        "target": "2",
+        "sets": null
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 500,
+        "class": "emph",
+        "preset": 1,
+        "subtype": 2,
+        "effect": "fill-color",
+        "dir": null,
+        "target": "2",
+        "sets": null
+      }
+    ],
+    [
+      {
+        "trigger": "click",
+        "start": 0,
+        "dur": 1000,
+        "class": "emph",
+        "preset": 3,
+        "subtype": 2,
+        "effect": "other",
+        "dir": null,
+        "target": "3:p0-2",
+        "sets": null
+      }
+    ]
+  ],
+  "states": [
+    {
+      "hidden": [],
+      "moved": {}
+    },
+    {
+      "hidden": [],
+      "moved": {},
+      "color": {
+        "2:p0-0": {
+          "text": {
+            "to": {
+              "type": "srgbClr",
+              "attrs": {
+                "val": "FF0000"
+              },
+              "mods": []
+            }
+          }
+        },
+        "2:p1-1": {
+          "text": {
+            "to": {
+              "type": "srgbClr",
+              "attrs": {
+                "val": "FF0000"
+              },
+              "mods": []
+            }
+          }
+        }
+      }
+    },
+    {
+      "hidden": [],
+      "moved": {},
+      "color": {
+        "2:p0-0": {
+          "text": {
+            "to": {
+              "type": "srgbClr",
+              "attrs": {
+                "val": "FF0000"
+              },
+              "mods": []
+            }
+          }
+        },
+        "2:p1-1": {
+          "text": {
+            "to": {
+              "type": "srgbClr",
+              "attrs": {
+                "val": "0000FF"
+              },
+              "mods": []
+            }
+          }
+        },
+        "2:p2-2": {
+          "text": {
+            "to": {
+              "type": "srgbClr",
+              "attrs": {
+                "val": "0000FF"
+              },
+              "mods": []
+            }
+          }
+        }
+      }
+    },
+    {
+      "hidden": [],
+      "moved": {},
+      "color": {
+        "2:p0-0": {
+          "text": {
+            "to": {
+              "type": "srgbClr",
+              "attrs": {
+                "val": "FF0000"
+              },
+              "mods": []
+            }
+          }
+        },
+        "2:p1-1": {
+          "text": {
+            "to": {
+              "type": "srgbClr",
+              "attrs": {
+                "val": "0000FF"
+              },
+              "mods": []
+            }
+          }
+        },
+        "2:p2-2": {
+          "text": {
+            "to": {
+              "type": "srgbClr",
+              "attrs": {
+                "val": "0000FF"
+              },
+              "mods": []
+            }
+          }
+        }
+      }
+    },
+    {
+      "hidden": [],
+      "moved": {},
+      "color": {
+        "2:bg": {
+          "fill": {
+            "to": {
+              "type": "srgbClr",
+              "attrs": {
+                "val": "FFC000"
+              },
+              "mods": []
+            }
+          }
+        },
+        "2:p0-0": {
+          "text": {
+            "to": {
+              "type": "srgbClr",
+              "attrs": {
+                "val": "FF0000"
+              },
+              "mods": []
+            }
+          }
+        },
+        "2:p1-1": {
+          "text": {
+            "to": {
+              "type": "srgbClr",
+              "attrs": {
+                "val": "0000FF"
+              },
+              "mods": []
+            }
+          }
+        },
+        "2:p2-2": {
+          "text": {
+            "to": {
+              "type": "srgbClr",
+              "attrs": {
+                "val": "0000FF"
+              },
+              "mods": []
+            }
+          }
+        }
+      }
+    },
+    {
+      "hidden": [],
+      "moved": {},
+      "color": {
+        "2:bg": {
+          "fill": {
+            "to": {
+              "type": "srgbClr",
+              "attrs": {
+                "val": "FFC000"
+              },
+              "mods": []
+            }
+          }
+        },
+        "2:p0-0": {
+          "text": {
+            "to": {
+              "type": "srgbClr",
+              "attrs": {
+                "val": "FF0000"
+              },
+              "mods": []
+            }
+          }
+        },
+        "2:p1-1": {
+          "text": {
+            "to": {
+              "type": "srgbClr",
+              "attrs": {
+                "val": "0000FF"
+              },
+              "mods": []
+            }
+          }
+        },
+        "2:p2-2": {
+          "text": {
+            "to": {
+              "type": "srgbClr",
+              "attrs": {
+                "val": "0000FF"
+              },
+              "mods": []
+            }
+          }
+        },
+        "3:p0-0": {
+          "text": {
+            "to": {
+              "type": "srgbClr",
+              "attrs": {
+                "val": "0000FF"
+              },
+              "mods": []
+            }
+          }
+        },
+        "3:p1-1": {
+          "text": {
+            "to": {
+              "type": "srgbClr",
+              "attrs": {
+                "val": "0000FF"
+              },
+              "mods": []
+            }
+          }
+        },
+        "3:p2-2": {
+          "text": {
+            "to": {
+              "type": "srgbClr",
+              "attrs": {
+                "val": "0000FF"
+              },
+              "mods": []
+            }
+          }
+        }
+      }
+    }
+  ],
+  "interactive": 0
+}

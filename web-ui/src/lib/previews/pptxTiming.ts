@@ -30,7 +30,20 @@
  * shape id is accepted only as 1–10 ASCII digits.
  */
 
-import { attr, decodeEntities, scan, type XmlEl } from "./pptxXml";
+import { decodeEntities, scan, type XmlEl } from "./pptxXml";
+
+/** An attribute's value as XML gives it (README R23a): each literal tab,
+ *  newline or carriage return in the source becomes a space (a CRLF pair
+ *  one space) before references are decoded, so `&#10;` stays a newline. */
+function attr(xml: string, el: XmlEl, name: string): string | null {
+  const a = el.attrs.find((x) => x.qname === name);
+  if (a === undefined) return null;
+  return decodeEntities(xml.slice(a.valueStart, a.valueEnd).replace(/\r\n|[\t\n\r]/g, " "));
+}
+
+/** Most child transforms or attributes a colour may carry, and most `by`
+ *  changes one target's part may hold (R21): a real colour has a handful. */
+export const COLOR_CAPS = { parts: 8, chain: 16 } as const;
 
 const NS_P = new Set([
   "http://schemas.openxmlformats.org/presentationml/2006/main",
@@ -53,6 +66,10 @@ export const TIMING_CAPS = {
   clicks: 300,
   /** `p:par`/`p:seq`/`p:excl` nesting, the root `p:par` being 1. */
   depth: 32,
+  /** What the states may hold in all: each main-sequence behaviour's
+   *  target keys (a paragraph range one per paragraph, up to
+   *  `HELD_PARAGRAPHS`) times the states from its step on (R21). */
+  values: 250_000,
 } as const;
 
 // --- types -------------------------------------------------------------------------
@@ -87,7 +104,9 @@ export type Approximate =
   | "timing-too-large"
   | "too-many-effects"
   | "too-many-clicks"
-  | "too-deep";
+  | "too-deep"
+  | "colour-too-large"
+  | "too-many-values";
 
 export interface Target {
   /** Shape id (`cNvPr@id`): 1–10 ASCII digits. */
@@ -105,6 +124,8 @@ export interface Color {
   type: string;
   /** Its attributes, as written (no prototype: keys are the file's). */
   attrs: Record<string, string>;
+  /** Its child transforms in order (`lumMod`, `tint`, `alpha`, …): local name and `val`. */
+  mods: { name: string; val: string | null }[];
 }
 
 interface BehaviourBase {
@@ -120,6 +141,8 @@ interface BehaviourBase {
   accel: number;
   decel: number;
   additive: string | null;
+  /** Its `p:cTn`'s `fill` (`hold`, `freeze`, `remove`, `transition`), as written. */
+  fill: string | null;
   /** `p:attrNameLst` entries. */
   attrs: string[];
 }
@@ -173,6 +196,8 @@ export interface Effect {
   decel: number;
   autoRev: boolean;
   repeatCount: number | null;
+  /** The effect node's own `fill`, as written. */
+  fill: string | null;
   behaviours: Behaviour[];
 }
 
@@ -225,6 +250,32 @@ export interface BuildState {
   /** Target key → summed path offset [dx, dy] in slide fractions, keys sorted.
    *  No prototype: keys come from the file. */
   moved: Record<string, [number, number]>;
+  /** Held size factors [x, y] (R26), only targets not at [1, 1]; absent when none. */
+  scale?: Record<string, [number, number]>;
+  /** Held turn in degrees, in [0, 360) (R27), only targets not at 0; absent when none. */
+  turn?: Record<string, number>;
+  /** Held opacity (R28), only targets not at 1; absent when none. */
+  opacity?: Record<string, number>;
+  /** Held colour changes per part (R29), absent when none. */
+  color?: Record<string, HeldColors>;
+}
+
+/** A target's held colour changes, by what they colour. */
+export interface HeldColors {
+  fill?: HeldColor;
+  line?: HeldColor;
+  text?: HeldColor;
+}
+
+/** One part's held colour: the last colour set (`to`), the changes made on
+ *  top of it in order (`by`), and the fill/line switches set with them. */
+export interface HeldColor {
+  to?: Color;
+  by?: Color[];
+  /** `fill.type` set to `solid`: the part is filled with one colour. */
+  solid?: true;
+  /** `fill.on` / `stroke.on`, as set. */
+  on?: boolean;
 }
 
 // --- numbers and strings -----------------------------------------------------------
@@ -241,11 +292,22 @@ function natOf(v: string | null): number | null {
   const n = intOf(v);
   return n === null ? null : Math.max(0, n);
 }
-/** A real number (in-memory values only: scale, tav, colour; never contract fields). */
+/** A decimal number (README R2a): an optional sign, digits with an
+ *  optional fraction (or a fraction alone), an optional exponent; nothing
+ *  else (no hex, no blank, no whitespace, no `Infinity`). */
+const DECIMAL = /^[-+]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][-+]?[0-9]+)?$/;
 function numOf(v: string | null): number | null {
-  if (v === null || v.trim() === "") return null;
+  if (v === null || !DECIMAL.test(v)) return null;
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
+}
+
+/** A time value as a number (R28): a `fltVal`/`intVal`, or a `strVal`
+ *  whose text is a decimal number (PowerPoint writes transparency as
+ *  `strVal "0.5"`); a `boolVal` never is. */
+export function decimalOf(v: TimeValue | null): number | null {
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
+  return typeof v === "string" ? numOf(v) : null;
 }
 function truthy(v: string | null): boolean {
   return v === "1" || v === "true";
@@ -284,8 +346,36 @@ function childP(el: XmlEl | undefined, local: string): XmlEl | undefined {
 function childrenP(el: XmlEl | undefined, local: string): XmlEl[] {
   return el === undefined ? [] : el.children.filter((c) => isP(c, local));
 }
+/** An element's text as XML gives it (R23a): a literal CR LF pair or lone
+ *  CR is a line feed (XML's end-of-line handling, before anything else),
+ *  comments and processing instructions dropped, CDATA sections taken as
+ *  written (not decoded), the rest's references decoded; a child element's
+ *  tags are dropped and its own text taken in place, as a DOM's
+ *  `textContent`. Trimmed of XML whitespace. */
 function text(xml: string, el: XmlEl): string {
-  return decodeEntities(xml.slice(el.openEnd, el.closeStart)).trim();
+  // XML's whitespace only (R23a): a no-break space or U+FEFF is text.
+  return innerText(xml, el).replace(/^[ \t\n\r]+|[ \t\n\r]+$/g, "");
+}
+function innerText(xml: string, el: XmlEl): string {
+  if (el.closeStart <= el.openEnd) return "";
+  let out = "";
+  let at = el.openEnd;
+  for (const c of el.children) {
+    out += charData(xml.slice(at, c.start)) + innerText(xml, c);
+    at = c.end;
+  }
+  return out + charData(xml.slice(at, el.closeStart));
+}
+function charData(source: string): string {
+  const raw = source.replace(/\r\n?/g, "\n");
+  let out = "";
+  const re = /<!--[\s\S]*?-->|<\?[\s\S]*?\?>|<!\[CDATA\[([\s\S]*?)\]\]>/g;
+  let last = 0;
+  for (let m = re.exec(raw); m !== null; m = re.exec(raw)) {
+    out += decodeEntities(raw.slice(last, m.index)) + (m[1] ?? "");
+    last = m.index + m[0].length;
+  }
+  return out + decodeEntities(raw.slice(last));
 }
 /** An attribute by namespace + local name, whatever prefix the part binds. */
 function attrNs(xml: string, el: XmlEl, ns: string, local: string): string | null {
@@ -436,9 +526,11 @@ function nodeTiming(xml: string, cTn: XmlEl | undefined): NodeTiming {
   };
 }
 
+/** A time value (R28): the holder's first child, when it is a PresentationML
+ *  `strVal`, `fltVal`, `intVal` or `boolVal`; any other element is no value. */
 function timeValue(xml: string, holder: XmlEl | undefined): TimeValue | null {
   const v = holder?.children[0];
-  if (v === undefined) return null;
+  if (v === undefined || !NS_P.has(v.ns)) return null;
   const val = attr(xml, v, "val");
   switch (v.local) {
     case "strVal":
@@ -449,7 +541,7 @@ function timeValue(xml: string, holder: XmlEl | undefined): TimeValue | null {
     case "boolVal":
       return truthy(val);
     default:
-      return val;
+      return null;
   }
 }
 
@@ -460,12 +552,20 @@ function point(xml: string, el: XmlEl | undefined): Point | null {
   return x === null || y === null ? null : { x, y };
 }
 
+/** A colour past `COLOR_CAPS`: the slide plays as a plain slide (R21). */
+class ColourTooLarge extends Error {}
+
 function color(xml: string, el: XmlEl | undefined): Color | null {
   const c = el?.children[0];
   if (c === undefined) return null;
   const attrs = Object.create(null) as Record<string, string>;
-  for (const a of c.attrs) attrs[a.qname] = decodeEntities(xml.slice(a.valueStart, a.valueEnd));
-  return { type: c.local, attrs };
+  // A prefixed attribute is never part of a colour (PowerPoint writes
+  // none; R29): dropped, so no unbound prefix reaches anything.
+  // Namespace declarations are not attributes (R21).
+  const own = c.attrs.filter((a) => !a.qname.includes(":") && a.qname !== "xmlns");
+  if (own.length > COLOR_CAPS.parts || c.children.length > COLOR_CAPS.parts) throw new ColourTooLarge();
+  for (const a of [...own].sort((x, y) => (x.qname < y.qname ? -1 : x.qname > y.qname ? 1 : 0))) attrs[a.qname] = attr(xml, c, a.qname)!;
+  return { type: c.local, attrs, mods: c.children.map((m) => ({ name: m.local, val: attr(xml, m, "val") })) };
 }
 
 const BEHAVIOURS = new Set(["set", "anim", "animEffect", "animScale", "animRot", "animMotion", "animClr", "cmd", "audio", "video"]);
@@ -494,6 +594,7 @@ function readBehaviours(xml: string, list: XmlEl | undefined, offset: number, ou
       accel: t.accel,
       decel: t.decel,
       additive: cBhvr === undefined ? null : attr(xml, cBhvr, "additive"),
+      fill: cTn === undefined ? null : attr(xml, cTn, "fill"),
       attrs: childrenP(childP(cBhvr, "attrNameLst"), "attrName").map((a) => text(xml, a)),
     };
     switch (b.local) {
@@ -657,6 +758,7 @@ function readEffect(xml: string, cTn: XmlEl, start: number, first: boolean): Eff
     decel: t.decel,
     autoRev: t.autoRev,
     repeatCount: t.repeatCount,
+    fill: attr(xml, cTn, "fill"),
     behaviours,
   };
 }
@@ -809,11 +911,18 @@ function readSlide(xml: string, root: XmlEl): SlideTimeline {
 
   const groups = main === undefined ? [] : groupsOf(main);
   if (groups.length > TIMING_CAPS.clicks) return plain(transition, "too-many-clicks");
-  const steps = readSteps(xml, groups);
+  let steps: Effect[][];
+  try {
+    steps = readSteps(xml, groups);
+  } catch (e) {
+    if (e instanceof ColourTooLarge) return plain(transition, "colour-too-large");
+    throw e;
+  }
   // A first group whose first effect isn't a click runs on entry: it is step 0.
   // Otherwise nothing runs on entry and every group is a click.
   if (steps[0]?.[0]?.trigger !== "with" && steps[0]?.[0]?.trigger !== "after") steps.unshift([]);
 
+  let tooLarge = false;
   const interactive: InteractiveSequence[] = seqs
     .filter((c) => attr(xml, c, "nodeType") === "interactiveSeq")
     .map((c) => {
@@ -823,8 +932,46 @@ function readSlide(xml: string, root: XmlEl): SlideTimeline {
         trigger = readTarget(xml, childP(cond, "tgtEl"))?.spid ?? null;
         if (trigger !== null) break;
       }
-      return { trigger, steps: readSteps(xml, groupsOf(c)) };
+      let isteps: Effect[][] = [];
+      try {
+        isteps = readSteps(xml, groupsOf(c));
+      } catch (e) {
+        if (!(e instanceof ColourTooLarge)) throw e;
+        tooLarge = true;
+      }
+      return { trigger, steps: isteps };
     });
+  if (tooLarge) return plain(transition, "colour-too-large");
+  // A held `by` chain is bounded too (R21), in every sequence alike: count
+  // the colour changes by target and attribute, each sequence on its own.
+  for (const seq of [steps, ...interactive.map((i) => i.steps)]) {
+    const chains = new Map<string, number>();
+    for (const step of seq) {
+      for (const e of step) {
+        for (const b of e.behaviours) {
+          if (b.kind !== "color" || b.by === null || b.target === null) continue;
+          const k = `${targetKey(b.target)} ${(b.attrs[0] ?? "").toLowerCase()}`;
+          const n = (chains.get(k) ?? 0) + 1;
+          if (n > COLOR_CAPS.chain) return plain(transition, "colour-too-large");
+          chains.set(k, n);
+        }
+      }
+    }
+  }
+  // What the states would hold (R21): bounded before any is built.
+  let values = 0;
+  for (let k = 0; k < steps.length; k++) {
+    for (const e of steps[k]!) {
+      for (const b of e.behaviours) {
+        // A behaviour without its own target writes nothing (R3), so it
+        // counts nothing, as the colour-chain cap above.
+        const t = b.target;
+        if (t === null) continue;
+        values += (t.para === null ? 1 : Math.max(0, Math.min(t.para[1] - t.para[0] + 1, HELD_PARAGRAPHS))) * (steps.length - k);
+        if (values > TIMING_CAPS.values) return plain(transition, "too-many-values");
+      }
+    }
+  }
 
   return { steps, transition, interactive, builds: readBuilds(xml, childP(timing, "bldLst")), approximate: null };
 }
@@ -877,21 +1024,181 @@ export function extractTiming(slideXml: string): TimingExtract {
 
 // --- build states -------------------------------------------------------------------
 
+/**
+ * SMIL acceleration: `accel` and `decel` (100000ths of the duration) turn
+ * linear progress `q` (0–1) into eased progress with the same end points.
+ */
+export function warp(q: number, accel: number, decel: number): number {
+  let a = Math.max(0, accel) / 100000;
+  let d = Math.max(0, decel) / 100000;
+  if (a + d > 1) {
+    const s = a + d;
+    a /= s;
+    d /= s;
+  }
+  if (a === 0 && d === 0) return q;
+  const r = 1 / (1 - a / 2 - d / 2);
+  if (q < a) return (r * q * q) / (2 * a);
+  if (q <= 1 - d) return r * (q - a / 2);
+  const e = 1 - q;
+  return 1 - (r * e * e) / (2 * d);
+}
+
+/**
+ * Progress (0–1) of a timed node `tau` ms after it begins: null before it
+ * begins; `repeat` in 1000ths (null: forever), `autoRev` plays each
+ * iteration forward then back, acceleration applies to each simple
+ * duration. Holds the last value after the end.
+ */
+export function progress(
+  tau: number,
+  dur: number,
+  repeat: number | null,
+  autoRev: boolean,
+  accel: number,
+  decel: number,
+): number | null {
+  if (tau < 0) return null;
+  if (dur <= 0) return autoRev ? 0 : 1;
+  const iter = autoRev ? 2 : 1;
+  const total = repeat === null ? Infinity : (dur * iter * repeat) / 1000;
+  const s = Math.min(tau, total) / dur;
+  if (autoRev) {
+    let pos = s % 2;
+    if (pos === 0 && s > 0) return total === 0 ? 0 : warp(0, accel, decel);
+    if (pos > 1) pos = 2 - pos;
+    return warp(pos, accel, decel);
+  }
+  let pos = s % 1;
+  if (pos === 0 && s > 0) pos = 1;
+  return warp(pos, accel, decel);
+}
+
+
+
+// --- time and path math shared with playback (`pptxMotion.ts`) --------------------
+// One copy of each: the state a click lands on and the frames that play it
+// must agree, or the landing jumps.
+
+/** A behaviour's dur, a set of dur 1 counting 0 (PowerPoint's instant, R10);
+ *  null when it never ends. */
+export function instantDur(b: Behaviour): number | null {
+  if (b.dur === null) return null;
+  return b.kind === "set" && b.dur === 1 ? 0 : b.dur;
+}
+
+/** The effect's span before its own repeat: its latest finite behaviour
+ *  end (R11, in ms as doubles: R25's `S`). */
+export function effectSpan(e: Effect): number {
+  let span = 0;
+  for (const b of e.behaviours) {
+    const d = instantDur(b);
+    if (d === null || b.repeatCount === null) continue;
+    span = Math.max(span, b.delay + (d * b.repeatCount * (b.autoRev ? 2 : 1)) / 1000);
+  }
+  return span;
+}
+
+/** The effect's own clock `tau` ms after it starts (its accel, decel,
+ *  repeat and autoRev; R25): null before it starts. */
+export function effectTime(e: Effect, tau: number): number | null {
+  if (tau < 0) return null;
+  const span = effectSpan(e);
+  if (span <= 0) return 0;
+  if (e.accel === 0 && e.decel === 0 && !e.autoRev && e.repeatCount === 1000) return Math.min(tau, span);
+  const q = progress(tau, span, e.repeatCount, e.autoRev, e.accel, e.decel);
+  return q === null ? null : q * span;
+}
+
+/** A behaviour's own progress (0–1) at its effect's clock `c`: null before
+ *  it begins or when it never ends. */
+export function behaviourProgress(b: Behaviour, c: number): number | null {
+  const d = instantDur(b);
+  if (d === null || b.repeatCount === null) return null;
+  return progress(c - b.delay, d, b.repeatCount, b.autoRev, b.accel, b.decel);
+}
+
+/** Keyframes: progress (0–1) → value, in document order. */
+export type Keys = { at: number; v: number }[];
+
+/**
+ * `p:anim`'s values as keyframes (R28), or null when it contributes
+ * nothing: a `valueType` other than `num`, `calcmode` `fmla`, a `tav`
+ * with a formula, a value `read` refuses, a time outside 0–1 or before
+ * the one before it. Without `tav`s: `from` (else `cur`, the value now)
+ * to `to`, or to `from + by`, or staying at `cur`.
+ */
+export function animKeys(b: Behaviour & { kind: "anim" }, read: (v: TimeValue | null) => number | null, cur: number): Keys | null {
+  if (b.valueType !== null && b.valueType !== "num") return null;
+  if (b.calcmode === "fmla") return null;
+  if (b.tav.length > 0) {
+    const n = b.tav.length;
+    const keys: Keys = [];
+    for (const [i, tav] of b.tav.entries()) {
+      if (tav.fmla !== null && tav.fmla !== "") return null;
+      const v = read(tav.val);
+      if (v === null) return null;
+      const at = tav.tm === null ? (n === 1 ? 0 : i / (n - 1)) : tav.tm / 100000;
+      if (!(at >= 0 && at <= 1)) return null;
+      if (keys.length > 0 && at < keys[keys.length - 1]!.at) return null;
+      keys.push({ at, v });
+    }
+    return keys;
+  }
+  const from = b.from === null ? cur : read(b.from);
+  if (from === null) return null;
+  let to: number | null = cur;
+  if (b.to !== null) to = read(b.to);
+  else if (b.by !== null) {
+    const by = read(b.by);
+    to = by === null ? null : from + by;
+  }
+  return to === null ? null : [
+    { at: 0, v: from },
+    { at: 1, v: to },
+  ];
+}
+
+/** The keyframes' value at progress `q` (R28): the first before the
+ *  first, the last after the last; between two times, linear (`discrete`:
+ *  the earlier); at a time several keys share, the last of them. */
+export function keyValue(keys: Keys, q: number, discrete: boolean): number {
+  if (q < keys[0]!.at) return keys[0]!.v;
+  let i = 0;
+  while (i + 1 < keys.length && keys[i + 1]!.at <= q) i++;
+  const a = keys[i]!;
+  const z = keys[i + 1];
+  if (z === undefined || q === a.at || discrete) return a.v;
+  return a.v + ((z.v - a.v) * (q - a.at)) / (z.at - a.at);
+}
+
 const PATH_ARITY = new Map<string, number>([
   ["M", 2],
   ["L", 2],
   ["C", 6],
 ]);
 
+/** One piece of a motion path, in absolute coordinates: a move or line to
+ *  `to`, a cubic through `c1`, `c2` to `to`, or a close back to `to`. */
+export type PathPiece =
+  | { kind: "move" | "line" | "close"; from: [number, number]; to: [number, number] }
+  | { kind: "curve"; from: [number, number]; c1: [number, number]; c2: [number, number]; to: [number, number] };
+
 /**
- * Where a PowerPoint motion path ends, relative to where it starts. Pairs
- * after an `M` beyond the first are line-tos (they don't move the subpath
- * start); `Z` returns to the subpath start; `E` or the end of the string ends
- * the path; lowercase `m`/`l`/`c` are relative; any other command, or a
- * number where none fits, stops the walk at the point reached so far.
+ * Walks a PowerPoint motion path from (0, 0) by R19, handing each piece to
+ * `visit` (return `false` to stop). Pairs after an `M` beyond the first are
+ * line-tos (they don't move the subpath start); `Z` returns to the subpath
+ * start; `E` or the end of the string ends the path; lowercase `m`/`l`/`c`
+ * are relative; any other command, or a number where none fits, stops the
+ * walk. Returns the point reached.
  */
-export function pathEnd(path: string): [number, number] {
-  const tokens = path.match(/[A-Za-z]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?/g) ?? [];
+export function walkPath(path: string, visit?: (p: PathPiece) => boolean | void): [number, number] {
+  // R19's grammar: words split at XML whitespace and commas; a word is one
+  // ASCII letter (a command) or an R2a decimal. Any other word, or a
+  // decimal too large to be finite, stops the walk where it stands.
+  const words = path.split(/[ \t\n\r,]+/).filter((w) => w !== "");
+  const bad = words.findIndex((w) => !/^[A-Za-z]$/.test(w) && numOf(w) === null);
+  const tokens = bad < 0 ? words : words.slice(0, bad);
   let x = 0;
   let y = 0;
   let sx = 0;
@@ -904,9 +1211,11 @@ export function pathEnd(path: string): [number, number] {
       i++;
       if (tok === "E" || tok === "e") break;
       if (tok === "Z" || tok === "z") {
+        const from: [number, number] = [x, y];
         x = sx;
         y = sy;
         cmd = "";
+        if (visit?.({ kind: "close", from, to: [x, y] }) === false) break;
         continue;
       }
       if (!PATH_ARITY.has(tok.toUpperCase())) break;
@@ -919,15 +1228,27 @@ export function pathEnd(path: string): [number, number] {
     if (v.some((n) => !Number.isFinite(n))) break;
     i += arity;
     const rel = cmd === cmd.toLowerCase();
-    x = v[arity - 2]! + (rel ? x : 0);
-    y = v[arity - 1]! + (rel ? y : 0);
-    if (cmd === "M" || cmd === "m") {
+    const ox = rel ? x : 0;
+    const oy = rel ? y : 0;
+    const from: [number, number] = [x, y];
+    x = v[arity - 2]! + ox;
+    y = v[arity - 1]! + oy;
+    let piece: PathPiece;
+    if (cmd === "C" || cmd === "c") piece = { kind: "curve", from, c1: [v[0]! + ox, v[1]! + oy], c2: [v[2]! + ox, v[3]! + oy], to: [x, y] };
+    else if (cmd === "M" || cmd === "m") {
+      piece = { kind: "move", from, to: [x, y] };
       sx = x;
       sy = y;
       cmd = cmd === "M" ? "L" : "l";
-    }
+    } else piece = { kind: "line", from, to: [x, y] };
+    if (visit?.(piece) === false) break;
   }
   return [x, y];
+}
+
+/** Where a PowerPoint motion path ends, relative to where it starts (R19). */
+export function pathEnd(path: string): [number, number] {
+  return walkPath(path);
 }
 
 /** To 4 decimals, half away from zero, never −0. */
@@ -957,6 +1278,222 @@ function visibilityEvents(effects: readonly Effect[]): VisEvent[] {
   return out;
 }
 
+// --- held values (R24-R31) ------------------------------------------------------------
+
+/** The behaviour's own progress (0-1) when its effect has ended, or null
+ *  when it never began (R25): the effect's repeat, autoRev and
+ *  acceleration first, then the behaviour's own. */
+function endProgress(e: Effect, b: Behaviour): number | null {
+  if (b.dur === null || b.repeatCount === null || e.repeatCount === null) return null;
+  const c = effectTime(e, (effectSpan(e) * e.repeatCount * (e.autoRev ? 2 : 1)) / 1000);
+  return behaviourProgress(b, c ?? 0);
+}
+
+/** Whether a behaviour's value stays once its effect is over (R24). */
+function holds(e: Effect, b: Behaviour): boolean {
+  if (e.fill === "remove" || b.repeatCount === null || e.repeatCount === null) return false;
+  if (b.dur === null) return b.kind === "set";
+  return b.fill === "hold" || b.fill === "freeze";
+}
+
+/** A held `p:anim`'s value at progress `q`, from `cur` the value held so
+ *  far: the same keyframes and interpolation playback uses (R28), values
+ *  read as R2a decimals; null when it contributes nothing. */
+function animHeld(b: Behaviour & { kind: "anim" }, q: number, cur: number): number | null {
+  const keys = animKeys(b, decimalOf, cur);
+  return keys === null ? null : keyValue(keys, q, b.calcmode === "discrete");
+}
+
+const ROTATION_ATTRS = new Set(["r", "ppt_r", "style.rotation"]);
+const COLOR_PART = new Map<string, keyof HeldColors>([
+  ["fillcolor", "fill"],
+  ["fill.color", "fill"],
+  ["stroke.color", "line"],
+  ["style.color", "text"],
+]);
+
+/** A change whose result isn't finite is dropped: the value stays (R31). */
+function setFinite(m: Map<string, number>, key: string, v: number): void {
+  if (Number.isFinite(v)) m.set(key, v);
+}
+
+interface Held {
+  scale: Map<string, [number, number]>;
+  turn: Map<string, number>;
+  opacity: Map<string, number>;
+  color: Map<string, HeldColors>;
+}
+
+/** Most paragraphs one held change on a paragraph range reaches (R31). */
+export const HELD_PARAGRAPHS = 256;
+
+/**
+ * The shapes whose text the main sequence animates by paragraph: on these
+ * PowerPoint draws the text apart from the shape's body, and an effect on
+ * the whole shape acts on the body alone (README R32; the `order` deck's
+ * film).
+ */
+export function splitShapes(timeline: SlideTimeline): Set<string> {
+  const out = new Set<string>();
+  for (const step of timeline.steps) for (const e of step) for (const b of e.behaviours) if (b.target?.para) out.add(b.target.spid);
+  return out;
+}
+
+/** The keys a held change on `t` is kept under (R31, R32): a paragraph
+ *  range, each of its paragraphs; the whole of a split shape, its body. */
+function heldKeys(t: Target, split: ReadonlySet<string>): string[] {
+  if (t.para !== null) {
+    const out: string[] = [];
+    for (let n = t.para[0]; n <= t.para[1] && n < t.para[0] + HELD_PARAGRAPHS; n++) out.push(`${t.spid}:p${n}-${n}`);
+    return out;
+  }
+  if (!t.bg && split.has(t.spid)) return [`${t.spid}:bg`];
+  return [targetKey(t)];
+}
+
+/** One step's held changes, applied in the order they end (as R17). */
+function applyHeld(step: readonly Effect[], held: Held, split: ReadonlySet<string>): void {
+  const changes: { at: bigint | null; i: number; run: () => void }[] = [];
+  let i = 0;
+  for (const e of step) {
+    for (const b of e.behaviours) {
+      const t = b.target;
+      if (t === null || !holds(e, b)) continue;
+      const q = b.dur === null ? 1 : endProgress(e, b);
+      if (q === null) continue;
+      const end = behaviourEnd(b);
+      const at = end === null ? null : BigInt(e.start) * 1000n + end;
+      // A split shape's text never takes a whole-shape change (R32).
+      const body = t.para === null && !t.bg && split.has(t.spid);
+      const order = i++;
+      for (const key of heldKeys(t, split)) {
+      let run: (() => void) | null = null;
+      if (b.kind === "scale") {
+        const f = (p: Point | null, axis: "x" | "y") => (p === null ? null : p[axis] / 100000);
+        run = () => {
+          const cur = held.scale.get(key) ?? [1, 1];
+          const next: [number, number] = [0, 1].map((k) => {
+            const axis = k === 0 ? "x" : "y";
+            const from = f(b.from, axis) ?? cur[k]!;
+            const to = f(b.to, axis);
+            if (to !== null) return from + (to - from) * q;
+            const by = f(b.by, axis);
+            return by === null ? from : from * (1 + (by - 1) * q);
+          }) as [number, number];
+          if (next.every(Number.isFinite)) held.scale.set(key, next);
+        };
+      } else if (b.kind === "rot") {
+        run = () => {
+          const cur = held.turn.get(key) ?? 0;
+          if (b.to !== null) {
+            const from = b.from === null ? cur : b.from / 60000;
+            setFinite(held.turn, key, from + (b.to / 60000 - from) * q);
+          } else if (b.by !== null) setFinite(held.turn, key, (b.from === null ? cur : b.from / 60000) + (b.by / 60000) * q);
+        };
+      } else if (b.kind === "anim" && b.attrs.some((a) => ROTATION_ATTRS.has(a))) {
+        run = () => {
+          const v = animHeld(b, q, held.turn.get(key) ?? 0);
+          if (v !== null) setFinite(held.turn, key, v);
+        };
+      } else if (b.kind === "anim" && b.attrs.includes("style.opacity")) {
+        run = () => {
+          const v = animHeld(b, q, held.opacity.get(key) ?? 1);
+          if (v !== null) setFinite(held.opacity, key, v);
+        };
+      } else if (b.kind === "set" && b.attrs.includes("style.opacity")) {
+        const v = decimalOf(b.to);
+        if (v !== null) run = () => setFinite(held.opacity, key, v);
+      } else if (b.kind === "color" && q === 1) {
+        const part = b.attrs.map((a) => COLOR_PART.get(a.toLowerCase())).find((x) => x !== undefined);
+        if (part !== undefined && !(body && part === "text") && (b.to !== null || b.by !== null)) {
+          run = () => {
+            const all = held.color.get(key) ?? {};
+            const c: HeldColor = { ...(all[part] ?? {}) };
+            if (b.to !== null) {
+              c.to = b.to;
+              delete c.by;
+            } else c.by = [...(c.by ?? []), b.by!];
+            all[part] = c;
+            held.color.set(key, all);
+          };
+        }
+      } else if (b.kind === "set" && q === 1) {
+        const a = b.attrs[0] ?? "";
+        const v = typeof b.to === "string" ? b.to : b.to === true ? "true" : b.to === false ? "false" : "";
+        const part: keyof HeldColors | null = a === "fill.type" || a === "fill.on" ? "fill" : a === "stroke.on" ? "line" : null;
+        if (part !== null && (a !== "fill.type" || v === "solid") && (a === "fill.type" || v === "true" || v === "false")) {
+          run = () => {
+            const all = held.color.get(key) ?? {};
+            const c: HeldColor = { ...(all[part] ?? {}) };
+            if (a === "fill.type") c.solid = true;
+            else c.on = v === "true";
+            all[part] = c;
+            held.color.set(key, all);
+          };
+        }
+      }
+      if (run !== null) changes.push({ at, i: order, run });
+      }
+    }
+  }
+  changes.sort((a, b) => {
+    if (a.at !== b.at) {
+      if (a.at === null) return 1;
+      if (b.at === null) return -1;
+      return a.at < b.at ? -1 : 1;
+    }
+    return a.i - b.i;
+  });
+  for (const c of changes) c.run();
+}
+
+/** A colour part in the golden key order. */
+function heldColorOut(c: HeldColor): HeldColor {
+  const out: HeldColor = {};
+  if (c.to !== undefined) out.to = c.to;
+  if (c.by !== undefined && c.by.length > 0) out.by = c.by;
+  if (c.solid) out.solid = true;
+  if (c.on !== undefined) out.on = c.on;
+  return out;
+}
+
+/** The held values as a state carries them: rounded, identities left out. */
+function heldOut(held: Held, state: BuildState): void {
+  const sorted = <V>(m: Map<string, V>) => [...m.keys()].sort().map((k) => [k, m.get(k)!] as const);
+  // A held value that isn't finite is not held (R31).
+  const scale = Object.create(null) as Record<string, [number, number]>;
+  for (const [k, [x, y]] of sorted(held.scale)) {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    const v: [number, number] = [round4(x), round4(y)];
+    if (v[0] !== 1 || v[1] !== 1) scale[k] = v;
+  }
+  const turn = Object.create(null) as Record<string, number>;
+  for (const [k, d] of sorted(held.turn)) {
+    if (!Number.isFinite(d)) continue;
+    const v = round4(((d % 360) + 360) % 360);
+    if (v !== 0 && v !== 360) turn[k] = v;
+  }
+  const opacity = Object.create(null) as Record<string, number>;
+  for (const [k, o] of sorted(held.opacity)) {
+    if (!Number.isFinite(o)) continue;
+    const v = round4(Math.min(1, Math.max(0, o)));
+    if (v !== 1) opacity[k] = v;
+  }
+  const color = Object.create(null) as Record<string, HeldColors>;
+  for (const [k, c] of sorted(held.color)) {
+    const out: HeldColors = {};
+    for (const part of ["fill", "line", "text"] as const) {
+      const v = c[part] === undefined ? null : heldColorOut(c[part]);
+      if (v !== null && Object.keys(v).length > 0) out[part] = v;
+    }
+    if (Object.keys(out).length > 0) color[k] = out;
+  }
+  if (Object.keys(scale).length > 0) state.scale = scale;
+  if (Object.keys(turn).length > 0) state.turn = turn;
+  if (Object.keys(opacity).length > 0) state.opacity = opacity;
+  if (Object.keys(color).length > 0) state.color = color;
+}
+
 /** The slide after each step: `states[k]` is after step k. */
 export function buildStates(timeline: SlideTimeline): BuildState[] {
   // Initially hidden: targets whose first visibility set, reading the main
@@ -967,6 +1504,8 @@ export function buildStates(timeline: SlideTimeline): BuildState[] {
   const hidden = new Set([...first].filter(([, v]) => v === "visible").map(([k]) => k));
 
   const moved = new Map<string, [number, number]>();
+  const held: Held = { scale: new Map(), turn: new Map(), opacity: new Map(), color: new Map() };
+  const split = splitShapes(timeline);
   const out: BuildState[] = [];
   for (const step of timeline.steps) {
     // In the order the sets end; one that never ends goes last; ties keep document order.
@@ -984,22 +1523,36 @@ export function buildStates(timeline: SlideTimeline): BuildState[] {
       if (ev.to === "hidden") hidden.add(ev.key);
       else hidden.delete(ev.key);
     }
+    // A path is an offset from the target's layout place, and the path
+    // that ends last replaces any before it (R18): PowerPoint's film shows
+    // a second path starting from the layout place again.
+    const paths: { key: string; at: bigint | null; i: number; end: [number, number] }[] = [];
     for (const e of step) {
       if (e.name !== "path") continue;
       for (const b of e.behaviours) {
         if (b.kind !== "motion" || b.path === null || b.target === null) continue;
-        const key = targetKey(b.target);
-        const [dx, dy] = pathEnd(b.path);
-        const was = moved.get(key) ?? [0, 0];
-        moved.set(key, [was[0] + dx, was[1] + dy]);
+        const end = behaviourEnd(b);
+        paths.push({ key: targetKey(b.target), at: end === null ? null : BigInt(e.start) * 1000n + end, i: paths.length, end: pathEnd(b.path) });
       }
     }
+    paths.sort((a, b) => {
+      if (a.at !== b.at) {
+        if (a.at === null) return 1;
+        if (b.at === null) return -1;
+        return a.at < b.at ? -1 : 1;
+      }
+      return a.i - b.i;
+    });
+    for (const p of paths) moved.set(p.key, p.end);
     const movedOut = Object.create(null) as Record<string, [number, number]>;
     for (const key of [...moved.keys()].sort()) {
       const [dx, dy] = moved.get(key)!;
       movedOut[key] = [round4(dx), round4(dy)];
     }
-    out.push({ hidden: [...hidden].sort(), moved: movedOut });
+    applyHeld(step, held, split);
+    const state: BuildState = { hidden: [...hidden].sort(), moved: movedOut };
+    heldOut(held, state);
+    out.push(state);
   }
   return out;
 }
