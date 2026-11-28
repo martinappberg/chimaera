@@ -326,8 +326,9 @@ async fn an_agent_page_imports_a_plugin_library_and_reads_the_files_beside_it() 
     std::fs::write(figs.join("demo.html"), page).unwrap();
     let t = page_ticket(&state, &figs.join("demo.html")).await;
 
-    // Shown by a host (the page API asked for): the fixed rule plus the
-    // library's host, its addresses rewritten, and a key to read with.
+    // Served: the fixed rule plus the library's host, and its addresses
+    // rewritten under a library ticket of their own. Never a key, however
+    // the page asks for itself.
     let (status, headers, bytes) = get(&state, &format!("/raw/{t}/demo.html?bridge=1")).await;
     assert_eq!(status, StatusCode::OK);
     let csp = header_str(&headers, "content-security-policy");
@@ -337,22 +338,51 @@ async fn an_agent_page_imports_a_plugin_library_and_reads_the_files_beside_it() 
     );
     assert!(csp.contains("https://cdn.jsdelivr.net") && csp.contains("https://cdn.plot.ly"));
     let body = std::str::from_utf8(&bytes).unwrap();
+    let lib = body
+        .split("from \"/lib/")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .expect("a rewritten import")
+        .to_string();
+    assert!(lib.starts_with("l-"), "{body}");
     assert!(
-        body.contains(&format!("from \"/lib/{t}/testlib/lib.mjs\"")),
+        body.contains(&format!("from \"/lib/{lib}/testlib/lib.mjs\"")),
         "{body}"
     );
-    assert!(body.contains(&format!("href=\"/lib/{t}/~css\"")));
-    let key = body
-        .split("__chimaeraDataKey=\"")
-        .nth(1)
-        .and_then(|rest| rest.split('"').next())
-        .expect("a data key")
-        .to_string();
+    assert!(body.contains(&format!("href=\"/lib/{lib}/~css\"")));
+
+    // The key, only for a host's bearer ask; its plugin is on, so nothing
+    // to offer.
+    let ask = |ticket: String| {
+        let state = state.clone();
+        async move {
+            request(
+                &state,
+                Method::POST,
+                "/api/v1/fs/page-key",
+                Some(json!({"ticket": ticket})),
+            )
+            .await
+        }
+    };
+    let (status, access) = ask(t.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{access}");
+    let key = access["key"].as_str().unwrap().to_string();
     assert!(key.starts_with("k-"), "{key}");
-    assert!(!body.contains("__chimaeraNeeds="), "its plugin is on");
+    assert_eq!(access["needs"], json!([]));
+    // Asked for by the page itself, it still carries no key.
+    for asked in ["?bridge=1", "?api=1", ""] {
+        let (_, _, bytes) = get(&state, &format!("/raw/{t}/demo.html{asked}")).await;
+        assert!(
+            !std::str::from_utf8(&bytes).unwrap().contains(&key),
+            "{asked}"
+        );
+    }
+    let (status, _) = ask("t-nope".into()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 
     // The library, readable by the page; the plugin's, where it is on.
-    let (status, headers, bytes) = get(&state, &format!("/lib/{t}/testlib/lib.mjs")).await;
+    let (status, headers, bytes) = get(&state, &format!("/lib/{lib}/testlib/lib.mjs")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(header_str(&headers, "access-control-allow-origin"), "*");
     assert!(std::str::from_utf8(&bytes)
@@ -375,31 +405,29 @@ async fn an_agent_page_imports_a_plugin_library_and_reads_the_files_beside_it() 
         let (status, _, _) = get(&state, &format!("/webdata/{key}/{rest}")).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{rest}");
     }
-    // The page ticket itself is no key, and the folder route stays
-    // unreadable: a page loaded any other way reads nothing.
-    let (status, _, _) = get(&state, &format!("/webdata/{t}/data.csv")).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    // Neither the page ticket nor the library ticket is a key, and the
+    // folder route stays unreadable: a page loaded any other way reads
+    // nothing.
+    for not_a_key in [&t, &lib] {
+        let (status, _, _) = get(&state, &format!("/webdata/{not_a_key}/data.csv")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
     let (status, headers, _) = get(&state, &format!("/raw/{t}/data.csv")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(headers.get("access-control-allow-origin").is_none());
-    let (_, _, bytes) = get(&state, &format!("/raw/{t}/demo.html")).await;
-    assert!(!std::str::from_utf8(&bytes)
-        .unwrap()
-        .contains("__chimaeraDataKey"));
 
-    // Where the plugin is off: no library, no host, and the page is told
-    // which plugin it needs.
+    // Where the plugin is off: no library, no host, and the host's ask
+    // names the plugin to offer.
     switch(&state, &ws, PID, false).await;
-    let (status, _, _) = get(&state, &format!("/lib/{t}/testlib/lib.mjs")).await;
+    let (status, _, _) = get(&state, &format!("/lib/{lib}/testlib/lib.mjs")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    let (_, headers, bytes) = get(&state, &format!("/raw/{t}/demo.html?api=1")).await;
+    let (_, headers, _) = get(&state, &format!("/raw/{t}/demo.html?api=1")).await;
     assert_eq!(
         header_str(&headers, "content-security-policy"),
         crate::plugins::web::agent_page_csp(&[])
     );
-    let body = std::str::from_utf8(&bytes).unwrap();
-    assert!(body.contains("__chimaeraNeeds=Object.freeze"), "{body}");
-    assert!(body.contains("\"plugin\":\"test-web\""), "{body}");
+    let (_, access) = ask(t.clone()).await;
+    assert_eq!(access["needs"][0]["plugin"], json!("test-web"), "{access}");
 }
 
 #[tokio::test]

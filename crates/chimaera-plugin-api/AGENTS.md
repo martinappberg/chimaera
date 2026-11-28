@@ -31,9 +31,10 @@ component; job resource limits do not isolate native filesystem/network access.
 
 | File | What |
 |---|---|
-| `wit/chimaera.wit` | The current world, package `chimaera:plugin@0.2.0`: `types`, `host` (imports as in 0.1: bounded fs, state, sessions, Timeline, emit, now, log), `platform` (imports: output folder, `publish`, `invalidate`, `watch`, `setting-get`, `state-keep`, `roots`, `job-*`, `tool-state`), `plugin` (exports as in 0.1) and `screens` (exports: `render`, `on-action`, `tool-resume`); new events and `tool-result.wait`. The daemon's `bindgen!` (`runtime::v2`) reads this file. |
+| `wit/chimaera.wit` | The current world, package `chimaera:plugin@0.3.0`: the 0.2 world plus the `web` export (`web-bundle() -> list<u8>`: a tar of the plugin's own pages and libraries, [web views](../../docs/agent-guides/plugins.md#web-views-api-03)). As in 0.2: `types`, `host` (imports as in 0.1: bounded fs, state, sessions, Timeline, emit, now, log), `platform` (imports: output folder, `publish`, `invalidate`, `watch`, `setting-get`, `state-keep`, `roots`, `job-*`, `tool-state`), `plugin` (exports as in 0.1) and `screens` (exports: `render`, `on-action`, `tool-resume`); new events and `tool-result.wait`. The daemon's `bindgen!` (`runtime::v3`) reads this file. |
+| `wit-0.2/chimaera.wit` | **Frozen**: `chimaera:plugin@0.2.0`, served beside 0.3 (`runtime::v2`, its `host`/`platform` imports adapted in `hostfns.rs` `v2_host`) so a 0.2 component — every first-party plugin built before 0.3 — keeps loading. Never edit it. |
 | `wit-0.1/chimaera.wit` | **Frozen**: `chimaera:plugin@0.1.0`, served beside 0.2 (`runtime::v1`) so a 0.1 component keeps loading. Never edit it; `plugins/api-0.1` builds the 0.1 fixture against it. |
-| `src/lib.rs` | `wit_bindgen::generate!` plus the ergonomic layer: the `Plugin` trait (every export has a default, 0.2's `render` / `on_action` / `tool_resume` too, so a 0.1 plugin compiles unchanged), `export!`, `host::*` and `platform::*` wrappers (JSON parsed, fallible calls return `Result<_, String>`), `ui::*` helpers for `ui/1` trees, `ToolDef::new`, `ToolResult::text` / `error` / `wait`, `Snapshot::new`, and `serde_json` re-exported. |
+| `src/lib.rs` | `wit_bindgen::generate!` plus the ergonomic layer: the `Plugin` trait (every export has a default, 0.2's `render` / `on_action` / `tool_resume` and 0.3's `web_bundle` too, so an older plugin compiles unchanged), `export!`, `host::*` and `platform::*` wrappers (JSON parsed, fallible calls return `Result<_, String>`), `ui::*` helpers for `ui/1` trees, `ToolDef::new`, `ToolResult::text` / `error` / `wait`, `Snapshot::new`, and `serde_json` re-exported. |
 
 ## Rules
 
@@ -58,7 +59,7 @@ component; job resource limits do not isolate native filesystem/network access.
 - **WIT keywords need `%`.** `%list` is the function `list`; a type and a
   function may not share a name inside one interface (hence
   `stat as file-stat` in `host`).
-- The crate's version tracks the WIT package (0.2.0), not the daemon release.
+- The crate's version tracks the WIT package (0.3.0), not the daemon release.
 - **An old WIT is frozen, not deleted.** A bump copies the current `wit/` to
   `wit-<old>/` first; the host binds each served version (`runtime::v1`,
-  `v2`) and translates at the edge.
+  `v2`, `v3`) and translates at the edge.

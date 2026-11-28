@@ -38,10 +38,14 @@ button:disabled, .ch-button:disabled {
   opacity: 0.5;
   cursor: default;
 }
+/* The app's primary button: an accent tint, the text in the theme's own. */
 button.ch-primary, .ch-button.ch-primary {
-  background: var(--ch-accent, Highlight);
-  border-color: var(--ch-accent, Highlight);
-  color: var(--ch-accent-text, HighlightText);
+  background: color-mix(in srgb, var(--ch-accent, Highlight) 15%, transparent);
+  border-color: color-mix(in srgb, var(--ch-accent, Highlight) 55%, var(--ch-edge, ButtonBorder));
+  color: var(--ch-fg, CanvasText);
+}
+button.ch-primary:hover, .ch-button.ch-primary:hover {
+  background: color-mix(in srgb, var(--ch-accent, Highlight) 24%, transparent);
 }
 
 input, select, textarea {

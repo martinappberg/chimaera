@@ -711,7 +711,12 @@ in total.
      switch live. Its quiz answer comes back as an attributed message, and the
      agent replies. It works in the browser and in the app, and an unchanged old
      report renders as before.
-2. **The web views platform.**
+2. **The web views platform.** *Built 2026-11-27* ([web views](../features/web-views.md)). What it taught:
+   - **The navigation guard holds.** A framed page sits in a same-origin `srcdoc` wrapper whose CSP is `frame-src 'self'`; the browser checks the container's `frame-src` before the frame navigates, so `location = "https://…"` sends no request (Chrome, checked against a control without it). Reading files is not app-only.
+   - **WebKit and `'self'`.** In WebKit (the app's view, Safari) `'self'` in a sandboxed page's CSP matches nothing: every request to the daemon failed until the CSP named the daemon's origin beside it.
+   - **Only a host-shown page reads files.** An agent page gets a data key only when Chimaera's own hosts ask for it with the page API, so a page loaded any other way (a browser pane, a direct visit) reads nothing; the folder route itself stays CORS-less.
+   - **What the fixed rule can't stop, accepted:** a library CDN's URLs, WebRTC (no CSP directive; the planned best-effort removal of `RTCPeerConnection` was dropped, as a page can take it back from a fresh frame), DNS prefetch, and in the app a link the person clicks opening in their browser. A framed page's own link click is stopped by the guard.
+   - **CDNs.** The fixed list adds `cdn.plot.ly` and `cdn.bokeh.org`, which Plotly's and Bokeh's own exports name.
    - The `web` node, API 0.3 `web-bundle()`, `/webdata` and `url()`.
    - `web/1`: data, theme, visibility, act, reference, save and status.
    - CSP built from `[web]`, the Can list and the capability atoms, and the

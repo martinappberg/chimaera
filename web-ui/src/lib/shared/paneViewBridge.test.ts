@@ -233,3 +233,54 @@ describe("page themed", () => {
     expect(decodeFrameMessage({ chimaeraPaneView: { kind: "page_themed" } })).toEqual({ kind: "page_themed" });
   });
 });
+
+describe("web/1 page events", () => {
+  it("decodes act, status and reference, bounded", () => {
+    expect(decodeNativeViewEvent({ id: "v", kind: "web_act", action: "ping", payload: { n: 1 } })).toEqual({
+      id: "v",
+      kind: "web_act",
+      action: "ping",
+      payload: { n: 1 },
+    });
+    expect(decodeNativeViewEvent({ id: "v", kind: "web_act", action: "" })).toBeNull();
+    expect(decodeNativeViewEvent({ id: "v", kind: "web_act", action: "x".repeat(65) })).toBeNull();
+    expect(decodeNativeViewEvent({ id: "v", kind: "web_status", state: "busy", text: "loading" })).toEqual({
+      id: "v",
+      kind: "web_status",
+      state: "busy",
+      text: "loading",
+    });
+    expect(decodeNativeViewEvent({ id: "v", kind: "web_status", state: "purple" })).toBeNull();
+    const ref = decodeNativeViewEvent({
+      id: "v",
+      kind: "web_reference",
+      text: "the drawing",
+      file: "a.csv",
+      line: 3,
+      crop: { x: 1, y: 2, width: 30, height: 40 },
+      title: "  Page  ",
+    });
+    expect(ref).toEqual({
+      id: "v",
+      kind: "web_reference",
+      text: "the drawing",
+      file: "a.csv",
+      line: 3,
+      crop: { rect: { x: 1, y: 2, width: 30, height: 40 } },
+      title: "Page",
+    });
+    // A crop that isn't a picture the host can attach is dropped, not the reference.
+    const bad = decodeNativeViewEvent({ id: "v", kind: "web_reference", text: "t", crop: "javascript:alert(1)" });
+    expect(bad).toMatchObject({ kind: "web_reference", crop: null });
+    const png = decodeNativeViewEvent({ id: "v", kind: "web_reference", text: "t", crop: "data:image/png;base64,iVBORw0KGgo=" });
+    expect(png).toMatchObject({ crop: { dataUrl: "data:image/png;base64,iVBORw0KGgo=" } });
+    // The plugins a page needs come from the daemon, never the page.
+    expect(decodeNativeViewEvent({ id: "v", kind: "page_needs", plugins: [{ plugin: "x", name: "X", library: "x" }] })).toBeNull();
+  });
+
+  it("carries a framed page's Blob crop", () => {
+    const blob = new Blob(["x"], { type: "image/png" });
+    const ev = decodeFrameMessage({ chimaeraPaneView: { kind: "web_reference", text: "t", crop: blob } });
+    expect(ev).toMatchObject({ kind: "web_reference", crop: { blob } });
+  });
+});

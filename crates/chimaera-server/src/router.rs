@@ -148,6 +148,9 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             "/workspaces/{id}/plugins/{pid}/web",
             post(plugins::web::mint_route),
         )
+        // An agent page's data key, for a host that shows it inside its
+        // navigation guard (`plugins::web::page_key_route`).
+        .route("/fs/page-key", post(plugins::web::page_key_route))
         .route(
             "/workspaces/{id}/plugins/{pid}/views/{view}/actions",
             post(plugins::screens::action_route),

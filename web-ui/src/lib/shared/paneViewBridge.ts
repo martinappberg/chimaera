@@ -69,21 +69,13 @@ export type NativeViewEvent =
       line: number | null;
       crop: WebCrop | null;
       title: string;
-    }
-  /** Plugins whose library this agent page imports and that are off here
-   *  (the daemon names them; the page's word, checked against the catalog). */
-  | { id: string; kind: "page_needs"; plugins: PageNeed[] };
+    };
 
 export type WebState = "idle" | "busy" | "ok" | "warn" | "bad";
 export type WebCrop = { blob: Blob } | { dataUrl: string } | { rect: ViewRectLike };
-export interface PageNeed {
-  plugin: string;
-  name: string;
-  library: string;
-}
 
 /** web/1's page events, as either transport delivers them. */
-export type WebEvent = WithoutId<Extract<NativeViewEvent, { kind: "web_act" | "web_status" | "web_reference" | "page_needs" }>>;
+export type WebEvent = WithoutId<Extract<NativeViewEvent, { kind: "web_act" | "web_status" | "web_reference" }>>;
 
 const WEB_STATES: readonly string[] = ["idle", "busy", "ok", "warn", "bad"];
 /** A `data:image/png` (or jpeg/webp) crop a native page may hand over. */
@@ -180,15 +172,7 @@ export function decodeNativeViewEvent(raw: unknown): NativeViewEvent | null {
         title,
       };
     }
-    case "page_needs": {
-      if (!Array.isArray(raw.plugins)) return null;
-      const plugins = raw.plugins
-        .filter(isObj)
-        .filter((p) => str(p.plugin) && str(p.name) && str(p.library))
-        .slice(0, 8)
-        .map((p) => ({ plugin: p.plugin as string, name: (p.name as string).slice(0, 80), library: p.library as string }));
-      return plugins.length === 0 ? null : { id, kind: "page_needs", plugins };
-    }
+
     default:
       return null;
   }
@@ -317,9 +301,12 @@ export function withBridge(url: string): string {
  */
 export function withPageApi(
   url: string,
-  opts: { framed: boolean; theme: string | null; inline?: number },
+  opts: { framed: boolean; theme: string | null; inline?: number; key?: string | null },
 ): string {
   let asked = opts.framed ? withBridge(url) : withPair(url, "api=1");
+  // An agent page's key to its folder (`shared/pageNeeds.ts` asked the
+  // daemon for it): only a page a host shows inside its guard gets one.
+  if (opts.key !== undefined && opts.key !== null && opts.key !== "") asked = withPair(asked, `chimaera-key=${opts.key}`);
   // An inline page (`#inline` on its embed) follows the theme's light/dark
   // for the browser's own defaults too (its text, its controls): it sits on
   // the app's background, not a white card. The value is the most height

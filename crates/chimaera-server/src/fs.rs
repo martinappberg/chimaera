@@ -5071,18 +5071,15 @@ async fn serve_page(
     tail: Option<PageTail>,
 ) -> Response {
     use crate::plugins::web;
+    let _permit = web::PAGE_WORK.acquire().await;
     let bytes = web::page_bytes(&mut file, meta).await;
-    let served = web::agent_page(state, ticket, page, bytes).await;
-    // Only a page shown by Chimaera's own hosts (asked with the page API:
-    // a native view, or a frame inside the navigation guard) gets the key
-    // its `chimaera.url` reads files with.
-    let more = tail.map(|_| web::page_more(state, ticket, page, &served.needs));
+    let origin = web::request_origin(headers);
+    let served = web::agent_page(state, ticket, page, bytes, origin.as_deref()).await;
     let serve = Serve {
         caching,
         security: web::page_security(&served.csp),
         extra: Vec::new(),
         tail,
-        more,
         body: served.body,
     };
     serve_file(file, meta, name, headers, serve).await
@@ -5418,9 +5415,6 @@ pub(crate) struct Serve {
     /// CORS headers and the like: on every status too.
     pub(crate) extra: Vec<(HeaderName, HeaderValue)>,
     pub(crate) tail: Option<PageTail>,
-    /// Script for this page alone, streamed after the file and before the
-    /// tail (an agent page's data key, the plugins its libraries need).
-    pub(crate) more: Option<String>,
     /// The page as served instead of the file (never in ranges), and a mark
     /// for its `ETag`: what it was made from besides the file.
     pub(crate) body: Option<(Vec<u8>, String)>,
@@ -5455,7 +5449,6 @@ async fn serve_raw(
         security: raw_security_headers(&mime, route),
         extra: Vec::new(),
         tail,
-        more: None,
         body: None,
     };
     serve_file(file, meta, name, headers, serve).await
@@ -5475,31 +5468,23 @@ pub(crate) async fn serve_file(
         mut security,
         extra,
         tail,
-        more,
         body,
     } = serve;
     security.extend(extra);
     let total = body.as_ref().map_or(meta.len(), |(b, _)| b.len() as u64);
-    let etag = match (tail, &body, &more) {
-        (None, None, None) => raw_etag(meta),
-        (tail, body, more) => format!(
-            "\"{}-{}{}{}{}\"",
+    let etag = match (tail, &body) {
+        (None, None) => raw_etag(meta),
+        (tail, body) => format!(
+            "\"{}-{}{}{}\"",
             mtime_token(meta),
             meta.len(),
             tail.map(|t| format!("-{}", t.tag())).unwrap_or_default(),
             body.as_ref()
                 .map(|(_, mark)| format!("-{mark}"))
-                .unwrap_or_default(),
-            more.as_deref()
-                .map(|m| format!("-{}", crate::plugins::web::fnv(m.as_bytes())))
                 .unwrap_or_default()
         ),
     };
-    let appended: String = format!(
-        "{}{}",
-        more.as_deref().unwrap_or(""),
-        tail.map(PageTail::text).unwrap_or("")
-    );
+    let appended: &'static str = tail.map(PageTail::text).unwrap_or("");
     let whole = !appended.is_empty() || body.is_some();
     let mime = mime_guess::from_path(name).first_or_octet_stream();
     let cache_control = match caching {
@@ -5563,8 +5548,7 @@ pub(crate) async fn serve_file(
             // un-ranged file (or attacker-chosen large range) wholly into
             // daemon RSS.
             Body::from_stream(tokio_util::io::ReaderStream::new(
-                file.take(len)
-                    .chain(std::io::Cursor::new(appended.clone().into_bytes())),
+                file.take(len).chain(appended.as_bytes()),
             ))
         }
     };

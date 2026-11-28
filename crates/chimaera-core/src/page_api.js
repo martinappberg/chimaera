@@ -30,8 +30,8 @@
 //   agent's input, which the person sends or not.
 // - web/1 (docs/design/rich-views-plan.md, Part 2): `url(path)` (a URL the
 //   page may `fetch`, by Range too: a file beside an agent's page — with
-//   the key the daemon puts before this script for a page a host shows
-//   inside its guard — or one within a plugin's access), `reference({text, file?, line?, crop?})` (a
+//   the key a host that shows it inside its guard puts in its URL — or one
+//   within a plugin's access), `reference({text, file?, line?, crop?})` (a
 //   draft with a picture, after a press), `visibility`/`onVisibility`; and
 //   on a plugin's page (served under `/web/{grant}/`) `data`/`onData` (its
 //   node's data), `act(action, payload)` (to its plugin), `status({state,
@@ -241,11 +241,11 @@
       }
     });
   }
-  const dataKey = typeof globalThis.__chimaeraDataKey === "string" ? globalThis.__chimaeraDataKey : null;
-  // A plugin library this page imports whose plugin is off here: the
-  // daemon names it, and the host offers to turn it on.
-  const needs = globalThis.__chimaeraNeeds;
-  if (Array.isArray(needs) && needs.length > 0) post({ kind: "page_needs", plugins: needs });
+  // An agent page's key to its folder: in its URL (`chimaera-key`), put
+  // there by a host that showed it inside its guard after asking the daemon
+  // with its bearer token. A page loaded any other way has none.
+  const keyParam = query.get("chimaera-key");
+  const dataKey = keyParam !== null && /^k-[0-9a-f]{32}$/.test(keyParam) ? keyParam : null;
 
   const fail = (why) => Promise.reject(new Error(why));
   const absolute = (u) => new URL(u, location.href).href;

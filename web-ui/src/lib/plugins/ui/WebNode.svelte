@@ -168,8 +168,6 @@
         );
         break;
       }
-      case "page_needs":
-        break;
     }
   };
 

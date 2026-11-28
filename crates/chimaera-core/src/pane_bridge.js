@@ -257,7 +257,6 @@
       webCount += 1;
       return webCount <= WEB_RATE;
     };
-    let needsSent = false;
     document.addEventListener("chimaera:page", (e) => {
       const detail = e.detail;
       if (typeof detail !== "string" || detail.length > WEB_MAX) return;
@@ -299,12 +298,6 @@
         } else {
           post({ kind: "web_status", state: String(m.state ?? ""), text: String(m.text ?? "").slice(0, 200) });
         }
-        return;
-      }
-      if (m.kind === "page_needs") {
-        if (needsSent || !Array.isArray(m.plugins)) return;
-        needsSent = true;
-        post({ kind: "page_needs", plugins: m.plugins.slice(0, 8) });
         return;
       }
       if (Date.now() - lastPress > INPUT_FRESH_MS) return;

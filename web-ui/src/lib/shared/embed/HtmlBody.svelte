@@ -40,7 +40,7 @@
   import { pageMessage } from "../pageMessage";
   import { guardedPage } from "../guardFrame";
   import { cropBlob, referenceText } from "../pageCrop";
-  import { pluginOffer, type PluginOffer } from "../pageNeeds";
+  import { fetchPageAccess, pluginOffer, type PageAccess, type PluginOffer } from "../pageNeeds";
   import type { WebEvent } from "../paneViewBridge";
 
   interface Props {
@@ -131,7 +131,21 @@
     void pageUrl;
     pageThemed = false;
   });
-  const waiting = $derived(pageUrl === null || (inline && box === null));
+  let access = $state<PageAccess | null>(null);
+  $effect(() => {
+    const u = pageUrl;
+    access = null;
+    if (u === null) return;
+    let live = true;
+    void fetchPageAccess(u).then((a) => {
+      if (live) access = a;
+    });
+    return () => {
+      live = false;
+    };
+  });
+  // The page waits for its key (`fetchPageAccess`): asked once per page.
+  const waiting = $derived(pageUrl === null || (inline && box === null) || access === null);
   const url = $derived(
     waiting || pageUrl === null
       ? null
@@ -139,35 +153,35 @@
           framed: false,
           theme: pageThemed ? theme : untrack(() => theme),
           inline: inline ? INLINE_MAX : undefined,
+          key: access?.key,
         }),
   );
   const frameUrl = $derived(
     waiting || pageUrl === null
       ? null
-      : withPageApi(pageUrl, { framed: true, theme: untrack(() => theme), inline: inline ? INLINE_MAX : undefined }),
+      : withPageApi(pageUrl, {
+          framed: true,
+          theme: untrack(() => theme),
+          inline: inline ? INLINE_MAX : undefined,
+          key: access?.key,
+        }),
   );
   const onPageMessage = (m: { send: boolean; text: string; title: string }): void => {
     pageMessage({ chat, writtenAtMs, ...m });
   };
   /** Plugins this page's libraries need that are off here, by their own
    *  names (`pluginOffer`): the strip above the card. */
-  let needs = $state<(PluginOffer & { id: string })[]>([]);
+  const needs = $derived(
+    (access?.needs ?? []).flatMap((id) => {
+      const offer = pluginOffer(id);
+      return offer === null ? [] : [{ id, ...offer }];
+    }),
+  );
   let turningOn = $state(false);
   /** A framed page loads again under a new key (after a plugin went on). */
   let reloadKey = $state(0);
-  $effect(() => {
-    void pageUrl;
-    needs = [];
-  });
   const onWeb = (ev: WebEvent): void => {
-    if (ev.kind === "page_needs") {
-      const seen = new Set<string>();
-      needs = ev.plugins.flatMap((p) => {
-        const offer = seen.has(p.plugin) ? null : pluginOffer(p.plugin);
-        seen.add(p.plugin);
-        return offer === null ? [] : [{ id: p.plugin, ...offer }];
-      });
-    } else if (ev.kind === "web_reference") {
+    if (ev.kind === "web_reference") {
       const text = referenceText(ev.text, ev.file, ev.line);
       void cropBlob(ev.crop, native ? control : null).then((image) =>
         pageMessage({ chat, writtenAtMs, send: false, text, title: ev.title, image }),
@@ -178,7 +192,7 @@
     turningOn = true;
     try {
       await offer.turnOn();
-      needs = [];
+      if (access !== null) access = { ...access, needs: [] };
       if (native) control.nav("reload");
       else reloadKey += 1;
     } finally {

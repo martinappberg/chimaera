@@ -46,7 +46,7 @@
   import ReferenceChip from "../shared/ReferenceChip.svelte";
   import { guardedPage } from "../shared/guardFrame";
   import { cropBlob, referenceText } from "../shared/pageCrop";
-  import { pluginOffer, type PluginOffer } from "../shared/pageNeeds";
+  import { fetchPageAccess, pluginOffer, type PageAccess, type PluginOffer } from "../shared/pageNeeds";
   import type { WebEvent } from "../shared/paneViewBridge";
   import { PINNED } from "../shared/keys";
   import type { Point, Region } from "./imageRegion";
@@ -144,13 +144,33 @@
     void url;
     pageThemed = false;
   });
+  let access = $state<PageAccess | null>(null);
+  $effect(() => {
+    const u = url;
+    access = null;
+    if (u === null) return;
+    let live = true;
+    void fetchPageAccess(u).then((a) => {
+      if (live) access = a;
+    });
+    return () => {
+      live = false;
+    };
+  });
+  // The page waits for its key (`fetchPageAccess`): asked once per page.
   const nativeUrl = $derived(
-    url === null
+    url === null || access === null
       ? null
-      : withPageApi(url, { framed: false, theme: pageThemed ? $pageTheme : untrack(() => $pageTheme) }),
+      : withPageApi(url, {
+          framed: false,
+          theme: pageThemed ? $pageTheme : untrack(() => $pageTheme),
+          key: access?.key,
+        }),
   );
   const frameUrl = $derived(
-    url === null ? null : withPageApi(url, { framed: true, theme: untrack(() => $pageTheme) }),
+    url === null || access === null
+      ? null
+      : withPageApi(url, { framed: true, theme: untrack(() => $pageTheme), key: access?.key }),
   );
   /** A page here is not in a chat's answer: what it asks to send is only
    *  drafted for the agent the person works with (`shared/pageMessage.ts`). */
@@ -160,22 +180,16 @@
   /** web/1 on the page: its `reference` drafts with a picture for the agent
    *  the person works with; a plugin its libraries need that is off here
    *  is offered above the page (`shared/pageNeeds.ts`). */
-  let needs = $state<(PluginOffer & { id: string })[]>([]);
+  const needs = $derived(
+    (access?.needs ?? []).flatMap((id) => {
+      const offer = pluginOffer(id);
+      return offer === null ? [] : [{ id, ...offer }];
+    }),
+  );
   let turningOn = $state(false);
   let reloadKey = $state(0);
-  $effect(() => {
-    void url;
-    needs = [];
-  });
   const onWeb = (ev: WebEvent): void => {
-    if (ev.kind === "page_needs") {
-      const seen = new Set<string>();
-      needs = ev.plugins.flatMap((p) => {
-        const offer = seen.has(p.plugin) ? null : pluginOffer(p.plugin);
-        seen.add(p.plugin);
-        return offer === null ? [] : [{ id: p.plugin, ...offer }];
-      });
-    } else if (ev.kind === "web_reference") {
+    if (ev.kind === "web_reference") {
       const text = referenceText(ev.text, ev.file, ev.line);
       void cropBlob(ev.crop, native ? control : null).then((image) =>
         pageMessage({ chat: null, writtenAtMs: null, send: false, text, title: ev.title, image }),
@@ -186,7 +200,7 @@
     turningOn = true;
     try {
       await offer.turnOn();
-      needs = [];
+      if (access !== null) access = { ...access, needs: [] };
       if (native) control.nav("reload");
       else reloadKey += 1;
     } finally {

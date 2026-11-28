@@ -42,7 +42,12 @@ impl Plugin for Fixture {
         }
     }
 
-    fn on_action(cx: Context, view: &str, action: &str, _payload: Value) -> Result<Option<Value>, String> {
+    fn on_action(
+        cx: Context,
+        view: &str,
+        action: &str,
+        _payload: Value,
+    ) -> Result<Option<Value>, String> {
         match action {
             "ping" => {
                 let n = pings(&cx) + 1;

@@ -71,9 +71,12 @@ const ACTIVE_FOR: Duration = Duration::from_secs(2);
 /// A page is read whole to rewrite its `chimaera:` addresses only up to
 /// this size; a bigger one is served as it is.
 pub(crate) const REWRITE_MAX: u64 = 4 << 20;
+/// Pages read whole at once, daemon-wide: each holds the page and its
+/// rewritten copy (≤ 8 MiB).
+pub(crate) static PAGE_WORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 /// A `web` node's `data`, and one `~save`.
 pub(crate) const DATA_MAX: usize = 64 * 1024;
-pub(crate) const SAVE_MAX: usize = 8 << 20;
+pub(crate) const SAVE_MAX: usize = super::output::WRITE_MAX;
 
 /// The library CDNs an agent's page may load scripts, styles and fonts
 /// from: the three general ones, and Plotly's and Bokeh's own, which their
@@ -214,9 +217,40 @@ fn page_csp(cdns: &[&str], hosts: &[String]) -> String {
          script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob: data:{cdns}; \
          style-src 'self' 'unsafe-inline'{cdns}; font-src 'self' data:{cdns}; \
          img-src 'self' data: blob:{hosts}; media-src 'self' data: blob:; \
-         connect-src 'self'{hosts}; worker-src 'self' blob:; frame-src 'self'; \
+         connect-src 'self'{hosts}; worker-src blob:; frame-src 'self'; \
          form-action 'none'; base-uri 'self'"
     )
+}
+
+/// The daemon's origin as this request reached it (`Host`, and the scheme
+/// a fronting proxy names): what a page's CSP names beside `'self'`.
+/// WebKit matches `'self'` against the page's own origin, which a sandboxed
+/// page doesn't have, so there `'self'` alone blocks every request to the
+/// daemon (the macOS app's view, Safari). `None` when the host isn't a
+/// plain `host[:port]`.
+pub(crate) fn request_origin(headers: &HeaderMap) -> Option<String> {
+    let host = headers.get(header::HOST)?.to_str().ok()?;
+    let plain = !host.is_empty()
+        && host.len() <= 255
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-:[]".contains(&b));
+    if !plain {
+        return None;
+    }
+    let https = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|p| p.eq_ignore_ascii_case("https"));
+    Some(format!("{}://{host}", if https { "https" } else { "http" }))
+}
+
+/// `csp` with the daemon's own origin beside every `'self'`.
+pub(crate) fn naming_origin(csp: &str, origin: Option<&str>) -> String {
+    match origin {
+        Some(origin) => csp.replace("'self'", &format!("'self' {origin}")),
+        None => csp.to_string(),
+    }
 }
 
 fn header_value(s: &str) -> HeaderValue {
@@ -285,8 +319,17 @@ pub(crate) async fn preflight() -> Response {
 /// Short-lived tickets, each standing for one `T`, re-minted to the same
 /// ticket while its key is alive.
 struct Tickets<T> {
-    map: HashMap<String, (T, String, Instant)>,
+    map: HashMap<String, Entry<T>>,
     by_key: HashMap<String, String>,
+}
+
+struct Entry<T> {
+    value: T,
+    key: String,
+    expires: Instant,
+    /// Each use pushes `expires` this far out again (a sliding life: a
+    /// genome view reads its BAM by Range for as long as it is open).
+    ttl: Duration,
 }
 
 impl<T> Default for Tickets<T> {
@@ -302,10 +345,10 @@ impl<T: Clone> Tickets<T> {
     fn purge(&mut self) {
         let now = Instant::now();
         let by_key = &mut self.by_key;
-        self.map.retain(|_, (_, key, expires)| {
-            let alive = *expires > now;
+        self.map.retain(|_, e| {
+            let alive = e.expires > now;
             if !alive {
-                by_key.remove(key);
+                by_key.remove(&e.key);
             }
             alive
         });
@@ -316,8 +359,8 @@ impl<T: Clone> Tickets<T> {
         let expires = Instant::now() + ttl;
         if let Some(ticket) = self.by_key.get(&key) {
             if let Some(entry) = self.map.get_mut(ticket) {
-                entry.0 = value;
-                entry.2 = entry.2.max(expires);
+                entry.value = value;
+                entry.expires = entry.expires.max(expires);
                 return ticket.clone();
             }
         }
@@ -325,23 +368,34 @@ impl<T: Clone> Tickets<T> {
             if let Some(oldest) = self
                 .map
                 .iter()
-                .min_by_key(|(_, (_, _, e))| *e)
+                .min_by_key(|(_, e)| e.expires)
                 .map(|(t, _)| t.clone())
             {
-                if let Some((_, key, _)) = self.map.remove(&oldest) {
-                    self.by_key.remove(&key);
+                if let Some(e) = self.map.remove(&oldest) {
+                    self.by_key.remove(&e.key);
                 }
             }
         }
         let ticket = format!("{prefix}-{}", &chimaera_core::generate_token()[..32]);
         self.by_key.insert(key.clone(), ticket.clone());
-        self.map.insert(ticket.clone(), (value, key, expires));
+        self.map.insert(
+            ticket.clone(),
+            Entry {
+                value,
+                key,
+                expires,
+                ttl,
+            },
+        );
         ticket
     }
 
+    /// The ticket's value, its life renewed by the use.
     fn get(&mut self, ticket: &str) -> Option<T> {
         self.purge();
-        self.map.get(ticket).map(|(v, _, _)| v.clone())
+        let e = self.map.get_mut(ticket)?;
+        e.expires = e.expires.max(Instant::now() + e.ttl);
+        Some(e.value.clone())
     }
 }
 
@@ -368,8 +422,15 @@ struct DataFile {
 pub(crate) struct Web {
     grants: Mutex<Tickets<Grant>>,
     data: Mutex<Tickets<DataFile>>,
-    /// An agent page's data key → the page (keyed by its `/raw` ticket).
+    /// An agent page's data key → the page (keyed by its `/raw` ticket):
+    /// minted only through the bearer-authed `POST /fs/page-key`.
     keys: Mutex<Tickets<PathBuf>>,
+    /// An agent page's library ticket (`/lib/{l-…}/`, rewritten into the
+    /// page) → the page: a page's own `/raw` ticket lives ten minutes, its
+    /// lazy library imports longer.
+    libs: Mutex<Tickets<PathBuf>>,
+    /// Builds whose bundle came back empty: not asked again.
+    empty: Mutex<std::collections::HashSet<String>>,
     /// One unpack at a time per build.
     unpacking: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// (plugin, workspace) → whether it was on there, and when that was read.
@@ -402,8 +463,17 @@ pub(crate) async fn bundle(
     if tokio::fs::metadata(&complete).await.is_ok() {
         return Ok(dir);
     }
+    let key = dir.to_string_lossy().into_owned();
+    if crate::lock(&state.plugin_platform.web.empty).contains(&key) {
+        return Err(format!("{} has no web pages", m.name));
+    }
     let bytes = state.plugin_runtime.web_bundle(state, m, ws).await?;
     if bytes.is_empty() {
+        let mut empty = crate::lock(&state.plugin_platform.web.empty);
+        if empty.len() > TICKETS_MAX {
+            empty.clear();
+        }
+        empty.insert(key);
         return Err(format!("{} has no web pages", m.name));
     }
     let id = m.id.clone();
@@ -438,8 +508,16 @@ fn unpack(dir: &Path, id: &str, name: &str, bytes: &[u8]) -> Result<PathBuf, Str
     if let Ok(entries) = std::fs::read_dir(web_root) {
         for entry in entries.flatten() {
             let n = entry.file_name();
-            let other =
-                n.to_string_lossy().starts_with(&format!("{id}-")) && Some(&n) != own.as_ref();
+            let name = n.to_string_lossy();
+            // `<id>-<16 hex>` exactly (another plugin's id may start with
+            // this one's), and this plugin's staging folders a crash left.
+            let build = name
+                .strip_prefix(&format!("{id}-"))
+                .is_some_and(|sha| sha.len() == 16 && sha.bytes().all(|b| b.is_ascii_hexdigit()));
+            let staging = name
+                .strip_prefix(&format!(".tmp-{id}-"))
+                .is_some_and(|r| r.len() == 12 && r.bytes().all(|b| b.is_ascii_hexdigit()));
+            let other = (build || staging) && Some(&n) != own.as_ref();
             if other {
                 let _ = std::fs::remove_dir_all(entry.path());
             }
@@ -647,6 +725,7 @@ pub(crate) async fn serve_route(
             .contains(&rest)
             .then(|| PageTail::asked(query.as_deref()))
             .flatten();
+        let _permit = PAGE_WORK.acquire().await;
         let body = page_bytes(&mut file, &meta).await.map(|bytes| {
             let page = rewrite(&bytes, &ticket);
             let mark = fnv(&page);
@@ -654,10 +733,12 @@ pub(crate) async fn serve_route(
         });
         Serve {
             caching: Caching::Revalidate,
-            security: page_security(&plugin_page_csp(&decl.network)),
+            security: page_security(&naming_origin(
+                &plugin_page_csp(&decl.network),
+                request_origin(&headers).as_deref(),
+            )),
             extra: cors(),
             tail,
-            more: None,
             body,
         }
     } else {
@@ -666,7 +747,6 @@ pub(crate) async fn serve_route(
             security: crate::fs::folder_security(&rel),
             extra: cors(),
             tail: None,
-            more: None,
             body: None,
         }
     };
@@ -709,7 +789,14 @@ async fn data_url(state: &AppState, g: &Grant, m: &Manifest, path: &str) -> Resp
         Ok((_, meta)) => crate::fs::mtime_token(&meta),
         Err(err) => return refused(StatusCode::NOT_FOUND, &format!("{path}: {err}")),
     };
-    let key = format!("{}\n{}\n{}", root.display(), rel.display(), version);
+    let key = format!(
+        "{}\n{}\n{}\n{}\n{}",
+        g.plugin,
+        g.ws,
+        root.display(),
+        rel.display(),
+        version
+    );
     let file = DataFile {
         plugin: g.plugin.clone(),
         ws: g.ws.clone(),
@@ -749,7 +836,6 @@ fn open_data(root: &Path, rel: &Path) -> Result<(std::fs::File, std::fs::Metadat
     Ok((file, meta))
 }
 
-
 /// GET /webdata/{ticket} — the one file a grant's `~url` named.
 pub(crate) async fn data_route(
     State(state): State<Arc<AppState>>,
@@ -772,7 +858,6 @@ pub(crate) async fn data_route(
         security: crate::fs::folder_security(&f.rel),
         extra: cors(),
         tail: None,
-        more: None,
         body: None,
     };
     crate::fs::serve_file(
@@ -787,8 +872,8 @@ pub(crate) async fn data_route(
 
 /// GET /webdata/{key}/{*rest} — a file in an agent page's own folder or
 /// below (the folder route's rules), readable by the page: `key` is the
-/// one the page got from a host that shows it inside the navigation guard
-/// ([`page_more`]).
+/// one a host that shows the page inside its navigation guard got for it
+/// ([`page_key_route`]).
 pub(crate) async fn page_data_route(
     State(state): State<Arc<AppState>>,
     UrlPath((ticket, rest)): UrlPath<(String, String)>,
@@ -811,7 +896,6 @@ pub(crate) async fn page_data_route(
         security: crate::fs::folder_security(&rel),
         extra: cors(),
         tail: None,
-        more: None,
         body: None,
     };
     crate::fs::serve_file(file, &meta, &rel, &headers, serve).await
@@ -845,15 +929,13 @@ async fn lib_workspaces(state: &AppState, ticket: &str) -> Option<Vec<String>> {
     if ticket.starts_with("w-") {
         return grant(state, ticket).await.map(|(g, _)| vec![g.ws]);
     }
-    let page = crate::lock(&state.tickets).lookup(ticket)?;
-    if !crate::fs::opens_its_folder(&page) {
-        return None;
-    }
+    let page = crate::lock(&state.plugin_platform.web.libs).get(ticket)?;
     Some(workspaces_holding(state, &page).await)
 }
 
 /// GET /lib/{ticket}/{*rest} — `~css`, or `<name>/<file>` of a library an
-/// active plugin lends in a workspace the page belongs to.
+/// active plugin lends in a workspace the page belongs to (`l-`: an agent
+/// page's library ticket; `w-`: a plugin page's grant).
 pub(crate) async fn lib_route(
     State(state): State<Arc<AppState>>,
     UrlPath((ticket, rest)): UrlPath<(String, String)>,
@@ -901,7 +983,6 @@ pub(crate) async fn lib_route(
                 security: crate::fs::folder_security(&rel),
                 extra: cors(),
                 tail: None,
-                more: None,
                 body: None,
             };
             return crate::fs::serve_file(file, &meta, &rel, &headers, serve).await;
@@ -976,8 +1057,6 @@ pub(crate) struct Need {
 pub(crate) struct AgentPage {
     pub(crate) csp: String,
     pub(crate) body: Option<(Vec<u8>, String)>,
-    /// Plugins lending a library it imports that are off where it is.
-    pub(crate) needs: Vec<Need>,
 }
 
 /// An agent's HTML page (`/raw`) under the fixed rule: `bytes` is the page
@@ -987,51 +1066,87 @@ pub(crate) async fn agent_page(
     ticket: &str,
     page: &Path,
     bytes: Option<Vec<u8>>,
+    origin: Option<&str>,
 ) -> AgentPage {
     let Some(bytes) = bytes else {
         return AgentPage {
-            csp: agent_page_csp(&[]),
+            csp: naming_origin(&agent_page_csp(&[]), origin),
             body: None,
-            needs: Vec::new(),
         };
     };
     let names = library_names(&bytes);
-    let (hosts, needs) = if names.is_empty() {
-        (Vec::new(), Vec::new())
+    let hosts = if names.is_empty() {
+        Vec::new()
     } else {
-        libraries_for(state, page, &names).await
+        libraries_for(state, page, &names).await.0
     };
-    let body = rewrite(&bytes, ticket);
-    let csp = agent_page_csp(&hosts);
-    let mark = fnv(&[body.as_slice(), csp.as_bytes()].concat());
-    AgentPage {
-        csp,
-        body: Some((body, mark)),
-        needs,
-    }
-}
-
-/// What an agent's page shown by Chimaera's own hosts gets before the page
-/// API (`fs::serve_page`): the key its `chimaera.url` reads its folder with,
-/// and the plugins its libraries need here. A page loaded any other way (a
-/// browser pane, a direct visit) has no key, so it can't read its folder.
-pub(crate) fn page_more(state: &AppState, ticket: &str, page: &Path, needs: &[Need]) -> String {
-    let key = crate::lock(&state.plugin_platform.web.keys).mint(
-        "k",
+    // Its library addresses under a ticket of their own, as long-lived as
+    // its data key: the page's `/raw` ticket lasts ten minutes, and a
+    // library may import more of itself long after the page loaded.
+    let libs = crate::lock(&state.plugin_platform.web.libs).mint(
+        "l",
         ticket.to_string(),
         page.to_path_buf(),
         KEY_TTL,
     );
-    let mut out = format!("\n<script>globalThis.__chimaeraDataKey=\"{key}\";</script>");
-    if !needs.is_empty() {
-        let json = serde_json::to_string(needs)
-            .unwrap_or_else(|_| "[]".into())
-            .replace("</", "<\\/");
-        out.push_str(&format!(
-            "\n<script>globalThis.__chimaeraNeeds=Object.freeze({json});</script>"
-        ));
+    let body = rewrite(&bytes, &libs);
+    let csp = naming_origin(&agent_page_csp(&hosts), origin);
+    let mark = format!("{}{}", fnv(&body), fnv(csp.as_bytes()));
+    AgentPage {
+        csp,
+        body: Some((body, mark)),
     }
-    out
+}
+
+#[derive(Deserialize)]
+pub(crate) struct PageKeyBody {
+    ticket: String,
+}
+
+/// POST /api/v1/fs/page-key {ticket} — for a host that shows an agent's page
+/// inside its navigation guard (an app view, a guarded frame): the key the
+/// page's `chimaera.url` reads its folder with (`chimaera-key` in the page's
+/// URL), and the plugins lending a library it imports that are off where it
+/// is (`needs`, the host's "Turn it on here"). Bearer-authed: a page loaded
+/// any other way — a browser pane, a direct visit, a page asking for itself
+/// — has no key and reads nothing, and a page can't name a plugin to offer.
+pub(crate) async fn page_key_route(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<PageKeyBody>,
+) -> Response {
+    let Some(page) = crate::lock(&state.tickets).lookup(&body.ticket) else {
+        return super::not_found("that page");
+    };
+    if !crate::fs::opens_its_folder(&page) {
+        return super::not_found("that page");
+    }
+    let key = crate::lock(&state.plugin_platform.web.keys).mint(
+        "k",
+        body.ticket.clone(),
+        page.clone(),
+        KEY_TTL,
+    );
+    let names = {
+        let Ok(_permit) = PAGE_WORK.acquire().await else {
+            return Json(json!({"key": key, "needs": []})).into_response();
+        };
+        match tokio::fs::File::open(&page).await {
+            Ok(mut file) => match file.metadata().await {
+                Ok(meta) => page_bytes(&mut file, &meta)
+                    .await
+                    .map(|b| library_names(&b))
+                    .unwrap_or_default(),
+                Err(_) => Vec::new(),
+            },
+            Err(_) => Vec::new(),
+        }
+    };
+    let needs = if names.is_empty() {
+        Vec::new()
+    } else {
+        libraries_for(&state, &page, &names).await.1
+    };
+    Json(json!({"key": key, "needs": needs})).into_response()
 }
 
 /// The hosts the libraries `names` bring (from plugins on in a workspace
@@ -1130,6 +1245,32 @@ mod tests {
         let plugin = plugin_page_csp(&[]);
         assert!(plugin.contains("connect-src 'self';"));
         assert!(!plugin.contains("cdn"));
+    }
+
+    #[test]
+    fn a_page_csp_names_the_daemon_beside_self() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:59444"));
+        let origin = request_origin(&headers);
+        assert_eq!(origin.as_deref(), Some("http://127.0.0.1:59444"));
+        let csp = naming_origin(&plugin_page_csp(&[]), origin.as_deref());
+        assert!(
+            csp.contains("connect-src 'self' http://127.0.0.1:59444;"),
+            "{csp}"
+        );
+        assert!(
+            csp.contains("script-src 'self' http://127.0.0.1:59444 "),
+            "{csp}"
+        );
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert_eq!(
+            request_origin(&headers).as_deref(),
+            Some("https://127.0.0.1:59444")
+        );
+        // A host that could end a directive is not named.
+        headers.insert(header::HOST, HeaderValue::from_static("evil; script-src *"));
+        assert_eq!(request_origin(&headers), None);
+        assert_eq!(naming_origin("x 'self'", None), "x 'self'");
     }
 
     #[test]

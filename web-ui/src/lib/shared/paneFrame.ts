@@ -46,8 +46,7 @@ export interface PaneFrameParams {
   /** The page wears the app's theme (see `page_themed`). */
   onPageThemed?: () => void;
   /** web/1's page events: `act` and `status` at most ten a second, a
-   *  `reference` only on the evidence a draft needs (`pageMessageTrust`),
-   *  the plugins its libraries need once per document. */
+   *  `reference` only on the evidence a draft needs (`pageMessageTrust`). */
   onWeb?: (ev: WebEvent) => void;
   /** The app's theme, encoded (`pageTheme.ts`): posted to the page API
    *  whenever it changes and to each new document, so a framed page
@@ -117,7 +116,6 @@ export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
   let theme = initial.theme ?? "";
   let webWindow = Number.NEGATIVE_INFINITY;
   let webCount = 0;
-  let needsTold = false;
   const webAllowed = (): boolean => {
     const now = performance.now();
     if (now - webWindow > 1000) {
@@ -212,12 +210,6 @@ export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
       case "web_status":
         if (webAllowed()) params.onWeb?.(ev);
         break;
-      case "page_needs":
-        if (!needsTold) {
-          needsTold = true;
-          params.onWeb?.(ev);
-        }
-        break;
       case "web_reference": {
         const now = performance.now();
         if (now - lastPageMessage < PAGE_MESSAGE_GAP_MS) break;
@@ -230,7 +222,6 @@ export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
       }
       case "page":
         if (ev.url === "about:blank") break;
-        needsTold = false;
         // A new document starts without the pill or the newest theme
         // (its URL holds the one it was first loaded with): give both back.
         control?.applyChip();
