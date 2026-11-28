@@ -15,12 +15,15 @@
 //
 // What the plugin can do is the maintainers' to approve (`tier` and `caps`,
 // docs/design/plugin-platform-plan.md §2): a bump auto-merges only when the
-// plugin is and stays sandboxed and its capability digest is exactly the one
-// the lock approved (`review`: the lock's tier is sandboxed, the pinned
-// release reads as the lock's tier and caps, the release reads as sandboxed
-// with the lock's caps, and — stricter still — its capability lines are the
-// pinned release's). Otherwise the PR opens without auto-merge and says which
-// condition failed. Either way the lock is written with the release's own
+// plugin keeps its tier and its capability digest is exactly the one the
+// lock approved (`review`: the pinned release reads as the lock's tier and
+// caps, the release reads as the lock's tier with the lock's caps, and —
+// stricter still — its capability lines are the pinned release's), and, for
+// a privileged plugin, its plugin.wasm is attested by its own repository's
+// release workflow (RELEASE_WORKFLOW) at the release's tag
+// (`verifyProvenance`, `gh attestation verify`). A sandboxed plugin needs no
+// attestation: the sandbox bounds its code. Otherwise the PR opens without
+// auto-merge and says which condition failed. Either way the lock is written with the release's own
 // `tier` and `caps`, read from its plugin.toml by plugin-caps.mjs (the
 // daemon's reading, held to it by fixtures), and the PR body says, per
 // plugin, whether the tier changed and which of the card's Can lines the
@@ -39,13 +42,17 @@
 // (names, capability strings) reaches the PR body escaped, and never
 // `$GITHUB_OUTPUT` or a workflow command unescaped.
 
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { promisify } from "node:util";
 
 import { beyond, describeManifest, linesOf, parseToml } from "./plugin-caps.mjs";
 
+const execFileAsync = promisify(execFile);
 const API = "https://api.github.com";
 /** The daemon's own caps (plugins::installed): a component, a manifest. */
 const WASM_MAX = 16 * 1024 * 1024;
@@ -290,6 +297,14 @@ function capabilitySection(b) {
     }
   }
   if (b.lock_drift) out.push(`- Note: the lock's tier and caps for v${b.from} aren't what this script reads from that release (${b.lock_drift}); check \`chimaera plugin caps\` on it.`);
+  if (b.provenance) {
+    const against = `\`${b.repo}\`'s \`${b.provenance.workflow}\` at \`${b.provenance.ref ?? "?"}\``;
+    out.push(
+      b.provenance.verified
+        ? `- Provenance: verified — \`plugin.wasm\` is attested by ${against}.`
+        : `- Provenance: **not verified** (${code(b.provenance.why)}); expected an attestation of \`plugin.wasm\` by ${against}.`,
+    );
+  }
   out.push("");
   return out;
 }
@@ -328,12 +343,12 @@ export function pullRequest(bumps) {
     ...bumps.flatMap(capabilitySection),
     ...(review.length === 0
       ? [
-          "Each release is and stays sandboxed, and its capability digest is exactly the one the lock already approved (its capability lines are the pinned release's too), so the `tier` and `caps` written are the approved ones.",
+          "Each release keeps its tier and its capability digest is exactly the one the lock already approved (its capability lines are the pinned release's too), so the `tier` and `caps` written are the approved ones. A privileged one's `plugin.wasm` is also attested by its repository's release workflow at the release's tag.",
           "",
           "CI installs these releases from GitHub against the new lock (`scripts/build-plugins.sh` and the server's plugin tests). Auto-merge (squash) is on: it lands when the required checks pass, and the `fix:` title requests a patch release, so the next daily release brings the app the new versions.",
         ]
       : [
-          "**Needs a maintainer's review — no auto-merge.** A bump merges by itself only when the plugin is and stays sandboxed and its capability digest is exactly the approved one. Here that doesn't hold:",
+          "**Needs a maintainer's review — no auto-merge.** A bump merges by itself only when the plugin keeps its tier, its capability digest is exactly the approved one, and — for a privileged plugin — its `plugin.wasm` is attested by its repository's release workflow at the release's tag. Here that doesn't hold:",
           "",
           ...review.map((b) => `- \`${b.id}\` ${b.to}: ${b.why}`),
           "",
@@ -346,21 +361,28 @@ export function pullRequest(bumps) {
 /**
  * Whether a bump may merge by itself, and if not why. Every condition must
  * hold:
- *   1. the lock has the plugin as exactly `sandboxed`;
- *   2. the pinned release, read in full, is what the lock says it is (its
- *      tier and caps digest), so the approval the lock records is real;
- *   3. the release, read in full, is `sandboxed`;
- *   4. the release's caps digest is the lock's — exactly the approved one;
- *   5. and, stricter still, its capability lines (`capabilityLines`) are the
- *      pinned release's: a line heuristic is never the only gate.
+ *   1. the lock's tier is exactly `sandboxed` or `privileged`, and the pinned
+ *      release, read in full, is what the lock says it is (its tier and caps
+ *      digest), so the approval the lock records is real;
+ *   2. the release, read in full, has the lock's tier: sandboxed stays
+ *      sandboxed, privileged stays privileged (any tier change waits);
+ *   3. the release's caps digest is the lock's — exactly the approved one;
+ *   4. stricter still, its capability lines (`capabilityLines`) are the
+ *      pinned release's: a line heuristic is never the only gate;
+ *   5. for a privileged plugin only: provenance verified (`provenance`, the
+ *      result of `verifyProvenance`): its plugin.wasm is attested by its own
+ *      repository's release workflow at the release's tag. Its new code can
+ *      pass new arguments to the same programs, which no digest sees, so
+ *      without that the lock PR is where a person reads it. A sandboxed
+ *      plugin needs no provenance: the sandbox bounds what its code can do.
  * Anything else waits for a person; `why` names every condition that failed.
  * Because the lock is then written with the release's own tier and caps,
  * CI going green is no approval: this function is the only thing between a
  * release and an unreviewed merge. plugin-lock.test.mjs pins every case.
  */
-export function review(entry, pinnedToml, releaseToml) {
+export function review(entry, pinnedToml, releaseToml, provenance = null) {
   const failed = [];
-  if (entry.tier !== "sandboxed") failed.push("the lock has it as privileged: every release is reviewed");
+  if (entry.tier !== "sandboxed" && entry.tier !== "privileged") failed.push("the lock's tier is neither sandboxed nor privileged");
   let pinned = null;
   try {
     pinned = describeManifest(pinnedToml);
@@ -376,12 +398,131 @@ export function review(entry, pinnedToml, releaseToml) {
   } catch {
     // Unreadable: conditions 3 and 4 fail below (check refuses it anyway).
   }
-  if (next === null || next.tier !== "sandboxed") failed.push("the release is privileged: it runs or downloads programs");
+  if (next === null) failed.push("the release can't be read for capabilities");
+  else if (next.tier !== entry.tier) failed.push(`its tier changes (${entry.tier} → ${next.tier})`);
   if (next === null || next.caps !== entry.caps) failed.push("its capability digest is not the approved one: it may ask for more");
   if (JSON.stringify(capabilityLines(pinnedToml)) !== JSON.stringify(capabilityLines(releaseToml))) {
     failed.push("its capability lines changed");
   }
+  if (entry.tier !== "sandboxed" && provenance?.verified !== true) {
+    failed.push(`it is privileged and its provenance did not verify: ${provenance?.why ?? "not checked"}`);
+  }
   return failed.length === 0 ? { automerge: true, why: null } : { automerge: false, why: failed.join("; ") };
+}
+
+/** The release workflow every first-party plugin repository publishes from:
+ *  a convention fixed here, never read from the release. */
+export const RELEASE_WORKFLOW = ".github/workflows/release.yml";
+
+/** The identity a release's plugin.wasm must be attested by: the plugin
+ *  repository's own release workflow, run for the release's tag. */
+export function attestationIdentity(repo, tag) {
+  if (!REPO_RE.test(repo)) throw new Error(`not a repository: ${JSON.stringify(repo)}`);
+  if (!/^v[0-9]+\.[0-9]+\.[0-9]+$/.test(tag)) throw new Error(`not a release tag: ${JSON.stringify(tag)}`);
+  const ref = `refs/tags/${tag}`;
+  return { repo, workflow: RELEASE_WORKFLOW, ref, san: `https://github.com/${repo}/${RELEASE_WORKFLOW}@${ref}` };
+}
+
+/**
+ * `gh attestation verify`'s arguments (an argv array, run without a shell)
+ * for the release's plugin.wasm at `file`: attestations of that repository
+ * only, whose certificate names exactly its release workflow at the tag
+ * (`--cert-identity`: the signer workflow and the ref together), from the
+ * tag's source ref, not built on a self-hosted runner, SLSA provenance (gh's
+ * default predicate). Repo and tag are checked first (lock and tag grammar).
+ */
+export function attestationArgs(file, repo, tag) {
+  const id = attestationIdentity(repo, tag);
+  return [
+    "attestation",
+    "verify",
+    file,
+    "--repo",
+    id.repo,
+    "--cert-identity",
+    id.san,
+    "--source-ref",
+    id.ref,
+    "--deny-self-hosted-runners",
+    "--format",
+    "json",
+  ];
+}
+
+/**
+ * What `gh attestation verify --format json` printed, checked again here
+ * (fail closed, whatever gh's flags did): at least one verified attestation,
+ * every one over `sha256` and signed by exactly the expected repository,
+ * workflow and ref. `{verified, why}`.
+ */
+export function provenanceFrom(stdout, id, sha256) {
+  let results;
+  try {
+    results = JSON.parse(stdout);
+  } catch {
+    return { verified: false, why: "gh printed no verification result" };
+  }
+  if (!Array.isArray(results) || results.length === 0) return { verified: false, why: "no attestation" };
+  for (const r of results) {
+    const cert = r?.verificationResult?.signature?.certificate ?? {};
+    const subjects = r?.verificationResult?.statement?.subject ?? [];
+    if (cert.sourceRepositoryURI !== `https://github.com/${id.repo}`) return { verified: false, why: "an attestation from another repository" };
+    if (cert.subjectAlternativeName !== id.san) {
+      const [workflow, ref] = String(cert.subjectAlternativeName ?? "").split("@");
+      if (workflow !== `https://github.com/${id.repo}/${id.workflow}`) return { verified: false, why: "an attestation signed by another workflow" };
+      if (ref !== id.ref) return { verified: false, why: `an attestation made at another ref, not ${id.ref}` };
+      return { verified: false, why: "an attestation signed by another identity" };
+    }
+    if (cert.sourceRepositoryRef !== id.ref) return { verified: false, why: `an attestation made at another ref, not ${id.ref}` };
+    if (!Array.isArray(subjects) || !subjects.some((s) => s?.digest?.sha256 === sha256)) {
+      return { verified: false, why: "an attestation over other bytes" };
+    }
+  }
+  return { verified: true, why: null };
+}
+
+/** What a failed `gh attestation verify` means, in one line. */
+export function provenanceFailure(error) {
+  if (error?.code === "ENOENT") return "gh is not installed";
+  const text = `${error?.stderr ?? ""} ${error?.message ?? ""}`;
+  if (/HTTP 404|no attestations? (were )?found/i.test(text)) return "no attestation";
+  if (error?.killed || error?.signal) return "gh attestation verify timed out";
+  const first = oneLine(String(error?.stderr ?? "").trim().split("\n")[0] || String(error?.message ?? "failed"), 160);
+  return `gh attestation verify failed: ${first}`;
+}
+
+/**
+ * Whether the release's plugin.wasm (`bytes`, the file whose sha256 the lock
+ * takes) is attested by `repo`'s release workflow at `tag`: runs gh (no
+ * shell; the token, when given, only as GH_TOKEN for GitHub's API). Every
+ * failure — gh missing, a network error, no attestation, another identity —
+ * is `verified: false` with why, never a throw.
+ */
+export async function verifyProvenance(bytes, repo, tag, token, run = execFileAsync) {
+  let id;
+  try {
+    id = attestationIdentity(repo, tag);
+  } catch (error) {
+    return { verified: false, why: error instanceof Error ? error.message : String(error), workflow: RELEASE_WORKFLOW, ref: null };
+  }
+  const where = { workflow: id.workflow, ref: id.ref };
+  const dir = await mkdtemp(join(tmpdir(), "plugin-lock-"));
+  try {
+    const file = join(dir, "plugin.wasm");
+    await writeFile(file, bytes);
+    const env = { ...process.env };
+    delete env.GITHUB_TOKEN;
+    if (token !== "") env.GH_TOKEN = token;
+    let stdout;
+    try {
+      ({ stdout } = await run("gh", attestationArgs(file, repo, tag), { env, timeout: 180_000, maxBuffer: 16 * 1024 * 1024 }));
+    } catch (error) {
+      return { verified: false, why: provenanceFailure(error), ...where };
+    }
+    return { ...provenanceFrom(stdout, id, sha256(bytes)), ...where };
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 }
 
 /**
@@ -503,7 +644,13 @@ async function check(entry, token) {
   } catch (error) {
     throw refuse(`plugin.toml can't be read for capabilities: ${error instanceof Error ? error.message : String(error)}`);
   }
-  const { automerge, why } = review(entry, pinned.toString("utf8"), toml.toString("utf8"));
+  // A privileged plugin's release merges by itself only if its plugin.wasm
+  // (these bytes, whose sha256 the lock takes) is attested by its own
+  // repository's release workflow at this tag.
+  const provenance =
+    entry.tier === "privileged" || caps.tier === "privileged" ? await verifyProvenance(wasm, entry.repo, tag, token) : null;
+  if (provenance !== null) console.log(`${entry.id} ${tag}: provenance ${provenance.verified ? "verified" : `not verified (${provenance.why})`}`);
+  const { automerge, why } = review(entry, pinned.toString("utf8"), toml.toString("utf8"), provenance);
   // Every tool download it names, fetched and compared: the lock pins this
   // manifest, the manifest pins these, so a reviewer's approval of the one
   // covers the others only if they are what it says.
@@ -531,6 +678,7 @@ async function check(entry, token) {
     wasm_bytes: wasm.length,
     tools_checked: artifacts.length,
     ...caps,
+    provenance,
     automerge,
     why,
   };

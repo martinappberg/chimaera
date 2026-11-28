@@ -117,15 +117,29 @@ does not activate it. Rebuild, copy and reinstall the same version to iterate.
    `the_lock_scripts_port_is_pinned`, read by `plugin-caps.test.mjs`); a
    manifest it can't read is refused like any failed check. The lock is
    written with the release's own `tier` and `caps`. A bump auto-merges
-   (squash) only when the plugin is and stays sandboxed and its capability
-   digest is exactly the approved one (`review` in the script): the lock has
-   it as `sandboxed`, the pinned release reads as the lock's `tier` and
-   `caps`, the release reads as `sandboxed` with the lock's `caps`, and, as a
-   stricter extra, its capability lines (`api` and every table but `[adds]`,
-   `[release]` and `[detect]`) equal its pinned release's. Otherwise the PR
-   waits for a maintainer, and its body says which condition failed, whether
-   the tier changed, and which of the card's Can lines the release adds and
-   drops, with links to the release and the compare view. Such a PR is
+   (squash) only when (`review` in the script) the pinned release reads as
+   the lock's `tier` and `caps`, the release keeps that tier (sandboxed stays
+   sandboxed, privileged stays privileged) with exactly the lock's `caps`,
+   its capability lines (`api` and every table but `[adds]`, `[release]` and
+   `[detect]`) equal its pinned release's, and, for a **privileged** plugin
+   only, its `plugin.wasm` is attested by its own repository's
+   `.github/workflows/release.yml` at the release's tag (`gh attestation
+   verify --repo <repo> --cert-identity
+   https://github.com/<repo>/.github/workflows/release.yml@refs/tags/v<version>
+   --source-ref refs/tags/v<version> --deny-self-hosted-runners`, then
+   checked again in the script). A privileged plugin's new code can pass new
+   arguments to the same programs, which no digest shows; the attestation
+   proves the release was built from its tagged source by its own release
+   workflow, so a person need not read it on every release. A sandboxed
+   plugin needs none: the sandbox bounds its code. Each plugin repository's
+   release workflow attests `plugin.wasm` (`actions/attest-build-provenance`;
+   the job holds `id-token: write` and `attestations: write`); a release run
+   by hand (`workflow_dispatch`) is attested at its branch, not the tag, so
+   its bump waits. Otherwise the PR waits for a maintainer, and its body says
+   which condition failed, whether the tier changed, whether provenance
+   verified (and against which workflow and tag), and which of the card's Can
+   lines the release adds and drops, with links to the release and the
+   compare view. Such a PR is
    usually green: CI checks only that the lock matches the release, which is
    not an approval. Read the code and those changes; merge to approve them,
    or close it unmerged to turn the version down. A note that the pinned

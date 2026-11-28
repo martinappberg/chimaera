@@ -8,10 +8,15 @@ name: plugin-lock
 # lock is written with each release's own tier and caps (read from its
 # plugin.toml by .github/scripts/plugin-caps.mjs, held to the daemon's
 # reading by fixtures). The PR auto-merges (squash) only when every bumped
-# plugin is and stays sandboxed and its capability digest is exactly the
-# one the lock approved (and its capability lines are its pinned release's);
-# anything else waits for a person (docs/design/plugin-platform-plan.md §2),
-# with a body that says which condition failed, whether the tier changed and
+# plugin keeps its tier and its capability digest is exactly the one the
+# lock approved (and its capability lines are its pinned release's), and a
+# privileged one's plugin.wasm is attested by its own repository's
+# .github/workflows/release.yml at the release's tag (`gh attestation
+# verify`, preinstalled on the runner, with this run's token; attestations of
+# public repositories need no extra permission). A sandboxed plugin needs no
+# attestation: the sandbox bounds it. Anything else waits for a person
+# (docs/design/plugin-platform-plan.md §2), with a body that says which
+# condition failed, whether provenance verified, whether the tier changed and
 # which Can lines the release adds and drops, with the compare link. CI then
 # checks only that the lock matches the release: that is not an approval, so
 # a green PR that waits for review still needs a person to read the code.
@@ -136,7 +141,7 @@ jobs:
           if [ "$AUTOMERGE" = true ]; then
             gh pr merge "$branch" --repo "$REPO" --auto --squash
           else
-            echo "::notice title=plugin-lock::'$title' needs a maintainer's review (not sandboxed with the approved capability digest; the PR body says why): no auto-merge"
+            echo "::notice title=plugin-lock::'$title' needs a maintainer's review (a tier or capability change, or a privileged release without a verified attestation; the PR body says which): no auto-merge"
           fi
 
       - name: a release failed its checks

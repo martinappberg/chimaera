@@ -222,14 +222,25 @@ The platform's rule:
   reach users through the lock: the plugin's release, then a lock bump, then a
   chimaera release. A user can still install a newer release early, through the trust
   prompt, as an unverified version.
-- **Lock bumps** (the `plugin-lock` workflow): auto-merge only when the tier is
-  sandboxed and the digest is unchanged. Any privileged bump, and any digest change,
-  opens the pull request without auto-merge and with a label asking for review.
-- **Provenance** for privileged plugins: the plugin repository's release workflow
-  attests that `plugin.wasm` was built from the tagged source (`actions/attest`, which
-  takes the release's existing `SHA256SUMS` as its subjects), and the lock check runs
-  `gh attestation verify` pinned to that repository and its release workflow before it
-  proposes the bump. Review then covers the code that actually ships. The daemon does
+- **Lock bumps** (the `plugin-lock` workflow): the bump writes the release's own tier
+  and digest, and auto-merges only when the tier is unchanged (sandboxed stays
+  sandboxed, privileged stays privileged), the digest is exactly the approved one, the
+  capability lines are unchanged, and, for a privileged plugin, provenance verifies
+  (below). Anything else opens the pull request without auto-merge, saying which
+  condition failed; CI checking the lock against the release is not an approval, so
+  such a PR still needs a person to read the code. A sandboxed plugin needs no
+  provenance: the sandbox bounds what its new code can do.
+- **Provenance** for privileged plugins (built): the plugin repository's release
+  workflow (`.github/workflows/release.yml`, a convention fixed in the chimaera
+  repository, never read from the release) attests `plugin.wasm`, the exact file it
+  uploads and lists in `SHA256SUMS` (`actions/attest-build-provenance`), and the lock
+  bump runs `gh attestation verify` on the release's bytes pinned to that repository,
+  that workflow and the release's tag ref (`--cert-identity`, `--source-ref`), then
+  checks gh's result again. A privileged release that changes none of its permissions
+  and verifies merges by itself: its code was built by its own repository's release
+  workflow from the tagged source, which is the review the lock PR stood in for. One
+  that doesn't verify (no attestation, another workflow or ref — a release run by hand
+  is attested at its branch — a network error, gh missing) waits for a person. The daemon does
   not verify attestations itself: it trusts the lock, which pins the hashes, so the
   check runs once, in CI, where people can see it.
 - **Rebuildable.** A plugin repository's CI builds its component twice, in different

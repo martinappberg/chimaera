@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import { describeManifest } from "./plugin-caps.mjs";
 import {
+  attestationArgs,
+  attestationIdentity,
   capabilityChange,
   capabilityLines,
   code,
@@ -14,10 +17,13 @@ import {
   outputs,
   parseLock,
   parseSums,
+  provenanceFailure,
+  provenanceFrom,
   pullRequest,
   review,
   setLockValues,
   toolArtifacts,
+  verifyProvenance,
 } from "./plugin-lock.mjs";
 
 const LOCK = `# comment
@@ -318,18 +324,32 @@ const entryOf = (pinned, over = {}) => {
   return { id: "notes", tier: d.tier, caps: d.caps, ...over };
 };
 
-test("auto-merge needs a plugin that is and stays sandboxed with the approved digest (the safeguard)", () => {
+/** A privileged release of the same plugin (it runs pandoc). */
+const privileged = (version, extra = "") => release(version, `[[programs]]\nname = "pandoc"${extra}`);
+/** What `verifyProvenance` answers for an attested release. */
+const VERIFIED = { verified: true, why: null, workflow: ".github/workflows/release.yml", ref: "refs/tags/v0.1.1" };
+const unverified = (why) => ({ verified: false, why, workflow: ".github/workflows/release.yml", ref: "refs/tags/v0.1.1" });
+
+test("auto-merge needs the same tier, the approved digest, and provenance when privileged (the safeguard)", () => {
   const pinned = release("0.1.0");
   const reworded = release("0.1.1").replace("Notes for agents.", "Other words.");
   const grown = release("0.1.1", '[[programs]]\nname = "pandoc"');
   const sandboxed = entryOf(pinned);
   // Every case of the rule, spelled out: loosening any of them must fail here.
-  assert.deepEqual(review(sandboxed, pinned, reworded), { automerge: true, why: null });
-  assert.equal(review(sandboxed, pinned, grown).automerge, false, "new capabilities wait for a person");
-  assert.equal(review({ ...sandboxed, tier: "privileged" }, pinned, reworded).automerge, false, "a privileged plugin always waits, even unchanged");
-  assert.equal(review({ ...sandboxed, tier: "privileged" }, pinned, grown).automerge, false);
-  assert.equal(review({ ...sandboxed, tier: "" }, pinned, reworded).automerge, false, "only the exact word sandboxed merges by itself");
+  assert.deepEqual(review(sandboxed, pinned, reworded), { automerge: true, why: null }, "sandboxed needs no provenance");
+  assert.deepEqual(review(sandboxed, pinned, reworded, unverified("no attestation")), { automerge: true, why: null });
+  assert.equal(review(sandboxed, pinned, grown, VERIFIED).automerge, false, "new capabilities wait, attested or not");
+  const pinnedPriv = privileged("0.1.0");
+  const priv = entryOf(pinnedPriv);
+  const privSame = privileged("0.1.1").replace("Notes for agents.", "Other words.");
+  assert.deepEqual(review(priv, pinnedPriv, privSame, VERIFIED), { automerge: true, why: null }, "privileged, unchanged, attested");
+  assert.equal(review(priv, pinnedPriv, privSame).automerge, false, "privileged without a provenance check waits");
+  assert.equal(review(priv, pinnedPriv, privSame, unverified("no attestation")).automerge, false);
+  assert.equal(review(priv, pinnedPriv, privSame, { verified: "true" }).automerge, false, "only verified === true counts");
+  assert.equal(review({ ...sandboxed, tier: "privileged" }, pinned, reworded, VERIFIED).automerge, false, "the lock's tier must be the pinned release's");
+  assert.equal(review({ ...sandboxed, tier: "" }, pinned, reworded).automerge, false, "only the exact words sandboxed or privileged");
   assert.equal(review({ ...sandboxed, tier: "Sandboxed" }, pinned, reworded).automerge, false);
+  assert.equal(review({ ...priv, tier: "Privileged" }, pinnedPriv, privSame, VERIFIED).automerge, false);
   // The line comparison stays as a stricter extra: lines that differ only in
   // a way the digest ignores (an inline comment) still wait.
   const commented = pinned.replace('files = "read"', 'files = "read" # still read');
@@ -360,17 +380,17 @@ test("capability changes the line heuristic can't see never merge by themselves"
   for (const [p, r] of [[pinned, topLevelProgram], [pinned, commentedHeader], [dottedPinned, dottedTool]]) {
     assert.deepEqual(capabilityLines(r), capabilityLines(p), "the line heuristic alone is blind to it");
   }
-  assert.deepEqual(review(entryOf(pinned), pinned, topLevelProgram), {
+  assert.deepEqual(review(entryOf(pinned), pinned, topLevelProgram, VERIFIED), {
     automerge: false,
-    why: "the release is privileged: it runs or downloads programs; its capability digest is not the approved one: it may ask for more",
+    why: "its tier changes (sandboxed → privileged); its capability digest is not the approved one: it may ask for more",
   });
   assert.equal(describeManifest(topLevelProgram).tier, "privileged");
-  assert.deepEqual(review(entryOf(pinned), pinned, commentedHeader), {
+  assert.deepEqual(review(entryOf(pinned), pinned, commentedHeader, VERIFIED), {
     automerge: false,
-    why: "the release is privileged: it runs or downloads programs; its capability digest is not the approved one: it may ask for more",
+    why: "its tier changes (sandboxed → privileged); its capability digest is not the approved one: it may ask for more",
   });
   assert.equal(describeManifest(dottedTool).tier, "sandboxed");
-  assert.deepEqual(review(entryOf(dottedPinned), dottedPinned, dottedTool), {
+  assert.deepEqual(review(entryOf(dottedPinned), dottedPinned, dottedTool, VERIFIED), {
     automerge: false,
     why: "its capability digest is not the approved one: it may ask for more",
   });
@@ -379,35 +399,168 @@ test("capability changes the line heuristic can't see never merge by themselves"
   assert.equal(bump.tier, "privileged");
   const { body, automerge } = pullRequest([bump]);
   assert.equal(automerge, false);
-  assert.match(body, /`notes` 0\.1\.1: the release is privileged: it runs or downloads programs; its capability digest is not the approved one/);
+  assert.match(body, /`notes` 0\.1\.1: its tier changes \(sandboxed → privileged\); its capability digest is not the approved one/);
   assert.match(body, /- Tier: sandboxed → \*\*privileged\*\*/);
   assert.match(body, /Runs bash: this plugin can run any command on this host/);
+});
+
+/** `gh attestation verify --format json` output for one attestation. */
+const ghResult = ({ repo = "o/notes", workflow = ".github/workflows/release.yml", ref = "refs/tags/v0.1.1", sha = "e".repeat(64) } = {}) =>
+  JSON.stringify([
+    {
+      attestation: {},
+      verificationResult: {
+        signature: {
+          certificate: {
+            subjectAlternativeName: `https://github.com/${repo}/${workflow}@${ref}`,
+            sourceRepositoryURI: `https://github.com/${repo}`,
+            sourceRepositoryRef: ref,
+          },
+        },
+        statement: { subject: [{ name: "plugin.wasm", digest: { sha256: sha } }] },
+      },
+    },
+  ]);
+
+test("provenance: gh's result is checked again for the repository, workflow, ref and bytes", () => {
+  const id = attestationIdentity("o/notes", "v0.1.1");
+  assert.deepEqual(id, {
+    repo: "o/notes",
+    workflow: ".github/workflows/release.yml",
+    ref: "refs/tags/v0.1.1",
+    san: "https://github.com/o/notes/.github/workflows/release.yml@refs/tags/v0.1.1",
+  });
+  const sha = "e".repeat(64);
+  assert.deepEqual(provenanceFrom(ghResult(), id, sha), { verified: true, why: null });
+  assert.deepEqual(provenanceFrom(ghResult({ repo: "evil/notes" }), id, sha), { verified: false, why: "an attestation from another repository" });
+  assert.deepEqual(provenanceFrom(ghResult({ workflow: ".github/workflows/ci.yml" }), id, sha), {
+    verified: false,
+    why: "an attestation signed by another workflow",
+  });
+  assert.deepEqual(provenanceFrom(ghResult({ ref: "refs/heads/main" }), id, sha), {
+    verified: false,
+    why: "an attestation made at another ref, not refs/tags/v0.1.1",
+  });
+  assert.deepEqual(provenanceFrom(ghResult({ sha: "0".repeat(64) }), id, sha), { verified: false, why: "an attestation over other bytes" });
+  assert.deepEqual(provenanceFrom("[]", id, sha), { verified: false, why: "no attestation" });
+  assert.deepEqual(provenanceFrom("not json", id, sha), { verified: false, why: "gh printed no verification result" });
+});
+
+test("provenance: every failure of gh is a reason, never a throw", async () => {
+  assert.equal(provenanceFailure({ code: "ENOENT" }), "gh is not installed");
+  assert.equal(
+    provenanceFailure({ stderr: "Error: HTTP 404: Not Found (https://api.github.com/repos/o/notes/attestations/sha256:ab)" }),
+    "no attestation",
+  );
+  assert.equal(provenanceFailure({ killed: true, signal: "SIGTERM", stderr: "" }), "gh attestation verify timed out");
+  assert.equal(provenanceFailure({ stderr: "dial tcp: lookup api.github.com: no such host\nmore" }), "gh attestation verify failed: dial tcp: lookup api.github.com: no such host");
+  const bytes = Buffer.from("wasm");
+  const fail = (error) => async () => {
+    throw error;
+  };
+  assert.deepEqual(await verifyProvenance(bytes, "o/notes", "v0.1.1", "", fail({ code: "ENOENT" })), unverified("gh is not installed"));
+  assert.deepEqual(await verifyProvenance(bytes, "o/notes", "v0.1.1", "", fail({ stderr: "Error: HTTP 404: Not Found" })), unverified("no attestation"));
+  assert.deepEqual(await verifyProvenance(bytes, "o/notes", "v0.1.1", "", fail({ stderr: "network is unreachable" })), unverified("gh attestation verify failed: network is unreachable"));
+  // A result for the right identity over these very bytes verifies.
+  const sha = createHash("sha256").update(bytes).digest("hex");
+  let seen = null;
+  const ok = async (cmd, args, opts) => {
+    seen = { cmd, args, opts };
+    return { stdout: ghResult({ sha }) };
+  };
+  assert.deepEqual(await verifyProvenance(bytes, "o/notes", "v0.1.1", "tok", ok), VERIFIED);
+  assert.equal(seen.cmd, "gh");
+  assert.equal(seen.opts.env.GH_TOKEN, "tok");
+  assert.equal(seen.opts.shell, undefined, "never through a shell");
+  assert.deepEqual(seen.args.slice(0, 2), ["attestation", "verify"]);
+  assert.deepEqual(seen.args.slice(3), [
+    "--repo",
+    "o/notes",
+    "--cert-identity",
+    "https://github.com/o/notes/.github/workflows/release.yml@refs/tags/v0.1.1",
+    "--source-ref",
+    "refs/tags/v0.1.1",
+    "--deny-self-hosted-runners",
+    "--format",
+    "json",
+  ]);
+  // A repository or tag outside the lock's grammar never reaches gh.
+  let ran = false;
+  const never = async () => {
+    ran = true;
+    return { stdout: "" };
+  };
+  assert.equal((await verifyProvenance(bytes, "o/notes --repo x", "v0.1.1", "", never)).verified, false);
+  assert.equal((await verifyProvenance(bytes, "o/notes", "v0.1.1 --format=x", "", never)).verified, false);
+  assert.equal(ran, false);
+});
+
+test("gh's arguments are an argv array: release-controlled text can't add a flag", () => {
+  assert.deepEqual(attestationArgs("/tmp/x/plugin.wasm", "o/notes", "v1.2.3"), [
+    "attestation",
+    "verify",
+    "/tmp/x/plugin.wasm",
+    "--repo",
+    "o/notes",
+    "--cert-identity",
+    "https://github.com/o/notes/.github/workflows/release.yml@refs/tags/v1.2.3",
+    "--source-ref",
+    "refs/tags/v1.2.3",
+    "--deny-self-hosted-runners",
+    "--format",
+    "json",
+  ]);
+  for (const [repo, tag] of [
+    ["o/notes; rm -rf /", "v1.2.3"],
+    ["o/notes", "v1.2.3\n--owner x"],
+    ["o/notes", "1.2.3"],
+    ["o/notes", "v1.2.3-rc1"],
+    ["$(x)/y", "v1.2.3"],
+  ]) {
+    assert.throws(() => attestationArgs("f", repo, tag), /not a (repository|release tag)/);
+  }
 });
 
 test("each auto-merge condition, false in turn, holds the bump for a person", () => {
   const pinned = release("0.1.0");
   const same = release("0.1.1");
   const base = entryOf(pinned);
-  assert.deepEqual(review(base, pinned, same), { automerge: true, why: null }, "all conditions hold");
+  const pinnedPriv = privileged("0.1.0");
+  const priv = entryOf(pinnedPriv);
+  const privSame = privileged("0.1.1");
+  assert.deepEqual(review(base, pinned, same), { automerge: true, why: null }, "sandboxed: all conditions hold");
+  assert.deepEqual(review(priv, pinnedPriv, privSame, VERIFIED), { automerge: true, why: null }, "privileged: all conditions hold");
+  const id = attestationIdentity("o/notes", "v0.1.1");
+  const sha = "e".repeat(64);
   const cases = [
-    ["the lock has it as privileged", { ...base, tier: "privileged" }, pinned, same, /the lock has it as privileged/],
-    ["the lock's caps were edited by hand", { ...base, caps: "0".repeat(64) }, pinned, same, /the pinned release doesn't read as the tier and caps the lock records/],
-    ["the lock's tier disagrees with the pinned release", { ...base, tier: "sandboxed " }, pinned, same, /the pinned release doesn't read as/],
-    ["the pinned release can't be read", base, "not toml [", same, /the pinned release doesn't read as/],
-    ["the release is privileged", base, pinned, release("0.1.1").replace('api = "0.2"', 'api = "0.2"\nprograms = [{ name = "pandoc" }]'), /the release is privileged/],
-    ["the release can't be read", base, pinned, "when = 1979-05-27\n", /the release is privileged/],
-    ["the release's digest changed", base, pinned, release("0.1.1").replace('mcp_tools = ["notes_read"]', 'mcp_tools = ["notes_read", "x"]'), /capability digest is not the approved one/],
-    ["the release's digest shrank", base, pinned, release("0.1.1").replace('files = "read"', 'files = "none"'), /capability digest is not the approved one/],
-    ["only the capability lines changed", base, pinned, release("0.1.1").replace('files = "read"', "files = 'read'"), /^its capability lines changed$/],
+    ["the lock's tier is another word", { ...base, tier: "sandboxed " }, pinned, same, VERIFIED, /neither sandboxed nor privileged/],
+    ["the lock's caps were edited by hand", { ...base, caps: "0".repeat(64) }, pinned, same, VERIFIED, /the pinned release doesn't read as the tier and caps the lock records/],
+    ["the lock's tier was edited by hand", { ...base, tier: "privileged" }, pinned, same, VERIFIED, /the pinned release doesn't read as/],
+    ["the pinned release can't be read", base, "not toml [", same, VERIFIED, /the pinned release doesn't read as/],
+    ["sandboxed becomes privileged", base, pinned, release("0.1.1").replace('api = "0.2"', 'api = "0.2"\nprograms = [{ name = "pandoc" }]'), VERIFIED, /its tier changes \(sandboxed → privileged\)/],
+    ["privileged becomes sandboxed", priv, pinnedPriv, same, VERIFIED, /its tier changes \(privileged → sandboxed\)/],
+    ["the release can't be read", base, pinned, "when = 1979-05-27\n", VERIFIED, /the release can't be read/],
+    ["the release's digest changed", base, pinned, release("0.1.1").replace('mcp_tools = ["notes_read"]', 'mcp_tools = ["notes_read", "x"]'), VERIFIED, /capability digest is not the approved one/],
+    ["the release's digest shrank", base, pinned, release("0.1.1").replace('files = "read"', 'files = "none"'), VERIFIED, /capability digest is not the approved one/],
+    ["a privileged release's digest changed", priv, pinnedPriv, privileged("0.1.1", '\nnetwork = "CTAN"'), VERIFIED, /capability digest is not the approved one/],
+    ["only the capability lines changed", base, pinned, release("0.1.1").replace('files = "read"', "files = 'read'"), VERIFIED, /^its capability lines changed$/],
+    ["a privileged release's lines changed", priv, pinnedPriv, privSame.replace('name = "pandoc"', "name = 'pandoc'"), VERIFIED, /^its capability lines changed$/],
+    ["privileged, not attested", priv, pinnedPriv, privSame, unverified("no attestation"), /privileged and its provenance did not verify: no attestation/],
+    ["privileged, gh missing", priv, pinnedPriv, privSame, unverified("gh is not installed"), /gh is not installed/],
+    ["privileged, never checked", priv, pinnedPriv, privSame, null, /did not verify: not checked/],
+    ["privileged, attested by another repository", priv, pinnedPriv, privSame, provenanceFrom(ghResult({ repo: "evil/notes" }), id, sha), /another repository/],
+    ["privileged, attested by another workflow", priv, pinnedPriv, privSame, provenanceFrom(ghResult({ workflow: ".github/workflows/ci.yml" }), id, sha), /another workflow/],
+    ["privileged, attested at another ref", priv, pinnedPriv, privSame, provenanceFrom(ghResult({ ref: "refs/heads/main" }), id, sha), /another ref/],
+    ["privileged, attested over other bytes", priv, pinnedPriv, privSame, provenanceFrom(ghResult({ sha: "0".repeat(64) }), id, sha), /other bytes/],
   ];
-  for (const [what, entry, p, r, reason] of cases) {
-    const got = review(entry, p, r);
+  for (const [what, entry, p, r, provenance, reason] of cases) {
+    const got = review(entry, p, r, provenance);
     assert.equal(got.automerge, false, what);
     assert.match(got.why, reason, what);
   }
 });
 
-test("over every pair of parity-fixture manifests, auto-merge only when both are sandboxed with equal digests", () => {
+test("over every pair of parity-fixture manifests, auto-merge only with the same tier, equal digests, and provenance when privileged", () => {
   const fixture = JSON.parse(readFileSync(new URL("../../web-ui/src/lib/net/fixtures/wire/plugin-caps.json", import.meta.url), "utf8"));
   const manifests = fixture.cases.map((c) => c.frame.manifest);
   let merged = 0;
@@ -416,21 +569,26 @@ test("over every pair of parity-fixture manifests, auto-merge only when both are
     for (const r of manifests) {
       const after = describeManifest(r);
       for (const tier of ["sandboxed", "privileged"]) {
-        const { automerge } = review({ id: "demo", tier, caps: before.caps }, p, r);
-        if (!automerge) continue;
-        merged++;
-        assert.equal(tier, "sandboxed");
-        assert.equal(before.tier, "sandboxed");
-        assert.equal(after.tier, "sandboxed");
-        assert.equal(after.caps, before.caps);
+        for (const provenance of [VERIFIED, unverified("no attestation"), null]) {
+          const { automerge } = review({ id: "demo", tier, caps: before.caps }, p, r, provenance);
+          if (!automerge) continue;
+          merged++;
+          assert.equal(tier, before.tier, "the lock's tier is the pinned release's");
+          assert.equal(after.tier, before.tier, "the same tier");
+          assert.equal(after.caps, before.caps, "equal digests");
+          if (tier === "privileged") assert.equal(provenance?.verified, true, "privileged needs provenance");
+        }
       }
     }
-    // A sandboxed release against itself is the one bump that merges.
-    const self = review({ id: "demo", tier: before.tier, caps: before.caps }, p, p).automerge;
-    assert.equal(self, before.tier === "sandboxed", "an unchanged sandboxed release merges by itself");
+    // An unchanged release merges by itself: sandboxed always, privileged
+    // only attested.
+    const entry = { id: "demo", tier: before.tier, caps: before.caps };
+    assert.equal(review(entry, p, p, VERIFIED).automerge, true);
+    assert.equal(review(entry, p, p, unverified("no attestation")).automerge, before.tier === "sandboxed");
   }
   assert.ok(merged > 0);
 });
+
 
 test("a bump whose capabilities are unchanged says so in one line, and keeps tier and caps", () => {
   const pinned = release("0.1.0");
