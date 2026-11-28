@@ -278,10 +278,11 @@ async fn a_0_2_plugin_draws_every_node_and_acts() {
     .await;
     assert_eq!(status, StatusCode::OK, "{doc}");
     assert!(doc["tree"].to_string().contains("one two"), "{doc}");
+    // A file no kind claims and no action takes (`*.md` is an action's).
     let (status, _) = request(
         &state,
         Method::GET,
-        &format!("/api/v1/workspaces/{ws}/plugins/{PID}/views/doc?file=notes.md"),
+        &format!("/api/v1/workspaces/{ws}/plugins/{PID}/views/doc?file=notes.txt"),
         None,
     )
     .await;

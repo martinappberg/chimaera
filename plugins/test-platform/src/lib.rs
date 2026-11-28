@@ -278,7 +278,11 @@ impl Plugin for Fixture {
                     .and_then(Value::as_str)
                     .ok_or("no file")?;
                 // `elsewhere.md` names a file no view of this plugin draws.
-                let file = if file == "elsewhere.md" { "notes.txt" } else { file };
+                let file = if file == "elsewhere.md" {
+                    "notes.txt"
+                } else {
+                    file
+                };
                 Ok(Some(json!({"open": {"view": "doc", "file": file}})))
             }
             other => Err(format!("no such action {other}")),
