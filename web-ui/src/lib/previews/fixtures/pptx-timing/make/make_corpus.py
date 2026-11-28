@@ -38,9 +38,11 @@ OUT = os.path.normpath(os.path.join(HERE, "..", "decks"))
 # A deck is a list of slides. A slide has:
 #   shapes: [(name, kind, {box?, text?, rot?, fill?, line?})]   kind: rect oval text
 #           table chart picture group line; fill: gradient | picture; line: width in pt
-#   fx:     [(shape, effect, trigger, {dir?, exit?, dur?, level?, amount?, size?, autorev?, color?, path?})]
+#   fx:     [(shape, effect, trigger, {dir?, exit?, dur?, level?, amount?, size?, autorev?, color?, to?, path?})]
 #           amount: a spin's degrees; size: a grow's percent; autorev: plays back
 #           color: (r, g, b) a colour effect changes to; path: a motion path's string
+#           to: DrawingML a colour effect's p:to is rewritten to after PowerPoint's save
+#           (its scripting sets only RGB), then saved again by PowerPoint, which keeps it
 #           (dur and color apply to every effect one add makes: by paragraph, several)
 #           effect: PowerPoint's own name after "animation type"
 #           trigger: click | with | after
@@ -60,6 +62,7 @@ def row(names, kind="rect"):
     return [(n, kind, {}) for n in names]
 
 
+ACCENT2 = '<a:schemeClr val="accent2">%s</a:schemeClr>'
 THREE = ["First point", "Second point", "Third point"]
 
 # A font no system ships: PowerPoint and browsers each substitute their own.
@@ -442,6 +445,44 @@ DECKS = {
             ],
         },
     ],
+    # What a colour effect holds when its "to" is a theme colour with
+    # modifiers, on a fill, a line and text (README R33), beside an RGB
+    # colour with the same kind of modifier and a plain theme colour.
+    # PowerPoint's scripting sets only RGB, so each "to" is written into
+    # its save and saved again by PowerPoint (make's rewrite step).
+    "colours": [
+        {
+            "shapes": row(["FillTint", "FillShade", "FillLum", "FillLum75", "FillRgbShade", "FillPlain"]),
+            "fx": [
+                ("FillTint", "change fill color", "click", {"dur": 1.0, "to": ACCENT2 % '<a:tint val="40000"/>'}),
+                ("FillShade", "change fill color", "with", {"dur": 1.0, "to": ACCENT2 % '<a:shade val="50000"/>'}),
+                ("FillLum", "change fill color", "with",
+                 {"dur": 1.0, "to": ACCENT2 % '<a:lumMod val="60000"/><a:lumOff val="40000"/>'}),
+                ("FillLum75", "change fill color", "with", {"dur": 1.0, "to": ACCENT2 % '<a:lumMod val="75000"/>'}),
+                ("FillRgbShade", "change fill color", "with",
+                 {"dur": 1.0, "to": '<a:srgbClr val="00A000"><a:shade val="50000"/></a:srgbClr>'}),
+                ("FillPlain", "change fill color", "with", {"dur": 1.0, "to": '<a:schemeClr val="accent3"/>'}),
+            ],
+        },
+        {
+            "shapes": [(n, "rect", {"line": 24}) for n in ["LineTint", "LineShade", "LineLum", "LineRgbShade"]]
+            + [(n, "text", {"text": ["Colour"], "size": 72}) for n in ["FontTint", "FontShade", "FontLum", "FontRgbShade"]],
+            "fx": [
+                ("LineTint", "change line color", "click", {"dur": 1.0, "to": ACCENT2 % '<a:tint val="40000"/>'}),
+                ("LineShade", "change line color", "with", {"dur": 1.0, "to": ACCENT2 % '<a:shade val="50000"/>'}),
+                ("LineLum", "change line color", "with",
+                 {"dur": 1.0, "to": ACCENT2 % '<a:lumMod val="60000"/><a:lumOff val="40000"/>'}),
+                ("LineRgbShade", "change line color", "with",
+                 {"dur": 1.0, "to": '<a:srgbClr val="00A000"><a:shade val="50000"/></a:srgbClr>'}),
+                ("FontTint", "change font color", "with", {"dur": 1.0, "to": ACCENT2 % '<a:tint val="40000"/>'}),
+                ("FontShade", "change font color", "with", {"dur": 1.0, "to": ACCENT2 % '<a:shade val="50000"/>'}),
+                ("FontLum", "change font color", "with",
+                 {"dur": 1.0, "to": ACCENT2 % '<a:lumMod val="60000"/><a:lumOff val="40000"/>'}),
+                ("FontRgbShade", "change font color", "with",
+                 {"dur": 1.0, "to": '<a:srgbClr val="00A000"><a:shade val="50000"/></a:srgbClr>'}),
+            ],
+        },
+    ],
     # No animation, and saved by PowerPoint: what happens to the ids python-pptx
     # wrote (see agent-written-raw.pptx, the same deck before PowerPoint).
     "agent-written": [
@@ -687,9 +728,65 @@ def make(name):
         osa(f'tell application "Microsoft PowerPoint" to close presentation {q(name + ".pptx")} saving no', 30)
         raise RuntimeError(f"{name}: {r.stderr.strip()}")
     problems = [p for p in r.stdout.strip().splitlines() if p]
+    if any("to" in o for spec in slides for *_, o in spec.get("fx", [])):
+        rewrite_to(path, slides)
+        open_in_powerpoint(path)
+        r = osa("\n".join([
+            'tell application "Microsoft PowerPoint"',
+            f"\tset pres to presentation {q(name + '.pptx')}",
+            "\tset n to name of shape 1 of slide 1 of pres",
+            "\tset name of shape 1 of slide 1 of pres to n",
+            "\tsave pres", "\tclose pres saving no", "end tell"]), 120)
+        if r.returncode != 0:
+            osa(f'tell application "Microsoft PowerPoint" to close presentation {q(name + ".pptx")} saving no', 30)
+            raise RuntimeError(f"{name} resave: {r.stderr.strip()}")
+        problems += kept_to(path, slides)
     print(f"{name}: {os.path.getsize(path)} bytes, {len(slides)} slides" + (f", {len(problems)} refused" if problems else ""))
     for p in problems:
         print("  refused:", p)
+
+
+def to_edits(slides):
+    """(slide number, shape name, p:to colour) for every effect with a "to"."""
+    return [(i, shape, o["to"]) for i, spec in enumerate(slides, 1)
+            for shape, _, _, o in spec.get("fx", []) if "to" in o]
+
+
+def rewrite_to(path, slides):
+    """Write each "to" into the p:to of the colour behaviours on its shape."""
+    import re
+    import shutil
+    import zipfile
+
+    edits = to_edits(slides)
+    tmp = path + ".tmp"
+    with zipfile.ZipFile(path) as zin, zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            m = re.fullmatch(r"ppt/slides/slide(\d+)\.xml", item.filename)
+            if m:
+                text = data.decode("utf-8")
+                for i, shape, colour in edits:
+                    if i != int(m.group(1)):
+                        continue
+                    spid = re.search(r'<p:cNvPr id="(\d+)" name="' + re.escape(shape) + '"', text).group(1)
+                    pat = re.compile(r'(<p:animClr\b(?:(?!</p:animClr>).)*?<p:spTgt spid="' + spid
+                                     + r'"(?:(?!</p:animClr>).)*?<p:to>).*?(</p:to>)', re.S)
+                    text, k = pat.subn(lambda mm: mm.group(1) + colour + mm.group(2), text)
+                    if k == 0:
+                        raise RuntimeError(f"{path}: no colour behaviour on {shape}")
+                data = text.encode("utf-8")
+            zout.writestr(item, data)
+    shutil.move(tmp, path)
+
+
+def kept_to(path, slides):
+    """Problems: a "to" PowerPoint's second save did not keep."""
+    import zipfile
+
+    with zipfile.ZipFile(path) as z:
+        return [f"slide {i} {shape}: PowerPoint did not keep {colour}" for i, shape, colour in to_edits(slides)
+                if f"<p:to>{colour}</p:to>" not in z.read(f"ppt/slides/slide{i}.xml").decode("utf-8")]
 
 
 def duplicate_an_id(src, dst):

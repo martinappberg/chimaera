@@ -979,9 +979,9 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   "next". Grow and shrink scale about the shape's centre (two grows multiply), turns add on top
   of the shape's own rotation, transparency is instant, and colour changes blend during their
   click and stay: fill colour replaces any fill (solid, gradient, picture) with one colour,
-  resolved against the slide's theme (a theme colour the effect names lighter or darker plays as
-  the plain theme colour, as PowerPoint's own show does; an RGB colour keeps its shade); line and font colour (by box or by paragraph) recolour the
-  outline and the text; darken, lighten, desaturate and complementary colour shift a solid
+  resolved against the slide's theme; line and font colour (by box or by paragraph) recolour the
+  outline and the text (on all three, a theme colour the effect names lighter or darker plays as
+  the plain theme colour, as PowerPoint's own show does, and an RGB colour keeps its shade); darken, lighten, desaturate and complementary colour shift a solid
   fill, each stop of a gradient, the outline and the text (a picture fill gets a CSS filter
   instead, named in the tooltip). Every click ends on exactly its build state, and its motion
   ends there too (each animation's last frame is the landed value). Nothing animates on back,

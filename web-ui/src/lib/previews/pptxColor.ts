@@ -236,9 +236,10 @@ export function applyBy(c: Rgba, by: Color): Rgba | null {
  *  drawn colour, a `to` then stands alone), or null when it can't be
  *  resolved. */
 export function heldColor(drawn: Rgba | null, held: HeldColor, palette: Palette): Rgba | null {
-  // A held scheme colour is the scheme colour alone: PowerPoint's film holds
-  // plain accent2 for accent2 with a tint, a shade or lumMod/lumOff, while an
-  // sRGB colour's shade applies (README R33).
+  // A held scheme colour is the scheme colour alone, on a fill, a line and
+  // text: PowerPoint's film of the corpus `colours` deck holds plain accent2
+  // for accent2 with a tint, a shade or lumMod/lumOff, while an sRGB colour's
+  // shade applies (README R33).
   const to = held.to?.type === "schemeClr" ? { ...held.to, mods: [] } : held.to;
   let c = to === undefined ? drawn : resolveColor(to, palette);
   if (c === null) return null;

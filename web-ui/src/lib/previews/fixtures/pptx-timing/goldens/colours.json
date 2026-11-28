@@ -1,0 +1,466 @@
+{
+  "deck": "colours.pptx",
+  "slides": [
+    {
+      "part": "ppt/slides/slide1.xml",
+      "id": 256,
+      "transition": null,
+      "steps": [
+        [],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 1000,
+            "class": "emph",
+            "preset": 1,
+            "subtype": 2,
+            "effect": "fill-color",
+            "dir": null,
+            "target": "2",
+            "sets": null
+          },
+          {
+            "trigger": "with",
+            "start": 0,
+            "dur": 1000,
+            "class": "emph",
+            "preset": 1,
+            "subtype": 2,
+            "effect": "fill-color",
+            "dir": null,
+            "target": "3",
+            "sets": null
+          },
+          {
+            "trigger": "with",
+            "start": 0,
+            "dur": 1000,
+            "class": "emph",
+            "preset": 1,
+            "subtype": 2,
+            "effect": "fill-color",
+            "dir": null,
+            "target": "4",
+            "sets": null
+          },
+          {
+            "trigger": "with",
+            "start": 0,
+            "dur": 1000,
+            "class": "emph",
+            "preset": 1,
+            "subtype": 2,
+            "effect": "fill-color",
+            "dir": null,
+            "target": "5",
+            "sets": null
+          },
+          {
+            "trigger": "with",
+            "start": 0,
+            "dur": 1000,
+            "class": "emph",
+            "preset": 1,
+            "subtype": 2,
+            "effect": "fill-color",
+            "dir": null,
+            "target": "6",
+            "sets": null
+          },
+          {
+            "trigger": "with",
+            "start": 0,
+            "dur": 1000,
+            "class": "emph",
+            "preset": 1,
+            "subtype": 2,
+            "effect": "fill-color",
+            "dir": null,
+            "target": "7",
+            "sets": null
+          }
+        ]
+      ],
+      "states": [
+        {
+          "hidden": [],
+          "moved": {}
+        },
+        {
+          "hidden": [],
+          "moved": {},
+          "color": {
+            "2": {
+              "fill": {
+                "to": {
+                  "type": "schemeClr",
+                  "attrs": {
+                    "val": "accent2"
+                  },
+                  "mods": [
+                    {
+                      "name": "tint",
+                      "val": "40000"
+                    }
+                  ]
+                },
+                "solid": true,
+                "on": true
+              }
+            },
+            "3": {
+              "fill": {
+                "to": {
+                  "type": "schemeClr",
+                  "attrs": {
+                    "val": "accent2"
+                  },
+                  "mods": [
+                    {
+                      "name": "shade",
+                      "val": "50000"
+                    }
+                  ]
+                },
+                "solid": true,
+                "on": true
+              }
+            },
+            "4": {
+              "fill": {
+                "to": {
+                  "type": "schemeClr",
+                  "attrs": {
+                    "val": "accent2"
+                  },
+                  "mods": [
+                    {
+                      "name": "lumMod",
+                      "val": "60000"
+                    },
+                    {
+                      "name": "lumOff",
+                      "val": "40000"
+                    }
+                  ]
+                },
+                "solid": true,
+                "on": true
+              }
+            },
+            "5": {
+              "fill": {
+                "to": {
+                  "type": "schemeClr",
+                  "attrs": {
+                    "val": "accent2"
+                  },
+                  "mods": [
+                    {
+                      "name": "lumMod",
+                      "val": "75000"
+                    }
+                  ]
+                },
+                "solid": true,
+                "on": true
+              }
+            },
+            "6": {
+              "fill": {
+                "to": {
+                  "type": "srgbClr",
+                  "attrs": {
+                    "val": "00A000"
+                  },
+                  "mods": [
+                    {
+                      "name": "shade",
+                      "val": "50000"
+                    }
+                  ]
+                },
+                "solid": true,
+                "on": true
+              }
+            },
+            "7": {
+              "fill": {
+                "to": {
+                  "type": "schemeClr",
+                  "attrs": {
+                    "val": "accent3"
+                  },
+                  "mods": []
+                },
+                "solid": true,
+                "on": true
+              }
+            }
+          }
+        }
+      ],
+      "interactive": 0
+    },
+    {
+      "part": "ppt/slides/slide2.xml",
+      "id": 257,
+      "transition": null,
+      "steps": [
+        [],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 1000,
+            "class": "emph",
+            "preset": 7,
+            "subtype": 2,
+            "effect": "other",
+            "dir": null,
+            "target": "2",
+            "sets": null
+          },
+          {
+            "trigger": "with",
+            "start": 0,
+            "dur": 1000,
+            "class": "emph",
+            "preset": 7,
+            "subtype": 2,
+            "effect": "other",
+            "dir": null,
+            "target": "3",
+            "sets": null
+          },
+          {
+            "trigger": "with",
+            "start": 0,
+            "dur": 1000,
+            "class": "emph",
+            "preset": 7,
+            "subtype": 2,
+            "effect": "other",
+            "dir": null,
+            "target": "4",
+            "sets": null
+          },
+          {
+            "trigger": "with",
+            "start": 0,
+            "dur": 1000,
+            "class": "emph",
+            "preset": 7,
+            "subtype": 2,
+            "effect": "other",
+            "dir": null,
+            "target": "5",
+            "sets": null
+          },
+          {
+            "trigger": "with",
+            "start": 0,
+            "dur": 1000,
+            "class": "emph",
+            "preset": 3,
+            "subtype": 2,
+            "effect": "other",
+            "dir": null,
+            "target": "6",
+            "sets": null
+          },
+          {
+            "trigger": "with",
+            "start": 0,
+            "dur": 1000,
+            "class": "emph",
+            "preset": 3,
+            "subtype": 2,
+            "effect": "other",
+            "dir": null,
+            "target": "7",
+            "sets": null
+          },
+          {
+            "trigger": "with",
+            "start": 0,
+            "dur": 1000,
+            "class": "emph",
+            "preset": 3,
+            "subtype": 2,
+            "effect": "other",
+            "dir": null,
+            "target": "8",
+            "sets": null
+          },
+          {
+            "trigger": "with",
+            "start": 0,
+            "dur": 1000,
+            "class": "emph",
+            "preset": 3,
+            "subtype": 2,
+            "effect": "other",
+            "dir": null,
+            "target": "9",
+            "sets": null
+          }
+        ]
+      ],
+      "states": [
+        {
+          "hidden": [],
+          "moved": {}
+        },
+        {
+          "hidden": [],
+          "moved": {},
+          "color": {
+            "2": {
+              "line": {
+                "to": {
+                  "type": "schemeClr",
+                  "attrs": {
+                    "val": "accent2"
+                  },
+                  "mods": [
+                    {
+                      "name": "tint",
+                      "val": "40000"
+                    }
+                  ]
+                },
+                "on": true
+              }
+            },
+            "3": {
+              "line": {
+                "to": {
+                  "type": "schemeClr",
+                  "attrs": {
+                    "val": "accent2"
+                  },
+                  "mods": [
+                    {
+                      "name": "shade",
+                      "val": "50000"
+                    }
+                  ]
+                },
+                "on": true
+              }
+            },
+            "4": {
+              "line": {
+                "to": {
+                  "type": "schemeClr",
+                  "attrs": {
+                    "val": "accent2"
+                  },
+                  "mods": [
+                    {
+                      "name": "lumMod",
+                      "val": "60000"
+                    },
+                    {
+                      "name": "lumOff",
+                      "val": "40000"
+                    }
+                  ]
+                },
+                "on": true
+              }
+            },
+            "5": {
+              "line": {
+                "to": {
+                  "type": "srgbClr",
+                  "attrs": {
+                    "val": "00A000"
+                  },
+                  "mods": [
+                    {
+                      "name": "shade",
+                      "val": "50000"
+                    }
+                  ]
+                },
+                "on": true
+              }
+            },
+            "6": {
+              "text": {
+                "to": {
+                  "type": "schemeClr",
+                  "attrs": {
+                    "val": "accent2"
+                  },
+                  "mods": [
+                    {
+                      "name": "tint",
+                      "val": "40000"
+                    }
+                  ]
+                }
+              }
+            },
+            "7": {
+              "text": {
+                "to": {
+                  "type": "schemeClr",
+                  "attrs": {
+                    "val": "accent2"
+                  },
+                  "mods": [
+                    {
+                      "name": "shade",
+                      "val": "50000"
+                    }
+                  ]
+                }
+              }
+            },
+            "8": {
+              "text": {
+                "to": {
+                  "type": "schemeClr",
+                  "attrs": {
+                    "val": "accent2"
+                  },
+                  "mods": [
+                    {
+                      "name": "lumMod",
+                      "val": "60000"
+                    },
+                    {
+                      "name": "lumOff",
+                      "val": "40000"
+                    }
+                  ]
+                }
+              }
+            },
+            "9": {
+              "text": {
+                "to": {
+                  "type": "srgbClr",
+                  "attrs": {
+                    "val": "00A000"
+                  },
+                  "mods": [
+                    {
+                      "name": "shade",
+                      "val": "50000"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      ],
+      "interactive": 0
+    }
+  ]
+}
