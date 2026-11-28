@@ -950,7 +950,8 @@ the redesign should build so that the two fit, decided here for both:
    snapshot out, 30 s, 4 MiB). A provider may stay on `api = "0.1"`. One that
    moves to `api = "0.2"` must declare `[access] files = "read"` (0.2 grants
    nothing unsaid), which changes its capability digest: its lock bump then
-   waits for a maintainer, who sets `caps` from `chimaera plugin caps`.
+   waits for a maintainer, who reviews the `tier` and `caps` the bump wrote (what
+   `chimaera plugin caps` prints) and the Can lines it adds.
 3. **Spans are one shape everywhere:** `{path, line, end_line}`,
    workspace-relative, 1-based, inclusive (as `diagnostics/1`). Core reads the
    slice through the ordinary file routes; bodies never ride a surface.

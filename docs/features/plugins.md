@@ -633,8 +633,10 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     a `blocked` entry; a soft block the user allowed (by the build's sha256) runs.
   - **Lock bumps.** The lock records each first-party plugin's `tier` and `caps`; the
     `plugin-lock` workflow auto-merges a bump only when the plugin is sandboxed and its release's
-    capability lines match the pinned release's — otherwise the PR waits for a maintainer, and
-    CI (which checks both against the release) stays red until they are set.
+    capability lines match the pinned release's — otherwise the PR waits for a maintainer. Either way the
+    bump writes the release's own `tier` and `caps` (`.github/scripts/plugin-caps.mjs`, held to the daemon's
+    reading by fixtures; CI checks both against the release), and the PR body lists the Can lines the
+    release adds and drops, so a reviewer reads and merges.
 
 ## Plugin screens, files and settings (the 0.2 platform)
 

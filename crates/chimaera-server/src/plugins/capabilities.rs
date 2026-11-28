@@ -720,4 +720,193 @@ mod tests {
         );
         assert!(text.iter().any(|t| t.contains("setup prompt")), "{text:?}");
     }
+
+    /// The plugin-lock workflow's JavaScript port of this module
+    /// (`.github/scripts/plugin-caps.mjs`) fills a bump's `tier` and `caps`
+    /// without building the daemon. These manifests cover every kind of atom
+    /// and the TOML forms a manifest uses; the fixture holds what
+    /// `describe_manifest` (`chimaera plugin caps`) gives each, and
+    /// `plugin-caps.test.mjs` requires the port to give the same. A change to
+    /// the atoms, the digest or the Can lines rewrites the fixture, and the
+    /// port follows in the same PR.
+    #[test]
+    fn the_lock_scripts_port_is_pinned() {
+        use chimaera_wire_fixtures::{case, pin};
+        const HEAD: &str =
+            "id = \"demo\"\nname = \"Demo\"\nversion = \"1.2.3\"\nsummary = \"A demo.\"\n";
+        let a = "a".repeat(64);
+        let b = "B".repeat(64);
+        let c = "c".repeat(64);
+        let manifests: Vec<(&'static str, &'static str, String)> = vec![
+            (
+                "api-0-1-implied",
+                "a 0.1 manifest that says nothing keeps what 0.1 allowed",
+                format!("{HEAD}api = \"0.1\"\n"),
+            ),
+            (
+                "api-0-1-narrowed",
+                "[access] narrows a 0.1 manifest key by key",
+                format!("{HEAD}api = \"0.1\"\n[access]\ntimeline = \"read\"\nsessions = \"none\"\n"),
+            ),
+            (
+                "api-0-2-nothing",
+                "a later API gets nothing it didn't declare: the bare digest",
+                format!("{HEAD}api = \"0.2\"\n"),
+            ),
+            (
+                "access-all",
+                "every [access] read, declared",
+                format!(
+                    "{HEAD}api = \"0.2\"\n[access]\nfiles = \"read\"\ntimeline = \"notes\"\n\
+                     sessions = \"read\"\n"
+                ),
+            ),
+            (
+                "agent-tools-hook-knowledge",
+                "agent tools (out of order), the hook line and Knowledge",
+                format!(
+                    "{HEAD}api = \"0.1\"\n[access]\nfiles = \"none\"\n[provides]\n\
+                     mcp_tools = [\"zeta_tool\", \"alpha-tool\", \"b_1\"]\n\
+                     events = [\"session-ended\", \"hook\"]\nknowledge = \"demo\"\nviews = [\"x\"]\n"
+                ),
+            ),
+            (
+                "setup-and-agent-plugins",
+                "a setup prompt, a required and two recommended agent-side plugins",
+                format!(
+                    "{HEAD}api = \"0.2\"\n[setup]\nprompt = \"\"\"\nSet it up.\nTwice.\"\"\"\n\
+                     [requires]\nsummary = \"Needed.\"\n\
+                     [requires.agent_plugins.claude]\nid = \"tool@market\"\nmarketplace = \"acme/market\"\n\
+                     [recommends]\nsummary = \"Nice.\"\n\
+                     [recommends.agent_plugins.codex]\nid = \"tool@market\"\n\
+                     [recommends.agent_plugins.claude]\nid = \"other@market\"\n\
+                     marketplace = \"https://example.org/market.git\"\n"
+                ),
+            ),
+            (
+                "programs-also-network",
+                "programs with usual folders and network use (trimmed as Rust trims)",
+                format!(
+                    "{HEAD}api = \"0.2\"\n\
+                     [[programs]]\nname = \"soffice\"\nversion = [\"--version\"]\n\
+                     also = [\"/Applications/LibreOffice.app/Contents/MacOS\", \
+                     \"~/Applications/LibreOffice.app/Contents/MacOS\"]\n\
+                     [[programs]]\nname = \"tlmgr\"\nnetwork = \"\\uFEFF CTAN mirrors \\u3000\"\n\
+                     [[programs]]\nname = \"cp\"\n"
+                ),
+            ),
+            (
+                "shell-programs",
+                "shell-class programs get a line each; the rest share one",
+                format!(
+                    "{HEAD}api = \"0.2\"\n[[programs]]\nname = \"bash\"\n[[programs]]\nname = \"python3\"\n\
+                     [[programs]]\nname = \"latexmk\"\n[[programs]]\nname = \"biber\"\n"
+                ),
+            ),
+            (
+                "tool-downloads",
+                "a downloaded tool on two platforms (one download line), and its host",
+                format!(
+                    "{HEAD}api = \"0.2\"\n[[programs]]\nname = \"typst\"\n\
+                     [[tools]]\nid = \"typst\"\nname = \"Typst\"\nversion = \"0.14.2\"\n\
+                     programs = [\"typst\"]\nhome = \"https://typst.app\"\n\
+                     [[tools.artifacts]]\nplatform = \"linux-x86_64\"\n\
+                     url = \"https://github.com/typst/typst/releases/download/v0.14.2/typst.tar.xz\"\n\
+                     sha256 = \"{a}\"\nsize = 40_000_000\nunpack = \"tar.xz\"\nbin = \"typst-linux\"\n\
+                     [[tools.artifacts]]\nplatform = \"macos-aarch64\"\n\
+                     url = \"https://user@dl.example.org:8443/typst.zip?x=1#y\"\n\
+                     sha256 = \"{b}\"\nsize = 0x10\nunpack = \"zip\"\n\
+                     [[tools.setup]]\nprogram = \"typst\"\nargs = [\"--version\"]\n"
+                ),
+            ),
+            (
+                "browser",
+                "a browser for agents' browser tools: its own line, not a job's",
+                format!(
+                    "{HEAD}api = \"0.2\"\n[provides]\nbrowser = \"chrome-headless-shell\"\n\
+                     [[programs]]\nname = \"chrome-headless-shell\"\n\
+                     [[tools]]\nid = \"chs\"\nname = \"Chrome Headless Shell\"\nversion = \"140.0.1\"\n\
+                     programs = [\"chrome-headless-shell\"]\n\
+                     [[tools.artifacts]]\nplatform = \"linux-x86_64\"\n\
+                     url = \"https://storage.example.com/140.0.1/chs.zip\"\nsha256 = \"{c}\"\n\
+                     size = 1\nunpack = \"zip\"\n"
+                ),
+            ),
+            (
+                "views-files-actions-settings",
+                "views, claimed file kinds, actions and settings: only the claims are capabilities",
+                format!(
+                    "{HEAD}api = \"0.2\"\n\
+                     [[views]]\nid = \"doc\"\ntitle = \"Doc\"\nslot = \"file\"\n\
+                     [[views]]\nid = \"panel\"\ntitle = \"Panel\"\nslot = \"tab\"\n\
+                     [[files]]\nmatch = [\"*.tex\", \"*.ltx\"]\nview = \"doc\"\nlabel = \"LaTeX\"\n\
+                     debounce_ms = 300\n\
+                     [[files]]\nmatch = [\"*.bib\"]\nview = \"doc\"\nlabel = \"BibTeX\"\n\
+                     [[actions]]\nmatch = [\"*.tex\"]\nlabel = \"Build\"\naction = \"build\"\n\
+                     [[settings]]\nkey = \"on\"\ntype = \"bool\"\ndefault = true\nlabel = \"On\"\n\
+                     [[settings]]\nkey = \"n\"\ntype = \"number\"\ndefault = 1.5e1\nmin = -1\n\
+                     max = +600.0\nlabel = \"N\"\nscope = \"host\"\n\
+                     [[settings]]\nkey = \"pick\"\ntype = \"enum\"\ndefault = 'A'\n\
+                     options = ['A', \"B\",]\nlabel = \"Pick\"\n"
+                ),
+            ),
+            (
+                "web-pages-libraries-hosts",
+                "its own pages, a library lent to agents' pages, hosts they reach",
+                format!(
+                    "{HEAD}api = \"0.3\"\n[web]\npages = [\"view.html\", \"app/index.html\"]\n\
+                     libraries = [\"genomespy\"]\nnetwork = [\"cdn.example.org\", \"data.example.com\"]\n"
+                ),
+            ),
+            (
+                "web-hosts-only",
+                "[web] with hosts and no pages or libraries has no web atom",
+                format!("{HEAD}api = \"0.3\"\n[web]\nnetwork = [\"cdn.example.org\"]\n"),
+            ),
+            (
+                "hostile-strings",
+                "strings a review reads: quotes, backslashes, markdown, a mention, \
+                 non-ASCII, and characters whose UTF-8 order is not their UTF-16 order \
+                 (the atoms sort as bytes)",
+                format!(
+                    "{HEAD}api = \"0.2\"\n\
+                     [[programs]]\nname = \"tool\"\nnetwork = \"\\\"a\\\" \\\\ *b* [c](https://evil.example) \
+                     <img> | @someone `x` \u{fc}n\u{ef} \\U0001F680\"\n\
+                     [[views]]\nid = \"doc\"\ntitle = \"Doc\"\nslot = \"file\"\n\
+                     [[files]]\nmatch = ['*.\u{e9}t\u{e9}', \"*.\\u00e9x\", \"*.[ch]\", '*.md|x', \
+                     \"*.\\U0001F680\", \"*.\\uFF01\"]\n\
+                     view = \"doc\"\nlabel = \"Odd\"\n\
+                     [recommends.agent_plugins.claude]\nid = \"x@y\"\nmarketplace = \"**bold**\"\n"
+                ),
+            ),
+            (
+                "toml-forms",
+                "dotted and quoted keys, inline tables, literal and multi-line strings, \
+                 comments, CRLF line ends",
+                format!(
+                    "# a comment\r\n{HEAD}\"api\" = \"0.2\"  # quoted key\r\n\
+                     provides.mcp_tools = [ # tools\r\n  \"one\",\r\n  'two', # trailing\r\n]\r\n\
+                     provides.events = [\"hook\"]\r\n\
+                     recommends.agent_plugins.codex = {{ id = \"p@q\", marketplace = '''o/r''' }}\r\n\
+                     [access]\r\nfiles = \"\"\"read\"\"\"\r\n"
+                ),
+            ),
+        ];
+        let cases = manifests
+            .into_iter()
+            .map(|(name, note, text)| {
+                let describe = describe_manifest(&text)
+                    .unwrap_or_else(|e| panic!("{name}: the manifest must parse: {e}"));
+                case(name, note, json!({"manifest": text, "describe": describe}))
+            })
+            .collect();
+        pin(
+            "plugin-caps",
+            "crates/chimaera-server/src/plugins/capabilities.rs",
+            "Plugin manifests and what `chimaera plugin caps` prints for each (tier, digest, \
+             atoms, the Can lines). Read by .github/scripts/plugin-caps.test.mjs, which holds \
+             the plugin-lock workflow's JavaScript port to them; not a daemon-to-UI shape.",
+            cases,
+        );
+    }
 }

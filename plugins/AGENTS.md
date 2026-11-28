@@ -109,13 +109,23 @@ does not activate it. Rebuild, copy and reinstall the same version to iterate.
    bytes and the manifest's id, version and `[release] github` against the
    lock, fetches every tool download the manifest names (`[[tools.artifacts]]`)
    and compares it with its sha256, rewrites the entry (`version`, both sha256s,
-   `name` / `summary`) and
-   opens `fix: update <Name> to <version>`. It auto-merges (squash) only when
-   the plugin is sandboxed and the release's capability lines (`api` and every
-   table but `[adds]`, `[release]` and `[detect]`) equal its pinned release's,
-   so `tier` and `caps` carry over. Otherwise the PR waits for a maintainer:
-   review the release, set `tier` and `caps` to what `chimaera plugin caps`
-   prints for its `plugin.toml` (CI stays red until they match), merge. CI
+   `name` / `summary`, and the release's own `tier` and `caps`) and
+   opens `fix: update <Name> to <version>`. `tier` and `caps` come from
+   `.github/scripts/plugin-caps.mjs`, a JavaScript port of
+   `plugins/capabilities.rs` (what `chimaera plugin caps` prints) held to it
+   by the `plugin-caps` fixture (written by the Rust test
+   `the_lock_scripts_port_is_pinned`, read by `plugin-caps.test.mjs`); a
+   manifest it can't read is refused like any failed check. It auto-merges
+   (squash) only when the plugin is sandboxed and the release's capability
+   lines (`api` and every table but `[adds]`, `[release]` and `[detect]`)
+   equal its pinned release's, so `tier` and `caps` carry over. Otherwise the
+   PR waits for a maintainer, already green: its body says per plugin whether
+   the tier changed and which of the card's Can lines the release adds and
+   drops, with links to the release and the compare view. Review the code and
+   those changes; merge to approve them, or close it unmerged to turn the
+   version down. A body note that the lock's values for the pinned release
+   aren't what the script reads from it means the port and the daemon
+   disagree: check with `chimaera plugin caps`. CI
    installs the release against the new lock; the merge requests a patch
    release, and from that release (the next daily batch) **Install** fetches
    that version. Run it by hand with **Actions →
