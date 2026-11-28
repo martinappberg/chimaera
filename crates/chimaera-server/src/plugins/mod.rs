@@ -105,7 +105,14 @@ const LOCK: &str = include_str!("../../../../plugins/plugins.lock");
 /// A first-party plugin's category is the lock's; any other plugin names
 /// one in its manifest. A plugin with none, or with a name this daemon
 /// doesn't know (a newer plugin on an older daemon), is listed under Other.
-pub(crate) const CATEGORIES: &[&str] = &["writing", "presentations", "data", "knowledge", "agents"];
+pub(crate) const CATEGORIES: &[&str] = &[
+    "writing",
+    "presentations",
+    "data",
+    "biology",
+    "knowledge",
+    "agents",
+];
 
 /// The category a plugin named, if it is one of ours.
 pub(crate) fn category(named: Option<&str>) -> Option<&'static str> {

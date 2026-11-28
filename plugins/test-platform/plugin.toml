@@ -53,6 +53,11 @@ match = ["*.md", "*.fixture"]
 label = "Count words"
 action = "count-words"
 
+[[actions]]
+match = ["*.md"]
+label = "Open as fixture"
+action = "open-as-doc"
+
 [[settings]]
 key = "greeting"
 type = "string"

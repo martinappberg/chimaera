@@ -4,6 +4,7 @@ import {
   actionsFor,
   claimsFor,
   downloadWords,
+  fileActionTarget,
   progressWords,
   EMPTY_PLATFORM,
   matchesPattern,
@@ -14,6 +15,7 @@ import {
   pluginViewIcon,
   pluginViewTitle,
   sizeWords,
+  viewClaim,
   viewsIn,
   workspaceRelative,
 } from "./platform";
@@ -236,5 +238,31 @@ describe("railViews", () => {
     expect(rows.map((r) => [r.plugin, r.view, r.title])).toEqual([["test-web", "board", "Web board"]]);
     expect(rows[0].icon).not.toBeNull();
     expect(railViews(undefined)).toEqual([]);
+  });
+});
+
+describe("a file action's open", () => {
+  const all = [plugin("latex"), plugin("off", false)];
+  it("opens a tab view, or a file view on the named file or the action's own", () => {
+    expect(fileActionTarget(all, "latex", { view: "board", file: null }, "a.md")).toEqual({ kind: "tab", view: "board" });
+    expect(fileActionTarget(all, "latex", { view: "doc", file: "b/c.tex" }, "a.md")).toEqual({ kind: "file", view: "doc", file: "b/c.tex" });
+    expect(fileActionTarget(all, "latex", { view: "doc", file: null }, "a.md")).toEqual({ kind: "file", view: "doc", file: "a.md" });
+  });
+  it("opens nothing on a file that isn't a plain workspace path", () => {
+    for (const bad of ["../x", "/etc/passwd", "a/../b", "a//b", "./a", "a\\b"]) {
+      expect(fileActionTarget(all, "latex", { view: "doc", file: bad }, "a.md")).toBeNull();
+    }
+  });
+  it("opens nothing for a view the plugin lacks or that has no place to open", () => {
+    expect(fileActionTarget(all, "latex", { view: "nope", file: null }, "a.md")).toBeNull();
+    expect(fileActionTarget(all, "latex", { view: "chip", file: null }, "a.md")).toBeNull();
+    expect(fileActionTarget(all, "ghost", { view: "doc", file: null }, "a.md")).toBeNull();
+  });
+  it("shows a file view on a file its pattern doesn't claim, only while the plugin is on", () => {
+    const c = viewClaim(all, "latex", "doc");
+    expect(c?.view.id).toBe("doc");
+    expect(c?.kind.match).toEqual([]);
+    expect(viewClaim(all, "latex", "board")).toBeNull();
+    expect(viewClaim(all, "off", "doc")).toBeNull();
   });
 });

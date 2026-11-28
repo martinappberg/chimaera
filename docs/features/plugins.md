@@ -99,6 +99,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   ([below](#programs-and-tools-the-privileged-tier)), and **PowerPoint** (`render_slides` shows
   agents their slides, `deck_read` gives every slide and shape a stable id with its animation
   timeline and Morph pairs and says what changed in the file since the agent last looked,
+  `render_slides` with `builds` shows a slide as it stands after each click,
   `check_deck` finds layout and animation problems, and plain themes or the user's own),
   **Chromium** (a headless `chrome-headless-shell` for the
   [agent browser](agent-browser.md#engines-and-how-one-is-chosen) on a host with none, downloaded
@@ -119,7 +120,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   scrolls on its own below it, keeping its place when you switch away and back. The **Plugins**
   segment opens with "Plugins add tools for your agents and views for you. Install one, then
   switch it on per workspace." and shows, under **Chimaera plugins**, the plugins grouped by
-  category (**Writing**, **Presentations**, **Data**, **Knowledge**, **Agent tools**, then
+  category (**Writing**, **Presentations**, **Data**, **Biology**, **Knowledge**, **Agent tools**, then
   **Other**; empty groups are left out, Chimaera's own first within a group), a
   card per plugin with one primary control. Its head: a two-letter tile · the name (a link to
   the plugin's `homepage`, opened in the system browser) · the check badge · version
@@ -654,7 +655,9 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   its icon and title, while the plugin is on there: one click opens or focuses the tab
   (`platform.ts::railViews`, App.svelte's rail). A file it claims opens in its view; the
   bar above has **Text** (and, when two plugins claim it, each one — the choice is remembered
-  per workspace), its status chips and file actions. Opening such a file where the plugin is
+  per workspace), its status chips and file actions. A file action may open one of its plugin's
+  file views on a file, claimed or not ("View on genome" on a plain VCF): that view joins the
+  file's switch for that opening only. Opening such a file where the plugin is
   installed but off offers **Turn on** in that bar (**Not now** is remembered per workspace;
   one waiting for trust is left to its card). The dashboard shows its panels after
   Chimaera's own. Settings → **Plugins** lists every installed plugin's settings (host-wide or

@@ -34,7 +34,7 @@ A plugin can ship its own HTML and JavaScript page for a drawing area that an ex
   - **The page's CSP.**
     - It keeps `sandbox allow-scripts`.
     - Scripts, styles and fonts come from the daemon. `'unsafe-eval'` and `'wasm-unsafe-eval'` are allowed.
-    - Images, media and requests go to the daemon and to the declared hosts only. Workers come from `blob:` only, so a worker keeps the page's own CSP.
+    - Images, media and requests go to the daemon and to the declared hosts only; requests may also read `data:` URLs, the page's own bytes (GenomeSpy fetches its built-in WebAssembly that way). Workers come from `blob:` only, so a worker keeps the page's own CSP.
     - The daemon is named twice: `'self'`, and its origin as the request reached it (`web::request_origin`: `Host`, and `X-Forwarded-Proto`). WebKit matches `'self'` against the page's own origin, which a sandboxed page doesn't have, so without the explicit origin the macOS app's view and Safari refuse every request to the daemon.
     - Forms are not allowed (`form-action 'none'`).
     - Every bundle file has `Access-Control-Allow-Origin: *`, so ES modules load.
@@ -65,7 +65,7 @@ A plugin can ship its own HTML and JavaScript page for a drawing area that an ex
   - **The CSP.** Every HTML page that `/raw` serves (the file, or the folder route) gets the fixed rule (`web::agent_page_csp`):
     - scripts, styles and fonts from the daemon and from `cdnjs.cloudflare.com`, `cdn.jsdelivr.net`, `unpkg.com`, `cdn.plot.ly` and `cdn.bokeh.org`;
     - images and media from the daemon, `data:` and `blob:`;
-    - requests to the daemon only, plus the declared hosts of a plugin library the page imports;
+    - requests to the daemon and `data:` URLs only, plus the declared hosts of a plugin library the page imports;
     - no forms.
 
     An old report that loads outside images or calls an outside API no longer reaches them inside Chimaera. It still opens fully in the browser pane.

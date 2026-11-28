@@ -209,6 +209,10 @@ pub(crate) fn plugin_page_csp(hosts: &[String]) -> String {
     page_csp(&[], hosts)
 }
 
+// `connect-src` takes `data:` too: a library reads what it carries inside
+// itself that way (GenomeSpy fetches its BGZF inflater, WebAssembly, from a
+// `data:` URL), and a `data:` URL is the page's own bytes, so it reaches
+// nothing outside the page.
 fn page_csp(cdns: &[&str], hosts: &[String]) -> String {
     let cdns: String = cdns.iter().map(|c| format!(" {c}")).collect();
     let hosts: String = hosts.iter().map(|h| format!(" https://{h}")).collect();
@@ -217,7 +221,7 @@ fn page_csp(cdns: &[&str], hosts: &[String]) -> String {
          script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob: data:{cdns}; \
          style-src 'self' 'unsafe-inline'{cdns}; font-src 'self' data:{cdns}; \
          img-src 'self' data: blob:{hosts}; media-src 'self' data: blob:; \
-         connect-src 'self'{hosts}; worker-src blob:; frame-src 'self'; \
+         connect-src 'self' data:{hosts}; worker-src blob:; frame-src 'self'; \
          form-action 'none'; base-uri 'self'"
     )
 }
@@ -1238,12 +1242,12 @@ mod tests {
         let agent = agent_page_csp(&["data.example.org".into()]);
         assert!(agent.starts_with("sandbox allow-scripts;"));
         assert!(agent.contains("default-src 'none'"));
-        assert!(agent.contains("connect-src 'self' https://data.example.org;"));
+        assert!(agent.contains("connect-src 'self' data: https://data.example.org;"));
         assert!(agent.contains("https://cdn.jsdelivr.net"));
         assert!(agent.contains("'unsafe-eval' 'wasm-unsafe-eval'"));
         assert!(agent.contains("form-action 'none'"));
         let plugin = plugin_page_csp(&[]);
-        assert!(plugin.contains("connect-src 'self';"));
+        assert!(plugin.contains("connect-src 'self' data:;"));
         assert!(!plugin.contains("cdn"));
     }
 
@@ -1255,7 +1259,7 @@ mod tests {
         assert_eq!(origin.as_deref(), Some("http://127.0.0.1:59444"));
         let csp = naming_origin(&plugin_page_csp(&[]), origin.as_deref());
         assert!(
-            csp.contains("connect-src 'self' http://127.0.0.1:59444;"),
+            csp.contains("connect-src 'self' http://127.0.0.1:59444 data:;"),
             "{csp}"
         );
         assert!(
