@@ -1081,6 +1081,17 @@ function rng(seed: number): () => number {
   };
 }
 
+/** A data URL as a short `blob:` URL: a keyframe list of 21 masks parses
+ *  in a fraction of the time (WKWebView: `animate()` took ~50 ms with the
+ *  data URLs inline). Falls back to the data URL. */
+function blobUrl(data: string): string {
+  if (typeof URL.createObjectURL !== "function" || typeof atob !== "function") return data;
+  const bin = atob(data.slice(data.indexOf(",") + 1));
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return URL.createObjectURL(new Blob([bytes], { type: "image/png" }));
+}
+
 /** Longest side of a pattern's mask image, px: past it the image is
  *  stretched (bounded memory for a picture that fills the slide). */
 const MASK_MAX = 640;
@@ -1128,9 +1139,12 @@ export function maskImages(pattern: Pattern, w: number, h: number, seedKey: stri
     const level = l / MASK_LEVELS;
     for (let i = 0; i < cellOf.length; i++) img.data[i * 4 + 3] = rank[cellOf[i]!]! < level ? 255 : 0;
     ctx.putImageData(img, 0, 0);
-    out.push(`url("${canvas.toDataURL("image/png")}")`);
+    out.push(`url("${blobUrl(canvas.toDataURL("image/png"))}")`);
   }
-  if (maskCache.size > 32) maskCache.clear();
+  if (maskCache.size > 32) {
+    for (const urls of maskCache.values()) for (const u of urls) URL.revokeObjectURL(/^url\("(.*)"\)$/.exec(u)?.[1] ?? "");
+    maskCache.clear();
+  }
   maskCache.set(cacheKey, out);
   return out;
 }
@@ -1207,6 +1221,9 @@ export function prepareStep(tagged: TaggedSlide, timeline: SlideTimeline, k: num
     };
     const plan = planStep(effects, before, info, elements, (id) => measure(tagged, id, opts.w, opts.h), landed, opts.w, opts.h, opts.maxMs);
     if (plan.overBudget) return null;
+    // A random pattern's mask images are drawn now, while the show is idle,
+    // not when the click starts them (they are cached by size and element).
+    for (const tr of plan.tracks) if (tr.pattern !== undefined && tr.box !== undefined) maskImages(tr.pattern, tr.box[2], tr.box[3], tr.id);
     let duration = plan.duration;
     // Colours blend from the paint before to the paint after, over the
     // window their effects run in.
