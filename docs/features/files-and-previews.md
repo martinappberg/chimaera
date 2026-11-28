@@ -963,10 +963,20 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   moving clip; with the file's delays, durations, repeats, auto-reverse and ease in/out. An
   arrival by a click plays the slide's on-entry step first, and "after previous" chains run on
   their own times. Rare filters (dissolve, checkerboard, random bars) fade; an entrance or exit
-  whose values can't be read fades over its duration; an emphasis that can't be read, a colour
-  change (fill colour, darken) and an effect that never ends (transparency) play nothing. Every
-  click ends on exactly its build state: a grow, an unfinished turn or a transparency doesn't
-  stay past its click, and the dots' tooltip names each such effect. Nothing animates on back,
+  whose values can't be read fades over its duration; an emphasis that can't be read plays
+  nothing; the dots' tooltip names each such effect. **Emphasis holds** until the slide is left,
+  as in PowerPoint: a build state carries each target's size, turn, opacity and colours
+  (`fixtures/pptx-timing/README.md` R24–R31: what is held is read from the file's `fill`,
+  `autoRev`, `repeatCount` and never-ending sets, so a pulse or a full spin holds nothing),
+  through later clicks, exits and re-entrances, on a jump, a step back and the presenter's
+  "next". Grow and shrink scale about the shape's centre (two grows multiply), turns add on top
+  of the shape's own rotation, transparency is instant, and colour changes blend during their
+  click and stay: fill colour replaces any fill (solid, gradient, picture) with one colour,
+  resolved against the slide's theme; line and font colour (by box or by paragraph) recolour the
+  outline and the text; darken, lighten, desaturate and complementary colour shift a solid
+  fill, each stop of a gradient, the outline and the text (a picture fill gets a CSS filter
+  instead, named in the tooltip). Every click ends on exactly its build state, and its motion
+  ends there too (each animation's last frame is the landed value). Nothing animates on back,
   Home, End, a dot or strip jump, a window joining, browsing, the presenter's own view (its now
   and next show states at once), thumbnails or edit mode; forward clicks under 400 ms apart land
   without playing (a click after a pause plays again); a click while one plays lands it first;

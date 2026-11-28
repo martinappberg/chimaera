@@ -224,27 +224,147 @@
         },
         {
           "hidden": [],
-          "moved": {}
+          "moved": {},
+          "scale": {
+            "2": [
+              1.5,
+              1.5
+            ]
+          }
         },
         {
           "hidden": [],
-          "moved": {}
+          "moved": {},
+          "scale": {
+            "2": [
+              1.5,
+              1.5
+            ]
+          }
         },
         {
           "hidden": [],
-          "moved": {}
+          "moved": {},
+          "scale": {
+            "2": [
+              1.5,
+              1.5
+            ]
+          },
+          "opacity": {
+            "4": 0.5
+          }
         },
         {
           "hidden": [],
-          "moved": {}
+          "moved": {},
+          "scale": {
+            "2": [
+              1.5,
+              1.5
+            ]
+          },
+          "opacity": {
+            "4": 0.5
+          }
         },
         {
           "hidden": [],
-          "moved": {}
+          "moved": {},
+          "scale": {
+            "2": [
+              1.5,
+              1.5
+            ]
+          },
+          "opacity": {
+            "4": 0.5
+          },
+          "color": {
+            "6": {
+              "fill": {
+                "to": {
+                  "type": "schemeClr",
+                  "attrs": {
+                    "val": "accent2"
+                  },
+                  "mods": []
+                },
+                "solid": true,
+                "on": true
+              }
+            }
+          }
         },
         {
           "hidden": [],
-          "moved": {}
+          "moved": {},
+          "scale": {
+            "2": [
+              1.5,
+              1.5
+            ]
+          },
+          "opacity": {
+            "4": 0.5
+          },
+          "color": {
+            "6": {
+              "fill": {
+                "to": {
+                  "type": "schemeClr",
+                  "attrs": {
+                    "val": "accent2"
+                  },
+                  "mods": []
+                },
+                "solid": true,
+                "on": true
+              }
+            },
+            "7": {
+              "fill": {
+                "by": [
+                  {
+                    "type": "hsl",
+                    "attrs": {
+                      "h": "0",
+                      "l": "-25098",
+                      "s": "-12549"
+                    },
+                    "mods": []
+                  }
+                ],
+                "solid": true
+              },
+              "line": {
+                "by": [
+                  {
+                    "type": "hsl",
+                    "attrs": {
+                      "h": "0",
+                      "l": "-25098",
+                      "s": "-12549"
+                    },
+                    "mods": []
+                  }
+                ]
+              },
+              "text": {
+                "by": [
+                  {
+                    "type": "hsl",
+                    "attrs": {
+                      "h": "0",
+                      "l": "-25098",
+                      "s": "-12549"
+                    },
+                    "mods": []
+                  }
+                ]
+              }
+            }
+          }
         }
       ],
       "interactive": 0

@@ -36,9 +36,10 @@ OUT = os.path.normpath(os.path.join(HERE, "..", "decks"))
 # --- the corpus --------------------------------------------------------------
 #
 # A deck is a list of slides. A slide has:
-#   shapes: [(name, kind, {box?, text?, rot?})]   kind: rect oval text table chart
-#           picture group line
-#   fx:     [(shape, effect, trigger, {dir?, exit?, dur?, level?})]
+#   shapes: [(name, kind, {box?, text?, rot?, fill?, line?})]   kind: rect oval text
+#           table chart picture group line; fill: gradient | picture; line: width in pt
+#   fx:     [(shape, effect, trigger, {dir?, exit?, dur?, level?, amount?, size?, autorev?})]
+#           amount: a spin's degrees; size: a grow's percent; autorev: plays back
 #           effect: PowerPoint's own name after "animation type"
 #           trigger: click | with | after
 #   transition: {effect, dur?, advance?}          effect: after "entry effect"
@@ -296,6 +297,62 @@ DECKS = {
             "fx": [("Heading", "fade", "click", {}), ("Under", "fade", "click", {})],
         },
     ],
+    # Emphasis that holds after its click (README R24-R31): sizes and turns
+    # that compound, opacity, colour on solid, gradient and picture fills,
+    # lines and text, a group, an effect that plays back (and must not hold),
+    # and held values through an exit and a re-entrance.
+    "emphasis": [
+        {
+            "shapes": [("GrowTwice", "rect", {}), ("GrowShrink", "rect", {}), ("Spin90", "rect", {}),
+                       ("Tilted", "rect", {"rot": 30}), ("Pulse", "rect", {}), ("Group", "group", {})],
+            "fx": [
+                ("GrowTwice", "grow shrink", "click", {}),
+                ("GrowTwice", "grow shrink", "click", {}),
+                ("GrowShrink", "grow shrink", "click", {}),
+                ("GrowShrink", "grow shrink", "click", {"size": 50}),
+                ("Spin90", "spin", "click", {"amount": 90}),
+                ("Tilted", "spin", "click", {"amount": 90}),
+                ("Pulse", "grow shrink", "click", {"autorev": True}),
+                ("Group", "grow shrink", "click", {}),
+            ],
+        },
+        {
+            "shapes": [("FillSolid", "rect", {}), ("FillGradient", "rect", {"fill": "gradient"}),
+                       ("FillPicture", "rect", {"fill": "picture"}), ("LineColor", "rect", {"line": 6}),
+                       ("FontBox", "text", {"text": THREE}), ("FontParagraphs", "text", {"text": THREE})],
+            "fx": [
+                ("FillSolid", "change fill color", "click", {}),
+                ("FillGradient", "change fill color", "click", {}),
+                ("FillPicture", "change fill color", "click", {}),
+                ("LineColor", "change line color", "click", {}),
+                ("FontBox", "change font color", "click", {}),
+                ("FontParagraphs", "change font color", "click", {"level": "first"}),
+            ],
+        },
+        {
+            "shapes": [("Darken", "rect", {}), ("Lighten", "rect", {}), ("Desaturate", "rect", {}),
+                       ("Complementary", "rect", {}), ("DarkenGradient", "rect", {"fill": "gradient"}),
+                       ("Transparency", "rect", {})],
+            "fx": [
+                ("Darken", "darken", "click", {}),
+                ("Lighten", "lighten", "click", {}),
+                ("Desaturate", "desaturate", "click", {}),
+                ("Complementary", "complementary color", "click", {}),
+                ("DarkenGradient", "darken", "click", {}),
+                ("Transparency", "transparency", "click", {}),
+            ],
+        },
+        {
+            "shapes": [("Cycle", "rect", {}), ("Boomerang", "rect", {"rot": 30})],
+            "fx": [
+                ("Cycle", "grow shrink", "click", {}),
+                ("Cycle", "spin", "with", {"amount": 90}),
+                ("Cycle", "fade", "click", {"exit": True}),
+                ("Cycle", "fade", "click", {}),
+                ("Boomerang", "boomerang", "click", {}),
+            ],
+        },
+    ],
     # No animation, and saved by PowerPoint: what happens to the ids python-pptx
     # wrote (see agent-written-raw.pptx, the same deck before PowerPoint).
     "agent-written": [
@@ -317,6 +374,25 @@ def picture_file():
     d.ellipse((90, 50, 210, 170), fill=(156, 74, 48))
     img.save(path)
     return path
+
+
+def picture_fill(slide, sh):
+    """Fill an autoshape with a picture (python-pptx has no API for it)."""
+    from pptx.oxml.ns import qn
+    from lxml import etree
+
+    _, rid = slide.part.get_or_add_image_part(picture_file())
+    sp_pr = sh._element.spPr
+    for tag in ("a:solidFill", "a:gradFill", "a:noFill", "a:blipFill", "a:pattFill"):
+        for el in sp_pr.findall(qn(tag)):
+            sp_pr.remove(el)
+    blip = etree.SubElement(sp_pr, qn("a:blipFill"))
+    etree.SubElement(blip, qn("a:blip")).set(qn("r:embed"), rid)
+    etree.SubElement(etree.SubElement(blip, qn("a:stretch")), qn("a:fillRect"))
+    # A fill goes right after the geometry, before any line.
+    geom = sp_pr.find(qn("a:prstGeom"))
+    if geom is not None:
+        geom.addnext(blip)
 
 
 def add_shape(slide, name, kind, opts, box):
@@ -362,6 +438,13 @@ def add_shape(slide, name, kind, opts, box):
     else:
         raise ValueError(kind)
     sh.name = name
+    if opts.get("fill") == "gradient":
+        sh.fill.gradient()
+        sh.fill.gradient_angle = 90
+    elif opts.get("fill") == "picture":
+        picture_fill(slide, sh)
+    if "line" in opts:
+        sh.line.width = Pt(opts["line"])
     if "rot" in opts:
         sh.rotation = opts["rot"]
     return sh
@@ -429,6 +512,12 @@ def script(name, slides):
                 attempt(L, what + " direction", [f"set direction of effect parameters of fx to {o['dir']}"])
             if "dur" in o:
                 attempt(L, what + " duration", [f"set duration of timing of fx to {o['dur']}"])
+            if "amount" in o:
+                attempt(L, what + " amount", [f"set amount of effect parameters of fx to {o['amount']}"])
+            if "size" in o:
+                attempt(L, what + " size", [f"set size2 of effect parameters of fx to {o['size']}"])
+            if o.get("autorev"):
+                attempt(L, what + " autorev", ["set autoreverse of timing of fx to true"])
         for j, (button, shape, effect) in enumerate(spec.get("interactive", []), 1):
             attempt(L, f"slide {i} interactive {j}", [
                 "set iseq to add sequence (timeline of s)",

@@ -1,11 +1,17 @@
 /**
  * A slide's build state put on its drawn shapes: what is on screen after
- * click k (`pptxTiming.ts`'s `BuildState`), with no motion. Hidden is
- * inline `opacity: 0` plus `inert` (never `visibility`/`display`: they
- * inherit and re-resolve the subtree, and `display` would reflow the text
- * around a hidden paragraph, which PowerPoint keeps in place). A path's
- * offset is the individual `translate` property, which composes with the
- * renderer's own `transform` (rotation, flips).
+ * click k (`pptxTiming.ts`'s `BuildState`). Hidden is inline `opacity: 0`
+ * plus `inert` (never `visibility`/`display`: they inherit and re-resolve
+ * the subtree, and `display` would reflow the text around a hidden
+ * paragraph, which PowerPoint keeps in place). A path's offset is the
+ * individual `translate` property; what emphasis holds (R24–R31) is the
+ * individual `scale` and `rotate` properties (about the element's centre,
+ * on top of the renderer's own `transform`: its rotation and flips),
+ * `opacity` times the drawn one, and colours painted over the renderer's
+ * own: `fill` on the shape's SVG paths (a `to` colour replaces any fill,
+ * gradient and picture included; a `by` change recolours a solid fill and
+ * each stop of a gradient, and only a picture gets a CSS filter, noted as
+ * approximate), `stroke` on its outline, `color` on its text's spans.
  *
  * Keys combine as the timing contract's R5 says: a shape is drawn unless
  * its key is hidden; a paragraph unless its range or its shape is hidden.
@@ -14,21 +20,37 @@
  * hidden too; otherwise the box stays drawn and the slide is approximate.
  *
  * `applyState` is idempotent and `clearState` leaves the elements exactly
- * as the renderer drew them (the original inline values are kept aside).
+ * as the renderer drew them (each inline value is kept aside the first
+ * time a state touches it, and put back).
  *
  * `playStep` plays a click as motion between two of those states: it puts
  * the state before the click, runs one Web Animation per element it moves
  * (`fill: "both"`, sampled from `pptxMotion.ts`: two behaviours on one
  * CSS property, as a zoom's width and height on `scale`, can't be two
- * animations without `composite`), and at the end — or on `finish()` —
- * cancels them and puts the state after the click. Animations write no
- * inline style, so the build states stay the only source of truth for
- * where a click ends.
+ * animations without `composite`) and one per colour it changes, and at
+ * the end — or on `finish()` — puts the state after the click and cancels
+ * them. Every animation's last frame is the landed value, so the landing
+ * moves nothing.
  */
 
+import { heldColor, parseCss, pictureFilter, toCss, type Palette } from "./pptxColor";
 import { effectMotion, type Geom, type Segment } from "./pptxMotion";
-import { buildStates, targetKey, type BuildState, type Effect, type SlideTimeline } from "./pptxTiming";
+import { buildStates, targetKey, type BuildState, type Effect, type HeldColor, type HeldColors, type SlideTimeline } from "./pptxTiming";
 import type { TaggedSlide } from "./pptxTag";
+
+export type { Palette } from "./pptxColor";
+
+/** An element a state acts on: `"4"` a shape, `"4#1"` its paragraph 1,
+ *  `"4!bg"` the box drawn behind its text (motion only). */
+export type ElementId = string;
+
+/** What one element holds (R26–R29). */
+export interface HeldPlan {
+  scale?: [number, number];
+  turn?: number;
+  opacity?: number;
+  colors?: HeldColors;
+}
 
 /** What the drawn shapes need, by shape id; pure so it can be tested. */
 export interface StatePlan {
@@ -39,6 +61,8 @@ export interface StatePlan {
   moveShapes: Map<string, [number, number]>;
   /** Shape id → paragraph index → offset in slide fractions. */
   moveParas: Map<string, Map<number, [number, number]>>;
+  /** Held size, turn, opacity and colours, by element. */
+  held: Map<ElementId, HeldPlan>;
   /** Something in the state couldn't be shown as PowerPoint would. */
   approximate: boolean;
 }
@@ -48,6 +72,8 @@ export interface ShapeInfo {
   paraCount: number;
   /** Its paragraphs were matched one to one. */
   paras: boolean;
+  /** It draws its box as an element of its own (its `:bg` can move apart from its text). */
+  bg?: boolean;
 }
 
 const KEY = /^([0-9]{1,10})(?::(?:(bg)|p([0-9]{1,9})-([0-9]{1,9})))?$/;
@@ -64,12 +90,32 @@ function parseKey(k: string): Key | null {
   return { spid: m[1]!, bg: m[2] !== undefined, range: m[3] === undefined ? null : [Number(m[3]), Number(m[4])] };
 }
 
+/** The elements a held value on target key `raw` lands on. */
+function heldIds(raw: string, shapes: ReadonlyMap<string, ShapeInfo>, plan: StatePlan): ElementId[] {
+  const k = parseKey(raw);
+  if (k === null) return [];
+  const info = shapes.get(k.spid);
+  if (info === undefined) {
+    plan.approximate = true;
+    return [];
+  }
+  if (k.range === null) return [k.spid];
+  if (!info.paras) {
+    plan.approximate = true;
+    return [k.spid];
+  }
+  const out: ElementId[] = [];
+  for (let i = k.range[0]; i <= Math.min(k.range[1], info.paraCount - 1); i++) out.push(`${k.spid}#${i}`);
+  return out;
+}
+
 export function planState(shapes: ReadonlyMap<string, ShapeInfo>, state: BuildState): StatePlan {
   const plan: StatePlan = {
     hideShapes: new Set(),
     hideParas: new Map(),
     moveShapes: new Map(),
     moveParas: new Map(),
+    held: new Map(),
     approximate: false,
   };
   // Per shape: is the shape, the background, which paragraphs hidden.
@@ -133,6 +179,20 @@ export function planState(shapes: ReadonlyMap<string, ShapeInfo>, state: BuildSt
     if (k.range !== null || k.bg) plan.approximate = true;
     plan.moveShapes.set(k.spid, off);
   }
+  const heldOf = (id: ElementId): HeldPlan => {
+    let h = plan.held.get(id);
+    if (h === undefined) plan.held.set(id, (h = {}));
+    return h;
+  };
+  for (const [raw, v] of Object.entries(state.scale ?? {})) for (const id of heldIds(raw, shapes, plan)) heldOf(id).scale = v;
+  for (const [raw, v] of Object.entries(state.turn ?? {})) for (const id of heldIds(raw, shapes, plan)) heldOf(id).turn = v;
+  for (const [raw, v] of Object.entries(state.opacity ?? {})) for (const id of heldIds(raw, shapes, plan)) heldOf(id).opacity = v;
+  for (const [raw, v] of Object.entries(state.color ?? {})) {
+    for (const id of heldIds(raw, shapes, plan)) {
+      const h = heldOf(id);
+      h.colors = { ...h.colors, ...v };
+    }
+  }
   return plan;
 }
 
@@ -169,67 +229,196 @@ export function paraOffset(off: readonly [number, number], w: number, h: number,
   return k === null ? null : [(off[0] * w) / k, (off[1] * h) / k];
 }
 
+
 // --- the DOM side ---------------------------------------------------------------------
 
-interface Original {
-  hadStyle: boolean;
-  opacity: string;
-  translate: string;
-  inert: boolean;
-}
+type Styled = HTMLElement | SVGElement;
 
 /** Inline values an element had before a state touched it. */
-const originals = new WeakMap<HTMLElement, Original>();
+interface Kept {
+  hadStyle: boolean;
+  inert: boolean;
+  props: Map<string, string>;
+}
+const kept = new WeakMap<Element, Kept>();
+/** Every element a state touched on a slide, so clearing finds them. */
+const touched = new WeakMap<TaggedSlide, Set<Styled>>();
 
-function keep(el: HTMLElement): void {
-  if (originals.has(el)) return;
-  originals.set(el, {
-    hadStyle: el.hasAttribute("style"),
-    opacity: el.style.opacity,
-    translate: el.style.translate,
-    inert: el.hasAttribute("inert"),
-  });
+/** The value `prop` had before any state touched `el` ("" when unset). */
+function original(el: Styled, prop: string): string {
+  return kept.get(el)?.props.get(prop) ?? el.style.getPropertyValue(prop);
 }
 
-function restore(el: HTMLElement): void {
-  const o = originals.get(el);
-  if (o === undefined) return;
-  originals.delete(el);
-  el.style.opacity = o.opacity;
-  el.style.translate = o.translate;
-  if (!o.inert) el.removeAttribute("inert");
-  if (!o.hadStyle && el.style.cssText === "") el.removeAttribute("style");
-}
-
-/** `px`: the offset in the element's own px. */
-function put(el: HTMLElement, hidden: boolean, px: [number, number] | undefined): void {
-  const moved = px !== undefined && (px[0] !== 0 || px[1] !== 0);
-  if (!hidden && !moved) {
-    restore(el);
-    return;
+function setProp(t: TaggedSlide, el: Styled, prop: string, value: string): void {
+  let k = kept.get(el);
+  if (k === undefined) {
+    k = { hadStyle: el.hasAttribute("style"), inert: el.hasAttribute("inert"), props: new Map() };
+    kept.set(el, k);
   }
-  keep(el);
-  const o = originals.get(el)!;
-  el.style.opacity = hidden ? "0" : o.opacity;
-  if (hidden) el.setAttribute("inert", "");
-  else if (!o.inert) el.removeAttribute("inert");
-  el.style.translate = moved ? `${px[0]}px ${px[1]}px` : o.translate;
+  if (!k.props.has(prop)) k.props.set(prop, el.style.getPropertyValue(prop));
+  el.style.setProperty(prop, value);
+  let set = touched.get(t);
+  if (set === undefined) touched.set(t, (set = new Set()));
+  set.add(el);
+}
+
+function setInert(t: TaggedSlide, el: Styled, on: boolean): void {
+  setProp(t, el, "opacity", el.style.getPropertyValue("opacity"));
+  if (on) el.setAttribute("inert", "");
+  else if (!kept.get(el)!.inert) el.removeAttribute("inert");
+}
+
+function restore(el: Styled): void {
+  const k = kept.get(el);
+  if (k === undefined) return;
+  kept.delete(el);
+  for (const [prop, v] of k.props) {
+    if (v === "") el.style.removeProperty(prop);
+    else el.style.setProperty(prop, v);
+  }
+  if (!k.inert) el.removeAttribute("inert");
+  if (!k.hadStyle && el.style.cssText === "") el.removeAttribute("style");
+}
+
+/** One inline value a state puts on: what `applyState` writes and what a
+ *  click animates between. */
+export interface Paint {
+  el: Styled;
+  /** A CSS property, kebab-case. */
+  prop: string;
+  value: string;
+}
+
+/** Bounds every value a file can push to the screen. */
+const LIMIT = { px: 1e5, scale: 1000, deg: 1e6 };
+const fin = (n: number, lo: number, hi: number, fallback: number) => (Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : fallback);
+const r3 = (n: number) => Math.round(n * 1000) / 1000;
+
+const SHAPE_TAGS = "path, rect, ellipse, circle, polygon, polyline, line";
+const NOT_DRAWN = "defs, clipPath, mask, pattern, filter, marker, symbol";
+
+/** The drawn (not defining) shapes of the SVGs inside `el`. */
+function drawnShapes(el: Element): SVGElement[] {
+  return Array.from(el.querySelectorAll<SVGElement>(`svg ${SHAPE_TAGS.split(", ").join(", svg ")}`)).filter((s) => s.closest(NOT_DRAWN) === null);
+}
+
+function gradientOf(shape: SVGElement, fill: string): Element | null {
+  const m = /^url\(\s*["']?#([^"')]+)["']?\s*\)$/.exec(fill.trim());
+  if (m === null) return null;
+  const svg = shape.ownerSVGElement;
+  if (svg === null) return null;
+  for (const g of Array.from(svg.querySelectorAll("linearGradient, radialGradient"))) if (g.id === m[1]) return g;
+  return null;
+}
+
+/** The paints that make `colors` show on a drawn shape `el` (its own
+ *  spans, or `spans` when the colour is a paragraph's). False when some of
+ *  it couldn't be shown exactly. */
+function colorPaints(el: Element, colors: HeldColors, palette: Palette | null, spans: readonly Element[] | null, out: Paint[]): boolean {
+  let exact = true;
+  const pal = palette ?? { scheme: new Map(), map: new Map() };
+  const shapes = drawnShapes(el);
+  const resolved = (base: string | null, held: HeldColor): string | null => {
+    const c = heldColor(base === null ? null : parseCss(base), held, pal);
+    if (c === null) exact = false;
+    return c === null ? null : toCss(c);
+  };
+  const fill = colors.fill;
+  if (fill !== undefined) {
+    const pictures = Array.from(el.querySelectorAll<SVGElement>("svg image")).filter((i) => i.closest(NOT_DRAWN) === null);
+    if (fill.to !== undefined) {
+      // One colour over whatever was drawn (gradient, picture, none).
+      const c = resolved(null, fill);
+      if (c !== null) {
+        const filled = shapes.filter((s) => (s.getAttribute("fill") ?? "") !== "none");
+        const outline = filled.length > 0 ? filled : pictures.length > 0 || fill.solid || fill.on ? shapes.slice(0, 1) : [];
+        for (const s of outline) out.push({ el: s, prop: "fill", value: c });
+      }
+    } else {
+      for (const s of shapes) {
+        const f = s.getAttribute("fill") ?? "";
+        if (f === "none" || f === "") continue;
+        const grad = gradientOf(s, f);
+        if (grad !== null) {
+          for (const stop of Array.from(grad.querySelectorAll<SVGElement>("stop"))) {
+            const c = resolved(stop.getAttribute("stop-color") ?? "#000000", fill);
+            if (c !== null) out.push({ el: stop, prop: "stop-color", value: c });
+          }
+        } else {
+          const c = resolved(f, fill);
+          if (c !== null) out.push({ el: s, prop: "fill", value: c });
+        }
+      }
+      for (const img of pictures) {
+        const f = pictureFilter(fill);
+        exact = false;
+        if (f !== null) out.push({ el: img, prop: "filter", value: f });
+      }
+    }
+  }
+  const line = colors.line;
+  if (line !== undefined) {
+    const stroked = shapes.filter((s) => !["none", ""].includes(s.getAttribute("stroke") ?? ""));
+    if (stroked.length === 0 && line.to !== undefined && line.on === true && shapes[0] !== undefined) {
+      const c = resolved(null, line);
+      if (c !== null) out.push({ el: shapes[0], prop: "stroke", value: c }, { el: shapes[0], prop: "stroke-width", value: "1" });
+    }
+    for (const s of stroked) {
+      const c = resolved(s.getAttribute("stroke"), line);
+      if (c !== null) out.push({ el: s, prop: "stroke", value: c });
+    }
+  }
+  const text = colors.text;
+  if (text !== undefined) {
+    for (const node of spans ?? Array.from(el.querySelectorAll<HTMLElement>("span"))) {
+      const span = node as HTMLElement;
+      if (span.querySelector("span") !== null) continue;
+      const c = resolved(original(span, "color") || "#000000", text);
+      if (c !== null) out.push({ el: span, prop: "color", value: c });
+    }
+  }
+  return exact;
+}
+
+function drawnOpacity(el: Styled): number {
+  const s = original(el, "opacity");
+  const n = s === "" ? 1 : Number(s);
+  return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : 1;
 }
 
 /**
- * Show `state` on a tagged slide drawn `w`×`h` slide px. True when some of
- * it could only be approximated (a target with no tagged element, a
- * paragraph build on unmatched paragraphs, a `:bg` drawn with its text).
+ * The inline values `state` needs on a tagged slide drawn `w`×`h` slide
+ * px, and whether some of it could only be approximated. Pure of the DOM
+ * apart from reading it: nothing is written.
  */
-export function applyState(tagged: TaggedSlide, state: BuildState, w: number, h: number): boolean {
+export function statePaints(tagged: TaggedSlide, state: BuildState, w: number, h: number, palette: Palette | null): { paints: Paint[]; inert: Styled[]; approximate: boolean } {
   const info = new Map<string, ShapeInfo>();
   for (const [id, s] of tagged.shapes) info.set(id, { paraCount: s.paraCount, paras: s.paras !== null });
   const plan = planState(info, state);
   let approximate = plan.approximate;
+  const paints: Paint[] = [];
+  const inert: Styled[] = [];
+  const place = (el: Styled, id: ElementId, hidden: boolean, px: [number, number] | undefined) => {
+    const held = plan.held.get(id);
+    if (hidden) {
+      paints.push({ el, prop: "opacity", value: "0" });
+      inert.push(el);
+    } else if (held?.opacity !== undefined) paints.push({ el, prop: "opacity", value: String(r3(drawnOpacity(el) * held.opacity)) });
+    if (px !== undefined && (px[0] !== 0 || px[1] !== 0)) {
+      paints.push({ el, prop: "translate", value: `${r3(fin(px[0], -LIMIT.px, LIMIT.px, 0))}px ${r3(fin(px[1], -LIMIT.px, LIMIT.px, 0))}px` });
+    }
+    if (held?.scale !== undefined) {
+      const [x, y] = held.scale.map((v) => r3(fin(v, 0, LIMIT.scale, 1)));
+      paints.push({ el, prop: "scale", value: `${x} ${y}` });
+    }
+    if (held?.turn !== undefined) paints.push({ el, prop: "rotate", value: `${r3(fin(held.turn, -LIMIT.deg, LIMIT.deg, 0))}deg` });
+  };
   for (const [id, s] of tagged.shapes) {
     const off = plan.moveShapes.get(id);
     // The shape's own `translate` acts in the slide's px, before its transform.
-    put(s.el, plan.hideShapes.has(id), off === undefined ? undefined : [off[0] * w, off[1] * h]);
+    place(s.el, id, plan.hideShapes.has(id), off === undefined ? undefined : [off[0] * w, off[1] * h]);
+    const colors = plan.held.get(id)?.colors;
+    if (colors !== undefined && !colorPaints(s.el, colors, palette, null, paints)) approximate = true;
     if (s.paras === null) continue;
     const hide = plan.hideParas.get(id);
     const move = plan.moveParas.get(id);
@@ -246,14 +435,43 @@ export function applyState(tagged: TaggedSlide, state: BuildState, w: number, h:
         if (exact === null) approximate = true;
         px = exact ?? [m[0] * w, m[1] * h];
       }
-      put(p, hide?.has(i) === true, px);
+      place(p, `${id}#${i}`, hide?.has(i) === true, px);
+      const pc = plan.held.get(`${id}#${i}`)?.colors;
+      if (pc !== undefined && !colorPaints(s.el, { text: pc.text }, palette, Array.from(p.querySelectorAll("span")), paints)) approximate = true;
     });
   }
+  return { paints, inert, approximate: approximate || tagged.fellBack };
+}
+
+/** Put paints on a slide (after clearing what a previous state left). */
+function paint(tagged: TaggedSlide, paints: readonly Paint[], inert: readonly Styled[]): void {
+  clearState(tagged);
+  for (const p of paints) setProp(tagged, p.el, p.prop, p.value);
+  for (const el of inert) setInert(tagged, el, true);
+}
+
+/**
+ * Show `state` on a tagged slide drawn `w`×`h` slide px; `palette` is the
+ * slide's theme (held colours that name a scheme colour need it). True
+ * when some of it could only be approximated (a target with no tagged
+ * element, a paragraph build on unmatched paragraphs, a `:bg` drawn with
+ * its text, a colour it couldn't resolve, a picture recoloured by filter).
+ */
+export function applyState(tagged: TaggedSlide, state: BuildState, w: number, h: number, palette: Palette | null = null): boolean {
+  const { paints, inert, approximate } = statePaints(tagged, state, w, h, palette);
+  paint(tagged, paints, inert);
   return approximate;
 }
 
 /** The slide as drawn: every shape and paragraph back as the renderer left it. */
 export function clearState(tagged: TaggedSlide): void {
+  const set = touched.get(tagged);
+  if (set !== undefined) {
+    for (const el of set) restore(el);
+    set.clear();
+  }
+  // Elements a state touched before this slide was tracked (none in
+  // practice; cheap): the tagged shapes and paragraphs themselves.
   for (const s of tagged.shapes.values()) {
     restore(s.el);
     for (const p of s.paras ?? []) restore(p);
@@ -271,11 +489,11 @@ export function entryState(timeline: SlideTimeline): BuildState {
 export const PLAY_MAX_MS = 20_000;
 /** Keyframes a second, at most, while something moves. */
 const FRAMES_PER_S = 60;
-/** Keyframes an element gets, at most, for a whole step. */
-const MAX_FRAMES = 600;
-
-/** An element the step moves: `"4"` a shape, `"4#1"` its paragraph 1. */
-export type ElementId = string;
+/** Keyframes an element gets for a whole step, at most (event samples included). */
+export const MAX_FRAMES = 600;
+/** Past these a click lands without playing: what a deck at the parser's
+ *  caps would otherwise cost to plan. */
+export const PLAY_BUDGET = { effects: 300, events: 200 } as const;
 
 /** What playback needs to know of a drawn element before the step. */
 export interface ElementBase {
@@ -286,11 +504,25 @@ export interface ElementBase {
   /** Its `translate` before the step, own px. */
   tx: number;
   ty: number;
-  /** Its opacity when shown. */
-  shown: number;
+  /** Its drawn opacity (the renderer's), and what it holds before the step. */
+  drawn: number;
+  held: number;
+  /** Its held scale and turn before the step. */
+  sx: number;
+  sy: number;
+  rot: number;
   /** Its own box, px (what `clip-path` measures). */
   bw: number;
   bh: number;
+}
+
+/** An element's inline values once the click has landed (`none` where the
+ *  landed state sets nothing): every track's last frame. */
+export interface Landed {
+  opacity: number;
+  translate: string;
+  scale: string;
+  rotate: string;
 }
 
 export interface PlayKeyframe {
@@ -308,17 +540,21 @@ export interface StepPlan {
   tracks: { id: ElementId; keyframes: PlayKeyframe[] }[];
   /** Why some of it plays other than as written. */
   notes: string[];
+  /** Past `PLAY_BUDGET` or `MAX_FRAMES`: the click lands without playing. */
+  overBudget: boolean;
 }
 
-/** The elements a target key acts on. */
-function elementsOf(key: string, shapes: ReadonlyMap<string, ShapeInfo>): ElementId[] {
-  const m = KEY.exec(key);
-  if (m === null) return [];
-  const info = shapes.get(m[1]!);
+/** The elements a target key acts on; a `:bg` key's motion moves the box
+ *  alone where the shape draws one (`motion`). */
+function elementsOf(key: string, shapes: ReadonlyMap<string, ShapeInfo>, motion = false): ElementId[] {
+  const k = parseKey(key);
+  if (k === null) return [];
+  const info = shapes.get(k.spid);
   if (info === undefined) return [];
-  if (m[3] === undefined || !info.paras) return [m[1]!];
+  if (k.bg && motion && info.bg === true) return [`${k.spid}!bg`];
+  if (k.range === null || !info.paras) return [k.spid];
   const out: ElementId[] = [];
-  for (let i = Number(m[3]); i <= Math.min(Number(m[4]), info.paraCount - 1); i++) out.push(`${m[1]}#${i}`);
+  for (let i = k.range[0]; i <= Math.min(k.range[1], info.paraCount - 1); i++) out.push(`${k.spid}#${i}`);
   return out;
 }
 
@@ -331,43 +567,49 @@ function union(gs: Geom[]): Geom | null {
     y0 = Math.min(y0, g.ppt_y - g.ppt_h / 2);
     y1 = Math.max(y1, g.ppt_y + g.ppt_h / 2);
   }
-  return { ppt_x: (x0 + x1) / 2, ppt_y: (y0 + y1) / 2, ppt_w: x1 - x0, ppt_h: y1 - y0 };
+  return { ppt_x: (x0 + x1) / 2, ppt_y: (y0 + y1) / 2, ppt_w: x1 - x0, ppt_h: y1 - y0, sx: gs[0]!.sx, sy: gs[0]!.sy, turn: gs[0]!.turn };
 }
 
-const r3 = (n: number) => Math.round(n * 1000) / 1000;
+/** The last snapshot at or before `t` (strictly before with `pre`). */
+function snapshotAt<T>(snaps: readonly { at: number; v: T }[], t: number, pre: boolean): T {
+  let lo = 0;
+  let hi = snaps.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    const at = snaps[mid]!.at;
+    if (pre ? at < t : at <= t) lo = mid;
+    else hi = mid - 1;
+  }
+  return snaps[lo]!.v;
+}
+
+const parseDeg = (s: string) => (s === "none" || s === "" ? 0 : parseFloat(s));
 
 /**
  * The keyframes step `effects` plays from state `before`: one track per
- * element it moves, on one clock from the step's start (`duration`, capped
- * at `maxMs`). Pure: `base` measures the drawn elements, `w`×`h` is the
- * slide in px. Visibility follows the step's sets at their begin times,
- * through `planState` (the same keys-to-elements rule `applyState` uses).
+ * element it moves or shows, on one clock from the step's start
+ * (`duration`, capped at `maxMs`). Pure: `base` measures the drawn
+ * elements, `landed` gives each one's values after the click, `elements`
+ * lists every element on the slide (shapes and `spid#i` paragraphs), and
+ * `w`×`h` is the slide in px. Visibility follows the step's sets at their
+ * begin times: each element's own hidden flag is read off `planState` for
+ * the hidden keys at each time, so an element no set names (a paragraph a
+ * box's background brought in with it) still shows exactly what the
+ * states say.
  */
 export function planStep(
   effects: readonly Effect[],
   before: BuildState,
   shapes: ReadonlyMap<string, ShapeInfo>,
+  elements: readonly ElementId[],
   base: (id: ElementId) => ElementBase | null,
+  landed: (id: ElementId) => Landed | null,
   w: number,
   h: number,
   maxMs = PLAY_MAX_MS,
 ): StepPlan {
-  const bases = new Map<ElementId, ElementBase | null>();
-  const baseOf = (id: ElementId) => {
-    if (!bases.has(id)) bases.set(id, base(id));
-    return bases.get(id) ?? null;
-  };
-  const geom = (key: string): Geom | null =>
-    union(elementsOf(key, shapes).map(baseOf).filter((b): b is ElementBase => b !== null).map((b) => b.geom));
-
-  const motions = effects.map((e) => effectMotion(e, geom));
-  const notes = [...new Set(motions.map((m) => m.note).filter((n): n is string => n !== null))];
-  let duration = 0;
-  for (const e of effects) if (e.dur !== null) duration = Math.max(duration, e.start + e.dur);
-  duration = Math.min(duration, maxMs);
-  if (!(duration > 0)) return { duration: 0, tracks: [], notes };
-
-  // Visibility over the step: the sets in begin order (ties: document order).
+  const empty = (overBudget: boolean, notes: string[] = []): StepPlan => ({ duration: 0, tracks: [], notes, overBudget });
+  if (effects.length > PLAY_BUDGET.effects) return empty(true);
   const events: { at: number; key: string; to: "visible" | "hidden" }[] = [];
   for (const e of effects) {
     for (const b of e.behaviours) {
@@ -376,9 +618,32 @@ export function planStep(
       events.push({ at: e.start + b.delay, key: targetKey(b.target), to: b.to });
     }
   }
+  if (events.length > PLAY_BUDGET.events) return empty(true);
+
+  const bases = new Map<ElementId, ElementBase | null>();
+  const baseOf = (id: ElementId) => {
+    if (!bases.has(id)) bases.set(id, base(id));
+    return bases.get(id) ?? null;
+  };
+  const geom = (key: string): Geom | null =>
+    union(
+      elementsOf(key, shapes)
+        .map(baseOf)
+        .filter((b): b is ElementBase => b !== null)
+        .map((b) => ({ ...b.geom, sx: b.sx, sy: b.sy, turn: b.rot })),
+    );
+
+  const motions = effects.map((e) => effectMotion(e, geom));
+  const notes = [...new Set(motions.map((m) => m.note).filter((n): n is string => n !== null))];
+  let duration = 0;
+  for (const e of effects) if (e.dur !== null) duration = Math.max(duration, e.start + e.dur);
+  duration = Math.min(duration, maxMs);
+  if (!(duration > 0)) return empty(false, notes);
+
+  // Each element's own hidden flag over the step: one plan per event time.
   events.sort((a, b) => a.at - b.at);
   const hidden = new Set(before.hidden);
-  const snapshots: { at: number; plan: StatePlan }[] = [{ at: -Infinity, plan: planState(shapes, { hidden: [...hidden], moved: {} }) }];
+  const snaps: { at: number; v: StatePlan }[] = [{ at: -Infinity, v: planState(shapes, { hidden: [...hidden], moved: {} }) }];
   for (let i = 0; i < events.length; ) {
     const at = events[i]!.at;
     for (; i < events.length && events[i]!.at === at; i++) {
@@ -386,20 +651,26 @@ export function planStep(
       if (ev.to === "hidden") hidden.add(ev.key);
       else hidden.delete(ev.key);
     }
-    snapshots.push({ at, plan: planState(shapes, { hidden: [...hidden], moved: {} }) });
+    snaps.push({ at, v: planState(shapes, { hidden: [...hidden], moved: {} }) });
   }
-  const hiddenAt = (id: ElementId, t: number, pre: boolean): boolean => {
-    let plan = snapshots[0]!.plan;
-    for (const s of snapshots) if (pre ? s.at < t : s.at <= t) plan = s.plan;
+  const hiddenIn = (plan: StatePlan, id: ElementId): boolean => {
+    const bang = id.indexOf("!");
+    if (bang >= 0) return plan.hideShapes.has(id.slice(0, bang));
     const [spid, para] = id.split("#");
     return para === undefined ? plan.hideShapes.has(spid!) : plan.hideParas.get(spid!)?.has(Number(para)) === true;
   };
+  const hiddenAt = (id: ElementId, t: number, pre: boolean) => hiddenIn(snapshotAt(snaps, t, pre), id);
 
-  // Each element's segments, and the elements whose visibility changes.
+  // The elements whose own hidden flag changes during the step.
+  const visIds = new Set<ElementId>();
+  for (const id of elements) {
+    const first = hiddenIn(snaps[0]!.v, id);
+    if (snaps.some((s) => hiddenIn(s.v, id) !== first) && baseOf(id) !== null) visIds.add(id);
+  }
   const per = new Map<ElementId, Segment[]>();
   for (const m of motions) {
     for (const seg of m.segments) {
-      for (const id of elementsOf(seg.key, shapes)) {
+      for (const id of elementsOf(seg.key, shapes, true)) {
         if (baseOf(id) === null) continue;
         const list = per.get(id) ?? [];
         list.push(seg);
@@ -407,23 +678,32 @@ export function planStep(
       }
     }
   }
-  const visIds = new Set<ElementId>();
-  for (const ev of events) for (const id of elementsOf(ev.key, shapes)) if (baseOf(id) !== null) visIds.add(id);
   for (const id of visIds) if (!per.has(id)) per.set(id, []);
 
-  // When to sample: the step's ends, densely through each moving span,
-  // and both sides of each visibility change.
-  const spans = motions.filter((m) => m.segments.length > 0).map((m) => [m.from, Math.min(m.to, duration)] as const);
+  // When to sample: the step's ends, both sides of each visibility change,
+  // and evenly through each moving span, all within MAX_FRAMES.
   const times: { t: number; pre: boolean }[] = [
     { t: 0, pre: false },
     { t: duration, pre: false },
   ];
-  const grid = Math.max(1000 / FRAMES_PER_S, spans.reduce((n, [a, b]) => n + Math.max(0, b - a), 0) / MAX_FRAMES);
+  for (const at of new Set(events.map((e) => e.at))) if (at > 0 && at <= duration) times.push({ t: at, pre: true }, { t: at, pre: false });
+  const spans = motions.filter((m) => m.segments.length > 0).map((m) => [m.from, Math.min(m.to, duration)] as const);
+  const room = MAX_FRAMES - times.length;
+  if (room < 2 && spans.length > 0) return empty(true, notes);
+  const total = spans.reduce((n, [a, b]) => n + Math.max(0, b - a), 0);
+  const step = Math.max(1000 / FRAMES_PER_S, total / room);
+  let grid: number[] = [];
   for (const [a, b] of spans) {
-    for (let t = a; t < b; t += grid) times.push({ t, pre: false });
-    times.push({ t: b, pre: false });
+    for (let t = a; t < b; t += step) grid.push(t);
+    grid.push(b);
   }
-  for (const ev of events) if (ev.at > 0 && ev.at <= duration) times.push({ t: ev.at, pre: true }, { t: ev.at, pre: false });
+  // Per-span ends can push past the cap: thin the even samples, never the
+  // step's ends or a visibility change.
+  if (grid.length > room) {
+    const every = Math.ceil(grid.length / room);
+    grid = grid.filter((_, i) => i % every === 0);
+  }
+  for (const t of grid) times.push({ t, pre: false });
   times.sort((a, b) => a.t - b.t || (a.pre === b.pre ? 0 : a.pre ? -1 : 1));
   const samples = times.filter((s, i) => i === 0 || s.t !== times[i - 1]!.t || s.pre !== times[i - 1]!.pre);
 
@@ -432,7 +712,7 @@ export function planStep(
     const b = baseOf(id)!;
     const has = (...chs: string[]) => segs.some((s) => chs.includes(s.ch));
     const moves = has("x", "y", "mx", "my");
-    const scales = has("w", "h", "sx", "sy");
+    const scales = has("w", "h", "sx", "sy", "sxAbs", "syAbs");
     const turns = has("rot", "rotAbs");
     const clips = has("clip");
     const fades = has("op", "opAbs") || visIds.has(id);
@@ -451,7 +731,7 @@ export function planStep(
       let clip: string | null = null;
       for (const s of segs) {
         const v = s.value(at);
-        if (v === null) continue;
+        if (v === null || !Number.isFinite(v)) continue;
         switch (s.ch) {
           case "mx":
             mx += v;
@@ -479,24 +759,45 @@ export function planStep(
         }
       }
       const f: PlayKeyframe = { offset: Math.min(1, Math.max(0, t / duration)) };
-      if (fades) f.opacity = r3(hiddenAt(id, t, pre) ? 0 : b.shown * Math.max(0, Math.min(1, op * (abs.opAbs ?? 1))));
+      if (fades) f.opacity = r3(hiddenAt(id, t, pre) ? 0 : b.drawn * fin(op * (abs.opAbs ?? b.held), 0, 1, 1));
       if (moves) {
         const dx = (abs.x ?? g.ppt_x) - g.ppt_x + mx;
         const dy = (abs.y ?? g.ppt_y) - g.ppt_y + my;
-        f.translate = `${r3(b.tx + dx * w * b.k)}px ${r3(b.ty + dy * h * b.k)}px`;
+        f.translate = `${r3(fin(b.tx + dx * w * b.k, -LIMIT.px, LIMIT.px, b.tx))}px ${r3(fin(b.ty + dy * h * b.k, -LIMIT.px, LIMIT.px, b.ty))}px`;
       }
       if (scales) {
         const kx = g.ppt_w > 0 ? (abs.w ?? g.ppt_w) / g.ppt_w : 1;
         const ky = g.ppt_h > 0 ? (abs.h ?? g.ppt_h) / g.ppt_h : 1;
-        f.scale = `${r3(kx * sx)} ${r3(ky * sy)}`;
+        f.scale = `${r3(fin(kx * (abs.sxAbs ?? b.sx) * sx, 0, LIMIT.scale, b.sx))} ${r3(fin(ky * (abs.syAbs ?? b.sy) * sy, 0, LIMIT.scale, b.sy))}`;
       }
-      if (turns) f.rotate = `${r3((abs.rotAbs ?? 0) + rot)}deg`;
+      if (turns) f.rotate = `${r3(fin((abs.rotAbs ?? b.rot) + rot, -LIMIT.deg, LIMIT.deg, b.rot))}deg`;
       if (clips) f.clipPath = clip ?? "none";
       return f;
     });
+    land(keyframes, landed(id));
     tracks.push({ id, keyframes });
   }
-  return { duration, tracks, notes };
+  return { duration, tracks, notes, overBudget: false };
+}
+
+/** Make a track's last frame the landed values exactly. A turn that ends a
+ *  whole number of circles off the landed one is shifted by them, so the
+ *  last step doesn't spin back. */
+function land(kf: PlayKeyframe[], to: Landed | null): void {
+  const last = kf[kf.length - 1];
+  if (last === undefined || to === null) return;
+  if (last.opacity !== undefined) last.opacity = to.opacity;
+  if (last.translate !== undefined) last.translate = to.translate;
+  if (last.scale !== undefined) last.scale = to.scale;
+  if (last.rotate !== undefined) {
+    const shift = parseDeg(to.rotate) - parseDeg(last.rotate);
+    const turns = Math.round(shift / 360);
+    if (turns !== 0 && Math.abs(shift - turns * 360) < 0.01) {
+      for (const f of kf) if (f.rotate !== undefined) f.rotate = `${r3(parseDeg(f.rotate) + turns * 360)}deg`;
+    }
+    last.rotate = to.rotate;
+  }
+  if (last.clipPath !== undefined) last.clipPath = "none";
 }
 
 /** A click being played. */
@@ -515,6 +816,8 @@ export interface PlayOptions {
   h: number;
   /** `buildStates(timeline)`, when the caller has it. */
   states?: readonly BuildState[];
+  /** The slide's theme (held colours that name scheme colours need it). */
+  palette?: Palette | null;
   /** No motion: stand on the state at once. */
   reduced?: boolean;
   maxMs?: number;
@@ -529,26 +832,37 @@ function pxPair(v: string): [number, number] | null {
   return Number.isFinite(x) && Number.isFinite(y) ? [x, y] : null;
 }
 
-function shownOpacity(el: HTMLElement): number {
-  const s = originals.get(el)?.opacity ?? el.style.opacity;
-  const n = s === "" ? 1 : Number(s);
-  return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : 1;
+function elementOf(tagged: TaggedSlide, id: ElementId): Styled | undefined {
+  const bang = id.indexOf("!");
+  if (bang >= 0) {
+    const el = tagged.shapes.get(id.slice(0, bang))?.el;
+    return el?.querySelector<SVGElement>(":scope > svg") ?? undefined;
+  }
+  const [spid, para] = id.split("#");
+  const shape = tagged.shapes.get(spid!);
+  return para === undefined ? shape?.el : shape?.paras?.[Number(para)];
 }
 
 /** Measure a tagged element (after the step's starting state is on it). */
 function measure(tagged: TaggedSlide, id: ElementId, w: number, h: number): ElementBase | null {
-  const [spid, para] = id.split("#");
-  const shape = tagged.shapes.get(spid!);
-  if (shape === undefined) return null;
-  const el = para === undefined ? shape.el : shape.paras?.[Number(para)];
-  if (el === undefined) return null;
+  const spid = id.split(/[#!]/)[0]!;
+  const shape = tagged.shapes.get(spid);
+  const el = elementOf(tagged, id);
+  if (shape === undefined || el === undefined) return null;
   const t = pxPair(el.style.translate);
   if (t === null) return null;
+  const sc = el.style.scale.trim();
+  const [sx, sy] = sc === "" || sc === "none" ? [1, 1] : sc.split(/\s+/).map(Number).concat(Number(sc.split(/\s+/)[0])).slice(0, 2);
+  const rot = parseDeg(el.style.rotate.trim());
+  const opNow = el.style.opacity;
+  const drawn = drawnOpacity(el);
+  const held = opNow === "" || opNow === "0" || drawn === 0 ? 1 : Math.min(1, Number(opNow) / drawn);
   let geom: Geom;
   let k = 1;
-  if (para === undefined) {
+  if (!id.includes("#")) {
     const px = (v: string) => (v.endsWith("px") ? parseFloat(v) : NaN);
-    const [x, y, bw, bh] = [px(el.style.left), px(el.style.top), px(el.style.width), px(el.style.height)];
+    const s = shape.el.style;
+    const [x, y, bw, bh] = [px(s.left), px(s.top), px(s.width), px(s.height)];
     if (![x, y, bw, bh].every(Number.isFinite)) return null;
     geom = { ppt_x: (x + bw / 2) / w, ppt_y: (y + bh / 2) / h, ppt_w: bw / w, ppt_h: bh / h };
   } else {
@@ -571,68 +885,176 @@ function measure(tagged: TaggedSlide, id: ElementId, w: number, h: number): Elem
     const body = transformScale(chain);
     k = body === null || body <= 0 ? 1 : 1 / body;
   }
-  return { geom, k, tx: t[0], ty: t[1], shown: shownOpacity(el), bw: el.offsetWidth, bh: el.offsetHeight };
+  const box = "offsetWidth" in el ? [el.offsetWidth, el.offsetHeight] : [geom.ppt_w * w, geom.ppt_h * h];
+  return {
+    geom,
+    k,
+    tx: t[0],
+    ty: t[1],
+    drawn,
+    held: Number.isFinite(held) ? held : 1,
+    sx: Number.isFinite(sx) ? sx! : 1,
+    sy: Number.isFinite(sy) ? sy! : 1,
+    rot: Number.isFinite(rot) ? rot : 0,
+    bw: box[0]!,
+    bh: box[1]!,
+  };
 }
 
-function elementOf(tagged: TaggedSlide, id: ElementId): HTMLElement | undefined {
-  const [spid, para] = id.split("#");
-  const shape = tagged.shapes.get(spid!);
-  return para === undefined ? shape?.el : shape?.paras?.[Number(para)];
+const camel = (p: string) => p.replace(/-([a-z])/g, (_, c: string) => c.toUpperCase());
+const COLOR_PROPS = new Set(["fill", "stroke", "stroke-width", "stop-color", "color", "filter"]);
+
+/** When each shape's colour changes run in the step: [start, end] ms. */
+function colorWindows(effects: readonly Effect[]): Map<string, [number, number]> {
+  const out = new Map<string, [number, number]>();
+  for (const e of effects) {
+    for (const b of e.behaviours) {
+      if (b.target === null || (b.kind !== "color" && !(b.kind === "set" && b.attrs.some((a) => /^(fill|stroke)\./.test(a))))) continue;
+      const begin = e.start + b.delay;
+      const end = begin + (b.dur === null ? 0 : (b.dur * (b.repeatCount ?? 1000) * (b.autoRev ? 2 : 1)) / 1000);
+      const was = out.get(b.target.spid);
+      out.set(b.target.spid, was === undefined ? [begin, end] : [Math.min(was[0], begin), Math.max(was[1], end)]);
+    }
+  }
+  return out;
 }
 
 /**
  * Play step `k` of `timeline` on a tagged slide (step 0 is what runs on
  * entry): from the state before it to `states[k]`. The returned `finish`
  * lands on that state at once; so does the end of the longest effect, the
- * `maxMs` cap, `reduced`, and a step with nothing to move.
+ * `maxMs` cap, `reduced`, a step past `PLAY_BUDGET`, a step with nothing
+ * to move, and any error while planning.
  */
 export function playStep(tagged: TaggedSlide, timeline: SlideTimeline, k: number, opts: PlayOptions): Playing {
   const states = opts.states ?? buildStates(timeline);
   const after = states[k];
   const effects = timeline.steps[k] ?? [];
   const before = k === 0 ? entryState(timeline) : states[k - 1];
+  const palette = opts.palette ?? null;
   let resolve!: () => void;
   const finished = new Promise<void>((r) => (resolve = r));
   const playing: Playing = { finished, finish: () => {}, approximate: false };
+  const anims: Animation[] = [];
+  let done = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   const land = () => {
-    if (after !== undefined) playing.approximate = applyState(tagged, after, opts.w, opts.h) || tagged.fellBack;
+    if (done) return;
+    done = true;
+    if (timer !== undefined) clearTimeout(timer);
+    // The state goes on first, in the same task: no frame shows neither.
+    if (after !== undefined) playing.approximate = applyState(tagged, after, opts.w, opts.h, palette);
+    for (const a of anims) a.cancel();
     resolve();
   };
+  playing.finish = land;
   if (after === undefined || before === undefined || opts.reduced === true || effects.length === 0) {
     land();
     return playing;
   }
-  applyState(tagged, before, opts.w, opts.h);
-  const info = new Map<string, ShapeInfo>();
-  for (const [id, s] of tagged.shapes) info.set(id, { paraCount: s.paraCount, paras: s.paras !== null });
-  // What the landing will say, known now (the landing sets it exactly).
-  playing.approximate = planState(info, after).approximate || tagged.fellBack;
-  const plan = planStep(effects, before, info, (id) => measure(tagged, id, opts.w, opts.h), opts.w, opts.h, opts.maxMs);
-  const anims: Animation[] = [];
-  if (plan.duration > 0) {
+  try {
+    const target = statePaints(tagged, after, opts.w, opts.h, palette);
+    playing.approximate = target.approximate;
+    applyState(tagged, before, opts.w, opts.h, palette);
+    const from = statePaints(tagged, before, opts.w, opts.h, palette);
+    const info = new Map<string, ShapeInfo>();
+    const elements: ElementId[] = [];
+    for (const [id, s] of tagged.shapes) {
+      info.set(id, { paraCount: s.paraCount, paras: s.paras !== null, bg: s.el.querySelector(":scope > svg") !== null && s.paraCount > 0 });
+      elements.push(id, ...(s.paras ?? []).map((_, i) => `${id}#${i}`));
+    }
+    // An element's landed values: what the state after puts inline, else none.
+    const landedBy = new Map<Styled, Map<string, string>>();
+    for (const p of target.paints) {
+      const m = landedBy.get(p.el) ?? new Map<string, string>();
+      m.set(p.prop, p.value);
+      landedBy.set(p.el, m);
+    }
+    const landed = (id: ElementId): Landed | null => {
+      const el = elementOf(tagged, id);
+      if (el === undefined) return null;
+      const m = landedBy.get(el);
+      const op = m?.get("opacity");
+      return {
+        opacity: op === undefined ? drawnOpacity(el) : Number(op),
+        translate: m?.get("translate") ?? "none",
+        scale: m?.get("scale") ?? "none",
+        rotate: m?.get("rotate") ?? "none",
+      };
+    };
+    const plan = planStep(effects, before, info, elements, (id) => measure(tagged, id, opts.w, opts.h), landed, opts.w, opts.h, opts.maxMs);
+    if (plan.overBudget) {
+      land();
+      return playing;
+    }
+    let duration = plan.duration;
+    // Colours blend from the paint before to the paint after, over the
+    // window their effects run in.
+    const windows = colorWindows(effects);
+    const fromBy = new Map<Styled, Map<string, string>>();
+    for (const p of from.paints) {
+      const m = fromBy.get(p.el) ?? new Map<string, string>();
+      m.set(p.prop, p.value);
+      fromBy.set(p.el, m);
+    }
+    const blends: { el: Styled; prop: string; a: string; b: string; spid: string }[] = [];
+    const drawnValue = (el: Styled, prop: string) => original(el, prop) || el.getAttribute(prop) || (prop === "filter" ? "none" : "");
+    for (const [el, m] of landedBy) {
+      for (const [prop, b] of m) {
+        if (!COLOR_PROPS.has(prop)) continue;
+        const a = fromBy.get(el)?.get(prop) ?? drawnValue(el, prop);
+        if (a === b) continue;
+        const spid = (el.closest("[data-sid]") as HTMLElement | null)?.dataset.sid ?? "";
+        const grad = prop === "fill" && "ownerSVGElement" in el ? gradientOf(el as SVGElement, a) : null;
+        if (grad !== null) {
+          // A gradient going solid: its stops blend to the colour; the
+          // landing then swaps the fill for that colour.
+          for (const stop of Array.from(grad.querySelectorAll<SVGElement>("stop"))) {
+            blends.push({ el: stop, prop: "stop-color", a: fromBy.get(stop)?.get("stop-color") ?? (stop.getAttribute("stop-color") ?? "#000000"), b, spid });
+          }
+        } else if (a === "none" && prop === "fill") blends.push({ el, prop: "fill-opacity", a: "0", b: "1", spid });
+        else blends.push({ el, prop, a, b, spid });
+      }
+    }
+    for (const w of windows.values()) duration = Math.max(duration, Math.min(w[1], opts.maxMs ?? PLAY_MAX_MS));
+    if (!(duration > 0)) {
+      land();
+      return playing;
+    }
     for (const tr of plan.tracks) {
       const el = elementOf(tagged, tr.id);
       if (el === undefined || typeof el.animate !== "function") continue;
-      try {
-        anims.push(el.animate(tr.keyframes as unknown as Keyframe[], { duration: plan.duration, fill: "both", easing: "linear" }));
-      } catch {
-        // A keyframe this engine refuses: that element lands with the rest.
-      }
+      // Tracks were planned for the step's motion; stretch to a longer colour window.
+      const scale = plan.duration / duration;
+      const kf = scale === 1 ? tr.keyframes : [...tr.keyframes.map((f) => ({ ...f, offset: f.offset * scale })), { ...tr.keyframes[tr.keyframes.length - 1]!, offset: 1 }];
+      anims.push(el.animate(kf as unknown as Keyframe[], { duration, fill: "both", easing: "linear" }));
     }
-  }
-  if (anims.length === 0) {
+    for (const bl of blends) {
+      if (typeof bl.el.animate !== "function") continue;
+      const [t0, t1] = windows.get(bl.spid) ?? [0, duration];
+      const p = camel(bl.prop);
+      const at = (t: number) => Math.min(1, Math.max(0, t / duration));
+      const fixed = bl.prop === "fill-opacity" ? { fill: landedBy.get(bl.el)?.get("fill") } : {};
+      anims.push(
+        bl.el.animate(
+          [
+            { offset: 0, [p]: bl.a, ...fixed },
+            { offset: at(t0), [p]: bl.a, ...fixed },
+            { offset: Math.max(at(t0), at(t1)), [p]: bl.b, ...fixed },
+            { offset: 1, [p]: bl.b, ...fixed },
+          ] as Keyframe[],
+          { duration, fill: "both", easing: "linear" },
+        ),
+      );
+    }
+    if (anims.length === 0) {
+      land();
+      return playing;
+    }
+    timer = setTimeout(land, duration);
+  } catch {
+    // A slide this can't plan never stays half-played: it lands.
     land();
-    return playing;
   }
-  let done = false;
-  const timer = setTimeout(() => playing.finish(), plan.duration);
-  playing.finish = () => {
-    if (done) return;
-    done = true;
-    clearTimeout(timer);
-    // The state goes on first, in the same task: no frame shows neither.
-    land();
-    for (const a of anims) a.cancel();
-  };
   return playing;
 }

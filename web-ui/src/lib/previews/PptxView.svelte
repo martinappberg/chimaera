@@ -55,7 +55,7 @@
   import { copyTabToWindow } from "../plugins/platform";
   import { buildStates, extractTiming, parseTimeline, type BuildState, type SlideTimeline, type TimingExtract } from "./pptxTiming";
   import { pruneTagged, tagSlide, type TaggedSlide } from "./pptxTag";
-  import { applyState, clearState, playStep, type Playing } from "./pptxPlay";
+  import { applyState, clearState, playStep, type Palette, type Playing } from "./pptxPlay";
   import { motionNotes } from "./pptxMotion";
   import { sanitizeRendered } from "./officeSafety";
   import { revealRequest, takeReveal } from "../shared/reveal";
@@ -131,6 +131,28 @@
   let playing: { p: Playing; slide: number; build: number; tagged: TaggedSlide; gen: string } | null = null;
   /** The click the next state pass plays rather than lands on. */
   let toPlay: { slide: number; build: number } | null = null;
+  /** The place the build-state pass last stood on. */
+  let lastPass: { slide: number; build: number | null } | null = null;
+
+  /** Slide `i`'s theme colours and colour map: what a held colour that
+   *  names a scheme colour (`accent2`, `tx1`) resolves against. */
+  const palettes = new Map<string, Palette>();
+  function paletteOf(i: number): Palette | null {
+    const pres = deck?.presentation;
+    const sl = pres?.slides[i];
+    if (pres === undefined || sl === undefined) return null;
+    const hit = palettes.get(sl.slidePath);
+    if (hit !== undefined) return hit;
+    const masterKey = pres.layoutToMaster.get(sl.layoutIndex);
+    const master = masterKey === undefined ? undefined : pres.masters.get(masterKey);
+    const themeKey = masterKey === undefined ? undefined : pres.masterToTheme.get(masterKey);
+    const theme = themeKey === undefined ? undefined : pres.themes.get(themeKey);
+    const map = new Map(master?.colorMap ?? []);
+    if (sl.colorMapOverride !== undefined && sl.colorMapOverrideMode !== "master") for (const [k, v] of sl.colorMapOverride) map.set(k, v);
+    const palette: Palette = { scheme: theme?.colorScheme ?? new Map(), map };
+    palettes.set(sl.slidePath, palette);
+    return palette;
+  }
   let lastClickAt = -Infinity;
   /** A click is playing: the advance timer waits for it to land. */
   let animating = $state(false);
@@ -175,8 +197,12 @@
     // the presenter's view keeps a build a click dot chose.
     opening: (mode, at) => ({ slide: at.slide, build: mode === "presenter" && !asDrawn ? at.build : 0 }),
     arrive: (from, to, how) => {
-      // Another window naming the place we stand on must not cut a click off.
-      if (to.slide === from.slide && to.build === from.build) return;
+      // Another window naming the place we stand on must not cut a click
+      // off; a click of our own there (the end of the show) lands it.
+      if (to.slide === from.slide && to.build === from.build) {
+        if (!how.heard) stopPlaying();
+        return;
+      }
       stopPlaying();
       toPlay = null;
       // Only a click on in the show plays (the presenter's own view and
@@ -289,6 +315,7 @@
       lastBytes = bytes;
       drawn.clear();
       resetTimelines(d);
+      palettes.clear();
       relTargets = null;
       deck = d;
       deckGen += 1;
@@ -596,12 +623,19 @@
     const t = timed;
     const editing = editMode;
     const gen = `${deckGen}:${slideGen}`;
+    // Only the show plays; the presenter's own view always lands.
+    const showing = show.mode === "present";
     void slot;
     untrack(() => {
-      const want = toPlay;
+      // A click plays only on the pass that brought its place: a re-read
+      // deck, a redraw or any later pass at the same place lands.
+      const arrived = lastPass === null || lastPass.slide !== i || lastPass.build !== b;
+      lastPass = { slide: i, build: b };
+      const want = arrived && showing ? toPlay : null;
       toPlay = null;
       const tagNow = stageHandles.get(i);
       const ownPass =
+        showing &&
         playing !== null &&
         playing.slide === i &&
         playing.build === b &&
@@ -624,7 +658,7 @@
           continue;
         }
         if (t !== null && b !== null && want?.slide === i && want.build === b && onScreen.shown) {
-          const p = playStep(tagged, t.timeline, b, { w, h, states: t.states, reduced: reducedMotion() });
+          const p = playStep(tagged, t.timeline, b, { w, h, states: t.states, palette: paletteOf(i), reduced: reducedMotion() });
           approx = p.approximate;
           const mine = { p, slide: i, build: b, tagged, gen };
           playing = mine;
@@ -639,7 +673,7 @@
           });
           continue;
         }
-        approx = applyState(tagged, state, w, h) || tagged.fellBack;
+        approx = applyState(tagged, state, w, h, paletteOf(j)) || tagged.fellBack;
       }
       playApprox = approx;
     });
@@ -1492,7 +1526,7 @@
       const state = timelineOf(p.slide)?.states[p.build];
       if (tagged !== undefined) {
         if (state === undefined) clearState(tagged);
-        else applyState(tagged, state, w, h);
+        else applyState(tagged, state, w, h, paletteOf(p.slide));
       }
     });
   });

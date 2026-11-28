@@ -1,7 +1,7 @@
 import JSZip from "jszip";
 import { describe, expect, it } from "vitest";
 import { clipMargin, clipRegion, effectMotion, motionNotes, pacedSampler, pathPolyline, progress, warp, type Geom } from "./pptxMotion";
-import { entryState, planStep, type ElementBase, type ShapeInfo } from "./pptxPlay";
+import { entryState, MAX_FRAMES, PLAY_BUDGET, planStep, type ElementBase, type ShapeInfo } from "./pptxPlay";
 import { buildStates, parseTimeline, pathEnd, type Effect, type SlideTimeline } from "./pptxTiming";
 
 /**
@@ -26,12 +26,13 @@ const W = 1280;
 const H = 720;
 /** A shape centred at (0.5, 0.5), a tenth of the slide wide, a fifth tall. */
 const G: Geom = { ppt_x: 0.5, ppt_y: 0.5, ppt_w: 0.1, ppt_h: 0.2 };
-const base = (g = G): ElementBase => ({ geom: g, k: 1, tx: 0, ty: 0, shown: 1, bw: g.ppt_w * W, bh: g.ppt_h * H });
+const base = (g = G): ElementBase => ({ geom: g, k: 1, tx: 0, ty: 0, drawn: 1, held: 1, sx: 1, sy: 1, rot: 0, bw: g.ppt_w * W, bh: g.ppt_h * H });
+const noLanding = () => null;
 
 /** Plan one effect alone on a shape with `G`'s place, from the slide's entry state. */
 function planOne(e: Effect, before = { hidden: e.sets === "visible" && e.target !== null ? [e.target.spid] : [], moved: {} }) {
   const shapes = new Map<string, ShapeInfo>([[e.target!.spid, { paraCount: 0, paras: false }]]);
-  return planStep([{ ...e, start: 0 }], before, shapes, () => base(), W, H);
+  return planStep([{ ...e, start: 0 }], before, shapes, [e.target!.spid], () => base(), noLanding, W, H);
 }
 /** A polygon's points. */
 const pts = (s: string) => [...s.matchAll(/(-?[0-9.]+)px (-?[0-9.]+)px/g)].map((m) => [Number(m[1]), Number(m[2])] as const);
@@ -198,11 +199,44 @@ describe("motion paths (paths slide 1)", async () => {
     const before = states[1]!;
     const moved = Object.values(before.moved)[0] ?? [0, 0];
     const b = { ...base(), tx: moved[0] * W, ty: moved[1] * H };
-    const kf = planStep(t2.steps[2]!, before, shapes, () => b, W, H).tracks[0]!.keyframes;
+    const kf = planStep(t2.steps[2]!, before, shapes, [...shapes.keys()], () => b, noLanding, W, H).tracks[0]!.keyframes;
     expect(px(kf[0]!.translate)).toEqual([moved[0] * W, moved[1] * H]);
     const end = states[2]!.moved[t2.steps[2]![0]!.target!.spid]!;
     expect(px(kf[kf.length - 1]!.translate)[0]).toBeCloseTo(end[0] * W, 0);
     expect(px(kf[kf.length - 1]!.translate)[1]).toBeCloseTo(end[1] * H, 0);
+  });
+});
+
+describe("held emphasis plays from what the state before holds", () => {
+  it("a second grow starts at 150% and ends at 225%; shrink to 50% is of the shape's own size", async () => {
+    const t = await slide("emphasis", 1);
+    const shapes = new Map<string, ShapeInfo>([["2", { paraCount: 0, paras: false }], ["3", { paraCount: 0, paras: false }]]);
+    const states = buildStates(t);
+    const grown = { ...base(), sx: 1.5, sy: 1.5 };
+    const kf = planStep(t.steps[2]!, states[1]!, shapes, ["2"], () => grown, noLanding, W, H).tracks[0]!.keyframes;
+    expect(kf[0]!.scale).toBe("1.5 1.5");
+    expect(kf[kf.length - 1]!.scale).toBe("2.25 2.25");
+    expect(states[2]!.scale!["2"]).toEqual([2.25, 2.25]);
+    const shrink = planStep(t.steps[4]!, states[3]!, shapes, ["3"], () => grown, noLanding, W, H).tracks[0]!.keyframes;
+    expect(shrink[0]!.scale).toBe("1.5 1.5");
+    expect(shrink[shrink.length - 1]!.scale).toBe("0.5 0.5");
+  });
+
+  it("the last frame is the landed value exactly, and a whole turn ends without spinning back", async () => {
+    const spin = (await slide("exits-emphasis", 2)).steps[2]![0]!;
+    const shapes = new Map<string, ShapeInfo>([[spin.target!.spid, { paraCount: 0, paras: false }]]);
+    const landed = { opacity: 1, translate: "none", scale: "none", rotate: "none" };
+    const kf = planStep([spin], { hidden: [], moved: {} }, shapes, [spin.target!.spid], () => base(), () => landed, W, H).tracks[0]!.keyframes;
+    // 0 → 360 becomes −360 → 0, so the frame before the last is close to it.
+    expect(kf[0]!.rotate).toBe("-360deg");
+    expect(kf[kf.length - 1]!.rotate).toBe("none");
+    expect(parseFloat(kf[kf.length - 2]!.rotate!)).toBeGreaterThan(-10);
+    const fly = (await slide("entrances", 2)).steps[1]![0]!;
+    const f = planOne(fly).tracks[0]!.keyframes;
+    const g = planStep([fly], { hidden: [fly.target!.spid], moved: {} }, shapes.set(fly.target!.spid, { paraCount: 0, paras: false }), [fly.target!.spid], () => base(), () => landed, W, H).tracks[0]!.keyframes;
+    expect(f[f.length - 1]!.translate).toBe("0px 0px");
+    expect(g[g.length - 1]!.translate).toBe("none");
+    expect(g[g.length - 1]!.opacity).toBe(1);
   });
 });
 
@@ -253,11 +287,11 @@ describe("fallbacks", () => {
   it("an entrance it can't read becomes a fade; an emphasis plays nothing", () => {
     const e: Effect = {
       trigger: "click", start: 0, dur: 500, presetClass: "entr", preset: 99, subtype: 0, name: "other", dir: null,
-      target: { spid: "2", bg: false, para: null }, sets: "visible", path: null, group: null, accel: 0, decel: 0, autoRev: false, repeatCount: 1000,
+      target: { spid: "2", bg: false, para: null }, sets: "visible", path: null, group: null, accel: 0, decel: 0, autoRev: false, repeatCount: 1000, fill: null,
       behaviours: [
-        { kind: "set", to: "visible", target: { spid: "2", bg: false, para: null }, delay: 0, dur: 1, repeatCount: 1000, autoRev: false, accel: 0, decel: 0, additive: null, attrs: ["style.visibility"] },
+        { kind: "set", to: "visible", target: { spid: "2", bg: false, para: null }, delay: 0, dur: 1, repeatCount: 1000, autoRev: false, accel: 0, decel: 0, additive: null, fill: null, attrs: ["style.visibility"] },
         { kind: "anim", calcmode: "lin", valueType: "num", by: null, from: null, to: null, tav: [{ tm: 0, fmla: null, val: "sin(#ppt_x)" }, { tm: 100000, fmla: null, val: "#ppt_x" }],
-          target: { spid: "2", bg: false, para: null }, delay: 0, dur: 500, repeatCount: 1000, autoRev: false, accel: 0, decel: 0, additive: null, attrs: ["ppt_x"] },
+          target: { spid: "2", bg: false, para: null }, delay: 0, dur: 500, repeatCount: 1000, autoRev: false, accel: 0, decel: 0, additive: null, fill: null, attrs: ["ppt_x"] },
       ],
     };
     const m = effectMotion(e, () => G);
@@ -268,15 +302,12 @@ describe("fallbacks", () => {
     expect(emph.note).toMatch(/not animated/);
   });
 
-  it("the slide's notes list what plays other than as written", async () => {
+  it("the slide's notes list what plays other than as written: only the fades standing in for rare filters", async () => {
     expect(motionNotes((await slide("entrances", 1)).steps)).toEqual(["dissolve-in: plays as a fade (dissolve)"]);
     expect(motionNotes((await slide("entrances", 2)).steps)).toEqual([]);
-    const notes = motionNotes((await slide("exits-emphasis", 2)).steps);
-    expect(notes).toContain("grow-shrink: returns to its size at the end of its click");
-    expect(notes).toContain("fill-color: its colour change isn't shown");
-    expect(notes).toContain("darken: its colour change isn't shown");
-    expect(notes.some((n) => n.startsWith("transparency"))).toBe(true);
-    expect(notes.some((n) => n.startsWith("spin") || n.startsWith("teeter"))).toBe(false);
+    // Emphasis holds now (R24-R31): grow, spin, transparency, colour play and stay.
+    for (const n of [1, 2, 3]) expect(motionNotes((await slide("exits-emphasis", n)).steps), `exits-emphasis ${n}`).toEqual([]);
+    for (const n of [1, 2, 3, 4]) expect(motionNotes((await slide("emphasis", n)).steps), `emphasis ${n}`).toEqual([]);
   });
 });
 
@@ -285,7 +316,7 @@ describe("the play planner: what starts when", () => {
     const t = await slide("triggers", 1);
     const step = t.steps[1]!;
     const shapes = new Map<string, ShapeInfo>(step.map((e) => [e.target!.spid, { paraCount: 0, paras: false }]));
-    const p = planStep(step, entryState(t), shapes, () => base(), W, H);
+    const p = planStep(step, entryState(t), shapes, [...shapes.keys()], () => base(), noLanding, W, H);
     expect(p.duration).toBe(1000);
     const byId = new Map(p.tracks.map((tr) => [tr.id, tr.keyframes]));
     const at = (id: string, ms: number) => {
@@ -305,12 +336,76 @@ describe("the play planner: what starts when", () => {
     const t = await slide("triggers", 1);
     const step = t.steps[2]!;
     const shapes = new Map<string, ShapeInfo>(step.map((e) => [e.target!.spid, { paraCount: 0, paras: false }]));
-    expect(planStep(step, buildStates(t)[1]!, shapes, () => base(), W, H, 300).duration).toBe(300);
+    expect(planStep(step, buildStates(t)[1]!, shapes, [...shapes.keys()], () => base(), noLanding, W, H, 300).duration).toBe(300);
   });
 
   it("an appear alone moves nothing: the step lands at once", async () => {
     const t = await slide("entrances", 1);
     const shapes = new Map<string, ShapeInfo>([[t.steps[1]![0]!.target!.spid, { paraCount: 0, paras: false }]]);
-    expect(planStep(t.steps[1]!, entryState(t), shapes, () => base(), W, H).duration).toBe(0);
+    expect(planStep(t.steps[1]!, entryState(t), shapes, [...shapes.keys()], () => base(), noLanding, W, H).duration).toBe(0);
+  });
+});
+
+describe("what a hostile deck can cost", () => {
+  /** A fade on shape `spid`, `start` ms into the step: the parser's own shape. */
+  const fadeOn = (spid: string, start: number): Effect => {
+    const target = { spid, bg: false, para: null };
+    const common = { target, delay: 0, repeatCount: 1000, autoRev: false, accel: 0, decel: 0, additive: null, fill: null };
+    return {
+      trigger: "with", start, dur: 500, presetClass: "entr", preset: 10, subtype: 0, name: "fade-in", dir: null, target, sets: "visible",
+      path: null, group: null, accel: 0, decel: 0, autoRev: false, repeatCount: 1000, fill: "hold",
+      behaviours: [
+        { ...common, kind: "set", dur: 1, to: "visible", attrs: ["style.visibility"] },
+        { ...common, kind: "effect", dur: 500, filter: "fade", transition: "in", prLst: null, attrs: [] },
+      ],
+    };
+  };
+  const shapes = new Map<string, ShapeInfo>(Array.from({ length: 200 }, (_, i) => [String(i + 2), { paraCount: 0, paras: false }]));
+  const ids = [...shapes.keys()];
+
+  it("past the budget (2,000 effects on 200 shapes, the parser's cap) the click lands without planning", () => {
+    const effects = Array.from({ length: 2000 }, (_, i) => fadeOn(String((i % 200) + 2), i * 7));
+    const t0 = performance.now();
+    const p = planStep(effects, { hidden: ids, moved: {} }, shapes, ids, () => base(), noLanding, W, H);
+    expect(p.overBudget).toBe(true);
+    expect(performance.now() - t0).toBeLessThan(50);
+  });
+
+  it("at the budget it plans in well under a frame budget and keeps every track within MAX_FRAMES", () => {
+    const effects = Array.from({ length: PLAY_BUDGET.events }, (_, i) => fadeOn(String((i % 200) + 2), i * 37));
+    const t0 = performance.now();
+    const p = planStep(effects, { hidden: ids, moved: {} }, shapes, ids, () => base(), noLanding, W, H);
+    const ms = performance.now() - t0;
+    expect(p.overBudget).toBe(false);
+    expect(p.tracks.length).toBe(200);
+    for (const tr of p.tracks) expect(tr.keyframes.length).toBeLessThanOrEqual(MAX_FRAMES);
+    expect(ms).toBeLessThan(1500);
+  });
+
+  it("clamps what a file can push: huge paths and scales stay finite and bounded", () => {
+    const huge = pathPolyline("M 0 0 L 1e308 0 L -1e308 0 E")!;
+    expect(huge.pts.every(([x, y]) => Number.isFinite(x) || x === Infinity || x === -Infinity || Number.isFinite(y))).toBe(true);
+    const target = { spid: "2", bg: false, para: null };
+    const common = { target, delay: 0, repeatCount: 1000, autoRev: false, accel: 0, decel: 0, additive: null, fill: "hold" };
+    const path: Effect = {
+      ...fadeOn("2", 0), presetClass: "path", name: "path", sets: null, path: "M 0 0 L 1e308 0 L -1e308 0 E",
+      behaviours: [{ ...common, kind: "motion", dur: 1000, path: "M 0 0 L 1e308 0 L -1e308 0 E", origin: "layout", pathEditMode: null, attrs: ["ppt_x", "ppt_y"] }],
+    };
+    const grow: Effect = {
+      ...fadeOn("2", 0), presetClass: "emph", name: "grow-shrink", sets: null,
+      behaviours: [{ ...common, kind: "scale", dur: 1000, by: { x: 1e300, y: 1e300 }, from: null, to: null, attrs: [] }],
+    };
+    const one = new Map<string, ShapeInfo>([["2", { paraCount: 0, paras: false }]]);
+    for (const e of [path, grow]) {
+      const kf = planStep([e], { hidden: [], moved: {} }, one, ["2"], () => base(), noLanding, W, H).tracks[0]?.keyframes ?? [];
+      for (const f of kf) {
+        for (const v of [f.translate, f.scale].filter((x): x is string => x !== undefined)) {
+          for (const n of v.split(/px|\s+/).filter((x) => x !== "").map(Number)) {
+            expect(Number.isFinite(n), `${e.name} ${v}`).toBe(true);
+            expect(Math.abs(n)).toBeLessThanOrEqual(1e5);
+          }
+        }
+      }
+    }
   });
 });

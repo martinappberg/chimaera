@@ -105,6 +105,8 @@ export interface Color {
   type: string;
   /** Its attributes, as written (no prototype: keys are the file's). */
   attrs: Record<string, string>;
+  /** Its child transforms in order (`lumMod`, `tint`, `alpha`, …): local name and `val`. */
+  mods: { name: string; val: string | null }[];
 }
 
 interface BehaviourBase {
@@ -120,6 +122,8 @@ interface BehaviourBase {
   accel: number;
   decel: number;
   additive: string | null;
+  /** Its `p:cTn`'s `fill` (`hold`, `freeze`, `remove`, `transition`), as written. */
+  fill: string | null;
   /** `p:attrNameLst` entries. */
   attrs: string[];
 }
@@ -173,6 +177,8 @@ export interface Effect {
   decel: number;
   autoRev: boolean;
   repeatCount: number | null;
+  /** The effect node's own `fill`, as written. */
+  fill: string | null;
   behaviours: Behaviour[];
 }
 
@@ -225,6 +231,32 @@ export interface BuildState {
   /** Target key → summed path offset [dx, dy] in slide fractions, keys sorted.
    *  No prototype: keys come from the file. */
   moved: Record<string, [number, number]>;
+  /** Held size factors [x, y] (R26), only targets not at [1, 1]; absent when none. */
+  scale?: Record<string, [number, number]>;
+  /** Held turn in degrees, in [0, 360) (R27), only targets not at 0; absent when none. */
+  turn?: Record<string, number>;
+  /** Held opacity (R28), only targets not at 1; absent when none. */
+  opacity?: Record<string, number>;
+  /** Held colour changes per part (R29), absent when none. */
+  color?: Record<string, HeldColors>;
+}
+
+/** A target's held colour changes, by what they colour. */
+export interface HeldColors {
+  fill?: HeldColor;
+  line?: HeldColor;
+  text?: HeldColor;
+}
+
+/** One part's held colour: the last colour set (`to`), the changes made on
+ *  top of it in order (`by`), and the fill/line switches set with them. */
+export interface HeldColor {
+  to?: Color;
+  by?: Color[];
+  /** `fill.type` set to `solid`: the part is filled with one colour. */
+  solid?: true;
+  /** `fill.on` / `stroke.on`, as set. */
+  on?: boolean;
 }
 
 // --- numbers and strings -----------------------------------------------------------
@@ -464,8 +496,10 @@ function color(xml: string, el: XmlEl | undefined): Color | null {
   const c = el?.children[0];
   if (c === undefined) return null;
   const attrs = Object.create(null) as Record<string, string>;
-  for (const a of c.attrs) attrs[a.qname] = decodeEntities(xml.slice(a.valueStart, a.valueEnd));
-  return { type: c.local, attrs };
+  for (const a of [...c.attrs].sort((x, y) => (x.qname < y.qname ? -1 : x.qname > y.qname ? 1 : 0))) {
+    attrs[a.qname] = decodeEntities(xml.slice(a.valueStart, a.valueEnd));
+  }
+  return { type: c.local, attrs, mods: c.children.map((m) => ({ name: m.local, val: attr(xml, m, "val") })) };
 }
 
 const BEHAVIOURS = new Set(["set", "anim", "animEffect", "animScale", "animRot", "animMotion", "animClr", "cmd", "audio", "video"]);
@@ -494,6 +528,7 @@ function readBehaviours(xml: string, list: XmlEl | undefined, offset: number, ou
       accel: t.accel,
       decel: t.decel,
       additive: cBhvr === undefined ? null : attr(xml, cBhvr, "additive"),
+      fill: cTn === undefined ? null : attr(xml, cTn, "fill"),
       attrs: childrenP(childP(cBhvr, "attrNameLst"), "attrName").map((a) => text(xml, a)),
     };
     switch (b.local) {
@@ -657,6 +692,7 @@ function readEffect(xml: string, cTn: XmlEl, start: number, first: boolean): Eff
     decel: t.decel,
     autoRev: t.autoRev,
     repeatCount: t.repeatCount,
+    fill: attr(xml, cTn, "fill"),
     behaviours,
   };
 }
@@ -877,6 +913,57 @@ export function extractTiming(slideXml: string): TimingExtract {
 
 // --- build states -------------------------------------------------------------------
 
+/**
+ * SMIL acceleration: `accel` and `decel` (100000ths of the duration) turn
+ * linear progress `q` (0–1) into eased progress with the same end points.
+ */
+export function warp(q: number, accel: number, decel: number): number {
+  let a = Math.max(0, accel) / 100000;
+  let d = Math.max(0, decel) / 100000;
+  if (a + d > 1) {
+    const s = a + d;
+    a /= s;
+    d /= s;
+  }
+  if (a === 0 && d === 0) return q;
+  const r = 1 / (1 - a / 2 - d / 2);
+  if (q < a) return (r * q * q) / (2 * a);
+  if (q <= 1 - d) return r * (q - a / 2);
+  const e = 1 - q;
+  return 1 - (r * e * e) / (2 * d);
+}
+
+/**
+ * Progress (0–1) of a timed node `tau` ms after it begins: null before it
+ * begins; `repeat` in 1000ths (null: forever), `autoRev` plays each
+ * iteration forward then back, acceleration applies to each simple
+ * duration. Holds the last value after the end.
+ */
+export function progress(
+  tau: number,
+  dur: number,
+  repeat: number | null,
+  autoRev: boolean,
+  accel: number,
+  decel: number,
+): number | null {
+  if (tau < 0) return null;
+  if (dur <= 0) return autoRev ? 0 : 1;
+  const iter = autoRev ? 2 : 1;
+  const total = repeat === null ? Infinity : (dur * iter * repeat) / 1000;
+  const s = Math.min(tau, total) / dur;
+  if (autoRev) {
+    let pos = s % 2;
+    if (pos === 0 && s > 0) return total === 0 ? 0 : warp(0, accel, decel);
+    if (pos > 1) pos = 2 - pos;
+    return warp(pos, accel, decel);
+  }
+  let pos = s % 1;
+  if (pos === 0 && s > 0) pos = 1;
+  return warp(pos, accel, decel);
+}
+
+
 const PATH_ARITY = new Map<string, number>([
   ["M", 2],
   ["L", 2],
@@ -957,6 +1044,198 @@ function visibilityEvents(effects: readonly Effect[]): VisEvent[] {
   return out;
 }
 
+// --- held values (R24-R31) ------------------------------------------------------------
+
+/** The behaviour's own progress (0-1) when its effect has ended, or null
+ *  when it never began (R25): the effect's repeat, autoRev and
+ *  acceleration first, then the behaviour's own. */
+function endProgress(e: Effect, b: Behaviour): number | null {
+  if (b.dur === null || b.repeatCount === null || e.repeatCount === null) return null;
+  const dur = b.kind === "set" && b.dur === 1 ? 0 : b.dur;
+  let span = 0;
+  for (const o of e.behaviours) {
+    if (o.dur === null || o.repeatCount === null) continue;
+    const d = o.kind === "set" && o.dur === 1 ? 0 : o.dur;
+    span = Math.max(span, o.delay + (d * o.repeatCount * (o.autoRev ? 2 : 1)) / 1000);
+  }
+  const total = (span * e.repeatCount * (e.autoRev ? 2 : 1)) / 1000;
+  const q = span > 0 ? progress(total, span, e.repeatCount, e.autoRev, e.accel, e.decel) : 1;
+  const local = q === null ? 0 : q * span;
+  return progress(local - b.delay, dur, b.repeatCount, b.autoRev, b.accel, b.decel);
+}
+
+/** Whether a behaviour's value stays once its effect is over (R24). */
+function holds(e: Effect, b: Behaviour): boolean {
+  if (e.fill === "remove" || b.repeatCount === null || e.repeatCount === null) return false;
+  if (b.dur === null) return b.kind === "set";
+  return b.fill === "hold" || b.fill === "freeze";
+}
+
+/** `p:anim`'s value at progress `q` when every value is a plain number
+ *  (R28): null otherwise. */
+function animNumber(b: Behaviour & { kind: "anim" }, q: number): number | null {
+  const n = b.tav.length;
+  if (n === 0) return null;
+  const keys: { at: number; v: number }[] = [];
+  for (const [i, tav] of b.tav.entries()) {
+    if (typeof tav.val !== "number" || (tav.fmla !== null && tav.fmla !== "")) return null;
+    keys.push({ at: tav.tm === null ? (n === 1 ? 0 : i / (n - 1)) : tav.tm / 100000, v: tav.val });
+  }
+  if (q <= keys[0]!.at) return keys[0]!.v;
+  for (let i = 1; i < keys.length; i++) {
+    const a = keys[i - 1]!;
+    const z = keys[i]!;
+    if (q <= z.at) return z.at === a.at ? z.v : a.v + ((z.v - a.v) * (q - a.at)) / (z.at - a.at);
+  }
+  return keys[n - 1]!.v;
+}
+
+const ROTATION_ATTRS = new Set(["r", "ppt_r", "style.rotation"]);
+const COLOR_PART = new Map<string, keyof HeldColors>([
+  ["fillcolor", "fill"],
+  ["fill.color", "fill"],
+  ["stroke.color", "line"],
+  ["style.color", "text"],
+]);
+
+interface Held {
+  scale: Map<string, [number, number]>;
+  turn: Map<string, number>;
+  opacity: Map<string, number>;
+  color: Map<string, HeldColors>;
+}
+
+/** One step's held changes, applied in the order they end (as R17). */
+function applyHeld(step: readonly Effect[], held: Held): void {
+  const changes: { at: bigint | null; i: number; run: () => void }[] = [];
+  let i = 0;
+  for (const e of step) {
+    for (const b of e.behaviours) {
+      const t = b.target;
+      if (t === null || !holds(e, b)) continue;
+      const q = b.dur === null ? 1 : endProgress(e, b);
+      if (q === null) continue;
+      const key = targetKey(t);
+      const end = behaviourEnd(b);
+      const at = end === null ? null : BigInt(e.start) * 1000n + end;
+      let run: (() => void) | null = null;
+      if (b.kind === "scale") {
+        const f = (p: Point | null, axis: "x" | "y") => (p === null ? null : p[axis] / 100000);
+        run = () => {
+          const cur = held.scale.get(key) ?? [1, 1];
+          const next: [number, number] = [0, 1].map((k) => {
+            const axis = k === 0 ? "x" : "y";
+            const from = f(b.from, axis) ?? cur[k]!;
+            const to = f(b.to, axis);
+            if (to !== null) return from + (to - from) * q;
+            const by = f(b.by, axis);
+            return by === null ? from : from * (1 + (by - 1) * q);
+          }) as [number, number];
+          held.scale.set(key, next);
+        };
+      } else if (b.kind === "rot") {
+        run = () => {
+          const cur = held.turn.get(key) ?? 0;
+          if (b.to !== null) {
+            const from = b.from === null ? cur : b.from / 60000;
+            held.turn.set(key, from + (b.to / 60000 - from) * q);
+          } else if (b.by !== null) held.turn.set(key, (b.from === null ? cur : b.from / 60000) + (b.by / 60000) * q);
+        };
+      } else if (b.kind === "anim" && b.attrs.some((a) => ROTATION_ATTRS.has(a))) {
+        const v = animNumber(b, q);
+        if (v !== null) run = () => held.turn.set(key, v);
+      } else if (b.kind === "anim" && b.attrs.includes("style.opacity")) {
+        const v = animNumber(b, q);
+        if (v !== null) run = () => held.opacity.set(key, v);
+      } else if (b.kind === "set" && b.attrs.includes("style.opacity")) {
+        const v = typeof b.to === "number" ? b.to : typeof b.to === "string" && b.to.trim() !== "" ? Number(b.to) : NaN;
+        if (Number.isFinite(v)) run = () => held.opacity.set(key, v);
+      } else if (b.kind === "color" && q === 1) {
+        const part = b.attrs.map((a) => COLOR_PART.get(a.toLowerCase())).find((x) => x !== undefined);
+        if (part !== undefined && (b.to !== null || b.by !== null)) {
+          run = () => {
+            const all = held.color.get(key) ?? {};
+            const c: HeldColor = { ...(all[part] ?? {}) };
+            if (b.to !== null) {
+              c.to = b.to;
+              delete c.by;
+            } else c.by = [...(c.by ?? []), b.by!];
+            all[part] = c;
+            held.color.set(key, all);
+          };
+        }
+      } else if (b.kind === "set" && q === 1) {
+        const a = b.attrs[0] ?? "";
+        const v = typeof b.to === "string" ? b.to : b.to === true ? "true" : b.to === false ? "false" : "";
+        const part: keyof HeldColors | null = a === "fill.type" || a === "fill.on" ? "fill" : a === "stroke.on" ? "line" : null;
+        if (part !== null && (a !== "fill.type" || v === "solid") && (a === "fill.type" || v === "true" || v === "false")) {
+          run = () => {
+            const all = held.color.get(key) ?? {};
+            const c: HeldColor = { ...(all[part] ?? {}) };
+            if (a === "fill.type") c.solid = true;
+            else c.on = v === "true";
+            all[part] = c;
+            held.color.set(key, all);
+          };
+        }
+      }
+      if (run !== null) changes.push({ at, i: i++, run });
+    }
+  }
+  changes.sort((a, b) => {
+    if (a.at !== b.at) {
+      if (a.at === null) return 1;
+      if (b.at === null) return -1;
+      return a.at < b.at ? -1 : 1;
+    }
+    return a.i - b.i;
+  });
+  for (const c of changes) c.run();
+}
+
+/** A colour part in the golden key order. */
+function heldColorOut(c: HeldColor): HeldColor {
+  const out: HeldColor = {};
+  if (c.to !== undefined) out.to = c.to;
+  if (c.by !== undefined && c.by.length > 0) out.by = c.by;
+  if (c.solid) out.solid = true;
+  if (c.on !== undefined) out.on = c.on;
+  return out;
+}
+
+/** The held values as a state carries them: rounded, identities left out. */
+function heldOut(held: Held, state: BuildState): void {
+  const sorted = <V>(m: Map<string, V>) => [...m.keys()].sort().map((k) => [k, m.get(k)!] as const);
+  const scale = Object.create(null) as Record<string, [number, number]>;
+  for (const [k, [x, y]] of sorted(held.scale)) {
+    const v: [number, number] = [round4(x), round4(y)];
+    if (v[0] !== 1 || v[1] !== 1) scale[k] = v;
+  }
+  const turn = Object.create(null) as Record<string, number>;
+  for (const [k, d] of sorted(held.turn)) {
+    const v = round4(((d % 360) + 360) % 360);
+    if (v !== 0 && v !== 360) turn[k] = v;
+  }
+  const opacity = Object.create(null) as Record<string, number>;
+  for (const [k, o] of sorted(held.opacity)) {
+    const v = round4(Math.min(1, Math.max(0, o)));
+    if (v !== 1) opacity[k] = v;
+  }
+  const color = Object.create(null) as Record<string, HeldColors>;
+  for (const [k, c] of sorted(held.color)) {
+    const out: HeldColors = {};
+    for (const part of ["fill", "line", "text"] as const) {
+      const v = c[part] === undefined ? null : heldColorOut(c[part]);
+      if (v !== null && Object.keys(v).length > 0) out[part] = v;
+    }
+    if (Object.keys(out).length > 0) color[k] = out;
+  }
+  if (Object.keys(scale).length > 0) state.scale = scale;
+  if (Object.keys(turn).length > 0) state.turn = turn;
+  if (Object.keys(opacity).length > 0) state.opacity = opacity;
+  if (Object.keys(color).length > 0) state.color = color;
+}
+
 /** The slide after each step: `states[k]` is after step k. */
 export function buildStates(timeline: SlideTimeline): BuildState[] {
   // Initially hidden: targets whose first visibility set, reading the main
@@ -967,6 +1246,7 @@ export function buildStates(timeline: SlideTimeline): BuildState[] {
   const hidden = new Set([...first].filter(([, v]) => v === "visible").map(([k]) => k));
 
   const moved = new Map<string, [number, number]>();
+  const held: Held = { scale: new Map(), turn: new Map(), opacity: new Map(), color: new Map() };
   const out: BuildState[] = [];
   for (const step of timeline.steps) {
     // In the order the sets end; one that never ends goes last; ties keep document order.
@@ -999,7 +1279,10 @@ export function buildStates(timeline: SlideTimeline): BuildState[] {
       const [dx, dy] = moved.get(key)!;
       movedOut[key] = [round4(dx), round4(dy)];
     }
-    out.push({ hidden: [...hidden].sort(), moved: movedOut });
+    applyHeld(step, held);
+    const state: BuildState = { hidden: [...hidden].sort(), moved: movedOut };
+    heldOut(held, state);
+    out.push(state);
   }
   return out;
 }

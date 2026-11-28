@@ -8,7 +8,8 @@
  *   (`p:anim` on `ppt_x` `ppt_y` `ppt_w` `ppt_h`, its time values read with
  *   `pptxFormula.ts`), absolute: the latest begun wins;
  * - `mx`, `my`: a motion path's offset in slide fractions, added up;
- * - `sx`, `sy`: `p:animScale` factors, multiplied;
+ * - `sx`, `sy`: `p:animScale` `by` factors, multiplied; `sxAbs`, `syAbs`:
+ *   its `to`, from the factor held before (absolute, as R26);
  * - `rot` (added up: `p:animRot by`) and `rotAbs` (`p:animRot from/to`,
  *   `p:anim` on a rotation), in degrees;
  * - `op` (a fade filter, multiplied) and `opAbs` (`style.opacity`);
@@ -18,17 +19,21 @@
  * What it can't play: an entrance or exit becomes a fade over its
  * duration, anything else plays nothing; either way the click ends on its
  * build state, and `note` says so for the slide's "approximate" tooltip.
- * Colour changes have no motion here and show nothing (the build state
- * holds no colour). An indefinite duration plays nothing.
+ * Colour changes are not segments: `pptxPlay.ts` blends the drawn colours
+ * between the states before and after the click. A set that never ends
+ * (transparency) is instant, as in PowerPoint, and the state holds it.
  */
 
 import { formulaValue, type FormulaVars } from "./pptxFormula";
-import { targetKey, type Behaviour, type Effect } from "./pptxTiming";
+import { progress, targetKey, type Behaviour, type Effect } from "./pptxTiming";
 
-/** A target's place: centre and size, in fractions of the slide. */
-export type Geom = FormulaVars;
+export { progress, warp } from "./pptxTiming";
 
-export type Channel = "x" | "y" | "w" | "h" | "mx" | "my" | "sx" | "sy" | "rot" | "rotAbs" | "op" | "opAbs" | "clip";
+/** A target's place (centre and size, in fractions of the slide) and what
+ *  it holds before the step (R26–R27): a `to` scale or turn starts there. */
+export type Geom = FormulaVars & { sx?: number; sy?: number; turn?: number };
+
+export type Channel = "x" | "y" | "w" | "h" | "mx" | "my" | "sx" | "sy" | "sxAbs" | "syAbs" | "rot" | "rotAbs" | "op" | "opAbs" | "clip";
 
 export interface Segment {
   /** The target key (`targetKey`). */
@@ -55,56 +60,6 @@ export interface EffectMotion {
 }
 
 // --- time ---------------------------------------------------------------------------
-
-/**
- * SMIL acceleration: `accel` and `decel` (100000ths of the duration) turn
- * linear progress `q` (0–1) into eased progress with the same end points.
- */
-export function warp(q: number, accel: number, decel: number): number {
-  let a = Math.max(0, accel) / 100000;
-  let d = Math.max(0, decel) / 100000;
-  if (a + d > 1) {
-    const s = a + d;
-    a /= s;
-    d /= s;
-  }
-  if (a === 0 && d === 0) return q;
-  const r = 1 / (1 - a / 2 - d / 2);
-  if (q < a) return (r * q * q) / (2 * a);
-  if (q <= 1 - d) return r * (q - a / 2);
-  const e = 1 - q;
-  return 1 - (r * e * e) / (2 * d);
-}
-
-/**
- * Progress (0–1) of a timed node `tau` ms after it begins: null before it
- * begins; `repeat` in 1000ths (null: forever), `autoRev` plays each
- * iteration forward then back, acceleration applies to each simple
- * duration. Holds the last value after the end.
- */
-export function progress(
-  tau: number,
-  dur: number,
-  repeat: number | null,
-  autoRev: boolean,
-  accel: number,
-  decel: number,
-): number | null {
-  if (tau < 0) return null;
-  if (dur <= 0) return autoRev ? 0 : 1;
-  const iter = autoRev ? 2 : 1;
-  const total = repeat === null ? Infinity : (dur * iter * repeat) / 1000;
-  const s = Math.min(tau, total) / dur;
-  if (autoRev) {
-    let pos = s % 2;
-    if (pos === 0 && s > 0) return total === 0 ? 0 : warp(0, accel, decel);
-    if (pos > 1) pos = 2 - pos;
-    return warp(pos, accel, decel);
-  }
-  let pos = s % 1;
-  if (pos === 0 && s > 0) pos = 1;
-  return warp(pos, accel, decel);
-}
 
 /** A set whose dur is 1 is PowerPoint's instant (README R10). */
 function bDur(b: Behaviour): number | null {
@@ -545,7 +500,12 @@ function direction(e: Effect): "in" | "out" | null {
  */
 export function effectMotion(e: Effect, geom: (key: string) => Geom | null): EffectMotion {
   const none = (note: string | null): EffectMotion => ({ segments: [], from: e.start, to: e.start, note });
-  if (e.dur === null) return none(`${e.name}: not animated (it never ends)`);
+  if (e.dur === null) {
+    // A set that never ends (transparency's) acts at once and the state
+    // holds it (R24); anything else that never ends can't be played.
+    const instant = e.behaviours.every((b) => (b.dur !== null && b.repeatCount !== null) || b.kind === "set" || (b.kind === "effect" && b.filter === "image"));
+    return none(instant ? null : `${e.name}: not animated (it never ends)`);
+  }
   const end = e.start + e.dur;
   const dir = direction(e);
   const fade = (why: string): EffectMotion => {
@@ -567,20 +527,13 @@ export function effectMotion(e: Effect, geom: (key: string) => Geom | null): Eff
     const g = geom(key);
     // Commands and media have no picture to move.
     if (b.kind === "other") continue;
-    if (b.kind === "color") {
-      colour = true;
-      continue;
-    }
+    if (b.kind === "color") continue;
     if (b.kind === "set") {
       if (b.attrs.includes("style.visibility")) continue;
       if (b.attrs.includes("style.opacity")) {
         const v = typeof b.to === "number" ? b.to : typeof b.to === "string" ? Number(b.to) : NaN;
         if (!Number.isFinite(v)) return fade("an opacity it can't read");
         segments.push({ key, ch: "opAbs", value: (s) => { const c = clock(s); return c === null || c < b.delay ? null : v; } });
-        continue;
-      }
-      if (b.attrs.some((a) => COLOUR_ATTRS.test(a))) {
-        colour = true;
         continue;
       }
       continue;
@@ -628,27 +581,28 @@ export function effectMotion(e: Effect, geom: (key: string) => Geom | null): Eff
         break;
       }
       case "scale": {
-        const k = (pt: { x: number; y: number } | null, fb: number, axis: "x" | "y") => (pt === null ? fb : pt[axis] / 100000);
+        const k = (pt: { x: number; y: number } | null, axis: "x" | "y") => (pt === null ? null : pt[axis] / 100000);
         for (const axis of ["x", "y"] as const) {
-          let a: number;
-          let z: number;
-          if (b.by !== null && b.from === null && b.to === null) {
-            a = 1;
-            z = k(b.by, 1, axis);
-          } else {
-            a = k(b.from, 1, axis);
-            z = b.to !== null ? k(b.to, 1, axis) : a * k(b.by, 1, axis);
+          const held = (axis === "x" ? g.sx : g.sy) ?? 1;
+          const from = k(b.from, axis);
+          const to = k(b.to, axis);
+          const by = k(b.by, axis);
+          // `to` wins over `by` and is of the shape's own size (R26).
+          if (to !== null) {
+            const a0 = from ?? held;
+            if (!Number.isFinite(a0) || !Number.isFinite(to)) return fade("a scale it can't read");
+            segments.push({ key, ch: axis === "x" ? "sxAbs" : "syAbs", value: (s) => { const q = local(s); return q === null ? null : a0 + (to - a0) * q; } });
+          } else if (by !== null) {
+            if (!Number.isFinite(by)) return fade("a scale it can't read");
+            const a0 = from === null ? null : from / held;
+            segments.push({ key, ch: axis === "x" ? "sx" : "sy", value: (s) => { const q = local(s); return q === null ? null : (a0 ?? 1) * (1 + (by - 1) * q); } });
           }
-          if (!Number.isFinite(a) || !Number.isFinite(z)) return fade("a scale it can't read");
-          segments.push({ key, ch: axis === "x" ? "sx" : "sy", value: (s) => { const q = local(s); return q === null ? null : a + (z - a) * q; } });
         }
-        const same = (b.by === null || (b.by.x === 100000 && b.by.y === 100000)) && b.to === null;
-        if (!same && !b.autoRev && !e.autoRev) note ??= `${e.name}: returns to its size at the end of its click`;
         break;
       }
       case "rot": {
         if (b.from !== null || b.to !== null) {
-          const a = (b.from ?? 0) / 60000;
+          const a = b.from === null ? (g.turn ?? 0) : b.from / 60000;
           const z = b.to !== null ? b.to / 60000 : a + (b.by ?? 0) / 60000;
           segments.push({ key, ch: "rotAbs", value: (s) => { const q = local(s); return q === null ? null : a + (z - a) * q; } });
         } else if (b.by !== null) {
@@ -668,10 +622,7 @@ export function effectMotion(e: Effect, geom: (key: string) => Geom | null): Eff
       }
     }
   }
-  // A turn the build state can't hold (spin 360° and teeter end where they began).
-  const turned = e.behaviours.reduce((n, b) => n + (b.kind === "rot" && b.from === null && b.to === null && !b.autoRev ? (b.by ?? 0) : 0), 0);
-  if (turned % 21600000 !== 0 && !e.autoRev) note ??= `${e.name}: turns back at the end of its click`;
-  if (colour) note ??= `${e.name}: its colour change isn't shown`;
+  if (colour) note ??= `${e.name}: a colour change on an attribute other than fill, line or text isn't shown`;
   return { segments, from: e.start, to: end, note };
 }
 
