@@ -10,10 +10,11 @@
    * span. The package is loaded with the renderer's zip limits for untrusted
    * input and every external load target stripped first (`pptxDeck.ts`), so
    * a deck never fetches anything; web links in it open through the app.
-   * Builds play click by click in the show, with no motion yet: each click
-   * lands on the state PowerPoint's show reaches after it (`pptxTiming.ts`
-   * parses the slide's timing, `pptxTag.ts` finds its shapes in the drawn
-   * slide, `pptxPlay.ts` hides and offsets them). Browsing shows each slide
+   * Builds play click by click in the show: each click ends on the state
+   * PowerPoint's show reaches after it (`pptxTiming.ts` parses the slide's
+   * timing, `pptxTag.ts` finds its shapes in the drawn slide, `pptxPlay.ts`
+   * hides and offsets them), and a forward click plays its effects as
+   * motion on the way there (`pptxPlay.ts` `playStep`, from `pptxMotion.ts`). Browsing shows each slide
    * as drawn until a click dot in the bar is used; thumbnails always do.
    *
    * Context bridge: the slide's @ sends the slide (its title and text); the
@@ -54,7 +55,8 @@
   import { copyTabToWindow } from "../plugins/platform";
   import { buildStates, extractTiming, parseTimeline, type BuildState, type SlideTimeline, type TimingExtract } from "./pptxTiming";
   import { pruneTagged, tagSlide, type TaggedSlide } from "./pptxTag";
-  import { applyState, clearState } from "./pptxPlay";
+  import { applyState, clearState, playStep, type Playing } from "./pptxPlay";
+  import { motionNotes } from "./pptxMotion";
   import { sanitizeRendered } from "./officeSafety";
   import { revealRequest, takeReveal } from "../shared/reveal";
   import { activateUrl } from "../shared/urlOpen";
@@ -116,6 +118,34 @@
   const wsId = getActiveWorkspaceId() ?? "";
   const syncKey = $derived(syncName(wsId, "file", path));
 
+  // --- a click's motion ------------------------------------------------------------
+  // A forward click in the show plays its effects (`playStep`) between two
+  // build states; everything else lands on its state at once. A new move,
+  // a redraw, edit mode, leaving the show, hiding and unmounting all finish
+  // a click that is playing (it lands on its state, never pauses).
+
+  /** Forward clicks closer together than this land without playing (the
+   *  plugin deck viewer's flick rule). */
+  const FLICK_MS = 400;
+  /** The click playing on the stage (plain, never `$state`). */
+  let playing: { p: Playing; slide: number; build: number; tagged: TaggedSlide; gen: string } | null = null;
+  /** The click the next state pass plays rather than lands on. */
+  let toPlay: { slide: number; build: number } | null = null;
+  let lastClickAt = -Infinity;
+  /** A click is playing: the advance timer waits for it to land. */
+  let animating = $state(false);
+
+  function stopPlaying(): void {
+    const p = playing;
+    playing = null;
+    p?.p.finish();
+    if (animating) animating = false;
+  }
+
+  function reducedMotion(): boolean {
+    return typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
+  }
+
   const show = new SlideShow({
     deck: {
       count: () => deck?.presentation.slides.length ?? 0,
@@ -144,7 +174,23 @@
     // The show opens a slide before its first click, as PowerPoint's does;
     // the presenter's view keeps a build a click dot chose.
     opening: (mode, at) => ({ slide: at.slide, build: mode === "presenter" && !asDrawn ? at.build : 0 }),
-    arrive: (from, to) => {
+    arrive: (from, to, how) => {
+      // Another window naming the place we stand on must not cut a click off.
+      if (to.slide === from.slide && to.build === from.build) return;
+      stopPlaying();
+      toPlay = null;
+      // Only a click on in the show plays (the presenter's own view and
+      // every jump land at once); an advance by itself neither flicks nor
+      // counts as the click before the next.
+      if (how.click && show.mode === "present") {
+        let animate = !reducedMotion();
+        if (!how.auto) {
+          const now = performance.now();
+          if (now - lastClickAt < FLICK_MS) animate = false;
+          lastClickAt = now;
+        }
+        if (animate) toPlay = { slide: to.slide, build: to.build };
+      }
       if (to.slide === from.slide) return;
       clearPick();
       if (show.mode === "browse") asDrawn = true;
@@ -540,34 +586,83 @@
   const clicks = $derived(Math.max(0, (timed?.states.length ?? 1) - 1));
 
   // Put the build on the stage slide: each redraw is re-tagged, and the
-  // state goes back on it at once (no motion), so a deck re-read mid-show
-  // keeps its place. Kept neighbours and edit mode show the slide as drawn.
+  // state goes back on it at once, so a deck re-read mid-show keeps its
+  // place. A forward click in the show plays its way there instead
+  // (`toPlay`); any other pass finishes a click still playing. Kept
+  // neighbours and edit mode show the slide as drawn.
   $effect(() => {
     const i = current;
     const b = buildAt;
     const t = timed;
     const editing = editMode;
-    void deckGen;
-    void slideGen;
+    const gen = `${deckGen}:${slideGen}`;
     void slot;
     untrack(() => {
+      const want = toPlay;
+      toPlay = null;
+      const tagNow = stageHandles.get(i);
+      const ownPass =
+        playing !== null &&
+        playing.slide === i &&
+        playing.build === b &&
+        !editing &&
+        playing.gen === gen &&
+        tagNow !== undefined &&
+        stageTags.get(tagNow.element) === playing.tagged;
+      if (!ownPass) stopPlaying();
       let approx = false;
       for (const [j, handle] of stageHandles) {
         const tagged = stageTags.get(handle.element);
         if (tagged === undefined) continue;
         const state = j === i && b !== null && !editing ? t?.states[b] : undefined;
-        if (state === undefined) clearState(tagged);
-        else approx = applyState(tagged, state, w, h) || tagged.fellBack;
+        if (state === undefined) {
+          clearState(tagged);
+          continue;
+        }
+        if (playing !== null && playing.tagged === tagged) {
+          approx = playing.p.approximate;
+          continue;
+        }
+        if (t !== null && b !== null && want?.slide === i && want.build === b && onScreen.shown) {
+          const p = playStep(tagged, t.timeline, b, { w, h, states: t.states, reduced: reducedMotion() });
+          approx = p.approximate;
+          const mine = { p, slide: i, build: b, tagged, gen };
+          playing = mine;
+          animating = true;
+          void p.finished.then(() => {
+            if (playing !== mine) return;
+            playing = null;
+            if (!disposed) {
+              animating = false;
+              playApprox = p.approximate;
+            }
+          });
+          continue;
+        }
+        approx = applyState(tagged, state, w, h) || tagged.fellBack;
       }
       playApprox = approx;
     });
   });
 
+  // A hidden pane or page lands the click that is playing; so does unmounting.
+  $effect(() => {
+    if (!onScreen.shown) untrack(stopPlaying);
+  });
+  $effect(() => () => stopPlaying());
+
+  /** Effects on this slide that play other than PowerPoint would. */
+  const motionNote = $derived(timed === null ? "" : motionNotes(timed.timeline.steps).join("; "));
+
   /** Why the current slide's builds are approximate, for the dots' tooltip. */
   const approxNote = $derived.by(() => {
     const code = timed?.timeline.approximate ?? null;
     if (code !== null) return `this slide's animation couldn't be read (${code}): it shows as a plain slide`;
-    return playApprox ? "some builds on this slide are approximate: a shape or paragraph couldn't be matched to what was drawn" : "";
+    const parts = [
+      playApprox ? "some builds on this slide are approximate: a shape or paragraph couldn't be matched to what was drawn" : "",
+      motionNote,
+    ];
+    return parts.filter((p) => p !== "").join(" · ");
   });
 
   /** Show build `k` (a click dot); the build already shown goes back to the
@@ -578,9 +673,10 @@
   }
 
   // The show moves on by itself where the slide says (`advTm`), once its
-  // last build is up; only while someone can see it, and any move restarts it.
+  // last build is up and has played; only while someone can see it, and
+  // any move restarts it.
   $effect(() => {
-    if (!inShow || editMode || !onScreen.shown) return;
+    if (!inShow || editMode || !onScreen.shown || animating) return;
     const b = buildAt;
     const t = timed;
     const after = t?.timeline.transition?.advanceAfter ?? null;
@@ -1596,7 +1692,7 @@
       {#if hiddenSlide}<span class="tag" title="this slide is hidden in the slide show">hidden</span>{/if}
       <span
         class="limits"
-        title="drawn in the browser: builds appear and disappear click by click with no motion, no transitions, and fonts the deck doesn't embed fall back to this system's{deck.blocked > 0
+        title="drawn in the browser: a click plays its effects (rare ones as a fade), slides change without their transitions, and fonts the deck doesn't embed fall back to this system's{deck.blocked > 0
           ? `; ${deck.blocked} linked outside ${deck.blocked === 1 ? 'resource was' : 'resources were'} not loaded`
           : ''}{nodeErrors > 0 ? `; ${nodeErrors} ${nodeErrors === 1 ? 'shape' : 'shapes'} couldn't be drawn` : ''}"
         aria-label="rendering limits"

@@ -925,7 +925,7 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   renderer finishes text layout asynchronously and a detached slide measures as empty and loses
   its text — and the strip mounts only the thumbnails near its visible span, two per tick. Charts
   draw with ECharts (most of the viewer's ~1.1 MB / 345 KB-gzip chunk, loaded only by a deck).
-  **Builds step click by click, with no motion yet.** The show opens each slide as PowerPoint's
+  **Builds step click by click.** The show opens each slide as PowerPoint's
   does, before its first click; each click (→, Space, Enter, PageDown) lands on the state
   PowerPoint's show reaches after it (shapes and paragraphs appear and disappear, motion paths
   land at their ends), and at the last build the next click is the next slide's first state. Back
@@ -952,7 +952,30 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   their boxes instead); a text box whose background builds apart from its text (the renderer
   draws one box, so it shows with its text); paragraphs the renderer didn't draw one to one (the
   whole shape then comes with its first paragraph). Group members animate with their group.
-  Transitions and effect motion aren't played yet, and missing fonts fall back to the system's;
+  **A click in the show plays its effects as motion**, read from the effect's own behaviours in
+  the file rather than a table of presets (`pptxMotion.ts`, the arithmetic of its time values in
+  `pptxFormula.ts`), so an effect outside the vocabulary, like boomerang, still plays: fades;
+  fly, float and rise (`ppt_x`/`ppt_y`, from off the slide on their side); zoom and grow
+  (`ppt_w`/`ppt_h`, `animScale`); spin, teeter and other turns; motion paths (followed at a steady
+  speed, curves sampled, ending where the build state puts the shape); wipe from the side it
+  names (`wipe(down)`, PowerPoint's "From Bottom", shows the bottom first), split, box, circle,
+  diamond, plus (`in` closes from the edges, `out` opens from the centre), blinds and wheel as a
+  moving clip; with the file's delays, durations, repeats, auto-reverse and ease in/out. An
+  arrival by a click plays the slide's on-entry step first, and "after previous" chains run on
+  their own times. Rare filters (dissolve, checkerboard, random bars) fade; an entrance or exit
+  whose values can't be read fades over its duration; an emphasis that can't be read, a colour
+  change (fill colour, darken) and an effect that never ends (transparency) play nothing. Every
+  click ends on exactly its build state: a grow, an unfinished turn or a transparency doesn't
+  stay past its click, and the dots' tooltip names each such effect. Nothing animates on back,
+  Home, End, a dot or strip jump, a window joining, browsing, the presenter's own view (its now
+  and next show states at once), thumbnails or edit mode; forward clicks under 400 ms apart land
+  without playing (a click after a pause plays again); a click while one plays lands it first;
+  a slide's advance time starts once its last click has played; leaving the show, edit mode, a
+  re-read deck, hiding the pane or page and closing the view all land a playing click on its
+  state; `prefers-reduced-motion` plays nothing. A show window following the presenter plays
+  the clicks the presenter makes and lands on the same state. Each moved element runs one Web
+  Animation over the click (`fill: both`, then cancelled), so nothing is left inline.
+  Slide transitions aren't played yet, and missing fonts fall back to the system's;
   the ⓘ in the bar says so, and counts shapes that couldn't be drawn. Refused past 100 MB. A reveal's
   plain line (`deck.pptx:3`, a deck check's problem on slide 3) lands on that slide.
   A click in the show advances one build, as the clicker would, except on a link in the slide (a
