@@ -1,0 +1,263 @@
+{
+  "deck": "paths.pptx",
+  "slides": [
+    {
+      "part": "ppt/slides/slide1.xml",
+      "id": 256,
+      "transition": null,
+      "steps": [
+        [],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "path",
+            "preset": 63,
+            "subtype": 0,
+            "effect": "path",
+            "dir": null,
+            "target": "2",
+            "sets": null,
+            "path": "M 0 0 L 0.25 0 E"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "path",
+            "preset": 42,
+            "subtype": 0,
+            "effect": "path",
+            "dir": null,
+            "target": "3",
+            "sets": null,
+            "path": "M 0 0 L 0 0.25 E"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "path",
+            "preset": 49,
+            "subtype": 0,
+            "effect": "path",
+            "dir": null,
+            "target": "4",
+            "sets": null,
+            "path": "M 0 0 L 0.25 0.25 E"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "path",
+            "preset": 44,
+            "subtype": 0,
+            "effect": "path",
+            "dir": null,
+            "target": "5",
+            "sets": null,
+            "path": "M 0 0 L 0.067 -0.04 C 0.081 -0.049 0.102 -0.054 0.124 -0.054 C 0.149 -0.054 0.169 -0.049 0.183 -0.04 L 0.25 0 E"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "path",
+            "preset": 1,
+            "subtype": 0,
+            "effect": "path",
+            "dir": null,
+            "target": "6",
+            "sets": null,
+            "path": "M 0 0 C 0.069 0 0.125 0.056 0.125 0.125 C 0.125 0.194 0.069 0.25 0 0.25 C -0.069 0.25 -0.125 0.194 -0.125 0.125 C -0.125 0.056 -0.069 0 0 0 Z"
+          }
+        ]
+      ],
+      "states": [
+        {
+          "hidden": [],
+          "moved": {}
+        },
+        {
+          "hidden": [],
+          "moved": {
+            "2": [
+              0.25,
+              0
+            ]
+          }
+        },
+        {
+          "hidden": [],
+          "moved": {
+            "2": [
+              0.25,
+              0
+            ],
+            "3": [
+              0,
+              0.25
+            ]
+          }
+        },
+        {
+          "hidden": [],
+          "moved": {
+            "2": [
+              0.25,
+              0
+            ],
+            "3": [
+              0,
+              0.25
+            ],
+            "4": [
+              0.25,
+              0.25
+            ]
+          }
+        },
+        {
+          "hidden": [],
+          "moved": {
+            "2": [
+              0.25,
+              0
+            ],
+            "3": [
+              0,
+              0.25
+            ],
+            "4": [
+              0.25,
+              0.25
+            ],
+            "5": [
+              0.25,
+              0
+            ]
+          }
+        },
+        {
+          "hidden": [],
+          "moved": {
+            "2": [
+              0.25,
+              0
+            ],
+            "3": [
+              0,
+              0.25
+            ],
+            "4": [
+              0.25,
+              0.25
+            ],
+            "5": [
+              0.25,
+              0
+            ],
+            "6": [
+              0,
+              0
+            ]
+          }
+        }
+      ],
+      "interactive": 0
+    },
+    {
+      "part": "ppt/slides/slide2.xml",
+      "id": 257,
+      "transition": null,
+      "steps": [
+        [],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 500,
+            "class": "entr",
+            "preset": 10,
+            "subtype": 0,
+            "effect": "fade-in",
+            "dir": null,
+            "target": "2",
+            "sets": "visible"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "path",
+            "preset": 63,
+            "subtype": 0,
+            "effect": "path",
+            "dir": null,
+            "target": "2",
+            "sets": null,
+            "path": "M 0 0 L 0.25 0 E"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "path",
+            "preset": 42,
+            "subtype": 0,
+            "effect": "path",
+            "dir": null,
+            "target": "2",
+            "sets": null,
+            "path": "M 0 0 L 0 0.25 E"
+          }
+        ]
+      ],
+      "states": [
+        {
+          "hidden": [
+            "2"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [],
+          "moved": {}
+        },
+        {
+          "hidden": [],
+          "moved": {
+            "2": [
+              0.25,
+              0
+            ]
+          }
+        },
+        {
+          "hidden": [],
+          "moved": {
+            "2": [
+              0.25,
+              0.25
+            ]
+          }
+        }
+      ],
+      "interactive": 0
+    }
+  ]
+}

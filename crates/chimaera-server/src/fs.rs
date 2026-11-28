@@ -1375,8 +1375,9 @@ fn write_in_place(
     })
 }
 
-/// Largest file `fs/package` splices and `fs/file/stream` accepts. Both
-/// stream, so this bounds disk and I/O per save, not memory.
+/// Largest file `fs/package` splices and `fs/file/stream` accepts, and the
+/// largest a package splice may write (`fs/zip_splice.rs`). Both stream,
+/// so this bounds disk and I/O per save, not memory.
 pub(crate) const MAX_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
 /// Cap on a `fs/package` body: the base64 JSON of the changed parts only.
 pub(crate) const MAX_PACKAGE_BODY_BYTES: usize = 8 * 1024 * 1024;

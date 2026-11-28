@@ -1,0 +1,22 @@
+{
+  "part": "transition-unknown-choice.xml",
+  "id": 0,
+  "transition": {
+    "kind": "fade",
+    "dir": null,
+    "dur": 1000,
+    "advanceAfter": null,
+    "advanceOnClick": true,
+    "morph": null
+  },
+  "steps": [
+    []
+  ],
+  "states": [
+    {
+      "hidden": [],
+      "moved": {}
+    }
+  ],
+  "interactive": 0
+}

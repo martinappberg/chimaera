@@ -23,7 +23,7 @@ use axum::{
 use serde::Serialize;
 use serde_json::json;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::{mpsc, watch},
     task::JoinHandle,
 };
@@ -124,10 +124,18 @@ impl<P: Progress> Operation<P> {
         if *cancel.borrow() {
             return Exit::NotStarted;
         }
+        let mut terminal = None;
         run.command
             .stdin(match run.stdin {
                 Stdin::Closed => Stdio::null(),
                 Stdin::Lines { .. } => Stdio::piped(),
+                Stdin::Terminal { .. } => match stdin_terminal() {
+                    Ok((master, slave)) => {
+                        terminal = Some(tokio::fs::File::from_std(master));
+                        Stdio::from(slave)
+                    }
+                    Err(err) => return Exit::SpawnFailed(err),
+                },
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -143,7 +151,13 @@ impl<P: Progress> Operation<P> {
         let group = Group(nix::unistd::Pid::from_raw(pid as i32));
         let stdout = child.stdout.take().expect("piped");
         let stderr = child.stderr.take().expect("piped");
-        let mut stdin = child.stdin.take();
+        let mut stdin: Option<Box<dyn AsyncWrite + Unpin + Send>> = match terminal {
+            Some(master) => Some(Box::new(master)),
+            None => child
+                .stdin
+                .take()
+                .map(|pipe| Box::new(pipe) as Box<dyn AsyncWrite + Unpin + Send>),
+        };
         let mut lines = lock(&self.lines).take();
         // The pipes are read on their own task, so a chunk never waits on
         // the exit whichever `OutputEnd` the operation chose.
@@ -191,7 +205,7 @@ impl<P: Progress> Operation<P> {
                             pipe.flush().await
                         };
                         if write.await.is_err() {
-                            if let Stdin::Lines { closed } = run.stdin {
+                            if let Stdin::Lines { closed } | Stdin::Terminal { closed } = run.stdin {
                                 self.set_message(closed);
                             }
                         }
@@ -409,6 +423,29 @@ pub(crate) enum Stdin {
     /// Kept open for [`Operation::send_line`]; `closed` is the message when
     /// a line could not be written (the process stopped reading).
     Lines { closed: &'static str },
+    /// [`Stdin::Lines`] through a pseudo-terminal instead of a pipe, for a
+    /// CLI that treats a piped stdin as its input and stops asking (agy's
+    /// print-mode login). Echo is off; stdout and stderr stay pipes.
+    Terminal { closed: &'static str },
+}
+
+/// The pseudo-terminal behind [`Stdin::Terminal`]: the parent's writing end
+/// and the end the child gets as stdin. Both close on exec, so no other
+/// child the daemon spawns meanwhile inherits either.
+fn stdin_terminal() -> io::Result<(std::fs::File, std::os::fd::OwnedFd)> {
+    use nix::{
+        fcntl::{fcntl, FcntlArg, FdFlag},
+        sys::termios::{tcgetattr, tcsetattr, LocalFlags, SetArg},
+    };
+    let pty = nix::pty::openpty(None, None).map_err(io::Error::from)?;
+    for fd in [&pty.master, &pty.slave] {
+        fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(io::Error::from)?;
+    }
+    // Nobody reads the master: an echoed code would only sit in its buffer.
+    let mut modes = tcgetattr(&pty.slave).map_err(io::Error::from)?;
+    modes.local_flags.remove(LocalFlags::ECHO);
+    tcsetattr(&pty.slave, SetArg::TCSANOW, &modes).map_err(io::Error::from)?;
+    Ok((std::fs::File::from(pty.master), pty.slave))
 }
 
 /// When the operation's result is read.
