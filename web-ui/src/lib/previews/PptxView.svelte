@@ -2446,7 +2446,14 @@
      proportional at every fit. Chrome already keeps them proportional and
      gets wider at small sizes with it off, so this is WebKit's alone
      (`-apple-system-body` is a font only WebKit knows). Measured by the
-     wrap probe across fits 0.4–3 in both engines. */
+     wrap probe across fits 0.4–3 in both engines. It reaches every slide
+     WebKit draws here: browse, edit, the show, the presenter's frames and
+     the thumbnails, on purpose, so browse and the show lay a paragraph out
+     alike. Against `origin/main` (optical sizing on in browse) the corpus's
+     181 paragraphs keep every line count at 960×600 and 1600×1000; line
+     widths change by up to 3.2% (72 pt text), the same at both sizes.
+     Browse against the show: 0 line counts, widths within 0.01% (WebKit)
+     and 2.2% at 960×600, 0.14% at 1600×1000 (Chrome, untouched by this). */
   @supports (font: -apple-system-body) {
     .slide-scale,
     .thumb-slide {

@@ -1000,8 +1000,12 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   composites the scaled stage whenever a shape animates and every label on the slide thins,
   shifts and (above a fit of 1) blurs until the click lands. Browsing and edit mode keep the
   transform fit; text lays out the same under both, and at every fit (WebKit sets optical sizing
-  off on slides, since it picks the optical size and tracking from the used font size), which a
-  wrap probe holds for every corpus paragraph at fits 0.4–3 in Chrome and WebKit. A shape that
+  off on every slide it draws, browse, edit, show, presenter and thumbnails alike, since it picks
+  the optical size and tracking from the used font size), which a wrap probe holds for every corpus
+  paragraph at fits 0.4–3 in Chrome and WebKit. In the native app this changed browsing from
+  earlier releases for text in the system font: no corpus paragraph changes its line count, line
+  widths move by up to 3.2% (largest at display sizes), so a line already at its box's edge can
+  wrap differently than before; browse and the show then agree. A shape that
   grows or shrinks during a click repaints its shadow, glow or soft edge every frame: WebKit keeps
   an SVG filter's picture from the scale it was first painted at, so a zoom from nothing drew a
   pale smear the size of the shadow until it landed. The last animated frame and the landed one
