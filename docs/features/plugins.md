@@ -636,8 +636,9 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     `plugin-lock` workflow writes each bump with the release's own `tier` and `caps`
     (`.github/scripts/plugin-caps.mjs`, held to the daemon's reading by fixtures) and auto-merges it only
     when the plugin keeps its tier and its capability digest is exactly the approved one (its capability
-    lines unchanged too) and, for a privileged plugin, its `plugin.wasm` is attested by its own
-    repository's release workflow at the release's tag (`gh attestation verify`). Otherwise the PR waits
+    lines unchanged too) and, for a privileged plugin, its `plugin.wasm` is attested by the plugin
+    repository's release workflow, at the release's tag or on main, from the commit the tag points to
+    (`gh attestation verify`), so a release run by hand on main counts too. Otherwise the PR waits
     for a maintainer, and its body says which condition failed, whether provenance verified, and which
     Can lines the release adds and drops. CI checks only that the lock matches
     the release, which is not an approval: a green bump that waits still needs a person to read the code.

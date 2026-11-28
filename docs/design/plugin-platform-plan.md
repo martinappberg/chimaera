@@ -234,13 +234,17 @@ The platform's rule:
   workflow (`.github/workflows/release.yml`, a convention fixed in the chimaera
   repository, never read from the release) attests `plugin.wasm`, the exact file it
   uploads and lists in `SHA256SUMS` (`actions/attest-build-provenance`), and the lock
-  bump runs `gh attestation verify` on the release's bytes pinned to that repository,
-  that workflow and the release's tag ref (`--cert-identity`, `--source-ref`), then
-  checks gh's result again. A privileged release that changes none of its permissions
-  and verifies merges by itself: its code was built by its own repository's release
-  workflow from the tagged source, which is the review the lock PR stood in for. One
-  that doesn't verify (no attestation, another workflow or ref — a release run by hand
-  is attested at its branch — a network error, gh missing) waits for a person. The daemon does
+  bump requires it attested by the plugin repository's release workflow, at the
+  release's tag or on main, from the commit the tag points to: it resolves the tag to
+  its commit through the GitHub API, runs `gh attestation verify` on the release's
+  bytes pinned to that repository, that workflow at exactly one of the two refs
+  (`--cert-identity`, `--source-ref`) and that commit (`--source-digest`), then checks
+  gh's result again. Binding to the commit, not a ref name, is what lets a release run
+  by hand on main (how these plugins are released) count. A privileged release that
+  changes none of its permissions and verifies merges by itself: its code was built by
+  its own repository's release workflow from the tagged source, which is the review the
+  lock PR stood in for. One that doesn't verify (no attestation, another workflow, ref
+  or commit, an unresolvable tag, a network error, gh missing) waits for a person. The daemon does
   not verify attestations itself: it trusts the lock, which pins the hashes, so the
   check runs once, in CI, where people can see it.
 - **Rebuildable.** A plugin repository's CI builds its component twice, in different

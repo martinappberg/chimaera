@@ -122,22 +122,29 @@ does not activate it. Rebuild, copy and reinstall the same version to iterate.
    sandboxed, privileged stays privileged) with exactly the lock's `caps`,
    its capability lines (`api` and every table but `[adds]`, `[release]` and
    `[detect]`) equal its pinned release's, and, for a **privileged** plugin
-   only, its `plugin.wasm` is attested by its own repository's
-   `.github/workflows/release.yml` at the release's tag (`gh attestation
-   verify --repo <repo> --cert-identity
-   https://github.com/<repo>/.github/workflows/release.yml@refs/tags/v<version>
-   --source-ref refs/tags/v<version> --deny-self-hosted-runners`, then
-   checked again in the script). A privileged plugin's new code can pass new
+   only, its `plugin.wasm` is attested by the plugin repository's release
+   workflow, at the release's tag or on main, from the commit the tag points
+   to. The script resolves the tag to its commit through the GitHub API (an
+   annotated tag dereferenced; one that doesn't resolve waits), then tries
+   each accepted ref `<ref>` (`refs/tags/v<version>`, then `refs/heads/main`):
+   `gh attestation verify plugin.wasm --repo <repo> --cert-identity
+   https://github.com/<repo>/.github/workflows/release.yml@<ref> --source-ref
+   <ref> --source-digest <commit> --deny-self-hosted-runners --format json`,
+   and checks gh's result again (repository, exact signer and ref, commit,
+   GitHub-hosted runner, the wasm's sha256). The workflow path and `main` are
+   constants in the script, never read from the release. A release run by
+   hand (`workflow_dispatch` on `main`, how these plugins are usually
+   released) counts, because the attestation is bound to the commit the tag
+   points to, not to a ref name. A privileged plugin's new code can pass new
    arguments to the same programs, which no digest shows; the attestation
    proves the release was built from its tagged source by its own release
    workflow, so a person need not read it on every release. A sandboxed
    plugin needs none: the sandbox bounds its code. Each plugin repository's
    release workflow attests `plugin.wasm` (`actions/attest-build-provenance`;
-   the job holds `id-token: write` and `attestations: write`); a release run
-   by hand (`workflow_dispatch`) is attested at its branch, not the tag, so
-   its bump waits. Otherwise the PR waits for a maintainer, and its body says
-   which condition failed, whether the tier changed, whether provenance
-   verified (and against which workflow and tag), and which of the card's Can
+   the job holds `id-token: write` and `attestations: write`). Otherwise the
+   PR waits for a maintainer, and its body says which condition failed,
+   whether the tier changed, whether provenance verified (the ref it was
+   signed at and the commit), and which of the card's Can
    lines the release adds and drops, with links to the release and the
    compare view. Such a PR is
    usually green: CI checks only that the lock matches the release, which is

@@ -20,6 +20,7 @@ import {
   provenanceFailure,
   provenanceFrom,
   pullRequest,
+  resolveTagCommit,
   review,
   setLockValues,
   toolArtifacts,
@@ -327,8 +328,9 @@ const entryOf = (pinned, over = {}) => {
 /** A privileged release of the same plugin (it runs pandoc). */
 const privileged = (version, extra = "") => release(version, `[[programs]]\nname = "pandoc"${extra}`);
 /** What `verifyProvenance` answers for an attested release. */
-const VERIFIED = { verified: true, why: null, workflow: ".github/workflows/release.yml", ref: "refs/tags/v0.1.1" };
-const unverified = (why) => ({ verified: false, why, workflow: ".github/workflows/release.yml", ref: "refs/tags/v0.1.1" });
+const PROVENANCE_AT = { workflow: ".github/workflows/release.yml", refs: ["refs/tags/v0.1.1", "refs/heads/main"], commit: "1".repeat(40) };
+const VERIFIED = { ...PROVENANCE_AT, verified: true, why: null, ref: "refs/tags/v0.1.1" };
+const unverified = (why) => ({ ...PROVENANCE_AT, verified: false, why, ref: null });
 
 test("auto-merge needs the same tier, the approved digest, and provenance when privileged (the safeguard)", () => {
   const pinned = release("0.1.0");
@@ -404,17 +406,32 @@ test("capability changes the line heuristic can't see never merge by themselves"
   assert.match(body, /Runs bash: this plugin can run any command on this host/);
 });
 
+/** The commit a test release's tag points to, and another one. */
+const TAGGED = "1".repeat(40);
+const OTHER_COMMIT = "2".repeat(40);
+const ID = { repo: "o/notes", workflow: ".github/workflows/release.yml", refs: ["refs/tags/v0.1.1", "refs/heads/main"], commit: TAGGED };
+
 /** `gh attestation verify --format json` output for one attestation. */
-const ghResult = ({ repo = "o/notes", workflow = ".github/workflows/release.yml", ref = "refs/tags/v0.1.1", sha = "e".repeat(64) } = {}) =>
+const ghResult = ({
+  repo = "o/notes",
+  san = null,
+  workflow = ".github/workflows/release.yml",
+  ref = "refs/tags/v0.1.1",
+  commit = TAGGED,
+  runner = "github-hosted",
+  sha = "e".repeat(64),
+} = {}) =>
   JSON.stringify([
     {
       attestation: {},
       verificationResult: {
         signature: {
           certificate: {
-            subjectAlternativeName: `https://github.com/${repo}/${workflow}@${ref}`,
+            subjectAlternativeName: san ?? `https://github.com/${repo}/${workflow}@${ref}`,
             sourceRepositoryURI: `https://github.com/${repo}`,
             sourceRepositoryRef: ref,
+            sourceRepositoryDigest: commit,
+            runnerEnvironment: runner,
           },
         },
         statement: { subject: [{ name: "plugin.wasm", digest: { sha256: sha } }] },
@@ -422,81 +439,161 @@ const ghResult = ({ repo = "o/notes", workflow = ".github/workflows/release.yml"
     },
   ]);
 
-test("provenance: gh's result is checked again for the repository, workflow, ref and bytes", () => {
-  const id = attestationIdentity("o/notes", "v0.1.1");
-  assert.deepEqual(id, {
-    repo: "o/notes",
-    workflow: ".github/workflows/release.yml",
-    ref: "refs/tags/v0.1.1",
-    san: "https://github.com/o/notes/.github/workflows/release.yml@refs/tags/v0.1.1",
-  });
+test("provenance: gh's result is checked again for the repository, workflow, ref, commit, runner and bytes", () => {
+  assert.deepEqual(attestationIdentity("o/notes", "v0.1.1", TAGGED), ID);
+  assert.throws(() => attestationIdentity("o/notes", "v0.1.1", "abc"), /not a commit/);
   const sha = "e".repeat(64);
-  assert.deepEqual(provenanceFrom(ghResult(), id, sha), { verified: true, why: null });
-  assert.deepEqual(provenanceFrom(ghResult({ repo: "evil/notes" }), id, sha), { verified: false, why: "an attestation from another repository" });
-  assert.deepEqual(provenanceFrom(ghResult({ workflow: ".github/workflows/ci.yml" }), id, sha), {
+  const at = (opts, ref = "refs/tags/v0.1.1") => provenanceFrom(ghResult({ ref, ...opts }), ID, sha, ref);
+  assert.deepEqual(at({}), { verified: true, why: null }, "signed at the tag, from the tagged commit");
+  assert.deepEqual(at({ ref: "refs/heads/main" }, "refs/heads/main"), { verified: true, why: null }, "run by hand on main, from the tagged commit");
+  assert.deepEqual(at({ commit: OTHER_COMMIT }), { verified: false, why: "an attestation built from another commit than the tag's" });
+  assert.deepEqual(at({ ref: "refs/heads/main", commit: OTHER_COMMIT }, "refs/heads/main"), {
     verified: false,
-    why: "an attestation signed by another workflow",
+    why: "an attestation built from another commit than the tag's",
   });
-  assert.deepEqual(provenanceFrom(ghResult({ ref: "refs/heads/main" }), id, sha), {
+  assert.deepEqual(at({ repo: "evil/notes" }), { verified: false, why: "an attestation from another repository" });
+  assert.deepEqual(at({ repo: "xo/notes" }), { verified: false, why: "an attestation from another repository" }, "a repository with the same name suffix");
+  assert.deepEqual(at({ runner: "self-hosted" }), { verified: false, why: "an attestation made on a self-hosted runner" });
+  assert.deepEqual(at({ sha: "0".repeat(64) }), { verified: false, why: "an attestation over other bytes" });
+  // Look-alike signers never pass for the expected one.
+  const base = "https://github.com/o/notes/.github/workflows";
+  for (const [san, why] of [
+    [`${base}/release.yml.evil@refs/tags/v0.1.1`, /another workflow/],
+    [`${base}/ci.yml@refs/tags/v0.1.1`, /another workflow/],
+    [`${base}/release.yml@refs/heads/main2`, /another ref/],
+    [`${base}/release.yml@refs/heads/feature`, /another ref/],
+    [`${base}/release.yml@refs/tags/v0.1.1-x`, /another ref/],
+    [`https://github.com/xo/notes/.github/workflows/release.yml@refs/tags/v0.1.1`, /another workflow/],
+  ]) {
+    const got = provenanceFrom(ghResult({ san }), ID, sha, "refs/tags/v0.1.1");
+    assert.equal(got.verified, false, san);
+    assert.match(got.why, why, san);
+  }
+  // Only the two accepted refs are ever attempted.
+  assert.deepEqual(provenanceFrom(ghResult({ ref: "refs/heads/feature" }), ID, sha, "refs/heads/feature"), {
     verified: false,
-    why: "an attestation made at another ref, not refs/tags/v0.1.1",
+    why: "not an accepted ref: refs/heads/feature",
   });
-  assert.deepEqual(provenanceFrom(ghResult({ sha: "0".repeat(64) }), id, sha), { verified: false, why: "an attestation over other bytes" });
-  assert.deepEqual(provenanceFrom("[]", id, sha), { verified: false, why: "no attestation" });
-  assert.deepEqual(provenanceFrom("not json", id, sha), { verified: false, why: "gh printed no verification result" });
+  assert.deepEqual(provenanceFrom("[]", ID, sha, "refs/tags/v0.1.1"), { verified: false, why: "no attestation" });
+  assert.deepEqual(provenanceFrom("not json", ID, sha, "refs/tags/v0.1.1"), { verified: false, why: "gh printed no verification result" });
 });
 
-test("provenance: every failure of gh is a reason, never a throw", async () => {
-  assert.equal(provenanceFailure({ code: "ENOENT" }), "gh is not installed");
+test("the tag resolves to a commit through the API, an annotated tag dereferenced", async () => {
+  const api = (map) => async (path) => {
+    if (!(path in map)) throw Object.assign(new Error(`${path}: HTTP 404`), { status: 404 });
+    return map[path];
+  };
+  const ref = "/repos/o/notes/git/ref/tags/v0.1.1";
+  assert.equal(await resolveTagCommit("o/notes", "v0.1.1", api({ [ref]: { object: { type: "commit", sha: TAGGED } } })), TAGGED);
+  const annotated = "3".repeat(40);
   assert.equal(
-    provenanceFailure({ stderr: "Error: HTTP 404: Not Found (https://api.github.com/repos/o/notes/attestations/sha256:ab)" }),
-    "no attestation",
+    await resolveTagCommit(
+      "o/notes",
+      "v0.1.1",
+      api({ [ref]: { object: { type: "tag", sha: annotated } }, [`/repos/o/notes/git/tags/${annotated}`]: { object: { type: "commit", sha: TAGGED } } }),
+    ),
+    TAGGED,
   );
+  await assert.rejects(resolveTagCommit("o/notes", "v0.1.1", api({})), /404/);
+  await assert.rejects(resolveTagCommit("o/notes", "v0.1.1", api({ [ref]: { object: { type: "tree", sha: TAGGED } } })), /does not resolve to a commit/);
+  await assert.rejects(resolveTagCommit("o/notes", "v0.1.1", api({ [ref]: { object: { type: "commit", sha: "abc" } } })), /does not resolve to a commit/);
+  await assert.rejects(resolveTagCommit("o/notes", "v0.1.1", api({ [ref]: { object: { type: "tag", sha: annotated } } })), /404/);
+});
+
+/** A gh stand-in: answers per `--cert-identity` ref, records every call. */
+function fakeGh(answers) {
+  const calls = [];
+  const run = async (cmd, args, opts) => {
+    calls.push({ cmd, args, opts });
+    const ref = args[args.indexOf("--source-ref") + 1];
+    const answer = answers[ref];
+    if (answer === undefined) throw Object.assign(new Error("exit 1"), { stderr: "Error: HTTP 404: Not Found" });
+    if (answer instanceof Error) throw answer;
+    return { stdout: answer };
+  };
+  return { run, calls };
+}
+const resolvesTo = (commit) => async () => ({ object: { type: "commit", sha: commit } });
+
+test("provenance: every failure is a reason, never a throw; either accepted ref verifies", async () => {
+  assert.equal(provenanceFailure({ code: "ENOENT" }), "gh is not installed");
+  assert.equal(provenanceFailure({ stderr: "Error: HTTP 404: Not Found (https://api.github.com/repos/o/notes/attestations/sha256:ab)" }), "no attestation");
   assert.equal(provenanceFailure({ killed: true, signal: "SIGTERM", stderr: "" }), "gh attestation verify timed out");
   assert.equal(provenanceFailure({ stderr: "dial tcp: lookup api.github.com: no such host\nmore" }), "gh attestation verify failed: dial tcp: lookup api.github.com: no such host");
   const bytes = Buffer.from("wasm");
-  const fail = (error) => async () => {
-    throw error;
-  };
-  assert.deepEqual(await verifyProvenance(bytes, "o/notes", "v0.1.1", "", fail({ code: "ENOENT" })), unverified("gh is not installed"));
-  assert.deepEqual(await verifyProvenance(bytes, "o/notes", "v0.1.1", "", fail({ stderr: "Error: HTTP 404: Not Found" })), unverified("no attestation"));
-  assert.deepEqual(await verifyProvenance(bytes, "o/notes", "v0.1.1", "", fail({ stderr: "network is unreachable" })), unverified("gh attestation verify failed: network is unreachable"));
-  // A result for the right identity over these very bytes verifies.
   const sha = createHash("sha256").update(bytes).digest("hex");
-  let seen = null;
-  const ok = async (cmd, args, opts) => {
-    seen = { cmd, args, opts };
-    return { stdout: ghResult({ sha }) };
-  };
-  assert.deepEqual(await verifyProvenance(bytes, "o/notes", "v0.1.1", "tok", ok), VERIFIED);
-  assert.equal(seen.cmd, "gh");
-  assert.equal(seen.opts.env.GH_TOKEN, "tok");
-  assert.equal(seen.opts.shell, undefined, "never through a shell");
-  assert.deepEqual(seen.args.slice(0, 2), ["attestation", "verify"]);
-  assert.deepEqual(seen.args.slice(3), [
-    "--repo",
-    "o/notes",
-    "--cert-identity",
-    "https://github.com/o/notes/.github/workflows/release.yml@refs/tags/v0.1.1",
-    "--source-ref",
-    "refs/tags/v0.1.1",
-    "--deny-self-hosted-runners",
-    "--format",
-    "json",
-  ]);
-  // A repository or tag outside the lock's grammar never reaches gh.
-  let ran = false;
+  const opts = (run, commit = TAGGED) => ({ token: "tok", run, getJson: resolvesTo(commit) });
+  const expect = (rest) => ({ workflow: ".github/workflows/release.yml", refs: ["refs/tags/v0.1.1", "refs/heads/main"], commit: TAGGED, ...rest });
+
+  // No attestation at either ref.
+  let gh = fakeGh({});
+  assert.deepEqual(await verifyProvenance(bytes, "o/notes", "v0.1.1", opts(gh.run)), expect({ verified: false, why: "no attestation", ref: null }));
+  assert.equal(gh.calls.length, 2, "both refs tried");
+  // gh missing.
+  gh = fakeGh({ "refs/tags/v0.1.1": Object.assign(new Error("spawn gh ENOENT"), { code: "ENOENT" }), "refs/heads/main": Object.assign(new Error("spawn gh ENOENT"), { code: "ENOENT" }) });
+  assert.equal((await verifyProvenance(bytes, "o/notes", "v0.1.1", opts(gh.run))).why, "gh is not installed");
+  // Signed at the tag.
+  gh = fakeGh({ "refs/tags/v0.1.1": ghResult({ sha }) });
+  assert.deepEqual(await verifyProvenance(bytes, "o/notes", "v0.1.1", opts(gh.run)), expect({ verified: true, why: null, ref: "refs/tags/v0.1.1" }));
+  // Run by hand on main, from the tagged commit: verified at main.
+  gh = fakeGh({ "refs/heads/main": ghResult({ sha, ref: "refs/heads/main" }) });
+  assert.deepEqual(await verifyProvenance(bytes, "o/notes", "v0.1.1", opts(gh.run)), expect({ verified: true, why: null, ref: "refs/heads/main" }));
+  // On main from another commit than the tag's: waits, saying why.
+  gh = fakeGh({ "refs/heads/main": ghResult({ sha, ref: "refs/heads/main", commit: OTHER_COMMIT }) });
+  assert.deepEqual(
+    await verifyProvenance(bytes, "o/notes", "v0.1.1", opts(gh.run)),
+    expect({ verified: false, ref: null, why: "at refs/tags/v0.1.1: no attestation; at refs/heads/main: an attestation built from another commit than the tag's" }),
+  );
+  // A tag that doesn't resolve never reaches gh.
+  gh = fakeGh({ "refs/tags/v0.1.1": ghResult({ sha }) });
+  const lost = await verifyProvenance(bytes, "o/notes", "v0.1.1", {
+    run: gh.run,
+    getJson: async () => {
+      throw new Error("HTTP 404");
+    },
+  });
+  assert.equal(lost.verified, false);
+  assert.match(lost.why, /^the tag's commit is unknown: HTTP 404/);
+  assert.equal(gh.calls.length, 0);
+  // The calls: gh, an argv array, no shell, the token only as GH_TOKEN.
+  gh = fakeGh({});
+  await verifyProvenance(bytes, "o/notes", "v0.1.1", opts(gh.run));
+  for (const call of gh.calls) {
+    assert.equal(call.cmd, "gh");
+    assert.equal(call.opts.shell, undefined, "never through a shell");
+    assert.equal(call.opts.env.GH_TOKEN, "tok");
+    assert.equal(call.opts.env.GITHUB_TOKEN, undefined);
+  }
+  assert.deepEqual(
+    gh.calls.map((c) => c.args.slice(3)),
+    ["refs/tags/v0.1.1", "refs/heads/main"].map((ref) => [
+      "--repo",
+      "o/notes",
+      "--cert-identity",
+      `https://github.com/o/notes/.github/workflows/release.yml@${ref}`,
+      "--source-ref",
+      ref,
+      "--source-digest",
+      TAGGED,
+      "--deny-self-hosted-runners",
+      "--format",
+      "json",
+    ]),
+  );
+  // A repository or tag outside the lock's grammar never reaches the API or gh.
+  let asked = false;
   const never = async () => {
-    ran = true;
+    asked = true;
     return { stdout: "" };
   };
-  assert.equal((await verifyProvenance(bytes, "o/notes --repo x", "v0.1.1", "", never)).verified, false);
-  assert.equal((await verifyProvenance(bytes, "o/notes", "v0.1.1 --format=x", "", never)).verified, false);
-  assert.equal(ran, false);
+  assert.equal((await verifyProvenance(bytes, "o/notes --repo x", "v0.1.1", { run: never, getJson: never })).verified, false);
+  assert.equal((await verifyProvenance(bytes, "o/notes", "v0.1.1 --format=x", { run: never, getJson: never })).verified, false);
+  assert.equal(asked, false);
 });
 
 test("gh's arguments are an argv array: release-controlled text can't add a flag", () => {
-  assert.deepEqual(attestationArgs("/tmp/x/plugin.wasm", "o/notes", "v1.2.3"), [
+  const id = attestationIdentity("o/notes", "v1.2.3", TAGGED);
+  assert.deepEqual(attestationArgs("/tmp/x/plugin.wasm", id, "refs/tags/v1.2.3"), [
     "attestation",
     "verify",
     "/tmp/x/plugin.wasm",
@@ -506,22 +603,29 @@ test("gh's arguments are an argv array: release-controlled text can't add a flag
     "https://github.com/o/notes/.github/workflows/release.yml@refs/tags/v1.2.3",
     "--source-ref",
     "refs/tags/v1.2.3",
+    "--source-digest",
+    TAGGED,
     "--deny-self-hosted-runners",
     "--format",
     "json",
   ]);
-  for (const [repo, tag] of [
-    ["o/notes; rm -rf /", "v1.2.3"],
-    ["o/notes", "v1.2.3\n--owner x"],
-    ["o/notes", "1.2.3"],
-    ["o/notes", "v1.2.3-rc1"],
-    ["$(x)/y", "v1.2.3"],
+  assert.equal(attestationArgs("f", id, "refs/heads/main")[6], "https://github.com/o/notes/.github/workflows/release.yml@refs/heads/main");
+  for (const ref of ["refs/heads/main2", "refs/heads/feature", "refs/tags/v1.2.3-x", "refs/tags/v1.2.4"]) {
+    assert.throws(() => attestationArgs("f", id, ref), /not an accepted ref/, ref);
+  }
+  for (const [repo, tag, commit] of [
+    ["o/notes; rm -rf /", "v1.2.3", TAGGED],
+    ["o/notes", "v1.2.3\n--owner x", TAGGED],
+    ["o/notes", "1.2.3", TAGGED],
+    ["o/notes", "v1.2.3-rc1", TAGGED],
+    ["$(x)/y", "v1.2.3", TAGGED],
+    ["o/notes", "v1.2.3", "--owner"],
   ]) {
-    assert.throws(() => attestationArgs("f", repo, tag), /not a (repository|release tag)/);
+    assert.throws(() => attestationIdentity(repo, tag, commit), /not a (repository|release tag|commit)/);
   }
 });
 
-test("each auto-merge condition, false in turn, holds the bump for a person", () => {
+test("each auto-merge condition, false in turn, holds the bump for a person", async () => {
   const pinned = release("0.1.0");
   const same = release("0.1.1");
   const base = entryOf(pinned);
@@ -530,8 +634,14 @@ test("each auto-merge condition, false in turn, holds the bump for a person", ()
   const privSame = privileged("0.1.1");
   assert.deepEqual(review(base, pinned, same), { automerge: true, why: null }, "sandboxed: all conditions hold");
   assert.deepEqual(review(priv, pinnedPriv, privSame, VERIFIED), { automerge: true, why: null }, "privileged: all conditions hold");
-  const id = attestationIdentity("o/notes", "v0.1.1");
-  const sha = "e".repeat(64);
+  // Provenance as verifyProvenance gives it, for each way a release is made.
+  const bytes = Buffer.from("wasm");
+  const sha = createHash("sha256").update(bytes).digest("hex");
+  const prov = (answers, commit = TAGGED) => verifyProvenance(bytes, "o/notes", "v0.1.1", { run: fakeGh(answers).run, getJson: resolvesTo(commit) });
+  const onMain = await prov({ "refs/heads/main": ghResult({ sha, ref: "refs/heads/main" }) });
+  assert.deepEqual(review(priv, pinnedPriv, privSame, onMain), { automerge: true, why: null }, "run by hand on main, from the tagged commit");
+  assert.deepEqual(review(priv, pinnedPriv, privSame, await prov({ "refs/tags/v0.1.1": ghResult({ sha }) })), { automerge: true, why: null }, "tag push");
+  const id = attestationIdentity("o/notes", "v0.1.1", TAGGED);
   const cases = [
     ["the lock's tier is another word", { ...base, tier: "sandboxed " }, pinned, same, VERIFIED, /neither sandboxed nor privileged/],
     ["the lock's caps were edited by hand", { ...base, caps: "0".repeat(64) }, pinned, same, VERIFIED, /the pinned release doesn't read as the tier and caps the lock records/],
@@ -545,19 +655,34 @@ test("each auto-merge condition, false in turn, holds the bump for a person", ()
     ["a privileged release's digest changed", priv, pinnedPriv, privileged("0.1.1", '\nnetwork = "CTAN"'), VERIFIED, /capability digest is not the approved one/],
     ["only the capability lines changed", base, pinned, release("0.1.1").replace('files = "read"', "files = 'read'"), VERIFIED, /^its capability lines changed$/],
     ["a privileged release's lines changed", priv, pinnedPriv, privSame.replace('name = "pandoc"', "name = 'pandoc'"), VERIFIED, /^its capability lines changed$/],
-    ["privileged, not attested", priv, pinnedPriv, privSame, unverified("no attestation"), /privileged and its provenance did not verify: no attestation/],
+    ["privileged, not attested", priv, pinnedPriv, privSame, await prov({}), /privileged and its provenance did not verify: no attestation/],
     ["privileged, gh missing", priv, pinnedPriv, privSame, unverified("gh is not installed"), /gh is not installed/],
     ["privileged, never checked", priv, pinnedPriv, privSame, null, /did not verify: not checked/],
-    ["privileged, attested by another repository", priv, pinnedPriv, privSame, provenanceFrom(ghResult({ repo: "evil/notes" }), id, sha), /another repository/],
-    ["privileged, attested by another workflow", priv, pinnedPriv, privSame, provenanceFrom(ghResult({ workflow: ".github/workflows/ci.yml" }), id, sha), /another workflow/],
-    ["privileged, attested at another ref", priv, pinnedPriv, privSame, provenanceFrom(ghResult({ ref: "refs/heads/main" }), id, sha), /another ref/],
-    ["privileged, attested over other bytes", priv, pinnedPriv, privSame, provenanceFrom(ghResult({ sha: "0".repeat(64) }), id, sha), /other bytes/],
+    ["privileged, on main from another commit", priv, pinnedPriv, privSame, await prov({ "refs/heads/main": ghResult({ sha, ref: "refs/heads/main", commit: OTHER_COMMIT }) }), /another commit than the tag's/],
+    ["privileged, at the tag from another commit", priv, pinnedPriv, privSame, await prov({ "refs/tags/v0.1.1": ghResult({ sha, commit: OTHER_COMMIT }) }), /another commit than the tag's/],
+    ["privileged, signed on another branch", priv, pinnedPriv, privSame, await prov({ "refs/heads/main": ghResult({ sha, san: "https://github.com/o/notes/.github/workflows/release.yml@refs/heads/feature", ref: "refs/heads/main" }) }), /another ref \(refs\/heads\/feature\)/],
+    ["privileged, the tag doesn't resolve", priv, pinnedPriv, privSame, await verifyProvenance(bytes, "o/notes", "v0.1.1", { run: fakeGh({}).run, getJson: async () => ({ object: { type: "tree", sha: TAGGED } }) }), /the tag's commit is unknown/],
+    ["privileged, attested by another repository", priv, pinnedPriv, privSame, provenanceFrom(ghResult({ repo: "evil/notes" }), id, "e".repeat(64), "refs/tags/v0.1.1"), /another repository/],
+    ["privileged, attested by another workflow", priv, pinnedPriv, privSame, provenanceFrom(ghResult({ workflow: ".github/workflows/ci.yml" }), id, "e".repeat(64), "refs/tags/v0.1.1"), /another workflow/],
+    ["privileged, attested at another ref", priv, pinnedPriv, privSame, provenanceFrom(ghResult({ ref: "refs/heads/main2" }), id, "e".repeat(64), "refs/tags/v0.1.1"), /another ref/],
+    ["privileged, attested over other bytes", priv, pinnedPriv, privSame, provenanceFrom(ghResult({ sha: "0".repeat(64) }), id, "e".repeat(64), "refs/tags/v0.1.1"), /other bytes/],
   ];
   for (const [what, entry, p, r, provenance, reason] of cases) {
     const got = review(entry, p, r, provenance);
     assert.equal(got.automerge, false, what);
     assert.match(got.why, reason, what);
   }
+  // The body says where it was signed and from which commit.
+  const bump = { ...bumpOf(pinnedPriv, privSame), provenance: onMain, ...review(priv, pinnedPriv, privSame, onMain) };
+  assert.match(
+    pullRequest([bump]).body,
+    /- Provenance: verified — `plugin.wasm` is attested by `o\/notes`'s `\.github\/workflows\/release\.yml`, signed at `refs\/heads\/main`, built from commit `1{40}` \(the tag's\)\./,
+  );
+  const waits = { ...bumpOf(pinnedPriv, privSame), provenance: await prov({}), ...review(priv, pinnedPriv, privSame, await prov({})) };
+  assert.match(
+    pullRequest([waits]).body,
+    /- Provenance: \*\*not verified\*\* \(` no attestation `\); expected an attestation of `plugin\.wasm` by `o\/notes`'s `\.github\/workflows\/release\.yml` at `refs\/tags\/v0\.1\.1` or `refs\/heads\/main`, built from commit `1{40}`\./,
+  );
 });
 
 test("over every pair of parity-fixture manifests, auto-merge only with the same tier, equal digests, and provenance when privileged", () => {

@@ -20,7 +20,8 @@
 // caps, the release reads as the lock's tier with the lock's caps, and —
 // stricter still — its capability lines are the pinned release's), and, for
 // a privileged plugin, its plugin.wasm is attested by its own repository's
-// release workflow (RELEASE_WORKFLOW) at the release's tag
+// release workflow (RELEASE_WORKFLOW), at the release's tag or on main
+// (MAIN_REF), from the commit the tag points to
 // (`verifyProvenance`, `gh attestation verify`). A sandboxed plugin needs no
 // attestation: the sandbox bounds its code. Otherwise the PR opens without
 // auto-merge and says which condition failed. Either way the lock is written with the release's own
@@ -298,11 +299,13 @@ function capabilitySection(b) {
   }
   if (b.lock_drift) out.push(`- Note: the lock's tier and caps for v${b.from} aren't what this script reads from that release (${b.lock_drift}); check \`chimaera plugin caps\` on it.`);
   if (b.provenance) {
-    const against = `\`${b.repo}\`'s \`${b.provenance.workflow}\` at \`${b.provenance.ref ?? "?"}\``;
+    const p = b.provenance;
+    const commit = p.commit ? `commit \`${p.commit}\`` : "the commit the tag points to (unresolved)";
+    const refs = (p.refs ?? []).map((r) => `\`${r}\``).join(" or ");
     out.push(
-      b.provenance.verified
-        ? `- Provenance: verified — \`plugin.wasm\` is attested by ${against}.`
-        : `- Provenance: **not verified** (${code(b.provenance.why)}); expected an attestation of \`plugin.wasm\` by ${against}.`,
+      p.verified
+        ? `- Provenance: verified — \`plugin.wasm\` is attested by \`${b.repo}\`'s \`${p.workflow}\`, signed at \`${p.ref}\`, built from ${commit} (the tag's).`
+        : `- Provenance: **not verified** (${code(p.why)}); expected an attestation of \`plugin.wasm\` by \`${b.repo}\`'s \`${p.workflow}\` at ${refs}, built from ${commit}.`,
     );
   }
   out.push("");
@@ -343,12 +346,12 @@ export function pullRequest(bumps) {
     ...bumps.flatMap(capabilitySection),
     ...(review.length === 0
       ? [
-          "Each release keeps its tier and its capability digest is exactly the one the lock already approved (its capability lines are the pinned release's too), so the `tier` and `caps` written are the approved ones. A privileged one's `plugin.wasm` is also attested by its repository's release workflow at the release's tag.",
+          "Each release keeps its tier and its capability digest is exactly the one the lock already approved (its capability lines are the pinned release's too), so the `tier` and `caps` written are the approved ones. A privileged one's `plugin.wasm` is also attested by the plugin repository's release workflow, at the release's tag or on main, from the commit the tag points to.",
           "",
           "CI installs these releases from GitHub against the new lock (`scripts/build-plugins.sh` and the server's plugin tests). Auto-merge (squash) is on: it lands when the required checks pass, and the `fix:` title requests a patch release, so the next daily release brings the app the new versions.",
         ]
       : [
-          "**Needs a maintainer's review — no auto-merge.** A bump merges by itself only when the plugin keeps its tier, its capability digest is exactly the approved one, and — for a privileged plugin — its `plugin.wasm` is attested by its repository's release workflow at the release's tag. Here that doesn't hold:",
+          "**Needs a maintainer's review — no auto-merge.** A bump merges by itself only when the plugin keeps its tier, its capability digest is exactly the approved one, and — for a privileged plugin — its `plugin.wasm` is attested by the plugin repository's release workflow, at the release's tag or on main, from the commit the tag points to. Here that doesn't hold:",
           "",
           ...review.map((b) => `- \`${b.id}\` ${b.to}: ${b.why}`),
           "",
@@ -370,8 +373,9 @@ export function pullRequest(bumps) {
  *   4. stricter still, its capability lines (`capabilityLines`) are the
  *      pinned release's: a line heuristic is never the only gate;
  *   5. for a privileged plugin only: provenance verified (`provenance`, the
- *      result of `verifyProvenance`): its plugin.wasm is attested by its own
- *      repository's release workflow at the release's tag. Its new code can
+ *      result of `verifyProvenance`): its plugin.wasm is attested by the
+ *      plugin repository's release workflow, at the release's tag or on
+ *      main, from the commit the tag points to. Its new code can
  *      pass new arguments to the same programs, which no digest sees, so
  *      without that the lock PR is where a person reads it. A sandboxed
  *      plugin needs no provenance: the sandbox bounds what its code can do.
@@ -413,26 +417,43 @@ export function review(entry, pinnedToml, releaseToml, provenance = null) {
 /** The release workflow every first-party plugin repository publishes from:
  *  a convention fixed here, never read from the release. */
 export const RELEASE_WORKFLOW = ".github/workflows/release.yml";
+/** The plugin repositories' default branch, where a release run by hand
+ *  (workflow_dispatch) signs from: a constant, never read from the release. */
+export const MAIN_REF = "refs/heads/main";
 
-/** The identity a release's plugin.wasm must be attested by: the plugin
- *  repository's own release workflow, run for the release's tag. */
-export function attestationIdentity(repo, tag) {
+const COMMIT_RE = /^[0-9a-f]{40}$/;
+
+/**
+ * The identity a release's plugin.wasm must be attested by: the plugin
+ * repository's own release workflow, signed at the release's tag or on main
+ * (exactly these two refs), from `commit`, the commit the tag points to.
+ * Repo, tag and commit are checked against the lock's, the tag's and git's
+ * grammar first.
+ */
+export function attestationIdentity(repo, tag, commit) {
   if (!REPO_RE.test(repo)) throw new Error(`not a repository: ${JSON.stringify(repo)}`);
   if (!/^v[0-9]+\.[0-9]+\.[0-9]+$/.test(tag)) throw new Error(`not a release tag: ${JSON.stringify(tag)}`);
-  const ref = `refs/tags/${tag}`;
-  return { repo, workflow: RELEASE_WORKFLOW, ref, san: `https://github.com/${repo}/${RELEASE_WORKFLOW}@${ref}` };
+  if (!COMMIT_RE.test(commit ?? "")) throw new Error(`not a commit: ${JSON.stringify(commit)}`);
+  return { repo, workflow: RELEASE_WORKFLOW, refs: [`refs/tags/${tag}`, MAIN_REF], commit };
+}
+
+/** The certificate identity (SAN) of `repo`'s release workflow at `ref`. */
+export function signerIdentity(repo, ref) {
+  return `https://github.com/${repo}/${RELEASE_WORKFLOW}@${ref}`;
 }
 
 /**
  * `gh attestation verify`'s arguments (an argv array, run without a shell)
- * for the release's plugin.wasm at `file`: attestations of that repository
- * only, whose certificate names exactly its release workflow at the tag
- * (`--cert-identity`: the signer workflow and the ref together), from the
- * tag's source ref, not built on a self-hosted runner, SLSA provenance (gh's
- * default predicate). Repo and tag are checked first (lock and tag grammar).
+ * for the release's plugin.wasm at `file`, one attempt per accepted ref:
+ * attestations of that repository only (`--repo`), whose certificate names
+ * exactly its release workflow at `ref` (`--cert-identity`, an exact SAN, so
+ * no look-alike path or ref can match), from that ref (`--source-ref`) and
+ * from the tagged commit (`--source-digest`, the certificate's source
+ * repository digest), not built on a self-hosted runner, SLSA provenance
+ * (gh's default predicate).
  */
-export function attestationArgs(file, repo, tag) {
-  const id = attestationIdentity(repo, tag);
+export function attestationArgs(file, id, ref) {
+  if (!id.refs.includes(ref)) throw new Error(`not an accepted ref: ${JSON.stringify(ref)}`);
   return [
     "attestation",
     "verify",
@@ -440,9 +461,11 @@ export function attestationArgs(file, repo, tag) {
     "--repo",
     id.repo,
     "--cert-identity",
-    id.san,
+    signerIdentity(id.repo, ref),
     "--source-ref",
-    id.ref,
+    ref,
+    "--source-digest",
+    id.commit,
     "--deny-self-hosted-runners",
     "--format",
     "json",
@@ -450,30 +473,35 @@ export function attestationArgs(file, repo, tag) {
 }
 
 /**
- * What `gh attestation verify --format json` printed, checked again here
- * (fail closed, whatever gh's flags did): at least one verified attestation,
- * every one over `sha256` and signed by exactly the expected repository,
- * workflow and ref. `{verified, why}`.
+ * What `gh attestation verify --format json` printed for the attempt at
+ * `ref`, checked again here (fail closed, whatever gh's flags did): at least
+ * one verified attestation, every one over `sha256`, from exactly the
+ * repository, signed by exactly its release workflow at `ref`, from the
+ * tagged commit, on a GitHub-hosted runner. `{verified, why}`.
  */
-export function provenanceFrom(stdout, id, sha256) {
+export function provenanceFrom(stdout, id, sha256, ref) {
   let results;
   try {
     results = JSON.parse(stdout);
   } catch {
     return { verified: false, why: "gh printed no verification result" };
   }
+  if (!id.refs.includes(ref)) return { verified: false, why: `not an accepted ref: ${ref}` };
   if (!Array.isArray(results) || results.length === 0) return { verified: false, why: "no attestation" };
+  const workflowURI = `https://github.com/${id.repo}/${id.workflow}`;
   for (const r of results) {
     const cert = r?.verificationResult?.signature?.certificate ?? {};
     const subjects = r?.verificationResult?.statement?.subject ?? [];
     if (cert.sourceRepositoryURI !== `https://github.com/${id.repo}`) return { verified: false, why: "an attestation from another repository" };
-    if (cert.subjectAlternativeName !== id.san) {
-      const [workflow, ref] = String(cert.subjectAlternativeName ?? "").split("@");
-      if (workflow !== `https://github.com/${id.repo}/${id.workflow}`) return { verified: false, why: "an attestation signed by another workflow" };
-      if (ref !== id.ref) return { verified: false, why: `an attestation made at another ref, not ${id.ref}` };
-      return { verified: false, why: "an attestation signed by another identity" };
+    const san = String(cert.subjectAlternativeName ?? "");
+    if (san !== signerIdentity(id.repo, ref)) {
+      const at = san.lastIndexOf("@");
+      if (at < 0 || san.slice(0, at) !== workflowURI) return { verified: false, why: "an attestation signed by another workflow" };
+      return { verified: false, why: `an attestation signed at another ref (${oneLine(san.slice(at + 1), 80)})` };
     }
-    if (cert.sourceRepositoryRef !== id.ref) return { verified: false, why: `an attestation made at another ref, not ${id.ref}` };
+    if (cert.sourceRepositoryRef !== ref) return { verified: false, why: `an attestation made at another ref, not ${ref}` };
+    if (cert.sourceRepositoryDigest !== id.commit) return { verified: false, why: "an attestation built from another commit than the tag's" };
+    if (cert.runnerEnvironment !== "github-hosted") return { verified: false, why: "an attestation made on a self-hosted runner" };
     if (!Array.isArray(subjects) || !subjects.some((s) => s?.digest?.sha256 === sha256)) {
       return { verified: false, why: "an attestation over other bytes" };
     }
@@ -492,20 +520,44 @@ export function provenanceFailure(error) {
 }
 
 /**
- * Whether the release's plugin.wasm (`bytes`, the file whose sha256 the lock
- * takes) is attested by `repo`'s release workflow at `tag`: runs gh (no
- * shell; the token, when given, only as GH_TOKEN for GitHub's API). Every
- * failure — gh missing, a network error, no attestation, another identity —
- * is `verified: false` with why, never a throw.
+ * The commit `tag` points to in `repo`, through the GitHub API (`getJson`
+ * fetches one API path): an annotated tag is dereferenced to its commit.
+ * Throws unless it ends at a commit with a 40-hex SHA.
  */
-export async function verifyProvenance(bytes, repo, tag, token, run = execFileAsync) {
-  let id;
-  try {
-    id = attestationIdentity(repo, tag);
-  } catch (error) {
-    return { verified: false, why: error instanceof Error ? error.message : String(error), workflow: RELEASE_WORKFLOW, ref: null };
+export async function resolveTagCommit(repo, tag, getJson) {
+  let object = (await getJson(`/repos/${repo}/git/ref/tags/${tag}`))?.object;
+  for (let hops = 0; object?.type === "tag" && hops < 4; hops++) {
+    if (!COMMIT_RE.test(object.sha ?? "")) break;
+    object = (await getJson(`/repos/${repo}/git/tags/${object.sha}`))?.object;
   }
-  const where = { workflow: id.workflow, ref: id.ref };
+  if (object?.type !== "commit" || !COMMIT_RE.test(object.sha ?? "")) {
+    throw new Error(`${tag} does not resolve to a commit`);
+  }
+  return object.sha;
+}
+
+/**
+ * Whether the release's plugin.wasm (`bytes`, the file whose sha256 the lock
+ * takes) is attested by `repo`'s release workflow, at the release's tag or on
+ * main, from the commit `tag` points to. Resolves the tag itself, then runs
+ * gh once per accepted ref (no shell; the token, when given, only as
+ * GH_TOKEN for GitHub's API). Every failure — an unresolvable tag, gh
+ * missing, a network error, no attestation, another identity or commit — is
+ * `verified: false` with why, never a throw. `{verified, why, workflow, ref,
+ * refs, commit}`: `ref` is the ref it was signed at, when it verified.
+ */
+export async function verifyProvenance(bytes, repo, tag, { token = "", run = execFileAsync, getJson } = {}) {
+  const base = { workflow: RELEASE_WORKFLOW, ref: null, refs: [`refs/tags/${tag}`, MAIN_REF], commit: null };
+  let commit;
+  try {
+    if (!REPO_RE.test(repo)) throw new Error(`not a repository: ${JSON.stringify(repo)}`);
+    if (!/^v[0-9]+\.[0-9]+\.[0-9]+$/.test(tag)) throw new Error(`not a release tag: ${JSON.stringify(tag)}`);
+    commit = await resolveTagCommit(repo, tag, getJson ?? ((path) => get(`${API}${path}`, { json: true, max: 1 << 20, token })));
+  } catch (error) {
+    return { ...base, verified: false, why: `the tag's commit is unknown: ${oneLine(error instanceof Error ? error.message : String(error), 160)}` };
+  }
+  const id = attestationIdentity(repo, tag, commit);
+  const where = { workflow: id.workflow, refs: id.refs, commit };
   const dir = await mkdtemp(join(tmpdir(), "plugin-lock-"));
   try {
     const file = join(dir, "plugin.wasm");
@@ -513,13 +565,21 @@ export async function verifyProvenance(bytes, repo, tag, token, run = execFileAs
     const env = { ...process.env };
     delete env.GITHUB_TOKEN;
     if (token !== "") env.GH_TOKEN = token;
-    let stdout;
-    try {
-      ({ stdout } = await run("gh", attestationArgs(file, repo, tag), { env, timeout: 180_000, maxBuffer: 16 * 1024 * 1024 }));
-    } catch (error) {
-      return { verified: false, why: provenanceFailure(error), ...where };
+    const failures = [];
+    for (const ref of id.refs) {
+      let result;
+      try {
+        const { stdout } = await run("gh", attestationArgs(file, id, ref), { env, timeout: 180_000, maxBuffer: 16 * 1024 * 1024 });
+        result = provenanceFrom(stdout, id, sha256(bytes), ref);
+      } catch (error) {
+        result = { verified: false, why: provenanceFailure(error) };
+      }
+      if (result.verified) return { ...where, verified: true, why: null, ref };
+      failures.push([ref, result.why]);
     }
-    return { ...provenanceFrom(stdout, id, sha256(bytes)), ...where };
+    const whys = [...new Set(failures.map(([, why]) => why))];
+    const why = whys.length === 1 ? whys[0] : failures.map(([ref, w]) => `at ${ref}: ${w}`).join("; ");
+    return { ...where, verified: false, why, ref: null };
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -645,10 +705,11 @@ async function check(entry, token) {
     throw refuse(`plugin.toml can't be read for capabilities: ${error instanceof Error ? error.message : String(error)}`);
   }
   // A privileged plugin's release merges by itself only if its plugin.wasm
-  // (these bytes, whose sha256 the lock takes) is attested by its own
-  // repository's release workflow at this tag.
+  // (these bytes, whose sha256 the lock takes) is attested by the plugin
+  // repository's release workflow, at this tag or on main, from the commit
+  // the tag points to.
   const provenance =
-    entry.tier === "privileged" || caps.tier === "privileged" ? await verifyProvenance(wasm, entry.repo, tag, token) : null;
+    entry.tier === "privileged" || caps.tier === "privileged" ? await verifyProvenance(wasm, entry.repo, tag, { token }) : null;
   if (provenance !== null) console.log(`${entry.id} ${tag}: provenance ${provenance.verified ? "verified" : `not verified (${provenance.why})`}`);
   const { automerge, why } = review(entry, pinned.toString("utf8"), toml.toString("utf8"), provenance);
   // Every tool download it names, fetched and compared: the lock pins this

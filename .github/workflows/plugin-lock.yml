@@ -10,8 +10,9 @@ name: plugin-lock
 # reading by fixtures). The PR auto-merges (squash) only when every bumped
 # plugin keeps its tier and its capability digest is exactly the one the
 # lock approved (and its capability lines are its pinned release's), and a
-# privileged one's plugin.wasm is attested by its own repository's
-# .github/workflows/release.yml at the release's tag (`gh attestation
+# privileged one's plugin.wasm is attested by the plugin repository's
+# release workflow, at the release's tag or on main, from the commit the tag
+# points to (the tag resolved through the API, then `gh attestation
 # verify`, preinstalled on the runner, with this run's token; attestations of
 # public repositories need no extra permission). A sandboxed plugin needs no
 # attestation: the sandbox bounds it. Anything else waits for a person
