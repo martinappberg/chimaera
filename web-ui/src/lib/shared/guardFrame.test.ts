@@ -13,4 +13,16 @@ describe("guardedPage", () => {
     expect(doc).toContain("e.source===f.contentWindow)parent.postMessage");
     expect(doc).toContain("e.source===parent&&f.contentWindow!==null)f.contentWindow.postMessage");
   });
+
+  it("wears the window's colour scheme from its first paint, then follows it", () => {
+    expect(guardedPage("/raw/t-1/a.html", "a", "dark")).toContain("<style>html{color-scheme:dark}");
+    expect(guardedPage("/raw/t-1/a.html", "a", "light")).toContain("<style>html{color-scheme:light}");
+    const doc = guardedPage("/raw/t-1/a.html", "a", "dark");
+    expect(doc).toContain("r.style.colorScheme||(r.dataset.theme==='dark'?'dark':'light')");
+    expect(doc).toContain("addEventListener('pagehide',()=>o.disconnect())");
+    // The page's frame matches the page's own first scheme, so neither
+    // frame paints a backdrop: the host's background shows while it loads.
+    expect(doc).toContain("color-scheme:normal}");
+    expect(doc).toContain("background:transparent");
+  });
 });

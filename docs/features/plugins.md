@@ -99,6 +99,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   ([below](#programs-and-tools-the-privileged-tier)), and **PowerPoint** (`render_slides` shows
   agents their slides, `deck_read` gives every slide and shape a stable id with its animation
   timeline and Morph pairs and says what changed in the file since the agent last looked,
+  `render_slides` with `builds` shows a slide as it stands after each click,
   `check_deck` finds layout and animation problems, and plain themes or the user's own),
   **Chromium** (a headless `chrome-headless-shell` for the
   [agent browser](agent-browser.md#engines-and-how-one-is-chosen) on a host with none, downloaded
