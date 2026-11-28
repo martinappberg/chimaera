@@ -2468,8 +2468,7 @@
     .bbtn,
     .opt,
     .thumb,
-    .slide-ref,
-    .pip > span {
+    .slide-ref {
       transition: none;
     }
   }
