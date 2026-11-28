@@ -652,6 +652,9 @@
     const gen = `${deckGen}:${slideGen}`;
     // Only the show plays; the presenter's own view always lands.
     const showing = show.mode === "present";
+    // Not `scale`: a click is planned in slide px inside the `zoom` fit, so
+    // a window resized while it plays keeps playing at the new size, as
+    // PowerPoint's does; re-reading the fit here would land it.
     void slot;
     untrack(() => {
       // A click plays only on the pass that brought its place: a re-read

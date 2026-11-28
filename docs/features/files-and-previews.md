@@ -989,7 +989,10 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   without playing (a click after a pause plays again); a click while one plays lands it first;
   a slide's advance time starts once its last click has played; leaving the show, edit mode, a
   re-read deck, hiding the pane or page and closing the view all land a playing click on its
-  state; `prefers-reduced-motion` plays nothing. A show window following the presenter plays
+  state; `prefers-reduced-motion` plays nothing. A window resized while a click plays keeps it
+  playing at the new size, as PowerPoint does (the click is planned in slide px inside the `zoom`
+  fit, so nothing is re-planned; checked in Chrome and WKWebView: fitted and centred at each size,
+  landed on its state, nothing left inline). A show window following the presenter plays
   the clicks the presenter makes and lands on the same state. Each moved element runs one Web
   Animation over the click (`fill: both`, then cancelled), so nothing is left inline. The show (and the presenter's now and next) fits the slide with CSS
   `zoom`, so it is laid out and painted at its real size: under a `transform: scale()` fit WebKit
