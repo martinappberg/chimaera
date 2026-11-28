@@ -750,6 +750,19 @@ pub(crate) fn file_kind<'a>(m: &'a Manifest, path: &str) -> Option<&'a FileKind>
         .find(|f| f.patterns.iter().any(|p| matches(p, path)))
 }
 
+/// Whether `view` (a file view of `m`) may draw `path`: a file `m` claims
+/// for that view, or one any of its file actions take, since an action's
+/// answer may open any of its file views on that file (a genome view on a
+/// plain VCF). Any file view of the plugin, for any file any of its actions
+/// match: drawing is the plugin's own choice, and reading the file still
+/// goes through `[access]`, the real limit on what it sees.
+pub(crate) fn file_view_may_draw(m: &Manifest, view: &str, path: &str) -> bool {
+    file_kind(m, path).is_some_and(|k| k.view == view)
+        || m.actions
+            .iter()
+            .any(|a| a.patterns.iter().any(|p| matches(p, path)))
+}
+
 /// The 0.2 tables on the wire (the card, the file-kind dispatch, the file
 /// menus, Settings → Plugins).
 pub(crate) fn wire(m: &Manifest) -> Value {
