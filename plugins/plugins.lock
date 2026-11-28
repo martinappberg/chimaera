@@ -22,11 +22,12 @@
 # (`chimaera plugin caps plugin.toml` prints both): a sandboxed plugin
 # keeps its badge on an update only while
 # its capability digest is this one, and a privileged plugin (one that runs
-# or downloads programs) is verified only at the pinned version. So the PR
-# auto-merges only when the release is sandboxed and asks for nothing new;
-# anything else waits for a person. Either way the bump writes the
-# release's own tier and caps (.github/scripts/plugin-caps.mjs) and its
-# PR says what changed, so the person reviews and merges. Hand edits
+# or downloads programs) is verified only at the pinned version. A bump
+# writes the release's own tier and caps (.github/scripts/plugin-caps.mjs)
+# and auto-merges only when the plugin is and stays sandboxed and its caps
+# digest is exactly the one approved here; anything else waits for a
+# person, who reads the code (CI checking the lock against the release is
+# not an approval). Hand edits
 # follow the same rules; keep every value a one-line "string". To run a
 # local build of a plugin against the daemon: `chimaera plugin add --path
 # <dir>` (see plugins/AGENTS.md).

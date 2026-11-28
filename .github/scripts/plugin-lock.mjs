@@ -14,17 +14,19 @@
 // so a bump this script writes still has to pass CI to merge.
 //
 // What the plugin can do is the maintainers' to approve (`tier` and `caps`,
-// docs/design/plugin-platform-plan.md §2): a bump auto-merges only when the entry is
-// sandboxed and the release's capability lines (`capabilityLines`: `api`
-// and every table but the card's words, the release source and detect) are
-// the pinned release's, so its digest is unchanged (`review`). Otherwise the
-// PR opens without auto-merge and says why. Either way the lock takes the
-// release's own `tier` and `caps`, read from its plugin.toml by
-// plugin-caps.mjs (the daemon's reading, held to it by fixtures), and the
-// PR body says, per plugin, whether the tier changed and which of the card's
-// Can lines the release adds and drops against the pinned one — so a bump
-// that waits for a person arrives green, and the person reads and merges.
-// CI still checks tier and caps against the release. A plugin.toml that
+// docs/design/plugin-platform-plan.md §2): a bump auto-merges only when the
+// plugin is and stays sandboxed and its capability digest is exactly the one
+// the lock approved (`review`: the lock's tier is sandboxed, the pinned
+// release reads as the lock's tier and caps, the release reads as sandboxed
+// with the lock's caps, and — stricter still — its capability lines are the
+// pinned release's). Otherwise the PR opens without auto-merge and says which
+// condition failed. Either way the lock is written with the release's own
+// `tier` and `caps`, read from its plugin.toml by plugin-caps.mjs (the
+// daemon's reading, held to it by fixtures), and the PR body says, per
+// plugin, whether the tier changed and which of the card's Can lines the
+// release adds and drops against the pinned one. CI then checks only that
+// the lock matches the release: that is not an approval, so a green PR that
+// waits for review still needs a person to read the code. A plugin.toml that
 // can't be read for capabilities is refused like any other failed check.
 //
 //   node .github/scripts/plugin-lock.mjs [--write] [--lock <file>] [--out <dir>]
@@ -42,7 +44,7 @@ import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { beyond, describeManifest, linesOf } from "./plugin-caps.mjs";
+import { beyond, describeManifest, linesOf, parseToml } from "./plugin-caps.mjs";
 
 const API = "https://api.github.com";
 /** The daemon's own caps (plugins::installed): a component, a manifest. */
@@ -165,38 +167,31 @@ export function capabilityLines(text) {
 /**
  * A plugin.toml's tool downloads (`[[tools.artifacts]]`,
  * docs/design/plugin-platform-plan.md §8): `{tool, platform, url, sha256, size}`
- * for each, read strictly (`key = "string"` and `size = <integer>`, `_`
- * allowed). The lock pins the manifest, the manifest pins every artifact:
- * a bump downloads each one and compares, so the chain holds only if
- * these are read right — an artifact missing its url or sha256 reads as
- * such and is refused.
+ * for each, from the same TOML parse that gives the capabilities
+ * (plugin-caps.mjs), so an artifact written in any TOML form — a
+ * `[[tools.artifacts]]` table or an inline `artifacts = [{ … }]` — is one the
+ * bump fetches and compares. The lock pins the manifest, the manifest pins
+ * every artifact: the chain holds only if these are read as the daemon reads
+ * them. A value of the wrong type reads as missing (null), and a missing url
+ * or sha256 is refused. Throws when the manifest is not TOML this reader
+ * knows.
  */
 export function toolArtifacts(text) {
+  const m = parseToml(text);
+  const str = (v) => (typeof v === "string" ? v : null);
   const out = [];
-  let tool = null;
-  let current = null;
-  let table = null;
-  for (const raw of text.split("\n")) {
-    const line = raw.trim();
-    if (line === "" || line.startsWith("#")) continue;
-    const header = /^(\[\[?)\s*([^\]]*?)\s*\]\]?$/.exec(line);
-    if (header !== null) {
-      table = header[2];
-      if (header[1] === "[[" && table === "tools") {
-        tool = { id: null };
-        current = null;
-      } else if (header[1] === "[[" && table === "tools.artifacts") {
-        current = { tool: tool?.id ?? null, platform: null, url: null, sha256: null, size: null };
-        out.push(current);
+  const tools = Array.isArray(m.tools) ? m.tools : [];
+  for (const tool of tools) {
+    if (tool === null || typeof tool !== "object" || Array.isArray(tool)) continue;
+    const artifacts = Array.isArray(tool.artifacts) ? tool.artifacts : [];
+    for (const a of artifacts) {
+      if (a === null || typeof a !== "object" || Array.isArray(a)) {
+        out.push({ tool: str(tool.id), platform: null, url: null, sha256: null, size: null });
+        continue;
       }
-      continue;
+      const size = Number.isSafeInteger(a.size) && a.size > 0 ? a.size : null;
+      out.push({ tool: str(tool.id), platform: str(a.platform), url: str(a.url), sha256: str(a.sha256), size });
     }
-    const str = /^([A-Za-z0-9_-]+)\s*=\s*"([^"\\]*)"\s*(#.*)?$/.exec(line);
-    const int = /^([A-Za-z0-9_-]+)\s*=\s*([0-9][0-9_]*)\s*(#.*)?$/.exec(line);
-    if (table === "tools" && tool !== null && str?.[1] === "id") tool.id = str[2];
-    if (table !== "tools.artifacts" || current === null) continue;
-    if (str !== null && ["platform", "url", "sha256"].includes(str[1])) current[str[1]] = str[2];
-    if (int !== null && int[1] === "size") current.size = Number(int[2].replaceAll("_", ""));
   }
   return out;
 }
@@ -333,36 +328,60 @@ export function pullRequest(bumps) {
     ...bumps.flatMap(capabilitySection),
     ...(review.length === 0
       ? [
-          "Each release is sandboxed and asks for nothing its pinned release didn't (the same capability lines), so `tier` and `caps` carry over.",
+          "Each release is and stays sandboxed, and its capability digest is exactly the one the lock already approved (its capability lines are the pinned release's too), so the `tier` and `caps` written are the approved ones.",
           "",
           "CI installs these releases from GitHub against the new lock (`scripts/build-plugins.sh` and the server's plugin tests). Auto-merge (squash) is on: it lands when the required checks pass, and the `fix:` title requests a patch release, so the next daily release brings the app the new versions.",
         ]
       : [
-          "**Needs a maintainer's review — no auto-merge.** What these plugins can do changed, or they run programs (privileged):",
+          "**Needs a maintainer's review — no auto-merge.** A bump merges by itself only when the plugin is and stays sandboxed and its capability digest is exactly the approved one. Here that doesn't hold:",
           "",
           ...review.map((b) => `- \`${b.id}\` ${b.to}: ${b.why}`),
           "",
-          "The lock already carries each release's `tier` and `caps`, so CI can go green without an edit. Review the release's code (the compare link) and the capability changes above; merge if the plugin should be able to do that. Merging approves those capabilities for every chimaera that installs it, and requests a patch release, which the next daily release ships. To turn the version down, close the PR unmerged.",
+          "The lock is written with each release's own `tier` and `caps`, so CI can go green without an edit. CI checks only that the lock matches the release; a green check here is not an approval. Read the release's code (the compare link) and the capability changes above, and merge only if the plugin should be able to do that: merging approves those capabilities for every chimaera that installs it, and requests a patch release, which the next daily release ships. To turn the version down, close the PR unmerged.",
         ]),
   ].join("\n");
   return { title, branch, body, automerge: review.length === 0 };
 }
 
 /**
- * Whether a bump may merge by itself, and if not why: only a plugin the lock
- * has as sandboxed whose release has its pinned release's capability lines.
- * A privileged plugin, or any change to those lines, waits for a person.
- * This rule is a safeguard: plugin-lock.test.mjs pins every case of it.
+ * Whether a bump may merge by itself, and if not why. Every condition must
+ * hold:
+ *   1. the lock has the plugin as exactly `sandboxed`;
+ *   2. the pinned release, read in full, is what the lock says it is (its
+ *      tier and caps digest), so the approval the lock records is real;
+ *   3. the release, read in full, is `sandboxed`;
+ *   4. the release's caps digest is the lock's — exactly the approved one;
+ *   5. and, stricter still, its capability lines (`capabilityLines`) are the
+ *      pinned release's: a line heuristic is never the only gate.
+ * Anything else waits for a person; `why` names every condition that failed.
+ * Because the lock is then written with the release's own tier and caps,
+ * CI going green is no approval: this function is the only thing between a
+ * release and an unreviewed merge. plugin-lock.test.mjs pins every case.
  */
-export function review(entryTier, pinnedToml, releaseToml) {
-  const same = JSON.stringify(capabilityLines(pinnedToml)) === JSON.stringify(capabilityLines(releaseToml));
-  const why =
-    entryTier !== "sandboxed"
-      ? "it runs programs (privileged): every release is reviewed"
-      : same
-        ? null
-        : "its capability lines changed: it may ask for more";
-  return { automerge: why === null, why };
+export function review(entry, pinnedToml, releaseToml) {
+  const failed = [];
+  if (entry.tier !== "sandboxed") failed.push("the lock has it as privileged: every release is reviewed");
+  let pinned = null;
+  try {
+    pinned = describeManifest(pinnedToml);
+  } catch {
+    // Unreadable: condition 2 fails below.
+  }
+  if (pinned === null || pinned.tier !== entry.tier || pinned.caps !== entry.caps) {
+    failed.push("the pinned release doesn't read as the tier and caps the lock records");
+  }
+  let next = null;
+  try {
+    next = describeManifest(releaseToml);
+  } catch {
+    // Unreadable: conditions 3 and 4 fail below (check refuses it anyway).
+  }
+  if (next === null || next.tier !== "sandboxed") failed.push("the release is privileged: it runs or downloads programs");
+  if (next === null || next.caps !== entry.caps) failed.push("its capability digest is not the approved one: it may ask for more");
+  if (JSON.stringify(capabilityLines(pinnedToml)) !== JSON.stringify(capabilityLines(releaseToml))) {
+    failed.push("its capability lines changed");
+  }
+  return failed.length === 0 ? { automerge: true, why: null } : { automerge: false, why: failed.join("; ") };
 }
 
 /**
@@ -484,7 +503,7 @@ async function check(entry, token) {
   } catch (error) {
     throw refuse(`plugin.toml can't be read for capabilities: ${error instanceof Error ? error.message : String(error)}`);
   }
-  const { automerge, why } = review(entry.tier, pinned.toString("utf8"), toml.toString("utf8"));
+  const { automerge, why } = review(entry, pinned.toString("utf8"), toml.toString("utf8"));
   // Every tool download it names, fetched and compared: the lock pins this
   // manifest, the manifest pins these, so a reviewer's approval of the one
   // covers the others only if they are what it says.

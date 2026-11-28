@@ -174,7 +174,7 @@ github = "o/x"
   assert.notDeepEqual(capabilityLines(base.replace('api = "0.1"', 'api = "0.2"')), capabilityLines(base), "the API decides the defaults");
 });
 
-test("tool downloads: every [[tools.artifacts]] with its tool, read strictly", () => {
+test("tool downloads: every [[tools.artifacts]] with its tool, read by the TOML parse", () => {
   const toml = [
     'id = "latex"',
     "[[tools]]",
@@ -187,7 +187,8 @@ test("tool downloads: every [[tools.artifacts]] with its tool, read strictly", (
     "size = 159_000_000",
     "[[tools.artifacts]]",
     'platform = "macos-aarch64"',
-    "url = 'single-quoted, so not read'",
+    "url = 'not-https'",
+    "size = -1",
     "[[tools.setup]]",
     'program = "tlmgr"',
     "[[tools]]",
@@ -205,10 +206,60 @@ test("tool downloads: every [[tools.artifacts]] with its tool, read strictly", (
       sha256: "a".repeat(64),
       size: 159000000,
     },
-    { tool: "tinytex", platform: "macos-aarch64", url: null, sha256: null, size: null },
+    { tool: "tinytex", platform: "macos-aarch64", url: "not-https", sha256: null, size: null },
     { tool: "other", platform: "linux-x86_64", url: "https://example.org/other.zip", sha256: "b".repeat(64), size: null },
   ]);
   assert.deepEqual(toolArtifacts('id = "notes"\n[adds]\nui = ["x"]\n'), []);
+  assert.throws(() => toolArtifacts("x = 1979-05-27\n"), /dates and times/, "TOML it can't read is refused");
+});
+
+test("tool downloads written inline are the same list as [[tools.artifacts]] tables", () => {
+  const a = "a".repeat(64);
+  const b = "b".repeat(64);
+  const tables = [
+    'api = "0.2"',
+    "[[programs]]",
+    'name = "typst"',
+    "[[tools]]",
+    'id = "typst"',
+    'name = "Typst"',
+    'version = "0.14.2"',
+    'programs = ["typst"]',
+    "[[tools.artifacts]]",
+    'platform = "linux-x86_64"',
+    'url = "https://example.org/typst.tar.xz"',
+    `sha256 = "${a}"`,
+    "size = 1_000",
+    'unpack = "tar.xz"',
+    "[[tools.artifacts]]",
+    'platform = "macos-aarch64"',
+    'url = "https://example.org/typst.zip"',
+    `sha256 = "${b}"`,
+    "size = 2000",
+    'unpack = "zip"',
+  ].join("\n");
+  const inline = [
+    'api = "0.2"',
+    'programs = [{ name = "typst" }]',
+    "[[tools]]",
+    'id = "typst"',
+    'name = "Typst"',
+    'version = "0.14.2"',
+    'programs = ["typst"]',
+    "artifacts = [",
+    `  { platform = "linux-x86_64", url = "https://example.org/typst.tar.xz", sha256 = "${a}", size = 1000, unpack = "tar.xz" },`,
+    `  { platform = "macos-aarch64", url = 'https://example.org/typst.zip', sha256 = "${b}", size = 2_000, unpack = "zip" },`,
+    "]",
+  ].join("\n");
+  const want = [
+    { tool: "typst", platform: "linux-x86_64", url: "https://example.org/typst.tar.xz", sha256: a, size: 1000 },
+    { tool: "typst", platform: "macos-aarch64", url: "https://example.org/typst.zip", sha256: b, size: 2000 },
+  ];
+  assert.deepEqual(toolArtifacts(tables), want);
+  assert.deepEqual(toolArtifacts(inline), want);
+  // The capability parse sees the same downloads in both forms.
+  const atoms = (t) => describeManifest(`id = "d"\nname = "D"\nversion = "0.1.0"\nsummary = "s"\n${t}`).atoms;
+  assert.deepEqual(atoms(inline), atoms(tables));
 });
 
 // --- A bump that needs review arrives ready: tier, caps and the change in words.
@@ -257,26 +308,33 @@ function bumpOf(pinned, next, { tier } = {}) {
     wasm_bytes: 1,
     tools_checked: 0,
     ...capabilityChange(entry, pinned, next),
-    ...review(entry.tier, pinned, next),
+    ...review(entry, pinned, next),
   };
 }
 
-test("auto-merge is only for a sandboxed plugin whose capability lines are unchanged (the safeguard)", () => {
+/** The lock entry for a pinned release, as the lock records it. */
+const entryOf = (pinned, over = {}) => {
+  const d = describeManifest(pinned);
+  return { id: "notes", tier: d.tier, caps: d.caps, ...over };
+};
+
+test("auto-merge needs a plugin that is and stays sandboxed with the approved digest (the safeguard)", () => {
   const pinned = release("0.1.0");
   const reworded = release("0.1.1").replace("Notes for agents.", "Other words.");
   const grown = release("0.1.1", '[[programs]]\nname = "pandoc"');
+  const sandboxed = entryOf(pinned);
   // Every case of the rule, spelled out: loosening any of them must fail here.
-  assert.deepEqual(review("sandboxed", pinned, reworded), { automerge: true, why: null });
-  assert.equal(review("sandboxed", pinned, grown).automerge, false, "new capability lines wait for a person");
-  assert.equal(review("privileged", pinned, reworded).automerge, false, "a privileged plugin always waits, even unchanged");
-  assert.equal(review("privileged", pinned, grown).automerge, false);
-  assert.equal(review("", pinned, reworded).automerge, false, "only the exact word sandboxed merges by itself");
-  assert.equal(review("Sandboxed", pinned, reworded).automerge, false);
-  // The capability digest never decides on its own: lines that differ only
-  // in a way the digest ignores (an inline comment) still wait.
+  assert.deepEqual(review(sandboxed, pinned, reworded), { automerge: true, why: null });
+  assert.equal(review(sandboxed, pinned, grown).automerge, false, "new capabilities wait for a person");
+  assert.equal(review({ ...sandboxed, tier: "privileged" }, pinned, reworded).automerge, false, "a privileged plugin always waits, even unchanged");
+  assert.equal(review({ ...sandboxed, tier: "privileged" }, pinned, grown).automerge, false);
+  assert.equal(review({ ...sandboxed, tier: "" }, pinned, reworded).automerge, false, "only the exact word sandboxed merges by itself");
+  assert.equal(review({ ...sandboxed, tier: "Sandboxed" }, pinned, reworded).automerge, false);
+  // The line comparison stays as a stricter extra: lines that differ only in
+  // a way the digest ignores (an inline comment) still wait.
   const commented = pinned.replace('files = "read"', 'files = "read" # still read');
   assert.equal(describeManifest(commented).caps, describeManifest(pinned).caps);
-  assert.equal(review("sandboxed", pinned, commented).automerge, false);
+  assert.deepEqual(review(sandboxed, pinned, commented), { automerge: false, why: "its capability lines changed" });
   // The pull request follows the bumps: one that waits holds back all.
   const ok = bumpOf(pinned, reworded);
   const waits = { ...bumpOf(pinned, grown), id: "other", to: "0.2.0" };
@@ -285,6 +343,93 @@ test("auto-merge is only for a sandboxed plugin whose capability lines are uncha
   assert.equal(outputs([ok], []), "bumped=true\nautomerge=true\nproblems=0\n");
   assert.equal(outputs([ok, waits], []), "bumped=true\nautomerge=false\nproblems=0\n");
   assert.equal(outputs([], ["x"]), "bumped=false\nautomerge=false\nproblems=1\n");
+});
+
+/** `release` without its [provides] table: capability tables written as
+ *  top-level keys then precede every table. */
+const noProvides = (version, top = "") => release(version).replace('[provides]\nmcp_tools = ["notes_read"]\n', "").replace('api = "0.2"', `api = "0.2"${top}`);
+
+test("capability changes the line heuristic can't see never merge by themselves", () => {
+  // Each of these has the pinned release's capability lines (the old,
+  // line-based rule said "unchanged" and would have merged it).
+  const pinned = release("0.1.0");
+  const topLevelProgram = release("0.1.1").replace('api = "0.2"', 'api = "0.2"\nprograms = [{ name = "bash" }]');
+  const commentedHeader = `${release("0.1.1")}[[programs]] # x\nname = "bash"\n`;
+  const dottedPinned = noProvides("0.1.0");
+  const dottedTool = noProvides("0.1.1", '\nprovides.mcp_tools = ["evil"]');
+  for (const [p, r] of [[pinned, topLevelProgram], [pinned, commentedHeader], [dottedPinned, dottedTool]]) {
+    assert.deepEqual(capabilityLines(r), capabilityLines(p), "the line heuristic alone is blind to it");
+  }
+  assert.deepEqual(review(entryOf(pinned), pinned, topLevelProgram), {
+    automerge: false,
+    why: "the release is privileged: it runs or downloads programs; its capability digest is not the approved one: it may ask for more",
+  });
+  assert.equal(describeManifest(topLevelProgram).tier, "privileged");
+  assert.deepEqual(review(entryOf(pinned), pinned, commentedHeader), {
+    automerge: false,
+    why: "the release is privileged: it runs or downloads programs; its capability digest is not the approved one: it may ask for more",
+  });
+  assert.equal(describeManifest(dottedTool).tier, "sandboxed");
+  assert.deepEqual(review(entryOf(dottedPinned), dottedPinned, dottedTool), {
+    automerge: false,
+    why: "its capability digest is not the approved one: it may ask for more",
+  });
+  // And the PR they open says so, and writes the release's own tier and caps.
+  const bump = bumpOf(pinned, topLevelProgram);
+  assert.equal(bump.tier, "privileged");
+  const { body, automerge } = pullRequest([bump]);
+  assert.equal(automerge, false);
+  assert.match(body, /`notes` 0\.1\.1: the release is privileged: it runs or downloads programs; its capability digest is not the approved one/);
+  assert.match(body, /- Tier: sandboxed → \*\*privileged\*\*/);
+  assert.match(body, /Runs bash: this plugin can run any command on this host/);
+});
+
+test("each auto-merge condition, false in turn, holds the bump for a person", () => {
+  const pinned = release("0.1.0");
+  const same = release("0.1.1");
+  const base = entryOf(pinned);
+  assert.deepEqual(review(base, pinned, same), { automerge: true, why: null }, "all conditions hold");
+  const cases = [
+    ["the lock has it as privileged", { ...base, tier: "privileged" }, pinned, same, /the lock has it as privileged/],
+    ["the lock's caps were edited by hand", { ...base, caps: "0".repeat(64) }, pinned, same, /the pinned release doesn't read as the tier and caps the lock records/],
+    ["the lock's tier disagrees with the pinned release", { ...base, tier: "sandboxed " }, pinned, same, /the pinned release doesn't read as/],
+    ["the pinned release can't be read", base, "not toml [", same, /the pinned release doesn't read as/],
+    ["the release is privileged", base, pinned, release("0.1.1").replace('api = "0.2"', 'api = "0.2"\nprograms = [{ name = "pandoc" }]'), /the release is privileged/],
+    ["the release can't be read", base, pinned, "when = 1979-05-27\n", /the release is privileged/],
+    ["the release's digest changed", base, pinned, release("0.1.1").replace('mcp_tools = ["notes_read"]', 'mcp_tools = ["notes_read", "x"]'), /capability digest is not the approved one/],
+    ["the release's digest shrank", base, pinned, release("0.1.1").replace('files = "read"', 'files = "none"'), /capability digest is not the approved one/],
+    ["only the capability lines changed", base, pinned, release("0.1.1").replace('files = "read"', "files = 'read'"), /^its capability lines changed$/],
+  ];
+  for (const [what, entry, p, r, reason] of cases) {
+    const got = review(entry, p, r);
+    assert.equal(got.automerge, false, what);
+    assert.match(got.why, reason, what);
+  }
+});
+
+test("over every pair of parity-fixture manifests, auto-merge only when both are sandboxed with equal digests", () => {
+  const fixture = JSON.parse(readFileSync(new URL("../../web-ui/src/lib/net/fixtures/wire/plugin-caps.json", import.meta.url), "utf8"));
+  const manifests = fixture.cases.map((c) => c.frame.manifest);
+  let merged = 0;
+  for (const p of manifests) {
+    const before = describeManifest(p);
+    for (const r of manifests) {
+      const after = describeManifest(r);
+      for (const tier of ["sandboxed", "privileged"]) {
+        const { automerge } = review({ id: "demo", tier, caps: before.caps }, p, r);
+        if (!automerge) continue;
+        merged++;
+        assert.equal(tier, "sandboxed");
+        assert.equal(before.tier, "sandboxed");
+        assert.equal(after.tier, "sandboxed");
+        assert.equal(after.caps, before.caps);
+      }
+    }
+    // A sandboxed release against itself is the one bump that merges.
+    const self = review({ id: "demo", tier: before.tier, caps: before.caps }, p, p).automerge;
+    assert.equal(self, before.tier === "sandboxed", "an unchanged sandboxed release merges by itself");
+  }
+  assert.ok(merged > 0);
 });
 
 test("a bump whose capabilities are unchanged says so in one line, and keeps tier and caps", () => {
@@ -306,7 +451,7 @@ test("a bump that adds a tool waits, carries the new caps, and says what it adds
   const next = release("0.2.0").replace('mcp_tools = ["notes_read"]', 'mcp_tools = ["notes_read", "notes_write"]');
   const bump = bumpOf(pinned, next);
   assert.equal(bump.automerge, false);
-  assert.equal(bump.why, "its capability lines changed: it may ask for more");
+  assert.equal(bump.why, "its capability digest is not the approved one: it may ask for more; its capability lines changed");
   assert.equal(bump.tier, "sandboxed");
   assert.equal(bump.caps, describeManifest(next).caps);
   assert.notEqual(bump.caps, bump.from_caps);
@@ -316,7 +461,8 @@ test("a bump that adds a tool waits, carries the new caps, and says what it adds
   assert.equal(automerge, false);
   assert.match(body, /- Tier: sandboxed \(unchanged\)\n- `caps`: `[0-9a-f]{12}` → `[0-9a-f]{12}`\n- Adds:\n  - ` Gives agents 1 tool: notes_write `\n/);
   assert.match(body, /no auto-merge/);
-  assert.match(body, /already carries each release's `tier` and `caps`/);
+  assert.match(body, /The lock is written with each release's own `tier` and `caps`/);
+  assert.match(body, /a green check here is not an approval/);
   assert.doesNotMatch(body, /set its `tier` and `caps`/, "no hand edit is asked for");
 });
 

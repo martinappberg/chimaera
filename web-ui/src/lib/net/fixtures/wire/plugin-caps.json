@@ -403,7 +403,7 @@
       "frame": {
         "describe": {
           "atoms": [
-            "[\"agent-plugin\",\"claude\",\"x@y\",\"**bold**\"]",
+            "[\"agent-plugin\",\"claude\",\"x@y\",\"**bold**\\t\\u0007\\u001f\\b end\"]",
             "[\"file-kind\",\"*.[ch]\"]",
             "[\"file-kind\",\"*.md|x\"]",
             "[\"file-kind\",\"*.été\"]",
@@ -416,7 +416,7 @@
           "can": [
             {
               "privileged": false,
-              "text": "Offers an agent-side plugin for claude: x@y from **bold** (installed only on your click; it then runs inside claude)"
+              "text": "Offers an agent-side plugin for claude: x@y from **bold**\t\u0007\u001f\b end (installed only on your click; it then runs inside claude)"
             },
             {
               "privileged": true,
@@ -431,15 +431,15 @@
               "text": "Opens *.[ch], *.md|x, *.été, *.éx, *.！, *.🚀 files in its own view (Text is always one click away)"
             }
           ],
-          "caps": "c8cd061a500faf2a0f141d4605071dda7437d8307eb5af25bb9721ebda73855f",
+          "caps": "55365b0d39450f16d215944b95cca59c7714ce79eb731b200762b08d2e0ed7fb",
           "id": "demo",
           "tier": "privileged",
           "version": "1.2.3"
         },
-        "manifest": "id = \"demo\"\nname = \"Demo\"\nversion = \"1.2.3\"\nsummary = \"A demo.\"\napi = \"0.2\"\n[[programs]]\nname = \"tool\"\nnetwork = \"\\\"a\\\" \\\\ *b* [c](https://evil.example) <img> | @someone `x` ünï \\U0001F680\"\n[[views]]\nid = \"doc\"\ntitle = \"Doc\"\nslot = \"file\"\n[[files]]\nmatch = ['*.été', \"*.\\u00e9x\", \"*.[ch]\", '*.md|x', \"*.\\U0001F680\", \"*.\\uFF01\"]\nview = \"doc\"\nlabel = \"Odd\"\n[recommends.agent_plugins.claude]\nid = \"x@y\"\nmarketplace = \"**bold**\"\n"
+        "manifest": "id = \"demo\"\nname = \"Demo\"\nversion = \"1.2.3\"\nsummary = \"A demo.\"\napi = \"0.2\"\n[[programs]]\nname = \"tool\"\nnetwork = \"\\\"a\\\" \\\\ *b* [c](https://evil.example) <img> | @someone `x` ünï \\U0001F680\"\n[[views]]\nid = \"doc\"\ntitle = \"Doc\"\nslot = \"file\"\n[[files]]\nmatch = ['*.été', \"*.\\u00e9x\", \"*.[ch]\", '*.md|x', \"*.\\U0001F680\", \"*.\\uFF01\"]\nview = \"doc\"\nlabel = \"Odd\"\n[recommends.agent_plugins.claude]\nid = \"x@y\"\nmarketplace = \"**bold**\\t\\u0007\\u001F\\u007F\\u0085\\b end\"\n"
       },
       "name": "hostile-strings",
-      "note": "strings a review reads: quotes, backslashes, markdown, a mention, non-ASCII, and characters whose UTF-8 order is not their UTF-16 order (the atoms sort as bytes)"
+      "note": "strings a review reads: quotes, backslashes, control characters (escaped in the atoms), markdown, a mention, non-ASCII, and characters whose UTF-8 order is not their UTF-16 order (the atoms sort as bytes)"
     },
     {
       "frame": {

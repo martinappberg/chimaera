@@ -5,15 +5,17 @@ name: plugin-lock
 # checked release (.github/scripts/plugin-lock.mjs) becomes a `fix:` PR, CI
 # installs it against the new lock, and the merge requests a patch release
 # (the next daily batch ships it, docs/agent-guides/releases.md). The
-# PR auto-merges (squash) only when every bumped plugin is sandboxed and asks
-# for nothing new (the same capability lines as its pinned release); a
-# privileged plugin, or one whose capabilities changed, waits for a person
-# (docs/design/plugin-platform-plan.md §2). Either way the PR arrives ready:
-# the lock already carries the release's own tier and caps (read from its
+# lock is written with each release's own tier and caps (read from its
 # plugin.toml by .github/scripts/plugin-caps.mjs, held to the daemon's
-# reading by fixtures), and the body says whether the tier changed and which
-# Can lines the release adds and drops, with the compare link, so a reviewer
-# reads and merges. Hourly, on demand, and on a `plugin-released` dispatch
+# reading by fixtures). The PR auto-merges (squash) only when every bumped
+# plugin is and stays sandboxed and its capability digest is exactly the
+# one the lock approved (and its capability lines are its pinned release's);
+# anything else waits for a person (docs/design/plugin-platform-plan.md §2),
+# with a body that says which condition failed, whether the tier changed and
+# which Can lines the release adds and drops, with the compare link. CI then
+# checks only that the lock matches the release: that is not an approval, so
+# a green PR that waits for review still needs a person to read the code.
+# Hourly, on demand, and on a `plugin-released` dispatch
 # (a plugin repository may send one after publishing; the schedule covers
 # it otherwise).
 #
@@ -134,7 +136,7 @@ jobs:
           if [ "$AUTOMERGE" = true ]; then
             gh pr merge "$branch" --repo "$REPO" --auto --squash
           else
-            echo "::notice title=plugin-lock::'$title' needs a maintainer's review (capabilities changed, or a privileged plugin): no auto-merge"
+            echo "::notice title=plugin-lock::'$title' needs a maintainer's review (not sandboxed with the approved capability digest; the PR body says why): no auto-merge"
           fi
 
       - name: a release failed its checks

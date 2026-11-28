@@ -865,7 +865,7 @@ mod tests {
             ),
             (
                 "hostile-strings",
-                "strings a review reads: quotes, backslashes, markdown, a mention, \
+                "strings a review reads: quotes, backslashes, control characters (escaped in the atoms), markdown, a mention, \
                  non-ASCII, and characters whose UTF-8 order is not their UTF-16 order \
                  (the atoms sort as bytes)",
                 format!(
@@ -876,7 +876,7 @@ mod tests {
                      [[files]]\nmatch = ['*.\u{e9}t\u{e9}', \"*.\\u00e9x\", \"*.[ch]\", '*.md|x', \
                      \"*.\\U0001F680\", \"*.\\uFF01\"]\n\
                      view = \"doc\"\nlabel = \"Odd\"\n\
-                     [recommends.agent_plugins.claude]\nid = \"x@y\"\nmarketplace = \"**bold**\"\n"
+                     [recommends.agent_plugins.claude]\nid = \"x@y\"\nmarketplace = \"**bold**\\t\\u0007\\u001F\\u007F\\u0085\\b end\"\n"
                 ),
             ),
             (

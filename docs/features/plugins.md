@@ -632,11 +632,12 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     that newly blocks a loaded build drops its instances and cancels its jobs at once and logs
     a `blocked` entry; a soft block the user allowed (by the build's sha256) runs.
   - **Lock bumps.** The lock records each first-party plugin's `tier` and `caps`; the
-    `plugin-lock` workflow auto-merges a bump only when the plugin is sandboxed and its release's
-    capability lines match the pinned release's — otherwise the PR waits for a maintainer. Either way the
-    bump writes the release's own `tier` and `caps` (`.github/scripts/plugin-caps.mjs`, held to the daemon's
-    reading by fixtures; CI checks both against the release), and the PR body lists the Can lines the
-    release adds and drops, so a reviewer reads and merges.
+    `plugin-lock` workflow writes each bump with the release's own `tier` and `caps`
+    (`.github/scripts/plugin-caps.mjs`, held to the daemon's reading by fixtures) and auto-merges it only
+    when the plugin is and stays sandboxed and its capability digest is exactly the approved one (its
+    capability lines unchanged too). Otherwise the PR waits for a maintainer, and its body says which
+    condition failed and which Can lines the release adds and drops. CI checks only that the lock matches
+    the release, which is not an approval: a green bump that waits still needs a person to read the code.
 
 ## Plugin screens, files and settings (the 0.2 platform)
 
