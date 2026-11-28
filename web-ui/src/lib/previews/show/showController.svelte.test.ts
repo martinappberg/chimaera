@@ -1,20 +1,21 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { clampPlace, INVITE_KEY, INVITE_MS, inviteFor, inviteText, nextClick, SlideShow, type ShowOptions } from "./showController.svelte";
+import { clampPlace, INVITE_KEY, INVITE_MS, inviteText, nextClick, readInvite, SlideShow, type ShowOptions } from "./showController.svelte";
 
-describe("inviteFor", () => {
+describe("readInvite", () => {
   const sync = "chimaera-deck:w:file:/a/talk.pptx";
-  it("is taken by a document created after it, while fresh, for its deck only", () => {
-    const raw = inviteText(sync, 1_000);
-    expect(inviteFor(raw, sync, 2_000, 1_500)).toBe(true);
+  it("is taken by a document created after it, while fresh, for its deck only, with the presenter's place", () => {
+    const raw = inviteText(sync, 1_000, "ppt/slides/slide3.xml", 1);
+    expect(readInvite(raw, sync, 2_000, 1_500)).toEqual({ key: "ppt/slides/slide3.xml", build: 1 });
     // A window that was already open (the deck in another pane) never takes it.
-    expect(inviteFor(raw, sync, 2_000, 900)).toBe(false);
-    expect(inviteFor(raw, "chimaera-deck:w:file:/a/other.pptx", 2_000, 1_500)).toBe(false);
-    expect(inviteFor(raw, sync, 1_000 + INVITE_MS + 1, 1_500)).toBe(false);
+    expect(readInvite(raw, sync, 2_000, 900)).toBeNull();
+    expect(readInvite(raw, "chimaera-deck:w:file:/a/other.pptx", 2_000, 1_500)).toBeNull();
+    expect(readInvite(raw, sync, 1_000 + INVITE_MS + 1, 1_500)).toBeNull();
   });
-  it("ignores what isn't an invite", () => {
+  it("ignores what isn't an invite, and reads a place it can't use as none", () => {
     for (const bad of [null, "", "{", "[]", JSON.stringify({ sync, at: "1" }), JSON.stringify({ at: 1 })]) {
-      expect(inviteFor(bad, sync, 2_000, 1_500)).toBe(false);
+      expect(readInvite(bad, sync, 2_000, 1_500)).toBeNull();
     }
+    expect(readInvite(JSON.stringify({ sync, at: 1_000, key: 4, build: -1 }), sync, 2_000, 1_500)).toEqual({ key: null, build: 0 });
   });
 });
 
@@ -133,12 +134,36 @@ describe("SlideShow", () => {
     const ok = make(deck());
     await ok.show.showInWindow();
     expect(ok.show.mode).toBe("presenter");
-    expect(store.has(INVITE_KEY)).toBe(true);
+    expect(readInvite(store.get(INVITE_KEY) ?? null, "test-sync", Date.now(), Date.now())).toEqual({ key: "s1", build: 0 });
     store.clear();
     const blocked = make(deck(), { openWindow: async () => false });
     await blocked.show.showInWindow();
     expect(blocked.show.mode).toBe("browse");
     expect(blocked.show.windowError).not.toBeNull();
     expect(store.has(INVITE_KEY)).toBe(false);
+  });
+
+  it("keeps the talk timer through presenter off and on, the show, and back", async () => {
+    const { show } = make(deck());
+    show.presenter();
+    const started = show.started;
+    show.started -= 60_000;
+    show.presenter();
+    expect(show.mode).toBe("browse");
+    show.presenter();
+    await show.present();
+    show.presenter();
+    expect(show.started).toBe(started - 60_000);
+    show.resetTimer();
+    expect(show.started).toBeGreaterThanOrEqual(started);
+  });
+
+  it("forgets a window that didn't open when the mode changes", async () => {
+    vi.stubGlobal("localStorage", { getItem: () => null, setItem: () => {}, removeItem: () => {} });
+    const { show } = make(deck(), { openWindow: async () => false });
+    await show.showInWindow();
+    expect(show.windowError).not.toBeNull();
+    show.presenter();
+    expect(show.windowError).toBeNull();
   });
 });

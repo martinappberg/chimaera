@@ -1,10 +1,11 @@
 <!--
-  The presenter's view, layout only: this slide large, the next click beside
-  it over the speaker notes, the timer, the place and the time of day under
-  them, and the strip of every slide below. Each viewer draws its own
-  pictures (`now`, `next`, `strip` snippets); the controller is
-  `showController.svelte.ts`. Its look is the plugin deck viewer's
-  (`plugins/ui/DeckNode.svelte`), so the two read as one product.
+  The presenter's view, layout only: this slide large on the left, its top
+  level with the next click's frame on the right, the speaker notes under
+  that, the timer, the place and its click dots and the time of day below,
+  and the strip of every slide at the bottom. Each viewer draws its own
+  pictures (`now`, `next`, `strip`, `dots` snippets); the controller is
+  `showController.svelte.ts`. Slides sit on the sunken surface the slide
+  viewers' stages use, so a white slide reads as an object in light themes.
 -->
 <script lang="ts">
   import type { Snippet } from "svelte";
@@ -17,42 +18,45 @@
     next: Snippet | null;
     /** The slide strip (optional: a one-slide deck has none). */
     strip?: Snippet;
+    /** The current slide's click dots beside the place (optional). */
+    dots?: Snippet;
     /** The slides' width over height, for the next picture's frame. */
     ratio: number;
     notes: string;
-    /** What the notes say when there are none. */
+    /** What the notes area says when there are none (default: nothing). */
     noNotes?: string;
     elapsed: number;
     onResetTimer: () => void;
-    /** Where the show stands ("3 / 12 · click 2 of 4"). */
+    /** Where the show stands among the slides it shows: "3 / 12". */
     place: string;
     wallClock: string;
   }
 
-  let { now, next, strip, ratio, notes, noNotes = "No notes for this slide.", elapsed, onResetTimer, place, wallClock }: Props = $props();
+  let { now, next, strip, dots, ratio, notes, noNotes = "", elapsed, onResetTimer, place, wallClock }: Props = $props();
 </script>
 
 <div class="presenter" style:--show-ratio={ratio}>
   <div class="console">
     <div class="now">{@render now()}</div>
     <div class="side">
-      <div class="next">
-        <span class="cap">Next</span>
+      <div class="pic" class:end={next === null}>
         {#if next === null}
-          <p class="end">End of the show</p>
+          <p class="end-note">End of the show</p>
         {:else}
-          <div class="pic">{@render next()}</div>
+          {@render next()}
+          <span class="cap" aria-hidden="true">Next</span>
         {/if}
       </div>
       <div class="speak" role="note" aria-label="speaker notes">
-        {#if notes.trim() !== ""}{notes}{:else}<span class="quiet">{noNotes}</span>{/if}
+        {#if notes.trim() !== ""}{notes}{:else if noNotes !== ""}<span class="quiet">{noNotes}</span>{/if}
       </div>
     </div>
     <div class="foot">
-      <button class="timer" onclick={onResetTimer} title="elapsed; click to start over">{clockText(elapsed)}</button>
-      <span class="meta">{place}</span>
+      <button class="timer" ondblclick={onResetTimer} title="elapsed · double-click to start over">{clockText(elapsed)}</button>
+      <span class="place">{place}</span>
+      {#if dots !== undefined}<span class="dots">{@render dots()}</span>{/if}
       <span class="grow"></span>
-      <span class="meta">{wallClock}</span>
+      <span class="clock">{wallClock}</span>
     </div>
   </div>
   {@render strip?.()}
@@ -65,22 +69,22 @@
     display: flex;
     flex-direction: column;
     container: presenter / size;
-    background: var(--term-bg);
+    background: color-mix(in srgb, var(--fg) 4%, var(--term-bg));
   }
   .console {
     flex: 1;
     min-height: 0;
     display: grid;
-    grid-template-columns: minmax(0, 1.9fr) minmax(0, 1fr);
+    grid-template-columns: minmax(0, 2.2fr) minmax(0, 1fr);
     grid-template-rows: minmax(0, 1fr) auto;
-    gap: 10px;
-    padding: 10px;
+    gap: 12px;
+    padding: 12px 12px 6px;
   }
   .now {
     min-width: 0;
     min-height: 0;
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: center;
   }
   .side {
@@ -88,45 +92,54 @@
     min-height: 0;
     display: flex;
     flex-direction: column;
-    gap: 10px;
-  }
-  .next {
-    flex: none;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    min-height: 0;
+    gap: 12px;
   }
   /* The next click's frame: the slide's shape, as wide as the column, never
-     taller than about two fifths of the view. */
+     taller than about two fifths of the view; the same size at the end. */
   .pic {
     position: relative;
-    align-self: center;
+    flex: none;
+    align-self: flex-start;
     width: min(100%, calc(38cqh * var(--show-ratio)));
     aspect-ratio: var(--show-ratio);
     overflow: hidden;
     border-radius: 3px;
-    box-shadow: 0 0 0 1px color-mix(in srgb, var(--fg) 12%, transparent);
+    box-shadow:
+      0 0 0 1px color-mix(in srgb, var(--fg) 10%, transparent),
+      0 1px 6px color-mix(in srgb, var(--fg) 10%, transparent);
   }
-  .cap {
-    font-size: var(--text-xs);
-    font-weight: 600;
-    color: color-mix(in srgb, var(--fg) 72%, var(--muted));
+  .pic.end {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: color-mix(in srgb, var(--fg) 7%, var(--term-bg));
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--fg) 8%, transparent);
   }
-  .end {
+  .end-note {
     margin: 0;
-    padding: 0.8rem 0;
     color: var(--muted);
     font-size: var(--text-sm);
+  }
+  /* A quiet label in the frame's corner, legible on any slide. */
+  .cap {
+    position: absolute;
+    top: 5px;
+    left: 5px;
+    z-index: 1;
+    padding: 0 5px;
+    border-radius: 3px;
+    background: color-mix(in srgb, var(--term-bg) 82%, transparent);
+    color: var(--muted);
+    font-size: var(--text-xs);
+    line-height: 1.5;
+    pointer-events: none;
   }
   .speak {
     flex: 1;
     min-height: 0;
     overflow: auto;
     scrollbar-width: thin;
-    padding: 0.6rem 0.8rem;
-    border: 1px solid var(--edge);
-    border-radius: 6px;
+    padding: 0 2px;
     color: var(--fg);
     font-size: 1.05rem;
     line-height: 1.55;
@@ -140,8 +153,8 @@
   .foot {
     grid-column: 1 / -1;
     display: flex;
-    align-items: baseline;
-    gap: 0.9rem;
+    align-items: center;
+    gap: 0.8rem;
     min-width: 0;
   }
   .grow {
@@ -149,15 +162,18 @@
   }
   .timer {
     appearance: none;
+    flex: none;
     border: none;
     background: none;
     padding: 0 0.2rem;
+    margin-left: -0.2rem;
     border-radius: 4px;
     font-family: var(--mono);
     font-size: 1.6rem;
     font-variant-numeric: tabular-nums;
     color: var(--fg);
-    cursor: pointer;
+    cursor: default;
+    user-select: none;
   }
   .timer:hover {
     background: var(--row-hover);
@@ -166,7 +182,21 @@
     outline: 2px solid var(--focus-ring);
     outline-offset: 1px;
   }
-  .meta {
+  .place {
+    flex: none;
+    font-family: var(--mono);
+    font-size: var(--text-md);
+    font-variant-numeric: tabular-nums;
+    color: color-mix(in srgb, var(--fg) 88%, var(--muted));
+    white-space: nowrap;
+  }
+  .dots {
+    flex: none;
+    display: inline-flex;
+    min-width: 0;
+  }
+  .clock {
+    flex: none;
     font-family: var(--mono);
     font-size: var(--text-sm);
     font-variant-numeric: tabular-nums;
@@ -180,7 +210,7 @@
       grid-template-columns: 1fr;
       grid-template-rows: minmax(0, 1.4fr) minmax(0, 1fr) auto;
     }
-    .next {
+    .pic {
       display: none;
     }
   }

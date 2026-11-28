@@ -50,6 +50,7 @@
   import { SlideShow } from "./show/showController.svelte";
   import { syncName } from "./show/showSync";
   import PresenterView from "./show/PresenterView.svelte";
+  import ClickDots from "./show/ClickDots.svelte";
   import { copyTabToWindow } from "../plugins/platform";
   import { buildStates, extractTiming, parseTimeline, type BuildState, type SlideTimeline, type TimingExtract } from "./pptxTiming";
   import { pruneTagged, tagSlide, type TaggedSlide } from "./pptxTag";
@@ -148,7 +149,18 @@
       clearPick();
       if (show.mode === "browse") asDrawn = true;
     },
-    left: () => (asDrawn = true),
+    left: () => {
+      asDrawn = true;
+      // The stage was re-created out of the presenter's cell (or the show
+      // ended): the keys go back to it unless focus went elsewhere.
+      void tick().then(() => {
+        if (disposed || !onScreen.pane) return;
+        const a = document.activeElement;
+        if (a === null || a === document.body || (viewEl?.contains(a) === true && !stageEl?.contains(a))) {
+          stageEl?.focus({ preventScroll: true });
+        }
+      });
+    },
   });
   const current = $derived(show.at.slide);
   /** The show has the screen (or covers the window). */
@@ -565,34 +577,6 @@
     setBuild(!inShow && buildAt === k ? null : k);
   }
 
-  /** The click dots: the slide's start, then one per click, at most DOTS
-   *  of them in a window that follows the build (a deck of 300 clicks
-   *  keeps a short row). */
-  const DOTS = 8;
-  const dotWindow = $derived.by(() => {
-    if (clicks <= DOTS) return { first: 1, last: clicks };
-    const first = Math.min(Math.max(1, (buildAt ?? 0) - Math.floor(DOTS / 2) + 1), clicks - DOTS + 1);
-    return { first, last: first + DOTS - 1 };
-  });
-
-  let dotsEl = $state<HTMLSpanElement | null>(null);
-  /** Arrows move along the dots (and the build with them); Escape is the
-   *  slide as drawn again. */
-  function onDotsKey(e: KeyboardEvent): void {
-    if (e.metaKey || e.ctrlKey || e.altKey) return;
-    let to: number | null;
-    if (e.key === "ArrowRight") to = Math.min(clicks, (buildAt ?? -1) + 1);
-    else if (e.key === "ArrowLeft") to = Math.max(0, (buildAt ?? 1) - 1);
-    else if (e.key === "Home") to = 0;
-    else if (e.key === "End") to = clicks;
-    else if (e.key === "Escape" && !inShow && build !== null) to = null;
-    else return;
-    e.preventDefault();
-    e.stopPropagation();
-    setBuild(to);
-    void tick().then(() => dotsEl?.querySelector<HTMLElement>('[tabindex="0"]')?.focus());
-  }
-
   // The show moves on by itself where the slide says (`advTm`), once its
   // last build is up; only while someone can see it, and any move restarts it.
   $effect(() => {
@@ -759,6 +743,13 @@
       nodeErrors += 1;
     }
     itemsMemo = null;
+    // The next click's picture of this slide is drawn again from the edit.
+    const nx = nextHandles.get(i);
+    if (nx !== undefined) {
+      nx.dispose();
+      nx.element.remove();
+      nextHandles.delete(i);
+    }
     const th = thumbHandles.get(i);
     if (th !== undefined) {
       // The old picture stays until the new one replaces it (syncThumbs'
@@ -1062,8 +1053,7 @@
 
   let stageW = $state(0);
   let stageH = $state(0);
-  // The presenter's view leaves room for the slide's focus ring.
-  const pad = $derived(presenting ? 0 : show.mode === "presenter" ? 3 : 20);
+  const pad = $derived(inShow ? 0 : 20);
   const scale = $derived(
     stageW > 0 && stageH > 0 ? Math.max(0.05, Math.min((stageW - pad * 2) / w, (stageH - pad * 2) / h)) : 0,
   );
@@ -1417,11 +1407,6 @@
     if (nextSlot === null) untrack(disposeNext);
   });
 
-  /** Where the presenter stands: "3 / 12 · 2 of 4 clicks". */
-  const presenterPlace = $derived(
-    `${showAt.n} / ${showAt.of}${clicks > 0 ? ` · ${buildAt ?? 0} of ${clicks} ${clicks === 1 ? "click" : "clicks"}` : ""}`,
-  );
-
   // --- keys, present -------------------------------------------------------------
 
   function onKey(e: KeyboardEvent): void {
@@ -1500,11 +1485,12 @@
   function onViewKey(e: KeyboardEvent): void {
     // The presenter's view pages from anywhere in it (the strip, the timer),
     // not only from the stage, which handles its own keys first.
-    if (show.mode === "presenter" && !e.defaultPrevented) {
+    // Modified keys go on to save and undo, as the bar's controls do.
+    if (show.mode === "presenter" && !e.defaultPrevented && !(e.metaKey || e.ctrlKey || e.altKey)) {
       onKey(e);
       return;
     }
-    if (!(e.metaKey || e.ctrlKey) || e.altKey || deck === null || inShow || texting) return;
+    if (!(e.metaKey || e.ctrlKey) || e.altKey || deck === null || presenting || texting) return;
     if (!(editMode || edits.dirty)) return;
     const t = e.target as HTMLElement | null;
     if (t !== null && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
@@ -1621,45 +1607,11 @@
         {#if nodeErrors > 0 || deck.blocked > 0}<span>approximate</span>{/if}
       </span>
       <!-- One dot a click, last in the bar's left cluster so a row that
-           grows or goes shifts nothing. The start mark is the slide before
-           its first click; the dot of the build on screen, clicked again (or
-           Escape), is the slide as drawn. -->
-      {#if !editMode && clicks > 0}
-        {@const tip = (label: string) => (approxNote === "" ? label : `${label} · ${approxNote}`)}
-        <span
-          class="builds"
-          bind:this={dotsEl}
-          role="group"
-          aria-label="builds"
-          title={approxNote || undefined}
-        >
-          <button
-            class="pip start"
-            class:on={buildAt !== null}
-            class:at={buildAt === 0}
-            tabindex={buildAt === null || buildAt === 0 ? 0 : -1}
-            onclick={() => showBuild(0)}
-            onkeydown={onDotsKey}
-            title={tip(buildAt === 0 && !inShow ? "before the first click (click again: as drawn)" : "before the first click")}
-            aria-label="before click 1 of {clicks}"
-            aria-current={buildAt === 0 ? "step" : undefined}
-          ><span aria-hidden="true"></span></button>
-          {#each { length: dotWindow.last - dotWindow.first + 1 } as _, n (n)}
-            {@const k = dotWindow.first + n}
-            <button
-              class="pip"
-              class:on={buildAt !== null && k <= buildAt}
-              class:at={buildAt === k}
-              class:more={(n === 0 && k > 1) || (k === dotWindow.last && k < clicks)}
-              tabindex={buildAt === k ? 0 : -1}
-              onclick={() => showBuild(k)}
-              onkeydown={onDotsKey}
-              title={tip(buildAt === k && !inShow ? `click ${k} of ${clicks} (click again: as drawn)` : `click ${k} of ${clicks}`)}
-              aria-label="click {k} of {clicks}"
-              aria-current={buildAt === k ? "step" : undefined}
-            ><span aria-hidden="true"></span></button>
-          {/each}
-        </span>
+           grows or goes shifts nothing; the dot of the build on screen,
+           clicked again (or Escape), is the slide as drawn. The presenter's
+           view has them in its footer. -->
+      {#if !editMode && clicks > 0 && show.mode !== "presenter"}
+        <span class="bar-dots">{@render clickDots()}</span>
       {/if}
     {/if}
     {#if downloadError !== null}<span class="bar-err">{downloadError}</span>{/if}
@@ -1667,7 +1619,7 @@
     {#if officeNote !== null}<span class="status" role="status">{officeNote}</span>{/if}
     {#if show.windowError !== null}<span class="bar-err" role="status">{show.windowError}</span>{/if}
     <span class="spacer"></span>
-    {#if deck !== null && (editMode || edits.dirty || edits.saving)}
+    {#if deck !== null && !show.isShowWindow && (editMode || edits.dirty || edits.saving)}
       <span class="edit-tools" role="group" aria-label="editing">
         {#if edits.blocked !== null}
           <span class="bar-err" title={edits.blocked}>can't edit: {edits.blocked}</span>
@@ -1729,8 +1681,10 @@
         </button>
       {/if}
       {#if !show.isShowWindow}
+        <!-- On while a show window answers: it is there and following. -->
         <button
           class="bbtn"
+          class:mode-on={show.followed}
           aria-busy={show.opening}
           onclick={() => void openShowWindow()}
           title="the show in a new window (drag it to the projector); this one shows your notes, the next click and every slide"
@@ -1739,7 +1693,7 @@
       {/if}
       <button
         class="bbtn"
-        class:on={show.mode === "presenter"}
+        class:mode-on={show.mode === "presenter"}
         onclick={() => void togglePresenter()}
         aria-pressed={show.mode === "presenter"}
         title="presenter view: this slide, the next click, your notes, a timer (P)">presenter</button
@@ -1917,7 +1871,7 @@
      presenter's view jumps the show to its first state, and a show window
      follows. -->
 {#snippet stripView()}
-  <div class="strip" bind:this={stripEl} onscroll={() => stripEl !== null && (stripLeft = stripEl.scrollLeft)}>
+  <div class="strip" class:flush={show.mode === "presenter"} bind:this={stripEl} onscroll={() => stripEl !== null && (stripLeft = stripEl.scrollLeft)}>
     <div class="strip-inner" style:width="{count * (thumbW + THUMB_GAP) - THUMB_GAP}px" style:height="{THUMB_H}px">
       {#each { length: count } as _, i (i)}
         <button
@@ -1956,6 +1910,17 @@
 {/snippet}
 
 <!-- The next click, drawn live at its build (`nextPlace`). -->
+{#snippet clickDots()}
+  <ClickDots
+    {clicks}
+    at={buildAt}
+    canClear={!inShow}
+    note={approxNote}
+    onpick={showBuild}
+    onset={setBuild}
+  />
+{/snippet}
+
 {#snippet nextView()}
   <div class="next-frame" bind:clientWidth={nextW}>
     {#if nextScale > 0}
@@ -1972,9 +1937,10 @@
       ratio={w / h}
       notes={noteSkipped ? "" : note}
       noNotes={noteSkipped ? "This slide's notes are too large to show here." : undefined}
+      dots={clicks > 0 ? clickDots : undefined}
       elapsed={show.elapsed}
       onResetTimer={() => show.resetTimer()}
-      place={presenterPlace}
+      place="{showAt.n} / {showAt.of}"
       wallClock={show.wallClock}
     />
   {:else}
@@ -2023,68 +1989,10 @@
     color: var(--fg);
   }
 
-  /* The click dots: as wide as their dots (at most the start mark and DOTS). */
-  .builds {
+  .bar-dots {
     flex: none;
     display: inline-flex;
-    align-items: center;
-    height: 18px;
     margin-left: 0.25rem;
-  }
-
-  .pip {
-    appearance: none;
-    flex: none;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 10px;
-    height: 18px;
-    padding: 0;
-    border: none;
-    border-radius: 3px;
-    background: none;
-    cursor: pointer;
-  }
-
-  .pip > span {
-    width: 5px;
-    height: 5px;
-    border-radius: 50%;
-    background: color-mix(in srgb, var(--fg) 22%, transparent);
-    transition:
-      background-color 0.12s ease,
-      box-shadow 0.12s ease;
-  }
-
-  /* The start mark: a short bar, the slide before its first click. */
-  .pip.start > span {
-    width: 2px;
-    height: 9px;
-    border-radius: 1px;
-  }
-
-  /* More clicks beyond the window's edge. */
-  .pip.more > span {
-    width: 3px;
-    height: 3px;
-  }
-
-  .pip:hover > span {
-    background: color-mix(in srgb, var(--fg) 50%, transparent);
-  }
-
-  .pip.on > span {
-    background: var(--accent);
-  }
-
-  .pip.at:not(.start) > span {
-    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 28%, transparent);
-  }
-
-  .pip:focus-visible {
-    outline: 2px solid var(--focus-ring);
-    outline-offset: -1px;
   }
 
   .tag {
@@ -2217,6 +2125,14 @@
     color: var(--fg);
   }
 
+  /* A mode that is on (the presenter's view, a connected show window):
+     a fill that stays under hover, so on never reads as hovered. */
+  .bbtn.mode-on,
+  .bbtn.mode-on:hover:not(:disabled) {
+    color: var(--fg);
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+  }
+
   .bbtn:disabled {
     opacity: 0.4;
     cursor: default;
@@ -2246,18 +2162,14 @@
      cell, on the view's own background. */
   .stage.in-presenter {
     align-self: stretch;
+    align-items: flex-start;
     background: none;
   }
 
-  /* There the slide, not the empty cell around it, shows the keys' focus. */
+  /* The stage holds the keys for the whole view: it is focused all the
+     time, so it wears no ring there (the controls around it do). */
   .stage.in-presenter:focus-visible {
     box-shadow: none;
-  }
-
-  .stage.in-presenter:focus-visible .slide-box {
-    box-shadow:
-      0 0 0 2px var(--focus-ring),
-      0 2px 12px color-mix(in srgb, var(--fg) 14%, transparent);
   }
 
   /* The next click: the slide scaled to its frame, white like the stage's. */
@@ -2454,6 +2366,17 @@
     margin: 0 auto;
   }
 
+  /* In the presenter's view the strip starts at the console's edge, on its
+     surface. */
+  .strip.flush {
+    padding: 8px 12px 10px;
+    background: none;
+  }
+
+  .strip.flush .strip-inner {
+    margin: 0;
+  }
+
   .thumb {
     position: absolute;
     top: 0;
@@ -2527,8 +2450,9 @@
     bottom: 2px;
     padding: 0 3px;
     border-radius: 3px;
-    background: color-mix(in srgb, var(--term-bg) 80%, transparent);
-    color: var(--muted);
+    /* On the slide's own white in every theme, so one style for both. */
+    background: color-mix(in srgb, #000 8%, transparent);
+    color: color-mix(in srgb, #000 60%, transparent);
     font-family: var(--mono);
     font-size: 9px;
     line-height: 1.4;
@@ -2536,15 +2460,15 @@
   }
 
   .thumb.on .num {
-    color: var(--accent);
+    background: var(--accent);
+    color: #fff;
   }
 
   @media (prefers-reduced-motion: reduce) {
     .bbtn,
     .opt,
     .thumb,
-    .slide-ref,
-    .pip > span {
+    .slide-ref {
       transition: none;
     }
   }

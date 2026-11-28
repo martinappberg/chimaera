@@ -9,13 +9,17 @@
  *
  * Two windows keep step only while a window is in the show or the
  * presenter's view, over a BroadcastChannel (`showSync.ts`): each move is
- * told as the slide's stable key and build, and a window joining late asks
- * where the others are. A window that is only browsing neither follows nor
- * leads.
+ * told as the slide's stable key and build. The presenter's view leads (as
+ * does a window presenting on its own) and the show window follows
+ * (`syncAction`): a leader joining tells its place, a follower joining
+ * asks for the leader's. A window that is only browsing neither follows
+ * nor leads. While leading, the presenter asks every few seconds whether a
+ * show window is there (`followed`).
  *
  * Show in window: this window leaves an invite in localStorage and opens
  * its tab again in a new window; the new document, created after the
- * invite, takes it (once, while fresh) and starts its own show. A document
+ * invite, takes it (once, while fresh) and starts its own show at the
+ * place the invite names (where the presenter stands). A document
  * that already existed (the same deck in another pane) never starts a show
  * by itself; a window that does not open clears the invite, and this view
  * becomes the presenter's only once the window is open.
@@ -25,7 +29,7 @@
  */
 import { tick, untrack } from "svelte";
 import { deckStep, showEdge, showReach, type Place } from "../slideShow";
-import { readSync, type DeckSync } from "./showSync";
+import { readSync, syncAction, type DeckSync } from "./showSync";
 
 export type ShowMode = "browse" | "present" | "presenter";
 
@@ -85,21 +89,28 @@ export interface ShowOptions {
 export const INVITE_KEY = "chimaera.deck.show-window";
 export const INVITE_MS = 60_000;
 
-/** The invite a presenter leaves for the window it opens. */
-export function inviteText(sync: string, at: number): string {
-  return JSON.stringify({ sync, at });
+/** How long a show window counts as there after it last answered. */
+export const FOLLOWER_MS = 5_000;
+const PING_MS = 2_000;
+
+/** The invite a presenter leaves for the window it opens: the deck, when,
+ *  and where the presenter stands (slide key and build). */
+export function inviteText(sync: string, at: number, key: string, build: number): string {
+  return JSON.stringify({ sync, at, key, build });
 }
 
-/** Whether the invite `raw` is for this deck, fresh at `now`, and made
- *  before this document was (`createdAt`, `performance.timeOrigin`). */
-export function inviteFor(raw: string | null, sync: string, now: number, createdAt: number): boolean {
-  if (raw === null) return false;
+/** The place the invite `raw` names when it is for this deck, fresh at
+ *  `now`, and made before this document was (`createdAt`,
+ *  `performance.timeOrigin`); null when it isn't this document's. */
+export function readInvite(raw: string | null, sync: string, now: number, createdAt: number): { key: string | null; build: number } | null {
+  if (raw === null) return null;
   try {
-    const v = JSON.parse(raw) as { sync?: unknown; at?: unknown };
-    if (v.sync !== sync || typeof v.at !== "number" || now - v.at > INVITE_MS || now < v.at) return false;
-    return createdAt >= v.at;
+    const v = JSON.parse(raw) as { sync?: unknown; at?: unknown; key?: unknown; build?: unknown };
+    if (v.sync !== sync || typeof v.at !== "number" || now - v.at > INVITE_MS || now < v.at || createdAt < v.at) return null;
+    const build = typeof v.build === "number" && Number.isInteger(v.build) && v.build >= 0 ? v.build : 0;
+    return { key: typeof v.key === "string" && v.key !== "" ? v.key.slice(0, 2048) : null, build };
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -129,8 +140,10 @@ export class SlideShow {
   opening = $state(false);
   /** Why the show's window didn't open. */
   windowError = $state<string | null>(null);
-  /** This window is the show a presenter opened. */
+  /** This window is the show a presenter opened (until that show ends). */
   isShowWindow = $state(false);
+  /** A show window answered within `FOLLOWER_MS` (this window leads). */
+  followed = $state(false);
 
   readonly #o: ShowOptions;
   readonly #me = Math.random().toString(36).slice(2);
@@ -141,6 +154,13 @@ export class SlideShow {
   #wentFull = false;
   #disposed = false;
   #inviteChecked = false;
+  /** The talk timer started once in this view's life: it keeps running
+   *  through presenter off and on, the show and an edit. */
+  #timerStarted = false;
+  #followerAt = 0;
+  /** In the show or the presenter's view: switching between the two keeps
+   *  the channel (no new question, no jump). */
+  readonly #inShow = $derived(this.mode !== "browse");
 
   constructor(o: ShowOptions) {
     this.#o = o;
@@ -150,18 +170,39 @@ export class SlideShow {
 
     // Two windows on one deck keep step while this one is in the show.
     $effect(() => {
-      if (this.mode === "browse" || typeof BroadcastChannel === "undefined") return;
+      if (!this.#inShow || typeof BroadcastChannel === "undefined") return;
       const name = o.sync();
       if (name === "") return;
       const ch = new BroadcastChannel(name);
       ch.onmessage = (e: MessageEvent) => this.#hear(ch, e.data);
       this.#channel = ch;
-      // Joining late: line up with whoever is already in the show.
-      this.#post(ch, { kind: "where", from: this.#me });
+      // Joining: a leader tells where the show is, a follower asks.
+      untrack(() => this.#post(ch, this.#lead ? this.#where(false) : { kind: "where", from: this.#me }));
       return () => {
         ch.close();
         if (this.#channel === ch) this.#channel = null;
+        this.followed = false;
       };
+    });
+
+    // The presenter asks every few seconds whether a show window is there
+    // (its answers are ignored for the place); only while it can be seen.
+    $effect(() => {
+      if (this.mode !== "presenter" || !o.visible()) return;
+      const ping = () => {
+        if (this.#channel !== null) this.#post(this.#channel, { kind: "where", from: this.#me });
+        this.followed = Date.now() - this.#followerAt < FOLLOWER_MS;
+      };
+      const id = setInterval(ping, PING_MS);
+      untrack(ping);
+      return () => clearInterval(id);
+    });
+
+    // "The show's window didn't open" goes after a while.
+    $effect(() => {
+      if (this.windowError === null) return;
+      const id = setTimeout(() => (this.windowError = null), 8_000);
+      return () => clearTimeout(id);
     });
 
     // The timer ticks only while someone can see it; the re-run on return
@@ -182,8 +223,7 @@ export class SlideShow {
       const onChange = () => {
         if (document.fullscreenElement === null && this.mode === "present" && this.#wentFull) {
           this.#wentFull = false;
-          this.mode = "browse";
-          o.left?.();
+          this.#toBrowse();
         }
       };
       document.addEventListener("fullscreenchange", onChange);
@@ -195,9 +235,12 @@ export class SlideShow {
       if (this.#inviteChecked || o.deck.count() === 0) return;
       this.#inviteChecked = true;
       untrack(() => {
-        if (!this.#takeInvite()) return;
+        const invite = this.#takeInvite();
+        if (invite === null) return;
         this.isShowWindow = true;
-        void this.present();
+        // The show opens where the presenter stands, before any message.
+        const place = invite.key === null ? null : this.placeOf(invite.key, invite.build, 0);
+        void this.present(place ?? undefined);
       });
     });
   }
@@ -212,7 +255,26 @@ export class SlideShow {
   }
 
   get wallClock(): string {
-    return new Date(this.now).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return new Date(this.now).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  }
+
+  /** This window leads the show: the presenter's view, or a show of its
+   *  own (not one a presenter opened). */
+  get #lead(): boolean {
+    return this.mode === "presenter" || (this.mode === "present" && !this.isShowWindow);
+  }
+
+  /** Every mode change goes through here: a stale "didn't open" goes too. */
+  #setMode(m: ShowMode): void {
+    this.windowError = null;
+    this.mode = m;
+  }
+
+  #toBrowse(): void {
+    // A show window whose show ended is a viewer like any other.
+    this.isShowWindow = false;
+    this.#setMode("browse");
+    this.#o.left?.();
   }
 
   /** The show's next click from where it stands: null at its end. */
@@ -278,9 +340,10 @@ export class SlideShow {
     this.#standing = deck.key(to.slide);
   }
 
-  async present(): Promise<void> {
-    const start = this.#o.opening?.("present", this.at) ?? { slide: this.at.slide, build: 0 };
-    this.mode = "present";
+  /** The show, at `start` (else where `opening` says). */
+  async present(start?: Place): Promise<void> {
+    start ??= this.#o.opening?.("present", this.at) ?? { slide: this.at.slide, build: 0 };
+    this.#setMode("present");
     // A show opens a slide as a click would have: at its first build.
     this.go(start, { tell: false });
     await tick();
@@ -301,28 +364,32 @@ export class SlideShow {
     this.#wentFull = false;
     if (typeof document !== "undefined" && document.fullscreenElement !== null) await document.exitFullscreen().catch(() => {});
     if (this.mode === "browse") return;
-    this.mode = "browse";
-    this.#o.left?.();
+    this.#toBrowse();
   }
 
   /** The presenter's view on, or off again. */
   presenter(): void {
     if (this.mode === "presenter") {
-      this.mode = "browse";
-      this.#o.left?.();
+      this.#toBrowse();
       return;
     }
     if (this.mode === "present" && typeof document !== "undefined" && document.fullscreenElement !== null) {
       this.#wentFull = false;
       void document.exitFullscreen().catch(() => {});
     }
-    const start = this.#o.opening?.("presenter", this.at) ?? this.at;
-    this.resetTimer();
-    this.mode = "presenter";
+    const start = this.#presenterStart();
+    if (!this.#timerStarted) this.resetTimer();
+    this.isShowWindow = false;
+    this.#setMode("presenter");
     this.go(start, { tell: false });
   }
 
+  #presenterStart(): Place {
+    return this.mode === "browse" ? (this.#o.opening?.("presenter", this.at) ?? this.at) : this.at;
+  }
+
   resetTimer(): void {
+    this.#timerStarted = true;
     this.started = Date.now();
     this.now = this.started;
   }
@@ -332,8 +399,10 @@ export class SlideShow {
     this.windowError = null;
     if (this.opening) return;
     const sync = this.#o.sync();
+    // The show window opens where the presenter's view will stand.
+    const start = this.#presenterStart();
     try {
-      localStorage.setItem(INVITE_KEY, inviteText(sync, Date.now()));
+      localStorage.setItem(INVITE_KEY, inviteText(sync, Date.now(), this.#o.deck.key(start.slide), start.build));
     } catch {
       // No storage: the window opens on the deck, and F starts its show.
     }
@@ -354,23 +423,25 @@ export class SlideShow {
     if (!this.#disposed && this.mode !== "presenter") this.presenter();
   }
 
-  #takeInvite(): boolean {
+  #takeInvite(): { key: string | null; build: number } | null {
     try {
-      const raw = localStorage.getItem(INVITE_KEY);
-      if (!inviteFor(raw, this.#o.sync(), Date.now(), performance.timeOrigin)) return false;
-      localStorage.removeItem(INVITE_KEY);
-      return true;
+      const got = readInvite(localStorage.getItem(INVITE_KEY), this.#o.sync(), Date.now(), performance.timeOrigin);
+      if (got !== null) localStorage.removeItem(INVITE_KEY);
+      return got;
     } catch {
-      return false;
+      return null;
     }
   }
 
-  #where(): DeckSync {
-    return { kind: "at", from: this.#me, title: this.#standing, slide: this.at.slide, build: this.at.build };
+  #where(reply: boolean): DeckSync {
+    const msg: DeckSync = { kind: "at", from: this.#me, title: this.#o.deck.key(this.at.slide), slide: this.at.slide, build: this.at.build };
+    if (this.#lead) msg.lead = true;
+    if (reply) msg.reply = true;
+    return msg;
   }
 
   #say(): void {
-    if (this.#channel !== null) this.#post(this.#channel, this.#where());
+    if (this.#channel !== null) this.#post(this.#channel, this.#where(false));
   }
 
   #post(ch: BroadcastChannel, msg: DeckSync): void {
@@ -385,14 +456,20 @@ export class SlideShow {
     const msg = readSync(data);
     if (msg === null || msg.from === this.#me || this.#disposed) return;
     if (msg.kind === "where") {
-      this.#post(ch, this.#where());
+      this.#post(ch, this.#where(true));
       return;
     }
+    if (msg.lead !== true && this.#lead) {
+      this.#followerAt = Date.now();
+      this.followed = true;
+    }
+    const act = syncAction(this.#lead, msg);
+    if (act === "ignore") return;
     const place = this.placeOf(msg.title, msg.build, msg.slide);
     if (place === null) return;
     // The show follows the presenter's clicker as a click: one click on
     // may animate, a jump lands.
     const click = this.mode === "present" && same(this.next(), place);
-    this.go(place, { tell: false, click, heard: true });
+    this.go(place, { tell: act === "take-and-tell", click, heard: true });
   }
 }
