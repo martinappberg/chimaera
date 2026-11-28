@@ -1010,7 +1010,9 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   an SVG filter's picture from the scale it was first painted at, so a zoom from nothing drew a
   pale smear the size of the shadow until it landed. The last animated frame and the landed one
   are the same picture (0 px apart in window captures of fade, zoom, float, fly, wipe, spin, grow
-  and a path in WebKit). A wipe, pattern or iris is laid over the shape's whole drawing, its
+  and a path in WebKit). A paragraph wiped from the left or right sweeps its words padded by
+  0.7 em on each side, at PowerPoint's pace (its film: 424 px/s for a 253 px line over 1 s, where
+  the words alone gave 300). A wipe, pattern or iris is laid over the shape's whole drawing, its
   outline and shadow included (a scaled shadow too), as PowerPoint's film lays it, and reveals the
   shadow with the shape: while it plays the shape's box is grown to the mask's by a transparent border,
   its content held in place to the device pixel, so nothing pops in when it lands. The next click

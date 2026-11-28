@@ -59,6 +59,8 @@ export interface Segment {
   value(t: number): number | null;
   /** For `clip`: the filter's mask at a progress, in the element's px. */
   region?: Region;
+  /** For `clip`: the filter (`wipe(left)`), for where it lays its sweep. */
+  filter?: string;
   /** For `mask`: the pattern whose pictures show the element (`value`: the filter's progress). */
   pattern?: Pattern;
 }
@@ -556,7 +558,7 @@ export function effectMotion(e: Effect, geom: (key: string) => Geom | null): Eff
           segments.push({ key, ch: "op", value: (s) => { const q = local(s); return q === null ? null : goingOut ? 1 - q : q; } });
           break;
         }
-        segments.push({ key, ch: "clip", value: local, region });
+        segments.push({ key, ch: "clip", value: local, region, filter: f.full });
         break;
       }
       case "anim": {

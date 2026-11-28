@@ -595,7 +595,23 @@ export interface ElementBase {
   bh: number;
   bx?: number;
   by?: number;
+  /** A paragraph's font size, its own px (its first run's). */
+  em?: number;
 }
+
+/**
+ * How far past a paragraph's words a wipe from the left or right lays its
+ * sweep, on each side, in the paragraph's font size. PowerPoint's film
+ * (one-line paragraphs at 40 pt, left and centred, a 253 px and a 1,287 px
+ * line, wiped from either side over 1 s; and the `paragraphs` deck's 28 pt
+ * line over 500 ms) moves the edge at (words + 1.4 em) × 1.15 per duration:
+ * 424 and 421 px/s against 1.15 × (253 + 112) = 420, 1,631 and 1,636
+ * against 1,609, 414 when centred; the D9 line 0.58 px/ms against 0.57.
+ * The words alone (as for a shape's box) ran 30 % slow on a short line.
+ */
+export const WIPE_PAD_EM = 0.7;
+/** A horizontal wipe: PowerPoint's film shows the padded sweep for these. */
+const HORIZONTAL_WIPE = /^wipe(?:\((?:left|right)?\))?$/;
 
 /** An element's inline values once the click has landed (`none` where the
  *  landed state sets nothing): every track's last frame. */
@@ -843,9 +859,12 @@ export function planStep(
           case "op":
             op *= v;
             break;
-          case "clip":
-            clip = s.region!(Math.min(1, Math.max(0, v)), b.bw, b.bh, b.bx ?? 0, b.by ?? 0);
+          case "clip": {
+            // A paragraph's horizontal wipe sweeps past its words (WIPE_PAD_EM).
+            const pad = id.includes("#") && b.em !== undefined && HORIZONTAL_WIPE.test(s.filter ?? "") ? WIPE_PAD_EM * b.em : 0;
+            clip = s.region!(Math.min(1, Math.max(0, v)), b.bw + 2 * pad, b.bh, (b.bx ?? 0) - pad, b.by ?? 0);
             break;
+          }
           case "mask":
             maskP = Math.min(1, Math.max(0, v));
             break;
@@ -1059,8 +1078,15 @@ function measure(tagged: TaggedSlide, id: ElementId, w: number, h: number): Elem
     bh: box[1]!,
     bx: textAt[0] * k,
     by: textAt[1] * k,
-    ...(id.includes("#") ? { origin: textOrigin(el) ?? undefined } : {}),
+    ...(id.includes("#") ? { origin: textOrigin(el) ?? undefined, em: fontPx(el) } : {}),
   };
+}
+
+/** An element's first run's font size in its own px, if it reads as one. */
+function fontPx(el: Styled): number | undefined {
+  const run = el.querySelector("span") ?? el;
+  const v = Number.parseFloat(getComputedStyle(run).fontSize);
+  return Number.isFinite(v) && v > 0 && v < 10000 ? v : undefined;
 }
 
 /**
