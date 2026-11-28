@@ -642,7 +642,10 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   restart. Shipped as the platform plan's phase P7; 0.1 plugins (Mycelium) run unchanged
   beside it.
 - **How to use.** Switch the plugin on in a workspace. Its card gains **Open <view>** for each
-  tab it offers, its card sections, and **Settings**. A file it claims opens in its view; the
+  tab it offers, its card sections, and **Settings**. A tab view that asks for it (`[[views]]
+  rail`, API 0.3; at most two per plugin) also gets a row in the sidebar beside Knowledge, in
+  its icon and title, while the plugin is on there: one click opens or focuses the tab
+  (`platform.ts::railViews`, App.svelte's rail). A file it claims opens in its view; the
   bar above has **Text** (and, when two plugins claim it, each one — the choice is remembered
   per workspace), its status chips and file actions. Opening such a file where the plugin is
   installed but off offers **Turn on** in that bar (**Not now** is remembered per workspace;

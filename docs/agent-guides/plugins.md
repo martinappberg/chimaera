@@ -807,6 +807,7 @@ id = "document"
 title = "Document"         # required: every view has a name
 slot = "file"
 icon = "book"              # optional: a tab view's glyph, a name from the `icon` node's set
+# rail = true              # 0.3, a tab view: a sidebar row (its icon and title) while the plugin is on here
 
 [[files]]                  # files matching `match` open in `view` (Text one click away)
 match = ["*.tex", "*.ltx"] # a pattern without `/` matches the name anywhere; `**` spans folders
@@ -908,8 +909,7 @@ bar with its stage and megabytes sits at the top of your screen meanwhile, the
 view draws again at once — `tool_state` then says `installing` — and when it is
 done).
 
-Where a view draws: `tab` (its own tab: the card's **Open**, `open-view`, a file
-action's `open`), `panel` (the dashboard, after core's sections), `file` (a
+Where a view draws: `tab` (its own tab: the card's **Open**, `open-view`, a file action's `open`, and with `rail = true` (0.3) a row in the sidebar beside Knowledge, in its icon and title, while the plugin is on in the workspace — for an app people come back to; at most two per plugin, and a view that opens from a file or an agent needs none), `panel` (the dashboard, after core's sections), `file` (a
 claimed file; the view owns the pane: the screen is at least the pane's height,
 the root stack's last child takes what is left, and an `editor` or `pdf` first
 in a split pane, a stack or a tab fills it; a root whose last child is a split

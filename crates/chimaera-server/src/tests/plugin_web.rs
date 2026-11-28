@@ -106,6 +106,20 @@ fn the_manifest_declares_pages_libraries_and_hosts_and_the_card_says_so() {
     let bad = text.replace("\"data.example.org\"", "\"https://data.example.org\"");
     let err = crate::plugins::parse_manifest(&bad).unwrap_err();
     assert!(err.contains("bare public hostname"), "{err}");
+
+    // Its board asks for a sidebar row, which the wire carries; only a tab
+    // view may, and only from 0.3.
+    assert!(m.views.iter().any(|v| v.id == "board" && v.rail));
+    let wire = crate::plugins::platform::wire(&m);
+    assert_eq!(wire["views"][0]["rail"], json!(true));
+    let panel = text.replace("slot = \"tab\"", "slot = \"panel\"");
+    let err = crate::plugins::parse_manifest(&panel).unwrap_err();
+    assert!(err.contains("only a tab view"), "{err}");
+    let old = text
+        .replace("api = \"0.3\"", "api = \"0.2\"")
+        .replace("[web]\npages = [\"view.html\"]\nlibraries = [\"testlib\"]\nnetwork = [\"data.example.org\"]\n", "");
+    let err = crate::plugins::parse_manifest(&old).unwrap_err();
+    assert!(err.contains("rail needs api = \"0.3\""), "{err}");
 }
 
 #[tokio::test]

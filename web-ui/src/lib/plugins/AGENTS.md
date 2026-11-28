@@ -13,7 +13,7 @@ with four equal segments: **Plugins** · **Connections** · **Skills** · **Brow
 "plugins". Its glyph (2×2 cells, the top-right a plus) is `glyph.ts`, drawn
 only through `ExtensionsGlyph.svelte` by PaneTabs, App's rail row and
 QuickOpen — not in `shared/icons.ts`, which `prebuild` regenerates from Tabler.
-A plugin's own tab wears the icon its view names (`[[views]] icon`, a name
+A tab view that asks for it (`[[views]] rail`, 0.3) gets a sidebar row beside Knowledge while its plugin is on in the workspace (`platform.ts::railViews`, drawn in App.svelte's rail: its icon, its title, opening or focusing the tab). A plugin's own tab wears the icon its view names (`[[views]] icon`, a name
 from `ui/icons.ts`, the set `ui/1` screens draw from) and falls back to that
 glyph.
 

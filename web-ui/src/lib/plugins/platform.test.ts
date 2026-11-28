@@ -219,3 +219,22 @@ describe("install progress in words", () => {
     expect(progressWords(null)).toEqual({ text: "Starting", fraction: null });
   });
 });
+
+describe("railViews", () => {
+  it("lists the tab views of active plugins that ask for a sidebar row", async () => {
+    const { railViews, normalizePlatform } = await import("./platform");
+    const platform = normalizePlatform({
+      views: [
+        { id: "board", title: "Web board", slot: "tab", icon: "grid", rail: true },
+        { id: "side", title: "Side", slot: "panel", rail: true },
+        { id: "plain", title: "Plain", slot: "tab" },
+      ],
+    });
+    const on = { id: "test-web", active: true, platform } as unknown as WorkspacePlugin;
+    const off = { ...on, id: "other", active: false } as typeof on;
+    const rows = railViews([on, off]);
+    expect(rows.map((r) => [r.plugin, r.view, r.title])).toEqual([["test-web", "board", "Web board"]]);
+    expect(rows[0].icon).not.toBeNull();
+    expect(railViews(undefined)).toEqual([]);
+  });
+});

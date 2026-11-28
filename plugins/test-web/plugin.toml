@@ -22,3 +22,4 @@ id = "board"
 title = "Web board"
 slot = "tab"
 icon = "grid"
+rail = true            # a sidebar row while it is on

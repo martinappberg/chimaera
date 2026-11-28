@@ -273,7 +273,7 @@
     workspacePlugins,
   } from "./lib/plugins/store";
   import { registerPluginOffers } from "./lib/shared/pageNeeds";
-  import { platformFrame, pluginViewTitle, setViewOpener, setWindowCopier } from "./lib/plugins/platform";
+  import { platformFrame, pluginViewTitle, railViews, setViewOpener, setWindowCopier } from "./lib/plugins/platform";
   import ExtensionsGlyph from "./lib/plugins/ExtensionsGlyph.svelte";
   import ComputeStrip from "./lib/workspace/ComputeStrip.svelte";
   import type JobWindowNotices from "./lib/workspace/JobWindowNotices.svelte";
@@ -1035,6 +1035,14 @@
   const pluginsOpen = $derived.by(() => {
     const p = findPane(layout.root, layout.focusedPaneId);
     return p?.tabs[p.active]?.surface === "plugins";
+  });
+  /** Sidebar rows active plugins ask for (`[[views]] rail`), and which one
+   *  the focused pane shows. */
+  const pluginRail = $derived(railViews($workspacePlugins?.plugins));
+  const pluginTabOpen = $derived.by(() => {
+    const p = findPane(layout.root, layout.focusedPaneId);
+    const t = p?.tabs[p.active];
+    return t?.surface === "plugin" ? `${t.plugin}\n${t.view}` : null;
   });
 
   // --- context bridge: reference target resolution ---------------------------
@@ -4720,6 +4728,37 @@
             <span class="dash-label">knowledge</span>
           </button>
         {/if}
+
+        <!-- A plugin's own row (`[[views]] rail`): only while it is on here,
+             in its icon, opening or focusing its tab. -->
+        {#each pluginRail as r (`${r.plugin}\n${r.view}`)}
+          <button
+            class="row dash-row"
+            class:dash-active={pluginTabOpen === `${r.plugin}\n${r.view}`}
+            title={r.title}
+            onclick={() => openPluginViewSurface(r.plugin, r.view)}
+          >
+            {#if r.icon !== null}
+              <svg
+                class="dash-glyph"
+                viewBox="0 0 24 24"
+                width="12"
+                height="12"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2.2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                {#each r.icon as d, n (n)}<path {d} />{/each}
+              </svg>
+            {:else}
+              <ExtensionsGlyph class="dash-glyph" />
+            {/if}
+            <span class="dash-label">{r.title}</span>
+          </button>
+        {/each}
 
         <!-- Extensions (Plugins · Skills): always a row — it is where a
              plugin gets installed in the first place. -->
