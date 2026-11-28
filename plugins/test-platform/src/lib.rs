@@ -270,6 +270,15 @@ impl Plugin for Fixture {
                 Ok(Some(json!({"message": format!("{file}: {words} words"),
                                "open": {"view": "board"}})))
             }
+            // A file view opened on the file the action ran on, a file its
+            // pattern doesn't claim (`*.md`).
+            "open-as-doc" if view.is_empty() => {
+                let file = payload
+                    .get("file")
+                    .and_then(Value::as_str)
+                    .ok_or("no file")?;
+                Ok(Some(json!({"open": {"view": "doc", "file": file}})))
+            }
             other => Err(format!("no such action {other}")),
         }
     }

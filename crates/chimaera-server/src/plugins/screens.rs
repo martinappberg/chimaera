@@ -490,7 +490,15 @@ pub(crate) async fn render_route(
         let Some(file) = q.file.as_deref() else {
             return super::bad_request("a file view needs ?file=");
         };
-        if super::platform::file_kind(&m, file).is_none_or(|k| k.view != view) {
+        // A file it claims for this view, or one its file actions take: an
+        // action's answer may open any of its file views on that file
+        // (`file_action_route`), such as a genome view on a plain VCF.
+        let claimed = super::platform::file_kind(&m, file).is_some_and(|k| k.view == view);
+        let acted_on = m
+            .actions
+            .iter()
+            .any(|a| a.patterns.iter().any(|p| super::platform::matches(p, file)));
+        if !claimed && !acted_on {
             return super::bad_request(format!("{} does not open {file} in {view}", m.name));
         }
     }
@@ -648,12 +656,31 @@ pub(crate) async fn file_action_route(
         .get("message")
         .and_then(Value::as_str)
         .map(|m| crate::timeline::cap(m, 400));
-    let open = answer.get("open").filter(|o| {
-        o.get("view")
+    let open = answer.get("open").and_then(|o| {
+        let view = o.get("view").and_then(Value::as_str)?;
+        if !m.views.iter().any(|d| d.id == view) {
+            return None;
+        }
+        // A file view opens on a file of this workspace: a plain relative
+        // path, never `..`, absolute or empty. Anything else is dropped, and
+        // the view opens on the file the action ran on.
+        let file = o
+            .get("file")
             .and_then(Value::as_str)
-            .is_some_and(|v| m.views.iter().any(|d| d.id == v))
+            .filter(|f| workspace_file(f));
+        Some(json!({"view": view, "file": file}))
     });
     Json(json!({"message": message, "open": open})).into_response()
+}
+
+/// A path a plugin may name for a file view to open on: workspace-relative,
+/// `/`-separated, with no empty, `.` or `..` segment.
+fn workspace_file(f: &str) -> bool {
+    !f.is_empty()
+        && f.len() <= 1024
+        && !f.contains('\\')
+        && !f.contains('\0')
+        && f.split('/').all(|s| !s.is_empty() && s != "." && s != "..")
 }
 
 #[derive(Deserialize)]
@@ -698,6 +725,26 @@ pub(crate) async fn query_route(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_file_action_names_only_a_plain_workspace_file() {
+        for ok in ["a.vcf", "data/tp53/calls.vcf.gz", "with space.bed"] {
+            assert!(super::workspace_file(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "/etc/passwd",
+            "../x",
+            "a/../b",
+            "a//b",
+            "./a",
+            "a/",
+            "a\\b",
+            "a\0b",
+        ] {
+            assert!(!super::workspace_file(bad), "{bad:?}");
+        }
+    }
+
     use super::*;
 
     #[test]

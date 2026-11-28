@@ -154,7 +154,7 @@ async fn a_plugin_page_is_served_under_its_grant() {
     let csp = header_str(&headers, "content-security-policy");
     assert!(csp.starts_with("sandbox allow-scripts;"), "{csp}");
     assert!(
-        csp.contains("connect-src 'self' https://data.example.org;"),
+        csp.contains("connect-src 'self' data: https://data.example.org;"),
         "{csp}"
     );
     assert!(csp.contains("'unsafe-eval' 'wasm-unsafe-eval'"), "{csp}");
@@ -458,7 +458,7 @@ async fn a_plain_report_keeps_its_bytes_under_the_fixed_rule() {
     assert_eq!(header_str(&headers, "accept-ranges"), "bytes");
     let csp = header_str(&headers, "content-security-policy");
     assert!(csp.contains("img-src 'self' data: blob:;"), "{csp}");
-    assert!(csp.contains("connect-src 'self';"), "{csp}");
+    assert!(csp.contains("connect-src 'self' data:;"), "{csp}");
 }
 
 #[tokio::test]

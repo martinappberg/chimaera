@@ -313,6 +313,36 @@ async fn file_actions_and_queries_reach_the_plugin() {
     assert_eq!(status, StatusCode::OK, "{answer}");
     assert_eq!(answer["message"], "README.md: 4 words");
     assert_eq!(answer["open"]["view"], "board");
+    assert!(answer["open"]["file"].is_null(), "{answer}");
+    // A file view opened on a file: the answer names it.
+    let (status, answer) = request(
+        &state,
+        Method::POST,
+        &format!("/api/v1/workspaces/{ws}/plugins/{PID}/file-actions/open-as-doc"),
+        Some(json!({"file": "README.md"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["open"], json!({"view": "doc", "file": "README.md"}));
+    // The file view draws it: a file its actions take, though no kind claims it.
+    let (status, screen) = request(
+        &state,
+        Method::GET,
+        &format!("/api/v1/workspaces/{ws}/plugins/{PID}/views/doc?file=README.md"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{screen}");
+    // A file neither claimed nor acted on stays refused.
+    std::fs::write(root_of(&state, &ws).join("notes.txt"), "x\n").unwrap();
+    let (status, _) = request(
+        &state,
+        Method::GET,
+        &format!("/api/v1/workspaces/{ws}/plugins/{PID}/views/doc?file=notes.txt"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     // Not a file the action matches.
     let (status, _) = request(
         &state,
