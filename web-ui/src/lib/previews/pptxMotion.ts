@@ -14,7 +14,8 @@
  * - `rot` (added up: `p:animRot by`) and `rotAbs` (`p:animRot from/to`,
  *   `p:anim` on a rotation), in degrees;
  * - `op` (a fade filter, multiplied) and `opAbs` (`style.opacity`);
- * - `clip`: a transition filter's visible region (`clipRegion`).
+ * - `clip`: a transition filter's mask, its soft edge moving (`clipRegion`);
+ * - `mask`: a pattern filter's pictures (`patternOf`).
  * Visibility sets are not segments: the step planner replays them.
  *
  * What it can't play: an entrance or exit becomes a fade over its
@@ -56,28 +57,11 @@ export interface Segment {
    *  behaviour begins. Past its end it holds its last value. For `clip`,
    *  the filter's progress (0–1). */
   value(t: number): number | null;
-  /** For `clip`: the visible region at a progress, in the element's px. */
+  /** For `clip`: the filter's mask at a progress, in the element's px. */
   region?: Region;
-  /** For `mask`: the random pattern that shows the element cell by cell. */
+  /** For `mask`: the pattern whose pictures show the element (`value`: the filter's progress). */
   pattern?: Pattern;
 }
-
-/**
- * A random pattern a filter reveals its target through (no polygon can
- * draw it): `dissolve`'s cells, `randombar`'s bars across (`horizontal`)
- * or down. `out`: it hides instead. The value of a `mask` segment is the
- * filter's progress; the shown fraction is that, or 1 minus it going out.
- */
-export interface Pattern {
-  kind: "dissolve" | "bars";
-  horizontal: boolean;
-  out: boolean;
-}
-
-/** A visible region: a CSS `clip-path` for progress `p` on a `w`×`h` box
- *  whose top-left corner is at (`ox`, `oy`) in the element (a paragraph's
- *  text inside its block). */
-export type Region = (p: number, w: number, h: number, ox?: number, oy?: number) => string;
 
 export interface EffectMotion {
   segments: Segment[];
@@ -139,262 +123,286 @@ function curOf(ch: Channel, g: Geom): number {
 
 // --- filters --------------------------------------------------------------------
 
-type Pt = [number, number];
+/**
+ * The soft edge of every transition filter, as a fraction of its sweep.
+ * PowerPoint's film (`entrances`, `filters`, `exits-emphasis`): wipe,
+ * split, blinds, box, circle, diamond, plus, wheel, wedge, checkerboard
+ * and strips all draw their moving edge as a linear ramp 15% of the
+ * distance the edge travels (47 px on a 388 px wipe, 27° on the wedge's
+ * 180°, 8 px on a 53 px checkerboard cell), and that ramp enters and
+ * leaves the shape inside the effect's duration.
+ */
+export const FEATHER = 0.15;
 
-function polygon(pts: readonly Pt[], evenodd: boolean): string {
-  const r = (n: number) => Math.round(n * 100) / 100;
-  return `polygon(${evenodd ? "evenodd, " : ""}${pts.map(([x, y]) => `${r(x)}px ${r(y)}px`).join(", ")})`;
+/** How much of a point at level `level` (0: the sweep reaches it first,
+ *  1: last) shows at progress `p`; going `out`, how much is left. */
+export function revealAt(level: number, p: number, out: boolean): number {
+  const a = Math.min(1, Math.max(0, (p * (1 + FEATHER) - level) / FEATHER));
+  return out ? 1 - a : a;
 }
 
-/** A shape centred on the box growing with `q` (0: nothing, 1: covers the
- *  box), its first vertex its leftmost at mid height (the hole's bridge is
- *  horizontal, which no rasterizer draws). */
-type Grow = (q: number, w: number, h: number) => Pt[];
+/** A level as a piecewise-linear function of one coordinate: `[t0, t1,
+ *  level at t0, level at t1]`, pieces in order; past the ends it holds. */
+type Piece = [number, number, number, number];
 
-const CIRCLE_POINTS = 48;
+/** One gradient a filter's reveal is drawn with, in the box's own px:
+ *  - `linear`: the level along a direction (`angle`, CSS degrees), `t` px
+ *    from the box's centre;
+ *  - `radial`: along an ellipse's radius (`rx`×`ry` at the centre), `t`
+ *    from 0 to 1;
+ *  - `conic`: by angle about the centre, clockwise from 12 o'clock, `t` in
+ *    degrees of the box squared up (PowerPoint's wheel and wedge sweep the
+ *    box's own aspect, not the screen's angle). */
+type Layer = { kind: "linear"; angle: number; pieces: Piece[] } | { kind: "radial"; rx: number; ry: number; pieces: Piece[] } | { kind: "conic"; pieces: Piece[] };
 
-const GROW = new Map<string, Grow>([
-  [
-    "box",
-    (q, w, h) => {
-      const [cx, cy, a, b] = [w / 2, h / 2, (q * w) / 2, (q * h) / 2];
-      return [[cx - a, cy], [cx - a, cy - b], [cx + a, cy - b], [cx + a, cy + b], [cx - a, cy + b]];
-    },
-  ],
-  [
-    "circle",
-    (q, w, h) => {
-      // An ellipse with the shape's aspect, through its corners at q = 1
-      // (PowerPoint's iris: about 0.70·w by 0.66·h halfway).
-      const rx = q * (w / 2) * Math.SQRT2;
-      const ry = q * (h / 2) * Math.SQRT2;
-      const out: Pt[] = [];
-      for (let i = 0; i < CIRCLE_POINTS; i++) {
-        const a = Math.PI + (2 * Math.PI * i) / CIRCLE_POINTS;
-        out.push([w / 2 + rx * Math.cos(a), h / 2 + ry * Math.sin(a)]);
-      }
-      return out;
-    },
-  ],
-  [
-    "diamond",
-    (q, w, h) => {
-      const [cx, cy] = [w / 2, h / 2];
-      return [[cx - q * w, cy], [cx, cy - q * h], [cx + q * w, cy], [cx, cy + q * h]];
-    },
-  ],
-  [
-    "plus",
-    (q, w, h) => {
-      // PowerPoint's film: the cross's arms span the whole box from the
-      // start and thicken with the box's own aspect.
-      const [cx, cy, t, u] = [w / 2, h / 2, (q * w) / 2, (q * h) / 2];
-      return [
-        [0, cy], [0, cy - u], [cx - t, cy - u], [cx - t, 0], [cx + t, 0], [cx + t, cy - u],
-        [w, cy - u], [w, cy + u], [cx + t, cy + u], [cx + t, h], [cx - t, h], [cx - t, cy + u], [0, cy + u],
-      ];
-    },
-  ],
-  // Split: a band across the box (doors on its vertical or horizontal axis).
-  ["barnVertical", (q, w, h) => { const a = (q * w) / 2; return [[w / 2 - a, h / 2], [w / 2 - a, 0], [w / 2 + a, 0], [w / 2 + a, h], [w / 2 - a, h]]; }],
-  ["barnHorizontal", (q, w, h) => { const b = (q * h) / 2; return [[0, h / 2], [0, h / 2 - b], [w, h / 2 - b], [w, h / 2 + b], [0, h / 2 + b]]; }],
-]);
-
-/** The box less a grown shape (even-odd, bridged at mid height). */
-function hole(shape: Pt[], w: number, h: number): Shape {
-  const ring: Pt[] = [[0, h / 2], [0, 0], [w, 0], [w, h], [0, h], [0, h / 2]];
-  return { pts: [...ring, ...shape, shape[0]!], evenodd: true };
+/** A filter's reveal: one layer, or two combined (`intersect`: both,
+ *  multiplied; `add`: either). Going out each layer is complemented and
+ *  the combination swapped, so the shown part is exactly what coming in
+ *  would show's complement. */
+interface Reveal {
+  layers: Layer[];
+  op: "intersect" | "add";
 }
 
-function rect(x0: number, y0: number, x1: number, y1: number): Pt[] {
-  return [[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
+/** A frame of a filter's mask, as inline CSS on the element (`maskImage`
+ *  "none": nothing hidden). */
+export interface MaskFrame {
+  maskImage: string;
+  maskSize: string;
+  maskPosition: string;
+  maskRepeat: string;
+  maskComposite: string;
 }
+
+/** A filter's mask at progress `p` on a `w`×`h` box whose top-left corner
+ *  is at (`ox`, `oy`) in the element (a paragraph's text inside its block). */
+export type Region = (p: number, w: number, h: number, ox?: number, oy?: number) => MaskFrame;
+
+const levelAt = (pieces: readonly Piece[], t: number): number => {
+  const first = pieces[0]!;
+  if (t <= first[0]) return first[2];
+  for (const [t0, t1, l0, l1] of pieces) if (t <= t1) return t1 > t0 ? l0 + ((l1 - l0) * (t - t0)) / (t1 - t0) : l1;
+  return pieces[pieces.length - 1]![3];
+};
+
+/** `t` of a point (box px, origin top-left) on a layer. */
+function layerT(l: Layer, x: number, y: number, w: number, h: number): number {
+  const [dx, dy] = [x - w / 2, y - h / 2];
+  if (l.kind === "linear") {
+    const a = (l.angle * Math.PI) / 180;
+    return dx * Math.sin(a) - dy * Math.cos(a);
+  }
+  if (l.kind === "radial") return Math.hypot(dx / l.rx, dy / l.ry);
+  // The squared-up angle: the box stretched to a square of side 2.
+  const deg = (Math.atan2(dx / (w / 2), -dy / (h / 2)) * 180) / Math.PI;
+  return deg < 0 ? deg + 360 : deg;
+}
+
+/** How much of the point (`x`, `y`) in the box shows, by the same layers
+ *  the mask draws (tests read the model through this). */
+export function revealPoint(filter: string, out: boolean, p: number, x: number, y: number, w: number, h: number): number | null {
+  const r = revealOf(filter, w, h);
+  if (r === null) return null;
+  const as = r.layers.map((l) => revealAt(levelAt(l.pieces, layerT(l, x, y, w, h)), p, out));
+  const op = out ? (r.op === "add" ? "intersect" : "add") : r.op;
+  return as.reduce((a, b) => (op === "intersect" ? a * b : a + b - a * b));
+}
+
+const px = (n: number) => `${Math.round(n * 100) / 100}px`;
+const deg = (n: number) => `${Math.round(n * 100) / 100}deg`;
+const alpha = (a: number) => `rgba(0,0,0,${Math.round(a * 1000) / 1000})`;
+
+/** The stops of one piece: its ends and where the ramp starts and stops.
+ *  `at` maps `t` to the gradient's own position; `bend`: extra stops
+ *  inside the ramp where `at` is not linear (a conic squared up). */
+function pieceStops(piece: Piece, p: number, out: boolean, at: (t: number) => string, bend: number): string[] {
+  const [t0, t1, l0, l1] = piece;
+  const ts = [t0, t1];
+  if (l1 !== l0) {
+    const lo = p * (1 + FEATHER) - FEATHER;
+    const hi = p * (1 + FEATHER);
+    for (const l of [lo, hi]) {
+      const t = t0 + ((l - l0) * (t1 - t0)) / (l1 - l0);
+      if (t > Math.min(t0, t1) && t < Math.max(t0, t1)) ts.push(t);
+    }
+    if (bend > 0) {
+      const [a, b] = [lo, hi].map((l) => Math.min(Math.max(t0 + ((l - l0) * (t1 - t0)) / (l1 - l0), Math.min(t0, t1)), Math.max(t0, t1)));
+      for (let i = 1; i < bend; i++) ts.push(a! + ((b! - a!) * i) / bend);
+    }
+  }
+  const lv = (t: number) => (t1 > t0 ? l0 + ((l1 - l0) * (t - t0)) / (t1 - t0) : l1);
+  return [...new Set(ts)].sort((a, b) => (t1 >= t0 ? a - b : b - a)).map((t) => `${alpha(revealAt(lv(t), p, out))} ${at(t)}`);
+}
+
+/** A layer as a CSS gradient on an image of `W`×`H` px whose centre is the box's. */
+function layerCss(l: Layer, p: number, out: boolean, w: number, h: number, W: number, H: number): string {
+  const stops = (at: (t: number) => string, bend = 0) => l.pieces.flatMap((pc) => pieceStops(pc, p, out, at, bend)).join(", ");
+  if (l.kind === "linear") {
+    const a = (l.angle * Math.PI) / 180;
+    const len = Math.abs(W * Math.sin(a)) + Math.abs(H * Math.cos(a));
+    return `linear-gradient(${deg(l.angle)}, ${stops((t) => px(len / 2 + t))})`;
+  }
+  if (l.kind === "radial") return `radial-gradient(${px(l.rx)} ${px(l.ry)} at ${px(W / 2)} ${px(H / 2)}, ${stops((t) => px(t * l.rx))})`;
+  // Squared-up degrees to the screen's.
+  const screen = (t: number) => {
+    const r = (t * Math.PI) / 180;
+    let d = (Math.atan2(w * Math.sin(r), h * Math.cos(r)) * 180) / Math.PI;
+    if (d < 0 || (d === 0 && t > 180)) d += 360;
+    return deg(d);
+  };
+  return `conic-gradient(from 0deg at ${px(W / 2)} ${px(H / 2)}, ${stops(screen, 6)})`;
+}
+
+/** |t| over a half extent `r`: 0 at the centre, 1 at the edge (`inv`: reversed). */
+const fromCentre = (r: number, inv: boolean): Piece[] => (inv ? [[-r, 0, 0, 1], [0, r, 1, 0]] : [[-r, 0, 1, 0], [0, r, 0, 1]]);
 
 const BLINDS = 6;
-const CHECKER_ROWS = 6;
-const WHEEL_ARC = 24;
+/** Rows of checkerboard cells (PowerPoint's film: cells h/6 square). */
+export const CHECKER_ROWS = 6;
 
-/**
- * A transition filter's visible region at progress `p`, for an effect
- * coming in (`out` false) or going out. A direction names where the
- * motion starts: `wipe(down)` (PowerPoint's "From Bottom", subtype 4)
- * reveals the bottom first; `in` closes from the edges to the centre,
- * `out` opens from the centre. Going out, the same edge moves the same
- * way and hides instead of revealing. Null: a filter with no region
- * (`fade`, or one this doesn't draw: it fades).
- */
-export function clipRegion(filter: string, out: boolean): Region | null {
-  const region = regionOf(filter, out);
-  if (region === null) return null;
-  return (p, w, h, ox = 0, oy = 0) => {
-    // The whole box shown is no clip at all.
-    if (out ? p <= 0 : p >= 1) return "none";
-    // The pattern is laid out on the shape's own box (PowerPoint's six
-    // slats start at its top); a point on the box's edge is then pushed
-    // out by a margin, so a shadow or an outline drawn past the box is
-    // revealed with it, without rescaling the pattern.
-    const e = clipMargin(w, h);
-    const { pts, evenodd } = region(p, w, h);
-    const push = (v: number, size: number) => (v <= 0.001 ? v - e : v >= size - 0.001 ? v + e : v);
-    return polygon(pts.map(([x, y]): Pt => [push(x, w) + ox, push(y, h) + oy]), evenodd);
-  };
-}
-
-/** px a region reaches past the box on each side. */
-export function clipMargin(w: number, h: number): number {
-  return Math.round(Math.max(w, h) * 0.08 + 6);
-}
-
-type Shape = { pts: Pt[]; evenodd: boolean };
-
-function regionOf(filter: string, out: boolean): ((p: number, w: number, h: number) => Shape) | null {
+/** A filter's reveal on a `w`×`h` box, else null (a filter it doesn't draw). */
+function revealOf(filter: string, w: number, h: number): Reveal | null {
   const m = /^([a-z]+)(?:\(([A-Za-z0-9]*)\))?$/.exec(filter.trim());
   if (m === null) return null;
   const name = m[1]!;
   const arg = m[2] ?? "";
+  const one = (l: Layer): Reveal => ({ layers: [l], op: "intersect" });
+  // Directions are CSS angles: 90 runs left to right, 180 top to bottom.
+  const across = (angle: number, pieces: Piece[]): Layer => ({ kind: "linear", angle, pieces });
   if (name === "wipe") {
+    // A direction names the side that shows first: `wipe(down)` is
+    // PowerPoint's "From Bottom" (subtype 4).
     const side = arg === "" ? "left" : arg;
-    if (!["left", "right", "up", "down"].includes(side)) return null;
-    return (p, w, h) => {
-      // The revealed span, from the named side.
-      const a = out ? p : 0;
-      const b = out ? 1 : p;
-      const pts =
-        side === "left" ? rect(a * w, 0, b * w, h)
-        : side === "right" ? rect((1 - b) * w, 0, (1 - a) * w, h)
-        : side === "up" ? rect(0, a * h, w, b * h)
-        : rect(0, (1 - b) * h, w, (1 - a) * h);
-      return { pts, evenodd: false };
-    };
+    const by = new Map([["left", [90, w]], ["right", [270, w]], ["up", [180, h]], ["down", [0, h]]]).get(side);
+    if (by === undefined) return null;
+    const [angle, len] = by as [number, number];
+    return one(across(angle, [[-len / 2, len / 2, 0, 1]]));
   }
-  if (name === "blinds") {
-    const horizontal = arg !== "vertical";
-    if (arg !== "" && arg !== "horizontal" && arg !== "vertical") return null;
-    return (p, w, h) => {
-      const pts: Pt[] = [];
-      for (let i = 0; i < BLINDS; i++) {
-        // Each slat opens from its top (left), and closes the same way.
-        const lo = (i + (out ? p : 0)) / BLINDS;
-        const hi = (i + (out ? 1 : p)) / BLINDS;
-        // Slats are joined along the box's own edge (x = 0 or y = 0).
-        pts.push(...(horizontal ? rect(0, lo * h, w, hi * h) : rect(lo * w, 0, hi * w, h)));
-        pts.push(horizontal ? [0, lo * h] : [lo * w, 0]);
-      }
-      return { pts, evenodd: false };
-    };
-  }
-  if (name === "checkerboard") {
-    // PowerPoint's film: six rows of squares a sixth of the box high, every
-    // other row half a square along, each square filling from its left
-    // edge (`across`; `down` is the same turned).
-    if (arg !== "" && arg !== "across" && arg !== "down") return null;
-    const down = arg === "down";
-    return (p, w, h) => {
-      const [U, V] = down ? [h, w] : [w, h];
-      const s = V / CHECKER_ROWS;
-      const q = out ? 1 - p : p;
-      const pts: Pt[] = [];
-      for (let r = 0; r < CHECKER_ROWS; r++) {
-        // Squares are laid out from the box's centre, odd rows half a square on.
-        const phase = U / 2 + (r % 2 === 1 ? s / 2 : 0);
-        const first = Math.floor(-phase / s) - 1;
-        for (let k = first; phase + k * s < U; k++) {
-          const u0 = Math.max(0, phase + k * s);
-          const u1 = Math.min(U, phase + k * s + q * s);
-          if (u1 <= u0) continue;
-          const [v0, v1] = [r * s, (r + 1) * s];
-          const cell = down ? rect(v0, u0, v1, u1) : rect(u0, v0, u1, v1);
-          pts.push(...cell, cell[0]!, [0, 0]);
-        }
-      }
-      return { pts: pts.length > 0 ? [[0, 0], ...pts] : [[0, 0], [0, 0], [0, 0]], evenodd: false };
-    };
-  }
-  if (name === "strips") {
-    // A diagonal edge crossing the box from the corner it names away from
-    // (`downLeft` starts at the top right and runs down to the left).
-    const corner = new Map([["downLeft", [1, 0]], ["upLeft", [1, 1]], ["downRight", [0, 0]], ["upRight", [0, 1]]]).get(arg === "" ? "downRight" : arg);
-    if (corner === undefined) return null;
-    return (p, w, h) => {
-      const [cx, cy] = [corner[0]! * w, corner[1]! * h];
-      // Points at distance d along the diagonal: |x − cx| + |y − cy| ≤ d (in w+h units).
-      const q = out ? 1 - p : p;
-      const d = q * (w + h);
-      const sx = corner[0] === 0 ? 1 : -1;
-      const sy = corner[1] === 0 ? 1 : -1;
-      const tri: Pt[] = [[cx, cy], [cx + sx * d, cy], [cx, cy + sy * d]];
-      // Going out, the swept corner is what is hidden.
-      return out ? hole(tri, w, h) : { pts: tri, evenodd: false };
-    };
-  }
-  if (name === "wedge") {
-    // Two edges sweeping down from 12 o'clock about the box's centre, one
-    // each way (PowerPoint's film).
-    if (arg !== "") return null;
-    return (p, w, h) => {
-      const [cx, cy] = [w / 2, h / 2];
-      const r = Math.hypot(w, h);
-      const q = out ? 1 - p : p;
-      const pts: Pt[] = [[cx, cy]];
-      for (let i = 0; i <= WHEEL_ARC; i++) {
-        const a = -Math.PI / 2 - q * Math.PI + (2 * q * Math.PI * i) / WHEEL_ARC;
-        pts.push([cx + r * Math.cos(a), cy + r * Math.sin(a)]);
-      }
-      return { pts, evenodd: false };
-    };
-  }
-  if (name === "wheel") {
-    const n = /^[1-8]$/.test(arg) ? Number(arg) : arg === "" ? 1 : NaN;
-    if (!Number.isInteger(n)) return null;
-    return (p, w, h) => {
-      const [cx, cy] = [w / 2, h / 2];
-      const r = Math.hypot(w, h);
-      const pts: Pt[] = [];
-      const sector = (2 * Math.PI) / n;
-      for (let k = 0; k < n; k++) {
-        // Clockwise from 12 o'clock; going out, the swept part is hidden.
-        const a0 = k * sector + (out ? p * sector : 0);
-        const a1 = k * sector + (out ? sector : p * sector);
-        pts.push([cx, cy]);
-        for (let i = 0; i <= WHEEL_ARC; i++) {
-          const a = a0 + ((a1 - a0) * i) / WHEEL_ARC - Math.PI / 2;
-          pts.push([cx + r * Math.cos(a), cy + r * Math.sin(a)]);
-        }
-      }
-      return { pts, evenodd: false };
-    };
-  }
-  let grow: Grow | undefined;
-  let opens: boolean;
   if (name === "barn") {
+    // Split: `out` opens from the centre line, `in` closes onto it.
     const bm = /^(in|out)(Vertical|Horizontal)$/.exec(arg);
     if (bm === null) return null;
-    grow = GROW.get(`barn${bm[2]}`);
-    opens = bm[1] === "out";
-  } else {
-    if (arg !== "in" && arg !== "out" && arg !== "") return null;
-    grow = GROW.get(name);
-    opens = arg !== "in";
+    const vertical = bm[2] === "Vertical";
+    return one(across(vertical ? 90 : 180, fromCentre((vertical ? w : h) / 2, bm[1] === "in")));
   }
-  if (grow === undefined) return null;
-  const g = grow;
-  // "out" opens from the centre (the shape grows); "in" closes from the
-  // edges (the box less a shrinking shape). Going out is the complement of
-  // coming in at the same progress.
-  return (p, w, h) => {
-    const showShape = opens !== out;
-    const q = opens ? p : 1 - p;
-    return showShape ? { pts: g(q, w, h), evenodd: false } : hole(g(q, w, h), w, h);
+  if (name === "blinds") {
+    // Six slats on the shape's own box, each opening from its top (left).
+    if (arg !== "" && arg !== "horizontal" && arg !== "vertical") return null;
+    const len = arg === "vertical" ? w : h;
+    const s = len / BLINDS;
+    const pieces: Piece[] = [];
+    for (let i = 0; i < BLINDS; i++) pieces.push([-len / 2 + i * s, -len / 2 + (i + 1) * s, 0, 1]);
+    return one(across(arg === "vertical" ? 90 : 180, pieces));
+  }
+  if (name === "wedge") {
+    // Two edges sweeping down from 12 o'clock, one each way.
+    if (arg !== "") return null;
+    return one({ kind: "conic", pieces: [[0, 180, 0, 1], [180, 360, 1, 0]] });
+  }
+  if (name === "wheel") {
+    // Spokes clockwise from 12 o'clock, each sweeping its sector.
+    const n = /^[1-8]$/.test(arg) ? Number(arg) : arg === "" ? 1 : NaN;
+    if (!Number.isInteger(n)) return null;
+    const s = 360 / n;
+    return one({ kind: "conic", pieces: Array.from({ length: n }, (_, k): Piece => [k * s, (k + 1) * s, 0, 1]) });
+  }
+  if (arg !== "in" && arg !== "out" && arg !== "") return null;
+  // `out` opens from the centre; `in` closes from the edges onto it.
+  const closes = arg === "in";
+  if (name === "circle") {
+    // An ellipse with the shape's aspect, through its corners at the end.
+    const [rx, ry] = [(w / 2) * Math.SQRT2, (h / 2) * Math.SQRT2];
+    return one({ kind: "radial", rx, ry, pieces: [[0, 1, closes ? 1 : 0, closes ? 0 : 1]] });
+  }
+  const bandX = across(90, fromCentre(w / 2, closes));
+  const bandY = across(180, fromCentre(h / 2, closes));
+  // A box is inside both bands; a plus (arms spanning the whole box,
+  // PowerPoint's film) inside either. Closing, the complement of each.
+  if (name === "box") return { layers: [bandX, bandY], op: closes ? "add" : "intersect" };
+  if (name === "plus") return { layers: [bandX, bandY], op: closes ? "intersect" : "add" };
+  if (name === "diamond") {
+    // |x|/w + |y|/h = max(|x/w + y/h|, |x/w − y/h|): two diagonal bands,
+    // reaching the box's corners at the end.
+    const g = Math.hypot(1 / w, 1 / h);
+    const a1 = (Math.atan2(1 / w, -1 / h) * 180) / Math.PI;
+    const a2 = (Math.atan2(1 / w, 1 / h) * 180) / Math.PI;
+    return { layers: [across(a1, fromCentre(1 / g, closes)), across(a2, fromCentre(1 / g, closes))], op: closes ? "add" : "intersect" };
+  }
+  return null;
+}
+
+/**
+ * A transition filter's mask at each progress, for an effect coming in
+ * (`out` false) or going out (the same edge moving the same way, hiding).
+ * Null: a filter with no gradient here (`fade`, a pattern, or one it
+ * doesn't draw: it fades). The mask covers the box pushed out by a margin
+ * on each side, holding the edge's value there, so a shadow or an outline
+ * drawn past the box comes with it.
+ */
+export function clipRegion(filter: string, out: boolean): Region | null {
+  if (revealOf(filter, 100, 100) === null) return null;
+  return (p, w, h, ox = 0, oy = 0) => {
+    const whole = out ? p <= 0 : p >= 1;
+    const e = clipMargin(w, h);
+    const [W, H] = [w + 2 * e, h + 2 * e];
+    const frame = { maskSize: `${px(W)} ${px(H)}`, maskPosition: `${px(ox - e)} ${px(oy - e)}`, maskRepeat: "no-repeat" };
+    const r = whole ? null : revealOf(filter, w, h);
+    if (r === null) return { maskImage: "none", maskComposite: "add", ...frame };
+    // The image's px are the box's, shifted by the margin; a linear layer's
+    // gradient line runs through the image's centre, which is the box's.
+    const op = out ? (r.op === "add" ? "intersect" : "add") : r.op;
+    return { maskImage: r.layers.map((l) => layerCss(l, p, out, w, h, W, H)).join(", "), maskComposite: op, ...frame };
   };
 }
 
-/** A random-pattern filter (`dissolve`, `randombar(horizontal|vertical)`), else null. */
+/** px a filter's mask reaches past the box on each side. */
+export function clipMargin(w: number, h: number): number {
+  return Math.round(Math.max(w, h) * 0.08 + 6);
+}
+
+/**
+ * A filter drawn through pictures, one per level, that no gradient can
+ * draw: `dissolve`'s cells and `randombar`'s bars (`horizontal`: bars
+ * across) appear at random, `checkerboard`'s cells (`horizontal`: across,
+ * rows half a cell apart) and `strips`' squares (from `corner`, in box
+ * fractions) fill with the soft edge every filter has. `out`: it hides.
+ */
+export interface Pattern {
+  kind: "dissolve" | "bars" | "checker" | "strips";
+  horizontal: boolean;
+  out: boolean;
+  corner?: [number, number];
+}
+
+/** A pattern filter, else null. */
 export function patternOf(filter: string, out: boolean): Pattern | null {
   const f = filter.trim();
   if (f === "dissolve") return { kind: "dissolve", horizontal: false, out };
-  const m = /^randombar(?:\((horizontal|vertical)\))?$/.exec(f);
-  return m === null ? null : { kind: "bars", horizontal: m[1] !== "vertical", out };
+  const bars = /^randombar(?:\((horizontal|vertical)\))?$/.exec(f);
+  if (bars !== null) return { kind: "bars", horizontal: bars[1] !== "vertical", out };
+  const checker = /^checkerboard(?:\((across|down)\))?$/.exec(f);
+  if (checker !== null) return { kind: "checker", horizontal: checker[1] !== "down", out };
+  const strips = /^strips(?:\(([A-Za-z]*)\))?$/.exec(f);
+  if (strips !== null) {
+    // The corner the squares start from (`downLeft` starts at the top right).
+    const corner = new Map<string, [number, number]>([["downLeft", [1, 0]], ["upLeft", [1, 1]], ["downRight", [0, 0]], ["upRight", [0, 1]]]).get(strips[1] || "downRight");
+    return corner === undefined ? null : { kind: "strips", horizontal: false, out, corner };
+  }
+  return null;
 }
+
+/** The share of a random pattern shown at progress `p` (coming in).
+ *  PowerPoint's film of the `filters` deck, the shape's ink by frame:
+ *  dissolve shows 9% a quarter of the way, 49% half way, 90% at three
+ *  quarters; random bars 18%, 50%, 86%. Both fit p^a / (p^a + (1−p)^a). */
+export function patternShare(kind: Pattern["kind"], p: number): number {
+  const a = kind === "dissolve" ? 2.1 : kind === "bars" ? 1.5 : 1;
+  const q = Math.min(1, Math.max(0, p));
+  if (q <= 0 || q >= 1) return q;
+  return q ** a / (q ** a + (1 - q) ** a);
+}
+
+type Pt = [number, number];
 
 // --- paths ----------------------------------------------------------------------
 
@@ -543,7 +551,7 @@ export function effectMotion(e: Effect, geom: (key: string) => Geom | null): Eff
         }
         const region = clipRegion(f.full, goingOut);
         if (region === null) {
-          // A filter with no region here (dissolve, checkerboard, …) fades.
+          // A filter it doesn't draw fades.
           note ??= `${e.name}: plays as a fade (${f.name})`;
           segments.push({ key, ch: "op", value: (s) => { const q = local(s); return q === null ? null : goingOut ? 1 - q : q; } });
           break;

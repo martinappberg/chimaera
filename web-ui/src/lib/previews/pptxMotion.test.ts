@@ -1,6 +1,6 @@
 import JSZip from "jszip";
 import { describe, expect, it } from "vitest";
-import { clipMargin, clipRegion, effectMotion, motionNotes, pacedSampler, pathPolyline, patternOf, progress, warp, type Geom } from "./pptxMotion";
+import { clipMargin, clipRegion, effectMotion, motionNotes, pacedSampler, pathPolyline, patternOf, patternShare, progress, revealPoint, warp, type Geom, type MaskFrame } from "./pptxMotion";
 import { entryState, MAX_FRAMES, PLAY_BUDGET, planStep, type ElementBase, type ShapeInfo } from "./pptxPlay";
 import { buildStates, parseTimeline, pathEnd, type Effect, type SlideTimeline } from "./pptxTiming";
 
@@ -34,8 +34,6 @@ function planOne(e: Effect, before = { hidden: e.sets === "visible" && e.target 
   const shapes = new Map<string, ShapeInfo>([[e.target!.spid, { paraCount: 0, paras: false }]]);
   return planStep([{ ...e, start: 0 }], before, shapes, [e.target!.spid], () => base(), noLanding, W, H);
 }
-/** A polygon's points. */
-const pts = (s: string) => [...s.matchAll(/(-?[0-9.]+)px (-?[0-9.]+)px/g)].map((m) => [Number(m[1]), Number(m[2])] as const);
 const px = (s: string | undefined): [number, number] => {
   const m = /^(-?[0-9.]+)px (-?[0-9.]+)px$/.exec(s ?? "")!;
   return [Number(m[1]), Number(m[2])];
@@ -92,115 +90,135 @@ describe("fly (entrances slide 2): off the slide on its side, then home", async 
   }
 });
 
-describe("wipe", () => {
-  it("names the side that shows first: right reveals from the right edge", () => {
-    const r = clipRegion("wipe(right)", false)!;
-    // The region reaches a margin past the box (a shadow comes with the shape).
-    const e = clipMargin(100, 50);
-    const xs = pts(r(0.25, 100, 50)).map(([x]) => x);
-    expect(Math.max(...xs)).toBe(100 + e);
-    expect(Math.min(...xs)).toBeCloseTo(75, 1);
-    expect(r(0, 100, 50)).toMatch(/^polygon\(/);
-    expect(Math.min(...pts(r(0, 100, 50)).map(([x]) => x))).toBe(100 + e);
-    expect(r(1, 100, 50)).toBe("none");
+/** A mask frame's alpha at (`x`, `y`) in its image, read back from the CSS
+ *  (linear, radial and conic gradients of `rgba(0,0,0,a) <pos>` stops). */
+function maskAt(f: MaskFrame, x: number, y: number): number {
+  const [W, H] = f.maskSize.split(" ").map((v) => Number.parseFloat(v)) as [number, number];
+  const layers = f.maskImage.split(/,\s*(?=(?:linear|radial|conic)-gradient)/);
+  const as = layers.map((g) => {
+    const stops = [...g.matchAll(/rgba\(0,0,0,([0-9.]+)\) (-?[0-9.]+)(px|deg)/g)].map((m) => [Number(m[2]), Number(m[1])] as const);
+    let pos: number;
+    const lin = /^linear-gradient\((-?[0-9.]+)deg/.exec(g);
+    const rad = /^radial-gradient\(([0-9.]+)px ([0-9.]+)px at ([0-9.]+)px ([0-9.]+)px/.exec(g);
+    const con = /^conic-gradient\(from 0deg at ([0-9.]+)px ([0-9.]+)px/.exec(g);
+    if (lin !== null) {
+      const a = (Number(lin[1]) * Math.PI) / 180;
+      const len = Math.abs(W * Math.sin(a)) + Math.abs(H * Math.cos(a));
+      pos = len / 2 + (x - W / 2) * Math.sin(a) - (y - H / 2) * Math.cos(a);
+    } else if (rad !== null) {
+      const [rx, ry, cx, cy] = rad.slice(1).map(Number) as [number, number, number, number];
+      pos = Math.hypot((x - cx) / rx, (y - cy) / ry) * rx;
+    } else {
+      const [cx, cy] = con!.slice(1).map(Number) as [number, number];
+      pos = (Math.atan2(x - cx, cy - y) * 180) / Math.PI;
+      if (pos < 0) pos += 360;
+    }
+    if (pos <= stops[0]![0]) return stops[0]![1];
+    for (let i = 1; i < stops.length; i++) {
+      const [p0, a0] = stops[i - 1]!;
+      const [p1, a1] = stops[i]!;
+      if (pos <= p1) return p1 > p0 ? a0 + ((a1 - a0) * (pos - p0)) / (p1 - p0) : a1;
+    }
+    return stops[stops.length - 1]![1];
+  });
+  return as.reduce((a, b) => (f.maskComposite === "intersect" ? a * b : a + b - a * b));
+}
+
+const SOFT = ["wipe(left)", "wipe(right)", "wipe(up)", "wipe(down)", "barn(inVertical)", "barn(outHorizontal)", "blinds(horizontal)", "blinds(vertical)", "box(in)", "box(out)", "circle(in)", "circle(out)", "diamond(in)", "diamond(out)", "plus(in)", "plus(out)", "wheel(1)", "wheel(4)", "wedge"];
+
+describe("transition filters: a soft edge 15% of the sweep, as PowerPoint's film draws it", () => {
+  it("the mask's CSS draws the model, in and out, on a wide and a tall box", () => {
+    for (const f of SOFT) {
+      for (const out of [false, true]) {
+        const r = clipRegion(f, out)!;
+        expect(r, f).not.toBe(null);
+        for (const [w, h] of [[388, 320], [150, 400]] as const) {
+          const e = clipMargin(w, h);
+          for (const p of [0.1, 0.5, 0.85]) {
+            const frame = r(p, w, h);
+            expect(frame.maskPosition).toBe(`${-e}px ${-e}px`);
+            for (let gx = 0.05; gx < 1; gx += 0.1) {
+              for (let gy = 0.05; gy < 1; gy += 0.1) {
+                const want = revealPoint(f, out, p, gx * w, gy * h, w, h)!;
+                // A conic's squared-up angle is drawn through a few stops.
+                expect(maskAt(frame, gx * w + e, gy * h + e), `${f} ${out} ${p} ${gx} ${gy}`).toBeCloseTo(want, f.startsWith("w") && !f.startsWith("wipe") ? 1 : 2);
+              }
+            }
+          }
+        }
+      }
+    }
   });
 
-  it("from bottom (subtype 4) is wipe(down): the bottom shows first", async () => {
+  it("wipe: PowerPoint's 388 px wipe from the left has a 47 px edge, its middle half way across at half time", () => {
+    const at = (x: number, p: number) => revealPoint("wipe(left)", false, p, x, 160, 388, 320)!;
+    expect(at(194, 0.5)).toBeCloseTo(0.5, 2);
+    // 0.9 to 0.1: 80% of the ramp, 15% of 388 px.
+    const x90 = 194 - 0.4 * 0.15 * 388;
+    expect(at(x90, 0.5)).toBeCloseTo(0.9, 2);
+    expect(at(x90 + 46.56, 0.5)).toBeCloseTo(0.1, 2);
+    expect(at(0, 0)).toBe(0);
+    expect(at(387, 1)).toBe(1);
+  });
+
+  it("wedge: half way, the edge's middle lies level with the centre; circle: half way out to the corners", () => {
+    expect(revealPoint("wedge", false, 0.5, 90, 50, 100, 100)).toBeCloseTo(0.5, 6);
+    expect(revealPoint("wedge", false, 0.5, 50, 10, 100, 100)).toBe(1);
+    expect(revealPoint("circle(out)", false, 0.5, 200 + 0.5 * 200 * Math.SQRT2, 100, 400, 200)).toBeCloseTo(0.5, 6);
+    // The plus's arms span the whole box from the start.
+    expect(revealPoint("plus(out)", false, 0.3, 200, 1, 400, 200)).toBe(1);
+  });
+
+  it("blinds: six slats on the shape's own box, each opening from its top", () => {
+    const h = 300;
+    for (let i = 0; i < 6; i++) {
+      expect(revealPoint("blinds(horizontal)", false, 0.5, 10, i * 50 + 1, 200, h)).toBe(1);
+      expect(revealPoint("blinds(horizontal)", false, 0.5, 10, i * 50 + 49, 200, h)).toBe(0);
+    }
+  });
+
+  it("the whole box shows at the end (no mask), and nothing is left going out", () => {
+    for (const f of SOFT) {
+      expect(clipRegion(f, false)!(1, 100, 80).maskImage).toBe("none");
+      expect(clipRegion(f, true)!(0, 100, 80).maskImage).toBe("none");
+      expect(revealPoint(f, true, 1, 30, 30, 100, 80)).toBe(0);
+    }
+  });
+
+  it("from bottom (subtype 4) is wipe(down): the bottom shows first, and the click lands unmasked", async () => {
     const e = (await slide("entrances", 3)).steps.flat().find((x) => x.subtype === 4)!;
     const f = e.behaviours.find((b) => b.kind === "effect");
     expect(f?.kind === "effect" && f.filter).toBe("wipe(down)");
     const kf = planOne(e).tracks[0]!.keyframes;
-    const mid = kf.find((k) => k.offset >= 0.25)!;
-    // The visible band's top edge rises from the bottom (h = 144 px) towards 0.
-    const ys = pts(mid.clipPath!).map(([, y]) => y);
-    expect(Math.max(...ys)).toBe(144 + clipMargin(128, 144));
-    expect(Math.min(...ys)).toBeGreaterThan(72);
-    expect(kf[kf.length - 1]!.clipPath).toBe("none");
+    const mid = kf.find((k) => k.offset >= 0.5)!;
+    expect(mid.maskImage).toMatch(/^linear-gradient\(0deg, /);
+    expect(kf[kf.length - 1]!.maskImage).toBe("none");
   });
 
-  it("going out hides from the same side (exits-emphasis: wipe(up) out)", () => {
-    const r = clipRegion("wipe(up)", true)!;
-    const e = clipMargin(100, 40);
-    const ys = pts(r(0.25, 100, 40)).map(([, y]) => y);
-    expect(Math.min(...ys)).toBeCloseTo(10, 1);
-    expect(Math.max(...ys)).toBe(40 + e);
-  });
-
-  it("box, circle, split and the rest keep one shape all the way, and close or open", () => {
-    for (const f of ["box(in)", "box(out)", "circle(in)", "circle(out)", "diamond(in)", "plus(out)", "barn(inVertical)", "barn(outHorizontal)", "blinds(horizontal)", "blinds(vertical)", "wheel(1)", "wheel(4)"]) {
-      for (const out of [false, true]) {
-        const r = clipRegion(f, out)!;
-        expect(r, f).not.toBe(null);
-        const n = (p: number) => r(p, 200, 100).split(",").length;
-        expect(n(0.2), f).toBe(n(0.7));
-      }
-    }
-    // In: the box less a shape shrinking to the centre (even-odd).
-    expect(clipRegion("box(in)", false)!(0.5, 200, 100)).toMatch(/^polygon\(evenodd, /);
-    // Out: a box growing from the centre, on the shape's own box.
-    expect(clipRegion("box(out)", false)!(0.5, 200, 100)).toBe("polygon(50px 50px, 50px 25px, 150px 25px, 150px 75px, 50px 75px)");
-  });
-
-  it("blinds: six slats laid out on the shape's own box, h/6 apart from its top (PowerPoint's film)", () => {
-    const h = 300;
-    const ys = pts(clipRegion("blinds(horizontal)", false)!(0.5, 200, h)).map(([, y]) => y);
-    const tops = [...new Set(ys)].sort((a, b) => a - b).filter((y) => y >= 0 && y <= h);
-    // Each slat shows its top half at p = 0.5: [0, 25], [50, 75], … (the
-    // first slat's top lies on the box edge, pushed out by the margin).
-    expect(tops).toEqual([25, 50, 75, 100, 125, 150, 175, 200, 225, 250, 275]);
-    expect(Math.min(...ys)).toBe(-clipMargin(200, h));
-  });
-
-  it("the iris is an ellipse with the shape's aspect (PowerPoint's circle)", () => {
-    const p = pts(clipRegion("circle(out)", false)!(0.5, 400, 200));
-    const xs = p.map(([x]) => x);
-    const ys = p.map(([, y]) => y);
-    expect((Math.max(...xs) - Math.min(...xs)) / 400).toBeCloseTo(0.707, 2);
-    expect((Math.max(...ys) - Math.min(...ys)) / 200).toBeCloseTo(0.707, 2);
-  });
-
-  it("refuses what it doesn't draw (the effect fades instead)", () => {
-    for (const f of ["dissolve", "randombar(horizontal)", "slide(fromTop)", "wipe(sideways)", "box(weird)", "wheel(99)", "checkerboard(diagonal)", "x(y)(z)"]) {
+  it("refuses what it doesn't draw as a moving edge (patterns, or a fade)", () => {
+    for (const f of ["dissolve", "randombar(horizontal)", "checkerboard(across)", "strips(downLeft)", "slide(fromTop)", "wipe(sideways)", "box(weird)", "wheel(99)", "x(y)(z)"]) {
       expect(clipRegion(f, false), f).toBe(null);
     }
   });
 });
 
 describe("pattern filters, laid out as PowerPoint's film of the filters deck shows them", () => {
-  it("checkerboard: six rows of squares from the centre, odd rows half a square on, each filling from its left", () => {
-    const at = pts(clipRegion("checkerboard(across)", false)!(0.5, 300, 300));
-    const e = clipMargin(300, 300);
-    // Squares are 50 px: row 0's at the centre fills 150 → 175, row 1's 175 → 200.
-    expect(at).toEqual(expect.arrayContaining([[150, -e], [175, -e], [175, 50], [150, 50], [200, 100], [175, 100]]));
-    expect(at).not.toEqual(expect.arrayContaining([[176, -e]]));
-    expect(clipRegion("checkerboard(across)", false)!(1, 300, 300)).toBe("none");
-  });
-
-  it("strips and wedge grow from their corner and from 12 o'clock", () => {
-    const strip = pts(clipRegion("strips(downLeft)", false)!(0.25, 200, 100));
-    expect(strip.slice(0, 3)).toEqual([[200, 0], [125, 0], [200, 75]].map(([x, y]) => [x === 200 ? 200 + clipMargin(200, 100) : x, y === 0 ? -clipMargin(200, 100) : y]));
-    const wedge = pts(clipRegion("wedge", false)!(0.5, 100, 100));
-    // Half way: the upper half, its two edges level with the centre.
-    expect(Math.max(...wedge.map(([, y]) => y))).toBeCloseTo(50, 0);
-  });
-
-  it("plus: arms span the whole box from the start and thicken with its aspect; circle and diamond keep its aspect", () => {
-    const e = clipMargin(400, 200);
-    const plus = pts(clipRegion("plus(out)", false)!(0.25, 400, 200));
-    // Arms reach the box's edges (pushed out by the margin) at a quarter.
-    expect(Math.min(...plus.map(([x]) => x))).toBe(-e);
-    expect(Math.max(...plus.map(([x]) => x))).toBe(400 + e);
-    expect(plus).toEqual(expect.arrayContaining([[150, -e], [250, -e], [-e, 75], [-e, 125]]));
-    const diamond = pts(clipRegion("diamond(out)", false)!(0.25, 400, 200));
-    const xs = diamond.map(([x]) => x);
-    const ys = diamond.map(([, y]) => y);
-    expect((Math.max(...xs) - Math.min(...xs)) / (Math.max(...ys) - Math.min(...ys))).toBeCloseTo(2, 6);
-  });
-
-  it("dissolve and random bars are patterns, in and out; slide still fades", () => {
+  it("dissolve, random bars, checkerboard and strips are patterns, in and out; slide still fades", () => {
     expect(patternOf("dissolve", true)).toEqual({ kind: "dissolve", horizontal: false, out: true });
     expect(patternOf("randombar(vertical)", false)).toEqual({ kind: "bars", horizontal: false, out: false });
+    expect(patternOf("checkerboard(down)", false)).toEqual({ kind: "checker", horizontal: false, out: false });
+    expect(patternOf("strips(downLeft)", false)).toEqual({ kind: "strips", horizontal: false, out: false, corner: [1, 0] });
+    expect(patternOf("checkerboard(diagonal)", false)).toBeNull();
     expect(patternOf("slide(fromTop)", false)).toBeNull();
+  });
+
+  it("dissolve fills slow, then fast, then slow; random bars less so (the film's ink by frame)", () => {
+    expect(patternShare("dissolve", 0.25)).toBeCloseTo(0.09, 2);
+    expect(patternShare("dissolve", 0.5)).toBe(0.5);
+    expect(patternShare("dissolve", 0.75)).toBeCloseTo(0.91, 2);
+    expect(patternShare("bars", 0.25)).toBeCloseTo(0.16, 2);
+    expect(patternShare("bars", 0.75)).toBeCloseTo(0.84, 2);
+    expect([0, 1].map((p) => patternShare("dissolve", p))).toEqual([0, 1]);
   });
 });
 

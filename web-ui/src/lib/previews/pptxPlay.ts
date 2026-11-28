@@ -34,7 +34,7 @@
  */
 
 import { heldColor, parseCss, pictureFilter, toCss, type Palette } from "./pptxColor";
-import { clipMargin, effectMotion, type Geom, type Pattern, type Segment } from "./pptxMotion";
+import { CHECKER_ROWS, clipMargin, effectMotion, patternShare, revealAt, type Geom, type MaskFrame, type Pattern, type Segment } from "./pptxMotion";
 import { behaviourProgress, buildStates, effectTime, splitShapes, targetKey, type BuildState, type Effect, type HeldColor, type HeldColors, type SlideTimeline } from "./pptxTiming";
 import type { TaggedShape, TaggedSlide } from "./pptxTag";
 
@@ -570,15 +570,20 @@ export interface PlayKeyframe {
   translate?: string;
   scale?: string;
   rotate?: string;
-  clipPath?: string;
-  /** A random pattern's shown fraction (0–1; 1 shows all, the landed value). */
+  /** A transition filter's mask (`maskImage` "none" once it has landed). */
+  maskImage?: string;
+  maskSize?: string;
+  maskPosition?: string;
+  maskRepeat?: string;
+  maskComposite?: string;
+  /** A pattern filter's progress (0–1), drawn by `withMasks` as its picture. */
   mask?: number;
 }
 
 export interface StepPlan {
   /** ms; 0 when nothing moves (the step lands at once). */
   duration: number;
-  tracks: { id: ElementId; keyframes: PlayKeyframe[]; pattern?: Pattern; box?: [number, number, number, number] }[];
+  tracks: { id: ElementId; keyframes: PlayKeyframe[]; pattern?: Pattern; box?: [number, number, number, number]; margin?: number; levels?: number }[];
   /** Why some of it plays other than as written. */
   notes: string[];
   /** Past `PLAY_BUDGET` or `MAX_FRAMES`: the click lands without playing. */
@@ -776,8 +781,8 @@ export function planStep(
       let sy = 1;
       let rot = 0;
       let op = 1;
-      let clip: string | null = null;
-      let shown = 1;
+      let clip: MaskFrame | null = null;
+      let maskP: number | null = null;
       for (const s of segs) {
         const v = s.value(at);
         if (v === null || !Number.isFinite(v)) continue;
@@ -797,11 +802,9 @@ export function planStep(
           case "clip":
             clip = s.region!(Math.min(1, Math.max(0, v)), b.bw, b.bh, b.bx ?? 0, b.by ?? 0);
             break;
-          case "mask": {
-            const q = Math.min(1, Math.max(0, v));
-            shown = s.pattern!.out ? 1 - q : q;
+          case "mask":
+            maskP = Math.min(1, Math.max(0, v));
             break;
-          }
           default:
             abs[s.ch] = v;
         }
@@ -823,8 +826,9 @@ export function planStep(
         f.scale = `${r3(fin(kx * (abs.sxAbs ?? b.sx) * sx, MIN_SCALE, LIMIT.scale, b.sx))} ${r3(fin(ky * (abs.syAbs ?? b.sy) * sy, MIN_SCALE, LIMIT.scale, b.sy))}`;
       }
       if (turns) f.rotate = `${r3(fin((abs.rotAbs ?? b.rot) + rot, -LIMIT.deg, LIMIT.deg, b.rot))}deg`;
-      if (clips) f.clipPath = clip ?? "none";
-      if (pattern !== undefined) f.mask = r3(shown);
+      if (clips) Object.assign(f, clip ?? { maskImage: "none" });
+      // Before its pattern begins, an exit shows whole (an entrance is hidden).
+      if (pattern !== undefined) f.mask = r3(maskP ?? (pattern.out ? 0 : 1));
       return f;
     });
     land(keyframes, landed(id));
@@ -833,7 +837,7 @@ export function planStep(
       // The pattern covers the box, pushed out like a clip so a shadow or
       // outline drawn past the box goes with it.
       const e = clipMargin(b.bw, b.bh);
-      tracks.push({ id, keyframes, pattern, box: [(b.bx ?? 0) - e, (b.by ?? 0) - e, b.bw + 2 * e, b.bh + 2 * e] });
+      tracks.push({ id, keyframes, pattern, box: [(b.bx ?? 0) - e, (b.by ?? 0) - e, b.bw + 2 * e, b.bh + 2 * e], margin: e, levels: maskLevels(duration) });
     }
   }
   return { duration, tracks, notes, overBudget: false };
@@ -856,7 +860,7 @@ function land(kf: PlayKeyframe[], to: Landed | null): void {
     }
     last.rotate = to.rotate;
   }
-  if (last.clipPath !== undefined) last.clipPath = "none";
+  if (last.maskImage !== undefined) last.maskImage = "none";
   if (last.mask !== undefined) last.mask = 1;
 }
 
@@ -988,7 +992,10 @@ function measure(tagged: TaggedSlide, id: ElementId, w: number, h: number): Elem
   }
   // The clip box in the element's own px: slide px, times a paragraph's
   // text-body factor (its own px are the body's, scaled into the slide).
-  const box = [geom.ppt_w * w * k, geom.ppt_h * h * k];
+  // A whole shape's is what it draws, outline and shadow included.
+  const pad = id.includes("#") ? [0, 0, 0, 0] : inkPad(shape.el);
+  const box = [geom.ppt_w * w * k + pad[0]! + pad[2]!, geom.ppt_h * h * k + pad[1]! + pad[3]!];
+  if (!id.includes("#")) textAt = [-pad[0]!, -pad[1]!];
   return {
     geom,
     k,
@@ -1004,6 +1011,32 @@ function measure(tagged: TaggedSlide, id: ElementId, w: number, h: number): Elem
     bx: textAt[0] * k,
     by: textAt[1] * k,
   };
+}
+
+/**
+ * How far a shape's drawing reaches past its box, px (left, top, right,
+ * bottom): half its widest outline, its shadow's blur (2σ) moved by its
+ * offset. PowerPoint lays a filter over all of it: in its film of the
+ * `entrances` deck a shadowed 318 px shape's six blinds are 55 px apart
+ * and its wipe crosses 401 px of a 388 px box, the shadow's reach.
+ */
+function inkPad(el: HTMLElement): [number, number, number, number] {
+  let line = 0;
+  for (const n of el.querySelectorAll(":scope > svg [stroke-width]")) {
+    const stroke = n.getAttribute("stroke");
+    if (stroke !== null && stroke !== "none") line = Math.max(line, Number.parseFloat(n.getAttribute("stroke-width") ?? "") || 0);
+  }
+  const pad: [number, number, number, number] = [line / 2, line / 2, line / 2, line / 2];
+  for (const d of el.querySelectorAll(":scope > svg feDropShadow")) {
+    const num = (a: string) => Number.parseFloat(d.getAttribute(a) ?? "") || 0;
+    const [dx, dy, b] = [num("dx"), num("dy"), 2 * num("stdDeviation")];
+    if (![dx, dy, b].every(Number.isFinite) || b > 1000) continue;
+    pad[0] = Math.max(pad[0], b - dx);
+    pad[1] = Math.max(pad[1], b - dy);
+    pad[2] = Math.max(pad[2], b + dx);
+    pad[3] = Math.max(pad[3], b + dy);
+  }
+  return pad.map((v) => Math.min(v, 200)) as [number, number, number, number];
 }
 
 const camel = (p: string) => p.replace(/-([a-z])/g, (_, c: string) => c.toUpperCase());
@@ -1060,14 +1093,29 @@ function linearEasing(): boolean {
   return typeof CSS !== "undefined" && typeof CSS.supports === "function" && CSS.supports("transition-timing-function", "linear(0, 0.5, 1)");
 }
 
-/** Shown fractions a random pattern steps through. */
-const MASK_LEVELS = 20;
-/** A dissolve cell and a random bar, in slide px (a 13.33 in slide is
- *  960 px): PowerPoint's film shows cells about 2 px and bars 2–3 px of a
- *  1920 px slide. */
-const DISSOLVE_CELL = 1;
-const BAR = 1.35;
-const maskCache = new Map<string, string[]>();
+/** Pictures a pattern steps through over a step of `ms`: one per ~40 ms
+ *  (12–50), so a cell's soft edge moves in small steps. */
+export function maskLevels(ms: number): number {
+  return Math.min(50, Math.max(12, Math.round(ms / 40)));
+}
+
+/** A dissolve cell, a random bar and a strips square, in the slide's px
+ *  (CSS px: 96 to the inch, 4/3 to the point). PowerPoint's film (1920 px
+ *  to a 13.33 in slide): dissolve's grain 2 px (1 pt), random bars 1.5 px
+ *  on average (3/4 pt), strips' squares 20 px (10 pt). */
+const DISSOLVE_CELL = 4 / 3;
+const BAR = 1;
+const STRIP = 40 / 3;
+/** A dissolve repeats a tile this many cells square, each cell 2 picture
+ *  px (crisp at a 1.5× fit: the film's 2 px): grain at any size of shape,
+ *  bounded memory. */
+const DISSOLVE_TILE = 192;
+/** Picture px per slide px for checkerboard cells and strips' squares
+ *  (soft-edged: a picture scaled up stays true); past `MASK_MAX` px a side
+ *  fewer, for bounded memory and a few ms a picture. */
+const MASK_SCALE = 1;
+const MASK_MAX = 768;
+const maskCache = new Map<string, MaskSet>();
 
 /** A seeded PRNG (mulberry32): the same element dissolves the same way. */
 function rng(seed: number): () => number {
@@ -1081,7 +1129,7 @@ function rng(seed: number): () => number {
   };
 }
 
-/** A data URL as a short `blob:` URL: a keyframe list of 21 masks parses
+/** A data URL as a short `blob:` URL: a keyframe list of many masks parses
  *  in a fraction of the time (WKWebView: `animate()` took ~50 ms with the
  *  data URLs inline). Falls back to the data URL. */
 function blobUrl(data: string): string {
@@ -1092,74 +1140,139 @@ function blobUrl(data: string): string {
   return URL.createObjectURL(new Blob([bytes], { type: "image/png" }));
 }
 
-/** Longest side of a pattern's mask image, px: past it the image is
- *  stretched (bounded memory for a picture that fills the slide). */
-const MASK_MAX = 640;
+/** A pattern's pictures: one per level from progress 0 to 1, each shown
+ *  `size` px (element px) at `offset` from the masked box's corner,
+ *  tiled when `repeat`. */
+export interface MaskSet {
+  urls: string[];
+  size: [number, number];
+  offset: [number, number];
+  repeat: boolean;
+}
 
 /**
- * The mask images a random pattern shows its element through, one per
- * level from nothing to all (`MASK_LEVELS + 1`), drawn at twice the box's
- * px (up to `MASK_MAX`) so cells stay crisp: each cell (or bar) opaque
- * once the level passes its random rank. Empty where there is no canvas.
+ * The pictures a pattern filter shows its element through on a `W`×`H`
+ * box (the shape's box pushed out by `margin` on each side), `levels + 1`
+ * of them. Dissolve and random bars: each cell (bar) opaque once the
+ * share shown (`patternShare`) passes its random rank, seeded by
+ * `seedKey`. Checkerboard (one tile of two rows, repeated) and strips:
+ * each cell's soft edge (`revealAt`). Null where there is no canvas.
  */
-export function maskImages(pattern: Pattern, w: number, h: number, seedKey: string): string[] {
-  // Twice the box's px, so a show fitted up to 2× keeps each cell's edge sharp.
-  const k = Math.min(2, MASK_MAX / Math.max(w, h, 1));
-  const cw = Math.max(1, Math.ceil(w * k));
-  const ch = Math.max(1, Math.ceil(h * k));
-  const cellX = pattern.kind === "dissolve" ? DISSOLVE_CELL : pattern.horizontal ? Infinity : BAR;
-  const cellY = pattern.kind === "dissolve" ? DISSOLVE_CELL : pattern.horizontal ? BAR : Infinity;
-  const nx = Number.isFinite(cellX) ? Math.max(1, Math.ceil(w / cellX)) : 1;
-  const ny = Number.isFinite(cellY) ? Math.max(1, Math.ceil(h / cellY)) : 1;
-  const cacheKey = `${pattern.kind}|${cw}x${ch}|${nx}x${ny}|${seedKey}`;
+export function maskImages(pattern: Pattern, W: number, H: number, margin: number, seedKey: string, levels: number): MaskSet | null {
+  const [w, h] = [Math.max(1, W - 2 * margin), Math.max(1, H - 2 * margin)];
+  const { kind, out } = pattern;
+  const cacheKey = `${kind}|${pattern.horizontal}|${pattern.corner ?? ""}|${out}|${W}x${H}|${margin}|${levels}|${kind === "dissolve" || kind === "bars" ? seedKey : ""}`;
   const hit = maskCache.get(cacheKey);
   if (hit !== undefined) return hit;
-  if (typeof document === "undefined") return [];
+  if (typeof document === "undefined") return null;
+  let set: Omit<MaskSet, "urls">;
+  let cw: number;
+  let ch: number;
+  // Each picture px's cell, and each cell's alpha (0–255) at a progress.
+  let cellOf: Uint32Array;
+  let alphaOf: (cell: number, p: number) => number;
+  let seed = 2166136261;
+  for (let i = 0; i < seedKey.length; i++) seed = Math.imul(seed ^ seedKey.charCodeAt(i), 16777619);
+  const random = (n: number) => {
+    const rand = rng(seed);
+    return Float32Array.from({ length: n }, () => rand());
+  };
+  if (kind === "dissolve") {
+    cw = ch = 2 * DISSOLVE_TILE;
+    cellOf = Uint32Array.from({ length: cw * ch }, (_, i) => Math.floor(i / cw / 2) * DISSOLVE_TILE + Math.floor((i % cw) / 2));
+    const rank = random(DISSOLVE_TILE * DISSOLVE_TILE);
+    alphaOf = (c, p) => (rank[c]! < (out ? 1 - patternShare(kind, p) : patternShare(kind, p)) ? 255 : 0);
+    set = { size: [DISSOLVE_TILE * DISSOLVE_CELL, DISSOLVE_TILE * DISSOLVE_CELL], offset: [0, 0], repeat: true };
+  } else if (kind === "bars") {
+    // Two picture px per bar, one px across: drawn stretched over the box.
+    const n = Math.max(1, Math.ceil((pattern.horizontal ? H : W) / BAR));
+    [cw, ch] = pattern.horizontal ? [1, 2 * n] : [2 * n, 1];
+    cellOf = Uint32Array.from({ length: cw * ch }, (_, i) => Math.floor(i / 2));
+    const rank = random(n);
+    alphaOf = (c, p) => (rank[c]! < (out ? 1 - patternShare(kind, p) : patternShare(kind, p)) ? 255 : 0);
+    set = { size: pattern.horizontal ? [W, n * BAR] : [n * BAR, H], offset: [0, 0], repeat: false };
+  } else if (kind === "checker") {
+    // One tile: a cell wide, two rows high (across), the second row half a
+    // cell on; each cell fills from its leading edge. Cells are laid out
+    // from the box's centre (PowerPoint's film of the `filters` deck).
+    const across = pattern.horizontal;
+    const c = (across ? h : w) / CHECKER_ROWS;
+    const U = across ? w : h;
+    const k = Math.max(1, Math.min(2, 64 / c));
+    const n = Math.max(2, Math.round(c * k));
+    [cw, ch] = across ? [n, 2 * n] : [2 * n, n];
+    // A cell here is a column of the tile's px: its level is its place in the cell.
+    cellOf = new Uint32Array(cw * ch);
+    for (let y = 0; y < ch; y++) {
+      for (let x = 0; x < cw; x++) {
+        const [u, v] = across ? [x, y] : [y, x];
+        const row = v < n ? 0 : 1;
+        cellOf[y * cw + x] = (u - row * (n / 2) + n) % n;
+      }
+    }
+    alphaOf = (u, p) => Math.round(255 * revealAt((u + 0.5) / n, p, out));
+    const phase = ((U / 2) % c) - c + margin;
+    set = { size: across ? [c, 2 * c] : [2 * c, c], offset: across ? [phase, margin] : [margin, phase], repeat: true };
+  } else {
+    // Squares from the corner, a diagonal at a time; the margin takes the
+    // value of the square at the box's edge.
+    const k = Math.min(MASK_SCALE, MASK_MAX / Math.max(W, H));
+    [cw, ch] = [Math.max(1, Math.ceil(W * k)), Math.max(1, Math.ceil(H * k))];
+    const [nx, ny] = [Math.ceil(w / STRIP), Math.ceil(h / STRIP)];
+    const [fx, fy] = pattern.corner ?? [0, 0];
+    cellOf = new Uint32Array(cw * ch);
+    const index = (v: number, len: number, n: number, from: number) => {
+      const d = Math.min(len - 1e-6, Math.max(0, v / k - margin));
+      return Math.min(n - 1, Math.floor((from === 1 ? len - d : d) / STRIP));
+    };
+    for (let y = 0; y < ch; y++) {
+      const j = index(y + 0.5, h, ny, fy);
+      for (let x = 0; x < cw; x++) cellOf[y * cw + x] = index(x + 0.5, w, nx, fx) + j;
+    }
+    const diagonals = nx + ny - 1;
+    alphaOf = (d, p) => Math.round(255 * revealAt(d / diagonals, p, out));
+    set = { size: [W, H], offset: [0, 0], repeat: false };
+  }
   const canvas = document.createElement("canvas");
   canvas.width = cw;
   canvas.height = ch;
   const ctx = canvas.getContext("2d");
-  if (ctx === null) return [];
-  let seed = 2166136261;
-  for (let i = 0; i < seedKey.length; i++) seed = Math.imul(seed ^ seedKey.charCodeAt(i), 16777619);
-  const rand = rng(seed);
-  const rank = new Float32Array(nx * ny).map(() => rand());
-  // Each image px's cell, once.
-  const cellOf = new Uint32Array(cw * ch);
-  for (let y = 0; y < ch; y++) {
-    const cy = Math.min(ny - 1, Math.floor((y / k) / (Number.isFinite(cellY) ? cellY : Infinity)) || 0);
-    for (let x = 0; x < cw; x++) {
-      const cx = Math.min(nx - 1, Math.floor((x / k) / (Number.isFinite(cellX) ? cellX : Infinity)) || 0);
-      cellOf[y * cw + x] = cy * nx + cx;
-    }
-  }
+  if (ctx === null) return null;
   const img = ctx.createImageData(cw, ch);
-  const out: string[] = [];
-  for (let l = 0; l <= MASK_LEVELS; l++) {
-    const level = l / MASK_LEVELS;
-    for (let i = 0; i < cellOf.length; i++) img.data[i * 4 + 3] = rank[cellOf[i]!]! < level ? 255 : 0;
+  const cells = cellOf.reduce((m, c) => Math.max(m, c), 0) + 1;
+  const alpha = new Uint8ClampedArray(cells);
+  const urls: string[] = [];
+  for (let l = 0; l <= levels; l++) {
+    const p = l / levels;
+    for (let c = 0; c < cells; c++) alpha[c] = alphaOf(c, p);
+    for (let i = 0; i < cellOf.length; i++) img.data[i * 4 + 3] = alpha[cellOf[i]!]!;
     ctx.putImageData(img, 0, 0);
-    out.push(`url("${blobUrl(canvas.toDataURL("image/png"))}")`);
+    urls.push(`url("${blobUrl(canvas.toDataURL("image/png"))}")`);
   }
   if (maskCache.size > 32) {
-    for (const urls of maskCache.values()) for (const u of urls) URL.revokeObjectURL(/^url\("(.*)"\)$/.exec(u)?.[1] ?? "");
+    for (const s of maskCache.values()) for (const u of s.urls) URL.revokeObjectURL(/^url\("(.*)"\)$/.exec(u)?.[1] ?? "");
     maskCache.clear();
   }
-  maskCache.set(cacheKey, out);
-  return out;
+  const done = { ...set, urls };
+  maskCache.set(cacheKey, done);
+  return done;
 }
 
-/** A track's keyframes with its pattern's shown fraction as mask images
- *  over the box (`x y w h` in the element's px); the last frame (landed)
- *  has no mask. */
-function withMasks(kf: readonly PlayKeyframe[], pattern: Pattern, box: [number, number, number, number], id: ElementId): Keyframe[] {
-  const [x, y, w, h] = box;
-  const images = maskImages(pattern, w, h, id);
-  if (images.length === 0) return kf.map(({ mask: _, ...f }) => f) as Keyframe[];
+/** A track's keyframes with its pattern's progress as the pictures over
+ *  the box (`x y W H` in the element's px, `margin` past the shape's box);
+ *  the last frame (landed) has no mask. */
+function withMasks(kf: readonly PlayKeyframe[], tr: { id: ElementId; pattern: Pattern; box: [number, number, number, number]; margin: number; levels: number }): Keyframe[] {
+  const [x, y, W, H] = tr.box;
+  const set = maskImages(tr.pattern, W, H, tr.margin, tr.id, tr.levels);
+  if (set === null) return kf.map(({ mask: _, ...f }) => f) as Keyframe[];
+  const frame = {
+    maskSize: `${r3(set.size[0])}px ${r3(set.size[1])}px`,
+    maskPosition: `${r3(x + set.offset[0])}px ${r3(y + set.offset[1])}px`,
+    maskRepeat: set.repeat ? "repeat" : "no-repeat",
+  };
   return kf.map(({ mask, ...f }, i) => {
-    if (mask === undefined || (i === kf.length - 1 && mask >= 1)) return { ...f, maskImage: "none" };
-    const at = images[Math.min(MASK_LEVELS, Math.max(0, Math.round(mask * MASK_LEVELS)))]!;
-    return { ...f, maskImage: at, maskSize: `${r3(w)}px ${r3(h)}px`, maskPosition: `${r3(x)}px ${r3(y)}px`, maskRepeat: "no-repeat" };
+    if (mask === undefined || i === kf.length - 1) return { ...f, maskImage: "none" };
+    return { ...f, maskImage: set.urls[Math.min(tr.levels, Math.max(0, Math.round(mask * tr.levels)))]!, ...frame };
   }) as Keyframe[];
 }
 
@@ -1223,7 +1336,7 @@ export function prepareStep(tagged: TaggedSlide, timeline: SlideTimeline, k: num
     if (plan.overBudget) return null;
     // A random pattern's mask images are drawn now, while the show is idle,
     // not when the click starts them (they are cached by size and element).
-    for (const tr of plan.tracks) if (tr.pattern !== undefined && tr.box !== undefined) maskImages(tr.pattern, tr.box[2], tr.box[3], tr.id);
+    for (const tr of plan.tracks) if (tr.pattern !== undefined && tr.box !== undefined) maskImages(tr.pattern, tr.box[2], tr.box[3], tr.margin ?? 0, tr.id, tr.levels ?? maskLevels(plan.duration));
     let duration = plan.duration;
     // Colours blend from the paint before to the paint after, over the
     // window their effects run in.
@@ -1306,7 +1419,7 @@ export function playStep(tagged: TaggedSlide, timeline: SlideTimeline, k: number
       // Tracks were planned for the step's motion; stretch to a longer colour window.
       const scale = plan.duration / duration;
       const planned = scale === 1 ? tr.keyframes : [...tr.keyframes.map((f) => ({ ...f, offset: f.offset * scale })), { ...tr.keyframes[tr.keyframes.length - 1]!, offset: 1 }];
-      const kf = tr.pattern === undefined || tr.box === undefined ? planned : withMasks(planned, tr.pattern, tr.box, tr.id);
+      const kf = tr.pattern === undefined || tr.box === undefined ? planned : withMasks(planned, { id: tr.id, pattern: tr.pattern, box: tr.box, margin: tr.margin ?? 0, levels: tr.levels ?? maskLevels(plan.duration) });
       anims.push(el.animate(kf as unknown as Keyframe[], { duration, fill: "both", easing: "linear" }));
     }
     for (const bl of blends) {

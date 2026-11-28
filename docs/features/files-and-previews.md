@@ -960,9 +960,10 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   speed, curves sampled, ending where the build state puts the shape); wipe from the side it
   names (`wipe(down)`, PowerPoint's "From Bottom", shows the bottom first), split, box, circle,
   diamond, plus (`in` closes from the edges, `out` opens from the centre), blinds, wheel,
-  checkerboard, strips and wedge as a moving clip laid out as PowerPoint's own film shows them;
-  dissolve and random bars through a random pattern of fine cells or bars, the same each time
-  for a shape; with the file's delays, durations, repeats, auto-reverse and ease in/out. An
+  wedge, checkerboard and strips laid out as PowerPoint's own film shows them, each moving edge
+  a soft band 15% of its sweep as in that film (gradient masks; checkerboard's cells and strips'
+  squares as pictures); dissolve and random bars through a random pattern of fine cells or bars,
+  the same each time for a shape, filling at the film's pace; with the file's delays, durations, repeats, auto-reverse and ease in/out. An
   arrival by a click plays the slide's on-entry step first, and "after previous" chains run on
   their own times. A filter the viewer does not draw (the contract lists them in
   `fixtures/pptx-timing/fallbacks.json`: only `slide`) fades; an entrance or exit
