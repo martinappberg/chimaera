@@ -21,11 +21,18 @@
  * origin, the daemon's, which the page's own URL is on. It runs only the
  * relay below; the page inside never shares its origin.
  *
- * The wrapper wears this window's colour scheme, from its first paint and
- * across theme switches. A frame whose document's scheme differs from its
- * element's gets an opaque backdrop in the document's Canvas colour, so a
+ * Neither frame paints a backdrop of its own, so the host's background (a
+ * card's white, an answer's or a view's own surface) is what shows while
+ * the page loads. A frame whose document's colour scheme differs from its
+ * element's gets an opaque backdrop in the document's Canvas colour: a
  * scheme-less wrapper in a dark window flashed white each time a view was
- * created, until the page inside painted over it.
+ * created. So each pair matches:
+ * - the wrapper wears this window's scheme, from its first paint and
+ *   across theme switches;
+ * - the page's frame element stays `normal`, as the page's document starts
+ *   (its first `about:blank`, then any page that sets no scheme). A page
+ *   that wears the theme sets its own scheme and paints its own background
+ *   (`page_api.js`), which covers the backdrop that pair then gets.
  */
 
 const escapeAttr = (s: string): string =>
@@ -45,7 +52,7 @@ export function guardedPage(url: string, title: string, mode: "light" | "dark" =
     `<meta http-equiv="Content-Security-Policy" content="frame-src 'self'">` +
     `<style>html{color-scheme:${mode}}` +
     "html,body{margin:0;height:100%;overflow:hidden;background:transparent}" +
-    "iframe{display:block;border:0;width:100%;height:100%}</style>" +
+    "iframe{display:block;border:0;width:100%;height:100%;color-scheme:normal}</style>" +
     "</head><body>" +
     `<iframe sandbox="allow-scripts" referrerpolicy="no-referrer" src="${escapeAttr(url)}" title="${escapeAttr(title)}"></iframe>` +
     "<script>" +
@@ -55,11 +62,15 @@ export function guardedPage(url: string, title: string, mode: "light" | "dark" =
     "else if(e.source===parent&&f.contentWindow!==null)f.contentWindow.postMessage(e.data,'*');" +
     "});" +
     // Same origin as this window, so the wrapper reads its root's scheme
-    // itself; the observer goes with the wrapper's document.
+    // itself: the appearance settings write it inline beside `data-theme`.
+    // Read from the attribute, not computed style, so a token write
+    // forces no style recalc in the window. The observer goes with the
+    // wrapper's document.
     "try{const r=parent.document.documentElement;" +
-    "const follow=()=>{document.documentElement.style.colorScheme=getComputedStyle(r).colorScheme};" +
+    "const follow=()=>{document.documentElement.style.colorScheme=" +
+    "r.style.colorScheme||(r.dataset.theme==='dark'?'dark':'light')};" +
     "const o=new MutationObserver(follow);" +
-    "o.observe(r,{attributes:true,attributeFilter:['data-theme','style','class']});" +
+    "o.observe(r,{attributes:true,attributeFilter:['data-theme','style']});" +
     "addEventListener('pagehide',()=>o.disconnect());follow()}catch{}" +
     "</script></body></html>"
   );

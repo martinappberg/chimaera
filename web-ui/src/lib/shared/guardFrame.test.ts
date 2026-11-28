@@ -18,9 +18,11 @@ describe("guardedPage", () => {
     expect(guardedPage("/raw/t-1/a.html", "a", "dark")).toContain("<style>html{color-scheme:dark}");
     expect(guardedPage("/raw/t-1/a.html", "a", "light")).toContain("<style>html{color-scheme:light}");
     const doc = guardedPage("/raw/t-1/a.html", "a", "dark");
-    expect(doc).toContain("getComputedStyle(r).colorScheme");
+    expect(doc).toContain("r.style.colorScheme||(r.dataset.theme==='dark'?'dark':'light')");
     expect(doc).toContain("addEventListener('pagehide',()=>o.disconnect())");
-    // The background stays see-through: the card or pane paints behind it.
+    // The page's frame matches the page's own first scheme, so neither
+    // frame paints a backdrop: the host's background shows while it loads.
+    expect(doc).toContain("color-scheme:normal}");
     expect(doc).toContain("background:transparent");
   });
 });
