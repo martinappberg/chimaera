@@ -399,8 +399,10 @@ fn forward(label: &str, message: &WKScriptMessage) {
         }
         return;
     }
-    if matches!(kind, "focus" | "link" | "key" | "selection" | "reference")
-        && with_pane(label, |pane| pane.agent_active(now)).unwrap_or(false)
+    if matches!(
+        kind,
+        "focus" | "link" | "key" | "selection" | "reference" | "page_send" | "page_draft"
+    ) && with_pane(label, |pane| pane.agent_active(now)).unwrap_or(false)
     {
         return;
     }

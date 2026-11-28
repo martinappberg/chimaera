@@ -24,6 +24,7 @@
 import { REFERENCE_CHORD } from "./keys";
 import type { PaneTransport, PaneViewControl } from "./paneView";
 import { decodeFrameMessage, isChord } from "./paneViewBridge";
+import { ownInputAgoMs } from "./ownInput";
 import type { ViewRect } from "../net/native";
 
 export interface PaneFrameParams {
@@ -35,17 +36,79 @@ export interface PaneFrameParams {
   onReference?: () => void;
   /** The page loaded, or its title or same-document URL changed. */
   onPage?: (page: { url: string; title: string }) => void;
+  /** The page API's `send` / `draft`: a send only on fresh evidence of the
+   *  person's press, else a draft (see `pageMessageTrust`). */
+  onPageMessage?: (m: { send: boolean; text: string; title: string }) => void;
+  /** The page API's content height (CSS px; the page's word). */
+  onPageSize?: (height: number) => void;
+  /** The pointer came over the page, or left it. */
+  onHover?: (inside: boolean) => void;
+  /** The page wears the app's theme (see `page_themed`). */
+  onPageThemed?: () => void;
+  /** The app's theme, encoded (`pageTheme.ts`): posted to the page API
+   *  whenever it changes and to each new document, so a framed page
+   *  follows the theme without a reload. */
+  theme?: string;
   control?: PaneViewControl;
 }
 
 /** The least time between two references a framed page may ask for. */
 const REFERENCE_GAP_MS = 1000;
+/** The least time between two messages a framed page may ask to send. */
+const PAGE_MESSAGE_GAP_MS = 1000;
+
+/**
+ * What a framed page's `send` / `draft` may become. The page shares the
+ * bridge's world and can post on a timer, and this window can't see into a
+ * frame of another origin — not its input, not even the pointer over it (a
+ * site-isolated frame runs in a process of its own) — and a canvas page
+ * often keeps focus out of its frame (GenomeSpy's does). What this window
+ * can see is its own transient activation, which a press or key in a frame
+ * gives its ancestors too:
+ * - a frame's activation is that activation when this window's last own
+ *   press or key came before focus moved into this frame (the person's
+ *   last press was in the frame: a page's button takes focus), or, for a
+ *   page that keeps focus out (a canvas), when this window saw no press or
+ *   key of its own for an activation's whole life (else it may be the
+ *   app's: a click or an Enter in the composer);
+ * - a send needs a frame's activation, at most one send per activation.
+ *   Where the browser can't say (no `navigator.userActivation`), a page
+ *   never sends;
+ * - a draft needs a frame's activation, or focus in the frame;
+ * - else nothing.
+ * The window's activation doesn't say WHICH frame was pressed: a press in
+ * another frame lets this page send once too. Bounded — one send per
+ * activation and frame, and only a page the agent wrote in that chat sends
+ * at all (`shared/pageMessage.ts`) — and accepted. The host then lets only a page in a chat's own answer,
+ *   written while that chat ran, send (`shared/pageMessage.ts`).
+ */
+function pageMessageTrust(
+  inFrame: boolean,
+  focusedAfterOwnInput: boolean,
+  ownInputAgoMs: number,
+  lastSendAgoMs: number,
+): "send" | "draft" | null {
+  const activation = (navigator as Navigator & { userActivation?: { isActive: boolean } }).userActivation;
+  const frames =
+    activation !== undefined &&
+    activation.isActive &&
+    ((inFrame && focusedAfterOwnInput) || ownInputAgoMs > ACTIVATION_LIFE_MS);
+  if (frames && lastSendAgoMs > ACTIVATION_LIFE_MS) return "send";
+  return frames || inFrame ? "draft" : null;
+}
+
+/** The longest a browser keeps transient activation (Chrome and Firefox:
+ *  about 5 s; WebKit: shorter). */
+const ACTIVATION_LIFE_MS = 5000;
 
 /** `use:paneFrame={{ … }}` on the `<iframe>`. */
 export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
   let params = initial;
   let control = initial.control ?? null;
   let lastReference = Number.NEGATIVE_INFINITY;
+  let lastPageMessage = Number.NEGATIVE_INFINITY;
+  let lastPageSend = Number.NEGATIVE_INFINITY;
+  let theme = initial.theme ?? "";
 
   const post = (cmd: Record<string, unknown>): void => {
     try {
@@ -57,6 +120,22 @@ export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
 
   /** The user is in the frame: it holds this document's focus. */
   const userInFrame = (): boolean => document.activeElement === node;
+  // When focus last moved into this frame (this window loses it to the
+  // frame: `blur`): later than this window's own last press, it was the
+  // person pressing in the frame.
+  let focusedAt = Number.NEGATIVE_INFINITY;
+  const onWindowBlur = (): void => {
+    // The frame takes focus a tick after the window lets it go.
+    setTimeout(() => {
+      if (document.activeElement === node) focusedAt = performance.now();
+    }, 0);
+  };
+  window.addEventListener("blur", onWindowBlur);
+
+
+  const sendTheme = (): void => {
+    if (theme !== "") post({ op: "theme", theme });
+  };
 
   const reference = (): void => {
     if (!userInFrame()) return;
@@ -89,10 +168,34 @@ export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
       case "reference":
         reference();
         break;
+      case "page_size":
+        params.onPageSize?.(ev.height);
+        break;
+      case "hover":
+        params.onHover?.(ev.inside);
+        break;
+      case "page_themed":
+        params.onPageThemed?.();
+        break;
+      case "page_send":
+      case "page_draft": {
+        const now = performance.now();
+        if (now - lastPageMessage < PAGE_MESSAGE_GAP_MS) break;
+        const ownAgo = ownInputAgoMs();
+        const trust = pageMessageTrust(userInFrame(), now - focusedAt < ownAgo, ownAgo, now - lastPageSend);
+        if (trust === null) break;
+        lastPageMessage = now;
+        const send = ev.kind === "page_send" && trust === "send";
+        if (send) lastPageSend = now;
+        params.onPageMessage?.({ send, text: ev.text, title: ev.title });
+        break;
+      }
       case "page":
         if (ev.url === "about:blank") break;
-        // A new document starts without the pill: give it back.
+        // A new document starts without the pill or the newest theme
+        // (its URL holds the one it was first loaded with): give both back.
         control?.applyChip();
+        sendTheme();
         params.onPage?.({ url: ev.url, title: ev.title });
         break;
     }
@@ -112,6 +215,10 @@ export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
   return {
     update(next: PaneFrameParams): void {
       params = next;
+      if ((next.theme ?? "") !== theme) {
+        theme = next.theme ?? "";
+        sendTheme();
+      }
       const nextControl = next.control ?? null;
       if (nextControl !== control) {
         control?.unbind(transport);
@@ -121,6 +228,7 @@ export function paneFrame(node: HTMLIFrameElement, initial: PaneFrameParams) {
     },
     destroy(): void {
       window.removeEventListener("message", onMessage);
+      window.removeEventListener("blur", onWindowBlur);
       control?.unbind(transport);
     },
   };

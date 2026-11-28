@@ -1105,6 +1105,76 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   since nothing draws over a view. A browser tab, the Linux and Windows apps, and an app build
   without pane views — or with pane views but older than this (`native_view_show` answers
   `fit`; an older shell drops the crop silently) — keep the sandboxed frame.
+- **Pages that wear the theme and answer back.** An HTML page a preview or a card shows gets
+  `window.chimaera`, the page API (`chimaera-core` `page_api.js`), which the daemon appends to the
+  ticket's own page: with the pane bridge for a framed page (`?bridge=1`), alone for an app view
+  (`?api=1`, whose bridge the app injects). Pages still draw whatever they like, with any script.
+  Appended after the document, it runs after the page's own inline scripts and before
+  `DOMContentLoaded`: a page reads `window.chimaera` from that event or a click handler.
+  - **Theme.** The app's tokens arrive as CSS variables on the page's root — `--ch-bg`, `--ch-fg`,
+    `--ch-muted`, `--ch-accent`, `--ch-accent-text`, `--ch-edge`, `--ch-surface`, `--ch-hover`,
+    `--ch-focus`, `--ch-err`, `--ch-warn`, `--ch-font`, `--ch-mono`, `--ch-text-sm/md/lg`,
+    `--ch-radius` — with the mode as `data-chimaera-theme`, `chimaera.theme` and `onTheme(fn)`.
+    Only variables, never an element style, so an old report renders exactly as before. A page
+    that wears the theme — inline, any `--ch-` variable in its own `<style>` or `style`
+    attributes, or `<meta name="chimaera" content="theme">` (a linked stylesheet can't be read
+    from the page's sandbox) — also gets the theme's canvas wherever it is shown, a preview pane included: its
+    root's background when it sets none of its own, and `color-scheme` for the browser's own
+    light or dark defaults. A page that never mentions the theme keeps the browser's white. An
+    app pane's placeholder is the workbench's surface while a page loads, not white. The
+    names are a contract (`shared/pageTheme.ts`, read off the window's computed style, so custom
+    themes and the accent come through): add, never rename. CSS that uses them follows a switch
+    live. A chart library is never re-coloured token by token: a page picks the library's own
+    light or dark theme from `chimaera.theme.mode` (Plotly's `plotly_dark`, Vega-Lite's dark config,
+    GenomeSpy's `defaultThemeColors` parameter) and draws again in `chimaera.onTheme`; a library
+    without a theme keeps its own light background, so nothing ends up dark on dark — the chat host
+    frame tells agents so. A fuller mapping for a library, where it is worth it, is written once by
+    its owner: the library's plugin, or the bundled plotting toolkit (issue 396). The page's URL carries the theme
+    (`chimaera-theme`, base64url JSON) so it applies at once; a framed page hears later themes as
+    messages and never reloads, while an app view loads again for a new theme.
+  - **`chimaera.send(text)` / `chimaera.draft(text)`.** 4,000 characters at most, at most one a
+    second, led by `[from the page “title”]` so the agent knows its source. A send goes over the
+    chat socket with `origin: "page"` — the one origin a window may ask for (`ws.rs`
+    `asked_origin`) — and journals as `UserMessage.origin = "page"`
+    (`chimaera_agent::model::ORIGIN_PAGE`); the transcript shows the words without the lead and the
+    page as a quiet "from <title>" tag under the bubble (`splitPageMessage`). A send needs the person's fresh press, one message
+    per press: the app's bridge, in its own world, takes a pointer press or Enter/Space in the page
+    and consumes it (`pane_bridge.js`; nothing while an agent drives the view); for a frame, which
+    the window can't look inside, the parent takes the person at the frame (focus in it, or the
+    pointer over it: a canvas such as GenomeSpy's keeps focus out), the window's transient
+    activation with no press or key of the window's own for an activation's life (5 s), and one
+    send per activation — and with no `navigator.userActivation` a frame never sends
+    (`shared/paneFrame.ts`). Short of that evidence a send is a draft. Even then only a card in a
+    chat's own answer whose file was written while that chat ran (its mtime against the session's
+    start, `writtenDuringChat`) sends, to that chat (`shared/pageMessage.ts`, App's handler, the
+    chat's live socket; a closed one drafts instead with a notice). Anywhere else — an older file
+    the agent only embedded, a preview pane, a card in a document, a hover — both draft into the
+    agent the person works with, who sends it or not: a page that isn't the agent's own must not
+    message an agent as the person. Agents learn the variables and the two calls from the chat
+    host frame (`launcher::CHAT_HOST_PROMPT`).
+  - **Inline or a file.** `![quiz](learn/quiz.html#inline)` makes a page part of the answer: no
+    file header, box, caption or expand; it sits on the app's background at its own height — the
+    page API reports its body's height (`page_size`, clamped 48–720 px; past that it scrolls
+    inside), and its browser defaults (text, controls) follow the theme's light or dark
+    (`chimaera-inline=<max px>` in its URL, `color-scheme` on its root); up to that most it never
+    shows a scrollbar (its root's `overflow-y` is hidden, so a scrollbar can't narrow the page,
+    rewrap it and resize the card in a loop), the app's bridge always delivers the latest size
+    (held to ten a second, never dropped), and a shrink under 3 px is ignored. With no background
+    of its own the page is painted the colour behind its card (`backgroundBehind`: a chat paints
+    its own, not the window's `--bg`), so a web view's default canvas never shows as a box. A small
+    **open ↗** shows under its corner, in space the card keeps, while the pointer is over the page
+    — the pane bridge reports `hover` from trusted pointer events, since the window sees no hover
+    over a view or a site-isolated frame — and nothing moves when it does. A page laid out at
+    `height: 100%` has no height of its own and stays at the 160 px start: give a plot an explicit
+    height. Without `#inline` an HTML page is a file card, right for a report. The agent decides,
+    per embed; Chimaera never guesses from size.
+  - **Limits.** A sandboxed page can't load the app's own fonts: `--ch-mono` and `--ch-font` name
+    them with their fallbacks, so a page shows the first one the system has. `--ch-text-*` are the
+    window's root sizes; chat prose sets its own, so a page in an answer may read a step larger.
+    An app view's URL carries the theme, so a page that wears the theme reloads once a theme
+    change settles (400 ms) — it says so with `page_themed` — while a page that doesn't (an old
+    report) is never reloaded for one and keeps its scroll and state; a framed page takes a new
+    theme live either way.
 - **PDF rendering.** Cards, panes and region snapshots share nonzero raster dimensions capped at
   12 million pixels and 8192 pixels per edge (`shared/pdfCanvas.ts`). Each draw owns a fresh canvas,
   and failed draws are cancelled before their handles are discarded: a graphics-initialization
@@ -1531,3 +1601,24 @@ _Captured 2026-11-04 (the maintainer, in the session that built it)._
 - **Deliberately left out:** "we skip all real Linters" — "If something is out of scope it should
   be an extension". Core reads and highlights; checking code is not core.
 - **Do not change (or: open to change):** nothing is frozen; the area is open to improvement.
+
+### Pages in an answer (theme, inline, answering back) — why it exists
+_Captured 2026-11-27 (the maintainer, in the session that built it; their words quoted)._
+
+- **Problem it solves:** agents write HTML artifacts all the time, "something that lives within
+  the answer, such as when you try to learn things". They "should be allowed to do that however
+  they want … like when they do interactive plots with like things to teach you", and "own
+  elements" meant the *theme*, not a fixed set of components. An HTML file that is part of the
+  answer should show inline, while "sometimes … there are files we definitely should open! So
+  needs to be a good distinction between those two". A click in such a page is an answer: "should
+  this not be an automatic answer? since it is a click." The page-to-agent message is meant to be
+  general, not only for quizzes.
+- **How settled it is (intended vs provisional):** **provisional**, in the maintainer's word: an
+  experiment, and most of it — the aim included — may change once it is used.
+- **Deliberately open / where it may go:** users configure nothing ("we dont want it complicated
+  for the users") — no modes, settings or prompts for pages. Chart libraries are themed through
+  their own light/dark themes, never colour by colour ("if something has not a default theme, we
+  cant go through all of these acrobatics"); the bundled plotting toolkit is a separate task
+  (issue 396). The open button shows on hover rather than as a permanent row.
+- **Do not change (or: open to change):** **open to change** — the maintainer named nothing as
+  off limits; everything here may change if improved.

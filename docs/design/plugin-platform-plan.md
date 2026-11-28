@@ -23,6 +23,11 @@ artifact attestations and Sigstore handle the same problems ([prior art](#prior-
 2. **Plugins draw screens in the Chimaera format.** A screen is data that core renders
    with Chimaera's own components and styles, so plugins look like Chimaera. There is
    no plugin HTML, script or stylesheet anywhere.
+   *Amended 2026-11-26 (maintainer):* screens stay data, but one node, `web`, may
+   be a page from the plugin's own bundle, sandboxed and bridged, for drawing
+   areas such as genome tracks, molecules and maps that existing JavaScript
+   libraries draw. Planned, not shipped; why and how:
+   [plugin web views](rich-views-plan.md#the-amendment-to-platform-decision-2).
 3. **Plugins may run programs, and install the side programs they need**, through
    the host, declared in the manifest, bounded by the host.
 4. **Verified plugins install freely. Anything else needs the user's explicit trust**

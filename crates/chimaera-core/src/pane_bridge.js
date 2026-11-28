@@ -220,6 +220,67 @@
   addEventListener("pointerdown", (e) => e.isTrusted && post({ kind: "focus" }), true);
   addEventListener("focus", (e) => e.isTrusted && post({ kind: "focus" }));
   for (const type of ["pointerdown", "pointerup", "keydown", "keyup"]) addEventListener(type, noteInput, true);
+
+  // The page API's messages (`page_api.js`, in the page's world) reach a
+  // native view's shell only through here, and only right after the person
+  // pressed in the page — a pointer press, or Enter or Space (what activates
+  // a control) — one message per press: a page can ask on a timer or on
+  // every keystroke typed into its field, never be believed on one. A
+  // framed page posts to its parent itself, which checks what it can
+  // (`shared/paneFrame.ts`).
+  if (native !== null) {
+    const PAGE_TEXT_MAX = 4000;
+    let lastPress = 0;
+    const notePress = (e) => {
+      if (!e.isTrusted) return;
+      if (e.type === "keydown" && e.key !== "Enter" && e.key !== " ") return;
+      lastPress = Date.now();
+    };
+    addEventListener("pointerdown", notePress, true);
+    addEventListener("keydown", notePress, true);
+    let lastSize = 0;
+    let sizeTimer = 0;
+    let pendingSize = 0;
+    document.addEventListener("chimaera:page", (e) => {
+      const detail = e.detail;
+      if (typeof detail !== "string" || detail.length > 16384) return;
+      let m;
+      try {
+        m = JSON.parse(detail);
+      } catch {
+        return;
+      }
+      if (m === null || typeof m !== "object") return;
+      // The page's height, for an inline card: no input needed (the host
+      // clamps it), ten a second at most — and always the latest: a report
+      // that comes too soon is held and sent at the end of the tenth, never
+      // dropped (a dropped last size left the card short, scrolling).
+      // The page wears the theme: its host may reload it for a new one.
+      if (m.kind === "page_themed") {
+        post({ kind: "page_themed" });
+        return;
+      }
+      if (m.kind === "page_size") {
+        if (typeof m.height !== "number" || !Number.isFinite(m.height)) return;
+        pendingSize = Math.max(0, Math.min(100000, m.height));
+        if (sizeTimer !== 0) return;
+        const flush = () => {
+          sizeTimer = 0;
+          lastSize = Date.now();
+          post({ kind: "page_size", height: pendingSize });
+        };
+        const wait = 100 - (Date.now() - lastSize);
+        if (wait <= 0) flush();
+        else sizeTimer = setTimeout(flush, wait);
+        return;
+      }
+      if (Date.now() - lastPress > INPUT_FRESH_MS) return;
+      if (m.kind !== "page_send" && m.kind !== "page_draft") return;
+      if (typeof m.text !== "string" || m.text.trim() === "") return;
+      lastPress = 0;
+      post({ kind: m.kind, text: m.text.slice(0, PAGE_TEXT_MAX), title: clip(document.title) ?? "" });
+    });
+  }
   // A trusted click on a link: the shell lets that exact URL out to the
   // user's browser, and nothing else (a script's `a.click()` is untrusted).
   const noteLink = (e) => {
@@ -254,6 +315,27 @@
     },
     true,
   );
+
+  // --- the pointer over the page -----------------------------------------------
+  // For a host control that shows while the pointer is over the page (an
+  // inline card's open button): a host can't see hover over a page in a
+  // view or a site-isolated frame. Only trusted pointer events; nothing acts
+  // on it but a control's visibility.
+  let pointerInside = false;
+  addEventListener(
+    "pointerover",
+    (e) => {
+      if (!e.isTrusted || pointerInside) return;
+      pointerInside = true;
+      post({ kind: "hover", inside: true });
+    },
+    true,
+  );
+  addEventListener("mouseout", (e) => {
+    if (!e.isTrusted || e.relatedTarget !== null || !pointerInside) return;
+    pointerInside = false;
+    post({ kind: "hover", inside: false });
+  });
 
   // --- the page, as the workbench names it ----------------------------------------
   let lastHref = "";

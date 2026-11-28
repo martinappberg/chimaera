@@ -31,7 +31,9 @@
   import Spinner from "./Spinner.svelte";
   import { PaneViewControl, paneView, paneViewsPossible } from "../shared/paneView";
   import { paneFrame } from "../shared/paneFrame";
-  import { referencePill, withBridge } from "../shared/paneViewBridge";
+  import { referencePill, withPageApi } from "../shared/paneViewBridge";
+  import { pageTheme } from "../shared/pageTheme";
+  import { pageMessage } from "../shared/pageMessage";
   import {
     activeSelection,
     clearSelection,
@@ -127,6 +129,30 @@
       : null,
   );
   const error = $derived(entry?.rawError ?? null);
+  // The page as Chimaera shows it: the page API appended, the app's theme
+  // in its URL. A native view loads again for a new theme (its URL holds
+  // it) only once the page said it wears the theme (`page_themed`): an old
+  // report keeps its scroll and state across a theme switch. A framed page
+  // keeps the theme it loaded with and hears later ones as messages
+  // (`paneFrame`'s `theme`), so a theme switch never reloads it.
+  let pageThemed = $state(false);
+  $effect(() => {
+    void url;
+    pageThemed = false;
+  });
+  const nativeUrl = $derived(
+    url === null
+      ? null
+      : withPageApi(url, { framed: false, theme: pageThemed ? $pageTheme : untrack(() => $pageTheme) }),
+  );
+  const frameUrl = $derived(
+    url === null ? null : withPageApi(url, { framed: true, theme: untrack(() => $pageTheme) }),
+  );
+  /** A page here is not in a chat's answer: what it asks to send is only
+   *  drafted for the agent the person works with (`shared/pageMessage.ts`). */
+  const onPageMessage = (m: { send: boolean; text: string; title: string }): void => {
+    pageMessage({ chat: null, writtenAtMs: null, ...m });
+  };
 
   // Reset per path.
   $effect(() => {
@@ -545,7 +571,7 @@
         <div
           class="native-slot"
           use:paneView={{
-            url,
+            url: nativeUrl,
             // A move (the tab dragged to another pane) takes the live page
             // along instead of reloading it.
             keep: `html:${path}`,
@@ -561,6 +587,8 @@
             onFocus: () => onFocusRequest?.(),
             onSelection: onPageSelection,
             onReference: onPageReference,
+            onPageMessage,
+            onPageThemed: () => (pageThemed = true),
             onCoverStill: (shot) =>
               (coverStill =
                 shot === null ? null : { src: `data:image/png;base64,${shot.png}`, width: shot.width, height: shot.height }),
@@ -633,16 +661,19 @@
           </div>
         {/if}
       {:else if url !== null}
-        <!-- `?bridge=1`: the daemon appends the pane bridge to this page, so
-             text marking works here too (shared/paneFrame.ts). -->
+        <!-- `?bridge=1`: the daemon appends the pane bridge and the page API
+             to this page, so text marking and `window.chimaera` work here too
+             (shared/paneFrame.ts). -->
         <iframe
-          src={withBridge(url)}
+          src={frameUrl}
           title={path}
           sandbox="allow-scripts"
           use:paneFrame={{
             onFocus: () => onFocusRequest?.(),
             onSelection: onPageSelection,
             onReference: onPageReference,
+            onPageMessage,
+            theme: $pageTheme,
             control,
           }}
         ></iframe>
@@ -760,11 +791,14 @@
     background: #ffffff; /* pages assume a white canvas regardless of theme */
   }
 
-  /* Where the native pane view sits: the page's own white until it paints. */
+  /* Where the native pane view sits: the workbench's own surface while the
+     page loads (a white one flashed the whole pane in dark mode); a page
+     that wears the theme paints the same colour, and a white report shows
+     its white once it is there. */
   .native-slot {
     position: absolute;
     inset: 0;
-    background: #ffffff;
+    background: var(--bg);
   }
 
   .cover-still {

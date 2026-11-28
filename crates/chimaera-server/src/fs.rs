@@ -5087,9 +5087,13 @@ pub(crate) async fn raw_asset(
         .file_name()
         .filter(|name| name.as_encoded_bytes() == rest.as_bytes())
         .map(PathBuf::from);
-    // A preview frame asks for its own page with the pane bridge appended
-    // (see [`PANE_BRIDGE_TAIL`]); nothing else ever gets it.
-    let bridge = own.is_some() && wants_pane_bridge(query.as_deref());
+    // A preview asks for its own page with the page API appended, and a
+    // framed one with the pane bridge before it ([`PageTail`]); nothing
+    // else ever gets either.
+    let tail = own
+        .is_some()
+        .then(|| PageTail::asked(query.as_deref()))
+        .flatten();
     let (Some(relative), Some(dir)) = (own.or_else(|| asset_relative(&rest)), path.parent()) else {
         return raw_not_found();
     };
@@ -5114,39 +5118,72 @@ pub(crate) async fn raw_asset(
         &relative,
         &headers,
         RawRoute::Folder,
-        bridge.then(pane_bridge_tail),
+        tail,
     )
     .await
 }
 
-/// The pane bridge as appended to a framed HTML preview: the same script the
-/// app injects into a native pane view (`chimaera_core::PANE_BRIDGE_JS`),
-/// here posting to the parent window. After `</html>` on purpose: the parser
-/// still runs it, and nothing before the page's own doctype changes (a
-/// leading script would drop the page into quirks mode).
-fn pane_bridge_tail() -> &'static str {
-    static TAIL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    TAIL.get_or_init(|| format!("\n<script>{}</script>\n", chimaera_core::PANE_BRIDGE_JS))
+/// What a preview's own page is served with, after `</html>` on purpose:
+/// the parser still runs it, and nothing before the page's own doctype
+/// changes (a leading script would drop the page into quirks mode).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PageTail {
+    /// `?bridge=1`, a framed preview: the pane bridge (the same script the
+    /// app injects into a native pane view, `chimaera_core::PANE_BRIDGE_JS`,
+    /// here posting to the parent window), then the page API.
+    Framed,
+    /// `?api=1`, a native pane view, whose bridge the app injects into a
+    /// world of its own: the page API alone (`chimaera_core::PAGE_API_JS`).
+    Native,
 }
 
-/// The bridged page's `ETag` part: a hash of the bridge itself, so a daemon
-/// whose bridge changed (at any length) never answers 304 for an old copy.
-fn pane_bridge_tag() -> &'static str {
-    static TAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    TAG.get_or_init(|| {
-        // FNV-1a: stable across builds and platforms (unlike `DefaultHasher`).
-        let hash = chimaera_core::PANE_BRIDGE_JS
-            .bytes()
-            .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+impl PageTail {
+    /// Which tail the query asks for, `bridge=1` winning.
+    fn asked(query: Option<&str>) -> Option<Self> {
+        let has = |want: &str| query.is_some_and(|q| q.split('&').any(|pair| pair == want));
+        if has("bridge=1") {
+            Some(Self::Framed)
+        } else if has("api=1") {
+            Some(Self::Native)
+        } else {
+            None
+        }
+    }
+
+    fn text(self) -> &'static str {
+        static FRAMED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        static NATIVE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        match self {
+            Self::Framed => FRAMED.get_or_init(|| {
+                format!(
+                    "\n<script>{}</script>\n<script>{}</script>\n",
+                    chimaera_core::PANE_BRIDGE_JS,
+                    chimaera_core::PAGE_API_JS
+                )
+            }),
+            Self::Native => NATIVE
+                .get_or_init(|| format!("\n<script>{}</script>\n", chimaera_core::PAGE_API_JS)),
+        }
+    }
+
+    /// The tailed page's `ETag` part: a hash of the tail itself, so a
+    /// daemon whose scripts changed (at any length) never answers 304 for
+    /// an old copy, and the two tails never share a validator.
+    fn tag(self) -> &'static str {
+        static FRAMED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        static NATIVE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let (cell, mark) = match self {
+            Self::Framed => (&FRAMED, "pb"),
+            Self::Native => (&NATIVE, "pa"),
+        };
+        cell.get_or_init(|| {
+            // FNV-1a: stable across builds and platforms (unlike `DefaultHasher`).
+            let hash = self.text().bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
                 (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
             });
-        format!("{hash:016x}")
-    })
-}
-
-/// `?bridge=1` among the query's pairs.
-fn wants_pane_bridge(query: Option<&str>) -> bool {
-    query.is_some_and(|q| q.split('&').any(|pair| pair == "bridge=1"))
+            format!("{mark}{hash:016x}")
+        })
+    }
 }
 
 fn raw_not_found() -> Response {
@@ -5302,27 +5339,23 @@ fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {
 /// revalidates to a 304 instead of re-downloading over the tunnel. A file
 /// in a report's folder is `private, no-cache`: revalidated every load.
 /// `name` decides the content type, and with `route` the sandbox
-/// ([`raw_security_headers`], on every status). `append` (the pane bridge
-/// on a preview's own page) is streamed after the file: it gets its own
-/// `ETag` and is never served in ranges.
+/// ([`raw_security_headers`], on every status). `tail` (the page API, and
+/// for a framed page the pane bridge, on a preview's own page) is streamed
+/// after the file: it gets its own `ETag` and is never served in ranges.
 async fn serve_raw(
     mut file: tokio::fs::File,
     meta: &std::fs::Metadata,
     name: &Path,
     headers: &HeaderMap,
     route: RawRoute,
-    append: Option<&'static str>,
+    tail: Option<PageTail>,
 ) -> Response {
     let total = meta.len();
-    let etag = match append {
+    let etag = match tail {
         None => raw_etag(meta),
-        Some(_) => format!(
-            "\"{}-{}-pb{}\"",
-            mtime_token(meta),
-            meta.len(),
-            pane_bridge_tag()
-        ),
+        Some(tail) => format!("\"{}-{}-{}\"", mtime_token(meta), meta.len(), tail.tag()),
     };
+    let append = tail.map(PageTail::text);
     let mime = mime_guess::from_path(name).first_or_octet_stream();
     let security = raw_security_headers(&mime, route);
     let cache_control = match route {
@@ -5378,9 +5411,9 @@ async fn serve_raw(
 
     // Stream the selected span. The previous `vec![0; len]` loaded an
     // un-ranged file (or attacker-chosen large range) wholly into daemon RSS.
-    let tail = append.unwrap_or("");
+    let appended = append.unwrap_or("");
     let body = Body::from_stream(tokio_util::io::ReaderStream::new(
-        file.take(len).chain(tail.as_bytes()),
+        file.take(len).chain(appended.as_bytes()),
     ));
     let mut response = (
         status,
@@ -5392,7 +5425,7 @@ async fn serve_raw(
             ),
             (
                 header::CONTENT_LENGTH,
-                (len + tail.len() as u64).to_string(),
+                (len + appended.len() as u64).to_string(),
             ),
         ],
         body,

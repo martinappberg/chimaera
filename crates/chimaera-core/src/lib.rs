@@ -28,6 +28,14 @@ pub const PANE_BRIDGE_JS: &str = include_str!("pane_bridge.js");
 /// `instrument`); never served to a framed preview.
 pub const PANE_AGENT_JS: &str = include_str!("pane_agent.js");
 
+/// The page API (`page_api.js`): `window.chimaera` for an HTML page a pane
+/// or an embed card shows — the app's theme as `--ch-*` variables, and
+/// `send` / `draft` for the agent, which the host honours only after the
+/// person's own input. The page's convenience, never a boundary. The daemon
+/// appends it to the ticket's own page (`?bridge=1`, after the bridge, for
+/// a framed page; `?api=1` alone for a native view).
+pub const PAGE_API_JS: &str = include_str!("page_api.js");
+
 /// Version of the chimaera workspace.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

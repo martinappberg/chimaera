@@ -58,6 +58,13 @@ pub const ORIGIN_AGENT: &str = "agent";
 /// `UserMessage.origin` for the workspace Mastermind's message to an agent:
 /// direction the user sanctioned by appointing it, not the user's words.
 pub const ORIGIN_MASTERMIND: &str = "mastermind";
+/// `UserMessage.origin` for a message the user sent with a click in an HTML
+/// page the agent embedded in its answer (the page API's `send`): the
+/// user's own message, worded by the page. Its text begins with the page's
+/// name (`[from the page “…”] `) so the agent knows where it came from; the
+/// transcript shows that as a tag instead. The only origin a window may ask
+/// for on a send (`ws.rs`).
+pub const ORIGIN_PAGE: &str = "page";
 /// Caps on an [`AgentEvent::AgentMessage`]: the Timeline's own text cap, and
 /// a one-line name.
 pub const AGENT_MESSAGE_TEXT_MAX: usize = 2 * 1024;
@@ -295,8 +302,9 @@ pub enum AgentEvent {
         /// it through the agent's own bridge, so it never crossed chimaera's
         /// composer; [`ORIGIN_RESTART`] = the daemon sent it itself after a
         /// restart cut work off; [`ORIGIN_WORKER`] = a worker's message the
-        /// daemon delivered to the Mastermind. Absent = this workbench's
-        /// composer. Additive.
+        /// daemon delivered to the Mastermind; [`ORIGIN_PAGE`] = a click in a
+        /// page the agent embedded. Absent = this workbench's composer.
+        /// Additive.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<String>,
     },
