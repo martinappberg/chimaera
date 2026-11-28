@@ -307,6 +307,14 @@ function drawnShapes(el: Element): SVGElement[] {
   return Array.from(el.querySelectorAll<SVGElement>(`svg ${SHAPE_TAGS.split(", ").join(", svg ")}`)).filter((s) => s.closest(NOT_DRAWN) === null);
 }
 
+/** A gradient's first stop colour (its lowest offset). */
+function firstStop(grad: Element): string {
+  const stops = Array.from(grad.querySelectorAll("stop"));
+  const at = (st: Element) => parseFloat(st.getAttribute("offset") ?? "0") || 0;
+  const first = stops.sort((a, b) => at(a) - at(b))[0];
+  return first?.getAttribute("stop-color") ?? "#000000";
+}
+
 function gradientOf(shape: SVGElement, fill: string): Element | null {
   const m = /^url\(\s*["']?#([^"')]+)["']?\s*\)$/.exec(fill.trim());
   if (m === null) return null;
@@ -344,7 +352,13 @@ function colorPaints(el: Element, colors: HeldColors, palette: Palette | null, s
         const f = s.getAttribute("fill") ?? "";
         if (f === "none" || f === "") continue;
         const grad = gradientOf(s, f);
-        if (grad !== null) {
+        if (grad !== null && fill.solid === true) {
+          // PowerPoint makes the fill solid, from the gradient's first stop
+          // (R29; matched against its own film: darken, lighten,
+          // desaturate and complementary colour on a gradient).
+          const c = resolved(firstStop(grad), fill);
+          if (c !== null) out.push({ el: s, prop: "fill", value: c });
+        } else if (grad !== null) {
           for (const stop of Array.from(grad.querySelectorAll<SVGElement>("stop"))) {
             const c = resolved(stop.getAttribute("stop-color") ?? "#000000", fill);
             if (c !== null) out.push({ el: stop, prop: "stop-color", value: c });
@@ -516,9 +530,13 @@ export interface ElementBase {
   sx: number;
   sy: number;
   rot: number;
-  /** Its own box, px (what `clip-path` measures). */
+  /** The box a clip effect runs across, in its own px: the shape's box, or
+   *  a paragraph's text (not its block: PowerPoint wipes across the
+   *  words), at (`bx`, `by`) in the element. */
   bw: number;
   bh: number;
+  bx?: number;
+  by?: number;
 }
 
 /** An element's inline values once the click has landed (`none` where the
@@ -727,8 +745,6 @@ export function planStep(
       const at = pre ? t - 0.001 : t;
       // Absolute channels: the last segment (in document order) that has begun.
       const abs: Partial<Record<string, number>> = {};
-      let mx = 0;
-      let my = 0;
       let sx = 1;
       let sy = 1;
       let rot = 0;
@@ -738,12 +754,6 @@ export function planStep(
         const v = s.value(at);
         if (v === null || !Number.isFinite(v)) continue;
         switch (s.ch) {
-          case "mx":
-            mx += v;
-            break;
-          case "my":
-            my += v;
-            break;
           case "sx":
             sx *= v;
             break;
@@ -757,7 +767,7 @@ export function planStep(
             op *= v;
             break;
           case "clip":
-            clip = s.region!(Math.min(1, Math.max(0, v)), b.bw, b.bh);
+            clip = s.region!(Math.min(1, Math.max(0, v)), b.bw, b.bh, b.bx ?? 0, b.by ?? 0);
             break;
           default:
             abs[s.ch] = v;
@@ -766,9 +776,13 @@ export function planStep(
       const f: PlayKeyframe = { offset: Math.min(1, Math.max(0, t / duration)) };
       if (fades) f.opacity = r3(hiddenAt(id, t, pre) ? 0 : b.drawn * fin(op * (abs.opAbs ?? b.held), 0, 1, 1));
       if (moves) {
-        const dx = (abs.x ?? g.ppt_x) - g.ppt_x + mx;
-        const dy = (abs.y ?? g.ppt_y) - g.ppt_y + my;
-        f.translate = `${r3(fin(b.tx + dx * w * b.k, -LIMIT.px, LIMIT.px, b.tx))}px ${r3(fin(b.ty + dy * h * b.k, -LIMIT.px, LIMIT.px, b.ty))}px`;
+        const dx = (abs.x ?? g.ppt_x) - g.ppt_x + (abs.mx ?? 0);
+        const dy = (abs.y ?? g.ppt_y) - g.ppt_y + (abs.my ?? 0);
+        // A path that has begun is an offset from the layout place: the
+        // offset an earlier path left goes (R18).
+        const tx = abs.mx === undefined ? b.tx : 0;
+        const ty = abs.my === undefined ? b.ty : 0;
+        f.translate = `${r3(fin(tx + dx * w * b.k, -LIMIT.px, LIMIT.px, b.tx))}px ${r3(fin(ty + dy * h * b.k, -LIMIT.px, LIMIT.px, b.ty))}px`;
       }
       if (scales) {
         const kx = g.ppt_w > 0 ? (abs.w ?? g.ppt_w) / g.ppt_w : 1;
@@ -896,6 +910,7 @@ function measure(tagged: TaggedSlide, id: ElementId, w: number, h: number): Elem
   const held = opNow === "" || opNow === "0" || drawn === 0 ? 1 : Math.min(1, Number(opNow) / drawn);
   let geom: Geom;
   let k = 1;
+  let textAt: [number, number] = [0, 0];
   if (!id.includes("#")) {
     const px = (v: string) => (v.endsWith("px") ? parseFloat(v) : NaN);
     const s = shape.el.style;
@@ -905,7 +920,23 @@ function measure(tagged: TaggedSlide, id: ElementId, w: number, h: number): Elem
   } else {
     const slideEl = shape.el.parentElement;
     if (slideEl === null) return null;
-    geom = boxGeom(el.getBoundingClientRect(), slideEl.getBoundingClientRect(), w, h);
+    const slideBox = slideEl.getBoundingClientRect();
+    const block = el.getBoundingClientRect();
+    // The paragraph's text, not its block: the union of its lines' boxes.
+    let text: ClientBox = block;
+    if (typeof document !== "undefined" && typeof document.createRange === "function") {
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      const rs = Array.from(range.getClientRects()).filter((r) => r.width > 0 && r.height > 0);
+      if (rs.length > 0) {
+        const x0 = Math.min(...rs.map((r) => r.left));
+        const y0 = Math.min(...rs.map((r) => r.top));
+        text = { left: x0, top: y0, width: Math.max(...rs.map((r) => r.right)) - x0, height: Math.max(...rs.map((r) => r.bottom)) - y0 };
+      }
+    }
+    geom = boxGeom(text, slideBox, w, h);
+    const f = slideBox.width > 0 ? slideBox.width / w : 1;
+    textAt = [(text.left - block.left) / f, (text.top - block.top) / f];
     const chain: string[] = [];
     for (let e = el.parentElement; e !== null; e = e.parentElement) {
       chain.push(e.style.transform);
@@ -929,6 +960,8 @@ function measure(tagged: TaggedSlide, id: ElementId, w: number, h: number): Elem
     rot: Number.isFinite(rot) ? rot : 0,
     bw: box[0]!,
     bh: box[1]!,
+    bx: textAt[0] * k,
+    by: textAt[1] * k,
   };
 }
 
@@ -1026,13 +1059,12 @@ export function prepareStep(tagged: TaggedSlide, timeline: SlideTimeline, k: num
         if (a === b) continue;
         const spid = (el.closest("[data-sid]") as HTMLElement | null)?.dataset.sid ?? "";
         const grad = prop === "fill" && "ownerSVGElement" in el ? gradientOf(el as SVGElement, a) : null;
-        if (grad !== null) {
-          // A gradient going solid: its stops blend to the colour; the
-          // landing then swaps the fill for that colour.
-          for (const stop of Array.from(grad.querySelectorAll<SVGElement>("stop"))) {
-            blends.push({ el: stop, prop: "stop-color", a: fromBy.get(stop)?.get("stop-color") ?? (stop.getAttribute("stop-color") ?? "#000000"), b, spid });
-          }
-        } else if (a === "none" && prop === "fill") blends.push({ el, prop: "fill-opacity", a: "0", b: "1", spid });
+        // As PowerPoint's film shows: a gradient going solid is solid at
+        // the click, in its first stop's colour, and blends from there; a
+        // picture going solid vanishes at the click and the colour blends
+        // in from white.
+        if (grad !== null) blends.push({ el, prop, a: toCss(parseCss(firstStop(grad)) ?? { r: 0, g: 0, b: 0, a: 1 }), b, spid });
+        else if (a === "none" && prop === "fill") blends.push({ el, prop, a: "rgb(255, 255, 255)", b, spid });
         else blends.push({ el, prop, a, b, spid });
       }
     }
@@ -1083,7 +1115,7 @@ export function playStep(tagged: TaggedSlide, timeline: SlideTimeline, k: number
       return playing;
     }
     playing.approximate = prep.approximate;
-    const { plan, duration, windows, blends, landedBy } = prep;
+    const { plan, duration, windows, blends } = prep;
     for (const tr of plan.tracks) {
       const el = elementOf(tagged, tr.id);
       if (el === undefined || typeof el.animate !== "function") continue;
@@ -1097,14 +1129,13 @@ export function playStep(tagged: TaggedSlide, timeline: SlideTimeline, k: number
       const [t0, t1] = windows.get(bl.spid) ?? [0, duration];
       const p = camel(bl.prop);
       const at = (t: number) => Math.min(1, Math.max(0, t / duration));
-      const fixed = bl.prop === "fill-opacity" ? { fill: landedBy.get(bl.el)?.get("fill") } : {};
       anims.push(
         bl.el.animate(
           [
-            { offset: 0, [p]: bl.a, ...fixed },
-            { offset: at(t0), [p]: bl.a, ...fixed },
-            { offset: Math.max(at(t0), at(t1)), [p]: bl.b, ...fixed },
-            { offset: 1, [p]: bl.b, ...fixed },
+            { offset: 0, [p]: bl.a },
+            { offset: at(t0), [p]: bl.a },
+            { offset: Math.max(at(t0), at(t1)), [p]: bl.b },
+            { offset: 1, [p]: bl.b },
           ] as Keyframe[],
           { duration, fill: "both", easing: "linear" },
         ),

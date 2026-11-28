@@ -216,13 +216,13 @@ describe("parseTimeline on the corpus", () => {
     expect(t.builds).toEqual([{ spid: "2", group: 0, kind: "bldP", build: "p", level: null, animBg: false }]);
   });
 
-  it("adds up paths on one shape (paths, slide 2)", async () => {
+  it("a second path on one shape replaces the first: offsets are from the layout place (paths, slide 2; PowerPoint's film)", async () => {
     const t = await slideOf("paths", 2);
     expect(buildStates(t).map((s) => s.moved)).toEqual([
       {},
       {},
       { "2": [0.25, 0] },
-      { "2": [0.25, 0.25] },
+      { "2": [0, 0.25] },
     ]);
   });
 
@@ -499,7 +499,7 @@ describe("the hand-written cases", () => {
     expect(parseTimeline(caseXml("transition-unknown-choice")).transition).toMatchObject({ kind: "fade", dur: 1000 });
   });
 
-  it("paths sum unrounded, then round half away from zero, never to -0", () => {
+  it("the path that ends last sets the offset, rounded half away from zero, never to -0", () => {
     const states = buildStates(parseTimeline(caseXml("path-edges")));
     expect(states.at(-1)!.moved).toEqual({
       "2": [0, 0],
@@ -507,7 +507,8 @@ describe("the hand-written cases", () => {
       "4": [0.0003, -0.0003],
       "5": [0, 0],
       "6": [0.1, 0.1],
-      "7": [0.0001, 0],
+      // Two paths of 0.00004 each: the later replaces (0.00004 rounds to 0).
+      "7": [0, 0],
     });
     expect(Object.is(states.at(-1)!.moved["5"]![0], 0)).toBe(true);
   });

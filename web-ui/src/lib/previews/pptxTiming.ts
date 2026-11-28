@@ -273,11 +273,22 @@ function natOf(v: string | null): number | null {
   const n = intOf(v);
   return n === null ? null : Math.max(0, n);
 }
-/** A real number (in-memory values only: scale, tav, colour; never contract fields). */
+/** A decimal number (README R2a): an optional sign, digits with an
+ *  optional fraction (or a fraction alone), an optional exponent; nothing
+ *  else (no hex, no blank, no whitespace, no `Infinity`). */
+const DECIMAL = /^[-+]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][-+]?[0-9]+)?$/;
 function numOf(v: string | null): number | null {
-  if (v === null || v.trim() === "") return null;
+  if (v === null || !DECIMAL.test(v)) return null;
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
+}
+
+/** A time value as a number (R28): a `fltVal`/`intVal`, or a `strVal`
+ *  whose text is a decimal number (PowerPoint writes transparency as
+ *  `strVal "0.5"`); a `boolVal` never is. */
+export function decimalOf(v: TimeValue | null): number | null {
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
+  return typeof v === "string" ? numOf(v) : null;
 }
 function truthy(v: string | null): boolean {
   return v === "1" || v === "true";
@@ -1078,8 +1089,13 @@ function animNumber(b: Behaviour & { kind: "anim" }, q: number): number | null {
   if (n === 0) return null;
   const keys: { at: number; v: number }[] = [];
   for (const [i, tav] of b.tav.entries()) {
-    if (typeof tav.val !== "number" || (tav.fmla !== null && tav.fmla !== "")) return null;
-    keys.push({ at: tav.tm === null ? (n === 1 ? 0 : i / (n - 1)) : tav.tm / 100000, v: tav.val });
+    const v = decimalOf(tav.val);
+    if (v === null || (tav.fmla !== null && tav.fmla !== "")) return null;
+    const at = tav.tm === null ? (n === 1 ? 0 : i / (n - 1)) : tav.tm / 100000;
+    // In document order; a time outside 0–1 or before the one before makes
+    // the anim contribute nothing (R28).
+    if (!(at >= 0 && at <= 1) || (keys.length > 0 && at < keys[keys.length - 1]!.at)) return null;
+    keys.push({ at, v });
   }
   if (q <= keys[0]!.at) return keys[0]!.v;
   for (let i = 1; i < keys.length; i++) {
@@ -1148,8 +1164,8 @@ function applyHeld(step: readonly Effect[], held: Held): void {
         const v = animNumber(b, q);
         if (v !== null) run = () => held.opacity.set(key, v);
       } else if (b.kind === "set" && b.attrs.includes("style.opacity")) {
-        const v = typeof b.to === "number" ? b.to : typeof b.to === "string" && b.to.trim() !== "" ? Number(b.to) : NaN;
-        if (Number.isFinite(v)) run = () => held.opacity.set(key, v);
+        const v = decimalOf(b.to);
+        if (v !== null) run = () => held.opacity.set(key, v);
       } else if (b.kind === "color" && q === 1) {
         const part = b.attrs.map((a) => COLOR_PART.get(a.toLowerCase())).find((x) => x !== undefined);
         if (part !== undefined && (b.to !== null || b.by !== null)) {
@@ -1264,16 +1280,27 @@ export function buildStates(timeline: SlideTimeline): BuildState[] {
       if (ev.to === "hidden") hidden.add(ev.key);
       else hidden.delete(ev.key);
     }
+    // A path is an offset from the target's layout place, and the path
+    // that ends last replaces any before it (R18): PowerPoint's film shows
+    // a second path starting from the layout place again.
+    const paths: { key: string; at: bigint | null; i: number; end: [number, number] }[] = [];
     for (const e of step) {
       if (e.name !== "path") continue;
       for (const b of e.behaviours) {
         if (b.kind !== "motion" || b.path === null || b.target === null) continue;
-        const key = targetKey(b.target);
-        const [dx, dy] = pathEnd(b.path);
-        const was = moved.get(key) ?? [0, 0];
-        moved.set(key, [was[0] + dx, was[1] + dy]);
+        const end = behaviourEnd(b);
+        paths.push({ key: targetKey(b.target), at: end === null ? null : BigInt(e.start) * 1000n + end, i: paths.length, end: pathEnd(b.path) });
       }
     }
+    paths.sort((a, b) => {
+      if (a.at !== b.at) {
+        if (a.at === null) return 1;
+        if (b.at === null) return -1;
+        return a.at < b.at ? -1 : 1;
+      }
+      return a.i - b.i;
+    });
+    for (const p of paths) moved.set(p.key, p.end);
     const movedOut = Object.create(null) as Record<string, [number, number]>;
     for (const key of [...moved.keys()].sort()) {
       const [dx, dy] = moved.get(key)!;

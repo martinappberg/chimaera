@@ -7,7 +7,8 @@
  * - `x`, `y`, `w`, `h`: the shape's centre and size in slide fractions
  *   (`p:anim` on `ppt_x` `ppt_y` `ppt_w` `ppt_h`, its time values read with
  *   `pptxFormula.ts`), absolute: the latest begun wins;
- * - `mx`, `my`: a motion path's offset in slide fractions, added up;
+ * - `mx`, `my`: a motion path's offset from the layout place in slide
+ *   fractions, absolute: the latest begun wins (R18);
  * - `sx`, `sy`: `p:animScale` `by` factors, multiplied; `sxAbs`, `syAbs`:
  *   its `to`, from the factor held before (absolute, as R26);
  * - `rot` (added up: `p:animRot by`) and `rotAbs` (`p:animRot from/to`,
@@ -25,7 +26,7 @@
  */
 
 import { formulaValue, type FormulaVars } from "./pptxFormula";
-import { progress, targetKey, type Behaviour, type Effect } from "./pptxTiming";
+import { decimalOf, progress, targetKey, type Behaviour, type Effect } from "./pptxTiming";
 
 export { progress, warp } from "./pptxTiming";
 
@@ -47,8 +48,10 @@ export interface Segment {
   region?: Region;
 }
 
-/** A visible region: a CSS `clip-path` for progress `p` on a `w`×`h` box. */
-export type Region = (p: number, w: number, h: number) => string;
+/** A visible region: a CSS `clip-path` for progress `p` on a `w`×`h` box
+ *  whose top-left corner is at (`ox`, `oy`) in the element (a paragraph's
+ *  text inside its block). */
+export type Region = (p: number, w: number, h: number, ox?: number, oy?: number) => string;
 
 export interface EffectMotion {
   segments: Segment[];
@@ -211,11 +214,14 @@ const GROW = new Map<string, Grow>([
   [
     "circle",
     (q, w, h) => {
-      const r = q * Math.hypot(w / 2, h / 2);
+      // An ellipse with the shape's aspect, through its corners at q = 1
+      // (PowerPoint's iris: about 0.70·w by 0.66·h halfway).
+      const rx = q * (w / 2) * Math.SQRT2;
+      const ry = q * (h / 2) * Math.SQRT2;
       const out: Pt[] = [];
       for (let i = 0; i < CIRCLE_POINTS; i++) {
         const a = Math.PI + (2 * Math.PI * i) / CIRCLE_POINTS;
-        out.push([w / 2 + r * Math.cos(a), h / 2 + r * Math.sin(a)]);
+        out.push([w / 2 + rx * Math.cos(a), h / 2 + ry * Math.sin(a)]);
       }
       return out;
     },
@@ -267,14 +273,17 @@ const WHEEL_ARC = 24;
 export function clipRegion(filter: string, out: boolean): Region | null {
   const region = regionOf(filter, out);
   if (region === null) return null;
-  return (p, w, h) => {
+  return (p, w, h, ox = 0, oy = 0) => {
     // The whole box shown is no clip at all.
     if (out ? p <= 0 : p >= 1) return "none";
-    // The region covers the box and a margin around it, so a shape's
-    // shadow (drawn past its box) is revealed with it, not after.
+    // The pattern is laid out on the shape's own box (PowerPoint's six
+    // slats start at its top); a point on the box's edge is then pushed
+    // out by a margin, so a shadow or an outline drawn past the box is
+    // revealed with it, without rescaling the pattern.
     const e = clipMargin(w, h);
-    const { pts, evenodd } = region(p, w + 2 * e, h + 2 * e);
-    return polygon(pts.map(([x, y]): Pt => [x - e, y - e]), evenodd);
+    const { pts, evenodd } = region(p, w, h);
+    const push = (v: number, size: number) => (v <= 0.001 ? v - e : v >= size - 0.001 ? v + e : v);
+    return polygon(pts.map(([x, y]): Pt => [push(x, w) + ox, push(y, h) + oy]), evenodd);
   };
 }
 
@@ -531,7 +540,7 @@ export function effectMotion(e: Effect, geom: (key: string) => Geom | null): Eff
     if (b.kind === "set") {
       if (b.attrs.includes("style.visibility")) continue;
       if (b.attrs.includes("style.opacity")) {
-        const v = typeof b.to === "number" ? b.to : typeof b.to === "string" ? Number(b.to) : NaN;
+        const v = decimalOf(b.to) ?? NaN;
         if (!Number.isFinite(v)) return fade("an opacity it can't read");
         segments.push({ key, ch: "opAbs", value: (s) => { const c = clock(s); return c === null || c < b.delay ? null : v; } });
         continue;

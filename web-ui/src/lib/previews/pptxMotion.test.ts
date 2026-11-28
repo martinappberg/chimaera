@@ -99,7 +99,7 @@ describe("wipe", () => {
     const e = clipMargin(100, 50);
     const xs = pts(r(0.25, 100, 50)).map(([x]) => x);
     expect(Math.max(...xs)).toBe(100 + e);
-    expect(Math.min(...xs)).toBeCloseTo(0.75 * (100 + 2 * e) - e, 1);
+    expect(Math.min(...xs)).toBeCloseTo(75, 1);
     expect(r(0, 100, 50)).toMatch(/^polygon\(/);
     expect(Math.min(...pts(r(0, 100, 50)).map(([x]) => x))).toBe(100 + e);
     expect(r(1, 100, 50)).toBe("none");
@@ -122,7 +122,7 @@ describe("wipe", () => {
     const r = clipRegion("wipe(up)", true)!;
     const e = clipMargin(100, 40);
     const ys = pts(r(0.25, 100, 40)).map(([, y]) => y);
-    expect(Math.min(...ys)).toBeCloseTo(0.25 * (40 + 2 * e) - e, 1);
+    expect(Math.min(...ys)).toBeCloseTo(10, 1);
     expect(Math.max(...ys)).toBe(40 + e);
   });
 
@@ -137,9 +137,26 @@ describe("wipe", () => {
     }
     // In: the box less a shape shrinking to the centre (even-odd).
     expect(clipRegion("box(in)", false)!(0.5, 200, 100)).toMatch(/^polygon\(evenodd, /);
-    // Out: a box growing from the centre (half the margin-wide box at 0.5).
-    expect(clipMargin(200, 100)).toBe(22);
-    expect(clipRegion("box(out)", false)!(0.5, 200, 100)).toBe("polygon(39px 50px, 39px 14px, 161px 14px, 161px 86px, 39px 86px)");
+    // Out: a box growing from the centre, on the shape's own box.
+    expect(clipRegion("box(out)", false)!(0.5, 200, 100)).toBe("polygon(50px 50px, 50px 25px, 150px 25px, 150px 75px, 50px 75px)");
+  });
+
+  it("blinds: six slats laid out on the shape's own box, h/6 apart from its top (PowerPoint's film)", () => {
+    const h = 300;
+    const ys = pts(clipRegion("blinds(horizontal)", false)!(0.5, 200, h)).map(([, y]) => y);
+    const tops = [...new Set(ys)].sort((a, b) => a - b).filter((y) => y >= 0 && y <= h);
+    // Each slat shows its top half at p = 0.5: [0, 25], [50, 75], … (the
+    // first slat's top lies on the box edge, pushed out by the margin).
+    expect(tops).toEqual([25, 50, 75, 100, 125, 150, 175, 200, 225, 250, 275]);
+    expect(Math.min(...ys)).toBe(-clipMargin(200, h));
+  });
+
+  it("the iris is an ellipse with the shape's aspect (PowerPoint's circle)", () => {
+    const p = pts(clipRegion("circle(out)", false)!(0.5, 400, 200));
+    const xs = p.map(([x]) => x);
+    const ys = p.map(([, y]) => y);
+    expect((Math.max(...xs) - Math.min(...xs)) / 400).toBeCloseTo(0.707, 2);
+    expect((Math.max(...ys) - Math.min(...ys)) / 200).toBeCloseTo(0.707, 2);
   });
 
   it("refuses what it doesn't draw (the effect fades instead)", () => {
@@ -237,6 +254,23 @@ describe("held emphasis plays from what the state before holds", () => {
     expect(f[f.length - 1]!.translate).toBe("0px 0px");
     expect(g[g.length - 1]!.translate).toBe("none");
     expect(g[g.length - 1]!.opacity).toBe(1);
+  });
+});
+
+describe("a second path replaces the first (R18, PowerPoint's film of paths slide 2)", () => {
+  it("snaps back to the layout place as it begins and ends at its own end point", async () => {
+    const t = await slide("paths", 2);
+    const states = buildStates(t);
+    const e = t.steps[3]![0]!;
+    const shapes = new Map<string, ShapeInfo>([[e.target!.spid, { paraCount: 0, paras: false }]]);
+    const moved = states[2]!.moved[e.target!.spid]!;
+    expect(moved).toEqual([0.25, 0]);
+    const b = { ...base(), tx: moved[0] * W, ty: moved[1] * H };
+    const kf = planStep(t.steps[3]!, states[2]!, shapes, [e.target!.spid], () => b, noLanding, W, H).tracks[0]!.keyframes;
+    expect(px(kf[0]!.translate)).toEqual([0, 0]);
+    expect(px(kf[kf.length - 1]!.translate)[0]).toBeCloseTo(0, 1);
+    expect(px(kf[kf.length - 1]!.translate)[1]).toBeCloseTo(0.25 * H, 0);
+    expect(states[3]!.moved[e.target!.spid]).toEqual([0, 0.25]);
   });
 });
 
