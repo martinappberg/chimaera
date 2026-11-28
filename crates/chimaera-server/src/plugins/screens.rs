@@ -490,15 +490,7 @@ pub(crate) async fn render_route(
         let Some(file) = q.file.as_deref() else {
             return super::bad_request("a file view needs ?file=");
         };
-        // A file it claims for this view, or one its file actions take: an
-        // action's answer may open any of its file views on that file
-        // (`file_action_route`), such as a genome view on a plain VCF.
-        let claimed = super::platform::file_kind(&m, file).is_some_and(|k| k.view == view);
-        let acted_on = m
-            .actions
-            .iter()
-            .any(|a| a.patterns.iter().any(|p| super::platform::matches(p, file)));
-        if !claimed && !acted_on {
+        if !super::platform::file_view_may_draw(&m, &view, file) {
             return super::bad_request(format!("{} does not open {file} in {view}", m.name));
         }
     }
@@ -658,16 +650,20 @@ pub(crate) async fn file_action_route(
         .map(|m| crate::timeline::cap(m, 400));
     let open = answer.get("open").and_then(|o| {
         let view = o.get("view").and_then(Value::as_str)?;
-        if !m.views.iter().any(|d| d.id == view) {
-            return None;
-        }
-        // A file view opens on a file of this workspace: a plain relative
-        // path, never `..`, absolute or empty. Anything else is dropped, and
-        // the view opens on the file the action ran on.
-        let file = o
-            .get("file")
-            .and_then(Value::as_str)
-            .filter(|f| workspace_file(f));
+        let decl = m.views.iter().find(|d| d.id == view)?;
+        // A file view opens on a file of this workspace (a plain relative
+        // path, never `..`, absolute or empty) that it may draw; one named
+        // otherwise opens nothing rather than an error screen. Unnamed, it
+        // opens on the file the action ran on.
+        let file = match o.get("file").and_then(Value::as_str) {
+            Some(f) if decl.slot == Slot::File => {
+                if !workspace_file(f) || !super::platform::file_view_may_draw(&m, view, f) {
+                    return None;
+                }
+                Some(f)
+            }
+            _ => None,
+        };
         Some(json!({"view": view, "file": file}))
     });
     Json(json!({"message": message, "open": open})).into_response()

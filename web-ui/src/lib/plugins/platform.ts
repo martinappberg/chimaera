@@ -745,9 +745,16 @@ export function viewClaim(plugins: readonly WorkspacePlugin[], plugin: string, v
   return p !== undefined && v !== undefined ? { plugin: p, view: v, kind: { match: [], view: v.id, label: v.title } } : null;
 }
 
+/** A plain workspace-relative path: no empty, `.` or `..` segment, no
+ *  backslash; the daemon's `workspace_file`, checked again here because an
+ *  older daemon passed a plugin's answer through unchecked. */
+export function plainWorkspaceFile(f: string): boolean {
+  return f.length > 0 && f.length <= 1024 && !/[\\\0]/.test(f) && f.split("/").every((s) => s !== "" && s !== "." && s !== "..");
+}
+
 /** Where a file action's `open` goes: a plugin's tab, or one of its file
- *  views on a file of the workspace (the daemon has checked the path is
- *  plain and relative; `null` is the file the action ran on). */
+ *  views on a file of the workspace (`null`: the file the action ran on).
+ *  A file that isn't a plain workspace path opens nothing. */
 export function fileActionTarget(
   plugins: readonly WorkspacePlugin[],
   plugin: string,
@@ -756,12 +763,16 @@ export function fileActionTarget(
 ): { kind: "tab"; view: string } | { kind: "file"; view: string; file: string } | null {
   const v = plugins.find((x) => x.id === plugin)?.platform.views.find((x) => x.id === open.view);
   if (v === undefined) return null;
-  if (v.slot === "file") return { kind: "file", view: v.id, file: open.file ?? from };
+  if (v.slot === "file") {
+    if (open.file !== null && !plainWorkspaceFile(open.file)) return null;
+    return { kind: "file", view: v.id, file: open.file ?? from };
+  }
   return v.slot === "tab" ? { kind: "tab", view: v.id } : null;
 }
 
-/** A file view asked for on the file at `path` (absolute), for the file
- *  gate that shows it, already open or about to open. `at` is when. */
+/** A file view asked for on the file at `path` (absolute), for the one
+ *  file gate that shows it, already open or about to open: the first gate
+ *  on that path takes it and clears it. `at` is when. */
 export interface FileViewRequest {
   path: string;
   plugin: string;

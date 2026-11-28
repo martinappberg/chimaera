@@ -352,6 +352,17 @@ async fn file_actions_and_queries_reach_the_plugin() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    // An answer naming a file its view may not draw opens nothing.
+    std::fs::write(root_of(&state, &ws).join("elsewhere.md"), "z\n").unwrap();
+    let (status, answer) = request(
+        &state,
+        Method::POST,
+        &format!("/api/v1/workspaces/{ws}/plugins/{PID}/file-actions/open-as-doc"),
+        Some(json!({"file": "elsewhere.md"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert!(answer["open"].is_null(), "{answer}");
     // A long list's next page, through the query route.
     let (status, page) = request(
         &state,

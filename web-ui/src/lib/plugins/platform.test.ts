@@ -248,6 +248,11 @@ describe("a file action's open", () => {
     expect(fileActionTarget(all, "latex", { view: "doc", file: "b/c.tex" }, "a.md")).toEqual({ kind: "file", view: "doc", file: "b/c.tex" });
     expect(fileActionTarget(all, "latex", { view: "doc", file: null }, "a.md")).toEqual({ kind: "file", view: "doc", file: "a.md" });
   });
+  it("opens nothing on a file that isn't a plain workspace path", () => {
+    for (const bad of ["../x", "/etc/passwd", "a/../b", "a//b", "./a", "a\\b"]) {
+      expect(fileActionTarget(all, "latex", { view: "doc", file: bad }, "a.md")).toBeNull();
+    }
+  });
   it("opens nothing for a view the plugin lacks or that has no place to open", () => {
     expect(fileActionTarget(all, "latex", { view: "nope", file: null }, "a.md")).toBeNull();
     expect(fileActionTarget(all, "latex", { view: "chip", file: null }, "a.md")).toBeNull();

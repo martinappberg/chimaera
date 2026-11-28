@@ -65,14 +65,25 @@
    *  shown while `showAsked` (until another choice is picked). */
   let asked = $state<{ path: string; plugin: string; view: string } | null>(null);
   let showAsked = $state(false);
-  let askedSeen = 0;
+  /** The path `asked` belongs to (plain: no effect reads it reactively). */
+  let askedFor = "";
   $effect(() => {
     const req = $fileViewRequest;
-    if (req === null || req.path !== path || req.at <= askedSeen) return;
-    askedSeen = req.at;
+    if (req === null || req.path !== path) return;
+    // One gate takes it (a second pane on the file, or a later reopen, must
+    // not), and a stale one is dropped.
+    fileViewRequest.set(null);
     if (Date.now() - req.at > FILE_VIEW_REQUEST_MS) return;
     asked = { path, plugin: req.plugin, view: req.view };
+    askedFor = path;
     showAsked = true;
+  });
+  // Another file in this gate starts without the asked-for view.
+  $effect(() => {
+    if (path === askedFor) return;
+    askedFor = path;
+    asked = null;
+    showAsked = false;
   });
   const askedClaim = $derived(asked !== null && asked.path === path ? viewClaim(plugins, asked.plugin, asked.view) : null);
   /** The switch's choices: the claimants, and the asked-for view if it is not one. */
@@ -190,9 +201,9 @@
           {#each claims as c (c.plugin.id)}
             <button
               class="seg"
-              class:on={claim?.plugin.id === c.plugin.id}
+              class:on={claim?.plugin.id === c.plugin.id && claim?.view.id === c.view.id}
               role="tab"
-              aria-selected={claim?.plugin.id === c.plugin.id}
+              aria-selected={claim?.plugin.id === c.plugin.id && claim?.view.id === c.view.id}
               title="Open with {c.plugin.name}"
               onclick={() => pick(c.plugin.id)}>{claims.length > 1 ? c.plugin.name : c.kind.label}</button
             >

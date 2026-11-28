@@ -198,7 +198,7 @@ rule:
   `unpkg.com`), so the Plotly or D3 `<script>` tag an agent already writes keeps
   working.
 - **It sends nothing anywhere else.** Requests (`connect-src`) and images go only
-  to the daemon. There is no fetch to arbitrary sites, no tracking pixel and no
+  to the daemon (requests may also read `data:` URLs, the page's own bytes). There is no fetch to arbitrary sites, no tracking pixel and no
   form post.
 
 The reason for the rule: a page that could read your files *and* reach any site
@@ -317,7 +317,7 @@ into core.
     `'wasm-unsafe-eval'` are allowed: a page with no origin and no network gains
     nothing from eval, and Vega-style libraries compile expressions.
   - `img-src` and `media-src`: its bundle and data URLs, plus `blob:` and `data:`.
-  - `connect-src`: only its data URLs and declared hosts.
+  - `connect-src`: only its data URLs, `data:` (its own bytes) and declared hosts.
   - `worker-src`: `blob:` and its bundle.
   - *Spike:* the minimum GenomeSpy needs.
 - **Resource limits.**
