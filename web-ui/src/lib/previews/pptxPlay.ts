@@ -1531,6 +1531,56 @@ function shiftMasks(kf: readonly Keyframe[], [dx, dy]: readonly [number, number]
   });
 }
 
+/**
+ * A grow, shrink or turn is played through registered custom properties
+ * that the element's own `scale` and `rotate` read, so the engine paints
+ * every frame at the size and angle the element stands at. Played on
+ * `scale` and `rotate` themselves the animation is composited, and WebKit
+ * draws the element's text once, at the size it had when the click began,
+ * and stretches that picture: a grow's label is soft, a shrink's thin and a
+ * turn's re-hinted until the animation ends and the text is drawn again at
+ * its landed size, so the last animated frame and the landed one differ
+ * (2,160 px of a 1.5x grow's label in a WKWebView window capture; painted,
+ * 0, and the label is as sharp as at rest). Where the properties can't be
+ * registered the click plays on `scale` and `rotate` as before.
+ */
+const PAINTED = [
+  ["--pptx-sx", "<number>", "1"],
+  ["--pptx-sy", "<number>", "1"],
+  ["--pptx-turn", "<angle>", "0deg"],
+] as const;
+let paintedReady: boolean | null = null;
+
+function paintedProps(): boolean {
+  if (paintedReady !== null) return paintedReady;
+  if (typeof CSS === "undefined" || typeof CSS.registerProperty !== "function") return (paintedReady = false);
+  let ok = true;
+  for (const [name, syntax, initialValue] of PAINTED) {
+    try {
+      CSS.registerProperty({ name, syntax, inherits: false, initialValue });
+    } catch (e) {
+      // Registered already (a second copy of this module): the same definition.
+      if (!(e instanceof DOMException && e.name === "InvalidModificationError")) ok = false;
+    }
+  }
+  return (paintedReady = ok);
+}
+
+/** Keyframes with `scale` and `rotate` moved onto the custom properties
+ *  `playStep` plays a grow or turn through (`none` is 1 and 0deg). */
+export function paintedKeyframes(frames: readonly Keyframe[]): Keyframe[] {
+  return frames.map(({ scale, rotate, ...f }) => {
+    const out: Keyframe = { ...f };
+    if (scale !== undefined && scale !== null) {
+      const [x = "1", y = x] = String(scale) === "none" ? [] : String(scale).trim().split(/\s+/);
+      out["--pptx-sx"] = x;
+      out["--pptx-sy"] = y;
+    }
+    if (rotate !== undefined && rotate !== null) out["--pptx-turn"] = String(rotate) === "none" ? "0deg" : String(rotate);
+    return out;
+  });
+}
+
 /** A click planned ahead: everything `playStep` needs but the animations. */
 export interface PreparedStep {
   tagged: TaggedSlide;
@@ -1736,6 +1786,11 @@ export function playStep(tagged: TaggedSlide, timeline: SlideTimeline, k: number
           inflated.push(grown);
           frames = shiftMasks(frames, grown.shift);
         } else frames = frames.map((f) => ({ ...f, maskClip: "no-clip" }));
+      }
+      if (frames.some((f) => f.scale !== undefined || f.rotate !== undefined) && paintedProps()) {
+        if (frames.some((f) => f.scale !== undefined)) setProp(tagged, el, "scale", "var(--pptx-sx) var(--pptx-sy)");
+        if (frames.some((f) => f.rotate !== undefined)) setProp(tagged, el, "rotate", "var(--pptx-turn)");
+        frames = paintedKeyframes(frames);
       }
       anims.push(el.animate(frames, { duration, fill: "both", easing: "linear" }));
     }

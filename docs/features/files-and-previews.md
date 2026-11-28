@@ -1009,9 +1009,15 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   wrap differently than before; browse and the show then agree. A shape that
   grows or shrinks during a click repaints its shadow, glow or soft edge every frame: WebKit keeps
   an SVG filter's picture from the scale it was first painted at, so a zoom from nothing drew a
-  pale smear the size of the shadow until it landed. The last animated frame and the landed one
-  are the same picture (0 px apart in window captures of fade, zoom, float, fly, wipe, spin, grow
-  and a path in WebKit). A paragraph wiped from the left or right sweeps its words padded by
+  pale smear the size of the shadow until it landed. A grow, shrink or turn is painted at the
+  size and angle it stands at in every frame (it plays through registered custom properties that
+  the shape's own `scale` and `rotate` read): played on `scale` itself WebKit stretched a picture
+  of the text drawn at the click's start, so a grown label was soft until it landed and then
+  sharpened (2,166 device px of a 1.5x grow's label changed at the landing; now 0, and a grown
+  paragraph's words at rest are as sharp as the same words laid out at that size). The last
+  animated frame and the landed one are the same picture (0 px apart in window captures of fade,
+  zoom, float, fly, wipe, grow by box and by paragraph and a path in WebKit; a shrink and a turn
+  differ 1 ms before their end only by the motion left). A paragraph wiped from the left or right sweeps its words padded by
   0.7 em on each side, at PowerPoint's pace (its film: 424 px/s for a 253 px line over 1 s, where
   the words alone gave 300). A wipe, pattern or iris is laid over the shape's whole drawing, its
   outline and shadow included (a scaled shadow too), as PowerPoint's film lays it, and reveals the

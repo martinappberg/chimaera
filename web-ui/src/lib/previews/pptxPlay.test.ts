@@ -1,6 +1,6 @@
 import JSZip from "jszip";
 import { describe, expect, it } from "vitest";
-import { boxGeom, clearMasks, clearState, colorEasing, colorWindows, maskCacheStats, maskImages, paraOffset, planState, playStep, releaseMasks, retainMasks, transformScale, type ShapeInfo } from "./pptxPlay";
+import { boxGeom, clearMasks, clearState, colorEasing, colorWindows, maskCacheStats, maskImages, paintedKeyframes, paraOffset, planState, playStep, releaseMasks, retainMasks, transformScale, type ShapeInfo } from "./pptxPlay";
 import type { Pattern } from "./pptxMotion";
 import type { TaggedSlide } from "./pptxTag";
 import { buildStates, parseTimeline, type BuildState, type GoldenSlide } from "./pptxTiming";
@@ -495,5 +495,22 @@ describe("colour blends run on the effect's clock (B5)", () => {
     expect(eased.progress(500)).toBeCloseTo(0.75, 6);
     const ease = colorEasing(eased, 4)!;
     expect(ease).toBe("linear(0, 0.4375, 0.75, 0.9375, 1)");
+  });
+});
+
+describe("a grow or turn plays through painted custom properties", () => {
+  it("moves scale and rotate onto the properties, none as 1 and 0deg, and keeps every other value", () => {
+    const out = paintedKeyframes([
+      { offset: 0, scale: "1 1", rotate: "0deg", opacity: 1, transformOrigin: "10px 5px" },
+      { offset: 0.5, scale: "1.25 0.75", rotate: "45deg" },
+      { offset: 1, scale: "none", rotate: "none" },
+      { offset: 1, scale: "2" },
+    ]);
+    expect(out).toEqual([
+      { offset: 0, opacity: 1, transformOrigin: "10px 5px", "--pptx-sx": "1", "--pptx-sy": "1", "--pptx-turn": "0deg" },
+      { offset: 0.5, "--pptx-sx": "1.25", "--pptx-sy": "0.75", "--pptx-turn": "45deg" },
+      { offset: 1, "--pptx-sx": "1", "--pptx-sy": "1", "--pptx-turn": "0deg" },
+      { offset: 1, "--pptx-sx": "2", "--pptx-sy": "2" },
+    ]);
   });
 });
