@@ -9,6 +9,7 @@ import {
   keyValue,
   parseTimeline,
   pathEnd,
+  splitShapes,
   targetKey,
   TIMING_CAPS,
   type GoldenSlide,
@@ -528,6 +529,19 @@ describe("the hand-written cases", () => {
     expect([0, 0.25, 0.5, 0.75, 1, 2].map((q) => keyValue(keys, q, false))).toEqual([0, 45, 180, 190, 200, 200]);
     expect([0, 0.25, 0.5, 0.75, 1].map((q) => keyValue(keys, q, true))).toEqual([0, 0, 180, 180, 200]);
     expect(keyValue([{ at: 0.2, v: 5 }], -1, false)).toBe(5);
+  });
+
+  it("keeps held values per paragraph, the later change winning where ranges overlap, and a split shape's whole on its body (R31, R32)", () => {
+    const t = parseTimeline(caseXml("paragraph-order"));
+    expect([...splitShapes(t)].sort()).toEqual(["2", "3"]);
+    const last = buildStates(t).at(-1)!;
+    const val = (k: string, part: "fill" | "text") => last.color?.[k]?.[part]?.to?.attrs.val;
+    expect(["2:p0-0", "2:p1-1", "2:p2-2"].map((k) => val(k, "text"))).toEqual(["FF0000", "0000FF", "0000FF"]);
+    // The whole box's green font colour holds nothing; its fill holds on the body.
+    expect(last.color?.["2"]).toBeUndefined();
+    expect(val("2:bg", "fill")).toBe("FFC000");
+    // One click: the range that ends later wins on the paragraph both reach.
+    expect(["3:p0-0", "3:p1-1", "3:p2-2"].map((k) => val(k, "text"))).toEqual(["0000FF", "0000FF", "0000FF"]);
   });
 
   it("hostile strings reach no lookup", () => {

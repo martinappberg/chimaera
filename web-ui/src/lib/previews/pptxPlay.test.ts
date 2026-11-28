@@ -47,6 +47,18 @@ describe("planState", () => {
     expect(p.approximate).toBe(true);
   });
 
+  it("a value held on :bg lands on the box's own drawing, and on the shape only approximately when it has none (R32)", () => {
+    const state: BuildState = { hidden: [], moved: {}, scale: { "4:bg": [2.25, 2.25], "4:p0-0": [1.5, 1.5] } };
+    const drawn = planState(shapes([["4", { paraCount: 2, paras: true, bg: true }]]), state);
+    expect(drawn.held.get("4!bg")).toEqual({ scale: [2.25, 2.25] });
+    expect(drawn.held.get("4#0")).toEqual({ scale: [1.5, 1.5] });
+    expect(drawn.held.has("4")).toBe(false);
+    expect(drawn.approximate).toBe(false);
+    const flat = planState(shapes([["4", { paraCount: 2, paras: true }]]), state);
+    expect(flat.held.get("4")).toEqual({ scale: [2.25, 2.25] });
+    expect(flat.approximate).toBe(true);
+  });
+
   it("unmatched paragraphs: the shape comes with its first shown paragraph", () => {
     const info = shapes([["2", { paraCount: 3, paras: false }]]);
     const all = planState(info, st(["2:p0-0", "2:p1-1", "2:p2-2"]));

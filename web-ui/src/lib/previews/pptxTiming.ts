@@ -1278,8 +1278,35 @@ interface Held {
   color: Map<string, HeldColors>;
 }
 
+/** Most paragraphs one held change on a paragraph range reaches (R31). */
+export const HELD_PARAGRAPHS = 256;
+
+/**
+ * The shapes whose text the main sequence animates by paragraph: on these
+ * PowerPoint draws the text apart from the shape's body, and an effect on
+ * the whole shape acts on the body alone (README R32; the `order` deck's
+ * film).
+ */
+export function splitShapes(timeline: SlideTimeline): Set<string> {
+  const out = new Set<string>();
+  for (const step of timeline.steps) for (const e of step) for (const b of e.behaviours) if (b.target?.para) out.add(b.target.spid);
+  return out;
+}
+
+/** The keys a held change on `t` is kept under (R31, R32): a paragraph
+ *  range, each of its paragraphs; the whole of a split shape, its body. */
+function heldKeys(t: Target, split: ReadonlySet<string>): string[] {
+  if (t.para !== null) {
+    const out: string[] = [];
+    for (let n = t.para[0]; n <= t.para[1] && n < t.para[0] + HELD_PARAGRAPHS; n++) out.push(`${t.spid}:p${n}-${n}`);
+    return out;
+  }
+  if (!t.bg && split.has(t.spid)) return [`${t.spid}:bg`];
+  return [targetKey(t)];
+}
+
 /** One step's held changes, applied in the order they end (as R17). */
-function applyHeld(step: readonly Effect[], held: Held): void {
+function applyHeld(step: readonly Effect[], held: Held, split: ReadonlySet<string>): void {
   const changes: { at: bigint | null; i: number; run: () => void }[] = [];
   let i = 0;
   for (const e of step) {
@@ -1288,9 +1315,12 @@ function applyHeld(step: readonly Effect[], held: Held): void {
       if (t === null || !holds(e, b)) continue;
       const q = b.dur === null ? 1 : endProgress(e, b);
       if (q === null) continue;
-      const key = targetKey(t);
       const end = behaviourEnd(b);
       const at = end === null ? null : BigInt(e.start) * 1000n + end;
+      // A split shape's text never takes a whole-shape change (R32).
+      const body = t.para === null && !t.bg && split.has(t.spid);
+      const order = i++;
+      for (const key of heldKeys(t, split)) {
       let run: (() => void) | null = null;
       if (b.kind === "scale") {
         const f = (p: Point | null, axis: "x" | "y") => (p === null ? null : p[axis] / 100000);
@@ -1329,7 +1359,7 @@ function applyHeld(step: readonly Effect[], held: Held): void {
         if (v !== null) run = () => setFinite(held.opacity, key, v);
       } else if (b.kind === "color" && q === 1) {
         const part = b.attrs.map((a) => COLOR_PART.get(a.toLowerCase())).find((x) => x !== undefined);
-        if (part !== undefined && (b.to !== null || b.by !== null)) {
+        if (part !== undefined && !(body && part === "text") && (b.to !== null || b.by !== null)) {
           run = () => {
             const all = held.color.get(key) ?? {};
             const c: HeldColor = { ...(all[part] ?? {}) };
@@ -1356,7 +1386,8 @@ function applyHeld(step: readonly Effect[], held: Held): void {
           };
         }
       }
-      if (run !== null) changes.push({ at, i: i++, run });
+      if (run !== null) changes.push({ at, i: order, run });
+      }
     }
   }
   changes.sort((a, b) => {
@@ -1428,6 +1459,7 @@ export function buildStates(timeline: SlideTimeline): BuildState[] {
 
   const moved = new Map<string, [number, number]>();
   const held: Held = { scale: new Map(), turn: new Map(), opacity: new Map(), color: new Map() };
+  const split = splitShapes(timeline);
   const out: BuildState[] = [];
   for (const step of timeline.steps) {
     // In the order the sets end; one that never ends goes last; ties keep document order.
@@ -1471,7 +1503,7 @@ export function buildStates(timeline: SlideTimeline): BuildState[] {
       const [dx, dy] = moved.get(key)!;
       movedOut[key] = [round4(dx), round4(dy)];
     }
-    applyHeld(step, held);
+    applyHeld(step, held, split);
     const state: BuildState = { hidden: [...hidden].sort(), moved: movedOut };
     heldOut(held, state);
     out.push(state);

@@ -38,8 +38,10 @@ OUT = os.path.normpath(os.path.join(HERE, "..", "decks"))
 # A deck is a list of slides. A slide has:
 #   shapes: [(name, kind, {box?, text?, rot?, fill?, line?})]   kind: rect oval text
 #           table chart picture group line; fill: gradient | picture; line: width in pt
-#   fx:     [(shape, effect, trigger, {dir?, exit?, dur?, level?, amount?, size?, autorev?})]
+#   fx:     [(shape, effect, trigger, {dir?, exit?, dur?, level?, amount?, size?, autorev?, color?, path?})]
 #           amount: a spin's degrees; size: a grow's percent; autorev: plays back
+#           color: (r, g, b) a colour effect changes to; path: a motion path's string
+#           (dur and color apply to every effect one add makes: by paragraph, several)
 #           effect: PowerPoint's own name after "animation type"
 #           trigger: click | with | after
 #   transition: {effect, dur?, advance?}          effect: after "entry effect"
@@ -353,6 +355,44 @@ DECKS = {
             ],
         },
     ],
+    # Which change wins when two land on one text box, a paragraph and the
+    # whole box (font colour, transparency, size), in both orders; and a
+    # second path written to start where the first ended, as PowerPoint's
+    # own UI chains them (README R18, R30).
+    "order": [
+        {
+            "shapes": [("ParaThenBox", "text", {"text": ["First", "Second"]}),
+                       ("BoxThenPara", "text", {"text": ["First", "Second"]})],
+            "fx": [
+                ("ParaThenBox", "change font color", "click", {"level": "first", "color": (255, 0, 0), "dur": 0.5}),
+                ("ParaThenBox", "change font color", "click", {"color": (0, 0, 255), "dur": 0.5}),
+                ("BoxThenPara", "change font color", "click", {"color": (0, 0, 255), "dur": 0.5}),
+                ("BoxThenPara", "change font color", "click", {"level": "first", "color": (255, 0, 0), "dur": 0.5}),
+            ],
+        },
+        {
+            "shapes": [("FadeParaThenBox", "rect", {"text": ["First", "Second"]}),
+                       ("FadeBoxThenPara", "rect", {"text": ["First", "Second"]}),
+                       ("GrowParaThenBox", "rect", {"text": ["First", "Second"]})],
+            "fx": [
+                ("FadeParaThenBox", "transparency", "click", {"level": "first"}),
+                ("FadeParaThenBox", "transparency", "click", {}),
+                ("FadeBoxThenPara", "transparency", "click", {}),
+                ("FadeBoxThenPara", "transparency", "click", {"level": "first"}),
+                ("GrowParaThenBox", "grow shrink", "click", {"level": "first", "dur": 0.5}),
+                ("GrowParaThenBox", "grow shrink", "click", {"dur": 0.5}),
+            ],
+        },
+        {
+            "shapes": row(["Chained", "Restart"]),
+            "fx": [
+                ("Chained", "right path", "click", {"path": "M 0 0 L 0.25 0 E"}),
+                ("Chained", "down path", "click", {"path": "M 0.25 0 L 0.25 0.25 E"}),
+                ("Restart", "right path", "click", {"path": "M 0 0 L 0.25 0 E"}),
+                ("Restart", "down path", "click", {"path": "M 0 0 L 0 0.25 E"}),
+            ],
+        },
+    ],
     # No animation, and saved by PowerPoint: what happens to the ids python-pptx
     # wrote (see agent-written-raw.pptx, the same deck before PowerPoint).
     "agent-written": [
@@ -400,7 +440,10 @@ def add_shape(slide, name, kind, opts, box):
     shapes = slide.shapes
     if kind in ("rect", "oval"):
         sh = shapes.add_shape(MSO_SHAPE.RECTANGLE if kind == "rect" else MSO_SHAPE.OVAL, x, y, w, h)
-        sh.text_frame.text = name
+        text = opts.get("text", [name])
+        sh.text_frame.text = text[0]
+        for t in text[1:]:
+            sh.text_frame.add_paragraph().text = t
     elif kind == "text":
         sh = shapes.add_textbox(x, y, w, h)
         tf = sh.text_frame
@@ -504,14 +547,26 @@ def script(name, slides):
             if "level" in o:
                 add += f" level {LEVEL[o['level']]}"
             add += f" trigger {TRIGGER[trigger]}"
-            body = [add]
+            body = ["set n0 to count of effects of seq", add]
             attempt(L, what, body)
             if o.get("exit"):
                 attempt(L, what + " exit", ["set exit animation of fx to true"])
             if "dir" in o:
                 attempt(L, what + " direction", [f"set direction of effect parameters of fx to {o['dir']}"])
             if "dur" in o:
-                attempt(L, what + " duration", [f"set duration of timing of fx to {o['dur']}"])
+                attempt(L, what + " duration", ["repeat with k from n0 + 1 to count of effects of seq",
+                                                 f"\tset duration of timing of effect k of seq to {o['dur']}", "end repeat"])
+            if "color" in o:
+                r, g, b = o["color"]
+                attempt(L, what + " color", ["repeat with k from n0 + 1 to count of effects of seq",
+                                             # By index: iterating the behaviours by reference crashes PowerPoint 16.115.
+                                             "\trepeat with m from 1 to count of animation behaviors of effect k of seq",
+                                             "\t\tset bh to animation behavior m of effect k of seq",
+                                             "\t\tif (animation behavior type of bh) is animation type color then",
+                                             f"\t\t\tset to_color of colors effect of bh to {{{r}, {g}, {b}}}",
+                                             "\t\tend if", "\tend repeat", "end repeat"])
+            if "path" in o:
+                attempt(L, what + " path", [f"set path of motion effect of animation behavior 1 of fx to {q(o['path'])}"])
             if "amount" in o:
                 attempt(L, what + " amount", [f"set amount of effect parameters of fx to {o['amount']}"])
             if "size" in o:

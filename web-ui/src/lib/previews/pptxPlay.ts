@@ -35,13 +35,14 @@
 
 import { heldColor, parseCss, pictureFilter, toCss, type Palette } from "./pptxColor";
 import { effectMotion, type Geom, type Segment } from "./pptxMotion";
-import { buildStates, targetKey, type BuildState, type Effect, type HeldColor, type HeldColors, type SlideTimeline } from "./pptxTiming";
-import type { TaggedSlide } from "./pptxTag";
+import { buildStates, splitShapes, targetKey, type BuildState, type Effect, type HeldColor, type HeldColors, type SlideTimeline } from "./pptxTiming";
+import type { TaggedShape, TaggedSlide } from "./pptxTag";
 
 export type { Palette } from "./pptxColor";
 
 /** An element a state acts on: `"4"` a shape, `"4#1"` its paragraph 1,
- *  `"4!bg"` the box drawn behind its text (motion only). */
+ *  `"4!bg"` the box drawn behind its text (a `:bg` key's motion and what
+ *  it holds, and a split shape's whole-shape emphasis: README R32). */
 export type ElementId = string;
 
 /** What one element holds (R26–R29). */
@@ -74,6 +75,9 @@ export interface ShapeInfo {
   paras: boolean;
   /** It draws its box as an element of its own (its `:bg` can move apart from its text). */
   bg?: boolean;
+  /** Its text is animated by paragraph (`splitShapes`): emphasis on the
+   *  whole shape plays on its body alone (R32). */
+  split?: boolean;
 }
 
 const KEY = /^([0-9]{1,10})(?::(?:(bg)|p([0-9]{1,9})-([0-9]{1,9})))?$/;
@@ -98,6 +102,11 @@ function heldIds(raw: string, shapes: ReadonlyMap<string, ShapeInfo>, plan: Stat
   if (info === undefined) {
     plan.approximate = true;
     return [];
+  }
+  if (k.bg) {
+    if (info.bg === true) return [`${k.spid}!bg`];
+    plan.approximate = true;
+    return [k.spid];
   }
   if (k.range === null) return [k.spid];
   if (!info.paras) {
@@ -412,7 +421,7 @@ function drawnOpacity(el: Styled): number {
  */
 export function statePaints(tagged: TaggedSlide, state: BuildState, w: number, h: number, palette: Palette | null): { paints: Paint[]; inert: Styled[]; approximate: boolean } {
   const info = new Map<string, ShapeInfo>();
-  for (const [id, s] of tagged.shapes) info.set(id, { paraCount: s.paraCount, paras: s.paras !== null });
+  for (const [id, s] of tagged.shapes) info.set(id, shapeInfo(s));
   const plan = planState(info, state);
   let approximate = plan.approximate;
   const paints: Paint[] = [];
@@ -438,6 +447,13 @@ export function statePaints(tagged: TaggedSlide, state: BuildState, w: number, h
     place(s.el, id, plan.hideShapes.has(id), off === undefined ? undefined : [off[0] * w, off[1] * h]);
     const colors = plan.held.get(id)?.colors;
     if (colors !== undefined && !colorPaints(s.el, colors, palette, null, paints)) approximate = true;
+    // The body a `:bg` key holds a value for: the box's own drawing.
+    const box = plan.held.has(`${id}!bg`) ? s.el.querySelector<SVGElement>(":scope > svg") : null;
+    if (box !== null) {
+      place(box, `${id}!bg`, false, undefined);
+      const bc = plan.held.get(`${id}!bg`)?.colors;
+      if (bc !== undefined && !colorPaints(box, bc, palette, null, paints)) approximate = true;
+    }
     if (s.paras === null) continue;
     const hide = plan.hideParas.get(id);
     const move = plan.moveParas.get(id);
@@ -567,6 +583,11 @@ export interface StepPlan {
   overBudget: boolean;
 }
 
+/** What the planner reads of a tagged shape. */
+function shapeInfo(s: TaggedShape): ShapeInfo {
+  return { paraCount: s.paraCount, paras: s.paras !== null, bg: s.el.querySelector(":scope > svg") !== null && s.paraCount > 0 };
+}
+
 /** The elements a target key acts on; a `:bg` key's motion moves the box
  *  alone where the shape draws one (`motion`). */
 function elementsOf(key: string, shapes: ReadonlyMap<string, ShapeInfo>, motion = false): ElementId[] {
@@ -691,9 +712,12 @@ export function planStep(
     if (snaps.some((s) => hiddenIn(s.v, id) !== first) && baseOf(id) !== null) visIds.add(id);
   }
   const per = new Map<ElementId, Segment[]>();
-  for (const m of motions) {
+  for (const [mi, m] of motions.entries()) {
+    const emph = effects[mi]!.presetClass === "emph";
     for (const seg of m.segments) {
-      for (const id of elementsOf(seg.key, shapes, true)) {
+      // Emphasis on a split shape's whole plays on its body (R32).
+      const key = emph && /^[0-9]+$/.test(seg.key) && shapes.get(seg.key)?.split === true ? `${seg.key}:bg` : seg.key;
+      for (const id of elementsOf(key, shapes, true)) {
         if (baseOf(id) === null) continue;
         const list = per.get(id) ?? [];
         list.push(seg);
@@ -1015,8 +1039,9 @@ export function prepareStep(tagged: TaggedSlide, timeline: SlideTimeline, k: num
     const from = statePaints(tagged, before, opts.w, opts.h, palette);
     const info = new Map<string, ShapeInfo>();
     const elements: ElementId[] = [];
+    const split = splitShapes(timeline);
     for (const [id, s] of tagged.shapes) {
-      info.set(id, { paraCount: s.paraCount, paras: s.paras !== null, bg: s.el.querySelector(":scope > svg") !== null && s.paraCount > 0 });
+      info.set(id, { ...shapeInfo(s), split: split.has(id) });
       elements.push(id, ...(s.paras ?? []).map((_, i) => `${id}#${i}`));
     }
     // An element's landed values: what the state after puts inline, else none.

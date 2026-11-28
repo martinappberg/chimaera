@@ -237,3 +237,25 @@ main = [
     half([anim(tgt(6), 'style.rotation', [(None, 0), (None, 40), (None, 80)], calcmode='lin', valueType='num')]),                # 40: spread evenly
 ]
 write('anim-keys.xml', slide([shape(i, f'S{i}', i - 2) for i in range(2, 7)], timing=timing(ids, main, bld=bldp(2, 3, 4, 5, 6))))
+
+# --- held values on overlapping paragraph ranges (R31: kept per paragraph,
+# the change that ends later wins) and a whole-shape fill colour on a
+# shape whose text is animated by paragraph (R32: its body, never its text).
+ids = new_ids()
+def clr(t, attr, val, dur=500):
+    return (f'<p:animClr clrSpc="rgb" dir="cw"><p:cBhvr override="childStyle"><p:cTn id="{ids()}" dur="{dur}" fill="hold"/>{t}'
+            f'<p:attrNameLst><p:attrName>{attr}</p:attrName></p:attrNameLst></p:cBhvr><p:to><a:srgbClr val="{val}"/></p:to></p:animClr>')
+def rng(spid, st, end):
+    return f'<p:tgtEl><p:spTgt spid="{spid}"><p:txEl><p:pRg st="{st}" end="{end}"/></p:txEl></p:spTgt></p:tgtEl>'
+def emph_click(preset, behaviours):
+    return group(ids, [sub(ids, 0, [effect(ids, 'emph', preset, 'clickEffect', behaviours, subtype=2)])])
+main = [
+    emph_click(3, [clr(rng(2, 0, 1), 'style.color', 'FF0000')]),
+    emph_click(3, [clr(rng(2, 1, 2), 'style.color', '0000FF')]),
+    emph_click(3, [clr(tgt(2), 'style.color', '00FF00')]),
+    emph_click(1, [clr(tgt(2), 'fillcolor', 'FFC000')]),
+    emph_click(3, [clr(rng(3, 0, 2), 'style.color', '0000FF', dur=1000), clr(rng(3, 1, 1), 'style.color', 'FF0000')]),
+]
+write('paragraph-order.xml', slide([shape(2, 'Split', 0, paras=['One', 'Two', 'Three'], fill=True),
+                                    shape(3, 'Same click', 1, paras=['One', 'Two', 'Three'])],
+      timing=timing(ids, main, bld='<p:bldP spid="2" grpId="0" build="p" animBg="1"/><p:bldP spid="3" grpId="0" build="p"/>')))
