@@ -1022,7 +1022,8 @@ pub(crate) async fn save_route(
     .and_then(|r| r);
     match written {
         Ok(()) => with_cors(
-            Json(json!({"path": format!("output:{}", rel.to_string_lossy())})).into_response(),
+            Json(json!({"path": format!("output:{}", chimaera_core::paths::wire_path(&rel))}))
+                .into_response(),
         ),
         Err(err) => refused(StatusCode::INTERNAL_SERVER_ERROR, &err),
     }
