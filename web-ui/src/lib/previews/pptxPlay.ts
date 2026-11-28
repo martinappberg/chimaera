@@ -34,7 +34,7 @@
  */
 
 import { heldColor, parseCss, pictureFilter, toCss, type Palette } from "./pptxColor";
-import { effectMotion, type Geom, type Segment } from "./pptxMotion";
+import { clipMargin, effectMotion, type Geom, type Pattern, type Segment } from "./pptxMotion";
 import { behaviourProgress, buildStates, effectTime, splitShapes, targetKey, type BuildState, type Effect, type HeldColor, type HeldColors, type SlideTimeline } from "./pptxTiming";
 import type { TaggedShape, TaggedSlide } from "./pptxTag";
 
@@ -571,12 +571,14 @@ export interface PlayKeyframe {
   scale?: string;
   rotate?: string;
   clipPath?: string;
+  /** A random pattern's shown fraction (0–1; 1 shows all, the landed value). */
+  mask?: number;
 }
 
 export interface StepPlan {
   /** ms; 0 when nothing moves (the step lands at once). */
   duration: number;
-  tracks: { id: ElementId; keyframes: PlayKeyframe[] }[];
+  tracks: { id: ElementId; keyframes: PlayKeyframe[]; pattern?: Pattern; box?: [number, number, number, number] }[];
   /** Why some of it plays other than as written. */
   notes: string[];
   /** Past `PLAY_BUDGET` or `MAX_FRAMES`: the click lands without playing. */
@@ -762,8 +764,9 @@ export function planStep(
     const scales = has("w", "h", "sx", "sy", "sxAbs", "syAbs");
     const turns = has("rot", "rotAbs");
     const clips = has("clip");
+    const pattern = segs.find((s) => s.ch === "mask")?.pattern;
     const fades = has("op", "opAbs") || visIds.has(id);
-    if (!moves && !scales && !turns && !clips && !fades) continue;
+    if (!moves && !scales && !turns && !clips && !fades && pattern === undefined) continue;
     const g = b.geom;
     const keyframes: PlayKeyframe[] = samples.map(({ t, pre }) => {
       const at = pre ? t - 0.001 : t;
@@ -774,6 +777,7 @@ export function planStep(
       let rot = 0;
       let op = 1;
       let clip: string | null = null;
+      let shown = 1;
       for (const s of segs) {
         const v = s.value(at);
         if (v === null || !Number.isFinite(v)) continue;
@@ -793,6 +797,11 @@ export function planStep(
           case "clip":
             clip = s.region!(Math.min(1, Math.max(0, v)), b.bw, b.bh, b.bx ?? 0, b.by ?? 0);
             break;
+          case "mask": {
+            const q = Math.min(1, Math.max(0, v));
+            shown = s.pattern!.out ? 1 - q : q;
+            break;
+          }
           default:
             abs[s.ch] = v;
         }
@@ -815,10 +824,17 @@ export function planStep(
       }
       if (turns) f.rotate = `${r3(fin((abs.rotAbs ?? b.rot) + rot, -LIMIT.deg, LIMIT.deg, b.rot))}deg`;
       if (clips) f.clipPath = clip ?? "none";
+      if (pattern !== undefined) f.mask = r3(shown);
       return f;
     });
     land(keyframes, landed(id));
-    tracks.push({ id, keyframes });
+    if (pattern === undefined) tracks.push({ id, keyframes });
+    else {
+      // The pattern covers the box, pushed out like a clip so a shadow or
+      // outline drawn past the box goes with it.
+      const e = clipMargin(b.bw, b.bh);
+      tracks.push({ id, keyframes, pattern, box: [(b.bx ?? 0) - e, (b.by ?? 0) - e, b.bw + 2 * e, b.bh + 2 * e] });
+    }
   }
   return { duration, tracks, notes, overBudget: false };
 }
@@ -841,6 +857,7 @@ function land(kf: PlayKeyframe[], to: Landed | null): void {
     last.rotate = to.rotate;
   }
   if (last.clipPath !== undefined) last.clipPath = "none";
+  if (last.mask !== undefined) last.mask = 1;
 }
 
 /** A click being played. */
@@ -1043,6 +1060,95 @@ function linearEasing(): boolean {
   return typeof CSS !== "undefined" && typeof CSS.supports === "function" && CSS.supports("transition-timing-function", "linear(0, 0.5, 1)");
 }
 
+/** Shown fractions a random pattern steps through. */
+const MASK_LEVELS = 20;
+/** A dissolve cell and a random bar, in slide px (a 13.33 in slide is
+ *  960 px): PowerPoint's film shows cells about 2 px and bars 2–3 px of a
+ *  1920 px slide. */
+const DISSOLVE_CELL = 1;
+const BAR = 1.35;
+const maskCache = new Map<string, string[]>();
+
+/** A seeded PRNG (mulberry32): the same element dissolves the same way. */
+function rng(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** Longest side of a pattern's mask image, px: past it the image is
+ *  stretched (bounded memory for a picture that fills the slide). */
+const MASK_MAX = 640;
+
+/**
+ * The mask images a random pattern shows its element through, one per
+ * level from nothing to all (`MASK_LEVELS + 1`), drawn at twice the box's
+ * px (up to `MASK_MAX`) so cells stay crisp: each cell (or bar) opaque
+ * once the level passes its random rank. Empty where there is no canvas.
+ */
+export function maskImages(pattern: Pattern, w: number, h: number, seedKey: string): string[] {
+  // Twice the box's px, so a show fitted up to 2× keeps each cell's edge sharp.
+  const k = Math.min(2, MASK_MAX / Math.max(w, h, 1));
+  const cw = Math.max(1, Math.ceil(w * k));
+  const ch = Math.max(1, Math.ceil(h * k));
+  const cellX = pattern.kind === "dissolve" ? DISSOLVE_CELL : pattern.horizontal ? Infinity : BAR;
+  const cellY = pattern.kind === "dissolve" ? DISSOLVE_CELL : pattern.horizontal ? BAR : Infinity;
+  const nx = Number.isFinite(cellX) ? Math.max(1, Math.ceil(w / cellX)) : 1;
+  const ny = Number.isFinite(cellY) ? Math.max(1, Math.ceil(h / cellY)) : 1;
+  const cacheKey = `${pattern.kind}|${cw}x${ch}|${nx}x${ny}|${seedKey}`;
+  const hit = maskCache.get(cacheKey);
+  if (hit !== undefined) return hit;
+  if (typeof document === "undefined") return [];
+  const canvas = document.createElement("canvas");
+  canvas.width = cw;
+  canvas.height = ch;
+  const ctx = canvas.getContext("2d");
+  if (ctx === null) return [];
+  let seed = 2166136261;
+  for (let i = 0; i < seedKey.length; i++) seed = Math.imul(seed ^ seedKey.charCodeAt(i), 16777619);
+  const rand = rng(seed);
+  const rank = new Float32Array(nx * ny).map(() => rand());
+  // Each image px's cell, once.
+  const cellOf = new Uint32Array(cw * ch);
+  for (let y = 0; y < ch; y++) {
+    const cy = Math.min(ny - 1, Math.floor((y / k) / (Number.isFinite(cellY) ? cellY : Infinity)) || 0);
+    for (let x = 0; x < cw; x++) {
+      const cx = Math.min(nx - 1, Math.floor((x / k) / (Number.isFinite(cellX) ? cellX : Infinity)) || 0);
+      cellOf[y * cw + x] = cy * nx + cx;
+    }
+  }
+  const img = ctx.createImageData(cw, ch);
+  const out: string[] = [];
+  for (let l = 0; l <= MASK_LEVELS; l++) {
+    const level = l / MASK_LEVELS;
+    for (let i = 0; i < cellOf.length; i++) img.data[i * 4 + 3] = rank[cellOf[i]!]! < level ? 255 : 0;
+    ctx.putImageData(img, 0, 0);
+    out.push(`url("${canvas.toDataURL("image/png")}")`);
+  }
+  if (maskCache.size > 32) maskCache.clear();
+  maskCache.set(cacheKey, out);
+  return out;
+}
+
+/** A track's keyframes with its pattern's shown fraction as mask images
+ *  over the box (`x y w h` in the element's px); the last frame (landed)
+ *  has no mask. */
+function withMasks(kf: readonly PlayKeyframe[], pattern: Pattern, box: [number, number, number, number], id: ElementId): Keyframe[] {
+  const [x, y, w, h] = box;
+  const images = maskImages(pattern, w, h, id);
+  if (images.length === 0) return kf.map(({ mask: _, ...f }) => f) as Keyframe[];
+  return kf.map(({ mask, ...f }, i) => {
+    if (mask === undefined || (i === kf.length - 1 && mask >= 1)) return { ...f, maskImage: "none" };
+    const at = images[Math.min(MASK_LEVELS, Math.max(0, Math.round(mask * MASK_LEVELS)))]!;
+    return { ...f, maskImage: at, maskSize: `${r3(w)}px ${r3(h)}px`, maskPosition: `${r3(x)}px ${r3(y)}px`, maskRepeat: "no-repeat" };
+  }) as Keyframe[];
+}
+
 /** A click planned ahead: everything `playStep` needs but the animations. */
 export interface PreparedStep {
   tagged: TaggedSlide;
@@ -1182,7 +1288,8 @@ export function playStep(tagged: TaggedSlide, timeline: SlideTimeline, k: number
       if (el === undefined || typeof el.animate !== "function") continue;
       // Tracks were planned for the step's motion; stretch to a longer colour window.
       const scale = plan.duration / duration;
-      const kf = scale === 1 ? tr.keyframes : [...tr.keyframes.map((f) => ({ ...f, offset: f.offset * scale })), { ...tr.keyframes[tr.keyframes.length - 1]!, offset: 1 }];
+      const planned = scale === 1 ? tr.keyframes : [...tr.keyframes.map((f) => ({ ...f, offset: f.offset * scale })), { ...tr.keyframes[tr.keyframes.length - 1]!, offset: 1 }];
+      const kf = tr.pattern === undefined || tr.box === undefined ? planned : withMasks(planned, tr.pattern, tr.box, tr.id);
       anims.push(el.animate(kf as unknown as Keyframe[], { duration, fill: "both", easing: "linear" }));
     }
     for (const bl of blends) {

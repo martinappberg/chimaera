@@ -1,6 +1,6 @@
 import JSZip from "jszip";
 import { describe, expect, it } from "vitest";
-import { clipMargin, clipRegion, effectMotion, motionNotes, pacedSampler, pathPolyline, progress, warp, type Geom } from "./pptxMotion";
+import { clipMargin, clipRegion, effectMotion, motionNotes, pacedSampler, pathPolyline, patternOf, progress, warp, type Geom } from "./pptxMotion";
 import { entryState, MAX_FRAMES, PLAY_BUDGET, planStep, type ElementBase, type ShapeInfo } from "./pptxPlay";
 import { buildStates, parseTimeline, pathEnd, type Effect, type SlideTimeline } from "./pptxTiming";
 
@@ -160,9 +160,34 @@ describe("wipe", () => {
   });
 
   it("refuses what it doesn't draw (the effect fades instead)", () => {
-    for (const f of ["dissolve", "checkerboard(across)", "randombar(horizontal)", "wipe(sideways)", "box(weird)", "wheel(99)", "x(y)(z)"]) {
+    for (const f of ["dissolve", "randombar(horizontal)", "slide(fromTop)", "wipe(sideways)", "box(weird)", "wheel(99)", "checkerboard(diagonal)", "x(y)(z)"]) {
       expect(clipRegion(f, false), f).toBe(null);
     }
+  });
+});
+
+describe("pattern filters, laid out as PowerPoint's film of the filters deck shows them", () => {
+  it("checkerboard: six rows of squares from the centre, odd rows half a square on, each filling from its left", () => {
+    const at = pts(clipRegion("checkerboard(across)", false)!(0.5, 300, 300));
+    const e = clipMargin(300, 300);
+    // Squares are 50 px: row 0's at the centre fills 150 → 175, row 1's 175 → 200.
+    expect(at).toEqual(expect.arrayContaining([[150, -e], [175, -e], [175, 50], [150, 50], [200, 100], [175, 100]]));
+    expect(at).not.toEqual(expect.arrayContaining([[176, -e]]));
+    expect(clipRegion("checkerboard(across)", false)!(1, 300, 300)).toBe("none");
+  });
+
+  it("strips and wedge grow from their corner and from 12 o'clock", () => {
+    const strip = pts(clipRegion("strips(downLeft)", false)!(0.25, 200, 100));
+    expect(strip.slice(0, 3)).toEqual([[200, 0], [125, 0], [200, 75]].map(([x, y]) => [x === 200 ? 200 + clipMargin(200, 100) : x, y === 0 ? -clipMargin(200, 100) : y]));
+    const wedge = pts(clipRegion("wedge", false)!(0.5, 100, 100));
+    // Half way: the upper half, its two edges level with the centre.
+    expect(Math.max(...wedge.map(([, y]) => y))).toBeCloseTo(50, 0);
+  });
+
+  it("dissolve and random bars are patterns, in and out; slide still fades", () => {
+    expect(patternOf("dissolve", true)).toEqual({ kind: "dissolve", horizontal: false, out: true });
+    expect(patternOf("randombar(vertical)", false)).toEqual({ kind: "bars", horizontal: false, out: false });
+    expect(patternOf("slide(fromTop)", false)).toBeNull();
   });
 });
 
@@ -324,11 +349,11 @@ describe("zoom, spin, teeter, boomerang: from the behaviours", () => {
 });
 
 describe("fallbacks", () => {
-  it("dissolve fades and says so; transparency (never ends) plays nothing", async () => {
+  it("dissolve plays through random cells; transparency (never ends) plays nothing", async () => {
     const dissolve = (await slide("entrances", 1)).steps[5]![0]!;
     const m = effectMotion(dissolve, () => G);
-    expect(m.note).toMatch(/dissolve-in: plays as a fade/);
-    expect(m.segments.map((s) => s.ch)).toEqual(["op"]);
+    expect(m.note).toBeNull();
+    expect(m.segments.map((s) => [s.ch, s.pattern])).toEqual([["mask", { kind: "dissolve", horizontal: false, out: false }]]);
     const transparency = (await slide("exits-emphasis", 2)).steps[3]![0]!;
     expect(effectMotion(transparency, () => G).segments).toEqual([]);
   });
@@ -351,8 +376,9 @@ describe("fallbacks", () => {
     expect(emph.note).toMatch(/not animated/);
   });
 
-  it("the slide's notes list what plays other than as written: only the fades standing in for rare filters", async () => {
-    expect(motionNotes((await slide("entrances", 1)).steps)).toEqual(["dissolve-in: plays as a fade (dissolve)"]);
+  it("the slide's notes list what plays other than as written: nothing on the corpus's entrances and emphasis", async () => {
+    expect(motionNotes((await slide("entrances", 1)).steps)).toEqual([]);
+    for (const n of [1, 2, 3]) expect(motionNotes((await slide("filters", n)).steps), `filters ${n}`).toEqual([]);
     expect(motionNotes((await slide("entrances", 2)).steps)).toEqual([]);
     // Emphasis holds now (R24-R31): grow, spin, transparency, colour play and stay.
     for (const n of [1, 2, 3]) expect(motionNotes((await slide("exits-emphasis", n)).steps), `exits-emphasis ${n}`).toEqual([]);

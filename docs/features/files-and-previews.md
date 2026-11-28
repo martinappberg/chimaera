@@ -959,11 +959,13 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   (`ppt_w`/`ppt_h`, `animScale`); spin, teeter and other turns; motion paths (followed at a steady
   speed, curves sampled, ending where the build state puts the shape); wipe from the side it
   names (`wipe(down)`, PowerPoint's "From Bottom", shows the bottom first), split, box, circle,
-  diamond, plus (`in` closes from the edges, `out` opens from the centre), blinds and wheel as a
-  moving clip; with the file's delays, durations, repeats, auto-reverse and ease in/out. An
+  diamond, plus (`in` closes from the edges, `out` opens from the centre), blinds, wheel,
+  checkerboard, strips and wedge as a moving clip laid out as PowerPoint's own film shows them;
+  dissolve and random bars through a random pattern of fine cells or bars, the same each time
+  for a shape; with the file's delays, durations, repeats, auto-reverse and ease in/out. An
   arrival by a click plays the slide's on-entry step first, and "after previous" chains run on
-  their own times. Rare filters (dissolve, checkerboard, random bars; the contract lists them in
-  `fixtures/pptx-timing/fallbacks.json`) fade; an entrance or exit
+  their own times. A filter the viewer does not draw (the contract lists them in
+  `fixtures/pptx-timing/fallbacks.json`: only `slide`) fades; an entrance or exit
   whose values can't be read fades over its duration; an emphasis that can't be read plays
   nothing; the dots' tooltip names each such effect. **Emphasis holds** until the slide is left,
   as in PowerPoint: a build state carries each target's size, turn, opacity and colours

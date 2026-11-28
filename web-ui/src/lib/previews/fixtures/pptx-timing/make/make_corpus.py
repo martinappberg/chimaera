@@ -393,6 +393,55 @@ DECKS = {
             ],
         },
     ],
+    # Every pattern filter PowerPoint's scripting offers, in and out, two
+    # seconds each so its film shows the pattern growing; and spins on
+    # shapes with and without shadow and outline, and on a picture, to find
+    # what PowerPoint turns them about.
+    "filters": [
+        {
+            "shapes": row(["Dissolve", "Checkerboard", "RandomBars", "Strips", "Wedge"]),
+            "fx": [
+                ("Dissolve", "dissolve", "click", {"dur": 2.0}),
+                ("Checkerboard", "checkerboard", "click", {"dur": 2.0}),
+                ("RandomBars", "random bars", "click", {"dur": 2.0}),
+                ("Strips", "strips", "click", {"dur": 2.0}),
+                ("Wedge", "wedge", "click", {"dur": 2.0}),
+            ],
+        },
+        {
+            "shapes": row(["CircleIn", "CircleOut", "DiamondIn", "DiamondOut", "PlusIn", "PlusOut"]),
+            "fx": [
+                ("CircleIn", "circle", "click", {"dur": 2.0, "dir": "inward"}),
+                ("CircleOut", "circle", "click", {"dur": 2.0, "dir": "out"}),
+                ("DiamondIn", "diamond", "click", {"dur": 2.0, "dir": "inward"}),
+                ("DiamondOut", "diamond", "click", {"dur": 2.0, "dir": "out"}),
+                ("PlusIn", "plus", "click", {"dur": 2.0, "dir": "inward"}),
+                ("PlusOut", "plus", "click", {"dur": 2.0, "dir": "out"}),
+            ],
+        },
+        {
+            "shapes": row(["DissolveOut", "CheckerboardOut", "RandomBarsOut", "StripsOut", "WedgeOut"]),
+            "fx": [
+                ("DissolveOut", "dissolve", "click", {"dur": 2.0, "exit": True}),
+                ("CheckerboardOut", "checkerboard", "click", {"dur": 2.0, "exit": True}),
+                ("RandomBarsOut", "random bars", "click", {"dur": 2.0, "exit": True}),
+                ("StripsOut", "strips", "click", {"dur": 2.0, "exit": True}),
+                ("WedgeOut", "wedge", "click", {"dur": 2.0, "exit": True}),
+            ],
+        },
+        {
+            "shapes": [("Plain", "rect", {"shadow": False, "noline": True}), ("Shadow", "rect", {"noline": True}),
+                       ("Outline", "rect", {"shadow": False, "line": 12}), ("Both", "rect", {"line": 12}),
+                       ("Picture", "picture", {})],
+            "fx": [
+                ("Plain", "spin", "click", {"amount": 90}),
+                ("Shadow", "spin", "click", {"amount": 90}),
+                ("Outline", "spin", "click", {"amount": 90}),
+                ("Both", "spin", "click", {"amount": 90}),
+                ("Picture", "spin", "click", {"amount": 90}),
+            ],
+        },
+    ],
     # No animation, and saved by PowerPoint: what happens to the ids python-pptx
     # wrote (see agent-written-raw.pptx, the same deck before PowerPoint).
     "agent-written": [
@@ -488,6 +537,10 @@ def add_shape(slide, name, kind, opts, box):
         picture_fill(slide, sh)
     if "line" in opts:
         sh.line.width = Pt(opts["line"])
+    if opts.get("noline"):
+        sh.line.fill.background()
+    if opts.get("shadow") is False:
+        sh.shadow.inherit = False
     if "rot" in opts:
         sh.rotation = opts["rot"]
     return sh

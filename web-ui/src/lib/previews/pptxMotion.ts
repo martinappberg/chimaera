@@ -46,7 +46,7 @@ export { progress, warp } from "./pptxTiming";
  *  without a `from` starts there. */
 export type Geom = FormulaVars & { sx?: number; sy?: number; turn?: number; op?: number };
 
-export type Channel = "x" | "y" | "w" | "h" | "mx" | "my" | "sx" | "sy" | "sxAbs" | "syAbs" | "rot" | "rotAbs" | "op" | "opAbs" | "clip";
+export type Channel = "x" | "y" | "w" | "h" | "mx" | "my" | "sx" | "sy" | "sxAbs" | "syAbs" | "rot" | "rotAbs" | "op" | "opAbs" | "clip" | "mask";
 
 export interface Segment {
   /** The target key (`targetKey`). */
@@ -58,6 +58,20 @@ export interface Segment {
   value(t: number): number | null;
   /** For `clip`: the visible region at a progress, in the element's px. */
   region?: Region;
+  /** For `mask`: the random pattern that shows the element cell by cell. */
+  pattern?: Pattern;
+}
+
+/**
+ * A random pattern a filter reveals its target through (no polygon can
+ * draw it): `dissolve`'s cells, `randombar`'s bars across (`horizontal`)
+ * or down. `out`: it hides instead. The value of a `mask` segment is the
+ * filter's progress; the shown fraction is that, or 1 minus it going out.
+ */
+export interface Pattern {
+  kind: "dissolve" | "bars";
+  horizontal: boolean;
+  out: boolean;
 }
 
 /** A visible region: a CSS `clip-path` for progress `p` on a `w`×`h` box
@@ -195,6 +209,7 @@ function rect(x0: number, y0: number, x1: number, y1: number): Pt[] {
 }
 
 const BLINDS = 6;
+const CHECKER_ROWS = 6;
 const WHEEL_ARC = 24;
 
 /**
@@ -266,6 +281,66 @@ function regionOf(filter: string, out: boolean): ((p: number, w: number, h: numb
       return { pts, evenodd: false };
     };
   }
+  if (name === "checkerboard") {
+    // PowerPoint's film: six rows of squares a sixth of the box high, every
+    // other row half a square along, each square filling from its left
+    // edge (`across`; `down` is the same turned).
+    if (arg !== "" && arg !== "across" && arg !== "down") return null;
+    const down = arg === "down";
+    return (p, w, h) => {
+      const [U, V] = down ? [h, w] : [w, h];
+      const s = V / CHECKER_ROWS;
+      const q = out ? 1 - p : p;
+      const pts: Pt[] = [];
+      for (let r = 0; r < CHECKER_ROWS; r++) {
+        // Squares are laid out from the box's centre, odd rows half a square on.
+        const phase = U / 2 + (r % 2 === 1 ? s / 2 : 0);
+        const first = Math.floor(-phase / s) - 1;
+        for (let k = first; phase + k * s < U; k++) {
+          const u0 = Math.max(0, phase + k * s);
+          const u1 = Math.min(U, phase + k * s + q * s);
+          if (u1 <= u0) continue;
+          const [v0, v1] = [r * s, (r + 1) * s];
+          const cell = down ? rect(v0, u0, v1, u1) : rect(u0, v0, u1, v1);
+          pts.push(...cell, cell[0]!, [0, 0]);
+        }
+      }
+      return { pts: pts.length > 0 ? [[0, 0], ...pts] : [[0, 0], [0, 0], [0, 0]], evenodd: false };
+    };
+  }
+  if (name === "strips") {
+    // A diagonal edge crossing the box from the corner it names away from
+    // (`downLeft` starts at the top right and runs down to the left).
+    const corner = new Map([["downLeft", [1, 0]], ["upLeft", [1, 1]], ["downRight", [0, 0]], ["upRight", [0, 1]]]).get(arg === "" ? "downRight" : arg);
+    if (corner === undefined) return null;
+    return (p, w, h) => {
+      const [cx, cy] = [corner[0]! * w, corner[1]! * h];
+      // Points at distance d along the diagonal: |x − cx| + |y − cy| ≤ d (in w+h units).
+      const q = out ? 1 - p : p;
+      const d = q * (w + h);
+      const sx = corner[0] === 0 ? 1 : -1;
+      const sy = corner[1] === 0 ? 1 : -1;
+      const tri: Pt[] = [[cx, cy], [cx + sx * d, cy], [cx, cy + sy * d]];
+      // Going out, the swept corner is what is hidden.
+      return out ? hole(tri, w, h) : { pts: tri, evenodd: false };
+    };
+  }
+  if (name === "wedge") {
+    // Two edges sweeping down from 12 o'clock about the box's centre, one
+    // each way (PowerPoint's film).
+    if (arg !== "") return null;
+    return (p, w, h) => {
+      const [cx, cy] = [w / 2, h / 2];
+      const r = Math.hypot(w, h);
+      const q = out ? 1 - p : p;
+      const pts: Pt[] = [[cx, cy]];
+      for (let i = 0; i <= WHEEL_ARC; i++) {
+        const a = -Math.PI / 2 - q * Math.PI + (2 * q * Math.PI * i) / WHEEL_ARC;
+        pts.push([cx + r * Math.cos(a), cy + r * Math.sin(a)]);
+      }
+      return { pts, evenodd: false };
+    };
+  }
   if (name === "wheel") {
     const n = /^[1-8]$/.test(arg) ? Number(arg) : arg === "" ? 1 : NaN;
     if (!Number.isInteger(n)) return null;
@@ -309,6 +384,14 @@ function regionOf(filter: string, out: boolean): ((p: number, w: number, h: numb
     const q = opens ? p : 1 - p;
     return showShape ? { pts: g(q, w, h), evenodd: false } : hole(g(q, w, h), w, h);
   };
+}
+
+/** A random-pattern filter (`dissolve`, `randombar(horizontal|vertical)`), else null. */
+export function patternOf(filter: string, out: boolean): Pattern | null {
+  const f = filter.trim();
+  if (f === "dissolve") return { kind: "dissolve", horizontal: false, out };
+  const m = /^randombar(?:\((horizontal|vertical)\))?$/.exec(f);
+  return m === null ? null : { kind: "bars", horizontal: m[1] !== "vertical", out };
 }
 
 // --- paths ----------------------------------------------------------------------
@@ -451,6 +534,11 @@ export function effectMotion(e: Effect, geom: (key: string) => Geom | null): Eff
           break;
         }
         if (f.name === "image" || f.name === "") break;
+        const pattern = patternOf(f.full, goingOut);
+        if (pattern !== null) {
+          segments.push({ key, ch: "mask", value: local, pattern });
+          break;
+        }
         const region = clipRegion(f.full, goingOut);
         if (region === null) {
           // A filter with no region here (dissolve, checkerboard, …) fades.

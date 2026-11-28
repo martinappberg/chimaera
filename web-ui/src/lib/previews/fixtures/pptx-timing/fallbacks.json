@@ -1,11 +1,6 @@
 {
   "about": "Transition filters (p:animEffect filter) the viewer does not draw as PowerPoint does: an entrance or exit using one plays as a fade over its duration, then lands on its state. Every other filter in ECMA-376's grammar is drawn. Kept true by pptxMotion.test.ts. README: Played as a fade.",
   "filters": [
-    { "filter": "dissolve", "effects": ["dissolve-in", "dissolve-out"], "reason": "a random pixel dissolve is not drawn" },
-    { "filter": "checkerboard", "effects": ["other"], "reason": "the checkerboard pattern is not drawn" },
-    { "filter": "randombar", "effects": ["other"], "reason": "random bars are not drawn" },
-    { "filter": "strips", "effects": ["other"], "reason": "diagonal strips are not drawn" },
-    { "filter": "wedge", "effects": ["other"], "reason": "the wedge is not drawn" },
-    { "filter": "slide", "effects": ["other"], "reason": "the slide filter's moving copy is not drawn" }
+    { "filter": "slide", "effects": ["other"], "reason": "the slide filter's moving copy of the shape is not drawn; PowerPoint's scripting offers no effect that writes it, so no film shows it" }
   ]
 }

@@ -1,0 +1,535 @@
+{
+  "deck": "filters.pptx",
+  "slides": [
+    {
+      "part": "ppt/slides/slide1.xml",
+      "id": 256,
+      "transition": null,
+      "steps": [
+        [],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "entr",
+            "preset": 9,
+            "subtype": 0,
+            "effect": "dissolve-in",
+            "dir": null,
+            "target": "2",
+            "sets": "visible"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "entr",
+            "preset": 5,
+            "subtype": 10,
+            "effect": "other",
+            "dir": null,
+            "target": "3",
+            "sets": "visible"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "entr",
+            "preset": 14,
+            "subtype": 10,
+            "effect": "other",
+            "dir": null,
+            "target": "4",
+            "sets": "visible"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "entr",
+            "preset": 18,
+            "subtype": 12,
+            "effect": "other",
+            "dir": null,
+            "target": "5",
+            "sets": "visible"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "entr",
+            "preset": 20,
+            "subtype": 0,
+            "effect": "other",
+            "dir": null,
+            "target": "6",
+            "sets": "visible"
+          }
+        ]
+      ],
+      "states": [
+        {
+          "hidden": [
+            "2",
+            "3",
+            "4",
+            "5",
+            "6"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [
+            "3",
+            "4",
+            "5",
+            "6"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [
+            "4",
+            "5",
+            "6"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [
+            "5",
+            "6"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [
+            "6"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [],
+          "moved": {}
+        }
+      ],
+      "interactive": 0
+    },
+    {
+      "part": "ppt/slides/slide2.xml",
+      "id": 257,
+      "transition": null,
+      "steps": [
+        [],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "entr",
+            "preset": 6,
+            "subtype": 16,
+            "effect": "circle-in",
+            "dir": null,
+            "target": "2",
+            "sets": "visible"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "entr",
+            "preset": 6,
+            "subtype": 32,
+            "effect": "circle-in",
+            "dir": null,
+            "target": "3",
+            "sets": "visible"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "entr",
+            "preset": 8,
+            "subtype": 16,
+            "effect": "other",
+            "dir": null,
+            "target": "4",
+            "sets": "visible"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "entr",
+            "preset": 8,
+            "subtype": 32,
+            "effect": "other",
+            "dir": null,
+            "target": "5",
+            "sets": "visible"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "entr",
+            "preset": 13,
+            "subtype": 16,
+            "effect": "other",
+            "dir": null,
+            "target": "6",
+            "sets": "visible"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "entr",
+            "preset": 13,
+            "subtype": 32,
+            "effect": "other",
+            "dir": null,
+            "target": "7",
+            "sets": "visible"
+          }
+        ]
+      ],
+      "states": [
+        {
+          "hidden": [
+            "2",
+            "3",
+            "4",
+            "5",
+            "6",
+            "7"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [
+            "3",
+            "4",
+            "5",
+            "6",
+            "7"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [
+            "4",
+            "5",
+            "6",
+            "7"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [
+            "5",
+            "6",
+            "7"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [
+            "6",
+            "7"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [
+            "7"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [],
+          "moved": {}
+        }
+      ],
+      "interactive": 0
+    },
+    {
+      "part": "ppt/slides/slide3.xml",
+      "id": 258,
+      "transition": null,
+      "steps": [
+        [],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "exit",
+            "preset": 9,
+            "subtype": 0,
+            "effect": "dissolve-out",
+            "dir": null,
+            "target": "2",
+            "sets": "hidden"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "exit",
+            "preset": 5,
+            "subtype": 10,
+            "effect": "other",
+            "dir": null,
+            "target": "3",
+            "sets": "hidden"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "exit",
+            "preset": 14,
+            "subtype": 10,
+            "effect": "other",
+            "dir": null,
+            "target": "4",
+            "sets": "hidden"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "exit",
+            "preset": 18,
+            "subtype": 12,
+            "effect": "other",
+            "dir": null,
+            "target": "5",
+            "sets": "hidden"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "exit",
+            "preset": 20,
+            "subtype": 0,
+            "effect": "other",
+            "dir": null,
+            "target": "6",
+            "sets": "hidden"
+          }
+        ]
+      ],
+      "states": [
+        {
+          "hidden": [],
+          "moved": {}
+        },
+        {
+          "hidden": [
+            "2"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [
+            "2",
+            "3"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [
+            "2",
+            "3",
+            "4"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [
+            "2",
+            "3",
+            "4",
+            "5"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [
+            "2",
+            "3",
+            "4",
+            "5",
+            "6"
+          ],
+          "moved": {}
+        }
+      ],
+      "interactive": 0
+    },
+    {
+      "part": "ppt/slides/slide4.xml",
+      "id": 259,
+      "transition": null,
+      "steps": [
+        [],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "emph",
+            "preset": 8,
+            "subtype": 0,
+            "effect": "spin",
+            "dir": null,
+            "target": "2",
+            "sets": null
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "emph",
+            "preset": 8,
+            "subtype": 0,
+            "effect": "spin",
+            "dir": null,
+            "target": "3",
+            "sets": null
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "emph",
+            "preset": 8,
+            "subtype": 0,
+            "effect": "spin",
+            "dir": null,
+            "target": "4",
+            "sets": null
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "emph",
+            "preset": 8,
+            "subtype": 0,
+            "effect": "spin",
+            "dir": null,
+            "target": "5",
+            "sets": null
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "emph",
+            "preset": 8,
+            "subtype": 0,
+            "effect": "spin",
+            "dir": null,
+            "target": "6",
+            "sets": null
+          }
+        ]
+      ],
+      "states": [
+        {
+          "hidden": [],
+          "moved": {}
+        },
+        {
+          "hidden": [],
+          "moved": {},
+          "turn": {
+            "2": 90
+          }
+        },
+        {
+          "hidden": [],
+          "moved": {},
+          "turn": {
+            "2": 90,
+            "3": 90
+          }
+        },
+        {
+          "hidden": [],
+          "moved": {},
+          "turn": {
+            "2": 90,
+            "3": 90,
+            "4": 90
+          }
+        },
+        {
+          "hidden": [],
+          "moved": {},
+          "turn": {
+            "2": 90,
+            "3": 90,
+            "4": 90,
+            "5": 90
+          }
+        },
+        {
+          "hidden": [],
+          "moved": {},
+          "turn": {
+            "2": 90,
+            "3": 90,
+            "4": 90,
+            "5": 90,
+            "6": 90
+          }
+        }
+      ],
+      "interactive": 0
+    }
+  ]
+}
