@@ -63,3 +63,19 @@ describe("colours", () => {
     expect(pictureFilter({ to: c("schemeClr", { val: "accent2" }) })).toBe(null);
   });
 });
+
+describe("colour modifiers against PowerPoint's film (fixtures/pptx-timing/colors.json, README R33)", () => {
+  type Vec = { name: string; color: Parameters<typeof resolveColor>[0]; rgb: number[]; film: number[] };
+  const file = (globalThis as unknown as { process: { getBuiltinModule(id: "node:fs"): { readFileSync(p: URL): Uint8Array } } }).process
+    .getBuiltinModule("node:fs")
+    .readFileSync(new URL("./fixtures/pptx-timing/colors.json", import.meta.url));
+  const { vectors } = JSON.parse(new TextDecoder().decode(file)) as { vectors: Vec[] };
+  const palette = { scheme: new Map([["accent1", "4F81BD"]]), map: new Map<string, string>() };
+  it.each(vectors.map((v) => [v.name, v] as const))("%s: tint and shade in linear light, the rest in HSL", (_, v) => {
+    const c = resolveColor(v.color, palette)!;
+    [c.r, c.g, c.b].forEach((x, i) => {
+      expect(Math.abs(x - v.rgb[i]!)).toBeLessThan(0.5);
+      expect(Math.abs(x - v.film[i]!)).toBeLessThanOrEqual(4);
+    });
+  });
+});

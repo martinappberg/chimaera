@@ -115,6 +115,17 @@ const MAPPED = new Set(["bg1", "bg2", "tx1", "tx2"]);
  * and black, alpha), or null when it names something this can't resolve
  * (`phClr`, an unknown preset or system colour).
  */
+const toLinear = (v: number) => {
+  const x = clamp01(v / 255);
+  return x <= 0.04045 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4;
+};
+const toSrgb = (x: number) => (clamp01(x) <= 0.0031308 ? 12.92 * clamp01(x) : 1.055 * clamp01(x) ** (1 / 2.4) - 0.055) * 255;
+
+/** A change made to each channel in linear light. */
+function linearly(c: Rgba, f: (x: number) => number): Rgba {
+  return { r: toSrgb(f(toLinear(c.r))), g: toSrgb(f(toLinear(c.g))), b: toSrgb(f(toLinear(c.b))), a: c.a };
+}
+
 export function resolveColor(c: Color, palette: Palette): Rgba | null {
   const at = (k: string) => c.attrs[k];
   let base: Rgba | null = null;
@@ -182,11 +193,14 @@ export function resolveColor(c: Color, palette: Palette): Rgba | null {
       case "hueOff":
         out = fromHsl(hsl.h + v / 60000, hsl.s, hsl.l, out.a);
         break;
+      // Tint and shade work in linear light (PowerPoint's film of flat
+      // accent fills: a 50 % shade of 4F81BD is 57,94,137, not 40,65,95);
+      // the other modifiers in sRGB's HSL, as the same film shows.
       case "tint":
-        out = mix({ r: 255, g: 255, b: 255, a: out.a }, out, f);
+        out = linearly(out, (x) => 1 - clamp01(f) * (1 - x));
         break;
       case "shade":
-        out = mix({ r: 0, g: 0, b: 0, a: out.a }, out, f);
+        out = linearly(out, (x) => clamp01(f) * x);
         break;
       case "alpha":
         out = { ...out, a: clamp01(f) };

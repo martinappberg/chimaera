@@ -1,0 +1,419 @@
+{
+ "about": "Colour modifiers resolved against accent1 = 4F81BD (README R33). `rgb` is the model's sRGB (0-255, 3 decimals), `film` PowerPoint's own film of flat fills (the deck make/make_colors.py writes, exported by PowerPoint 16.115 for Mac as a movie; a rectangle's middle, BT.709 decode, +3 per channel), within 4 of `rgb`.",
+ "palette": {
+  "accent1": "4F81BD"
+ },
+ "vectors": [
+  {
+   "name": "tint25",
+   "color": {
+    "type": "schemeClr",
+    "attrs": {
+     "val": "accent1"
+    },
+    "mods": [
+     {
+      "name": "tint",
+      "val": "25000"
+     }
+    ]
+   },
+   "rgb": [
+    227.182,
+    231.737,
+    240.71
+   ],
+   "film": [
+    226,
+    232,
+    240
+   ]
+  },
+  {
+   "name": "tint50",
+   "color": {
+    "type": "schemeClr",
+    "attrs": {
+     "val": "accent1"
+    },
+    "mods": [
+     {
+      "name": "tint",
+      "val": "50000"
+     }
+    ]
+   },
+   "rgb": [
+    193.938,
+    204.89,
+    225.198
+   ],
+   "film": [
+    193,
+    206,
+    226
+   ]
+  },
+  {
+   "name": "tint75",
+   "color": {
+    "type": "schemeClr",
+    "attrs": {
+     "val": "accent1"
+    },
+    "mods": [
+     {
+      "name": "tint",
+      "val": "75000"
+     }
+    ]
+   },
+   "rgb": [
+    150.816,
+    172.394,
+    208.133
+   ],
+   "film": [
+    150,
+    172,
+    207
+   ]
+  },
+  {
+   "name": "shade25",
+   "color": {
+    "type": "schemeClr",
+    "attrs": {
+     "val": "accent1"
+    },
+    "mods": [
+     {
+      "name": "shade",
+      "val": "25000"
+     }
+    ]
+   },
+   "rgb": [
+    38.184,
+    66.245,
+    99.919
+   ],
+   "film": [
+    37,
+    66,
+    100
+   ]
+  },
+  {
+   "name": "shade50",
+   "color": {
+    "type": "schemeClr",
+    "attrs": {
+     "val": "accent1"
+    },
+    "mods": [
+     {
+      "name": "shade",
+      "val": "50000"
+     }
+    ]
+   },
+   "rgb": [
+    55.665,
+    93.123,
+    138.072
+   ],
+   "film": [
+    57,
+    94,
+    137
+   ]
+  },
+  {
+   "name": "shade75",
+   "color": {
+    "type": "schemeClr",
+    "attrs": {
+     "val": "accent1"
+    },
+    "mods": [
+     {
+      "name": "shade",
+      "val": "75000"
+     }
+    ]
+   },
+   "rgb": [
+    68.492,
+    112.844,
+    166.066
+   ],
+   "film": [
+    69,
+    114,
+    168
+   ]
+  },
+  {
+   "name": "satMod130",
+   "color": {
+    "type": "schemeClr",
+    "attrs": {
+     "val": "accent1"
+    },
+    "mods": [
+     {
+      "name": "satMod",
+      "val": "130000"
+     }
+    ]
+   },
+   "rgb": [
+    62.5,
+    127.5,
+    205.5
+   ],
+   "film": [
+    62,
+    129,
+    204
+   ]
+  },
+  {
+   "name": "lumMod75",
+   "color": {
+    "type": "schemeClr",
+    "attrs": {
+     "val": "accent1"
+    },
+    "mods": [
+     {
+      "name": "lumMod",
+      "val": "75000"
+     }
+    ]
+   },
+   "rgb": [
+    54.818,
+    96.347,
+    146.182
+   ],
+   "film": [
+    56,
+    97,
+    147
+   ]
+  },
+  {
+   "name": "lumMod60off40",
+   "color": {
+    "type": "schemeClr",
+    "attrs": {
+     "val": "accent1"
+    },
+    "mods": [
+     {
+      "name": "lumMod",
+      "val": "60000"
+     },
+     {
+      "name": "lumOff",
+      "val": "40000"
+     }
+    ]
+   },
+   "rgb": [
+    149.4,
+    179.4,
+    215.4
+   ],
+   "film": [
+    148,
+    181,
+    215
+   ]
+  },
+  {
+   "name": "lumMod40off60",
+   "color": {
+    "type": "schemeClr",
+    "attrs": {
+     "val": "accent1"
+    },
+    "mods": [
+     {
+      "name": "lumMod",
+      "val": "40000"
+     },
+     {
+      "name": "lumOff",
+      "val": "60000"
+     }
+    ]
+   },
+   "rgb": [
+    184.6,
+    204.6,
+    228.6
+   ],
+   "film": [
+    184,
+    205,
+    227
+   ]
+  },
+  {
+   "name": "lumMod50",
+   "color": {
+    "type": "schemeClr",
+    "attrs": {
+     "val": "accent1"
+    },
+    "mods": [
+     {
+      "name": "lumMod",
+      "val": "50000"
+     }
+    ]
+   },
+   "rgb": [
+    36.545,
+    64.231,
+    97.455
+   ],
+   "film": [
+    38,
+    65,
+    98
+   ]
+  },
+  {
+   "name": "plain",
+   "color": {
+    "type": "schemeClr",
+    "attrs": {
+     "val": "accent1"
+    },
+    "mods": []
+   },
+   "rgb": [
+    79,
+    129,
+    189
+   ],
+   "film": [
+    80,
+    129,
+    189
+   ]
+  },
+  {
+   "name": "tint50satMod130",
+   "color": {
+    "type": "schemeClr",
+    "attrs": {
+     "val": "accent1"
+    },
+    "mods": [
+     {
+      "name": "tint",
+      "val": "50000"
+     },
+     {
+      "name": "satMod",
+      "val": "130000"
+     }
+    ]
+   },
+   "rgb": [
+    189.249,
+    203.487,
+    229.887
+   ],
+   "film": [
+    190,
+    204,
+    229
+   ]
+  },
+  {
+   "name": "shade94satMod135",
+   "color": {
+    "type": "schemeClr",
+    "attrs": {
+     "val": "accent1"
+    },
+    "mods": [
+     {
+      "name": "shade",
+      "val": "94000"
+     },
+     {
+      "name": "satMod",
+      "val": "135000"
+     }
+    ]
+   },
+   "rgb": [
+    57.872,
+    123.654,
+    202.593
+   ],
+   "film": [
+    58,
+    126,
+    203
+   ]
+  },
+  {
+   "name": "tint100",
+   "color": {
+    "type": "schemeClr",
+    "attrs": {
+     "val": "accent1"
+    },
+    "mods": [
+     {
+      "name": "tint",
+      "val": "100000"
+     }
+    ]
+   },
+   "rgb": [
+    79,
+    129,
+    189
+   ],
+   "film": [
+    80,
+    129,
+    189
+   ]
+  },
+  {
+   "name": "shade100",
+   "color": {
+    "type": "schemeClr",
+    "attrs": {
+     "val": "accent1"
+    },
+    "mods": [
+     {
+      "name": "shade",
+      "val": "100000"
+     }
+    ]
+   },
+   "rgb": [
+    79,
+    129,
+    189
+   ],
+   "film": [
+    80,
+    129,
+    189
+   ]
+  }
+ ]
+}
