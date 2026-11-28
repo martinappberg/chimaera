@@ -20,18 +20,31 @@
  * The wrapper is NOT sandboxed: `'self'` in its CSP must be this window's
  * origin, the daemon's, which the page's own URL is on. It runs only the
  * relay below; the page inside never shares its origin.
+ *
+ * The wrapper wears this window's colour scheme, from its first paint and
+ * across theme switches. A frame whose document's scheme differs from its
+ * element's gets an opaque backdrop in the document's Canvas colour, so a
+ * scheme-less wrapper in a dark window flashed white each time a view was
+ * created, until the page inside painted over it.
  */
 
 const escapeAttr = (s: string): string =>
   s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
+/** This window's mode, as the appearance settings write it on the root. */
+const windowMode = (): "light" | "dark" =>
+  typeof document !== "undefined" && document.documentElement.dataset.theme === "dark" ? "dark" : "light";
+
 /** The wrapper's `srcdoc` for the page at `url` (same-origin, `/raw/…` or
- *  `/web/…`), titled `title`. */
-export function guardedPage(url: string, title: string): string {
+ *  `/web/…`), titled `title`, starting in `mode`. Only `url` and `title`
+ *  belong in a caller's reactive dependencies: a new `srcdoc` reloads the
+ *  page, and the wrapper follows a theme switch by itself. */
+export function guardedPage(url: string, title: string, mode: "light" | "dark" = windowMode()): string {
   return (
     "<!doctype html><html><head>" +
     `<meta http-equiv="Content-Security-Policy" content="frame-src 'self'">` +
-    "<style>html,body{margin:0;height:100%;overflow:hidden;background:transparent}" +
+    `<style>html{color-scheme:${mode}}` +
+    "html,body{margin:0;height:100%;overflow:hidden;background:transparent}" +
     "iframe{display:block;border:0;width:100%;height:100%}</style>" +
     "</head><body>" +
     `<iframe sandbox="allow-scripts" referrerpolicy="no-referrer" src="${escapeAttr(url)}" title="${escapeAttr(title)}"></iframe>` +
@@ -41,6 +54,13 @@ export function guardedPage(url: string, title: string): string {
     "if(f.contentWindow!==null&&e.source===f.contentWindow)parent.postMessage(e.data,'*');" +
     "else if(e.source===parent&&f.contentWindow!==null)f.contentWindow.postMessage(e.data,'*');" +
     "});" +
+    // Same origin as this window, so the wrapper reads its root's scheme
+    // itself; the observer goes with the wrapper's document.
+    "try{const r=parent.document.documentElement;" +
+    "const follow=()=>{document.documentElement.style.colorScheme=getComputedStyle(r).colorScheme};" +
+    "const o=new MutationObserver(follow);" +
+    "o.observe(r,{attributes:true,attributeFilter:['data-theme','style','class']});" +
+    "addEventListener('pagehide',()=>o.disconnect());follow()}catch{}" +
     "</script></body></html>"
   );
 }

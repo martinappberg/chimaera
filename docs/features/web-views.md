@@ -80,6 +80,7 @@ A plugin can ship its own HTML and JavaScript page for a drawing area that an ex
   - **The navigation guard (browser, Linux, Windows).**
     - Hosts put the sandboxed frame inside a same-origin `srcdoc` wrapper whose CSP is `frame-src 'self'`. The browser checks the container's `frame-src` before the frame navigates, so `location = "https://…"` sends no request.
     - The wrapper relays `postMessage` both ways.
+    - The wrapper wears the window's colour scheme from its first paint and follows a theme switch. A wrapper without one flashed white in a dark window whenever a view was created, until the page painted.
     - The macOS app's view needs no guard: its shell refuses the navigation itself.
   - **References.** `chimaera.reference({text, crop})` drafts with a picture: into the chat whose answer shows the page, else into the agent the person works with. It is honoured only after a press in the page.
   - **What the rule does not stop** (accepted, as in the design): a few bytes encoded in a library CDN's URLs, WebRTC (CSP has no directive for it), DNS prefetch, and in the app a link the person clicks opening in their browser.

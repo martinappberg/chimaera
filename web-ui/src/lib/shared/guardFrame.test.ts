@@ -13,4 +13,14 @@ describe("guardedPage", () => {
     expect(doc).toContain("e.source===f.contentWindow)parent.postMessage");
     expect(doc).toContain("e.source===parent&&f.contentWindow!==null)f.contentWindow.postMessage");
   });
+
+  it("wears the window's colour scheme from its first paint, then follows it", () => {
+    expect(guardedPage("/raw/t-1/a.html", "a", "dark")).toContain("<style>html{color-scheme:dark}");
+    expect(guardedPage("/raw/t-1/a.html", "a", "light")).toContain("<style>html{color-scheme:light}");
+    const doc = guardedPage("/raw/t-1/a.html", "a", "dark");
+    expect(doc).toContain("getComputedStyle(r).colorScheme");
+    expect(doc).toContain("addEventListener('pagehide',()=>o.disconnect())");
+    // The background stays see-through: the card or pane paints behind it.
+    expect(doc).toContain("background:transparent");
+  });
 });
