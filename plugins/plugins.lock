@@ -24,11 +24,16 @@
 # its capability digest is this one, and a privileged plugin (one that runs
 # or downloads programs) is verified only at the pinned version. A bump
 # writes the release's own tier and caps (.github/scripts/plugin-caps.mjs)
-# and auto-merges only when the plugin keeps its tier and its caps digest
-# is exactly the one approved here, and a privileged plugin's plugin.wasm is
-# attested by the plugin repository's release workflow, at the release's tag
-# or on main, from the commit the tag points to; anything else waits for a person, who reads the code (CI
-# checking the lock against the release is not an approval). Hand edits
+# and auto-merges only when the plugin keeps its tier, its caps digest is
+# exactly the one approved here, its plugin.toml changes nothing but its
+# words, and, for a privileged plugin, its plugin.wasm and plugin.toml are in
+# one attestation from the plugin repository's release workflow, at the
+# release's tag or on main, from the commit the tag points to, which is on
+# main. That proves where the files were built, not that anyone reviewed
+# the commit: whoever can merge to a privileged plugin's main and release it
+# ships without a second look here. Anything else waits for a person, who
+# reads the code (CI checking the lock against the release is not an
+# approval). Hand edits
 # follow the same rules; keep every value a one-line "string". To run a
 # local build of a plugin against the daemon: `chimaera plugin add --path
 # <dir>` (see plugins/AGENTS.md).

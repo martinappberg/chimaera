@@ -120,28 +120,53 @@ does not activate it. Rebuild, copy and reinstall the same version to iterate.
    (squash) only when (`review` in the script) the pinned release reads as
    the lock's `tier` and `caps`, the release keeps that tier (sandboxed stays
    sandboxed, privileged stays privileged) with exactly the lock's `caps`,
-   its capability lines (`api` and every table but `[adds]`, `[release]` and
-   `[detect]`) equal its pinned release's, and, for a **privileged** plugin
-   only, its `plugin.wasm` is attested by the plugin repository's release
-   workflow, at the release's tag or on main, from the commit the tag points
-   to. The script resolves the tag to its commit through the GitHub API (an
-   annotated tag dereferenced; one that doesn't resolve waits), then tries
-   each accepted ref `<ref>` (`refs/tags/v<version>`, then `refs/heads/main`):
+   its whole manifest, parsed, is the pinned release's except for the keys
+   that carry no behaviour (`sameBehaviour`; `WORDS_ONLY_KEYS`: `version`,
+   `name`, `summary`, `description`, `homepage`, `category`, `[adds]`,
+   `requires.summary`, `recommends.summary`, each with the daemon file that
+   reads it; tool setup steps, program version args, downloads' `bin` and
+   `unpack` and every unknown key are compared), and, for a **privileged**
+   plugin only, its `plugin.wasm` and `plugin.toml` are covered by one
+   attestation from the plugin repository's release workflow, at the
+   release's tag or on main, from the commit the tag points to, which is on
+   main. The script resolves the tag to its commit through the GitHub API
+   (the answer must be for exactly that tag; an annotated tag is
+   dereferenced; one that doesn't resolve waits), requires that commit to be
+   on `main` (`GET /repos/<repo>/compare/<commit>...main`: `ahead` or
+   `identical`, with the commit as the merge base), then tries each accepted
+   ref `<ref>` (`refs/tags/v<version>`, then `refs/heads/main`):
    `gh attestation verify plugin.wasm --repo <repo> --cert-identity
    https://github.com/<repo>/.github/workflows/release.yml@<ref> --source-ref
-   <ref> --source-digest <commit> --deny-self-hosted-runners --format json`,
-   and checks gh's result again (repository, exact signer and ref, commit,
-   GitHub-hosted runner, the wasm's sha256). The workflow path and `main` are
+   <ref> --source-digest <commit> --deny-self-hosted-runners --format json`
+   (gh gets a minimal environment with the token as `GH_TOKEN` only), and
+   checks gh's result again: one attestation, on its own, from the
+   repository, the exact signer and ref, GitHub Actions' issuer, the commit,
+   a GitHub-hosted runner, SLSA provenance, with both the wasm's and the
+   toml's sha256 among its subjects. The workflow path and `main` are
    constants in the script, never read from the release. A release run by
    hand (`workflow_dispatch` on `main`, how these plugins are usually
    released) counts, because the attestation is bound to the commit the tag
-   points to, not to a ref name. A privileged plugin's new code can pass new
-   arguments to the same programs, which no digest shows; the attestation
-   proves the release was built from its tagged source by its own release
-   workflow, so a person need not read it on every release. A sandboxed
-   plugin needs none: the sandbox bounds its code. Each plugin repository's
-   release workflow attests `plugin.wasm` (`actions/attest-build-provenance`;
-   the job holds `id-token: write` and `attestations: write`). Otherwise the
+   points to, not to a ref name. What that proves: the files were built by
+   the repository's release workflow from a commit on `main`. It does not
+   prove anyone reviewed that commit: with this rule, whoever can merge to a
+   privileged plugin's `main` and release it ships to users without a
+   second look at the lock PR, which is the maintainer's chosen trade. The
+   check on `main` is only as strong as who can push to it and create `v*`
+   tags. The five privileged plugin repositories (pptx, latex, typst, chromium,
+   manimble) each have two rulesets: a `refs/tags/v*` tag cannot be updated
+   or deleted, by anyone, and `main` cannot be force-pushed or deleted. Who
+   may create a `v*` tag is not restricted (GitHub refuses the Actions app as
+   a bypass actor on a personal-account repository, and a release run by
+   hand creates its tag with the workflow token), so a release tag, once
+   made, cannot be moved, and the script's own checks (the tagged commit is
+   on `main`, the signer is `release.yml` at that tag or on `main`, both
+   files in one attestation) are what stop a tag on a side commit. The only
+   collaborator on all five is the maintainer. A sandboxed plugin needs no attestation: the
+   sandbox bounds its code. Each plugin repository's release workflow
+   builds in a read-only job and attests both files in a separate
+   `publish` job that checks them against the build job's SHA256SUMS
+   before signing and publishing exactly those (`actions/attest`; only that
+   job holds `contents`, `id-token` and `attestations` write). Otherwise the
    PR waits for a maintainer, and its body says which condition failed,
    whether the tier changed, whether provenance verified (the ref it was
    signed at and the commit), and which of the card's Can

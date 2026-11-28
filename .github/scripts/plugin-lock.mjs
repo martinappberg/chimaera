@@ -14,17 +14,21 @@
 // so a bump this script writes still has to pass CI to merge.
 //
 // What the plugin can do is the maintainers' to approve (`tier` and `caps`,
-// docs/design/plugin-platform-plan.md §2): a bump auto-merges only when the
-// plugin keeps its tier and its capability digest is exactly the one the
-// lock approved (`review`: the pinned release reads as the lock's tier and
-// caps, the release reads as the lock's tier with the lock's caps, and —
-// stricter still — its capability lines are the pinned release's), and, for
-// a privileged plugin, its plugin.wasm is attested by its own repository's
-// release workflow (RELEASE_WORKFLOW), at the release's tag or on main
-// (MAIN_REF), from the commit the tag points to
-// (`verifyProvenance`, `gh attestation verify`). A sandboxed plugin needs no
-// attestation: the sandbox bounds its code. Otherwise the PR opens without
-// auto-merge and says which condition failed. Either way the lock is written with the release's own
+// docs/design/plugin-platform-plan.md §2): a bump auto-merges only when
+// (`review`) the pinned release reads as the lock's tier and caps, the
+// release keeps that tier with exactly the lock's caps, its whole manifest is
+// the pinned release's but for its words (`sameBehaviour`), and, for a
+// privileged plugin, its plugin.wasm and plugin.toml are covered by one
+// attestation from the plugin repository's release workflow
+// (RELEASE_WORKFLOW), at the release's tag or on main (MAIN_REF), from the
+// commit the tag points to, which is on main (`verifyProvenance`,
+// `gh attestation verify`). That proves the files were built by that
+// workflow from a commit on main; it does not prove anyone reviewed the
+// commit: whoever can merge to a privileged plugin's main and release it
+// ships to users without a second look at the lock PR, which is the
+// maintainer's chosen trade. A sandboxed plugin needs no attestation: the
+// sandbox bounds its code. Otherwise the PR opens without auto-merge and
+// says which condition failed. Either way the lock is written with the release's own
 // `tier` and `caps`, read from its plugin.toml by plugin-caps.mjs (the
 // daemon's reading, held to it by fixtures), and the PR body says, per
 // plugin, whether the tier changed and which of the card's Can lines the
@@ -144,12 +148,84 @@ export function manifestFields(text) {
 }
 
 /**
- * The lines of a plugin.toml that decide what the plugin can do: the
- * top-level `api`, and every line of every table except the card's words
- * (`[adds]`), its release source and its detect paths. Comment and blank
- * lines are dropped, the rest trimmed. Equal lines mean an equal capability
- * digest; any difference (an inline comment too) is treated as asking for
- * more, which only costs a person's review.
+ * The keys of a plugin.toml that carry no behaviour: the daemon only shows
+ * them (or checks them against the tag and the lock). Everything else — every
+ * `provides.*`, `[[programs]]` (`version` args included), `[[tools]]` (urls,
+ * hashes, `bin`, `unpack`, `setup` steps), `[access]`, `[detect]`,
+ * `[release]`, views, files, actions, settings, `requires.*` but its summary,
+ * and any key this list doesn't name — must be identical for a bump to merge
+ * by itself (`sameBehaviour`). Where the daemon reads each:
+ *   version             mod.rs `Manifest::version` + `validate`: checked
+ *                       against the tag here and the lock in CI; it selects
+ *                       nothing.
+ *   name, summary       mod.rs `manifest_fields` (the card) and the lock's
+ *                       name/summary; `validate` keeps them one line.
+ *   description,
+ *   homepage            mod.rs `manifest_fields`: shown on the card only.
+ *   category            mod.rs `category()`: the Extensions page's group.
+ *   adds                mod.rs `Adds` ("the card's Adds lines, in words"),
+ *                       shown by `manifest_fields`.
+ *   requires.summary,
+ *   recommends.summary  mod.rs `Requires`/`Recommends::summary`: one sentence
+ *                       on the card (`manifest_fields`).
+ */
+export const WORDS_ONLY_KEYS = [
+  ["version"],
+  ["name"],
+  ["summary"],
+  ["description"],
+  ["homepage"],
+  ["category"],
+  ["adds"],
+  ["requires", "summary"],
+  ["recommends", "summary"],
+];
+
+/** A parsed TOML value as canonical JSON: tables with sorted keys, arrays in
+ *  order, numbers and strings as they are (NaN/Infinity spelled out). */
+function canonical(value) {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const keys = Object.keys(value).sort();
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${canonical(value[k])}`).join(",")}}`;
+  }
+  if (typeof value === "number" && !Number.isFinite(value)) return `"#${String(value)}"`;
+  return JSON.stringify(value);
+}
+
+/** What a plugin.toml makes the plugin do, canonical: the whole parsed
+ *  manifest without `WORDS_ONLY_KEYS`. Throws when it isn't TOML this reads. */
+export function manifestBehaviour(text) {
+  const m = parseToml(text);
+  const copy = JSON.parse(JSON.stringify(m, (_k, v) => (typeof v === "number" && !Number.isFinite(v) ? `#${v}` : v)));
+  for (const path of WORDS_ONLY_KEYS) {
+    let t = copy;
+    for (const part of path.slice(0, -1)) t = t !== null && typeof t === "object" && !Array.isArray(t) ? t[part] : undefined;
+    if (t !== null && typeof t === "object" && !Array.isArray(t)) delete t[path.at(-1)];
+  }
+  // A table emptied of its words reads as absent, as an absent one does.
+  for (const table of ["requires", "recommends"]) {
+    const t = copy[table];
+    if (t !== null && typeof t === "object" && !Array.isArray(t) && Object.keys(t).length === 0) delete copy[table];
+  }
+  return canonical(copy);
+}
+
+/** Whether two plugin.tomls make the plugin do the same, key by key (only
+ *  their words may differ). False when either can't be read. */
+export function sameBehaviour(a, b) {
+  try {
+    return manifestBehaviour(a) === manifestBehaviour(b);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The lines of a plugin.toml that decide what the plugin can do, by a line
+ * heuristic. It gates nothing any more (a commented header such as
+ * `[[tools.setup]] # x` hides its lines from it); `sameBehaviour` decides.
+ * Kept for the tests that show what it misses.
  */
 export function capabilityLines(text) {
   const out = [];
@@ -304,8 +380,8 @@ function capabilitySection(b) {
     const refs = (p.refs ?? []).map((r) => `\`${r}\``).join(" or ");
     out.push(
       p.verified
-        ? `- Provenance: verified — \`plugin.wasm\` is attested by \`${b.repo}\`'s \`${p.workflow}\`, signed at \`${p.ref}\`, built from ${commit} (the tag's).`
-        : `- Provenance: **not verified** (${code(p.why)}); expected an attestation of \`plugin.wasm\` by \`${b.repo}\`'s \`${p.workflow}\` at ${refs}, built from ${commit}.`,
+        ? `- Provenance: verified — one attestation covers \`plugin.wasm\` and \`plugin.toml\`, by \`${b.repo}\`'s \`${p.workflow}\`, signed at \`${p.ref}\`, built from ${commit} (the tag's, on main).`
+        : `- Provenance: **not verified** (${code(p.why)}); expected one attestation of \`plugin.wasm\` and \`plugin.toml\` by \`${b.repo}\`'s \`${p.workflow}\` at ${refs}, built from ${commit}, which must be on main.`,
     );
   }
   out.push("");
@@ -346,14 +422,14 @@ export function pullRequest(bumps) {
     ...bumps.flatMap(capabilitySection),
     ...(review.length === 0
       ? [
-          "Each release keeps its tier and its capability digest is exactly the one the lock already approved (its capability lines are the pinned release's too), so the `tier` and `caps` written are the approved ones. A privileged one's `plugin.wasm` is also attested by the plugin repository's release workflow, at the release's tag or on main, from the commit the tag points to.",
+          "Each release keeps its tier, its capability digest is exactly the one the lock already approved, and its manifest is the pinned release's except for its words, so the `tier` and `caps` written are the approved ones. A privileged one's `plugin.wasm` and `plugin.toml` are also covered by one attestation from the plugin repository's release workflow, at the release's tag or on main, from the commit the tag points to, which is on main. That proves where and from what they were built, not that anyone reviewed that commit: merging a privileged plugin's main and releasing it ships it without a second look here, by the maintainer's choice.",
           "",
           "CI installs these releases from GitHub against the new lock (`scripts/build-plugins.sh` and the server's plugin tests). Auto-merge (squash) is on: it lands when the required checks pass, and the `fix:` title requests a patch release, so the next daily release brings the app the new versions.",
         ]
       : [
-          "**Needs a maintainer's review — no auto-merge.** A bump merges by itself only when the plugin keeps its tier, its capability digest is exactly the approved one, and — for a privileged plugin — its `plugin.wasm` is attested by the plugin repository's release workflow, at the release's tag or on main, from the commit the tag points to. Here that doesn't hold:",
+          "**Needs a maintainer's review — no auto-merge.** A bump merges by itself only when the plugin keeps its tier, its capability digest is exactly the approved one, its manifest changes nothing but its words, and — for a privileged plugin — its `plugin.wasm` and `plugin.toml` are covered by one attestation from the plugin repository's release workflow, at the release's tag or on main, from the commit the tag points to, which is on main. Here that doesn't hold:",
           "",
-          ...review.map((b) => `- \`${b.id}\` ${b.to}: ${b.why}`),
+          ...review.map((b) => `- \`${b.id}\` ${b.to}: ${code(b.why)}`),
           "",
           "The lock is written with each release's own `tier` and `caps`, so CI can go green without an edit. CI checks only that the lock matches the release; a green check here is not an approval. Read the release's code (the compare link) and the capability changes above, and merge only if the plugin should be able to do that: merging approves those capabilities for every chimaera that installs it, and requests a patch release, which the next daily release ships. To turn the version down, close the PR unmerged.",
         ]),
@@ -370,15 +446,20 @@ export function pullRequest(bumps) {
  *   2. the release, read in full, has the lock's tier: sandboxed stays
  *      sandboxed, privileged stays privileged (any tier change waits);
  *   3. the release's caps digest is the lock's — exactly the approved one;
- *   4. stricter still, its capability lines (`capabilityLines`) are the
- *      pinned release's: a line heuristic is never the only gate;
+ *   4. its whole manifest, parsed, is the pinned release's except for the
+ *      keys that carry no behaviour (`sameBehaviour`, `WORDS_ONLY_KEYS`):
+ *      tool setup steps, program version args, downloads' `bin`/`unpack` and
+ *      every other key the digest leaves out are compared too;
  *   5. for a privileged plugin only: provenance verified (`provenance`, the
- *      result of `verifyProvenance`): its plugin.wasm is attested by the
- *      plugin repository's release workflow, at the release's tag or on
- *      main, from the commit the tag points to. Its new code can
- *      pass new arguments to the same programs, which no digest sees, so
- *      without that the lock PR is where a person reads it. A sandboxed
- *      plugin needs no provenance: the sandbox bounds what its code can do.
+ *      result of `verifyProvenance`): its plugin.wasm and plugin.toml are
+ *      covered by one attestation from the plugin repository's release
+ *      workflow, at the release's tag or on main, from the commit the tag
+ *      points to, which is on main. That proves where and from what the
+ *      files were built; it does not prove anyone reviewed that commit, so
+ *      with this rule whoever can merge to a privileged plugin's main and
+ *      release it ships without a second look at the lock PR (the
+ *      maintainer's chosen trade). A sandboxed plugin needs no provenance:
+ *      the sandbox bounds what its code can do.
  * Anything else waits for a person; `why` names every condition that failed.
  * Because the lock is then written with the release's own tier and caps,
  * CI going green is no approval: this function is the only thing between a
@@ -405,9 +486,7 @@ export function review(entry, pinnedToml, releaseToml, provenance = null) {
   if (next === null) failed.push("the release can't be read for capabilities");
   else if (next.tier !== entry.tier) failed.push(`its tier changes (${entry.tier} → ${next.tier})`);
   if (next === null || next.caps !== entry.caps) failed.push("its capability digest is not the approved one: it may ask for more");
-  if (JSON.stringify(capabilityLines(pinnedToml)) !== JSON.stringify(capabilityLines(releaseToml))) {
-    failed.push("its capability lines changed");
-  }
+  if (!sameBehaviour(pinnedToml, releaseToml)) failed.push("its manifest changes more than its words");
   if (entry.tier !== "sandboxed" && provenance?.verified !== true) {
     failed.push(`it is privileged and its provenance did not verify: ${provenance?.why ?? "not checked"}`);
   }
@@ -472,14 +551,49 @@ export function attestationArgs(file, id, ref) {
   ];
 }
 
+/** The OIDC issuer of GitHub Actions' signing certificates, and the
+ *  predicate a build provenance attestation carries. */
+const ACTIONS_ISSUER = "https://token.actions.githubusercontent.com";
+const SLSA_PROVENANCE = "https://slsa.dev/provenance/v1";
+
+/** Why one attestation from gh's result is not the one we need, or null when
+ *  it is: from exactly the repository, signed by exactly its release
+ *  workflow at `ref`, by GitHub Actions' issuer, from the tagged commit, on
+ *  a GitHub-hosted runner, SLSA provenance, with both files among its
+ *  subjects. */
+function attestationProblem(r, id, digests, ref) {
+  const cert = r?.verificationResult?.signature?.certificate ?? {};
+  const statement = r?.verificationResult?.statement ?? {};
+  if (cert.sourceRepositoryURI !== `https://github.com/${id.repo}`) return "an attestation from another repository";
+  const san = String(cert.subjectAlternativeName ?? "");
+  if (san !== signerIdentity(id.repo, ref)) {
+    const at = san.lastIndexOf("@");
+    if (at < 0 || san.slice(0, at) !== `https://github.com/${id.repo}/${id.workflow}`) return "an attestation signed by another workflow";
+    return `an attestation signed at another ref (${oneLine(san.slice(at + 1), 80)})`;
+  }
+  if (cert.issuer !== ACTIONS_ISSUER) return "an attestation not issued to GitHub Actions";
+  if (cert.sourceRepositoryRef !== ref) return `an attestation made at another ref, not ${ref}`;
+  if (cert.sourceRepositoryDigest !== id.commit) return "an attestation built from another commit than the tag's";
+  if (cert.runnerEnvironment !== "github-hosted") return "an attestation made on a self-hosted runner";
+  if (statement.predicateType !== SLSA_PROVENANCE) return "an attestation that is not SLSA build provenance";
+  const subjects = Array.isArray(statement.subject) ? statement.subject : [];
+  const has = (sha) => subjects.some((s) => s?.digest?.sha256 === sha);
+  if (!has(digests.wasm)) return "an attestation over other bytes";
+  if (!has(digests.toml)) return "no attestation covers this plugin.toml with this plugin.wasm";
+  return null;
+}
+
 /**
  * What `gh attestation verify --format json` printed for the attempt at
- * `ref`, checked again here (fail closed, whatever gh's flags did): at least
- * one verified attestation, every one over `sha256`, from exactly the
- * repository, signed by exactly its release workflow at `ref`, from the
- * tagged commit, on a GitHub-hosted runner. `{verified, why}`.
+ * `ref`, checked again here (fail closed, whatever gh's flags did): verified
+ * only when ONE attestation, on its own, is from exactly the repository,
+ * signed by exactly its release workflow at `ref`, issued to GitHub Actions,
+ * from the tagged commit, on a GitHub-hosted runner, SLSA build provenance,
+ * and has both the wasm's and the toml's sha256 (`digests`, the bytes the
+ * lock pins) among its subjects — so two unrelated attestations, one over
+ * each file, never add up to one. `{verified, why}`.
  */
-export function provenanceFrom(stdout, id, sha256, ref) {
+export function provenanceFrom(stdout, id, digests, ref) {
   let results;
   try {
     results = JSON.parse(stdout);
@@ -488,25 +602,9 @@ export function provenanceFrom(stdout, id, sha256, ref) {
   }
   if (!id.refs.includes(ref)) return { verified: false, why: `not an accepted ref: ${ref}` };
   if (!Array.isArray(results) || results.length === 0) return { verified: false, why: "no attestation" };
-  const workflowURI = `https://github.com/${id.repo}/${id.workflow}`;
-  for (const r of results) {
-    const cert = r?.verificationResult?.signature?.certificate ?? {};
-    const subjects = r?.verificationResult?.statement?.subject ?? [];
-    if (cert.sourceRepositoryURI !== `https://github.com/${id.repo}`) return { verified: false, why: "an attestation from another repository" };
-    const san = String(cert.subjectAlternativeName ?? "");
-    if (san !== signerIdentity(id.repo, ref)) {
-      const at = san.lastIndexOf("@");
-      if (at < 0 || san.slice(0, at) !== workflowURI) return { verified: false, why: "an attestation signed by another workflow" };
-      return { verified: false, why: `an attestation signed at another ref (${oneLine(san.slice(at + 1), 80)})` };
-    }
-    if (cert.sourceRepositoryRef !== ref) return { verified: false, why: `an attestation made at another ref, not ${ref}` };
-    if (cert.sourceRepositoryDigest !== id.commit) return { verified: false, why: "an attestation built from another commit than the tag's" };
-    if (cert.runnerEnvironment !== "github-hosted") return { verified: false, why: "an attestation made on a self-hosted runner" };
-    if (!Array.isArray(subjects) || !subjects.some((s) => s?.digest?.sha256 === sha256)) {
-      return { verified: false, why: "an attestation over other bytes" };
-    }
-  }
-  return { verified: true, why: null };
+  const problems = results.map((r) => attestationProblem(r, id, digests, ref));
+  if (problems.includes(null)) return { verified: true, why: null };
+  return { verified: false, why: problems[0] };
 }
 
 /** What a failed `gh attestation verify` means, in one line. */
@@ -521,11 +619,14 @@ export function provenanceFailure(error) {
 
 /**
  * The commit `tag` points to in `repo`, through the GitHub API (`getJson`
- * fetches one API path): an annotated tag is dereferenced to its commit.
- * Throws unless it ends at a commit with a 40-hex SHA.
+ * fetches one API path): the response must be for exactly `refs/tags/<tag>`,
+ * and an annotated tag is dereferenced to its commit. Throws unless it ends
+ * at a commit with a 40-hex SHA.
  */
 export async function resolveTagCommit(repo, tag, getJson) {
-  let object = (await getJson(`/repos/${repo}/git/ref/tags/${tag}`))?.object;
+  const found = await getJson(`/repos/${repo}/git/ref/tags/${tag}`);
+  if (found?.ref !== `refs/tags/${tag}`) throw new Error(`the API answered for another ref than refs/tags/${tag}`);
+  let object = found.object;
   for (let hops = 0; object?.type === "tag" && hops < 4; hops++) {
     if (!COMMIT_RE.test(object.sha ?? "")) break;
     object = (await getJson(`/repos/${repo}/git/tags/${object.sha}`))?.object;
@@ -537,40 +638,77 @@ export async function resolveTagCommit(repo, tag, getJson) {
 }
 
 /**
- * Whether the release's plugin.wasm (`bytes`, the file whose sha256 the lock
- * takes) is attested by `repo`'s release workflow, at the release's tag or on
- * main, from the commit `tag` points to. Resolves the tag itself, then runs
- * gh once per accepted ref (no shell; the token, when given, only as
- * GH_TOKEN for GitHub's API). Every failure — an unresolvable tag, gh
- * missing, a network error, no attestation, another identity or commit — is
- * `verified: false` with why, never a throw. `{verified, why, workflow, ref,
- * refs, commit}`: `ref` is the ref it was signed at, when it verified.
+ * Whether `commit` is on `repo`'s main: GitHub's compare of `commit...main`
+ * says main is `ahead` of it or `identical`, with `commit` itself as the
+ * merge base. A tag pushed to a side commit runs that commit's own copy of
+ * the release workflow, so its attestation would otherwise verify. Throws on
+ * any other answer, an error or a missing field. Only as strong as who can
+ * push to main.
  */
-export async function verifyProvenance(bytes, repo, tag, { token = "", run = execFileAsync, getJson } = {}) {
+export async function assertOnMain(repo, commit, getJson) {
+  if (!REPO_RE.test(repo)) throw new Error(`not a repository: ${JSON.stringify(repo)}`);
+  if (!COMMIT_RE.test(commit ?? "")) throw new Error(`not a commit: ${JSON.stringify(commit)}`);
+  const branch = MAIN_REF.slice("refs/heads/".length);
+  const cmp = await getJson(`/repos/${repo}/compare/${commit}...${branch}`);
+  if (cmp?.status !== "ahead" && cmp?.status !== "identical") {
+    throw new Error(`the tagged commit is not on ${branch} (compare: ${oneLine(String(cmp?.status ?? "no status"), 40)})`);
+  }
+  if (cmp?.merge_base_commit?.sha !== commit) throw new Error(`the tagged commit is not on ${branch} (another merge base)`);
+}
+
+/** The environment gh runs with: only what it needs to find its config and
+ *  reach the API, and the token as GH_TOKEN — never the rest of ours (the
+ *  workflow's other tokens). */
+export function ghEnv(source, token) {
+  const keep = ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "XDG_CONFIG_HOME", "GH_CONFIG_DIR", "HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"];
+  const env = {};
+  for (const key of keep) if (typeof source[key] === "string") env[key] = source[key];
+  if (token !== "") env.GH_TOKEN = token;
+  return env;
+}
+
+/**
+ * Whether the release's plugin.wasm and plugin.toml (`wasm`, `toml`: the
+ * exact bytes whose sha256s the lock takes) are covered by one attestation
+ * from `repo`'s release workflow, at the release's tag or on main, from the
+ * commit `tag` points to, which is on main. Resolves the tag and checks main
+ * itself, then runs gh on the wasm once per accepted ref (no shell; a
+ * minimal environment with the token only as GH_TOKEN) and checks the toml's
+ * digest in the same attestation. Every failure — an unresolvable tag, a
+ * commit off main, gh missing, a network error, no attestation, another
+ * identity, commit or file — is `verified: false` with why, never a throw.
+ * `{verified, why, workflow, ref, refs, commit}`: `ref` is the ref it was
+ * signed at, when it verified.
+ */
+export async function verifyProvenance(wasm, toml, repo, tag, { token = "", run = execFileAsync, getJson, env = process.env } = {}) {
   const base = { workflow: RELEASE_WORKFLOW, ref: null, refs: [`refs/tags/${tag}`, MAIN_REF], commit: null };
+  const api = getJson ?? ((path) => get(`${API}${path}`, { json: true, max: 4 << 20, token }));
   let commit;
   try {
     if (!REPO_RE.test(repo)) throw new Error(`not a repository: ${JSON.stringify(repo)}`);
     if (!/^v[0-9]+\.[0-9]+\.[0-9]+$/.test(tag)) throw new Error(`not a release tag: ${JSON.stringify(tag)}`);
-    commit = await resolveTagCommit(repo, tag, getJson ?? ((path) => get(`${API}${path}`, { json: true, max: 1 << 20, token })));
+    commit = await resolveTagCommit(repo, tag, api);
   } catch (error) {
     return { ...base, verified: false, why: `the tag's commit is unknown: ${oneLine(error instanceof Error ? error.message : String(error), 160)}` };
   }
+  try {
+    await assertOnMain(repo, commit, api);
+  } catch (error) {
+    return { ...base, commit, verified: false, why: oneLine(error instanceof Error ? error.message : String(error), 160) };
+  }
   const id = attestationIdentity(repo, tag, commit);
   const where = { workflow: id.workflow, refs: id.refs, commit };
+  const digests = { wasm: sha256(wasm), toml: sha256(toml) };
   const dir = await mkdtemp(join(tmpdir(), "plugin-lock-"));
   try {
     const file = join(dir, "plugin.wasm");
-    await writeFile(file, bytes);
-    const env = { ...process.env };
-    delete env.GITHUB_TOKEN;
-    if (token !== "") env.GH_TOKEN = token;
+    await writeFile(file, wasm);
     const failures = [];
     for (const ref of id.refs) {
       let result;
       try {
-        const { stdout } = await run("gh", attestationArgs(file, id, ref), { env, timeout: 180_000, maxBuffer: 16 * 1024 * 1024 });
-        result = provenanceFrom(stdout, id, sha256(bytes), ref);
+        const { stdout } = await run("gh", attestationArgs(file, id, ref), { env: ghEnv(env, token), timeout: 180_000, maxBuffer: 16 * 1024 * 1024 });
+        result = provenanceFrom(stdout, id, digests, ref);
       } catch (error) {
         result = { verified: false, why: provenanceFailure(error) };
       }
@@ -709,7 +847,7 @@ async function check(entry, token) {
   // repository's release workflow, at this tag or on main, from the commit
   // the tag points to.
   const provenance =
-    entry.tier === "privileged" || caps.tier === "privileged" ? await verifyProvenance(wasm, entry.repo, tag, { token }) : null;
+    entry.tier === "privileged" || caps.tier === "privileged" ? await verifyProvenance(wasm, toml, entry.repo, tag, { token }) : null;
   if (provenance !== null) console.log(`${entry.id} ${tag}: provenance ${provenance.verified ? "verified" : `not verified (${provenance.why})`}`);
   const { automerge, why } = review(entry, pinned.toString("utf8"), toml.toString("utf8"), provenance);
   // Every tool download it names, fetched and compared: the lock pins this

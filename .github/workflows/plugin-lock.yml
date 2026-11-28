@@ -8,14 +8,19 @@ name: plugin-lock
 # lock is written with each release's own tier and caps (read from its
 # plugin.toml by .github/scripts/plugin-caps.mjs, held to the daemon's
 # reading by fixtures). The PR auto-merges (squash) only when every bumped
-# plugin keeps its tier and its capability digest is exactly the one the
-# lock approved (and its capability lines are its pinned release's), and a
-# privileged one's plugin.wasm is attested by the plugin repository's
-# release workflow, at the release's tag or on main, from the commit the tag
-# points to (the tag resolved through the API, then `gh attestation
-# verify`, preinstalled on the runner, with this run's token; attestations of
+# plugin keeps its tier, its capability digest is exactly the one the lock
+# approved, its plugin.toml is its pinned release's but for its words (the
+# whole parsed manifest compared), and a privileged one's plugin.wasm and
+# plugin.toml are in one attestation from the plugin repository's release
+# workflow, at the release's tag or on main, from the commit the tag points
+# to, which is on main (the tag and main checked through the API, then
+# `gh attestation verify`, preinstalled on the runner, with this run's token; attestations of
 # public repositories need no extra permission). A sandboxed plugin needs no
-# attestation: the sandbox bounds it. Anything else waits for a person
+# attestation: the sandbox bounds it. An attestation proves the files were
+# built by the plugin repository's release workflow from a commit on its
+# main; it does not prove anyone reviewed that commit, so whoever can merge
+# to a privileged plugin's main and release it ships without a second look
+# here (the maintainer's chosen trade). Anything else waits for a person
 # (docs/design/plugin-platform-plan.md §2), with a body that says which
 # condition failed, whether provenance verified, whether the tier changed and
 # which Can lines the release adds and drops, with the compare link. CI then
