@@ -97,7 +97,9 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   `plugins/plugins.lock` pins: **Mycelium** (fills Knowledge and "Where things stand"; adds
   `knowledge_search` · `knowledge_get` for every agent here), **LaTeX** and **Typst**
   ([below](#programs-and-tools-the-privileged-tier)), and **PowerPoint** (`render_slides` shows
-  agents their slides, `check_deck` finds layout problems, and plain themes or the user's own),
+  agents their slides, `deck_read` gives every slide and shape a stable id with its animation
+  timeline and Morph pairs and says what changed in the file since the agent last looked,
+  `check_deck` finds layout and animation problems, and plain themes or the user's own),
   **Chromium** (a headless `chrome-headless-shell` for the
   [agent browser](agent-browser.md#engines-and-how-one-is-chosen) on a host with none, downloaded
   only from its Tools' Install), **Manimble** (a Manimble deck's slides beside its code in the
