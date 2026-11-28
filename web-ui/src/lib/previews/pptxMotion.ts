@@ -487,6 +487,13 @@ function direction(e: Effect): "in" | "out" | null {
   return null;
 }
 
+/** A name a deck wrote, as a note quotes it: a file can make it any
+ *  length, and a tooltip only needs to say which. */
+const NOTE_NAME_MAX = 40;
+export function noteName(s: string): string {
+  return s.length <= NOTE_NAME_MAX ? s : `${s.slice(0, NOTE_NAME_MAX - 1)}…`;
+}
+
 /**
  * The segments of one effect, its times from the step's start. `geom`
  * gives a target's place (null: not drawn; its behaviours are skipped).
@@ -554,7 +561,7 @@ export function effectMotion(e: Effect, geom: (key: string) => Geom | null): Eff
         const region = clipRegion(f.full, goingOut);
         if (region === null) {
           // A filter it doesn't draw fades.
-          note ??= `${e.name}: plays as a fade (${f.name})`;
+          note ??= `${e.name}: plays as a fade (${noteName(f.name)})`;
           segments.push({ key, ch: "op", value: (s) => { const q = local(s); return q === null ? null : goingOut ? 1 - q : q; } });
           break;
         }
@@ -569,11 +576,11 @@ export function effectMotion(e: Effect, geom: (key: string) => Geom | null): Eff
             colour = true;
             break;
           }
-          return fade(`${attr || "an attribute"} isn't animated here`);
+          return fade(`${noteName(attr) || "an attribute"} isn't animated here`);
         }
         const read = HELD_CHANNELS.has(ch) ? decimalOf : (v: TimeValue | null) => valueOf(v, g);
         const keys = animKeys(b, read, curOf(ch, g));
-        if (keys === null) return fade(`a value it can't read on ${attr}`);
+        if (keys === null) return fade(`a value it can't read on ${noteName(attr)}`);
         const discrete = b.calcmode === "discrete";
         segments.push({ key, ch, value: (s) => { const q = local(s); return q === null ? null : keyValue(keys, q, discrete); } });
         break;

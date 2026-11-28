@@ -243,11 +243,12 @@ export function paraOffset(off: readonly [number, number], w: number, h: number,
 
 type Styled = HTMLElement | SVGElement;
 
-/** Inline values an element had before a state touched it. */
+/** Inline values an element had before a state touched it, each with its
+ *  priority (`important` or ""). */
 interface Kept {
   hadStyle: boolean;
   inert: boolean;
-  props: Map<string, string>;
+  props: Map<string, readonly [string, string]>;
 }
 const kept = new WeakMap<Element, Kept>();
 /** Every element a state touched on a slide, so clearing finds them. */
@@ -255,7 +256,7 @@ const touched = new WeakMap<TaggedSlide, Set<Styled>>();
 
 /** The value `prop` had before any state touched `el` ("" when unset). */
 function original(el: Styled, prop: string): string {
-  return kept.get(el)?.props.get(prop) ?? el.style.getPropertyValue(prop);
+  return kept.get(el)?.props.get(prop)?.[0] ?? el.style.getPropertyValue(prop);
 }
 
 function setProp(t: TaggedSlide, el: Styled, prop: string, value: string): void {
@@ -264,7 +265,7 @@ function setProp(t: TaggedSlide, el: Styled, prop: string, value: string): void 
     k = { hadStyle: el.hasAttribute("style"), inert: el.hasAttribute("inert"), props: new Map() };
     kept.set(el, k);
   }
-  if (!k.props.has(prop)) k.props.set(prop, el.style.getPropertyValue(prop));
+  if (!k.props.has(prop)) k.props.set(prop, [el.style.getPropertyValue(prop), el.style.getPropertyPriority(prop)]);
   el.style.setProperty(prop, value);
   let set = touched.get(t);
   if (set === undefined) touched.set(t, (set = new Set()));
@@ -281,9 +282,9 @@ function restore(el: Styled): void {
   const k = kept.get(el);
   if (k === undefined) return;
   kept.delete(el);
-  for (const [prop, v] of k.props) {
+  for (const [prop, [v, priority]] of k.props) {
     if (v === "") el.style.removeProperty(prop);
-    else el.style.setProperty(prop, v);
+    else el.style.setProperty(prop, v, priority);
   }
   if (!k.inert) el.removeAttribute("inert");
   if (!k.hadStyle && el.style.cssText === "") el.removeAttribute("style");
@@ -618,18 +619,23 @@ export interface ElementBase {
 }
 
 /**
- * How far past a paragraph's words a wipe from the left or right lays its
- * sweep, on each side, in the paragraph's font size. PowerPoint's film
- * (one-line paragraphs at 40 pt, left and centred, a 253 px and a 1,287 px
- * line, wiped from either side over 1 s; and the `paragraphs` deck's 28 pt
- * line over 500 ms) moves the edge at (words + 1.4 em) × 1.15 per duration:
- * 424 and 421 px/s against 1.15 × (253 + 112) = 420, 1,631 and 1,636
- * against 1,609, 414 when centred; the D9 line 0.58 px/ms against 0.57.
- * The words alone (as for a shape's box) ran 30 % slow on a short line.
+ * How far past a paragraph's words (left and right) and lines (top and
+ * bottom) a transition filter lays the box it sweeps, on each side, in
+ * the paragraph's font size. PowerPoint's film (one-line paragraphs at
+ * 40 pt, left and centred, a 253 px and a 1,287 px line, wiped from either
+ * side over 1 s; and the `paragraphs` deck's 28 pt line over 500 ms) moves
+ * the edge at (words + 1.4 em) × 1.15 per duration: 424 and 421 px/s
+ * against 1.15 × (253 + 112) = 420, 1,631 and 1,636 against 1,609, 414
+ * when centred; the D9 line 0.58 px/ms against 0.57. The words alone (as
+ * for a shape's box) ran 30 % slow on a short line. A split across a
+ * 40 pt line and a three-line paragraph moves each edge at 202 and 458
+ * px/s, the words plus 0.6–0.7 em a side; a wipe from the top or bottom at
+ * 205/208 and 425 px/s, the lines plus 0.5–0.6 em a side (the lines
+ * alone: 110 and 315). So every filter on a paragraph sweeps the padded
+ * box (only wipes and split are filmed).
  */
 export const WIPE_PAD_EM = 0.7;
-/** A horizontal wipe: PowerPoint's film shows the padded sweep for these. */
-const HORIZONTAL_WIPE = /^wipe(?:\((?:left|right)?\))?$/;
+export const WIPE_PAD_Y_EM = 0.55;
 
 /** An element's inline values once the click has landed (`none` where the
  *  landed state sets nothing): every track's last frame. */
@@ -878,9 +884,10 @@ export function planStep(
             op *= v;
             break;
           case "clip": {
-            // A paragraph's horizontal wipe sweeps past its words (WIPE_PAD_EM).
-            const pad = id.includes("#") && b.em !== undefined && HORIZONTAL_WIPE.test(s.filter ?? "") ? WIPE_PAD_EM * b.em : 0;
-            clip = s.region!(Math.min(1, Math.max(0, v)), b.bw + 2 * pad, b.bh, (b.bx ?? 0) - pad, b.by ?? 0);
+            // A paragraph's filter sweeps past its words and lines (WIPE_PAD_EM).
+            const para = id.includes("#") && b.em !== undefined;
+            const [px, py] = para ? [WIPE_PAD_EM * b.em!, WIPE_PAD_Y_EM * b.em!] : [0, 0];
+            clip = s.region!(Math.min(1, Math.max(0, v)), b.bw + 2 * px, b.bh + 2 * py, (b.bx ?? 0) - px, (b.by ?? 0) - py);
             break;
           }
           case "mask":

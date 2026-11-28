@@ -1,6 +1,6 @@
 import JSZip from "jszip";
 import { describe, expect, it } from "vitest";
-import { clipMargin, clipRegion, effectMotion, motionNotes, pacedSampler, pathPolyline, patternOf, patternShare, progress, revealPoint, warp, type Geom, type MaskFrame } from "./pptxMotion";
+import { clipMargin, clipRegion, effectMotion, motionNotes, noteName, pacedSampler, pathPolyline, patternOf, patternShare, progress, revealPoint, warp, type Geom, type MaskFrame } from "./pptxMotion";
 import { entryState, MAX_FRAMES, PLAY_BUDGET, planStep, type ElementBase, type ShapeInfo } from "./pptxPlay";
 import { buildStates, parseTimeline, pathEnd, type Effect, type SlideTimeline } from "./pptxTiming";
 
@@ -546,5 +546,14 @@ describe("the contract's played-as-a-fade list (fixtures/pptx-timing/fallbacks.j
       if (note !== null && note.includes("plays as a fade")) fallsBack.add(/^[a-z]+/.exec(f)![0]);
     }
     expect([...fallsBack].sort()).toEqual([...new Set(listed)].sort());
+  });
+});
+
+describe("a note quotes a deck's names bounded", () => {
+  it("keeps a short name and cuts a long one to 40 characters", () => {
+    expect(noteName("style.rotation")).toBe("style.rotation");
+    const long = noteName(`style.${"x".repeat(300)}`);
+    expect(long).toHaveLength(40);
+    expect(long.endsWith("…")).toBe(true);
   });
 });

@@ -1017,9 +1017,12 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   paragraph's words at rest are as sharp as the same words laid out at that size). The last
   animated frame and the landed one are the same picture (0 px apart in window captures of fade,
   zoom, float, fly, wipe, grow by box and by paragraph and a path in WebKit; a shrink and a turn
-  differ 1 ms before their end only by the motion left). A paragraph wiped from the left or right sweeps its words padded by
-  0.7 em on each side, at PowerPoint's pace (its film: 424 px/s for a 253 px line over 1 s, where
-  the words alone gave 300). A wipe, pattern or iris is laid over the shape's whole drawing, its
+  differ 1 ms before their end only by the motion left). A paragraph's wipe, split or other filter sweeps its words padded by
+  0.7 em on the left and right and its lines by 0.55 em above and below, at PowerPoint's pace (its
+  film: 424 px/s for a 253 px line wiped from the side over 1 s, where the words alone gave 300; a
+  wipe from the top or bottom reveals a 40 pt line in 0.35 s of 1 s, and the viewer now in 0.32–0.36
+  against 0.60–0.64 unpadded; a split's edges move at 202 and 458 px/s on one and three lines,
+  the viewer's at 212 and 461; blinds, box, circle and the rest follow the same box, unfilmed). A wipe, pattern or iris is laid over the shape's whole drawing, its
   outline and shadow included (a scaled shadow too), as PowerPoint's film lays it, and reveals the
   shadow with the shape: while it plays the shape's box is grown to the mask's by a transparent border,
   its content held in place to the device pixel, so nothing pops in when it lands. The next click

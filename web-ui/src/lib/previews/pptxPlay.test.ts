@@ -1,6 +1,6 @@
 import JSZip from "jszip";
 import { describe, expect, it } from "vitest";
-import { boxGeom, clearMasks, clearState, colorEasing, colorWindows, maskCacheStats, maskImages, paintedKeyframes, paraOffset, planState, playStep, releaseMasks, retainMasks, transformScale, type ShapeInfo } from "./pptxPlay";
+import { applyState, boxGeom, clearMasks, clearState, colorEasing, colorWindows, maskCacheStats, maskImages, paintedKeyframes, paraOffset, planState, playStep, releaseMasks, retainMasks, transformScale, type ShapeInfo } from "./pptxPlay";
 import type { Pattern } from "./pptxMotion";
 import type { TaggedSlide } from "./pptxTag";
 import { buildStates, parseTimeline, type BuildState, type GoldenSlide } from "./pptxTiming";
@@ -134,7 +134,9 @@ const kebab = (k: string) => k.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`);
  *  keyframes it was given). */
 class FakeEl {
   props = new Map<string, string>();
-  style: Record<string, string> & { cssText: string; getPropertyValue(p: string): string; setProperty(p: string, v: string): void; removeProperty(p: string): void };
+  /** Properties set `!important`. */
+  important = new Set<string>();
+  style: Record<string, string> & { cssText: string; getPropertyValue(p: string): string; getPropertyPriority(p: string): string; setProperty(p: string, v: string, priority?: string): void; removeProperty(p: string): void };
   attrs = new Map<string, string>();
   parentElement: FakeEl | null = null;
   offsetWidth = 100;
@@ -147,8 +149,14 @@ class FakeEl {
     if (box) for (const [k, v] of Object.entries({ left: "10px", top: "20px", width: "100px", height: "50px", position: "absolute" })) this.props.set(k, v);
     const methods = {
       getPropertyValue: (p: string) => this.props.get(p) ?? "",
-      setProperty: (p: string, v: string) => void (v === "" ? this.props.delete(p) : this.props.set(p, v)),
-      removeProperty: (p: string) => void this.props.delete(p),
+      getPropertyPriority: (p: string) => (this.important.has(p) ? "important" : ""),
+      setProperty: (p: string, v: string, priority = "") => {
+        if (priority === "important") this.important.add(p);
+        else this.important.delete(p);
+        if (v === "") this.props.delete(p);
+        else this.props.set(p, v);
+      },
+      removeProperty: (p: string) => void (this.props.delete(p), this.important.delete(p)),
     };
     this.style = new Proxy(methods, {
       get: (t, k: string) => {
@@ -512,5 +520,25 @@ describe("a grow or turn plays through painted custom properties", () => {
       { offset: 1, "--pptx-sx": "1", "--pptx-sy": "1", "--pptx-turn": "0deg" },
       { offset: 1, "--pptx-sx": "2", "--pptx-sy": "2" },
     ]);
+  });
+});
+
+describe("clearState puts back what the renderer drew", () => {
+  it("keeps an inline declaration's priority", () => {
+    const t = parseTimeline(
+      `<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree/></p:cSld><p:timing><p:tnLst><p:par><p:cTn id="1" dur="indefinite" nodeType="tmRoot"><p:childTnLst><p:seq><p:cTn id="2" dur="indefinite" nodeType="mainSeq"><p:childTnLst>` +
+        `<p:par><p:cTn id="3" fill="hold"><p:stCondLst><p:cond delay="indefinite"/></p:stCondLst><p:childTnLst><p:par><p:cTn id="4" fill="hold"><p:stCondLst><p:cond delay="0"/></p:stCondLst><p:childTnLst>` +
+        `<p:par><p:cTn id="5" presetID="10" presetClass="exit" nodeType="clickEffect"><p:stCondLst><p:cond delay="0"/></p:stCondLst><p:childTnLst>` +
+        `<p:set><p:cBhvr><p:cTn id="6" dur="1" fill="hold"><p:stCondLst><p:cond delay="499"/></p:stCondLst></p:cTn><p:tgtEl><p:spTgt spid="2"/></p:tgtEl><p:attrNameLst><p:attrName>style.visibility</p:attrName></p:attrNameLst></p:cBhvr><p:to><p:strVal val="hidden"/></p:to></p:set>` +
+        `</p:childTnLst></p:cTn></p:par></p:childTnLst></p:cTn></p:par></p:childTnLst></p:cTn></p:par></p:childTnLst></p:cTn></p:seq></p:childTnLst></p:cTn></p:par></p:tnLst></p:timing></p:sld>`,
+    );
+    const { tagged, all } = fakeSlide(t);
+    const el = all[0]!;
+    el.style.setProperty("opacity", "0.5", "important");
+    applyState(tagged, buildStates(t)[1]!, W, H);
+    expect(el.style.getPropertyValue("opacity")).toBe("0");
+    clearState(tagged);
+    expect(el.style.getPropertyValue("opacity")).toBe("0.5");
+    expect(el.style.getPropertyPriority("opacity")).toBe("important");
   });
 });
