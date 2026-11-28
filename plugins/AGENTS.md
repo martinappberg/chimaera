@@ -10,7 +10,7 @@ its `plugin.toml`, and each publishing a GitHub release per version:
 - PowerPoint (privileged: LibreOffice): [martinappberg/chimaera-plugin-pptx](https://github.com/martinappberg/chimaera-plugin-pptx)
 - Chromium (privileged: a downloaded chrome-headless-shell, `provides.browser`): [martinappberg/chimaera-plugin-chromium](https://github.com/martinappberg/chimaera-plugin-chromium)
 - Manimble (privileged: python3, which drives the Manimble engine installed on the host): [martinappberg/chimaera-plugin-manimble](https://github.com/martinappberg/chimaera-plugin-manimble)
-- GenomeSpy (sandboxed: reads files): [martinappberg/chimaera-plugin-genomespy](https://github.com/martinappberg/chimaera-plugin-genomespy)
+- GenomeSpy (sandboxed: reads files, draws its own web view): [martinappberg/chimaera-plugin-genomespy](https://github.com/martinappberg/chimaera-plugin-genomespy)
 
 This directory holds what the chimaera repository needs of them: the lock
 that names them and pins one release of each (the only plugin data the daemon
