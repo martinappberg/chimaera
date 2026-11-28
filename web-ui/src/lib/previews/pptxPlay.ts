@@ -877,7 +877,11 @@ export function planStep(
       return f;
     });
     land(keyframes, landed(id));
-    if (pattern === undefined) tracks.push({ id, keyframes });
+    if (pattern === undefined) {
+      // A clip's mask covers the box pushed out by the margin (`clipRegion`).
+      const e = clipMargin(b.bw, b.bh);
+      tracks.push(clips ? { id, keyframes, box: [(b.bx ?? 0) - e, (b.by ?? 0) - e, b.bw + 2 * e, b.bh + 2 * e] } : { id, keyframes });
+    }
     else {
       // The pattern covers the box, pushed out like a clip so a shadow or
       // outline drawn past the box goes with it.
@@ -1081,6 +1085,31 @@ function inkPad(el: HTMLElement): [number, number, number, number] {
     pad[1] = Math.max(pad[1], b - dy);
     pad[2] = Math.max(pad[2], b + dx);
     pad[3] = Math.max(pad[3], b + dy);
+  }
+  // A shadow the renderer draws as a blurred, scaled copy of the outline
+  // (PowerPoint's scaled shadows): its box is the shape's scaled about the
+  // anchor, moved by the group's translate, and reaches the shadow's blur
+  // radius past it, which the renderer draws as 3σ. PowerPoint's film of a
+  // 92 % shadow (blur 25 pt, 10 pt at 135°, aligned top right) on a 317 px
+  // tall shape lays its blinds 65 px apart: over 390 px, the scaled box
+  // plus the radius (49 slide px past the box), not 2σ (27).
+  const [W0, H0] = [parseFloat(el.style.width), parseFloat(el.style.height)];
+  for (const g of el.querySelectorAll(':scope > svg g[data-pptx-outer-shadow="scaled-silhouette"]')) {
+    if (!Number.isFinite(W0) || !Number.isFinite(H0)) break;
+    const num = (a: string) => Number.parseFloat(g.getAttribute(a) ?? "");
+    const [sx, sy, ax, ay] = [num("data-pptx-shadow-scale-x"), num("data-pptx-shadow-scale-y"), num("data-pptx-shadow-anchor-x"), num("data-pptx-shadow-anchor-y")];
+    const m = /translate\(\s*(-?[\d.e]+)[\s,]+(-?[\d.e]+)\s*\)/.exec(g.getAttribute("transform") ?? "");
+    const filter = /url\(#([^)]+)\)/.exec(g.getAttribute("filter") ?? "")?.[1];
+    const blur = filter === undefined ? null : el.querySelector(`:scope > svg filter[id="${CSS.escape(filter)}"] feGaussianBlur`);
+    const b = 3 * (Number.parseFloat(blur?.getAttribute("stdDeviation") ?? "") || 0);
+    const [dx, dy] = m === null ? [0, 0] : [Number(m[1]), Number(m[2])];
+    if (![sx, sy, ax, ay, dx, dy, b].every(Number.isFinite) || b > 1000) continue;
+    const xs = [ax + (0 - ax) * sx + dx, ax + (W0 - ax) * sx + dx];
+    const ys = [ay + (0 - ay) * sy + dy, ay + (H0 - ay) * sy + dy];
+    pad[0] = Math.max(pad[0], b - Math.min(...xs));
+    pad[1] = Math.max(pad[1], b - Math.min(...ys));
+    pad[2] = Math.max(pad[2], Math.max(...xs) + b - W0);
+    pad[3] = Math.max(pad[3], Math.max(...ys) + b - H0);
   }
   return pad.map((v) => Math.min(v, 200)) as [number, number, number, number];
 }
@@ -1386,16 +1415,94 @@ function withMasks(kf: readonly PlayKeyframe[], tr: { box: [number, number, numb
   }) as Keyframe[];
 }
 
-/** A mask is painted only inside the element's border box by default
- *  (`mask-clip: border-box`), so a shape's shadow and the outer half of its
- *  outline, drawn past the box, vanished for the length of a wipe, a
- *  pattern or an iris and came back when it landed; the masks already
- *  reach past the box by the shadow's margin (`clipMargin`). The outline
- *  now stays; the shadow past the box is still clipped in Chrome and WebKit
- *  (not `mask-clip`: removing the mask brings it back, a transparent
- *  outline widening the ink does not). */
+/** Whether a track draws through a mask on any frame. */
 function masked(kf: readonly object[]): boolean {
   return kf.some((f) => "maskImage" in f && (f as { maskImage?: string }).maskImage !== "none");
+}
+
+/**
+ * A mask is painted only inside its element's border box: WebKit ignores
+ * `mask-clip: no-clip` and Chrome clips a masked element to an ink box that
+ * falls short of an SVG shadow, so a shape's shadow (and in WebKit the
+ * outer half of its outline) vanished for the length of a wipe, a pattern
+ * or an iris and popped in when it landed. PowerPoint's film shows the
+ * filter laid over the shadow too. So while a whole shape (or its `!bg`
+ * picture) plays through a mask, its border box is grown to the mask's
+ * box (`box`: the shape's box pushed out by its ink and the margin) with
+ * a transparent border, and a negative margin keeps its content where it
+ * was. Engines snap border widths to device px in their own ways (Chrome
+ * after `zoom`, WebKit before it), so the margin is corrected by what
+ * layout did, measured on the content with the element's transforms off;
+ * the correction is in rect units over rect units, never assumed. Returns
+ * where the content sits in the grown border box (the masks' shift) and
+ * how to put every touched value back; null where it can't (a
+ * `transform-origin` of its own, nothing to measure): the mask then
+ * clips as before.
+ */
+function inflate(el: Styled, size: readonly [number, number], box: readonly [number, number, number, number]): { shift: [number, number]; restore(): void } | null {
+  const [W0, H0] = size;
+  const [x, y, bw, bh] = box;
+  const [L, T, R, B] = [-x, -y, x + bw - W0, y + bh - H0].map((v) => Math.max(0, Math.ceil(v)));
+  if (![W0, H0, L, T, R, B].every(Number.isFinite) || L + T + R + B === 0) return null;
+  const s = el.style;
+  const origin = s.getPropertyValue("transform-origin").trim();
+  if (origin !== "" && origin !== "center" && origin !== "50% 50%") return null;
+  const probe = "ownerSVGElement" in el || el.tagName.toLowerCase() === "svg" ? el.querySelector("path, rect, ellipse, polygon, image, use") : el.firstElementChild;
+  if (probe === null) return null;
+  const keys = ["border-style", "border-color", "border-top-width", "border-right-width", "border-bottom-width", "border-left-width", "margin-left", "margin-top", "box-sizing", "transform-origin"];
+  const moves = ["transform", "translate", "rotate", "scale"];
+  let saved: (readonly [string, string, string])[];
+  try {
+    saved = [...keys, ...moves].map((k) => [k, s.getPropertyValue(k), s.getPropertyPriority(k)] as const);
+  } catch {
+    return null;
+  }
+  const put = (only: readonly string[]) => {
+    for (const [k, v, pr] of saved) if (only.includes(k)) v === "" ? s.removeProperty(k) : s.setProperty(k, v, pr);
+  };
+  const restore = () => put([...keys, ...moves]);
+  try {
+    for (const k of moves) s.setProperty(k, "none");
+    const c0 = probe.getBoundingClientRect();
+    s.setProperty("box-sizing", "content-box");
+    s.setProperty("border-style", "solid");
+    s.setProperty("border-color", "transparent");
+    s.setProperty("border-width", `${T}px ${R}px ${B}px ${L}px`);
+    const at = (dx: number, dy: number) => {
+      s.setProperty("margin-left", `${-L - dx}px`);
+      s.setProperty("margin-top", `${-T - dy}px`);
+      return probe.getBoundingClientRect();
+    };
+    const c2 = at(8, 8);
+    const c1 = at(0, 0);
+    const [fx, fy] = [(c1.left - c2.left) / 8, (c1.top - c2.top) / 8];
+    if (!(fx > 0 && fy > 0)) {
+      restore();
+      return null;
+    }
+    const [cx, cy] = [(c1.left - c0.left) / fx, (c1.top - c0.top) / fy];
+    if (!Number.isFinite(cx) || !Number.isFinite(cy) || Math.abs(cx) > 4 || Math.abs(cy) > 4) {
+      restore();
+      return null;
+    }
+    at(cx, cy);
+    const shift: [number, number] = [L + cx, T + cy];
+    s.setProperty("transform-origin", `${r3(shift[0] + W0 / 2)}px ${r3(shift[1] + H0 / 2)}px`);
+    put(moves);
+    return { shift, restore };
+  } catch {
+    restore();
+    return null;
+  }
+}
+
+/** Keyframes with each mask moved by `shift` (the grown border box's origin
+ *  to the content's). */
+function shiftMasks(kf: readonly Keyframe[], [dx, dy]: readonly [number, number]): Keyframe[] {
+  return kf.map((f) => {
+    const pos = typeof f.maskPosition === "string" ? /^(-?[\d.]+)px (-?[\d.]+)px$/.exec(f.maskPosition) : null;
+    return pos === null ? f : { ...f, maskPosition: `${r3(Number(pos[1]) + dx)}px ${r3(Number(pos[2]) + dy)}px` };
+  });
 }
 
 /** A click planned ahead: everything `playStep` needs but the animations. */
@@ -1544,6 +1651,7 @@ export function playStep(tagged: TaggedSlide, timeline: SlideTimeline, k: number
   const playing: Playing = { finished, finish: () => {}, approximate: false };
   const anims: Animation[] = [];
   const held: MaskSet[] = [];
+  const inflated: { restore(): void }[] = [];
   let done = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const land = () => {
@@ -1555,6 +1663,7 @@ export function playStep(tagged: TaggedSlide, timeline: SlideTimeline, k: number
     try {
       if (after !== undefined) playing.approximate = applyState(tagged, after, opts.w, opts.h, palette);
     } finally {
+      for (const g of inflated.splice(0)) g.restore();
       for (const a of anims) a.cancel();
       releaseMasks(held.splice(0));
       resolve();
@@ -1591,7 +1700,18 @@ export function playStep(tagged: TaggedSlide, timeline: SlideTimeline, k: number
         }
         kf = withMasks(planned, { box: tr.box }, set);
       }
-      anims.push(el.animate((masked(kf) ? kf.map((f) => ({ ...f, maskClip: "no-clip" })) : kf) as unknown as Keyframe[], { duration, fill: "both", easing: "linear" }));
+      let frames = kf as Keyframe[];
+      if (masked(kf)) {
+        const spid = tr.id.split(/[#!]/)[0]!;
+        const shape = tagged.shapes.get(spid);
+        const size = shape === undefined ? null : ([parseFloat(shape.el.style.width), parseFloat(shape.el.style.height)] as const);
+        const grown = !tr.id.includes("#") && tr.box !== undefined && size !== null ? inflate(el, size, tr.box) : null;
+        if (grown !== null) {
+          inflated.push(grown);
+          frames = shiftMasks(frames, grown.shift);
+        } else frames = frames.map((f) => ({ ...f, maskClip: "no-clip" }));
+      }
+      anims.push(el.animate(frames, { duration, fill: "both", easing: "linear" }));
     }
     for (const bl of blends) {
       if (typeof bl.el.animate !== "function") continue;
