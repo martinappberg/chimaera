@@ -955,6 +955,29 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   Transitions and effect motion aren't played yet, and missing fonts fall back to the system's;
   the ⓘ in the bar says so, and counts shapes that couldn't be drawn. Refused past 100 MB. A reveal's
   plain line (`deck.pptx:3`, a deck check's problem on slide 3) lands on that slide.
+  A click in the show advances one build, as the clicker would, except on a link in the slide (a
+  web link opens through the app, a slide link jumps) and when the press dragged or selected text.
+- **Presenting a deck.** **presenter** (or P) is the speaker's side of the show: the stage
+  becomes this slide at its current build, beside the next click drawn live (a second render of
+  that slide with the state it reaches: the same slide one build on, or the next shown slide
+  before its first click; "End of the show" after the last), over the speaker notes, with a timer
+  (it ticks only while the view is visible; a click on it starts it over), the place ("3 / 12 ·
+  2 of 4 clicks") and the time of day, and the strip of every slide below, hidden ones dimmed,
+  whose click jumps the show to that slide's first state. The click dots stay in the bar, and the
+  keys work as in the show from anywhere in the view. **show in window** opens the same tab in a
+  new window that starts its own show (drag it to the projector) and makes this view the
+  presenter's once that window is open: a localStorage invite, fresh for 60 s and taken only by
+  a document created after it, starts the new window's show, and a blocked window clears it and
+  leaves the view as it was. The two windows keep step over a `BroadcastChannel` named for the
+  workspace and the deck's path, only while either is in the show or the presenter's view: each
+  click, jump and dot names the slide's part (`ppt/slides/slide3.xml`, stable when slides are
+  reordered) and the build, and a window joining late asks where the other stands. A deck saved
+  again on disk mid-show (from PowerPoint, an agent) keeps both windows on the same slide part,
+  the build held to its clicks. Edit mode is not offered in the show window, and **edit** from
+  the presenter's view leaves it first. The show, the presenter's view, the timer, the windows'
+  sync and the invite are the shared show controller (`show/showController.svelte.ts`, messages
+  in `show/showSync.ts`) that the plugin deck viewer's presenter view mirrors, and the layout is
+  `show/PresenterView.svelte`, styled as that viewer's.
 - **Editing a deck.** The bar's **edit** turns the stage into an editor (`PptxEditLayer.svelte`):
   click a shape to select it (the grey around the slide deselects), drag it (snapping to the
   slide's edges and centre and to other shapes, with guides and a position readout in points;
