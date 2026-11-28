@@ -9,9 +9,11 @@ import { parseUpdateStatus, type UpdateStatus } from "../workspace/update.svelte
 import {
   decodeBrowserLinks,
   decodeBrowserRequest,
+  parsePluginReveal,
   type BrowserClientMessage,
   type BrowserLink,
   type BrowserRequest,
+  type PluginReveal,
 } from "./browserWire";
 
 const INITIAL_BACKOFF_MS = 500;
@@ -93,6 +95,12 @@ export interface EventsSocketHandlers {
    * decides whether it is the one to act (`browser/agentOpen.ts`).
    */
   onBrowserOpen?(open: AgentBrowserOpen): void;
+  /**
+   * A plugin opens one of its views beside an agent session (`reveal`):
+   * sent to every window connected at that moment, never replayed; the
+   * window decides as for `browser_open`.
+   */
+  onPluginReveal?(reveal: PluginReveal): void;
   /**
    * The agent browser asks this window to act on a page (open, drive,
    * hand over…). Sent to ONE chosen window, never replayed; every request
@@ -353,6 +361,9 @@ export class EventsSocket {
       } else if (msg.type === "browser_open") {
         const open = parseAgentBrowserOpen(msg);
         if (open !== null) this.handlers.onBrowserOpen?.(open);
+      } else if (msg.type === "plugin_reveal") {
+        const reveal = parsePluginReveal(msg);
+        if (reveal !== null) this.handlers.onPluginReveal?.(reveal);
       } else if (msg.type === "browser_request") {
         const req = decodeBrowserRequest(msg);
         if (req !== null) this.handlers.onBrowserRequest?.(req);

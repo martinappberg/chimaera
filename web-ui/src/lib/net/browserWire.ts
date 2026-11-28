@@ -87,6 +87,20 @@ export interface BrowserHello {
    *  and its address in the app's terms, `http://host:port/path` — never
    *  the `/proxy/` URL, and no query (a token rides there). */
   pages?: BrowserPage[];
+  /** Plugins' web nodes shown on screen here: they answer their plugin's
+   *  calls (`web_call`, `plugins/ui/webCalls.ts`). */
+  web_views?: HelloWebView[];
+}
+
+/** One plugin web node a window shows (a file view's file is
+ *  workspace-relative). */
+export interface HelloWebView {
+  /** The workspace whose screen shows it. */
+  workspace: string;
+  plugin: string;
+  view: string;
+  id: string;
+  file: string | null;
 }
 
 export interface BrowserPage {
@@ -108,8 +122,52 @@ export function sameHello(a: BrowserHello | null, b: BrowserHello): boolean {
     a.height === b.height &&
     a.tabs.length === b.tabs.length &&
     a.tabs.every((t, i) => t === b.tabs[i]) &&
-    samePages(a.pages ?? [], b.pages ?? [])
+    samePages(a.pages ?? [], b.pages ?? []) &&
+    sameWebViews(a.web_views ?? [], b.web_views ?? [])
   );
+}
+
+function sameWebViews(a: HelloWebView[], b: HelloWebView[]): boolean {
+  return (
+    a.length === b.length &&
+    a.every(
+      (w, i) =>
+        w.workspace === b[i].workspace && w.plugin === b[i].plugin && w.view === b[i].view && w.id === b[i].id && w.file === b[i].file,
+    )
+  );
+}
+
+/** One `{"type":"plugin_reveal", ...}` frame: a plugin opens one of its
+ *  views (or a file it claims, in its view) beside an agent session,
+ *  without taking focus (`plugins::reveal`). */
+export interface PluginReveal {
+  sessionId: string;
+  workspaceId: string;
+  plugin: string;
+  view: string;
+  /** Workspace-relative, for a file it claims. */
+  file: string | null;
+  args: Record<string, unknown>;
+}
+
+/** Validate a frame; null for anything malformed (dropped, never thrown). */
+export function parsePluginReveal(raw: unknown): PluginReveal | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const f = raw as Record<string, unknown>;
+  const text = (v: unknown): v is string => typeof v === "string" && v !== "";
+  if (!text(f.session_id) || !text(f.workspace_id) || !text(f.plugin) || !text(f.view)) return null;
+  const file = f.file === null || f.file === undefined ? null : f.file;
+  if (file !== null && (!text(file) || file.startsWith("/") || file.split("/").includes(".."))) return null;
+  const args = f.args ?? {};
+  if (typeof args !== "object" || args === null || Array.isArray(args)) return null;
+  return {
+    sessionId: f.session_id,
+    workspaceId: f.workspace_id,
+    plugin: f.plugin,
+    view: f.view,
+    file,
+    args: args as Record<string, unknown>,
+  };
 }
 
 function samePages(a: BrowserPage[], b: BrowserPage[]): boolean {

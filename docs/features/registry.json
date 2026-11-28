@@ -709,14 +709,20 @@
       "page": "docs/features/web-views.md",
       "paths": [
         "crates/chimaera-server/src/plugins/web.rs",
+        "crates/chimaera-server/src/plugins/web_calls.rs",
+        "crates/chimaera-server/src/plugins/web_headless.rs",
+        "crates/chimaera-server/src/plugins/reveal.rs",
         "crates/chimaera-core/src/page_api.js",
         "crates/chimaera-core/src/chimaera_web.css",
         "web-ui/src/lib/plugins/ui/WebNode.svelte",
         "web-ui/src/lib/plugins/ui/webViews.svelte.ts",
+        "web-ui/src/lib/plugins/ui/webCalls.ts",
         "web-ui/src/lib/shared/guardFrame.ts",
         "web-ui/src/lib/shared/pageCrop.ts",
         "web-ui/src/lib/shared/pageNeeds.ts",
-        "plugins/test-web/**"
+        "plugins/test-web/**",
+        "plugins/api-0.3/**",
+        "plugins/test-api-0.3/**"
       ],
       "maps": [
         "crates/chimaera-server/AGENTS.md",

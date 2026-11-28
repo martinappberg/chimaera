@@ -1,11 +1,12 @@
 //! The Rust side of the `chimaera:plugin` WIT world (`wit/chimaera.wit`,
-//! package `chimaera:plugin@0.3.0`): what a Chimaera plugin implements
+//! package `chimaera:plugin@0.4.0`): what a Chimaera plugin implements
 //! ([`Plugin`]), what it may ask the host ([`host`], and the platform's
 //! [`platform`]). Design: `docs/design/plugin-system-plan.md` (the host) and
 //! `docs/design/plugin-platform-plan.md` (screens, surfaces, files, settings,
 //! output folders, programs) and `docs/design/rich-views-plan.md` (0.3's web
-//! pages). A 0.1 or 0.2 plugin moves to 0.3 by bumping this dependency and its
-//! manifest's `api`: every new export has a default.
+//! pages; 0.4's calls to them and reveal). An older plugin moves to 0.4 by
+//! bumping this dependency and its manifest's `api`: every new export has a
+//! default, and 0.4 adds imports only.
 //!
 //! A plugin is a `cdylib` crate built for `wasm32-wasip2`:
 //!
@@ -248,6 +249,15 @@ impl ToolResult {
             wait: Some(job.into()),
         }
     }
+
+    /// The answer waits for a call to one of the plugin's pages (one
+    /// [`platform::web_call`] returned), as [`ToolResult::wait`] does for a
+    /// job: in [`Plugin::tool_resume`] read the page's answer with
+    /// [`platform::web_call_result`]. `text` is what the agent reads if the
+    /// page outlasts the hold.
+    pub fn wait_call(call: impl Into<String>, text: impl Into<String>) -> Self {
+        Self::wait(call, text)
+    }
 }
 
 impl Snapshot {
@@ -445,6 +455,72 @@ pub mod platform {
     /// A declared side program: `{"installed", "version", "found_on_path", ...}`.
     pub fn tool_state(cx: &Context, tool: &str) -> Value {
         serde_json::from_str(&raw::tool_state(cx, tool)).unwrap_or(Value::Null)
+    }
+
+    /// A call to one of the plugin's own pages (0.4): the `web` node `id`
+    /// in view `view`, its `chimaera.handle(method, fn)`.
+    #[derive(Debug, Clone, Default, serde::Serialize)]
+    pub struct WebCall {
+        pub view: String,
+        pub id: String,
+        pub method: String,
+        pub args: Value,
+        /// A file view's file (workspace-relative): which file the page
+        /// shows, for the window's node and the headless host's render.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub file: Option<String>,
+        /// Skip any window and ask a fresh headless page.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        pub fresh: bool,
+    }
+
+    /// Ask the page of `web` node `id` in `view` to run `method` with
+    /// `args` (0.4). The window showing that node answers, else a headless
+    /// browser on this host. Returns the call's id at once: answer
+    /// [`super::ToolResult::wait_call`] with it and read the answer with
+    /// [`web_call_result`] in `tool_resume`.
+    pub fn web_call(
+        cx: &Context,
+        view: &str,
+        id: &str,
+        method: &str,
+        args: &Value,
+    ) -> Result<String, String> {
+        web_call_with(
+            cx,
+            &WebCall {
+                view: view.into(),
+                id: id.into(),
+                method: method.into(),
+                args: args.clone(),
+                ..WebCall::default()
+            },
+        )
+    }
+
+    /// [`web_call`] with a file or `fresh`.
+    pub fn web_call_with(cx: &Context, call: &WebCall) -> Result<String, String> {
+        let spec = serde_json::to_string(call).map_err(|e| e.to_string())?;
+        raw::web_call(cx, &spec)
+    }
+
+    /// A call's answer (0.4): `Ok(Some(value))` once the page answered,
+    /// `Ok(None)` while it still waits, `Err(why)` when it failed.
+    pub fn web_call_result(cx: &Context, call: &str) -> Result<Option<Value>, String> {
+        match raw::web_call_result(cx, call)? {
+            Some(text) => serde_json::from_str(&text)
+                .map(Some)
+                .map_err(|e| format!("the page's answer is not JSON: {e}")),
+            None => Ok(None),
+        }
+    }
+
+    /// Open one of the plugin's views beside the calling session, without
+    /// taking focus (0.4): `{"view", "args"?}` for a tab view, `{"file",
+    /// "args"?}` for a file it claims. Only from a session's own call, at
+    /// most 4 a minute per session. What happened, in words.
+    pub fn reveal(cx: &Context, spec: &Value) -> Result<String, String> {
+        raw::reveal(cx, &spec.to_string())
     }
 }
 

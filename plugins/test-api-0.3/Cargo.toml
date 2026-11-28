@@ -1,0 +1,17 @@
+# The frozen 0.3 world's fixture: a plugin built against plugins/api-0.3
+# (the 0.3 SDK), so the daemon's tests run a 0.3 component through its own
+# bindings (`runtime::v3`, `hostfns::v3_host`). Laid out under
+# plugins/dist-test, which only test builds embed: never in a real catalog.
+[package]
+name = "chimaera-plugin-test-api-03"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+chimaera-plugin-api = { package = "chimaera-plugin-api-v0-3", path = "../api-0.3" }

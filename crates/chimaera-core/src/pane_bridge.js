@@ -300,6 +300,21 @@
         }
         return;
       }
+      // A page's answer to its plugin's call: no press needed; the host
+      // takes it only for an id it sent, and only within 64 KiB.
+      if (m.kind === "web_answer") {
+        if (typeof m.call !== "string" || m.call === "" || m.call.length > 64) return;
+        const ok = m.ok === true;
+        let value = null;
+        let error = ok ? null : String(m.error ?? "the page failed").slice(0, 2000);
+        if (ok) {
+          const text = JSON.stringify(m.value ?? null) ?? "null";
+          if (text.length > 64 * 1024) error = "the page's answer is over 64 KiB";
+          else value = JSON.parse(text);
+        }
+        post(error === null ? { kind: "web_answer", call: m.call, ok: true, value } : { kind: "web_answer", call: m.call, ok: false, error });
+        return;
+      }
       if (Date.now() - lastPress > INPUT_FRESH_MS) return;
       if (m.kind === "web_reference") {
         if (typeof m.text !== "string") return;

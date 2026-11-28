@@ -296,6 +296,10 @@ export interface AgentBrowserHost {
   /** The agent cursor's colour on a shared tab (`#rrggbb`, the hue of the
    *  agent it is shared with), or null. */
   cursorColor(tab: string): string | null;
+  /** A plugin's call to the page of a web node this window shows
+   *  (`web_call`, `plugins/ui/webCalls.ts`): `{value}`, or throws why not.
+   *  Absent: this window answers no calls. */
+  webCall?(fields: Record<string, unknown>): Promise<unknown>;
 }
 
 const NAV_ACTIONS: readonly NativeViewNav[] = ["back", "forward", "reload", "stop"];
@@ -469,6 +473,10 @@ export class AgentBrowserChannel {
           lastDriveAt: f.driving ? this.host.now() : (prev?.lastDriveAt ?? null),
         });
         return {};
+      }
+      case "web_call": {
+        if (this.host.webCall === undefined) throw new Refusal("this window answers no plugin calls");
+        return await this.host.webCall(f);
       }
       default:
         throw new Refusal(`this window doesn't know "${req.op}" (an older build: reload it)`);

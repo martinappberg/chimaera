@@ -47,6 +47,16 @@ async fn chat(state: &Arc<AppState>, ws: &str, label: &str) -> (String, String) 
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let sid = body["id"].as_str().unwrap().to_string();
+    // Comms counts a chat as working only once its driver is alive: a test
+    // that marks it Running before then reads as idle under a loaded CI.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !state.chat.get(&sid).is_some_and(|info| info.alive) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the fake chat never came up"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     let key = lock(&state.agents).get(&sid).unwrap().key.clone();
     (sid, key)
 }
