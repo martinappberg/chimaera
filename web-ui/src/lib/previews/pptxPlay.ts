@@ -416,27 +416,43 @@ const textOrigins = new WeakMap<Element, string | null>();
  * its block. PowerPoint's film of the `order` deck: paragraphs holding a
  * 1.5x grow stay centred on their words (left-aligned text 634-687 px of
  * 1920 grows to 620-700), where the block's centre would put them 95 px
- * left. Read once per drawn paragraph, before any state transforms it
- * (the renderer draws a fresh element for each layout); null where it has
- * no text or no layout yet.
+ * left. Read with every transform between the paragraph and its slide
+ * (the shape's rotation, its text body's fit, what a state holds) off for
+ * the read and put back with its priority in the same task, so the boxes
+ * are the layout's whatever the shape stands at; the screen px per own px
+ * is the slide's box over `w`, as `boxGeom` measures it (no
+ * `offset*`/`client*`). Read once per drawn paragraph (the renderer draws
+ * a fresh element for each layout); null where it has no text or no
+ * layout yet.
  */
-function textOrigin(el: Styled): string | null {
+function textOrigin(el: Styled, shape: HTMLElement, w: number): string | null {
   const hit = textOrigins.get(el);
   if (hit !== undefined) return hit;
+  const slide = shape.parentElement;
+  if (typeof document === "undefined" || typeof document.createRange !== "function" || !(el instanceof HTMLElement) || slide === null) return null;
+  const chain: HTMLElement[] = [];
+  for (let e: HTMLElement | null = el; e !== null && e !== slide; e = e.parentElement) chain.push(e);
+  const props = ["transform", "translate", "rotate", "scale"];
+  const saved = chain.flatMap((e) => props.map((p) => [e, p, e.style.getPropertyValue(p), e.style.getPropertyPriority(p)] as const));
   let out: string | null = null;
-  if (typeof document !== "undefined" && typeof document.createRange === "function" && el instanceof HTMLElement && el.offsetWidth > 0) {
+  try {
+    for (const e of chain) for (const p of props) e.style.setProperty(p, "none", "important");
+    const f = slide.getBoundingClientRect().width / w;
     const block = el.getBoundingClientRect();
     const range = document.createRange();
     range.selectNodeContents(el);
     const rs = Array.from(range.getClientRects()).filter((r) => r.width > 0 && r.height > 0);
-    // Screen px per own px (the stage's fit, a scaled text body).
-    const f = block.width / el.offsetWidth;
-    if (rs.length > 0 && f > 0 && Number.isFinite(f)) {
+    if (rs.length > 0 && block.width > 0 && f > 0 && Number.isFinite(f)) {
       const x0 = Math.min(...rs.map((r) => r.left));
       const x1 = Math.max(...rs.map((r) => r.right));
       const y0 = Math.min(...rs.map((r) => r.top));
       const y1 = Math.max(...rs.map((r) => r.bottom));
       out = `${r3(((x0 + x1) / 2 - block.left) / f)}px ${r3(((y0 + y1) / 2 - block.top) / f)}px`;
+    }
+  } finally {
+    for (const [e, p, v, pr] of saved) {
+      if (v === "") e.style.removeProperty(p);
+      else e.style.setProperty(p, v, pr);
     }
   }
   // No layout yet (a hidden pane): read again next time.
@@ -453,7 +469,8 @@ function drawnOpacity(el: Styled): number {
 /**
  * The inline values `state` needs on a tagged slide drawn `w`×`h` slide
  * px, and whether some of it could only be approximated. Pure of the DOM
- * apart from reading it: nothing is written.
+ * apart from reading it: nothing is left written (`textOrigin` turns
+ * transforms off for its read and puts them back in the same task).
  */
 export function statePaints(tagged: TaggedSlide, state: BuildState, w: number, h: number, palette: Palette | null): { paints: Paint[]; inert: Styled[]; approximate: boolean } {
   const info = new Map<string, ShapeInfo>();
@@ -462,7 +479,8 @@ export function statePaints(tagged: TaggedSlide, state: BuildState, w: number, h
   let approximate = plan.approximate;
   const paints: Paint[] = [];
   const inert: Styled[] = [];
-  const place = (el: Styled, id: ElementId, hidden: boolean, px: [number, number] | undefined) => {
+  // `shapeEl`: the shape a paragraph is drawn in.
+  const place = (el: Styled, id: ElementId, hidden: boolean, px: [number, number] | undefined, shapeEl?: HTMLElement) => {
     const held = plan.held.get(id);
     if (hidden) {
       paints.push({ el, prop: "opacity", value: "0" });
@@ -476,8 +494,8 @@ export function statePaints(tagged: TaggedSlide, state: BuildState, w: number, h
       paints.push({ el, prop: "scale", value: `${x} ${y}` });
     }
     if (held?.turn !== undefined) paints.push({ el, prop: "rotate", value: `${r3(fin(held.turn, -LIMIT.deg, LIMIT.deg, 0))}deg` });
-    if (id.includes("#") && (held?.scale !== undefined || held?.turn !== undefined)) {
-      const o = textOrigin(el);
+    if (shapeEl !== undefined && (held?.scale !== undefined || held?.turn !== undefined)) {
+      const o = textOrigin(el, shapeEl, w);
       if (o !== null) paints.push({ el, prop: "transform-origin", value: o });
     }
   };
@@ -510,7 +528,7 @@ export function statePaints(tagged: TaggedSlide, state: BuildState, w: number, h
         if (exact === null) approximate = true;
         px = exact ?? [m[0] * w, m[1] * h];
       }
-      place(p, `${id}#${i}`, hide?.has(i) === true, px);
+      place(p, `${id}#${i}`, hide?.has(i) === true, px, s.el);
       const pc = plan.held.get(`${id}#${i}`)?.colors;
       if (pc !== undefined && !colorPaints(s.el, { text: pc.text }, palette, Array.from(p.querySelectorAll("span")), paints)) approximate = true;
     });
@@ -1078,7 +1096,7 @@ function measure(tagged: TaggedSlide, id: ElementId, w: number, h: number): Elem
     bh: box[1]!,
     bx: textAt[0] * k,
     by: textAt[1] * k,
-    ...(id.includes("#") ? { origin: textOrigin(el) ?? undefined, em: fontPx(el) } : {}),
+    ...(id.includes("#") ? { origin: textOrigin(el, shape.el, w) ?? undefined, em: fontPx(el) } : {}),
   };
 }
 
