@@ -1,6 +1,6 @@
 import JSZip from "jszip";
 import { describe, expect, it } from "vitest";
-import { clearState, paraOffset, planState, playStep, transformScale, type ShapeInfo } from "./pptxPlay";
+import { boxGeom, clearState, paraOffset, planState, playStep, transformScale, type ShapeInfo } from "./pptxPlay";
 import type { TaggedSlide } from "./pptxTag";
 import { buildStates, parseTimeline, type BuildState, type GoldenSlide } from "./pptxTiming";
 
@@ -326,4 +326,20 @@ describe("playStep lands every corpus click on its golden state", async () => {
     const info = new Map([...tagged.shapes].map(([id, x]) => [id, { paraCount: x.paraCount, paras: x.paras !== null }]));
     for (const [id, x] of tagged.shapes) expect(inline(x.el as unknown as FakeEl)).toEqual(expected(info, buildStates(s.t)[1]!, id));
   });
+});
+
+describe("measured, never assumed: geometry under any fit", () => {
+  // A 1280×720 slide shown at 0.625 (a small window) and 1.5 (full screen),
+  // offset in the page; a paragraph a quarter in from the left, a fifth down.
+  for (const k of [0.625, 1, 1.5, 2.67]) {
+    it(`a paragraph's place in slide fractions is the same at a fit of ${k}`, () => {
+      const slide = { left: 40, top: 30, width: 1280 * k, height: 720 * k };
+      const para = { left: 40 + 320 * k, top: 30 + 144 * k, width: 400 * k, height: 60 * k };
+      const g = boxGeom(para, slide, 1280, 720);
+      expect(g.ppt_x).toBeCloseTo((320 + 200) / 1280, 10);
+      expect(g.ppt_y).toBeCloseTo((144 + 30) / 720, 10);
+      expect(g.ppt_w).toBeCloseTo(400 / 1280, 10);
+      expect(g.ppt_h).toBeCloseTo(60 / 720, 10);
+    });
+  }
 });

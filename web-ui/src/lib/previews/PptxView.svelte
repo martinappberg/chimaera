@@ -55,7 +55,7 @@
   import { copyTabToWindow } from "../plugins/platform";
   import { buildStates, extractTiming, parseTimeline, type BuildState, type SlideTimeline, type TimingExtract } from "./pptxTiming";
   import { pruneTagged, tagSlide, type TaggedSlide } from "./pptxTag";
-  import { applyState, clearState, playStep, type Palette, type Playing } from "./pptxPlay";
+  import { applyState, clearState, playStep, prepareStep, type Palette, type Playing, type PreparedStep } from "./pptxPlay";
   import { motionNotes } from "./pptxMotion";
   import { sanitizeRendered } from "./officeSafety";
   import { revealRequest, takeReveal } from "../shared/reveal";
@@ -131,6 +131,33 @@
   let playing: { p: Playing; slide: number; build: number; tagged: TaggedSlide; gen: string } | null = null;
   /** The click the next state pass plays rather than lands on. */
   let toPlay: { slide: number; build: number } | null = null;
+  /** The next forward click, planned while idle (`prepareStep`): a click
+   *  then only starts animations. Dropped on every pass. */
+  let warmed: { slide: number; build: number; gen: string; p: PreparedStep } | null = null;
+  let warmTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function warmNext(gen: string): void {
+    clearTimeout(warmTimer);
+    warmed = null;
+    if (show.mode !== "present" || reducedMotion()) return;
+    warmTimer = setTimeout(() => {
+      if (disposed || playing !== null || show.mode !== "present") return;
+      const n = show.next();
+      if (n === null) return;
+      const handle = stageHandles.get(n.slide);
+      const tagged = handle === undefined ? undefined : stageTags.get(handle.element);
+      const t = timelineOf(n.slide);
+      if (tagged === undefined || t === null) return;
+      try {
+        const p = prepareStep(tagged, t.timeline, n.build, { w, h, states: t.states, palette: paletteOf(n.slide) });
+        if (p !== null) warmed = { slide: n.slide, build: n.build, gen, p };
+      } catch {
+        // Planned again at the click.
+      }
+    }, 200);
+  }
+  $effect(() => () => clearTimeout(warmTimer));
+
   /** The place the build-state pass last stood on. */
   let lastPass: { slide: number; build: number | null } | null = null;
 
@@ -658,7 +685,8 @@
           continue;
         }
         if (t !== null && b !== null && want?.slide === i && want.build === b && onScreen.shown) {
-          const p = playStep(tagged, t.timeline, b, { w, h, states: t.states, palette: paletteOf(i), reduced: reducedMotion() });
+          const ready = warmed !== null && warmed.slide === i && warmed.build === b && warmed.gen === gen ? warmed.p : null;
+          const p = playStep(tagged, t.timeline, b, { w, h, states: t.states, palette: paletteOf(i), reduced: reducedMotion(), prepared: ready });
           approx = p.approximate;
           const mine = { p, slide: i, build: b, tagged, gen };
           playing = mine;
@@ -669,6 +697,7 @@
             if (!disposed) {
               animating = false;
               playApprox = p.approximate;
+              warmNext(gen);
             }
           });
           continue;
@@ -676,6 +705,10 @@
         approx = applyState(tagged, state, w, h, paletteOf(j)) || tagged.fellBack;
       }
       playApprox = approx;
+      // Plan the next click once this pass stands still (a playing click
+      // plans it when it lands).
+      if (playing === null) warmNext(gen);
+      else if (warmed !== null) warmed = null;
     });
   });
 
@@ -1930,7 +1963,23 @@
         onpointercancel={onBoxPointerCancel}
         onclickcapture={onBoxClickCapture}
       >
-        <div class="slide-scale" style:width="{w}px" style:height="{h}px" style:transform="scale({scale})" bind:this={slot}></div>
+        <!-- The show fits the slide with `zoom`, so it is laid out and painted
+             at its real size. Under `transform: scale()` WebKit composites
+             the scaled ancestor whenever a shape animates (a bitmap of the
+             unscaled slide, stretched), so every label on the slide thins and
+             shifts for the length of each click and snaps back when it lands,
+             and above a fit of 1 it blurs. Keep it `zoom`: one rendering path.
+             Browsing and editing never animate and keep `transform`, which the
+             edit layer's pointer mapping is written for; text is laid out the
+             same under both (`fit-text` below, the wrap probe). -->
+        <div
+          class="slide-scale"
+          style:width="{w}px"
+          style:height="{h}px"
+          style:transform={inShow ? null : `scale(${scale})`}
+          style:zoom={inShow ? String(scale) : null}
+          bind:this={slot}
+        ></div>
         {#if show.mode === "browse"}
           {#if editMode && edits.ready && edits.blocked === null && editSlide !== undefined}
             <PptxEditLayer
@@ -2054,7 +2103,8 @@
 {#snippet nextView()}
   <div class="next-frame" bind:clientWidth={nextW}>
     {#if nextScale > 0}
-      <div class="slide-scale" style:width="{w}px" style:height="{h}px" style:transform="scale({nextScale})" bind:this={nextSlot}></div>
+      <!-- `zoom`, as the show's stage: see there. -->
+      <div class="slide-scale" style:width="{w}px" style:height="{h}px" style:zoom={String(nextScale)} bind:this={nextSlot}></div>
     {/if}
   </div>
 {/snippet}
@@ -2373,6 +2423,23 @@
   .slide-scale {
     position: relative;
     transform-origin: 0 0;
+  }
+
+  /* A slide's text must lay out the same at every fit (the show is fitted
+     with `zoom`, so its text is set at the real size; browsing is fitted
+     with a transform at the slide's own size). WebKit picks the optical
+     size and Apple's size-dependent tracking from the used font size, so
+     a line's width changed with the window (up to 1.9% of the slide at
+     a fit of 0.4): with optical sizing off, widths are exactly
+     proportional at every fit. Chrome already keeps them proportional and
+     gets wider at small sizes with it off, so this is WebKit's alone
+     (`-apple-system-body` is a font only WebKit knows). Measured by the
+     wrap probe across fits 0.4–3 in both engines. */
+  @supports (font: -apple-system-body) {
+    .slide-scale,
+    .thumb-slide {
+      font-optical-sizing: none;
+    }
   }
 
   /* Kept slides stack in the slot; only the current one is visible. */

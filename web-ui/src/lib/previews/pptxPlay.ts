@@ -293,6 +293,11 @@ export interface Paint {
 const LIMIT = { px: 1e5, scale: 1000, deg: 1e6 };
 const fin = (n: number, lo: number, hi: number, fallback: number) => (Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : fallback);
 const r3 = (n: number) => Math.round(n * 1000) / 1000;
+/** The smallest scale a frame shows. A frame at scale exactly 0 makes
+ *  WebKit build the animated layer's backing at no size, and it draws the
+ *  shape washed out for the rest of the click (zoom in, measured in a
+ *  WKWebView); 0.001 is as invisible and keeps the backing whole. */
+const MIN_SCALE = 0.001;
 
 const SHAPE_TAGS = "path, rect, ellipse, circle, polygon, polyline, line";
 const NOT_DRAWN = "defs, clipPath, mask, pattern, filter, marker, symbol";
@@ -768,7 +773,7 @@ export function planStep(
       if (scales) {
         const kx = g.ppt_w > 0 ? (abs.w ?? g.ppt_w) / g.ppt_w : 1;
         const ky = g.ppt_h > 0 ? (abs.h ?? g.ppt_h) / g.ppt_h : 1;
-        f.scale = `${r3(fin(kx * (abs.sxAbs ?? b.sx) * sx, 0, LIMIT.scale, b.sx))} ${r3(fin(ky * (abs.syAbs ?? b.sy) * sy, 0, LIMIT.scale, b.sy))}`;
+        f.scale = `${r3(fin(kx * (abs.sxAbs ?? b.sx) * sx, MIN_SCALE, LIMIT.scale, b.sx))} ${r3(fin(ky * (abs.syAbs ?? b.sy) * sy, MIN_SCALE, LIMIT.scale, b.sy))}`;
       }
       if (turns) f.rotate = `${r3(fin((abs.rotAbs ?? b.rot) + rot, -LIMIT.deg, LIMIT.deg, b.rot))}deg`;
       if (clips) f.clipPath = clip ?? "none";
@@ -820,6 +825,9 @@ export interface PlayOptions {
   palette?: Palette | null;
   /** No motion: stand on the state at once. */
   reduced?: boolean;
+  /** This click planned ahead (`prepareStep`); used only when it is for
+   *  the same slide, timeline and step. */
+  prepared?: PreparedStep | null;
   maxMs?: number;
 }
 
@@ -843,7 +851,36 @@ function elementOf(tagged: TaggedSlide, id: ElementId): Styled | undefined {
   return para === undefined ? shape?.el : shape?.paras?.[Number(para)];
 }
 
-/** Measure a tagged element (after the step's starting state is on it). */
+/** A box on screen (client px, as `getBoundingClientRect` gives it). */
+export interface ClientBox {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * A drawn paragraph's place in slide fractions, from its box and the
+ * slide's box on screen. The screen px per slide px is measured (the
+ * slide's box over its own width `w`), never assumed: the show fits the
+ * slide with `zoom` and browsing with a transform, and engines report
+ * boxes under `zoom` differently, but a box and the slide's box are
+ * always in the same units.
+ */
+export function boxGeom(box: ClientBox, slide: ClientBox, w: number, h: number): Geom {
+  const k = slide.width > 0 ? slide.width / w : 1;
+  return {
+    ppt_x: (box.left + box.width / 2 - slide.left) / k / w,
+    ppt_y: (box.top + box.height / 2 - slide.top) / k / h,
+    ppt_w: box.width / k / w,
+    ppt_h: box.height / k / h,
+  };
+}
+
+/** Measure a tagged element (after the step's starting state is on it).
+ *  Every length comes from inline slide px or from `boxGeom`'s measured
+ *  factor; nothing reads `offset*`/`client*`, whose meaning under `zoom`
+ *  differs between engines. */
 function measure(tagged: TaggedSlide, id: ElementId, w: number, h: number): ElementBase | null {
   const spid = id.split(/[#!]/)[0]!;
   const shape = tagged.shapes.get(spid);
@@ -868,15 +905,7 @@ function measure(tagged: TaggedSlide, id: ElementId, w: number, h: number): Elem
   } else {
     const slideEl = shape.el.parentElement;
     if (slideEl === null) return null;
-    const s = slideEl.getBoundingClientRect();
-    const r = el.getBoundingClientRect();
-    const scale = s.width > 0 ? s.width / w : 1;
-    geom = {
-      ppt_x: ((r.left + r.right) / 2 - s.left) / scale / w,
-      ppt_y: ((r.top + r.bottom) / 2 - s.top) / scale / h,
-      ppt_w: r.width / scale / w,
-      ppt_h: r.height / scale / h,
-    };
+    geom = boxGeom(el.getBoundingClientRect(), slideEl.getBoundingClientRect(), w, h);
     const chain: string[] = [];
     for (let e = el.parentElement; e !== null; e = e.parentElement) {
       chain.push(e.style.transform);
@@ -885,7 +914,9 @@ function measure(tagged: TaggedSlide, id: ElementId, w: number, h: number): Elem
     const body = transformScale(chain);
     k = body === null || body <= 0 ? 1 : 1 / body;
   }
-  const box = "offsetWidth" in el ? [el.offsetWidth, el.offsetHeight] : [geom.ppt_w * w, geom.ppt_h * h];
+  // The clip box in the element's own px: slide px, times a paragraph's
+  // text-body factor (its own px are the body's, scaled into the slide).
+  const box = [geom.ppt_w * w * k, geom.ppt_h * h * k];
   return {
     geom,
     k,
@@ -917,6 +948,97 @@ function colorWindows(effects: readonly Effect[]): Map<string, [number, number]>
     }
   }
   return out;
+}
+
+/** A click planned ahead: everything `playStep` needs but the animations. */
+export interface PreparedStep {
+  tagged: TaggedSlide;
+  timeline: SlideTimeline;
+  k: number;
+  approximate: boolean;
+  plan: StepPlan;
+  duration: number;
+  windows: Map<string, [number, number]>;
+  blends: { el: Styled; prop: string; a: string; b: string; spid: string }[];
+  landedBy: Map<Styled, Map<string, string>>;
+}
+
+/**
+ * Plan step `k` without touching the slide: what `playStep` would animate
+ * from the state the slide stands on now (the state before step `k`, or a
+ * slide drawn as is for its step 0). Null when the click would land at
+ * once (nothing to move, past the budget). A viewer plans the next click
+ * while idle and passes it to `playStep`, which then only starts
+ * animations; any change to the slide or its place makes it stale.
+ */
+export function prepareStep(tagged: TaggedSlide, timeline: SlideTimeline, k: number, opts: PlayOptions): PreparedStep | null {
+  const states = opts.states ?? buildStates(timeline);
+  const after = states[k];
+  const effects = timeline.steps[k] ?? [];
+  const before = k === 0 ? entryState(timeline) : states[k - 1];
+  const palette = opts.palette ?? null;
+  if (after === undefined || before === undefined || effects.length === 0) return null;
+    const target = statePaints(tagged, after, opts.w, opts.h, palette);
+    const from = statePaints(tagged, before, opts.w, opts.h, palette);
+    const info = new Map<string, ShapeInfo>();
+    const elements: ElementId[] = [];
+    for (const [id, s] of tagged.shapes) {
+      info.set(id, { paraCount: s.paraCount, paras: s.paras !== null, bg: s.el.querySelector(":scope > svg") !== null && s.paraCount > 0 });
+      elements.push(id, ...(s.paras ?? []).map((_, i) => `${id}#${i}`));
+    }
+    // An element's landed values: what the state after puts inline, else none.
+    const landedBy = new Map<Styled, Map<string, string>>();
+    for (const p of target.paints) {
+      const m = landedBy.get(p.el) ?? new Map<string, string>();
+      m.set(p.prop, p.value);
+      landedBy.set(p.el, m);
+    }
+    const landed = (id: ElementId): Landed | null => {
+      const el = elementOf(tagged, id);
+      if (el === undefined) return null;
+      const m = landedBy.get(el);
+      const op = m?.get("opacity");
+      return {
+        opacity: op === undefined ? drawnOpacity(el) : Number(op),
+        translate: m?.get("translate") ?? "none",
+        scale: m?.get("scale") ?? "none",
+        rotate: m?.get("rotate") ?? "none",
+      };
+    };
+    const plan = planStep(effects, before, info, elements, (id) => measure(tagged, id, opts.w, opts.h), landed, opts.w, opts.h, opts.maxMs);
+    if (plan.overBudget) return null;
+    let duration = plan.duration;
+    // Colours blend from the paint before to the paint after, over the
+    // window their effects run in.
+    const windows = colorWindows(effects);
+    const fromBy = new Map<Styled, Map<string, string>>();
+    for (const p of from.paints) {
+      const m = fromBy.get(p.el) ?? new Map<string, string>();
+      m.set(p.prop, p.value);
+      fromBy.set(p.el, m);
+    }
+    const blends: { el: Styled; prop: string; a: string; b: string; spid: string }[] = [];
+    const drawnValue = (el: Styled, prop: string) => original(el, prop) || el.getAttribute(prop) || (prop === "filter" ? "none" : "");
+    for (const [el, m] of landedBy) {
+      for (const [prop, b] of m) {
+        if (!COLOR_PROPS.has(prop)) continue;
+        const a = fromBy.get(el)?.get(prop) ?? drawnValue(el, prop);
+        if (a === b) continue;
+        const spid = (el.closest("[data-sid]") as HTMLElement | null)?.dataset.sid ?? "";
+        const grad = prop === "fill" && "ownerSVGElement" in el ? gradientOf(el as SVGElement, a) : null;
+        if (grad !== null) {
+          // A gradient going solid: its stops blend to the colour; the
+          // landing then swaps the fill for that colour.
+          for (const stop of Array.from(grad.querySelectorAll<SVGElement>("stop"))) {
+            blends.push({ el: stop, prop: "stop-color", a: fromBy.get(stop)?.get("stop-color") ?? (stop.getAttribute("stop-color") ?? "#000000"), b, spid });
+          }
+        } else if (a === "none" && prop === "fill") blends.push({ el, prop: "fill-opacity", a: "0", b: "1", spid });
+        else blends.push({ el, prop, a, b, spid });
+      }
+    }
+    for (const w of windows.values()) duration = Math.max(duration, Math.min(w[1], opts.maxMs ?? PLAY_MAX_MS));
+    if (!(duration > 0)) return null;
+    return { tagged, timeline, k, approximate: target.approximate, plan, duration, windows, blends, landedBy };
 }
 
 /**
@@ -953,74 +1075,15 @@ export function playStep(tagged: TaggedSlide, timeline: SlideTimeline, k: number
     return playing;
   }
   try {
-    const target = statePaints(tagged, after, opts.w, opts.h, palette);
-    playing.approximate = target.approximate;
     applyState(tagged, before, opts.w, opts.h, palette);
-    const from = statePaints(tagged, before, opts.w, opts.h, palette);
-    const info = new Map<string, ShapeInfo>();
-    const elements: ElementId[] = [];
-    for (const [id, s] of tagged.shapes) {
-      info.set(id, { paraCount: s.paraCount, paras: s.paras !== null, bg: s.el.querySelector(":scope > svg") !== null && s.paraCount > 0 });
-      elements.push(id, ...(s.paras ?? []).map((_, i) => `${id}#${i}`));
-    }
-    // An element's landed values: what the state after puts inline, else none.
-    const landedBy = new Map<Styled, Map<string, string>>();
-    for (const p of target.paints) {
-      const m = landedBy.get(p.el) ?? new Map<string, string>();
-      m.set(p.prop, p.value);
-      landedBy.set(p.el, m);
-    }
-    const landed = (id: ElementId): Landed | null => {
-      const el = elementOf(tagged, id);
-      if (el === undefined) return null;
-      const m = landedBy.get(el);
-      const op = m?.get("opacity");
-      return {
-        opacity: op === undefined ? drawnOpacity(el) : Number(op),
-        translate: m?.get("translate") ?? "none",
-        scale: m?.get("scale") ?? "none",
-        rotate: m?.get("rotate") ?? "none",
-      };
-    };
-    const plan = planStep(effects, before, info, elements, (id) => measure(tagged, id, opts.w, opts.h), landed, opts.w, opts.h, opts.maxMs);
-    if (plan.overBudget) {
+    const p = opts.prepared;
+    const prep = p != null && p.tagged === tagged && p.k === k && p.timeline === timeline ? p : prepareStep(tagged, timeline, k, opts);
+    if (prep === null) {
       land();
       return playing;
     }
-    let duration = plan.duration;
-    // Colours blend from the paint before to the paint after, over the
-    // window their effects run in.
-    const windows = colorWindows(effects);
-    const fromBy = new Map<Styled, Map<string, string>>();
-    for (const p of from.paints) {
-      const m = fromBy.get(p.el) ?? new Map<string, string>();
-      m.set(p.prop, p.value);
-      fromBy.set(p.el, m);
-    }
-    const blends: { el: Styled; prop: string; a: string; b: string; spid: string }[] = [];
-    const drawnValue = (el: Styled, prop: string) => original(el, prop) || el.getAttribute(prop) || (prop === "filter" ? "none" : "");
-    for (const [el, m] of landedBy) {
-      for (const [prop, b] of m) {
-        if (!COLOR_PROPS.has(prop)) continue;
-        const a = fromBy.get(el)?.get(prop) ?? drawnValue(el, prop);
-        if (a === b) continue;
-        const spid = (el.closest("[data-sid]") as HTMLElement | null)?.dataset.sid ?? "";
-        const grad = prop === "fill" && "ownerSVGElement" in el ? gradientOf(el as SVGElement, a) : null;
-        if (grad !== null) {
-          // A gradient going solid: its stops blend to the colour; the
-          // landing then swaps the fill for that colour.
-          for (const stop of Array.from(grad.querySelectorAll<SVGElement>("stop"))) {
-            blends.push({ el: stop, prop: "stop-color", a: fromBy.get(stop)?.get("stop-color") ?? (stop.getAttribute("stop-color") ?? "#000000"), b, spid });
-          }
-        } else if (a === "none" && prop === "fill") blends.push({ el, prop: "fill-opacity", a: "0", b: "1", spid });
-        else blends.push({ el, prop, a, b, spid });
-      }
-    }
-    for (const w of windows.values()) duration = Math.max(duration, Math.min(w[1], opts.maxMs ?? PLAY_MAX_MS));
-    if (!(duration > 0)) {
-      land();
-      return playing;
-    }
+    playing.approximate = prep.approximate;
+    const { plan, duration, windows, blends, landedBy } = prep;
     for (const tr of plan.tracks) {
       const el = elementOf(tagged, tr.id);
       if (el === undefined || typeof el.animate !== "function") continue;

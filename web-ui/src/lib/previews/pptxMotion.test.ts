@@ -245,7 +245,8 @@ describe("zoom, spin, teeter, boomerang: from the behaviours", () => {
     const zoom = (await slide("entrances", 1)).steps[3]![0]!;
     expect(zoom.name).toBe("zoom-in");
     const kf = planOne(zoom).tracks[0]!.keyframes;
-    expect(kf[0]!.scale).toBe("0 0");
+    // From nothing: 0.001, the smallest frame (a frame at exactly 0 breaks WebKit's layer).
+    expect(kf[0]!.scale).toBe("0.001 0.001");
     expect(kf[kf.length - 1]!.scale).toBe("1 1");
     expect(kf[0]!.translate).toBeUndefined();
   });

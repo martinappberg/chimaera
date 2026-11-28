@@ -984,7 +984,14 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   re-read deck, hiding the pane or page and closing the view all land a playing click on its
   state; `prefers-reduced-motion` plays nothing. A show window following the presenter plays
   the clicks the presenter makes and lands on the same state. Each moved element runs one Web
-  Animation over the click (`fill: both`, then cancelled), so nothing is left inline.
+  Animation over the click (`fill: both`, then cancelled), so nothing is left inline. The show (and the presenter's now and next) fits the slide with CSS
+  `zoom`, so it is laid out and painted at its real size: under a `transform: scale()` fit WebKit
+  composites the scaled stage whenever a shape animates and every label on the slide thins,
+  shifts and (above a fit of 1) blurs until the click lands. Browsing and edit mode keep the
+  transform fit; text lays out the same under both, and at every fit (WebKit sets optical sizing
+  off on slides, since it picks the optical size and tracking from the used font size), which a
+  wrap probe holds for every corpus paragraph at fits 0.4–3 in Chrome and WebKit. The next click
+  is planned while the show is idle, so a click only starts its animations.
   Slide transitions aren't played yet, and missing fonts fall back to the system's;
   the ⓘ in the bar says so, and counts shapes that couldn't be drawn. Refused past 100 MB. A reveal's
   plain line (`deck.pptx:3`, a deck check's problem on slide 3) lands on that slide.
