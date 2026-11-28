@@ -58,6 +58,20 @@ impl Plugin for Fixture {
         }
     }
 
+    /// `read-at {path, offset, cap}`: 0.3's `host::read_at`, for the tests.
+    fn query(cx: Context, name: &str, args: Value) -> Result<Value, String> {
+        match name {
+            "read-at" => {
+                let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+                let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0);
+                let cap = args.get("cap").and_then(Value::as_u64).unwrap_or(64) as u32;
+                let bytes = host::read_at(&cx, path, offset, cap)?;
+                Ok(json!({"text": String::from_utf8_lossy(&bytes)}))
+            }
+            other => Err(format!("no such query {other}")),
+        }
+    }
+
     fn web_bundle() -> Vec<u8> {
         BUNDLE.to_vec()
     }

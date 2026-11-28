@@ -442,7 +442,7 @@ stay as they are.
 
 ### Smaller additions
 
-- **`host::read_at(path, offset, cap)`.** `host::read` reads only a file's first
+- **`host::read_at(path, offset, cap)`.** *Built in API 0.3, with phase 2.* `host::read` reads only a file's first
   bytes. BigWig chromosome trees and very large BAM headers can lie past 8 MiB.
 
 Double extensions (`*.vcf.gz`, `*.genomespy.json`) already work. A pattern

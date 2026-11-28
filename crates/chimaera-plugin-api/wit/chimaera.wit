@@ -6,7 +6,7 @@ package chimaera:plugin@0.3.0;
 // roots, and programs run as jobs), the `screens` exports (render, on-action,
 // tool-resume), new events, and `wait` on a tool result. 0.3 adds the `web`
 // export: the plugin's own web pages (docs/design/rich-views-plan.md, Part
-// 2). The host serves 0.1 and 0.2 beside it (`wit-0.1/`, `wit-0.2/`).
+// 2), and `host.read-at`. The host serves 0.1 and 0.2 beside it (`wit-0.1/`, `wit-0.2/`).
 
 interface types {
     /// A JSON document as text (serde on both sides).
@@ -73,6 +73,10 @@ interface host {
     /// Workspace files. Paths are workspace-relative; no component may be a
     /// symlink; reads stop at `cap` bytes; listings at `cap` entries.
     read: func(cx: context, path: string, cap: u32) -> result<list<u8>, string>;
+    /// 0.3: `read` from `offset`: a header past the first 8 MiB (a BigWig's
+    /// chromosome tree, a large BAM header), or records an index points at.
+    /// Empty at or past the end.
+    read-at: func(cx: context, path: string, offset: u64, cap: u32) -> result<list<u8>, string>;
     stat: func(cx: context, path: string) -> result<file-stat, string>;
     %list: func(cx: context, path: string, cap: u32) -> result<list<entry>, string>;
 

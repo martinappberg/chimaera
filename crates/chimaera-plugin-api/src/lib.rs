@@ -278,6 +278,13 @@ pub mod host {
         raw::read(cx, path, cap)
     }
 
+    /// [`read`] from `offset` (0.3): at most `cap` bytes (clamped to 8 MiB),
+    /// empty at or past the end. For a header past the first 8 MiB, or the
+    /// records an index points at.
+    pub fn read_at(cx: &Context, path: &str, offset: u64, cap: u32) -> Result<Vec<u8>, String> {
+        raw::read_at(cx, path, offset, cap)
+    }
+
     /// Size, mtime and kind of a workspace path (never through a symlink).
     pub fn stat(cx: &Context, path: &str) -> Result<Stat, String> {
         raw::stat(cx, path)

@@ -5,7 +5,7 @@ A plugin can ship its own HTML and JavaScript page for a drawing area that an ex
 **Where it lives (shared):**
 
 - **Daemon.** `crates/chimaera-server/src/plugins/web.rs`: the `[web]` table, the bundle unpack, grants, data tickets, data keys, the CSPs, and the routes. Also `fs.rs` (`serve_page` for agents' pages, `serve_file`/`Serve`) and the `web` node check in `plugins/screens.rs`.
-- **Interface.** WIT `chimaera:plugin@0.3.0` exports `web.web-bundle` (`crates/chimaera-plugin-api/wit/`; 0.2 is frozen in `wit-0.2/`). The SDK's `Plugin::web_bundle` defaults to empty.
+- **Interface.** WIT `chimaera:plugin@0.3.0` exports `web.web-bundle` (`crates/chimaera-plugin-api/wit/`; 0.2 is frozen in `wit-0.2/`). The SDK's `Plugin::web_bundle` defaults to empty. 0.3 also adds `host::read_at` (a workspace file from an offset, same limits as `read`), which genome headers past 8 MiB need.
 - **Page side.** `chimaera-core`: `page_api.js` (`window.chimaera`, `web/1`), `pane_bridge.js` (relays `web_*` in the app's view; `command` hands the host's word to the page) and `chimaera_web.css` (`WEB_CSS`).
 - **UI.**
   - `web-ui/src/lib/plugins/ui/WebNode.svelte` and `webViews.svelte.ts`: the node and the per-window limit.

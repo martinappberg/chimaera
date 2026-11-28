@@ -534,6 +534,7 @@ return the host's reason as a `String`). The limits are in
 | Call | What | Limit |
 |---|---|---|
 | `host::read(&cx, path, cap)` | a workspace file's bytes | workspace-relative only (`..` and absolute paths refused), `O_NOFOLLOW` on every component (no symlink anywhere in the path), at most `cap`, clamped to 8 MiB; off the reactor behind the filesystem semaphore |
+| `host::read_at(&cx, path, offset, cap)` (0.3) | the same, from `offset` | the same limits; empty at or past the end — a header past the first 8 MiB, the records an index points at |
 | `host::stat(&cx, path)` | size, `mtime_ms`, `is_dir` | the same path rules |
 | `host::list(&cx, path, cap)` | a directory's entries (`name`, `is_dir`, `is_symlink`) | the same path rules; at most `cap`, clamped to 4,096 |
 | `host::state_get` / `state_put(&cx, key, &value)` | small per-(plugin, workspace) state; `null` removes a key | 64 KiB per plugin per workspace, keys and values; in memory, so a daemon restart clears it; kept across a switch off and on and across versions |

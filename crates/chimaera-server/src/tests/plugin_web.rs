@@ -446,3 +446,50 @@ async fn a_plain_report_keeps_its_bytes_under_the_fixed_rule() {
     assert!(csp.contains("img-src 'self' data: blob:;"), "{csp}");
     assert!(csp.contains("connect-src 'self';"), "{csp}");
 }
+
+#[tokio::test]
+async fn a_0_3_plugin_reads_a_workspace_file_from_an_offset() {
+    let (state, ws, root) = web_workspace("web-read-at").await;
+    let read_at = |args: Value| {
+        let state = state.clone();
+        let ws = ws.clone();
+        async move {
+            let args = urlencoding_lite(&args.to_string());
+            request(
+                &state,
+                Method::GET,
+                &format!("/api/v1/workspaces/{ws}/plugins/{PID}/query/read-at?args={args}"),
+                None,
+            )
+            .await
+        }
+    };
+    // `sample.csv` is "chrom,pos\nchr1,100\nchr2,200\n": `chr1,` starts at 10.
+    let (status, body) = read_at(json!({"path": "sample.csv", "offset": 10, "cap": 5})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["text"], json!("chr1,"));
+    // At or past the end: nothing, not an error.
+    let (status, body) = read_at(json!({"path": "sample.csv", "offset": 1000, "cap": 5})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["text"], json!(""));
+    // The same confinement as `read`: no `..`, no link.
+    let outside = test_dir("web-read-at-outside");
+    std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("away")).unwrap();
+    for path in ["../x", "away/secret.txt"] {
+        let (status, body) = read_at(json!({"path": path, "offset": 0, "cap": 5})).await;
+        assert_ne!(status, StatusCode::OK, "{path}: {body}");
+    }
+}
+
+/// Percent-encode a query value (the JSON `args`).
+fn urlencoding_lite(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}

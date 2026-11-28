@@ -345,15 +345,22 @@ fn open_under(root: &Path, rel: &Path, dir: bool) -> Result<std::fs::File, Strin
     crate::download::open_beneath(&root_dir, rel, flags).map_err(|e| refused(root, rel, e))
 }
 
-fn read_capped(root: &Path, rel: &Path, cap: usize) -> Result<Vec<u8>, String> {
-    let file = open_under(root, rel, false)?;
+fn read_capped(root: &Path, rel: &Path, offset: u64, cap: usize) -> Result<Vec<u8>, String> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = open_under(root, rel, false)?;
     let meta = file
         .metadata()
         .map_err(|e| format!("{}: {e}", shown(rel)))?;
     if !meta.is_file() {
         return Err(format!("{}: not a regular file", shown(rel)));
     }
-    let mut bytes = Vec::with_capacity((meta.len() as usize).min(cap));
+    let left = meta.len().saturating_sub(offset);
+    let mut bytes = Vec::with_capacity((left as usize).min(cap));
+    if left == 0 {
+        return Ok(bytes);
+    }
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| format!("{}: {e}", shown(rel)))?;
     file.take(cap as u64)
         .read_to_end(&mut bytes)
         .map_err(|e| format!("{}: {e}", shown(rel)))?;
@@ -439,7 +446,19 @@ impl host::Host for HostState {
     async fn read(&mut self, _cx: wit::Context, path: String, cap: u32) -> Result<Vec<u8>, String> {
         let (root, rel) = self.target(&path)?;
         let cap = (cap as usize).min(READ_CEILING);
-        blocking(move || read_capped(&root, &rel, cap)).await
+        blocking(move || read_capped(&root, &rel, 0, cap)).await
+    }
+
+    async fn read_at(
+        &mut self,
+        _cx: wit::Context,
+        path: String,
+        offset: u64,
+        cap: u32,
+    ) -> Result<Vec<u8>, String> {
+        let (root, rel) = self.target(&path)?;
+        let cap = (cap as usize).min(READ_CEILING);
+        blocking(move || read_capped(&root, &rel, offset, cap)).await
     }
 
     async fn stat(&mut self, _cx: wit::Context, path: String) -> Result<wit::Stat, String> {
