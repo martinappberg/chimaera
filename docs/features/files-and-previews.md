@@ -972,7 +972,8 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   as in PowerPoint: a build state carries each target's size, turn, opacity and colours
   (`fixtures/pptx-timing/README.md` R24–R32: what is held is read from the file's `fill`,
   `autoRev`, `repeatCount` and never-ending sets, so a pulse or a full spin holds nothing; on a
-  text box animated by paragraph, an effect on the whole box acts on its body and never its
+  text box animated by paragraph, a paragraph grows and turns about the centre of its own words
+  (as PowerPoint's film shows), an effect on the whole box acts on its body and never its
   text, as PowerPoint's own film shows, and overlapping paragraph changes keep the later),
   through later clicks, exits and re-entrances, on a jump, a step back and the presenter's
   "next". Grow and shrink scale about the shape's centre (two grows multiply), turns add on top

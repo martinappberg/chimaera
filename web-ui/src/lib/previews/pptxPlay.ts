@@ -408,6 +408,42 @@ function colorPaints(el: Element, colors: HeldColors, palette: Palette | null, s
   return exact;
 }
 
+const textOrigins = new WeakMap<Element, string | null>();
+
+/**
+ * Where a paragraph grows and turns about, as a `transform-origin` in its
+ * own px: the centre of its text (the union of its lines' boxes), not of
+ * its block. PowerPoint's film of the `order` deck: paragraphs holding a
+ * 1.5x grow stay centred on their words (left-aligned text 634-687 px of
+ * 1920 grows to 620-700), where the block's centre would put them 95 px
+ * left. Read once per drawn paragraph, before any state transforms it
+ * (the renderer draws a fresh element for each layout); null where it has
+ * no text or no layout yet.
+ */
+function textOrigin(el: Styled): string | null {
+  const hit = textOrigins.get(el);
+  if (hit !== undefined) return hit;
+  let out: string | null = null;
+  if (typeof document !== "undefined" && typeof document.createRange === "function" && el instanceof HTMLElement && el.offsetWidth > 0) {
+    const block = el.getBoundingClientRect();
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const rs = Array.from(range.getClientRects()).filter((r) => r.width > 0 && r.height > 0);
+    // Screen px per own px (the stage's fit, a scaled text body).
+    const f = block.width / el.offsetWidth;
+    if (rs.length > 0 && f > 0 && Number.isFinite(f)) {
+      const x0 = Math.min(...rs.map((r) => r.left));
+      const x1 = Math.max(...rs.map((r) => r.right));
+      const y0 = Math.min(...rs.map((r) => r.top));
+      const y1 = Math.max(...rs.map((r) => r.bottom));
+      out = `${r3(((x0 + x1) / 2 - block.left) / f)}px ${r3(((y0 + y1) / 2 - block.top) / f)}px`;
+    }
+  }
+  // No layout yet (a hidden pane): read again next time.
+  if (out !== null) textOrigins.set(el, out);
+  return out;
+}
+
 function drawnOpacity(el: Styled): number {
   const s = original(el, "opacity");
   const n = s === "" ? 1 : Number(s);
@@ -440,6 +476,10 @@ export function statePaints(tagged: TaggedSlide, state: BuildState, w: number, h
       paints.push({ el, prop: "scale", value: `${x} ${y}` });
     }
     if (held?.turn !== undefined) paints.push({ el, prop: "rotate", value: `${r3(fin(held.turn, -LIMIT.deg, LIMIT.deg, 0))}deg` });
+    if (id.includes("#") && (held?.scale !== undefined || held?.turn !== undefined)) {
+      const o = textOrigin(el);
+      if (o !== null) paints.push({ el, prop: "transform-origin", value: o });
+    }
   };
   for (const [id, s] of tagged.shapes) {
     const off = plan.moveShapes.get(id);
@@ -534,6 +574,8 @@ export const PLAY_BUDGET = { effects: 300, events: 200 } as const;
 export interface ElementBase {
   /** Its place in slide fractions (centre and size). */
   geom: Geom;
+  /** A paragraph's `transform-origin`: the centre of its text (`textOrigin`). */
+  origin?: string;
   /** Its own px per slide px (a paragraph inside a scaled text body). */
   k: number;
   /** Its `translate` before the step, own px. */
@@ -570,6 +612,8 @@ export interface PlayKeyframe {
   translate?: string;
   scale?: string;
   rotate?: string;
+  /** A paragraph's origin while it grows or turns (`ElementBase.origin`). */
+  transformOrigin?: string;
   /** A transition filter's mask (`maskImage` "none" once it has landed). */
   maskImage?: string;
   maskSize?: string;
@@ -826,6 +870,7 @@ export function planStep(
         f.scale = `${r3(fin(kx * (abs.sxAbs ?? b.sx) * sx, MIN_SCALE, LIMIT.scale, b.sx))} ${r3(fin(ky * (abs.syAbs ?? b.sy) * sy, MIN_SCALE, LIMIT.scale, b.sy))}`;
       }
       if (turns) f.rotate = `${r3(fin((abs.rotAbs ?? b.rot) + rot, -LIMIT.deg, LIMIT.deg, b.rot))}deg`;
+      if ((scales || turns) && b.origin !== undefined) f.transformOrigin = b.origin;
       if (clips) Object.assign(f, clip ?? { maskImage: "none" });
       // Before its pattern begins, an exit shows whole (an entrance is hidden).
       if (pattern !== undefined) f.mask = r3(maskP ?? (pattern.out ? 0 : 1));
@@ -1010,6 +1055,7 @@ function measure(tagged: TaggedSlide, id: ElementId, w: number, h: number): Elem
     bh: box[1]!,
     bx: textAt[0] * k,
     by: textAt[1] * k,
+    ...(id.includes("#") ? { origin: textOrigin(el) ?? undefined } : {}),
   };
 }
 
