@@ -6,6 +6,7 @@ Decks whose animations and transitions were written by PowerPoint itself, and th
 
 - `decks/*.pptx`: the corpus. Small, synthetic, no real content.
 - `goldens/<deck>.json`: what each deck parses to (format below). Written by `npm --prefix web-ui run timing:golden` from the TypeScript parser, then checked by a person against PowerPoint's own slide show, once. After that it changes only through a reviewed diff.
+- `cases/*.xml`: hand-written slide parts for what the scripting model can't make. `interactive-trigger.xml` (one on-shape-click sequence beside a main sequence) follows ECMA-376 and the main sequences above; it is **not yet confirmed against a PowerPoint save**.
 - `make/make_corpus.py`: rebuilds the decks. python-pptx lays out named shapes; PowerPoint for Mac, driven in the background through its scripting model, adds the effects and transitions and saves. Needs a Mac with PowerPoint. Rerunning it changes ids inside the files, so regenerate the goldens with it.
 
 | Deck | Covers |
@@ -16,8 +17,8 @@ Decks whose animations and transitions were written by PowerPoint itself, and th
 | `triggers` | on click, with previous, after previous; a slide that starts by itself; durations; auto-advance |
 | `paths` | motion paths (lines, arc, circle); paths that add up on one shape |
 | `objects` | picture, table, chart, group, connector, rotated shape |
-| `interactive` | (PowerPoint's scripting cannot set a trigger shape; the on-shape-click case is a hand-written slide in `cases/`) |
-| `transitions` | none, fade, fade through black, push, wipe, cut, one outside the vocabulary (checker), auto-advance |
+| `interactive` | (PowerPoint's scripting cannot set a trigger shape, so the deck holds only a plain click; the on-shape-click case is the hand-written `cases/interactive-trigger.xml`) |
+| `transitions` | none (slide 1 has no `p:transition` at all), fade, fade through black, push, wipe, cut, one outside the vocabulary (checker), auto-advance |
 | `morph` | Morph by object (moved, resized, rotated, `!!` names across shape types, arriving and leaving shapes), by word, by character |
 | `agent-written` | no animation; `-raw` is the file as python-pptx wrote it with a duplicated shape id, the other is that file after PowerPoint saved it |
 
@@ -30,6 +31,8 @@ Decks whose animations and transitions were written by PowerPoint itself, and th
 - A slide that starts by itself has a first click group like any other (`delay="indefinite"`) whose first effect is `withEffect` or `afterEffect`, not `clickEffect`. That group runs on entry.
 - Every entrance begins with `p:set style.visibility = visible`, every exit ends with `hidden`. That, not the preset, says what is on screen.
 - A text box built by paragraph has one effect for its background (`p:spTgt/p:bg`) only when the box has a fill, then one per paragraph (`p:txEl/p:pRg st end`). Child paragraphs are `withEffect` in their parent's click. `p:bldLst/p:bldP build="p"` records the choice; a chart gets `p:bldGraphic`.
+- Effect durations live on the behaviours, not the effect: an effect lasts until its last behaviour ends (behaviour delay + `dur`, times `repeatCount`/1000, doubled by `autoRev`). A `p:set` written with `dur="1"` is PowerPoint's instant: an appear lasts 0 ms, and PowerPoint starts the "after previous" effect that follows it at 0. Transparency writes `dur="indefinite"` (until the slide ends).
+- PowerPoint writes an "after previous" effect's start into the delay of the group around it, so the delays along the tree already say when each effect starts.
 - A transition is wrapped: `mc:AlternateContent` with `mc:Choice Requires="p14"` (duration in `p14:dur`, ms) or `Requires="p159"` for Morph (`p159:morph option="byObject|byWord|byChar"`), and an `mc:Fallback` (for Morph, a plain fade). `advTm` (ms) is on `p:transition`.
 - Presets seen (class, id, subtype): appear `entr 1`; fly `2` with subtype 1 top, 2 right, 4 bottom, 8 left; blinds `3`; box `4`; circle `6`; dissolve `9`; fade `10`; split `16`; wheel `21`; wipe `22` with the same side subtypes; zoom `23` subtype 16; float `42`. Exits use the same ids with class `exit`. Emphasis: fill colour `1`, grow/shrink `6` (`p:animScale by 150000`), spin `8` (`p:animRot by 21600000`), transparency `9`, darken `24`, teeter `32`. Paths: class `path`, `p:animMotion path="M 0 0 L 0.25 0 E"` in fractions of the slide.
 
@@ -50,9 +53,13 @@ One name per effect, shared by both parsers, the plugin's timeline text and its 
 | `path` | class `path` (any id), with its path |
 | `other` | anything else: kept and shown by PowerPoint's preset numbers, never rewritten |
 
-Transitions: `none`, `fade`, `fade-black`, `push`, `wipe`, `cut`, `morph`, `other`; `dir` is `l` `r` `u` `d` as PowerPoint writes it (absent means its default).
+Fly and wipe carry `dir`, the side from the subtype (`top` `right` `bottom` `left`); every other effect has `dir: null`.
+
+Transitions: `none` (an empty `p:transition`), `fade`, `fade-black` (`p:fade thruBlk="1"`), `push`, `wipe`, `cut`, `morph` (`p159:morph`), `other`; `dir` is the transition element's `dir` as PowerPoint writes it (`l` `r` `u` `d`; absent means its default, `null`).
 
 ## Golden format
+
+An abridged example (the real `goldens/triggers.json` differs):
 
 ```json
 {
@@ -83,10 +90,18 @@ Transitions: `none`, `fade`, `fade-black`, `push`, `wipe`, `cut`, `morph`, `othe
 }
 ```
 
-- `transition` is `null` when the slide has none. `dur` and `advanceAfter` are milliseconds; `advanceAfter` is `null` without `advTm`.
-- `steps[0]` is what runs when the slide appears (empty for most slides); `steps[k]` is click `k`. `start` is milliseconds from the start of that step; an `after` effect starts when everything before it in the step has ended.
-- `target` is the shape id as a string: `"4"` for the shape, `"4:bg"` for a text box's background, `"4:p1-1"` for paragraphs 1 to 1 (as PowerPoint numbers them, from 0).
-- `sets` is `"visible"`, `"hidden"` or `null` (emphasis and paths change nothing about visibility).
+- `transition` is `null` when the slide has no `p:transition`. In `mc:AlternateContent` the first `mc:Choice` whose every `Requires` prefix resolves to the p14 or p159 namespace wins, else `mc:Fallback` (so Morph is read, never its fade fallback). `dur` and `advanceAfter` are milliseconds: `dur` is `p14:dur`, else `spd` (`fast` 500, `med` 750, `slow` 1000; absent is `fast`); `advanceAfter` is `null` without `advTm`; `advanceOnClick` is false only for `advClick="0"`/`"false"`; `morph` is the option (`byObject` when unstated), `null` for every other kind.
+- `steps[0]` is what runs when the slide appears (empty for most slides); `steps[k]` is click `k`. Every slide has `steps[0]`, so a slide without animation is `"steps": [[]]`. The first `delay="indefinite"` group of the main sequence is `steps[0]` when its first effect is not a `clickEffect`; otherwise `steps[0]` is empty and that group is click 1.
+- `start` is milliseconds from the start of that step: the sum of the start delays on the path from the click group down to the effect, which for PowerPoint's files means an `after` effect starts when everything before it in the step has ended (the test checks that identity on the corpus).
+- `dur` is milliseconds (see above), or `null` when nothing in the effect ever ends (every behaviour `indefinite`).
+- `class`, `preset`, `subtype` are `presetClass`, `presetID`, `presetSubtype` as written (`preset` and `subtype` are 0 when absent).
+- `target` is the shape id as a string: `"4"` for the shape, `"4:bg"` for a text box's background, `"4:p1-1"` for paragraphs 1 to 1 (as PowerPoint numbers them, from 0). It is the first target among the effect's behaviours; a character range or chart element targets its whole shape; `null` when no behaviour targets a shape.
+- `sets` is `"visible"`, `"hidden"` or `null` (emphasis and paths change nothing about visibility): the value of the effect's last `style.visibility` set in time.
 - `path` (only on `path` effects) is PowerPoint's path string.
-- `states[k]` is the slide after step `k`: `hidden` lists the targets not on screen, sorted as strings; `moved` maps a target to its summed path offset `[dx, dy]` in slide fractions, rounded to 4 places. `states.length == steps.length`.
-- `interactive` counts on-shape-click sequences, which are not in `steps`; their entrance targets count as hidden in every state.
+- `states[k]` is the slide after step `k`: `hidden` lists the targets not on screen, sorted as strings; `moved` maps a target to its summed path offset `[dx, dy]` in slide fractions, rounded to 4 places, keys sorted. `states.length == steps.length`.
+  - Before step 0, the hidden targets are those whose first `style.visibility` set (in document order across the main sequence) is `visible`. Within a step the sets apply in time order.
+  - A path's offset is where its path ends (`Z` returns to the subpath's start). Every target a path effect has moved so far is in `moved`, even when its paths sum to `[0, 0]`.
+- `interactive` counts on-shape-click sequences (`p:seq` whose `p:cTn` has `nodeType="interactiveSeq"`), which are not in `steps`; their entrance targets count as hidden in every state.
+- `approximate` appears only when the parser dropped the slide's timing (it then plays as a plain slide, `"steps": [[]]`; the transition is still read unless the XML doesn't scan), with a reason: XML that doesn't scan, `p:timing` over 512 KB of source, more than 2,000 effects, more than 300 clicks, or time containers (`p:par`/`p:seq`/`p:excl`) nested deeper than 32. The reason's wording is for people, not part of the contract; no corpus slide has the key.
+
+Regenerate the goldens with `npm --prefix web-ui run timing:golden` (`pptxTiming.test.ts` with `TIMING_GOLDEN=write`); `npm --prefix web-ui run test` compares against them.

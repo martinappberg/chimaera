@@ -1,0 +1,482 @@
+{
+  "deck": "entrances.pptx",
+  "slides": [
+    {
+      "part": "ppt/slides/slide1.xml",
+      "id": 256,
+      "transition": null,
+      "steps": [
+        [],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 0,
+            "class": "entr",
+            "preset": 1,
+            "subtype": 0,
+            "effect": "appear",
+            "dir": null,
+            "target": "2",
+            "sets": "visible"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 500,
+            "class": "entr",
+            "preset": 10,
+            "subtype": 0,
+            "effect": "fade-in",
+            "dir": null,
+            "target": "3",
+            "sets": "visible"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 500,
+            "class": "entr",
+            "preset": 23,
+            "subtype": 16,
+            "effect": "zoom-in",
+            "dir": null,
+            "target": "4",
+            "sets": "visible"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 1000,
+            "class": "entr",
+            "preset": 42,
+            "subtype": 0,
+            "effect": "float-in",
+            "dir": null,
+            "target": "5",
+            "sets": "visible"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 500,
+            "class": "entr",
+            "preset": 9,
+            "subtype": 0,
+            "effect": "dissolve-in",
+            "dir": null,
+            "target": "6",
+            "sets": "visible"
+          }
+        ]
+      ],
+      "states": [
+        {
+          "hidden": [
+            "2",
+            "3",
+            "4",
+            "5",
+            "6"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [
+            "3",
+            "4",
+            "5",
+            "6"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [
+            "4",
+            "5",
+            "6"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [
+            "5",
+            "6"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [
+            "6"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [],
+          "moved": {}
+        }
+      ],
+      "interactive": 0
+    },
+    {
+      "part": "ppt/slides/slide2.xml",
+      "id": 257,
+      "transition": null,
+      "steps": [
+        [],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 500,
+            "class": "entr",
+            "preset": 2,
+            "subtype": 4,
+            "effect": "fly-in",
+            "dir": "bottom",
+            "target": "2",
+            "sets": "visible"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 500,
+            "class": "entr",
+            "preset": 2,
+            "subtype": 8,
+            "effect": "fly-in",
+            "dir": "left",
+            "target": "3",
+            "sets": "visible"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 500,
+            "class": "entr",
+            "preset": 2,
+            "subtype": 2,
+            "effect": "fly-in",
+            "dir": "right",
+            "target": "4",
+            "sets": "visible"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 500,
+            "class": "entr",
+            "preset": 2,
+            "subtype": 1,
+            "effect": "fly-in",
+            "dir": "top",
+            "target": "5",
+            "sets": "visible"
+          }
+        ]
+      ],
+      "states": [
+        {
+          "hidden": [
+            "2",
+            "3",
+            "4",
+            "5"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [
+            "3",
+            "4",
+            "5"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [
+            "4",
+            "5"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [
+            "5"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [],
+          "moved": {}
+        }
+      ],
+      "interactive": 0
+    },
+    {
+      "part": "ppt/slides/slide3.xml",
+      "id": 258,
+      "transition": null,
+      "steps": [
+        [],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 500,
+            "class": "entr",
+            "preset": 22,
+            "subtype": 4,
+            "effect": "wipe-in",
+            "dir": "bottom",
+            "target": "2",
+            "sets": "visible"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 500,
+            "class": "entr",
+            "preset": 22,
+            "subtype": 8,
+            "effect": "wipe-in",
+            "dir": "left",
+            "target": "3",
+            "sets": "visible"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 500,
+            "class": "entr",
+            "preset": 22,
+            "subtype": 2,
+            "effect": "wipe-in",
+            "dir": "right",
+            "target": "4",
+            "sets": "visible"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 500,
+            "class": "entr",
+            "preset": 22,
+            "subtype": 1,
+            "effect": "wipe-in",
+            "dir": "top",
+            "target": "5",
+            "sets": "visible"
+          }
+        ]
+      ],
+      "states": [
+        {
+          "hidden": [
+            "2",
+            "3",
+            "4",
+            "5"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [
+            "3",
+            "4",
+            "5"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [
+            "4",
+            "5"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [
+            "5"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [],
+          "moved": {}
+        }
+      ],
+      "interactive": 0
+    },
+    {
+      "part": "ppt/slides/slide4.xml",
+      "id": 259,
+      "transition": null,
+      "steps": [
+        [],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 500,
+            "class": "entr",
+            "preset": 16,
+            "subtype": 21,
+            "effect": "split-in",
+            "dir": null,
+            "target": "2",
+            "sets": "visible"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "entr",
+            "preset": 21,
+            "subtype": 1,
+            "effect": "wheel-in",
+            "dir": null,
+            "target": "3",
+            "sets": "visible"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "entr",
+            "preset": 6,
+            "subtype": 16,
+            "effect": "circle-in",
+            "dir": null,
+            "target": "4",
+            "sets": "visible"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 2000,
+            "class": "entr",
+            "preset": 4,
+            "subtype": 16,
+            "effect": "box-in",
+            "dir": null,
+            "target": "5",
+            "sets": "visible"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 500,
+            "class": "entr",
+            "preset": 3,
+            "subtype": 10,
+            "effect": "blinds-in",
+            "dir": null,
+            "target": "6",
+            "sets": "visible"
+          }
+        ],
+        [
+          {
+            "trigger": "click",
+            "start": 0,
+            "dur": 1000,
+            "class": "entr",
+            "preset": 25,
+            "subtype": 0,
+            "effect": "other",
+            "dir": null,
+            "target": "7",
+            "sets": "visible"
+          }
+        ]
+      ],
+      "states": [
+        {
+          "hidden": [
+            "2",
+            "3",
+            "4",
+            "5",
+            "6",
+            "7"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [
+            "3",
+            "4",
+            "5",
+            "6",
+            "7"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [
+            "4",
+            "5",
+            "6",
+            "7"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [
+            "5",
+            "6",
+            "7"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [
+            "6",
+            "7"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [
+            "7"
+          ],
+          "moved": {}
+        },
+        {
+          "hidden": [],
+          "moved": {}
+        }
+      ],
+      "interactive": 0
+    }
+  ]
+}
