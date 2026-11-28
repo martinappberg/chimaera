@@ -63,13 +63,14 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
   `appearance.interfaceFontFamily` supplies the shared UI font stack. Small chrome uses those
   tokens rather than fixed rem/px sizes.
 - **Content surfaces stay independently legible.** Chat defaults to a 14 px base at line height
-  1.57 and overrides the shared scale within each `ChatView` (panes, the subagent read-only view,
+  1.6 and overrides the shared scale within each `ChatView` (panes, the subagent read-only view,
   and the dashboard's embedded Mastermind) and exposes font size/family and line height. Terminal
   keeps its xterm-specific font controls. Editor typography
   covers code, diffs, and the JSON editor; rendered Markdown defaults to the same 14 px as Chat, so
   an agent's reply and the document it wrote read alike,
   but has its own font-size and line-height settings rather than borrowing `terminal.fontSize`.
-  CodeMirror views reconfigure while mounted.
+  CodeMirror views reconfigure while mounted. Word Wrap (`editor.wordWrap`, on by default) applies
+  to the same set, the JSON editor included (`previews/wrap.ts`).
 - **Reading Width is the column width.** `chat.contentWidth` (Appearance › Reading Width, 680 px by
   default, the Claude desktop app's column) sets the transcript column, its composer and trays, and the
   rendered Markdown column (plus its padding) on every chat surface; a narrower pane still fits its

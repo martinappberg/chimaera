@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { wantsCoverStill } from "./paneView";
+import { floatsOver, overlayHides, wantsCoverStill } from "./paneView";
 
 describe("wantsCoverStill", () => {
   const base = { shownNow: true, hiding: true, covered: true, hostDraws: true, stillUp: false };
@@ -14,5 +14,21 @@ describe("wantsCoverStill", () => {
     expect(wantsCoverStill({ ...base, hiding: false })).toBe(false);
     expect(wantsCoverStill({ ...base, hostDraws: false })).toBe(false);
     expect(wantsCoverStill({ ...base, stillUp: true })).toBe(false);
+  });
+});
+
+describe("overlays over a view", () => {
+  it("counts a dialog inside a fixed backdrop, not only a positioned one", () => {
+    expect(floatsOver(["fixed"])).toBe(true); // a positioned menu
+    expect(floatsOver(["static", "fixed"])).toBe(true); // the SSH prompt: its box in a fixed backdrop
+    expect(floatsOver(["static", "relative", "absolute"])).toBe(true);
+    expect(floatsOver(["static", "relative", "static"])).toBe(false); // an inline card in the page flow
+    expect(floatsOver([])).toBe(false);
+  });
+
+  it("hides every view under a window modal, any other overlay only where it meets", () => {
+    expect(overlayHides(true, false)).toBe(true); // the modal's backdrop dims the whole window
+    expect(overlayHides(false, true)).toBe(true);
+    expect(overlayHides(false, false)).toBe(false);
   });
 });

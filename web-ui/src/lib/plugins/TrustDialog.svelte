@@ -168,11 +168,9 @@
     gap: 10px;
   }
   .head {
-    font-size: 11px;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--muted);
+    font-size: var(--text-sm);
     font-weight: 600;
+    color: color-mix(in srgb, var(--fg) 72%, var(--muted));
     margin-bottom: 4px;
   }
   ul {

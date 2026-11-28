@@ -87,15 +87,15 @@
     display: flex;
     gap: 8px;
     align-items: baseline;
-    font-size: 10.5px;
+    font-size: var(--text-sm);
     font-weight: 600;
-    letter-spacing: 0.09em;
-    text-transform: uppercase;
-    color: var(--muted);
+    color: color-mix(in srgb, var(--fg) 72%, var(--muted));
   }
   .n {
     font-family: var(--mono);
-    letter-spacing: 0;
+    font-size: var(--text-xs);
+    font-weight: 500;
+    color: var(--muted);
   }
   .lead {
     margin: 0 0 12px;

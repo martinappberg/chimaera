@@ -15,10 +15,18 @@
     system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --ui-font: var(--ui-font-custom, var(--ui-font-default));
   --editor-font: var(--editor-font-custom, var(--mono));
+  /* What things are called in chrome: session titles, view tabs, the
+     agent's name. These are titles people read, so they are set in the
+     interface face; --mono is for what is literally code or
+     terminal text (commands, paths in prose, hashes, counts that must align). */
+  --name-font: var(--ui-font);
+  /* A file's name is literal text from the disk and keeps the terminal's
+     face, in the tree and on its tab: the workbench's link to the shell. */
+  --file-font: var(--mono);
   /* The whole interface scale — four sizes, set live from
      appearance.interfaceFontSize. Content surfaces may override the scale
      locally (chat) or use their own pixel settings (terminal/editor).
-     xs: tabs/titles/strip/crumbs/badges · sm: mono names/hints ·
+     xs: titles/strip/crumbs/badges · sm: tabs/hints ·
      md: rows/buttons/inputs · lg: body/terminal. */
   --text-xs: 11.5px;
   --text-sm: 12.5px;
@@ -32,6 +40,11 @@
   --notice-stack-offset: 140px;
   /* Single focus treatment for every keyboard-focusable control. */
   --focus-ring: color-mix(in srgb, var(--accent) 70%, transparent);
+  /* The edge of the surface that has focus (the active pane among several,
+     the Mastermind card, the composer's field): a tint of the accent on the
+     ordinary edge, enough to find at a glance and never a coloured frame.
+     Keyboard focus on a control keeps the full --focus-ring. */
+  --focus-edge: color-mix(in srgb, var(--accent) 32%, var(--edge));
   /* The accent as TEXT (links, paths, allowed-labels): an accent chosen for
      dots and buttons can sit under 4.5:1 on the sheet (chimaera-light's green
      is 3.4:1), so prose-sized accent text takes it a quarter toward --fg —
@@ -41,6 +54,9 @@
      composer (plan, plan approval, agent messages, the pinned trays) —
      the composer's box too, so the stack reads as one family. */
   --radius-card: 8px;
+  /* The composer's card: softer than a transcript card, because it is the
+     one surface the user writes on rather than reads. */
+  --composer-radius: 12px;
   /* A floating surface's corners and shadow (menus, popovers, tooltips). */
   --overlay-radius: 8px;
   --overlay-shadow: 0 6px 24px rgba(0, 0, 0, 0.22);
@@ -178,7 +194,7 @@
    comrak's bare <table>, so there the table itself scrolls as a display:block
    box, which keeps its table semantics (verified on WebKit 26.6 and Chromium
    151: table / row / columnheader / cell all survive). Either scroller
-   chains like the surface's own bar (thin) and contains horizontal
+   draws a slim bar ("Scrollers inside prose", below) and contains horizontal
    overscroll so a trackpad swipe at a table edge never becomes WebKit's back
    gesture; its 1px padding keeps the outer half of the collapsed border
    (which lies outside the table box) inside the clip. An agent's unhosted
@@ -206,8 +222,13 @@
   display: block;
   overflow-x: auto;
   overscroll-behavior-x: contain;
-  scrollbar-width: thin;
   padding: 1px;
+}
+@supports not selector(::-webkit-scrollbar) {
+  :is(.md, .cm-md-live) .md-table,
+  :is(.md-body, .md-doc) table:not(:where(.embed-card *)) {
+    scrollbar-width: thin;
+  }
 }
 :is(.md, .cm-md-live) .md-table,
 .md table:not(.md-table > table):not(:where(.embed-card *)),
@@ -218,10 +239,22 @@
   border-collapse: collapse;
   font-size: var(--md-table-font-size, 0.924em);
 }
+/* Ruled, not boxed: one hairline under each row and a firmer one under the
+   header, no verticals and no header fill — the numbers carry the table and
+   the page stays one surface. The first column starts on the prose's left
+   edge so a table reads as part of the text it sits in. */
 :is(.md, .md-body, .md-doc, .cm-md-live) table:not(:where(.embed-card *)) :is(th, td) {
-  border: 1px solid var(--edge);
-  padding: var(--md-table-cell-padding, 0.35em 0.7em);
+  border: none;
+  border-bottom: 1px solid color-mix(in srgb, var(--edge) 85%, transparent);
+  padding: var(--md-table-cell-padding, 0.5em 0.85em);
   text-align: left;
+  vertical-align: top;
+}
+:is(.md, .md-body, .md-doc, .cm-md-live) table:not(:where(.embed-card *)) :is(th, td):first-child {
+  padding-left: 0.15em;
+}
+:is(.md, .md-body, .md-doc, .cm-md-live) table:not(:where(.embed-card *)) tbody tr:last-child > td {
+  border-bottom-color: transparent;
 }
 :is(.md, .md-body, .md-doc, .cm-md-live) table:not(:where(.embed-card *)) :is(th, td)[align="center" i] {
   text-align: center;
@@ -231,7 +264,8 @@
 }
 :is(.md, .md-body, .md-doc, .cm-md-live) table:not(:where(.embed-card *)) th {
   font-weight: 600;
-  background: color-mix(in srgb, var(--fg) 4%, transparent);
+  vertical-align: bottom;
+  border-bottom-color: color-mix(in srgb, var(--fg) 22%, transparent);
 }
 :is(.md, .cm-md-live) .md-table table :is(th, td),
 :is(.md-body, .md-doc) table:not(:where(.embed-card *)) :is(th, td) {
@@ -706,6 +740,66 @@ body.dragging {
   }
 }
 
+/* Scrollers inside prose (a fenced block's code, a wide table, display
+   math: chat, the document views, notebooks, hover previews): a slim thumb
+   that shows only while the pointer or the keyboard is on the block. A
+   full-size bar under three lines of code is the heaviest thing in the
+   block. Styling the WebKit pseudos replaces the platform's bar outright,
+   overlay bars included, so a block that overflows keeps a 6px strip under
+   it and the thumb is this rule's alone. The component rules must not set
+   scrollbar-width / scrollbar-color on these: a non-auto standard value
+   switches the pseudos off — and scrollbar-color inherits (the transcript
+   sets one), so both are reset here. */
+@supports selector(::-webkit-scrollbar) {
+  :is(.md, .md-doc, .md-body) pre > code,
+  .nb-md :is(pre, .nb-math-block),
+  :is(.md, .cm-md-live) .md-table,
+  :is(.md-body, .md-doc) table:not(:where(.embed-card *)),
+  .md-doc .md-math-display {
+    scrollbar-width: auto;
+    scrollbar-color: auto;
+  }
+  :is(.md, .md-doc, .md-body) pre > code::-webkit-scrollbar,
+  .nb-md :is(pre, .nb-math-block)::-webkit-scrollbar,
+  :is(.md, .cm-md-live) .md-table::-webkit-scrollbar,
+  :is(.md-body, .md-doc) table:not(:where(.embed-card *))::-webkit-scrollbar,
+  .md-doc .md-math-display::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  :is(.md, .md-doc, .md-body) pre > code::-webkit-scrollbar-track,
+  .nb-md :is(pre, .nb-math-block)::-webkit-scrollbar-track,
+  :is(.md, .cm-md-live) .md-table::-webkit-scrollbar-track,
+  :is(.md-body, .md-doc) table:not(:where(.embed-card *))::-webkit-scrollbar-track,
+  .md-doc .md-math-display::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  :is(.md, .md-doc, .md-body) pre > code::-webkit-scrollbar-thumb,
+  .nb-md :is(pre, .nb-math-block)::-webkit-scrollbar-thumb,
+  :is(.md, .cm-md-live) .md-table::-webkit-scrollbar-thumb,
+  :is(.md-body, .md-doc) table:not(:where(.embed-card *))::-webkit-scrollbar-thumb,
+  .md-doc .md-math-display::-webkit-scrollbar-thumb {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 3px;
+    background-clip: padding-box;
+  }
+  :is(.md, .md-doc, .md-body) pre:is(:hover, :focus-within) > code::-webkit-scrollbar-thumb,
+  .nb-md :is(pre, .nb-math-block):is(:hover, :focus-within)::-webkit-scrollbar-thumb,
+  :is(.md, .cm-md-live) .md-table:is(:hover, :focus-within)::-webkit-scrollbar-thumb,
+  :is(.md-body, .md-doc) table:not(:where(.embed-card *)):is(:hover, :focus-within)::-webkit-scrollbar-thumb,
+  .md-doc .md-math-display:is(:hover, :focus-within)::-webkit-scrollbar-thumb {
+    background-color: color-mix(in srgb, var(--fg) 24%, transparent);
+  }
+}
+@supports not selector(::-webkit-scrollbar) {
+  .nb-md :is(pre, .nb-math-block),
+  :is(.md, .md-doc, .md-body) pre > code,
+  .md-doc .md-math-display {
+    scrollbar-width: thin;
+  }
+}
+
 /* xterm chrome: transparent viewport (the slot owns the background) and a
    thin, quiet scrollbar instead of the default heavy one. */
 .xterm .xterm-viewport {
@@ -798,6 +892,11 @@ body.dragging {
   --pane-tab-height: 28px;
   --pane-toolbar-height: 30px;
   --pane-control-size: 24px;
+  /* A pane's toolbar (the chat's agent strip, a document's mode strip) sits
+     on the page's own sheet under a faint rule: one surface with what it
+     controls, not a second bar stacked under the tabs. */
+  --pane-toolbar-bg: var(--term-bg);
+  --pane-toolbar-edge: color-mix(in srgb, var(--edge) 60%, transparent);
   --pane-control-hover: color-mix(in srgb, var(--fg) 5%, transparent);
   --pane-control-selected: color-mix(in srgb, var(--fg) 8%, transparent);
 }

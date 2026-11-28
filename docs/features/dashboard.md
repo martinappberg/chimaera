@@ -102,7 +102,7 @@ workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
 ## Now (the roster line)
 
 - **What & when.** "Who's running?" as ONE line by default (`NowLine.svelte`) — the rail
-  already lists sessions, so the dashboard stops competing: each agent's name in mono plus an
+  already lists sessions, so the dashboard stops competing: each agent's name plus an
   honest phrase from the rail's vocabulary (its `now_line` / status detail while working,
   "waiting on you", "errored", "finished", "idle", "exited"), up to 6 then "+N more",
   terminals folded into a count ("2 terminals · 1 running"), a quiet `↳` on the agent this

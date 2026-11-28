@@ -36,6 +36,8 @@ export interface EmbedProps {
   resolve?: () => Promise<TargetResult | null>;
   /** Open in a pane (default: the workbench opener, `openPath`). */
   onOpen?: (path: string, kind: "file" | "dir", reveal?: Reveal) => void;
+  /** The chat whose answer shows the card (an HTML page may send to it). */
+  chat?: string | null;
 }
 
 export interface EmbedHandle {

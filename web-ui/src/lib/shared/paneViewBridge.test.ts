@@ -7,6 +7,8 @@ import {
   referencePill,
   samePill,
   withBridge,
+  withPageApi,
+  PAGE_TEXT_MAX,
 } from "./paneViewBridge";
 
 const key = { key: "r", code: "KeyR", metaKey: true, ctrlKey: false, altKey: false, shiftKey: true };
@@ -155,5 +157,79 @@ describe("user input (agent browser take-over)", () => {
   });
   it("never takes one from a framed page", () => {
     expect(decodeFrameMessage({ chimaeraPaneView: { kind: "user_input" } })).toBeNull();
+  });
+});
+
+describe("page messages", () => {
+  it("reads a page's send and draft, from the shell and from a frame", () => {
+    expect(decodeNativeViewEvent({ id: "v1", kind: "page_send", text: "a = FORMAT", title: " Quiz\n 1 " })).toEqual({
+      id: "v1",
+      kind: "page_send",
+      text: "a = FORMAT",
+      title: "Quiz 1",
+    });
+    expect(decodeFrameMessage({ chimaeraPaneView: { kind: "page_draft", text: "hi", title: "T" } })).toEqual({
+      kind: "page_draft",
+      text: "hi",
+      title: "T",
+    });
+  });
+
+  it("drops an empty or malformed one, and caps a long one", () => {
+    expect(decodeNativeViewEvent({ id: "v1", kind: "page_send", text: "  ", title: "" })).toBeNull();
+    expect(decodeNativeViewEvent({ id: "v1", kind: "page_send", text: 3 })).toBeNull();
+    const long = decodeNativeViewEvent({ id: "v1", kind: "page_draft", text: "x".repeat(PAGE_TEXT_MAX + 50) });
+    expect(long !== null && "text" in long && long.text.length).toBe(PAGE_TEXT_MAX);
+    // A missing title is the page's silence, not a fault.
+    expect(decodeNativeViewEvent({ id: "v1", kind: "page_draft", text: "ok" })).toEqual({
+      id: "v1",
+      kind: "page_draft",
+      text: "ok",
+      title: "",
+    });
+  });
+});
+
+describe("withPageApi", () => {
+  it("asks a framed page for the bridge, a native one for the API alone", () => {
+    expect(withPageApi("/raw/t/a.html", { framed: true, theme: null })).toBe("/raw/t/a.html?bridge=1");
+    expect(withPageApi("/raw/t/a.html", { framed: false, theme: null })).toBe("/raw/t/a.html?api=1");
+  });
+
+  it("carries the theme, keeping the URL's own query and fragment", () => {
+    expect(withPageApi("/raw/t/a.html?v=2#top", { framed: false, theme: "eyJt" })).toBe(
+      "/raw/t/a.html?v=2&api=1&chimaera-theme=eyJt#top",
+    );
+    expect(withPageApi("/raw/t/a.html", { framed: true, theme: "" })).toBe("/raw/t/a.html?bridge=1");
+  });
+});
+
+describe("page size", () => {
+  it("reads a page's height and refuses a bad one", () => {
+    expect(decodeNativeViewEvent({ id: "v1", kind: "page_size", height: 412.5 })).toEqual({ id: "v1", kind: "page_size", height: 412.5 });
+    expect(decodeFrameMessage({ chimaeraPaneView: { kind: "page_size", height: 9e9 } })).toEqual({ kind: "page_size", height: 100_000 });
+    expect(decodeNativeViewEvent({ id: "v1", kind: "page_size", height: -1 })).toBeNull();
+    expect(decodeNativeViewEvent({ id: "v1", kind: "page_size", height: "400" })).toBeNull();
+  });
+
+  it("marks an inline page in its URL", () => {
+    expect(withPageApi("/raw/t/a.html", { framed: true, theme: null, inline: 720 })).toBe(
+      "/raw/t/a.html?bridge=1&chimaera-inline=720",
+    );
+  });
+});
+
+describe("hover", () => {
+  it("reads the pointer coming over the page and leaving it", () => {
+    expect(decodeNativeViewEvent({ id: "v1", kind: "hover", inside: true })).toEqual({ id: "v1", kind: "hover", inside: true });
+    expect(decodeFrameMessage({ chimaeraPaneView: { kind: "hover", inside: false } })).toEqual({ kind: "hover", inside: false });
+    expect(decodeNativeViewEvent({ id: "v1", kind: "hover", inside: "yes" })).toBeNull();
+  });
+});
+
+describe("page themed", () => {
+  it("reads a page saying it wears the theme", () => {
+    expect(decodeNativeViewEvent({ id: "v1", kind: "page_themed" })).toEqual({ id: "v1", kind: "page_themed" });
+    expect(decodeFrameMessage({ chimaeraPaneView: { kind: "page_themed" } })).toEqual({ kind: "page_themed" });
   });
 });

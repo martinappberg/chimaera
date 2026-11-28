@@ -79,6 +79,7 @@
   import { subagentChatId, subagentModel, subagentRunning } from "./subagentView";
   import ArtifactGallery from "./ArtifactGallery.svelte";
   import { EmbedResolver } from "./embeds";
+  import { splitPageMessage } from "../shared/pageMessage";
   import { HoverTargets } from "./hoverTargets";
   import { isMissing, rawUrl, resolveFile, resolveTargets } from "../shared/embed/embed";
   import { HoverPreviews } from "../previews/doc/hoverController.svelte";
@@ -2121,7 +2122,10 @@
   /** Files the chat shows as embed cards (prose `![](…)`, the turn
    *  gallery's shell-written files) resolve against the same directories,
    *  strictly: an embed names one file. */
-  const proseEmbeds = new EmbedResolver(() => untrack(() => linkContext()));
+  const proseEmbeds = new EmbedResolver(
+    () => untrack(() => linkContext()),
+    () => untrack(() => session.id),
+  );
   /** What the transcript's path links and document chips preview on a
    *  rest (the document view's hover preview, over the transcript). */
   const hoverTargets = new HoverTargets();
@@ -3370,6 +3374,9 @@
         <!-- Only delivered (sent) user messages render inline; queued/dropped
              ones live in the pending tail below. -->
         {@const pictureOnly = block.text.length === 0 && block.attachmentPaths.length > 0}
+        <!-- A click in a page the agent embedded sent this (origin `page`):
+             the user's words, the page as a tag under the bubble. -->
+        {@const pageSent = block.origin === "page" ? splitPageMessage(block.text) : null}
         <div class="msg user" data-block-index={item.index} data-block-uid={block.uid}>
           {#if block.attachmentPaths.length > 0 && !pictureOnly}
             {@render sentImages(block.attachmentPaths)}
@@ -3402,16 +3409,18 @@
             {:else}
               <div class="bubble">
                 {#if agentKind === "claude" && block.checkpoint?.id}
-                  <ModSite {mods} component="UserMessage" instanceId={block.checkpoint.id} active={visible && $pageVisible} props={{ text: block.text, origin: { kind: block.origin ? "unclassified" : "composer" }, isExpanded: true }}>
-                    {#snippet children(draw)}<UserText {terminals} {onOpenTerminal} text={typeof draw.text === "string" ? draw.text : block.text} onOpenPath={openProsePath} resolvePaths={prosePaths} />{/snippet}
+                  <ModSite {mods} component="UserMessage" instanceId={block.checkpoint.id} active={visible && $pageVisible} props={{ text: pageSent?.body ?? block.text, origin: { kind: block.origin ? "unclassified" : "composer" }, isExpanded: true }}>
+                    {#snippet children(draw)}<UserText {terminals} {onOpenTerminal} text={typeof draw.text === "string" ? draw.text : (pageSent?.body ?? block.text)} onOpenPath={openProsePath} resolvePaths={prosePaths} />{/snippet}
                   </ModSite>
-                {:else}<UserText {terminals} {onOpenTerminal} text={block.text} onOpenPath={openProsePath} resolvePaths={prosePaths} />{/if}
+                {:else}<UserText {terminals} {onOpenTerminal} text={pageSent?.body ?? block.text} onOpenPath={openProsePath} resolvePaths={prosePaths} />{/if}
               </div>
             {/if}
           </div>
-          {#if unsavedImages(block) !== "" || block.origin === "remote" || block.origin === "restart" || block.origin === "worker"}
+          {#if unsavedImages(block) !== "" || block.origin === "remote" || block.origin === "restart" || block.origin === "worker" || pageSent !== null}
             <span class="bubble-meta">
-              {#if block.origin === "remote"}
+              {#if pageSent !== null}
+                <span class="origin auto" title={pageSent.title !== "" ? `sent with your click in the page “${pageSent.title}”` : "sent with your click in a page"}>{pageSent.title !== "" ? `from ${pageSent.title}` : "from a page"}</span>
+              {:else if block.origin === "remote"}
                 <span class="origin" title="sent from a Remote Control client (the Claude app or claude.ai/code)">via Remote Control</span>
               {:else if block.origin === "restart"}
                 <span class="origin auto" title="chimaera sent this itself: the daemon restarted while this chat had work running, so it asked the resumed agent to pick that work back up (setting: Pick Up Interrupted Work After a Restart)">sent by chimaera after a restart</span>
@@ -3787,7 +3796,7 @@
               {:else}
                 <div class="bubble">
                   <UserText {terminals} {onOpenTerminal}
-                    text={send.text}
+                    text={send.origin === "page" ? (splitPageMessage(send.text)?.body ?? send.text) : send.text}
                     onOpenPath={openProsePath}
                     resolvePaths={prosePaths}
                   />
@@ -4180,6 +4189,8 @@
      is the boundary (the Claude Desktop treatment). */
   .chat > :global(.composer) {
     border-top: none;
+    /* Room for the card's shadow to fall before the pane's edge. */
+    padding-bottom: 14px;
   }
   /* The pinned cards (subagents, background, plan) keep their borders on
      the column's text edges and stack 6px apart. */
@@ -4258,13 +4269,15 @@
     flex-direction: column;
     align-items: flex-end;
     max-width: min(85%, 40rem);
-    margin-top: 14px;
-    margin-bottom: 6px;
+    /* A new turn starts here: the gap above a question is the widest in the
+       transcript, so turns separate at a glance while scrolling. */
+    margin-top: 22px;
+    margin-bottom: 8px;
   }
   .msg.user .bubble {
     background: color-mix(in srgb, var(--fg) 6%, transparent);
-    border-radius: 14px;
-    padding: 8px 14px;
+    border-radius: 18px;
+    padding: 9px 16px;
     max-width: 100%;
   }
   .attach {
@@ -4729,27 +4742,28 @@
   }
   .jump {
     position: sticky;
-    bottom: 4px;
+    bottom: 8px;
     align-self: center;
     display: grid;
     place-items: center;
-    width: 24px;
-    height: 24px;
+    width: 28px;
+    height: 28px;
     /* No net height in the column (its own plus the column's gap): it
        appears and goes as the reader leaves and reaches the bottom, and a
        row coming and going there clamped scrollTop — a snap on every
        arrival at the live edge. */
-    margin-top: calc(-24px - var(--row-gap));
+    margin-top: calc(-28px - var(--row-gap));
     padding: 0;
     font: inherit;
-    font-size: var(--text-lg);
+    font-size: var(--text-md);
     line-height: 1;
-    color: color-mix(in srgb, var(--fg) 40%, transparent);
-    background: none;
-    border: none;
-    text-shadow:
-      0 1px 2px var(--term-bg),
-      0 0 6px var(--term-bg);
+    /* A real control over the text it floats on: a small raised disc, not a
+       bare glyph the words show through. */
+    color: var(--muted);
+    background: var(--overlay-bg);
+    border: 1px solid var(--edge);
+    border-radius: 999px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
     cursor: pointer;
     transition:
       color 0.12s ease,
@@ -4757,7 +4771,7 @@
   }
   .jump:hover,
   .jump:focus-visible {
-    color: color-mix(in srgb, var(--fg) 72%, transparent);
+    color: var(--fg);
   }
   .jump:hover {
     transform: translateY(1px);

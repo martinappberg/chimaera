@@ -1024,7 +1024,6 @@
     border-radius: 6px;
     padding: 0.7em 0.9em;
     overflow-x: auto;
-    scrollbar-width: thin;
     line-height: 1.5;
   }
 
@@ -1034,11 +1033,9 @@
   }
 
   .nb-md :global(blockquote) {
-    margin: 0.8em 0;
-    padding: 0.4em 1em;
-    border-left: 3px solid color-mix(in srgb, var(--accent) 60%, transparent);
-    border-radius: 0 6px 6px 0;
-    background: color-mix(in srgb, var(--accent) 5%, transparent);
+    margin: 0.9em 0;
+    padding: 0.1em 1em;
+    border-left: 3px solid color-mix(in srgb, var(--fg) 16%, transparent);
     color: color-mix(in srgb, var(--fg) 55%, var(--muted));
   }
 
@@ -1048,8 +1045,13 @@
     margin: 0.5em 0;
   }
 
-  .nb-md :global(li)::marker {
+  .nb-md :global(ul > li)::marker {
     color: color-mix(in srgb, var(--accent) 70%, var(--muted));
+  }
+  .nb-md :global(ol > li)::marker {
+    color: var(--accent-text);
+    font-variant-numeric: tabular-nums;
+    font-weight: 500;
   }
 
   .nb-md :global(hr) {
@@ -1064,7 +1066,6 @@
 
   .nb-md :global(.nb-math-block) {
     overflow-x: auto;
-    scrollbar-width: thin;
     text-align: center;
   }
 

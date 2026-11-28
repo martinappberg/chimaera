@@ -906,6 +906,10 @@ async fn a_working_chat_hears_it_at_its_next_step_and_its_transcript_shows_it() 
     assert!(content.contains("heads-up: qc/ moved"), "{content}");
 
     // Still working, a second message; then the turn ends before any hook.
+    // Working again explicitly: the fake chat's own startup can land after
+    // the first line above and reset the record (a race the test must not
+    // depend on).
+    lock(&state.agents).get_mut(&c).unwrap().state = agent_state::AgentState::Running;
     let b = tui(&state, &ws, "kb");
     let (_, text) = send(
         &state,

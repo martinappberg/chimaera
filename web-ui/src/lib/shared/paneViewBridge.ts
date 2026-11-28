@@ -36,7 +36,27 @@ export type NativeViewEvent =
   | { id: string; kind: "crashed" }
   /** Trusted input in the view that matches no input an agent injected:
    *  the person at the window acted (agent browser take-over). */
-  | { id: string; kind: "user_input" };
+  | { id: string; kind: "user_input" }
+  /** The page API's `send` / `draft` (`chimaera-core` `page_api.js`): a
+   *  page asking to message the agent, believed only right after the
+   *  person's own input (the native bridge checks; a framed page's host
+   *  checks itself). `title` is the page's own and only words. */
+  | { id: string; kind: "page_send" | "page_draft"; text: string; title: string }
+  /** The page API's report of the page's content height (CSS px), for an
+   *  inline card that takes the page's own height. The page's word: a host
+   *  clamps it. */
+  | { id: string; kind: "page_size"; height: number }
+  /** The pointer came over the page or left it (trusted pointer events,
+   *  for a control that shows on hover). */
+  | { id: string; kind: "hover"; inside: boolean }
+  /** The page wears the app's theme (the page API: `--ch-*` in its own
+   *  styles, `#inline`, or its meta tag): its host may load it again for a
+   *  new theme. A page that doesn't is never reloaded for one. */
+  | { id: string; kind: "page_themed" };
+
+/** The most of a page's message, and of its title, that is kept. */
+export const PAGE_TEXT_MAX = 4000;
+const PAGE_TITLE_MAX = 120;
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null;
 const str = (v: unknown): v is string => typeof v === "string";
@@ -82,6 +102,20 @@ export function decodeNativeViewEvent(raw: unknown): NativeViewEvent | null {
     case "page":
       if (!str(raw.url) || !str(raw.title)) return null;
       return { id, kind: "page", url: raw.url, title: raw.title };
+    case "page_themed":
+      return { id, kind: "page_themed" };
+    case "hover":
+      if (!bool(raw.inside)) return null;
+      return { id, kind: "hover", inside: raw.inside };
+    case "page_size":
+      if (!num(raw.height) || raw.height < 0) return null;
+      return { id, kind: "page_size", height: Math.min(raw.height, 100_000) };
+    case "page_send":
+    case "page_draft": {
+      if (!str(raw.text) || raw.text.trim() === "") return null;
+      const title = str(raw.title) ? raw.title.replace(/\s+/g, " ").trim().slice(0, PAGE_TITLE_MAX) : "";
+      return { id, kind: raw.kind, text: raw.text.slice(0, PAGE_TEXT_MAX), title };
+    }
     default:
       return null;
   }
@@ -182,13 +216,41 @@ export function isChord(k: NativeViewKey, chord: ChordLike): boolean {
   );
 }
 
-/** `url` asking the daemon for its pane bridge (`?bridge=1`), any query
- *  and fragment it already carries kept. */
-export function withBridge(url: string): string {
+/** `url` with `pair` added to its query (unless it is already there), any
+ *  query and fragment it carries kept. */
+function withPair(url: string, pair: string): string {
   const hash = url.indexOf("#");
   const base = hash === -1 ? url : url.slice(0, hash);
   const frag = hash === -1 ? "" : url.slice(hash);
-  if (/[?&]bridge=1(&|$)/.test(base)) return url;
+  const [key] = pair.split("=");
+  if (new RegExp(`[?&]${key}=`).test(base)) return url;
   const sep = !base.includes("?") ? "?" : base.endsWith("?") || base.endsWith("&") ? "" : "&";
-  return `${base}${sep}bridge=1${frag}`;
+  return `${base}${sep}${pair}${frag}`;
+}
+
+/** `url` asking the daemon for its pane bridge (`?bridge=1`), any query
+ *  and fragment it already carries kept. A framed page gets the page API
+ *  with it. */
+export function withBridge(url: string): string {
+  return withPair(url, "bridge=1");
+}
+
+/**
+ * A preview's own page as Chimaera shows it: with the page API
+ * (`window.chimaera`) — and, framed, the pane bridge — appended by the
+ * daemon, and the app's theme (`pageTheme.ts`, encoded) for the page to
+ * read at once. A framed page hears later themes as messages; a native
+ * view's URL carries the current one, so a new theme loads it again.
+ */
+export function withPageApi(
+  url: string,
+  opts: { framed: boolean; theme: string | null; inline?: number },
+): string {
+  let asked = opts.framed ? withBridge(url) : withPair(url, "api=1");
+  // An inline page (`#inline` on its embed) follows the theme's light/dark
+  // for the browser's own defaults too (its text, its controls): it sits on
+  // the app's background, not a white card. The value is the most height
+  // the card gives it: up to that, the page never shows a scrollbar.
+  if (opts.inline !== undefined && opts.inline > 0) asked = withPair(asked, `chimaera-inline=${Math.round(opts.inline)}`);
+  return opts.theme === null || opts.theme === "" ? asked : withPair(asked, `chimaera-theme=${opts.theme}`);
 }

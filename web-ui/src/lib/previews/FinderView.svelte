@@ -1283,7 +1283,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-family: var(--mono);
+    font-family: var(--file-font);
     font-size: var(--text-sm);
   }
 
@@ -1328,7 +1328,7 @@
   .edit-input {
     flex: 1;
     min-width: 0;
-    font-family: var(--mono);
+    font-family: var(--file-font);
     font-size: var(--text-sm);
     color: var(--fg);
     background: var(--bg);

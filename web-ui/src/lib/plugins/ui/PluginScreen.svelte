@@ -397,6 +397,21 @@
     box-sizing: border-box;
     min-height: 100%;
   }
+  /* A split body pins the screen to the pane's height: with only a minimum
+     it grew to its tallest side (a 44-slide list), and a viewer beside it
+     centred its picture in a box taller than the window. Any other body
+     keeps growing with its content (the tab scrolls), so a long list never
+     overflows a pinned box. A pane too short for the split's floor still
+     scrolls (the tab's overflow). */
+  .screen.fill:has(> :global(.stack > .split:last-child)) {
+    height: 100%;
+  }
+  /* Stacked (a narrow pane), the split scrolls inside the pinned screen,
+     so nothing after it (the Replace note) is painted over. */
+  .screen.fill > :global(.stack > .split:last-child) {
+    overflow: auto;
+    scrollbar-width: thin;
+  }
   .screen.fill > :global(.stack) {
     flex: 1;
     min-height: 0;
@@ -406,6 +421,18 @@
   .screen.fill > :global(.stack > :last-child) {
     flex: 1;
     min-height: 0;
+  }
+  /* A body split side by side is one row the body's height, and each side
+     scrolls on its own: the long side (a list) never sets the row. */
+  @container plugin-screen (min-width: 561px) {
+    .screen.fill > :global(.stack > .split:last-child) {
+      grid-template-rows: minmax(0, 1fr);
+      min-height: 320px;
+    }
+    .screen.fill > :global(.stack > .split:last-child > .pane) {
+      overflow: auto;
+      scrollbar-width: thin;
+    }
   }
   .screen.fill > :global(.stack > .rich.tall:last-child) {
     height: auto;

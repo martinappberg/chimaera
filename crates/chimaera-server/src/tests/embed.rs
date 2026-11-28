@@ -620,6 +620,10 @@ async fn a_preview_page_can_carry_the_pane_bridge() {
     let tail = &body[page.len()..];
     assert!(tail.trim_start().starts_with("<script>"));
     assert!(tail.contains("__chimaeraPaneView"));
+    // The page API follows the bridge, in its own element.
+    let bridge_at = tail.find("__chimaeraPaneView").unwrap();
+    let api_at = tail.find(chimaera_core::PAGE_API_JS).expect("the page API");
+    assert!(bridge_at < api_at);
     assert_eq!(
         header_str(&headers, "content-length"),
         body.len().to_string()
@@ -646,8 +650,35 @@ async fn a_preview_page_can_carry_the_pane_bridge() {
     // Only the page itself: an asset asked the same way is just the asset.
     let (_, _, js) = get_with(&state, &format!("/raw/{ticket}/app.js?bridge=1"), &[]).await;
     assert_eq!(&js[..], b"console.log(1)");
-    // The script can't end its own element early.
+    // The scripts can't end their own elements early.
     assert!(!chimaera_core::PANE_BRIDGE_JS.contains("</script"));
+    assert!(!chimaera_core::PAGE_API_JS.contains("</script"));
+
+    // A native view asks with `?api=1`: the page API alone (the app injects
+    // its own bridge), under a validator of its own.
+    let native = format!("/raw/{ticket}/index.html?api=1");
+    let (status, native_headers, body) = get_with(&state, &native, &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let body = std::str::from_utf8(&body).unwrap();
+    assert!(body.starts_with(page), "the page comes first, untouched");
+    let tail = &body[page.len()..];
+    assert!(tail.contains(chimaera_core::PAGE_API_JS));
+    assert!(
+        !tail.contains("__chimaeraPaneView"),
+        "no bridge in the page's world"
+    );
+    assert_eq!(header_str(&native_headers, "accept-ranges"), "none");
+    assert_ne!(
+        header_str(&native_headers, "etag"),
+        header_str(&headers, "etag")
+    );
+    assert_ne!(
+        header_str(&native_headers, "etag"),
+        header_str(&plain_headers, "etag")
+    );
+    // `bridge=1` wins when both are asked.
+    let (_, both, _) = get_with(&state, &format!("{uri}&api=1"), &[]).await;
+    assert_eq!(header_str(&both, "etag"), header_str(&headers, "etag"));
     std::fs::remove_dir_all(&root).ok();
 }
 

@@ -159,7 +159,7 @@
 </section>
 
 <style>
-  /* Matches the shared settings grammar (see AgentsSettings): an uppercase
+  /* Matches the shared settings grammar (see AgentsSettings): a sentence-case
      category header, an intro, then SettingRow-shaped scope blocks with the
      modified-gutter idiom (here: unsaved-changes) and container-query
      narrowing, so the section reads as one system. */

@@ -309,11 +309,9 @@
     white-space: nowrap;
   }
   .lbl {
-    font-size: 11px;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--muted);
+    font-size: var(--text-sm);
     font-weight: 600;
+    color: color-mix(in srgb, var(--fg) 72%, var(--muted));
   }
   .hint {
     font-size: var(--text-xs);
@@ -412,7 +410,7 @@
     margin: 0 0 6px 2px;
   }
   .pname {
-    font-family: var(--mono);
+    font-family: var(--name-font);
     font-size: var(--text-sm);
     font-weight: 600;
     color: var(--fg);
@@ -487,8 +485,8 @@
     padding-top: 1px;
   }
   .agent {
-    font-family: var(--mono);
-    font-size: 10.5px;
+    font-family: var(--name-font);
+    font-size: var(--text-xs);
     line-height: 1.6;
     padding: 0 7px;
     border-radius: 999px;
@@ -539,11 +537,9 @@
     background: color-mix(in srgb, var(--accent) 5%, transparent);
   }
   .sbody dt {
-    font-size: 11px;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--muted);
+    font-size: var(--text-sm);
     font-weight: 600;
+    color: color-mix(in srgb, var(--fg) 72%, var(--muted));
     white-space: nowrap;
   }
   .sbody dd {

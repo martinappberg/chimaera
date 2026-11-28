@@ -1226,7 +1226,7 @@
     background: none;
     color: var(--muted);
     font: inherit;
-    font-family: var(--mono);
+    font-family: var(--name-font);
     font-size: var(--text-sm);
     display: inline-flex;
     align-items: center;
@@ -1551,7 +1551,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-family: var(--mono);
+    font-family: var(--name-font);
     font-size: var(--text-md);
   }
 

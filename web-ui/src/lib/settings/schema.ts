@@ -462,7 +462,7 @@ const DEFS = {
     category: "Chat",
     description: "Line height multiplier for messages and the composer.",
     type: "number",
-    default: 1.57,
+    default: 1.6,
     min: 1.2,
     max: 2.2,
     step: 0.01,
@@ -670,9 +670,10 @@ const DEFS = {
   "editor.wordWrap": {
     title: "Word Wrap",
     category: "Editor",
-    description: "Wrap long lines instead of scrolling horizontally.",
+    description:
+      "Wrap long lines to the pane instead of scrolling sideways, in every editor, diff and comparison. A wrapped line continues under its own indentation.",
     type: "boolean",
-    default: false,
+    default: true,
     scope: "client",
   },
   "editor.tabSize": {

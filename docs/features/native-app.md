@@ -52,7 +52,10 @@ app-build` (never the root `cargo`).
   capability names its web view's label (`authorize_daemon_origin`; for every daemon window
   the two labels are the same). Tauri hands a window-scoped capability to every web view in
   that window, so this keeps any future Tauri web view in a window from inheriting the grants.
-  Defence in depth: pane views are plain WKWebViews with no IPC.
+  Defence in depth: pane views are plain WKWebViews with no IPC. A page in a view reaches the
+  workbench only through the pane bridge (selections, references, the page API's theme, size,
+  hover and `send`/`draft` — the last only after the person's own press, never while an agent
+  drives the view; [files & previews](files-and-previews.md#embed-cards)).
 - **A deck in PowerPoint** (`shell/office.rs`): `office_open` takes the host from the calling
   window's own scope, never an argument. A local window's deck opens in Microsoft PowerPoint (or
   the default app); a remote window's deck (macro-free types only) goes on a round trip — a

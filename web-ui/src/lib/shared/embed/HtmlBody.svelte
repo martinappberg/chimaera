@@ -27,8 +27,13 @@
   import SlowLoad from "../SlowLoad.svelte";
   import { PaneViewControl, paneView, paneViewsPossible } from "../paneView";
   import { liveViews, type Still } from "./liveViews.svelte";
+  import { paneFrame } from "../paneFrame";
+  import { withPageApi } from "../paneViewBridge";
+  import { backgroundBehind, pageTheme, pageThemeOn } from "../pageTheme";
+  import { pageMessage } from "../pageMessage";
 
   interface Props {
+    /** The page's own `/raw` URL, as the card resolved it. */
     url: string | null;
     title: string;
     compact: boolean;
@@ -36,12 +41,106 @@
     active: boolean;
     /** On screen now (the app's view shows only while it is). */
     visible?: boolean;
+    /** The chat whose answer shows this card: a page may send to it
+     *  (`shared/pageMessage.ts`); null anywhere else. */
+    chat?: string | null;
+    /** When the page's file was last written (epoch ms): only a page written
+     *  during its chat may send. */
+    writtenAtMs?: number | null;
+    /** Part of the answer (`#inline`): the page's own height, the app's
+     *  background, no expand; an open button on hover. */
+    inline?: boolean;
+    /** Open the page in a pane (inline mode's only control). */
+    onOpen?: () => void;
   }
 
-  let { url, title, compact, active, visible = true }: Props = $props();
+  let {
+    url: pageUrl,
+    title,
+    compact,
+    active,
+    visible = true,
+    chat = null,
+    writtenAtMs = null,
+    inline = false,
+    onOpen,
+  }: Props = $props();
+
+  /** An inline page's height as it reports it (the page API's `page_size`),
+   *  kept between these bounds: past the top it scrolls inside itself. */
+  const INLINE_MIN = 48;
+  const INLINE_MAX = 720;
+  const INLINE_START = 160;
+  /** An inline page's open button shows while the pointer is over the page
+   *  or the button, and lingers this long after (the pointer travels from
+   *  one to the other). The page reports its hover (the bridge's `hover`):
+   *  the window can't see the pointer over a view or a site-isolated frame. */
+  const OPEN_LINGER_MS = 600;
+  let pageHover = $state(false);
+  let openHover = $state(false);
+  let lingering = $state(false);
+  let lingerTimer: ReturnType<typeof setTimeout> | null = null;
+  const onHover = (inside: boolean): void => {
+    pageHover = inside;
+    if (lingerTimer !== null) clearTimeout(lingerTimer);
+    lingering = true;
+    lingerTimer = setTimeout(() => {
+      lingering = false;
+      lingerTimer = null;
+    }, OPEN_LINGER_MS);
+  };
+  $effect(() => () => {
+    if (lingerTimer !== null) clearTimeout(lingerTimer);
+  });
+  const openShown = $derived(pageHover || openHover || lingering);
+  let reported = $state<number | null>(null);
+  const onPageSize = (h: number): void => {
+    reported = Math.min(INLINE_MAX, Math.max(INLINE_MIN, Math.ceil(h)));
+  };
+
+  // The page as Chimaera shows it (`withPageApi`): in the app, its URL
+  // carries the theme (a new theme loads it again); framed, the theme it
+  // loaded with, and later ones as messages, so the frame never reloads.
+  /** The card's own box, to read what is painted behind it. */
+  let box = $state<HTMLElement | null>(null);
+  /** The theme this page gets: the window's, and for an inline page the
+   *  colour behind its card as `bg` (a chat paints its own, not `--bg`),
+   *  so the page sits seamlessly on it. Read again when the theme changes. */
+  const theme = $derived.by(() => {
+    const base = $pageTheme;
+    if (!inline || box === null) return base;
+    return pageThemeOn(backgroundBehind(box.parentElement ?? box));
+  });
+  // An app view carries a new theme in its URL (a reload) only once the
+  // page said it wears it (`page_themed`): an old report keeps its state
+  // across a theme switch. An inline card waits for its box, so its page's
+  // first theme already has the colour behind it.
+  let pageThemed = $state(false);
+  $effect(() => {
+    void pageUrl;
+    pageThemed = false;
+  });
+  const waiting = $derived(pageUrl === null || (inline && box === null));
+  const url = $derived(
+    waiting || pageUrl === null
+      ? null
+      : withPageApi(pageUrl, {
+          framed: false,
+          theme: pageThemed ? theme : untrack(() => theme),
+          inline: inline ? INLINE_MAX : undefined,
+        }),
+  );
+  const frameUrl = $derived(
+    waiting || pageUrl === null
+      ? null
+      : withPageApi(pageUrl, { framed: true, theme: untrack(() => theme), inline: inline ? INLINE_MAX : undefined }),
+  );
+  const onPageMessage = (m: { send: boolean; text: string; title: string }): void => {
+    pageMessage({ chat, writtenAtMs, ...m });
+  };
 
   let expanded = $state(false);
-  const height = $derived(compact ? 200 : expanded ? 720 : 360);
+  const height = $derived(compact ? 200 : inline ? (reported ?? INLINE_START) : expanded ? 720 : 360);
 
   /** A still is taken this long after the page shows (its first paint
    *  settles: fonts, a chart drawing in). */
@@ -142,7 +241,7 @@
 </script>
 
 {#if native}
-  <div class="html-body native" class:tile={compact} style:height="{height}px">
+  <div class="html-body native" class:tile={compact} class:inline style:height="{height}px" bind:this={box}>
     <div class="stage" bind:this={host} bind:clientWidth={stageWidth}>
       {#if still !== null}
         <img
@@ -174,6 +273,10 @@
             onPage: () => (crashed = false),
             onFocus: () => liveViews.activate(id),
             onShown: (on) => (shownNow = on),
+            onPageMessage,
+            onPageSize,
+            onHover,
+            onPageThemed: () => (pageThemed = true),
             control,
           }}
         >
@@ -193,7 +296,18 @@
         </div>
       {/if}
     </div>
-    {#if !compact}
+    {#if inline}
+      <!-- Under the page, in the space the card keeps for it: nothing draws
+           over a view, and showing it never moves anything. -->
+      <button
+        class="pill open-under"
+        class:shown={openShown}
+        onclick={() => onOpen?.()}
+        onpointerenter={() => (openHover = true)}
+        onpointerleave={() => (openHover = false)}
+        title="open in a pane">open ↗</button
+      >
+    {:else if !compact}
       <!-- Outside the stage: the view draws above anything over it. -->
       <div class="foot">
         <button class="pill" onclick={() => (expanded = !expanded)} title={expanded ? "collapse" : "show more of the page"}>
@@ -203,11 +317,26 @@
     {/if}
   </div>
 {:else}
-  <div class="html-body" class:tile={compact} style:height="{height}px">
-    {#if active && url !== null}
-      <iframe src={url} {title} sandbox="allow-scripts" referrerpolicy="no-referrer"></iframe>
+  <div class="html-body" class:tile={compact} class:inline style:height="{height}px" bind:this={box}>
+    {#if active && frameUrl !== null}
+      <iframe
+        src={frameUrl}
+        {title}
+        sandbox="allow-scripts"
+        referrerpolicy="no-referrer"
+        use:paneFrame={{ onPageMessage, onPageSize, onHover, theme }}
+      ></iframe>
     {/if}
-    {#if !compact}
+    {#if inline}
+      <button
+        class="pill open-under"
+        class:shown={openShown}
+        onclick={() => onOpen?.()}
+        onpointerenter={() => (openHover = true)}
+        onpointerleave={() => (openHover = false)}
+        title="open in a pane">open ↗</button
+      >
+    {:else if !compact}
       <button class="expand" onclick={() => (expanded = !expanded)} title={expanded ? "collapse" : "show more of the page"}>
         {expanded ? "collapse" : "expand"}
       </button>
@@ -221,6 +350,35 @@
     /* Pages assume a white canvas regardless of theme. */
     background: #ffffff;
     transition: height 0.18s ease;
+  }
+  /* Part of the answer: the page wears the app's theme (`--ch-*`), so it
+     sits on the app's own background; its open button shows on hover. */
+  .html-body.inline {
+    background: transparent;
+    transition: none;
+  }
+  .open-under {
+    position: absolute;
+    top: calc(100% + 3px);
+    right: 0;
+    padding: 0 7px;
+    line-height: 17px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.12s ease;
+  }
+  .open-under.shown,
+  .open-under:focus-visible {
+    opacity: 1;
+    pointer-events: auto;
+  }
+  /* In the app the page is a view of its own: the box under it shows only
+     while the view catches up with a new size, so it takes the card's tone
+     (a white one flashed in dark mode), and it never animates its height
+     (the view follows in steps, leaving a gap). */
+  .html-body.native:not(.inline) {
+    background: color-mix(in srgb, var(--fg) 2%, var(--bg));
+    transition: none;
   }
   .html-body.tile {
     flex: 1;

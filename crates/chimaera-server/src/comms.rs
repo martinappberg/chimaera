@@ -1105,6 +1105,16 @@ pub(crate) fn naming_text(text: &str, origin: Option<&str>) -> Option<String> {
             let body = body.trim();
             (!body.is_empty()).then(|| body.to_string())
         }
+        // A page's send: the user's words, without the page's lead
+        // (`[from the page “…”] `, the web UI's `pageMessageText`).
+        Some(chimaera_agent::model::ORIGIN_PAGE) => {
+            let body = text
+                .strip_prefix('[')
+                .and_then(|rest| rest.split_once("] ").map(|(_, body)| body))
+                .unwrap_or(text)
+                .trim();
+            (!body.is_empty()).then(|| body.to_string())
+        }
         _ => Some(text.to_string()),
     }
 }
@@ -3518,5 +3528,15 @@ mod tests {
             Some("Write the tests first.")
         );
         assert_eq!(naming_text("fix it", None).as_deref(), Some("fix it"));
+        // A page's send names the chat by the user's words, not the lead.
+        assert_eq!(
+            naming_text(
+                "[from the page “TP53 variants”] Tell me about chr17:7671909",
+                Some("page")
+            )
+            .as_deref(),
+            Some("Tell me about chr17:7671909")
+        );
+        assert_eq!(naming_text("[from a page] ", Some("page")), None);
     }
 }

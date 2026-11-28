@@ -196,7 +196,7 @@
 {/if}
 
 <style>
-  /* The shared settings grammar (see EnvironmentSettings): an uppercase
+  /* The shared settings grammar (see EnvironmentSettings): a sentence-case
      category header, an intro, then SettingRow-shaped blocks. */
   .docs {
     display: flex;

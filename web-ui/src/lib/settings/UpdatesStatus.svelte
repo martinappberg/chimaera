@@ -388,7 +388,7 @@
 
 <style>
   /* The shared settings grammar (AgentsSettings' header row, the
-     NotificationStatus card): an uppercase category header with a quiet
+     NotificationStatus card): a sentence-case category header with a quiet
      action, then a bordered status card. */
   .cat-row {
     display: flex;

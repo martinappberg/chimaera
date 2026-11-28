@@ -970,6 +970,7 @@
             <span
               class="tab-name"
               class:preview={isPreviewTab(tab)}
+              class:file={tab.surface === "file"}
               class:unread
               data-label={label(tab)}
               style:color={fDeco ? fDeco.color : undefined}>{label(tab)}</span
@@ -1452,8 +1453,8 @@
     /* Never wider than the strip: a lone long name ellipsizes instead of
        overflowing under the bar's controls. */
     max-width: min(180px, 100%);
-    font-family: var(--mono);
-    font-size: var(--text-xs);
+    font-family: var(--name-font);
+    font-size: var(--text-sm);
     color: var(--muted);
     cursor: default;
     user-select: none;
@@ -1477,7 +1478,7 @@
     background: color-mix(in srgb, var(--fg) 4%, transparent);
     border-radius: 6px 6px 0 0;
     color: var(--fg);
-    box-shadow: inset 0 -2px 0 color-mix(in srgb, var(--accent) 70%, transparent);
+    box-shadow: inset 0 -2px 0 color-mix(in srgb, var(--accent) 55%, transparent);
   }
 
   /* Hairline between neighbours: absolute, so it costs no width. Vertically
@@ -1577,6 +1578,12 @@
     font-weight: 600;
   }
 
+  /* A file's tab is its file name (app.css --file-font); a session's or a
+     view's is a title. */
+  .tab-name.file {
+    font-family: var(--file-font);
+    font-size: var(--text-xs);
+  }
   /* A VS Code preview tab: italic until it is pinned (dbl-click / edit). */
   .tab-name.preview {
     font-style: italic;
@@ -1675,7 +1682,7 @@
     border-radius: 9px;
     background: hsl(var(--hue) 50% 55% / 0.08);
     color: var(--fg);
-    font-family: var(--mono);
+    font-family: var(--name-font);
     font-size: var(--text-xs);
     max-width: 150px;
     min-width: 0;
@@ -1816,8 +1823,7 @@
   .link-menu-title {
     padding: 3px 8px 5px;
     font-size: var(--text-xs);
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
+    font-weight: 500;
     color: var(--muted);
   }
 

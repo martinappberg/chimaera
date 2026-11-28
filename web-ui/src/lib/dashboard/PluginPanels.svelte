@@ -46,11 +46,11 @@
     gap: 10px;
   }
   .lbl {
-    font-size: 11px;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--muted);
+    /* A section's heading in the page's own voice: sentence case, a size
+       below the body, in ink — not a tracked capital label. */
+    font-size: var(--text-sm);
     font-weight: 600;
+    color: color-mix(in srgb, var(--fg) 72%, var(--muted));
   }
   .sub {
     font-size: var(--text-xs);

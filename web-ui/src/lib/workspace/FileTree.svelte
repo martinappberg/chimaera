@@ -1562,7 +1562,7 @@
     border: none;
     outline: none;
     background: none;
-    font-family: var(--mono);
+    font-family: var(--file-font);
     font-size: var(--text-sm);
     color: var(--fg);
     padding: 1px 0;
@@ -1663,8 +1663,8 @@
   }
 
   .node.active {
-    background-color: color-mix(in srgb, var(--accent) 15%, var(--rail-bg));
-    box-shadow: inset 3px 0 0 var(--accent);
+    background-color: color-mix(in srgb, var(--accent) 9%, var(--row-active));
+    box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent) 75%, transparent);
   }
 
   /* Reveal flash (terminal dir links): a brief accent wash that fades. */
@@ -1755,7 +1755,7 @@
   }
 
   .node-name {
-    font-family: var(--mono);
+    font-family: var(--file-font);
     font-size: var(--text-sm);
     color: var(--fg);
     overflow: hidden;
@@ -1769,7 +1769,7 @@
   .edit-input {
     flex: 1;
     min-width: 0;
-    font-family: var(--mono);
+    font-family: var(--file-font);
     font-size: var(--text-sm);
     color: var(--fg);
     background: var(--bg);

@@ -66,6 +66,9 @@
     resolve?: () => Promise<TargetResult | null>;
     /** Open in a pane. Default: the workbench opener (`openPath`). */
     onOpen?: (path: string, kind: "file" | "dir", reveal?: Reveal) => void;
+    /** The chat whose answer shows the card: an HTML page in it may send
+     *  to that chat (`shared/pageMessage.ts`). */
+    chat?: string | null;
   }
 
   let {
@@ -78,6 +81,7 @@
     chrome = true,
     resolve,
     onOpen,
+    chat = null,
   }: Props = $props();
 
   /** A fresher answer than `info` (a self-resolve, or a refresh after the
@@ -103,6 +107,11 @@
    *  depends on the file's extension). */
   const frag = $derived(parseEmbedFragment(fragment, hit?.path ?? path));
   const label = $derived(fragmentLabel(frag, tableHeaderRow(hit?.path ?? path)));
+  /** `![…](page.html#inline)`: a page that is part of the answer (a quiz, an
+   *  interactive plot), not a file to open — drawn in the prose at its own
+   *  height, without the file's header, box or caption; an open button on
+   *  hover. Without `#inline` an HTML page is a file card (a report). */
+  const inline = $derived(kind === "html" && frag.anchor === "inline" && !compact && chrome);
 
   let card = $state<HTMLElement | null>(null);
   /** Near the scroller's viewport: load (one-way — a loaded body stays). */
@@ -268,10 +277,11 @@
   class:bare={!chrome}
   class:fit={kind === "image" && !compact}
   class:missing={current !== null && isMissing(current)}
+  class:inline
   bind:this={card}
   data-embed-kind={kind ?? "pending"}
 >
-  {#if chrome}
+  {#if chrome && !inline}
   <div class="head">
     <button class="name" title={hit !== null ? `open ${hit.path} in a pane` : path} disabled={hit === null} onclick={open} {@attach grip}>
       {#if kind === "dir"}
@@ -336,7 +346,17 @@
   {:else if kind === "table" || kind === "xlsx"}
     <TableBody path={hit.path} version={hit.version} {kind} {frag} {compact} active={near} />
   {:else if kind === "html"}
-    <HtmlBody {url} title={name} {compact} active={near} visible={onScreen} />
+    <HtmlBody
+      {url}
+      title={alt !== "" ? alt : name}
+      {compact}
+      {inline}
+      active={near}
+      visible={onScreen}
+      {chat}
+      writtenAtMs={hit?.mtime_ms ?? null}
+      onOpen={open}
+    />
   {:else if kind === "video" || kind === "audio"}
     <MediaBody {url} {kind} time={frag.at?.time} {compact} active={near} onDownload={remote ? download : undefined} />
   {:else if kind === "notebook"}
@@ -362,20 +382,31 @@
       {#if !chrome && kind === "file"}<span class="quiet">No inline preview for this file type.</span>{/if}
     </div>
   {/if}
-  {#if alt !== "" && kind !== null && kind !== "image" && !compact}
+  {#if alt !== "" && kind !== null && kind !== "image" && !compact && !inline}
     <div class="caption">{alt}</div>
   {/if}
 </div>
 
 <style>
+  /* Part of the answer: no box, no header, no caption — the page draws in
+     the prose on the app's background, at its own height. */
+  .embed-card.inline {
+    border-color: transparent;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+    /* The open button sits under the page, in this kept space. */
+    overflow: visible;
+    margin-bottom: 1.7em;
+  }
   .embed-card {
     display: flex;
     flex-direction: column;
     min-width: 0;
     max-width: 100%;
-    margin: 0.5em 0;
+    margin: 0.9em 0;
     border: 1px solid color-mix(in srgb, var(--edge) 75%, transparent);
-    border-radius: 8px;
+    border-radius: 10px;
     background: color-mix(in srgb, var(--fg) 2%, var(--bg));
     overflow: hidden;
     /* Agent prose around the card must not restyle it. */
@@ -389,10 +420,40 @@
     margin: 0;
     height: 100%;
   }
-  /* A picture's card hugs the picture (a figure, not a banner). */
+  /* A picture is a figure, not a card: it hugs the picture, draws no box of
+     its own, and names the file in a caption under it. */
   .embed-card.fit {
     width: fit-content;
     min-width: min(240px, 100%);
+    border: none;
+    border-radius: 0;
+    background: none;
+    overflow: visible;
+  }
+  .embed-card.fit > .head {
+    order: 1;
+    min-height: 24px;
+    padding: 3px 0 0;
+    border-bottom: none;
+  }
+  .embed-card.fit > .head .name {
+    padding-left: 2px;
+  }
+  .embed-card.fit > :global(.image-body) {
+    padding: 0;
+    background: none;
+  }
+  .embed-card.fit:not(.bare) > :global(.image-body .frame) {
+    border-radius: 10px;
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--edge) 80%, transparent);
+  }
+  .embed-card.fit.missing {
+    border: 1px dashed color-mix(in srgb, var(--edge) 75%, transparent);
+    border-radius: 10px;
+  }
+  .embed-card.fit.missing > .head {
+    order: 0;
+    padding: 0 4px 0 6px;
   }
   .embed-card.missing {
     border-style: dashed;
@@ -412,7 +473,7 @@
     gap: 6px;
     min-height: 28px;
     padding: 0 4px 0 6px;
-    border-bottom: 1px solid color-mix(in srgb, var(--edge) 55%, transparent);
+    border-bottom: 1px solid color-mix(in srgb, var(--edge) 45%, transparent);
   }
   .missing .head {
     border-bottom-style: dashed;
@@ -426,16 +487,34 @@
     border: none;
     border-radius: 4px;
     background: none;
-    color: var(--fg);
+    /* The name is there when you look for it: the muted voice at rest (no
+       fainter: it must hold the theme's contrast floor), in ink once the
+       pointer or the keyboard is on the card. */
+    color: var(--muted);
     font: inherit;
-    font-family: var(--mono, monospace);
+    font-family: var(--file-font, var(--mono, monospace));
     font-size: var(--text-xs);
     cursor: pointer;
     transition:
       color 0.12s ease,
       background-color 0.12s ease;
   }
-  .name:hover:not(:disabled) {
+  .name > :global(svg) {
+    flex: none;
+    opacity: 0.75;
+    transition: opacity 0.12s ease;
+  }
+  .embed-card:hover .name:not(:disabled),
+  .embed-card:focus-within .name:not(:disabled) {
+    color: var(--fg);
+  }
+  .embed-card:hover .name > :global(svg),
+  .embed-card:focus-within .name > :global(svg) {
+    opacity: 1;
+  }
+  /* Out-specifies the card-hover ink above: on the name itself, the link
+     colour. */
+  .embed-card .name:hover:not(:disabled) {
     color: var(--accent);
     background: color-mix(in srgb, var(--fg) 5%, transparent);
   }
@@ -475,9 +554,23 @@
     background: none;
     color: var(--muted);
     cursor: pointer;
+    /* Actions keep their place and show with the pointer or the keyboard,
+       so nothing moves when they appear. */
+    opacity: 0;
     transition:
+      opacity 0.12s ease,
       color 0.12s ease,
       background-color 0.12s ease;
+  }
+  .embed-card:hover .act,
+  .embed-card:focus-within .act,
+  .embed-card.compact .act {
+    opacity: 1;
+  }
+  @media (hover: none) {
+    .act {
+      opacity: 1;
+    }
   }
   .act:hover {
     color: var(--accent);

@@ -20,17 +20,33 @@ color values are only the no-JS fallback.
   `--accent`, `--err`, `--warn`, `--edge`, `--row-hover`, …). Add a new
   themable color to `TOKEN_NAMES` and to every theme, not to `app.css`.
 - Use `--accent-text` for accent-colored text. It keeps 75% `--accent` and
-  mixes in 25% `--fg`, so that text holds 4.5:1 (`app.css:35-39`).
-- Use `--focus-ring` for every keyboard focus outline (`app.css:33-34`).
-- Use the four type roles: `--text-xs` (tabs, titles, badges), `--text-sm`
-  (monospace names, hints), `--text-md` (rows, buttons, inputs) and `--text-lg`
+  mixes in 25% `--fg`, so that text holds 4.5:1 (`app.css`, `--accent-text`).
+- Use `--focus-ring` for every keyboard focus outline (`app.css`).
+- Use `--focus-edge` for the border of the surface that has focus (the
+  active pane among several, the composer's field): a tint, not a frame.
+- Use the four type roles: `--text-xs` (section labels, badges), `--text-sm`
+  (tabs, hints), `--text-md` (rows, names, buttons, inputs) and `--text-lg`
   (body text). `lib/settings/store.svelte.ts:351-355` derives them from
   `appearance.interfaceFontSize` (11–18 px, default 13.5). Do not hard-code a
   chrome font size. Chat, terminal and editor have their own size settings.
-- Use `--mono`, `--ui-font` and `--editor-font` for type faces;
-  `--radius-card`, `--overlay-radius`, `--overlay-shadow` and `--hover-tint`
-  for surfaces; `--pane-tab-height`, `--pane-toolbar-height` and
-  `--pane-control-size` for pane chrome (`app.css:757-764`).
+- Use `--ui-font`, `--name-font`, `--file-font`, `--mono` and
+  `--editor-font` for type faces. A title a person reads (a session, a view's
+  tab, an agent's name) is `--name-font`; a file's name, in the tree and on
+  its tab, is `--file-font` (the terminal's face); `--mono` is for what is
+  literally code or terminal text (commands, paths in prose, hashes, counts
+  that must align).
+- Label a section in its own case: the rail's lowercase labels, a page's
+  sentence-case heads (the dashboard's `.lbl`). No tracked capitals.
+- Markdown reads the same on every surface: the chat transcript
+  (`chat/Markdown.svelte`), the reading and live document views
+  (`previews/MarkdownView.svelte`, `previews/mdLive.ts`), notebooks, hover
+  previews and published pages (`previews/doc/publishCss.ts`) share one
+  recipe for quotes (a margin rule, no fill), markers (bullets in a quiet
+  accent, numbers in `--accent-text`) and tables (ruled rows, `app.css` "Markdown
+  tables"). Change one, change them all.
+- Use `--radius-card`, `--composer-radius`, `--overlay-radius`,
+  `--overlay-shadow` and `--hover-tint` for surfaces; `--pane-tab-height`, `--pane-toolbar-height` and
+  `--pane-control-size` for pane chrome (`app.css`, "pane chrome" tokens).
 
 **Contrast.** `lib/settings/themes.contrast.test.ts` holds every theme to
 4.5:1 against `--term-bg` for `--fg`, `--muted`, `--err`, `--warn`, the

@@ -1,7 +1,7 @@
 <script lang="ts">
   /**
    * "Now" — who is running, as ONE line (decision 1: the rail has the
-   * detail, the dashboard stops competing). Each agent is its name in mono
+   * detail, the dashboard stops competing). Each agent is its name
    * plus a short honest phrase from the same state vocabulary as the rail;
    * terminals fold into a count. "show cards" flips the roster setting.
    */
@@ -98,11 +98,11 @@
     min-width: 0;
   }
   .lbl {
-    font-size: 11px;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--muted);
+    /* A section's heading in the page's own voice: sentence case, a size
+       below the body, in ink — not a tracked capital label. */
+    font-size: var(--text-sm);
     font-weight: 600;
+    color: color-mix(in srgb, var(--fg) 72%, var(--muted));
   }
   .agent {
     appearance: none;
@@ -123,7 +123,8 @@
     text-decoration: underline;
   }
   .name {
-    font-family: var(--mono);
+    font-family: var(--name-font);
+    font-weight: 500;
     color: var(--fg);
     flex: none;
   }

@@ -87,7 +87,7 @@ sits between Context and Agent communication; `SettingsView` picks it out by id 
 | `UpdatesStatus.svelte` | The Updates section's status block: app / daemon / agents, each up to date, available, or couldn't check (with why), plus "check now". Reads `workspace/update.svelte.ts`; the auto-check switch below it is a schema row. |
 | `NotificationStatus.svelte` | The Notifications section's status line: whether the OS (native) or browser will show alerts, with Allow / Open System Settings / Send test. The switches below it are ordinary schema rows. |
 | `SettingRow.svelte` | One schema-driven control. |
-| `SettingsJson.svelte` | The raw-JSON editor (validates against the schema). |
+| `SettingsJson.svelte` | The raw-JSON editor (validates against the schema; wraps through `previews/wrap.ts` like every editor). |
 
 ## Invariants / gotchas
 
@@ -100,7 +100,7 @@ sits between Context and Agent communication; `SettingsView` picks it out by id 
   sensitivity during any restructure. Interface chrome consumes the shared `--text-*`
   scale; chat overrides it locally, while terminal/editor keep content-specific settings.
   Defaults: interface 13.5 px (`--text-xs/sm/md/lg` = 11.5/12.5/13.5/15.5, mirrored as
-  `app.css` fallbacks), chat 14 px at line height 1.57, rendered Markdown 14 px.
+  `app.css` fallbacks), chat 14 px at line height 1.6, rendered Markdown 14 px.
 - **Reading Width (`chat.contentWidth`) is the column width**, not a cap on 48em:
   `ChatView`'s `--chat-column` and `MarkdownView`/`mdLive`'s `--doc-measure` use it
   directly (default 680, the desktop app's column). Wrapping it in a `min()` with an em measure

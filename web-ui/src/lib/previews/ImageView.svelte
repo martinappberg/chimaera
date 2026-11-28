@@ -34,9 +34,19 @@
 
   interface Props {
     path: string;
+    /** Pixel inspection: blocky scaling past 1:1 and a grid past 8×. Off for
+     *  a picture that stands for something drawn (a rendered slide), which
+     *  stays smooth however far it is zoomed. */
+    pixels?: boolean;
+    /** The picture's URL, minted and decoded by the host (a deck paging
+     *  through its slides): swapped in place, with no ticket or disk watch of
+     *  its own. `onbroken` asks the host for a fresh one. */
+    src?: string;
+    onbroken?: () => void;
   }
 
-  let { path }: Props = $props();
+  let { path, pixels = true, src, onbroken }: Props = $props();
+  const hosted = $derived(src !== undefined);
 
   const MIN_SCALE = 0.05;
   const MAX_SCALE = 64;
@@ -61,7 +71,7 @@
   const isSvg = $derived(innerExtension(path) === "svg");
   const pct = $derived(Math.round(scale * 100));
   /** Pixel grid only helps for raster pixels; SVG stays vector-crisp. */
-  const showGrid = $derived(!isSvg && scale >= GRID_SCALE && natural !== null);
+  const showGrid = $derived(pixels && !isSvg && scale >= GRID_SCALE && natural !== null);
 
   // The ticketed /raw/ URL comes from the shared store: cached across a tab
   // switch (no re-mint), and re-minted in place when the file changes on disk.
@@ -69,12 +79,18 @@
   // ticket; the store sync below feeds them and clears a stale error on re-mint.
   let entry = $state<FileEntry | null>(null);
   $effect(() => {
+    if (hosted) return;
     const e = retain(path);
     entry = e;
     void e.ensureRawUrl();
     return () => release(path);
   });
   $effect(() => {
+    if (src !== undefined) {
+      url = src;
+      error = null;
+      return;
+    }
     const e = entry;
     if (e === null) return;
     if (e.rawUrl !== null) {
@@ -531,13 +547,18 @@
         bind:this={imgEl}
         src={url}
         alt={path}
-        class:pixelated={!isSvg && scale > 1}
+        class:pixelated={pixels && !isSvg && scale > 1}
         class:measuring={natural === null}
         style:width={natural !== null ? `${natural.w * scale}px` : undefined}
         style:height={natural !== null ? `${natural.h * scale}px` : undefined}
         style:transform={natural !== null ? `translate(${tx}px, ${ty}px)` : undefined}
         onload={onLoad}
-        onerror={() => (error = "image failed to load (ticket may have expired — reopen the tab)")}
+        onerror={() => {
+          // The host's fresh URL replaces this message; one it answers with
+          // the same URL (a picture that really won't load) leaves it shown.
+          error = "image failed to load (ticket may have expired — reopen the tab)";
+          onbroken?.();
+        }}
         draggable="false"
       />
       {#if showGrid && natural !== null}

@@ -411,8 +411,9 @@
     display: inline;
   }
   .name {
-    font-family: var(--mono);
-    font-size: var(--text-xs);
+    font-family: var(--name-font);
+    font-weight: 500;
+    font-size: var(--text-sm);
     color: var(--muted);
     margin-right: 8px;
   }
@@ -423,8 +424,9 @@
     padding: 0;
     cursor: pointer;
     font: inherit;
-    font-family: var(--mono);
-    font-size: var(--text-xs);
+    font-family: var(--name-font);
+    font-weight: 500;
+    font-size: var(--text-sm);
     color: var(--muted);
   }
   button.name:hover {

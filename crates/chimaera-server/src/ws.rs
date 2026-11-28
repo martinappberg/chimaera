@@ -978,6 +978,9 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                     }
                     match serde_json::from_str::<chimaera_agent::model::AgentCommand>(&text) {
                         Ok(mut cmd) => {
+                            // A send a page asked for (the page API's
+                            // `send`, after the user's click) journals as one.
+                            let origin = asked_origin(&text, &cmd);
                             // Before the images are saved: a blank block never
                             // reaches an agent, and a send left with nothing is
                             // refused like an oversized one.
@@ -1005,7 +1008,7 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                                     | chimaera_agent::model::AgentCommand::SendAfterTurn { .. }
                                     | chimaera_agent::model::AgentCommand::SendNow { .. }
                             );
-                            let sent = state.chat.command(&id, cmd).await;
+                            let sent = state.chat.command_as(&id, cmd, origin).await;
                             if sent.is_ok() && prompt {
                                 crate::comms::user_stepped_in(&state, &id);
                             }
@@ -1780,6 +1783,30 @@ async fn send_json(socket: &mut WebSocket, value: &serde_json::Value) -> Result<
     socket.send(Message::Text(value.to_string().into())).await
 }
 
+/// The `origin` a chat send may carry beside its command (`AgentCommand`
+/// itself ignores it): only [`chimaera_agent::model::ORIGIN_PAGE`] is honoured.
+#[derive(serde::Deserialize)]
+struct AskedOrigin {
+    #[serde(default)]
+    origin: Option<String>,
+}
+
+/// The origin a window's chat frame asks its send to journal with: a page's
+/// send (`"page"`, the page API after the user's click) or nothing — the one
+/// origin a window may name; any other it asks for (`restart`, `agent`, …)
+/// is the daemon's alone and the send is the composer's.
+fn asked_origin(text: &str, cmd: &chimaera_agent::model::AgentCommand) -> Option<&'static str> {
+    use chimaera_agent::model::{AgentCommand, ORIGIN_PAGE};
+    if !matches!(
+        cmd,
+        AgentCommand::Send { .. } | AgentCommand::SendAfterTurn { .. }
+    ) {
+        return None;
+    }
+    let asked = serde_json::from_str::<AskedOrigin>(text).ok()?.origin?;
+    (asked == ORIGIN_PAGE).then_some(ORIGIN_PAGE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1861,6 +1888,37 @@ mod tests {
         batch.clear();
         assert!(batch.take_frame().is_none());
         assert_eq!(batch.bytes, 0);
+    }
+
+    /// A window may ask that its send journal as a page's, and nothing else.
+    #[test]
+    fn a_chat_send_may_say_it_came_from_a_page_only() {
+        let origin_of = |text: &str| {
+            let cmd = serde_json::from_str::<AgentCommand>(text)
+                .expect("the command parses beside origin");
+            asked_origin(text, &cmd)
+        };
+        let send = |origin: &str| {
+            format!(
+                r#"{{"type":"send","blocks":[{{"type":"text","text":"hi"}}],"origin":{origin}}}"#
+            )
+        };
+        assert_eq!(origin_of(&send(r#""page""#)), Some("page"));
+        assert_eq!(origin_of(&send(r#""restart""#)), None);
+        assert_eq!(origin_of(&send(r#""agent""#)), None);
+        assert_eq!(origin_of(&send("null")), None);
+        assert_eq!(
+            origin_of(r#"{"type":"send","blocks":[{"type":"text","text":"hi"}]}"#),
+            None
+        );
+        assert_eq!(
+            origin_of(
+                r#"{"type":"send_after_turn","blocks":[{"type":"text","text":"hi"}],"origin":"page"}"#
+            ),
+            Some("page")
+        );
+        // Only a send journals a message.
+        assert_eq!(origin_of(r#"{"type":"interrupt","origin":"page"}"#), None);
     }
 
     #[test]
