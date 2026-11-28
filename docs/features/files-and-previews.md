@@ -1025,7 +1025,8 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   the viewer's at 212 and 461; blinds, box, circle and the rest follow the same box, unfilmed). A wipe, pattern or iris is laid over the shape's whole drawing, its
   outline and shadow included (a scaled shadow too), as PowerPoint's film lays it, and reveals the
   shadow with the shape: while it plays the shape's box is grown to the mask's by a transparent border,
-  its content held in place to the device pixel, so nothing pops in when it lands. The next click
+  its content held in place to the device pixel, so nothing pops in when it lands; a shape wiped
+  while it moves, grows or turns in the same click lands where its state says. The next click
   is planned while the show is idle, so a click only starts its animations.
   Slide transitions aren't played yet, and missing fonts fall back to the system's;
   the ⓘ in the bar says so, and counts shapes that couldn't be drawn. Refused past 100 MB. A reveal's

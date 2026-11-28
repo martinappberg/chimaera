@@ -139,6 +139,11 @@ class FakeEl {
   style: Record<string, string> & { cssText: string; getPropertyValue(p: string): string; getPropertyPriority(p: string): string; setProperty(p: string, v: string, priority?: string): void; removeProperty(p: string): void };
   attrs = new Map<string, string>();
   parentElement: FakeEl | null = null;
+  tagName = "DIV";
+  /** Its first child: a probe whose box follows this element's margin
+   *  and border, as `inflate` measures it. */
+  firstElementChild: FakeEl | null = null;
+  probeFor: FakeEl | null = null;
   offsetWidth = 100;
   offsetHeight = 50;
   running = 0;
@@ -193,6 +198,13 @@ class FakeEl {
     return null;
   }
   getBoundingClientRect() {
+    const p = this.probeFor;
+    if (p !== null) {
+      const n = (v: string | undefined) => Number.parseFloat(v ?? "") || 0;
+      const left = n(p.props.get("margin-left")) + n(p.props.get("border-left-width"));
+      const top = n(p.props.get("margin-top")) + n(p.props.get("border-top-width"));
+      return { left, top, right: left + 100, bottom: top + 50, width: 100, height: 50 };
+    }
     return { left: 0, top: 0, right: 100, bottom: 50, width: 100, height: 50 };
   }
   animate(frames: Record<string, unknown>[]) {
@@ -205,7 +217,7 @@ class FakeEl {
 
 /** A tagged slide with one element per shape the timeline names (and its
  *  paragraphs, as many as the keys reach). */
-function fakeSlide(t: ReturnType<typeof parseTimeline>): { tagged: TaggedSlide; all: FakeEl[] } {
+function fakeSlide(t: ReturnType<typeof parseTimeline>, probes = false): { tagged: TaggedSlide; all: FakeEl[] } {
   const paras = new Map<string, number>();
   const note = (spid: string, n: number) => paras.set(spid, Math.max(paras.get(spid) ?? 0, n));
   for (const step of [...t.steps, ...t.interactive.flatMap((s) => s.steps)]) {
@@ -222,6 +234,10 @@ function fakeSlide(t: ReturnType<typeof parseTimeline>): { tagged: TaggedSlide; 
   for (const [spid, n] of paras) {
     const el = new FakeEl(true);
     el.parentElement = slideEl;
+    if (probes) {
+      el.firstElementChild = new FakeEl(false);
+      el.firstElementChild.probeFor = el;
+    }
     const ps = Array.from({ length: n }, () => {
       const p = new FakeEl(false);
       p.parentElement = el;
@@ -540,5 +556,37 @@ describe("clearState puts back what the renderer drew", () => {
     clearState(tagged);
     expect(el.style.getPropertyValue("opacity")).toBe("0.5");
     expect(el.style.getPropertyPriority("opacity")).toBe("important");
+  });
+});
+
+describe("a click that masks a shape and moves, grows or turns it lands on exactly its state", () => {
+  // PowerPoint-made (`maskmove`): click 1 wipes A in along a path while C
+  // turns, click 2 wipes B in as it grows, click 3 wipes all three out and
+  // click 4 wipes them back in, each still holding its move, size or turn.
+  const t = parseTimeline(new TextDecoder().decode(fs.readFileSync(new URL("./pptxPlay.maskmove.fixture.xml", import.meta.url))));
+  const states = buildStates(t);
+
+  it("grows each masked shape's border box while it plays and leaves applyState's values when it lands", async () => {
+    expect(t.steps.length).toBe(5);
+    const { tagged, all } = fakeSlide(t, true);
+    const twin = fakeSlide(t, true);
+    for (let k = 1; k < t.steps.length; k++) {
+      const play = playStep(tagged, t, k, { w: W, h: H, states });
+      // The masked shapes play inflated (the case the landing has to undo).
+      expect(all.some((e) => e.props.has("border-left-width")), `click ${k} inflates`).toBe(true);
+      play.finish();
+      await play.finished;
+      applyState(twin.tagged, states[k]!, W, H);
+      all.forEach((el, i) => {
+        expect(Object.fromEntries(el.props), `element ${i} after click ${k}`).toEqual(Object.fromEntries(twin.all[i]!.props));
+        expect([...el.important], `element ${i} after click ${k}`).toEqual([...twin.all[i]!.important]);
+        expect(el.running).toBe(0);
+      });
+    }
+    // Something was held through the wipes: a move, a size and a turn.
+    const held = all.map((e) => [e.props.get("translate"), e.props.get("scale"), e.props.get("rotate")]);
+    expect(held.some(([tr]) => tr !== undefined)).toBe(true);
+    expect(held.some(([, sc]) => sc !== undefined)).toBe(true);
+    expect(held.some(([, , ro]) => ro !== undefined)).toBe(true);
   });
 });

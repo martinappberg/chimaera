@@ -1486,8 +1486,11 @@ function masked(kf: readonly object[]): boolean {
  * layout did, measured on the content with the element's transforms off;
  * the correction is in rect units over rect units, never assumed. Returns
  * where the content sits in the grown border box (the masks' shift) and
- * how to put every touched value back; null where it can't (a
- * `transform-origin` of its own, nothing to measure): the mask then
+ * how to put back the values it set (the border, margin, box sizing and
+ * origin, never the moves: the state's `translate`, `scale` and `rotate`
+ * are only turned off for the measuring and put back at once, and the
+ * landing puts this back before the state goes on); null where it can't
+ * (a `transform-origin` of its own, nothing to measure): the mask then
  * clips as before.
  */
 function inflate(el: Styled, size: readonly [number, number], box: readonly [number, number, number, number]): { shift: [number, number]; restore(): void } | null {
@@ -1511,14 +1514,17 @@ function inflate(el: Styled, size: readonly [number, number], box: readonly [num
   const put = (only: readonly string[]) => {
     for (const [k, v, pr] of saved) if (only.includes(k)) v === "" ? s.removeProperty(k) : s.setProperty(k, v, pr);
   };
-  const restore = () => put([...keys, ...moves]);
+  const restore = () => put(keys);
   try {
     for (const k of moves) s.setProperty(k, "none");
     const c0 = probe.getBoundingClientRect();
     s.setProperty("box-sizing", "content-box");
     s.setProperty("border-style", "solid");
     s.setProperty("border-color", "transparent");
-    s.setProperty("border-width", `${T}px ${R}px ${B}px ${L}px`);
+    s.setProperty("border-top-width", `${T}px`);
+    s.setProperty("border-right-width", `${R}px`);
+    s.setProperty("border-bottom-width", `${B}px`);
+    s.setProperty("border-left-width", `${L}px`);
     const at = (dx: number, dy: number) => {
       s.setProperty("margin-left", `${-L - dx}px`);
       s.setProperty("margin-top", `${-T - dy}px`);
@@ -1528,12 +1534,12 @@ function inflate(el: Styled, size: readonly [number, number], box: readonly [num
     const c1 = at(0, 0);
     const [fx, fy] = [(c1.left - c2.left) / 8, (c1.top - c2.top) / 8];
     if (!(fx > 0 && fy > 0)) {
-      restore();
+      put([...keys, ...moves]);
       return null;
     }
     const [cx, cy] = [(c1.left - c0.left) / fx, (c1.top - c0.top) / fy];
     if (!Number.isFinite(cx) || !Number.isFinite(cy) || Math.abs(cx) > 4 || Math.abs(cy) > 4) {
-      restore();
+      put([...keys, ...moves]);
       return null;
     }
     at(cx, cy);
@@ -1542,7 +1548,7 @@ function inflate(el: Styled, size: readonly [number, number], box: readonly [num
     put(moves);
     return { shift, restore };
   } catch {
-    restore();
+    put([...keys, ...moves]);
     return null;
   }
 }
@@ -1759,9 +1765,12 @@ export function playStep(tagged: TaggedSlide, timeline: SlideTimeline, k: number
     if (done) return;
     done = true;
     if (timer !== undefined) clearTimeout(timer);
-    // The state goes on first, in the same task: no frame shows neither.
-    // Whatever it throws, the animations end and `finished` resolves.
+    // The inflation comes off and the state goes on, then the animations
+    // end, all in one task: no frame shows neither. The inflation first, so
+    // what it puts back can't overwrite the state's values. Whatever it
+    // throws, the animations end and `finished` resolves.
     try {
+      for (const g of inflated.splice(0)) g.restore();
       if (after !== undefined) playing.approximate = applyState(tagged, after, opts.w, opts.h, palette);
     } finally {
       for (const g of inflated.splice(0)) g.restore();
