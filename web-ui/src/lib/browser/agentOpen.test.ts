@@ -27,6 +27,7 @@ import {
   placeAgentBrowser,
   placeAgentBrowserTab,
   placeHandover,
+  placeReveal,
   shouldActOnAgentBrowserOpen,
 } from "./agentOpen";
 
@@ -401,5 +402,39 @@ describe("auto-share on open_browser (one page per agent)", () => {
     const again = placeAgentBrowserTab(l, frame({ path: "/c" }));
     expect(again.tabId).toBe(placed.tabId);
     expect(browserTabs(again.layout).find((b) => b.tab.id === placed.tabId)?.tab).toMatchObject({ path: "/c" });
+  });
+});
+
+describe("placeReveal", () => {
+  const view = { surface: "plugin" as const, plugin: "gs", view: "genome" };
+
+  it("opens a plugin's view beside the agent, focus kept", () => {
+    const l = withAgent();
+    const agentPane = sessionPaneId(l, "s-agent")!;
+    const next = placeReveal(l, "s-agent", view);
+    expect(next.focusedPaneId).toBe(l.focusedPaneId);
+    const where = panes(next.root).find((p) => p.tabs.some((t) => t.surface === "plugin"));
+    expect(where).toBeDefined();
+    expect(where!.id).not.toBe(agentPane);
+    expect(findPane(next.root, agentPane)!.tabs[findPane(next.root, agentPane)!.active]).toMatchObject({ surface: "terminal" });
+  });
+
+  it("shows an open one where it is, and never twice", () => {
+    const once = placeReveal(withAgent(), "s-agent", view);
+    const twice = placeReveal(once, "s-agent", view);
+    const all = panes(twice.root).flatMap((p) => p.tabs.filter((t) => t.surface === "plugin"));
+    expect(all).toHaveLength(1);
+    expect(twice.focusedPaneId).toBe(once.focusedPaneId);
+  });
+
+  it("moves an open one that would cover the agent's own view", () => {
+    // The view is a background tab in the agent's own pane.
+    let l = openTab(withAgent(), view);
+    const agentPane = sessionPaneId(l, "s-agent")!;
+    l = activateTab(l, agentPane, 0);
+    const next = placeReveal(l, "s-agent", view);
+    const agent = findPane(next.root, agentPane)!;
+    expect(agent.tabs.some((t) => t.surface === "plugin")).toBe(false);
+    expect(panes(next.root).some((p) => p.id !== agentPane && p.tabs.some((t) => t.surface === "plugin"))).toBe(true);
   });
 });

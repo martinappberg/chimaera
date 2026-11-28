@@ -34,6 +34,8 @@ export interface ScreenCtx {
   wsRoot: string | null;
   plugin: string;
   view: string;
+  /** A file view's file (workspace-relative); null for any other view. */
+  file: string | null;
   /** Run a node's action (the plugin's, or a built-in one). */
   act(action: string, payload: unknown, extra?: { form?: Record<string, unknown>; value?: unknown }): Promise<void>;
   /** A workspace path or `output:<path>`, made absolute. */

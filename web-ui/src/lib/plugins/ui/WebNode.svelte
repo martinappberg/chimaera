@@ -41,6 +41,7 @@
   import { mintWebPage } from "../platform";
   import { useScreen } from "./screen";
   import { PARKED_MS, webViews } from "./webViews.svelte";
+  import { PendingCalls, registerWebCallTarget } from "./webCalls";
 
   let { node }: { node: Record<string, unknown> } = $props();
 
@@ -96,7 +97,7 @@
     if (want === "" || !shown) return;
     let stop = false;
     const mint = (): void => {
-      mintWebPage(screen.ws, screen.plugin, want).then(
+      mintWebPage(screen.ws, screen.plugin, want, untrack(() => $pageTheme)).then(
         (url) => {
           if (stop) return;
           error = null;
@@ -113,6 +114,19 @@
       stop = true;
       clearInterval(timer);
     };
+  });
+
+  // A new theme: the daemon keeps the window's latest for the headless
+  // pages that answer this plugin's calls when no window shows its view.
+  // (Not on mount: the grant's own first mint carries it.)
+  let mintedTheme: string | null = null;
+  $effect(() => {
+    const theme = $pageTheme;
+    const first = mintedTheme === null;
+    mintedTheme = theme;
+    const want = untrack(() => entry);
+    if (first || theme === "" || want === "" || !untrack(() => vis.shown)) return;
+    void mintWebPage(screen.ws, screen.plugin, want, theme).catch(() => {});
   });
 
   // On screen: one of the window's most recent; hidden for long: closed.
@@ -134,6 +148,34 @@
   $effect(() => {
     if (!live) loaded = false;
   });
+
+  // Calls from the plugin to this page (`web-call`): while the page runs
+  // and is shown, this window answers for its node; else the daemon asks a
+  // headless page. A node without an `id` can't be named, so takes none.
+  const calls = new PendingCalls();
+  const nodeId = $derived(typeof node.id === "string" && node.id !== "" ? node.id : null);
+  $effect(() => {
+    const key = nodeId;
+    if (key === null || !live || !loaded || !vis.shown) return;
+    const unregister = registerWebCallTarget({
+      workspace: screen.ws,
+      plugin: screen.plugin,
+      view: screen.view,
+      id: key,
+      file: screen.file,
+      call: (callId, method, args) =>
+        calls.start(callId, () => {
+          if (!untrack(() => loaded)) return false;
+          control.command({ op: "call", id: callId, method, args });
+          return true;
+        }),
+    });
+    return () => {
+      unregister();
+      if (!untrack(() => loaded)) calls.failAll("the page closed");
+    };
+  });
+  $effect(() => () => calls.failAll("the view closed"));
 
   const nativeUrl = $derived(
     pageUrl === null ? null : withPageApi(pageUrl, { framed: false, theme: untrack(() => $pageTheme) }),
@@ -179,6 +221,9 @@
         break;
       case "web_status":
         status = ev.state === "idle" && ev.text === "" ? null : { state: ev.state, text: ev.text };
+        break;
+      case "web_answer":
+        calls.answer(ev.call, ev.ok, ev.value, ev.error);
         break;
       case "web_reference": {
         const text = referenceText(ev.text, ev.file, ev.line);

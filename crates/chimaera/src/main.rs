@@ -180,6 +180,12 @@ enum PluginCmd {
         /// Print the JSON the lock and the card read.
         #[arg(long)]
         json: bool,
+        /// Compare with the release the lock pins now: each one's tier,
+        /// digest and Can lines, what is added and dropped, and whether the
+        /// two are the same but for their words (JSON; the plugin-lock
+        /// workflow reads it).
+        #[arg(long, value_name = "PINNED_TOML")]
+        against: Option<std::path::PathBuf>,
     },
     /// A plugin's activity log (installs, updates, trust, blocks), newest first.
     Activity { id: String },
@@ -488,7 +494,11 @@ async fn dispatch(command: Command) -> anyhow::Result<()> {
             PluginCmd::Remove { id } => plugin::remove(&id).await,
             PluginCmd::Trust { id, yes } => plugin::trust(&id, yes).await,
             PluginCmd::Untrust { id } => plugin::untrust(&id).await,
-            PluginCmd::Caps { manifest, json } => plugin::caps(&manifest, json),
+            PluginCmd::Caps {
+                manifest,
+                json,
+                against,
+            } => plugin::caps(&manifest, json, against.as_deref()),
             PluginCmd::Activity { id } => plugin::activity(&id).await,
         },
     }
@@ -607,6 +617,15 @@ mod tests {
             &["chimaera", "plugin", "trust", "latex", "--yes"],
             &["chimaera", "plugin", "untrust", "latex"],
             &["chimaera", "plugin", "caps", "plugin.toml", "--json"],
+            &[
+                "chimaera",
+                "plugin",
+                "caps",
+                "new.toml",
+                "--against",
+                "old.toml",
+                "--json",
+            ],
             &["chimaera", "plugin", "activity", "latex"],
         ] {
             assert!(Cli::try_parse_from(args).is_ok(), "{args:?}");

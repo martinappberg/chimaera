@@ -22,9 +22,19 @@
 # (`chimaera plugin caps plugin.toml` prints both): a sandboxed plugin
 # keeps its badge on an update only while
 # its capability digest is this one, and a privileged plugin (one that runs
-# or downloads programs) is verified only at the pinned version. So the PR
-# auto-merges only when the release is sandboxed and asks for nothing new;
-# anything else waits for a person, who updates tier and caps. Hand edits
+# or downloads programs) is verified only at the pinned version. A bump
+# writes the release's own tier and caps (read by the chimaera CLI built
+# from the checkout: `chimaera plugin caps --against`) and auto-merges only
+# when the pinned release reads as this file records, the two plugin.tomls
+# are identical except for words, and, for a privileged plugin, its
+# plugin.wasm and plugin.toml are in
+# one attestation from the plugin repository's release workflow, at the
+# release's tag or on main, from the commit the tag points to, which is on
+# main. That proves where the files were built, not that anyone reviewed
+# the commit: whoever can merge to a privileged plugin's main and release it
+# ships without a second look here. Anything else waits for a person, who
+# reads the code (CI checking the lock against the release is not an
+# approval). Hand edits
 # follow the same rules; keep every value a one-line "string". To run a
 # local build of a plugin against the daemon: `chimaera plugin add --path
 # <dir>` (see plugins/AGENTS.md).
@@ -74,10 +84,10 @@ id = "pptx"
 name = "PowerPoint"
 summary = "Agents see their slides, build on curated themes, and fix what the deck checker finds."
 category = "presentations"
-version = "0.2.0"
+version = "0.2.1"
 repo = "martinappberg/chimaera-plugin-pptx"
-sha256_wasm = "877891194f5a8435a779fe8d91e697076524df7c6c3ecb2c974d2ca0067e2c95"
-sha256_toml = "7bdb2eb076886f3aabd38324409f11865e608beb93448186f94f84663ced37b6"
+sha256_wasm = "fd51b51092d66b593805608207a4de6ad001b101bd312677c5ce2e9c3eac4ff1"
+sha256_toml = "1a1c0fbc0c7358724c8b6d7e834b8a9ccd7ee9329838928d655510bfcfabe68b"
 tier = "privileged"
 caps = "4fef10d57f6d0f6b03dc4e1a54fcbda688cff4bd827510db82b107bb0288c10d"
 
@@ -108,11 +118,11 @@ caps = "19664ea3327545386301f4088ae758fe04f46d6b8bdd733874832f7d0a8b09fd"
 [[plugin]]
 id = "genomespy"
 name = "GenomeSpy"
-summary = "Agents read genomic files' headers and check GenomeSpy views before anyone opens them."
-category = "data"
-version = "0.1.0"
+summary = "Genome views of BAM, VCF, BigWig and GenomeSpy specs, and agents that read genomic files' headers and check views before anyone opens them."
+category = "biology"
+version = "0.2.1"
 repo = "martinappberg/chimaera-plugin-genomespy"
-sha256_wasm = "736791aa34b72e11f7d2af4ca6b7cd7b2755c7fcd5d0c4e4283c94b5ed65fa1b"
-sha256_toml = "b810be52cf9efcdb12ca27d22839586a932286e3a37e1b3ef25722fc9ae6d8a0"
+sha256_wasm = "67af1c981e89704e2ed3c4197420345cbda6919ef93a8559dbf580eafea69ea7"
+sha256_toml = "5bbeda649cdbbea2bb7c709ef67e40a98e9a60765cea03b2ed04d3d468b47a6d"
 tier = "sandboxed"
-caps = "fc963855f0deaecce1a3b0995938dc01c368b5e5e1ee3fe6f2a2761e0dc6f476"
+caps = "6d732af1b2e9d765edb6b7c62e4bec9dd2da7ef360b140a583d196e2293e72a5"

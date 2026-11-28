@@ -540,6 +540,60 @@ pub fn describe_manifest(text: &str) -> Result<Value, String> {
     }))
 }
 
+/// What `chimaera plugin caps <release.toml> --against <pinned.toml>`
+/// prints: everything the plugin-lock workflow decides a bump with, read by
+/// this daemon's own code, never a second reader. Per manifest its lock
+/// fields, tier, digest, Can lines and tool downloads; the Can lines the
+/// release adds and drops; and whether the two are the same but for their
+/// words (`same_behaviour`). The release must parse (an `Err` refuses the
+/// bump). A pinned manifest this daemon refuses (a parse or validation
+/// error) is `null` with `pinned_error`, and then nothing is the same; a
+/// pinned file the CLI can't read at all (missing, not UTF-8) makes it exit 1
+/// before this runs. Both fail closed.
+pub fn describe_bump(release: &str, pinned: &str) -> Result<Value, String> {
+    let next = super::parse_manifest(release)?;
+    let (prev, pinned_error) = match super::parse_manifest(pinned) {
+        Ok(m) => (Some(m), None),
+        Err(e) => (None, Some(e)),
+    };
+    let side = |m: &Manifest| {
+        let downloads: Vec<Value> = m
+            .tools
+            .iter()
+            .flat_map(|t| {
+                t.artifacts.iter().map(move |a| {
+                    json!({
+                        "tool": t.id,
+                        "platform": a.platform,
+                        "url": a.url,
+                        "sha256": a.sha256,
+                        "size": a.size,
+                    })
+                })
+            })
+            .collect();
+        json!({
+            "id": m.id,
+            "version": m.version,
+            "name": m.name,
+            "summary": m.summary,
+            "github": m.release.as_ref().map(|r| r.github.clone()),
+            "tier": m.caps.tier().as_str(),
+            "caps": m.caps.digest(),
+            "can": m.caps.lines_json(),
+            "downloads": downloads,
+        })
+    };
+    Ok(json!({
+        "release": side(&next),
+        "pinned": prev.as_ref().map(side),
+        "pinned_error": pinned_error,
+        "added": prev.as_ref().map(|p| next.caps.beyond(&p.caps).lines_json()),
+        "dropped": prev.as_ref().map(|p| p.caps.beyond(&next.caps).lines_json()),
+        "same_behaviour": prev.as_ref().is_some_and(|p| super::same_behaviour(p, &next)),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

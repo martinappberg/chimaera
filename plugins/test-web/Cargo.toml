@@ -1,4 +1,4 @@
-# The web views fixture (API 0.3): a plugin page in its bundle, a library it
+# The web views fixture (API 0.4): a plugin page in its bundle, a library it
 # lends agents' pages, and a declared host, driven by the daemon's tests
 # (crates/chimaera-server/src/tests/plugin_web.rs) and by hand in the
 # isolated preview. Laid out under plugins/dist-test, which only test builds

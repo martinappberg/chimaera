@@ -11,6 +11,7 @@ import { nativeViewClose, nativeViewDrive, nativeViewNav, nativeViewPlace, nativ
 import { paneViewsPossible, routeNativeView } from "../shared/paneViewRoute";
 import type { BrowserClientMessage } from "../net/browserWire";
 import { agentHue } from "../workspace/agentLinks";
+import { dispatch as dispatchWebCall, onWebViewsChanged, webViews } from "../plugins/ui/webCalls";
 import { AgentBrowserChannel, PROBE_VIEW_ID, driveProbeSaysPresent, hueHex, sameHello, type BrowserHello, type BrowserLink, type Handover } from "./agentBrowser";
 
 /** What the runtime needs of the events socket (`net/events.ts`). */
@@ -46,6 +47,7 @@ export const agentBrowser = new AgentBrowserChannel({
   route: routeNativeView,
   now: () => Date.now(),
   helloNow: () => reportHello(),
+  webCall: (fields) => dispatchWebCall(fields),
   cursorColor: (tab) => {
     const agent = get(links).get(tab);
     return agent === undefined ? null : hueHex(agentHue(agent));
@@ -112,6 +114,7 @@ function currentHello(): BrowserHello {
     height: Math.round(window.innerHeight),
     tabs: agentBrowser.registry.tabs(),
     pages: agentBrowser.registry.pages(),
+    web_views: webViews(),
   };
 }
 
@@ -156,7 +159,9 @@ export function attachAgentBrowser(s: AgentBrowserSocket, handover: (h: Handover
   window.addEventListener("blur", scheduleHello);
   window.addEventListener("resize", onResize);
   const offRegistry = agentBrowser.registry.onChange(scheduleHello);
+  const offWebViews = onWebViewsChanged(scheduleHello);
   return () => {
+    offWebViews();
     document.removeEventListener("visibilitychange", scheduleHello);
     window.removeEventListener("focus", scheduleHello);
     window.removeEventListener("blur", scheduleHello);

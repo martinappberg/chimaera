@@ -198,7 +198,7 @@ rule:
   `unpkg.com`), so the Plotly or D3 `<script>` tag an agent already writes keeps
   working.
 - **It sends nothing anywhere else.** Requests (`connect-src`) and images go only
-  to the daemon. There is no fetch to arbitrary sites, no tracking pixel and no
+  to the daemon (requests may also read `data:` URLs, the page's own bytes). There is no fetch to arbitrary sites, no tracking pixel and no
   form post.
 
 The reason for the rule: a page that could read your files *and* reach any site
@@ -317,7 +317,7 @@ into core.
     `'wasm-unsafe-eval'` are allowed: a page with no origin and no network gains
     nothing from eval, and Vega-style libraries compile expressions.
   - `img-src` and `media-src`: its bundle and data URLs, plus `blob:` and `data:`.
-  - `connect-src`: only its data URLs and declared hosts.
+  - `connect-src`: only its data URLs, `data:` (its own bytes) and declared hosts.
   - `worker-src`: `blob:` and its bundle.
   - *Spike:* the minimum GenomeSpy needs.
 - **Resource limits.**
@@ -744,13 +744,40 @@ in total.
      - a missing index, a `chr` mismatch and a typo in a field each read
        plainly.
 4. **Calls and the headless host.** `look`, `query`, `where`, and the `check`
-   that runs GenomeSpy.
+   that runs GenomeSpy. *The platform built 2026-11-27, as API 0.4*
+   ([web views](../features/web-views.md#a-plugins-tools-and-its-page-api-04)):
+   `web-call`, `web-call-result`, `ToolResult::wait_call`, the page's
+   `handle`, and the headless host on the agent browser's Chromium. What it
+   taught:
+   - **A new WIT version, not an amended one.** 0.3 hadn't shipped, but a
+     release would before this merged, so the imports went into 0.4 and 0.3
+     was frozen: an older daemon refuses a 0.4 plugin by its `api` instead of
+     failing to link it.
+   - **The answer's id is `call`.** A bridge message's `id` is its view's
+     (a framed page's is empty), so a page's `web_answer` carrying the call
+     in `id` was dropped in the window.
+   - **The window's theme rides the mint.** The daemon has no tokens of its
+     own; a window sends its `chimaera-theme` with each grant, again on a
+     theme switch, and the headless page gets it, as a command when it
+     changed.
+   - **Two web views on screen at once** looped the per-window limit's
+     effects (fixed in `webViews.seen`): reveal makes that layout common.
+   - **Not built:** the built-in `snapshot` without page code. A library's
+     own export through `save` covers GenomeSpy.
+
+   The plugin's tools are the plugin's (phase 3's repository).
    - Acceptance:
      - With the view closed, `look` returns a correct picture within 10 s.
      - On a login node it refuses plainly.
      - When the user brushes a region and asks "what's in here?", the agent
        answers from `where` and `query`.
-5. **Reveal and locus chips.**
+5. **Reveal and locus chips.** *The platform built 2026-11-27, with phase
+   4:* `platform::reveal` (a `plugin_reveal` frame placed like
+   `open_browser`'s pane, 4 a minute per session), view `args` through
+   `render`, and `references/1` shapes with `view: {view,
+   args_from_match}`. A locus shape keeps at most two unbounded repeats per
+   alternative (the regex guard), so it bounds the rest:
+   `chr[0-9XYM]{1,2}:[0-9,]{1,13}-[0-9,]{1,13}`.
 6. **Later, if wanted.**
    - GenomeSpy's sample-collection App (cohorts, provenance) as a second page.
    - A privileged opt-in plugin for indexing and bgzipping.

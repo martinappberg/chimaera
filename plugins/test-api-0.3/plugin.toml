@@ -1,0 +1,22 @@
+# Test-only: built into plugins/dist-test, embedded only by the daemon's
+# test builds. A 0.3 component, so the host's frozen 0.3 world stays proven.
+id = "test-api-03"
+name = "API 0.3 fixture"
+version = "0.1.0"
+summary = "A plugin built against plugin API 0.3, for chimaera's tests."
+api = "0.3"
+
+[access]
+files = "read"
+
+[provides]
+mcp_tools = ["echo03"]
+
+[adds]
+ui = ["A board tab"]
+agents = ["1 tool: echo03"]
+
+[[views]]
+id = "board"
+title = "API 0.3 board"
+slot = "tab"

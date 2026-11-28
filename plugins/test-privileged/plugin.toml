@@ -6,7 +6,7 @@ name = "Privileged fixture"
 version = "0.1.0"
 summary = "Runs programs and installs a tool, for chimaera's tests."
 description = "A plugin that exists only for chimaera's own tests of plugin programs and tools: jobs under the host's limits, a download checked and unpacked, a setup step, a long agent tool."
-api = "0.3"
+api = "0.4"
 
 [access]
 files = "read"

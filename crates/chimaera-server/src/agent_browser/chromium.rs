@@ -476,6 +476,15 @@ impl Chromium {
         Ok(browser)
     }
 
+    /// Keep the page keyed `page` on documents under `prefix` (a plugin's
+    /// headless page, after its first load): any other main-frame
+    /// navigation is refused.
+    pub(crate) fn pin(&self, page: &str, prefix: &str) {
+        if let Ok((_, pg)) = self.find(page) {
+            *lock(&pg.shared.pinned) = Some(prefix.to_string());
+        }
+    }
+
     /// Close targets idle ≥ 10 min, and the browser itself when it has no
     /// targets left (call every minute from the core's reaper).
     pub(crate) async fn reap_idle(&self) {
@@ -2256,6 +2265,11 @@ struct PageShared {
     /// Fetch pauses, decided by `page_task` (bounded: a full queue fails
     /// the request rather than growing).
     to_task: mpsc::Sender<Event>,
+    /// A plugin's headless page (`plugins::web_headless`): the one path
+    /// prefix its main frame may load, its own `/web/{grant}/`. A window's
+    /// plugin page can't navigate away (its guard, the app's policy), so
+    /// neither may this one.
+    pinned: Mutex<Option<String>>,
 }
 
 impl PageShared {
@@ -2265,6 +2279,7 @@ impl PageShared {
             st: Mutex::new(PageState::default()),
             changed: watch::channel(0).0,
             to_task,
+            pinned: Mutex::new(None),
         }
     }
 
@@ -2982,10 +2997,13 @@ async fn decide(
     };
     let url = p["request"]["url"].as_str().unwrap_or_default();
     let method = p["request"]["method"].as_str().unwrap_or("GET");
-    let verdict = if local_document(url) {
-        Ok(())
-    } else {
-        allow_document(&state, url).await
+    let pinned = lock(&shared.pinned).clone();
+    let verdict = match pinned {
+        Some(prefix) if shared.is_main(&p["frameId"]) && !url_path(url).starts_with(&prefix) => {
+            Err("a plugin's page stays on its own page".to_string())
+        }
+        _ if local_document(url) => Ok(()),
+        _ => allow_document(&state, url).await,
     };
     let (cmd, params) = match verdict {
         Ok(()) => ("Fetch.continueRequest", json!({"requestId": request_id})),
@@ -3036,6 +3054,11 @@ async fn allow_document(state: &Weak<AppState>, url: &str) -> Result<(), String>
         )),
         // A ticketed file (`file_page`): the one daemon path a page may load.
         Ok(Err(proxy::Refusal::Daemon)) if super::file_page::is_raw_path(url_path(url)) => Ok(()),
+        // A plugin's page under its grant (the headless host,
+        // `plugins::web_headless`): the grant is the capability.
+        Ok(Err(proxy::Refusal::Daemon)) if crate::plugins::web::is_page_path(url_path(url)) => {
+            Ok(())
+        }
         Ok(Err(proxy::Refusal::Daemon)) => Err(format!(
             "{host}:{port} is the Chimaera daemon itself, which the agent browser never opens."
         )),

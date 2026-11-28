@@ -462,9 +462,13 @@ pub(crate) struct RenderQuery {
     file: Option<String>,
     #[serde(default)]
     width: Option<String>,
+    /// 0.4: the view's args (a JSON object, ≤ 4 KiB): what a reveal or a
+    /// reference chip opened it with.
+    #[serde(default)]
+    args: Option<String>,
 }
 
-/// `GET /workspaces/{id}/plugins/{pid}/views/{view}?file=&width=`: the
+/// `GET /workspaces/{id}/plugins/{pid}/views/{view}?file=&width=&args=`: the
 /// view's tree, checked — `{"view", "title", "slot", "tree"}`, or
 /// `{"error", "problems"}` when the plugin failed or sent a bad tree.
 pub(crate) async fn render_route(
@@ -490,7 +494,7 @@ pub(crate) async fn render_route(
         let Some(file) = q.file.as_deref() else {
             return super::bad_request("a file view needs ?file=");
         };
-        if super::platform::file_kind(&m, file).is_none_or(|k| k.view != view) {
+        if !super::platform::file_view_may_draw(&m, &view, file) {
             return super::bad_request(format!("{} does not open {file} in {view}", m.name));
         }
     }
@@ -498,7 +502,21 @@ pub(crate) async fn render_route(
         Some("narrow") => "narrow",
         _ => "wide",
     };
-    let args = json!({"file": q.file, "width": width, "slot": decl.slot.as_str()});
+    let view_args = match q.args.as_deref() {
+        None | Some("") => Value::Object(Map::new()),
+        Some(text) if text.len() > super::reveal::ARGS_MAX => {
+            return super::bad_request(format!(
+                "a view's args are at most {} KiB",
+                super::reveal::ARGS_MAX >> 10
+            ))
+        }
+        Some(text) => match serde_json::from_str::<Value>(text) {
+            Ok(v @ Value::Object(_)) => v,
+            _ => return super::bad_request("a view's args are a JSON object"),
+        },
+    };
+    let args =
+        json!({"file": q.file, "width": width, "slot": decl.slot.as_str(), "args": view_args});
     crate::lock(&state.plugin_platform.screens).mark_open(&m.id, &ws, q.file.as_deref());
     // The watch sweep runs while a view is open: start it if it sleeps.
     state.plugin_platform.files_wake.notify_one();
@@ -648,12 +666,35 @@ pub(crate) async fn file_action_route(
         .get("message")
         .and_then(Value::as_str)
         .map(|m| crate::timeline::cap(m, 400));
-    let open = answer.get("open").filter(|o| {
-        o.get("view")
-            .and_then(Value::as_str)
-            .is_some_and(|v| m.views.iter().any(|d| d.id == v))
+    let open = answer.get("open").and_then(|o| {
+        let view = o.get("view").and_then(Value::as_str)?;
+        let decl = m.views.iter().find(|d| d.id == view)?;
+        // A file view opens on a file of this workspace (a plain relative
+        // path, never `..`, absolute or empty) that it may draw; one named
+        // otherwise opens nothing rather than an error screen. Unnamed, it
+        // opens on the file the action ran on.
+        let file = match o.get("file").and_then(Value::as_str) {
+            Some(f) if decl.slot == Slot::File => {
+                if !workspace_file(f) || !super::platform::file_view_may_draw(&m, view, f) {
+                    return None;
+                }
+                Some(f)
+            }
+            _ => None,
+        };
+        Some(json!({"view": view, "file": file}))
     });
     Json(json!({"message": message, "open": open})).into_response()
+}
+
+/// A path a plugin may name for a file view to open on: workspace-relative,
+/// `/`-separated, with no empty, `.` or `..` segment.
+fn workspace_file(f: &str) -> bool {
+    !f.is_empty()
+        && f.len() <= 1024
+        && !f.contains('\\')
+        && !f.contains('\0')
+        && f.split('/').all(|s| !s.is_empty() && s != "." && s != "..")
 }
 
 #[derive(Deserialize)]
@@ -698,6 +739,26 @@ pub(crate) async fn query_route(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_file_action_names_only_a_plain_workspace_file() {
+        for ok in ["a.vcf", "data/tp53/calls.vcf.gz", "with space.bed"] {
+            assert!(super::workspace_file(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "/etc/passwd",
+            "../x",
+            "a/../b",
+            "a//b",
+            "./a",
+            "a/",
+            "a\\b",
+            "a\0b",
+        ] {
+            assert!(!super::workspace_file(bad), "{bad:?}");
+        }
+    }
+
     use super::*;
 
     #[test]

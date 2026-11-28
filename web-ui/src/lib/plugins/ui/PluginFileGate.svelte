@@ -8,6 +8,9 @@
    * (`slot = "status"`) and every matching file action (`[[actions]]`).
    * A file no active plugin claims but an installed one switched off here
    * would gets a one-click Turn on (Not now is remembered per workspace).
+   * A file action may open one of its plugin's file views on a file,
+   * claimed or not (`fileViewRequest`): that view joins the switch for this
+   * opening only, and is not remembered.
    * With none of that, the file shows exactly as it always did.
    */
   import type { Snippet } from "svelte";
@@ -17,14 +20,19 @@
     claimsFor,
     declinedOffers,
     declineOffer,
+    fileActionTarget,
+    fileViewRequest,
+    FILE_VIEW_REQUEST_MS,
     offersFor,
     openPluginView,
     openWith,
     postFileAction,
     rememberOpenWith,
+    viewClaim,
     viewsIn,
     workspaceRelative,
   } from "../platform";
+  import { openPath, pathPaneFrom } from "../../shared/openPath";
   import PluginScreen from "./PluginScreen.svelte";
 
   interface Props {
@@ -53,6 +61,38 @@
     viewsIn(plugins, "status").filter((s) => claims.some((c) => c.plugin.id === s.plugin.id)),
   );
 
+  /** A file view a file action asked for on this file (see the header),
+   *  shown while `showAsked` (until another choice is picked). */
+  let asked = $state<{ path: string; plugin: string; view: string } | null>(null);
+  let showAsked = $state(false);
+  /** The path `asked` belongs to (plain: no effect reads it reactively). */
+  let askedFor = "";
+  $effect(() => {
+    const req = $fileViewRequest;
+    if (req === null || req.path !== path) return;
+    // One gate takes it (a second pane on the file, or a later reopen, must
+    // not), and a stale one is dropped.
+    fileViewRequest.set(null);
+    if (Date.now() - req.at > FILE_VIEW_REQUEST_MS) return;
+    asked = { path, plugin: req.plugin, view: req.view };
+    askedFor = path;
+    showAsked = true;
+  });
+  // Another file in this gate starts without the asked-for view.
+  $effect(() => {
+    if (path === askedFor) return;
+    askedFor = path;
+    asked = null;
+    showAsked = false;
+  });
+  const askedClaim = $derived(asked !== null && asked.path === path ? viewClaim(plugins, asked.plugin, asked.view) : null);
+  /** The switch's choices: the claimants, and the asked-for view if it is not one. */
+  const askedExtra = $derived(
+    askedClaim !== null && !claims.some((c) => c.plugin.id === askedClaim.plugin.id && c.view.id === askedClaim.view.id)
+      ? askedClaim
+      : null,
+  );
+
   /** A plugin id, `"text"`, or null (the first claimant). */
   let picked = $state<string | null>(null);
   $effect(() => {
@@ -60,10 +100,15 @@
     picked = wsId !== null && first !== undefined ? openWith(wsId, first.kind.label) : null;
   });
   const claim = $derived(
-    picked === "text" ? null : (claims.find((c) => c.plugin.id === picked) ?? claims[0] ?? null),
+    showAsked && askedClaim !== null
+      ? askedClaim
+      : picked === "text"
+        ? null
+        : (claims.find((c) => c.plugin.id === picked) ?? claims[0] ?? null),
   );
 
   function pick(choice: string): void {
+    showAsked = false;
     picked = choice;
     const first = claims[0];
     if (wsId !== null && first !== undefined) {
@@ -71,6 +116,7 @@
     }
   }
 
+  let gateEl = $state<HTMLElement | null>(null);
   let running = $state<string | null>(null);
   let message = $state<{ text: string; bad: boolean } | null>(null);
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -102,7 +148,13 @@
     try {
       const answer = await postFileAction(wsId, pid, action, rel);
       if (answer.message !== null) message = { text: answer.message, bad: false };
-      if (answer.open !== null) openPluginView(pid, answer.open.view);
+      const target = answer.open === null ? null : fileActionTarget(plugins, pid, answer.open, rel);
+      if (target?.kind === "tab") openPluginView(pid, target.view);
+      else if (target?.kind === "file" && wsRoot !== null) {
+        const file = `${wsRoot.replace(/\/+$/, "")}/${target.file}`;
+        fileViewRequest.set({ path: file, plugin: pid, view: target.view, at: Date.now() });
+        if (file !== path) openPath(file, "file", { fromPane: pathPaneFrom(gateEl ?? null) });
+      }
     } catch (e) {
       message = { text: e instanceof Error ? e.message : String(e), bad: true };
     } finally {
@@ -113,10 +165,10 @@
   }
 </script>
 
-{#if wsId === null || rel === null || (claims.length === 0 && actions.length === 0 && offer === null)}
+{#if wsId === null || rel === null || (claims.length === 0 && askedClaim === null && actions.length === 0 && offer === null)}
   {@render children()}
 {:else}
-  <div class="gate">
+  <div class="gate" bind:this={gateEl}>
     <div class="bar">
       {#each chips as c (`${c.plugin.id}/${c.view.id}`)}
         <div class="chip" title={c.view.title}>
@@ -144,18 +196,28 @@
           onclick={() => void runAction(a.plugin.id, a.action.action)}>{a.action.label}</button
         >
       {/each}
-      {#if claims.length > 0}
+      {#if claims.length > 0 || askedExtra !== null}
         <div class="switch" role="tablist" aria-label="open with">
           {#each claims as c (c.plugin.id)}
             <button
               class="seg"
-              class:on={claim?.plugin.id === c.plugin.id}
+              class:on={claim?.plugin.id === c.plugin.id && claim?.view.id === c.view.id}
               role="tab"
-              aria-selected={claim?.plugin.id === c.plugin.id}
+              aria-selected={claim?.plugin.id === c.plugin.id && claim?.view.id === c.view.id}
               title="Open with {c.plugin.name}"
               onclick={() => pick(c.plugin.id)}>{claims.length > 1 ? c.plugin.name : c.kind.label}</button
             >
           {/each}
+          {#if askedExtra !== null}
+            <button
+              class="seg"
+              class:on={claim === askedExtra}
+              role="tab"
+              aria-selected={claim === askedExtra}
+              title="Open with {askedExtra.plugin.name}"
+              onclick={() => (showAsked = true)}>{askedExtra.view.title}</button
+            >
+          {/if}
           <button class="seg" class:on={claim === null} role="tab" aria-selected={claim === null} onclick={() => pick("text")}
             >Text</button
           >

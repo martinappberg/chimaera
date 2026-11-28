@@ -284,3 +284,26 @@ describe("web/1 page events", () => {
     expect(ev).toMatchObject({ kind: "web_reference", crop: { blob } });
   });
 });
+
+describe("a page's answer to its plugin's call (web_answer)", () => {
+  it("keeps its call id apart from the view's id, in a frame and a native view", () => {
+    // A frame's message gets the frame's own (empty) id: the call's rides `call`.
+    expect(decodeFrameMessage({ chimaeraPaneView: { kind: "web_answer", call: "wc-1", ok: true, value: { a: 1 } } })).toEqual({
+      kind: "web_answer",
+      call: "wc-1",
+      ok: true,
+      value: { a: 1 },
+      error: null,
+    });
+    expect(decodeNativeViewEvent({ id: "v", kind: "web_answer", call: "wc-2", ok: false, error: "no handler for look" })).toEqual({
+      id: "v",
+      kind: "web_answer",
+      call: "wc-2",
+      ok: false,
+      value: null,
+      error: "no handler for look",
+    });
+    expect(decodeNativeViewEvent({ id: "v", kind: "web_answer", ok: true })).toBeNull();
+    expect(decodeNativeViewEvent({ id: "v", kind: "web_answer", call: "wc-3" })).toBeNull();
+  });
+});

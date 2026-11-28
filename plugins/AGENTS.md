@@ -10,7 +10,7 @@ its `plugin.toml`, and each publishing a GitHub release per version:
 - PowerPoint (privileged: LibreOffice): [martinappberg/chimaera-plugin-pptx](https://github.com/martinappberg/chimaera-plugin-pptx)
 - Chromium (privileged: a downloaded chrome-headless-shell, `provides.browser`): [martinappberg/chimaera-plugin-chromium](https://github.com/martinappberg/chimaera-plugin-chromium)
 - Manimble (privileged: python3, which drives the Manimble engine installed on the host): [martinappberg/chimaera-plugin-manimble](https://github.com/martinappberg/chimaera-plugin-manimble)
-- GenomeSpy (sandboxed: reads files): [martinappberg/chimaera-plugin-genomespy](https://github.com/martinappberg/chimaera-plugin-genomespy)
+- GenomeSpy (sandboxed: reads files, draws its own web view): [martinappberg/chimaera-plugin-genomespy](https://github.com/martinappberg/chimaera-plugin-genomespy)
 
 This directory holds what the chimaera repository needs of them: the lock
 that names them and pins one release of each (the only plugin data the daemon
@@ -39,14 +39,16 @@ WIT host imports; verify those in an isolated daemon or host integration tests.
 
 | Path | What |
 |---|---|
-| `plugins.lock` | One `[[plugin]]` per first-party plugin: `id`, `name` and `summary` (what an available card shows before any install), `category` (the Extensions page's group for it: `writing`, `presentations`, `data`, `knowledge` or `agents`; the maintainers' call, which a release bump never changes; all three readers of the lock require it), `version` (the pinned release), `repo` (`owner/name`), `sha256_wasm`, `sha256_toml` (that release's `SHA256SUMS`), and `tier` + `caps` — what the maintainers approved it to do (`sandboxed` / `privileged`, and its capability digest; `chimaera plugin caps plugin.toml` prints both for a release's manifest). A sandboxed update keeps the badge only while its digest is `caps`; a privileged plugin is verified only at the pin (docs/design/plugin-platform-plan.md §2). The daemon embeds it (`include_str!`, parsed with toml in `crates/chimaera-server/src/plugins/mod.rs`): each entry is listed as available until installed, and a first-party install fetches `https://github.com/<repo>/releases/download/v<version>/{SHA256SUMS,plugin.toml,plugin.wasm}` and refuses bytes that don't match both the release's `SHA256SUMS` and these sha256s. A bump is automatic — `.github/workflows/plugin-lock.yml` (below) — and CI-gated. `plugins::tests::every_locked_release_is_what_the_lock_says` checks each locked release (downloaded into `dist-test/`) against it: both sha256s, id, version, name, `[release] github` equal to `repo`, the gates, that it says what it adds, and that `tier` and `caps` are its manifest's. |
+| `plugins.lock` | One `[[plugin]]` per first-party plugin: `id`, `name` and `summary` (what an available card shows before any install), `category` (the Extensions page's group for it: `writing`, `presentations`, `data`, `biology`, `knowledge` or `agents`; the maintainers' call, which a release bump never changes; all three readers of the lock require it), `version` (the pinned release), `repo` (`owner/name`), `sha256_wasm`, `sha256_toml` (that release's `SHA256SUMS`), and `tier` + `caps` — what the maintainers approved it to do (`sandboxed` / `privileged`, and its capability digest; `chimaera plugin caps plugin.toml` prints both for a release's manifest). A sandboxed update keeps the badge only while its digest is `caps`; a privileged plugin is verified only at the pin (docs/design/plugin-platform-plan.md §2). The daemon embeds it (`include_str!`, parsed with toml in `crates/chimaera-server/src/plugins/mod.rs`): each entry is listed as available until installed, and a first-party install fetches `https://github.com/<repo>/releases/download/v<version>/{SHA256SUMS,plugin.toml,plugin.wasm}` and refuses bytes that don't match both the release's `SHA256SUMS` and these sha256s. A bump is automatic — `.github/workflows/plugin-lock.yml` (below) — and CI-gated. `plugins::tests::every_locked_release_is_what_the_lock_says` checks each locked release (downloaded into `dist-test/`) against it: both sha256s, id, version, name, `[release] github` equal to `repo`, the gates, that it says what it adds, and that `tier` and `caps` are its manifest's. |
 | retired plugins | A first-party plugin whose job moves into chimaera itself leaves the lock for the daemon's `RETIRED` list (`crates/chimaera-server/src/plugins/retired.rs`: id, repository, the one-line reason). An installed copy stays listed with the reason as its fault and **Remove**, never runs, and every install path refuses the id (409); the workspace registry drops its switch at load. Agent notes (`agent-notes`), 2026-09-30: built in as Agent communication. Archive its repository rather than deleting it — older chimaera releases pin its releases. |
 | pre-release pins | A pinned release can be a GitHub **pre-release** that isn't "latest" (Mycelium 0.2.1, 2026-09-29: its `[access]` is a table a released daemon can't parse). This lock downloads it by tag; every daemon's release checker and the lock bot read `releases/latest` and don't see it — the bot only moves a pin forward. Once a chimaera release that pins it is out, `release.yml`'s `plugin-pins` job (`.github/scripts/plugin-pins.mjs`) makes it a full release and its repository's latest (by hand: `gh release edit vX.Y.Z --repo <repo> --prerelease=false --latest`). The plugin repos' release workflow publishes one by hand (`workflow_dispatch`, `prerelease: true`). |
 | `revoked.json`, `revocation-keys.txt` | The kill switch (`crates/chimaera-server/src/plugins/revoke.rs`): the list of blocked plugin builds (id, versions and/or `plugin.wasm` sha256s, `hard` or `soft`, a reason), embedded in every build, and the Ed25519 public keys (plus `threshold`) whose signatures make the live copy — this file on `main`, fetched daily — count. With no key listed only the embedded list counts. Block a build: add its entry and raise `serial` (a host refuses a list older than its own), then `node scripts/revocations.mjs sign --key <your private key>` (writes `revoked.sig`), commit both, and ship a release for hosts that never fetch; `keygen` makes a maintainer's key (its private half never enters the repository), `verify` checks the current signatures. |
-| `Cargo.toml`, `Cargo.lock` | The workspace: `api-0.1`, `test-fixture`, `test-platform`, `test-privileged`, `test-web`; `chimaera-plugin-api` by path; a small release profile. |
+| `Cargo.toml`, `Cargo.lock` | The workspace: `api-0.1`, `api-0.3`, `test-api-0.3`, `test-fixture`, `test-platform`, `test-privileged`, `test-web`; `chimaera-plugin-api` by path; a small release profile. |
 | `api-0.1/` | **Frozen**: the 0.1 guest API (`chimaera-plugin-api-v0-1`, reading `crates/chimaera-plugin-api/wit-0.1`), which `test-fixture` depends on renamed as `chimaera-plugin-api` — the host's proof that a 0.1 plugin still loads. Never edit it. |
+| `api-0.3/` | **Frozen**: the 0.3 guest API (`chimaera-plugin-api-v0-3`, the SDK as it was at 0.3.0, reading `crates/chimaera-plugin-api/wit-0.3`), which `test-api-0.3` depends on renamed. Never edit it. |
+| `test-api-0.3/` | A 0.3 component (id `test-api-03`): one tool `echo03` (state, `host.read_at`, a `wait` on no job) and a `board` view — the host's proof that a 0.3 plugin runs beside 0.4 (`tests/plugin_web.rs` `a_0_3_component_runs_beside_0_4`). |
 | `test-platform/` | The platform fixture (built against the current 0.3 SDK): every `ui/1` node, every `platform` import, the new events, five views (one per slot), a file kind (`*.fixture`), a file action, five settings. Laid out as `dist-test/test-platform/`; driven by `crates/chimaera-server/src/tests/plugin_platform.rs`. |
-| `test-web/` | The web views fixture (0.3): `[web] pages = ["view.html"]`, `libraries = ["testlib"]`, `network = ["data.example.org"]`, `[access] files = "read"`; a `board` tab (with a sidebar row, `rail = true`) whose `web` node carries `data` and a `key` (an `on_action` `ping` bumps both); `build.rs` packs `web/` into the tar `web_bundle()` returns (plain ustar, no dependency). Its page reads `sample.csv` by Range, fetches outside (refused), tries to leave (stopped), pings, saves, and references its canvas. Laid out as `dist-test/test-web/`; driven by `crates/chimaera-server/src/tests/plugin_web.rs`, and installed by path for the live checks ([feature](../docs/features/web-views.md)). |
+| `test-web/` | The web views fixture (0.4): `[web] pages = ["view.html"]`, `libraries = ["testlib"]`, `network = ["data.example.org"]`, `[access] files = "read"`; a `board` tab (with a sidebar row, `rail = true`) whose `web` node carries `data` and a `key` (an `on_action` `ping` bumps both); `build.rs` packs `web/` into the tar `web_bundle()` returns (plain ustar, no dependency). Its page reads `sample.csv` by Range, fetches outside (refused), tries to leave (stopped), pings, saves, and references its canvas. 0.4: its page answers `handle` calls (`ping`, `slow`, `big` over the limit, `fail`, and `late`, registered after 2 s); tools `web_ask` (`web_call` → `wait_call` → `tool_resume`; `fresh`, `file`) and `web_show` (`reveal` of the board at an `item`, or a `.webfix` file in its `doc` view); a `references/1` shape `TW-[0-9]+` whose matches open the board at that item. Laid out as `dist-test/test-web/`; driven by `crates/chimaera-server/src/tests/plugin_web.rs`, and installed by path for the live checks ([feature](../docs/features/web-views.md)). |
 | `test-privileged/` | The programs-and-tools fixture (0.3, privileged): `[[programs]]` `sh`, `echo`, `sleep` and `fixture-tool`; `[[tools]]` `fixture-tool` 1.0.0, whose archive `fixture-tool-1.0.0.tar.gz` (a `bin/fixture-tool` shell script) sits beside it with its sha256 in the manifest and a setup step; a `jobs` view whose actions start jobs, a long agent tool `build` (`wait` → `tool_resume`; `picture: true` writes `output:pictures/one.png` and answers with a picture line, which the host turns into an MCP image block), and `job-finished` recorded for the tests. Laid out as `dist-test/test-privileged/`; driven by `crates/chimaera-server/src/tests/plugin_jobs.rs`, which serves the archive from a fake host. |
 | `test-fixture/` | The host's test fixture (echo, loop, allocate, panic, read, state, append, recent): each tool pokes one host limit. Built here into `dist-test/`, which only the daemon's **test** builds embed — never shipped. Its `v2` feature (one more tool, `version`) with `plugin-v2.toml` (0.2.0) is its "next release" for the daemon's update tests: the script also lays that out as `dist-test/test-fixture-v2/`, which the tests serve from a fake releases server (`crates/chimaera-server/src/tests/plugin_updates.rs`). |
 | `dist-test/`, `target/` | Build output (gitignored). `dist-test/` holds the fixture (and its v2), embedded by test builds, and each locked release as `dist-test/<id>/{plugin.wasm,plugin.toml,SHA256SUMS}`, which tests install by path. |
@@ -109,18 +111,89 @@ does not activate it. Rebuild, copy and reinstall the same version to iterate.
    bytes and the manifest's id, version and `[release] github` against the
    lock, fetches every tool download the manifest names (`[[tools.artifacts]]`)
    and compares it with its sha256, rewrites the entry (`version`, both sha256s,
-   `name` / `summary`) and
-   opens `fix: update <Name> to <version>`. It auto-merges (squash) only when
-   the plugin is sandboxed and the release's capability lines (`api` and every
-   table but `[adds]`, `[release]` and `[detect]`) equal its pinned release's,
-   so `tier` and `caps` carry over. Otherwise the PR waits for a maintainer:
-   review the release, set `tier` and `caps` to what `chimaera plugin caps`
-   prints for its `plugin.toml` (CI stays red until they match), merge. CI
+   `name` / `summary`, and the release's own `tier` and `caps`) and
+   opens `fix: update <Name> to <version>`. No TOML is read in JavaScript:
+   when a newer release exists the workflow builds the `chimaera` CLI from
+   the checkout (after the web UI it embeds) and runs `chimaera plugin caps
+   <release.toml> --against <pinned.toml> --json` (`describe_bump` in
+   `crates/chimaera-server/src/plugins/capabilities.rs`), which reads both
+   manifests with the daemon's own code and answers each one's tier, digest,
+   Can lines and tool downloads, the Can lines added and dropped, and whether
+   the two are the same but for their words (`plugins::same_behaviour`: an
+   exhaustive destructure of `Manifest`, `Requires` and `Recommends`, so a
+   new field there fails to compile until it is named words or behaviour;
+   the nested declarations (programs, tools, views, settings…) are compared
+   whole through their derived `Debug`, so a field added to one is compared
+   automatically; the words are `name`, `version`, `summary`,
+   `description`, `category`, `[adds]` and the two agent-plugin summaries —
+   `homepage` is behaviour, a link on a verified card; unknown keys are
+   refused by the manifest type at every level). The script validates that answer strictly (`bumpFacts`); a
+   manifest the daemon refuses is refused like any failed check. It is
+   never a downloaded release binary: an older one could ignore a key the
+   current daemon reads. The lock is written with the release's own `tier`
+   and `caps`. A bump auto-merges (squash) only when (`review` in the
+   script) the pinned release reads as the lock records (its `tier` and
+   `caps`); the manifests are identical except for words (so the tier and
+   digest are the pinned ones too, which the script also checks, for free);
+   and, for a **privileged** plugin only, its `plugin.wasm` and `plugin.toml` are covered by one
+   attestation from the plugin repository's release workflow, at the
+   release's tag or on main, from the commit the tag points to, which is on
+   main. The script resolves the tag to its commit through the GitHub API
+   (the answer must be for exactly that tag; an annotated tag is
+   dereferenced; one that doesn't resolve waits), requires that commit to be
+   on `main` (`GET /repos/<repo>/compare/<commit>...main`: `ahead` or
+   `identical`, with the commit as the merge base), then tries each accepted
+   ref `<ref>` (`refs/tags/v<version>`, then `refs/heads/main`):
+   `gh attestation verify plugin.wasm --repo <repo> --cert-identity
+   https://github.com/<repo>/.github/workflows/release.yml@<ref> --source-ref
+   <ref> --source-digest <commit> --deny-self-hosted-runners --format json`
+   (gh gets a minimal environment with the token as `GH_TOKEN` only), and
+   checks gh's result again: one attestation, on its own, from the
+   repository, the exact signer and ref, GitHub Actions' issuer, the commit,
+   a GitHub-hosted runner, SLSA provenance, with both the wasm's and the
+   toml's sha256 among its subjects. The workflow path and `main` are
+   constants in the script, never read from the release. A release run by
+   hand (`workflow_dispatch` on `main`, how these plugins are usually
+   released) counts, because the attestation is bound to the commit the tag
+   points to, not to a ref name. What that proves: the files were built by
+   the repository's release workflow from a commit on `main`. It does not
+   prove anyone reviewed that commit: with this rule, whoever can merge to a
+   privileged plugin's `main` and release it ships to users without a
+   second look at the lock PR, which is the maintainer's chosen trade. The
+   check on `main` is only as strong as who can push to it and create `v*`
+   tags. The five privileged plugin repositories (pptx, latex, typst, chromium,
+   manimble) each have two rulesets: a `refs/tags/v*` tag cannot be updated
+   or deleted, by anyone, and `main` cannot be force-pushed or deleted. Who
+   may create a `v*` tag is not restricted (GitHub refuses the Actions app as
+   a bypass actor on a personal-account repository, and a release run by
+   hand creates its tag with the workflow token), so a release tag, once
+   made, cannot be moved, and the script's own checks (the tagged commit is
+   on `main`, the signer is `release.yml` at that tag or on `main`, both
+   files in one attestation) are what stop a tag on a side commit. The only
+   collaborator on all five is the maintainer. A sandboxed plugin needs no attestation: the
+   sandbox bounds its code. Each plugin repository's release workflow
+   builds in a read-only job and attests both files in a separate
+   `publish` job that checks them against the build job's SHA256SUMS
+   before signing and publishing exactly those (`actions/attest`; only that
+   job holds `contents`, `id-token` and `attestations` write). Otherwise the
+   PR waits for a maintainer, and its body says which condition failed,
+   whether the tier changed, whether provenance verified (the ref it was
+   signed at and the commit), and which of the card's Can
+   lines the release adds and drops, with links to the release and the
+   compare view. Such a PR is
+   usually green: CI checks only that the lock matches the release, which is
+   not an approval. Read the code and those changes; merge to approve them,
+   or close it unmerged to turn the version down. A note that the pinned
+   release doesn't read as the lock records means the lock was hand-edited
+   or the port and the daemon disagree: check with `chimaera plugin caps`. CI
    installs the release against the new lock; the merge requests a patch
    release, and from that release (the next daily batch) **Install** fetches
    that version. Run it by hand with **Actions →
    plugin-lock → Run workflow**, or locally without writing:
-   `node .github/scripts/plugin-lock.mjs`. One bump PR at a time: a newer
+   `cargo build -p chimaera && node .github/scripts/plugin-lock.mjs --chimaera
+   target/debug/chimaera` (with `CHIMAERA_BIN=target/debug/chimaera`,
+   `node --test .github/scripts/` also runs its end-to-end test against
+   that binary). One bump PR at a time: a newer
    release waits for the open one to land, and one that can no longer land
    (it conflicts with a lock edited on `main`, or `main` already has its
    change) is closed as "Superseded:"
@@ -152,7 +225,7 @@ does not activate it. Rebuild, copy and reinstall the same version to iterate.
   the test implements natively (the plugin repositories do both).
 - **A manifest's `provides.mcp_tools` equals the component's `tools()` names**
   — the host refuses the plugin otherwise — and `api` names the WIT version
-  it was built against (`"0.1"`, `"0.2"` or `"0.3"`; the script checks it is
+  it was built against (`"0.1"` … `"0.4"`; the script checks it is
   one the host serves).
 - **`version` is the manifest's, and it is the crate's.** Every manifest
   carries `version` (plain `MAJOR.MINOR.PATCH`) and `api`; the fixture's must
