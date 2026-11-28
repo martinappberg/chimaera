@@ -35,8 +35,8 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use super::capabilities::{FilesAccess, SessionsAccess, TimelineAccess};
-use super::runtime::v2::chimaera::plugin::{host, platform};
-use super::runtime::{v1, wit, CallScope, HostState, EVENT_MAX};
+use super::runtime::v3::chimaera::plugin::{host, platform};
+use super::runtime::{v1, v2, wit, CallScope, HostState, EVENT_MAX};
 use crate::timeline;
 
 /// A read's ceiling, whatever `cap` the plugin asks for.
@@ -313,7 +313,7 @@ fn shown(rel: &Path) -> String {
 /// refusal from a missing file by these words (" is a symlink — refused"):
 /// the mycelium reader warns about and stamps a refused path, pinned by
 /// `tests/knowledge.rs`.
-fn refused(root: &Path, rel: &Path, err: std::io::Error) -> String {
+pub(super) fn refused(root: &Path, rel: &Path, err: std::io::Error) -> String {
     let mut at = root.to_path_buf();
     let mut walked = PathBuf::new();
     for part in rel.components() {
@@ -345,15 +345,22 @@ fn open_under(root: &Path, rel: &Path, dir: bool) -> Result<std::fs::File, Strin
     crate::download::open_beneath(&root_dir, rel, flags).map_err(|e| refused(root, rel, e))
 }
 
-fn read_capped(root: &Path, rel: &Path, cap: usize) -> Result<Vec<u8>, String> {
-    let file = open_under(root, rel, false)?;
+fn read_capped(root: &Path, rel: &Path, offset: u64, cap: usize) -> Result<Vec<u8>, String> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = open_under(root, rel, false)?;
     let meta = file
         .metadata()
         .map_err(|e| format!("{}: {e}", shown(rel)))?;
     if !meta.is_file() {
         return Err(format!("{}: not a regular file", shown(rel)));
     }
-    let mut bytes = Vec::with_capacity((meta.len() as usize).min(cap));
+    let left = meta.len().saturating_sub(offset);
+    let mut bytes = Vec::with_capacity((left as usize).min(cap));
+    if left == 0 {
+        return Ok(bytes);
+    }
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| format!("{}: {e}", shown(rel)))?;
     file.take(cap as u64)
         .read_to_end(&mut bytes)
         .map_err(|e| format!("{}: {e}", shown(rel)))?;
@@ -439,7 +446,19 @@ impl host::Host for HostState {
     async fn read(&mut self, _cx: wit::Context, path: String, cap: u32) -> Result<Vec<u8>, String> {
         let (root, rel) = self.target(&path)?;
         let cap = (cap as usize).min(READ_CEILING);
-        blocking(move || read_capped(&root, &rel, cap)).await
+        blocking(move || read_capped(&root, &rel, 0, cap)).await
+    }
+
+    async fn read_at(
+        &mut self,
+        _cx: wit::Context,
+        path: String,
+        offset: u64,
+        cap: u32,
+    ) -> Result<Vec<u8>, String> {
+        let (root, rel) = self.target(&path)?;
+        let cap = (cap as usize).min(READ_CEILING);
+        blocking(move || read_capped(&root, &rel, offset, cap)).await
     }
 
     async fn stat(&mut self, _cx: wit::Context, path: String) -> Result<wit::Stat, String> {
@@ -763,6 +782,220 @@ mod v1_host {
                 old::Level::Error => wit::Level::Error,
             };
             host::Host::log(self, level, message).await
+        }
+    }
+}
+
+/// 0.2's `host` and `platform`: the same functions as 0.3's (the `cx` a
+/// guest passes is ignored either way), under 0.2's package version and
+/// types.
+mod v2_host {
+    use super::*;
+    use v2::chimaera::plugin::{host as old_host, platform as old_platform, types as old};
+
+    fn cx(c: old::Context) -> wit::Context {
+        wit::Context {
+            workspace: c.workspace,
+            session: c.session,
+            mastermind: c.mastermind,
+        }
+    }
+
+    impl old::Host for HostState {}
+
+    impl old_host::Host for HostState {
+        async fn read(
+            &mut self,
+            c: old::Context,
+            path: String,
+            cap: u32,
+        ) -> Result<Vec<u8>, String> {
+            host::Host::read(self, cx(c), path, cap).await
+        }
+
+        async fn stat(&mut self, c: old::Context, path: String) -> Result<old::Stat, String> {
+            host::Host::stat(self, cx(c), path)
+                .await
+                .map(|s| old::Stat {
+                    size: s.size,
+                    mtime_ms: s.mtime_ms,
+                    is_dir: s.is_dir,
+                })
+        }
+
+        async fn list(
+            &mut self,
+            c: old::Context,
+            path: String,
+            cap: u32,
+        ) -> Result<Vec<old::Entry>, String> {
+            host::Host::list(self, cx(c), path, cap)
+                .await
+                .map(|entries| {
+                    entries
+                        .into_iter()
+                        .map(|e| old::Entry {
+                            name: e.name,
+                            is_dir: e.is_dir,
+                            is_symlink: e.is_symlink,
+                        })
+                        .collect()
+                })
+        }
+
+        async fn state_get(&mut self, c: old::Context, key: String) -> Option<String> {
+            host::Host::state_get(self, cx(c), key).await
+        }
+
+        async fn state_put(
+            &mut self,
+            c: old::Context,
+            key: String,
+            value: String,
+        ) -> Result<(), String> {
+            host::Host::state_put(self, cx(c), key, value).await
+        }
+
+        async fn sessions(&mut self, c: old::Context) -> Vec<old::Session> {
+            host::Host::sessions(self, cx(c))
+                .await
+                .into_iter()
+                .map(|s| old::Session {
+                    id: s.id,
+                    kind: s.kind,
+                    name: s.name,
+                    chat: s.chat,
+                    alive: s.alive,
+                    mastermind: s.mastermind,
+                })
+                .collect()
+        }
+
+        async fn timeline_append(&mut self, c: old::Context, entry: String) -> Result<u64, String> {
+            host::Host::timeline_append(self, cx(c), entry).await
+        }
+
+        async fn timeline_recent(
+            &mut self,
+            c: old::Context,
+            kinds: Vec<String>,
+            limit: u32,
+        ) -> Vec<String> {
+            host::Host::timeline_recent(self, cx(c), kinds, limit).await
+        }
+
+        async fn emit(&mut self, c: old::Context, event: String) {
+            host::Host::emit(self, cx(c), event).await
+        }
+
+        async fn now_ms(&mut self) -> u64 {
+            host::Host::now_ms(self).await
+        }
+
+        async fn log(&mut self, level: old::Level, message: String) {
+            let level = match level {
+                old::Level::Debug => wit::Level::Debug,
+                old::Level::Info => wit::Level::Info,
+                old::Level::Warn => wit::Level::Warn,
+                old::Level::Error => wit::Level::Error,
+            };
+            host::Host::log(self, level, message).await
+        }
+    }
+
+    impl old_platform::Host for HostState {
+        async fn output_read(
+            &mut self,
+            c: old::Context,
+            path: String,
+            offset: u64,
+            cap: u32,
+        ) -> Result<Vec<u8>, String> {
+            platform::Host::output_read(self, cx(c), path, offset, cap).await
+        }
+
+        async fn output_list(
+            &mut self,
+            c: old::Context,
+            path: String,
+            cap: u32,
+        ) -> Result<Vec<old::Entry>, String> {
+            platform::Host::output_list(self, cx(c), path, cap)
+                .await
+                .map(|entries| {
+                    entries
+                        .into_iter()
+                        .map(|e| old::Entry {
+                            name: e.name,
+                            is_dir: e.is_dir,
+                            is_symlink: e.is_symlink,
+                        })
+                        .collect()
+                })
+        }
+
+        async fn output_write(
+            &mut self,
+            c: old::Context,
+            path: String,
+            bytes: Vec<u8>,
+        ) -> Result<(), String> {
+            platform::Host::output_write(self, cx(c), path, bytes).await
+        }
+
+        async fn output_remove(&mut self, c: old::Context, path: String) -> Result<(), String> {
+            platform::Host::output_remove(self, cx(c), path).await
+        }
+
+        async fn publish(
+            &mut self,
+            c: old::Context,
+            surface: String,
+            key: String,
+            data: String,
+        ) -> Result<(), String> {
+            platform::Host::publish(self, cx(c), surface, key, data).await
+        }
+
+        async fn invalidate(&mut self, c: old::Context, view: String) {
+            platform::Host::invalidate(self, cx(c), view).await
+        }
+
+        async fn watch(&mut self, c: old::Context, paths: Vec<String>) -> Result<(), String> {
+            platform::Host::watch(self, cx(c), paths).await
+        }
+
+        async fn setting_get(&mut self, c: old::Context, key: String) -> Option<String> {
+            platform::Host::setting_get(self, cx(c), key).await
+        }
+
+        async fn state_keep(
+            &mut self,
+            c: old::Context,
+            key: String,
+            value: String,
+        ) -> Result<(), String> {
+            platform::Host::state_keep(self, cx(c), key, value).await
+        }
+
+        async fn roots(&mut self, c: old::Context) -> String {
+            platform::Host::roots(self, cx(c)).await
+        }
+
+        async fn job_start(&mut self, c: old::Context, spec: String) -> Result<String, String> {
+            platform::Host::job_start(self, cx(c), spec).await
+        }
+
+        async fn job_status(&mut self, c: old::Context, id: String) -> String {
+            platform::Host::job_status(self, cx(c), id).await
+        }
+
+        async fn job_cancel(&mut self, c: old::Context, id: String) {
+            platform::Host::job_cancel(self, cx(c), id).await
+        }
+
+        async fn tool_state(&mut self, c: old::Context, tool: String) -> String {
+            platform::Host::tool_state(self, cx(c), tool).await
         }
     }
 }

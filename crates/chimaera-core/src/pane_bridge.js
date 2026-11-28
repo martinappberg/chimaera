@@ -241,9 +241,25 @@
     let lastSize = 0;
     let sizeTimer = 0;
     let pendingSize = 0;
+    // web/1 (a plugin's page): `act` and `status` need no press — the page
+    // talks to its own plugin and its own pill — but are rate-limited;
+    // `reference` drafts, so it waits for a press like `draft`.
+    const WEB_MAX = 200000;
+    const WEB_RATE = 10;
+    let webWindow = 0;
+    let webCount = 0;
+    const webAllowed = () => {
+      const now = Date.now();
+      if (now - webWindow > 1000) {
+        webWindow = now;
+        webCount = 0;
+      }
+      webCount += 1;
+      return webCount <= WEB_RATE;
+    };
     document.addEventListener("chimaera:page", (e) => {
       const detail = e.detail;
-      if (typeof detail !== "string" || detail.length > 16384) return;
+      if (typeof detail !== "string" || detail.length > WEB_MAX) return;
       let m;
       try {
         m = JSON.parse(detail);
@@ -274,7 +290,30 @@
         else sizeTimer = setTimeout(flush, wait);
         return;
       }
+      if (m.kind === "web_act" || m.kind === "web_status") {
+        if (!webAllowed()) return;
+        if (m.kind === "web_act") {
+          if (typeof m.action !== "string" || m.action === "" || m.action.length > 64) return;
+          post({ kind: "web_act", action: m.action, payload: m.payload ?? null });
+        } else {
+          post({ kind: "web_status", state: String(m.state ?? ""), text: String(m.text ?? "").slice(0, 200) });
+        }
+        return;
+      }
       if (Date.now() - lastPress > INPUT_FRESH_MS) return;
+      if (m.kind === "web_reference") {
+        if (typeof m.text !== "string") return;
+        lastPress = 0;
+        post({
+          kind: "web_reference",
+          text: m.text.slice(0, PAGE_TEXT_MAX),
+          file: typeof m.file === "string" ? m.file.slice(0, 1000) : null,
+          line: Number.isInteger(m.line) ? m.line : null,
+          crop: m.crop ?? null,
+          title: clip(document.title) ?? "",
+        });
+        return;
+      }
       if (m.kind !== "page_send" && m.kind !== "page_draft") return;
       if (typeof m.text !== "string" || m.text.trim() === "") return;
       lastPress = 0;
@@ -528,6 +567,14 @@
           ? { text: String(next.text ?? ""), title: String(next.title ?? ""), enabled: next.enabled === true }
           : null;
       drawChip();
+      return null;
+    },
+    // A host's word for the page (web/1: its data, visibility, theme): handed
+    // to the page API in the page's own world as a `chimaera:host` event,
+    // a string, as a page's own events come the other way.
+    command(json) {
+      if (typeof json !== "string" || json.length > 262144) return null;
+      document.dispatchEvent(new CustomEvent("chimaera:host", { detail: json }));
       return null;
     },
     region(rect) {

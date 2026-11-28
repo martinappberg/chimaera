@@ -269,7 +269,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
 - **Where it lives.** `plugins/runtime.rs` (engine, instances, deadlines, faults; the entry
   points `offer` / `call_tool` / `knowledge` / `on_event`, `hook`, `session_ended`),
   `plugins/hostfns.rs` (the WIT `host` interface), `crates/chimaera-plugin-api/wit/chimaera.wit`
-  (the 0.2 world; `wit-0.1/chimaera.wit` retains 0.1; the daemon binds both). Tests:
+  (the 0.3 world; `wit-0.1/` and `wit-0.2/` retain 0.1 and 0.2; the daemon binds all three, `runtime::v1`/`v2`/`v3`). Tests:
   `crates/chimaera-server/src/tests/plugin_host.rs`, against `plugins/test-fixture` (embedded
   only by test builds, from `plugins/dist-test`, never shipped).
 - **Key behaviors** (every limit is the host's, so no plugin can forget one):
@@ -645,7 +645,10 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   restart. Shipped as the platform plan's phase P7; 0.1 plugins (Mycelium) run unchanged
   beside it.
 - **How to use.** Switch the plugin on in a workspace. Its card gains **Open <view>** for each
-  tab it offers, its card sections, and **Settings**. A file it claims opens in its view; the
+  tab it offers, its card sections, and **Settings**. A tab view that asks for it (`[[views]]
+  rail`, API 0.3; at most two per plugin) also gets a row in the sidebar beside Knowledge, in
+  its icon and title, while the plugin is on there: one click opens or focuses the tab
+  (`platform.ts::railViews`, App.svelte's rail). A file it claims opens in its view; the
   bar above has **Text** (and, when two plugins claim it, each one — the choice is remembered
   per workspace), its status chips and file actions. Opening such a file where the plugin is
   installed but off offers **Turn on** in that bar (**Not now** is remembered per workspace;
@@ -727,6 +730,10 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   - Claiming a file kind is on the **Can** list, so a release that claims a new one asks again.
   - The author's guide has every node, prop, surface and limit:
     [docs/agent-guides/plugins.md](../agent-guides/plugins.md#the-platform-api-02).
+
+## Web views (API 0.3)
+
+A 0.3 plugin may ship its own HTML/JS page for a drawing area (a `web` node), and lend libraries to agents' pages; each page, library and host it declares is a line on its card's **Can** list, and web views alone keep it sandboxed. The whole feature: [web views](web-views.md); writing one: [the guide](../agent-guides/plugins.md#web-views-api-03).
 
 ## Programs and tools (the privileged tier)
 

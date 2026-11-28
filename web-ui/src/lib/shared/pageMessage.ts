@@ -24,6 +24,9 @@ export interface PageMessage {
   text: string;
   /** The page's own title, as it named itself. */
   title: string;
+  /** A picture with the draft (web/1 `reference`: a crop of the page). A
+   *  message with a picture always drafts. */
+  image?: Blob | null;
 }
 
 /** How much earlier than its chat a page's file may look and still count

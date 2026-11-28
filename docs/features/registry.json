@@ -621,7 +621,7 @@
         "crates/chimaera-app/src/**",
         "web-ui/src/lib/net/native.ts",
         "web-ui/src/lib/workspace/UpdateToast.svelte",
-    "web-ui/src/lib/workspace/WindowNameCard.svelte",
+        "web-ui/src/lib/workspace/WindowNameCard.svelte",
         "web-ui/src/lib/workspace/update.svelte.ts"
       ],
       "maps": [
@@ -698,6 +698,41 @@
         "cargo test -p chimaera-server",
         "cargo test -p chimaera",
         "cargo test -p chimaera-plugin-api",
+        "bash scripts/build-plugins.sh",
+        "npm --prefix web-ui run check",
+        "npm --prefix web-ui run test"
+      ]
+    },
+    {
+      "id": "web-views",
+      "name": "Web views",
+      "page": "docs/features/web-views.md",
+      "paths": [
+        "crates/chimaera-server/src/plugins/web.rs",
+        "crates/chimaera-core/src/page_api.js",
+        "crates/chimaera-core/src/chimaera_web.css",
+        "web-ui/src/lib/plugins/ui/WebNode.svelte",
+        "web-ui/src/lib/plugins/ui/webViews.svelte.ts",
+        "web-ui/src/lib/shared/guardFrame.ts",
+        "web-ui/src/lib/shared/pageCrop.ts",
+        "web-ui/src/lib/shared/pageNeeds.ts",
+        "plugins/test-web/**"
+      ],
+      "maps": [
+        "crates/chimaera-server/AGENTS.md",
+        "crates/chimaera-core/AGENTS.md",
+        "crates/chimaera-plugin-api/AGENTS.md",
+        "docs/agent-guides/plugins.md",
+        "plugins/AGENTS.md",
+        "web-ui/src/lib/plugins/AGENTS.md",
+        "web-ui/src/lib/shared/AGENTS.md"
+      ],
+      "rules": [
+        ".claude/rules/daemon.md",
+        ".claude/rules/web-ui.md"
+      ],
+      "checks": [
+        "cargo test -p chimaera-server plugin_web",
         "bash scripts/build-plugins.sh",
         "npm --prefix web-ui run check",
         "npm --prefix web-ui run test"

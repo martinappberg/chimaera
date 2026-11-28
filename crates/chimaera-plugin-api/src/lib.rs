@@ -1,10 +1,11 @@
 //! The Rust side of the `chimaera:plugin` WIT world (`wit/chimaera.wit`,
-//! package `chimaera:plugin@0.2.0`): what a Chimaera plugin implements
+//! package `chimaera:plugin@0.3.0`): what a Chimaera plugin implements
 //! ([`Plugin`]), what it may ask the host ([`host`], and the platform's
 //! [`platform`]). Design: `docs/design/plugin-system-plan.md` (the host) and
 //! `docs/design/plugin-platform-plan.md` (screens, surfaces, files, settings,
-//! output folders, programs). A 0.1 plugin moves to 0.2 by bumping this
-//! dependency and its manifest's `api`: every new export has a default.
+//! output folders, programs) and `docs/design/rich-views-plan.md` (0.3's web
+//! pages). A 0.1 or 0.2 plugin moves to 0.3 by bumping this dependency and its
+//! manifest's `api`: every new export has a default.
 //!
 //! A plugin is a `cdylib` crate built for `wasm32-wasip2`:
 //!
@@ -52,6 +53,7 @@ pub use chimaera::plugin::types::{
 
 use exports::chimaera::plugin::plugin::Guest;
 use exports::chimaera::plugin::screens::Guest as ScreensGuest;
+use exports::chimaera::plugin::web::Guest as WebGuest;
 
 /// What a plugin provides. Every function has a default, so a plugin
 /// implements only what it offers; the set is the WIT world's complete
@@ -123,6 +125,13 @@ pub trait Plugin {
         let _ = (cx, job);
         ToolResult::error(format!("{name} has no answer to resume"))
     }
+
+    /// 0.3: a tar of the pages and libraries the manifest's `[web]` names,
+    /// usually `include_bytes!` of one the plugin's build made. The host asks
+    /// once per installed build. Empty: the plugin has no pages.
+    fn web_bundle() -> Vec<u8> {
+        Vec::new()
+    }
 }
 
 /// Wire a type implementing [`Plugin`] to the component's exports. Invoke
@@ -185,6 +194,12 @@ impl<T: Plugin> ScreensGuest for T {
 
     fn tool_resume(cx: Context, name: String, job: String) -> ToolResult {
         T::tool_resume(cx, &name, &job)
+    }
+}
+
+impl<T: Plugin> WebGuest for T {
+    fn web_bundle() -> Vec<u8> {
+        T::web_bundle()
     }
 }
 
@@ -261,6 +276,13 @@ pub mod host {
     /// `path` is workspace-relative; no component may be a symlink.
     pub fn read(cx: &Context, path: &str, cap: u32) -> Result<Vec<u8>, String> {
         raw::read(cx, path, cap)
+    }
+
+    /// [`read`] from `offset` (0.3): at most `cap` bytes (clamped to 8 MiB),
+    /// empty at or past the end. For a header past the first 8 MiB, or the
+    /// records an index points at.
+    pub fn read_at(cx: &Context, path: &str, offset: u64, cap: u32) -> Result<Vec<u8>, String> {
+        raw::read_at(cx, path, offset, cap)
     }
 
     /// Size, mtime and kind of a workspace path (never through a symlink).

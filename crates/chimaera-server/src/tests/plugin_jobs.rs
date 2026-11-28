@@ -723,7 +723,7 @@ fn browser_manifest() -> String {
         .collect();
     format!(
         "id = \"{BROWSER_PID}\"\nname = \"Browser fixture\"\nversion = \"0.1.0\"\n\
-         summary = \"Provides a stand-in browser, for chimaera's tests.\"\napi = \"0.2\"\n\n\
+         summary = \"Provides a stand-in browser, for chimaera's tests.\"\napi = \"0.3\"\n\n\
          [provides]\nmcp_tools = [\"build\"]\nbrowser = \"fixture-tool\"\n\n\
          [[programs]]\nname = \"fixture-tool\"\n\n\
          [[tools]]\nid = \"fixture-tool\"\nname = \"Fixture browser\"\nversion = \"1.0.0\"\n\

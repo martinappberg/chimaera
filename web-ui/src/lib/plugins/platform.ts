@@ -21,6 +21,8 @@ export interface ViewDecl {
   title: string;
   slot: Slot;
   icon: string | null;
+  /** A `tab` view with a sidebar row of its own (0.3, `[[views]] rail`). */
+  rail: boolean;
 }
 
 export interface FileKindDecl {
@@ -99,7 +101,9 @@ export function normalizePlatform(raw: unknown): PlatformTables {
     const id = text(o?.id);
     const title = text(o?.title);
     const slot = o?.slot as Slot;
-    if (id !== null && title !== null && SLOTS.includes(slot)) views.push({ id, title, slot, icon: text(o.icon) });
+    if (id !== null && title !== null && SLOTS.includes(slot)) {
+      views.push({ id, title, slot, icon: text(o.icon), rail: o.rail === true && slot === "tab" });
+    }
   }
   const files: FileKindDecl[] = [];
   for (const f of list(r.files)) {
@@ -386,6 +390,21 @@ export async function fetchView(
 
 /** A node's action: the view's new tree, `null` (keep what it shows), or
  *  why it failed. */
+/** A page of the plugin's own bundle for a `web` node: its URL under a
+ *  grant ticket (`/web/{grant}/{entry}`, `plugins::web`). Asked again while
+ *  the node is shown, it answers the same URL and keeps it alive. */
+export async function mintWebPage(ws: string, pid: string, entry: string): Promise<string> {
+  const b = await body<{ url?: unknown; error?: unknown }>(
+    await api(`${base(ws, pid)}/web`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ entry }),
+    }),
+  );
+  if (typeof b.url !== "string") throw new Error(typeof b.error === "string" ? b.error : "no page");
+  return b.url;
+}
+
 export async function postViewAction(
   ws: string,
   pid: string,
@@ -726,6 +745,20 @@ export function openPluginView(plugin: string, view: string): boolean {
   if (viewOpener === null) return false;
   viewOpener(plugin, view);
   return true;
+}
+
+/** The sidebar rows active plugins ask for (`[[views]] rail`): each a tab
+ *  view of a plugin on in this workspace, in the catalog's order. */
+export function railViews(
+  plugins: readonly WorkspacePlugin[] | undefined,
+): { plugin: string; view: string; title: string; icon: string[] | null }[] {
+  return (plugins ?? []).flatMap((p) =>
+    p.active
+      ? p.platform.views
+          .filter((v) => v.rail && v.slot === "tab")
+          .map((v) => ({ plugin: p.id, view: v.id, title: v.title, icon: pluginIcon(v.icon) }))
+      : [],
+  );
 }
 
 /** A plugin tab's name: its view's title, else the view id. */

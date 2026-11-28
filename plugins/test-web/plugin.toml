@@ -1,0 +1,25 @@
+# Test-only: built into plugins/dist-test, embedded only by the daemon's
+# test builds. A plugin page, a library for agents' pages, a declared host.
+id = "test-web"
+name = "Web fixture"
+version = "0.1.0"
+summary = "Draws its own web view and lends a library to agents' pages, for chimaera's tests."
+api = "0.3"
+
+[access]
+files = "read"
+
+[adds]
+ui = ["A Web board tab with a page of its own"]
+
+[web]
+pages = ["view.html"]
+libraries = ["testlib"]
+network = ["data.example.org"]
+
+[[views]]
+id = "board"
+title = "Web board"
+slot = "tab"
+icon = "grid"
+rail = true            # a sidebar row while it is on
