@@ -175,8 +175,10 @@ class FakeEl {
   querySelector() {
     return null;
   }
-  querySelectorAll() {
-    return [];
+  /** SVG nodes carrying a filter inside this element. */
+  filtered: FakeEl[] = [];
+  querySelectorAll(sel: string) {
+    return sel === "[filter]" ? this.filtered : [];
   }
   closest() {
     return null;
@@ -326,6 +328,30 @@ describe("playStep lands every corpus click on its golden state", async () => {
       else expect(fe.props.get("opacity") === "0" || hiddenBefore).toBe(true);
     });
     play.finish();
+  });
+
+  it("repaints a growing shape's filtered drawing every frame, ending on its own opacity (WebKit's stale filter picture)", () => {
+    const s = slides.find((x) => x.name === "entrances" && x.part.endsWith("slide1.xml"))!;
+    const { tagged } = fakeSlide(s.t);
+    const shadow = new FakeEl(false);
+    shadow.attrs.set("opacity", "0.5");
+    const zoomed = tagged.shapes.get("4")!.el as unknown as FakeEl;
+    zoomed.filtered.push(shadow);
+    const faded = new FakeEl(false);
+    (tagged.shapes.get("3")!.el as unknown as FakeEl).filtered.push(faded);
+    for (let k = 0; k < 3; k++) playStep(tagged, s.t, k, { w: W, h: H }).finish();
+    const play = playStep(tagged, s.t, 3, { w: W, h: H });
+    expect(zoomed.running).toBe(1);
+    expect(shadow.running).toBe(1);
+    const frames = shadow.frames.at(-1)!;
+    expect(frames[0]!.opacity).toBe(0.5);
+    expect(frames.at(-1)!.opacity).toBe(0.5);
+    expect(frames.some((f) => f.opacity !== 0.5)).toBe(true);
+    play.finish();
+    expect(shadow.running).toBe(0);
+    // A fade scales nothing: its shadow is left alone.
+    playStep(tagged, s.t, 2, { w: W, h: H }).finish();
+    expect(faded.started).toBe(0);
   });
 
   it("a slide whose drawing throws while planning lands on its state", async () => {

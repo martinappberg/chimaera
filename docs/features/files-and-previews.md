@@ -997,7 +997,12 @@ These are existing preview endpoints; no new daemon routes or persisted layout f
   shifts and (above a fit of 1) blurs until the click lands. Browsing and edit mode keep the
   transform fit; text lays out the same under both, and at every fit (WebKit sets optical sizing
   off on slides, since it picks the optical size and tracking from the used font size), which a
-  wrap probe holds for every corpus paragraph at fits 0.4–3 in Chrome and WebKit. The next click
+  wrap probe holds for every corpus paragraph at fits 0.4–3 in Chrome and WebKit. A shape that
+  grows or shrinks during a click repaints its shadow, glow or soft edge every frame: WebKit keeps
+  an SVG filter's picture from the scale it was first painted at, so a zoom from nothing drew a
+  pale smear the size of the shadow until it landed. The last animated frame and the landed one
+  are the same picture (0 px apart in window captures of fade, zoom, float, fly, wipe, spin, grow
+  and a path in WebKit). The next click
   is planned while the show is idle, so a click only starts its animations.
   Slide transitions aren't played yet, and missing fonts fall back to the system's;
   the ⓘ in the bar says so, and counts shapes that couldn't be drawn. Refused past 100 MB. A reveal's

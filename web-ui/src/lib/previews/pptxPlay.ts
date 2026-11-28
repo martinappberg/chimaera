@@ -1333,7 +1333,37 @@ export interface PreparedStep {
   windows: Map<string, ColorWindow>;
   blends: { el: Styled; prop: string; a: string; b: string; spid: string }[];
   landedBy: Map<Styled, Map<string, string>>;
+  /** Filtered drawings inside an element that grows or shrinks, repainted every frame (`filteredIn`). */
+  repaint: { el: SVGElement; opacity: number }[];
 }
+
+/**
+ * The SVG nodes carrying a filter (a shadow, a glow, a soft edge) inside
+ * the elements a step scales. WebKit renders an SVG filter at the scale
+ * its element was first painted at and keeps that picture while the
+ * compositor scales the element: a zoom from nothing showed its shape as
+ * a pale smear the size of the shadow's region, crisp only once it landed
+ * (the native app's engine, window captures). A barely-there opacity
+ * change on each such node, for the length of the click, repaints it every
+ * frame at the scale it stands at; its last frame is its own opacity.
+ */
+function filteredIn(tagged: TaggedSlide, tracks: StepPlan["tracks"]): { el: SVGElement; opacity: number }[] {
+  const out: { el: SVGElement; opacity: number }[] = [];
+  for (const tr of tracks) {
+    if (!tr.keyframes.some((f) => f.scale !== undefined && f.scale !== "none")) continue;
+    const el = elementOf(tagged, tr.id);
+    if (el === undefined) continue;
+    for (const n of el.querySelectorAll<SVGElement>("[filter]")) {
+      const op = Number.parseFloat(n.style.opacity || (n.getAttribute("opacity") ?? ""));
+      out.push({ el: n, opacity: Number.isFinite(op) ? Math.max(0, Math.min(1, op)) : 1 });
+      if (out.length >= REPAINT_MAX) return out;
+    }
+  }
+  return out;
+}
+/** At most this many filtered nodes repaint during one click; past it they
+ *  keep WebKit's picture (a shape with hundreds of shadows is rare). */
+const REPAINT_MAX = 64;
 
 /**
  * Plan step `k` without touching the slide: what `playStep` would animate
@@ -1413,7 +1443,7 @@ export function prepareStep(tagged: TaggedSlide, timeline: SlideTimeline, k: num
     }
     for (const w of windows.values()) duration = Math.max(duration, Math.min(w.to, opts.maxMs ?? PLAY_MAX_MS));
     if (!(duration > 0)) return null;
-    return { tagged, timeline, k, approximate: target.approximate, plan, duration, windows, blends, landedBy };
+    return { tagged, timeline, k, approximate: target.approximate, plan, duration, windows, blends, landedBy, repaint: filteredIn(tagged, plan.tracks) };
 }
 
 /**
@@ -1458,7 +1488,7 @@ export function playStep(tagged: TaggedSlide, timeline: SlideTimeline, k: number
       return playing;
     }
     playing.approximate = prep.approximate;
-    const { plan, duration, windows, blends } = prep;
+    const { plan, duration, windows, blends, repaint } = prep;
     for (const tr of plan.tracks) {
       const el = elementOf(tagged, tr.id);
       if (el === undefined || typeof el.animate !== "function") continue;
@@ -1492,6 +1522,11 @@ export function playStep(tagged: TaggedSlide, timeline: SlideTimeline, k: number
     if (anims.length === 0) {
       land();
       return playing;
+    }
+    for (const r of repaint) {
+      if (typeof r.el.animate !== "function") continue;
+      const o = r.opacity;
+      anims.push(r.el.animate([{ opacity: o }, { opacity: o * 0.9999 }, { opacity: o }], { duration, easing: "linear" }));
     }
     timer = setTimeout(land, duration);
   } catch {
